@@ -1,0 +1,17 @@
+{
+  "id": "event_native_read_png",
+  "type": "session.tool.success",
+  "data": {
+    "sessionID": "sess_1",
+    "assistantMessageID": "message_read_png",
+    "id": "tool_read_png",
+    "content": [
+      { "type": "text", "text": "Read image" },
+      {
+        "type": "file",
+        "uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+iR1sAAAAASUVORK5CYII=",
+        "mime": "image/png"
+      }
+    ]
+  }
+}

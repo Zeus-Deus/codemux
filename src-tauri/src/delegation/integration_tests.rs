@@ -88,6 +88,15 @@ async fn validation_coordinator_shutdown_joins_transport_and_maintenance_closes_
     restarted.shutdown().await.unwrap();
 }
 
+fn persisted_user_message(db: &crate::database::DatabaseStore, thread: &str, nonce: &str) -> Value {
+    // Native control also appends durable lifecycle records. Select the
+    // correlated user envelope rather than treating the newest row as one.
+    db.list_agent_chat_messages(thread).into_iter().rev()
+        .map(|row| serde_json::from_str::<Value>(&row).unwrap())
+        .find(|row| row["type"] == "user_message" && row["client_nonce"] == nonce)
+        .expect("correlated user message must be persisted")
+}
+
 #[derive(Debug)]
 struct HeldCheckpoint {
     entered: tokio::sync::Notify,
@@ -140,7 +149,7 @@ async fn final_dispatch_unsupported_parent_fails_before_provider_or_app_side_eff
         app.handle().clone(),
         ProviderKind::OpenCode,
         input,
-        crate::commands::agent_chat::TurnOrigin::Delegation,
+        crate::commands::agent_chat::TurnOrigin::RemoteDelegation,
     )
     .await;
     assert!(result.unwrap_err().contains("unsupported"));
@@ -550,7 +559,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
         };
         if action.starts_with("presentation") {
             let db = app.state::<crate::database::DatabaseStore>();
-            let delivered: Value = serde_json::from_str(&db.get_agent_chat_message(db.max_agent_chat_message_id(&thread).unwrap()).unwrap()).unwrap();
+            let delivered = persisted_user_message(&db, &thread, &format!("delegation:{}", task.id));
             let delivered_state = journal.task(&task.id).unwrap().wake_state;
             let delivered_outcome = journal.delivery_outcome(&task.id).unwrap();
             provider.stop_session(ThreadId(thread.clone())).await.unwrap();
@@ -568,7 +577,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
                     delivery: crate::agent_provider::types::MessageDelivery::Queue,
                 }, crate::commands::agent_chat::TurnOrigin::User,
             ).await;
-            let ordinary: Value = serde_json::from_str(&db.get_agent_chat_message(db.max_agent_chat_message_id(&thread).unwrap()).unwrap()).unwrap();
+            let ordinary = persisted_user_message(&db, &thread, "literal-user-prose");
             provider.stop_session(ThreadId(thread.clone())).await.unwrap();
             let trace = std::fs::read_to_string(root.join("parent-trace.jsonl")).unwrap();
             let method = if kind == ProviderKind::Codex { "turn/start" } else { "send-turn" };
@@ -1373,11 +1382,8 @@ async fn control_launch_lost_reply_restart_follow_and_normal_idle_native_parent_
         .to_string()
         .contains("actual native child fixture output"));
     let db = handle.state::<crate::database::DatabaseStore>();
-    let id = db.max_agent_chat_message_id("fixture-parent").unwrap();
-    assert!(db
-        .get_agent_chat_message(id)
-        .unwrap()
-        .contains(&format!("delegation:{}", task.id)));
+    let delivered = persisted_user_message(&db, "fixture-parent", &format!("delegation:{}", task.id));
+    assert_eq!(delivered["client_nonce"], format!("delegation:{}", task.id));
     let actor = app::NativeActor {
         thread_id: "fixture-parent".into(),
         provider: ProviderKind::Codex,

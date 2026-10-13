@@ -53,7 +53,7 @@ pub(super) async fn execute_claimed(
         startup_attempted=true;
         let session=tokio::time::timeout(Duration::from_secs(60),provider.start_session(StartSessionInput {
             thread_id:thread.clone(),cwd,model:request.model.clone(),resume_cursor:None,fresh_session:true,
-            permission_mode:Some(request.permission_mode.clone()),effort:request.effort.clone(),context_window:None,fast_mode:false,
+            permission_mode:Some(request.permission_mode.clone()),effort:request.effort.clone(),context_window:None,fast_mode:false, service_tier:None, remote:None,
             additional_directories:vec![],env:None,workspace_id:Some(workspace_id),extra:serde_json::Value::Null,recorded_usage_baseline:None,
         })).await.map_err(|_|"native session startup timed out; execution is uncertain".to_string())?.map_err(|e|e.to_string())?;
         if let Some(bound)=bound_checkout.as_mut() {bound.release_registry()?;}
@@ -222,9 +222,9 @@ fn apply_event(
     event: &ProviderRuntimeEvent,
 ) -> Option<(TaskStatus, Option<String>)> {
     // This worker owns one fresh session and dispatches exactly one turn.
-    // Claude may emit callbacks and its final result before the send ack,
-    // stamping an empty native turn ID. The pump preserves those events until
-    // the single accepted turn is known; never rewrite their original IDs.
+    // New Claude adapters reserve their runtime turn before the send ACK;
+    // older adapters can still emit an empty ID. Keep that compatibility
+    // while preserving every observed event's original identity.
     let is_turn = |turn: &TurnId| {
         task.turn_id.as_deref() == Some(turn.0.as_str())
             || (task.request.provider == crate::agent_provider::ProviderKind::Claude

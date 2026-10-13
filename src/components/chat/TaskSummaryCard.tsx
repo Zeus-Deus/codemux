@@ -41,14 +41,14 @@ export const TaskSummaryCard = memo(function TaskSummaryCard({
       disabled={!interactive}
       data-testid="task-receipt"
       className={cn(
-        "flex w-full items-center gap-2.5 rounded-lg border border-border/60 bg-surface-1 px-3 py-2 text-left transition-colors duration-150",
+        "flex w-full items-center gap-2.5 rounded-lg border border-hairline bg-surface-1 px-3 py-2 text-left transition-colors duration-150",
         interactive
           ? "cursor-pointer hover:border-border hover:bg-surface-2"
           : "cursor-default",
       )}
     >
       <ListTodo
-        className="size-[15px] shrink-0 text-muted-foreground"
+        className="size-3.5 shrink-0 text-muted-foreground"
         aria-hidden
       />
       <span className="min-w-0 flex-1 truncate text-label text-foreground/80">

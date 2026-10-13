@@ -8,7 +8,6 @@ import {
   FolderPlus,
   GitBranch,
   FolderOpen,
-  Loader2,
   X,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
@@ -25,6 +24,7 @@ import {
 import { pickFolder } from "@/lib/file-dialog";
 import { useCloneProgress } from "@/hooks/use-clone-progress";
 import { CloneProgressRow } from "@/components/overlays/clone-progress-row";
+import { Spinner } from "@/components/ui/spinner";
 
 type Mode = "empty" | "clone";
 
@@ -180,6 +180,7 @@ export function NewProjectScreen() {
                 onClick={handleBrowse}
                 disabled={loading}
                 className="shrink-0"
+                aria-label="Browse for folder"
               >
                 <FolderOpen className="size-4" />
               </Button>
@@ -281,6 +282,7 @@ export function NewProjectScreen() {
               <button
                 type="button"
                 onClick={() => setError(null)}
+                aria-label="Dismiss error"
                 className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors duration-150"
               >
                 <X className="size-3.5" />
@@ -305,7 +307,7 @@ export function NewProjectScreen() {
               </span>
             )}
             <Button onClick={handleCreate} disabled={loading} size="sm" className="bg-foreground text-background hover:bg-foreground/90">
-              {loading && <Loader2 className="size-3 animate-spin mr-1" />}
+              {loading && <Spinner className="size-3 mr-1" aria-hidden />}
               {loading
                 ? mode === "clone"
                   ? "Cloning..."

@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { create } from "zustand";
 
 import { agentChatProviderHealth } from "@/tauri/commands";
@@ -39,15 +39,32 @@ const HEALTH_TTL_MS = 5 * 60 * 1000;
  *  poll can usefully do. */
 export const HEALTH_REPROBE_MS = HEALTH_TTL_MS;
 
+/** Floor between focus-triggered re-checks, so alt-tabbing through the
+ *  app does not spawn a CLI probe on every switch. */
+const FOCUS_REPROBE_MIN_MS = 10_000;
+
+/** A report that means a session cannot start at all: the CLI is missing,
+ *  or it is installed and signed out. Inconclusive and partial failures do
+ *  not qualify; the session gets a chance to explain itself. */
+export function healthBlocksSend(report: ProviderHealthReport | null): boolean {
+  if (!report || report.status !== "error") return false;
+  return !report.installed || !!report.login_command;
+}
+
 interface ProviderHealthSlot {
   report: ProviderHealthReport | null;
   fetchedAt: number;
+  /** The last attempt failed at the command layer. Retain cached banner
+   *  data, but do not use it as a fresh answer for agent defaults. */
+  lastProbeFailed: boolean;
+  /** Last settled attempt, including IPC failures, for the focus retry floor. */
+  lastAttemptAt: number;
   /** In-flight probe, for single-flight coalescing. */
-  inFlight: Promise<void> | null;
+  inFlight: Promise<ProviderHealthReport | null> | null;
   /** A forced probe that arrived while `inFlight` was still running and
    *  is waiting to start after it settles. Held so several forced calls
    *  in one burst share ONE follow-up instead of stacking spawns. */
-  queuedForce: Promise<void> | null;
+  queuedForce: Promise<ProviderHealthReport | null> | null;
   /** Dismissal identity (`status\0message`) the user closed. A CHANGED
    *  failure re-surfaces the banner; the same one stays dismissed until
    *  the provider recovers (recovery clears it). */
@@ -58,19 +75,26 @@ type SlotMap = Record<AgentChatProviderKind, ProviderHealthSlot>;
 
 interface ProviderHealthStore {
   slots: SlotMap;
-  /** Probe `provider`, respecting TTL unless `force`. Resolves when the
-   *  slot is up to date (or the probe failed — failure keeps the last
-   *  report rather than fabricating one). */
+  /** Probe `provider`, respecting TTL unless `force`. Returns the cached
+   *  or newly verified report; `null` on a failed probe, which keeps the
+   *  previous report for advisory display without refreshing its age. */
   refresh: (
     provider: AgentChatProviderKind,
     opts?: { force?: boolean },
-  ) => Promise<void>;
+  ) => Promise<ProviderHealthReport | null>;
   /** A start/turn just SUCCEEDED — direct evidence the provider runs.
    *  Drops a stale failure banner and re-probes for ground truth. */
   noteProviderSuccess: (provider: AgentChatProviderKind) => Promise<void>;
   /** Scheduled recovery poll: re-probe only an already-unhealthy
    *  provider. No-op while healthy. */
   reprobeUnhealthy: (provider: AgentChatProviderKind) => Promise<void>;
+  /** Pre-send gate: resolves to the report that rules out a session, or
+   *  `null` when sending may proceed. A cached failure is re-probed so a
+   *  sign-in done elsewhere is never blocked by a stale answer. A
+   *  blocking report un-dismisses the banner, which carries its fix. */
+  ensureReady: (
+    provider: AgentChatProviderKind,
+  ) => Promise<ProviderHealthReport | null>;
   dismiss: (provider: AgentChatProviderKind) => void;
 }
 
@@ -80,6 +104,8 @@ export function emptyHealthSlot(): ProviderHealthSlot {
   return {
     report: null,
     fetchedAt: 0,
+    lastProbeFailed: false,
+    lastAttemptAt: 0,
     inFlight: null,
     queuedForce: null,
     dismissedKey: null,
@@ -100,9 +126,11 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
     cursor: emptyHealthSlot(),
     grok: emptyHealthSlot(),
     hermes: emptyHealthSlot(),
+    acp: emptyHealthSlot(),
     opencode: emptyHealthSlot(),
   },
   refresh: async (provider, opts) => {
+    if (provider === "acp") return null; // Health is instance-scoped; never launch on generic provider intent.
     const slot = get().slots[provider];
     if (slot.inFlight) {
       // An unforced caller just wants a fresh-enough answer, and the
@@ -135,8 +163,9 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
       }));
       return queued;
     }
-    const fresh = Date.now() - slot.fetchedAt < HEALTH_TTL_MS;
-    if (fresh && !opts?.force) return;
+    const checkedAt = slot.lastProbeFailed ? slot.lastAttemptAt : slot.fetchedAt;
+    const fresh = Date.now() - checkedAt < HEALTH_TTL_MS;
+    if (fresh && !opts?.force) return slot.lastProbeFailed ? null : slot.report;
     const probe = agentChatProviderHealth(provider)
       .then((report) => {
         set((state) => {
@@ -152,12 +181,15 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
                 ...prev,
                 report,
                 fetchedAt: Date.now(),
+                lastProbeFailed: false,
+                lastAttemptAt: Date.now(),
                 inFlight: null,
                 dismissedKey,
               },
             },
           };
         });
+        return report;
       })
       .catch((err) => {
         // Command-layer failure (mock without handler, IPC hiccup):
@@ -170,11 +202,13 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
             ...state.slots,
             [provider]: {
               ...state.slots[provider],
-              fetchedAt: Date.now(),
+              lastProbeFailed: true,
+              lastAttemptAt: Date.now(),
               inFlight: null,
             },
           },
         }));
+        return null;
       });
     set((state) => ({
       slots: {
@@ -223,8 +257,23 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
     // Unlike the post-failure forced probes, this is a poll with no
     // triggering event, so an in-flight probe is a perfectly good
     // answer — coalesce instead of queueing another CLI spawn.
-    if (slot.inFlight) return slot.inFlight;
+    if (slot.inFlight) {
+      await slot.inFlight;
+      return;
+    }
     await get().refresh(provider, { force: true });
+  },
+  ensureReady: async (provider) => {
+    const cached = get().slots[provider].report;
+    const report = await get().refresh(provider, { force: healthBlocksSend(cached) });
+    if (!report || !healthBlocksSend(report)) return null;
+    set((state) => ({
+      slots: {
+        ...state.slots,
+        [provider]: { ...state.slots[provider], dismissedKey: null },
+      },
+    }));
+    return report;
   },
   dismiss: (provider) => {
     set((state) => {
@@ -252,13 +301,73 @@ export function selectVisibleHealthReport(
   return slot.report;
 }
 
-/** Poll an already-known unhealthy provider for recovery on the TTL cadence.
+/** What a provider's report means for someone choosing an agent. A
+ *  `warning` is a probe that could not tell (sessions may still work), so
+ *  it is not treated as broken. */
+export type ProviderReadiness = "ready" | "unverified" | "not_ready" | "not_installed";
+
+export function providerReadiness(report: ProviderHealthReport): ProviderReadiness {
+  if (report.status === "ready") return "ready";
+  if (!report.installed) return "not_installed";
+  return report.status === "warning" ? "unverified" : "not_ready";
+}
+
+export interface ProbedProviderHealth {
+  report: ProviderHealthReport | null;
+  /** True while an opening needs a fresh answer, including an expired
+   *  cached report before its refresh starts. A settled probe with no
+   *  report failed at the IPC layer, so its readiness is unknown. */
+  pending: boolean;
+}
+
+/** Probe `providers` (TTL-cached) while `active`, and return each one's
+ *  latest report.
+ *
+ *  Only for surfaces where opening them IS the provider intent the store's
+ *  contract asks for: the automation form choosing an agent, and the
+ *  first-run agent strip on Home. Pass a stable `providers` array. */
+export function useProbedProviderHealth(
+  providers: readonly AgentChatProviderKind[],
+  active: boolean,
+): Partial<Record<AgentChatProviderKind, ProbedProviderHealth>> {
+  const refresh = useProviderHealth((s) => s.refresh);
+  const slots = useProviderHealth((s) => s.slots);
+  useEffect(() => {
+    if (!active) return;
+    for (const provider of providers) void refresh(provider);
+    // Another probe's completion can expose a cached answer that expired
+    // while this surface was open. Schedule that refresh too; the store
+    // still applies its TTL and single-flight guards.
+  }, [active, providers, refresh, slots]);
+  return useMemo(
+    () =>
+      Object.fromEntries(
+        providers.map((provider) => {
+          const slot = slots[provider];
+          const checkedAt = slot.lastProbeFailed ? slot.lastAttemptAt : slot.fetchedAt;
+          const pending =
+            slot.inFlight !== null ||
+            slot.queuedForce !== null ||
+            checkedAt === 0 ||
+            Date.now() - checkedAt >= HEALTH_TTL_MS;
+          return [provider, { report: slot.lastProbeFailed ? null : slot.report, pending }];
+        }),
+      ),
+    [active, providers, slots],
+  );
+}
+
+/** Poll an already-known unhealthy provider for recovery on the TTL
+ *  cadence, and again on mount and whenever the window regains focus.
  *
  *  The poll is what closes the "fixed it, banner still up" gap: nothing
  *  in the app observes a `claude login` run in some other terminal, so
  *  without it a banner could outlive its cause until the next failed
- *  send. There is deliberately no eager `refresh` here: merely restoring a
- *  persisted chat pane is not provider intent and must never spawn a CLI. */
+ *  send. Focus covers the common sign-in path, which finishes in a
+ *  browser and then returns to Codemux; mount covers coming back to the
+ *  chat from the sign-in terminal tab. A provider with no known failure
+ *  is never probed here: merely restoring a persisted chat pane is not
+ *  provider intent and must never spawn a CLI. */
 export function useProviderHealthRecoveryPoll(
   provider: AgentChatProviderKind | null | undefined,
 ): void {
@@ -268,6 +377,16 @@ export function useProviderHealthRecoveryPoll(
     const timer = setInterval(() => {
       void reprobeUnhealthy(provider);
     }, HEALTH_REPROBE_MS);
-    return () => clearInterval(timer);
+    const onFocus = () => {
+      const { fetchedAt, lastAttemptAt } = useProviderHealth.getState().slots[provider];
+      if (Date.now() - Math.max(fetchedAt, lastAttemptAt) < FOCUS_REPROBE_MIN_MS) return;
+      void reprobeUnhealthy(provider);
+    };
+    onFocus();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [provider, reprobeUnhealthy]);
 }

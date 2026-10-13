@@ -34,7 +34,7 @@ use super::parser::{
 };
 use super::paths::{enumerate_mcp_paths, is_claude_wrapped_path};
 use super::runtime::{
-    aggregate_tools, start_mcp_server, McpServerHandle, McpServerStatus, McpTool,
+    start_mcp_server, McpServerHandle, McpServerStatus, McpTool,
 };
 use super::{McpConfigSource, McpServerConfig};
 
@@ -104,6 +104,43 @@ pub struct McpRegistry {
     /// adapters that need a remote MCP URL (OpenCode and future providers).
     gateway: Arc<OnceCell<Arc<super::gateway::McpGatewayRuntime>>>,
     native_delegation: Arc<std::sync::Mutex<Option<NativeDelegationHandler>>>,
+    /// Tools Codemux serves itself, in-process, to its own Claude and Codex
+    /// chats (see [`HostTools`]). Set once at startup.
+    host: Arc<std::sync::OnceLock<Arc<dyn HostTools>>>,
+}
+
+/// The chat calling a host tool, as identified by the adapter session that
+/// received the call. Nothing in it comes from the model's arguments, so a
+/// tool can trust it for permission and ownership checks.
+#[derive(Debug, Clone)]
+pub struct HostCaller {
+    pub thread_id: String,
+    pub provider: crate::agent_provider::ProviderKind,
+    /// Owning workspace of the session's chat pane, when it has one.
+    pub workspace_id: Option<String>,
+    /// Claude: the session's live mode. Codex: the mode its session started
+    /// with, since Codex cannot change mode mid-session.
+    pub permission_mode: Option<String>,
+}
+
+/// Tools Codemux answers itself instead of forwarding to an MCP child.
+///
+/// Deliberately invisible to [`McpRegistry::list_all_tools`] and
+/// [`McpRegistry::dispatch_tool_call`]: those also back the OpenCode
+/// gateway and `codemux mcp`, which cannot identify the calling chat. Only
+/// adapters that know their session (Claude, Codex) list and call these.
+pub trait HostTools: Send + Sync {
+    /// Tools to offer `caller`, already prefixed like registry tools.
+    fn tools_for(&self, caller: &HostCaller) -> Vec<McpTool>;
+    /// Answer a call as an MCP `tools/call` result (`content` + `isError`),
+    /// or `None` when `prefixed_name` is not a host tool. Codex answers its
+    /// tool requests inline, so this must never wait on a provider.
+    fn call(
+        &self,
+        caller: &HostCaller,
+        prefixed_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<serde_json::Value>;
 }
 
 impl std::fmt::Debug for McpRegistry {
@@ -159,6 +196,7 @@ impl Default for McpRegistry {
             prime_lock: Arc::new(Mutex::new(())),
             gateway: Arc::new(OnceCell::new()),
             native_delegation: Arc::new(std::sync::Mutex::new(None)),
+            host: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -194,6 +232,49 @@ impl McpRegistry {
             })
             .await?;
         Ok(runtime.connection())
+    }
+
+    /// Install the process-wide host tools. Only the first call wins; every
+    /// clone of this registry (one per provider adapter) sees it.
+    pub fn set_host_tools(&self, tools: Arc<dyn HostTools>) {
+        let _ = self.host.set(tools);
+    }
+
+    /// Host tools to offer `caller`. Empty until [`set_host_tools`] runs.
+    ///
+    /// [`set_host_tools`]: Self::set_host_tools
+    pub fn host_tools(&self, caller: &HostCaller) -> Vec<McpTool> {
+        self.host
+            .get()
+            .map(|host| host.tools_for(caller))
+            .unwrap_or_default()
+    }
+
+    /// Answer `prefixed_name` if it is a host tool; `None` means "not mine,
+    /// dispatch it to the MCP children as usual".
+    pub fn host_call(
+        &self,
+        caller: &HostCaller,
+        prefixed_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        self.host.get()?.call(caller, prefixed_name, arguments)
+    }
+
+    /// Tell live sessions to re-collect their tool lists because the host
+    /// tool surface changed (e.g. a setting that gates it flipped). Rides the
+    /// in-process status bus only — the Settings UI has no row for it.
+    pub fn notify_host_tools_changed(&self) {
+        let row = McpServerRuntime {
+            id: "codemux-host".to_string(),
+            name: "codemux".to_string(),
+            status: McpServerStatus::Running { tool_count: 0 },
+            tools_count: 0,
+            error_message: None,
+            stderr_tail: None,
+            started_at_ms: None,
+        };
+        let _ = self.status_tx.send(row);
     }
 
     /// Mirror the frontend's disabled-set into the registry. The next
@@ -416,12 +497,10 @@ impl McpRegistry {
         out
     }
 
-    /// All currently-running tools across all servers. No cap is
-    /// applied — every tool from every enabled server is exposed; the
-    /// per-server toggle in Settings is the user's control surface.
+    /// Provider-facing tools across running servers, without a count cap.
+    /// Trusted native-controller tools are never injected into a provider.
     pub async fn list_all_tools(&self) -> Vec<McpTool> {
-        let inner = self.inner.lock().await;
-        aggregate_tools(&inner.handles)
+        self.list_all_tools_excluding_sources(&[]).await
     }
 
     /// Running tools except servers already native to `source`. This lets a
@@ -451,7 +530,10 @@ impl McpRegistry {
                 .iter()
                 .any(|source| sources.contains(source));
             if handle.status.is_running() && !provider_native {
-                tools.extend(handle.tools.iter().cloned());
+                let is_self = handle.config.sources.contains(&McpConfigSource::Codemux);
+                tools.extend(handle.tools.iter().filter(|tool|
+                    !is_self || !crate::agent_control::is_native_tool(&tool.name)
+                ).cloned());
             }
         }
         tools
@@ -591,6 +673,12 @@ impl McpRegistry {
             }
         };
 
+        // This relay has provider identity only, never a local controller or
+        // connector grant. In particular a persisted Codex dynamic tool can
+        // outlive its catalog. Omission alone is not an authority boundary.
+        if is_codemux_self && crate::agent_control::is_native_tool(&raw_name) {
+            return Err("provider_control_denied: native controller tools are not available through provider MCP relays".into());
+        }
         let params = tool_call_params(&raw_name, arguments, is_codemux_self, workspace_id);
         if let Some(child) = child {
             child
@@ -865,6 +953,87 @@ mod tests {
             transport: McpTransport::Stdio,
             raw: serde_json::Value::Null,
         }
+    }
+
+    struct EchoHost;
+
+    impl HostTools for EchoHost {
+        fn tools_for(&self, caller: &HostCaller) -> Vec<McpTool> {
+            vec![McpTool {
+                name: "echo".into(),
+                prefixed_name: "mcp__codemux__echo".into(),
+                description: Some(caller.thread_id.clone()),
+                input_schema: serde_json::json!({}),
+                server_id: "codemux-host".into(),
+            }]
+        }
+
+        fn call(
+            &self,
+            caller: &HostCaller,
+            prefixed_name: &str,
+            _arguments: &serde_json::Value,
+        ) -> Option<serde_json::Value> {
+            (prefixed_name == "mcp__codemux__echo")
+                .then(|| serde_json::json!({ "content": [{"type": "text", "text": caller.thread_id}] }))
+        }
+    }
+
+    #[tokio::test]
+    async fn host_tools_are_served_per_caller_and_never_reach_shared_surfaces() {
+        let reg = McpRegistry::new();
+        let caller = HostCaller {
+            thread_id: "thread-1".into(),
+            provider: crate::agent_provider::ProviderKind::Claude,
+            workspace_id: None,
+            permission_mode: None,
+        };
+        assert!(reg.host_tools(&caller).is_empty(), "nothing before install");
+        assert!(reg.host_call(&caller, "mcp__codemux__echo", &serde_json::json!({})).is_none());
+
+        // Installing through a clone reaches every other clone.
+        reg.clone_handle().set_host_tools(Arc::new(EchoHost));
+        let tools = reg.host_tools(&caller);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].description.as_deref(), Some("thread-1"));
+        assert!(reg.host_call(&caller, "mcp__codemux__echo", &serde_json::json!({})).is_some());
+        assert!(reg.host_call(&caller, "mcp__codemux__other", &serde_json::json!({})).is_none());
+
+        // The gateway / `codemux mcp` surfaces stay unaware of host tools.
+        assert!(reg.list_all_tools().await.is_empty());
+        assert!(reg
+            .dispatch_tool_call("mcp__codemux__echo", serde_json::json!({}), None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn review_s1_provider_relay_rejects_native_controller_tools_before_transport() {
+        use mockito::Matcher;
+        let (mut server, registry, _) = test_support::codemux_remote_server("worker-ws").await;
+        {
+            let mut inner = registry.inner.lock().await;
+            let handle = inner.handles.get_mut("codemux-remote").unwrap();
+            handle.tools[0].name = "thread_launch".into();
+            handle.tools[0].prefixed_name = "mcp__codemux__thread_launch".into();
+        }
+        let call = server.mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({"method":"tools/call","params":{"name":"thread_launch"}})))
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({"jsonrpc":"2.0","id":3,"result":{"content":[]}}).to_string())
+            .expect(0).create_async().await;
+        let result = registry.dispatch_tool_call("mcp__codemux__thread_launch",
+            serde_json::json!({"workspace_id":"worker-ws","provider":"codex","permission_mode":"danger-full-access","client_request_id":"nested"}),
+            Some("worker-ws")).await;
+        assert!(result.is_err(), "provider relay must not confer trusted native-controller authority: {result:?}");
+        assert!(result.unwrap_err().starts_with("provider_control_denied:"));
+        call.assert_async().await;
+        assert!(!registry.list_all_tools().await.iter().any(|t| t.name == "thread_launch"),
+            "provider snapshot must not advertise an unusable trusted control route");
+        assert!(!registry.list_all_tools_excluding_source(McpConfigSource::CodexUser).await.iter().any(|t| t.name == "thread_launch"));
+        // Controller discovery itself and Settings retain the native catalog.
+        assert!(crate::agent_control::native_tools().iter().any(|t| t.name == "thread_launch"));
+        assert!(registry.list_tools_for_server("codemux-remote").await.iter().any(|t| t.name == "thread_launch"));
     }
 
     #[tokio::test]

@@ -38,16 +38,19 @@ describe("TypographySettings", () => {
     });
     mocks.updateSetting.mockImplementation(
       async (section: string, key: string, value: unknown) => ({
-        ...structuredClone(DEFAULT_SETTINGS),
-        [section]: {
-          ...(structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, Record<string, unknown>>)[
-            section
-          ],
-          [key]: value,
+        settings: {
+          ...structuredClone(DEFAULT_SETTINGS),
+          [section]: {
+            ...(structuredClone(DEFAULT_SETTINGS) as unknown as Record<string, Record<string, unknown>>)[
+              section
+            ],
+            [key]: value,
+          },
         },
+        synced: true,
       }),
     );
-    mocks.updateSettings.mockImplementation(async (settings) => settings);
+    mocks.updateSettings.mockImplementation(async (settings) => ({ settings, synced: true }));
   });
 
   it("starts with two linked decisions and truthful live specimens", () => {

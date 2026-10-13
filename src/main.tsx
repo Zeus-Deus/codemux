@@ -4,6 +4,7 @@ import ReactDOM from "react-dom/client";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
+import { ReducedMotionProvider } from "@/components/layout/reduced-motion-provider";
 import "./globals.css";
 import "./mobile.css";
 import { markStartup } from "@/lib/perf/interaction-trace";
@@ -59,9 +60,14 @@ function mountApp() {
   ReactDOM.createRoot(document.getElementById("root")!).render(
     <React.StrictMode>
       <QueryClientProvider client={queryClient}>
-        <TooltipProvider>
-          <App />
-        </TooltipProvider>
+        <ReducedMotionProvider>
+          {/* A short wait before the first tooltip keeps a pointer sweeping the
+              dense title bar from flashing a chain of them; once one is open,
+              its neighbours show immediately for the skip window. */}
+          <TooltipProvider delayDuration={300} skipDelayDuration={300}>
+            <App />
+          </TooltipProvider>
+        </ReducedMotionProvider>
       </QueryClientProvider>
     </React.StrictMode>,
   );

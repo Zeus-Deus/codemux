@@ -1,0 +1,1 @@
+[codemux::vblank] DRM vblank waits unavailable; using display-mode timer (200.00 Hz initially). Timer is not synchronized to scanout. Set CODEMUX_VBLANK_FALLBACK=0 to disable.

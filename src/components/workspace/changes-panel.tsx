@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -15,7 +16,6 @@ import {
   TooltipContent,
 } from "@/components/ui/tooltip";
 import {
-  Loader2,
   Sparkles,
   GitBranch,
   ArrowUp,
@@ -71,7 +71,7 @@ import { useAppStore, useHomeDir } from "@/stores/app-store";
 import { useAiCommitStore } from "@/stores/ai-commit-store";
 import { showNoGitState, useInitializeGit } from "@/hooks/use-initialize-git";
 import { cn } from "@/lib/utils";
-import { utilitySelectionFromStores } from "@/lib/utility-agent";
+import { aiTextCliSelection, utilitySelectionFromStores } from "@/lib/utility-agent";
 import { PanelHeader } from "@/components/ui/panel-header";
 import type {
   WorkspaceSnapshot,
@@ -80,6 +80,7 @@ import type {
   MergeState,
 } from "@/tauri/types";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 /** Which file sections the panel lists. Driven by the deck's pane-bar
  *  filter; `"all"` is the historic behavior. */
@@ -94,6 +95,10 @@ interface Props {
   /** Where a file row's diff opens. Defaults to a main-area diff tab; the
    *  deck routes it to its own Diff pane so the click stays in the panel. */
   onOpenDiff?: (filePath: string, staged: boolean) => void;
+  /** The file whose diff the user just backed out of. Its row takes focus
+   *  once the list loads, so the keyboard review loop (Enter, Escape,
+   *  ArrowDown, Enter) picks up where it left off. */
+  returnFocusPath?: string | null;
 }
 
 // ── File-status icon mapping ──
@@ -114,6 +119,22 @@ function fileName(path: string): string {
   return i >= 0 ? path.slice(i + 1) : path;
 }
 
+/** Move focus to the row `step` places away in the list; false at an end. */
+function focusSiblingRow(row: HTMLElement, step: 1 | -1): boolean {
+  const list = row.closest("[data-changes-list]");
+  if (!list) return false;
+  const rows = Array.from(list.querySelectorAll<HTMLElement>("[data-file-row]"));
+  const next = rows[rows.indexOf(row) + step];
+  next?.focus();
+  return !!next;
+}
+
+/** Hand focus on before a keyboard action moves or removes this row, so
+ *  the next key lands on the next file instead of on nothing. */
+function handFocusOn(row: HTMLElement) {
+  if (!focusSiblingRow(row, 1)) focusSiblingRow(row, -1);
+}
+
 // ── FileRow ──
 
 function FileRow({
@@ -130,38 +151,77 @@ function FileRow({
   onOpenDiff: (filePath: string, staged: boolean) => void;
 }) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const meta = STATUS_META[file.status] ?? STATUS_META.modified;
   const name = fileName(file.path);
   const dir = file.path.length > name.length ? file.path.slice(0, -name.length - 1) : "";
 
-  const handleStageToggle = async (e: React.MouseEvent) => {
-    e.stopPropagation();
+  useEffect(
+    () => () => {
+      if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    },
+    [],
+  );
+
+  const toggleStage = async () => {
     try {
       if (staged) await gitUnstageFiles(cwd, [file.path]);
       else await gitStageFiles(cwd, [file.path]);
       onRefresh();
     } catch (err) {
-      toast.error(String(err));
+      toast.failure(staged ? "Couldn't unstage the file" : "Couldn't stage the file", err);
     }
   };
 
   // Two-tap discard so a stray hover-click can't blow away uncommitted
   // work. The 3s timeout reverts the row to its idle state if the user
   // doesn't follow through.
-  const handleDiscard = async (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const discard = async () => {
+    if (confirmTimer.current) clearTimeout(confirmTimer.current);
     if (!confirmDiscard) {
       setConfirmDiscard(true);
-      setTimeout(() => setConfirmDiscard(false), 3000);
+      confirmTimer.current = setTimeout(() => setConfirmDiscard(false), 3000);
       return;
     }
     try {
       await gitDiscardFile(cwd, file.path);
       onRefresh();
     } catch (err) {
-      toast.error(String(err));
+      toast.failure("Couldn't discard the changes", err);
     }
     setConfirmDiscard(false);
+  };
+
+  // Keys act on the row itself only: on its buttons, Enter and Space
+  // must stay those buttons' own.
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget || e.ctrlKey || e.metaKey || e.altKey) return;
+    const row = e.currentTarget;
+    switch (e.key) {
+      case "Enter":
+      case " ":
+        e.preventDefault();
+        onOpenDiff(file.path, staged);
+        return;
+      case "ArrowDown":
+      case "ArrowUp":
+        e.preventDefault();
+        focusSiblingRow(row, e.key === "ArrowDown" ? 1 : -1);
+        return;
+      // Caps Lock or Shift must not turn the stage key into a no-op.
+      case "s":
+      case "S":
+        e.preventDefault();
+        handFocusOn(row);
+        void toggleStage();
+        return;
+      case "Delete":
+      case "Backspace":
+        e.preventDefault();
+        if (confirmDiscard) handFocusOn(row);
+        void discard();
+        return;
+    }
   };
 
   return (
@@ -170,14 +230,15 @@ function FileRow({
         <div
           role="button"
           tabIndex={0}
+          data-file-row
+          data-path={file.path}
+          data-confirm-discard={confirmDiscard ? "true" : undefined}
           onClick={() => onOpenDiff(file.path, staged)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              onOpenDiff(file.path, staged);
-            }
-          }}
-          className="group/file flex items-center gap-1.5 px-2.5 h-6 cursor-default rounded-sm hover:bg-muted/40 transition-colors duration-150"
+          onKeyDown={handleKeyDown}
+          className={cn(
+            "group/file relative flex items-center gap-1.5 px-2.5 h-6 cursor-default rounded-sm transition-colors duration-150",
+            confirmDiscard ? "bg-danger/10" : "hover:bg-muted/40",
+          )}
         >
           <span className={cn("shrink-0 flex items-center justify-center w-3", meta.color)}>
             {meta.icon}
@@ -189,18 +250,22 @@ function FileRow({
             )}
           </span>
           {(file.additions > 0 || file.deletions > 0) && (
-            <span className="shrink-0 flex items-center gap-1 text-caption tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 transition-opacity duration-150">
+            <span className="shrink-0 flex items-center gap-1 text-caption tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 group-focus-within/file:opacity-0 transition-opacity duration-150">
               {file.additions > 0 && <span className="text-success">+{file.additions}</span>}
               {file.deletions > 0 && <span className="text-danger">{file.deletions}</span>}
             </span>
           )}
-          <span className="shrink-0 hidden group-hover/file:flex items-center gap-0.5 ml-auto absolute right-1">
+          <span className="shrink-0 hidden group-hover/file:flex group-focus-within/file:flex items-center gap-0.5 ml-auto absolute right-1">
             <Button
               variant="ghost"
               size="icon-xs"
               className={cn("size-5", confirmDiscard ? "text-danger" : "text-muted-foreground hover:text-foreground")}
-              onClick={handleDiscard}
-              title={confirmDiscard ? "Click again to discard" : "Discard changes"}
+              onClick={(e) => {
+                e.stopPropagation();
+                void discard();
+              }}
+              aria-label={confirmDiscard ? "Confirm discard" : "Discard changes"}
+              title={confirmDiscard ? "Click again to discard" : "Discard changes (Delete)"}
             >
               <Trash2 className="size-3" />
             </Button>
@@ -208,8 +273,12 @@ function FileRow({
               variant="ghost"
               size="icon-xs"
               className="size-5 text-muted-foreground hover:text-foreground"
-              onClick={handleStageToggle}
-              title={staged ? "Unstage" : "Stage"}
+              onClick={(e) => {
+                e.stopPropagation();
+                void toggleStage();
+              }}
+              aria-label={staged ? "Unstage" : "Stage"}
+              title={staged ? "Unstage (S)" : "Stage (S)"}
             >
               {staged ? <Minus className="size-3" /> : <Plus className="size-3" />}
             </Button>
@@ -225,6 +294,11 @@ function FileRow({
 
 // ── FileSection (Staged / Changed grouping) ──
 
+const BULK_ACTIONS = {
+  stage: { label: "Stage all", icon: Plus },
+  unstage: { label: "Unstage all", icon: Minus },
+} as const;
+
 function FileSection({
   label,
   files,
@@ -232,6 +306,7 @@ function FileSection({
   cwd,
   onRefresh,
   onOpenDiff,
+  bulkAction,
 }: {
   label: string;
   files: GitFileStatus[];
@@ -239,14 +314,42 @@ function FileSection({
   cwd: string;
   onRefresh: () => void;
   onOpenDiff: (filePath: string, staged: boolean) => void;
+  /** The section-wide counterpart of the rows' own +/− button. */
+  bulkAction?: keyof typeof BULK_ACTIONS;
 }) {
   if (files.length === 0) return null;
+  const bulk = bulkAction ? BULK_ACTIONS[bulkAction] : null;
+  const runBulk = async () => {
+    if (!bulkAction) return;
+    const paths = files.map((f) => f.path);
+    try {
+      if (bulkAction === "stage") await gitStageFiles(cwd, paths);
+      else await gitUnstageFiles(cwd, paths);
+      onRefresh();
+    } catch (err) {
+      toast.failure(bulkAction === "stage" ? "Couldn't stage the files" : "Couldn't unstage the files", err);
+    }
+  };
   return (
-    <div className="mb-2">
-      <Eyebrow className="flex items-center px-2.5 h-5">
-        <span>{label}</span>
-        <span className="ml-1.5 tabular-nums text-muted-foreground/40">{files.length}</span>
-      </Eyebrow>
+    <div className="group/section mb-2">
+      <div className="flex h-5 items-center pr-1">
+        <Eyebrow className="flex flex-1 items-center px-2.5">
+          <span>{label}</span>
+          <span className="ml-1.5 tabular-nums text-muted-foreground/40">{files.length}</span>
+        </Eyebrow>
+        {bulk && (
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            className="size-5 text-muted-foreground opacity-0 transition-opacity duration-100 group-hover/section:opacity-100 hover:text-foreground focus-visible:opacity-100"
+            onClick={() => void runBulk()}
+            aria-label={bulk.label}
+            title={bulk.label}
+          >
+            <bulk.icon className="size-3" />
+          </Button>
+        )}
+      </div>
       <div className="flex flex-col">
         {files.map((file) => (
           <FileRow
@@ -303,17 +406,40 @@ export function ChangesPanel({
   refreshKey = 0,
   sectionFilter = "all",
   onOpenDiff: onOpenDiffOverride,
+  returnFocusPath = null,
 }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
   const queryClient = useQueryClient();
 
   const [files, setFiles] = useState<GitFileStatus[]>([]);
+  // Which checkout the status above belongs to. Until the first read for
+  // this one lands, an empty list means "not read yet", not "clean".
+  const [loadedCwd, setLoadedCwd] = useState<string | null>(null);
+  const loaded = loadedCwd === cwd;
+  const listRef = useRef<HTMLDivElement>(null);
+  const focusReturned = useRef(false);
+
+  // Back from a diff, the row it came from takes focus again — but only
+  // when focus fell to the page (the diff unmounted under it), never away
+  // from something the user picked.
+  useEffect(() => {
+    if (!loaded || !returnFocusPath || focusReturned.current) return;
+    focusReturned.current = true;
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
+    const rows = listRef.current?.querySelectorAll<HTMLElement>("[data-file-row]") ?? [];
+    Array.from(rows)
+      .find((row) => row.dataset.path === returnFocusPath)
+      ?.focus();
+  }, [loaded, returnFocusPath]);
   const [branchInfo, setBranchInfo] = useState<GitBranchInfo | null>(null);
   const [mergeState, setMergeState] = useState<MergeState | null>(null);
-  const [busy, setBusy] = useState<"commit" | "push" | "pull" | "sync" | "fetch" | "merge" | "amend" | "undo" | "stash" | null>(null);
+  const [busy, setBusy] = useState<"commit" | "push" | "pull" | "sync" | "fetch" | "merge" | "amend" | "undo" | "stash" | "stash-pop" | null>(null);
   const [editing, setEditing] = useState(false);
   const [editedMsg, setEditedMsg] = useState("");
   const [pushAfterCommit, setPushAfterCommit] = useState(false);
+  const [justDone, setJustDone] = useState<RemoteAction | null>(null);
+  const justDoneTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [claudeReady, setClaudeReady] = useState<boolean | null>(null);
   const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -352,6 +478,7 @@ export function ChangesPanel({
       // previous objects when nothing moved makes the idle tick a React
       // bail-out instead of a full panel re-render.
       setFiles((prev) => keepIfUnchanged(prev, s));
+      setLoadedCwd(cwd);
       if (info) setBranchInfo((prev) => keepIfUnchanged(prev, info));
       setMergeState((prev) => keepIfUnchanged(prev, merge));
     });
@@ -434,19 +561,11 @@ export function ChangesPanel({
         await gitStageFiles(cwd, unstaged.map((f) => f.path));
         refresh();
       } catch (err) {
-        toast.error(`Stage failed: ${err}`);
+        toast.failure("Stage failed", err);
         return;
       }
     }
-    // An explicit commit-message CLI wins; otherwise the Utility agent
-    // supplies the provider. Its model only rides along when the provider
-    // matches, so an override CLI is never handed another provider's model
-    // name (`claude --model <codex model>` fails every commit).
-    const utility = utilitySelectionFromStores();
-    const cli = config?.ai_commit_message_cli ?? utility?.provider ?? "claude";
-    const model =
-      config?.ai_commit_message_model ??
-      (utility?.provider === cli ? utility.model : null);
+    const { cli, model } = aiTextCliSelection(config, utilitySelectionFromStores());
     // Only claude has an availability preflight; when it says "missing" we
     // fall back to the manual textarea instead of a doomed spawn.
     const canUseAi = aiEnabled && (cli !== "claude" || claudeReady !== false);
@@ -472,32 +591,55 @@ export function ChangesPanel({
         try {
           await gitPushChanges(cwd, branchInfo ? !branchInfo.has_upstream : false);
         } catch (err) {
-          toast.error(`Push after commit failed: ${err}`);
+          toast.failure("Push after commit failed", err);
         }
         setPushAfterCommit(false);
       }
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Commit failed: ${err}`);
+      toast.failure("Commit failed", err);
     } finally {
       setBusy(null);
     }
   };
 
+  // Push, Pull and Sync confirm on the button itself — a brief check
+  // where the spinner was — instead of a toast for something you just
+  // watched happen.
+  const flashDone = useCallback((action: RemoteAction) => {
+    if (justDoneTimer.current) clearTimeout(justDoneTimer.current);
+    setJustDone(action);
+    justDoneTimer.current = setTimeout(() => setJustDone(null), DONE_FLASH_MS);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (justDoneTimer.current) clearTimeout(justDoneTimer.current);
+    },
+    [],
+  );
+
   const handleAmend = async () => {
     if (busy) return;
     setBusy("amend");
     try {
-      if (unstaged.length > 0 && staged.length === 0) {
+      // Nothing staged means "amend with everything", and the menu item
+      // says so; the toast repeats it so the scope is never a surprise.
+      const stagedAll = unstaged.length > 0 && staged.length === 0;
+      if (stagedAll) {
         await gitStageFiles(cwd, unstaged.map((f) => f.path));
       }
       await gitAmendCommit(cwd, null);
-      toast.success("Amended last commit");
+      toast.success(
+        stagedAll
+          ? `Amended last commit with ${unstaged.length} ${unstaged.length === 1 ? "file" : "files"}`
+          : "Amended last commit",
+      );
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Amend failed: ${err}`);
+      toast.failure("Amend failed", err);
     } finally {
       setBusy(null);
     }
@@ -512,7 +654,7 @@ export function ChangesPanel({
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Undo failed: ${err}`);
+      toast.failure("Undo failed", err);
     } finally {
       setBusy(null);
     }
@@ -526,7 +668,7 @@ export function ChangesPanel({
       toast.success("Stashed changes");
       refresh();
     } catch (err) {
-      toast.error(`Stash failed: ${err}`);
+      toast.failure("Stash failed", err);
     } finally {
       setBusy(null);
     }
@@ -534,13 +676,13 @@ export function ChangesPanel({
 
   const handleStashPop = async () => {
     if (busy) return;
-    setBusy("stash");
+    setBusy("stash-pop");
     try {
       await gitStashPop(cwd);
       toast.success("Popped stash");
       refresh();
     } catch (err) {
-      toast.error(`Stash pop failed: ${err}`);
+      toast.failure("Stash pop failed", err);
     } finally {
       setBusy(null);
     }
@@ -563,8 +705,9 @@ export function ChangesPanel({
       await gitPushChanges(cwd, branchInfo ? !branchInfo.has_upstream : false);
       refresh();
       invalidateReviewQueries();
+      flashDone("push");
     } catch (err) {
-      toast.error(`Push failed: ${err}`);
+      toast.failure("Push failed", err);
     } finally {
       setBusy(null);
     }
@@ -577,8 +720,9 @@ export function ChangesPanel({
       await gitPullChanges(cwd);
       refresh();
       invalidateReviewQueries();
+      flashDone("pull");
     } catch (err) {
-      toast.error(`Pull failed: ${err}`);
+      toast.failure("Pull failed", err);
     } finally {
       setBusy(null);
     }
@@ -592,8 +736,9 @@ export function ChangesPanel({
       await gitPushChanges(cwd, false);
       refresh();
       invalidateReviewQueries();
+      flashDone("sync");
     } catch (err) {
-      toast.error(`Sync failed: ${err}`);
+      toast.failure("Sync failed", err);
     } finally {
       setBusy(null);
     }
@@ -606,7 +751,7 @@ export function ChangesPanel({
       await gitFetchChanges(cwd);
       refresh();
     } catch (err) {
-      toast.error(`Fetch failed: ${err}`);
+      toast.failure("Fetch failed", err);
     } finally {
       setBusy(null);
     }
@@ -619,7 +764,7 @@ export function ChangesPanel({
       await abortMerge(cwd);
       refresh();
     } catch (err) {
-      toast.error(`Abort failed: ${err}`);
+      toast.failure("Abort failed", err);
     } finally {
       setBusy(null);
     }
@@ -633,7 +778,7 @@ export function ChangesPanel({
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Continue failed: ${err}`);
+      toast.failure("Continue failed", err);
     } finally {
       setBusy(null);
     }
@@ -688,7 +833,21 @@ export function ChangesPanel({
 
       <ScrollArea className="flex-1 min-h-0">
         <div className="py-1">
-          {totalChanges === 0 ? (
+          {!loaded && !showNoGit ? (
+            <div
+              data-testid="changes-loading"
+              aria-busy="true"
+              aria-label="Loading changes"
+              className="flex flex-col px-2.5"
+            >
+              {["w-3/4", "w-1/2", "w-2/3"].map((width) => (
+                <div key={width} className="flex h-6 items-center gap-1.5">
+                  <Skeleton className="size-3 rounded-sm" />
+                  <Skeleton className={cn("h-2.5 rounded-sm", width)} />
+                </div>
+              ))}
+            </div>
+          ) : totalChanges === 0 ? (
             showNoGit ? (
               <div className="flex flex-col items-center justify-center px-4 py-10 gap-2 text-center text-muted-foreground/70">
                 <GitBranch className="size-4 opacity-50" />
@@ -715,7 +874,7 @@ export function ChangesPanel({
               </div>
             )
           ) : (
-            <>
+            <div ref={listRef} data-changes-list className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-150">
               {(sectionFilter === "all" || sectionFilter === "staged") && (
                 <FileSection
                   label="Staged"
@@ -724,6 +883,7 @@ export function ChangesPanel({
                   cwd={cwd}
                   onRefresh={refresh}
                   onOpenDiff={openDiff}
+                  bulkAction="unstage"
                 />
               )}
               {(sectionFilter === "all" || sectionFilter === "unstaged") && (
@@ -734,6 +894,7 @@ export function ChangesPanel({
                   cwd={cwd}
                   onRefresh={refresh}
                   onOpenDiff={openDiff}
+                  bulkAction="stage"
                 />
               )}
               {(sectionFilter === "all" || sectionFilter === "conflicts") && (
@@ -746,7 +907,7 @@ export function ChangesPanel({
                   onOpenDiff={openDiff}
                 />
               )}
-            </>
+            </div>
           )}
         </div>
       </ScrollArea>
@@ -776,7 +937,7 @@ export function ChangesPanel({
                 onClick={() => finalizeCommit(generatedMsg)}
                 disabled={busy !== null}
               >
-                {busy === "commit" ? <Loader2 className="size-3 animate-spin" /> : "Commit"}
+                {busy === "commit" ? <Spinner className="size-3" /> : "Commit"}
               </Button>
               <Button
                 size="xs"
@@ -828,7 +989,7 @@ export function ChangesPanel({
                 onClick={() => finalizeCommit(editedMsg)}
                 disabled={!editedMsg.trim() || busy !== null}
               >
-                {busy === "commit" ? <Loader2 className="size-3 animate-spin" /> : "Commit"}
+                {busy === "commit" ? <Spinner className="size-3" /> : "Commit"}
               </Button>
               <Button
                 size="icon-xs"
@@ -846,11 +1007,13 @@ export function ChangesPanel({
 
         {!showPreview && !showEditor && (
           <SmartCommitButton
+            loading={!loaded}
             hasChanges={totalChanges > 0}
             staged={staged.length}
             isGenerating={isGenerating ?? false}
             isMerging={isMerging}
             busy={busy}
+            justDone={justDone}
             onCommit={() => beginCommit(false)}
             onCommitAndPush={() => beginCommit(true)}
             onAmend={handleAmend}
@@ -871,18 +1034,42 @@ export function ChangesPanel({
   );
 }
 
+type RemoteAction = "push" | "pull" | "sync";
+
+const DONE_FLASH_MS = 1200;
+
+/** What the primary says while an action from it or its menu runs. */
+const IN_FLIGHT_LABEL: Partial<Record<string, string>> = {
+  push: "Pushing…",
+  pull: "Pulling…",
+  sync: "Syncing…",
+  fetch: "Fetching…",
+  amend: "Amending…",
+  undo: "Undoing…",
+  stash: "Stashing…",
+  "stash-pop": "Popping…",
+};
+
+const DONE_LABEL: Record<RemoteAction, string> = {
+  push: "Pushed",
+  pull: "Pulled",
+  sync: "Synced",
+};
+
 // ── SmartCommitButton ──
 //
 // Primary action morphs with state: Commit when there's something to
 // commit, Push when ahead, Pull when behind, Sync when both, Fetch when
 // clean and even. Dropdown always exposes every action so power users
 // aren't trapped by the heuristic.
-function SmartCommitButton({
+export function SmartCommitButton({
+  loading,
   hasChanges,
   staged,
   isGenerating,
   isMerging,
   busy,
+  justDone,
   onCommit,
   onCommitAndPush,
   onAmend,
@@ -896,11 +1083,14 @@ function SmartCommitButton({
   ahead,
   behind,
 }: {
+  /** Status not read yet: no action is the right one until it is. */
+  loading: boolean;
   hasChanges: boolean;
   staged: number;
   isGenerating: boolean;
   isMerging: boolean;
   busy: string | null;
+  justDone: RemoteAction | null;
   onCommit: () => void;
   onCommitAndPush: () => void;
   onAmend: () => void;
@@ -915,11 +1105,19 @@ function SmartCommitButton({
   behind: number;
 }) {
   const primary = (() => {
+    if (loading) {
+      return {
+        label: "Checking changes…",
+        icon: <Spinner className="size-3" aria-hidden />,
+        action: () => {},
+        disabled: true,
+      };
+    }
     if (isMerging) return null;
     if (hasChanges) {
       return {
         label: isGenerating ? "Writing message…" : staged > 0 ? `Commit ${staged}` : "Commit",
-        icon: isGenerating ? <Loader2 className="size-3 animate-spin" /> : <Sparkles className="size-3" />,
+        icon: isGenerating ? <Spinner className="size-3" aria-hidden /> : <Sparkles className="size-3" />,
         action: onCommit,
         disabled: isGenerating || busy !== null,
       };
@@ -936,7 +1134,23 @@ function SmartCommitButton({
     return { label: "Fetch", icon: <Download className="size-3" />, action: onFetch, disabled: busy !== null };
   })();
 
-  if (!primary) {
+  // A running action (from the primary or the menu) takes over the
+  // primary's label in place, then briefly confirms; the box never moves.
+  const inFlight = busy ? IN_FLIGHT_LABEL[busy] : undefined;
+  const display = !primary
+    ? null
+    : inFlight
+      ? { label: inFlight, icon: <Spinner className="size-3" aria-hidden /> }
+      : justDone && !hasChanges
+        ? {
+            label: DONE_LABEL[justDone],
+            icon: (
+              <Check className="size-3 text-status-open motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-150" />
+            ),
+          }
+        : primary;
+
+  if (!primary || !display) {
     return (
       <div className="text-caption text-muted-foreground/60 text-center py-1">
         Resolve or abort the merge above.
@@ -963,9 +1177,10 @@ function SmartCommitButton({
         )}
         onClick={primary.action}
         disabled={primary.disabled}
+        aria-busy={inFlight ? true : undefined}
       >
-        {primary.icon}
-        {primary.label}
+        {display.icon}
+        {display.label}
       </Button>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
@@ -977,7 +1192,7 @@ function SmartCommitButton({
             variant="ghost"
             className={cn("rounded-l-none border-l-0", fillCls)}
             aria-label="More actions"
-            disabled={busy !== null}
+            disabled={loading || busy !== null}
           >
             <ChevronDown className="size-3.5" />
           </Button>
@@ -995,7 +1210,7 @@ function SmartCommitButton({
               </DropdownMenuItem>
               <DropdownMenuItem onClick={onAmend}>
                 <Pencil className="size-3 mr-2" />
-                Amend last commit
+                {staged > 0 ? "Amend last commit" : "Amend with all changes"}
               </DropdownMenuItem>
               <DropdownMenuSeparator />
             </>

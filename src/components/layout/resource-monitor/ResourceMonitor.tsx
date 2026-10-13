@@ -221,6 +221,7 @@ export function ResourceMonitor({
               <button
                 type="button"
                 onClick={() => refetch()}
+                aria-busy={isFetching}
                 className="size-6 inline-flex items-center justify-center rounded-sm text-muted-foreground hover:text-foreground hover:bg-surface-2 transition-colors duration-150"
                 aria-label="Refresh metrics"
               >

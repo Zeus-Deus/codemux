@@ -33,6 +33,37 @@ use super::protocol::{
 };
 use super::translate::{translate_notification_with, translate_server_request, CodexSubagentDemux};
 
+fn resolve_catalog_service_tier(
+    models: &[super::protocol::ModelEntry],
+    model: Option<&str>,
+    tier: &str,
+) -> String {
+    let entry = model
+        .and_then(|id| {
+            models
+                .iter()
+                .find(|entry| entry.id == id || entry.model == id)
+        })
+        .or_else(|| {
+            if model.is_none() {
+                models.iter().find(|entry| entry.is_default)
+            } else {
+                None
+            }
+        });
+    let Some(entry) = entry else {
+        return "default".into();
+    };
+    let tiers = super::capabilities::service_tiers_for_model(entry);
+    if tiers.iter().any(|option| option.value == tier) {
+        return tier.into();
+    }
+    if tier == "fast" && tiers.iter().any(|option| option.value == "priority") {
+        return "priority".into();
+    }
+    "default".into()
+}
+
 /// Default per-request timeout, mirroring the upstream reference's
 /// `sendRequest(..., 20_000)` default.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(20);
@@ -105,6 +136,8 @@ pub struct CodexSpawnConfig {
     pub client_info: ClientInfo,
     /// Shared MCP registry used to publish and execute dynamic tools.
     pub mcp_registry: Option<McpRegistry>,
+    /// Device to run `codex app-server` on over SSH; `None` runs it here.
+    pub remote: Option<crate::agent_provider::types::RemoteSpawnTarget>,
 }
 
 /// Runtime-mutable state inside a [`CodexSession`].
@@ -133,7 +166,8 @@ pub(crate) struct CodexSessionState {
     /// Service-speed tier applied to subsequent `turn/start` requests.
     /// Codex accepts this per turn, so changing Fast mode does not require
     /// rebuilding or resuming the provider thread.
-    pub fast_mode: bool,
+    pub service_tier: String,
+    pub tier_models: Vec<super::protocol::ModelEntry>,
     /// Follow-up turns queued while a turn was in flight, in FIFO
     /// dispatch order. Drained one-at-a-time as the session returns to
     /// idle (see [`CodexSession::drain_queue`]).
@@ -243,6 +277,11 @@ pub(crate) struct CodexSession {
     /// learn the caller from its env.
     workspace_id: Option<String>,
     native_authority: Arc<crate::delegation::authority::NativeAuthority>,
+    managed: Option<Arc<crate::agent_provider::managed::ManagedSession>>,
+    /// This session as a host-tool caller. Its permission mode is the one
+    /// the session started with: Codex cannot change mode mid-session, and
+    /// the host tools it lists are fixed at `thread/start`.
+    host_caller: crate::mcp::registry::HostCaller,
 }
 
 impl CodexSession {
@@ -259,7 +298,7 @@ impl CodexSession {
         model: Option<String>,
         permission_mode: Option<String>,
         effort: Option<String>,
-        fast_mode: bool,
+        service_tier: String,
         resume_cursor: Option<Value>,
         caller_env: Option<HashMap<String, String>>,
         // Owning workspace of the calling chat pane; stored on the
@@ -279,23 +318,85 @@ impl CodexSession {
         // point at Codemux's managed config dir regardless of what the
         // workspace env carries.
         let mut env = caller_env.unwrap_or_default();
-        if let Some(home) = spawn.codex_home.as_ref() {
+        // A device uses its own `~/.codex`; a local CODEX_HOME path means
+        // nothing there.
+        if let (Some(home), None) = (spawn.codex_home.as_ref(), spawn.remote.as_ref()) {
             env.insert("CODEX_HOME".to_string(), home.to_string_lossy().to_string());
         }
 
-        let child = JsonRpcChild::spawn(SpawnConfig {
-            program: spawn.codex_binary.clone(),
-            args: vec!["app-server".into()],
-            env,
-            cwd: Some(cwd.clone()),
-            default_timeout: DEFAULT_RPC_TIMEOUT,
-        })
-        .await
-        .map_err(|e| ProviderError::ProcessError {
-            message: "failed to spawn `codex app-server`".into(),
-            source: Some(e.to_string()),
-        })?;
-        let child = Arc::new(child);
+        let managed = crate::agent_provider::managed::lookup_session(&thread_id);
+        if managed.is_some() && !cfg!(target_os = "linux") {
+            return Err(ProviderError::ValidationError {
+                message: "managed-start-rejected: managed Codex requires Linux process containment".into(),
+            });
+        }
+        if managed.is_some() && resume_cursor.is_some() {
+            return Err(ProviderError::ValidationError {
+                message: "managed-start-rejected: managed attempts cannot resume an unscoped native session".into(),
+            });
+        }
+        // Managed threads select no native environment, including writer
+        // attempts. File access goes through the host's scoped virtual tools.
+        // The read-only policy is an independent defense for native startup.
+        let permission_mode = if managed.is_some() {
+            Some("managed-read-only".to_owned())
+        } else {
+            permission_mode
+        };
+        let child = if managed.is_some() {
+            spawn_managed_codex(
+                &spawn,
+                &env,
+                &cwd,
+                managed
+                    .as_ref()
+                    .ok_or_else(|| ProviderError::ValidationError {
+                        message: "missing managed authority".into(),
+                    })?,
+            )
+            .await?
+        } else {
+            let args = vec!["app-server".to_string()];
+            let child = match spawn.remote.as_ref() {
+                #[cfg(unix)]
+                Some(remote) => {
+                    let codex =
+                        crate::ssh::sidecar::device_program(remote, &spawn.codex_binary).await?;
+                    JsonRpcChild::spawn(crate::ssh::sidecar::device_spawn_config(
+                        remote,
+                        &codex,
+                        &args,
+                        &env,
+                        &cwd,
+                        DEFAULT_RPC_TIMEOUT,
+                    )?)
+                    .await
+                    .map_err(crate::ssh::sidecar::ssh_spawn_error)?
+                }
+                #[cfg(not(unix))]
+                Some(_) => {
+                    return Err(ProviderError::ValidationError {
+                        message: "Threads on another device need macOS or Linux on this computer"
+                            .into(),
+                    })
+                }
+                None => JsonRpcChild::spawn(SpawnConfig {
+                    program: spawn.codex_binary.clone(),
+                    args,
+                    env,
+                    cwd: Some(cwd.clone()),
+                    default_timeout: DEFAULT_RPC_TIMEOUT,
+                })
+                .await
+                .map_err(|e| ProviderError::ProcessError {
+                    message: "failed to spawn `codex app-server`".into(),
+                    source: Some(e.to_string()),
+                })?,
+            };
+            Arc::new(child)
+        };
+
+        let mut startup_guard = child.managed_startup_guard();
 
         // Pull the single incoming-request receiver before any background
         // tasks start; otherwise the adapter could race the watchdog.
@@ -307,68 +408,123 @@ impl CodexSession {
             })?;
 
         // --- initialize handshake -------------------------------------------
-        let init_params = serde_json::to_value(InitializeParams {
-            client_info: spawn.client_info.clone(),
-            capabilities: Capabilities {
-                experimental_api: true,
-            },
-        })
-        .map_err(|e| ProviderError::ProcessError {
-            message: "serialize initialize params".into(),
-            source: Some(e.to_string()),
-        })?;
-        child
-            .request("initialize", init_params)
-            .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("initialize failed: {e}"),
+        if managed.is_none() {
+            let init_params = serde_json::to_value(InitializeParams {
+                client_info: spawn.client_info.clone(),
+                capabilities: Capabilities {
+                    experimental_api: true,
+                },
+            })
+            .map_err(|e| ProviderError::ProcessError {
+                message: "serialize initialize params".into(),
+                source: Some(e.to_string()),
             })?;
-        child
-            .notify("initialized", json!({}))
-            .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("initialized notification failed: {e}"),
-            })?;
+            child
+                .request("initialize", init_params)
+                .await
+                .map_err(|e| {
+                    // `initialize` is the first thing a device-side child
+                    // answers, so an install or connection problem there
+                    // surfaces here.
+                    #[cfg(unix)]
+                    if let Some(error) = spawn.remote.as_ref().and_then(|remote| {
+                        crate::ssh::sidecar::device_start_error(
+                            &e,
+                            crate::agent_provider::ProviderKind::Codex,
+                            remote,
+                            format!(
+                                "Install the Codex CLI on {} and run `codex login` there",
+                                remote.host_name
+                            ),
+                        )
+                    }) {
+                        return error;
+                    }
+                    ProviderError::RpcError {
+                        message: format!("initialize failed: {e}"),
+                    }
+                })?;
+            child
+                .notify("initialized", json!({}))
+                .await
+                .map_err(|e| ProviderError::RpcError {
+                    message: format!("initialized notification failed: {e}"),
+                })?;
+        }
 
+        let host_caller = crate::mcp::registry::HostCaller {
+            thread_id: thread_id.0.clone(),
+            provider: crate::agent_provider::ProviderKind::Codex,
+            workspace_id: workspace_id.clone(),
+            permission_mode: permission_mode.clone(),
+        };
+        // A session on a device publishes none of this computer's tools and
+        // keeps no registry to run the device's tool calls through.
+        let mcp_registry = crate::agent_provider::local_tool_registry(
+            spawn.mcp_registry.as_ref(),
+            spawn.remote.as_ref(),
+        );
         // Capture the live registry tool surface once for thread/start.
         // Codex persists dynamic tool definitions in the rollout, while the
         // request handler below always dispatches through the live registry.
-        let dynamic_tools = match spawn.mcp_registry.as_ref() {
-            Some(registry) => {
-                let tools = if spawn.codex_home.is_none() {
-                    registry
-                        .list_all_tools_excluding_source(crate::mcp::McpConfigSource::CodexUser)
-                        .await
-                } else {
-                    registry.list_all_tools().await
-                };
-                Some(
-                    tools
-                        .into_iter()
-                        .map(|tool| DynamicToolSpec::Function {
-                            name: codex_dynamic_tool_name(&tool.prefixed_name),
-                            description: tool.description.unwrap_or_default(),
-                            input_schema: tool.input_schema,
-                            defer_loading: None,
-                        })
-                        .collect(),
-                )
-            }
-            None => None,
+        let dynamic_tools = if let Some(context) = managed.as_ref() {
+            Some(
+                context
+                    .handler
+                    .tools()
+                    .into_iter()
+                    .map(|tool| DynamicToolSpec::Function {
+                        name: tool.name,
+                        description: tool.description,
+                        input_schema: tool.input_schema,
+                        defer_loading: None,
+                    })
+                    .collect(),
+            )
+        } else {
+            // Host tools are decided here too, from the mode the session starts
+            // in, so a Codex chat only ever lists what it could actually use.
+            dynamic_tool_specs(
+                mcp_registry.as_ref(),
+                spawn.codex_home.is_some(),
+                &host_caller,
+            )
+            .await
         };
 
         // Best-effort probes. Failures are non-fatal — we log via
         // RuntimeWarning and continue.
-        match child.request("model/list", json!({})).await {
-            Ok(_) => {}
+        let tier_models = match child.request("model/list", json!({})).await {
+            Ok(value) => match serde_json::from_value::<super::protocol::ModelListResponse>(value) {
+                Ok(response) => response.data,
+                Err(error) => {
+                    let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                        thread_id: Some(thread_id.clone()),
+                        message: format!("model/list decode failed: {error}"),
+                        original_payload: None,
+                    });
+                    vec![]
+                }
+            },
             Err(e) => {
                 let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                     thread_id: Some(thread_id.clone()),
                     message: format!("model/list probe failed: {e}"),
                     original_payload: None,
                 });
+                vec![]
             }
+        };
+        let resolved_tier =
+            resolve_catalog_service_tier(&tier_models, model.as_deref(), &service_tier);
+        if resolved_tier == "default" && service_tier != "default" {
+            let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(thread_id.clone()),
+                message: "service-tier-fallback: Saved service tier could not be verified for this model/account; using Standard.".into(),
+                original_payload: None,
+            });
         }
+        let service_tier = resolved_tier;
         // account/read is the canonical "can this provider run?" check.
         // `requires_openai_auth` describes the active provider and stays true
         // for a logged-in ChatGPT/API-key account, so only gate when the
@@ -378,10 +534,25 @@ impl CodexSession {
         match child.request("account/read", json!({})).await {
             Ok(resp) => match serde_json::from_value::<AccountReadResponse>(resp) {
                 Ok(info) if info.needs_login() => {
+                    if managed.is_some() {
+                        child.shutdown_managed().await.map_err(|error| {
+                            ProviderError::ProcessError {
+                                message: "managed Codex authentication rejection stop unconfirmed"
+                                    .into(),
+                                source: Some(error.to_string()),
+                            }
+                        })?;
+                        return Err(ProviderError::ValidationError{message:"managed-start-rejected: Codex requires authentication; run codex login before launching a workflow".into()});
+                    }
                     let _ = child.shutdown().await;
                     return Err(ProviderError::NotAuthenticated {
                         provider: crate::agent_provider::ProviderKind::Codex,
-                        hint: "Run `codex login` and try again.".into(),
+                        hint: match spawn.remote.as_ref() {
+                            Some(remote) => {
+                                format!("Run `codex login` on {} and try again.", remote.host_name)
+                            }
+                            None => "Run `codex login` and try again.".into(),
+                        },
                     });
                 }
                 Ok(info) => {
@@ -478,7 +649,9 @@ impl CodexSession {
                         let params = ThreadResumeParams {
                             thread_id: rid.clone(),
                             model: model.clone(),
-                            service_tier: Some(fast_mode.then(|| "fast".to_string())),
+                            service_tier: Some(
+                                (service_tier != "default").then(|| service_tier.clone()),
+                            ),
                             cwd: Some(cwd.clone()),
                             collaboration_mode: None,
                             approval_policy,
@@ -514,7 +687,7 @@ impl CodexSession {
                                     cwd.clone(),
                                     model.clone(),
                                     permission_mode.clone(),
-                                    fast_mode,
+                                    service_tier.clone(),
                                     dynamic_tools.clone(),
                                 )
                                 .await?
@@ -532,7 +705,7 @@ impl CodexSession {
                             cwd.clone(),
                             model.clone(),
                             permission_mode.clone(),
-                            fast_mode,
+                            service_tier.clone(),
                             dynamic_tools.clone(),
                         )
                         .await?
@@ -545,7 +718,7 @@ impl CodexSession {
                     cwd.clone(),
                     model.clone(),
                     permission_mode.clone(),
-                    fast_mode,
+                    service_tier.clone(),
                     dynamic_tools.clone(),
                 )
                 .await?
@@ -554,6 +727,7 @@ impl CodexSession {
 
         // --- assemble session handle ----------------------------------------
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(4);
+        if let Some(guard) = startup_guard.as_mut() { guard.set_task_shutdown(shutdown_tx.clone()); }
         let state = Mutex::new(CodexSessionState {
             codex_thread_id: codex_thread_id.clone(),
             active_turn: None,
@@ -564,7 +738,8 @@ impl CodexSession {
             model,
             default_effort: effort,
             permission_mode,
-            fast_mode,
+            service_tier,
+            tier_models,
             queued_turns: VecDeque::new(),
         });
         let session = Arc::new(Self {
@@ -581,6 +756,8 @@ impl CodexSession {
             recorded_usage_baseline: recorded_usage_baseline.unwrap_or_default(),
             workspace_id,
             native_authority: crate::delegation::authority::NativeAuthority::new(&thread_id.0),
+            managed,
+            host_caller,
         });
 
         // Emit SessionConfigured up front so subscribers see the thread
@@ -605,7 +782,7 @@ impl CodexSession {
         let requests_task = spawn_incoming_requests_task(
             Arc::clone(&session),
             Arc::clone(&child),
-            spawn.mcp_registry.clone(),
+            mcp_registry,
             incoming_rx,
             event_tx.clone(),
             shutdown_tx.subscribe(),
@@ -624,7 +801,14 @@ impl CodexSession {
             guard.push(watchdog_task);
         }
 
+        if let Some(guard) = startup_guard.as_mut() { guard.disarm(); }
         Ok(session)
+    }
+
+    pub(crate) fn managed_startup_guard(&self) -> Option<crate::json_rpc_child::ManagedStartupGuard> {
+        let mut guard = self.child.managed_startup_guard()?;
+        guard.set_task_shutdown(self.shutdown_tx.clone());
+        Some(guard)
     }
 
     /// Clone of the canonical event broadcaster, for methods that emit
@@ -686,6 +870,7 @@ impl CodexSession {
                 input.model_override,
                 input.effort_override,
                 input.dispatch_guard,
+                checkpoint.clone(),
             )
             .await;
         match sent {
@@ -755,6 +940,7 @@ impl CodexSession {
                         input.skill_invocations.clone(),
                     ),
                 };
+                if let Some(checkpoint) = &input.turn_checkpoint { checkpoint.authorize_dispatch()?; }
                 match self
                     .child
                     .request("turn/steer", serde_json::to_value(params).unwrap())
@@ -800,6 +986,7 @@ impl CodexSession {
                     input.model_override.clone(),
                     input.effort_override.clone(),
                     input.dispatch_guard.clone(),
+                    input.turn_checkpoint.clone(),
                 )
                 .await
             } else {
@@ -811,6 +998,7 @@ impl CodexSession {
                     input.effort_override.clone(),
                     input.client_nonce.clone(),
                     input.dispatch_guard.clone(),
+                    input.turn_checkpoint.clone(),
                 )
                 .await
                 .map_err(plain_send_error)
@@ -916,6 +1104,7 @@ impl CodexSession {
                     queued.input.model_override,
                     queued.input.effort_override,
                     queued.input.dispatch_guard,
+                    checkpoint.clone(),
                 )
                 .await
             {
@@ -1065,6 +1254,7 @@ impl CodexSession {
         model_override: Option<String>,
         effort_override: Option<String>,
         dispatch_guard: Option<Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard>>,
+        checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) -> Result<TurnId, ProviderError> {
         let thread_id = self.state.lock().await.codex_thread_id.clone();
         let native = super::slash_commands::request(&text, &thread_id)
@@ -1084,6 +1274,12 @@ impl CodexSession {
             // its response, and own the final lifecycle/real turn identifier.
             let pending = TurnId(format!("native-{}", uuid::Uuid::new_v4()));
             self.state.lock().await.active_turn = Some(pending.clone());
+            if let Some(checkpoint) = &checkpoint {
+                if let Err(error) = checkpoint.authorize_dispatch() {
+                    self.state.lock().await.active_turn = None;
+                    return Err(error);
+                }
+            }
             let response = match self.child.request(method, params).await {
                 Ok(response) => response,
                 Err(error) => {
@@ -1133,6 +1329,7 @@ impl CodexSession {
             effort_override,
             None,
             dispatch_guard,
+            checkpoint,
         )
         .await
         .map_err(plain_send_error)
@@ -1147,14 +1344,19 @@ impl CodexSession {
         effort_override: Option<String>,
         client_id: Option<String>,
         dispatch_guard: Option<Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard>>,
+        checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) -> Result<TurnId, TurnStartError> {
-        let (codex_thread_id, model_default, effort_default, fast_mode) = {
+        let (codex_thread_id, model_default, effort_default, service_tier) = {
             let state = self.state.lock().await;
             (
                 state.codex_thread_id.clone(),
                 state.model.clone(),
                 state.default_effort.clone(),
-                state.fast_mode,
+                resolve_catalog_service_tier(
+                    &state.tier_models,
+                    model_override.as_deref().or(state.model.as_deref()),
+                    &state.service_tier,
+                ),
             )
         };
 
@@ -1184,13 +1386,21 @@ impl CodexSession {
             // thread keeps whatever tier the user configured. Send an explicit
             // `default` when Fast is off: omission would inherit the thread's
             // tier and silently keep a previous Fast turn's speed.
-            service_tier_for_turn: Some(if fast_mode { "fast" } else { "default" }.into()),
+            service_tier_for_turn: Some(service_tier),
             effort,
             collaboration_mode,
         };
         let mut params_value = serde_json::to_value(&params).unwrap();
+        if self.managed.is_some() {
+            restrict_managed_codex_environment(&mut params_value);
+        }
         if let Some(id) = client_id {
             params_value["clientUserMessageId"] = json!(id);
+        }
+        if let Some(checkpoint) = &checkpoint {
+            checkpoint.authorize_dispatch().map_err(|error| TurnStartError::Rpc(
+                crate::json_rpc_child::RpcChildError::RpcError(crate::json_rpc_child::RpcError {code:-32001,message:error.to_string(),data:None})
+            ))?;
         }
         let generation = {
             let mut state = self.state.lock().await;
@@ -1346,6 +1556,7 @@ impl CodexSession {
                         None,
                         Some(input.submission_id.clone()),
                         None,
+                        input.checkpoint.clone(),
                     )
                     .await;
                 match result {
@@ -1505,9 +1716,40 @@ impl CodexSession {
 
     /// Update the service tier used by subsequent turns without replacing
     /// the Codex app-server or its loaded thread.
-    pub async fn set_fast_mode(&self, fast_mode: bool) {
+    pub async fn set_service_tier(&self, tier: String) -> Result<(), ProviderError> {
+        // Refresh when choosing a premium tier: entitlement can change while
+        // the conversation stays alive. Standard always clears a stale choice.
+        let models = if tier != "default" {
+            let value = self
+                .child
+                .request("model/list", json!({}))
+                .await
+                .map_err(|error| ProviderError::RpcError {
+                    message: error.to_string(),
+                })?;
+            Some(
+                serde_json::from_value::<super::protocol::ModelListResponse>(value)
+                    .map_err(|error| ProviderError::RpcError {
+                        message: error.to_string(),
+                    })?
+                    .data,
+            )
+        } else {
+            None
+        };
         let mut state = self.state.lock().await;
-        state.fast_mode = fast_mode;
+        if let Some(models) = models {
+            state.tier_models = models;
+        }
+        let resolved =
+            resolve_catalog_service_tier(&state.tier_models, state.model.as_deref(), &tier);
+        if resolved == "default" && tier != "default" {
+            return Err(ProviderError::ValidationError {
+                message: "service tier is unavailable for this Codex model or account".into(),
+            });
+        }
+        state.service_tier = resolved;
+        Ok(())
     }
 
     /// Gracefully shut the session down: close the JSON-RPC child
@@ -1550,6 +1792,284 @@ impl CodexSession {
             source: Some(e.to_string()),
         })
     }
+
+    pub async fn shutdown_managed(&self) -> Result<(), ProviderError> {
+        if self.managed.is_none() {
+            return Err(ProviderError::ValidationError {
+                message: "session is not a managed attempt".into(),
+            });
+        }
+        self.child
+            .shutdown_managed()
+            .await
+            .map_err(|error| ProviderError::ProcessError {
+                message: "managed Codex stop is unconfirmed".into(),
+                source: Some(error.to_string()),
+            })?;
+        if let Some(context) = self.managed.as_ref() {
+            context
+                .handler
+                .quiesce()
+                .await
+                .map_err(|error| ProviderError::ProcessError {
+                    message: "managed Codex host-tool stop unconfirmed".into(),
+                    source: Some(error),
+                })?;
+        }
+        self.shutdown().await
+
+    }
+}
+
+const MANAGED_DISABLED_FEATURES: &[&str] = &[
+    "multi_agent",
+    "multi_agent_v2",
+    "shell_tool",
+    "unified_exec",
+    "hooks",
+    "plugins",
+    "plugin_hooks",
+    "apps",
+    "code_mode",
+    "code_mode_host",
+    "code_mode_only",
+    "code_mode_prewarm",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "computer_use",
+    "in_app_browser",
+    "in_app_chat",
+    "in_app_dictation",
+    "in_app_local_automation",
+    "in_app_updates",
+    "remote_plugin",
+    "skill_mcp_dependency_install",
+    "skill_search",
+    "tool_suggest",
+    "image_generation",
+    "view_image",
+    "daemon_auto_start",
+    "deferred_executor",
+    "shell_snapshot",
+    "apply_patch_freeform",
+];
+
+fn managed_codex_args(disabled_servers: &[String]) -> Vec<String> {
+    let mut args = Vec::new();
+    for feature in MANAGED_DISABLED_FEATURES {
+        args.extend(["-c".into(), format!("features.{feature}=false")]);
+    }
+    args.extend([
+        "-c".into(),
+        "agents.enabled=false".into(),
+        "-c".into(),
+        "web_search=\"disabled\"".into(),
+    ]);
+    for name in disabled_servers {
+        // Quoted TOML keys preserve punctuation; these are argv entries,
+        // never shell interpolation or mutations of the user's config.
+        args.extend([
+            "-c".into(),
+            format!(
+                "mcp_servers.{}.enabled=false",
+                serde_json::to_string(name).unwrap_or_default()
+            ),
+        ]);
+    }
+    args.push("app-server".into());
+    args
+}
+
+fn disabled(value: Option<&Value>) -> bool {
+    value.is_some_and(|v| v == &json!(false) || v.get("enabled") == Some(&json!(false)))
+}
+
+fn enabled_native_servers(config: &Value) -> Result<Vec<String>, String> {
+    let Some(servers) = config.get("mcp_servers") else {
+        return Ok(vec![]);
+    };
+    if servers.is_null() {
+        return Ok(vec![]);
+    }
+    let servers = servers
+        .as_object()
+        .ok_or("invalid native MCP configuration")?;
+    Ok(servers
+        .iter()
+        .filter(|(_, server)| !disabled(server.get("enabled")))
+        .map(|(name, _)| name.clone())
+        .collect())
+}
+
+fn validate_managed_codex_config(config: &Value, feature_report: &Value) -> Result<(), String> {
+    let features = config
+        .get("features")
+        .and_then(Value::as_object)
+        .ok_or("Codex did not report effective feature controls")?;
+    for key in MANAGED_DISABLED_FEATURES {
+        if !disabled(features.get(*key)) {
+            return Err(format!("managed Codex requires features.{key}=false"));
+        }
+    }
+    let reported = feature_report
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or("Codex feature capabilities are unavailable")?;
+    // Require the actual implementation to recognize the essential controls;
+    // a permissive config parser accepting unknown keys proves nothing.
+    for key in [
+        "shell_tool",
+        "multi_agent",
+        "multi_agent_v2",
+        "hooks",
+        "plugins",
+        "apps",
+        "code_mode_host",
+    ] {
+        let feature = reported
+            .iter()
+            .find(|feature| feature.get("name").and_then(Value::as_str) == Some(key))
+            .ok_or_else(|| format!("Codex lacks verified {key} control"))?;
+        if feature.get("enabled") != Some(&json!(false)) {
+            return Err(format!("Codex still enables {key}"));
+        }
+    }
+    // 0.160 keeps this execution backend on despite config false. Tool
+    // authority is gated separately by shell_tool and the acknowledged empty
+    // environment selection; require the backend to be recognized, not off.
+    let unified_exec = reported
+        .iter()
+        .find(|feature| feature.get("name").and_then(Value::as_str) == Some("unified_exec"));
+    if unified_exec
+        .and_then(|feature| feature.get("enabled"))
+        .and_then(Value::as_bool)
+        .is_none()
+    {
+        return Err("Codex lacks a recognized unified_exec backend".into());
+    }
+    if config.get("web_search").and_then(Value::as_str) != Some("disabled") {
+        return Err("Codex web search was not disabled".into());
+    }
+    if !enabled_native_servers(config)?.is_empty() {
+        return Err("native MCPs are still enabled in managed Codex".into());
+    }
+    Ok(())
+}
+
+async fn spawn_managed_codex(
+    spawn: &CodexSpawnConfig,
+    env: &HashMap<String, String>,
+    cwd: &std::path::Path,
+    context: &crate::agent_provider::managed::ManagedSession,
+) -> Result<Arc<JsonRpcChild>, ProviderError> {
+    let mut disabled_servers = Vec::new();
+    for pass in 0..2 {
+        let child = Arc::new(
+            JsonRpcChild::spawn_managed(SpawnConfig {
+                program: spawn.codex_binary.clone(),
+                args: managed_codex_args(&disabled_servers),
+                env: env.clone(),
+                cwd: Some(cwd.into()),
+                default_timeout: DEFAULT_RPC_TIMEOUT,
+            })
+            .await
+            .map_err(|error| match error {
+                crate::json_rpc_child::RpcChildError::SpawnFailed(io) => ProviderError::ValidationError {
+                    message: format!("managed-start-rejected: setup_required: failed to spawn Codex workflow app-server: {io}"),
+                },
+                other => ProviderError::ProcessError {
+                    message: "managed Codex launch failed".into(),
+                    source: Some(other.to_string()),
+                },
+            })?,
+        );
+        let mut startup_guard = child.managed_startup_guard();
+        let recorded = child
+            .managed_evidence()
+            .map_err(|e| e.to_string())
+            .and_then(|evidence| context.handler.record_runtime(evidence));
+        if let Err(error) = recorded {
+            child
+                .shutdown_managed()
+                .await
+                .map_err(|stop| ProviderError::ProcessError {
+                    message: "managed Codex startup stop unconfirmed".into(),
+                    source: Some(stop.to_string()),
+                })?;
+            return Err(ProviderError::ValidationError {
+                message: format!("managed-start-rejected: {error}"),
+            });
+        }
+        let checked = async {
+            child
+                .request(
+                    "initialize",
+                    serde_json::to_value(InitializeParams {
+                        client_info: spawn.client_info.clone(),
+                        capabilities: Capabilities {
+                            experimental_api: true,
+                        },
+                    })
+                    .map_err(|e| e.to_string())?,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            child
+                .notify("initialized", json!({}))
+                .await
+                .map_err(|e| e.to_string())?;
+            let response = child
+                .request("config/read", json!({"includeLayers":false,"cwd":cwd}))
+                .await
+                .map_err(|e| e.to_string())?;
+            let config = response
+                .get("config")
+                .ok_or("Codex did not report effective configuration")?;
+            let servers = enabled_native_servers(config)?;
+            if !servers.is_empty() && pass == 0 {
+                return Ok(Some(servers));
+            }
+            let feature_report = child
+                .request("experimentalFeature/list", json!({"limit":1000}))
+                .await
+                .map_err(|e| e.to_string())?;
+            validate_managed_codex_config(config, &feature_report)?;
+            Ok::<_, String>(None)
+        }
+        .await;
+        match checked {
+            Ok(None) => {
+                if let Some(guard) = startup_guard.as_mut() { guard.disarm(); }
+                return Ok(child);
+            },
+            Ok(Some(servers)) => {
+                child
+                    .shutdown_managed()
+                    .await
+                    .map_err(|error| ProviderError::ProcessError {
+                        message: "managed Codex configuration probe stop unconfirmed".into(),
+                        source: Some(error.to_string()),
+                    })?;
+                disabled_servers = servers;
+            }
+            Err(error) => {
+                child.shutdown_managed().await.map_err(|stop_error| {
+                    ProviderError::ProcessError {
+                        message: "managed Codex rejected configuration but stop is unconfirmed"
+                            .into(),
+                        source: Some(stop_error.to_string()),
+                    }
+                })?;
+                return Err(ProviderError::ValidationError {
+                    message: format!("managed-start-rejected: {error}"),
+                });
+            }
+        }
+    }
+    Err(ProviderError::ValidationError {
+        message: "managed-start-rejected: native MCP configuration did not stabilize".into(),
+    })
 }
 
 impl Drop for CodexSession {
@@ -1572,11 +2092,44 @@ impl Drop for CodexSession {
 /// entirely rather than sending empty strings.
 pub(crate) fn codex_permission_mode_to_policy_pair(mode: Option<&str>) -> Option<(String, String)> {
     match mode? {
+        "managed-read-only" => Some(("never".into(), "read-only".into())),
         "read-only" => Some(("untrusted".into(), "read-only".into())),
         "workspace-write" => Some(("on-request".into(), "workspace-write".into())),
         "danger-full-access" => Some(("never".into(), "danger-full-access".into())),
         _ => None,
     }
+}
+
+fn restrict_managed_codex_environment(params: &mut Value) {
+    // Exact experimental thread/start and turn/start API in Codex 0.160.
+    // Omission selects the default environment; [] removes environment-native
+    // shell, apply_patch, and view_image tools while retaining dynamic tools.
+    // See rust-v0.160.0/core/src/tools/spec_plan.rs:1083,1269,1283,1425.
+    params["environments"] = json!([]);
+    params["approvalPolicy"] = json!("never");
+}
+
+fn validate_managed_codex_thread(response: &Value) -> Result<(), String> {
+    if !response
+        .get("thread")
+        .and_then(|thread| thread.get("environments"))
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        return Err("Codex did not acknowledge an empty native environment selection".into());
+    }
+    if response.get("approvalPolicy").and_then(Value::as_str) != Some("never") {
+        return Err("Codex did not acknowledge approvals disabled".into());
+    }
+    if response
+        .get("sandbox")
+        .and_then(|sandbox| sandbox.get("type"))
+        .and_then(Value::as_str)
+        != Some("readOnly")
+    {
+        return Err("Codex did not acknowledge the read-only native startup policy".into());
+    }
+    Ok(())
 }
 
 /// Issue a fresh `thread/start` and return the Codex-assigned thread id.
@@ -1585,9 +2138,10 @@ async fn start_fresh_thread(
     cwd: PathBuf,
     model: Option<String>,
     permission_mode: Option<String>,
-    fast_mode: bool,
+    service_tier: String,
     dynamic_tools: Option<Vec<DynamicToolSpec>>,
 ) -> Result<String, ProviderError> {
+    let managed = permission_mode.as_deref() == Some("managed-read-only");
     let (approval_policy, sandbox) =
         match codex_permission_mode_to_policy_pair(permission_mode.as_deref()) {
             Some((ap, sb)) => (Some(ap), Some(sb)),
@@ -1597,7 +2151,7 @@ async fn start_fresh_thread(
         model,
         // `Some(None)` deliberately serializes as JSON null: it clears a
         // user-level fast default so the composer's Standard choice is honest.
-        service_tier: Some(fast_mode.then(|| "fast".to_string())),
+        service_tier: Some((service_tier != "default").then(|| service_tier.clone())),
         cwd: Some(cwd),
         collaboration_mode: None,
         approval_policy,
@@ -1605,18 +2159,41 @@ async fn start_fresh_thread(
         dynamic_tools,
         experimental_raw_events: false,
     };
-    let params_value = serde_json::to_value(&params).unwrap();
-    let resp = child
-        .request("thread/start", params_value)
-        .await
-        .map_err(|e| ProviderError::RpcError {
-            message: format!("thread/start failed: {e}"),
-        })?;
-    let parsed: ThreadStartResponse =
-        serde_json::from_value(resp).map_err(|e| ProviderError::RpcError {
-            message: format!("malformed thread/start response: {e}"),
-        })?;
-    Ok(parsed.thread_id().to_string())
+    let mut params_value = serde_json::to_value(&params).unwrap();
+    if managed {
+        restrict_managed_codex_environment(&mut params_value);
+    }
+    let started = async {
+        let resp = child
+            .request("thread/start", params_value)
+            .await
+            .map_err(|e| format!("thread/start failed: {e}"))?;
+        if managed {
+            validate_managed_codex_thread(&resp)?;
+        }
+        let parsed: ThreadStartResponse = serde_json::from_value(resp)
+            .map_err(|e| format!("malformed thread/start response: {e}"))?;
+        Ok::<_, String>(parsed.thread_id().to_owned())
+    }
+    .await;
+    match started {
+        Ok(id) => Ok(id),
+        Err(message) if managed => {
+            // No turn has been started. Refuse older/unknown APIs instead of
+            // falling back to native file access, and prove process shutdown.
+            child
+                .shutdown_managed()
+                .await
+                .map_err(|error| ProviderError::ProcessError {
+                    message: "managed Codex thread rejection stop unconfirmed".into(),
+                    source: Some(error.to_string()),
+                })?;
+            Err(ProviderError::ValidationError {
+                message: format!("managed-start-rejected: {message}"),
+            })
+        }
+        Err(message) => Err(ProviderError::RpcError { message }),
+    }
 }
 
 /// Case-insensitive match against the recoverable-resume-error snippet list.
@@ -1636,7 +2213,7 @@ fn is_recoverable_resume_error(err_msg: &str) -> bool {
 /// The wire values are lowercase tags (`"pro"`, `"plus"`); the dashboard
 /// wants something a human recognizes. Unknown tags are title-cased and
 /// passed through rather than dropped, so a new plan still shows a name.
-fn codex_plan_label(plan_type: Option<&str>) -> Option<String> {
+pub(crate) fn codex_plan_label(plan_type: Option<&str>) -> Option<String> {
     let plan = plan_type?.trim();
     if plan.is_empty() {
         return None;
@@ -1674,8 +2251,8 @@ fn spawn_notifications_task(
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> JoinHandle<()> {
+    let mut notifications = child.notifications();
     tokio::spawn(async move {
-        let mut notifications = child.notifications();
         // One demux per session, rooted at the parent Codex thread id, so
         // child-thread (sub-agent) registrations persist across messages.
         let parent_codex_thread_id = {
@@ -1733,7 +2310,13 @@ fn spawn_notifications_task(
                                 _ => session.drain_queue().await,
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                        Err(broadcast::error::RecvError::Lagged(count)) => {
+                            if session.managed.is_some() {
+                                let _=event_tx.send(ProviderRuntimeEvent::RuntimeWarning{
+                                    thread_id:Some(session.thread_id.clone()),
+                                    message:format!("Managed event stream lagged: native Codex notification channel dropped {count}"),original_payload:None,
+                                });
+                            }
                             // Lag is logged but ignored — the upstream
                             // buffer is large enough in practice.
                             continue;
@@ -1764,6 +2347,22 @@ fn spawn_incoming_requests_task(
                     let Some(req) = maybe_req else { break; };
                     let msg = ServerRequestMessage::from_raw(&req.method, req.params.clone());
                     if let ServerRequestMessage::ToolCall(params) = msg {
+                        if let Some(context) = session.managed.clone() {
+                            // Managed callbacks never touch the broad MCP
+                            // registry, and cannot block the request reader.
+                            let child = Arc::clone(&child);
+                            tokio::spawn(async move {
+                                let result = match serde_json::from_value::<DynamicToolCallParams>(params) {
+                                    Ok(call) => match context.call(&call.tool, call.arguments).await {
+                                        Ok(value) => json!({"success":true,"contentItems":[{"type":"inputText","text":value.to_string()}]}),
+                                        Err(error) => json!({"success":false,"contentItems":[{"type":"inputText","text":error}]}),
+                                    },
+                                    Err(error) => json!({"success":false,"contentItems":[{"type":"inputText","text":error.to_string()}]}),
+                                };
+                                let _ = child.respond(req.id, Ok(result)).await;
+                            });
+                            continue;
+                        }
                         let actor = {
                             let state = session.state.lock().await;
                             let turn = params.get("turnId").and_then(Value::as_str);
@@ -1783,6 +2382,7 @@ fn spawn_incoming_requests_task(
                         let result = handle_dynamic_tool_call_native(
                             mcp_registry.as_ref(),
                             session.workspace_id.as_deref(),
+                            Some((&session.host_caller, session.provider_session_id.0.as_str())),
                             params, actor,
                         )
                         .await;
@@ -1808,60 +2408,107 @@ fn spawn_incoming_requests_task(
     })
 }
 
+/// The registry's tools, plus the host tools Codemux serves to
+/// `host_caller`, as Codex dynamic tools, or `None` without a registry
+/// (including every session on a device). With Codex's own config
+/// (`codex_home_managed == false`) Codex already loads the user's Codex MCP
+/// servers itself, so those are left out to avoid duplicates.
+async fn dynamic_tool_specs(
+    registry: Option<&McpRegistry>,
+    codex_home_managed: bool,
+    host_caller: &crate::mcp::registry::HostCaller,
+) -> Option<Vec<DynamicToolSpec>> {
+    let registry = registry?;
+    let mut tools = if codex_home_managed {
+        registry.list_all_tools().await
+    } else {
+        registry
+            .list_all_tools_excluding_source(crate::mcp::McpConfigSource::CodexUser)
+            .await
+    };
+    tools.extend(registry.host_tools(host_caller));
+    Some(
+        tools
+            .into_iter()
+            .map(|tool| DynamicToolSpec::Function {
+                name: codex_dynamic_tool_name(&tool.prefixed_name),
+                description: tool.description.unwrap_or_default(),
+                input_schema: tool.input_schema,
+                defer_loading: None,
+            })
+            .collect(),
+    )
+}
+
 /// Execute a Codex dynamic-tool request through the process-wide registry and
-/// translate the MCP content envelope into Codex's input-content shape.
+/// translate the MCP content envelope into Codex's input-content shape. With
+/// no registry (a session on a device, which must not reach this computer's
+/// tools whatever name it sends) the call fails without dispatching.
 #[cfg(test)]
 async fn handle_dynamic_tool_call(
     registry: Option<&McpRegistry>,
     workspace_id: Option<&str>,
+    // The root chat's caller and its Codex thread id.
+    host: Option<(&crate::mcp::registry::HostCaller, &str)>,
     raw: Value,
 ) -> Value {
-    handle_dynamic_tool_call_native(registry, workspace_id, raw, None).await
+    handle_dynamic_tool_call_native(registry, workspace_id, host, raw, None).await
 }
+
 async fn handle_dynamic_tool_call_native(
     registry: Option<&McpRegistry>,
     workspace_id: Option<&str>,
+    host: Option<(&crate::mcp::registry::HostCaller, &str)>,
     raw: Value,
     actor: Option<crate::delegation::app::NativeActor>,
 ) -> Value {
     let parsed = serde_json::from_value::<DynamicToolCallParams>(raw);
-    let (success, result) = match (registry, parsed) {
-        (Some(registry), Ok(call)) => match async {
+    let dispatched = match (registry, parsed) {
+        (Some(registry), Ok(call)) => {
             let name = registry_tool_name(&call.tool);
-            match actor {
-                Some(actor) => {
+            // Host tools answer synchronously (no provider waits), which
+            // matters here: this request loop handles approvals too. They act
+            // as the root chat, so a call from another thread (a native
+            // subagent that inherited the dynamic tools) is refused rather
+            // than handed the root's identity and permission mode.
+            let host = host.and_then(|(caller, root_thread)| {
+                if call.thread_id == root_thread {
+                    registry.host_call(caller, &name, &call.arguments)
+                } else {
                     registry
-                        .dispatch_native_tool_call(&name, call.arguments, actor)
-                        .await
+                        .host_tools(caller)
+                        .iter()
+                        .any(|tool| tool.prefixed_name == name)
+                        .then(|| {
+                            json!({
+                                "content": [{ "type": "text", "text": "This tool is only available in the main conversation, not from a subagent." }],
+                                "isError": true,
+                            })
+                        })
                 }
-                None => {
-                    registry
-                        .dispatch_tool_call(&name, call.arguments, workspace_id)
-                        .await
+            });
+            match host {
+                Some(result) => Ok(result),
+                None => match actor {
+                    Some(actor) => registry.dispatch_native_tool_call(&name, call.arguments, actor).await,
+                    None => registry.dispatch_tool_call(&name, call.arguments, workspace_id).await,
                 }
             }
         }
-        .await
-        {
-            Ok(result) => {
-                let success = !result
-                    .get("isError")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                (success, result)
-            }
-            Err(message) => (
-                false,
-                json!({ "content": [{ "type": "text", "text": message }] }),
-            ),
-        },
-        (None, _) => (
+        (None, _) => Err("Codemux's tools aren't available to this thread".to_string()),
+        (_, Err(error)) => Err(format!("invalid dynamic tool call: {error}")),
+    };
+    let (success, result) = match dispatched {
+        Ok(result) => {
+            let success = !result
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            (success, result)
+        }
+        Err(message) => (
             false,
-            json!({ "content": [{ "type": "text", "text": "Codemux MCP registry is unavailable" }] }),
-        ),
-        (_, Err(error)) => (
-            false,
-            json!({ "content": [{ "type": "text", "text": format!("invalid dynamic tool call: {error}") }] }),
+            json!({ "content": [{ "type": "text", "text": message }] }),
         ),
     };
 
@@ -2054,6 +2701,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn managed_codex_configuration_requires_verified_isolation() {
+        let features: serde_json::Map<String, Value> = MANAGED_DISABLED_FEATURES
+            .iter()
+            .map(|key| (key.to_string(), json!(false)))
+            .collect();
+        let mut report = json!({"data":MANAGED_DISABLED_FEATURES.iter().map(|key|json!({"name":key,"enabled":false})).collect::<Vec<_>>()});
+        let mut config = json!({"features":features,"web_search":"disabled","mcp_servers":{"native":{"enabled":false}}});
+        assert!(validate_managed_codex_config(&config, &report).is_ok());
+        config["features"]["multi_agent_v2"] = json!({"enabled":false});
+        assert!(validate_managed_codex_config(&config, &report).is_ok());
+        config["features"]["shell_tool"] = json!(true);
+        assert!(validate_managed_codex_config(&config, &report).is_err());
+        config["features"]["shell_tool"] = json!(false);
+        config["mcp_servers"]["native"]["enabled"] = json!(true);
+        assert!(validate_managed_codex_config(&config, &report).is_err());
+        config["mcp_servers"]["native"]["enabled"] = json!(false);
+        assert!(validate_managed_codex_config(&config, &json!({"data":[]})).is_err());
+        let backend = report["data"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|feature| feature["name"] == "unified_exec")
+            .unwrap();
+        backend["enabled"] = json!(true);
+        assert!(validate_managed_codex_config(&config, &report).is_ok());
+        let shell = report["data"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|feature| feature["name"] == "shell_tool")
+            .unwrap();
+        shell["enabled"] = json!(true);
+        assert!(validate_managed_codex_config(&config, &report).is_err());
+        let args = managed_codex_args(&["name.with.dot\"quoted".into()]);
+        assert!(args.contains(&"mcp_servers.\"name.with.dot\\\"quoted\".enabled=false".to_string()));
+        assert_eq!(args.last().unwrap(), "app-server");
+    }
+
+    #[test]
+    fn managed_codex_no_environment_request_preserves_captured_tools() {
+        let tool = json!({"name":"workflow_submit_result","description":"Result","inputSchema":{"type":"object"}});
+        let mut thread = json!({"dynamicTools":[tool.clone()],"sandbox":"read-only"});
+        restrict_managed_codex_environment(&mut thread);
+        assert_eq!(thread["environments"], json!([]));
+        assert_eq!(thread["approvalPolicy"], "never");
+        assert_eq!(thread["sandbox"], "read-only");
+        assert_eq!(thread["dynamicTools"], json!([tool]));
+        let mut turn = json!({"threadId":"owned","input":[{"type":"text","text":"work"}]});
+        restrict_managed_codex_environment(&mut turn);
+        assert_eq!(turn["environments"], json!([]));
+        assert_eq!(turn["approvalPolicy"], "never");
+        assert_eq!(turn["input"][0]["text"], "work");
+    }
+
+    #[test]
+    fn managed_codex_no_environment_ack_fails_closed() {
+        let response = json!({"thread":{"environments":[]},"approvalPolicy":"never","sandbox":{"type":"readOnly"}});
+        assert!(validate_managed_codex_thread(&response).is_ok());
+        for environments in [Value::Null, json!([{"id":"native"}]), json!({})] {
+            let mut rejected = response.clone();
+            rejected["thread"]["environments"] = environments;
+            assert!(validate_managed_codex_thread(&rejected).is_err());
+        }
+        let mut missing = response.clone();
+        missing["thread"]
+            .as_object_mut()
+            .unwrap()
+            .remove("environments");
+        assert!(validate_managed_codex_thread(&missing).is_err());
+        for key in ["approvalPolicy", "sandbox"] {
+            let mut missing = response.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(validate_managed_codex_thread(&missing).is_err());
+        }
+        let mut approvals = response.clone();
+        approvals["approvalPolicy"] = json!("on-request");
+        assert!(validate_managed_codex_thread(&approvals).is_err());
+        let mut writable = response;
+        writable["sandbox"]["type"] = json!("workspaceWrite");
+        assert!(validate_managed_codex_thread(&writable).is_err());
+    }
+
+    #[test]
     fn runtime_identity_uses_the_resolved_turn_settings() {
         let mode = runtime_collaboration_mode(Some("gpt-5.6-sol"), Some("high")).unwrap();
         assert_eq!(mode.mode, "default");
@@ -2239,6 +2969,7 @@ mod tests {
         let response = handle_dynamic_tool_call(
             Some(&registry),
             Some("ws-42"),
+            None,
             json!({
                 "threadId": "thread",
                 "turnId": "turn",
@@ -2254,9 +2985,82 @@ mod tests {
         call.assert_async().await;
     }
 
+    struct HandOffHost;
+
+    impl crate::mcp::registry::HostTools for HandOffHost {
+        fn tools_for(&self, _caller: &crate::mcp::registry::HostCaller) -> Vec<crate::mcp::runtime::McpTool> {
+            vec![crate::mcp::runtime::McpTool {
+                name: "delegate_task".into(),
+                prefixed_name: "mcp__codemux__delegate_task".into(),
+                description: None,
+                input_schema: json!({}),
+                server_id: "codemux-host".into(),
+            }]
+        }
+
+        fn call(
+            &self,
+            caller: &crate::mcp::registry::HostCaller,
+            prefixed_name: &str,
+            _arguments: &Value,
+        ) -> Option<Value> {
+            (prefixed_name == "mcp__codemux__delegate_task").then(|| {
+                json!({ "content": [{ "type": "text", "text": format!("as {}", caller.thread_id) }] })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn host_tools_answer_only_the_root_thread() {
+        let registry = McpRegistry::new();
+        registry.set_host_tools(Arc::new(HandOffHost));
+        let caller = crate::mcp::registry::HostCaller {
+            thread_id: "codemux-chat".into(),
+            provider: crate::agent_provider::ProviderKind::Codex,
+            workspace_id: None,
+            permission_mode: Some("danger-full-access".into()),
+        };
+        let request = |thread: &str| {
+            json!({
+                "threadId": thread,
+                "turnId": "turn",
+                "callId": "call",
+                "namespace": null,
+                "tool": "codemux_mcp__codemux__delegate_task",
+                "arguments": {}
+            })
+        };
+
+        let root = handle_dynamic_tool_call(
+            Some(&registry),
+            None,
+            Some((&caller, "codex-root")),
+            request("codex-root"),
+        )
+        .await;
+        assert_eq!(root["success"], true, "{root}");
+        assert_eq!(root["contentItems"][0]["text"], "as codemux-chat");
+
+        // A native subagent that inherited the dynamic tools has its own
+        // thread id and must not act as the root chat.
+        let native_child = handle_dynamic_tool_call(
+            Some(&registry),
+            None,
+            Some((&caller, "codex-root")),
+            request("codex-native-child"),
+        )
+        .await;
+        assert_eq!(native_child["success"], false, "{native_child}");
+        assert!(native_child["contentItems"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("only available in the main conversation"));
+    }
+
     #[tokio::test]
     async fn dynamic_tool_call_without_registry_returns_failed_response() {
         let response = handle_dynamic_tool_call(
+            None,
             None,
             None,
             json!({
@@ -2273,7 +3077,49 @@ mod tests {
         assert!(response["contentItems"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("registry is unavailable"));
+            .contains("aren't available to this thread"));
+    }
+
+    #[tokio::test]
+    async fn device_session_gets_and_runs_none_of_this_computers_tools() {
+        let (_server, registry, call) =
+            crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
+        let caller = crate::mcp::registry::HostCaller {
+            thread_id: "codemux-chat".into(),
+            provider: crate::agent_provider::ProviderKind::Codex,
+            workspace_id: Some("ws-42".into()),
+            permission_mode: None,
+        };
+        let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
+        let published = dynamic_tool_specs(local.as_ref(), false, &caller).await.unwrap();
+        assert_eq!(published.len(), 1);
+
+        let device = crate::agent_provider::types::RemoteSpawnTarget {
+            host_id: 3,
+            ssh_target: "deus@ai-node".into(),
+            host_name: "ai-node".into(),
+        };
+        let on_device = crate::agent_provider::local_tool_registry(Some(&registry), Some(&device));
+        assert!(dynamic_tool_specs(on_device.as_ref(), true, &caller).await.is_none());
+
+        // A call the device sends anyway, by a name it guessed, fails and
+        // never reaches the registry.
+        let response = handle_dynamic_tool_call(
+            on_device.as_ref(),
+            Some("ws-42"),
+            None,
+            json!({
+                "threadId": "thread",
+                "turnId": "turn",
+                "callId": "call",
+                "namespace": null,
+                "tool": "codemux_mcp__codemux-remote__echo",
+                "arguments": {"text": "hi"}
+            }),
+        )
+        .await;
+        assert_eq!(response["success"], false);
+        assert!(!call.matched_async().await);
     }
 
     fn rpc_failure(code: i64) -> TurnStartError {

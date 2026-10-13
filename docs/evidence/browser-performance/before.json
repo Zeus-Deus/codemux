@@ -1,0 +1,804 @@
+{
+  "initial_navigation_ms": 25562.677883,
+  "initial_navigation_response": {
+    "result": "✓ Browser benchmark\n  http://127.0.0.1:36211/\n✓ Done\n",
+    "success": true
+  },
+  "samples": [
+    {
+      "elapsed_ms": 25867.220001,
+      "passed": true,
+      "state": {
+        "loaded": true,
+        "ready": "complete",
+        "slowReady": true
+      },
+      "task": "navigation"
+    },
+    {
+      "elapsed_ms": 25864.758281,
+      "passed": true,
+      "state": {
+        "loaded": true,
+        "ready": "complete",
+        "slowReady": true
+      },
+      "task": "navigation"
+    },
+    {
+      "elapsed_ms": 25868.077532,
+      "passed": true,
+      "state": {
+        "loaded": true,
+        "ready": "complete",
+        "slowReady": true
+      },
+      "task": "navigation"
+    },
+    {
+      "elapsed_ms": 1329.986449,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "code": "A-42 & 'quoted'",
+        "inputs": 0,
+        "keys": 0,
+        "name": "Zoë Example",
+        "result": "{\"clicks\":0,\"inputs\":0,\"keys\":0,\"submissions\":1,\"trusted\":true,\"name\":\"Zoë Example\",\"code\":\"A-42 & 'quoted'\"}",
+        "submissions": 1,
+        "text": "",
+        "trusted": true
+      },
+      "task": "structured_form"
+    },
+    {
+      "elapsed_ms": 2832.899356,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 220,
+        "keys": 220,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! ",
+        "trusted": true
+      },
+      "task": "coordinate_text"
+    },
+    {
+      "elapsed_ms": 4274.177903,
+      "expected": {
+        "clicks": 0,
+        "text": "Zoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 81,
+        "keys": 84,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Zoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second line",
+        "trusted": true
+      },
+      "task": "unicode_text"
+    },
+    {
+      "elapsed_ms": 3580.517582,
+      "expected": {
+        "clicks": 1,
+        "text": "first line\nsecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 21,
+        "keys": 23,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "first linesecond line",
+        "trusted": true
+      },
+      "task": "keyboard_controls"
+    },
+    {
+      "elapsed_ms": 2206.4945589999998,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 12,
+        "inputs": 0,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "",
+        "trusted": true
+      },
+      "task": "coordinate_clicks"
+    },
+    {
+      "elapsed_ms": 685.4421619999999,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 2,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Screenshot correctness fixture",
+        "trusted": false
+      },
+      "task": "screenshot"
+    },
+    {
+      "elapsed_ms": 1329.422849,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "code": "A-42 & 'quoted'",
+        "inputs": 0,
+        "keys": 0,
+        "name": "Zoë Example",
+        "result": "{\"clicks\":0,\"inputs\":0,\"keys\":0,\"submissions\":1,\"trusted\":true,\"name\":\"Zoë Example\",\"code\":\"A-42 & 'quoted'\"}",
+        "submissions": 1,
+        "text": "",
+        "trusted": true
+      },
+      "task": "structured_form"
+    },
+    {
+      "elapsed_ms": 2829.910922,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 220,
+        "keys": 220,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! ",
+        "trusted": true
+      },
+      "task": "coordinate_text"
+    },
+    {
+      "elapsed_ms": 4272.9148190000005,
+      "expected": {
+        "clicks": 0,
+        "text": "Zoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 81,
+        "keys": 84,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Zoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second line",
+        "trusted": true
+      },
+      "task": "unicode_text"
+    },
+    {
+      "elapsed_ms": 3578.12342,
+      "expected": {
+        "clicks": 1,
+        "text": "first line\nsecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 21,
+        "keys": 23,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "first linesecond line",
+        "trusted": true
+      },
+      "task": "keyboard_controls"
+    },
+    {
+      "elapsed_ms": 5248.638126000001,
+      "expected": {
+        "clicks": 12,
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 10,
+        "inputs": 0,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "",
+        "trusted": true
+      },
+      "task": "coordinate_clicks"
+    },
+    {
+      "elapsed_ms": 685.6469960000001,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 2,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Screenshot correctness fixture",
+        "trusted": false
+      },
+      "task": "screenshot"
+    },
+    {
+      "elapsed_ms": 1329.742915,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "code": "A-42 & 'quoted'",
+        "inputs": 0,
+        "keys": 0,
+        "name": "Zoë Example",
+        "result": "{\"clicks\":0,\"inputs\":0,\"keys\":0,\"submissions\":1,\"trusted\":true,\"name\":\"Zoë Example\",\"code\":\"A-42 & 'quoted'\"}",
+        "submissions": 1,
+        "text": "",
+        "trusted": true
+      },
+      "task": "structured_form"
+    },
+    {
+      "elapsed_ms": 2830.844056,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 220,
+        "keys": 220,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! ",
+        "trusted": true
+      },
+      "task": "coordinate_text"
+    },
+    {
+      "elapsed_ms": 4275.550977,
+      "expected": {
+        "clicks": 0,
+        "text": "Zoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 81,
+        "keys": 84,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Zoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second line",
+        "trusted": true
+      },
+      "task": "unicode_text"
+    },
+    {
+      "elapsed_ms": 3578.724078,
+      "expected": {
+        "clicks": 1,
+        "text": "first line\nsecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 21,
+        "keys": 23,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "first linesecond line",
+        "trusted": true
+      },
+      "task": "keyboard_controls"
+    },
+    {
+      "elapsed_ms": 2303.985995,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 12,
+        "inputs": 0,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "",
+        "trusted": true
+      },
+      "task": "coordinate_clicks"
+    },
+    {
+      "elapsed_ms": 685.30152,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 2,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Screenshot correctness fixture",
+        "trusted": false
+      },
+      "task": "screenshot"
+    },
+    {
+      "elapsed_ms": 1329.759712,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "code": "A-42 & 'quoted'",
+        "inputs": 0,
+        "keys": 0,
+        "name": "Zoë Example",
+        "result": "{\"clicks\":0,\"inputs\":0,\"keys\":0,\"submissions\":1,\"trusted\":true,\"name\":\"Zoë Example\",\"code\":\"A-42 & 'quoted'\"}",
+        "submissions": 1,
+        "text": "",
+        "trusted": true
+      },
+      "task": "structured_form"
+    },
+    {
+      "elapsed_ms": 2828.7262650000002,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 220,
+        "keys": 220,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! ",
+        "trusted": true
+      },
+      "task": "coordinate_text"
+    },
+    {
+      "elapsed_ms": 4275.9078739999995,
+      "expected": {
+        "clicks": 0,
+        "text": "Zoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 81,
+        "keys": 84,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Zoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second line",
+        "trusted": true
+      },
+      "task": "unicode_text"
+    },
+    {
+      "elapsed_ms": 3579.716563,
+      "expected": {
+        "clicks": 1,
+        "text": "first line\nsecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 21,
+        "keys": 23,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "first linesecond line",
+        "trusted": true
+      },
+      "task": "keyboard_controls"
+    },
+    {
+      "elapsed_ms": 2326.336526,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 12,
+        "inputs": 0,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "",
+        "trusted": true
+      },
+      "task": "coordinate_clicks"
+    },
+    {
+      "elapsed_ms": 705.353801,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 2,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Screenshot correctness fixture",
+        "trusted": false
+      },
+      "task": "screenshot"
+    },
+    {
+      "elapsed_ms": 1329.893757,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "code": "A-42 & 'quoted'",
+        "inputs": 0,
+        "keys": 0,
+        "name": "Zoë Example",
+        "result": "{\"clicks\":0,\"inputs\":0,\"keys\":0,\"submissions\":1,\"trusted\":true,\"name\":\"Zoë Example\",\"code\":\"A-42 & 'quoted'\"}",
+        "submissions": 1,
+        "text": "",
+        "trusted": true
+      },
+      "task": "structured_form"
+    },
+    {
+      "elapsed_ms": 2833.222476,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 220,
+        "keys": 220,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! ",
+        "trusted": true
+      },
+      "task": "coordinate_text"
+    },
+    {
+      "elapsed_ms": 4273.363391,
+      "expected": {
+        "clicks": 0,
+        "text": "Zoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 81,
+        "keys": 84,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Zoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second line",
+        "trusted": true
+      },
+      "task": "unicode_text"
+    },
+    {
+      "elapsed_ms": 3580.6969889999996,
+      "expected": {
+        "clicks": 1,
+        "text": "first line\nsecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 21,
+        "keys": 23,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "first linesecond line",
+        "trusted": true
+      },
+      "task": "keyboard_controls"
+    },
+    {
+      "elapsed_ms": 5166.755128,
+      "expected": {
+        "clicks": 12,
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 11,
+        "inputs": 0,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "",
+        "trusted": true
+      },
+      "task": "coordinate_clicks"
+    },
+    {
+      "elapsed_ms": 705.146026,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 2,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Screenshot correctness fixture",
+        "trusted": false
+      },
+      "task": "screenshot"
+    },
+    {
+      "elapsed_ms": 1330.006456,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "code": "A-42 & 'quoted'",
+        "inputs": 0,
+        "keys": 0,
+        "name": "Zoë Example",
+        "result": "{\"clicks\":0,\"inputs\":0,\"keys\":0,\"submissions\":1,\"trusted\":true,\"name\":\"Zoë Example\",\"code\":\"A-42 & 'quoted'\"}",
+        "submissions": 1,
+        "text": "",
+        "trusted": true
+      },
+      "task": "structured_form"
+    },
+    {
+      "elapsed_ms": 2830.1861019999997,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 220,
+        "keys": 220,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! ",
+        "trusted": true
+      },
+      "task": "coordinate_text"
+    },
+    {
+      "elapsed_ms": 4272.199285,
+      "expected": {
+        "clicks": 0,
+        "text": "Zoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 81,
+        "keys": 84,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Zoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second line",
+        "trusted": true
+      },
+      "task": "unicode_text"
+    },
+    {
+      "elapsed_ms": 3580.7228179999997,
+      "expected": {
+        "clicks": 1,
+        "text": "first line\nsecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 21,
+        "keys": 23,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "first linesecond line",
+        "trusted": true
+      },
+      "task": "keyboard_controls"
+    },
+    {
+      "elapsed_ms": 2303.5419519999996,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 12,
+        "inputs": 0,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "",
+        "trusted": true
+      },
+      "task": "coordinate_clicks"
+    },
+    {
+      "elapsed_ms": 685.199486,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 2,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Screenshot correctness fixture",
+        "trusted": false
+      },
+      "task": "screenshot"
+    },
+    {
+      "elapsed_ms": 1330.1761880000001,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "code": "A-42 & 'quoted'",
+        "inputs": 0,
+        "keys": 0,
+        "name": "Zoë Example",
+        "result": "{\"clicks\":0,\"inputs\":0,\"keys\":0,\"submissions\":1,\"trusted\":true,\"name\":\"Zoë Example\",\"code\":\"A-42 & 'quoted'\"}",
+        "submissions": 1,
+        "text": "",
+        "trusted": true
+      },
+      "task": "structured_form"
+    },
+    {
+      "elapsed_ms": 2828.655342,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 220,
+        "keys": 220,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! Browser benchmark: exact input, punctuation & symbols! ",
+        "trusted": true
+      },
+      "task": "coordinate_text"
+    },
+    {
+      "elapsed_ms": 4276.054187,
+      "expected": {
+        "clicks": 0,
+        "text": "Zoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond lineZoë — café 日本語 🚀\nSecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 81,
+        "keys": 84,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Zoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second lineZoë — café 日本語 🚀Second line",
+        "trusted": true
+      },
+      "task": "unicode_text"
+    },
+    {
+      "elapsed_ms": 3580.4915450000003,
+      "expected": {
+        "clicks": 1,
+        "text": "first line\nsecond line",
+        "trusted": true
+      },
+      "passed": false,
+      "state": {
+        "clicks": 0,
+        "inputs": 21,
+        "keys": 23,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "first linesecond line",
+        "trusted": true
+      },
+      "task": "keyboard_controls"
+    },
+    {
+      "elapsed_ms": 2273.4336380000004,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 12,
+        "inputs": 0,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "",
+        "trusted": true
+      },
+      "task": "coordinate_clicks"
+    },
+    {
+      "elapsed_ms": 685.012999,
+      "expected": null,
+      "passed": true,
+      "state": {
+        "clicks": 0,
+        "inputs": 2,
+        "keys": 0,
+        "result": "Ready",
+        "submissions": 0,
+        "text": "Screenshot correctness fixture",
+        "trusted": false
+      },
+      "task": "screenshot"
+    }
+  ],
+  "scope": "production browser backend; real Chromium; local fixture; one warmup and seven measured runs per task; model inference and outer CLI/MCP transport excluded",
+  "summaries": [
+    {
+      "max_ms": 25868.077532,
+      "median_ms": 25867.220001,
+      "min_ms": 25864.758281,
+      "passed": 3,
+      "runs": 3,
+      "task": "navigation"
+    },
+    {
+      "max_ms": 1330.1761880000001,
+      "median_ms": 1329.893757,
+      "min_ms": 1329.422849,
+      "passed": 7,
+      "runs": 7,
+      "task": "structured_form"
+    },
+    {
+      "max_ms": 2833.222476,
+      "median_ms": 2830.1861019999997,
+      "min_ms": 2828.655342,
+      "passed": 7,
+      "runs": 7,
+      "task": "coordinate_text"
+    },
+    {
+      "max_ms": 4276.054187,
+      "median_ms": 4274.177903,
+      "min_ms": 4272.199285,
+      "passed": 0,
+      "runs": 7,
+      "task": "unicode_text"
+    },
+    {
+      "max_ms": 3580.7228179999997,
+      "median_ms": 3580.4915450000003,
+      "min_ms": 3578.12342,
+      "passed": 0,
+      "runs": 7,
+      "task": "keyboard_controls"
+    },
+    {
+      "max_ms": 5248.638126000001,
+      "median_ms": 2303.985995,
+      "min_ms": 2206.4945589999998,
+      "passed": 5,
+      "runs": 7,
+      "task": "coordinate_clicks"
+    },
+    {
+      "max_ms": 705.353801,
+      "median_ms": 685.4421619999999,
+      "min_ms": 685.012999,
+      "passed": 7,
+      "runs": 7,
+      "task": "screenshot"
+    }
+  ]
+}

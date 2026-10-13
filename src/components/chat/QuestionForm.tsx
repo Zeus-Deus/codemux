@@ -37,14 +37,24 @@ import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
 import { COMPOSER_OVERLAY_CARD } from "./composer-overlay";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
+export type QuestionAnswer = string | string[];
+
+/** Text-only provider contracts retain their existing display representation. */
+export function questionAnswerText(answer: QuestionAnswer): string {
+  return Array.isArray(answer) ? answer.join(", ") : answer;
+}
+
 interface Props {
   questions: Question[];
-  onSubmit: (answers: string[]) => void | Promise<void>;
+  onSubmit: (answers: QuestionAnswer[]) => void | Promise<void>;
   idPrefix?: string;
   active?: boolean;
   globalShortcuts?: boolean;
   initialAnswers?: string[];
-  onAnswersChange?: (answers: string[]) => void;
+  onAnswersChange?: (answers: QuestionAnswer[]) => void;
+  /** Dismiss the whole prompt so the user can answer in the chat instead.
+   *  Absent: no Skip action is offered. */
+  onSkip?: () => void;
 }
 
 const OTHER_LABEL = "Other";
@@ -84,6 +94,7 @@ export function QuestionForm({
   globalShortcuts = true,
   initialAnswers = [],
   onAnswersChange,
+  onSkip,
   idPrefix = "aq",
 }: Props) {
   /** Root.items drives paging, validation *and* the auto-rendered
@@ -174,16 +185,16 @@ export function QuestionForm({
   );
   const currentAnswered = questionAnswered(qi);
 
-  const collectAnswers = useCallback((): string[] => {
+  const collectAnswers = useCallback((): QuestionAnswer[] => {
     // Preserve question order; duplicate question titles are valid.
-    const answers: string[] = [];
+    const answers: QuestionAnswer[] = [];
     questions.forEach((q, i) => {
       const p = picks[i] ?? new Set<string>();
       const free = q.allowOther ? (otherText[i] ?? "").trim() : "";
       if (q.multiSelect) {
         const labels = [...p].filter((l) => l !== OTHER_LABEL);
         if (free) labels.push(free);
-        answers[i] = labels.join(", ");
+        answers[i] = labels;
       } else if (free) {
         answers[i] = free;
       } else {
@@ -241,13 +252,14 @@ export function QuestionForm({
     setQi(itemIndexFor(name));
   }, []);
 
-  // ------- Keyboard shortcuts (global, with input-focus guard) --------
+  // ------- Keyboard shortcuts (global, scoped to this pane) -----------
   //
   // The primitive already handles digits / arrows / Enter, but only for
   // events that originate *inside* its form. This document-level layer
-  // keeps the panel drivable when nothing (or the composer) has focus.
-  // It bails on text-entry targets and on anything inside the form, so
-  // the two layers never both handle the same keystroke.
+  // keeps the panel drivable when nothing in particular has focus. It
+  // never takes a key from a control (a sidebar button, a tree row, the
+  // composer) or from another pane, so Enter there still does what it
+  // says (see `ownsGlobalKeystroke`).
 
   const advanceOrSubmitRef = useRef(advanceOrSubmit);
   advanceOrSubmitRef.current = advanceOrSubmit;
@@ -260,28 +272,10 @@ export function QuestionForm({
     const handler = (e: globalThis.KeyboardEvent) => {
       if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
       const form = formRef.current;
-      // A foreign modal owns all interaction, including document-targeted
-      // shortcuts. Leave native buttons, Tab and the modal's own form alone.
+      // A foreign modal owns shortcuts even when the key targets the document.
       const modal = document.querySelector('[role="dialog"]:not([aria-hidden="true"]):not([data-state="closed"]), [role="alertdialog"]:not([aria-hidden="true"]):not([data-state="closed"])');
       if (modal && (!form || !modal.contains(form))) return;
-      const target = e.target;
-      if (
-        target instanceof HTMLInputElement ||
-        target instanceof HTMLTextAreaElement ||
-        target instanceof HTMLSelectElement
-      ) {
-        return;
-      }
-      if (
-        target instanceof HTMLElement &&
-        target.closest('[contenteditable]:not([contenteditable="false"])')
-      ) {
-        return;
-      }
-      // Inside the questionnaire form the primitive's own key handling
-      // is authoritative — bail so a keystroke isn't applied twice.
-      if (target instanceof Node && form?.contains(target)) return;
-      if (target instanceof HTMLElement && target.closest('form, [role="dialog"], [role="alertdialog"]')) return;
+      if (!ownsGlobalKeystroke(e.target, form)) return;
 
       // Digit 1-9 → toggle Nth option on the current question.
       const digit = Number.parseInt(e.key, 10);
@@ -335,10 +329,24 @@ export function QuestionForm({
   const active = questions[qi]!;
   const nextDisabled = !currentAnswered;
 
+  // Esc anywhere in the form skips the prompt, unless it would throw away
+  // text typed into any question's "Something else". Decided from form
+  // state, not the focused element: choice rows are native inputs whose
+  // value is the option label, and focus may sit outside the text field.
+  const handleSkipKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!onSkip || e.key !== "Escape" || e.defaultPrevented) return;
+    if (Object.values(otherText).some((text) => text.trim())) return;
+    e.preventDefault();
+    onSkip();
+  };
+
   return (
     <div className={cn(CHAT_COLUMN_OUTER, "pb-2")}>
       <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
-        <div className="rounded-lg border border-border bg-muted/40 shadow-sm px-4 py-3">
+        <div
+          className="rounded-lg border border-border bg-muted/40 shadow-sm px-4 py-3"
+          onKeyDown={handleSkipKey}
+        >
           <Questionnaire
             ref={formRef}
             items={rootItems}
@@ -440,8 +448,26 @@ export function QuestionForm({
                   <span>
                     <Kbd>Enter</Kbd> {isLast ? "send" : "next"}
                   </span>
+                  {onSkip && (
+                    <>
+                      <span aria-hidden>·</span>
+                      <span>
+                        <Kbd>Esc</Kbd> skip
+                      </span>
+                    </>
+                  )}
                 </div>
               </div>
+              {onSkip && (
+                <button
+                  type="button"
+                  data-testid="aq-skip"
+                  onClick={onSkip}
+                  className="col-start-2 row-start-1 h-7 rounded-md px-2 text-label text-muted-foreground transition-colors duration-100 hover:bg-surface-2 hover:text-foreground"
+                >
+                  Skip · answer in chat
+                </button>
+              )}
               <QuestionnaireNext
                 size="sm"
                 disabled={nextDisabled}
@@ -607,6 +633,47 @@ function Kbd({ children }: { children: ReactNode }) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Anything whose own Enter, arrows or digits mean something. */
+const KEYBOARD_CONTROL = [
+  "button",
+  "a[href]",
+  "input",
+  "textarea",
+  "select",
+  '[contenteditable]:not([contenteditable="false"])',
+  '[role="button"]',
+  '[role="link"]',
+  '[role="menuitem"]',
+  '[role="treeitem"]',
+  '[role="option"]',
+  '[role="tab"]',
+  '[role="checkbox"]',
+  '[role="radio"]',
+  '[role="switch"]',
+  '[role="gridcell"]',
+].join(",");
+
+/**
+ * Whether the question form's document-level shortcuts may act on a key
+ * aimed at `target`: nothing focused at all, or a passive spot (the
+ * transcript, the pane background) inside the same chat pane. Inside the
+ * form the primitive's own handling is authoritative, so the two layers
+ * never apply one keystroke twice.
+ */
+export function ownsGlobalKeystroke(
+  target: EventTarget | null,
+  form: HTMLFormElement | null,
+): boolean {
+  if (!(target instanceof Element)) return true;
+  if (target === document.body || target === document.documentElement) {
+    return true;
+  }
+  if (form?.contains(target)) return false;
+  if (target.closest(KEYBOARD_CONTROL)) return false;
+  const pane = form?.closest("[data-agent-chat-pane]");
+  return pane != null && pane.contains(target);
+}
 
 export interface Question {
   header: string;

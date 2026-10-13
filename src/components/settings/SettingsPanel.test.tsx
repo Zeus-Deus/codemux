@@ -1,5 +1,6 @@
-import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
-import { render, screen, fireEvent, within, cleanup } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, beforeAll, afterEach } from "vitest";
+import { act, render, screen, fireEvent, within, cleanup, waitFor } from "@testing-library/react";
+afterEach(cleanup);
 
 // Polyfill ResizeObserver for jsdom (used by Radix Slider)
 beforeAll(() => {
@@ -19,6 +20,21 @@ let requestedSection: string | null = null;
 let navigationVersion = 0;
 const mockSignOut = vi.fn();
 const mockSettingsSet = vi.fn();
+const mockToastError = vi.fn();
+let mockWorkspaces: Array<Record<string, unknown>> = [
+  { workspace_id: "ws-1", project_root: "/tmp/proj" },
+];
+let mockActiveWorkspaceId: string | null = "ws-1";
+
+vi.mock("@/lib/toast", () => ({
+  toast: { error: (...args: unknown[]) => mockToastError(...args) },
+}));
+
+vi.mock("@/components/settings/custom-acp-settings", () => ({
+  CustomAcpSettings: () => null,
+}));
+const mockUpdateSyncedSetting = vi.fn().mockResolvedValue(undefined);
+let mockSignedIn = true;
 
 vi.mock("@/stores/ui-store", () => ({
   useUIStore: (sel: (s: Record<string, unknown>) => unknown) =>
@@ -44,8 +60,8 @@ vi.mock("@/stores/app-store", async (importOriginal) => ({
           ai_resolver_model: null,
           ai_resolver_strategy: "smart_merge",
         },
-        active_workspace_id: "ws-1",
-        workspaces: [{ workspace_id: "ws-1", project_root: "/tmp/proj" }],
+        active_workspace_id: mockActiveWorkspaceId,
+        workspaces: mockWorkspaces,
       },
     }),
 }));
@@ -57,12 +73,17 @@ vi.mock("@/stores/settings-store", () => {
     auto_mcp_config: "true",
     "appearance.palette": "cool",
     "appearance.density": "comfortable",
-    "appearance.smooth_scrolling": "false",
     "sidebar.show_git_stats": "true",
     "sidebar.auto_settle_days": "3",
     "agents.orb_match_activity": "true",
     "agents.auto_resume_usage_limit": "true",
+    "agents.cross_provider_delegation": "true",
     "chat.code_wrap": "false",
+    "chat.default_checkout": "worktree",
+    "diff.layout": "unified",
+    "diff.hide_whitespace": "false",
+    "diff.file_state": "expanded",
+    "appearance.time_format": "system",
   };
   // Built lazily: `mockSettingsSet` is hoisted below this factory.
   const state = () => ({
@@ -81,23 +102,35 @@ vi.mock("@/stores/settings-store", () => {
     selectTerminalColorTheme: () => "app",
     selectPalette: () => "cool",
     selectDensity: () => "comfortable",
-    selectSmoothScrolling: () => false,
     selectSidebarShowGitStats: () => true,
     selectChatCodeWrap: () => false,
+    selectReduceMotion: () => false,
     selectSidebarAutoSettleDays: () => 3,
     selectOrbMatchActivity: () => true,
     selectAutoResumeUsageLimit: () => true,
+    selectCrossProviderDelegation: () => false,
+    selectNewChatCheckout: () => "worktree",
+    selectDiffLayoutPreference: () => "unified",
+    selectHideWhitespacePreference: () => false,
+    selectDiffFileState: () => "expanded",
+    selectTimeFormat: () => "system",
+    getNewChatCheckout: () => "worktree",
+    getTimeFormat: () => "system",
   };
 });
 
 vi.mock("@/stores/auth-store", () => ({
   useAuthStore: (sel: (s: Record<string, unknown>) => unknown) =>
     sel({
-      user: { id: "u1", email: "test@codemux.org", name: "Test User", image: null },
-      isAuthenticated: true,
+      user: mockSignedIn ? { id: "u1", email: "test@codemux.org", name: "Test User", image: null } : null,
+      isAuthenticated: mockSignedIn,
       signOut: mockSignOut,
     }),
 }));
+
+// The synced sound flag differs from `config.notification_sound_enabled`
+// above on purpose: the switches must follow the synced values.
+const syncedNotifications = { sound_enabled: false, desktop_enabled: true };
 
 vi.mock("@/stores/synced-settings-store", () => ({
   useSyncedSettingsStore: (sel: (s: Record<string, unknown>) => unknown) =>
@@ -108,20 +141,25 @@ vi.mock("@/stores/synced-settings-store", () => ({
         terminal: { scrollback_limit: 10000, cursor_style: "bar" },
         git: { default_base_branch: "main" },
         keyboard: { shortcuts: {} },
-        notifications: { sound_enabled: true, desktop_enabled: true },
+        notifications: syncedNotifications,
+        session_restore: { enabled: true, scrollback_lines: 10000, max_total_mb: 100 },
+        agent_chat: { checkpoints_enabled: false, background_browser_desktop_viewport: true },
       },
-      updateSetting: vi.fn(),
+      updateSetting: mockUpdateSyncedSetting,
+      isSyncing: false,
+      syncIssue: null,
     }),
   selectTerminalCursorStyle: () => "bar",
   selectDefaultEditor: () => "",
   selectDefaultBaseBranch: () => "main",
+  selectBrowserDefaultViewport: () => null,
   selectNotificationSoundEnabled: () => true,
   selectDesktopNotificationsEnabled: () => true,
+  selectKeyboardShortcuts: () => ({}),
 }));
 
 vi.mock("@/tauri/commands", () => ({
   detectEditors: vi.fn().mockResolvedValue([]),
-  setNotificationSoundEnabled: vi.fn().mockResolvedValue(undefined),
   setAiCommitMessageEnabled: vi.fn().mockResolvedValue(undefined),
   setAiCommitMessageCli: vi.fn().mockResolvedValue(undefined),
   setAiCommitMessageModel: vi.fn().mockResolvedValue(undefined),
@@ -132,20 +170,42 @@ vi.mock("@/tauri/commands", () => ({
   getProjectScripts: vi.fn().mockResolvedValue(null),
   setProjectScripts: vi.fn().mockResolvedValue(undefined),
   getWorkspaceConfig: vi.fn().mockResolvedValue(null),
+  hasCodemuxinclude: vi.fn().mockResolvedValue(false),
+  getBrowserDataSize: vi.fn().mockResolvedValue(0),
+  getPackageFormat: vi.fn().mockResolvedValue("appimage"),
   getPresets: vi.fn().mockResolvedValue({ presets: [], bar_visible: true, default_preset_id: null }),
   setPresetPinned: vi.fn().mockResolvedValue(undefined),
   setPresetBarVisible: vi.fn().mockResolvedValue(undefined),
   deletePreset: vi.fn().mockResolvedValue(undefined),
   updatePreset: vi.fn().mockResolvedValue(undefined),
+  clearBrowserCookies: vi.fn().mockResolvedValue(undefined),
+  clearAllBrowserData: vi.fn().mockResolvedValue(undefined),
+  listLaunchGeminiModels: vi.fn().mockResolvedValue([]),
+  listChatProviderCapabilities: vi.fn().mockResolvedValue({
+    provider: "claude", models: [], effort_label_map: {},
+  }),
+  agentChatProviderHealth: vi.fn().mockResolvedValue({ status: "ready" }),
   // Usage section — needed so switching to it renders rather than
   // throwing on an undefined command wrapper.
   usageSummary: vi.fn().mockResolvedValue(null),
   usageExportCsv: vi.fn().mockResolvedValue(""),
+  agentConnectorStatus: vi.fn().mockResolvedValue({ enabled: true, publicOrigin: null, listenerRunning: false, mcpUrl: null, localCommand: "codemux mcp", pending: [], clients: [] }),
+  agentConnectorRevoke: vi.fn().mockResolvedValue(undefined),
+  listMcpServers: vi.fn().mockResolvedValue([]),
+  getMcpRuntimeStatus: vi.fn().mockResolvedValue([]),
+  setMcpDisabledIds: vi.fn().mockResolvedValue(undefined),
+  primeMcpRuntime: vi.fn().mockResolvedValue([]),
+  usageRefreshQuota: vi.fn().mockResolvedValue({ quota: {}, statuses: [], refreshed_at_ms: 0 }),
+  usagePriceOverrides: vi.fn().mockResolvedValue({}),
 }));
+
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
 
 vi.mock("@/tauri/events", () => ({
   onPresetsChanged: vi.fn().mockReturnValue(Promise.resolve(() => {})),
+  onAgentConnectorChanged: vi.fn().mockResolvedValue(() => {}),
 }));
+vi.mock("./custom-acp-settings", () => ({ CustomAcpSettings: () => null }));
 
 // ── Model picker mock ──
 //
@@ -202,7 +262,9 @@ vi.mock("@/components/chat/pickers/MultiProviderModelPicker", () => ({
 }));
 
 import { SettingsView } from "./settings-view";
+import { revealSettingsAnchor } from "./settings-search";
 import * as commands from "@/tauri/commands";
+import { SETTINGS_SEARCH_ENTRIES, searchSettings } from "@/lib/settings-search";
 
 describe("SettingsPanel", () => {
   beforeEach(() => {
@@ -213,8 +275,9 @@ describe("SettingsPanel", () => {
     render(<SettingsView />);
 
     // Group headers
-    expect(screen.getByText("PERSONAL")).toBeInTheDocument();
-    expect(screen.getByText("EDITOR & WORKFLOW")).toBeInTheDocument();
+    for (const group of ["PERSONAL", "AGENTS", "WORKSPACES", "TOOLS", "SYSTEM"]) {
+      expect(screen.getByText(group)).toBeInTheDocument();
+    }
 
     // Nav items
     expect(screen.getByRole("button", { name: /Account/i })).toBeInTheDocument();
@@ -425,6 +488,68 @@ describe("SettingsPanel — Git section model pickers", () => {
 // picker and the indicator-color swatches were deleted outright when the
 // orb replaced them — there is nothing left to pick.
 
+describe("SettingsPanel — Git section diff defaults", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function openGitSection() {
+    render(<SettingsView />);
+    fireEvent.click(screen.getAllByRole("button", { name: /Git/i })[0]);
+  }
+
+  it("writes the diff layout and file state defaults", () => {
+    openGitSection();
+    fireEvent.click(screen.getAllByRole("radio", { name: /^Split$/i })[0]);
+    expect(mockSettingsSet).toHaveBeenCalledWith("diff.layout", "split");
+    fireEvent.click(screen.getAllByRole("radio", { name: /^Collapsed$/i })[0]);
+    expect(mockSettingsSet).toHaveBeenCalledWith("diff.file_state", "collapsed");
+  });
+
+  it("toggling Hide whitespace changes writes diff.hide_whitespace", () => {
+    openGitSection();
+    fireEvent.click(screen.getByRole("switch", { name: "Hide whitespace changes" }));
+    expect(mockSettingsSet).toHaveBeenCalledWith("diff.hide_whitespace", "true");
+  });
+});
+
+describe("SettingsPanel — Notifications section", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function openNotifications() {
+    render(<SettingsView />);
+    fireEvent.click(screen.getAllByRole("button", { name: /Notifications/i })[0]);
+  }
+
+  it("shows the synced sound and desktop preferences", () => {
+    openNotifications();
+    expect(
+      screen.getAllByRole("switch", { name: "Notification sounds" })[0],
+    ).toHaveAttribute("aria-checked", "false");
+    expect(
+      screen.getAllByRole("switch", { name: "Desktop notifications" })[0],
+    ).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("writes each toggle to the synced notification settings", () => {
+    openNotifications();
+    fireEvent.click(screen.getAllByRole("switch", { name: "Notification sounds" })[0]);
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledWith(
+      "notifications",
+      "sound_enabled",
+      true,
+    );
+    fireEvent.click(screen.getAllByRole("switch", { name: "Desktop notifications" })[0]);
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledWith(
+      "notifications",
+      "desktop_enabled",
+      false,
+    );
+  });
+});
+
 describe("SettingsPanel — Appearance Agents section", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -461,10 +586,8 @@ describe("SettingsPanel — Appearance Agents section", () => {
   it("renders the Sidebar subsection and toggling Show git stats writes sidebar.show_git_stats", () => {
     openAppearance();
     expect(screen.getAllByText("Show git stats").length).toBeGreaterThan(0);
-    const row = screen
-      .getAllByText("Show git stats")[0]
-      .closest("div")!.parentElement!;
-    const toggle = within(row).getByRole("switch");
+    // The row's label names its switch.
+    const [toggle] = screen.getAllByRole("switch", { name: "Show git stats" });
     fireEvent.click(toggle);
     expect(mockSettingsSet).toHaveBeenCalledWith(
       "sidebar.show_git_stats",
@@ -482,15 +605,30 @@ describe("SettingsPanel — Appearance Agents section", () => {
     );
   });
 
+  it("choosing a time format writes appearance.time_format", () => {
+    openAppearance();
+    const [twentyFour] = screen.getAllByRole("radio", { name: /^24-hour$/i });
+    fireEvent.click(twentyFour);
+    expect(mockSettingsSet).toHaveBeenCalledWith("appearance.time_format", "24h");
+  });
+
   it("toggling Match the orb to the activity writes agents.orb_match_activity", () => {
     openAppearance();
-    const row = screen
-      .getAllByText("Match the orb to the activity")[0]
-      .closest("div")!.parentElement!;
-    fireEvent.click(within(row).getByRole("switch"));
+    fireEvent.click(
+      screen.getAllByRole("switch", { name: "Match the orb to the activity" })[0],
+    );
     expect(mockSettingsSet).toHaveBeenCalledWith(
       "agents.orb_match_activity",
       "false",
+    );
+  });
+
+  it("toggling Reduce motion writes appearance.reduce_motion", () => {
+    openAppearance();
+    fireEvent.click(screen.getAllByRole("switch", { name: "Reduce motion" })[0]);
+    expect(mockSettingsSet).toHaveBeenCalledWith(
+      "appearance.reduce_motion",
+      "true",
     );
   });
 
@@ -506,7 +644,6 @@ describe("SettingsPanel — Appearance Agents section", () => {
     openAppearance();
     for (const label of [
       "Typography",
-      "Border radius",
       "Resource monitor",
       "Density",
       "Wrap code in chat",
@@ -516,6 +653,11 @@ describe("SettingsPanel — Appearance Agents section", () => {
     ]) {
       expect(screen.getAllByText(label).length).toBeGreaterThan(0);
     }
+  });
+
+  it("drops the read-only Border radius row", () => {
+    openAppearance();
+    expect(screen.queryByText("Border radius")).toBeNull();
   });
 });
 
@@ -544,6 +686,30 @@ describe("Settings footer navigation", () => {
     view.unmount();
   });
 
+  it("keeps inbound administration on the shared MCP route in classic CLI mode without mounting outbound runtime", async () => {
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    useFeatureFlags.setState({ enableAgentChat: false });
+    vi.clearAllMocks();
+    const status = { enabled: true, publicOrigin: null, listenerRunning: false, mcpUrl: null,
+      localCommand: "codemux mcp", pending: [], clients: [{ id: "synthetic-granted", clientName: "Synthetic read-only assistant", callbackOrigin: "https://client.example",
+        access: "read_only" as const, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString() }] };
+    vi.mocked(commands.agentConnectorStatus).mockResolvedValue(status);
+    requestedSection = "mcp";
+    const view = render(<SettingsView />);
+    try {
+      expect(view.getByRole("button", { name: "MCP Servers" })).toHaveAttribute("aria-current", "page");
+      fireEvent.click(await view.findByRole("button", { name: "Revoke" }));
+      vi.mocked(commands.agentConnectorStatus).mockResolvedValue({ ...status, clients: [] });
+      fireEvent.click(view.getByRole("button", { name: "Revoke access" }));
+      await waitFor(() => expect(commands.agentConnectorRevoke).toHaveBeenCalledWith("synthetic-granted"));
+      await waitFor(() => expect(view.queryByText("Synthetic read-only assistant")).not.toBeInTheDocument());
+      expect(commands.agentConnectorStatus).toHaveBeenCalledTimes(2);
+      for (const fn of [commands.listMcpServers, commands.getMcpRuntimeStatus, commands.setMcpDisabledIds, commands.primeMcpRuntime]) expect(fn).not.toHaveBeenCalled();
+      expect(view.queryByLabelText("Refresh MCP servers")).not.toBeInTheDocument();
+      expect(useFeatureFlags.getState().enableAgentChat).toBe(false);
+    } finally { view.unmount(); useFeatureFlags.setState({ enableAgentChat: true }); requestedSection = null; }
+  });
+
   it("does not render a chat-only Settings section when the feature is disabled", async () => {
     const { useFeatureFlags } = await import("@/stores/feature-flags");
     useFeatureFlags.setState({ enableAgentChat: false });
@@ -553,6 +719,167 @@ describe("Settings footer navigation", () => {
     expect(view.queryByRole("button", { name: "Skills" })).toBeNull();
     view.unmount();
     useFeatureFlags.setState({ enableAgentChat: true });
+  });
+
+  it("renders the Hermes setup card once on the Agent page", () => {
+    requestedSection = "agent";
+    const view = render(<SettingsView />);
+    expect(view.getAllByRole("region", { name: "Hermes setup" })).toHaveLength(1);
+    view.unmount();
+  });
+
+  it("opens each section at the top rather than the previous page's offset", () => {
+    const view = render(<SettingsView />);
+    const viewport = () =>
+      view.container.querySelector('[data-slot="scroll-area-viewport"]') as HTMLElement;
+    viewport().scrollTop = 600;
+    fireEvent.click(view.getByRole("button", { name: "Terminal" }));
+    expect(viewport().scrollTop).toBe(0);
+    view.unmount();
+  });
+
+  it("lets the nav column scroll on its own on short windows", () => {
+    const view = render(<SettingsView />);
+    const nav = view.container.querySelector("nav") as HTMLElement;
+    const scroller = nav.querySelector(".overflow-y-auto");
+    expect(scroller).toContainElement(view.getByRole("button", { name: "Account" }));
+    expect(scroller).not.toContainElement(view.getByRole("combobox", { name: "Search settings" }));
+    view.unmount();
+  });
+
+  it("saves the default base branch once on commit and refuses an empty one", () => {
+    requestedSection = "git";
+    const view = render(<SettingsView />);
+    const input = view.getByRole("textbox", { name: "Default base branch" });
+    fireEvent.change(input, { target: { value: "dev" } });
+    fireEvent.change(input, { target: { value: "develop" } });
+    expect(mockUpdateSyncedSetting).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.blur(input);
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledTimes(1);
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledWith("git", "default_base_branch", "develop");
+
+    mockUpdateSyncedSetting.mockClear();
+    fireEvent.change(input, { target: { value: "   " } });
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    fireEvent.blur(input);
+    expect(mockUpdateSyncedSetting).not.toHaveBeenCalled();
+    // The mocked store still holds "main", so the field snaps back to it.
+    expect(input).toHaveValue("main");
+    expect(input).not.toHaveAttribute("aria-invalid");
+    view.unmount();
+  });
+
+  it("saves a preset name typed just before Escape closes the editor", async () => {
+    vi.mocked(commands.getPresets).mockResolvedValueOnce({
+      presets: [{
+        id: "p1",
+        name: "Git Pull",
+        description: null,
+        commands: ["git pull"],
+        working_directory: null,
+        launch_mode: "new_tab",
+        icon: null,
+        pinned: true,
+        is_builtin: false,
+        auto_run_on_workspace: false,
+        auto_run_on_new_tab: false,
+        kind: "cli",
+        launch_config: null,
+      }],
+      bar_visible: true,
+      default_preset_id: null,
+    });
+    requestedSection = "presets";
+    const view = render(<SettingsView />);
+    fireEvent.click(await view.findByText("Git Pull"));
+    const name = await screen.findByPlaceholderText("e.g. Git Pull");
+    fireEvent.change(name, { target: { value: "Git Pull --rebase" } });
+    expect(commands.updatePreset).not.toHaveBeenCalled();
+    navigationVersion += 1;
+    view.rerender(<SettingsView />);
+    expect(screen.getByPlaceholderText("e.g. Git Pull")).toHaveValue("Git Pull --rebase");
+    fireEvent.keyDown(name, { key: "Escape" });
+    expect(commands.updatePreset).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "p1", name: "Git Pull --rebase" }),
+    );
+    view.unmount();
+  });
+
+  it("preserves a new preset's draft fields when Settings is requested again", async () => {
+    vi.mocked(commands.updatePreset).mockClear();
+    requestedSection = "presets";
+    const view = render(<SettingsView />);
+    await view.findByText("Show preset bar");
+    fireEvent.click(view.getByRole("button", { name: "New preset" }));
+    const name = await screen.findByPlaceholderText("e.g. Git Pull");
+    const description = screen.getByPlaceholderText("Optional description");
+    const prompt = screen.getByPlaceholderText("e.g. pull the latest changes and resolve any conflicts");
+    fireEvent.change(name, { target: { value: "Review my changes" } });
+    fireEvent.change(description, { target: { value: "A draft I am still editing" } });
+    fireEvent.change(prompt, { target: { value: "Review the diff and run the affected tests" } });
+    const viewport = view.container.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')!;
+    viewport.scrollTop = 400;
+
+    // Ctrl+, requests Settings without a section while it is already open.
+    requestedSection = null;
+    navigationVersion += 1;
+    view.rerender(<SettingsView />);
+
+    expect(screen.getByPlaceholderText("e.g. Git Pull")).toHaveValue("Review my changes");
+    expect(screen.getByPlaceholderText("Optional description")).toHaveValue("A draft I am still editing");
+    expect(screen.getByPlaceholderText("e.g. pull the latest changes and resolve any conflicts")).toHaveValue("Review the diff and run the affected tests");
+    expect(view.container.querySelector('[data-slot="scroll-area-viewport"]')).toBe(viewport);
+    expect(viewport.scrollTop).toBe(0);
+    expect(commands.updatePreset).not.toHaveBeenCalled();
+    view.unmount();
+  });
+
+  it("shows session-restore slider values beside the control", () => {
+    requestedSection = "session_restore";
+    const view = render(<SettingsView />);
+    expect(view.getByText("10,000 lines")).toBeInTheDocument();
+    expect(view.getByText("100 MB")).toBeInTheDocument();
+    expect(view.queryByText(/agent sessions/)).toBeNull();
+    view.unmount();
+  });
+
+  it("saves a scrollback slider once when the drag ends, not on every tick", () => {
+    requestedSection = "session_restore";
+    mockUpdateSyncedSetting.mockClear();
+    const view = render(<SettingsView />);
+    const [lines] = view.getAllByRole("slider");
+    // jsdom has no layout: give the track a 360px width so pointer
+    // positions map onto the 1,000–50,000 range.
+    const track = lines.closest('[data-slot="slider"]') as HTMLElement;
+    track.getBoundingClientRect = () =>
+      ({ left: 0, right: 360, width: 360, top: 0, bottom: 10, height: 10, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
+    track.setPointerCapture = () => {};
+    track.releasePointerCapture = () => {};
+    track.hasPointerCapture = () => true;
+
+    fireEvent.pointerDown(track, { clientX: 72, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(track, { clientX: 144, pointerId: 1 });
+    fireEvent.pointerMove(track, { clientX: 180, pointerId: 1 });
+    expect(view.getByText("26,000 lines")).toBeInTheDocument();
+    expect(mockUpdateSyncedSetting).not.toHaveBeenCalled();
+
+    fireEvent.pointerUp(track, { clientX: 180, pointerId: 1 });
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledTimes(1);
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledWith("session_restore", "scrollback_lines", 26000);
+    view.unmount();
+  });
+
+  it("returns to the top when a deep link reopens the current section", () => {
+    requestedSection = "terminal";
+    const view = render(<SettingsView />);
+    const viewport = () =>
+      view.container.querySelector('[data-slot="scroll-area-viewport"]') as HTMLElement;
+    viewport().scrollTop = 400;
+    navigationVersion += 1;
+    view.rerender(<SettingsView />);
+    expect(viewport().scrollTop).toBe(0);
+    view.unmount();
   });
 
   it("pins the current Settings page from its header", async () => {
@@ -565,5 +892,465 @@ describe("Settings footer navigation", () => {
     expect(view.getByRole("button", { name: "Unpin from footer" })).toBeInTheDocument();
     view.unmount();
     requestedSection = null;
+  });
+});
+
+describe("Settings destructive actions", () => {
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+  afterEach(() => {
+    requestedSection = null;
+  });
+
+  const customPreset = {
+    id: "p-1",
+    name: "Review bot",
+    description: null,
+    commands: ["claude"],
+    working_directory: null,
+    launch_mode: "new_tab",
+    icon: "claude",
+    pinned: false,
+    is_builtin: false,
+    auto_run_on_workspace: false,
+    auto_run_on_new_tab: false,
+    kind: "cli",
+    launch_config: null,
+  };
+
+  it("asks before deleting a preset from the list, and only deletes on confirm", async () => {
+    vi.mocked(commands.getPresets).mockResolvedValueOnce({
+      presets: [customPreset],
+      bar_visible: true,
+      default_preset_id: null,
+    } as never);
+    requestedSection = "presets";
+    render(<SettingsView />);
+
+    const remove = await screen.findByRole("button", { name: "Delete preset Review bot" });
+    fireEvent.click(remove);
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog).toHaveTextContent('Delete "Review bot"?');
+    expect(commands.deletePreset).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(commands.deletePreset).not.toHaveBeenCalled();
+
+    fireEvent.click(remove);
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Delete preset" }),
+    );
+    await waitFor(() => expect(commands.deletePreset).toHaveBeenCalledWith("p-1"));
+  });
+
+  it("opens a preset's editor from the keyboard", async () => {
+    vi.mocked(commands.getPresets).mockResolvedValueOnce({
+      presets: [customPreset],
+      bar_visible: true,
+      default_preset_id: null,
+    } as never);
+    requestedSection = "presets";
+    render(<SettingsView />);
+
+    const row = await screen.findByRole("button", { name: "Edit Review bot" });
+    expect(row.tagName).toBe("BUTTON");
+    fireEvent.click(row);
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("clears browser data through the app's dialog, not window.confirm", async () => {
+    const nativeConfirm = vi.spyOn(window, "confirm");
+    requestedSection = "browser";
+    render(<SettingsView />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear all data" }));
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog).toHaveTextContent("Clear all browser data?");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Clear all data" }));
+
+    await waitFor(() => expect(commands.clearAllBrowserData).toHaveBeenCalled());
+    expect(nativeConfirm).not.toHaveBeenCalled();
+    expect(await screen.findByRole("status")).toHaveTextContent("All browser data cleared.");
+    nativeConfirm.mockRestore();
+  });
+
+  it("shows a failed clear as an error, not a success", async () => {
+    vi.mocked(commands.clearBrowserCookies).mockRejectedValueOnce("profile locked");
+    requestedSection = "browser";
+    render(<SettingsView />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear cookies" }));
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Clear cookies" }),
+    );
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Couldn't clear cookies: profile locked");
+    expect(alert.querySelector(".bg-destructive")).not.toBeNull();
+  });
+});
+
+describe("Settings → Projects", () => {
+  const chooseOtherProject = async () => {
+    Element.prototype.hasPointerCapture ??= () => false;
+    Element.prototype.scrollIntoView ??= () => {};
+    fireEvent.keyDown(screen.getByRole("combobox", { name: "Project" }), { key: "Enter" });
+    fireEvent.keyDown(await screen.findByRole("option", { name: "other" }), { key: "Enter" });
+  };
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    requestedSection = "projects";
+  });
+  afterEach(() => {
+    requestedSection = null;
+    mockWorkspaces = [{ workspace_id: "ws-1", project_root: "/tmp/proj" }];
+    mockActiveWorkspaceId = "ws-1";
+  });
+
+  it("offers to open a project instead of editable fields when there is none", () => {
+    mockWorkspaces = [];
+    mockActiveWorkspaceId = null;
+    render(<SettingsView />);
+
+    expect(screen.getByText("Open a project to configure its lifecycle scripts.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Open project/ })).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("e.g. npm install")).toBeNull();
+  });
+
+  it("edits another project without switching workspaces", async () => {
+    mockWorkspaces = [
+      { workspace_id: "ws-1", project_root: "/tmp/proj" },
+      { workspace_id: "ws-2", project_root: "/tmp/other" },
+    ];
+    render(<SettingsView />);
+
+    // Defaults to the active workspace's project.
+    await waitFor(() => expect(commands.getProjectScripts).toHaveBeenCalledWith("/tmp/proj"));
+    const picker = screen.getByRole("combobox", { name: "Project" });
+    expect(picker).toHaveTextContent("proj");
+
+    // Radix Select reaches for pointer capture and scrolling jsdom lacks.
+    Element.prototype.hasPointerCapture ??= () => false;
+    Element.prototype.scrollIntoView ??= () => {};
+    fireEvent.keyDown(picker, { key: "Enter" });
+    fireEvent.keyDown(await screen.findByRole("option", { name: "other" }), { key: "Enter" });
+    await waitFor(() => expect(commands.getProjectScripts).toHaveBeenCalledWith("/tmp/other"));
+    expect(screen.getByRole("combobox", { name: "Project" })).toHaveTextContent("other");
+  });
+
+  it("saves on blur only when something changed, then says so", async () => {
+    render(<SettingsView />);
+    await waitFor(() => expect(commands.getProjectScripts).toHaveBeenCalled());
+    const setup = screen.getByPlaceholderText("e.g. npm install");
+
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).not.toHaveBeenCalled();
+
+    fireEvent.change(setup, { target: { value: "npm ci" } });
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).toHaveBeenCalledWith("/tmp/proj", {
+      setup: ["npm ci"],
+      teardown: [],
+      run: null,
+      worktree_includes: [],
+    });
+    // Every field carries a hidden note; only the one just saved shows.
+    const visibleNotes = () =>
+      screen.getAllByText("Saved").filter((el) => !el.closest("[aria-hidden='true']"));
+    await waitFor(() => expect(visibleNotes()).toHaveLength(1));
+    expect(visibleNotes()[0].closest(".space-y-2")).toContainElement(setup);
+  });
+
+  it("cannot save the previous project's values while the new project is loading", async () => {
+    mockWorkspaces = [
+      { workspace_id: "ws-1", project_root: "/tmp/proj" },
+      { workspace_id: "ws-2", project_root: "/tmp/other" },
+    ];
+    let resolveOther!: (scripts: Awaited<ReturnType<typeof commands.getProjectScripts>>) => void;
+    vi.mocked(commands.getProjectScripts)
+      .mockResolvedValueOnce({ setup: ["setup-for-a"], teardown: [], run: null, worktree_includes: [] })
+      .mockReturnValueOnce(new Promise((resolve) => { resolveOther = resolve; }));
+    render(<SettingsView />);
+    await waitFor(() => expect(screen.getByPlaceholderText("e.g. npm install")).toHaveValue("setup-for-a"));
+    await chooseOtherProject();
+
+    const setup = screen.getByPlaceholderText("e.g. npm install");
+    expect(setup).toBeDisabled();
+    expect(setup).toHaveValue("");
+    expect(screen.getByRole("status")).toHaveTextContent("Loading project scripts");
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).not.toHaveBeenCalled();
+
+    resolveOther({ setup: ["setup-for-b"], teardown: [], run: null, worktree_includes: [] });
+    await waitFor(() => expect(setup).toBeEnabled());
+    expect(setup).toHaveValue("setup-for-b");
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).not.toHaveBeenCalled();
+  });
+
+  it("keeps fields disabled and shows a project load error", async () => {
+    vi.mocked(commands.getProjectScripts).mockRejectedValueOnce(new Error("permission denied"));
+    render(<SettingsView />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't load proj's scripts: Error: permission denied");
+    const setup = screen.getByPlaceholderText("e.g. npm install");
+    expect(setup).toBeDisabled();
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).not.toHaveBeenCalled();
+  });
+
+  it("ignores a previous project's late save completion", async () => {
+    mockWorkspaces = [
+      { workspace_id: "ws-1", project_root: "/tmp/proj" },
+      { workspace_id: "ws-2", project_root: "/tmp/other" },
+    ];
+    let resolveSave!: () => void;
+    vi.mocked(commands.setProjectScripts).mockReturnValueOnce(new Promise((resolve) => { resolveSave = resolve; }));
+    render(<SettingsView />);
+    const setup = screen.getByPlaceholderText("e.g. npm install");
+    await waitFor(() => expect(setup).toBeEnabled());
+    fireEvent.change(setup, { target: { value: "setup-for-a" } });
+    fireEvent.blur(setup);
+    await chooseOtherProject();
+    await waitFor(() => expect(setup).toBeEnabled());
+    resolveSave();
+    await waitFor(() => expect(screen.getAllByText("Saved").filter((el) => !el.closest("[aria-hidden='true']"))).toHaveLength(0));
+
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a failed save and keeps the edit dirty", async () => {
+    vi.mocked(commands.setProjectScripts).mockRejectedValueOnce("read-only");
+    render(<SettingsView />);
+    await waitFor(() => expect(commands.getProjectScripts).toHaveBeenCalled());
+    const run = screen.getByPlaceholderText("e.g. npm run dev");
+
+    fireEvent.change(run, { target: { value: "npm run dev" } });
+    fireEvent.blur(run);
+    await waitFor(() => expect(mockToastError).toHaveBeenCalled());
+    expect(mockToastError.mock.calls[0][0]).toBe("Couldn't save proj's scripts");
+
+    // Still dirty: the next blur tries again.
+    fireEvent.blur(run);
+    expect(commands.setProjectScripts).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("Settings rows", () => {
+  beforeEach(() => {
+    cleanup();
+    requestedSection = "appearance";
+  });
+  afterEach(() => {
+    requestedSection = null;
+  });
+
+  it("marks settings that stay on this device", () => {
+    render(<SettingsView />);
+    const density = screen.getByRole("group", { name: "Density" });
+    expect(density).toHaveAccessibleDescription(/Only on this device/);
+    // Resource monitor syncs with the account, so it carries no mark.
+    expect(
+      screen.getByRole("switch", { name: "Resource monitor" }),
+    ).not.toHaveAccessibleDescription(/Only on this device/);
+  });
+
+  it("marks the Agent page's machine-local settings", async () => {
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    useFeatureFlags.setState({ enableAgentChat: true });
+    requestedSection = "agent";
+    render(<SettingsView />);
+    for (const name of [
+      "Auto-configure MCP for workspaces",
+      "Resume automatically after usage limits reset",
+    ]) {
+      expect(screen.getByRole("switch", { name })).toHaveAccessibleDescription(
+        /Only on this device/,
+      );
+    }
+    // Checkpoints sync with the account, so they carry no mark.
+    expect(
+      screen.getByRole("switch", { name: "Per-turn revert checkpoints" }),
+    ).not.toHaveAccessibleDescription(/Only on this device/);
+  });
+});
+
+// ── Settings search ──
+
+describe("Settings search", () => {
+  beforeEach(async () => {
+    cleanup();
+    requestedSection = null;
+    navigationVersion = 0;
+    mockSignedIn = true;
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    useFeatureFlags.setState({ enableAgentChat: true });
+  });
+
+  const searchField = (view: ReturnType<typeof render>) =>
+    view.getByRole("combobox", { name: "Search settings" });
+
+  it("updates search results when Agent Chat or sign-in state changes", async () => {
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    const view = render(<SettingsView />);
+    const hasResult = (label: string) => view.queryAllByRole("option").some((option) => option.textContent?.includes(label));
+    fireEvent.change(searchField(view), { target: { value: "checkpoint" } });
+    expect(hasResult("Per-turn revert checkpoints")).toBe(true);
+
+    act(() => useFeatureFlags.setState({ enableAgentChat: false }));
+    view.rerender(<SettingsView />);
+    expect(hasResult("Per-turn revert checkpoints")).toBe(false);
+    fireEvent.change(searchField(view), { target: { value: "skills sync" } });
+    expect(hasResult("Skills sync")).toBe(false);
+
+    act(() => useFeatureFlags.setState({ enableAgentChat: true }));
+    view.rerender(<SettingsView />);
+    expect(hasResult("Skills sync")).toBe(true);
+    mockSignedIn = false;
+    view.rerender(<SettingsView />);
+    expect(hasResult("Skills sync")).toBe(false);
+    fireEvent.change(searchField(view), { target: { value: "email" } });
+    expect(hasResult("Email")).toBe(false);
+    view.unmount();
+  });
+
+  it("lists matching rows by page and opens the page on Enter", async () => {
+    const view = render(<SettingsView />);
+    fireEvent.change(searchField(view), { target: { value: "orb" } });
+
+    const results = view.getByRole("listbox", { name: "Settings search results" });
+    expect(within(results).getByRole("group", { name: "Appearance" })).toBeInTheDocument();
+    expect(within(results).getByRole("option", { name: /Match the orb to the activity/ }))
+      .toHaveAttribute("aria-selected", "true");
+    // The nav is replaced while searching.
+    expect(view.queryByRole("button", { name: "Account" })).toBeNull();
+
+    fireEvent.keyDown(searchField(view), { key: "Enter" });
+
+    expect(view.getByRole("button", { name: "Appearance" })).toHaveAttribute("aria-current", "page");
+    expect(searchField(view)).toHaveValue("");
+    // The row search named is lit once the page has painted.
+    await waitFor(() =>
+      expect(
+        view.getByText("Match the orb to the activity").closest("[data-settings-row]"),
+      ).toHaveAttribute("data-settings-flash"),
+    );
+    view.unmount();
+  });
+
+  it("scrolls the nav to the page a result opened", () => {
+    const view = render(<SettingsView />);
+    // jsdom has no layout: the nav shows y 100–500 and the About row sits at
+    // y 900–932, below the fold.
+    const scroller = view
+      .getByRole("button", { name: "Account" })
+      .closest<HTMLElement>(".overflow-y-auto")!;
+    let scrollTop = 0;
+    Object.defineProperty(scroller, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => {
+        scrollTop = value;
+      },
+    });
+    scroller.getBoundingClientRect = () => new DOMRect(0, 100, 240, 400);
+    const rects = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        return this.getAttribute("aria-current") === "page"
+          ? new DOMRect(0, 900, 240, 32)
+          : new DOMRect(0, 0, 0, 0);
+      });
+
+    fireEvent.change(searchField(view), { target: { value: "diagnostics" } });
+    fireEvent.keyDown(searchField(view), { key: "Enter" });
+
+    expect(view.getByRole("button", { name: "About" })).toHaveAttribute("aria-current", "page");
+    // 932 − 500, plus the 12px margin.
+    expect(scrollTop).toBe(444);
+    rects.mockRestore();
+    view.unmount();
+  });
+
+  it("moves through results with the arrow keys", () => {
+    const view = render(<SettingsView />);
+    fireEvent.change(searchField(view), { target: { value: "cursor" } });
+    const options = () => view.getAllByRole("option");
+    expect(options()[0]).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(searchField(view), { key: "ArrowDown" });
+    expect(options()[1]).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(searchField(view), { key: "ArrowUp" });
+    fireEvent.keyDown(searchField(view), { key: "ArrowUp" });
+    expect(options()[options().length - 1]).toHaveAttribute("aria-selected", "true");
+    view.unmount();
+  });
+
+  it("says so when nothing matches, and Escape clears the query", () => {
+    const view = render(<SettingsView />);
+    fireEvent.change(searchField(view), { target: { value: "zzzz" } });
+    expect(view.getByRole("status")).toHaveTextContent("No settings match");
+    fireEvent.keyDown(searchField(view), { key: "Escape" });
+    expect(searchField(view)).toHaveValue("");
+    expect(view.getByRole("button", { name: "Account" })).toBeInTheDocument();
+    view.unmount();
+  });
+
+  it("focuses the field on Ctrl+F, and on / outside a text field", () => {
+    const view = render(<SettingsView />);
+    const field = searchField(view);
+
+    fireEvent.keyDown(document.body, { key: "f", ctrlKey: true });
+    expect(field).toHaveFocus();
+
+    field.blur();
+    fireEvent.keyDown(document.body, { key: "/" });
+    expect(field).toHaveFocus();
+
+    // "/" typed into another field is text, not a shortcut.
+    const other = document.createElement("input");
+    document.body.appendChild(other);
+    other.focus();
+    fireEvent.keyDown(other, { key: "/" });
+    expect(other).toHaveFocus();
+    other.remove();
+    view.unmount();
+  });
+
+  it.each([
+    { agentChat: true, signedIn: true },
+    { agentChat: false, signedIn: true },
+    { agentChat: true, signedIn: false },
+    { agentChat: false, signedIn: false },
+  ])("finds every searchable row on its rendered page (Agent Chat: $agentChat, signed in: $signedIn)", async ({ agentChat, signedIn }) => {
+    // The index stands in for pages that are not rendered, so a renamed row
+    // must be renamed here too or search lands on the top of the page. The
+    // check uses the same lookup navigation does, not just any text match.
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    useFeatureFlags.setState({ enableAgentChat: agentChat });
+    mockSignedIn = signedIn;
+    const view = render(<SettingsView />);
+    const searchable = SETTINGS_SEARCH_ENTRIES.flatMap((entry) =>
+      searchSettings(entry.label, agentChat, signedIn).flatMap((group) => group.results)
+        .filter((result) => result.section === entry.section && result.anchor === entry.label),
+    );
+    const sections = new Set(searchable.map((result) => result.section));
+    for (const section of sections) {
+      requestedSection = section;
+      navigationVersion++;
+      view.rerender(<SettingsView />);
+      for (const entry of searchable.filter((result) => result.section === section)) {
+        // Some pages fill in after an async load (Presets).
+        await waitFor(() =>
+          expect(
+            revealSettingsAnchor(view.container, entry.label),
+            `${section} → ${entry.label}`,
+          ).toBe(true),
+        );
+      }
+    }
+    view.unmount();
   });
 });

@@ -12,13 +12,15 @@
  */
 import { memo, useState, useEffect, useCallback } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { ChevronRight, Folder, Loader2 } from "lucide-react";
+import { ChevronRight, Folder } from "lucide-react";
 import { FileTypeIcon } from "@/components/icons/file-type-icon";
 import { listDirectory } from "@/tauri/commands";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import { cn } from "@/lib/utils";
+import { Empty, EmptyDescription } from "@/components/ui/empty";
 import { useSyncedSettingsStore, selectShowHiddenFiles } from "@/stores/synced-settings-store";
 import type { WorkspaceSnapshot, FileEntry } from "@/tauri/types";
+import { Spinner } from "@/components/ui/spinner";
 
 /** Row geometry, in one place because the "empty" caption has to line up
  *  with the children it stands in for. */
@@ -98,7 +100,7 @@ const TreeNode = memo(function TreeNode({
           <Folder className="size-3.5 shrink-0 text-primary/70" />
           <span className="truncate">{entry.name}</span>
           {isLoading && (
-            <Loader2 className="ml-auto size-3 shrink-0 animate-spin text-foreground/35" />
+            <Spinner className="ml-auto size-3 shrink-0 text-foreground/35" />
           )}
         </button>
         {isExpanded && children && (
@@ -242,7 +244,9 @@ export function FileTreePanel({
             />
           ))}
           {rootEntries.length === 0 && (
-            <p className="py-8 text-center text-label text-foreground/40">No files</p>
+            <Empty>
+              <EmptyDescription>No files</EmptyDescription>
+            </Empty>
           )}
         </div>
       </ScrollArea>

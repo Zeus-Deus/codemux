@@ -433,7 +433,7 @@ pub(super) async fn wake_open<R: Runtime>(handle: &AppHandle<R>, id: &str) -> Re
         handle.clone(),
         parent.provider,
         input,
-        TurnOrigin::Delegation,
+        TurnOrigin::RemoteDelegation,
     )
     .await;
     store.finish_delivery(id, &attempt)?;

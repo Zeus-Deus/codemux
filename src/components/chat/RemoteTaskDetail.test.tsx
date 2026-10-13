@@ -640,6 +640,24 @@ it('native question presentation leaves opaque durable activity and complete num
   expect(view.container.querySelector('a,img')).toBeNull();
 });
 
+it('normalizes remote multi-select answers to the supported providers\' text contract', async () => {
+  const Detail = await component();
+  const payload = { questions: [{ question: 'Which capabilities?', multiSelect: true, options: [{ label: 'Read, local' }, { label: 'Write' }] }], remote_hint: 'retain original fields' };
+  const request = { request_id: 'multi-select', request_kind: 'user-input', payload };
+  const task = taskFixture({ provider: 'codex', status: 'awaiting_approval', remote: remoteFixture({ pending_requests: [request] }) });
+  native.invoke.mockImplementation(cmd => Promise.resolve(cmd === 'delegation_read' ? { task, events: [], next_cursor: 0, has_more: false } : cmd === 'delegation_respond' ? task : [task]));
+  renderHook(() => useDelegationTasks('pane', 'thread-1'));
+  render(<Detail task={task} paneId="pane" writable onBack={vi.fn()} />);
+  const read = await screen.findByRole('checkbox', { name: /Read, local/ });
+  await waitFor(() => expect(read).toBeEnabled());
+  fireEvent.click(read);
+  fireEvent.click(screen.getByRole('checkbox', { name: /Write/ }));
+  fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() => expect(native.invoke.mock.calls.filter(([cmd]) => cmd === 'delegation_respond')).toEqual([
+    ['delegation_respond', { paneId: 'pane', taskId: task.id, requestId: request.request_id, originalRequest: request, decision: { decision: 'allow', updated_input: { ...payload, answers: { 'Which capabilities?': 'Read, local, Write' } } } }],
+  ]));
+});
+
 it('requires structured remote AskUserQuestion answers and submits the original fields with exact allow.updated_input once', async () => {
   const Detail=await component();
   const payload={questions:[{question:'Which route?',header:'Route',multiSelect:false,options:[{label:'Safe',description:'Use /srv/remote',preview:'[remote](file:///srv/remote)'}]},{question:'Why?',options:[]}],remote_hint:'retain literal fields'};

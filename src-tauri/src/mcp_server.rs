@@ -12,6 +12,10 @@ use std::sync::{LazyLock, Mutex};
 // removes the entry after the repair. It can never remove-then-resurrect it.
 static MCP_CONFIG_IO_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// Set by app-owned provider MCP descriptors, never per-call metadata.
+pub(crate) const PROVIDER_ORIGIN_ENV: &str = "CODEMUX_MCP_PROVIDER_ORIGIN";
+fn provider_stdio_origin() -> bool { std::env::var_os(PROVIDER_ORIGIN_ENV).is_some() }
+
 /// Check if auto-MCP config is enabled in settings (default: true).
 pub fn is_auto_mcp_enabled<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
     use tauri::Manager;
@@ -86,7 +90,7 @@ struct McpTool {
 }
 
 fn register_tools() -> Vec<McpTool> {
-    vec![
+    let mut tools = vec![
         McpTool {name:"delegation_targets",description:"List user-authorized host/existing-checkout/provider/mode targets for this native parent. Grants are immutable to agents. Available only in an actual Codex/Claude adapter; generic MCP metadata is not authority.",input_schema:json!({"type":"object","properties":{},"additionalProperties":false})},
         McpTool {name:"delegate_task",description:"Delegate a SELF-CONTAINED coding task to an explicitly authorized remote checkout. Supply only the needed goal/context, never credentials or full conversation history. Returns a durable task receipt promptly; the backend follows asynchronously and delivers its specific final result when this parent is idle. Continue local work or end the turn; do not busy-poll. Exact client_request_id retries dedupe; changed reuse is rejected. Only receiver-native Codex/Claude execution is currently supported.",input_schema:json!({"type":"object","properties":{"target_id":{"type":"string"},"prompt":{"type":"string","maxLength":32000},"title":{"type":"string"},"model":{"type":["string","null"]},"effort":{"type":["string","null"]},"client_request_id":{"type":"string","description":"Stable per-parent request identity. Reuse only for the identical task request."}},"required":["target_id","prompt","client_request_id"],"additionalProperties":false})},
         McpTool {name:"task_status",description:"Read this native parent's cached remote task and actual native events after an optional cursor. No launch and no remote busy-poll: the coordinator follows in the background. Use on demand, not in a tight waiting loop.",input_schema:json!({"type":"object","properties":{"task_id":{"type":"string"},"cursor":{"type":"integer","minimum":0}},"required":["task_id"],"additionalProperties":false})},
@@ -869,7 +873,99 @@ fn register_tools() -> Vec<McpTool> {
                 "required": ["number"]
             }),
         },
-    ]
+        // -- Visual replies --
+        McpTool {
+            name: "html_render",
+            description: HTML_RENDER_DESCRIPTION,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short name for the page.",
+                        "maxLength": HTML_RENDER_MAX_TITLE_CHARS
+                    },
+                    "html": {
+                        "type": "string",
+                        "description": "A complete, self-contained HTML document."
+                    },
+                    "height": {
+                        "type": "integer",
+                        "description": "Optional frame height cap in CSS pixels (80-2000). Omit it and the frame fits the page; set it below the page's height to make long content scroll inside the frame.",
+                        "minimum": 80,
+                        "maximum": 2000
+                    }
+                },
+                "required": ["title", "html"]
+            }),
+        },
+    ];
+    if !provider_stdio_origin() {
+        tools.extend(crate::agent_control::native_tools().into_iter().map(|tool| McpTool {
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.input_schema,
+        }));
+    }
+    tools
+}
+
+/// Largest page `html_render` accepts. The page lives in the chat
+/// transcript as the tool call's input, so it is bounded like one.
+const HTML_RENDER_MAX_BYTES: usize = 512 * 1024;
+const HTML_RENDER_MAX_TITLE_CHARS: usize = 200;
+
+/// Agent-facing contract for `html_render`. The variable names mirror
+/// `htmlRenderThemeVariables` in `src/lib/agent-chat/html-render.ts`, which
+/// injects them into the page; keep the two lists in sync.
+const HTML_RENDER_DESCRIPTION: &str = concat!(
+    "Show a finished HTML page (chart, dashboard, table, diagram, mockup) inline in this Codemux chat thread, above your final text reply; call it before writing that reply. ",
+    "The reader already sees the page, so the reply should not announce it or restate it: add only what the page doesn't say. ",
+    "Pages are only visible in Codemux's agent chat, not in a terminal session. ",
+    "Write one self-contained document with inline <style> and <script>; remote http(s) resources such as a CDN chart library load as-is. ",
+    "The page runs in a sandboxed frame with no access to Codemux, the filesystem, or local images; links the reader clicks open in their browser. ",
+    "Layout: the frame is borderless on the thread's background and as wide as the reply column (about 760px, narrower on small windows). ",
+    "Use a fluid width with no outer padding, card, border, or banner title: the page is part of your reply. ",
+    "Give charts fixed pixel heights, and let content set the page height: avoid 100vh or height:100% on html/body, since the frame grows to fit the page. ",
+    "Theme: Codemux injects the user's active theme as CSS custom properties on :root, and they follow theme changes live: ",
+    "--background (identical to the thread around the frame), --foreground, --muted, --muted-foreground, --card, --card-foreground, ",
+    "--popover, --popover-foreground, --secondary, --secondary-foreground, --border, --input, --ring, --primary, --primary-foreground, ",
+    "--accent, --accent-foreground (the theme's brand accent), --destructive, --success, --warning, --info, ",
+    "--chart-1 ... --chart-6 (categorical series colors; assign them in order), --radius, --font-sans, --font-mono. ",
+    "A base stylesheet sets the html background, color, and font from these and zeroes the body margin; your own CSS overrides it. ",
+    "Style everything with these variables rather than fixed colors so the page matches the app in light and dark themes."
+);
+
+/// Check an `html_render` call. The page itself needs no storage: the chat
+/// transcript keeps the call's input, and the client renders it from there.
+fn html_render_result(arguments: &Value) -> Result<Value, String> {
+    let title = arguments
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if title.is_empty() {
+        return Err("html_render: missing required argument 'title'".to_string());
+    }
+    if title.chars().count() > HTML_RENDER_MAX_TITLE_CHARS {
+        return Err(format!(
+            "html_render: 'title' is longer than {HTML_RENDER_MAX_TITLE_CHARS} characters"
+        ));
+    }
+    let html = arguments.get("html").and_then(Value::as_str).unwrap_or_default();
+    if html.trim().is_empty() {
+        return Err("html_render: missing required argument 'html'".to_string());
+    }
+    if html.len() > HTML_RENDER_MAX_BYTES {
+        return Err(format!(
+            "html_render: the page is {} KB; the limit is {} KB. Trim embedded data or load large libraries from a CDN.",
+            html.len() / 1024,
+            HTML_RENDER_MAX_BYTES / 1024
+        ));
+    }
+    Ok(json!(
+        "Shown to the reader above your reply. Don't mention or describe the page; reply with only what it doesn't already say."
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -891,6 +987,9 @@ async fn dispatch(request: JsonRpcRequest) -> Option<JsonRpcResponse> {
             json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
+                "instructions": if provider_stdio_origin() {
+                    "Use the advertised workspace and browser tools. Native thread control is unavailable on provider-injected MCP; it requires a separate authorized controller connection."
+                } else { crate::agent_control::INSTRUCTIONS },
                 "serverInfo": {
                     "name": "codemux",
                     "version": env!("CARGO_PKG_VERSION")
@@ -969,6 +1068,10 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
         Some(name) => name.to_string(),
         None => return JsonRpcResponse::error(id, INVALID_REQUEST, "Missing tool name"),
     };
+    if provider_stdio_origin() && crate::agent_control::is_native_tool(&tool_name) {
+        return JsonRpcResponse::error(id, INVALID_REQUEST,
+            "provider_control_denied: provider MCP cannot use trusted native-controller tools");
+    }
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
     // Workspace ID for workspace-scoped routing (browser session binding,
@@ -991,6 +1094,7 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
 
     let result = match tool_name.as_str() {
         "delegation_targets" | "delegate_task" | "task_status" | "task_cancel" => Err("Native-only delegation tool: use the actual Codex/Claude adapter context. Generic stdio MCP and caller-supplied metadata cannot authorize a parent.".into()),
+        name if crate::agent_control::is_native_tool(name) => call_socket(name,arguments.clone()).await,
         // -- Browser tools --
         "browser_navigate" => {
             let url = arguments.get("url").and_then(Value::as_str).unwrap_or_default();
@@ -1549,6 +1653,9 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             }
         }
 
+        // -- Visual replies --
+        "html_render" => html_render_result(&arguments),
+
         _ => Err(format!("Unknown tool: {tool_name}")),
     };
 
@@ -1726,7 +1833,8 @@ fn codemux_mcp_entry() -> Value {
     let command = codemux_mcp_command();
     json!({
         "command": command,
-        "args": ["mcp"]
+        "args": ["mcp"],
+        "env": { (PROVIDER_ORIGIN_ENV): "1" }
     })
 }
 
@@ -2143,6 +2251,30 @@ fn remove_mcp_config_locked(workspace_dir: &Path) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn review_s1_provider_stdio_has_no_trusted_native_controller_route() {
+        const MARKER: &str = "CODEMUX_MCP_PROVIDER_ORIGIN";
+        if std::env::var_os("CODEMUX_REVIEW_STDIO_CHILD").is_none() {
+            // Process-owned origin, never mutable global test environment or
+            // caller-controlled request metadata. This invokes only this test.
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["mcp_server::tests::review_s1_provider_stdio_has_no_trusted_native_controller_route", "--exact", "--nocapture"])
+                .env(MARKER, "1").env("CODEMUX_REVIEW_STDIO_CHILD", "1").output().unwrap();
+            assert!(result.status.success(), "provider-origin stdio assertion failed: {}", String::from_utf8_lossy(&result.stderr));
+            assert_eq!(codemux_mcp_entry()["env"][MARKER], "1", "app-installed provider configs must bind the restricted invocation");
+            return;
+        }
+        assert!(!register_tools().iter().any(|tool| crate::agent_control::is_native_tool(tool.name)),
+            "provider-origin stdio must omit trusted native tools");
+        let result = handle_tool_call(json!(1), json!({"name":"thread_launch","arguments":{},
+            "_meta":{"control_access":"full_access"}})).await;
+        assert!(serde_json::to_string(&result).unwrap().contains("provider_control_denied"),
+            "provider stdio must reject guessed native calls before opening a trusted socket");
+        let initialized = dispatch(JsonRpcRequest {jsonrpc:"2.0".into(),method:"initialize".into(),params:json!({}),id:Some(json!(2))}).await.unwrap();
+        assert!(initialized.result.unwrap()["instructions"].as_str().unwrap().contains("Native thread control is unavailable"),
+            "provider instructions must not promise the native tools removed from its catalog");
+    }
+
     #[test]
     fn scroll_amount_reaches_receiver_as_i64() {
         // The receiver (stream_input handle_vision_action) reads `amount` with
@@ -2197,9 +2329,10 @@ mod tests {
         // then 52 → 55 with the workspace-archive tools, then 55 → 57
         // with provider-neutral attached-conversation history
         // (workspace_archive / workspace_unarchive /
-        // workspace_archive_list). Keep this number in sync with
-        // register_tools() when adding new entries.
-        assert_eq!(tools.len(), 61);
+        // workspace_archive_list), then 57 → 58 with html_render. Keep
+        // this number in sync with register_tools() when adding new entries.
+        // Native control adds eleven.
+        assert_eq!(tools.len(), 73);
         let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
@@ -2367,9 +2500,10 @@ mod tests {
     fn path_level_entry_leaves_each_session_workspace_id_inherited() {
         let entry = codemux_mcp_entry();
         assert!(
-            entry.get("env").is_none(),
+            entry["env"].get("CODEMUX_WORKSPACE_ID").is_none(),
             "a shared path must not pin one workspace id in .mcp.json"
         );
+        assert_eq!(entry["env"][PROVIDER_ORIGIN_ENV], "1");
 
         let params = json!({ "name": "browser_navigate", "arguments": {} });
         assert_eq!(
@@ -2414,9 +2548,9 @@ mod tests {
         // Bumped 39 → 44 with the Phase 1.6 lifecycle + issue tools,
         // then 44 → 52 with the eight automation tools, then 52 → 55
         // with the workspace-archive tools, then 55 → 57 with attached
-        // conversation history. See
-        // tool_registry_has_all_tools for the canonical count.
-        assert_eq!(tools.len(), 61);
+        // conversation history, then 57 → 58 with html_render. See
+        // tool_registry_has_all_tools for the canonical count (native control adds eleven).
+        assert_eq!(tools.len(), 73);
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());
@@ -2477,6 +2611,42 @@ mod tests {
         assert!(text.contains("Unknown tool"));
     }
 
+    async fn call_html_render(arguments: Value) -> Value {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            method: "tools/call".into(),
+            params: json!({ "name": "html_render", "arguments": arguments }),
+            id: Some(json!(6)),
+        };
+        dispatch(req).await.unwrap().result.unwrap()
+    }
+
+    #[tokio::test]
+    async fn html_render_accepts_a_page_without_touching_the_socket() {
+        let result = call_html_render(json!({
+            "title": "Weekly turns",
+            "html": "<!doctype html><p>hi</p>"
+        }))
+        .await;
+        assert!(result.get("isError").is_none(), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Shown to the reader"));
+    }
+
+    #[tokio::test]
+    async fn html_render_rejects_missing_and_oversized_input() {
+        for arguments in [
+            json!({ "html": "<p>hi</p>" }),
+            json!({ "title": "  ", "html": "<p>hi</p>" }),
+            json!({ "title": "Chart", "html": " " }),
+            json!({ "title": "x".repeat(HTML_RENDER_MAX_TITLE_CHARS + 1), "html": "<p>hi</p>" }),
+            json!({ "title": "Chart", "html": "x".repeat(HTML_RENDER_MAX_BYTES + 1) }),
+        ] {
+            let result = call_html_render(arguments.clone()).await;
+            assert_eq!(result["isError"], true, "{arguments}");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // .mcp.json upsert tests
     // -----------------------------------------------------------------------
@@ -2489,7 +2659,7 @@ mod tests {
         let config = read_mcp(&dir);
         assert!(config["mcpServers"]["codemux"]["command"].as_str().is_some_and(|c| !c.is_empty()));
         assert_eq!(config["mcpServers"]["codemux"]["args"][0], "mcp");
-        assert!(config["mcpServers"]["codemux"].get("env").is_none());
+        assert_eq!(config["mcpServers"]["codemux"]["env"], json!({(PROVIDER_ORIGIN_ENV): "1"}));
 
         cleanup(&dir);
     }
@@ -2527,7 +2697,7 @@ mod tests {
         let config = read_mcp(&dir);
         // codemux updated
         assert!(config["mcpServers"]["codemux"]["command"].as_str().is_some_and(|c| !c.is_empty()));
-        assert!(config["mcpServers"]["codemux"].get("env").is_none());
+        assert_eq!(config["mcpServers"]["codemux"]["env"], json!({(PROVIDER_ORIGIN_ENV): "1"}));
         // other server untouched
         assert_eq!(config["mcpServers"]["other"]["command"], "x");
 
@@ -2617,7 +2787,7 @@ mod tests {
         upsert_mcp_config(&dir);
 
         let config = read_mcp(&dir);
-        assert!(config["mcpServers"]["codemux"].get("env").is_none());
+        assert_eq!(config["mcpServers"]["codemux"]["env"], json!({(PROVIDER_ORIGIN_ENV): "1"}));
         assert_eq!(std::fs::read(dir.join(".mcp.json")).unwrap(), before);
 
         cleanup(&dir);
@@ -3164,6 +3334,28 @@ mod tests {
         );
 
         cleanup(&dir);
+    }
+
+    #[test]
+    fn native_thread_control_tools_are_discoverable() {
+        let tools = register_tools();
+        let names: std::collections::HashSet<_> = tools.iter().map(|tool| tool.name).collect();
+        for name in [
+            "agent_capabilities",
+            "thread_list",
+            "thread_launch",
+            "thread_send",
+            "thread_read",
+            "thread_status",
+            "thread_wait",
+            "thread_interrupt",
+            "thread_stop",
+            "thread_respond",
+            "operation_status",
+        ] {
+            assert!(names.contains(name), "native control tool {name} is missing from MCP discovery");
+        }
+        assert_eq!(names.len(), tools.len(), "MCP tool names must remain unique");
     }
 
     /// Upsert path uses atomic_write under the hood — verify a fresh

@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { Profiler } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
+import type { AuthUser } from "@/tauri/types";
 
 const mocks = vi.hoisted(() => ({
   ui: {
@@ -11,6 +12,10 @@ const mocks = vi.hoisted(() => ({
     openThemeStudio: vi.fn(),
     takeCommandPaletteQuery: vi.fn<() => string | null>(() => null),
     setShowNewWorkspaceDialog: vi.fn(),
+    setShowAutomations: vi.fn(),
+    setShowSettings: vi.fn(),
+    setRightPanelTab: vi.fn(),
+    setShowLocalSessionImport: vi.fn(),
   },
   synced: {
     settings: {
@@ -21,12 +26,19 @@ const mocks = vi.hoisted(() => ({
   app: {
     appState: null as unknown,
   },
+  auth: { user: null as AuthUser | null },
   backend: {
     dbGetUiState: vi.fn(),
-    prOverview: vi.fn(() => ({ rows: [] })),
+    prOverview: vi.fn((_enabled: boolean) => ({
+      rows: [] as unknown[],
+      isLoading: false,
+      allRootsFailed: false,
+      rateLimitedUntil: 0,
+    })),
     agentChatSearch: vi.fn(),
     openConversationSearchResult: vi.fn(),
     reloadInterface: vi.fn(),
+    agentChatInterruptTurn: vi.fn(),
   },
 }));
 
@@ -54,6 +66,9 @@ vi.mock("@/stores/app-store", async (importOriginal) => ({
 }));
 
 vi.mock("@/stores/hosts-store", () => ({ useHosts: () => [] }));
+vi.mock("@/stores/auth-store", () => ({
+  useAuthStore: (selector: (state: typeof mocks.auth) => unknown) => selector(mocks.auth),
+}));
 
 // Use the real inbox subscriptions to cover its asynchronous first read.
 
@@ -81,6 +96,7 @@ vi.mock("@/lib/perf/instrumented-activate", () => ({
 vi.mock("@/tauri/commands", () => ({
   dbGetUiState: mocks.backend.dbGetUiState,
   dbSetSetting: vi.fn().mockResolvedValue(undefined),
+  dbSetUiState: vi.fn().mockResolvedValue(undefined),
   agentChatSearch: mocks.backend.agentChatSearch,
   createBrowserPane: vi.fn(),
   cyclePane: vi.fn(),
@@ -88,6 +104,9 @@ vi.mock("@/tauri/commands", () => ({
   regenerateMcpConfig: vi.fn(),
   reloadInterface: mocks.backend.reloadInterface,
   setPresetBarVisible: vi.fn(),
+  agentChatInterruptTurn: mocks.backend.agentChatInterruptTurn,
+  detectEditors: vi.fn().mockResolvedValue([]),
+  openInEditor: vi.fn(),
 }));
 
 vi.mock("@/lib/agent-chat/conversation-search", () => ({
@@ -96,7 +115,10 @@ vi.mock("@/lib/agent-chat/conversation-search", () => ({
 
 vi.mock("@/lib/addons/platform", () => ({ executeAddon: vi.fn() }));
 
-import { CommandPalette } from "./command-palette";
+import { DIALOG_TOP_ANCHORED_MOTION } from "@/components/ui/dialog";
+import { CommandPalette, PALETTE_COMMANDS } from "./command-palette";
+import { KEYBIND_REGISTRY } from "@/lib/keybind-registry";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { useSidebarInboxStore, __resetSidebarInboxStoreForTests } from "@/stores/sidebar-inbox-store";
 import { executeAddon } from "@/lib/addons/platform";
 import { useAddonsStore } from "@/stores/addons-store";
@@ -104,6 +126,7 @@ import type { AddonInstallation, AddonManifest } from "@/lib/addons/types";
 import { BUILT_IN_THEMES, applyTheme } from "@/lib/themes";
 import { useOmarchyStore } from "@/stores/omarchy-store";
 import { useSettingsStore } from "@/stores/settings-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { omarchyToTheme } from "@/lib/omarchy-theme";
 import { fallbackTheme } from "@/hooks/use-theme-colors";
 
@@ -135,6 +158,15 @@ Element.prototype.scrollTo ??= () => {};
 Element.prototype.scrollIntoView ??= () => {};
 
 beforeEach(() => {
+  window.localStorage.clear();
+  mocks.backend.prOverview.mockImplementation(() => ({
+    rows: [],
+    isLoading: false,
+    allRootsFailed: false,
+    rateLimitedUntil: 0,
+  }));
+  useFeatureFlags.setState({ enableAgentChat: true });
+  mocks.auth.user = { id: "u1", email: "test@codemux.org", name: "Test User", image: null };
   useSettingsStore.setState({ settings: { "appearance.theme_source": "manual" }, loaded: true });
   useOmarchyStore.setState({ theme: null, loaded: true });
   vi.clearAllMocks();
@@ -387,7 +419,7 @@ describe("command palette — stable async sections", () => {
     renderPalette();
     expect(screen.getByText("Settings")).toBeInTheDocument();
     expect(screen.queryByText("Workspaces")).not.toBeInTheDocument();
-    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", "cmd:new-agent"));
+    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", "cmd:rename-workspace"));
     await act(async () => resolveInbox(JSON.stringify({ settled: [{ id: "ws-1", at: 1 }] })));
     const workspaceOptions = screen.getAllByRole("option").filter((el) => el.dataset.value?.startsWith("ws:"));
     expect(workspaceOptions.map((el) => el.dataset.value)).toEqual(["ws:ws-2", "ws:ws-1"]);
@@ -403,11 +435,11 @@ describe("command palette — stable async sections", () => {
     ] };
     const user = userEvent.setup();
     renderPalette();
-    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", "cmd:new-agent"));
+    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", "cmd:rename-workspace"));
     if (inputKind === "keyboard") await user.keyboard("{ArrowDown}");
     else await user.hover(screen.getByText("Settings"));
     const selected = document.querySelector('[cmdk-item][aria-selected="true"]')?.getAttribute("data-value");
-    expect(selected).not.toBe("cmd:new-agent");
+    expect(selected).not.toBe("cmd:rename-workspace");
     await act(async () => resolveInbox(null));
     expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", selected);
   });
@@ -523,6 +555,12 @@ describe("command palette — conversation search", () => {
     expect(dialog).toHaveClass("in-[[data-mobile]]:top-[calc(var(--mobile-top,0px)+12px)]!");
     expect(dialog).toHaveClass("in-[[data-mobile]]:p-0!");
     expect(document.querySelector("[cmdk-list]")).toHaveClass("max-h-[max(96px,calc(var(--mobile-height,100dvh)-220px))]");
+  });
+
+  it("drops in from the top it is anchored to instead of zooming from the middle", () => {
+    renderPalette();
+    const dialog = document.querySelector<HTMLElement>('[data-slot="dialog-content"]')!;
+    for (const cls of DIALOG_TOP_ANCHORED_MOTION.split(" ")) expect(dialog).toHaveClass(cls);
   });
 
   it("reserves the result viewport even for a single match", async () => {
@@ -771,5 +809,310 @@ describe("command palette — reload interface", () => {
     expect(row).toHaveTextContent("Ctrl+Alt+R");
     await user.click(screen.getByText("Reload interface"));
     expect(mocks.backend.reloadInterface).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("command palette — across opens", () => {
+  // jsdom has no CSS animations, so Radix would unmount the content the
+  // instant it closes and every reopen would remount the body regardless.
+  // Reporting an exit animation on `data-state="closed"` keeps the content
+  // mounted until `animationend`, as it is in the app.
+  beforeEach(() => {
+    const realGetComputedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, "getComputedStyle").mockImplementation((el, pseudo) => {
+      const styles = realGetComputedStyle(el, pseudo);
+      return new Proxy(styles, {
+        get(target, prop) {
+          if (prop === "animationName") {
+            const state = (el as Element).getAttribute("data-state");
+            return state === "closed" ? "exit" : state === "open" ? "enter" : "none";
+          }
+          const value = Reflect.get(target, prop, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    });
+  });
+  afterEach(() => vi.mocked(window.getComputedStyle).mockRestore());
+
+  it("reopens with an empty query while the last open is still animating out", () => {
+    const onOpenChange = vi.fn();
+    const view = render(withClient(<CommandPalette open onOpenChange={onOpenChange} />));
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "ember" } });
+    expect(screen.getByRole("combobox")).toHaveValue("ember");
+
+    view.rerender(withClient(<CommandPalette open={false} onOpenChange={onOpenChange} />));
+    // Still mounted for the exit animation, with the old query in place.
+    expect(screen.getByRole("dialog", { hidden: true })).toHaveAttribute("data-state", "closed");
+    expect(screen.getByRole("combobox", { hidden: true })).toHaveValue("ember");
+
+    view.rerender(withClient(<CommandPalette open onOpenChange={onOpenChange} />));
+    expect(screen.getByRole("combobox")).toHaveValue("");
+  });
+});
+
+const selectedValue = () =>
+  document.querySelector('[cmdk-item][aria-selected="true"]')?.getAttribute("data-value");
+const optionValues = (prefix: string) =>
+  screen
+    .getAllByRole("option")
+    .map((el) => el.dataset.value ?? "")
+    .filter((value) => value.startsWith(prefix));
+const workspace = (id: string, title: string, extra: Record<string, unknown> = {}) => ({
+  workspace_id: id,
+  title,
+  cwd: "/repo",
+  git_branch: null,
+  surfaces: [],
+  active_surface_id: "",
+  ...extra,
+});
+const chatSurface = (paneId: string, threadId: string) => ({
+  surface_id: "surface-1",
+  title: "Chat",
+  active_pane_id: paneId,
+  root: { kind: "agent_chat", pane_id: paneId, title: "Chat", thread_id: threadId, provider: "claude", cwd: "/repo" },
+});
+
+describe("command palette — switching away from the current workspace", () => {
+  beforeEach(() => {
+    mocks.app.appState = {
+      active_workspace_id: "ws-here",
+      pane_statuses: {},
+      workspaces: [
+        workspace("ws-here", "Here", { last_active_at: 2_000 }),
+        workspace("ws-there", "There", { last_active_at: 1_000 }),
+      ],
+    };
+  });
+
+  it("preselects another workspace and tags the current one", async () => {
+    renderPalette();
+    expect(optionValues("ws:")).toEqual(["ws:ws-there", "ws:ws-here"]);
+    await waitFor(() => expect(selectedValue()).toBe("ws:ws-there"));
+    expect(screen.getByRole("option", { name: /Here/ })).toHaveTextContent("current");
+    expect(screen.getByRole("option", { name: /There/ })).not.toHaveTextContent("current");
+  });
+
+  it("still ranks the current workspace by match once you search", async () => {
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("here");
+    renderPalette();
+    expect(optionValues("ws:")[0]).toBe("ws:ws-here");
+  });
+});
+
+describe("command palette — command catalogue", () => {
+  it("offers every window-level keybind action", () => {
+    // Pure slot actions and the guards that exist only to swallow a key.
+    const notCommands = new Set(["commandPalette", "closeOverlay", "blockReload", "blockHardReload", "blockF5Reload"]);
+    const missing = KEYBIND_REGISTRY.filter(
+      (entry) =>
+        entry.when !== "terminal" &&
+        entry.when !== "composer" &&
+        !/^(workspaceJump|switchTab)\d$/.test(entry.id) &&
+        !notCommands.has(entry.id) &&
+        !PALETTE_COMMANDS.some((command) => command.actionId === entry.id),
+    ).map((entry) => entry.id);
+    expect(missing).toEqual([]);
+  });
+
+  it("finds the theme picker from command mode and opens it in place", async () => {
+    const user = userEvent.setup();
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">theme");
+    renderPalette();
+    await user.click(screen.getByRole("option", { name: /Change theme/ }));
+    expect(screen.getByRole("combobox")).toHaveValue("theme");
+    expect(document.querySelector('[data-palette-group="Themes"]')).not.toBeNull();
+    expect(screen.getByText("Ember")).toBeInTheDocument();
+  });
+
+  it("opens Automations", async () => {
+    const user = userEvent.setup();
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">automations");
+    renderPalette();
+    await user.click(screen.getByRole("option", { name: /Automations/ }));
+    expect(mocks.ui.setShowAutomations).toHaveBeenCalledWith(true);
+    expect(mocks.ui.setShowSettings).toHaveBeenCalledWith(false);
+  });
+
+  it("lists recently run commands first in the resting palette", async () => {
+    const user = userEvent.setup();
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">automations");
+    renderPalette();
+    await user.click(screen.getByRole("option", { name: /Automations/ }));
+    cleanup();
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(null);
+    renderPalette();
+    expect(document.querySelector('[data-palette-group="Recent"]')).not.toBeNull();
+    expect(optionValues("recent:")).toEqual(["recent:automations"]);
+  });
+});
+
+describe("command palette — this workspace", () => {
+  it.each(["settle", "snooze"])("waits for inbox hydration before %s can persist", async (command) => {
+    useSidebarInboxStore.setState({ loaded: false });
+    let resolveInbox!: (raw: string | null) => void;
+    mocks.backend.dbGetUiState.mockImplementation(() => new Promise((resolve) => { resolveInbox = resolve; }));
+    mocks.app.appState = {
+      active_workspace_id: "ws-1", pane_statuses: {},
+      workspaces: [workspace("ws-1", "Done"), workspace("ws-2", "Existing shelf")],
+    };
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(`>${command}`);
+    const user = userEvent.setup();
+    renderPalette();
+    const optionName = command === "settle" ? /Settle workspace/ : /Snooze for 1 hour/;
+    expect(screen.queryByRole("option", { name: optionName })).toBeNull();
+    const { dbSetUiState } = await import("@/tauri/commands");
+    expect(dbSetUiState).not.toHaveBeenCalled();
+    await act(async () => resolveInbox(JSON.stringify({
+      settled: [{ id: "ws-2", at: 1 }], snoozed: [], keepActive: ["ws-3"],
+      activity: { "ws-2": 1 },
+    })));
+    await user.click(await screen.findByRole("option", { name: optionName }));
+    expect(useSidebarInboxStore.getState().settled.map((entry) => entry.id)).toContain("ws-2");
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({ "ws-3": true });
+    expect(useSidebarInboxStore.getState().activity).toEqual({ "ws-2": 1 });
+    expect(dbSetUiState).toHaveBeenCalled();
+  });
+
+  it("stops the running agent from '>stop'", async () => {
+    mocks.backend.agentChatInterruptTurn.mockResolvedValue(true);
+    mocks.app.appState = {
+      active_workspace_id: "ws-1",
+      pane_statuses: { "pane-1": "working" },
+      workspaces: [
+        workspace("ws-1", "Busy", {
+          surfaces: [chatSurface("pane-1", "thread-1")],
+          active_surface_id: "surface-1",
+        }),
+      ],
+    };
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">stop");
+    const user = userEvent.setup();
+    renderPalette();
+    await waitFor(() => expect(selectedValue()).toBe("cmd:stop-agent"));
+    // Live work is never swept aside.
+    expect(screen.queryByText("Settle workspace")).toBeNull();
+    await user.click(screen.getByRole("option", { name: /Stop agent/ }));
+    expect(mocks.backend.agentChatInterruptTurn).toHaveBeenCalledWith("claude", "thread-1", null);
+  });
+
+  it("offers no Stop agent when nothing is running", () => {
+    mocks.app.appState = {
+      active_workspace_id: "ws-1",
+      pane_statuses: {},
+      workspaces: [workspace("ws-1", "Idle", { surfaces: [chatSurface("pane-1", "thread-1")], active_surface_id: "surface-1" })],
+    };
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">");
+    renderPalette();
+    expect(screen.queryByText("Stop agent")).toBeNull();
+    expect(document.querySelector('[data-palette-group="This workspace"]')).not.toBeNull();
+  });
+
+  it("settles an idle workspace and moves on to the next one", async () => {
+    mocks.app.appState = {
+      active_workspace_id: "ws-1",
+      pane_statuses: {},
+      workspaces: [workspace("ws-1", "Done", { last_active_at: 5 }), workspace("ws-2", "Next")],
+    };
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">settle");
+    const user = userEvent.setup();
+    renderPalette();
+    await user.click(screen.getByRole("option", { name: /Settle workspace/ }));
+    expect(useSidebarInboxStore.getState().settled.map((entry) => entry.id)).toContain("ws-1");
+    expect(activateWorkspaceInteraction).toHaveBeenCalledWith("ws-2");
+  });
+});
+
+describe("command palette — pull-request mode", () => {
+  it("shows the mode and says it is loading rather than 'no matches'", () => {
+    mocks.backend.prOverview.mockImplementation(() => ({
+      rows: [],
+      isLoading: true,
+      allRootsFailed: false,
+      rateLimitedUntil: 0,
+    }));
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("pr 123");
+    renderPalette();
+    expect(screen.getByText("Pull requests")).toBeInTheDocument();
+    expect(screen.getByText("Loading pull requests…")).toBeInTheDocument();
+    expect(screen.queryByText(/No matches/)).toBeNull();
+  });
+
+  it("says when no repository could be reached", () => {
+    mocks.backend.prOverview.mockImplementation(() => ({
+      rows: [],
+      isLoading: false,
+      allRootsFailed: true,
+      rateLimitedUntil: 0,
+    }));
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("pr 123");
+    renderPalette();
+    expect(screen.getByText("Couldn't reach your pull requests")).toBeInTheDocument();
+  });
+});
+
+describe("command palette — settings pages", () => {
+  it("updates row-based page matches when Agent Chat or sign-in state changes", () => {
+    const view = renderPalette();
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "checkpoint" } });
+    expect(screen.getByText("Settings · Agent")).toBeInTheDocument();
+
+    act(() => useFeatureFlags.setState({ enableAgentChat: false }));
+    expect(screen.queryByText("Settings · Agent")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "skills sync" } });
+    expect(screen.queryByText("Settings · Account")).not.toBeInTheDocument();
+
+    act(() => useFeatureFlags.setState({ enableAgentChat: true }));
+    expect(screen.getByText("Settings · Account")).toBeInTheDocument();
+    mocks.auth.user = null;
+    view.rerender(withClient(<CommandPalette open onOpenChange={vi.fn()} />));
+    expect(screen.queryByText("Settings · Account")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "email" } });
+    expect(screen.queryByText("Settings · Account")).not.toBeInTheDocument();
+  });
+
+  it("keeps settings pages out of the resting list", () => {
+    renderPalette();
+    expect(screen.queryByText("Settings pages")).not.toBeInTheDocument();
+  });
+
+  it("opens the page that holds a setting named by the query", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "scrollback");
+
+    expect(screen.getByText("Settings pages")).toBeInTheDocument();
+    await user.click(screen.getByText("Settings · Session Restore"));
+    expect(mocks.ui.setShowSettings).toHaveBeenCalledWith(true, "session_restore");
+  });
+
+  it("lists every page for 'settings'", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "settings");
+    expect(screen.getByText("Settings · Account")).toBeInTheDocument();
+    expect(screen.getByText("Settings · About")).toBeInTheDocument();
+  });
+});
+
+describe("command palette — import recent chats", () => {
+  afterEach(() => useFeatureFlags.setState({ enableAgentChat: false }));
+
+  it("opens the recent chat import from anywhere", async () => {
+    useFeatureFlags.setState({ enableAgentChat: true });
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "import");
+    await user.click(screen.getByText("Import recent chats…"));
+    expect(mocks.ui.setShowLocalSessionImport).toHaveBeenCalledWith(true);
+  });
+
+  it("is hidden when agent chat is off", async () => {
+    useFeatureFlags.setState({ enableAgentChat: false });
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "import");
+    expect(screen.queryByText("Import recent chats…")).toBeNull();
   });
 });

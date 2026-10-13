@@ -528,6 +528,42 @@ pub async fn send_control_request(request: ControlRequest) -> Result<ControlResp
 pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlRequest) -> ControlResponse {
     let result = match request.command.as_str() {
         "delegation_host_info" | "delegation_grants" | "delegation_authorize" | "delegation_revoke" | "delegate_task" | "delegation_list" | "delegation_read" | "delegation_cancel" | "delegation_respond" | "delegation_deliver" => crate::delegation::app::invoke(app, &request.command, request.params).await,
+        name if crate::agent_control::is_native_tool(name) => {
+            crate::agent_control::execute(app,&crate::agent_control::ControlCaller::trusted(),name,request.params.clone())
+                .await.map_err(|error|error.to_string())
+        }
+        "agent_connector_status" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct Args {}
+            serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
+                .and_then(|_|crate::mcp_connector::agent_connector_status(app.clone()))
+                .and_then(|status|serde_json::to_value(status).map_err(|e|e.to_string()))
+        }
+        "agent_connector_set_config" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct Args { enabled: bool, public_origin: Option<String> }
+            serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
+                .and_then(|args|crate::mcp_connector::agent_connector_set_config(app.clone(),args.enabled,args.public_origin))
+                .and_then(|status|serde_json::to_value(status).map_err(|e|e.to_string()))
+        }
+        "agent_connector_approve" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct Args { request_id: String, access: crate::agent_control::ControlAccess }
+            serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
+                .and_then(|args|crate::mcp_connector::agent_connector_approve(app.clone(),args.request_id,args.access))
+                .and_then(|status|serde_json::to_value(status).map_err(|e|e.to_string()))
+        }
+        "agent_connector_deny" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct Args { request_id: String }
+            serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
+                .and_then(|args|crate::mcp_connector::agent_connector_deny(app.clone(),args.request_id))
+                .and_then(|status|serde_json::to_value(status).map_err(|e|e.to_string()))
+        }
+        "agent_connector_revoke" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct Args { client_id: String }
+            serde_json::from_value::<Args>(request.params.clone()).map_err(|e|e.to_string())
+                .and_then(|args|crate::mcp_connector::agent_connector_revoke(app.clone(),args.client_id))
+                .and_then(|status|serde_json::to_value(status).map_err(|e|e.to_string()))
+        }
         "status" => {
             let state: State<'_, AppStateStore> = app.state();
             let snap = state.snapshot();
@@ -1957,6 +1993,41 @@ mod tests {
     use super::*;
     use crate::state::PortInfoSnapshot;
 
+    #[tokio::test]
+    async fn native_thread_discovery_dispatches_through_the_shared_facade() {
+        use tauri::Manager;
+        let app = tauri::test::mock_app();
+        let state = AppStateStore::default();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = state.create_empty_workspace_at_path(root.path().to_path_buf()).0;
+        app.manage(state);
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        let response = dispatch_request(app.handle(),ControlRequest {
+            command: "thread_list".into(), params:serde_json::json!({"workspace_id":workspace}),
+        }).await;
+        assert!(response.ok,"{:?}",response.error);
+        assert_eq!(response.data.unwrap()["threads"].as_array().unwrap().len(),0);
+    }
+
+    #[tokio::test]
+    async fn native_connector_administration_is_reachable_without_enabling_the_listener() {
+        use tauri::Manager;
+        let app = tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(crate::web_remote::WebRemoteState::default());
+        app.manage(crate::mcp_connector::McpConnectorState::default());
+        let response = dispatch_request(app.handle(),ControlRequest {
+            command:"agent_connector_status".into(),params:serde_json::json!({}),
+        }).await;
+        assert!(response.ok,"{:?}",response.error);
+        let status = response.data.unwrap();
+        let mut fields: Vec<_> = status.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(fields,vec!["clients","enabled","listenerRunning","localCommand","mcpUrl","pending","publicOrigin"]);
+        assert_eq!(status["enabled"],false);
+        assert_eq!(status["listenerRunning"],false);
+    }
+
     fn port(port: u16, ws: Option<&str>, label: Option<&str>) -> PortInfoSnapshot {
         PortInfoSnapshot {
             port,
@@ -2143,6 +2214,7 @@ mod tests {
             surfaces: Vec::new(),
             host_id: None,
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             last_active_at: None,

@@ -5,32 +5,48 @@ import { Puzzle } from "lucide-react";
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Command as CommandPrimitive } from "cmdk";
 import {
+  AlarmClock,
+  ArrowDown,
   ArrowLeft,
   ArrowRight,
+  ArrowUp,
   Bot,
+  CalendarClock,
+  Check,
+  CircleAlert,
   ClipboardPaste,
+  Code,
   Columns2,
+  Copy,
   FolderOpen,
   Globe,
+  Import,
   GitPullRequest,
   MonitorSmartphone,
   Keyboard,
   LayoutGrid,
-  LoaderCircle,
+  Maximize2,
   MessageSquareText,
+  Palette,
   PanelLeft,
+  Pencil,
   Play,
   Plus,
   RefreshCw,
+  RotateCcw,
   Search,
   Settings,
   SplitSquareHorizontal,
   SplitSquareVertical,
+  Square,
   Terminal,
   UserRound,
   X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { CommandDialog } from "@/components/ui/command";
+import { DIALOG_TOP_ANCHORED_MOTION } from "@/components/ui/dialog";
 import {
   ThemeAnsiDots,
   ThemeCoins,
@@ -69,12 +85,21 @@ import {
   cyclePane,
   getPresets,
   agentChatSearch,
+  openInEditor,
   regenerateMcpConfig,
   reloadInterface,
   setPresetBarVisible,
   type AgentChatSearchResult,
 } from "@/tauri/commands";
+import { ensureEditorsDetected } from "@/stores/editor-discovery-store";
+import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
+import {
+  findRunningAgent,
+  stopRunningAgent,
+  type RunningAgent,
+} from "@/lib/agent-chat/stop-running-agent";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { useCanImportLocalSessions } from "@/components/chat/LocalSessionImportEntry";
 import { dispatch } from "@/hooks/use-keyboard-shortcuts";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
@@ -94,9 +119,13 @@ import {
   PR_MODE_PREFIX,
   commandSearchText,
   compareWorkspaceOrder,
+  demoteCurrentWorkspace,
   groupCountLabel,
   parsePaletteQuery,
+  prModeEmptyState,
   previewedThemeId,
+  pushRecentCommand,
+  type PrModeEmptyState,
   rankByQuery,
   rankPalettePrs,
   resultCountLabel,
@@ -107,6 +136,14 @@ import {
   workspaceSearchText,
 } from "./command-palette-model";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
+import { useFeatureFlags } from "@/stores/feature-flags";
+import { useAuthStore } from "@/stores/auth-store";
+import { buildNavGroups } from "@/lib/settings-sections";
+import { settingsPagesForQuery } from "@/lib/settings-search";
+import { KeyHint } from "@/components/ui/key-hint";
+import { formatKeyCombo } from "@/components/ui/menu-chrome";
+import { toast, reportFailure } from "@/lib/toast";
 
 interface Props {
   open: boolean;
@@ -126,6 +163,25 @@ const PROJECT_CAP_SEARCH = 8;
  *  stable while the store has no appearance blob yet. */
 const EMPTY_THEME_PAYLOADS: unknown[] = [];
 
+const RECENT_COMMANDS_KEY = "codemux.commandPalette.recentCommands";
+
+function readRecentCommands(): string[] {
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(RECENT_COMMANDS_KEY) ?? "[]");
+    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeRecentCommands(ids: string[]) {
+  try {
+    window.localStorage.setItem(RECENT_COMMANDS_KEY, JSON.stringify(ids));
+  } catch {
+    // Storage blocked: the Recent group just stays empty.
+  }
+}
+
 // ── Command catalogue ────────────────────────────────────────────────────
 
 /**
@@ -144,17 +200,147 @@ interface PaletteCommand {
   actionId?: string;
   /** Overrides `actionId` dispatch when the action has no keybind entry. */
   run?: (ctx: CommandContext) => void;
+  /** Instead of running and closing, refill the palette with this query —
+   *  for commands that are really a door into one of its own modes. */
+  query?: string;
   /** Hidden when there is no active workspace to act on. */
   requiresWorkspace?: boolean;
+  /** Hidden unless this holds for the active workspace's current state. */
+  available?: (ctx: CommandContext) => boolean;
+  /** Acts on the active workspace itself; listed under "This workspace". */
+  workspaceScoped?: boolean;
+  /** Hidden where recent chats can't be imported (see `useCanImportLocalSessions`). */
+  requiresChatImport?: boolean;
   addon?: boolean;
 }
 
 interface CommandContext {
+  inboxLoaded: boolean;
   workspace: WorkspaceSnapshot | null;
   activePaneId: string | undefined;
+  workspaceStatus: ActivePaneStatus | null;
+  /** The active workspace sits on the Settled or Snoozed shelf. */
+  parked: boolean;
+  runningAgent: RunningAgent | null;
+  /** Where to land after parking the workspace you are in: the most urgent
+   *  other active workspace, or null to stay put. */
+  nextWorkspaceId: string | null;
 }
 
-const COMMANDS: PaletteCommand[] = [
+/** Same guard as the inbox card's Settle and Snooze: live or blocked work is
+ *  never swept out of sight, and a pin is a visibility override that parking
+ *  would silently defeat. */
+function canPark({ inboxLoaded, workspace, workspaceStatus, parked }: CommandContext): boolean {
+  return (
+    inboxLoaded &&
+    !!workspace &&
+    !parked &&
+    workspace.pinned_at == null &&
+    workspaceStatus !== "working" &&
+    workspaceStatus !== "permission"
+  );
+}
+
+function parkActiveWorkspace(ctx: CommandContext, park: (workspaceId: string) => void) {
+  if (!canPark(ctx) || !ctx.workspace || !useSidebarInboxStore.getState().loaded) return;
+  park(ctx.workspace.workspace_id);
+  if (ctx.nextWorkspaceId) activateWorkspaceInteraction(ctx.nextWorkspaceId).catch(console.error);
+}
+
+async function openWorkspaceInEditor(workspace: WorkspaceSnapshot) {
+  const editors = await ensureEditorsDetected();
+  const preferred = useSyncedSettingsStore.getState().settings?.editor?.default_ide;
+  const editor = editors.find((e) => e.id === preferred) ?? editors[0];
+  if (!editor) {
+    toast.error("No editor found", { description: "Install an editor Codemux can detect, such as VS Code or Zed." });
+    return;
+  }
+  await openInEditor(editor.id, workspace.cwd);
+}
+
+/**
+ * Commands about the workspace you are in. Most of them have no shortcut and
+ * otherwise live only in the sidebar card's hover controls or right-click
+ * menu, which is exactly where you are not looking while supervising an agent.
+ */
+const WORKSPACE_COMMANDS: PaletteCommand[] = ([
+  {
+    id: "stop-agent",
+    label: "Stop agent",
+    icon: Square,
+    keywords: "interrupt cancel halt abort turn",
+    available: (ctx) => ctx.runningAgent !== null,
+    run: ({ runningAgent }) => {
+      if (runningAgent) void stopRunningAgent(runningAgent);
+    },
+  },
+  { id: "rename-workspace", label: "Rename workspace", icon: Pencil, actionId: "renameWorkspace", keywords: "title name" },
+  {
+    id: "open-in-editor",
+    label: "Open in editor",
+    icon: Code,
+    keywords: "ide vscode cursor zed code",
+    // A remote workspace's path means nothing to an editor on this machine.
+    available: ({ workspace }) => !isRemoteClient() && !workspace?.host_id,
+    run: ({ workspace }) => {
+      if (workspace) void openWorkspaceInEditor(workspace).catch(console.error);
+    },
+  },
+  {
+    id: "copy-branch",
+    label: "Copy branch name",
+    icon: Copy,
+    keywords: "git clipboard",
+    available: ({ workspace }) => !!workspace?.git_branch,
+    run: ({ workspace }) => {
+      const branch = workspace?.git_branch;
+      if (!branch) return;
+      // copyToClipboard falls back to execCommand where navigator.clipboard is
+      // missing (the remote web client on a plain-HTTP origin).
+      void copyToClipboard(branch).then((ok) =>
+        ok
+          ? toast.success("Copied branch name", { description: branch })
+          : toast.error(COPY_FAILED_MESSAGE),
+      );
+    },
+  },
+  {
+    id: "open-review",
+    label: "Review and pull request",
+    icon: GitPullRequest,
+    keywords: "pr create merge checks",
+    run: ({ workspace }) => {
+      if (workspace) useUIStore.getState().setRightPanelTab(workspace.workspace_id, "review");
+    },
+  },
+  {
+    id: "settle-workspace",
+    label: "Settle workspace",
+    icon: Check,
+    keywords: "done park archive hide",
+    available: canPark,
+    run: (ctx) =>
+      parkActiveWorkspace(ctx, (id) =>
+        useSidebarInboxStore.getState().settle(id, ctx.workspace?.last_active_at ?? undefined),
+      ),
+  },
+  {
+    id: "snooze-workspace",
+    label: "Snooze for 1 hour",
+    icon: AlarmClock,
+    keywords: "later park hide remind",
+    available: canPark,
+    run: (ctx) =>
+      parkActiveWorkspace(ctx, (id) =>
+        useSidebarInboxStore.getState().snooze(id, Date.now() + 60 * 60 * 1000),
+      ),
+  },
+] satisfies PaletteCommand[]).map((command) => ({ ...command, requiresWorkspace: true, workspaceScoped: true }));
+
+/** Exported so a test can hold the catalogue to the keybind registry. */
+export const PALETTE_COMMANDS: PaletteCommand[] = [
+  { id: "open-launcher", label: "Launch an agent…", icon: Bot, actionId: "openLauncher", keywords: "agent chat new start" },
+  ...WORKSPACE_COMMANDS,
   // Workspaces & projects
   { id: "new-agent", label: "New agent", icon: Plus, actionId: "newAgent", keywords: "chat thread start" },
   {
@@ -182,6 +368,13 @@ const COMMANDS: PaletteCommand[] = [
   },
   { id: "next-workspace", label: "Next workspace", icon: ArrowRight, actionId: "nextWorkspace" },
   { id: "prev-workspace", label: "Previous workspace", icon: ArrowLeft, actionId: "prevWorkspace" },
+  {
+    id: "jump-needs-you",
+    label: "Jump to a workspace that needs you",
+    icon: CircleAlert,
+    actionId: "jumpToNeedsYou",
+    keywords: "waiting permission attention stuck",
+  },
 
   // Search
   { id: "file-search", label: "Find file by name", icon: Search, actionId: "fileSearch", keywords: "goto open" },
@@ -193,19 +386,34 @@ const COMMANDS: PaletteCommand[] = [
   { id: "close-pane", label: "Close pane", icon: X, actionId: "closePane", requiresWorkspace: true },
   { id: "new-tab", label: "New terminal tab", icon: Terminal, actionId: "newTab", keywords: "shell console", requiresWorkspace: true },
   { id: "close-tab", label: "Close tab", icon: X, actionId: "closeTab", requiresWorkspace: true },
+  { id: "reopen-closed-tab", label: "Reopen closed chat", icon: RotateCcw, actionId: "reopenClosedTab", keywords: "restore undo transcript", requiresWorkspace: true },
+  { id: "next-tab", label: "Next tab", icon: ArrowRight, actionId: "nextTab", requiresWorkspace: true },
+  { id: "prev-tab", label: "Previous tab", icon: ArrowLeft, actionId: "prevTab", requiresWorkspace: true },
+  { id: "focus-pane-left", label: "Focus pane left", icon: ArrowLeft, actionId: "focusPaneLeft", requiresWorkspace: true },
+  { id: "focus-pane-right", label: "Focus pane right", icon: ArrowRight, actionId: "focusPaneRight", requiresWorkspace: true },
+  { id: "focus-pane-up", label: "Focus pane above", icon: ArrowUp, actionId: "focusPaneUp", requiresWorkspace: true },
+  { id: "focus-pane-down", label: "Focus pane below", icon: ArrowDown, actionId: "focusPaneDown", requiresWorkspace: true },
+  {
+    id: "zoom-pane",
+    label: "Zoom pane",
+    icon: Maximize2,
+    actionId: "togglePaneZoom",
+    keywords: "maximize fullscreen focus restore split",
+    requiresWorkspace: true,
+  },
   {
     id: "focus-next-pane",
     label: "Focus next pane",
     icon: LayoutGrid,
     requiresWorkspace: true,
-    run: () => void cyclePane(1).catch(console.error),
+    run: () => void cyclePane(1).catch(reportFailure("Couldn't focus the next pane")),
   },
   {
     id: "focus-prev-pane",
     label: "Focus previous pane",
     icon: LayoutGrid,
     requiresWorkspace: true,
-    run: () => void cyclePane(-1).catch(console.error),
+    run: () => void cyclePane(-1).catch(reportFailure("Couldn't focus the previous pane")),
   },
   {
     id: "open-browser",
@@ -214,7 +422,7 @@ const COMMANDS: PaletteCommand[] = [
     keywords: "web preview localhost",
     requiresWorkspace: true,
     run: ({ activePaneId }) => {
-      if (activePaneId) void createBrowserPane(activePaneId).catch(console.error);
+      if (activePaneId) void createBrowserPane(activePaneId).catch(reportFailure("Couldn't open a browser pane"));
     },
   },
 
@@ -228,9 +436,30 @@ const COMMANDS: PaletteCommand[] = [
     run: () =>
       void getPresets()
         .then((s) => setPresetBarVisible(!s.bar_visible))
-        .catch(console.error),
+        .catch(reportFailure("Couldn't toggle the preset bar")),
+  },
+  { id: "zoom-in", label: "Increase interface size", icon: ZoomIn, actionId: "zoomIn", keywords: "zoom bigger larger font scale" },
+  { id: "zoom-out", label: "Decrease interface size", icon: ZoomOut, actionId: "zoomOut", keywords: "zoom smaller font scale" },
+  { id: "zoom-reset", label: "Reset interface size", icon: RotateCcw, actionId: "zoomReset", keywords: "zoom font scale" },
+  {
+    id: "change-theme",
+    label: "Change theme…",
+    icon: Palette,
+    keywords: "colors palette appearance dark light",
+    query: "theme",
   },
   { id: "shortcuts", label: "Keyboard shortcuts", icon: Keyboard, actionId: "showShortcuts", keywords: "keybinds bindings" },
+  {
+    id: "automations",
+    label: "Automations",
+    icon: CalendarClock,
+    keywords: "schedule cron recurring routine",
+    run: () => {
+      const ui = useUIStore.getState();
+      ui.setShowSettings(false);
+      ui.setShowAutomations(true);
+    },
+  },
   {
     id: "pull-requests",
     label: "Pull requests",
@@ -247,6 +476,14 @@ const COMMANDS: PaletteCommand[] = [
   },
   { id: "settings", label: "Settings", icon: Settings, actionId: "openSettings", keywords: "preferences config" },
   {
+    id: "import-recent-chats",
+    label: "Import recent chats…",
+    icon: Import,
+    keywords: "claude code codex sessions history conversations copy",
+    requiresChatImport: true,
+    run: () => useUIStore.getState().setShowLocalSessionImport(true),
+  },
+  {
     id: "reload-interface",
     label: "Reload interface",
     icon: RefreshCw,
@@ -258,7 +495,7 @@ const COMMANDS: PaletteCommand[] = [
     // reload the desktop's; its browser tab is the interface there.
     run: () => {
       if (isRemoteClient()) window.location.reload();
-      else void reloadInterface().catch(console.error);
+      else void reloadInterface().catch(reportFailure("Couldn't reload the interface"));
     },
   },
   {
@@ -267,7 +504,11 @@ const COMMANDS: PaletteCommand[] = [
     icon: RefreshCw,
     requiresWorkspace: true,
     run: ({ workspace }) => {
-      if (workspace) void regenerateMcpConfig(workspace.workspace_id).catch(console.error);
+      if (!workspace) return;
+      // Nothing on screen changes when this works, so say that it did.
+      void regenerateMcpConfig(workspace.workspace_id)
+        .then(() => toast.success("MCP config regenerated"))
+        .catch(reportFailure("Couldn't regenerate the MCP config"));
     },
   },
 ];
@@ -323,6 +564,15 @@ interface ThemeStudioRow {
 }
 
 export function CommandPalette({ open, onOpenChange }: Props) {
+  // The content stays mounted while it animates out, and reopening during
+  // that exit reuses it. A fresh body per open keeps the last query from
+  // coming back.
+  const [openCount, setOpenCount] = useState(0);
+  const [prevOpen, setPrevOpen] = useState(open);
+  if (open !== prevOpen) {
+    setPrevOpen(open);
+    if (open) setOpenCount((count) => count + 1);
+  }
   return (
     <CommandDialog
       open={open}
@@ -331,11 +581,14 @@ export function CommandPalette({ open, onOpenChange }: Props) {
       description="Search workspaces, conversations, projects, and commands."
       // Mobile's generic dialog rule centers at mid-screen; this top-anchored
       // palette must instead leave room for its reserved results and keyboard.
-      className="top-24 w-full gap-0 border border-border p-0 sm:max-w-[640px] in-[[data-mobile]]:top-[calc(var(--mobile-top,0px)+12px)]! in-[[data-mobile]]:p-0!"
+      className={cn(
+        "top-24 w-full gap-0 border border-border p-0 sm:max-w-[640px] in-[[data-mobile]]:top-[calc(var(--mobile-top,0px)+12px)]! in-[[data-mobile]]:p-0!",
+        DIALOG_TOP_ANCHORED_MOTION,
+      )}
     >
       {/* Radix unmounts dialog content while closed, so the body's stores,
           clock, and avatar loads cost nothing until the palette opens. */}
-      <PaletteBody onOpenChange={onOpenChange} />
+      <PaletteBody key={openCount} onOpenChange={onOpenChange} />
     </CommandDialog>
   );
 }
@@ -350,7 +603,8 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   const query = useMemo(() => parsePaletteQuery(rawQuery), [rawQuery]);
   // Shares its key with the sidebar badge's fetch, so `pr ` is answered
   // from rows that are already loaded rather than a fresh round trip.
-  const { rows: prOverviewRows } = usePrOverview(query.mode === "prs");
+  const prOverview = usePrOverview(query.mode === "prs");
+  const prOverviewRows = prOverview.rows;
   const listRef = useRef<HTMLDivElement>(null);
   // A seeded `theme` query is a deep link from Settings ▸ Appearance, not
   // an ordinary palette search. Remember that distinction after the store's
@@ -469,6 +723,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   );
 
   // ── Command rows ───────────────────────────────────────────────────────
+  const canImportChats = useCanImportLocalSessions();
   const addonInstalled = useAddonsStore(s => s.installed);
   const addonsPaused = useAddonsStore(s => s.paused);
   // Add-on commands are attributed ("title · add-on") and never get a
@@ -502,16 +757,54 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
       activeWorkspace?.attach_only,
     ],
   );
+  const activeStatus = useMemo(
+    () =>
+      activeWorkspace && paneStatuses
+        ? getWorkspaceStatus(activeWorkspace.surfaces, paneStatuses)
+        : null,
+    [activeWorkspace, paneStatuses],
+  );
+  const commandContext = useMemo<CommandContext>(
+    () => ({
+      inboxLoaded,
+      workspace: activeWorkspace,
+      activePaneId,
+      workspaceStatus: activeStatus,
+      parked: activeWorkspaceId !== null && parkedIds.has(activeWorkspaceId),
+      runningAgent: activeWorkspace
+        ? findRunningAgent(activeWorkspace, paneStatuses, activePaneId)
+        : null,
+      nextWorkspaceId:
+        workspaceRows.find((r) => !r.parked && r.workspace.workspace_id !== activeWorkspaceId)
+          ?.workspace.workspace_id ?? null,
+    }),
+    [inboxLoaded, activeWorkspace, activePaneId, activeStatus, activeWorkspaceId, parkedIds, paneStatuses, workspaceRows],
+  );
   const commandRows = useMemo<CommandRow[]>(
     () =>
-      [...COMMANDS, ...addonCommands].filter((c) => !c.requiresWorkspace || activeWorkspace !== null).map((command) => ({
-        kind: "command" as const,
-        key: `cmd:${command.id}`,
-        command,
-        keys: command.actionId ? getKeysForAction(command.actionId) : "",
-      })),
-    [activeWorkspace, getKeysForAction, addonCommands],
+      [...PALETTE_COMMANDS, ...addonCommands]
+        .filter((c) => !c.requiresWorkspace || activeWorkspace !== null)
+        .filter((c) => !c.requiresChatImport || canImportChats)
+        .filter((c) => !c.available || c.available(commandContext))
+        .map((command) => ({
+          kind: "command" as const,
+          key: `cmd:${command.id}`,
+          command,
+          keys: command.actionId ? getKeysForAction(command.actionId) : "",
+        })),
+    [activeWorkspace, getKeysForAction, addonCommands, commandContext, canImportChats],
   );
+
+  // Per-viewer convenience: what this person ran lately, offered first in the
+  // resting list. Losing it (private window, cleared storage) costs nothing.
+  const [recentCommandIds, setRecentCommandIds] = useState(readRecentCommands);
+  const recentRows = useMemo<CommandRow[]>(() => {
+    const byId = new Map(commandRows.map((row) => [row.command.id, row]));
+    return recentCommandIds.flatMap((id) => {
+      const row = byId.get(id);
+      return row ? [{ ...row, key: `recent:${id}` }] : [];
+    });
+  }, [commandRows, recentCommandIds]);
 
   // ── Theme rows ─────────────────────────────────────────────────────────
   const customThemes = useMemo(
@@ -572,13 +865,19 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     () =>
       commandsOnly || prsOnly
         ? []
-        : rankByQuery(
-            workspaceRows,
-            query,
-            (r) => workspaceSearchText(r.workspace),
-            (r) => workspacePathText(r.workspace),
-          ),
-    [workspaceRows, query, commandsOnly, prsOnly],
+        : query.needle === ""
+          ? demoteCurrentWorkspace(
+              workspaceRows,
+              activeWorkspaceId && `ws:${activeWorkspaceId}`,
+              WORKSPACE_CAP_RESTING,
+            )
+          : rankByQuery(
+              workspaceRows,
+              query,
+              (r) => workspaceSearchText(r.workspace),
+              (r) => workspacePathText(r.workspace),
+            ),
+    [workspaceRows, query, commandsOnly, prsOnly, activeWorkspaceId],
   );
   const matchedProjects = useMemo(
     () =>
@@ -607,6 +906,30 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           ),
     [commandRows, query, commandsOnly, prsOnly],
   );
+
+  // Settings pages are search-only: "settings" lists them all, and a query
+  // that names a page or one of its rows ("scrollback") jumps straight there.
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  const signedIn = useAuthStore((s) => s.user !== null);
+  const settingsRows = useMemo<CommandRow[]>(() => {
+    if (prsOnly || query.pathMode) return [];
+    const pages = buildNavGroups(enableAgentChat).flatMap((group) => group.items);
+    return settingsPagesForQuery(query.needle, enableAgentChat, signedIn).flatMap((id) => {
+      const page = pages.find((item) => item.id === id);
+      if (!page) return [];
+      return [{
+        kind: "command" as const,
+        key: `cmd:settings:${id}`,
+        command: {
+          id: `settings:${id}`,
+          label: `Settings · ${page.label}`,
+          icon: page.icon,
+          run: () => useUIStore.getState().setShowSettings(true, id),
+        },
+        keys: "",
+      }];
+    });
+  }, [prsOnly, query.pathMode, query.needle, enableAgentChat, signedIn]);
 
   const searching = query.needle !== "";
   const conversationsEligible =
@@ -699,21 +1022,41 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     openedForThemesRef.current &&
     rawQuery === "theme" &&
     matchedThemes.length + matchedThemeStudio.length > 0;
-  // Add-on commands rank with the core ones but render in their own
-  // "Add-ons" group, so each header counts only its own rows.
+  // Workspace and add-on commands rank with the core ones but render in their
+  // own "This workspace" and "Add-ons" groups, so each header counts only its
+  // own rows.
+  const matchedWorkspaceCommands = useMemo(
+    () => matchedCommands.filter((row) => row.command.workspaceScoped),
+    [matchedCommands],
+  );
   const matchedCoreCommands = useMemo(
-    () => matchedCommands.filter((row) => !row.command.addon),
+    () => matchedCommands.filter((row) => !row.command.addon && !row.command.workspaceScoped),
     [matchedCommands],
   );
   const matchedAddonCommands = useMemo(
     () => matchedCommands.filter((row) => row.command.addon),
     [matchedCommands],
   );
+  // Only while nothing has been typed: once there is a query, the ranked
+  // groups below already answer it.
+  const shownRecent = query.needle === "" && !prsOnly ? recentRows : [];
+  const nothingBeforeProjects =
+    !themeResultsFirst && shownWorkspaces.length === 0 && shownRecent.length === 0;
   const nothingBeforeCommands =
     shownWorkspaces.length === 0 &&
+    shownRecent.length === 0 &&
     shownProjects.length === 0 &&
     conversationRows.length === 0 &&
     matchedThemes.length + matchedThemeStudio.length === 0;
+  const prEmpty = prsOnly
+    ? prModeEmptyState({
+        needle: query.needle,
+        rowCount: prOverviewRows.length,
+        isLoading: prOverview.isLoading,
+        allRootsFailed: prOverview.allRootsFailed,
+        rateLimitedUntil: prOverview.rateLimitedUntil,
+      })
+    : null;
 
   // Every keystroke re-ranks the list and cmdk re-selects the first row, but
   // it only scrolls on arrow navigation. Resetting here keeps ordinary search
@@ -728,7 +1071,9 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     conversationRows.length +
     matchedThemes.length +
     matchedThemeStudio.length +
-    matchedCommands.length;
+    shownRecent.length +
+    matchedCommands.length +
+    settingsRows.length;
 
   // ── Live preview ───────────────────────────────────────────────────────
   //
@@ -818,9 +1163,20 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   };
 
   const runCommand = (command: PaletteCommand) => {
+    const recent = pushRecentCommand(recentCommandIds, command.id);
+    setRecentCommandIds(recent);
+    writeRecentCommands(recent);
+    if (command.query !== undefined) {
+      // A door into the palette's own theme list: behave exactly like the
+      // Settings ▸ Appearance entry, which seeds the same query.
+      openedForThemesRef.current = command.query === "theme";
+      selectionIntentRef.current = false;
+      setRawQuery(command.query);
+      return;
+    }
     close();
     if (command.run) {
-      command.run({ workspace: activeWorkspace, activePaneId });
+      command.run(commandContext);
       return;
     }
     if (command.actionId) dispatch(command.actionId);
@@ -899,15 +1255,20 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
       className="flex w-full flex-col overflow-hidden bg-popover text-popover-foreground"
     >
       {/* Header */}
-      <div className="flex h-[52px] flex-none items-center gap-2.5 border-b border-border/60 pr-3.5 pl-4">
-        <Search className="size-[15px] shrink-0 text-muted-foreground/70" />
+      <div className="flex h-[52px] flex-none items-center gap-2.5 border-b border-hairline pr-3.5 pl-4">
+        <Search className="size-4 shrink-0 text-muted-foreground/70" />
         {commandsOnly && (
-          <span className="flex h-[22px] flex-none items-center rounded-md bg-accent-ember/15 px-2 font-mono text-caption tracking-wide text-accent-ember">
+          <span className="flex h-[22px] flex-none items-center rounded-sm bg-accent-ember/15 px-2 font-mono text-caption tracking-wide text-accent-ember">
             Commands
           </span>
         )}
-        {previewTheme && (
+        {prsOnly && (
           <span className="flex h-[22px] flex-none items-center rounded-md bg-accent-ember/15 px-2 font-mono text-caption tracking-wide text-accent-ember">
+            Pull requests
+          </span>
+        )}
+        {previewTheme && (
+          <span className="flex h-[22px] flex-none items-center rounded-sm bg-accent-ember/15 px-2 font-mono text-caption tracking-wide text-accent-ember">
             Themes
           </span>
         )}
@@ -921,7 +1282,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           placeholder={`Search workspaces, conversations, commands…  (${COMMAND_MODE_PREFIX} for commands)`}
           className="h-8 min-w-0 flex-1 bg-transparent text-body outline-none placeholder:text-muted-foreground/70"
         />
-        <kbd className="flex-none rounded-sm border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground/70">
+        <kbd className="flex-none rounded-sm border border-hairline-strong px-1.5 py-0.5 font-mono text-caption text-muted-foreground/70">
           esc
         </kbd>
       </div>
@@ -934,14 +1295,15 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           // every debounce, empty state, and asynchronously added section.
           className="thin-scrollbar [scrollbar-gutter:stable] h-[352px] max-h-[max(96px,calc(var(--mobile-height,100dvh)-220px))] scroll-py-8 overflow-x-hidden overflow-y-auto py-1.5 pr-0.5 pl-1.5"
         >
-          {totalShown === 0 && (
+          {totalShown === 0 && prEmpty && <PrModeEmpty state={prEmpty} needle={query.needle} />}
+          {totalShown === 0 && !prEmpty && (
             <div className="flex flex-col items-center gap-1.5 px-5 py-11 text-center">
               <span className="text-body text-muted-foreground">
                 {inboxSearching ? (
                   "Loading workspaces…"
                 ) : conversationSearching ? (
                   <span className="inline-flex items-center gap-2">
-                    <LoaderCircle className="size-3.5 animate-spin" />
+                    <Spinner className="size-3.5" />
                     Searching conversations…
                   </span>
                 ) : query.needle === "" ? (
@@ -974,6 +1336,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
               key={row.key}
               row={row}
               now={now}
+              current={row.workspace.workspace_id === activeWorkspaceId}
               onSelect={() => openWorkspace(row.workspace.workspace_id)}
             />
           ))}
@@ -995,11 +1358,22 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             />
           ))}
 
+          {shownRecent.length > 0 && (
+            <GroupHeader
+              label="Recent"
+              count={`${shownRecent.length}`}
+              first={!themeResultsFirst && shownWorkspaces.length === 0}
+            />
+          )}
+          {shownRecent.map((row) => (
+            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
+          ))}
+
           {shownProjects.length > 0 && (
             <GroupHeader
               label="Projects"
               count={groupCountLabel(shownProjects.length, matchedProjects.length)}
-              first={!themeResultsFirst && shownWorkspaces.length === 0}
+              first={nothingBeforeProjects}
             />
           )}
           {shownProjects.map((row) => (
@@ -1010,9 +1384,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <GroupHeader
               label="Conversations"
               count={`${conversationRows.length}`}
-              first={
-                !themeResultsFirst && shownWorkspaces.length === 0 && shownProjects.length === 0
-              }
+              first={nothingBeforeProjects && shownProjects.length === 0}
             />
           )}
           {conversationRows.map((row) => (
@@ -1027,21 +1399,46 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
 
           {!themeResultsFirst && themeResults}
 
+          {matchedWorkspaceCommands.length > 0 && (
+            <GroupHeader
+              label="This workspace"
+              count={`${matchedWorkspaceCommands.length}`}
+              first={nothingBeforeCommands}
+            />
+          )}
+          {matchedWorkspaceCommands.map((row) => (
+            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
+          ))}
           {matchedCoreCommands.length > 0 && (
             <GroupHeader
               label="Commands"
               count={`${matchedCoreCommands.length}`}
-              first={nothingBeforeCommands}
+              first={nothingBeforeCommands && matchedWorkspaceCommands.length === 0}
             />
           )}
           {matchedCoreCommands.map((row) => (
+            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
+          ))}
+          {settingsRows.length > 0 && (
+            <GroupHeader
+              label="Settings pages"
+              count={`${settingsRows.length}`}
+              first={nothingBeforeCommands && matchedWorkspaceCommands.length === 0 && matchedCoreCommands.length === 0}
+            />
+          )}
+          {settingsRows.map((row) => (
             <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
           ))}
           {matchedAddonCommands.length > 0 && (
             <GroupHeader
               label="Add-ons"
               count={`${matchedAddonCommands.length}`}
-              first={nothingBeforeCommands && matchedCoreCommands.length === 0}
+              first={
+                nothingBeforeCommands &&
+                matchedWorkspaceCommands.length === 0 &&
+                matchedCoreCommands.length === 0 &&
+                settingsRows.length === 0
+              }
             />
           )}
           {matchedAddonCommands.map((row) => (
@@ -1054,12 +1451,12 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
       {/* Footer — while a theme is previewing it explains the preview instead
           of the palette, because that is the only moment Esc does something
           other than close. */}
-      <div className="flex h-[34px] flex-none items-center gap-3.5 border-t border-border/60 bg-muted/30 px-3.5">
+      <div className="flex h-[34px] flex-none items-center gap-3.5 border-t border-hairline bg-surface-1 px-3.5">
         {previewTheme ? (
           <>
-            <FooterHint keys="↑↓" label="preview" />
-            <FooterHint keys="↵" label="keep it" />
-            <FooterHint keys="esc" label={`back to ${appliedTheme.label}`} />
+            <KeyHint keys="↑↓" label="preview" />
+            <KeyHint keys="↵" label="keep it" />
+            <KeyHint keys="esc" label={`back to ${appliedTheme.label}`} />
             <span className="flex-1" />
             <span className="font-mono text-caption text-muted-foreground/70">
               {previewTheme.id === OMARCHY_THEME_ID ? "follows this desktop" : "syncs to your account"}
@@ -1067,10 +1464,10 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           </>
         ) : (
           <>
-            <FooterHint keys="↑↓" label="navigate" />
-            <FooterHint keys="↵" label="open" />
-            <FooterHint keys={COMMAND_MODE_PREFIX} label="commands" />
-            <FooterHint keys={PR_MODE_PREFIX.trim()} label="pull requests" />
+            <KeyHint keys="↑↓" label="navigate" />
+            <KeyHint keys="↵" label="open" />
+            <KeyHint keys={COMMAND_MODE_PREFIX} label="commands" />
+            <KeyHint keys={PR_MODE_PREFIX.trim()} label="pull requests" />
             <span className="flex-1" />
             <span className="font-mono text-caption text-muted-foreground/70 tabular-nums">
               {resultCountLabel(totalShown)}
@@ -1127,7 +1524,7 @@ function PaletteItem({
       value={value}
       onSelect={onSelect}
       className={cn(
-        "group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-lg px-2.5 outline-none select-none data-selected:bg-accent",
+        "group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-md px-2.5 outline-none select-none data-selected:bg-accent",
         className,
       )}
     >
@@ -1166,10 +1563,13 @@ function RowAvatar({ name, path }: { name: string; path: string }) {
 function WorkspaceItem({
   row,
   now,
+  current,
   onSelect,
 }: {
   row: WorkspaceRow;
   now: number;
+  /** The workspace already on screen, tagged like the applied theme row. */
+  current: boolean;
   onSelect: () => void;
 }) {
   // Formatted here rather than baked into the row so the coarse clock can't
@@ -1194,6 +1594,11 @@ function WorkspaceItem({
           {workspaceRowSubtitle(row.workspace, row.projectName)}
         </span>
       </span>
+      {current && (
+        <span className="flex-none font-mono text-label text-muted-foreground/70">
+          current
+        </span>
+      )}
       {row.status && (
         <span
           className={cn(
@@ -1362,7 +1767,7 @@ function ThemeStudioItemRow({
   return (
     <PaletteItem value={row.key} onSelect={onSelect}>
       <span className="flex size-5 flex-none items-center justify-center rounded-sm border border-border/60 text-muted-foreground/70">
-        <Icon className="size-[11px]" />
+        <Icon className="size-3" />
       </span>
       <span className="min-w-0 flex-1 truncate text-body text-muted-foreground">
         {row.label}
@@ -1377,14 +1782,14 @@ function CommandItemRow({ row, onSelect }: { row: CommandRow; onSelect: () => vo
   return (
     <PaletteItem value={row.key} onSelect={onSelect}>
       <span className="flex size-5 flex-none items-center justify-center rounded-sm border border-border/60 text-muted-foreground/70">
-        <Icon className="size-[11px]" />
+        <Icon className="size-3" />
       </span>
       <span className="min-w-0 flex-1 truncate text-body font-medium text-foreground/90">
         {row.command.label}
       </span>
       {row.keys && (
         <span className="flex-none rounded-sm border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground group-data-selected/pal-row:hidden">
-          {row.keys}
+          {formatKeyCombo(row.keys)}
         </span>
       )}
       <EnterBadge />
@@ -1427,13 +1832,37 @@ function PrPaletteItem({ row, onSelect }: { row: PrRow; onSelect: () => void }) 
   );
 }
 
-function FooterHint({ keys, label }: { keys: string; label: string }) {
+/** The `pr ` empty state: says whether the list is still loading or could
+ *  not be fetched, rather than implying the pull request does not exist. */
+function PrModeEmpty({ state, needle }: { state: PrModeEmptyState; needle: string }) {
+  const headline =
+    state.kind === "loading" ? (
+      <span className="inline-flex items-center gap-2">
+        <Spinner className="size-3.5" aria-hidden />
+        Loading pull requests…
+      </span>
+    ) : state.kind === "rate-limited" ? (
+      "Rate limit reached"
+    ) : state.kind === "unreachable" ? (
+      "Couldn't reach your pull requests"
+    ) : state.kind === "none" ? (
+      "No open pull requests"
+    ) : (
+      <>
+        No pull requests match{" "}
+        <span className="font-mono text-foreground">{needle}</span>
+      </>
+    );
+  const hint =
+    state.kind === "rate-limited"
+      ? `Refreshing resumes at ${new Date(state.until).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`
+      : state.kind === "unreachable"
+        ? "Check your connection or sign-in, then open Pull requests to retry"
+        : "Search by number, title, repository, or author";
   return (
-    <span className="flex items-center gap-1.5 text-label text-muted-foreground/70">
-      <kbd className="rounded-sm border border-border/60 px-1.5 py-px font-mono text-caption text-muted-foreground">
-        {keys}
-      </kbd>
-      {label}
-    </span>
+    <div className="flex flex-col items-center gap-1.5 px-5 py-11 text-center">
+      <span className="text-body text-muted-foreground">{headline}</span>
+      <span className="text-label text-muted-foreground/70">{hint}</span>
+    </div>
   );
 }

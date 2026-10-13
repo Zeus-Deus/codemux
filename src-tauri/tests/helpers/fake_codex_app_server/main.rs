@@ -66,6 +66,9 @@ struct IncomingMessage {
 #[derive(Debug, Clone, Deserialize)]
 struct ScriptEntry {
     after: String,
+    /// Restrict a turn/start fixture to its actual acknowledged turn number.
+    #[serde(default)]
+    on_turn: Option<u64>,
     #[serde(default)]
     delay_ms: u64,
     emit: String,
@@ -105,9 +108,10 @@ fn fire_script_entries_for(
     script: &[ScriptEntry],
     pending_server: &Arc<Mutex<HashMap<String, Value>>>,
 ) {
+    let turn = (method == "turn/start").then(|| TURN_COUNTER.load(Ordering::Relaxed) - 1);
     let matches: Vec<_> = script
         .iter()
-        .filter(|e| e.after == method)
+        .filter(|e| e.after == method && e.on_turn.is_none_or(|expected| turn == Some(expected)))
         .cloned()
         .collect();
     if matches.is_empty() {
@@ -158,6 +162,23 @@ fn fire_script_entries_for(
 
 fn main() {
     let script = load_script();
+    // An explicit synthetic catalog lets adapter tests exercise entitlement
+    // and model-specific tier changes without making real inference requests.
+    let default_model_catalog: Value = json!([{
+        "id": "gpt-test",
+        "model": "gpt-test",
+        "displayName": "GPT Test",
+        "description": "Fixture model",
+        "hidden": false,
+        "isDefault": true,
+        "defaultReasoningEffort": "medium",
+        "supportedReasoningEfforts": [{
+            "reasoningEffort": "medium",
+            "description": "Fixture effort"
+        }],
+        "inputModalities": ["text"],
+        "additionalSpeedTiers": ["fast"]
+    }]);
     let fail_resume = env_truthy("FAKE_CODEX_FAIL_RESUME");
     let thread_id = std::env::var("FAKE_CODEX_THREAD_ID").unwrap_or_else(|_| "c-1".to_string());
     let exit_after = std::env::var("FAKE_CODEX_EXIT_AFTER").ok();
@@ -258,26 +279,16 @@ fn main() {
                 // no-op notification
             }
             "model/list" => {
+                let model_catalog: Value = std::env::var("FAKE_CODEX_MODELS")
+                    .ok()
+                    .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
+                    .unwrap_or_else(|| default_model_catalog.clone());
                 if let Some(id) = id {
                     write_line(&json!({
                         "jsonrpc":"2.0",
                         "id": id,
                         "result": {
-                            "data": [{
-                                "id": "gpt-test",
-                                "model": "gpt-test",
-                                "displayName": "GPT Test",
-                                "description": "Fixture model",
-                                "hidden": false,
-                                "isDefault": true,
-                                "defaultReasoningEffort": "medium",
-                                "supportedReasoningEfforts": [{
-                                    "reasoningEffort": "medium",
-                                    "description": "Fixture effort"
-                                }],
-                                "inputModalities": ["text"],
-                                "additionalSpeedTiers": []
-                            }],
+                            "data": model_catalog,
                             "nextCursor": null
                         },
                     }));

@@ -451,6 +451,71 @@ describe("agent-chat reducer", () => {
     expect(state.pendingRequestIds).toEqual([]);
   });
 
+  it("stamps approved_at on a gated call when its request is answered", () => {
+    let t = 1_000;
+    const clock: Clock = () => t;
+    let state = runEvents(
+      [
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: {
+            kind: "tool_use",
+            tool_name: "Bash",
+            input: { command: "pwd" },
+            tool_use_id: "tool-gated",
+          },
+        },
+        {
+          type: "request_opened",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          request_id: "req-gated",
+          request_kind: "tool-permission",
+          payload: { tool_name: "Bash" },
+          tool_use_id: "tool-gated",
+        },
+      ],
+      createEmptyThreadState(),
+      clock,
+    );
+    t = 121_000;
+    state = applyEvent(
+      state,
+      {
+        type: "request_resolved",
+        thread_id: "t1",
+        request_id: "req-gated",
+        decision: { decision: "allow" },
+      },
+      clock,
+    );
+    const tool = state.messages.find(
+      (m): m is ToolCallItem => m.kind === "tool_call",
+    );
+    expect(tool?.started_at).toBe(1_000);
+    expect(tool?.approved_at).toBe(121_000);
+
+    // A second window re-delivers the same answer later; the call has been
+    // running since the first one.
+    t = 300_000;
+    state = applyEvent(
+      state,
+      {
+        type: "request_resolved",
+        thread_id: "t1",
+        request_id: "req-gated",
+        decision: { decision: "allow" },
+      },
+      clock,
+    );
+    const again = state.messages.find(
+      (m): m is ToolCallItem => m.kind === "tool_call",
+    );
+    expect(again?.approved_at).toBe(121_000);
+  });
+
   it("keeps a resolved request resolved when a duplicate respond fails", () => {
     // Two windows on the same thread: the second respond loses the race and
     // the provider answers "not found" — which it cannot distinguish from
@@ -1125,6 +1190,21 @@ describe("agent-chat reducer", () => {
     }
   });
 
+  it("runtime_warning marks a signed-out Claude run with a sign-in notice", () => {
+    const state = applyEvent(createEmptyThreadState(), {
+      type: "runtime_warning",
+      thread_id: "t1",
+      message: "assistant error: authentication_failed",
+      original_payload: null,
+    });
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({
+      kind: "runtime_notice",
+      message: "Claude Code isn't signed in.",
+      signIn: "claude",
+    });
+  });
+
   it("runtime_warning debug noise still appends nothing", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const base = createEmptyThreadState();
@@ -1136,6 +1216,25 @@ describe("agent-chat reducer", () => {
     });
     expect(after).toBe(base);
     warn.mockRestore();
+  });
+
+  it("shows the Hermes restriction live and after reopening the transcript", () => {
+    const message = "Automatic resume after usage limits is unavailable with this Hermes version. Continue manually once your provider limit resets.";
+    const event: ProviderRuntimeEvent = {
+      type: "runtime_warning",
+      thread_id: "t1",
+      message: "hermes-usage-limit-recovery: " + message,
+      original_payload: null,
+    };
+    for (const state of [
+      applyEvent(createEmptyThreadState(), event),
+      replayPayloads([JSON.stringify(event)], { provider: "hermes" }),
+    ]) {
+      expect(state.messages).toEqual([
+        expect.objectContaining({ kind: "runtime_notice", message }),
+      ]);
+      expect(state.usageLimit).toBeNull();
+    }
   });
 
   it("content_delta that follows a sealed assistant + tool_call starts a NEW assistant block at a fresh seq (AskUserQuestion position bug)", () => {
@@ -2975,6 +3074,7 @@ describe("usage limit", () => {
       provider: "claude",
       resetsAtMs: 5_000_000,
       autoResumeAtMs: 5_060_000,
+      autoResumeBlockedReason: null,
       window: "five_hour",
       at: 1_000,
     });
@@ -3013,6 +3113,50 @@ describe("usage limit", () => {
     expect(
       applyEvent(idle, { type: "usage_resume_cancelled", thread_id: "t1" }),
     ).toBe(idle);
+  });
+
+  it("replays why continuation is unavailable or failed", () => {
+    const state = runEvents([
+      limitEvent({ auto_resume_at_ms: null, auto_resume_blocked_reason: "attempts_exhausted" }),
+    ]);
+    expect(state.usageLimit?.autoResumeBlockedReason).toBe("attempts_exhausted");
+    const failed = runEvents([
+      limitEvent(),
+      { type: "usage_resume_cancelled", thread_id: "t1", reason: "dispatch_failed" },
+    ]);
+    expect(failed.usageLimit?.autoResumeBlockedReason).toBe("dispatch_failed");
+    expect(failed.usageLimit?.autoResumeAtMs).toBeNull();
+  });
+
+  it("a manual dispatch failure lands after the disarm that preceded it", () => {
+    // Manual Resume: the backend disarms first, then reports the failure.
+    const disarmed = runEvents([
+      limitEvent(),
+      { type: "usage_resume_cancelled", thread_id: "t1", reason: "cancelled" },
+    ]);
+    expect(disarmed.usageLimit?.autoResumeBlockedReason).toBe("cancelled");
+    const failed = applyEvent(disarmed, {
+      type: "usage_resume_cancelled",
+      thread_id: "t1",
+      reason: "dispatch_failed",
+    });
+    expect(failed.usageLimit).toMatchObject({
+      autoResumeAtMs: null,
+      autoResumeBlockedReason: "dispatch_failed",
+      at: disarmed.usageLimit?.at,
+    });
+
+    // Disarming an unarmed limit keeps its own explanation.
+    const unknown = runEvents([
+      limitEvent({ resets_at_ms: null, auto_resume_at_ms: null, auto_resume_blocked_reason: "unknown_reset" }),
+    ]);
+    expect(
+      applyEvent(unknown, { type: "usage_resume_cancelled", thread_id: "t1", reason: "cancelled" }),
+    ).toBe(unknown);
+    expect(
+      applyEvent(unknown, { type: "usage_resume_cancelled", thread_id: "t1", reason: "dispatch_failed" })
+        .usageLimit?.autoResumeBlockedReason,
+    ).toBe("dispatch_failed");
   });
 
   it("the closing turn_completed keeps the limit and records a silent boundary", () => {

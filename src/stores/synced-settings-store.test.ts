@@ -7,12 +7,18 @@ const mockUpdateSyncedSettings = vi.fn();
 const mockUpdateSetting = vi.fn();
 const mockResetSyncedSettings = vi.fn();
 
-vi.mock("@/tauri/commands", () => ({
-  getSyncedSettings: (...args: unknown[]) => mockGetSyncedSettings(...args),
-  updateSyncedSettings: (...args: unknown[]) => mockUpdateSyncedSettings(...args),
-  updateSetting: (...args: unknown[]) => mockUpdateSetting(...args),
-  resetSyncedSettings: (...args: unknown[]) => mockResetSyncedSettings(...args),
-}));
+vi.mock("@/tauri/commands", () => {
+  const result = async (request: Promise<UserSettings | SettingsPersistence>) => {
+    const value = await request;
+    return "settings" in value ? value : { settings: value, synced: true };
+  };
+  return {
+    getSyncedSettings: (...args: unknown[]) => result(mockGetSyncedSettings(...args)),
+    updateSyncedSettings: (...args: unknown[]) => result(mockUpdateSyncedSettings(...args)),
+    updateSetting: (...args: unknown[]) => result(mockUpdateSetting(...args)),
+    resetSyncedSettings: (...args: unknown[]) => result(mockResetSyncedSettings(...args)),
+  };
+});
 
 import {
   useSyncedSettingsStore,
@@ -26,7 +32,7 @@ import {
   selectBrowserDefaultViewport,
   parseViewportString,
 } from "./synced-settings-store";
-import type { UserSettings } from "@/tauri/types";
+import type { UserSettings, SettingsPersistence } from "@/tauri/types";
 
 const DARK_SETTINGS: UserSettings = {
   appearance: { theme: "dark", shell_font: "Fira Code", terminal_font_size: 16, show_resource_monitor: true },
@@ -42,14 +48,23 @@ const DARK_SETTINGS: UserSettings = {
   browser: { default_viewport: "2560x1440" },
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
 describe("synced-settings-store", () => {
   beforeEach(() => {
+    useSyncedSettingsStore.getState().replaceSessionSettings(DEFAULT_SETTINGS);
     useSyncedSettingsStore.setState({
       settings: DEFAULT_SETTINGS,
       isLoading: true,
       isSyncing: false,
+      syncIssue: null,
     });
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
 
   describe("initial state", () => {
@@ -72,6 +87,21 @@ describe("synced-settings-store", () => {
   });
 
   describe("loadSettings", () => {
+    it("finishes loading without replacing an edit made during the read", async () => {
+      const read = deferred<UserSettings>();
+      mockGetSyncedSettings.mockReturnValue(read.promise);
+      const loading = useSyncedSettingsStore.getState().loadSettings();
+      mockUpdateSetting.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
+        git: { default_base_branch: "local-edit" },
+      });
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "local-edit");
+      read.resolve(DARK_SETTINGS);
+      await loading;
+      expect(useSyncedSettingsStore.getState().isLoading).toBe(false);
+      expect(useSyncedSettingsStore.getState().settings.git.default_base_branch).toBe("local-edit");
+    });
+
     it("fetches settings and updates store", async () => {
       mockGetSyncedSettings.mockResolvedValue(DARK_SETTINGS);
 
@@ -110,6 +140,30 @@ describe("synced-settings-store", () => {
   });
 
   describe("updateSettings", () => {
+    it("reports an offline full write and clears the queue only after confirmed reconciliation", async () => {
+      mockUpdateSyncedSettings.mockResolvedValue({ settings: DARK_SETTINGS, synced: false });
+      await useSyncedSettingsStore.getState().updateSettings(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("saved-locally");
+
+      mockGetSyncedSettings.mockResolvedValue({ settings: DARK_SETTINGS, synced: false });
+      await useSyncedSettingsStore.getState().loadSettings();
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("saved-locally");
+      mockGetSyncedSettings.mockResolvedValue({ settings: DARK_SETTINGS, synced: true });
+      await useSyncedSettingsStore.getState().loadSettings();
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
+
+    it("lets an older full write settle after a rejected reset preserves it", async () => {
+      const old = deferred<UserSettings>();
+      mockUpdateSyncedSettings.mockReturnValue(old.promise);
+      const write = useSyncedSettingsStore.getState().updateSettings(DARK_SETTINGS);
+      mockResetSyncedSettings.mockRejectedValue(new Error("reset failed"));
+      await expect(useSyncedSettingsStore.getState().resetSettings()).rejects.toThrow("reset failed");
+      old.resolve(DARK_SETTINGS);
+      await write;
+      expect(useSyncedSettingsStore.getState().settings).toEqual(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
     it("optimistically updates and syncs", async () => {
       mockUpdateSyncedSettings.mockResolvedValue(DARK_SETTINGS);
 
@@ -137,6 +191,190 @@ describe("synced-settings-store", () => {
   });
 
   describe("updateSetting", () => {
+    it.each(["failed", "saved-locally"] as const)(
+      "preserves a %s Git edit through PATCH snapshots and a keyboard correction",
+      async (issue) => {
+        const server = { ...DEFAULT_SETTINGS, keyboard: { shortcuts: { "ctrl+s": "save" } } };
+        useSyncedSettingsStore.getState().replaceSessionSettings(server);
+        if (issue === "failed") {
+          mockUpdateSetting.mockRejectedValueOnce(new Error("Git PATCH failed"));
+          mockUpdateSyncedSettings.mockRejectedValueOnce(new Error("Git PUT failed"));
+        } else {
+          mockUpdateSetting.mockResolvedValueOnce({
+            settings: { ...server, git: { default_base_branch: "dev" } }, synced: false,
+          });
+        }
+        await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+
+        const remote = { ...server, appearance: { ...server.appearance, theme: "dark" } };
+        mockUpdateSetting.mockResolvedValueOnce(remote);
+        await useSyncedSettingsStore.getState().updateSetting("appearance", "theme", "dark");
+        expect(useSyncedSettingsStore.getState().settings.git.default_base_branch).toBe("dev");
+        expect(useSyncedSettingsStore.getState().syncIssue).toBe(issue);
+
+        // Empty-map PATCHes deep-merge instead of deleting the old shortcuts.
+        mockUpdateSetting.mockResolvedValueOnce(remote);
+        mockUpdateSyncedSettings.mockImplementation(async (settings: UserSettings) => settings);
+        await useSyncedSettingsStore.getState().updateSetting("keyboard", "shortcuts", {});
+
+        const calls = mockUpdateSyncedSettings.mock.calls;
+        const correction = calls[calls.length - 1][0];
+        expect(correction.git.default_base_branch).toBe("dev");
+        expect(correction.keyboard.shortcuts).toEqual({});
+        expect(useSyncedSettingsStore.getState().settings.git.default_base_branch).toBe("dev");
+        expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+      },
+    );
+
+    it.each(["failed", "saved-locally"] as const)("reports an unpersisted %s intent omitted from a full acknowledgement", async (issue) => {
+      const server = { ...DEFAULT_SETTINGS, keyboard: { shortcuts: { "ctrl+s": "save" } } };
+      useSyncedSettingsStore.getState().replaceSessionSettings(server);
+      if (issue === "failed") {
+        mockUpdateSetting.mockRejectedValueOnce(new Error("Git PATCH failed"));
+        mockUpdateSyncedSettings.mockRejectedValueOnce(new Error("Git PUT failed"));
+      } else {
+        mockUpdateSetting.mockResolvedValueOnce({
+          settings: { ...server, git: { default_base_branch: "dev" } }, synced: false,
+        });
+      }
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+
+      mockUpdateSetting.mockResolvedValueOnce(server);
+      mockUpdateSyncedSettings.mockResolvedValueOnce({ ...server, keyboard: { shortcuts: {} } });
+      await useSyncedSettingsStore.getState().updateSetting("keyboard", "shortcuts", {});
+
+      const calls = mockUpdateSyncedSettings.mock.calls;
+      expect(calls[calls.length - 1][0].git.default_base_branch).toBe("dev");
+      expect(useSyncedSettingsStore.getState().settings.git.default_base_branch).toBe("dev");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("failed");
+    });
+
+    it("includes a pending edit in a correction and ignores its later failed PATCH", async () => {
+      const pending = deferred<UserSettings>();
+      const server = { ...DEFAULT_SETTINGS, keyboard: { shortcuts: { "ctrl+s": "save" } } };
+      useSyncedSettingsStore.getState().replaceSessionSettings(server);
+      mockUpdateSetting.mockReturnValueOnce(pending.promise).mockResolvedValueOnce(server);
+      mockUpdateSyncedSettings.mockImplementation(async (settings: UserSettings) => settings);
+      const git = useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      await useSyncedSettingsStore.getState().updateSetting("keyboard", "shortcuts", {});
+      expect(mockUpdateSyncedSettings.mock.calls[0][0].git.default_base_branch).toBe("dev");
+
+      pending.reject(new Error("late Git PATCH failure"));
+      await git;
+      expect(mockUpdateSyncedSettings).toHaveBeenCalledTimes(1);
+      expect(useSyncedSettingsStore.getState().settings.git.default_base_branch).toBe("dev");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
+
+    it("corrects an older deep-merged PATCH with the newer pending edit", async () => {
+      const keyboard = deferred<UserSettings>();
+      const git = deferred<UserSettings>();
+      const server = { ...DEFAULT_SETTINGS, keyboard: { shortcuts: { "ctrl+s": "save" } } };
+      useSyncedSettingsStore.getState().replaceSessionSettings(server);
+      mockUpdateSetting.mockReturnValueOnce(keyboard.promise).mockReturnValueOnce(git.promise);
+      mockUpdateSyncedSettings.mockImplementation(async (settings: UserSettings) => settings);
+      const clearing = useSyncedSettingsStore.getState().updateSetting("keyboard", "shortcuts", {});
+      const changingGit = useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+
+      keyboard.resolve(server);
+      await clearing;
+      expect(mockUpdateSyncedSettings.mock.calls[0][0]).toMatchObject({
+        keyboard: { shortcuts: {} }, git: { default_base_branch: "dev" },
+      });
+      git.reject(new Error("late Git PATCH failure"));
+      await changingGit;
+      expect(mockUpdateSyncedSettings).toHaveBeenCalledTimes(1);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
+
+    it.each(["updateSettings", "resetSettings"] as const)(
+      "%s intentionally supersedes an earlier failed edit",
+      async (action) => {
+        mockUpdateSetting.mockRejectedValueOnce(new Error("Git PATCH failed"));
+        mockUpdateSyncedSettings.mockRejectedValueOnce(new Error("Git PUT failed"));
+        await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+        if (action === "updateSettings") {
+          mockUpdateSyncedSettings.mockResolvedValueOnce(DEFAULT_SETTINGS);
+          await useSyncedSettingsStore.getState().updateSettings(DEFAULT_SETTINGS);
+        } else {
+          mockResetSyncedSettings.mockResolvedValueOnce(DEFAULT_SETTINGS);
+          await useSyncedSettingsStore.getState().resetSettings();
+        }
+        expect(useSyncedSettingsStore.getState().settings.git.default_base_branch).toBe("main");
+        expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+      },
+    );
+
+    it("only clears a queued edit when reconciliation contains its intended value", async () => {
+      const intended = { ...DEFAULT_SETTINGS, git: { default_base_branch: "dev" } };
+      mockUpdateSetting.mockResolvedValueOnce({ settings: intended, synced: false });
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      useSyncedSettingsStore.getState().applySettingsFromEvent(DEFAULT_SETTINGS, true);
+      expect(useSyncedSettingsStore.getState().settings.git.default_base_branch).toBe("dev");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("saved-locally");
+      useSyncedSettingsStore.getState().applySettingsFromEvent(intended, true);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
+
+    it("does not dispatch a fallback after the request's account was replaced", async () => {
+      const old = deferred<UserSettings>();
+      mockUpdateSetting.mockReturnValue(old.promise);
+      const write = useSyncedSettingsStore.getState().updateSetting("appearance", "theme", "old-account");
+      useSyncedSettingsStore.getState().replaceSessionSettings(DARK_SETTINGS);
+      old.reject(new Error("account changed"));
+      await write;
+      expect(mockUpdateSyncedSettings).not.toHaveBeenCalled();
+      expect(useSyncedSettingsStore.getState().settings).toEqual(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
+
+    it("reports an online full fallback as synced", async () => {
+      mockUpdateSetting.mockRejectedValue(new Error("PATCH rejected"));
+      mockUpdateSyncedSettings.mockImplementation(async (settings: UserSettings) => ({ settings, synced: true }));
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
+
+    it("does not let an older PATCH success hide a newer failed edit", async () => {
+      const old = deferred<UserSettings>();
+      mockUpdateSetting.mockReturnValueOnce(old.promise).mockRejectedValueOnce(new Error("PATCH failed"));
+      mockUpdateSyncedSettings.mockRejectedValue(new Error("PUT failed"));
+      const write = useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      await useSyncedSettingsStore.getState().updateSetting("terminal", "cursor_style", "block");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("failed");
+      old.resolve({ ...DEFAULT_SETTINGS, git: { default_base_branch: "dev" } });
+      await write;
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("failed");
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(false);
+
+      // Even a newer unrelated PATCH cannot confirm the failed cursor edit.
+      mockUpdateSetting.mockResolvedValue({ ...DEFAULT_SETTINGS, git: { default_base_branch: "other" } });
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "other");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("failed");
+    });
+
+    it("keeps a fallback scoped to its account until it completes", async () => {
+      const fallback = deferred<SettingsPersistence>();
+      mockUpdateSetting.mockRejectedValue(new Error("PATCH failed"));
+      mockUpdateSyncedSettings.mockReturnValue(fallback.promise);
+      const write = useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      await vi.waitFor(() => expect(mockUpdateSyncedSettings).toHaveBeenCalled());
+      useSyncedSettingsStore.getState().replaceSessionSettings(DARK_SETTINGS);
+      fallback.resolve({ settings: DEFAULT_SETTINGS, synced: false });
+      await write;
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+      expect(useSyncedSettingsStore.getState().settings).toEqual(DARK_SETTINGS);
+    });
+
+    it("reports a signed-out PATCH as locally queued", async () => {
+      mockUpdateSetting.mockResolvedValue({ settings: DARK_SETTINGS, synced: false });
+      await useSyncedSettingsStore.getState().updateSetting("appearance", "theme", "dark");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("saved-locally");
+      useSyncedSettingsStore.getState().applySettingsFromEvent(DARK_SETTINGS, false);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("saved-locally");
+      useSyncedSettingsStore.getState().applySettingsFromEvent(DARK_SETTINGS, true);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
     it("updates a single field", async () => {
       const returned = {
         ...DEFAULT_SETTINGS,
@@ -150,6 +388,37 @@ describe("synced-settings-store", () => {
       expect(state.settings.appearance.theme).toBe("dark");
       expect(state.isSyncing).toBe(false);
       expect(mockUpdateSetting).toHaveBeenCalledWith("appearance", "theme", "dark");
+      expect(state.syncIssue).toBeNull();
+    });
+
+    it("falls back to a full write that keeps the edit locally when the single-field write fails", async () => {
+      mockUpdateSetting.mockRejectedValue("Network error: offline");
+      mockUpdateSyncedSettings.mockImplementation(async (settings: UserSettings) => ({ settings, synced: false }));
+
+      await useSyncedSettingsStore.getState().updateSetting("terminal", "cursor_style", "block");
+
+      // The full write carries the edit the user made, not the old value.
+      expect(mockUpdateSyncedSettings).toHaveBeenCalledTimes(1);
+      expect(mockUpdateSyncedSettings.mock.calls[0][0].terminal.cursor_style).toBe("block");
+      const state = useSyncedSettingsStore.getState();
+      expect(state.settings.terminal.cursor_style).toBe("block");
+      expect(state.syncIssue).toBe("saved-locally");
+      expect(state.isSyncing).toBe(false);
+    });
+
+    it("reports a write that could not be saved anywhere, and clears it on the next success", async () => {
+      mockUpdateSetting.mockRejectedValueOnce("API error: 500");
+      mockUpdateSyncedSettings.mockRejectedValueOnce("API error: 500");
+
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("failed");
+
+      mockUpdateSetting.mockResolvedValueOnce({
+        ...DEFAULT_SETTINGS,
+        git: { default_base_branch: "dev" },
+      });
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
     });
   });
 
@@ -164,6 +433,68 @@ describe("synced-settings-store", () => {
       const state = useSyncedSettingsStore.getState();
       expect(state.settings).toEqual(DEFAULT_SETTINGS);
       expect(state.isSyncing).toBe(false);
+    });
+
+    it("keeps current settings until reset persistence is confirmed", async () => {
+      useSyncedSettingsStore.setState({ settings: DARK_SETTINGS });
+      let resolveReset!: (settings: UserSettings) => void;
+      mockResetSyncedSettings.mockReturnValue(new Promise<UserSettings>((resolve) => {
+        resolveReset = resolve;
+      }));
+      const reset = useSyncedSettingsStore.getState().resetSettings();
+      expect(useSyncedSettingsStore.getState().settings).toBe(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(true);
+
+      resolveReset(DEFAULT_SETTINGS);
+      await reset;
+      expect(useSyncedSettingsStore.getState().settings).toEqual(DEFAULT_SETTINGS);
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(false);
+    });
+
+    it("rejects a failed backend reset without changing settings", async () => {
+      useSyncedSettingsStore.setState({ settings: DARK_SETTINGS });
+      const error = new Error("Network error");
+      mockResetSyncedSettings.mockRejectedValue(error);
+
+      await expect(useSyncedSettingsStore.getState().resetSettings()).rejects.toBe(error);
+      expect(useSyncedSettingsStore.getState().settings).toBe(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(false);
+    });
+
+    it("preserves queued field values and their status after a rejected reset", async () => {
+      const intended = { ...DEFAULT_SETTINGS, git: { default_base_branch: "dev" } };
+      mockUpdateSetting.mockResolvedValueOnce({ settings: intended, synced: false });
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      mockResetSyncedSettings.mockRejectedValueOnce(new Error("reset failed"));
+
+      await expect(useSyncedSettingsStore.getState().resetSettings()).rejects.toThrow("reset failed");
+      useSyncedSettingsStore.getState().applySettingsFromEvent(DEFAULT_SETTINGS, true);
+      expect(useSyncedSettingsStore.getState().settings.git.default_base_branch).toBe("dev");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("saved-locally");
+    });
+
+    it("reports a persisted offline reset until its defaults are confirmed synced", async () => {
+      mockResetSyncedSettings.mockResolvedValueOnce({ settings: DEFAULT_SETTINGS, synced: false });
+      await useSyncedSettingsStore.getState().resetSettings();
+      expect(useSyncedSettingsStore.getState().settings).toEqual(DEFAULT_SETTINGS);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("saved-locally");
+      useSyncedSettingsStore.getState().applySettingsFromEvent(DEFAULT_SETTINGS, true);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
+
+    it("does not let a completed reset replace a newer local edit", async () => {
+      let resolveReset!: (settings: UserSettings) => void;
+      mockResetSyncedSettings.mockReturnValue(new Promise<UserSettings>((resolve) => {
+        resolveReset = resolve;
+      }));
+      const reset = useSyncedSettingsStore.getState().resetSettings();
+      mockUpdateSyncedSettings.mockResolvedValue(DARK_SETTINGS);
+      await useSyncedSettingsStore.getState().updateSettings(DARK_SETTINGS);
+
+      resolveReset(DEFAULT_SETTINGS);
+      await reset;
+      expect(useSyncedSettingsStore.getState().settings).toEqual(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(false);
     });
   });
 

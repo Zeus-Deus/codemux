@@ -134,6 +134,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: true,
             supports_thinking_toggle: false,
             supports_fast_mode: false,
+            service_tiers: vec![],
             supports_images: true,
             sub_provider: None,
             is_free: false,
@@ -161,6 +162,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: true,
             supports_thinking_toggle: false,
             supports_fast_mode: false,
+            service_tiers: vec![],
             supports_images: true,
             sub_provider: None,
             is_free: false,
@@ -185,6 +187,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: true,
             supports_thinking_toggle: false,
             supports_fast_mode: false,
+            service_tiers: vec![],
             supports_images: true,
             sub_provider: None,
             is_free: false,
@@ -210,6 +213,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: true,
             supports_thinking_toggle: false,
             supports_fast_mode: false,
+            service_tiers: vec![],
             supports_images: true,
             sub_provider: None,
             is_free: false,
@@ -233,6 +237,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: false,
             supports_thinking_toggle: false,
             supports_fast_mode: false,
+            service_tiers: vec![],
             supports_images: true,
             sub_provider: None,
             is_free: false,
@@ -251,6 +256,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: false,
             supports_thinking_toggle: false,
             supports_fast_mode: false,
+            service_tiers: vec![],
             supports_images: true,
             sub_provider: None,
             is_free: false,
@@ -270,6 +276,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: false,
             supports_thinking_toggle: true,
             supports_fast_mode: false,
+            service_tiers: vec![],
             supports_images: true,
             sub_provider: None,
             is_free: false,
@@ -635,6 +642,7 @@ fn infer_model_info(id: &str, display_name: &str) -> ChatModelInfo {
         supports_adaptive_thinking: family.is_flagship(),
         supports_thinking_toggle: matches!(family, ClaudeFamily::Haiku),
         supports_fast_mode: false,
+        service_tiers: vec![],
         supports_images: true,
         sub_provider: None,
         is_free: false,
@@ -995,6 +1003,26 @@ fn concrete_name_from_description(description: &str) -> Option<String> {
     (family_ok && version_ok).then(|| format!("Claude {family} {version}"))
 }
 
+/// Split a `"(currently <Family> <Version>)"` clause out of a
+/// description — the shape the CLI uses for its `default` row:
+/// `"Use the default model (currently Opus 5.5)"`. Returns the
+/// description with the clause removed and the concrete name the clause
+/// carries (`"Claude Opus 5.5"`), or `None` when there is no such clause
+/// or it doesn't name a versioned model.
+fn split_currently_clause(description: &str) -> Option<(String, String)> {
+    const OPEN: &str = "(currently ";
+    let start = description.find(OPEN)?;
+    let rest = &description[start + OPEN.len()..];
+    let end = rest.find(')')?;
+    let concrete = concrete_name_from_description(rest[..end].trim())?;
+    let remainder = format!(
+        "{} {}",
+        description[..start].trim_end(),
+        rest[end + 1..].trim_start()
+    );
+    Some((remainder.trim().to_string(), concrete))
+}
+
 /// Promote an alias row's picker presentation from the CLI's bare
 /// nickname to the concrete model name it resolves to. The CLI reports
 /// alias rows as `"Default (recommended)"` / `"Opus (1M context)"` /
@@ -1006,7 +1034,8 @@ fn concrete_name_from_description(description: &str) -> Option<String> {
 ///   fable   → `"Claude Fable 5"` + `"<blurb>"`
 ///
 /// The concrete name comes from the row's version-bearing description
-/// (see [`concrete_name_from_description`]), then from a versioned
+/// (see [`concrete_name_from_description`]), then from a
+/// `"(currently Opus 5.5)"` clause in it, then from a versioned
 /// display name (`"Opus 5.5"`), and only then from the canonical
 /// maintained entry's label. Non-alias rows and alias rows
 /// with no resolvable concrete name pass through untouched. The version
@@ -1034,6 +1063,11 @@ fn promote_alias_row(
         .as_deref()
         .and_then(concrete_name_from_description);
     let desc_carries_name = from_desc.is_some();
+    // Only consulted when the leading segment isn't already a name, so
+    // a description never contributes two different concrete names.
+    let currently = (!desc_carries_name)
+        .then(|| description.as_deref().and_then(split_currently_clause))
+        .flatten();
     // Newer CLIs put the resolved version in the alias row's display
     // name instead (`opus` → "Opus 5.5", description "Most capable for
     // ambitious work"). That live answer must beat the maintained
@@ -1043,7 +1077,8 @@ fn promote_alias_row(
         .then(|| base_model_name(&label))
         .map(|name| name.strip_prefix("Claude ").unwrap_or(name))
         .and_then(concrete_name_from_description);
-    let Some(concrete) = from_desc.or(from_label).or_else(|| {
+    let from_currently = currently.as_ref().map(|(_, name)| name.clone());
+    let Some(concrete) = from_desc.or(from_currently).or(from_label).or_else(|| {
         alias_canonical
             .and_then(|cid| maintained.get(cid))
             .or_else(|| maintained.get(base_id))
@@ -1063,7 +1098,9 @@ fn promote_alias_row(
     let blurb = description
         .as_deref()
         .map(|d| {
-            if desc_carries_name {
+            if let Some((remainder, _)) = &currently {
+                remainder.clone()
+            } else if desc_carries_name {
                 d.split_once(" · ")
                     .map(|(_, rest)| rest.to_string())
                     .unwrap_or_default()
@@ -1203,6 +1240,7 @@ fn merge_sdk_with_maintained(
         // first (pick-time `accountInfo` entitlement gate + post-turn
         // `usage.speed` heal).
         supports_fast_mode: false,
+        service_tiers: vec![],
         supports_images: true,
         sub_provider: None,
         is_free: false,
@@ -2227,6 +2265,61 @@ mod tests {
         );
         assert_eq!(label("sonnet"), "Claude Sonnet 5");
         assert_eq!(label("claude-opus-4-8"), "Opus 4.8");
+    }
+
+    #[test]
+    fn default_row_resolves_its_currently_clause() {
+        // The CLI describes its `default` row as "Use the default model
+        // (currently Opus 5.5)". That clause is the live answer; the
+        // maintained canonical table (Opus 4.8) must not win over it, or
+        // the label contradicts its own tooltip.
+        let live: ListModelsResponse = serde_json::from_value(json!({ "models": [
+            { "value": "default", "displayName": "Default (recommended)",
+              "description": "Use the default model (currently Opus 5.5)" },
+            { "value": "opus", "displayName": "Opus 5.5",
+              "description": "Most capable for ambitious work" },
+            { "value": "haiku", "displayName": "Haiku 4.5",
+              "description": "Fastest for quick answers" },
+        ]}))
+        .unwrap();
+        let caps = build_capabilities_from_sdk(live.models);
+        // Resolves to the same model as `opus`, so it folds into that twin.
+        assert!(caps.models.iter().all(|m| m.id != "default"));
+        assert_eq!(caps.models[0].id, "opus");
+        assert_eq!(caps.models[0].label, "Claude Opus 5.5");
+        assert_eq!(
+            caps.models[0].description.as_deref(),
+            Some("Recommended · Most capable for ambitious work"),
+        );
+        assert!(caps.models.iter().all(|m| !m.label.contains("4.8")));
+    }
+
+    #[test]
+    fn default_row_without_twin_keeps_currently_name_and_drops_clause() {
+        let mut default_row =
+            sdk_model("default", "Default (recommended)", &["high"], Some(true), None);
+        default_row.description = "Use the default model (currently Opus 5.5)".into();
+        let caps = build_capabilities_from_sdk(vec![default_row]);
+        let m = caps.models.iter().find(|m| m.id == "default").unwrap();
+        assert_eq!(m.label, "Claude Opus 5.5");
+        assert_eq!(
+            m.description.as_deref(),
+            Some("Recommended · Use the default model"),
+        );
+    }
+
+    #[test]
+    fn split_currently_clause_requires_a_versioned_name() {
+        assert_eq!(
+            split_currently_clause("Use the default model (currently Opus 5.5)"),
+            Some(("Use the default model".into(), "Claude Opus 5.5".into())),
+        );
+        assert_eq!(
+            split_currently_clause("Pick (currently Sonnet 5) for speed"),
+            Some(("Pick for speed".into(), "Claude Sonnet 5".into())),
+        );
+        assert_eq!(split_currently_clause("Use the default model"), None);
+        assert_eq!(split_currently_clause("(currently whatever you set)"), None);
     }
 
     #[test]

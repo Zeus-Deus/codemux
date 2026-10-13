@@ -162,6 +162,44 @@ fn remote_spawn_cwd_from_fields(
         .to_string()
 }
 
+/// [`hydration_remote_spawn_cwd`] as an absolute path on the device. The
+/// remote daemon expands `~` in a spawn's cwd but sets env values verbatim,
+/// so env built from a `~` path would name a directory no shell can `cd`
+/// into. `~` resolves against the device's `$HOME` (cached per SSH target),
+/// never this computer's. If that lookup fails the terminal still starts,
+/// in the `~` path, rather than not opening at all.
+async fn resolve_device_spawn_dir<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace: &PtyHydrationWorkspace,
+) -> String {
+    let dir = hydration_remote_spawn_cwd(workspace);
+    if dir != "~" && !dir.starts_with("~/") {
+        return dir;
+    }
+    let ssh_target = workspace.host_id.and_then(|host_id| {
+        app.try_state::<crate::database::DatabaseStore>()?
+            .list_hosts()
+            .into_iter()
+            .find(|host| host.id == host_id)
+            .map(|host| host.ssh_target)
+    });
+    let home = match ssh_target {
+        Some(ssh_target) => crate::ssh::exec::remote_home(&ssh_target).await,
+        None => Err("its device is no longer configured".to_string()),
+    };
+    match home {
+        Ok(home) => crate::ssh::exec::expand_remote_tilde(&dir, &home),
+        Err(error) => {
+            eprintln!(
+                "[codemux::terminal::daemon_backed] couldn't resolve the device home for \
+                 workspace {}; terminal env keeps {dir}: {error}",
+                workspace.workspace_id
+            );
+            dir
+        }
+    }
+}
+
 const HYDRATION_CONCURRENCY: usize = 4;
 
 /// Whether a local in-process shell can safely replace a failed daemon RPC.
@@ -332,19 +370,29 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
         }
     }
 
-    let client =
-        match crate::ssh::client_for_workspace(&app, &workspace.workspace_id, workspace.host_id)
-            .await
-        {
-            Ok(client) => client,
-            Err(error) => {
-                crate::diagnostics::record_perf_timing(
-                    "pty.workspace-hydration",
-                    hydration_started.elapsed(),
-                );
-                return Err(classify_client_acquisition_failure(error));
-            }
-        };
+    // A device workspace's terminals start in an absolute directory there.
+    // Resolving it can cost an SSH round trip, so it overlaps the tunnel
+    // setup and is dropped if the client can't be acquired.
+    let device_dir = async {
+        Ok::<_, PtyDaemonError>(if is_remote {
+            Some(resolve_device_spawn_dir(&app, &workspace).await)
+        } else {
+            None
+        })
+    };
+    let (client, device_dir) = match tokio::try_join!(
+        crate::ssh::client_for_workspace(&app, &workspace.workspace_id, workspace.host_id),
+        device_dir,
+    ) {
+        Ok(acquired) => acquired,
+        Err(error) => {
+            crate::diagnostics::record_perf_timing(
+                "pty.workspace-hydration",
+                hydration_started.elapsed(),
+            );
+            return Err(classify_client_acquisition_failure(error));
+        }
+    };
 
     let list_started = std::time::Instant::now();
     let listed = list_daemon_session_map(&client).await;
@@ -366,8 +414,10 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
     // every pane in the workspace.
     let prep_workspace = workspace.clone();
     let prep_sessions = pending.clone();
+    let prep_device_dir = device_dir.clone();
     let prepared = tokio::task::spawn_blocking(move || {
-        let mut workspace_env = hydration_workspace_pty_env(&prep_workspace);
+        let mut workspace_env =
+            hydration_workspace_pty_env(&prep_workspace, prep_device_dir.as_deref());
         if !is_remote {
             if let Some((shim_dir, current_exe)) = super::ensure_cli_shims() {
                 let current_path = crate::execution::sanitized_child_path();
@@ -424,6 +474,7 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
         let workspace = workspace.clone();
         let client = client.clone();
         let workspace_env = workspace_env.clone();
+        let device_dir = device_dir.clone();
         let shell = shell.clone();
         work.push(async move {
             let result = spawn_prepared_session(
@@ -434,6 +485,7 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
                 prior,
                 meta,
                 workspace_env,
+                device_dir,
                 shell,
                 session_restore_enabled,
             )
@@ -459,6 +511,8 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
 /// so user-typed commands inside the shell get the same Codemux context
 /// AND reopening a previously-killed agent triggers the same
 /// `claude --continue` / adapter-driven resume the in-process path does.
+/// `device_dir` is where a device workspace's terminals start there, the
+/// directory `workspace_env` names; `None` for a local workspace.
 async fn spawn_prepared_session<R: Runtime>(
     app: AppHandle<R>,
     workspace: Arc<PtyHydrationWorkspace>,
@@ -467,6 +521,7 @@ async fn spawn_prepared_session<R: Runtime>(
     existing: Option<DaemonSessionInfo>,
     disk_meta: Option<(String, String, crate::scrollback::ScrollbackMeta)>,
     workspace_env: Arc<Vec<(String, String)>>,
+    device_dir: Option<String>,
     shell: String,
     session_restore_enabled: bool,
 ) -> Result<(), DaemonHydrationFailure> {
@@ -496,13 +551,13 @@ async fn spawn_prepared_session<R: Runtime>(
     // tools like `claude --resume` find their state, and (b) capture an
     // `auto_resume_command` that we'll write into the shell after spawn.
     // Mirrors `spawn_pty_for_session_in_process` lines around 1166-1200.
-    // Remote workspaces spawn into the conventional remote path
-    // (`~/.codemux/worktrees/<project>/<branch>`) rather than the
-    // local cwd — the workspace's `cwd` field is a local-filesystem
-    // path that doesn't exist on the remote host. Local workspaces
-    // keep using the local cwd as before.
-    let mut effective_cwd = if is_remote {
-        let computed = hydration_remote_spawn_cwd(&workspace);
+    // Remote workspaces spawn into their directory on the host
+    // (`device_dir`: `remote_cwd` or the conventional
+    // `~/.codemux/worktrees/<project>/<branch>`, made absolute) rather
+    // than the local cwd — the workspace's `cwd` field is a
+    // local-filesystem path that doesn't exist on the remote host. Local
+    // workspaces keep using the local cwd as before.
+    let mut effective_cwd = if let Some(computed) = device_dir {
         crate::trace_cloud_push!(
             "[codemux::terminal::daemon_backed] remote cwd for {session_id}: \
              {computed} (attach_only={}, remote_cwd={:?}, \
@@ -1364,5 +1419,42 @@ mod tests {
         assert!(cwd.contains("worktrees"), "got {cwd}");
         assert!(cwd.contains("workspace"), "default project name; got {cwd}");
         assert!(cwd.ends_with("main"), "default branch; got {cwd}");
+    }
+
+    #[test]
+    fn pushed_terminal_env_names_absolute_device_paths() {
+        // A push only stamps `host_id`, so its terminals start in the
+        // conventional `~` path. The daemon expands `~` in the cwd but sets
+        // env verbatim, so the env must be built from the path resolved
+        // with the device's home.
+        let local_worktree = "/home/zeus/.codemux/worktrees/app/feat-x";
+        let ws = crate::state::PtyHydrationWorkspace {
+            workspace_id: "ws-pushed".into(),
+            title: "feat-x".into(),
+            cwd: local_worktree.into(),
+            git_branch: Some("feat-x".into()),
+            worktree_path: Some(local_worktree.into()),
+            project_root: Some("/home/zeus/projects/app".into()),
+            project_uid: None,
+            host_id: Some(4),
+            remote_cwd: None,
+            remote_root: None,
+            attach_only: false,
+        };
+        let unresolved = super::hydration_remote_spawn_cwd(&ws);
+        assert_eq!(unresolved, "~/.codemux/worktrees/app/feat-x");
+        let device_dir = crate::ssh::exec::expand_remote_tilde(&unresolved, "/home/deus");
+
+        let env: std::collections::HashMap<_, _> =
+            super::hydration_workspace_pty_env(&ws, Some(&device_dir))
+                .into_iter()
+                .collect();
+        let expected = "/home/deus/.codemux/worktrees/app/feat-x";
+        assert_eq!(env["CODEMUX_WORKSPACE_PATH"], expected);
+        assert_eq!(env["CODEMUX_ROOT_PATH"], expected);
+        for (key, value) in &env {
+            assert!(!value.contains("~/"), "{key}={value}");
+            assert!(!value.contains("/home/zeus"), "{key}={value}");
+        }
     }
 }

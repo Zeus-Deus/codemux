@@ -27,7 +27,7 @@ fn claude_task(dir: &tempfile::TempDir) -> (Arc<TaskStore>, String, String) {
     (store, request.id, thread)
 }
 #[tokio::test]
-async fn r1_native_claude_before_ack_approval_keeps_original_empty_id() {
+async fn r1_native_claude_before_ack_approval_keeps_runtime_identity_and_original_payload() {
     let dir = tempfile::TempDir::new().unwrap();
     let (store, id, thread) = claude_task(&dir);
     let provider = claude_fixture(&dir, json!([
@@ -59,7 +59,9 @@ async fn r1_native_claude_before_ack_approval_keeps_original_empty_id() {
     assert_eq!(read.task.status,TaskStatus::Completed);
     assert_eq!(read.task.result.as_deref(),Some("approved final"));
     let approval=read.events.iter().find(|e|e.event["type"]=="request_opened").unwrap();
-    assert_eq!(approval.event["turn_id"],"","journal must not fabricate native event IDs");
+    assert_eq!(approval.event["turn_id"].as_str(), read.task.turn_id.as_deref(), "journal must retain the adapter's accepted turn identity");
+    assert_eq!(approval.event["payload"], json!({"command":"fixture"}));
+    assert_eq!(pending[0].payload, approval.event["payload"], "approval admission must retain the original payload");
 }
 #[tokio::test]
 async fn r1_native_claude_before_ack_result_and_completion_bind_fresh_run() {
@@ -74,7 +76,9 @@ async fn r1_native_claude_before_ack_result_and_completion_bind_fresh_run() {
     let read=store.read(&id,0).unwrap();
     assert_eq!(read.task.result.as_deref(),Some("early final"));
     assert_eq!(read.task.status,TaskStatus::Completed);
-    for event in read.events.iter().filter(|e|matches!(e.event["type"].as_str(),Some("item_completed"|"turn_completed"))) {assert_eq!(event.event["turn_id"],"");}
+    for event in read.events.iter().filter(|e|matches!(e.event["type"].as_str(),Some("item_completed"|"turn_completed"))) {
+        assert_eq!(event.event["turn_id"].as_str(), read.task.turn_id.as_deref(), "early output must belong to the accepted adapter turn");
+    }
 }
 #[tokio::test]
 async fn r3_native_claude_async_session_error_after_ack_is_interrupted_without_replay() {

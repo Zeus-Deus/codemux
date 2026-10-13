@@ -6,7 +6,7 @@ import type { ApprovalDecision } from '@/tauri/events';
 import { beginDelegationResponse, delegationResponseReadBoundary, qualifiesDelegationResponseRead, type ResponseReadBoundary, isDelegationPaneOwner, retainedDelegationResponse, retainDelegationResponse, upsertDelegationTask } from '@/stores/delegation-store';
 import { deliveryExplanation, isRemoteTaskActive, RemoteTaskStatus } from './RemoteTaskCard';
 import { extractQuestions } from './ComposerPendingInputPanel';
-import { QuestionForm } from './QuestionForm';
+import { QuestionForm, questionAnswerText } from './QuestionForm';
 
 function RemoteQuestion({request,disabled,retained,isCurrent,onSubmit}:{request:RemoteApproval;disabled:boolean;retained:boolean;isCurrent:()=>boolean;onSubmit:(decision:ApprovalDecision)=>Promise<void>}) {
   const questions=extractQuestions(request.payload);
@@ -19,9 +19,10 @@ function RemoteQuestion({request,disabled,retained,isCurrent,onSubmit}:{request:
     <legend className="text-body-sm font-medium">Answer remote questions</legend>
     <QuestionForm questions={questions} idPrefix={`remote-${request.request_id}`} globalShortcuts={false} onSubmit={async answers=>{
       if(!isCurrent()) throw new Error('Displayed approval owner is no longer current.');
-      if(disabled || submitted || retained || answers.length!==questions.length || answers.some(answer=>!answer.trim())) return;
+      const textAnswers=answers.map(questionAnswerText);
+      if(disabled || submitted || retained || textAnswers.length!==questions.length || textAnswers.some(answer=>!answer.trim())) return;
       setSubmitted(true);
-      await onSubmit({decision:'allow',updated_input:{...payload,answers:Object.fromEntries(questions.map((q,index)=>[q.question,answers[index]]))}});
+      await onSubmit({decision:'allow',updated_input:{...payload,answers:Object.fromEntries(questions.map((q,index)=>[q.question,textAnswers[index]]))}});
     }} />
     {submitted && <p role="status">Answer submitted; refresh the saved task to confirm. Answers cannot be changed or blindly resent.</p>}
   </fieldset>;

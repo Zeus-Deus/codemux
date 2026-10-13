@@ -29,6 +29,8 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 pub struct ProbeInstalledResult {
     pub installed: bool,
     pub version: Option<String>,
+    /// The CLI exists but did not answer `--version` cleanly.
+    pub unresponsive: bool,
 }
 
 /// Coarse authentication status.
@@ -69,6 +71,7 @@ pub async fn probe_installed(
     Ok(ProbeInstalledResult {
         installed: parsed.installed,
         version: parsed.version,
+        unresponsive: parsed.unresponsive,
     })
 }
 
@@ -125,7 +128,11 @@ async fn run_probe(
         program: sidecar_binary.to_path_buf(),
         args: vec![],
         env: HashMap::new(),
-        cwd: None,
+        // The probe's answer must not depend on where the app was started:
+        // an unreadable inherited cwd (e.g. launched from /root) makes the
+        // sidecar's `claude` child fail before it runs, which reads as an
+        // unresponsive CLI.
+        cwd: dirs::home_dir(),
         default_timeout: Duration::from_secs(5),
     })
     .await

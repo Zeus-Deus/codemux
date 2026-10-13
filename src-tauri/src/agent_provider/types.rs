@@ -30,6 +30,8 @@ pub enum ProviderKind {
     Grok,
     /// Official Hermes ACP, bound to an existing local profile.
     Hermes,
+    /// User-configured instances speaking the standard Agent Client Protocol.
+    Acp,
     /// OpenCode via the `opencode` HTTP server. Step 12 Stage 1 scaffold —
     /// the runtime adapter is not implemented yet and command dispatch
     /// returns a placeholder error.
@@ -83,9 +85,19 @@ pub struct ProviderCapabilities {
 /// prompts capture the state at dispatch, not when they were typed.
 #[async_trait]
 pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
+    /// Fallible runtime-only authority at actual dispatch, including drains.
+    /// Plain Git snapshots have no caller; the native owner wraps controlled
+    /// inputs with a live authority check regardless of checkpoint settings.
+    fn authorize_dispatch(&self) -> Result<(), super::ProviderError> { Ok(()) }
     async fn prepare(&self);
     async fn commit(&self);
     async fn abort(&self);
+}
+
+#[async_trait]
+pub trait SessionStartCancellation: Send + Sync {
+    fn check(&self) -> Result<(), String>;
+    async fn cancelled(&self);
 }
 
 /// Opaque identifier a provider hands back for its own internal session.
@@ -159,11 +171,12 @@ pub struct StartSessionInput {
     /// id before the SDK call.
     #[serde(default)]
     pub context_window: Option<String>,
-    /// Whether to request the provider's premium fast inference tier.
-    /// Capability gating happens in the UI; providers that do not expose
-    /// fast mode ignore this field.
+    /// Legacy Fast flag retained for older clients. New clients use service_tier.
     #[serde(default)]
     pub fast_mode: bool,
+    /// Provider-native service tier. Takes precedence over legacy Fast mode.
+    #[serde(default)]
+    pub service_tier: Option<String>,
     /// Optional list of extra directories the agent should be allowed to
     /// access beyond `cwd`.
     pub additional_directories: Vec<PathBuf>,
@@ -181,6 +194,13 @@ pub struct StartSessionInput {
     /// provider sessions with no owning workspace.
     #[serde(skip_deserializing)]
     pub workspace_id: Option<String>,
+    /// Device the provider process runs on, for workspaces that live on a
+    /// remote host. Filled by the command layer from the workspace's
+    /// `host_id` and never taken from the IPC caller. `None` runs the
+    /// provider locally; `Some` spawns it over `ssh -T` with `cwd` as a path
+    /// on that host (see `ssh::exec::stdio_spawn_config`).
+    #[serde(skip_deserializing, default)]
+    pub remote: Option<RemoteSpawnTarget>,
     /// Free-form provider-specific extras. Adapters parse what they
     /// understand and ignore the rest. First-class fields above win over
     /// keys here when both are present.
@@ -195,6 +215,31 @@ pub struct StartSessionInput {
     /// per-message counters ignore it.
     #[serde(default)]
     pub recorded_usage_baseline: Option<UsageBaseline>,
+}
+
+impl StartSessionInput {
+    /// Resolve the legacy flag for providers whose native protocol is boolean.
+    pub fn boolean_fast_mode(&self) -> Result<bool, super::errors::ProviderError> {
+        match self.service_tier.as_deref() {
+            None => Ok(self.fast_mode),
+            Some("default") => Ok(false),
+            Some("fast") => Ok(true),
+            Some(_) => Err(super::errors::ProviderError::ValidationError {
+                message: "provider does not support this service tier".into(),
+            }),
+        }
+    }
+}
+
+/// A configured device a provider session runs on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteSpawnTarget {
+    /// Local `hosts.id` of the device.
+    pub host_id: i64,
+    /// What `ssh` connects to: `user@host` or a `~/.ssh/config` alias.
+    pub ssh_target: String,
+    /// Display name, for error messages.
+    pub host_name: String,
 }
 
 /// Token totals already recorded in the usage ledger for one thread.
@@ -330,6 +375,14 @@ pub struct PermissionModeOption {
     pub is_default: bool,
 }
 
+/// A provider-native tier advertised for a model and the current account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceTierOption {
+    pub value: String,
+    pub label: String,
+    pub description: String,
+}
+
 /// Chat-side model metadata — what the composer pickers need to know.
 ///
 /// Separate from the per-provider runtime capabilities (`capabilities()` on
@@ -374,6 +427,9 @@ pub struct ChatModelInfo {
     /// True when the model supports the fast-mode flag.
     #[serde(default)]
     pub supports_fast_mode: bool,
+    /// Live provider catalog; empty on adapters with a boolean Fast option.
+    #[serde(default)]
+    pub service_tiers: Vec<ServiceTierOption>,
     /// True when the model accepts image attachments (multimodal
     /// input). Drives the `+ → Image…` enable state and whether the
     /// composer's paste/drop handlers stage attachments at all.

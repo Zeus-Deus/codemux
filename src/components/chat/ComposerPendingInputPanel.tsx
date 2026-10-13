@@ -1,39 +1,63 @@
 import { useMemo } from "react";
 import type { PermissionRequestItem } from "@/lib/agent-chat/types";
-import { QuestionForm, type Question } from "./QuestionForm";
+import { useEaseInOnce } from "@/hooks/use-ease-in-once";
+import { QuestionForm, type Question, type QuestionAnswer } from "./QuestionForm";
 
 export interface AskUserQuestionOutput {
   questions: unknown;
-  answers: Record<string, string>;
+  answers: Record<string, QuestionAnswer>;
 }
 
-/** Legacy callback wrapper: preserve each provider's existing answer shape. */
+/** What the agent is told when the user skips its question. */
+export const USER_INPUT_SKIPPED_MESSAGE =
+  "The user skipped this question and will answer in the chat instead. Stop and wait for their message.";
+
+/** Preserve structured selections until the provider's reply boundary. */
 export function ComposerPendingInputPanel({
   item,
   onSubmit,
+  onSkip,
 }: {
   item: PermissionRequestItem;
   onSubmit: (output: AskUserQuestionOutput) => void | Promise<void>;
+  onSkip?: () => void;
 }) {
   const questions = useMemo(
     () => extractQuestions(item.payload),
     [item.payload],
   );
+  // The panel remounts on tab and session switches; a request seen before
+  // renders in place instead of easing in again.
+  const ease = useEaseInOnce(item.id);
+  // A resolved request renders nothing; the transcript marker owns it.
+  if (item.resolution.state !== "pending") return null;
+  // Eases up into place so the composer moving to make room reads as the
+  // agent asking something, not a layout jump.
   return (
-    <QuestionForm
-      questions={questions}
-      active={item.resolution.state === "pending"}
-      onSubmit={(answers) =>
-        onSubmit({
-          questions: isRecord(item.payload)
-            ? (item.payload.questions ?? [])
-            : [],
-          answers: Object.fromEntries(
-            questions.map((q, i) => [q.question, answers[i]]),
-          ),
-        })
+    <div
+      data-testid="pending-input-panel"
+      className={
+        ease
+          ? "animate-in fade-in-0 slide-in-from-bottom-2 duration-150 ease-out"
+          : undefined
       }
-    />
+    >
+      <QuestionForm
+        questions={questions}
+        active={item.resolution.state === "pending"}
+        onSkip={onSkip}
+        onSubmit={(answers) =>
+          onSubmit({
+            questions: isRecord(item.payload)
+              ? (item.payload.questions ?? [])
+              : [],
+            answers: Object.fromEntries(
+              questions.map((q, i) => [q.question, answers[i]]),
+            ),
+          })
+        }
+      />
+    </div>
   );
 }
 

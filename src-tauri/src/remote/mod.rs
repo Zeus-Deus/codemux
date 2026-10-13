@@ -33,6 +33,7 @@
 #![cfg(unix)]
 
 pub mod auth;
+pub mod checkout;
 pub mod config;
 pub mod git;
 pub mod host_status;

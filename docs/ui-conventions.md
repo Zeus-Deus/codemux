@@ -23,6 +23,7 @@ setting (and its `Ctrl+=` / `Ctrl+-` shortcuts) scales the whole app.
 | `text-body-sm`  | 0.8125rem | 13px — dense rows, menus             |
 | `text-body`     | 0.875rem  | 14px — primary UI text               |
 | `text-body-lg`  | 0.9375rem | 15px — emphasized UI text            |
+| `text-title`    | 1.3125rem | 21px — page titles (`SectionHeader`) |
 
 10px is the floor. Anything smaller is unreadable on a 1× desktop display.
 
@@ -121,6 +122,29 @@ Three durations, always explicit:
 An implicit duration silently inherits 150ms, which is how eleven distinct
 durations ended up in one window. Name the properties that transition rather
 than using `transition-all`, and gate anything that loops on `motion-safe:`.
+
+Dialogs enter at `duration-250` and leave at `data-closed:duration-150`, so
+dismissing one never lags the keypress. Centered dialogs zoom; dialogs
+anchored near the top (the command palette, the search overlays) drop in from
+above with `DIALOG_TOP_ANCHORED_MOTION`. An overlay rendered behind a store
+flag stays mounted after its first open (`useMountedOnceOpen`); unmounting it
+on close cuts its exit animation off.
+
+Reduced motion is global. One block in `src/globals.css` collapses every
+animation and transition to its end state when the OS asks for it, or when
+Settings → Appearance → Reduce motion puts the `reduce-motion` class on
+`<html>`. `motion-safe:` only sees the OS preference, so new motion does not
+need extra gating to honour the in-app setting, but a JS-driven animation
+does: read `useReducedMotionConfig()` from `motion/react`, or check the class.
+
+Loading spinners use `Spinner` from `src/components/ui/spinner.tsx`, sized
+with the icon ladder through `className`. It carries `role="status"` and a
+`label`, and under reduced motion it fades slowly instead of freezing. A
+refresh icon that spins in place keeps its icon and puts `aria-busy` on its
+button.
+
+The ping halo means "needs you" and nothing else: `StatusIndicator` uses it
+only for `permission`. Working state breathes (`cm-breathe`).
 
 ## Focus
 

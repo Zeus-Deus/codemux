@@ -1,3 +1,5 @@
+import { SERVICE_TIER_FALLBACK_PREFIX } from "@/lib/agent-chat/runtime-notice";
+import { resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { parseMessageDelivery, STEERING_UNAVAILABLE } from "@/lib/agent-chat/message-delivery";
 import { AsyncQuestionPanel } from "./AsyncQuestionPanel";
@@ -48,6 +50,7 @@ import {
   resolveSkillSelection,
   skillsForProvider,
 } from "@/lib/agent-chat/skill-tokens";
+import { useCustomAcp, selectedAcpCatalog } from "@/stores/custom-acp-store";
 import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
 import type {
   ChatViewItem,
@@ -103,9 +106,10 @@ import {
   agentChatListMessagesAfter,
   agentChatListSessions,
   agentChatRevertTurnCheckpoint,
+  agentChatUndoTurnRevert,
   agentChatRespondToRequest,
   agentChatSendTurn,
-  agentChatSetFastMode,
+  agentChatSetServiceTier,
   agentChatSetModel,
   agentChatSetPermissionMode,
   agentChatStartSession,
@@ -149,6 +153,7 @@ import type { RemoteTaskScope } from "./remote-task-context";
 import { useDelegationTasks } from "@/stores/delegation-store";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { ChatHomeLanding } from "./ChatHomeLanding";
+import { TranscriptSkeleton } from "./TranscriptSkeleton";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
 import { ProviderUpdateNotice } from "./ProviderUpdateNotice";
 import {
@@ -161,13 +166,16 @@ import { Composer } from "./Composer";
 import { Button } from "@/components/ui/button";
 import { ComposerStrip, type StripGoal } from "./ComposerStrip";
 import {
+  approvalOccupant,
   queuedMessages,
   queuedOccupant,
   sessionErrorOccupant,
+  useDelegationOccupant,
   useMonitoringOccupant,
   useSubagentOccupant,
   useUsageLimitOccupant,
 } from "./use-composer-strip-occupants";
+import { openDelegatedChat, stopDelegatedTask } from "./delegation-actions";
 import { SubagentBreadcrumb } from "./SubagentBreadcrumb";
 import { SubagentView } from "./SubagentView";
 import { DebugCleanupBanner } from "./DebugCleanupBanner";
@@ -175,13 +183,21 @@ import { DebugExitDialog, type DebugExitChoice } from "./DebugExitDialog";
 import {
   type AskUserQuestionOutput,
   ComposerPendingInputPanel,
+  USER_INPUT_SKIPPED_MESSAGE,
 } from "./ComposerPendingInputPanel";
+import { questionAnswerText } from "./QuestionForm";
 import type { SendAnchorRequest } from "./send-scroll-state";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { SCOPE_STRIP, SCOPE_STRIP_INSET } from "./pickers/ThreadScopeRow";
 import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
+import { MobileComposerChips } from "@/components/mobile/mobile-composer-chips";
 import { RevertTurnDialog } from "./revert-turn-dialog";
+import {
+  captureRevertedPrompt,
+  findRevertedUserMessage,
+  mergeRevertedDraft,
+} from "./reverted-prompt";
 import { randomUUID } from "@/lib/uuid";
 
 // Kept for parity with Step 1's export shape. The pane tree renderer
@@ -207,6 +223,7 @@ const CONTEXT_USAGE_PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
   cursor: "Cursor",
   grok: "Grok",
   hermes: "Hermes",
+  acp: "Custom agent",
   opencode: "OpenCode",
 };
 
@@ -256,6 +273,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     (state) => state.observe,
   );
   const [threadId, setThreadId] = useState<string | null>(pane.thread_id);
+  // Stable draft identity lets an unbound custom pane select a harness before
+  // launching anything. Native providers retain their existing startup path.
+  const [pendingAcpThreadId] = useState(() => initialProvider === "acp" ? `chat-${pane.pane_id}-acp-${randomUUID()}` : "");
+  const pendingAcpAgentId = useCustomAcp(s => s.selections[pendingAcpThreadId]);
+  const [pendingAcpModel, setPendingAcpModel] = useState<string | null>(null);
   const [sessionMetadata, setSessionMetadata] = useState<{
     threadId: string;
     imported: boolean;
@@ -505,7 +527,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         permissionMode: match.permissionMode,
         effort: match.effort,
         contextWindow: match.contextWindow,
-        fastMode: match.fastMode ?? false,
+        serviceTier: match.serviceTier ?? "default",
       };
     }),
   );
@@ -605,7 +627,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
   const setStoreEffort = useAgentChatStore((s) => s.setEffort);
   const setStoreContextWindow = useAgentChatStore((s) => s.setContextWindow);
-  const setStoreFastMode = useAgentChatStore((s) => s.setFastMode);
+  const setStoreServiceTier = useAgentChatStore((s) => s.setServiceTier);
   const setStoreResumeCursor = useAgentChatStore((s) => s.setResumeCursor);
   const setStoreMode = useAgentChatStore((s) => s.setMode);
   const setStoreModePriorPermissionMode = useAgentChatStore(
@@ -641,9 +663,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // Chat-side capabilities for the active provider. `null` until the
   // refresh hook resolves (or when the backend errors — pickers render
   // a disabled "unavailable" state in that case).
-  const capabilities = useProviderCapabilities((s) =>
+  const nativeCapabilities = useProviderCapabilities((s) =>
     selectCapabilities(s, provider),
   );
+  const acpCatalog = useCustomAcp(s => selectedAcpCatalog(s, threadId));
+  const capabilities = provider === "acp" ? acpCatalog?.capabilities ?? null : nativeCapabilities;
 
   // Field-level subscriptions, grouped by update cadence, instead of one
   // whole-slice read. Every store write mints a new slice object, so a
@@ -684,7 +708,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         permissionMode: t?.permissionMode ?? null,
         effort: t?.effort ?? null,
         contextWindow: t?.contextWindow ?? null,
-        fastMode: t?.fastMode ?? false,
+        serviceTier: t?.serviceTier ?? "default",
         mode: t?.mode ?? ("default" as ChatMode),
         hasDebugActivity: t?.hasDebugActivity ?? false,
         debugActivityResolved: t?.debugActivityResolved ?? false,
@@ -796,6 +820,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
+        // Claims the key, so the composer's Escape-to-stop leaves the run be.
+        e.preventDefault();
         setEnteredSubagentId(null);
       }
     };
@@ -902,35 +928,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     },
     [transcriptStreaming, turnCheckpoints],
   );
-  const handleConfirmTurnRevert = useCallback(async () => {
-    if (!threadId || !revertTarget || revertingTurnIndex !== null) return;
-    setRevertingTurnIndex(revertTarget.turn_index);
-    try {
-      await agentChatRevertTurnCheckpoint(threadId, revertTarget.turn_index);
-      await refreshAfterTurnRevert({
-        thread_id: threadId,
-        turn_index: revertTarget.turn_index,
-        transcript_cutoff_id: revertTarget.transcript_cutoff_id,
-        remaining_checkpoints: turnCheckpoints.filter(
-          (checkpoint) => checkpoint.turn_index < revertTarget.turn_index,
-        ),
-      });
-      setRevertTarget(null);
-      toast.success("Turn reverted", {
-        description: "Workspace and Codex conversation restored.",
-      });
-    } catch (error) {
-      toast.error("Could not revert turn", { description: String(error) });
-    } finally {
-      setRevertingTurnIndex(null);
-    }
-  }, [
-    refreshAfterTurnRevert,
-    revertTarget,
-    revertingTurnIndex,
-    threadId,
-    turnCheckpoints,
-  ]);
   const [subagentJumpRequest, setSubagentJumpRequest] = useState<{
     cardId: string;
     nonce: number;
@@ -968,7 +965,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     model,
     effort,
     contextWindow,
-    fastMode,
+    serviceTier,
     mode,
     hasDebugActivity,
     debugActivityResolved,
@@ -979,7 +976,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     settings.permissionMode ??
     providerDefaultPermissionMode ??
     DEFAULT_THREAD_PERMISSION_MODE;
-  const activeModel = selectModel(capabilities, model);
+  const activeModel = provider === "acp" ? capabilities?.models.find(m => m.id === model) ?? null : selectModel(capabilities, model);
   // Context meter (composer footer). The snapshot rides on the thread
   // state, so it survives hydrate-replay and the silent-restart slice
   // migration for free. The seed only covers the window between the
@@ -1113,8 +1110,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             (!current || current.contextWindow === null)
           )
             setStoreContextWindow(seedThreadId, record.context_window);
-          if (!current || current.fastMode === false)
-            setStoreFastMode(seedThreadId, record.fast_mode ?? false);
+          if (!current || current.serviceTier === "default")
+            setStoreServiceTier(seedThreadId, record.service_tier ?? "default");
         }
         if (
           record.permission_mode != null &&
@@ -1155,7 +1152,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStoreModel,
     setStoreEffort,
     setStoreContextWindow,
-    setStoreFastMode,
+    setStoreServiceTier,
     setStorePermissionMode,
     setStoreResumeCursor,
   ]);
@@ -1231,6 +1228,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // Anything that is not a `content_delta` still applies synchronously —
   // see lib/agent-chat/event-batcher.ts.
   const handleEvent = useCallback((payload: AgentChatEventPayload) => {
+    if (
+      payload.event.type === "runtime_warning" &&
+      payload.event.message.startsWith(SERVICE_TIER_FALLBACK_PREFIX)
+    ) {
+      void useProviderCapabilities.getState().refresh("codex");
+    }
     enqueueAgentChatEvent(
       payload.thread_id,
       payload.event,
@@ -1294,12 +1297,23 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // re-triggers hydrate, but a stable thread id within one mount only
   // hydrates once.
   const hydrateAttemptedRef = useRef<string | null>(null);
+  // The thread whose first hydrate has finished. Until it matches, an empty
+  // slice of a thread this pane opened (rather than started) means "not
+  // loaded yet", not "new chat": the pane shows a transcript skeleton
+  // instead of the landing. A locally started thread has no history to wait
+  // for, and swapping its landing out would remount the focused composer.
+  const [hydratedThreadId, setHydratedThreadId] = useState<string | null>(null);
+  const hydrating =
+    threadId != null &&
+    hydratedThreadId !== threadId &&
+    startupThreadRef.current !== threadId;
   useEffect(() => {
     if (!threadId) return;
     if (hydrateAttemptedRef.current === threadId) return;
     hydrateAttemptedRef.current = threadId;
     let cancelled = false;
     void hydrateThreadByCursor(threadId, provider, () => cancelled).finally(() => {
+      if (!cancelled) setHydratedThreadId(threadId);
       // Nonempty transcripts report readiness from their visible rows, not
       // this promise: the virtualizer can still be measuring hidden content.
       if (!cancelled && !useAgentChatStore.getState().threads[threadId]?.messages.length) {
@@ -1401,7 +1415,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         permission_mode: recoveryMode,
         effort: draft.effort,
         context_window: draft.contextWindow,
-        fast_mode: draft.fastMode ?? false,
+        service_tier: draft.serviceTier ?? "default",
         additional_directories: [],
         env: null,
       };
@@ -1423,7 +1437,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           }
           setStoreEffort(id, draft.effort);
           setStoreContextWindow(id, draft.contextWindow);
-          setStoreFastMode(id, draft.fastMode ?? false);
+          setStoreServiceTier(id, draft.serviceTier ?? "default");
           setSessionLaunchMode(id, recoveryMode);
           // Mark the draft as promoted so subsequent mounts take the
           // existing promotedDraftThreadId branch above instead of
@@ -1501,9 +1515,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     }
     if (starting || startAttempted.current) return;
     if (!cwd) return;
+    if (provider === "acp" && !pendingAcpAgentId) return;
     startAttempted.current = true;
     setStarting(true);
-    const localThreadId = `chat-${pane.pane_id}-${Date.now()}`;
+    const localThreadId = provider === "acp" ? pendingAcpThreadId : `chat-${pane.pane_id}-${Date.now()}`;
     startupThreadRef.current = localThreadId;
     // For a brand-new thread with no slice yet, use this provider's
     // native default. OpenCode deliberately launches with a null
@@ -1514,10 +1529,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const startInput = {
       thread_id: localThreadId,
       cwd,
-      model: null,
+      model: provider === "acp" ? pendingAcpModel : null,
       resume_cursor: null,
       permission_mode: startMode,
-      fast_mode: false,
+      service_tier: "default",
       additional_directories: [],
       env: null,
     };
@@ -1562,6 +1577,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     threadId,
     promotedDraftThreadId,
     recoveryDraft,
+    pendingAcpAgentId, pendingAcpThreadId, pendingAcpModel,
     starting,
     pane.pane_id,
     provider,
@@ -1573,7 +1589,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStorePermissionMode,
     setStoreEffort,
     setStoreContextWindow,
-    setStoreFastMode,
+    setStoreServiceTier,
     setSessionLaunchMode,
     providerDefaultPermissionMode,
     markDraftPromoted,
@@ -1784,7 +1800,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const sdkText = applyAllPrefixes(
         skillSelection.text,
         mode,
-        effort,
+        provider === "acp" ? null : effort,
         null,
         attachmentBlock,
         selectProviderCommands(provider, cwd, threadId)(useProviderCommandsStore.getState()).commands,
@@ -2343,6 +2359,86 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [threadId, addStagedAttachment, updateStagedAttachment],
   );
 
+  const handleConfirmTurnRevert = useCallback(async () => {
+    if (!threadId || !revertTarget || revertingTurnIndex !== null) return;
+    const target = revertTarget;
+    setRevertingTurnIndex(target.turn_index);
+    try {
+      // Captured first: the revert deletes the images only this turn used.
+      const revertedMessage = findRevertedUserMessage(
+        useAgentChatStore.getState().threads[threadId]?.messages ?? [],
+        target.client_nonce,
+      );
+      const prompt = revertedMessage
+        ? await captureRevertedPrompt(revertedMessage)
+        : null;
+      await agentChatRevertTurnCheckpoint(threadId, target.turn_index);
+      // The revert has landed: a failed transcript refresh must not report it
+      // as failed or skip the prompt hand-back and the undo below.
+      try {
+        await refreshAfterTurnRevert({
+          thread_id: threadId,
+          turn_index: target.turn_index,
+          transcript_cutoff_id: target.transcript_cutoff_id,
+          remaining_checkpoints: turnCheckpoints.filter(
+            (checkpoint) => checkpoint.turn_index < target.turn_index,
+          ),
+        });
+      } catch (error) {
+        console.warn("[agent-chat] failed to refresh reverted transcript:", error);
+      }
+      setRevertTarget(null);
+      // The usual reason to revert is to rephrase, so the prompt comes back
+      // ready to edit rather than vanishing with the turn.
+      if (prompt) {
+        const current =
+          useAgentChatStore.getState().threads[threadId]?.inputDraft ?? "";
+        setInputDraft(threadId, mergeRevertedDraft(prompt.text, current));
+        for (const image of prompt.images) void handleAttachImage(image);
+        requestAnimationFrame(() => {
+          const textarea = paneRootRef.current?.querySelector<HTMLTextAreaElement>(
+            '[data-testid="composer-wrapper"] textarea',
+          );
+          if (!textarea) return;
+          textarea.focus();
+          const end = textarea.value.length;
+          textarea.setSelectionRange(end, end);
+        });
+      }
+      const restoredNote = prompt
+        ? prompt.missingImages > 0
+          ? `Prompt restored to the composer; ${prompt.missingImages} image${prompt.missingImages === 1 ? "" : "s"} could not be restored.`
+          : "Prompt restored to the composer."
+        : "Workspace and conversation rewound.";
+      const revertedThreadId = threadId;
+      toast.undoable({
+        message: "Turn reverted",
+        description: restoredNote,
+        undoLabel: "Restore files",
+        durationMs: 15_000,
+        onUndo: async () => {
+          await agentChatUndoTurnRevert(revertedThreadId);
+          toast.success("Files restored", {
+            description:
+              "The workspace is back to how it was before the revert. The conversation stays rewound.",
+          });
+        },
+      });
+    } catch (error) {
+      toast.error("Could not revert turn", { description: String(error) });
+    } finally {
+      setRevertingTurnIndex(null);
+    }
+  }, [
+    handleAttachImage,
+    refreshAfterTurnRevert,
+    revertTarget,
+    revertingTurnIndex,
+    setInputDraft,
+    threadId,
+    turnCheckpoints,
+  ]);
+
   useEffect(() => {
     if (streaming || messages.length > 0) localSendFocusRef.current = false;
   }, [streaming, messages.length]);
@@ -2566,7 +2662,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           : currentSlice.contextWindow;
       const nextModel =
         updates.model !== undefined ? updates.model : currentSlice.model;
-      const nextFastMode = currentSlice.fastMode;
+      const nextServiceTier = currentSlice.serviceTier;
       void (async () => {
         try {
           await agentChatStopSession(provider, threadId);
@@ -2589,7 +2685,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               permission_mode: nextMode,
               effort: nextEffort,
               context_window: nextContext,
-              fast_mode: nextFastMode,
+              service_tier: nextServiceTier,
               additional_directories: [],
               env: null,
             },
@@ -2979,6 +3075,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     (next: string) => {
       if (!threadId) return;
       if (grokConfigurationBusy || restartInFlightRef.current) return;
+      if (provider === "acp") {
+        if (useCustomAcp.getState().busy[threadId]) return;
+        void useCustomAcp.getState().setModel(threadId, next).then(catalog => setStoreModel(threadId, catalog.current_model)).catch(err => toast.error(`Failed to change custom agent model: ${formatProviderError(err)}`));
+        return;
+      }
       const previous = useAgentChatStore.getState().threads[threadId];
       if (!previous) return;
       const rollback = () => {
@@ -2989,12 +3090,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         setStoreModel(threadId, previous.model);
         setStoreEffort(threadId, previous.effort);
         setStoreContextWindow(threadId, previous.contextWindow);
-        setStoreFastMode(threadId, previous.fastMode);
+        setStoreServiceTier(threadId, previous.serviceTier);
         persistSessionConfig({
           model: previous.model,
           effort: previous.effort,
           context_window: previous.contextWindow,
-          fast_mode: previous.fastMode,
+          service_tier: previous.serviceTier,
         });
       };
       setStoreModel(threadId, next);
@@ -3007,7 +3108,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         newModel: nextModel,
         currentEffort: effort,
         currentContextWindow: contextWindow,
-        currentFastMode: fastMode,
+        currentServiceTier: serviceTier,
       });
       // Fold the model change and any compat-driven effort/context
       // resets into a single persisted patch so a restart doesn't
@@ -3021,9 +3122,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         setStoreContextWindow(threadId, plan.resetContextWindow);
         configPatch.context_window = plan.resetContextWindow;
       }
-      if (plan.resetFastMode !== undefined) {
-        setStoreFastMode(threadId, plan.resetFastMode);
-        configPatch.fast_mode = plan.resetFastMode;
+      if (plan.resetServiceTier !== undefined) {
+        setStoreServiceTier(threadId, plan.resetServiceTier);
+        configPatch.service_tier = plan.resetServiceTier;
       }
       persistSessionConfig(configPatch);
       agentChatSetModel(provider, threadId, next).catch((err) => {
@@ -3047,11 +3148,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         rollback();
         toast.error(`Failed to set model: ${formatProviderError(err)}`);
       });
-      // A compat-driven Fast reset rides the live session too: both
-      // Fast-capable providers apply the tier without a relaunch, so the
+      // A compatibility reset rides the live session too: supported
+      // providers apply the tier without a relaunch, so the
       // model swap above stays the only reason to touch the session.
-      if (plan.resetFastMode !== undefined) {
-        agentChatSetFastMode(provider, threadId, plan.resetFastMode).catch(
+      if (plan.resetServiceTier !== undefined) {
+        agentChatSetServiceTier(provider, threadId, plan.resetServiceTier).catch(
           (err) => {
             toast.error(`Failed to set service tier: ${err}`);
           },
@@ -3065,11 +3166,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       capabilities,
       effort,
       contextWindow,
-      fastMode,
+      serviceTier,
       setStoreModel,
       setStoreEffort,
       setStoreContextWindow,
-      setStoreFastMode,
+      setStoreServiceTier,
       persistSessionConfig,
       restartSessionWith,
     ],
@@ -3190,43 +3291,47 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     ],
   );
 
-  const fastModeChangesInFlightRef = useRef(new Set<string>());
-  const handleFastModeChange = useCallback(
-    (next: boolean) => {
-      if (!threadId || (next && !activeModel?.supports_fast_mode)) return;
+  const serviceTierChangesInFlightRef = useRef(new Set<string>());
+  const handleServiceTierChange = useCallback(
+    (next: string) => {
+      if (!threadId || (next !== "default" && resolveServiceTier(activeModel, next) !== next)) return;
       if (grokConfigurationBusy || restartInFlightRef.current) return;
-      if (fastModeChangesInFlightRef.current.has(threadId)) return;
+      if (serviceTierChangesInFlightRef.current.has(threadId)) return;
       const current = useAgentChatStore.getState().threads[threadId];
-      if (!current || current.fastMode === next) return;
-      fastModeChangesInFlightRef.current.add(threadId);
+      if (!current || current.serviceTier === next) return;
+      serviceTierChangesInFlightRef.current.add(threadId);
       // Codex carries the service tier on `turn/start`; Cursor exposes a live
       // ACP Fast config option. Neither requires replacing the conversation.
-      agentChatSetFastMode(provider, threadId, next)
+      agentChatSetServiceTier(provider, threadId, next)
         // Reflect the tier only after the provider accepts it. Keep requests
         // for this thread sequential so an older result cannot win a race.
-        .then(() => setStoreFastMode(threadId, next))
+        .then(() => setStoreServiceTier(threadId, next))
         .catch((err) => {
-          toast.error(`Failed to set service tier: ${err}`);
+          const message = formatProviderError(err);
+          toast.error(`Failed to set service tier: ${message}`);
+          if (provider === "codex" && message.includes("service tier is unavailable")) {
+            void useProviderCapabilities.getState().refresh(provider);
+          }
         })
-        .finally(() => fastModeChangesInFlightRef.current.delete(threadId));
+        .finally(() => serviceTierChangesInFlightRef.current.delete(threadId));
     },
     [
       threadId,
       provider,
       activeModel,
       grokConfigurationBusy,
-      setStoreFastMode,
+      setStoreServiceTier,
     ],
   );
 
   // Capability payloads can change between app launches. If a persisted
-  // Fast choice is no longer valid for the resolved model, heal it back to
-  // Standard instead of keeping a hidden premium-tier override alive.
+  // tier choice is no longer valid for the resolved model, resolve it
+  // against the current catalog instead of keeping a hidden premium-tier override alive.
   useEffect(() => {
-    if (conversationWritable && fastMode && activeModel && !activeModel.supports_fast_mode) {
-      handleFastModeChange(false);
+    if (conversationWritable && activeModel && resolveServiceTier(activeModel, serviceTier) !== serviceTier) {
+      handleServiceTierChange(resolveServiceTier(activeModel, serviceTier));
     }
-  }, [conversationWritable, fastMode, activeModel, handleFastModeChange]);
+  }, [conversationWritable, serviceTier, activeModel, handleServiceTierChange]);
 
   // Grok's installed CLI owns this catalogue and the store refreshes it while
   // Codemux is running. Reconcile removals as well as additions: a retired
@@ -3265,7 +3370,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       newModel: advertisedModel,
       currentEffort: effort,
       currentContextWindow: contextWindow,
-      currentFastMode: fastMode,
+      currentServiceTier: serviceTier,
     });
     const previousEffort = effort;
     const effortAttemptKey =
@@ -3324,7 +3429,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     model,
     effort,
     contextWindow,
-    fastMode,
+    serviceTier,
     handleModelChange,
     persistSessionConfig,
     setStoreEffort,
@@ -3332,11 +3437,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   ]);
 
   const handleProviderModelChange = useCallback(
-    (nextProvider: AgentChatProviderKind, nextModel: string) => {
+    (nextProvider: AgentChatProviderKind, nextModel: string | null) => {
       if (grokConfigurationBusy || restartInFlightRef.current) return;
       // A model pick inside the current provider is the cheap live setter.
+      if (provider === "acp" && nextProvider !== provider && threadId && useCustomAcp.getState().bindings[threadId]) {
+        toast.error("This chat is bound to its custom agent. Create a new chat to change harnesses.");
+        return;
+      }
       if (nextProvider === provider) {
-        handleModelChange(nextModel);
+        if (provider === "acp" && !threadId) { setPendingAcpModel(nextModel); observeProviderRuntimeIntent(provider); return; }
+        if (nextModel !== null) handleModelChange(nextModel);
         return;
       }
       if (!threadId || !cwd) return;
@@ -3380,7 +3490,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               context_window: defaults.contextWindow,
               // Speed tiers are provider/model-scoped: never carry a Fast
               // selection across a provider switch.
-              fast_mode: false,
+              service_tier: "default",
               additional_directories: [],
               env: null,
             },
@@ -3401,7 +3511,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           setStoreContextWindow(targetThreadId, defaults.contextWindow);
           setStorePermissionMode(targetThreadId, nextDisplayMode);
           setSessionLaunchMode(targetThreadId, nextLaunchMode);
-          setStoreFastMode(targetThreadId, false);
+          setStoreServiceTier(targetThreadId, "default");
           setStoreResumeCursor(targetThreadId, null);
           // Provider-specific transient modes cannot safely cross adapters.
           setStoreMode(targetThreadId, "default");
@@ -3422,7 +3532,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
                 permission_mode: oldLaunchMode,
                 effort: currentSlice.effort,
                 context_window: currentSlice.contextWindow,
-                fast_mode: currentSlice.fastMode ?? false,
+                service_tier: currentSlice.serviceTier ?? "default",
                 additional_directories: [],
                 env: null,
               },
@@ -3453,13 +3563,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       cwd,
       pane.pane_id,
       handleModelChange,
+      observeProviderRuntimeIntent,
       migrateThreadId,
       setStoreModel,
       setStoreEffort,
       setStoreContextWindow,
       setStorePermissionMode,
       setSessionLaunchMode,
-      setStoreFastMode,
+      setStoreServiceTier,
       setStoreResumeCursor,
       setStoreMode,
       setStoreModePriorPermissionMode,
@@ -3473,7 +3584,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const sessionAwaitingIntent =
     threadId == null &&
     !starting &&
-    !providerRuntimeIntent &&
+    (!providerRuntimeIntent || (provider === "acp" && !pendingAcpAgentId)) &&
     promotedDraftThreadId == null;
 
   // ── Thread Scope (new-thread empty state) ──
@@ -3508,17 +3619,20 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // context bar. Rendered at every message count:
     // an empty thread has nothing to choose either (see above), so the
     // strip never changes shape across the first send.
-    <div className={SCOPE_STRIP_INSET}>
+    <div className={`${SCOPE_STRIP_INSET} @container`}>
       <div className={SCOPE_STRIP} data-mobile-scope-strip>
-        <div className="flex min-w-0 items-center gap-0.5 text-label font-medium text-muted-foreground">
+        {/* As the pane narrows the branch goes first, then the project:
+            the status cluster on the right is what's actionable. Labels
+            truncate in between rather than spill under the cluster. */}
+        <div className="flex min-w-0 items-center gap-0.5 overflow-hidden text-label font-medium text-muted-foreground @max-[450px]:hidden">
           <span
-            className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2"
+            className="inline-flex h-6 min-w-0 items-center gap-1.5 rounded-md px-2"
             title={workspaceProjectRoot}
           >
             {isHomeWorkspace ? (
-              <Home className="size-3.5 text-status-remote" />
+              <Home className="size-3.5 shrink-0 text-status-remote" />
             ) : (
-              <Folder className="size-3.5 text-muted-foreground" />
+              <Folder className="size-3.5 shrink-0 text-muted-foreground" />
             )}
             <span className="max-w-[140px] truncate">
               {isHomeWorkspace ? "Home" : basename(workspaceProjectRoot)}
@@ -3526,12 +3640,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           </span>
           {paneWorkspaceBranch && (
             <>
-              <span className="select-none text-muted-foreground/50">·</span>
+              <span className="shrink-0 select-none text-muted-foreground/50 @max-[500px]:hidden">·</span>
               <span
-                className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 font-mono"
+                className="inline-flex h-6 min-w-0 shrink-[2] items-center gap-1.5 rounded-md px-2 font-mono @max-[500px]:hidden"
                 title={`Branch: ${paneWorkspaceBranch}`}
               >
-                <GitBranch className="size-3 text-muted-foreground" />
+                <GitBranch className="size-3 shrink-0 text-muted-foreground" />
                 <span className="max-w-[160px] truncate">
                   {paneWorkspaceBranch}
                 </span>
@@ -3618,13 +3732,37 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         pendingUserInput.request_id,
         {
           decision: "allow",
-          updated_input: output,
+          updated_input: provider === "opencode" ? output : {
+            ...output,
+            answers: Object.fromEntries(Object.entries(output.answers).map(
+              ([question, answer]) => [question, questionAnswerText(answer)],
+            )),
+          },
         },
         true,
       );
     },
-    [pendingUserInput, handleRespond],
+    [pendingUserInput, handleRespond, provider],
   );
+
+  // "Skip · answer in chat": decline the prompt with a note the agent can
+  // act on, then hand the keyboard to the composer for the real answer.
+  const handleSkipUserInput = useCallback(() => {
+    if (!pendingUserInput || pendingUserInput.kind !== "permission_request") {
+      return;
+    }
+    void handleRespond(pendingUserInput.request_id, {
+      decision: "deny",
+      message: USER_INPUT_SKIPPED_MESSAGE,
+    });
+    requestAnimationFrame(() => {
+      paneRootRef.current
+        ?.querySelector<HTMLTextAreaElement>(
+          '[data-testid="composer-wrapper"] textarea',
+        )
+        ?.focus();
+    });
+  }, [pendingUserInput, handleRespond]);
 
   const pendingInputPanelEl =
     pendingUserInput && pendingUserInput.kind === "permission_request" ? (
@@ -3635,13 +3773,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         key={pendingUserInput.request_id}
         item={pendingUserInput}
         onSubmit={handleSubmitUserInput}
+        onSkip={handleSkipUserInput}
       />
     ) : null;
 
   // ── Composer strip ──
   // One strip above the pill for everything pending: session error,
-  // monitoring, running / just-finished subagents, queued follow-ups. The
-  // strip picks the lead occupant; these only describe what exists.
+  // monitoring, delegated tasks, running / just-finished subagents, queued
+  // follow-ups. The strip picks the lead occupant; these only describe what
+  // exists.
+  const delegationOccupant = useDelegationOccupant({
+    messages,
+    threadId,
+    streaming: transcriptStreaming,
+    onOpen: openDelegatedChat,
+    onStop: stopDelegatedTask,
+  });
   const subagentOccupant = useSubagentOccupant({
     messages,
     threadId,
@@ -3789,6 +3936,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     goalSourceInTranscript,
     goalLastRun,
   ]);
+  const pendingApprovalOccupant = useMemo(
+    () =>
+      conversationWritable
+        ? approvalOccupant(messages, {
+            onRespond: (requestId, decision) => {
+              void handleRespond(requestId, decision);
+            },
+            onJump: (itemId) =>
+              setMessageJumpRequest((current) => ({
+                itemId,
+                nonce: (current?.nonce ?? 0) + 1,
+              })),
+          })
+        : null,
+    [conversationWritable, messages, handleRespond],
+  );
   // Hidden in a subagent drill-in: the design only shows it in the
   // conversation view. Keyed by thread so the open list never leaks
   // across a thread switch.
@@ -3797,9 +3960,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       key={threadId ?? "no-thread"}
       goal={stripGoal}
       occupants={[
+        pendingApprovalOccupant,
         errorOccupant,
         usageOccupant,
         monitoringOccupant,
+        delegationOccupant,
         subagentOccupant,
         queuedOccupant(queued, handleCancelQueued),
       ]}
@@ -3937,8 +4102,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       readOnly={!conversationWritable}
       cwd={cwd}
       // An empty pane reads as a new chat: "Describe what you want the
-      // agent to do…" until the first turn lands (design D10 copy).
-      isDraft={messages.length === 0}
+      // agent to do…" until the first turn lands (design D10 copy). A thread
+      // still loading its history is not a new chat.
+      isDraft={messages.length === 0 && !hydrating}
       // A local first send replaces ChatHomeLanding with the transcript;
       // a promoted lazy draft replaces DraftChatSurface with this pane.
       // Both swaps create a new textarea, so explicitly carry keyboard
@@ -3969,12 +4135,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onTasksClick={handleTasksClick}
       provider={provider}
       workspaceId={paneWorkspaceId}
-      threadId={threadId}
+      threadId={threadId ?? (provider === "acp" ? pendingAcpThreadId : null)}
       model={model}
       permissionMode={permissionMode}
       effort={effort}
       contextWindow={contextWindow}
-      fastMode={fastMode}
+      serviceTier={serviceTier}
       activeModel={activeModel}
       effortLabelMap={effortLabelMap}
       permissionModes={permissionModes}
@@ -4018,7 +4184,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onAttachSession={conversationWritable ? handleAttachSession : undefined}
       onDelegateTask={conversationWritable && threadId ? () => setDelegateDialogThread(threadId) : undefined}
       onAttachImage={conversationWritable ? handleAttachImage : undefined}
-      modelSupportsImages={activeModel?.supports_images ?? false}
+      modelSupportsImages={provider === "acp" ? acpCatalog?.supports_images ?? false : activeModel?.supports_images ?? false}
       repoSupported={repoSupported}
       providerKind={workspaceProviderKind}
       providerCliInstalled={providerCliInstalled}
@@ -4039,7 +4205,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onPermissionModeChange={handlePermissionModeChange}
       onEffortChange={handleEffortChange}
       onContextWindowChange={handleContextWindowChange}
-      onFastModeChange={handleFastModeChange}
+      onServiceTierChange={handleServiceTierChange}
       onModeActivate={handleModeActivate}
       onModeRemove={handleModeRemove}
     />
@@ -4056,6 +4222,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   return (
     <div
       ref={paneRootRef}
+      data-agent-chat-pane=""
       className="relative flex h-full w-full flex-col bg-background"
       onDragEnter={handlePaneDragEnter}
       onDragLeave={handlePaneDragLeave}
@@ -4067,9 +4234,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       {/* Provider runtime health (probe-backed, TTL-cached): a dead CLI
           used to fail silently into a perpetual "Working…" spinner.
           Renders as a floating top overlay; needs `relative` above. */}
-      {conversationWritable && <ProviderStatusNotice provider={provider} />}
+      {conversationWritable && (
+        <ProviderStatusNotice provider={provider} workspaceId={paneWorkspaceId} />
+      )}
       {conversationWritable && <ProviderUpdateNotice provider={provider} threadId={threadId} remote={providerUpdatesRemote} />}
-      {transcriptMessages.length === 0 ? (
+      {transcriptMessages.length === 0 && !hydrating ? (
         <ChatHomeLanding composer={composerEl} />
       ) : (
         <>
@@ -4091,12 +4260,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
                 />
               </div>
             </>
+          ) : transcriptMessages.length === 0 ? (
+            <TranscriptSkeleton />
           ) : (
             <ChatTranscript
               messages={transcriptMessages}
               streaming={transcriptStreaming}
               compacting={compacting}
               stalled={stalled}
+              onStop={conversationWritable ? handleStop : undefined}
               interrupted={interrupted}
               sendAnchor={sendAnchor}
               positionedNonceRef={sendAnchorPositionedNonceRef}
@@ -4164,6 +4336,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               // own buttons have to opt back in.
               <div className="pointer-events-auto">{debugBannerEl}</div>
             )}
+            {mobile && conversationWritable && !enteredSubagent && paneWorkspaceId && (
+              <MobileComposerChips workspaceId={paneWorkspaceId} />
+            )}
             {composerEl}
           </div>
         </>
@@ -4190,6 +4365,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       </Dialog>}
       <RevertTurnDialog
         checkpoint={revertTarget}
+        turnCount={
+          revertTarget
+            ? turnCheckpoints.filter(
+                (checkpoint) => checkpoint.turn_index >= revertTarget.turn_index,
+              ).length
+            : 0
+        }
         reverting={revertingTurnIndex !== null}
         onOpenChange={(open) => {
           if (!open) setRevertTarget(null);

@@ -42,10 +42,13 @@ import {
   MoreHorizontal,
   LogOut,
   ExternalLink,
+  ArrowLeft,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
+import { selectUtilityPage } from "@/lib/utility-pages";
 import { useAuthStore } from "@/stores/auth-store";
 import { useUpdateStatusStore } from "@/stores/update-status-store";
+import { manualUpdateCommand, releasePageUrl } from "@/lib/update-release";
 import { cn } from "@/lib/utils";
 import {
   MENU_ROW,
@@ -87,8 +90,12 @@ function AppMenuFooter({ version }: { version: string | null }) {
   const published = useUpdateStatusStore((s) => s.published);
   const updateVersion = useUpdateStatusStore((s) => s.updateVersion);
   const isRemote = useUpdateStatusStore((s) => s.isRemote);
+  const canAutoUpdate = useUpdateStatusStore((s) => s.canAutoUpdate);
+  const packageFormat = useUpdateStatusStore((s) => s.packageFormat);
+  const errorMessage = useUpdateStatusStore((s) => s.errorMessage);
   const startDownload = useUpdateStatusStore((s) => s.startDownload);
   const installAndRestart = useUpdateStatusStore((s) => s.installAndRestart);
+  const retry = useUpdateStatusStore((s) => s.retry);
   const requestDesktopUpdate = useUpdateStatusStore(
     (s) => s.requestDesktopUpdate,
   );
@@ -98,16 +105,29 @@ function AppMenuFooter({ version }: { version: string | null }) {
   let label = "Up to date";
   let tone = "text-status-open";
   let action: (() => void) | null = null;
+  let title = updateVersion ? `Version ${updateVersion}` : undefined;
   if (state === "checking") {
     label = "Checking…";
     tone = "text-muted-foreground";
   } else if (state === "update-available") {
     // The remote client has no updater plugin, so `startDownload` there is a
     // no-op; its only route is asking the desktop to update itself, exactly as
-    // the toast's "Update & restart desktop" button does.
+    // the toast's "Update & restart desktop" button does. A package-manager
+    // install cannot be replaced in place either, so it opens the release
+    // page, as the toast does.
     label = isRemote ? "Update desktop" : "Update available";
     tone = "text-status-working";
-    action = isRemote ? requestDesktopUpdate : startDownload;
+    if (isRemote) {
+      action = requestDesktopUpdate;
+    } else if (canAutoUpdate) {
+      action = startDownload;
+    } else {
+      action = () => void openUrl(releasePageUrl(updateVersion));
+      const command = manualUpdateCommand(packageFormat);
+      title = `Version ${updateVersion}. ${
+        command ? `Run: ${command}` : "Update with your package manager"
+      }`;
+    }
   } else if (state === "downloading") {
     label = "Downloading…";
     tone = "text-status-working";
@@ -116,8 +136,12 @@ function AppMenuFooter({ version }: { version: string | null }) {
     tone = "text-status-working";
     action = installAndRestart;
   } else if (state === "error") {
-    label = "Update failed";
+    // The strip has room for the action, not the reason; the reason rides in
+    // the tooltip and in full on the toast.
+    label = "Retry update";
     tone = "text-status-attention";
+    action = retry;
+    title = `Update failed${errorMessage ? `: ${errorMessage}` : ""}`;
   }
 
   const status = (
@@ -129,7 +153,7 @@ function AppMenuFooter({ version }: { version: string | null }) {
 
   return (
     <div className="-mx-1.5 mt-1.5 flex h-8 items-center gap-2 rounded-b-lg border-t border-border/70 bg-background/50 px-3.5">
-      <span className="font-mono text-caption text-muted-foreground/70">
+      <span className="min-w-0 truncate font-mono text-caption text-muted-foreground/70">
         Codemux {version ? `v${version}` : ""}
       </span>
       <span className="flex-1" />
@@ -140,19 +164,19 @@ function AppMenuFooter({ version }: { version: string | null }) {
         <button
           type="button"
           onClick={action}
-          title={updateVersion ? `Version ${updateVersion}` : undefined}
+          title={title}
           className={cn(
             // `tone` is a fixed status colour, so hover has to *deepen* it on
             // a light rail and *lift* it on a dark one — a single
             // `brightness-125` washes the label out to nothing on white.
-            "flex items-center gap-1.5 rounded-sm px-1 text-label transition-colors duration-150 hover:brightness-90 dark:hover:brightness-125",
+            "flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-sm px-1 text-label transition-colors duration-150 hover:brightness-90 dark:hover:brightness-125",
             tone,
           )}
         >
           {status}
         </button>
       ) : (
-        <span className={cn("flex items-center gap-1.5 text-label", tone)}>
+        <span className={cn("flex shrink-0 items-center gap-1.5 whitespace-nowrap text-label", tone)}>
           {status}
         </span>
       )}
@@ -199,7 +223,7 @@ function AppMenu({
       </Tooltip>
       {/* Bottom padding is zero so the version/update strip can sit flush in
           the container's bottom corners. */}
-      <DropdownMenuContent side="top" align="start" className="w-[252px] pb-0">
+      <DropdownMenuContent side="top" align="start" className="w-auto min-w-[252px] max-w-[320px] pb-0">
         <DropdownMenuItem
           className={MENU_ROW}
           onClick={() => setShowSettings(true)}
@@ -229,7 +253,7 @@ function AppMenu({
         </DropdownMenuItem>
         <DropdownMenuItem
           className={MENU_ROW}
-          onClick={() => setShowSettings(true, "shortcuts")}
+          onClick={() => useUIStore.getState().setShowShortcutsSheet(true)}
         >
           <Keyboard />
           <span className="flex-1">Keyboard shortcuts</span>
@@ -288,6 +312,7 @@ function FooterDestination({
 }) {
   const setShowAutomations = useUIStore((s) => s.setShowAutomations);
   const setShowSettings = useUIStore((s) => s.setShowSettings);
+  const setShowUsage = useUIStore((s) => s.setShowUsage);
   const action = getFooterAction(pin.id)!;
   const Icon = pin.iconId ? FOOTER_ICONS[pin.iconId] : action.icon;
   if (pin.id === "codemux.devices.open")
@@ -324,9 +349,11 @@ function FooterDestination({
         fullWidth && "w-full justify-start",
       )}
       onClick={() =>
-        action.section
-          ? setShowSettings(true, action.section)
-          : setShowAutomations(true)
+        action.section === "usage"
+          ? setShowUsage(true)
+          : action.section
+            ? setShowSettings(true, action.section)
+            : setShowAutomations(true)
       }
     >
       <Icon className={labeled ? "size-[13px]" : "size-[18px]"} />
@@ -380,9 +407,43 @@ function SortableFooterDestination({
   );
 }
 
+/**
+ * The footer while a utility page is open: one way out, back to the
+ * workspace the page opened over. Destinations return once you're back.
+ */
+function SidebarBackButton({ collapsed }: { collapsed: boolean }) {
+  const closeUtilityPages = useUIStore((s) => s.closeUtilityPages);
+  const button = (
+    <Button
+      variant="ghost"
+      size={collapsed ? "icon-sm" : "sm"}
+      aria-label="Back"
+      data-testid="sidebar-back"
+      className={cn(
+        "text-muted-foreground hover:bg-surface-2 hover:text-foreground",
+        !collapsed && "h-8 flex-1 justify-start gap-2 px-2 font-medium",
+      )}
+      onClick={closeUtilityPages}
+    >
+      <ArrowLeft className="size-4" />
+      {!collapsed && "Back"}
+    </Button>
+  );
+  if (!collapsed) return button;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{button}</TooltipTrigger>
+      <TooltipContent side="right" sideOffset={4} className="text-label">
+        Back
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
 export function SidebarFooterBar() {
   const { state } = useSidebar();
   const collapsed = state === "collapsed";
+  const pageOpen = useUIStore((s) => selectUtilityPage(s) !== null);
   const pins = useFooterPinsStore((s) => s.pins);
   const { agentChatEnabled, hasDevices } = useFooterAvailability();
   const [customizing, setCustomizing] = useState(false);
@@ -444,71 +505,83 @@ export function SidebarFooterBar() {
             : "h-[42px] items-center px-2",
         )}
       >
-        {/* The app menu anchors the start of the row; destinations pack
-            beside it so the strip reads as one left-aligned group. */}
-        <AppMenu
-          tooltipSide={tooltipSide}
-          onCustomize={() => setCustomizing(true)}
-        />
-        {/* Destinations reorder by drag; the menu stays outside the sortable
-            list so it always anchors the start. */}
-        <DndContext
-          sensors={sensors}
-          collisionDetection={closestCenter}
-          onDragEnd={handleDragEnd}
-        >
-          <SortableContext
-            items={visible.map((pin) => pin.id)}
-            strategy={
-              collapsed
-                ? verticalListSortingStrategy
-                : horizontalListSortingStrategy
-            }
-          >
-            {visible.map((pin) => (
-              <SortableFooterDestination
-                key={pin.id}
-                pin={pin}
-                tooltipSide={tooltipSide}
-              />
-            ))}
-          </SortableContext>
-        </DndContext>
-        {overflow.length > 0 && (
-          <Popover open={overflowOpen} onOpenChange={setOverflowOpen}>
-            <PopoverTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-label="More footer destinations"
-                title="More footer destinations"
-                className="size-7 shrink-0 text-muted-foreground"
-              >
-                <MoreHorizontal className="size-4" />
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent
-              side={collapsed ? "right" : "top"}
-              align="start"
-              className="w-64 p-2"
+        {pageOpen ? (
+          <SidebarBackButton collapsed={collapsed} />
+        ) : (
+          <>
+            {/* The app menu anchors the start of the row; destinations pack
+                beside it so the strip reads as one left-aligned group. */}
+            <AppMenu
+              tooltipSide={tooltipSide}
+              onCustomize={() => setCustomizing(true)}
+            />
+            {/* Destinations reorder by drag; the menu stays outside the sortable
+                list so it always anchors the start. */}
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCenter}
+              onDragEnd={handleDragEnd}
             >
-              <p className="px-2 py-1 text-label font-medium text-muted-foreground">
-                Footer destinations
-              </p>
-              <div className="thin-scrollbar [scrollbar-gutter:stable] max-h-[50vh] overflow-y-auto p-1">
-                {overflow.map((pin) => (
-                  <div key={pin.id} className="py-0.5">
-                    <FooterDestination
-                      pin={pin}
-                      labeled
-                      fullWidth
-                      tooltipSide="right"
-                    />
-                  </div>
+              <SortableContext
+                items={visible.map((pin) => pin.id)}
+                strategy={
+                  collapsed
+                    ? verticalListSortingStrategy
+                    : horizontalListSortingStrategy
+                }
+              >
+                {visible.map((pin) => (
+                  <SortableFooterDestination
+                    key={pin.id}
+                    pin={pin}
+                    tooltipSide={tooltipSide}
+                  />
                 ))}
-              </div>
-            </PopoverContent>
-          </Popover>
+              </SortableContext>
+            </DndContext>
+            {overflow.length > 0 && (
+              <Popover open={overflowOpen} onOpenChange={setOverflowOpen}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="More footer destinations"
+                        className="size-7 shrink-0 text-muted-foreground"
+                      >
+                        <MoreHorizontal className="size-4" />
+                      </Button>
+                    </PopoverTrigger>
+                  </TooltipTrigger>
+                  <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
+                    More
+                  </TooltipContent>
+                </Tooltip>
+                <PopoverContent
+                  side={collapsed ? "right" : "top"}
+                  align="start"
+                  className="w-64 p-2"
+                >
+                  <p className="px-2 py-1 text-label font-medium text-muted-foreground">
+                    Footer destinations
+                  </p>
+                  <div className="thin-scrollbar [scrollbar-gutter:stable] max-h-[50vh] overflow-y-auto p-1">
+                    {overflow.map((pin) => (
+                      <div key={pin.id} className="py-0.5">
+                        <FooterDestination
+                          pin={pin}
+                          labeled
+                          fullWidth
+                          tooltipSide="right"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </PopoverContent>
+              </Popover>
+            )}
+          </>
         )}
       </div>
       {customizing && (

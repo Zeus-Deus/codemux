@@ -111,6 +111,7 @@ impl CodexAgentProvider {
             codex_home: self.config.codex_home.clone(),
             client_info: self.config.client_info.clone(),
             mcp_registry: self.config.mcp_registry.clone(),
+            remote: None,
         }
     }
 
@@ -177,6 +178,20 @@ impl AgentProvider for CodexAgentProvider {
         }
     }
 
+    fn managed_capabilities(&self) -> crate::agent_provider::managed::ManagedCapabilities {
+        crate::agent_provider::managed::ManagedCapabilities {
+            scoped_tools:true,native_fanout_disabled:true,enforced_read_only:true,
+            isolated_writes:true,verified_stop:cfg!(target_os = "linux"),
+        }
+    }
+
+    async fn stop_managed_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+        let session = self.sessions.read().await.get(&thread_id).cloned()
+            .ok_or_else(|| ProviderError::SessionNotFound { thread_id: thread_id.clone() })?;
+        session.shutdown_managed().await?;
+        self.sessions.write().await.remove(&thread_id); Ok(())
+    }
+
     async fn start_session(
         &self,
         input: StartSessionInput,
@@ -208,26 +223,34 @@ impl AgentProvider for CodexAgentProvider {
             dead.shutdown().await?;
         }
 
+        let spawn = CodexSpawnConfig {
+            remote: input.remote,
+            ..self.spawn_config()
+        };
         let session = CodexSession::spawn_and_initialize(
             thread_id.clone(),
             input.cwd,
             input.model,
             input.permission_mode,
             input.effort,
-            input.fast_mode,
+            input
+                .service_tier
+                .unwrap_or_else(|| if input.fast_mode { "fast" } else { "default" }.into()),
             input.resume_cursor.clone(),
             input.env,
             input.workspace_id,
-            self.spawn_config(),
+            spawn,
             self.event_tx.clone(),
             input.recorded_usage_baseline,
         )
         .await?;
+        let mut startup_guard = session.managed_startup_guard();
 
         {
             let mut sessions = self.sessions.write().await;
             sessions.insert(thread_id.clone(), Arc::clone(&session));
         }
+        if let Some(guard) = startup_guard.as_mut() { guard.disarm(); }
 
         Ok(ProviderSession {
             thread_id,
@@ -420,8 +443,24 @@ impl AgentProvider for CodexAgentProvider {
             sessions.get(&thread_id).cloned()
         };
         let session = session.ok_or(ProviderError::SessionNotFound { thread_id })?;
-        session.set_fast_mode(fast_mode).await;
-        Ok(())
+        session
+            .set_service_tier(if fast_mode { "fast" } else { "default" }.into())
+            .await
+    }
+
+    async fn set_service_tier(
+        &self,
+        thread_id: ThreadId,
+        tier: String,
+    ) -> Result<(), ProviderError> {
+        let session = self
+            .sessions
+            .read()
+            .await
+            .get(&thread_id)
+            .cloned()
+            .ok_or(ProviderError::SessionNotFound { thread_id })?;
+        session.set_service_tier(tier).await
     }
 
     async fn set_permission_mode(
@@ -553,5 +592,18 @@ impl AgentProvider for CodexAgentProvider {
             }
         });
         Box::pin(stream) as Pin<Box<dyn Stream<Item = ProviderRuntimeEvent> + Send + 'static>>
+    }
+
+    fn managed_event_stream(&self, thread_id: &ThreadId) -> ProviderEventStream {
+        let rx = self.event_tx.subscribe(); let id = thread_id.clone();
+        Box::pin(futures_util::stream::unfold((rx,id), |(mut rx,id)| async move {
+            match rx.recv().await {
+                Ok(item)=>Some((item,(rx,id))),
+                Err(broadcast::error::RecvError::Closed)=>None,
+                Err(broadcast::error::RecvError::Lagged(count))=>Some((ProviderRuntimeEvent::RuntimeWarning {
+                    thread_id:Some(id.clone()),message:format!("Managed event stream lagged by {count} events"),original_payload:None,
+                },(rx,id))),
+            }
+        }))
     }
 }

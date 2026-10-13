@@ -1,0 +1,564 @@
+{
+  "status": "passed",
+  "results": [
+    {
+      "letter": "a",
+      "scopeViolations": [],
+      "outputControl": [
+        {
+          "label": "Output size limit (bytes)",
+          "value": "262144"
+        },
+        {
+          "label": "Workflow JavaScriptawait workflow.phase(\"Plan\");\n// The coordinator adds children with graph tools,\n// yields its slot while they run, and resumes\n// with their typed outcomes. Children may only\n// narrow this scope, never widen it.\nreturn await agent(goal, {\n  id: \"coordinator\",\n  title: \"Coordinate session recovery\",\n  route_id: \"claude/coordinator\",\n  access: \"write\",\n  scope: [\"src/session\", \"src/ui/recovery\"],\n  output_schema: { type: \"object\",\n    required: [\"summary\", \"accepted\", \"follow_up\"] }\n});"
+        }
+      ],
+      "persistedFields": [
+        "su-name",
+        "su-goal",
+        "su-cc",
+        "su-tb",
+        "su-ab",
+        "su-nd",
+        "su-tk",
+        "su-ob",
+        "su-tl",
+        "su-saved",
+        "su-js"
+      ],
+      "matrix": [
+        {
+          "state": "setup",
+          "width": "narrow",
+          "busy": 2,
+          "paneWidth": 360
+        },
+        {
+          "state": "setup",
+          "width": "normal",
+          "busy": 2,
+          "paneWidth": 500
+        },
+        {
+          "state": "setup",
+          "width": "expanded",
+          "busy": 2,
+          "paneWidth": 941
+        },
+        {
+          "state": "running",
+          "width": "narrow",
+          "busy": 2,
+          "paneWidth": 360
+        },
+        {
+          "state": "running",
+          "width": "normal",
+          "busy": 2,
+          "paneWidth": 500
+        },
+        {
+          "state": "running",
+          "width": "expanded",
+          "busy": 2,
+          "paneWidth": 941
+        },
+        {
+          "state": "paused",
+          "width": "narrow",
+          "busy": 1,
+          "paneWidth": 360
+        },
+        {
+          "state": "paused",
+          "width": "normal",
+          "busy": 1,
+          "paneWidth": 500
+        },
+        {
+          "state": "paused",
+          "width": "expanded",
+          "busy": 1,
+          "paneWidth": 941
+        },
+        {
+          "state": "unknown",
+          "width": "narrow",
+          "busy": 2,
+          "paneWidth": 360
+        },
+        {
+          "state": "unknown",
+          "width": "normal",
+          "busy": 2,
+          "paneWidth": 500
+        },
+        {
+          "state": "unknown",
+          "width": "expanded",
+          "busy": 2,
+          "paneWidth": 941
+        },
+        {
+          "state": "review",
+          "width": "narrow",
+          "busy": 0,
+          "paneWidth": 360
+        },
+        {
+          "state": "review",
+          "width": "normal",
+          "busy": 0,
+          "paneWidth": 500
+        },
+        {
+          "state": "review",
+          "width": "expanded",
+          "busy": 0,
+          "paneWidth": 941
+        },
+        {
+          "state": "cancelled",
+          "width": "narrow",
+          "busy": 0,
+          "paneWidth": 360
+        },
+        {
+          "state": "cancelled",
+          "width": "normal",
+          "busy": 0,
+          "paneWidth": 500
+        },
+        {
+          "state": "cancelled",
+          "width": "expanded",
+          "busy": 0,
+          "paneWidth": 941
+        }
+      ],
+      "unknownReconcileRetry": "2 -> 1 -> 2",
+      "apply": "mock only, no files written",
+      "cancel": "no enabled retry"
+    },
+    {
+      "letter": "b",
+      "scopeViolations": [],
+      "outputControl": [
+        {
+          "label": "Output size limit (bytes)",
+          "value": "262144"
+        },
+        {
+          "label": "Workflow JavaScriptawait workflow.phase(\"Plan\");\n// The coordinator adds children with graph tools,\n// yields its slot while they run, and resumes\n// with their typed outcomes. Children may only\n// narrow this scope, never widen it.\nreturn await agent(goal, {\n  id: \"coordinator\",\n  title: \"Coordinate session recovery\",\n  route_id: \"claude/coordinator\",\n  access: \"write\",\n  scope: [\"src/session\", \"src/ui/recovery\"],\n  output_schema: { type: \"object\",\n    required: [\"summary\", \"accepted\", \"follow_up\"] }\n});"
+        }
+      ],
+      "persistedFields": [
+        "su-cc",
+        "su-tb",
+        "su-ab",
+        "su-nd",
+        "su-tk",
+        "su-ob",
+        "su-tl",
+        "su-name",
+        "su-goal",
+        "su-saved",
+        "su-js"
+      ],
+      "matrix": [
+        {
+          "state": "setup",
+          "width": "narrow",
+          "busy": 2,
+          "paneWidth": 360
+        },
+        {
+          "state": "setup",
+          "width": "normal",
+          "busy": 2,
+          "paneWidth": 500
+        },
+        {
+          "state": "setup",
+          "width": "expanded",
+          "busy": 2,
+          "paneWidth": 941
+        },
+        {
+          "state": "running",
+          "width": "narrow",
+          "busy": 2,
+          "paneWidth": 360
+        },
+        {
+          "state": "running",
+          "width": "normal",
+          "busy": 2,
+          "paneWidth": 500
+        },
+        {
+          "state": "running",
+          "width": "expanded",
+          "busy": 2,
+          "paneWidth": 941
+        },
+        {
+          "state": "paused",
+          "width": "narrow",
+          "busy": 1,
+          "paneWidth": 360
+        },
+        {
+          "state": "paused",
+          "width": "normal",
+          "busy": 1,
+          "paneWidth": 500
+        },
+        {
+          "state": "paused",
+          "width": "expanded",
+          "busy": 1,
+          "paneWidth": 941
+        },
+        {
+          "state": "unknown",
+          "width": "narrow",
+          "busy": 2,
+          "paneWidth": 360
+        },
+        {
+          "state": "unknown",
+          "width": "normal",
+          "busy": 2,
+          "paneWidth": 500
+        },
+        {
+          "state": "unknown",
+          "width": "expanded",
+          "busy": 2,
+          "paneWidth": 941
+        },
+        {
+          "state": "review",
+          "width": "narrow",
+          "busy": 0,
+          "paneWidth": 360
+        },
+        {
+          "state": "review",
+          "width": "normal",
+          "busy": 0,
+          "paneWidth": 500
+        },
+        {
+          "state": "review",
+          "width": "expanded",
+          "busy": 0,
+          "paneWidth": 941
+        },
+        {
+          "state": "cancelled",
+          "width": "narrow",
+          "busy": 0,
+          "paneWidth": 360
+        },
+        {
+          "state": "cancelled",
+          "width": "normal",
+          "busy": 0,
+          "paneWidth": 500
+        },
+        {
+          "state": "cancelled",
+          "width": "expanded",
+          "busy": 0,
+          "paneWidth": 941
+        }
+      ],
+      "unknownReconcileRetry": "2 -> 1 -> 2",
+      "apply": "mock only, no files written",
+      "cancel": "no enabled retry"
+    },
+    {
+      "letter": "c",
+      "scopeViolations": [],
+      "outputControl": [
+        {
+          "label": "Workflow JavaScriptawait workflow.phase(\"Plan\");\n// The coordinator adds children with graph tools,\n// yields its slot while they run, and resumes\n// with their typed outcomes. Children may only\n// narrow this scope, never widen it.\nreturn await agent(goal, {\n  id: \"coordinator\",\n  title: \"Coordinate session recovery\",\n  route_id: \"claude/coordinator\",\n  access: \"write\",\n  scope: [\"src/session\", \"src/ui/recovery\"],\n  output_schema: { type: \"object\",\n    required: [\"summary\", \"accepted\", \"follow_up\"] }\n});"
+        },
+        {
+          "label": "Output size limit (bytes)",
+          "value": "262144"
+        }
+      ],
+      "persistedFields": [
+        "su-name",
+        "su-goal",
+        "su-saved",
+        "su-js",
+        "su-cc",
+        "su-tb",
+        "su-ab",
+        "su-nd",
+        "su-tk",
+        "su-ob",
+        "su-tl"
+      ],
+      "matrix": [
+        {
+          "state": "setup",
+          "width": "narrow",
+          "busy": 2,
+          "paneWidth": 360
+        },
+        {
+          "state": "setup",
+          "width": "normal",
+          "busy": 2,
+          "paneWidth": 500
+        },
+        {
+          "state": "setup",
+          "width": "expanded",
+          "busy": 2,
+          "paneWidth": 941
+        },
+        {
+          "state": "running",
+          "width": "narrow",
+          "busy": 2,
+          "paneWidth": 360
+        },
+        {
+          "state": "running",
+          "width": "normal",
+          "busy": 2,
+          "paneWidth": 500
+        },
+        {
+          "state": "running",
+          "width": "expanded",
+          "busy": 2,
+          "paneWidth": 941
+        },
+        {
+          "state": "paused",
+          "width": "narrow",
+          "busy": 1,
+          "paneWidth": 360
+        },
+        {
+          "state": "paused",
+          "width": "normal",
+          "busy": 1,
+          "paneWidth": 500
+        },
+        {
+          "state": "paused",
+          "width": "expanded",
+          "busy": 1,
+          "paneWidth": 941
+        },
+        {
+          "state": "unknown",
+          "width": "narrow",
+          "busy": 2,
+          "paneWidth": 360
+        },
+        {
+          "state": "unknown",
+          "width": "normal",
+          "busy": 2,
+          "paneWidth": 500
+        },
+        {
+          "state": "unknown",
+          "width": "expanded",
+          "busy": 2,
+          "paneWidth": 941
+        },
+        {
+          "state": "review",
+          "width": "narrow",
+          "busy": 0,
+          "paneWidth": 360
+        },
+        {
+          "state": "review",
+          "width": "normal",
+          "busy": 0,
+          "paneWidth": 500
+        },
+        {
+          "state": "review",
+          "width": "expanded",
+          "busy": 0,
+          "paneWidth": 941
+        },
+        {
+          "state": "cancelled",
+          "width": "narrow",
+          "busy": 0,
+          "paneWidth": 360
+        },
+        {
+          "state": "cancelled",
+          "width": "normal",
+          "busy": 0,
+          "paneWidth": 500
+        },
+        {
+          "state": "cancelled",
+          "width": "expanded",
+          "busy": 0,
+          "paneWidth": 941
+        }
+      ],
+      "unknownReconcileRetry": "2 -> 1 -> 2",
+      "apply": "mock only, no files written",
+      "cancel": "no enabled retry"
+    },
+    {
+      "letter": "d",
+      "scopeViolations": [],
+      "outputControl": [
+        {
+          "label": "Workflow JavaScriptawait workflow.phase(\"Plan\");\n// The coordinator adds children with graph tools,\n// yields its slot while they run, and resumes\n// with their typed outcomes. Children may only\n// narrow this scope, never widen it.\nreturn await agent(goal, {\n  id: \"coordinator\",\n  title: \"Coordinate session recovery\",\n  route_id: \"claude/coordinator\",\n  access: \"write\",\n  scope: [\"src/session\", \"src/ui/recovery\"],\n  output_schema: { type: \"object\",\n    required: [\"summary\", \"accepted\", \"follow_up\"] }\n});"
+        },
+        {
+          "label": "Output size limit (bytes)",
+          "value": "262144"
+        }
+      ],
+      "persistedFields": [
+        "su-name",
+        "su-goal",
+        "su-saved",
+        "su-js",
+        "su-cc",
+        "su-tb",
+        "su-ab",
+        "su-nd",
+        "su-tk",
+        "su-ob",
+        "su-tl"
+      ],
+      "matrix": [
+        {
+          "state": "setup",
+          "width": "narrow",
+          "busy": 2,
+          "paneWidth": 360
+        },
+        {
+          "state": "setup",
+          "width": "normal",
+          "busy": 2,
+          "paneWidth": 500
+        },
+        {
+          "state": "setup",
+          "width": "expanded",
+          "busy": 2,
+          "paneWidth": 941
+        },
+        {
+          "state": "running",
+          "width": "narrow",
+          "busy": 2,
+          "paneWidth": 360
+        },
+        {
+          "state": "running",
+          "width": "normal",
+          "busy": 2,
+          "paneWidth": 500
+        },
+        {
+          "state": "running",
+          "width": "expanded",
+          "busy": 2,
+          "paneWidth": 941
+        },
+        {
+          "state": "paused",
+          "width": "narrow",
+          "busy": 1,
+          "paneWidth": 360
+        },
+        {
+          "state": "paused",
+          "width": "normal",
+          "busy": 1,
+          "paneWidth": 500
+        },
+        {
+          "state": "paused",
+          "width": "expanded",
+          "busy": 1,
+          "paneWidth": 941
+        },
+        {
+          "state": "unknown",
+          "width": "narrow",
+          "busy": 2,
+          "paneWidth": 360
+        },
+        {
+          "state": "unknown",
+          "width": "normal",
+          "busy": 2,
+          "paneWidth": 500
+        },
+        {
+          "state": "unknown",
+          "width": "expanded",
+          "busy": 2,
+          "paneWidth": 941
+        },
+        {
+          "state": "review",
+          "width": "narrow",
+          "busy": 0,
+          "paneWidth": 360
+        },
+        {
+          "state": "review",
+          "width": "normal",
+          "busy": 0,
+          "paneWidth": 500
+        },
+        {
+          "state": "review",
+          "width": "expanded",
+          "busy": 0,
+          "paneWidth": 941
+        },
+        {
+          "state": "cancelled",
+          "width": "narrow",
+          "busy": 0,
+          "paneWidth": 360
+        },
+        {
+          "state": "cancelled",
+          "width": "normal",
+          "busy": 0,
+          "paneWidth": 500
+        },
+        {
+          "state": "cancelled",
+          "width": "expanded",
+          "busy": 0,
+          "paneWidth": 941
+        }
+      ],
+      "unknownReconcileRetry": "2 -> 1 -> 2",
+      "apply": "mock only, no files written",
+      "cancel": "no enabled retry"
+    }
+  ],
+  "errors": [],
+  "external": [],
+  "failed": []
+}

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { Info, Loader2, RotateCw, Server } from "lucide-react";
+import { Info, RotateCw, Server } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -12,8 +12,10 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useMcpRuntime } from "@/hooks/use-mcp-runtime";
+import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { useMcpStore } from "@/stores/mcp-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import {
   listMcpServers,
   MCP_CODEMUX_SELF_ID,
@@ -26,8 +28,11 @@ import {
   type McpServerRuntime,
 } from "@/tauri/commands";
 
+import { OutsideAssistantsSection } from "./outside-assistants-section";
 import { McpToolModal } from "./mcp-tool-modal";
+import { SectionHeader } from "./settings-primitives";
 import { eyebrowVariants } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 /** Slow-start threshold (ms). Servers stuck in `starting` longer than
  *  this surface a "taking longer than usual" hint. 3 s matches
@@ -63,6 +68,14 @@ interface Props {
  * updates so the UI never polls.
  */
 export function McpSection({ projectRoot }: Props) {
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  return <div>
+    {enableAgentChat && <OutboundMcpSection projectRoot={projectRoot} />}
+    <OutsideAssistantsSection />
+  </div>;
+}
+
+function OutboundMcpSection({ projectRoot }: Props) {
   const [servers, setServers] = useState<McpServerConfig[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -116,31 +129,26 @@ export function McpSection({ projectRoot }: Props) {
 
   return (
     <div>
-      <div className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <h2 className="text-body-lg font-semibold tracking-tight">
-            MCP Servers
-          </h2>
-          <p className="mt-1 text-body text-muted-foreground">
-            Model Context Protocol servers expose tools to your agent.
-            Servers spawn lazily on first chat session start; toggle a
-            row off to stop it. Codemux's own MCP is always on.
-          </p>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => void load()}
-          disabled={loading}
-          aria-label="Refresh MCP servers"
-        >
-          <RotateCw
-            className={cn("mr-1 size-3", loading && "animate-spin")}
-            aria-hidden
-          />
-          Refresh
-        </Button>
-      </div>
+      <SectionHeader
+        title="MCP Servers"
+        description="Model Context Protocol servers expose tools to your agent. Servers spawn lazily on first chat session start; toggle a row off to stop it. Codemux's own MCP is always on."
+        action={
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void load()}
+            disabled={loading}
+            aria-busy={loading}
+            aria-label="Refresh MCP servers"
+          >
+            <RotateCw
+              className={cn("mr-1 size-3", loading && "animate-spin")}
+              aria-hidden
+            />
+            Refresh
+          </Button>
+        }
+      />
 
       {error && (
         <p
@@ -156,7 +164,7 @@ export function McpSection({ projectRoot }: Props) {
           data-testid="mcp-loading"
           className="flex items-center gap-2 py-6 text-body text-muted-foreground"
         >
-          <Loader2 className="size-4 animate-spin" aria-hidden />
+          <Spinner className="size-4" aria-hidden />
           Loading MCP servers…
         </div>
       ) : servers.length === 0 && !error ? (
@@ -286,19 +294,24 @@ function ServerRow({
   const additionalSources = server.sources.slice(1);
   const isCodemuxSelf = server.id === MCP_CODEMUX_SELF_ID;
 
+  const reportFailure = (verb: "start" | "stop" | "restart") => (err: unknown) => {
+    console.warn(`[mcp] ${verb} ${server.id} failed:`, err);
+    toast.error(`Couldn't ${verb} ${server.name}`, {
+      description: err instanceof Error ? err.message : String(err),
+    });
+  };
+
   const handleToggle = (next: boolean) => {
     onToggle();
     // The store-level toggle persists + syncs to the backend; here we
     // just trigger the runtime spawn/stop so the row's status updates
     // immediately without waiting for the next prime.
     if (next) {
-      void startMcpServerCmd(server.id, projectRoot).catch((err) =>
-        console.warn(`[mcp] start ${server.id} failed:`, err),
+      void startMcpServerCmd(server.id, projectRoot).catch(
+        reportFailure("start"),
       );
     } else {
-      void stopMcpServerCmd(server.id).catch((err) =>
-        console.warn(`[mcp] stop ${server.id} failed:`, err),
-      );
+      void stopMcpServerCmd(server.id).catch(reportFailure("stop"));
     }
   };
 
@@ -364,11 +377,11 @@ function ServerRow({
           {commandPreview(server)}
         </p>
       </div>
-      {/* Hover-reveal "View tools" button — opens the modal. */}
+      {/* Revealed on row hover or keyboard focus, always shown on touch. */}
       <Button
         variant="ghost"
         size="sm"
-        className="opacity-0 transition-opacity duration-150 group-hover:opacity-100"
+        className="opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100"
         onClick={onView}
         data-testid={`mcp-row-${server.id}-view`}
       >
@@ -380,9 +393,7 @@ function ServerRow({
           variant="ghost"
           size="sm"
           onClick={() =>
-            void restartMcpServerCmd(server.id).catch((err) =>
-              console.warn(`[mcp] restart ${server.id} failed:`, err),
-            )
+            void restartMcpServerCmd(server.id).catch(reportFailure("restart"))
           }
           data-testid={`mcp-row-${server.id}-restart`}
         >
@@ -447,7 +458,7 @@ function McpStatusBadge({
         data-testid={`mcp-row-${server.id}-status`}
         data-status={slow ? "starting-slow" : "starting"}
       >
-        <Loader2 className="size-3 animate-spin" aria-hidden />
+        <Spinner className="size-3" aria-hidden />
         {slow ? "slow start — taking longer than usual" : "starting…"}
       </span>
     );
