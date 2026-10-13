@@ -1012,21 +1012,31 @@ impl ClaudeSession {
     }
 
     pub async fn interrupt(self: &Arc<Self>, turn_id: Option<TurnId>) -> Result<(), ProviderError> {
-        self.native_authority.invalidate();
+        // Blanket Stop revokes authority synchronously, including idle waits.
+        if turn_id.is_none() {
+            self.native_authority.invalidate();
+        }
         let active = {
             let state = self.state.lock().await;
+            if let Some(requested) = turn_id.as_ref() {
+                let active = state.active_turn.as_ref().ok_or_else(|| {
+                    ProviderError::ValidationError {
+                        message: "no active turn to interrupt".into(),
+                    }
+                })?;
+                if requested != active {
+                    return Err(ProviderError::ValidationError {
+                        message: format!(
+                            "turn id mismatch: requested {}, active {}",
+                            requested.0, active.0
+                        ),
+                    });
+                }
+                // Keep selection and revocation atomic with turn transitions.
+                self.native_authority.invalidate();
+            }
             state.active_turn.clone()
         };
-        if let (Some(requested), Some(active)) = (turn_id.as_ref(), active.as_ref()) {
-            if requested != active {
-                return Err(ProviderError::ValidationError {
-                    message: format!(
-                        "turn id mismatch: requested {}, active {}",
-                        requested.0, active.0
-                    ),
-                });
-            }
-        }
         let params = InterruptParams {
             thread_id: self.thread_id.0.clone(),
         };

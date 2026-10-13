@@ -14,3 +14,6 @@ mod integration_tests;
 mod tests;
 #[cfg(all(test, unix))]
 mod ownership_tests;
+
+#[cfg(all(test, unix))]
+mod selected_interrupt_tests;

@@ -262,6 +262,9 @@ fn main() {
                 }
             }
             "interrupt" | "set-model" | "set-permission-mode" => {
+                if method == "interrupt" {
+                    capture_params(method, &msg.params);
+                }
                 if let Some(id) = id {
                     write_line(&json!({
                         "jsonrpc": "2.0",

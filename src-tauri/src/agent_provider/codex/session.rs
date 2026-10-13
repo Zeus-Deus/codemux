@@ -1610,29 +1610,32 @@ impl CodexSession {
     /// Interrupt the currently active turn. If `turn_id` is provided,
     /// only interrupt if it matches the live turn.
     pub async fn interrupt_turn(&self, turn_id: Option<TurnId>) -> Result<(), ProviderError> {
-        self.native_authority.invalidate();
+        // Blanket Stop revokes authority synchronously, even while state is busy.
+        if turn_id.is_none() {
+            self.native_authority.invalidate();
+        }
         let (codex_thread_id, active_turn) = {
             let state = self.state.lock().await;
-            (state.codex_thread_id.clone(), state.active_turn.clone())
-        };
-        let active_turn = match active_turn {
-            Some(t) => t,
-            None => {
-                return Err(ProviderError::ValidationError {
+            let active_turn = state.active_turn.as_ref().ok_or_else(|| {
+                ProviderError::ValidationError {
                     message: "no active turn to interrupt".into(),
-                });
+                }
+            })?;
+            if let Some(requested) = turn_id.as_ref() {
+                if requested != active_turn {
+                    return Err(ProviderError::ValidationError {
+                        message: format!(
+                            "turn id mismatch: requested {}, active {}",
+                            requested.0, active_turn.0
+                        ),
+                    });
+                }
+                // Selection and revocation share the lifecycle lock: a stale
+                // selection must never revoke a subsequently active turn.
+                self.native_authority.invalidate();
             }
+            (state.codex_thread_id.clone(), active_turn.clone())
         };
-        if let Some(requested) = turn_id.as_ref() {
-            if requested != &active_turn {
-                return Err(ProviderError::ValidationError {
-                    message: format!(
-                        "turn id mismatch: requested {}, active {}",
-                        requested.0, active_turn.0
-                    ),
-                });
-            }
-        }
         let params = TurnInterruptParams {
             thread_id: codex_thread_id,
             turn_id: active_turn.0.clone(),

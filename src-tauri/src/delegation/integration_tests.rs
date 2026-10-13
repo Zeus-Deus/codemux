@@ -1317,7 +1317,7 @@ async fn control_launch_lost_reply_restart_follow_and_normal_idle_native_parent_
             // This fixture turn intentionally stays active until explicit
             // stop_session cleanup below. A reusable Ready actor is no longer
             // authority for the later native status/retry/cancel operations.
-            {"after":"turn/start","delay_ms":100,"emit":"server_request","method":"item/tool/call","params":{"threadId":"c-1","turnId":"t-1","callId":"native-targets","tool":"codemux_mcp__codemux-self__delegation_targets","arguments":{}}}
+            {"after":"turn/start","delay_ms":100,"emit":"server_request","method":"item/tool/call","params":{"threadId":"c-1","turnId":"t-1","callId":"native-targets","tool":"codemux_mcp__codemux__delegation_targets","arguments":{}}}
         ]),
     );
     let mcp = crate::mcp::registry::McpRegistry::new();
@@ -1541,7 +1541,7 @@ async fn claude_callback_authority_ends_with_turn_and_callback_job_ends_with_run
         let script_path = root.join("claude-script.json");
         let mut script = vec![
             json!({"after":"send-turn","delay_ms":100,"emit":"server_request","method":"mcp-tool-call",
-            "params":{"name":"mcp__codemux-self__delegation_targets","arguments":{}}}),
+            "params":{"name":"mcp__codemux__delegation_targets","arguments":{}}}),
         ];
         if !replacement {
             script.push(json!({"after":"send-turn","delay_ms":100,"emit":"notification","method":"sdk-message",
@@ -2087,7 +2087,7 @@ async fn codex_delayed_native_admission_is_denied_after_completed_stop() {
         json!([
             {"after":"turn/start","delay_ms":100,"emit":"server_request","method":"item/tool/call",
              "params":{"threadId":"c-1","turnId":"t-1","callId":"delayed-admission",
-                       "tool":"codemux_mcp__codemux-self__delegate_task","arguments":input}}
+                       "tool":"codemux_mcp__codemux__delegate_remote_task","arguments":input}}
         ]),
     );
     let mcp = crate::mcp::registry::McpRegistry::new();
@@ -2205,12 +2205,12 @@ async fn native_callbacks_before_ack_keep_the_original_turn_authority() {
         let gate = root.join("ack-release");
         let script = if codex {
             json!([
-                {"after":"turn/start","emit":"server_request","method":"item/tool/call","params":{"threadId":"c-1","turnId":"t-1","callId":"early","tool":"codemux_mcp__codemux-self__delegation_targets","arguments":{}}},
+                {"after":"turn/start","emit":"server_request","method":"item/tool/call","params":{"threadId":"c-1","turnId":"t-1","callId":"early","tool":"codemux_mcp__codemux__delegation_targets","arguments":{}}},
                 {"after":"turn/start","delay_ms":100,"emit":"notification","method":"fixture/admitted","params":{}}
             ])
         } else {
             json!([
-                {"after":"send-turn","emit":"server_request","method":"mcp-tool-call","params":{"name":"mcp__codemux-self__delegation_targets","arguments":{}}},
+                {"after":"send-turn","emit":"server_request","method":"mcp-tool-call","params":{"name":"mcp__codemux__delegation_targets","arguments":{}}},
                 {"after":"send-turn","delay_ms":100,"emit":"notification","method":"sdk-message","params":{"threadId":thread,"message":{"type":"tool_progress","tool_use_id":"admitted"}}}
             ])
         };
