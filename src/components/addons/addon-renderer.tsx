@@ -265,6 +265,18 @@ function VirtualRows({
       aria-rowcount={headers ? rows.length + 1 : undefined}
       className="max-h-72 overflow-auto rounded-md border"
       onScroll={(e) => setTop(e.currentTarget.scrollTop)}
+      onKeyDown={(e) => {
+        if (e.key !== "Home" && e.key !== "End") return;
+        e.preventDefault();
+        // Native End scrolling can stop at an intermediate virtual window.
+        // Jump this container directly and render its destination rows now.
+        const viewport = e.currentTarget;
+        viewport.scrollTop =
+          e.key === "Home"
+            ? 0
+            : Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+        setTop(viewport.scrollTop);
+      }}
     >
       {headers && (
         <div

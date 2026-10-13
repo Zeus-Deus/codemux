@@ -174,6 +174,48 @@ describe("trusted add-on rendering", () => {
     );
     expect(screen.getAllByRole("listitem")[0]).toHaveTextContent("98");
   });
+  it("jumps to the final and first virtual list rows with End and Home", () => {
+    render(
+      <AddonRenderer
+        nodes={[
+          node("list", "cmx-list", {
+            items: Array.from({ length: 500 }, (_, i) => `Path ${i + 1}`),
+          }),
+        ]}
+        event={vi.fn()}
+        link={vi.fn()}
+      />,
+    );
+    const list = screen.getByRole("list", { name: "Add-on list" });
+    // jsdom has no layout; supply the real list's row and viewport dimensions.
+    Object.defineProperties(list, {
+      scrollHeight: { value: 500 * 36 },
+      clientHeight: { value: 288 },
+    });
+    list.focus();
+
+    expect(fireEvent.keyDown(list, { key: "End" })).toBe(false);
+    const finalRows = screen.getAllByRole("listitem");
+    const finalRow = finalRows[finalRows.length - 1];
+    expect(finalRows.length).toBeLessThanOrEqual(14);
+    expect(finalRow).toHaveAttribute("aria-posinset", "500");
+    expect(finalRow).toHaveTextContent("Path 500");
+    expect(finalRow).toHaveAttribute("aria-setsize", "500");
+    expect(list.scrollTop).toBe(500 * 36 - 288);
+    expect(document.activeElement).toBe(list);
+
+    expect(fireEvent.keyDown(list, { key: "ArrowDown" })).toBe(true);
+    expect(fireEvent.keyDown(list, { key: "a" })).toBe(true);
+    expect(screen.getAllByRole("listitem")).toEqual(finalRows);
+
+    expect(fireEvent.keyDown(list, { key: "Home" })).toBe(false);
+    const firstRows = screen.getAllByRole("listitem");
+    expect(firstRows.length).toBeLessThanOrEqual(14);
+    expect(firstRows[0]).toHaveAttribute("aria-posinset", "1");
+    expect(firstRows[0]).toHaveTextContent("Path 1");
+    expect(list.scrollTop).toBe(0);
+    expect(document.activeElement).toBe(list);
+  });
   it("exposes complete table dimensions and row positions across a virtual scroll", () => {
     render(
       <AddonRenderer
