@@ -58,6 +58,8 @@ export type SlotBody =
   | {
       kind: "item";
       item: ChatViewItem;
+      /** Running narration renders without the settled answer’s footer. */
+      commentary?: boolean;
       /** Belongs to the turn still running, so a `running` call on it really
        *  is executing. Absent for a settled turn. */
       turnLive?: boolean;
@@ -320,16 +322,33 @@ function buildPresentationEntries(
   messages: ChatViewItem[],
   streaming: boolean,
   expandedTurnIds: ReadonlySet<string>,
-): { entries: PresentationEntry[]; workingEntryId: string | null } {
+): {
+  entries: PresentationEntry[];
+  workingEntryId: string | null;
+  commentaryIds: Set<string>;
+} {
   const segments = splitTurns(messages);
   const activeIndex = activeTurnIndex(segments, streaming);
   const pendingIds = pendingRequestIds(messages);
   const entries: PresentationEntry[] = [];
+  const commentaryIds = new Set<string>();
   let workingEntryId: string | null = null;
 
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
     const segment = segments[segmentIndex];
     const ended = lastTurnEnd(segment);
+    const terminalId = terminalAssistantId(segment);
+
+    // Only a finished turn's last answer is the reply; everything else the
+    // assistant said along the way is narration.
+    for (const item of segment.items) {
+      if (
+        item.kind === "assistant_message" &&
+        (segmentIndex === activeIndex || item.id !== terminalId)
+      ) {
+        commentaryIds.add(item.id);
+      }
+    }
 
     if (segmentIndex === activeIndex) {
       for (let i = segment.items.length - 1; i >= 0; i--) {
@@ -349,7 +368,6 @@ function buildPresentationEntries(
       continue;
     }
 
-    const terminalId = terminalAssistantId(segment);
     const hidden = segment.items.filter((item) =>
       isFoldableSettledItem(item, terminalId, pendingIds),
     );
@@ -386,7 +404,7 @@ function buildPresentationEntries(
     }
   }
 
-  return { entries, workingEntryId };
+  return { entries, workingEntryId, commentaryIds };
 }
 
 export function buildTranscriptSlots(
@@ -411,7 +429,7 @@ export function buildTranscriptSlots(
     }
   }
 
-  const { entries, workingEntryId } = buildPresentationEntries(
+  const { entries, workingEntryId, commentaryIds } = buildPresentationEntries(
     messages,
     streaming,
     expandedTurnIds,
@@ -515,11 +533,12 @@ export function buildTranscriptSlots(
     }
     flush();
     flushDelegations();
-    bodies.push(
-      entry.turnLive
-        ? { kind: "item", item, turnLive: true }
-        : { kind: "item", item },
-    );
+    bodies.push({
+      kind: "item",
+      item,
+      commentary: commentaryIds.has(item.id),
+      ...(entry.turnLive ? { turnLive: true } : {}),
+    });
   }
   flush();
   flushDelegations();
@@ -577,7 +596,11 @@ function slotsEquivalent(a: TranscriptSlot, b: TranscriptSlot): boolean {
 
 function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
   if (a.kind === "item" && b.kind === "item") {
-    return a.item === b.item && a.turnLive === b.turnLive;
+    return (
+      a.item === b.item &&
+      a.commentary === b.commentary &&
+      a.turnLive === b.turnLive
+    );
   }
   if (a.kind === "turn_fold" && b.kind === "turn_fold") {
     return (
