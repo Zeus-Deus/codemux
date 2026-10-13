@@ -55,6 +55,7 @@
 //! stream.
 
 pub mod agent;
+pub mod api;
 pub mod capabilities;
 pub mod client;
 pub mod discovery;
@@ -65,6 +66,7 @@ pub mod server;
 pub mod session;
 pub mod sse;
 pub mod translate;
+pub mod v2;
 
 pub use agent::{OpenCodeAgentProvider, OpenCodeProviderConfig};
 pub use capabilities::opencode_stage1_placeholder;

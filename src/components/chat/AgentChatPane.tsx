@@ -179,6 +179,7 @@ import {
   ComposerPendingInputPanel,
   USER_INPUT_SKIPPED_MESSAGE,
 } from "./ComposerPendingInputPanel";
+import { questionAnswerText } from "./QuestionForm";
 import type { SendAnchorRequest } from "./send-scroll-state";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
@@ -3706,12 +3707,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         pendingUserInput.request_id,
         {
           decision: "allow",
-          updated_input: output,
+          updated_input: provider === "opencode" ? output : {
+            ...output,
+            answers: Object.fromEntries(Object.entries(output.answers).map(
+              ([question, answer]) => [question, questionAnswerText(answer)],
+            )),
+          },
         },
         true,
       );
     },
-    [pendingUserInput, handleRespond],
+    [pendingUserInput, handleRespond, provider],
   );
 
   // "Skip · answer in chat": decline the prompt with a note the agent can

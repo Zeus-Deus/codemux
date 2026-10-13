@@ -5388,7 +5388,8 @@ pub async fn list_chat_slash_commands(
         ProviderKind::OpenCode => {
             let handle = opencode_manager.ensure_running().await?;
             let mut config = crate::agent_provider::opencode::OpenCodeClientConfig::new(handle.base_url);
-            config.server_password = Some(handle.server_password);
+            config.api = handle.api;
+    config.server_password = Some(handle.server_password);
             let client = crate::agent_provider::opencode::OpenCodeClient::new(config)?;
             let mut commands = vec![
                 crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
@@ -6589,6 +6590,16 @@ fn is_renderable_image_entry(entry: &serde_json::Value) -> bool {
                 None => iu.as_str(),
             })
             .is_some_and(is_safe_image_src),
+        Some("file") => {
+            entry
+                .get("mime")
+                .and_then(|mime| mime.as_str())
+                .is_some_and(|mime| mime.to_ascii_lowercase().starts_with("image/"))
+                && entry
+                    .get("uri")
+                    .and_then(|uri| uri.as_str())
+                    .is_some_and(is_safe_image_src)
+        }
         Some("image") => {
             let Some(source) = entry.get("source").and_then(|s| s.as_object()) else {
                 return false;
@@ -9208,6 +9219,20 @@ mod tests {
     }
 
     #[test]
+    fn shape_never_stubs_native_image_tool_result_fixture() {
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../src/lib/agent-chat/__fixtures__/opencode-native-image-tool-result.json"
+        ))
+        .unwrap();
+        fixture["data"]["content"][1]["uri"] = json!(format!(
+            "data:image/png;base64,{}",
+            "A".repeat(LAZY_TOOL_RESULT_THRESHOLD_BYTES + 5_000)
+        ));
+        let payload = tool_result_payload(fixture["data"]["content"].clone());
+        assert_eq!(shape_persisted_payload(9, &payload), payload);
+    }
+
+    #[test]
     fn shape_stubs_entries_the_frontend_would_never_render_as_images() {
         // The heaviest payloads used to ride through unstubbed on nothing
         // but a `type` prefix. None of these draw anything.
@@ -9227,6 +9252,11 @@ mod tests {
             json!([{ "type": "image_url", "image_url": { "url": format!("file:///{data}.png") } }]),
             // Prefix-matching junk type.
             json!([{ "type": "imagemagick", "text": data }]),
+            // Native file blocks must obey the renderer's same image/scheme guards.
+            json!([{ "type": "file", "mime": "application/pdf", "uri": format!("https://example.test/{data}") }]),
+            json!([{ "type": "file", "mime": "image/png", "uri": format!("file:///{data}.png") }]),
+            json!([{ "type": "file", "mime": "image/png", "uri": format!("data:text/html;base64,{data}") }]),
+            json!([{ "type": "file", "mime": "image/png", "note": data }]),
         ];
         for content in cases {
             let payload = tool_result_payload(content.clone());
