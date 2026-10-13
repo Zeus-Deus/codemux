@@ -289,6 +289,16 @@ pub(super) fn allowed(cmd: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn chatgpt_private_metadata_and_mutations_are_denied_to_web_remote() {
+        for cmd in [
+            "get_chatgpt_status", "start_chatgpt_login", "cancel_chatgpt_login",
+            "disconnect_chatgpt", "acknowledge_chatgpt_welcome",
+            "get_local_workbench", "set_local_workbench",
+        ] {
+            assert!(!allowed(cmd), "{cmd} exposes local-only ChatGPT account/preferences authority");
+        }
+    }
+    #[test]
     fn custom_acp_thread_catalog_matches_existing_remote_read_policy() {
         for cmd in ["acp_binding", "acp_catalog", "acp_thread_catalog"] {
             assert!(allowed(cmd), "{cmd}");

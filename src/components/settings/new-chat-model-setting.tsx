@@ -10,7 +10,6 @@ import {
 } from "@/components/ui/select";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import {
-  AUTOMATIC_NEW_CHAT_PROVIDER,
   NEW_CHAT_DEFAULT_PROVIDERS,
   NEW_CHAT_SETTING_KEYS,
   resolveNewChatModelDefaults,
@@ -22,12 +21,13 @@ import {
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
 import { useSettingsStore } from "@/stores/settings-store";
+import { useChatGptStore } from "@/stores/chatgpt-store";
 
 /**
  * Settings → Agent → New chats → Default model.
  *
- * "Automatic" stores nothing and keeps the built-in choice (Claude on its
- * default model). "Custom" stores provider, model and effort; every write
+ * "Automatic" stores nothing and prefers a connected ChatGPT plan, then
+ * Claude's default model. "Custom" stores provider, model and effort; every write
  * also re-seeds untouched composer drafts so the open composer agrees with
  * the setting straight away.
  */
@@ -35,6 +35,7 @@ export function NewChatModelSetting() {
   const settings = useSettingsStore((state) => state.settings);
   const setSetting = useSettingsStore((state) => state.set);
   const capabilities = useProviderCapabilities();
+  useChatGptStore((state) => state.status?.phase);
   const custom = !!settings[NEW_CHAT_SETTING_KEYS.provider];
   // Read through the resolver so the controls show what a new chat will
   // actually get, including the fallbacks for a model that went away.
@@ -110,14 +111,14 @@ export function NewChatModelSetting() {
           data-testid="new-chat-model-auto-resolution"
         >
           <ProviderLogo
-            provider={AUTOMATIC_NEW_CHAT_PROVIDER}
+            provider={resolved.provider}
             className="size-4 shrink-0"
           />
           <div className="min-w-0 text-left leading-tight">
             <div className="truncate text-label font-medium text-foreground">
-              {model?.label ?? resolved.model}
+              {model?.label ?? resolved.model ?? "Loading models…"}
             </div>
-            <Eyebrow>Claude default</Eyebrow>
+            <Eyebrow>{resolved.provider === "codex" ? "ChatGPT plan" : "Claude default"}</Eyebrow>
           </div>
         </div>
       )}

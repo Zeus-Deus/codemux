@@ -1,4 +1,7 @@
 import { useAddonPlatform } from "@/lib/addons/platform";
+import { useChatGptStore } from "@/stores/chatgpt-store";
+import { useChatGptStatus } from "@/hooks/use-chatgpt-status";
+import { ChatGptWelcome } from "@/components/auth/chatgpt-welcome";
 import { lazy, useCallback, useEffect, useRef } from "react";
 import { useAppStateInit } from "@/hooks/use-app-state";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
@@ -68,6 +71,10 @@ const CloseGuardDialog = lazy(() =>
 
 function App() {
   useAddonPlatform();
+  useChatGptStatus();
+  const localMode = useChatGptStore((s) => s.localMode);
+  const localReady = useChatGptStore((s) => s.ready);
+  const cloudLogin = useChatGptStore((s) => s.cloudLogin);
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   const isLoading = useAuthStore((s) => s.isLoading);
   const sessionStatus = useAuthStore((s) => s.sessionStatus);
@@ -77,6 +84,10 @@ function App() {
   const remotePathRequest = useRemotePathPickerStore((s) => s.request);
   const closeGuardPrompt = useCloseGuardStore((s) => s.prompt);
   const postPaintStartupBegan = useRef(false);
+
+  useEffect(() => {
+    if (isAuthenticated && cloudLogin) useChatGptStore.setState({ cloudLogin: false });
+  }, [isAuthenticated, cloudLogin]);
 
   // Paint from the local auth/settings cache first. AppShell explicitly tells
   // us when the useful shell (not the interim login/loading frame) has painted;
@@ -103,6 +114,9 @@ function App() {
         console.warn("[startup] deferred MCP config repair failed:", error);
       });
     }
+    // A local ChatGPT connection is not a cloud session. Signed-out refresh
+    // would replace the locally bootstrapped settings with cloud defaults.
+    if (useAuthStore.getState().sessionStatus === "signed-out") return;
     const refreshed = useAuthStore.getState().refreshSession();
     void (firstRun
       ? refreshed.finally(() => markStartup("remote-session-ready"))
@@ -147,7 +161,7 @@ function App() {
   }, []);
 
   // Only initialize app state and shortcuts when authenticated
-  useAppStateInit(!isAuthenticated);
+  useAppStateInit(!(isAuthenticated || localMode));
   useKeyboardShortcuts();
   // Ctrl+Shift+J ranks blocked workspaces by how long they have waited, so
   // their status marks must keep updating while the sidebar is collapsed.
@@ -176,13 +190,14 @@ function App() {
   // Desktop only: clicking a native agent notification opens that agent.
   useNotificationActivate();
 
-  if (isLoading || !isAuthenticated) {
-    return <LoginScreen />;
+  if (isLoading || (!isAuthenticated && (!localReady || !localMode || cloudLogin))) {
+    return <><LoginScreen /><ChatGptWelcome enterWorkbench /></>;
   }
 
   return (
     <>
       <AppShell onFirstPaint={handleShellFirstPaint} />
+      <ChatGptWelcome enterWorkbench={false} />
       {renameWorkspaceId && (
         <LazyBoundary
           label="workspace rename"

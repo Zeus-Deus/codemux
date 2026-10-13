@@ -13,7 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, RwLock};
+#[path="managed_runtime.rs"]
+mod managed_runtime;
+pub(crate) use managed_runtime::read_model_catalog;
 use tokio::task::JoinHandle;
 
 use crate::agent_provider::{
@@ -126,10 +129,11 @@ fn mint_request_id() -> RequestId {
 }
 
 /// Configuration for spawning the `codex app-server` subprocess.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CodexSpawnConfig {
     /// Path to the `codex` binary.
     pub codex_binary: PathBuf,
+    pub chatgpt_owner: Option<Arc<super::chatgpt::Owner>>,
     /// Value to set for `CODEX_HOME`, if any.
     pub codex_home: Option<PathBuf>,
     /// Client identification block to hand Codex at `initialize` time.
@@ -148,8 +152,8 @@ pub(crate) struct CodexSessionState {
     /// The turn currently in flight, if any. `Option::None` means
     /// the session is idle and ready for a new turn.
     pub active_turn: Option<TurnId>,
-    pending_generation: Option<u64>,
-    pending_completed: VecDeque<String>,
+    // Notifications can finish a turn before its start response is consumed.
+    pending_turn_start: Option<PendingTurnStart>,
     /// Map from synthesised [`RequestId`] to the raw JSON-RPC id we need
     /// to reply to.
     pub pending_approvals: HashMap<RequestId, Value>,
@@ -172,6 +176,12 @@ pub(crate) struct CodexSessionState {
     /// dispatch order. Drained one-at-a-time as the session returns to
     /// idle (see [`CodexSession::drain_queue`]).
     pub queued_turns: VecDeque<QueuedTurn>,
+}
+
+#[derive(Default)]
+struct PendingTurnStart {
+    completed_turns: VecDeque<TurnId>,
+    failed: bool,
 }
 
 /// A user turn parked in the follow-up queue behind the active turn.
@@ -242,7 +252,11 @@ pub(crate) struct CodexSession {
     #[allow(dead_code)]
     pub cwd: PathBuf,
     /// Wrapped JSON-RPC child. Shared via `Arc` with background tasks.
-    pub child: Arc<JsonRpcChild>,
+    child: RwLock<Arc<JsonRpcChild>>,
+    chatgpt_runtime: Option<managed_runtime::ManagedSession>,
+    runtime_lease: Mutex<Option<Arc<std::fs::File>>>,
+    // Retain lifetime usage and subagent registrations across child renewal.
+    notification_demux: Mutex<CodexSubagentDemux>,
     /// Mutable session state.
     pub state: Mutex<CodexSessionState>,
     outbound: Mutex<()>,
@@ -266,10 +280,6 @@ pub(crate) struct CodexSession {
     /// child is gone. Only the watchdog (a confirmed dead child) sets this, so
     /// a recoverable error stays recoverable in place without a rebuild.
     dead: Arc<AtomicBool>,
-    /// Ledger totals already recorded for this thread at build time.
-    /// Handed to the notification task's demux so a resumed thread does
-    /// not re-record its history. Zero for a fresh thread.
-    recorded_usage_baseline: UsageBaseline,
     /// Owning workspace of the chat pane this session runs in, from
     /// `StartSessionInput.workspace_id`. Attached per-call to dynamic
     /// tool dispatches so workspace-scoped built-in tools bind to THIS
@@ -311,19 +321,14 @@ impl CodexSession {
         // re-recorded from zero — see `CodexSubagentDemux`.
         recorded_usage_baseline: Option<UsageBaseline>,
     ) -> Result<Arc<Self>, ProviderError> {
-        // Start from the caller-supplied workspace env (CODEMUX_WORKSPACE_ID,
-        // CODEMUX_PANE_ID, BROWSER, …) so the agent's Bash subprocesses route
-        // `codemux browser open` at their OWN workspace. Provider-critical
-        // vars are overlaid AFTER so they win on conflict — CODEX_HOME must
-        // point at Codemux's managed config dir regardless of what the
-        // workspace env carries.
-        let mut env = caller_env.unwrap_or_default();
-        // A device uses its own `~/.codex`; a local CODEX_HOME path means
-        // nothing there.
+        let caller_env = caller_env.unwrap_or_default();
+        let mut env = caller_env.clone();
+        let mut spawn = spawn;
+        // A device owns its own account; local credentials never enter SSH.
+        if spawn.remote.is_some() { spawn.chatgpt_owner = None; }
         if let (Some(home), None) = (spawn.codex_home.as_ref(), spawn.remote.as_ref()) {
-            env.insert("CODEX_HOME".to_string(), home.to_string_lossy().to_string());
+            env.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
         }
-
         let managed = crate::agent_provider::managed::lookup_session(&thread_id);
         if managed.is_some() && !cfg!(target_os = "linux") {
             return Err(ProviderError::ValidationError {
@@ -343,61 +348,24 @@ impl CodexSession {
         } else {
             permission_mode
         };
-        let child = if managed.is_some() {
-            spawn_managed_codex(
-                &spawn,
-                &env,
-                &cwd,
-                managed
-                    .as_ref()
-                    .ok_or_else(|| ProviderError::ValidationError {
-                        message: "missing managed authority".into(),
-                    })?,
-            )
-            .await?
-        } else {
-            let args = vec!["app-server".to_string()];
-            let child = match spawn.remote.as_ref() {
-                #[cfg(unix)]
-                Some(remote) => {
-                    let codex =
-                        crate::ssh::sidecar::device_program(remote, &spawn.codex_binary).await?;
-                    JsonRpcChild::spawn(crate::ssh::sidecar::device_spawn_config(
-                        remote,
-                        &codex,
-                        &args,
-                        &env,
-                        &cwd,
-                        DEFAULT_RPC_TIMEOUT,
-                    )?)
-                    .await
-                    .map_err(crate::ssh::sidecar::ssh_spawn_error)?
-                }
-                #[cfg(not(unix))]
-                Some(_) => {
-                    return Err(ProviderError::ValidationError {
-                        message: "Threads on another device need macOS or Linux on this computer"
-                            .into(),
-                    })
-                }
-                None => JsonRpcChild::spawn(SpawnConfig {
-                    program: spawn.codex_binary.clone(),
-                    args,
-                    env,
-                    cwd: Some(cwd.clone()),
-                    default_timeout: DEFAULT_RPC_TIMEOUT,
-                })
-                .await
-                .map_err(|e| ProviderError::ProcessError {
-                    message: "failed to spawn `codex app-server`".into(),
-                    source: Some(e.to_string()),
-                })?,
-            };
-            Arc::new(child)
+        let runtime_lease = spawn.chatgpt_owner.as_ref()
+            .map(|owner| owner.acquire_runtime().map(Arc::new)).transpose()
+            .map_err(|message| ProviderError::ValidationError { message })?;
+        let grant = match spawn.chatgpt_owner.as_ref() {
+            Some(owner) => owner.usable().await.map_err(|hint| ProviderError::NotAuthenticated {
+                provider: crate::agent_provider::ProviderKind::Codex, hint,
+            })?,
+            None => None,
         };
-
+        let child = if let Some(context) = managed.as_ref() {
+            spawn_managed_codex(&spawn, &env, &cwd, context, grant.as_ref(), runtime_lease.clone()).await?
+        } else {
+            managed_runtime::spawn_child(&spawn, &cwd, caller_env.clone(), grant.as_ref(), runtime_lease.clone()).await?
+        };
         let mut startup_guard = child.managed_startup_guard();
-
+        // Keep the outer lease alive through exact-child teardown on failed init.
+        let initialized = async {
+        let mut model = model;
         // Pull the single incoming-request receiver before any background
         // tasks start; otherwise the adapter could race the watchdog.
         let incoming_rx = child
@@ -492,9 +460,13 @@ impl CodexSession {
             .await
         };
 
-        // Best-effort probes. Failures are non-fatal — we log via
-        // RuntimeWarning and continue.
-        let tier_models = match child.request("model/list", json!({})).await {
+        let tier_models = if grant.is_some() {
+            let entries = read_model_catalog(&child).await
+                .map_err(|message| ProviderError::RpcError { message })?;
+            model = Some(managed_runtime::selected_model(&entries, model.as_deref())?);
+            entries
+        } else {
+            match child.request("model/list", json!({})).await {
             Ok(value) => match serde_json::from_value::<super::protocol::ModelListResponse>(value) {
                 Ok(response) => response.data,
                 Err(error) => {
@@ -514,7 +486,11 @@ impl CodexSession {
                 });
                 vec![]
             }
+        }
         };
+        let managed_models = if grant.is_some() {
+            tier_models.iter().filter(|entry| !entry.hidden).map(|entry| entry.id.clone()).collect()
+        } else { Vec::new() };
         let resolved_tier =
             resolve_catalog_service_tier(&tier_models, model.as_deref(), &service_tier);
         if resolved_tier == "default" && service_tier != "default" {
@@ -525,6 +501,7 @@ impl CodexSession {
             });
         }
         let service_tier = resolved_tier;
+        if grant.is_none() {
         // account/read is the canonical "can this provider run?" check.
         // `requires_openai_auth` describes the active provider and stays true
         // for a logged-in ChatGPT/API-key account, so only gate when the
@@ -629,6 +606,9 @@ impl CodexSession {
             }
         }
 
+        }else{
+            let _=event_tx.send(ProviderRuntimeEvent::PlanUsageUpdated{thread_id:thread_id.clone(),provider:crate::agent_provider::ProviderKind::Codex,windows:Vec::new(),plan_label:Some("Using ChatGPT plan".into()),auth_mode:Some(PlanAuthMode::Subscription)});
+        }
         // --- thread/start or thread/resume ----------------------------------
         let require_original = resume_cursor
             .as_ref()
@@ -726,18 +706,18 @@ impl CodexSession {
         };
 
         // --- assemble session handle ----------------------------------------
+        let mut demux=CodexSubagentDemux::new(codex_thread_id.clone());demux.set_recorded_usage_baseline(recorded_usage_baseline.unwrap_or_default());
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(4);
         if let Some(guard) = startup_guard.as_mut() { guard.set_task_shutdown(shutdown_tx.clone()); }
         let state = Mutex::new(CodexSessionState {
             codex_thread_id: codex_thread_id.clone(),
             active_turn: None,
-            pending_generation: None,
-            pending_completed: VecDeque::new(),
+            pending_turn_start: None,
             pending_approvals: HashMap::new(),
             status: SessionStatus::Ready,
             model,
             default_effort: effort,
-            permission_mode,
+            permission_mode: permission_mode.clone(),
             service_tier,
             tier_models,
             queued_turns: VecDeque::new(),
@@ -746,17 +726,19 @@ impl CodexSession {
             thread_id: thread_id.clone(),
             provider_session_id: ProviderSessionId(codex_thread_id.clone()),
             cwd,
-            child: Arc::clone(&child),
+            child: RwLock::new(Arc::clone(&child)),
+            chatgpt_runtime: grant.as_ref().map(|g|managed_runtime::ManagedSession{owner:spawn.chatgpt_owner.as_ref().unwrap().clone(),spawn:spawn.clone(),env:env.iter().filter(|(k,_)|matches!(k.as_str(),"CODEMUX_WORKSPACE_ID"|"CODEMUX_PANE_ID"|"CODEMUX_HOOK_PORT"|"CODEMUX_CONTROL_SOCKET"|"CODEX_HOME")).map(|(k,v)|(k.clone(),v.clone())).collect(),revision:Mutex::new(g.revision.clone()),permission:permission_mode.clone(),models:Mutex::new(managed_models)}),
+            runtime_lease: Mutex::new(runtime_lease.clone()),
+            notification_demux: Mutex::new(demux),
             state,
             outbound: Mutex::new(()),
             event_tx: event_tx.clone(),
             shutdown_tx: shutdown_tx.clone(),
             tasks: Mutex::new(Vec::new()),
             dead: Arc::new(AtomicBool::new(false)),
-            recorded_usage_baseline: recorded_usage_baseline.unwrap_or_default(),
             workspace_id,
             native_authority: crate::delegation::authority::NativeAuthority::new(&thread_id.0),
-            managed,
+            managed: managed.clone(),
             host_caller,
         });
 
@@ -803,10 +785,14 @@ impl CodexSession {
 
         if let Some(guard) = startup_guard.as_mut() { guard.disarm(); }
         Ok(session)
+        }.await;
+        if initialized.is_err(){if managed.is_some(){let _=child.shutdown_managed().await;}else if runtime_lease.is_some(){let _=child.shutdown_owned().await;}else{let _=child.shutdown().await;}}
+        initialized
     }
+    pub(crate) async fn child(&self)->Arc<JsonRpcChild>{self.child.read().await.clone()}
 
-    pub(crate) fn managed_startup_guard(&self) -> Option<crate::json_rpc_child::ManagedStartupGuard> {
-        let mut guard = self.child.managed_startup_guard()?;
+    pub(crate) async fn managed_startup_guard(&self) -> Option<crate::json_rpc_child::ManagedStartupGuard> {
+        let mut guard = self.child().await.managed_startup_guard()?;
         guard.set_task_shutdown(self.shutdown_tx.clone());
         Some(guard)
     }
@@ -830,6 +816,7 @@ impl CodexSession {
         input: SendTurnInput,
     ) -> Result<SendOutcome, ProviderError> {
         let _outbound = self.outbound.lock().await;
+        self.ensure_open().await?;
         {
             let mut state = self.state.lock().await;
             if state.active_turn.is_some() {
@@ -904,9 +891,10 @@ impl CodexSession {
     }
 
     async fn deliver_steer(
-        &self,
+        self: &Arc<Self>,
         input: SendTurnInput,
     ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
+        self.ensure_open().await?;
         let root = self.state.lock().await.codex_thread_id.clone();
         for attempt in 0..2 {
             // Native state, rather than a potentially delayed notification,
@@ -941,8 +929,7 @@ impl CodexSession {
                     ),
                 };
                 if let Some(checkpoint) = &input.turn_checkpoint { checkpoint.authorize_dispatch()?; }
-                match self
-                    .child
+                match self.child().await
                     .request("turn/steer", serde_json::to_value(params).unwrap())
                     .await
                 {
@@ -1121,7 +1108,9 @@ impl CodexSession {
                             turn_id,
                             text,
                         });
-                    return;
+                    // A terminal notification may have arrived before the RPC
+                    // response. Recheck idle so the following item is not stranded.
+                    continue;
                 }
                 Err(err) => {
                     if let Some(checkpoint) = checkpoint.as_ref() {
@@ -1247,7 +1236,7 @@ impl CodexSession {
     /// override is threaded straight into the RPC. Does NOT perform the
     /// busy check (callers gate that); assumes the session is idle.
     async fn do_send(
-        &self,
+        self: &Arc<Self>,
         text: String,
         images: Vec<crate::agent_provider::ImageInput>,
         skill_invocations: Vec<crate::skills::ResolvedSkillInvocation>,
@@ -1256,6 +1245,7 @@ impl CodexSession {
         dispatch_guard: Option<Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard>>,
         checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) -> Result<TurnId, ProviderError> {
+        self.ensure_managed_child().await?;
         let thread_id = self.state.lock().await.codex_thread_id.clone();
         let native = super::slash_commands::request(&text, &thread_id)
             .map_err(|message| ProviderError::ValidationError { message })?;
@@ -1280,7 +1270,7 @@ impl CodexSession {
                     return Err(error);
                 }
             }
-            let response = match self.child.request(method, params).await {
+            let response = match self.child().await.request(method, params).await {
                 Ok(response) => response,
                 Err(error) => {
                     let mut state = self.state.lock().await;
@@ -1336,7 +1326,7 @@ impl CodexSession {
     }
 
     async fn do_send_with_id(
-        &self,
+        self: &Arc<Self>,
         text: String,
         images: Vec<crate::agent_provider::ImageInput>,
         skill_invocations: Vec<crate::skills::ResolvedSkillInvocation>,
@@ -1346,6 +1336,7 @@ impl CodexSession {
         dispatch_guard: Option<Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard>>,
         checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) -> Result<TurnId, TurnStartError> {
+        self.ensure_managed_child().await.map_err(TurnStartError::Admission)?;
         let (codex_thread_id, model_default, effort_default, service_tier) = {
             let state = self.state.lock().await;
             (
@@ -1405,47 +1396,53 @@ impl CodexSession {
         let generation = {
             let mut state = self.state.lock().await;
             let generation = self.native_authority.begin();
-            state.pending_generation = Some(generation);
-            state.pending_completed.clear();
+            state.pending_turn_start = Some(PendingTurnStart::default());
             generation
         };
-        let resp = match dispatch_guard.as_deref() {
-            Some(guard) => {
-                self.child
-                    .request_guarded("turn/start", params_value, guard)
-                    .await
-            }
-            None => self.child.request("turn/start", params_value).await,
-        }
-        .map_err(|error| {
+        let child = self.child().await;
+        let response = match dispatch_guard.as_deref() {
+            Some(guard) => child.request_guarded("turn/start", params_value, guard).await,
+            None => child.request("turn/start", params_value).await,
+        };
+        let parsed = response
+            .map_err(TurnStartError::Rpc)
+            .and_then(|value| serde_json::from_value::<TurnStartResponse>(value)
+                .map_err(TurnStartError::Malformed))
+            .and_then(|response| {
+                if let Some(guard) = dispatch_guard.as_ref() {
+                    guard.accepted().map_err(|error| TurnStartError::Rpc(
+                        crate::json_rpc_child::RpcChildError::ProtocolError(error)
+                    ))?;
+                }
+                Ok(response)
+            });
+        let mut state = self.state.lock().await;
+        let pending = state.pending_turn_start.take().unwrap_or_default();
+        let parsed = parsed.map_err(|error| {
             self.native_authority.finish_pending(generation);
-            TurnStartError::Rpc(error)
-        })?;
-        let parsed: TurnStartResponse = serde_json::from_value(resp).map_err(|error| {
-            self.native_authority.finish_pending(generation);
-            TurnStartError::Malformed(error)
+            error
         })?;
         let turn_id = TurnId(parsed.turn.id);
-        if let Some(guard) = dispatch_guard.as_ref() {
-            guard.accepted().map_err(|e| {
-                TurnStartError::Rpc(crate::json_rpc_child::RpcChildError::ProtocolError(e))
-            })?;
+        if pending.completed_turns.contains(&turn_id) || pending.failed {
+            self.native_authority.finish_pending(generation);
         }
-        {
-            let mut state = self.state.lock().await;
-            if state.pending_completed.iter().any(|id| id == &turn_id.0) {
-                self.native_authority.finish_pending(generation);
-            }
-            state.pending_generation = None;
-            state.pending_completed.clear();
-            if self.native_authority.bind(generation, &turn_id.0) {
-                state.active_turn = Some(turn_id.clone());
-                state.status = SessionStatus::Running {
-                    active_turn: turn_id.clone(),
-                };
-            }
+        if self.native_authority.bind(generation, &turn_id.0) {
+            state.active_turn = Some(turn_id.clone());
+            state.status = SessionStatus::Running {
+                active_turn: turn_id.clone(),
+            };
         }
         Ok(turn_id)
+    }
+
+    // Called with outbound held, so explicit shutdown cannot race admission.
+    async fn ensure_open(&self) -> Result<(), ProviderError> {
+        if matches!(self.state.lock().await.status, SessionStatus::Closed) {
+            return Err(ProviderError::ValidationError {
+                message: "This Codex session has been stopped. Start a new session to continue.".into(),
+            });
+        }
+        Ok(())
     }
 
     /// Whether the child-exit watchdog has declared this session's
@@ -1453,6 +1450,13 @@ impl CodexSession {
     /// treated as absent by the provider so the next send auto-resumes.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
+    }
+
+    /// A managed replacement temporarily marks its retired child dead while
+    /// holding outbound. Provider eviction must wait for that owner to settle
+    /// and recheck death, rather than removing an in-progress renewal.
+    pub(super) async fn lifecycle_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.outbound.lock().await
     }
 
     pub async fn answer_question(
@@ -1469,11 +1473,12 @@ impl CodexSession {
     }
 
     async fn deliver_question_answer(
-        &self,
+        self: &Arc<Self>,
         input: crate::agent_provider::AnswerQuestionInput,
     ) -> Result<crate::agent_provider::QuestionDelivery, crate::agent_provider::QuestionDeliveryError>
     {
         use crate::agent_provider::{QuestionDelivery as Delivery, QuestionDeliveryError as Error};
+        self.ensure_open().await.map_err(|error| Error::Rejected(error.to_string()))?;
         let text = input
             .question
             .answer_text(&input.answers)
@@ -1512,8 +1517,7 @@ impl CodexSession {
                         text_elements: vec![],
                     }],
                 };
-                match self
-                    .child
+                match self.child().await
                     .request("turn/steer", serde_json::to_value(params).unwrap())
                     .await
                 {
@@ -1581,8 +1585,7 @@ impl CodexSession {
     }
 
     async fn read_question_thread(&self, target: &str) -> Result<Value, String> {
-        let value = self
-            .child
+        let value = self.child().await
             .request(
                 "thread/read",
                 json!({"threadId": target, "includeTurns": true}),
@@ -1641,7 +1644,7 @@ impl CodexSession {
             turn_id: active_turn.0.clone(),
         };
         let params_value = serde_json::to_value(&params).unwrap();
-        self.child
+        self.child().await
             .request("turn/interrupt", params_value)
             .await
             .map_err(|e| ProviderError::RpcError {
@@ -1678,7 +1681,7 @@ impl CodexSession {
             message: format!("failed to serialize thread/rollback: {error}"),
             source: None,
         })?;
-        self.child
+        self.child().await
             .request("thread/rollback", params)
             .await
             .map_err(|error| ProviderError::RpcError {
@@ -1702,7 +1705,7 @@ impl CodexSession {
             })?
         };
         let payload = serde_json::to_value(&response).unwrap();
-        self.child
+        self.child().await
             .respond(jsonrpc_id, Ok(payload))
             .await
             .map_err(|e| ProviderError::RpcError {
@@ -1723,8 +1726,7 @@ impl CodexSession {
         // Refresh when choosing a premium tier: entitlement can change while
         // the conversation stays alive. Standard always clears a stale choice.
         let models = if tier != "default" {
-            let value = self
-                .child
+            let value = self.child().await
                 .request("model/list", json!({}))
                 .await
                 .map_err(|error| ProviderError::RpcError {
@@ -1764,6 +1766,7 @@ impl CodexSession {
     /// later invocations are cheap no-ops.
     pub async fn shutdown(&self) -> Result<(), ProviderError> {
         self.native_authority.revoke();
+        let _outbound = self.outbound.lock().await;
         // Cancel any queued follow-ups so the UI clears its greyed items.
         self.cancel_all_queued().await;
 
@@ -1772,7 +1775,19 @@ impl CodexSession {
         let _ = self.shutdown_tx.send(());
 
         // Close the JSON-RPC child cleanly (EOF → 2s grace → kill).
-        let stopped = self.child.shutdown().await;
+        let child = self.child().await;
+        let stopped = if self.runtime_lease.lock().await.is_some() {
+            child.shutdown_owned().await
+        } else {
+            child.shutdown().await
+        };
+        if stopped.is_err() && self.chatgpt_runtime.is_some() {
+            let _ = self.event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(self.thread_id.clone()),
+                message: "Codex is still stopping. Wait before changing the ChatGPT connection.".into(),
+                original_payload: None,
+            });
+        }
 
         // Abort any tasks that haven't exited on their own.
         let tasks: Vec<_> = {
@@ -1783,6 +1798,7 @@ impl CodexSession {
             t.abort();
             let _ = t.await;
         }
+        self.runtime_lease.lock().await.take();
         // Flip internal status so concurrent callers see Closed without
         // waiting for the child to actually exit.
         {
@@ -1802,7 +1818,7 @@ impl CodexSession {
                 message: "session is not a managed attempt".into(),
             });
         }
-        self.child
+        self.child().await
             .shutdown_managed()
             .await
             .map_err(|error| ProviderError::ProcessError {
@@ -1965,18 +1981,33 @@ async fn spawn_managed_codex(
     env: &HashMap<String, String>,
     cwd: &std::path::Path,
     context: &crate::agent_provider::managed::ManagedSession,
+    grant: Option<&super::chatgpt::ManagedGrant>,
+    lease: Option<Arc<std::fs::File>>,
 ) -> Result<Arc<JsonRpcChild>, ProviderError> {
     let mut disabled_servers = Vec::new();
     for pass in 0..2 {
+        let mut args = managed_codex_args(&disabled_servers);
+        let child_env = if let Some(grant) = grant {
+            let (plan_args, mut plan_env) = grant.launch(env.clone());
+            // Keep the workflow's configured home, and compose its feature
+            // restrictions with the explicit bearer-bound model provider.
+            if let Some(home) = env.get("CODEX_HOME") {
+                plan_env.insert("CODEX_HOME".into(), home.clone());
+            }
+            args.pop(); // the plan launch supplies the app-server subcommand
+            args.extend(plan_args);
+            plan_env
+        } else { env.clone() };
+        let config = SpawnConfig {
+            program: spawn.codex_binary.clone(), args, env: child_env,
+            cwd: Some(cwd.into()), default_timeout: DEFAULT_RPC_TIMEOUT,
+        };
+        let spawned = match lease.as_ref() {
+            Some(lease) => JsonRpcChild::spawn_managed_owned(config, grant.is_some(), lease.clone()).await,
+            None => JsonRpcChild::spawn_managed(config).await,
+        };
         let child = Arc::new(
-            JsonRpcChild::spawn_managed(SpawnConfig {
-                program: spawn.codex_binary.clone(),
-                args: managed_codex_args(&disabled_servers),
-                env: env.clone(),
-                cwd: Some(cwd.into()),
-                default_timeout: DEFAULT_RPC_TIMEOUT,
-            })
-            .await
+            spawned
             .map_err(|error| match error {
                 crate::json_rpc_child::RpcChildError::SpawnFailed(io) => ProviderError::ValidationError {
                     message: format!("managed-start-rejected: setup_required: failed to spawn Codex workflow app-server: {io}"),
@@ -2256,18 +2287,6 @@ fn spawn_notifications_task(
 ) -> JoinHandle<()> {
     let mut notifications = child.notifications();
     tokio::spawn(async move {
-        // One demux per session, rooted at the parent Codex thread id, so
-        // child-thread (sub-agent) registrations persist across messages.
-        let parent_codex_thread_id = {
-            let state = session.state.lock().await;
-            state.codex_thread_id.clone()
-        };
-        let mut demux = CodexSubagentDemux::new(parent_codex_thread_id);
-        // Codex's `total` is a lifetime counter that survives
-        // `thread/resume`, but this demux is rebuilt with the session.
-        // Seed what the ledger already holds so the first report after a
-        // rebuild records only genuinely new work.
-        demux.set_recorded_usage_baseline(session.recorded_usage_baseline);
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
@@ -2278,6 +2297,7 @@ fn spawn_notifications_task(
                             // Update local state for a few special
                             // notifications before broadcasting.
                             update_state_from_notification(&session, &msg).await;
+                            let mut demux=session.notification_demux.lock().await;
                             // Codex never states a model on the usage
                             // notification, so the ledger has to learn it
                             // from session state. Refreshed only on the
@@ -2290,7 +2310,9 @@ fn spawn_notifications_task(
                             }
                             let events =
                                 translate_notification_with(&mut demux, &session.thread_id, msg);
+                            drop(demux);
                             for ev in events {
+                                if session.chatgpt_runtime.is_some() && matches!(ev,ProviderRuntimeEvent::PlanUsageUpdated{..}){continue}
                                 if event_tx.send(ev).is_err() {
                                     // No subscribers — silently drop.
                                 }
@@ -2310,7 +2332,7 @@ fn spawn_notifications_task(
                                 SessionStatus::Closed | SessionStatus::Error { .. } => {
                                     session.cancel_all_queued().await;
                                 }
-                                _ => session.drain_queue().await,
+                                _ => {let session=session.clone();tokio::spawn(async move{session.drain_queue().await;});},
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(count)) => {
@@ -2371,7 +2393,7 @@ fn spawn_incoming_requests_task(
                             let turn = params.get("turnId").and_then(Value::as_str);
                             let owned = params.get("threadId").and_then(Value::as_str) == Some(state.codex_thread_id.as_str())
                                 && turn.is_some_and(|turn| state.active_turn.as_ref().is_some_and(|active| active.0 == turn)
-                                    || state.pending_generation.is_some());
+                                    || state.pending_turn_start.is_some());
                             owned.then(|| crate::delegation::app::NativeActor {
                                 thread_id: session.thread_id.0.clone(), provider: crate::agent_provider::ProviderKind::Codex,
                                 workspace_id: session.workspace_id.clone(), session_id: session.provider_session_id.0.clone(),
@@ -2656,11 +2678,11 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
             if state.active_turn.as_ref().is_some_and(|t| t.0 != p.turn_id) {
                 return;
             }
-            if state.pending_generation.is_some() {
-                if state.pending_completed.len() == 64 {
-                    state.pending_completed.pop_front();
+            if let Some(pending) = state.pending_turn_start.as_mut() {
+                if pending.completed_turns.len() == 64 {
+                    pending.completed_turns.pop_front();
                 }
-                state.pending_completed.push_back(p.turn_id.clone());
+                pending.completed_turns.push_back(TurnId(p.turn_id.clone()));
             }
             if state
                 .active_turn
@@ -2690,6 +2712,9 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
                 .as_deref()
                 .map_or(true, |t| t == state.codex_thread_id)
             {
+                if let Some(pending) = state.pending_turn_start.as_mut() {
+                    pending.failed = true;
+                }
                 state.status = SessionStatus::Error {
                     message: e.message.clone(),
                 };
@@ -2698,6 +2723,10 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
         _ => {}
     }
 }
+
+#[cfg(all(test,unix))]
+#[path="managed_tests.rs"]
+pub(crate) mod managed_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2867,7 +2896,7 @@ mod tests {
 
     /// Build a bare `QueuedTurn` with a given id for reorder tests. Only
     /// `queued_id` is inspected by `promote_queued_to_front`.
-    fn queued(id: &str) -> QueuedTurn {
+    pub(super) fn queued(id: &str) -> QueuedTurn {
         QueuedTurn {
             queued_id: id.to_string(),
             input: SendTurnInput {
@@ -3183,6 +3212,7 @@ mod tests {
 /// apart from one whose outcome is unknown.
 #[derive(Debug)]
 enum TurnStartError {
+    Admission(ProviderError),
     Rpc(crate::json_rpc_child::RpcChildError),
     Malformed(serde_json::Error),
 }
@@ -3191,6 +3221,7 @@ enum TurnStartError {
 fn plain_send_error(error: TurnStartError) -> ProviderError {
     ProviderError::RpcError {
         message: match error {
+            TurnStartError::Admission(e) => e.to_string(),
             TurnStartError::Rpc(e) => format!("turn/start failed: {e}"),
             TurnStartError::Malformed(e) => format!("malformed turn/start response: {e}"),
         },
@@ -3202,6 +3233,7 @@ fn question_turn_start_error(
     error: TurnStartError,
 ) -> crate::agent_provider::QuestionDeliveryError {
     match error {
+        TurnStartError::Admission(e) => crate::agent_provider::QuestionDeliveryError::Rejected(e.to_string()),
         TurnStartError::Rpc(e) => question_rpc_error(e),
         TurnStartError::Malformed(e) => crate::agent_provider::QuestionDeliveryError::Unknown(
             format!("Malformed turn/start response: {e}"),

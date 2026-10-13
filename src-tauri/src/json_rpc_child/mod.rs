@@ -103,7 +103,7 @@ pub enum TransportFailure {
 }
 
 /// Parameters for spawning a JSON-RPC child process.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SpawnConfig {
     /// Executable path to spawn.
     pub program: PathBuf,
@@ -117,6 +117,11 @@ pub struct SpawnConfig {
     /// [`JsonRpcChild::request`]. Individual callers can override via
     /// [`JsonRpcChild::request_with_timeout`].
     pub default_timeout: Duration,
+}
+impl std::fmt::Debug for SpawnConfig {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.debug_struct("SpawnConfig").field("program",&self.program).field("args",&self.args).field("env_keys",&self.env.keys().collect::<Vec<_>>()).field("cwd",&self.cwd).field("default_timeout",&self.default_timeout).finish()
+    }
 }
 
 /// JSON-RPC notification (a message with a `method` but no `id`) received
@@ -446,23 +451,47 @@ impl JsonRpcChild {
     /// Fails with [`RpcChildError::SpawnFailed`] if the executable cannot start.
     /// An unexpected pipe-capture failure after spawn is a protocol error.
     pub async fn spawn(config: SpawnConfig) -> Result<Self, RpcChildError> {
-        Self::spawn_mode(config, false, false).await
+        Self::spawn_mode(config, false, false, false, None).await
     }
 
     /// Standards-driven peers fail closed on malformed framing or callback
     /// loss. Existing native adapters retain their tolerant transport mode.
     pub async fn spawn_strict(config: SpawnConfig) -> Result<Self, RpcChildError> {
-        Self::spawn_mode(config, true, false).await
+        Self::spawn_mode(config, true, false, false, None).await
     }
 
     pub async fn spawn_managed(config: SpawnConfig) -> Result<Self, RpcChildError> {
-        Self::spawn_mode(config, false, true).await
+        Self::spawn_mode(config, false, true, false, None).await
+    }
+
+    /// App-owned bearer credentials require a minimal inherited environment.
+    /// Existing adapters retain their ordinary overlay semantics.
+    pub async fn spawn_isolated(config: SpawnConfig) -> Result<Self, RpcChildError> {
+        Self::spawn_mode(config, false, false, true, None).await
+    }
+
+    pub(crate) async fn spawn_owned(
+        config: SpawnConfig,
+        isolated: bool,
+        lease: Arc<std::fs::File>,
+    ) -> Result<Self, RpcChildError> {
+        Self::spawn_mode(config, false, false, isolated, Some(lease)).await
+    }
+
+    pub(crate) async fn spawn_managed_owned(
+        config: SpawnConfig,
+        isolated: bool,
+        lease: Arc<std::fs::File>,
+    ) -> Result<Self, RpcChildError> {
+        Self::spawn_mode(config, false, true, isolated, Some(lease)).await
     }
 
     async fn spawn_mode(
         config: SpawnConfig,
         strict: bool,
         managed: bool,
+        isolated: bool,
+        owner_lease: Option<Arc<std::fs::File>>,
     ) -> Result<Self, RpcChildError> {
         let mut cmd = Command::new(&config.program);
         cmd.args(&config.args)
@@ -487,6 +516,19 @@ impl JsonRpcChild {
         // env pair from `config` still wins. No-op outside an AppImage.
         crate::execution::sanitize_appimage_env_tokio(&mut cmd);
 
+        if isolated {
+            cmd.env_clear();
+            for key in ["HOME","USER","LOGNAME","PATH","SHELL","LANG","LC_ALL","LC_CTYPE","TERM","COLORTERM","TMPDIR","TMP","TEMP","XDG_RUNTIME_DIR","WAYLAND_DISPLAY","DISPLAY","DBUS_SESSION_BUS_ADDRESS"] {
+                if let Some(value) = std::env::var_os(key) {
+                    // Clearing the environment also cleared the AppImage fixups above.
+                    if key == "PATH" {
+                        cmd.env(key, crate::execution::sanitized_child_path());
+                    } else {
+                        cmd.env(key, value);
+                    }
+                }
+            }
+        }
         for (k, v) in &config.env {
             cmd.env(k, v);
         }
@@ -674,6 +716,8 @@ impl JsonRpcChild {
                     }
                 };
 
+                if exit_status.is_ok() { drop(owner_lease); }
+                else if let Some(lease)=owner_lease{std::mem::forget(lease);} // fail closed if OS reap cannot be confirmed
                 alive_watchdog.store(false, Ordering::SeqCst);
 
                 let reap_result = exit_status
@@ -1028,6 +1072,12 @@ impl JsonRpcChild {
         })?
     }
 
+    /// Owned credential processes join the same reap and pipe-drain boundary.
+    /// Shutdown initiation is retained by the watchdog if the caller cancels.
+    pub(crate) async fn shutdown_owned(&self) -> Result<(), RpcChildError> {
+        self.shutdown().await
+    }
+    /// Whether the child process is still running (best-effort).
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }

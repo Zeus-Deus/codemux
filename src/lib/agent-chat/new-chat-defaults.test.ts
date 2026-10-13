@@ -7,6 +7,7 @@ vi.mock("@/tauri/commands", () => ({
 
 import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
 import { useSettingsStore } from "@/stores/settings-store";
+import { useChatGptStore } from "@/stores/chatgpt-store";
 import type { ChatModelInfo, ProviderChatCapabilities } from "@/tauri/types";
 import { resolveNewChatModelDefaults } from "./new-chat-defaults";
 
@@ -45,6 +46,7 @@ function choose(settings: Record<string, string>) {
 
 describe("resolveNewChatModelDefaults", () => {
   beforeEach(() => {
+    useChatGptStore.setState({ status: null });
     useProviderCapabilities.setState({
       claude: caps([model("claude-opus", ["low", "high"])]),
       codex: caps([model("gpt-a", ["low", "high"]), model("gpt-b", ["medium"])]),
@@ -52,6 +54,7 @@ describe("resolveNewChatModelDefaults", () => {
   });
 
   afterEach(() => {
+    useChatGptStore.setState({ status: null });
     useSettingsStore.setState({ settings: {} });
     useProviderCapabilities.setState({ claude: null, codex: null });
   });
@@ -76,6 +79,23 @@ describe("resolveNewChatModelDefaults", () => {
       model: "gpt-a",
       effort: "high",
     });
+  });
+
+  it("uses the connected plan's live catalog for Automatic and preserves custom defaults", () => {
+    useChatGptStore.setState({ status: {
+      phase: "connected", attemptId: null, email: null, error: null,
+      profiles: [], activeProfileId: "plan", welcomePending: false, installed: true,
+    } });
+    choose({});
+    expect(resolveNewChatModelDefaults()).toEqual({ provider: "codex", model: "gpt-a", effort: null });
+    useProviderCapabilities.setState({ codex: null });
+    expect(resolveNewChatModelDefaults()).toEqual({ provider: "codex", model: null, effort: null });
+    choose({ "chat.default_provider": "codex" });
+    expect(resolveNewChatModelDefaults()).toEqual({ provider: "codex", model: null, effort: null });
+    useProviderCapabilities.setState({ codex: caps([]) });
+    expect(resolveNewChatModelDefaults()).toEqual({ provider: "codex", model: null, effort: null });
+    choose({ "chat.default_provider": "claude", "chat.default_model": "claude-opus" });
+    expect(resolveNewChatModelDefaults()).toEqual({ provider: "claude", model: "claude-opus", effort: null });
   });
 
   it("drops an effort the chosen model does not offer", () => {

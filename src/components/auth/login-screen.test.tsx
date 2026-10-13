@@ -25,12 +25,20 @@ import {
 import { useAuthStore } from "@/stores/auth-store";
 import { resendVerificationEmail } from "@/tauri/commands";
 
+import { useChatGptStore } from "@/stores/chatgpt-store";
+
+const startChatGpt = vi.fn();
+const enterLocal = vi.fn();
 const startOAuthFlow = vi.fn();
 const signInEmail = vi.fn();
 const signUpEmail = vi.fn();
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useChatGptStore.setState({
+    status: null, loading: false, busy: false, error: null, subscriptionError: null,
+    localMode: false, start: startChatGpt, enterLocal,
+  });
   vi.mocked(resendVerificationEmail).mockResolvedValue(undefined);
   useAuthStore.setState({
     isLoading: false,
@@ -50,6 +58,16 @@ function passwordInput() {
 }
 
 describe("LoginScreen", () => {
+  it("offers ChatGPT plan setup separately from cloud account sign-in", () => {
+    render(<LoginScreen />);
+    expect(screen.getByText(/GitHub or email connects your CodeMux account for sync/i)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Continue with ChatGPT" }));
+    expect(startChatGpt).toHaveBeenCalledWith(null);
+    expect(startOAuthFlow).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Continue locally with another provider" }));
+    expect(enterLocal).toHaveBeenCalledOnce();
+  });
+
   it("replaces the form with a cancellable wait while GitHub sign-in is open", () => {
     useAuthStore.setState({ oauthPending: true });
     render(<LoginScreen />);

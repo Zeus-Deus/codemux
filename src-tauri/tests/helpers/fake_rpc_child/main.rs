@@ -5,6 +5,7 @@
 //!
 //! Methods understood:
 //!   - `echo`             → result = params
+//!   - `read_env`         → result = the value of params.key, or null
 //!   - `sleep`            → params.ms millis (on a background thread so the
 //!                          main loop keeps processing new messages);
 //!                          result = {"slept": ms}
@@ -132,6 +133,14 @@ fn main() {
         let id = msg.id.clone();
 
         match method {
+            "read_env" => {
+                let key = msg.params["key"].as_str().expect("environment key");
+                write_line(&json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": std::env::var(key).ok(),
+                }));
+            }
             "echo" => {
                 if let Some(id) = id {
                     write_line(&json!({"jsonrpc":"2.0","id":id,"result":msg.params}));
