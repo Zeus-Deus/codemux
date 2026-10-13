@@ -192,7 +192,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         } else {
           useSyncedSettingsStore
             .getState()
-            .reconcileRemoteSettings(session.settings, settingsToken);
+            .reconcileRemoteSettings(session.settings, settingsToken, session.status === "verified");
         }
         set({
           user: session.user,

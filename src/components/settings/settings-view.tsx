@@ -15,6 +15,8 @@ import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { basename } from "@/lib/path";
+import { toast } from "@/lib/toast";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
   Sheet,
   SheetContent,
@@ -33,6 +35,8 @@ import {
 } from "@/components/ui/select";
 import {
   ArrowLeft,
+  Check,
+  FolderOpen,
   Trash2,
   X,
   Plus,
@@ -40,7 +44,12 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
-import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
+import {
+  groupWorkspacesByProject,
+  selectActiveWorkspaceId,
+  useAppStore,
+} from "@/stores/app-store";
+import { openProjectFlow } from "@/hooks/use-project-actions";
 import { useAuthStore } from "@/stores/auth-store";
 import {
   useSyncedSettingsStore,
@@ -174,10 +183,11 @@ import { SourceControlSection } from "./source-control-section";
 import {
   SectionHeader,
   SegmentedControl,
+  SettingsCard,
   SettingRow,
   SubsectionHeader,
-  SettingsCard,
 } from "./settings-primitives";
+import { SettingsSyncIndicator } from "./settings-sync-indicator";
 import { AboutSection } from "./about-section";
 import { SettingsNavSearch, revealSettingsAnchor } from "./settings-search";
 import type { SettingsSearchResult } from "@/lib/settings-search";
@@ -215,6 +225,7 @@ function FormField({
   label,
   helper,
   caption,
+  status,
   htmlFor,
   children,
   className,
@@ -222,6 +233,8 @@ function FormField({
   label: string;
   helper?: React.ReactNode;
   caption?: React.ReactNode;
+  /** Right of the label: a save confirmation or similar. */
+  status?: React.ReactNode;
   htmlFor?: string;
   children: React.ReactNode;
   className?: string;
@@ -229,12 +242,15 @@ function FormField({
   return (
     <div className={cn("space-y-2", className)}>
       <div className="space-y-1">
-        <label
-          htmlFor={htmlFor}
-          className="text-body font-medium text-foreground leading-none block"
-        >
-          {label}
-        </label>
+        <div className="flex items-center justify-between gap-4">
+          <label
+            htmlFor={htmlFor}
+            className="text-body font-medium text-foreground leading-none block"
+          >
+            {label}
+          </label>
+          {status}
+        </div>
         {helper && (
           <p className="text-body-sm text-muted-foreground/85 leading-relaxed">
             {helper}
@@ -289,7 +305,7 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cn(
-        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-md text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
         active
           ? "bg-surface-3 text-foreground"
           : "text-muted-foreground/90 hover:bg-surface-2 hover:text-foreground",
@@ -297,7 +313,7 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
     >
       <Icon
         className={cn(
-          "h-[15px] w-[15px] shrink-0 transition-colors duration-150",
+          "size-4 shrink-0 transition-colors duration-150",
           active
             ? "text-foreground/85"
             : "text-muted-foreground/70 group-hover/nav:text-foreground/80",
@@ -400,7 +416,8 @@ const DEFAULT_VIEWPORT_OPTIONS = [
 function BrowserSection() {
   const [dataSize, setDataSize] = useState<number | null>(null);
   const [clearing, setClearing] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
+  const [message, setMessage] = useState<{ text: string; failed: boolean } | null>(null);
+  const { confirm, dialog: confirmDialog } = useConfirm();
   const defaultViewport = useSyncedSettingsStore(selectBrowserDefaultViewport);
   const updateSyncedSetting = useSyncedSettingsStore((s) => s.updateSetting);
 
@@ -411,30 +428,44 @@ function BrowserSection() {
   useEffect(() => { refreshSize(); }, []);
 
   const handleClearCookies = async () => {
-    if (!confirm("This will clear all saved cookies and site data. You'll need to re-accept cookie consent pages. Continue?")) return;
+    const confirmed = await confirm({
+      title: "Clear cookies and site data?",
+      description:
+        "Saved cookies and session storage are removed from the built-in browser. You'll need to sign in to sites and accept cookie consent pages again.",
+      confirmLabel: "Clear cookies",
+      destructive: true,
+    });
+    if (!confirmed) return;
     setClearing("cookies");
     setMessage(null);
     try {
       await clearBrowserCookies();
-      setMessage("Cookies and site data cleared.");
+      setMessage({ text: "Cookies and site data cleared.", failed: false });
       refreshSize();
     } catch (e) {
-      setMessage(`Failed: ${e}`);
+      setMessage({ text: `Couldn't clear cookies: ${e}`, failed: true });
     } finally {
       setClearing(null);
     }
   };
 
   const handleClearAll = async () => {
-    if (!confirm("This will completely reset the browser. All cookies, cache, and saved data will be deleted. Continue?")) return;
+    const confirmed = await confirm({
+      title: "Clear all browser data?",
+      description:
+        "This resets the built-in browser profile. Cookies, cache, screenshots and all saved data are deleted.",
+      confirmLabel: "Clear all data",
+      destructive: true,
+    });
+    if (!confirmed) return;
     setClearing("all");
     setMessage(null);
     try {
       await clearAllBrowserData();
-      setMessage("All browser data cleared.");
+      setMessage({ text: "All browser data cleared.", failed: false });
       refreshSize();
     } catch (e) {
-      setMessage(`Failed: ${e}`);
+      setMessage({ text: `Couldn't clear browser data: ${e}`, failed: true });
     } finally {
       setClearing(null);
     }
@@ -519,11 +550,20 @@ function BrowserSection() {
         </SettingRow>
       </div>
       {message && (
-        <SettingsCard className="mt-4 flex items-start gap-3 border-border/50 bg-muted/40">
-          <div className="size-1.5 rounded-full bg-success shrink-0 mt-1.5" />
-          <p className="text-body-sm text-muted-foreground/90 leading-relaxed">{message}</p>
+        <SettingsCard
+          role={message.failed ? "alert" : "status"}
+          className="mt-4 flex items-start gap-3"
+        >
+          <div
+            className={cn(
+              "size-1.5 rounded-full shrink-0 mt-1.5",
+              message.failed ? "bg-destructive" : "bg-success",
+            )}
+          />
+          <p className="text-body-sm text-muted-foreground/90 leading-relaxed">{message.text}</p>
         </SettingsCard>
       )}
+      {confirmDialog}
     </div>
   );
 }
@@ -546,6 +586,63 @@ function quotePrompt(value: string): string {
 function structuredCommandFor(agentCommand: string, prompt: string): string {
   const p = prompt.trim();
   return p ? `${agentCommand} ${quotePrompt(p)}` : agentCommand;
+}
+
+/** Report a failed write the user would otherwise never hear about. */
+function reportFailure(message: string) {
+  return (error: unknown) => {
+    console.error(`[settings] ${message}:`, error);
+    toast.error(message, { description: String(error) });
+  };
+}
+
+/** Deleting a custom preset cannot be undone, from the list or the editor. */
+function confirmPresetDelete(
+  confirm: ReturnType<typeof useConfirm>["confirm"],
+  name: string,
+): Promise<boolean> {
+  return confirm({
+    title: `Delete "${name}"?`,
+    description: "The preset is removed from Settings and the preset bar. This can't be undone.",
+    confirmLabel: "Delete preset",
+    destructive: true,
+  });
+}
+
+type ProjectField = "includes" | "setup" | "teardown" | "run";
+
+/** Shape the Projects form into what `setProjectScripts` stores: one entry
+ *  per non-blank line. */
+function projectScriptsFrom(
+  setup: string,
+  teardown: string,
+  run: string,
+  includes: string,
+) {
+  const lines = (text: string) =>
+    text.trim() ? text.trim().split("\n").filter((l) => l.trim()) : [];
+  return {
+    setup: lines(setup),
+    teardown: lines(teardown),
+    run: run.trim() || null,
+    worktree_includes: lines(includes),
+  };
+}
+
+/** A brief "Saved" beside a Projects field after its blur-save lands. */
+function SavedNote({ visible }: { visible: boolean }) {
+  return (
+    <span
+      aria-hidden={!visible || undefined}
+      className={cn(
+        "flex items-center gap-1 text-label text-muted-foreground transition-opacity duration-150 motion-reduce:transition-none",
+        visible ? "opacity-100" : "opacity-0",
+      )}
+    >
+      <Check className="size-3" aria-hidden />
+      Saved
+    </span>
+  );
 }
 
 function PresetEditorSheet({
@@ -590,7 +687,7 @@ function PresetEditorSheet({
     context: null,
   });
   const [prompt, setPrompt] = useState("");
-  const [confirmDelete, setConfirmDelete] = useState(false);
+  const { confirm, dialog: confirmDialog } = useConfirm();
 
   // Sync when preset changes
   useEffect(() => {
@@ -609,7 +706,6 @@ function PresetEditorSheet({
       lc?.model_selection ?? { model: null, reasoning: null, context: null },
     );
     setPrompt(lc?.prompt ?? "");
-    setConfirmDelete(false);
   }, [preset]);
 
   // ── Launch model/reasoning sourcing (mirrors new-workspace-dialog) ──
@@ -729,7 +825,7 @@ function PresetEditorSheet({
         autoRunOnWorkspace: aw,
         autoRunOnNewTab: an,
         launchConfig: { agent_command: ac, model_selection: ms, prompt: pr },
-      }).catch(console.error);
+      }).catch(reportFailure("Couldn't save the preset"));
     } else {
       updatePreset({
         id: preset.id,
@@ -741,7 +837,7 @@ function PresetEditorSheet({
         icon: preset.icon,
         autoRunOnWorkspace: aw,
         autoRunOnNewTab: an,
-      }).catch(console.error);
+      }).catch(reportFailure("Couldn't save the preset"));
     }
   };
 
@@ -801,7 +897,7 @@ function PresetEditorSheet({
           launchMode,
           icon: opt?.icon ?? preset.icon,
           launchConfig: { agent_command: ac, model_selection: ms, prompt },
-        }).catch(console.error);
+        }).catch(reportFailure("Couldn't save the preset"));
       }
     } else if (mode === "raw" && structured) {
       const cmd = structuredCommandFor(agentCommand, prompt);
@@ -818,13 +914,14 @@ function PresetEditorSheet({
           launchMode,
           icon: preset.icon,
           clearLaunchConfig: true,
-        }).catch(console.error);
+        }).catch(reportFailure("Couldn't save the preset"));
       }
     }
   };
 
-  const handleDelete = () => {
-    deletePreset(preset.id).catch(console.error);
+  const handleDelete = async () => {
+    if (!(await confirmPresetDelete(confirm, preset.name))) return;
+    deletePreset(preset.id).catch(reportFailure("Couldn't delete the preset"));
     onOpenChange(false);
   };
 
@@ -844,7 +941,7 @@ function PresetEditorSheet({
   const handlePinnedChange = (checked: boolean) => {
     setPinned(checked);
     if (isDraft) return;
-    setPresetPinned(preset.id, checked).catch(console.error);
+    setPresetPinned(preset.id, checked).catch(reportFailure("Couldn't pin the preset"));
   };
 
   // Snapshot of local editor state shaped for `createPreset` — used when a
@@ -1177,25 +1274,14 @@ function PresetEditorSheet({
               Cancel
             </Button>
           ) : !preset.is_builtin ? (
-            confirmDelete ? (
-              <div className="flex items-center gap-2">
-                <Button variant="destructive" size="sm" onClick={handleDelete}>
-                  Confirm Delete
-                </Button>
-                <Button variant="ghost" size="sm" onClick={() => setConfirmDelete(false)}>
-                  Cancel
-                </Button>
-              </div>
-            ) : (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setConfirmDelete(true)}
-                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-              >
-                Delete Preset
-              </Button>
-            )
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void handleDelete()}
+              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+            >
+              Delete preset
+            </Button>
           ) : (
             <div />
           )}
@@ -1212,6 +1298,7 @@ function PresetEditorSheet({
           </Button>
         </SheetFooter>
       </SheetContent>
+      {confirmDialog}
     </Sheet>
   );
 }
@@ -1254,9 +1341,10 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
         provider={provider}
         model={model}
         onProviderModelChange={(nextProvider, nextModel) => {
-          setAiCommitMessageCli(nextProvider).catch(console.error);
+          const failed = reportFailure("Couldn't save the commit message agent");
+          setAiCommitMessageCli(nextProvider).catch(failed);
           storeSet("ai_commit_message_cli", nextProvider);
-          setAiCommitMessageModel(nextModel ?? "").catch(console.error);
+          setAiCommitMessageModel(nextModel ?? "").catch(failed);
           storeSet("ai_commit_message_model", nextModel ?? "");
         }}
         disabled={disabled}
@@ -1267,9 +1355,10 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
           size="sm"
           className="text-muted-foreground"
           onClick={() => {
-            setAiCommitMessageCli(null).catch(console.error);
+            const failed = reportFailure("Couldn't reset the commit message agent");
+            setAiCommitMessageCli(null).catch(failed);
             storeSet("ai_commit_message_cli", "");
-            setAiCommitMessageModel(null).catch(console.error);
+            setAiCommitMessageModel(null).catch(failed);
             storeSet("ai_commit_message_model", "");
           }}
         >
@@ -1326,7 +1415,26 @@ export function SettingsView() {
     return st?.workspaces.find((w) => w.workspace_id === selectActiveWorkspaceId(s));
   });
   const projectRoot = activeWorkspace?.project_root ?? null;
-  const projectName = projectRoot ? basename(projectRoot) || "Project" : "Project";
+  // Projects edits any known project, defaulting to the active one, so a
+  // Settings visit from Home or another project still has a target.
+  const workspaces = useAppStore((s) => s.appState?.workspaces);
+  const knownProjects = useMemo(
+    () =>
+      groupWorkspacesByProject(
+        (workspaces ?? []).filter(
+          (w) => w.project_root && w.workspace_type !== "home",
+        ),
+        null,
+      ),
+    [workspaces],
+  );
+  const [chosenProject, setChosenProject] = useState<string | null>(null);
+  const scriptsRoot =
+    knownProjects.find((p) => p.projectPath === chosenProject)?.projectPath ??
+    projectRoot ??
+    knownProjects[0]?.projectPath ??
+    null;
+  const { confirm, dialog: confirmDialog } = useConfirm();
 
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const navGroups = buildNavGroups(enableAgentChat);
@@ -1470,36 +1578,102 @@ export function SettingsView() {
   const setTerminalThemeMode = (v: string) => storeSet("terminal.color_theme", v);
   const setAutoMcpConfig = (v: boolean) => storeSet("auto_mcp_config", v ? "true" : "false");
 
+  // What the backend last confirmed for `scriptsRoot`, so a blur with no
+  // edits does not write, and a failed save stays dirty for the next blur.
+  const savedScripts = useRef<{ root: string; generation: number; snapshot: string } | null>(null);
+  const scriptsGeneration = useRef(0);
+  const scriptSaveGeneration = useRef(0);
+  const currentScriptsRoot = useRef(scriptsRoot);
+  currentScriptsRoot.current = scriptsRoot;
+  const [loadedScriptsRoot, setLoadedScriptsRoot] = useState<string | null>(null);
+  const [scriptsLoadError, setScriptsLoadError] = useState<string | null>(null);
+  const scriptsReady = loadedScriptsRoot === scriptsRoot && savedScripts.current?.root === scriptsRoot;
+  const [savedField, setSavedField] = useState<ProjectField | null>(null);
+  const [savedVisible, setSavedVisible] = useState(false);
+  const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (savedTimer.current) clearTimeout(savedTimer.current);
+  }, []);
+
   // Load project scripts when switching to the projects section
   useEffect(() => {
-    if (activeSection !== "projects" || !projectRoot) return;
-    getProjectScripts(projectRoot).then((scripts) => {
-      if (scripts) {
-        setSetupScripts(scripts.setup.join("\n"));
-        setTeardownScripts(scripts.teardown.join("\n"));
-        setRunCommand(scripts.run ?? "");
-        setWorktreeIncludes(scripts.worktree_includes.join("\n"));
-      } else {
-        setSetupScripts("");
-        setTeardownScripts("");
-        setRunCommand("");
-        setWorktreeIncludes("");
-      }
+    const generation = ++scriptsGeneration.current;
+    ++scriptSaveGeneration.current;
+    savedScripts.current = null;
+    setLoadedScriptsRoot(null);
+    setScriptsLoadError(null);
+    setSetupScripts("");
+    setTeardownScripts("");
+    setRunCommand("");
+    setWorktreeIncludes("");
+    setHasConfigFile(false);
+    setHasIncludeFile(false);
+    setSavedVisible(false);
+    if (savedTimer.current) clearTimeout(savedTimer.current);
+    if (activeSection !== "projects" || !scriptsRoot) return;
+    // A slow answer for the previously chosen project must not land in
+    // the form after the user picked another one.
+    let stale = false;
+    getProjectScripts(scriptsRoot).then((scripts) => {
+      if (stale) return;
+      const setup = scripts?.setup.join("\n") ?? "";
+      const teardown = scripts?.teardown.join("\n") ?? "";
+      const run = scripts?.run ?? "";
+      const includes = scripts?.worktree_includes.join("\n") ?? "";
+      setSetupScripts(setup);
+      setTeardownScripts(teardown);
+      setRunCommand(run);
+      setWorktreeIncludes(includes);
+      savedScripts.current = {
+        root: scriptsRoot,
+        generation,
+        snapshot: JSON.stringify(projectScriptsFrom(setup, teardown, run, includes)),
+      };
+      setLoadedScriptsRoot(scriptsRoot);
+    }).catch((error) => {
+      if (!stale) setScriptsLoadError(String(error));
+    });
+    getWorkspaceConfig(scriptsRoot).then((config) => {
+      if (!stale) setHasConfigFile(config !== null);
     }).catch(console.error);
-    getWorkspaceConfig(projectRoot).then((config) => {
-      setHasConfigFile(config !== null);
-    }).catch(console.error);
-    hasCodemuxinclude(projectRoot).then(setHasIncludeFile).catch(() => setHasIncludeFile(false));
-  }, [activeSection, projectRoot]);
+    hasCodemuxinclude(scriptsRoot)
+      .then((has) => { if (!stale) setHasIncludeFile(has); })
+      .catch(() => { if (!stale) setHasIncludeFile(false); });
+    return () => {
+      stale = true;
+      ++scriptsGeneration.current;
+      ++scriptSaveGeneration.current;
+    };
+  }, [activeSection, scriptsRoot]);
 
-  const saveProjectSettings = () => {
-    if (!projectRoot) return;
-    setProjectScripts(projectRoot, {
-      setup: setupScripts.trim() ? setupScripts.trim().split("\n").filter((l) => l.trim()) : [],
-      teardown: teardownScripts.trim() ? teardownScripts.trim().split("\n").filter((l) => l.trim()) : [],
-      run: runCommand.trim() || null,
-      worktree_includes: worktreeIncludes.trim() ? worktreeIncludes.trim().split("\n").filter((l) => l.trim()) : [],
-    }).catch(console.error);
+  const saveProjectSettings = (field: ProjectField) => {
+    const owner = savedScripts.current;
+    if (!scriptsRoot || !scriptsReady || owner?.root !== scriptsRoot) return;
+    const root = scriptsRoot;
+    const generation = owner.generation;
+    const scripts = projectScriptsFrom(
+      setupScripts,
+      teardownScripts,
+      runCommand,
+      worktreeIncludes,
+    );
+    const snapshot = JSON.stringify(scripts);
+    if (snapshot === owner.snapshot) return;
+    const saveGeneration = ++scriptSaveGeneration.current;
+    const stillCurrent = () => currentScriptsRoot.current === root &&
+      scriptsGeneration.current === generation && scriptSaveGeneration.current === saveGeneration;
+    setProjectScripts(root, scripts)
+      .then(() => {
+        if (!stillCurrent()) return;
+        savedScripts.current = { root, generation, snapshot };
+        setSavedField(field);
+        setSavedVisible(true);
+        if (savedTimer.current) clearTimeout(savedTimer.current);
+        savedTimer.current = setTimeout(() => setSavedVisible(false), 1500);
+      })
+      .catch((error) => {
+        if (stillCurrent()) reportFailure(`Couldn't save ${basename(root)}'s scripts`)(error);
+      });
   };
 
   useEffect(() => {
@@ -1684,6 +1858,7 @@ export function SettingsView() {
                 <SettingRow
                   label="Density"
                   description="Comfortable gives cards and lists more breathing room. Compact tightens padding and gaps to fit more on screen."
+                  scope="device"
                 >
                   <SegmentedControl<AppearanceDensity>
                     ariaLabel="Spacing density"
@@ -1698,6 +1873,7 @@ export function SettingsView() {
                 <SettingRow
                   label="Wrap code in chat"
                   description="Soft-wrap long lines in agent chat code blocks. Off keeps each line intact behind a horizontal scroll, which is easier to read for diffs and command output."
+                  scope="device"
                 >
                   <Switch
                     checked={chatCodeWrap}
@@ -1733,6 +1909,7 @@ export function SettingsView() {
                 <SettingRow
                   label="Show git stats"
                   description="Show the ↑ahead and +/− diff numbers on workspace cards. The branch name always shows."
+                  scope="device"
                 >
                   <Switch
                     checked={showGitStats}
@@ -1744,6 +1921,7 @@ export function SettingsView() {
                 <SettingRow
                   label="Auto-settle idle work"
                   description="Sweep a workspace card into the Settled section after this many days without agent activity. Cards whose PR merges or closes settle once the agent has also been idle for an hour, so follow-up work stays visible while it is warm. Un-settling a card keeps it active until its agent runs again."
+                  scope="device"
                 >
                   <SegmentedControl<AutoSettleDays>
                     ariaLabel="Auto-settle idle work"
@@ -1772,6 +1950,7 @@ export function SettingsView() {
                 <SettingRow
                   label="Match the orb to the activity"
                   description="The orb changes with what the agent is doing — searching the repo, solving a failure, talking to GitHub. Off shows the same working orb everywhere."
+                  scope="device"
                 >
                   <Switch
                     checked={orbMatchActivity}
@@ -1792,7 +1971,7 @@ export function SettingsView() {
                 <Eyebrow className="mb-1.5">
                   Preview
                 </Eyebrow>
-                <div className="flex max-w-[300px] flex-col gap-0.5 rounded-lg border border-border/60 bg-muted/30 p-1.5">
+                <div className="flex max-w-[300px] flex-col gap-0.5 rounded-md border border-hairline bg-surface-1 p-1.5">
                   <OrbPreviewRow
                     activity={{ toolName: "Grep" }}
                     label="Fix scroll pinning on send"
@@ -1903,7 +2082,7 @@ export function SettingsView() {
                 </Select>
               </SettingRow>
               <Separator />
-              <SettingRow label="Color theme" description="How the terminal gets its colors.">
+              <SettingRow label="Color theme" description="How the terminal gets its colors." scope="device">
                 <Select value={terminalThemeMode} onValueChange={setTerminalThemeMode}>
                   <SelectTrigger className="h-9 w-44">
                     <SelectValue />
@@ -1928,10 +2107,12 @@ export function SettingsView() {
             />
             <div className="space-y-1">
               {presetStore && (
-                <SettingRow label="Show preset bar" description="Display the preset quick-launch bar below the tab bar.">
+                <SettingRow label="Show preset bar" description="Display the preset quick-launch bar below the tab bar." scope="device">
                   <Switch
                     checked={presetStore.bar_visible}
-                    onCheckedChange={(checked) => setPresetBarVisible(checked).catch(console.error)}
+                    onCheckedChange={(checked) =>
+                      setPresetBarVisible(checked).catch(reportFailure("Couldn't update the preset bar"))
+                    }
                   />
                 </SettingRow>
               )}
@@ -1958,7 +2139,7 @@ export function SettingsView() {
                     items={presetStore.presets.map((p) => p.id)}
                     strategy={verticalListSortingStrategy}
                   >
-                    <div className="overflow-hidden rounded-lg border border-border/60">
+                    <div className="overflow-hidden rounded-md border border-hairline">
                       {presetStore.presets.map((preset) => (
                         <SortablePresetRow
                           key={preset.id}
@@ -1966,10 +2147,13 @@ export function SettingsView() {
                           selected={selectedPresetId === preset.id}
                           onSelect={() => setSelectedPresetId(preset.id)}
                           onTogglePin={() =>
-                            setPresetPinned(preset.id, !preset.pinned).catch(console.error)
+                            setPresetPinned(preset.id, !preset.pinned).catch(
+                              reportFailure("Couldn't pin the preset"),
+                            )
                           }
-                          onDelete={() => {
-                            deletePreset(preset.id).catch(console.error);
+                          onDelete={async () => {
+                            if (!(await confirmPresetDelete(confirm, preset.name))) return;
+                            deletePreset(preset.id).catch(reportFailure("Couldn't delete the preset"));
                             if (selectedPresetId === preset.id) setSelectedPresetId(null);
                           }}
                         />
@@ -2075,11 +2259,11 @@ export function SettingsView() {
                 description="AI-assisted git workflows. Requires the Claude CLI."
               />
               <div className="space-y-1">
-                <SettingRow label="AI commit messages" description="Show the generate button next to the commit input.">
+                <SettingRow label="AI commit messages" description="Show the generate button next to the commit input." scope="device">
                   <Switch
                     checked={config?.ai_commit_message_enabled ?? true}
                     onCheckedChange={(checked) => {
-                      setAiCommitMessageEnabled(checked).catch(console.error);
+                      setAiCommitMessageEnabled(checked).catch(reportFailure("Couldn't save AI commit messages"));
                       storeSet("ai_commit_message_enabled", String(checked));
                     }}
                   />
@@ -2097,7 +2281,7 @@ export function SettingsView() {
                     model anywhere (chat composer, this row, the resolver
                     row) and it's starred everywhere via the shared
                     `picker-favorites-store`. */}
-                <SettingRow label="Agent override" description="Uses the Utility agent by default. Set an override only when commit messages need a different model.">
+                <SettingRow label="Agent override" description="Uses the Utility agent by default. Set an override only when commit messages need a different model." scope="device">
                   <AiCommitMessageAgentRow
                     disabled={!(config?.ai_commit_message_enabled ?? true)}
                   />
@@ -2125,6 +2309,7 @@ export function SettingsView() {
                 <SettingRow
                   label="Agent"
                   description="Which AI agent (and model) resolves conflicts."
+                  scope="device"
                 >
                   <MultiProviderModelPicker
                     // Same `build_resolver_argv` constraint as the
@@ -2133,18 +2318,19 @@ export function SettingsView() {
                     provider={(config?.ai_resolver_cli ?? "claude") as AgentChatProviderKind}
                     model={config?.ai_resolver_model ?? null}
                     onProviderModelChange={(provider, model) => {
-                      setAiResolverCli(provider).catch(console.error);
+                      const failed = reportFailure("Couldn't save the conflict resolver agent");
+                      setAiResolverCli(provider).catch(failed);
                       storeSet("ai_resolver_cli", provider);
-                      setAiResolverModel(model ?? "").catch(console.error);
+                      setAiResolverModel(model ?? "").catch(failed);
                       storeSet("ai_resolver_model", model ?? "");
                     }}
                   />
                 </SettingRow>
-                <SettingRow label="Strategy" description="How the AI should approach conflict resolution.">
+                <SettingRow label="Strategy" description="How the AI should approach conflict resolution." scope="device">
                   <Select
                     value={config?.ai_resolver_strategy ?? "smart_merge"}
                     onValueChange={(v) => {
-                      setAiResolverStrategy(v).catch(console.error);
+                      setAiResolverStrategy(v).catch(reportFailure("Couldn't save the conflict strategy"));
                       storeSet("ai_resolver_strategy", v);
                     }}
                   >
@@ -2220,7 +2406,8 @@ export function SettingsView() {
                 <SettingRow
                   label="Utility agent"
                   description="One inexpensive default for conversation handoffs and lightweight generation. Automatic prefers Codex Luna, then Claude Haiku; individual features can still offer an override when it matters."
-                >
+                scope="device"
+                  >
                   <UtilityAgentSetting />
                 </SettingRow>
                 <Separator />
@@ -2231,7 +2418,8 @@ export function SettingsView() {
                 <SettingRow
                   label="Default Hermes profile"
                   description="New Hermes chats start with this profile. Automatic uses the only installed profile; a profile you pick in a project's chat is remembered for that project."
-                >
+                scope="device"
+                  >
                   <HermesDefaultProfileSetting />
                 </SettingRow>
                 <Separator />
@@ -2240,7 +2428,8 @@ export function SettingsView() {
                 <SettingRow
                   label="Auto-configure MCP for workspaces"
                   description="Automatically write .mcp.json so agents discover Codemux tools. Disable if you manage MCP config manually."
-                >
+                scope="device"
+                  >
                   <Switch
                     checked={autoMcpConfig}
                     onCheckedChange={(checked) => {
@@ -2268,7 +2457,8 @@ export function SettingsView() {
                     <SettingRow
                       label="Resume automatically after usage limits reset"
                       description="When a provider reports when your usage limit resets, continue the interrupted run then. At most two automatic attempts before it waits for you."
-                    >
+                    scope="device"
+                  >
                       <Switch
                         checked={autoResumeUsageLimit}
                         onCheckedChange={(checked) =>
@@ -2398,14 +2588,68 @@ export function SettingsView() {
           ["$CODEMUX_WORKSPACE_NAME", "Workspace title"],
           ["$CODEMUX_WORKSPACE_ID", "Workspace ID"],
         ];
+        if (!scriptsRoot) {
+          return (
+            <div>
+              <SectionHeader
+                title="Projects"
+                description="Lifecycle scripts and worktree files for each project."
+              />
+              <SettingsCard className="flex flex-col items-start gap-3">
+                <p className="text-body text-muted-foreground">
+                  Open a project to configure its lifecycle scripts.
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    openProjectFlow().catch(reportFailure("Couldn't open the project"));
+                  }}
+                >
+                  <FolderOpen className="size-3.5" />
+                  Open project…
+                </Button>
+              </SettingsCard>
+            </div>
+          );
+        }
+        const savedNote = (field: ProjectField) => (
+          <SavedNote visible={scriptsReady && savedVisible && savedField === field} />
+        );
         return (
           <div>
             <SectionHeader
               title="Projects"
-              description={`Automate your workspace lifecycle for ${projectName}. Changes are saved automatically.`}
+              description="Lifecycle scripts and worktree files for each project. Changes save when you leave a field."
+              action={
+                <Select value={scriptsRoot} onValueChange={setChosenProject}>
+                  <SelectTrigger aria-label="Project" className="h-9 w-48">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {knownProjects.map((p) => (
+                      <SelectItem key={p.projectPath} value={p.projectPath}>
+                        {p.projectName}
+                      </SelectItem>
+                    ))}
+                    {/* The active workspace's project, even when no other
+                        workspace lists it, so the trigger never goes blank. */}
+                    {!knownProjects.some((p) => p.projectPath === scriptsRoot) && (
+                      <SelectItem value={scriptsRoot}>{basename(scriptsRoot)}</SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+              }
             />
+            {!scriptsReady && (
+              <SettingsCard className="mb-6">
+                <p role={scriptsLoadError ? "alert" : "status"} className="text-body text-muted-foreground">
+                  {scriptsLoadError ? `Couldn't load ${basename(scriptsRoot)}'s scripts: ${scriptsLoadError}` : "Loading project scripts…"}
+                </p>
+              </SettingsCard>
+            )}
             {hasConfigFile && (
-              <SettingsCard className="mb-6 flex items-start gap-3 border-border/50 bg-muted/40">
+              <SettingsCard className="mb-6 flex items-start gap-3">
                 <div className="size-1.5 rounded-full bg-warning shrink-0 mt-1.5" />
                 <p className="text-body-sm text-muted-foreground/90 leading-relaxed">
                   A <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemux/config.json</code> file was found.
@@ -2417,6 +2661,7 @@ export function SettingsView() {
             <div className="space-y-8">
               <FormField
                 label="Worktree includes"
+                status={savedNote("includes")}
                 helper="Files matching these patterns are copied from the main project into new worktrees. One pattern per line."
                 caption={
                   <>
@@ -2428,7 +2673,7 @@ export function SettingsView() {
                 }
               >
                 {hasIncludeFile && (
-                  <SettingsCard className="border-border/50 bg-muted/40 py-2.5 px-3 mb-2">
+                  <SettingsCard className="py-2.5 px-3 mb-2">
                     <p className="text-body-sm text-muted-foreground/90 leading-relaxed">
                       This project has a <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemuxinclude</code> file —
                       those patterns take priority over the settings below.
@@ -2439,39 +2684,45 @@ export function SettingsView() {
                   className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder={".env\n.env.*\n.env.local"}
                   value={worktreeIncludes}
+                  disabled={!scriptsReady}
                   onChange={(e) => setWorktreeIncludes(e.target.value)}
-                  onBlur={saveProjectSettings}
+                  onBlur={() => saveProjectSettings("includes")}
                 />
               </FormField>
 
               <FormField
                 label="Setup"
+                status={savedNote("setup")}
                 helper="Runs when a new workspace is created. One command per line."
               >
                 <Textarea
                   className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder="e.g. npm install"
                   value={setupScripts}
+                  disabled={!scriptsReady}
                   onChange={(e) => setSetupScripts(e.target.value)}
-                  onBlur={saveProjectSettings}
+                  onBlur={() => saveProjectSettings("setup")}
                 />
               </FormField>
 
               <FormField
                 label="Teardown"
+                status={savedNote("teardown")}
                 helper="Runs when a workspace is deleted. One command per line."
               >
                 <Textarea
                   className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder="e.g. docker compose down"
                   value={teardownScripts}
+                  disabled={!scriptsReady}
                   onChange={(e) => setTeardownScripts(e.target.value)}
-                  onBlur={saveProjectSettings}
+                  onBlur={() => saveProjectSettings("teardown")}
                 />
               </FormField>
 
               <FormField
                 label="Run"
+                status={savedNote("run")}
                 helper={
                   <>
                     A command to start your dev server<RunShortcutHint />.
@@ -2482,8 +2733,9 @@ export function SettingsView() {
                   className="font-mono text-body h-9"
                   placeholder="e.g. npm run dev"
                   value={runCommand}
+                  disabled={!scriptsReady}
                   onChange={(e) => setRunCommand(e.target.value)}
-                  onBlur={saveProjectSettings}
+                  onBlur={() => saveProjectSettings("run")}
                 />
               </FormField>
             </div>
@@ -2648,6 +2900,9 @@ export function SettingsView() {
             </>
           )}
         </div>
+        <div className="ml-2">
+          <SettingsSyncIndicator />
+        </div>
         {sectionAvailable && !mobile && <SettingsFooterPin section={activeSection} />}
       </div>
 
@@ -2703,9 +2958,11 @@ export function SettingsView() {
             )}
           >
             {sectionAvailable ? renderSection() : (
-              <div role="status" className="space-y-2">
-                <h2 className="text-lg font-semibold">Settings section unavailable</h2>
-                <p className="text-body text-muted-foreground">This section is hidden or no longer available. Choose a section from Settings.</p>
+              <div role="status">
+                <SectionHeader
+                  title="Settings section unavailable"
+                  description="This section is hidden or no longer available. Choose a section from Settings."
+                />
               </div>
             )}
           </div>
@@ -2717,6 +2974,7 @@ export function SettingsView() {
           must not eject you from the page you were reading — so Settings
           carries its own instance and the picker layers over it. */}
       <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
+      {confirmDialog}
     </div>
   );
 }
@@ -2770,25 +3028,32 @@ function SortablePresetRow({
       ref={setNodeRef}
       style={style}
       className={cn(
-        "group/preset flex items-center gap-3 pl-2 pr-2.5 py-2.5 border-b border-border/40 last:border-b-0 cursor-pointer transition-colors duration-150",
-        selected ? "bg-muted/60" : "hover:bg-muted/30",
+        "group/preset flex items-center gap-3 pl-2 pr-2.5 border-b border-hairline last:border-b-0 transition-colors duration-150",
+        selected ? "bg-surface-3" : "hover:bg-surface-2",
       )}
-      onClick={onSelect}
     >
       <button
         type="button"
-        className="p-1 rounded-sm text-muted-foreground/30 hover:text-muted-foreground hover:bg-muted/60 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 transition-opacity duration-150"
-        aria-label="Drag to reorder"
+        className="p-1 rounded-sm text-muted-foreground/30 hover:text-muted-foreground hover:bg-surface-2 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 group-focus-within/preset:opacity-100 transition-opacity duration-150"
         title="Drag to reorder"
-        onClick={(e) => e.stopPropagation()}
         {...attributes}
         {...listeners}
+        aria-label={`Reorder ${preset.name}`}
       >
         <GripVertical className="size-3.5" />
       </button>
+      {/* The row body is one button, so Tab reaches it and Enter or Space
+          opens the editor. */}
+      <button
+        type="button"
+        onClick={onSelect}
+        aria-label={`Edit ${preset.name}`}
+        // Inset ring: the list clips anything drawn outside a row.
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-sm py-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
+      >
       {/* Glyph tile — the agent icon seated in a rounded tile, per the
           design's preset rows. */}
-      <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-muted/60">
+      <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-surface-2">
         <PresetIcon icon={preset.icon} className="size-3.5" />
       </span>
       <div className="flex-1 min-w-0">
@@ -2806,6 +3071,7 @@ function SortablePresetRow({
           </code>
         )}
       </div>
+      </button>
       <div className="flex items-center gap-0.5 shrink-0">
         {/* Delete sits to the LEFT of the pin so the pin stays anchored to
             the row's right edge — keeping it aligned across builtin rows
@@ -2815,11 +3081,9 @@ function SortablePresetRow({
             variant="ghost"
             size="icon-sm"
             title="Delete preset"
-            className="opacity-0 group-hover/preset:opacity-100 transition-opacity duration-150 hover:bg-destructive/10 hover:text-destructive"
-            onClick={(e) => {
-              e.stopPropagation();
-              onDelete();
-            }}
+            aria-label={`Delete preset ${preset.name}`}
+            className="opacity-0 group-hover/preset:opacity-100 group-focus-within/preset:opacity-100 transition-opacity duration-150 hover:bg-destructive/10 hover:text-destructive"
+            onClick={onDelete}
           >
             <Trash2 className="size-3.5" />
           </Button>
@@ -2828,14 +3092,15 @@ function SortablePresetRow({
           variant="ghost"
           size="icon-sm"
           title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
+          aria-label={`Pin ${preset.name} to the preset bar`}
+          aria-pressed={preset.pinned}
           className={cn(
             "transition-opacity duration-150",
-            preset.pinned ? "opacity-100" : "opacity-60 group-hover/preset:opacity-100",
+            preset.pinned
+              ? "opacity-100"
+              : "opacity-60 group-hover/preset:opacity-100 group-focus-within/preset:opacity-100",
           )}
-          onClick={(e) => {
-            e.stopPropagation();
-            onTogglePin();
-          }}
+          onClick={onTogglePin}
         >
           {preset.pinned ? (
             <Star className="size-3.5 fill-current text-foreground" />

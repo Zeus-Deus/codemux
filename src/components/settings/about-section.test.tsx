@@ -56,7 +56,7 @@ describe("AboutSection", () => {
   beforeEach(() => {
     __resetUpdateStatusStoreForTests();
     useSyncedSettingsStore.getState().replaceSessionSettings(DEFAULT_SETTINGS);
-    vi.mocked(resetSyncedSettings).mockResolvedValue(DEFAULT_SETTINGS);
+    vi.mocked(resetSyncedSettings).mockResolvedValue({ settings: DEFAULT_SETTINGS, synced: true });
   });
   afterEach(() => {
     cleanup();

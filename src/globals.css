@@ -114,6 +114,7 @@
     --text-body-sm: 0.8125rem; /* 13px — dense rows, menus */
     --text-body: 0.875rem;    /* 14px — primary UI text */
     --text-body-lg: 0.9375rem; /* 15px — emphasized UI text */
+    --text-title: 1.3125rem;  /* 21px — the title of a whole page */
     /* Section-label (eyebrow) tracking. Uppercase mono at 11px needs the
      * letters opened up or it reads as a smudge; 0.1em is the value the
      * settings primitives already converged on, so it becomes the one

@@ -4345,19 +4345,19 @@ const handlers: Record<string, Handler> = {
       : "appimage",
 
   // ── Settings ──
-  get_synced_settings: () => structuredClone(SYNCED_SETTINGS),
+  get_synced_settings: () => ({ settings: structuredClone(SYNCED_SETTINGS), synced: true }),
   update_synced_settings: (a) => {
     if (a.settings) Object.assign(SYNCED_SETTINGS, structuredClone(a.settings as UserSettings));
-    return structuredClone(SYNCED_SETTINGS);
+    return { settings: structuredClone(SYNCED_SETTINGS), synced: true };
   },
   update_setting: (a) => {
     const section = a.section as keyof UserSettings;
     const key = String(a.key ?? "");
     const target = SYNCED_SETTINGS[section] as unknown as Record<string, unknown> | undefined;
     if (target && key) target[key] = structuredClone(a.value);
-    return structuredClone(SYNCED_SETTINGS);
+    return { settings: structuredClone(SYNCED_SETTINGS), synced: true };
   },
-  reset_synced_settings: () => structuredClone(SYNCED_SETTINGS),
+  reset_synced_settings: () => ({ settings: structuredClone(SYNCED_SETTINGS), synced: true }),
   db_get_all_settings: () => ({}),
   // The sidebar's settled shelf. Three settled worktrees so the Devices
   // page's "Sweep N settled" chip has something to offer.

@@ -63,7 +63,7 @@ beforeEach(() => {
 describe("settings single-store integration", () => {
   describe("synced store is the sole source of truth for per-user settings", () => {
     it("login loads all per-user settings into synced store", async () => {
-      mockGetSyncedSettings.mockResolvedValue(FULL_CUSTOM);
+      mockGetSyncedSettings.mockResolvedValue({ settings: FULL_CUSTOM, synced: true });
       await useSyncedSettingsStore.getState().loadSettings();
 
       const s = useSyncedSettingsStore.getState().settings;
@@ -77,7 +77,7 @@ describe("settings single-store integration", () => {
 
     it("logout resets all per-user settings to defaults", async () => {
       // Login
-      mockGetSyncedSettings.mockResolvedValue(FULL_CUSTOM);
+      mockGetSyncedSettings.mockResolvedValue({ settings: FULL_CUSTOM, synced: true });
       await useSyncedSettingsStore.getState().loadSettings();
       expect(useSyncedSettingsStore.getState().settings.appearance.theme).toBe("dark");
 
@@ -95,14 +95,14 @@ describe("settings single-store integration", () => {
 
     it("all setting types survive logout/login cycle", async () => {
       // Login with custom settings
-      mockGetSyncedSettings.mockResolvedValue(FULL_CUSTOM);
+      mockGetSyncedSettings.mockResolvedValue({ settings: FULL_CUSTOM, synced: true });
       await useSyncedSettingsStore.getState().loadSettings();
 
       // Logout
       useSyncedSettingsStore.setState({ settings: DEFAULT_SETTINGS });
 
       // Login again — server returns same settings
-      mockGetSyncedSettings.mockResolvedValue(FULL_CUSTOM);
+      mockGetSyncedSettings.mockResolvedValue({ settings: FULL_CUSTOM, synced: true });
       await useSyncedSettingsStore.getState().loadSettings();
 
       expect(useSyncedSettingsStore.getState().settings).toEqual(FULL_CUSTOM);
@@ -110,7 +110,7 @@ describe("settings single-store integration", () => {
 
     it("User A → sign out → User B → sees own settings, not A's", async () => {
       // User A
-      mockGetSyncedSettings.mockResolvedValue(FULL_CUSTOM);
+      mockGetSyncedSettings.mockResolvedValue({ settings: FULL_CUSTOM, synced: true });
       await useSyncedSettingsStore.getState().loadSettings();
 
       // Sign out
@@ -122,7 +122,7 @@ describe("settings single-store integration", () => {
         appearance: { theme: "light", shell_font: null, terminal_font_size: 14, show_resource_monitor: true },
         git: { default_base_branch: "release" },
       };
-      mockGetSyncedSettings.mockResolvedValue(userBSettings);
+      mockGetSyncedSettings.mockResolvedValue({ settings: userBSettings, synced: true });
       await useSyncedSettingsStore.getState().loadSettings();
 
       const s = useSyncedSettingsStore.getState().settings;
@@ -143,7 +143,7 @@ describe("settings single-store integration", () => {
       useSettingsStore.getState().set("ai_commit_message_enabled", "false");
 
       // Login
-      mockGetSyncedSettings.mockResolvedValue(FULL_CUSTOM);
+      mockGetSyncedSettings.mockResolvedValue({ settings: FULL_CUSTOM, synced: true });
       await useSyncedSettingsStore.getState().loadSettings();
 
       // Logout
