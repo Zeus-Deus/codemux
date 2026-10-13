@@ -369,6 +369,7 @@ async fn harvest_opencode_catalog(
 ) -> Result<Vec<Skill>, String> {
     let handle = manager.ensure_running().await?;
     let mut config = OpenCodeClientConfig::new(handle.base_url);
+    config.api = handle.api;
     config.server_password = Some(handle.server_password);
     let client = OpenCodeClient::new(config)?;
     let entries = client.list_skills(cwd).await?;

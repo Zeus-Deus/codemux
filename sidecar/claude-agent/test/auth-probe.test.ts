@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import { classifyAuthOutput, parseCliVersion } from "../src/auth-probe";
+import {
+  classifyAuthOutput,
+  classifyInstallOutcome,
+  parseCliVersion,
+  probeInstalled,
+} from "../src/auth-probe";
 
 describe("classifyAuthOutput", () => {
   test("JSON loggedIn:true is authenticated", () => {
@@ -99,5 +104,62 @@ describe("parseCliVersion", () => {
     expect(parseCliVersion("Claude Code 2.1.114")).toBe("2.1.114");
     expect(parseCliVersion("claude 2.2.0-beta.1")).toBe("2.2.0-beta.1");
     expect(parseCliVersion("unexpected output")).toBe("unknown");
+  });
+});
+
+describe("classifyInstallOutcome", () => {
+  test("a missing binary is not installed", () => {
+    const error = Object.assign(new Error("spawn claude ENOENT"), {
+      code: "ENOENT",
+    });
+    expect(
+      classifyInstallOutcome({ stdout: "", exitCode: null, error, timedOut: false }),
+    ).toEqual({ installed: false });
+  });
+
+  test("a timeout is installed but unresponsive, not missing", () => {
+    expect(
+      classifyInstallOutcome({ stdout: "", exitCode: null, timedOut: true }),
+    ).toEqual({ installed: true, unresponsive: true });
+  });
+
+  test("a non-zero exit is installed but unresponsive", () => {
+    expect(
+      classifyInstallOutcome({ stdout: "", exitCode: 1, timedOut: false }),
+    ).toEqual({ installed: true, unresponsive: true });
+  });
+
+  test("a permission error is installed but unresponsive", () => {
+    const error = Object.assign(new Error("spawn claude EACCES"), {
+      code: "EACCES",
+    });
+    expect(
+      classifyInstallOutcome({ stdout: "", exitCode: null, error, timedOut: false }),
+    ).toEqual({ installed: true, unresponsive: true });
+  });
+
+  test("a clean run reports the version", () => {
+    expect(
+      classifyInstallOutcome({
+        stdout: "2.1.114 (Claude Code)\n",
+        exitCode: 0,
+        timedOut: false,
+      }),
+    ).toEqual({ installed: true, version: "2.1.114" });
+  });
+});
+
+describe("probeInstalled", () => {
+  test("a binary that does not exist is not installed", async () => {
+    expect(await probeInstalled("/nonexistent/codemux-claude-probe")).toEqual({
+      installed: false,
+    });
+  });
+
+  test("a binary that exits non-zero is unresponsive", async () => {
+    expect(await probeInstalled("false")).toEqual({
+      installed: true,
+      unresponsive: true,
+    });
   });
 });

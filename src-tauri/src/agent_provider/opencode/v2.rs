@@ -1,0 +1,986 @@
+//! Native OpenCode 2.x wire boundary. Legacy SDK DTOs are not native-v2 DTOs.
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Stable updates consumed by the runtime bridge; no v1 wire-defaulting.
+#[derive(Debug, Clone)]
+pub enum Update {
+    Content {
+        thinking: bool,
+        complete: bool,
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        id: String,
+        content: Value,
+        error: bool,
+    },
+    Usage(Value),
+    Started,
+    Terminal {
+        outcome: String,
+        error: Option<Value>,
+    },
+    Child {
+        id: String,
+        status: String,
+        detail: Value,
+    },
+    Permission(Value),
+    Form(Value),
+    Resolved {
+        id: String,
+        answer: Option<Value>,
+    },
+    Compacted,
+    UserDelivered(String),
+}
+
+#[derive(Debug, Default)]
+pub struct State {
+    running: HashSet<String>,
+    settled: HashSet<String>,
+    recovered_idle: HashMap<String, Value>,
+    seen: HashSet<String>,
+    recent: VecDeque<String>,
+    content: HashMap<(String, String, bool, u64), (String, bool)>,
+    tools: HashMap<(String, String, String), Tool>,
+    models: HashMap<String, Value>,
+    recovered_sequences: HashMap<String, u64>,
+    terminal_sequences: HashMap<String, (String, u64)>,
+    recovered_terminals: HashSet<(String, String)>,
+    user_admissions: HashMap<String, (String, String)>,
+    pending_user_admissions: HashMap<String, (String, String)>,
+    awaiting_execution: HashMap<String, Option<u64>>,
+}
+
+#[derive(Debug, Default)]
+struct Tool {
+    name: String,
+    input: Value,
+    raw: String,
+    metadata: Value,
+    called: bool,
+    ended: bool,
+}
+
+impl State {
+    pub fn mark_running(&mut self, session: &str) {
+        self.running.insert(session.into());
+    }
+    pub fn recovered_sequence(&self, session: &str) -> Option<u64> {
+        self.recovered_sequences.get(session).copied()
+    }
+    pub fn observed_execution_sequence(&self, session: &str) -> Option<u64> {
+        self.recovered_sequence(session)
+            .into_iter()
+            .chain(self.terminal_sequences.get(session).map(|(_, seq)| *seq))
+            .max()
+    }
+    pub fn observed_idle_id(&self, session: &str) -> Option<String> {
+        let recovered = self.recovered_idle.get(session).and_then(Value::as_str);
+        let terminal = self.terminal_sequences.get(session);
+        if recovered.is_some()
+            && self
+                .recovered_sequence(session)
+                .is_some_and(|seq| terminal.is_none_or(|(_, live)| seq >= *live))
+        {
+            return recovered.map(str::to_string);
+        }
+        terminal
+            .and_then(|(id, _)| id.strip_prefix("evt_"))
+            .map(|suffix| format!("msg_{suffix}"))
+    }
+    pub fn remember_user_admission(&mut self, session: &str, input_id: &str, turn_id: &str) {
+        self.user_admissions
+            .insert(session.into(), (input_id.into(), turn_id.into()));
+        self.pending_user_admissions
+            .insert(session.into(), (input_id.into(), turn_id.into()));
+    }
+    pub fn has_pending_user_admission(&self, session: &str) -> bool {
+        self.pending_user_admissions.contains_key(session)
+    }
+    pub fn pending_user_admission(&self, session: &str) -> Option<(String, String)> {
+        self.pending_user_admissions.get(session).cloned()
+    }
+    pub fn claim_pending_user_admission(
+        &mut self,
+        session: &str,
+        input_id: &str,
+    ) -> Option<String> {
+        if self
+            .pending_user_admissions
+            .get(session)
+            .is_some_and(|(input, _)| input == input_id)
+        {
+            self.awaiting_execution.remove(session);
+            return self
+                .pending_user_admissions
+                .remove(session)
+                .map(|(_, turn)| turn);
+        }
+        None
+    }
+    pub fn user_admission_for(&self, session: &str, turn_id: &str) -> Option<String> {
+        self.user_admissions
+            .get(session)
+            .filter(|(_, admitted)| admitted == turn_id)
+            .map(|(input, _)| input.clone())
+    }
+    pub fn awaiting_execution(&self, session: &str) -> bool {
+        self.awaiting_execution.contains_key(session)
+    }
+    pub fn defer_execution(&mut self, session: &str, sequence: u64) {
+        self.defer_live_execution(session, Some(sequence));
+    }
+    pub fn defer_live_execution(&mut self, session: &str, sequence: Option<u64>) {
+        self.awaiting_execution.insert(session.into(), sequence);
+        self.running.insert(session.into());
+    }
+    pub fn clear_deferred_execution(&mut self, session: &str) -> bool {
+        if self.awaiting_execution.remove(session).is_some() {
+            self.running.remove(session);
+            return true;
+        }
+        false
+    }
+    fn observe_terminal(&mut self, session: &str, event: &Event) {
+        if let Some(seq) = event.sequence(session) {
+            if self
+                .terminal_sequences
+                .get(session)
+                .is_none_or(|(_, observed)| seq > *observed)
+            {
+                self.terminal_sequences
+                    .insert(session.into(), (event.id.clone(), seq));
+            }
+        }
+    }
+    pub fn completed_idle_sequence(&self, session: &str, idle_id: &str) -> Option<u64> {
+        let event_id = idle_id
+            .strip_prefix("msg_")
+            .map(|suffix| format!("evt_{suffix}"))?;
+        if let Some((observed, sequence)) = self.terminal_sequences.get(session) {
+            if observed == &event_id {
+                return Some(*sequence);
+            }
+        }
+        if self.recovered_idle.get(session).and_then(Value::as_str) == Some(idle_id) {
+            return self.recovered_sequence(session);
+        }
+        None
+    }
+    pub fn recover_through(&mut self, session: &str, seq: u64) {
+        let boundary = self.recovered_sequences.entry(session.into()).or_default();
+        *boundary = (*boundary).max(seq);
+    }
+    /// Claim a durable descendant terminal once per idle boundary. A live
+    /// terminal already observed before the first snapshot must not repeat.
+    pub fn recover_terminal(&mut self, session: &str, boundary: Value) -> bool {
+        let previous = self.recovered_idle.insert(session.into(), boundary.clone());
+        if let Some(suffix) = boundary.as_str().and_then(|id| id.strip_prefix("msg_")) {
+            let event_id = format!("evt_{suffix}");
+            let observed = self
+                .terminal_sequences
+                .get(session)
+                .is_some_and(|(id, _)| id == &event_id);
+            let unseen = self.recovered_terminals.insert((session.into(), event_id));
+            return !observed && unseen;
+        }
+        self.running.contains(session)
+            || previous.as_ref().is_some_and(|old| old != &boundary)
+            || (previous.is_none() && !self.settled.contains(session))
+    }
+    pub fn reduce(&mut self, event: &Event) -> Result<Vec<Update>, String> {
+        if let Some(session) = event.session_id() {
+            // The active snapshot can include a buffered start without enough
+            // current history to distinguish it from completed callbacks.
+            // Only newer starts or genuine new content/requests admit a turn.
+            if event.kind == "session.execution.started"
+                && event
+                    .sequence(session)
+                    .zip(self.awaiting_execution.get(session).copied().flatten())
+                    .is_some_and(|(seq, checkpoint)| seq <= checkpoint)
+            {
+                return Ok(vec![]);
+            }
+            if matches!(
+                event.kind.as_str(),
+                "session.execution.succeeded"
+                    | "session.execution.failed"
+                    | "session.execution.interrupted"
+            ) && self
+                .recovered_terminals
+                .contains(&(session.into(), event.id.clone()))
+            {
+                self.observe_terminal(session, event);
+                return Ok(vec![]);
+            }
+            if event
+                .sequence(session)
+                .zip(self.recovered_sequence(session))
+                .is_some_and(|(seq, boundary)| seq <= boundary)
+            {
+                return Ok(vec![]);
+            }
+            // A moving snapshot cannot cover content, but an observed durable
+            // terminal still proves older lifecycle records have settled.
+            if matches!(
+                event.kind.as_str(),
+                "session.execution.started"
+                    | "session.execution.succeeded"
+                    | "session.execution.failed"
+                    | "session.execution.interrupted"
+            ) && event
+                .sequence(session)
+                .zip(self.terminal_sequences.get(session))
+                .is_some_and(|(seq, (_, boundary))| seq <= *boundary)
+            {
+                return Ok(vec![]);
+            }
+        }
+        // Snapshot identities may recur with a newer partial value. Their
+        // per-item state/high-water guards, not event IDs, reconcile them.
+        if !event.id.starts_with("snapshot:") {
+            if !self.seen.insert(event.id.clone()) {
+                return Ok(vec![]);
+            }
+            self.recent.push_back(event.id.clone());
+            if self.recent.len() > 2048 {
+                if let Some(id) = self.recent.pop_front() {
+                    self.seen.remove(&id);
+                }
+            }
+        }
+        let d = &event.data;
+        let Some(session) = event.session_id() else {
+            return Ok(vec![]);
+        };
+        let mut out = Vec::new();
+        match event.kind.as_str() {
+            "session.inbox.delivered" if event.sequence(session).is_some() => {
+                let input = required_str(d, "inboxID")?;
+                if let Some(turn) = self.claim_pending_user_admission(session, input) {
+                    self.running.insert(session.into());
+                    out.push(Update::UserDelivered(turn));
+                }
+            }
+            "session.execution.started" => {
+                // Message/tool identities span executions. Reconnect snapshots
+                // can complete them before their buffered live start arrives.
+                self.running.insert(session.into());
+                out.push(Update::Started);
+            }
+            "session.execution.succeeded"
+            | "session.execution.failed"
+            | "session.execution.interrupted" => {
+                self.observe_terminal(session, event);
+                if self.running.remove(session) {
+                    self.settled.insert(session.into());
+                    out.push(Update::Terminal {
+                        outcome: event.kind.rsplit('.').next().unwrap().into(),
+                        error: d.get("error").cloned(),
+                    });
+                }
+            }
+            "session.step.started" => {
+                self.models.insert(session.into(), d["model"].clone());
+            }
+            "session.step.ended" | "session.step.failed" => {
+                if d.get("tokens").is_some() {
+                    out.push(Update::Usage(json!({"id": required_str(d,"assistantMessageID")?, "sessionID":session,"role":"assistant", "tokens":d["tokens"],"cost":d["cost"],"providerID":self.models.get(session).and_then(|m|m.get("providerID")),"modelID":self.models.get(session).and_then(|m|m.get("id"))})));
+                }
+            }
+            kind if kind.starts_with("session.text.") || kind.starts_with("session.reasoning.") => {
+                let thinking = kind.starts_with("session.reasoning.");
+                let message = required_str(d, "assistantMessageID")?;
+                let ordinal = d["ordinal"].as_u64().ok_or("missing content ordinal")?;
+                let content = self
+                    .content
+                    .entry((session.into(), message.into(), thinking, ordinal))
+                    .or_default();
+                if content.1 {
+                    return Ok(vec![]);
+                }
+                if kind.ends_with(".delta") {
+                    let text = required_str(d, "delta")?;
+                    content.0.push_str(text);
+                    out.push(Update::Content {
+                        thinking,
+                        complete: false,
+                        text: text.into(),
+                    });
+                } else if kind.ends_with(".snapshot") {
+                    let full = required_str(d, "text")?;
+                    let missing = full
+                        .strip_prefix(&content.0)
+                        .ok_or("native content snapshot is not an append of the streamed value")?;
+                    if !missing.is_empty() {
+                        out.push(Update::Content {
+                            thinking,
+                            complete: false,
+                            text: missing.into(),
+                        });
+                    }
+                    content.0 = full.into();
+                } else if kind.ends_with(".ended") {
+                    let text = required_str(d, "text")?.into();
+                    content.0 = String::new();
+                    content.1 = true;
+                    out.push(Update::Content {
+                        thinking,
+                        complete: true,
+                        text,
+                    });
+                }
+            }
+            kind if kind.starts_with("session.tool.") => {
+                let message = required_str(d, "assistantMessageID")?;
+                let id = required_str(d, "id")?;
+                let tool = self
+                    .tools
+                    .entry((session.into(), message.into(), id.into()))
+                    .or_default();
+                if tool.ended {
+                    return Ok(vec![]);
+                }
+                match kind {
+                    "session.tool.input.started" => {
+                        tool.name = required_str(d, "name")?.into();
+                    }
+                    "session.tool.input.delta" => {
+                        tool.raw.push_str(required_str(d, "delta")?);
+                    }
+                    "session.tool.input.ended" => {
+                        tool.raw = required_str(d, "text")?.into();
+                        tool.input = serde_json::from_str(&tool.raw).unwrap_or(Value::Null);
+                    }
+                    "session.tool.called" => {
+                        tool.input = d["input"].clone();
+                        if !tool.called {
+                            tool.called = true;
+                            out.push(Update::ToolUse {
+                                id: id.into(),
+                                name: tool.name.clone(),
+                                input: tool.input.clone(),
+                            });
+                        }
+                    }
+                    "session.tool.progress" => {
+                        tool.metadata = d["metadata"].clone();
+                    }
+                    "session.tool.success" | "session.tool.failed" => {
+                        if !tool.called {
+                            out.push(Update::ToolUse {
+                                id: id.into(),
+                                name: tool.name.clone(),
+                                input: tool.input.clone(),
+                            });
+                            tool.called = true;
+                        }
+                        tool.ended = true;
+                        out.push(Update::ToolResult {
+                            id: id.into(),
+                            content: d
+                                .get("content")
+                                .filter(|v| !v.is_null() || kind == "session.tool.success")
+                                .cloned()
+                                .unwrap_or_else(
+                                    || json!([{"type":"text","text":d["error"]["message"]}]),
+                                ),
+                            error: kind.ends_with(".failed"),
+                        });
+                    }
+                    _ => {}
+                }
+                // Tool completion is not child completion: background subagents
+                // can outlive both this call and the parent's execution.
+                if tool.name == "subagent" {
+                    let metadata = d.get("metadata").unwrap_or(&tool.metadata);
+                    if let Some(child) = metadata.get("sessionID").and_then(Value::as_str) {
+                        out.push(Update::Child {
+                            id: child.into(),
+                            status: metadata["status"].as_str().unwrap_or("running").into(),
+                            detail: json!({"id":id,"input":tool.input,"metadata":metadata}),
+                        });
+                    }
+                }
+                if tool.ended {
+                    // Keep a completion tombstone, not the finished payload.
+                    *tool = Tool {
+                        called: true,
+                        ended: true,
+                        ..Tool::default()
+                    };
+                }
+            }
+            "permission.asked" => out.push(Update::Permission(d.clone())),
+            "permission.replied" => out.push(Update::Resolved {
+                id: required_str(d, "requestID")?.into(),
+                answer: Some(d["reply"].clone()),
+            }),
+            "form.created" => out.push(Update::Form(d["form"].clone())),
+            "form.replied" | "form.cancelled" => out.push(Update::Resolved {
+                id: required_str(d, "id")?.into(),
+                answer: d.get("answer").cloned(),
+            }),
+            "session.compaction.ended" => out.push(Update::Compacted),
+            // Busy/idle, step completion, and deprecated session.idle never
+            // settle the user turn. Execution terminals are authoritative.
+            _ => {}
+        }
+        if self.awaiting_execution.contains_key(session)
+            && out.iter().any(|update| {
+                matches!(
+                    update,
+                    Update::Started
+                        | Update::Content { .. }
+                        | Update::ToolUse { .. }
+                        | Update::ToolResult { .. }
+                        | Update::Permission(_)
+                        | Update::Form(_)
+                ) || matches!(update, Update::Terminal { outcome, .. } if outcome != "succeeded")
+            })
+        {
+            self.awaiting_execution.remove(session);
+            if !out.iter().any(|update| matches!(update, Update::Started)) {
+                out.insert(0, Update::Started);
+            }
+        } else if out
+            .iter()
+            .any(|update| matches!(update, Update::Terminal { .. }))
+        {
+            // An idle doorbell may start and finish without delivering input.
+            // Retire its activity without inventing a successful user callback.
+            self.awaiting_execution.remove(session);
+        }
+        Ok(out)
+    }
+}
+
+fn required_str<'a>(data: &'a Value, key: &str) -> Result<&'a str, String> {
+    data.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing native v2 {key}"))
+}
+
+pub fn model_ref(model: &str, variant: Option<&str>) -> Result<Value, String> {
+    let (provider, id) = model
+        .split_once('/')
+        .filter(|(p, m)| !p.is_empty() && !m.is_empty())
+        .ok_or("invalid_model_id: expected providerID/modelID")?;
+    let mut model = json!({"providerID":provider,"id":id});
+    if let Some(variant) = variant.filter(|v| !v.is_empty()) {
+        model["variant"] = json!(variant);
+    }
+    Ok(model)
+}
+pub fn create_body(
+    directory: &str,
+    model: Option<&str>,
+    variant: Option<&str>,
+) -> Result<Value, String> {
+    let mut body = json!({"location":{"directory":directory}});
+    if let Some(model) = model {
+        body["model"] = model_ref(model, variant)?;
+    }
+    Ok(body)
+}
+pub fn prompt_body(text: &str, files: Vec<Value>, steer: bool) -> Value {
+    let mut body = json!({"text":text,"delivery":if steer {"steer"} else {"queue"},"resume":true});
+    if !files.is_empty() {
+        body["files"] = json!(files);
+    }
+    body
+}
+/// Only native question-tool forms fit the existing question UI. Do not
+/// project auth, MCP-global, hidden, or conditional forms into chat inputs.
+pub fn question_payload(form: &Value) -> Result<Value, String> {
+    if form["metadata"]["kind"] != "question" || form["sessionID"] == "global" {
+        return Err(
+            "unsupported OpenCode form (only ordinary question-tool forms are supported)".into(),
+        );
+    }
+    let fields = form["fields"]
+        .as_array()
+        .filter(|f| !f.is_empty())
+        .ok_or("empty question form")?;
+    let mut questions = Vec::new();
+    for field in fields {
+        let kind = required_str(field, "type")?;
+        if !matches!(kind, "string" | "multiselect")
+            || field["hidden"] == true
+            || field.get("when").is_some()
+        {
+            return Err("unsupported question field".into());
+        }
+        let question = field
+            .get("description")
+            .and_then(Value::as_str)
+            .or_else(|| field.get("title").and_then(Value::as_str))
+            .unwrap_or(required_str(field, "key")?);
+        // The current UI returns labels, so accepting differing option values
+        // would silently answer with the wrong token.
+        let options = field
+            .get("options")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if options.iter().any(|o| o["value"] != o["label"]) {
+            return Err("question option label/value mismatch".into());
+        }
+        questions.push(json!({"id":field["key"],"question":question,"header":field["title"].as_str().unwrap_or(""),"multiSelect":kind=="multiselect","allowOther":field["custom"]==true,"options":options}));
+    }
+    // The UI keys answers by question text. Preserve exact native keys in the
+    // outbound map and deny an unrepresentable duplicate instead of guessing.
+    let unique: HashSet<_> = questions
+        .iter()
+        .map(|q| q["question"].as_str().unwrap())
+        .collect();
+    if unique.len() != questions.len() {
+        return Err("duplicate question text is not representable by the question UI".into());
+    }
+    Ok(json!({"questions":questions}))
+}
+
+pub fn question_answer(form: &Value, input: &Value) -> Result<Value, String> {
+    let payload = question_payload(form)?;
+    let answers = input
+        .get("answers")
+        .unwrap_or(input)
+        .as_object()
+        .ok_or("missing question answers")?;
+    let mut answer = serde_json::Map::new();
+    for (field, question) in form["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(payload["questions"].as_array().unwrap())
+    {
+        let key = required_str(field, "key")?;
+        let value = answers
+            .get(key)
+            .or_else(|| answers.get(question["question"].as_str().unwrap()))
+            .ok_or_else(|| format!("missing answer for {key}"))?;
+        let options = field
+            .get("options")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let values: Vec<String> = if field["type"] == "multiselect" {
+            value
+                .as_array()
+                .ok_or("expected multiselect selections")?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "expected string selection".into())
+                })
+                .collect::<Result<_, String>>()?
+        } else {
+            vec![value.as_str().ok_or("expected string answer")?.into()]
+        };
+        if values.is_empty() || values.iter().any(|v| v.is_empty()) {
+            return Err(format!("missing answer for {key}"));
+        }
+        if field["custom"] != true
+            && values
+                .iter()
+                .any(|v| !options.iter().any(|o| o["value"] == v.as_str()))
+        {
+            return Err(format!("invalid option for {key}"));
+        }
+        answer.insert(
+            key.into(),
+            if field["type"] == "multiselect" {
+                json!(values)
+            } else {
+                json!(values[0])
+            },
+        );
+    }
+    Ok(Value::Object(answer))
+}
+
+/// Normalize the history boundary only; live native events use State. Native
+/// messages omit sessionID, so the client must install the requested session
+/// ID on info/parts after decoding a page (never infer it from process cwd).
+pub fn decode_session_messages(
+    value: Value,
+) -> Result<Vec<super::protocol::SessionMessage>, String> {
+    let messages = value["data"]
+        .as_array()
+        .ok_or("missing native v2 message data array")?;
+    let mut out = Vec::new();
+    for message in messages {
+        let kind = required_str(message, "type")?;
+        if !matches!(kind, "user" | "assistant") {
+            continue;
+        }
+        let id = required_str(message, "id")?;
+        let session = message["sessionID"].as_str().unwrap_or("");
+        let error = message
+            .get("error")
+            .map(|e| json!({"name":e["type"],"data":{"message":e["message"]}}));
+        let info = json!({"id":id,"sessionID":session,"role":kind,"time":message["time"],"tokens":message["tokens"],"error":error,"providerID":message["model"]["providerID"],"modelID":message["model"]["id"]});
+        let mut parts = Vec::new();
+        let content = if kind == "user" {
+            vec![json!({"type":"text","text":message["text"]})]
+        } else {
+            message["content"]
+                .as_array()
+                .ok_or("missing assistant content")?
+                .clone()
+        };
+        for (ordinal, item) in content.iter().enumerate() {
+            let mut part = json!({"id":format!("{id}:{ordinal}"),"sessionID":session,"messageID":id,"type":item["type"],"text":item["text"]});
+            if item["type"] == "tool" {
+                let state = &item["state"];
+                let status = state["status"].as_str().ok_or("missing tool state")?;
+                let projected_status = if status == "streaming" {
+                    "pending"
+                } else {
+                    status
+                };
+                let output = state["content"]
+                    .as_array()
+                    .map(|c| {
+                        c.iter()
+                            .filter_map(|c| c["text"].as_str().or_else(|| c["uri"].as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                part["callID"] = item["id"].clone();
+                part["tool"] = item["name"].clone();
+                part["state"] = json!({"status":projected_status,"input":state["input"],"metadata":state["metadata"],"output":output,"error":state["error"]["message"].as_str().unwrap_or(""),"time":{"start":item["time"]["ran"],"end":item["time"]["completed"]}});
+            }
+            parts.push(part);
+        }
+        out.push(
+            serde_json::from_value(json!({"info":info,"parts":parts}))
+                .map_err(|e| format!("native message decode failed: {e}"))?,
+        );
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn event(id: &str, kind: &str, data: Value) -> Event {
+        Event {
+            durable: None,
+            id: id.into(),
+            kind: kind.into(),
+            data,
+        }
+    }
+
+    #[test]
+    fn native_event_fixtures_without_a_durable_envelope_still_decode() {
+        let decoded: Event = serde_json::from_value(json!({
+            "id":"evt_fixture", "type":"session.execution.started", "data":{"sessionID":"root"}
+        }))
+        .unwrap();
+        assert!(decoded.durable.is_none());
+        assert!(matches!(
+            State::default().reduce(&decoded).unwrap().as_slice(),
+            [Update::Started]
+        ));
+    }
+
+    #[test]
+    fn observed_terminal_fences_old_lifecycle_but_preserves_late_content_and_new_execution() {
+        let durable = |id: &str, kind: &str, data: Value, seq: u64| {
+            let mut event = event(id, kind, data);
+            event.durable = Some(Durable {
+                aggregate_id: "s".into(),
+                seq,
+            });
+            event
+        };
+        let lifecycle =
+            |id: &str, kind: &str, seq| durable(id, kind, json!({"sessionID":"s"}), seq);
+        let mut state = State::default();
+        state.mark_running("s");
+        let terminal = lifecycle("evt_a_done", "session.execution.succeeded", 10);
+        assert!(matches!(
+            state.reduce(&terminal).unwrap().as_slice(),
+            [Update::Terminal { .. }]
+        ));
+        assert!(state.recovered_sequence("s").is_none());
+        assert!(state
+            .reduce(&lifecycle("evt_a_start", "session.execution.started", 5))
+            .unwrap()
+            .is_empty());
+        for i in 0..2100 {
+            state
+                .reduce(&event(
+                    &format!("evict_{i}"),
+                    "ignored",
+                    json!({"sessionID":"s"}),
+                ))
+                .unwrap();
+        }
+        assert!(!state.seen.contains("evt_a_done"));
+        let late = durable(
+            "late_content",
+            "session.text.ended",
+            json!({"sessionID":"s","assistantMessageID":"m","ordinal":0,"text":"late"}),
+            9,
+        );
+        assert!(matches!(
+            state.reduce(&late).unwrap().as_slice(),
+            [Update::Content { complete: true, .. }]
+        ));
+        assert!(matches!(
+            state
+                .reduce(&lifecycle("evt_b_start", "session.execution.started", 11))
+                .unwrap()
+                .as_slice(),
+            [Update::Started]
+        ));
+        assert!(state.reduce(&terminal).unwrap().is_empty());
+        assert!(state
+            .reduce(&lifecycle(
+                "evt_older_terminal",
+                "session.execution.failed",
+                7
+            ))
+            .unwrap()
+            .is_empty());
+        assert_eq!(state.terminal_sequences["s"].1, 10);
+        assert!(state.running.contains("s"));
+        assert!(state
+            .reduce(&lifecycle(
+                "evt_old_start_again",
+                "session.execution.started",
+                8
+            ))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            state
+                .reduce(&lifecycle("evt_b_done", "session.execution.succeeded", 15))
+                .unwrap()
+                .as_slice(),
+            [Update::Terminal { .. }]
+        ));
+        assert_eq!(state.terminal_sequences["s"].1, 15);
+    }
+    #[test]
+    fn reconnect_snapshot_appends_only_missing_partial_content_then_accepts_live_deltas() {
+        let mut state = State::default();
+        let base = json!({"sessionID":"s","assistantMessageID":"m","ordinal":0});
+        let mut d = base.clone();
+        d["delta"] = json!("hel");
+        state
+            .reduce(&event("first", "session.text.delta", d))
+            .unwrap();
+        let mut d = base.clone();
+        d["text"] = json!("hello");
+        assert!(
+            matches!(&state.reduce(&event("snapshot:content:m:0","session.text.snapshot",d)).unwrap()[..],[Update::Content{complete:false,text,..}] if text=="lo")
+        );
+        let mut d = base.clone();
+        d["delta"] = json!(" world");
+        assert!(
+            matches!(&state.reduce(&event("live","session.text.delta",d)).unwrap()[..],[Update::Content{complete:false,text,..}] if text==" world")
+        );
+        let mut d = base;
+        d["text"] = json!("hello world!");
+        assert!(
+            matches!(&state.reduce(&event("snapshot:content:m:0","session.text.snapshot",d)).unwrap()[..],[Update::Content{complete:false,text,..}] if text=="!")
+        );
+    }
+
+    #[test]
+    fn question_roundtrip_preserves_native_keys_and_rejects_general_forms() {
+        let form = json!({"id":"f","sessionID":"child","metadata":{"kind":"question"},"fields":[
+          {"key":"q0","type":"string","title":"Storage","description":"Which storage?","custom":true,"options":[{"value":"A","label":"A"}]},
+          {"key":"q1","type":"multiselect","description":"Features?","custom":true,"options":[{"value":"with, comma","label":"with, comma"},{"value":"B","label":"B"}]}]});
+        let payload = question_payload(&form).unwrap();
+        assert_eq!(payload["questions"][0]["question"], "Which storage?");
+        assert_eq!(
+            question_answer(
+                &form,
+                &json!({"answers":{"Which storage?":"custom","Features?":["with, comma"]}})
+            )
+            .unwrap(),
+            json!({"q0":"custom","q1":["with, comma"]})
+        );
+        assert!(
+            question_payload(&json!({"metadata":{"kind":"mcp-elicitation"},"fields":[]})).is_err()
+        );
+        assert!(question_answer(&form, &json!({"answers":{}})).is_err());
+    }
+
+    #[test]
+    fn question_multiselect_preserves_comma_labels_and_combined_option_identities() {
+        let form = json!({"metadata":{"kind":"question"},"fields":[{
+            "key":"q0", "type":"multiselect", "description":"Pick", "custom":true,
+            "options":[{"value":"with, comma","label":"with, comma"},{"value":"A","label":"A"},
+                {"value":"B","label":"B"},{"value":"A, B","label":"A, B"}]
+        }]});
+        for selections in [
+            json!(["with, comma", "B"]),
+            json!(["A", "B"]),
+            json!(["A, B"]),
+        ] {
+            assert_eq!(
+                question_answer(&form, &json!({"answers":{"Pick":selections}})).unwrap(),
+                json!({"q0":selections})
+            );
+        }
+        for ambiguous in [json!("A, B"), json!([]), json!(["A", 1])] {
+            assert!(question_answer(&form, &json!({"answers":{"Pick":ambiguous}})).is_err());
+        }
+    }
+
+    #[test]
+    fn history_page_decodes_native_user_assistant_and_tool_without_v1_defaults() {
+        let page = json!({"data":[{"id":"u","type":"user","text":"hi","time":{"created":1}},
+          {"id":"a","type":"assistant","agent":"build","model":{"providerID":"p","id":"m"},"time":{"created":2,"completed":3},"tokens":{"input":4,"output":2},"content":[{"type":"reasoning","text":"thought"},{"type":"text","text":"answer"},{"type":"tool","id":"t","name":"read","time":{"created":2,"completed":3},"state":{"status":"completed","input":{"path":"x"},"content":[{"type":"text","text":"ok"}]}}]},
+          {"id":"i","type":"idle","outcome":"succeeded"}],"cursor":{"next":"opaque"}});
+        let messages = decode_session_messages(page).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[1].info.qualified_model_id().as_deref(),
+            Some("p/m")
+        );
+        assert!(
+            matches!(&messages[1].parts[0],super::super::protocol::PartPayload::Reasoning(p) if p.text=="thought")
+        );
+        assert!(
+            matches!(&messages[1].parts[2],super::super::protocol::PartPayload::Tool(p) if p.call_id=="t")
+        );
+        assert!(decode_session_messages(json!({"wrong":[]})).is_err());
+    }
+
+    #[test]
+    fn create_and_durable_prompt_use_native_fields_and_opaque_model_variant() {
+        assert_eq!(
+            model_ref("p/model/slash", Some("high")).unwrap(),
+            json!({"providerID":"p","id":"model/slash","variant":"high"})
+        );
+        assert_eq!(
+            create_body("/project", Some("p/m"), Some("high")).unwrap(),
+            json!({"location":{"directory":"/project"},"model":{"providerID":"p","id":"m","variant":"high"}})
+        );
+        let prompt = prompt_body(
+            "hi",
+            vec![json!({"uri":"data:image/png;base64,YQ=="})],
+            false,
+        );
+        assert_eq!(
+            prompt,
+            json!({"text":"hi","files":[{"uri":"data:image/png;base64,YQ=="}],"delivery":"queue","resume":true})
+        );
+        assert_eq!(prompt_body("steer", vec![], true)["delivery"], "steer");
+        assert!(model_ref("invalid", None).is_err());
+    }
+
+    #[test]
+    fn native_turn_stream_keeps_thinking_tools_usage_and_one_execution_terminal() {
+        let mut state = State::default();
+        let data = json!({"sessionID":"s", "assistantMessageID":"m", "ordinal":0});
+        state
+            .reduce(&event("1", "session.execution.started", data.clone()))
+            .unwrap();
+        let mut delta = data.clone();
+        delta["delta"] = json!("thinking");
+        let updates = state
+            .reduce(&event("2", "session.reasoning.delta", delta))
+            .unwrap();
+        assert!(
+            matches!(&updates[..], [Update::Content{thinking:true,complete:false,text}] if text == "thinking")
+        );
+        let mut ended = data.clone();
+        ended["text"] = json!("thinking done");
+        let updates = state
+            .reduce(&event("3", "session.reasoning.ended", ended.clone()))
+            .unwrap();
+        assert!(
+            matches!(&updates[..], [Update::Content{thinking:true,complete:true,text}] if text == "thinking done")
+        );
+        assert!(state
+            .reduce(&event("4", "session.reasoning.ended", ended))
+            .unwrap()
+            .is_empty());
+        let tool = json!({"sessionID":"s","assistantMessageID":"m","id":"call","name":"read"});
+        state
+            .reduce(&event("5", "session.tool.input.started", tool))
+            .unwrap();
+        let called = json!({"sessionID":"s","assistantMessageID":"m","id":"call","input":{"path":"x"},"executed":true});
+        assert!(
+            matches!(&state.reduce(&event("6","session.tool.called",called)).unwrap()[..], [Update::ToolUse{name,input,..}] if name=="read" && input["path"]=="x")
+        );
+        let result = json!({"sessionID":"s","assistantMessageID":"m","id":"call","content":[{"type":"text","text":"ok"},{"type":"file","uri":"file:///x","mime":"text/plain"}],"executed":true});
+        assert!(
+            matches!(&state.reduce(&event("7","session.tool.success",result.clone())).unwrap()[..], [Update::ToolResult{content,error:false,..}] if content.as_array().unwrap().len()==2)
+        );
+        assert!(state
+            .reduce(&event("8", "session.tool.success", result))
+            .unwrap()
+            .is_empty());
+        let usage = json!({"sessionID":"s","assistantMessageID":"m","tokens":{"input":10,"output":3,"reasoning":2,"cache":{"read":1,"write":0}},"cost":0.02});
+        assert!(matches!(
+            &state
+                .reduce(&event("9", "session.step.ended", usage))
+                .unwrap()[..],
+            [Update::Usage(_)]
+        ));
+        assert!(state
+            .reduce(&event("10", "session.idle", data.clone()))
+            .unwrap()
+            .is_empty());
+        assert!(
+            matches!(&state.reduce(&event("11","session.execution.succeeded",data.clone())).unwrap()[..], [Update::Terminal{outcome,..}] if outcome=="succeeded")
+        );
+        assert!(state
+            .reduce(&event("12", "session.execution.succeeded", data))
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Event {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub data: Value,
+    #[serde(default)]
+    pub durable: Option<Durable>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Durable {
+    #[serde(rename = "aggregateID")]
+    pub aggregate_id: String,
+    pub seq: u64,
+}
+
+impl Event {
+    pub(super) fn sequence(&self, session: &str) -> Option<u64> {
+        self.durable
+            .as_ref()
+            .filter(|d| d.aggregate_id == session)
+            .map(|d| d.seq)
+    }
+    pub fn session_id(&self) -> Option<&str> {
+        if self.kind.starts_with("form.") && self.kind == "form.created" {
+            self.data.get("form")?.get("sessionID")?.as_str()
+        } else {
+            self.data.get("sessionID")?.as_str()
+        }
+    }
+}

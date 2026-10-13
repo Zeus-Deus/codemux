@@ -17,6 +17,7 @@ import { FileTypeIcon } from "@/components/icons/file-type-icon";
 import { listDirectory } from "@/tauri/commands";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import { cn } from "@/lib/utils";
+import { Empty, EmptyDescription } from "@/components/ui/empty";
 import { useSyncedSettingsStore, selectShowHiddenFiles } from "@/stores/synced-settings-store";
 import type { WorkspaceSnapshot, FileEntry } from "@/tauri/types";
 
@@ -242,7 +243,9 @@ export function FileTreePanel({
             />
           ))}
           {rootEntries.length === 0 && (
-            <p className="py-8 text-center text-label text-foreground/40">No files</p>
+            <Empty>
+              <EmptyDescription>No files</EmptyDescription>
+            </Empty>
           )}
         </div>
       </ScrollArea>

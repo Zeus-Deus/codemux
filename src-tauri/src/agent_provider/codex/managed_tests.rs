@@ -6,6 +6,7 @@ pub(crate) fn fixture_binary(root: &std::path::Path) -> PathBuf {
 import sys,json,os,threading,time
 from pathlib import Path
 root=Path(__ROOT__)
+features=__FEATURES__
 if '--version' in sys.argv:
  print('codex-cli 0.162.0');sys.exit(0)
 if 'login' in sys.argv:
@@ -15,7 +16,7 @@ def output(v):
  with lock: print(json.dumps(v),flush=True)
 def record(v):
  with (root/'wire.jsonl').open('a') as f: f.write(json.dumps(v)+'\n')
-record({'spawn':os.getpid(),'args':sys.argv[1:],'token':os.environ.get('ACCESS_TOKEN'),'home':os.environ.get('CODEX_HOME'),'base':os.environ.get('OPENAI_BASE_URL'),'key':os.environ.get('OPENAI_API_KEY'),'proxy':os.environ.get('HTTPS_PROXY')})
+record({'spawn':os.getpid(),'pgid':os.getpgid(0),'args':sys.argv[1:],'token':os.environ.get('ACCESS_TOKEN'),'home':os.environ.get('CODEX_HOME'),'base':os.environ.get('OPENAI_BASE_URL'),'key':os.environ.get('OPENAI_API_KEY'),'proxy':os.environ.get('HTTPS_PROXY')})
 count=0
 def finish():
  while not (root/'finish').exists(): time.sleep(.01)
@@ -32,12 +33,15 @@ for line in sys.stdin:
   if (root/'catalog-block').exists():
    while not (root/'catalog-release').exists(): time.sleep(.01)
   result={'data':[{'id':'fixture-model','isDefault':True,'displayName':'Fixture model','inputModalities':['text'],'defaultReasoningEffort':'medium','supportedReasoningEfforts':[{'reasoningEffort':'medium','description':'Fixture effort'}]}]}
+  if (root/'premium-catalog').exists(): result['data'][0]['serviceTiers']=[{'id':'priority','name':'Fast','description':'Fixture priority tier'}]
   if (root/'catalog-pages').exists():
    if m.get('params',{}).get('cursor')=='page-2': result={'data':[{'id':'fixture-next-model','displayName':'Next model','supportedReasoningEfforts':[{'reasoningEffort':'ultra','description':'Provider-authored effort'}]}]}
    else: result['nextCursor']='page-2'
+ elif method=='config/read': result={'config':{'features':{key:False for key in features},'web_search':'disabled','mcp_servers':{}}}
+ elif method=='experimentalFeature/list': result={'data':[{'name':key,'enabled':False} for key in features]}
  elif method=='account/read': result={'account':None,'requiresOpenaiAuth':False}
  elif method=='account/rateLimits/read': result={'rateLimits':{}}
- elif method in ['thread/start','thread/resume']: result={'thread':{'id':'fixture-thread'}}
+ elif method in ['thread/start','thread/resume']: result={'thread':{'id':'fixture-thread','environments':[]},'approvalPolicy':'never','sandbox':{'type':'readOnly'}}
  elif method=='turn/start':
   count+=1;result={'turn':{'id':'turn-'+str(count),'status':'inProgress'}}
   if count==2 and (root/'fast-queue').exists():
@@ -55,6 +59,7 @@ for line in sys.stdin:
         "__ROOT__",
         &serde_json::to_string(&root.to_string_lossy()).unwrap(),
     );
+    let source = source.replace("__FEATURES__", &serde_json::to_string(MANAGED_DISABLED_FEATURES).unwrap());
     let binary = root.join("codex-fixture.py");
     std::fs::write(&binary, source).unwrap();
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -80,7 +85,7 @@ async fn chatgpt_runtime_renews_idle_child_and_resumes_queued_turn() {
         Some("fixture-model".into()),
         Some("read-only".into()),
         Some("medium".into()),
-        false,
+        "default".into(),
         None,
         Some(HashMap::from([
             ("OPENAI_BASE_URL".into(), "https://evil.example.test".into()),
@@ -91,6 +96,7 @@ async fn chatgpt_runtime_renews_idle_child_and_resumes_queued_turn() {
             codex_binary: binary,
             chatgpt_owner: Some(owner.clone()),
             codex_home: None,
+            remote: None,
             client_info: ClientInfo {
                 name: "codemux".into(),
                 title: "Codemux".into(),
@@ -201,7 +207,7 @@ async fn chatgpt_stop_reaps_owned_child_even_when_stdout_closes_early() {
         Some("fixture-model".into()),
         None,
         None,
-        false,
+        "default".into(),
         None,
         None,
         None,
@@ -209,6 +215,7 @@ async fn chatgpt_stop_reaps_owned_child_even_when_stdout_closes_early() {
             codex_binary: binary,
             chatgpt_owner: Some(owner.clone()),
             codex_home: None,
+            remote: None,
             client_info: ClientInfo {
                 name: "codemux".into(),
                 title: "Codemux".into(),
@@ -266,7 +273,7 @@ async fn chatgpt_retry_after_retirement_reacquires_runtime_admission() {
             Some("fixture-model".into()),
             None,
             None,
-            false,
+            "default".into(),
             None,
             None,
             None,
@@ -274,6 +281,7 @@ async fn chatgpt_retry_after_retirement_reacquires_runtime_admission() {
                 codex_binary: binary,
                 chatgpt_owner: Some(owner.clone()),
                 codex_home: None,
+                remote: None,
                 client_info: ClientInfo {
                     name: "codemux".into(),
                     title: "Codemux".into(),
@@ -805,4 +813,75 @@ async fn chatgpt_queued_completion_before_start_response_does_not_strand_followu
         next_dispatched,
         "a completed queued turn must not be resurrected by its late start response"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn chatgpt_workflow_uses_owned_grant_and_containment_through_renewal() {
+    use crate::agent_provider::AgentProvider;
+    use super::super::{CodexAgentProvider, CodexProviderConfig};
+    #[derive(Default)]
+    struct WorkflowTools { evidence: std::sync::Mutex<Vec<Value>> }
+    #[async_trait::async_trait]
+    impl crate::agent_provider::managed::ManagedToolHandler for WorkflowTools {
+        fn tools(&self) -> Vec<crate::agent_provider::managed::ManagedTool> { Vec::new() }
+        async fn call(&self, _: &str, _: Value) -> Result<Value, String> { Err("no fixture tools".into()) }
+        fn record_runtime(&self, evidence: Value) -> Result<(), String> {
+            self.evidence.lock().unwrap().push(evidence); Ok(())
+        }
+        async fn quiesce(&self) -> Result<(), String> { Ok(()) }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let owner = super::super::chatgpt::Owner::testing(dir.path().join("chatgpt"));
+    let home = dir.path().join("workflow-home");
+    std::fs::write(dir.path().join("premium-catalog"), "yes").unwrap();
+    let tools = Arc::new(WorkflowTools::default());
+    let thread = ThreadId(format!("workflow-plan-{}", uuid::Uuid::new_v4()));
+    let _registration = crate::agent_provider::managed::register_session(thread.clone(),
+        crate::agent_provider::managed::ManagedSession { handler: tools.clone(), read_only: true }).unwrap();
+    let mut provider = CodexAgentProvider::new(CodexProviderConfig {
+        codex_binary: fixture_binary(dir.path()), codex_home: Some(home.clone()), ..Default::default()
+    });
+    provider.chatgpt_owner = Some(owner.clone());
+    let mut input = timeline_start_input(dir.path(), &thread);
+    input.service_tier = Some("priority".into());
+    provider.start_session(input).await.unwrap();
+    let session = provider.sessions.read().await.get(&thread).unwrap().clone();
+    session.enqueue_or_send(super::tests::queued("first").input).await.unwrap();
+    owner.testing_rotate().await;
+    session.enqueue_or_send(super::tests::queued("after renewal").input).await.unwrap();
+    std::fs::write(dir.path().join("finish"), "yes").unwrap();
+    let dispatched = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if wire(dir.path()).iter().filter(|entry| entry["rpc"] == "turn/start").count() == 2 { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.is_ok();
+    provider.stop_managed_session(thread).await.unwrap();
+    let captured = wire(dir.path());
+    let spawns: Vec<_> = captured.iter().filter(|entry| entry.get("spawn").is_some()).collect();
+    let evidence = tools.evidence.lock().unwrap();
+    assert!(dispatched, "contained workflow must resume and dispatch its queued turn");
+    assert_eq!(spawns.len(), 2);
+    assert_eq!(spawns[0]["token"], "synthetic-runtime-a");
+    assert_eq!(spawns[1]["token"], "synthetic-runtime-b");
+    assert_eq!(evidence.len(), 2, "every replacement must record real containment evidence");
+    for (spawn, runtime) in spawns.iter().zip(evidence.iter()) {
+        assert_eq!(spawn["pgid"], spawn["spawn"]);
+        assert_eq!(runtime["pid"], spawn["spawn"]);
+        assert_eq!(runtime["kind"], "linux_process_group");
+        assert_eq!(spawn["home"].as_str(), home.to_str());
+        assert!(spawn["args"].as_array().unwrap().iter().any(|arg| arg == "features.shell_tool=false"));
+        assert!(spawn["args"].as_array().unwrap().iter().any(|arg| arg == "model_provider=\"openai_chatgpt_plan\""));
+        assert!(!std::path::Path::new(&format!("/proc/{}", spawn["spawn"])).exists(), "verified Stop/retirement must reap every child");
+    }
+    for entry in captured.iter().filter(|entry| matches!(entry["rpc"].as_str(), Some("thread/start" | "thread/resume" | "turn/start"))) {
+        assert_eq!(entry["params"]["environments"], json!([]));
+        assert_eq!(entry["params"]["approvalPolicy"], "never");
+        let tier_field = if entry["rpc"] == "turn/start" { "serviceTierForTurn" } else { "serviceTier" };
+        assert_eq!(entry["params"][tier_field], "priority", "current catalog entitlement survives renewal");
+    }
+    assert!(!captured.iter().any(|entry| entry["rpc"] == "account/read"));
+    assert!(!dir.path().join("auth-called").exists());
+    assert!(session.runtime_lease.lock().await.is_none());
 }

@@ -16,10 +16,12 @@
 //!   memory. A host with no live entry has not been probed yet.
 //!
 //! `hosts_inventory` feeds one [`Observation`] per host per tick into
-//! [`HostStatusStore::apply`]; the pure [`next_live`] transition decides
-//! how an observation changes the live bits, and is what unit tests pin
-//! down. [`HostStatusStore::views_for`] overlays the live bits onto each
-//! host record's persisted columns to build the wire shape.
+//! [`HostStatusStore::apply`], and so do the connection test and the
+//! helper install, so a dot updates the moment the user acts. The pure
+//! [`next_live`] transition decides how an observation changes the live
+//! bits, and is what unit tests pin down. [`HostStatusStore::views_for`]
+//! overlays the live bits onto each host record's persisted columns to
+//! build the wire shape.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -44,8 +46,8 @@ pub struct HostStatusView {
     pub reachable: bool,
     /// RFC 3339 timestamp of the last successful probe (persisted).
     pub last_seen_at: Option<String>,
-    /// Why the host is unreachable, or — while reachable — why the last
-    /// tick fell short (host agent missing, inventory failed/timed out).
+    /// Why the host is unreachable, or — while reachable — why it needs
+    /// setup (host agent missing, damaged or out of date).
     pub last_error: Option<String>,
     /// Sum of the host's workspace directories in bytes (persisted).
     /// `None` while unknown.
@@ -74,19 +76,25 @@ pub struct HostFacts {
     pub remote_control_serving: Option<bool>,
 }
 
-/// What one poll tick learned about a host.
+/// What one poll tick, connection test or install learned about a host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Observation {
     /// SSH itself failed (offline, DNS, refused, key not authorized,
     /// timed out).
     Unreachable { reason: String },
-    /// SSH connected, but the tick could not complete — the binary is
-    /// missing, or the inventory fetch/parse failed or timed out. The
-    /// host counts as seen; the error is surfaced so the card can
-    /// explain itself.
-    Degraded { reason: String },
+    /// SSH connected, but the host's helper is missing, damaged or out of
+    /// date, so it needs setup. The host counts as seen; the error is
+    /// surfaced so the card can explain itself. `facts` is set when an
+    /// outdated helper still answered the inventory read.
+    Degraded {
+        reason: String,
+        facts: Option<HostFacts>,
+    },
     /// SSH connected and the inventory came back.
     Reachable { facts: HostFacts },
+    /// SSH connected and the host's helper is current, but no inventory
+    /// was read (a connection test or an install).
+    Alive,
 }
 
 /// Pure transition: fold one observation into the previous live bits.
@@ -98,13 +106,17 @@ pub fn next_live(prev: &LiveStatus, observation: &Observation) -> LiveStatus {
             // A server we can't reach is not one the user can open.
             remote_control_serving: false,
         },
-        Observation::Degraded { reason } => LiveStatus {
+        Observation::Degraded { reason, facts } => LiveStatus {
             reachable: true,
             last_error: Some(reason.clone()),
-            // The envelope was unreadable, so we learned nothing about
-            // the server either way; keep the last answer rather than
-            // flashing the "open" affordance off and on.
-            remote_control_serving: prev.remote_control_serving,
+            remote_control_serving: match facts {
+                // An outdated helper still reports its server.
+                Some(facts) => facts.remote_control_serving.unwrap_or(false),
+                // Nothing was read about the server either way; keep the
+                // last answer rather than flashing the "open" affordance
+                // off and on.
+                None => prev.remote_control_serving,
+            },
         },
         Observation::Reachable { facts } => LiveStatus {
             reachable: true,
@@ -112,6 +124,12 @@ pub fn next_live(prev: &LiveStatus, observation: &Observation) -> LiveStatus {
             // An old daemon that doesn't report the flag can't be
             // offering the feature either.
             remote_control_serving: facts.remote_control_serving.unwrap_or(false),
+        },
+        Observation::Alive => LiveStatus {
+            reachable: true,
+            last_error: None,
+            // Nothing was learned about the server; the next poll reads it.
+            remote_control_serving: prev.remote_control_serving,
         },
     }
 }
@@ -209,28 +227,50 @@ mod tests {
         assert!(!next.remote_control_serving);
     }
 
+    fn degraded(reason: &str, facts: Option<HostFacts>) -> Observation {
+        Observation::Degraded {
+            reason: reason.into(),
+            facts,
+        }
+    }
+
     #[test]
     fn degraded_is_reachable_with_error_and_keeps_serving() {
-        let next = next_live(
-            &online(true),
-            &Observation::Degraded {
-                reason: "codemux-remote missing".into(),
-            },
-        );
+        let next = next_live(&online(true), &degraded("codemux-remote missing", None));
         assert!(next.reachable);
         assert_eq!(next.last_error.as_deref(), Some("codemux-remote missing"));
         assert!(
             next.remote_control_serving,
-            "an unreadable envelope says nothing about the server; keep the last answer"
+            "no envelope says nothing about the server; keep the last answer"
         );
 
-        let from_off = next_live(
-            &online(false),
-            &Observation::Degraded {
-                reason: "inventory timed out after 20s".into(),
-            },
-        );
+        let from_off = next_live(&online(false), &degraded("codemux-remote missing", None));
         assert!(!from_off.remote_control_serving);
+    }
+
+    #[test]
+    fn degraded_with_facts_reads_serving_from_them() {
+        // An outdated helper still answers the inventory read: a first
+        // observation must show its running server, not default to off.
+        let facts = |serving| HostFacts {
+            disk_bytes: None,
+            remote_control_serving: serving,
+        };
+        let next = next_live(
+            &LiveStatus::default(),
+            &degraded("out of date", Some(facts(Some(true)))),
+        );
+        assert!(next.reachable);
+        assert_eq!(next.last_error.as_deref(), Some("out of date"));
+        assert!(next.remote_control_serving);
+
+        let stopped = next_live(
+            &online(true),
+            &degraded("out of date", Some(facts(Some(false)))),
+        );
+        assert!(!stopped.remote_control_serving, "a stopped server is reported");
+        let too_old = next_live(&online(true), &degraded("out of date", Some(facts(None))));
+        assert!(!too_old.remote_control_serving, "too old to report it");
     }
 
     #[test]
@@ -244,6 +284,33 @@ mod tests {
         assert!(next.reachable);
         assert!(next.last_error.is_none());
         assert!(next.remote_control_serving);
+    }
+
+    #[test]
+    fn alive_clears_error_and_keeps_serving() {
+        let prev = LiveStatus {
+            reachable: true,
+            last_error: Some("Needs setup".into()),
+            remote_control_serving: true,
+        };
+        let next = next_live(&prev, &Observation::Alive);
+        assert!(next.reachable);
+        assert!(next.last_error.is_none());
+        assert!(
+            next.remote_control_serving,
+            "a connection test reads no facts, so it must not flip serving off"
+        );
+
+        let from_down = next_live(
+            &LiveStatus {
+                reachable: false,
+                last_error: Some("down".into()),
+                remote_control_serving: false,
+            },
+            &Observation::Alive,
+        );
+        assert!(from_down.reachable);
+        assert!(!from_down.remote_control_serving);
     }
 
     #[test]

@@ -1,0 +1,101 @@
+{
+  "baseline": {
+    "active_frame_count": 120,
+    "mean_ms": 19.95,
+    "median_ms": 17.0,
+    "p95_ms": 46,
+    "max_ms": 101,
+    "frames_at_least_25ms": 22,
+    "forced_layout_ms": 0
+  },
+  "nomask": {
+    "active_frame_count": 121,
+    "mean_ms": 19.64,
+    "median_ms": 16,
+    "p95_ms": 48,
+    "max_ms": 89,
+    "frames_at_least_25ms": 21,
+    "forced_layout_ms": 0
+  },
+  "contain": {
+    "active_frame_count": 127,
+    "mean_ms": 18.97,
+    "median_ms": 16,
+    "p95_ms": 43,
+    "max_ms": 103,
+    "frames_at_least_25ms": 14,
+    "forced_layout_ms": 0
+  },
+  "mvcp": {
+    "active_frame_count": 116,
+    "mean_ms": 21.25,
+    "median_ms": 17.0,
+    "p95_ms": 52,
+    "max_ms": 103,
+    "frames_at_least_25ms": 32,
+    "forced_layout_ms": 0
+  },
+  "profile2": {
+    "active_frame_count": 105,
+    "mean_ms": 23.18,
+    "median_ms": 20,
+    "p95_ms": 56,
+    "max_ms": 91,
+    "frames_at_least_25ms": 36,
+    "forced_layout_ms": 230.0
+  },
+  "clock320clean": {
+    "active_frame_count": 154,
+    "mean_ms": 15.98,
+    "median_ms": 7.0,
+    "p95_ms": 45,
+    "max_ms": 95,
+    "frames_at_least_25ms": 43,
+    "forced_layout_ms": 0
+  },
+  "clock335clean": {
+    "active_frame_count": 189,
+    "mean_ms": 13.14,
+    "median_ms": 6,
+    "p95_ms": 48,
+    "max_ms": 73,
+    "frames_at_least_25ms": 35,
+    "forced_layout_ms": 0
+  },
+  "clockbaseline": {
+    "active_frame_count": 138,
+    "mean_ms": 17.52,
+    "median_ms": 8.0,
+    "p95_ms": 50,
+    "max_ms": 104,
+    "frames_at_least_25ms": 46,
+    "forced_layout_ms": 238.0
+  },
+  "clockrowcontain": {
+    "active_frame_count": 156,
+    "mean_ms": 15.84,
+    "median_ms": 8.0,
+    "p95_ms": 44,
+    "max_ms": 96,
+    "frames_at_least_25ms": 40,
+    "forced_layout_ms": 235.0
+  },
+  "clocknowrap": {
+    "active_frame_count": 163,
+    "mean_ms": 15.06,
+    "median_ms": 7,
+    "p95_ms": 45,
+    "max_ms": 95,
+    "frames_at_least_25ms": 34,
+    "forced_layout_ms": 324.0
+  },
+  "clockfasttext": {
+    "active_frame_count": 153,
+    "mean_ms": 15.93,
+    "median_ms": 8,
+    "p95_ms": 46,
+    "max_ms": 93,
+    "frames_at_least_25ms": 34,
+    "forced_layout_ms": 324.0
+  }
+}

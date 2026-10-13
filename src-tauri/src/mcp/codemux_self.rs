@@ -25,7 +25,7 @@ pub fn codemux_self_config() -> McpServerConfig {
         sources: vec![McpConfigSource::Codemux],
         command,
         args: vec!["mcp".to_string()],
-        env: HashMap::new(),
+        env: HashMap::from([(crate::mcp_server::PROVIDER_ORIGIN_ENV.into(), "1".into())]),
         // Always-on. Toggling is suppressed in the UI; the field is here
         // only to keep the type uniform with user-installed entries.
         disabled: false,
@@ -39,13 +39,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn review_s1_injected_self_process_is_bound_to_provider_origin() {
+        let config = codemux_self_config();
+        assert_eq!(config.env.get("CODEMUX_MCP_PROVIDER_ORIGIN").map(String::as_str), Some("1"),
+            "provider registry must start a restricted self MCP process, not an indistinguishable local controller");
+    }
+
+    #[test]
     fn config_matches_published_entry_shape() {
         let cfg = codemux_self_config();
         assert_eq!(cfg.name, "codemux");
         assert_eq!(cfg.id, "codemux-self");
         assert_eq!(cfg.sources, vec![McpConfigSource::Codemux]);
         assert_eq!(cfg.args, vec!["mcp".to_string()]);
-        assert!(cfg.env.is_empty());
+        assert_eq!(cfg.env, HashMap::from([(crate::mcp_server::PROVIDER_ORIGIN_ENV.into(), "1".into())]));
         assert!(!cfg.disabled);
         assert!(matches!(cfg.transport, McpTransport::Stdio));
         // The command is non-empty even when current_exe fails (falls back

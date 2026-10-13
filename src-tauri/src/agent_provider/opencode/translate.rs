@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use crate::agent_provider::context_usage::ContextUsageTracker;
 use crate::agent_provider::events::{
-    CompletedItem, ContentDelta, CostSource, ProviderRuntimeEvent, SubagentSnapshot, SubagentStatus,
-    TaskSnapshotItem, TaskStatus, TasksSnapshot, TurnStatus,
+    CompletedItem, ContentDelta, CostSource, ProviderRuntimeEvent, SubagentSnapshot,
+    SubagentStatus, TaskSnapshotItem, TaskStatus, TasksSnapshot, TurnStatus,
 };
 use crate::agent_provider::pricing;
 use crate::agent_provider::types::{
@@ -28,8 +28,8 @@ use crate::agent_provider::types::{
 };
 
 use super::protocol::{
-    KnownEvent, ModelRef, OpenCodeApiError, OpenCodeEvent, PartInput, PartPayload,
-    PermissionReply, PromptAsyncRequest, TaskMetadata, ToolStateValue,
+    KnownEvent, ModelRef, OpenCodeApiError, OpenCodeEvent, PartInput, PartPayload, PermissionReply,
+    PromptAsyncRequest, TaskMetadata, ToolStateValue,
 };
 
 // ── Outbound translation (Codemux → OpenCode wire) ──────────────────
@@ -63,12 +63,13 @@ pub fn build_prompt_async_request(
     variant: Option<&str>,
     images: &[crate::agent_provider::types::ImageInput],
 ) -> Result<PromptAsyncRequest, String> {
-    let model = match model_id {
-        Some(id) => Some(split_model_id(id).ok_or_else(|| {
-            format!("invalid_model_id: expected providerID/modelID, got {id:?}")
-        })?),
-        None => None,
-    };
+    let model =
+        match model_id {
+            Some(id) => Some(split_model_id(id).ok_or_else(|| {
+                format!("invalid_model_id: expected providerID/modelID, got {id:?}")
+            })?),
+            None => None,
+        };
     let mut parts = Vec::with_capacity(1 + images.len());
     parts.push(PartInput::Text { text });
     for image in images {
@@ -171,12 +172,7 @@ pub fn opencode_event_to_runtime(
     ctx: &EventContext,
     subagent_id: Option<&str>,
 ) -> Vec<ProviderRuntimeEvent> {
-    opencode_event_to_runtime_with(
-        event,
-        ctx,
-        subagent_id,
-        &mut OpenCodeUsageState::default(),
-    )
+    opencode_event_to_runtime_with(event, ctx, subagent_id, &mut OpenCodeUsageState::default())
 }
 
 /// Per-session token accounting for the OpenCode adapter.
@@ -210,6 +206,7 @@ pub struct OpenCodeUsageState {
     /// work. Emitting only when the model is genuinely new keeps the
     /// snapshot to the one tick that actually says something.
     subagent_models: HashMap<String, String>,
+    native_costs: HashMap<String, f64>,
 }
 
 /// A non-overlapping token split, in the shape
@@ -305,6 +302,21 @@ pub fn opencode_event_to_runtime_with(
 ) -> Vec<ProviderRuntimeEvent> {
     match event {
         OpenCodeEvent::Known(known) => translate_known(known, ctx, subagent_id, usage),
+        OpenCodeEvent::V2(event) => {
+            let mut state = super::v2::State::default();
+            state.mark_running(event.session_id().unwrap_or(&ctx.provider_session_id.0));
+            match state.reduce(&event) {
+                Ok(updates) => updates
+                    .into_iter()
+                    .flat_map(|update| v2_update_to_runtime(update, ctx, subagent_id, usage))
+                    .collect(),
+                Err(message) => vec![ProviderRuntimeEvent::RuntimeWarning {
+                    thread_id: Some(ctx.thread_id.clone()),
+                    message,
+                    original_payload: Some(event.data),
+                }],
+            }
+        }
         OpenCodeEvent::Other(payload) => {
             let event_type = payload
                 .get("type")
@@ -320,6 +332,222 @@ pub fn opencode_event_to_runtime_with(
     }
 }
 
+/// The stateful native reducer is shared by the live listener and reconnect
+/// snapshots. Only this bridge knows Codemux runtime types.
+pub fn v2_update_to_runtime(
+    update: super::v2::Update,
+    ctx: &EventContext,
+    subagent_id: Option<&str>,
+    usage: &mut OpenCodeUsageState,
+) -> Vec<ProviderRuntimeEvent> {
+    use super::v2::Update as U;
+    let item = |item| ProviderRuntimeEvent::ItemCompleted {
+        subagent_id: subagent_id.map(str::to_string),
+        thread_id: ctx.thread_id.clone(),
+        turn_id: ctx.turn_id.clone(),
+        item,
+    };
+    match update {
+        U::UserDelivered(_) => vec![],
+        U::Content {
+            thinking,
+            complete,
+            text,
+        } => {
+            if complete {
+                vec![item(if thinking {
+                    CompletedItem::AssistantThinking { text }
+                } else {
+                    CompletedItem::AssistantText { text }
+                })]
+            } else {
+                vec![ProviderRuntimeEvent::ContentDelta {
+                    subagent_id: subagent_id.map(str::to_string),
+                    thread_id: ctx.thread_id.clone(),
+                    turn_id: ctx.turn_id.clone(),
+                    delta: if thinking {
+                        ContentDelta::Thinking { text }
+                    } else {
+                        ContentDelta::Text { text }
+                    },
+                }]
+            }
+        }
+        U::ToolUse { id, name, input } => vec![item(CompletedItem::ToolUse {
+            tool_use_id: id,
+            tool_name: name,
+            input,
+        })],
+        U::ToolResult { id, content, error } => vec![item(CompletedItem::ToolResult {
+            tool_use_id: id,
+            content,
+            is_error: error,
+        })],
+        U::Usage(value) => {
+            let Ok(info) = serde_json::from_value::<super::protocol::MessageInfo>(value.clone())
+            else {
+                return vec![];
+            };
+            let mut events = translate_message_tokens(&info, ctx, subagent_id, usage);
+            if let Some(cost) = value["cost"]
+                .as_f64()
+                .filter(|c| c.is_finite() && *c >= 0.0)
+            {
+                let seen = usage.native_costs.entry(info.id).or_default();
+                let delta = (cost - *seen).max(0.0);
+                *seen = cost.max(*seen);
+                for event in &mut events {
+                    if let ProviderRuntimeEvent::UsageRecorded {
+                        cost_usd,
+                        cost_source,
+                        ..
+                    } = event
+                    {
+                        *cost_usd = Some(delta);
+                        *cost_source = Some(CostSource::Provider);
+                    }
+                }
+            }
+            events
+        }
+        U::Started | U::Terminal { .. } if subagent_id.is_some() => {
+            let id = subagent_id.unwrap();
+            let (status, result_text) = match update {
+                U::Started => (SubagentStatus::Running, None),
+                U::Terminal { outcome, error } => (
+                    match outcome.as_str() {
+                        "succeeded" => SubagentStatus::Completed,
+                        "interrupted" => SubagentStatus::Stopped,
+                        _ => SubagentStatus::Failed,
+                    },
+                    error.and_then(|e| e["message"].as_str().map(str::to_string)),
+                ),
+                _ => unreachable!(),
+            };
+            vec![subagent_event(
+                ctx,
+                SubagentSnapshot {
+                    subagent_id: id.into(),
+                    provider_ref: Some(id.into()),
+                    status,
+                    result_text,
+                    ..Default::default()
+                },
+            )]
+        }
+        U::Started => {
+            if ctx.turn_active {
+                vec![ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: ctx.thread_id.clone(),
+                    status: SessionStatus::Running {
+                        active_turn: ctx.turn_id.clone(),
+                    },
+                }]
+            } else {
+                vec![]
+            }
+        }
+        U::Terminal { outcome, error } => {
+            if !ctx.turn_active {
+                return vec![];
+            }
+            let status = match outcome.as_str() {
+                "succeeded" => TurnStatus::Success,
+                "interrupted" => TurnStatus::Error {
+                    subtype: "interrupted".into(),
+                    message: "OpenCode execution interrupted".into(),
+                },
+                _ => TurnStatus::Error {
+                    subtype: error
+                        .as_ref()
+                        .and_then(|e| e["type"].as_str())
+                        .unwrap_or("opencode_execution_failed")
+                        .into(),
+                    message: error
+                        .as_ref()
+                        .and_then(|e| e["message"].as_str())
+                        .unwrap_or("OpenCode execution failed")
+                        .into(),
+                },
+            };
+            vec![
+                ProviderRuntimeEvent::TurnCompleted {
+                    thread_id: ctx.thread_id.clone(),
+                    turn_id: ctx.turn_id.clone(),
+                    status,
+                    usage: None,
+                },
+                ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: ctx.thread_id.clone(),
+                    status: SessionStatus::Ready,
+                },
+            ]
+        }
+        U::Child { id, status, detail } => vec![subagent_event(
+            ctx,
+            SubagentSnapshot {
+                subagent_id: id.clone(),
+                provider_ref: Some(id),
+                parent_item_id: detail["id"].as_str().map(str::to_string),
+                description: detail["input"]["description"].as_str().map(str::to_string),
+                agent_type: detail["input"]["agent"].as_str().map(str::to_string),
+                status: if status == "completed" {
+                    SubagentStatus::Completed
+                } else {
+                    SubagentStatus::Running
+                },
+                ..Default::default()
+            },
+        )],
+        U::Permission(p) => vec![ProviderRuntimeEvent::RequestOpened {
+            subagent_id: subagent_id.map(str::to_string),
+            thread_id: ctx.thread_id.clone(),
+            turn_id: ctx.turn_id.clone(),
+            request_id: RequestId(p["id"].as_str().unwrap_or_default().into()),
+            request_kind: "tool_permission".into(),
+            tool_use_id: p["source"]["id"].as_str().map(str::to_string),
+            payload: serde_json::json!({"permission":p["action"],"patterns":p["resources"],"metadata":p["metadata"],"message":p["message"]}),
+        }],
+        U::Form(form) => match super::v2::question_payload(&form) {
+            Ok(payload) => vec![ProviderRuntimeEvent::RequestOpened {
+                subagent_id: subagent_id.map(str::to_string),
+                thread_id: ctx.thread_id.clone(),
+                turn_id: ctx.turn_id.clone(),
+                request_id: RequestId(form["id"].as_str().unwrap_or_default().into()),
+                request_kind: "user-input".into(),
+                tool_use_id: form["metadata"]["tool"]["id"].as_str().map(str::to_string),
+                payload,
+            }],
+            Err(message) => vec![ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(ctx.thread_id.clone()),
+                message,
+                original_payload: None,
+            }],
+        },
+        U::Resolved { id, answer } => vec![ProviderRuntimeEvent::RequestResolved {
+            thread_id: ctx.thread_id.clone(),
+            request_id: RequestId(id),
+            decision: match answer.as_ref() {
+                Some(serde_json::Value::String(reply)) if reply == "always" => {
+                    ApprovalDecision::AllowForSession
+                }
+                Some(serde_json::Value::String(reply)) if reply == "reject" => {
+                    ApprovalDecision::Cancel
+                }
+                None | Some(serde_json::Value::Null) => ApprovalDecision::Cancel,
+                _ => ApprovalDecision::Allow {
+                    updated_input: answer,
+                    updated_permissions: None,
+                },
+            },
+        }],
+        U::Compacted => vec![ProviderRuntimeEvent::ContextCompactionChanged {
+            thread_id: ctx.thread_id.clone(),
+            active: false,
+        }],
+    }
+}
+
 fn translate_known(
     event: KnownEvent,
     ctx: &EventContext,
@@ -332,9 +560,7 @@ fn translate_known(
             translate_part_updated(updated, ctx, subagent_id)
         }
         KnownEvent::MessagePartRemoved(_) => vec![],
-        KnownEvent::MessageUpdated(env) => {
-            translate_message_updated(env, ctx, subagent_id, usage)
-        }
+        KnownEvent::MessageUpdated(env) => translate_message_updated(env, ctx, subagent_id, usage),
         KnownEvent::MessageRemoved(_) => vec![],
         KnownEvent::SessionIdle(_) => {
             // A child session going idle fires *before* the parent's
@@ -668,7 +894,10 @@ fn translate_task_part(
             // Without a child session id we cannot key the row. Fall
             // back to the spawning tool call id so a failure is never
             // silently swallowed.
-            let child = md.session_id.clone().unwrap_or_else(|| tool.call_id.clone());
+            let child = md
+                .session_id
+                .clone()
+                .unwrap_or_else(|| tool.call_id.clone());
             let duration_ms = time.as_ref().and_then(|t| match (t.start, t.end) {
                 (Some(start), Some(end)) if end >= start => Some(end - start),
                 _ => None,
@@ -764,6 +993,7 @@ fn empty_snapshot(id: &str) -> SubagentSnapshot {
         // `None` reads as ordinary agent work everywhere downstream.
         task_kind: None,
         model: None,
+        effort: None,
         status: SubagentStatus::Pending,
         activity: None,
         result_text: None,
@@ -863,7 +1093,12 @@ fn translate_message_updated(
     if subagent_id.is_none() && env.info.summary.as_bool() == Some(true) {
         events.push(ProviderRuntimeEvent::ContextCompactionChanged {
             thread_id: ctx.thread_id.clone(),
-            active: env.info.time.as_ref().and_then(|time| time.completed).is_none(),
+            active: env
+                .info
+                .time
+                .as_ref()
+                .and_then(|time| time.completed)
+                .is_none(),
         });
     }
     events
@@ -975,18 +1210,26 @@ fn record_usage(
     // heard of. The fallback still matters — the probe is fire-and-forget
     // and may not have landed yet.
     let (cost_usd, cost_source) = match ctx.model_cost.as_ref() {
-        Some(rates) => (Some(
-            pricing::ModelRates {
-                input: rates.input,
-                output: rates.output,
-                cache_read: rates.cache_read,
-                cache_write: rates.cache_write,
-                // The OpenCode catalogue publishes one cache-write rate
-                // per model, with no TTL tiers to distinguish.
-                cache_write_1h: rates.cache_write,
-            }
-            .cost_usd(delta.input, delta.output, delta.cache_read, delta.cache_write),
-        ), Some(CostSource::Provider)),
+        Some(rates) => (
+            Some(
+                pricing::ModelRates {
+                    input: rates.input,
+                    output: rates.output,
+                    cache_read: rates.cache_read,
+                    cache_write: rates.cache_write,
+                    // The OpenCode catalogue publishes one cache-write rate
+                    // per model, with no TTL tiers to distinguish.
+                    cache_write_1h: rates.cache_write,
+                }
+                .cost_usd(
+                    delta.input,
+                    delta.output,
+                    delta.cache_read,
+                    delta.cache_write,
+                ),
+            ),
+            Some(CostSource::Provider),
+        ),
         None => {
             let cost = pricing::cost_for(
                 model.as_deref(),
@@ -1030,12 +1273,21 @@ fn translate_session_error(
         }];
     };
     let (subtype, message) = err.display_pair();
-    vec![ProviderRuntimeEvent::TurnCompleted {
+    let mut events = crate::agent_provider::usage_limit::usage_limit_notice(
+        &ctx.thread_id,
+        crate::agent_provider::ProviderKind::OpenCode,
+        &serde_json::json!({"name": err.name, "data": err.data}),
+        &message,
+    )
+    .into_iter()
+    .collect::<Vec<_>>();
+    events.push(ProviderRuntimeEvent::TurnCompleted {
         thread_id: ctx.thread_id.clone(),
         turn_id: ctx.turn_id.clone(),
         status: TurnStatus::Error { subtype, message },
         usage: None,
-    }]
+    });
+    events
 }
 
 fn translate_assistant_error(
@@ -1043,18 +1295,27 @@ fn translate_assistant_error(
     ctx: &EventContext,
 ) -> Vec<ProviderRuntimeEvent> {
     let (subtype, message) = err.display_pair();
-    vec![ProviderRuntimeEvent::TurnCompleted {
+    let mut events = crate::agent_provider::usage_limit::usage_limit_notice(
+        &ctx.thread_id,
+        crate::agent_provider::ProviderKind::OpenCode,
+        &serde_json::json!({"name": err.name, "data": err.data}),
+        &message,
+    )
+    .into_iter()
+    .collect::<Vec<_>>();
+    events.push(ProviderRuntimeEvent::TurnCompleted {
         thread_id: ctx.thread_id.clone(),
         turn_id: ctx.turn_id.clone(),
         status: TurnStatus::Error { subtype, message },
         usage: None,
-    }]
+    });
+    events
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::protocol::KnownEvent;
+    use super::*;
     use crate::agent_provider::types::{ImageInput, ProviderSessionId, ThreadId, TurnId};
     use serde_json::json;
 
@@ -1079,6 +1340,79 @@ mod tests {
     }
 
     #[test]
+    fn native_form_reply_preserves_structured_answer_as_allow() {
+        let answer = json!({"q0": "A", "q1": ["with, comma", "B"]});
+        let event: OpenCodeEvent = serde_json::from_value(json!({
+            "id": "reply_form", "type": "form.replied",
+            "data": {"sessionID": "sess_1", "id": "form_1", "answer": answer}
+        }))
+        .unwrap();
+        let events = opencode_event_to_runtime(event, &ctx(), None);
+        assert!(matches!(events.as_slice(),
+            [ProviderRuntimeEvent::RequestResolved {
+                request_id,
+                decision: ApprovalDecision::Allow { updated_input: Some(input), updated_permissions: None },
+                ..
+            }] if request_id.0 == "form_1" && *input == answer));
+    }
+
+    #[test]
+    fn native_request_resolution_retains_permission_and_cancel_decisions() {
+        for (reply, expected) in [
+            ("always", "allow_for_session"),
+            ("reject", "cancel"),
+            ("once", "allow"),
+        ] {
+            let event: OpenCodeEvent = serde_json::from_value(json!({
+                "id": format!("permission_{reply}"), "type": "permission.replied",
+                "data": {"sessionID": "sess_1", "requestID": "permission_1", "reply": reply}
+            }))
+            .unwrap();
+            let events = opencode_event_to_runtime(event, &ctx(), None);
+            let [ProviderRuntimeEvent::RequestResolved { decision, .. }] = events.as_slice() else {
+                panic!("expected a permission resolution");
+            };
+            assert_eq!(
+                serde_json::to_value(decision).unwrap()["decision"],
+                expected
+            );
+        }
+        let event: OpenCodeEvent = serde_json::from_value(json!({
+            "id": "cancel_form", "type": "form.cancelled",
+            "data": {"sessionID": "sess_1", "id": "form_1"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            opencode_event_to_runtime(event, &ctx(), None).as_slice(),
+            [ProviderRuntimeEvent::RequestResolved {
+                decision: ApprovalDecision::Cancel,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn native_image_tool_result_preserves_renderer_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../src/lib/agent-chat/__fixtures__/opencode-native-image-tool-result.json"
+        ))
+        .unwrap();
+        let event: OpenCodeEvent = serde_json::from_value(fixture.clone()).unwrap();
+        let events = opencode_event_to_runtime(event, &ctx(), None);
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                ProviderRuntimeEvent::ItemCompleted {
+                    item: CompletedItem::ToolResult { content, .. },
+                    ..
+                } => Some(content),
+                _ => None,
+            })
+            .expect("native tool completion must reach the renderer");
+        assert_eq!(*result, fixture["data"]["content"]);
+    }
+
+    #[test]
     fn context_compaction_uses_assistant_summary_lifecycle() {
         for (completed, active) in [(None, true), (Some(42u64), false)] {
             let event: OpenCodeEvent = serde_json::from_value(json!({
@@ -1086,7 +1420,8 @@ mod tests {
                     "id": "summary", "sessionID": "s1", "role": "assistant",
                     "summary": true, "time": {"created": 1, "completed": completed}
                 }}
-            })).unwrap();
+            }))
+            .unwrap();
             let out = opencode_event_to_runtime(event.clone(), &ctx(), None);
             assert!(matches!(out.as_slice(),
                 [ProviderRuntimeEvent::ContextCompactionChanged { active: actual, .. }] if *actual == active));
@@ -1097,7 +1432,8 @@ mod tests {
                 "id": "user", "sessionID": "s1", "role": "user",
                 "summary": {"title": "A normal user summary"}
             }}
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(opencode_event_to_runtime(event, &ctx(), None).is_empty());
     }
 
@@ -1121,13 +1457,8 @@ mod tests {
             data: vec![1, 2, 3, 4],
             media_type: "image/png".into(),
         }];
-        let req = build_prompt_async_request(
-            "hello".into(),
-            Some("openai/gpt-5"),
-            None,
-            &images,
-        )
-        .unwrap();
+        let req = build_prompt_async_request("hello".into(), Some("openai/gpt-5"), None, &images)
+            .unwrap();
         assert_eq!(req.parts.len(), 2);
         assert_eq!(req.variant, None);
         match &req.parts[0] {
@@ -1147,9 +1478,13 @@ mod tests {
     fn build_prompt_async_request_carries_the_reasoning_variant() {
         // A picked reasoning level rides on `variant` (OpenCode's
         // per-prompt effort selector) and serializes into the body.
-        let req =
-            build_prompt_async_request("hi".into(), Some("anthropic/claude-sonnet-4-5"), Some("high"), &[])
-                .unwrap();
+        let req = build_prompt_async_request(
+            "hi".into(),
+            Some("anthropic/claude-sonnet-4-5"),
+            Some("high"),
+            &[],
+        )
+        .unwrap();
         assert_eq!(req.variant.as_deref(), Some("high"));
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["variant"], "high");
@@ -1158,17 +1493,19 @@ mod tests {
     #[test]
     fn build_prompt_async_request_normalizes_blank_variant_to_none() {
         // A cleared picker (empty/whitespace) must not send `variant: ""`.
-        let req =
-            build_prompt_async_request("hi".into(), Some("openai/gpt-5"), Some("   "), &[]).unwrap();
+        let req = build_prompt_async_request("hi".into(), Some("openai/gpt-5"), Some("   "), &[])
+            .unwrap();
         assert_eq!(req.variant, None);
         let json = serde_json::to_value(&req).unwrap();
-        assert!(json.get("variant").is_none(), "blank variant must be omitted");
+        assert!(
+            json.get("variant").is_none(),
+            "blank variant must be omitted"
+        );
     }
 
     #[test]
     fn build_prompt_async_request_rejects_invalid_model() {
-        let err =
-            build_prompt_async_request("hi".into(), Some("invalid"), None, &[]).unwrap_err();
+        let err = build_prompt_async_request("hi".into(), Some("invalid"), None, &[]).unwrap_err();
         assert!(err.starts_with("invalid_model_id"));
     }
 
@@ -1199,9 +1536,11 @@ mod tests {
 
     #[test]
     fn translate_session_idle_emits_turn_completed_success() {
-        let event = OpenCodeEvent::Known(KnownEvent::SessionIdle(super::super::protocol::SessionIdle {
-            session_id: "s1".into(),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::SessionIdle(
+            super::super::protocol::SessionIdle {
+                session_id: "s1".into(),
+            },
+        ));
         let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 1);
         match &out[0] {
@@ -1214,13 +1553,15 @@ mod tests {
 
     #[test]
     fn translate_part_delta_emits_content_delta_text() {
-        let event = OpenCodeEvent::Known(KnownEvent::MessagePartDelta(super::super::protocol::MessagePartDelta {
-            session_id: "s1".into(),
-            message_id: "m1".into(),
-            part_id: "p1".into(),
-            field: "text".into(),
-            delta: "hi".into(),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::MessagePartDelta(
+            super::super::protocol::MessagePartDelta {
+                session_id: "s1".into(),
+                message_id: "m1".into(),
+                part_id: "p1".into(),
+                field: "text".into(),
+                delta: "hi".into(),
+            },
+        ));
         let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 1);
         match &out[0] {
@@ -1234,28 +1575,32 @@ mod tests {
 
     #[test]
     fn translate_part_delta_skips_non_text_field() {
-        let event = OpenCodeEvent::Known(KnownEvent::MessagePartDelta(super::super::protocol::MessagePartDelta {
-            session_id: "s1".into(),
-            message_id: "m1".into(),
-            part_id: "p1".into(),
-            field: "title".into(),
-            delta: "filename.rs".into(),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::MessagePartDelta(
+            super::super::protocol::MessagePartDelta {
+                session_id: "s1".into(),
+                message_id: "m1".into(),
+                part_id: "p1".into(),
+                field: "title".into(),
+                delta: "filename.rs".into(),
+            },
+        ));
         let out = opencode_event_to_runtime(event, &ctx(), None);
         assert!(out.is_empty());
     }
 
     #[test]
     fn translate_text_part_updated_emits_assistant_text() {
-        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(super::super::protocol::MessagePartUpdated {
-            part: PartPayload::Text(super::super::protocol::TextPart {
-                id: "p1".into(),
-                session_id: "s1".into(),
-                message_id: "m1".into(),
-                text: "Hello, world.".into(),
-                synthetic: None,
-            }),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(
+            super::super::protocol::MessagePartUpdated {
+                part: PartPayload::Text(super::super::protocol::TextPart {
+                    id: "p1".into(),
+                    session_id: "s1".into(),
+                    message_id: "m1".into(),
+                    text: "Hello, world.".into(),
+                    synthetic: None,
+                }),
+            },
+        ));
         let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 1);
         match &out[0] {
@@ -1269,36 +1614,40 @@ mod tests {
 
     #[test]
     fn translate_synthetic_text_part_drops_event() {
-        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(super::super::protocol::MessagePartUpdated {
-            part: PartPayload::Text(super::super::protocol::TextPart {
-                id: "p1".into(),
-                session_id: "s1".into(),
-                message_id: "m1".into(),
-                text: "synthetic".into(),
-                synthetic: Some(true),
-            }),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(
+            super::super::protocol::MessagePartUpdated {
+                part: PartPayload::Text(super::super::protocol::TextPart {
+                    id: "p1".into(),
+                    session_id: "s1".into(),
+                    message_id: "m1".into(),
+                    text: "synthetic".into(),
+                    synthetic: Some(true),
+                }),
+            },
+        ));
         assert!(opencode_event_to_runtime(event, &ctx(), None).is_empty());
     }
 
     #[test]
     fn translate_completed_tool_part_emits_use_and_result() {
-        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(super::super::protocol::MessagePartUpdated {
-            part: PartPayload::Tool(super::super::protocol::ToolPart {
-                id: "tp".into(),
-                session_id: "s1".into(),
-                message_id: "m1".into(),
-                call_id: "call_x".into(),
-                tool: "read".into(),
-                state: ToolStateValue::Completed {
-                    input: serde_json::json!({ "path": "src/main.rs" }),
-                    output: "fn main() {}".into(),
-                    title: None,
-                    metadata: serde_json::Value::Null,
-                    time: None,
-                },
-            }),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(
+            super::super::protocol::MessagePartUpdated {
+                part: PartPayload::Tool(super::super::protocol::ToolPart {
+                    id: "tp".into(),
+                    session_id: "s1".into(),
+                    message_id: "m1".into(),
+                    call_id: "call_x".into(),
+                    tool: "read".into(),
+                    state: ToolStateValue::Completed {
+                        input: serde_json::json!({ "path": "src/main.rs" }),
+                        output: "fn main() {}".into(),
+                        title: None,
+                        metadata: serde_json::Value::Null,
+                        time: None,
+                    },
+                }),
+            },
+        ));
         let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 2, "expected ToolUse + ToolResult");
         match &out[0] {
@@ -1335,21 +1684,23 @@ mod tests {
 
     #[test]
     fn translate_error_tool_part_emits_use_and_error_result() {
-        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(super::super::protocol::MessagePartUpdated {
-            part: PartPayload::Tool(super::super::protocol::ToolPart {
-                id: "tp".into(),
-                session_id: "s1".into(),
-                message_id: "m1".into(),
-                call_id: "call_x".into(),
-                tool: "bash".into(),
-                state: ToolStateValue::Error {
-                    input: serde_json::json!({ "command": "exit 1" }),
-                    error: "exit code 1".into(),
-                    metadata: serde_json::Value::Null,
-                    time: None,
-                },
-            }),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(
+            super::super::protocol::MessagePartUpdated {
+                part: PartPayload::Tool(super::super::protocol::ToolPart {
+                    id: "tp".into(),
+                    session_id: "s1".into(),
+                    message_id: "m1".into(),
+                    call_id: "call_x".into(),
+                    tool: "bash".into(),
+                    state: ToolStateValue::Error {
+                        input: serde_json::json!({ "command": "exit 1" }),
+                        error: "exit code 1".into(),
+                        metadata: serde_json::Value::Null,
+                        time: None,
+                    },
+                }),
+            },
+        ));
         let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 2);
         match &out[1] {
@@ -1363,13 +1714,15 @@ mod tests {
 
     #[test]
     fn translate_session_error_emits_turn_completed_with_error() {
-        let event = OpenCodeEvent::Known(KnownEvent::SessionError(super::super::protocol::SessionErrorEvent {
-            session_id: Some("s1".into()),
-            error: Some(OpenCodeApiError {
-                name: "ProviderAuthError".into(),
-                data: serde_json::json!({ "providerID": "openai", "message": "no key" }),
-            }),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::SessionError(
+            super::super::protocol::SessionErrorEvent {
+                session_id: Some("s1".into()),
+                error: Some(OpenCodeApiError {
+                    name: "ProviderAuthError".into(),
+                    data: serde_json::json!({ "providerID": "openai", "message": "no key" }),
+                }),
+            },
+        ));
         let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 1);
         match &out[0] {
@@ -1385,18 +1738,44 @@ mod tests {
     }
 
     #[test]
+    fn usage_limit_opencode_errors_report_retry_timing_and_a_failed_turn() {
+        for assistant in [false, true] {
+            let error = OpenCodeApiError {
+                name: "APIError".into(),
+                data: json!({"statusCode":429,"message":"Too many requests",
+                    "responseHeaders":{"retry-after":"120"}}),
+            };
+            let before = crate::agent_provider::usage_limit::now_ms();
+            let out = if assistant {
+                translate_assistant_error(error, &ctx())
+            } else {
+                translate_session_error(Some(error), &ctx())
+            };
+            assert!(matches!(&out[0], ProviderRuntimeEvent::UsageLimitReached {
+                provider: crate::agent_provider::ProviderKind::OpenCode,
+                resets_at_ms: Some(at), ..
+            } if *at >= before + 120_000));
+            assert!(matches!(&out[1], ProviderRuntimeEvent::TurnCompleted {
+                status: TurnStatus::Error { subtype, .. }, ..
+            } if subtype == "rate_limit"));
+        }
+    }
+
+    #[test]
     fn translate_permission_asked_emits_request_opened() {
-        let event = OpenCodeEvent::Known(KnownEvent::PermissionAsked(super::super::protocol::PermissionAskedEvent {
-            id: "perm_1".into(),
-            session_id: "s1".into(),
-            permission: "bash".into(),
-            patterns: vec!["ls *".into()],
-            metadata: serde_json::json!({}),
-            tool: Some(super::super::protocol::PermissionToolRef {
-                message_id: "m1".into(),
-                call_id: "call_x".into(),
-            }),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::PermissionAsked(
+            super::super::protocol::PermissionAskedEvent {
+                id: "perm_1".into(),
+                session_id: "s1".into(),
+                permission: "bash".into(),
+                patterns: vec!["ls *".into()],
+                metadata: serde_json::json!({}),
+                tool: Some(super::super::protocol::PermissionToolRef {
+                    message_id: "m1".into(),
+                    call_id: "call_x".into(),
+                }),
+            },
+        ));
         let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 1);
         match &out[0] {
@@ -1416,7 +1795,8 @@ mod tests {
 
     #[test]
     fn translate_unknown_event_emits_runtime_warning() {
-        let out = opencode_event_to_runtime(OpenCodeEvent::Other(serde_json::Value::Null), &ctx(), None);
+        let out =
+            opencode_event_to_runtime(OpenCodeEvent::Other(serde_json::Value::Null), &ctx(), None);
         assert_eq!(out.len(), 1);
         assert!(matches!(
             out[0],
@@ -1487,7 +1867,10 @@ mod tests {
                 assert_eq!(subagent.provider_ref.as_deref(), Some("ses_child"));
                 assert_eq!(subagent.parent_item_id.as_deref(), Some("call_task"));
                 assert_eq!(subagent.status, SubagentStatus::Running);
-                assert_eq!(subagent.name.as_deref(), Some("List current directory files"));
+                assert_eq!(
+                    subagent.name.as_deref(),
+                    Some("List current directory files")
+                );
                 assert_eq!(subagent.agent_type.as_deref(), Some("explore"));
                 assert_eq!(subagent.model.as_deref(), Some("opencode/big-pickle"));
                 assert!(subagent.result_text.is_none());
@@ -1554,7 +1937,10 @@ mod tests {
         match &out[0] {
             ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
                 assert_eq!(subagent.status, SubagentStatus::Failed);
-                assert_eq!(subagent.result_text.as_deref(), Some("Subagent hit a wall."));
+                assert_eq!(
+                    subagent.result_text.as_deref(),
+                    Some("Subagent hit a wall.")
+                );
             }
             other => panic!("wrong event: {other:?}"),
         }
@@ -1592,7 +1978,8 @@ mod tests {
         }));
         let out = opencode_event_to_runtime(event, &ctx(), None);
         assert!(
-            out.iter().all(|e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { .. })),
+            out.iter()
+                .all(|e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { .. })),
             "task tool must not emit generic ItemCompleted cards"
         );
     }
@@ -1621,15 +2008,17 @@ mod tests {
 
     #[test]
     fn child_text_part_routes_with_subagent_id() {
-        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(super::super::protocol::MessagePartUpdated {
-            part: PartPayload::Text(super::super::protocol::TextPart {
-                id: "p1".into(),
-                session_id: "ses_child".into(),
-                message_id: "m1".into(),
-                text: "child reply".into(),
-                synthetic: None,
-            }),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(
+            super::super::protocol::MessagePartUpdated {
+                part: PartPayload::Text(super::super::protocol::TextPart {
+                    id: "p1".into(),
+                    session_id: "ses_child".into(),
+                    message_id: "m1".into(),
+                    text: "child reply".into(),
+                    synthetic: None,
+                }),
+            },
+        ));
         let out = opencode_event_to_runtime(event, &ctx(), Some("ses_child"));
         assert_eq!(out.len(), 1);
         match &out[0] {
@@ -1647,13 +2036,15 @@ mod tests {
 
     #[test]
     fn child_delta_routes_with_subagent_id() {
-        let event = OpenCodeEvent::Known(KnownEvent::MessagePartDelta(super::super::protocol::MessagePartDelta {
-            session_id: "ses_child".into(),
-            message_id: "m1".into(),
-            part_id: "p1".into(),
-            field: "text".into(),
-            delta: "hi".into(),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::MessagePartDelta(
+            super::super::protocol::MessagePartDelta {
+                session_id: "ses_child".into(),
+                message_id: "m1".into(),
+                part_id: "p1".into(),
+                field: "text".into(),
+                delta: "hi".into(),
+            },
+        ));
         let out = opencode_event_to_runtime(event, &ctx(), Some("ses_child"));
         match &out[0] {
             ProviderRuntimeEvent::ContentDelta { subagent_id, .. } => {
@@ -1694,9 +2085,11 @@ mod tests {
 
     #[test]
     fn child_session_idle_does_not_complete_parent_turn() {
-        let event = OpenCodeEvent::Known(KnownEvent::SessionIdle(super::super::protocol::SessionIdle {
-            session_id: "ses_child".into(),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::SessionIdle(
+            super::super::protocol::SessionIdle {
+                session_id: "ses_child".into(),
+            },
+        ));
         assert!(
             opencode_event_to_runtime(event, &ctx(), Some("ses_child")).is_empty(),
             "child idle must not emit TurnCompleted"
@@ -1705,19 +2098,23 @@ mod tests {
 
     #[test]
     fn parent_session_idle_completes_turn() {
-        let event = OpenCodeEvent::Known(KnownEvent::SessionIdle(super::super::protocol::SessionIdle {
-            session_id: "ses_root".into(),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::SessionIdle(
+            super::super::protocol::SessionIdle {
+                session_id: "ses_root".into(),
+            },
+        ));
         let out = opencode_event_to_runtime(event, &ctx(), None);
         assert!(matches!(out[0], ProviderRuntimeEvent::TurnCompleted { .. }));
     }
 
     #[test]
     fn child_session_status_busy_ticks_subagent_running() {
-        let event = OpenCodeEvent::Known(KnownEvent::SessionStatus(super::super::protocol::SessionStatusEvent {
-            session_id: "ses_child".into(),
-            status: super::super::protocol::SessionStatusValue::Busy,
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::SessionStatus(
+            super::super::protocol::SessionStatusEvent {
+                session_id: "ses_child".into(),
+                status: super::super::protocol::SessionStatusValue::Busy,
+            },
+        ));
         let out = opencode_event_to_runtime(event, &ctx(), Some("ses_child"));
         match &out[0] {
             ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
@@ -1730,26 +2127,30 @@ mod tests {
 
     #[test]
     fn child_session_status_idle_is_noop() {
-        let event = OpenCodeEvent::Known(KnownEvent::SessionStatus(super::super::protocol::SessionStatusEvent {
-            session_id: "ses_child".into(),
-            status: super::super::protocol::SessionStatusValue::Idle,
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::SessionStatus(
+            super::super::protocol::SessionStatusEvent {
+                session_id: "ses_child".into(),
+                status: super::super::protocol::SessionStatusValue::Idle,
+            },
+        ));
         assert!(opencode_event_to_runtime(event, &ctx(), Some("ses_child")).is_empty());
     }
 
     #[test]
     fn child_permission_asked_tags_subagent_id() {
-        let event = OpenCodeEvent::Known(KnownEvent::PermissionAsked(super::super::protocol::PermissionAskedEvent {
-            id: "per_1".into(),
-            session_id: "ses_child".into(),
-            permission: "external_directory".into(),
-            patterns: vec!["/*".into()],
-            metadata: serde_json::json!({ "filepath": "/" }),
-            tool: Some(super::super::protocol::PermissionToolRef {
-                message_id: "m1".into(),
-                call_id: "call_y".into(),
-            }),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::PermissionAsked(
+            super::super::protocol::PermissionAskedEvent {
+                id: "per_1".into(),
+                session_id: "ses_child".into(),
+                permission: "external_directory".into(),
+                patterns: vec!["/*".into()],
+                metadata: serde_json::json!({ "filepath": "/" }),
+                tool: Some(super::super::protocol::PermissionToolRef {
+                    message_id: "m1".into(),
+                    call_id: "call_y".into(),
+                }),
+            },
+        ));
         let out = opencode_event_to_runtime(event, &ctx(), Some("ses_child"));
         match &out[0] {
             ProviderRuntimeEvent::RequestOpened {
@@ -1766,14 +2167,16 @@ mod tests {
 
     #[test]
     fn agent_mention_part_is_inert() {
-        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(super::super::protocol::MessagePartUpdated {
-            part: PartPayload::Agent(super::super::protocol::AgentPart {
-                id: "p".into(),
-                session_id: "ses_root".into(),
-                message_id: "m1".into(),
-                name: Some("explore".into()),
-            }),
-        }));
+        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(
+            super::super::protocol::MessagePartUpdated {
+                part: PartPayload::Agent(super::super::protocol::AgentPart {
+                    id: "p".into(),
+                    session_id: "ses_root".into(),
+                    message_id: "m1".into(),
+                    name: Some("explore".into()),
+                }),
+            },
+        ));
         assert!(opencode_event_to_runtime(event, &ctx(), None).is_empty());
     }
 
@@ -1948,9 +2351,7 @@ mod tests {
     #[test]
     fn a_model_swap_with_no_reading_yet_emits_nothing() {
         let mut usage = OpenCodeUsageState::default();
-        assert!(usage
-            .model_changed(&ThreadId("thread_1".into()))
-            .is_empty());
+        assert!(usage.model_changed(&ThreadId("thread_1".into())).is_empty());
     }
 
     #[test]
@@ -2200,9 +2601,8 @@ mod usage_ledger_tests {
     /// Codex), and `reasoning` is billed as output.
     #[test]
     fn normalization_keeps_cache_tiers_as_siblings_and_folds_reasoning() {
-        let split = UsageSplit::from_tokens(
-            &serde_json::from_value(tokens(100, 40, 60, 500, 25)).unwrap(),
-        );
+        let split =
+            UsageSplit::from_tokens(&serde_json::from_value(tokens(100, 40, 60, 500, 25)).unwrap());
         assert_eq!(split.input, 100, "input is NOT reduced by the cache tiers");
         assert_eq!(split.output, 100, "output + reasoning");
         assert_eq!(split.cache_read, 500);
@@ -2215,7 +2615,11 @@ mod usage_ledger_tests {
         let mut usage = OpenCodeUsageState::default();
         let ctx = ctx();
         let first = translate_message_tokens(
-            &info("msg_1", tokens(100, 10, 0, 0, 0), Some(("anthropic", "claude-sonnet-4-5"))),
+            &info(
+                "msg_1",
+                tokens(100, 10, 0, 0, 0),
+                Some(("anthropic", "claude-sonnet-4-5")),
+            ),
             &ctx,
             None,
             &mut usage,
@@ -2223,7 +2627,11 @@ mod usage_ledger_tests {
         assert_eq!(rows(&first)[0].0, 100);
 
         let second = translate_message_tokens(
-            &info("msg_1", tokens(100, 60, 0, 0, 0), Some(("anthropic", "claude-sonnet-4-5"))),
+            &info(
+                "msg_1",
+                tokens(100, 60, 0, 0, 0),
+                Some(("anthropic", "claude-sonnet-4-5")),
+            ),
             &ctx,
             None,
             &mut usage,
@@ -2242,7 +2650,11 @@ mod usage_ledger_tests {
         let ctx = ctx();
 
         let first = translate_message_tokens(
-            &info("msg_child", tokens(200, 20, 0, 0, 0), Some(("anthropic", "claude-haiku-4-5"))),
+            &info(
+                "msg_child",
+                tokens(200, 20, 0, 0, 0),
+                Some(("anthropic", "claude-haiku-4-5")),
+            ),
             &ctx,
             Some("child_session"),
             &mut usage,
@@ -2267,7 +2679,11 @@ mod usage_ledger_tests {
 
         // Re-broadcast of the SAME child message: growth only.
         let second = translate_message_tokens(
-            &info("msg_child", tokens(200, 90, 0, 0, 0), Some(("anthropic", "claude-haiku-4-5"))),
+            &info(
+                "msg_child",
+                tokens(200, 90, 0, 0, 0),
+                Some(("anthropic", "claude-haiku-4-5")),
+            ),
             &ctx,
             Some("child_session"),
             &mut usage,
@@ -2294,7 +2710,11 @@ mod usage_ledger_tests {
         let mut usage = OpenCodeUsageState::default();
         let ctx = ctx();
         let first = translate_message_tokens(
-            &info("m1", tokens(10, 30, 20, 0, 0), Some(("openai", "gpt-5-mini"))),
+            &info(
+                "m1",
+                tokens(10, 30, 20, 0, 0),
+                Some(("openai", "gpt-5-mini")),
+            ),
             &ctx,
             None,
             &mut usage,
@@ -2310,10 +2730,18 @@ mod usage_ledger_tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(e, (50, 20), "output = 30 + 20 reasoning; reasoning reported alongside");
+        assert_eq!(
+            e,
+            (50, 20),
+            "output = 30 + 20 reasoning; reasoning reported alongside"
+        );
 
         let second = translate_message_tokens(
-            &info("m1", tokens(10, 30, 55, 0, 0), Some(("openai", "gpt-5-mini"))),
+            &info(
+                "m1",
+                tokens(10, 30, 55, 0, 0),
+                Some(("openai", "gpt-5-mini")),
+            ),
             &ctx,
             None,
             &mut usage,
@@ -2335,7 +2763,11 @@ mod usage_ledger_tests {
     #[test]
     fn cost_source_records_which_price_list_was_used() {
         let mut usage = OpenCodeUsageState::default();
-        let known = info("m1", tokens(1_000, 0, 0, 0, 0), Some(("anthropic", "claude-sonnet-4-5")));
+        let known = info(
+            "m1",
+            tokens(1_000, 0, 0, 0, 0),
+            Some(("anthropic", "claude-sonnet-4-5")),
+        );
         let table = translate_message_tokens(&known, &ctx(), None, &mut usage);
         let src = |events: &[ProviderRuntimeEvent]| {
             events.iter().find_map(|e| match e {
@@ -2360,7 +2792,11 @@ mod usage_ledger_tests {
 
         // Unpriced model with no catalogue → no cost, no source.
         let mut usage = OpenCodeUsageState::default();
-        let unknown = info("m2", tokens(10, 0, 0, 0, 0), Some(("openrouter", "kimi-k2")));
+        let unknown = info(
+            "m2",
+            tokens(10, 0, 0, 0, 0),
+            Some(("openrouter", "kimi-k2")),
+        );
         let none = translate_message_tokens(&unknown, &ctx(), None, &mut usage);
         assert_eq!(src(&none), Some(None));
     }
@@ -2369,7 +2805,11 @@ mod usage_ledger_tests {
     fn model_is_the_qualified_provider_slash_model_pair() {
         let mut usage = OpenCodeUsageState::default();
         let events = translate_message_tokens(
-            &info("m", tokens(10, 10, 0, 0, 0), Some(("openrouter", "kimi-k2"))),
+            &info(
+                "m",
+                tokens(10, 10, 0, 0, 0),
+                Some(("openrouter", "kimi-k2")),
+            ),
             &ctx(),
             None,
             &mut usage,
@@ -2382,9 +2822,17 @@ mod usage_ledger_tests {
     #[test]
     fn catalogue_price_beats_the_static_fallback() {
         let mut usage = OpenCodeUsageState::default();
-        let unknown = info("m1", tokens(1_000_000, 0, 0, 0, 0), Some(("openrouter", "kimi-k2")));
+        let unknown = info(
+            "m1",
+            tokens(1_000_000, 0, 0, 0, 0),
+            Some(("openrouter", "kimi-k2")),
+        );
         let without = translate_message_tokens(&unknown, &ctx(), None, &mut usage);
-        assert_eq!(rows(&without)[0].6, None, "unknown model has no static price");
+        assert_eq!(
+            rows(&without)[0].6,
+            None,
+            "unknown model has no static price"
+        );
 
         let mut usage = OpenCodeUsageState::default();
         let priced = EventContext {

@@ -155,7 +155,7 @@ describe("ComposerPendingInputPanel", () => {
     );
   });
 
-  it("multi-select answers are comma-joined under the question text key", () => {
+  it("multi-select answers remain arrays under the question text key", () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     const item = makeAskItem({
       payload: {
@@ -179,9 +179,52 @@ describe("ComposerPendingInputPanel", () => {
     fireEvent.click(screen.getByText("Send"));
     expect(onSubmit).toHaveBeenCalledWith(
       expect.objectContaining({
-        answers: { "Which features do you want?": "Auth, Analytics" },
+        answers: { "Which features do you want?": ["Auth", "Analytics"] },
       }),
     );
+  });
+
+  it.each([
+    { options: ["with, comma", "B"], selected: ["with, comma", "B"] },
+    { options: ["A", "B", "A, B"], selected: ["A", "B"] },
+  ])("preserves multiselect identities for $selected", ({ options, selected }) => {
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ComposerPendingInputPanel
+        item={makeAskItem({ payload: { questions: [{
+          question: "Features?",
+          multiSelect: true,
+          options: options.map((label) => ({ label, description: "" })),
+        }] } })}
+        onSubmit={onSubmit}
+      />,
+    );
+    for (const label of selected) fireEvent.click(screen.getByText(label));
+    fireEvent.click(screen.getByText("Send"));
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      answers: { "Features?": selected },
+    }));
+  });
+
+  it("keeps a custom multiselect answer containing commas as one value", () => {
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ComposerPendingInputPanel
+        item={makeAskItem({ payload: { questions: [{
+          question: "Features?", multiSelect: true,
+          options: [{ label: "A", description: "" }],
+        }] } })}
+        onSubmit={onSubmit}
+      />,
+    );
+    fireEvent.click(screen.getByText("A"));
+    fireEvent.change(screen.getByPlaceholderText("Something else…"), {
+      target: { value: "custom, answer" },
+    });
+    fireEvent.click(screen.getByText("Send"));
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      answers: { "Features?": ["A", "custom, answer"] },
+    }));
   });
 
   it("multi-question: Next button advances, pagination label updates, Send appears on the last question", () => {
@@ -817,5 +860,134 @@ describe("ComposerPendingInputPanel", () => {
       "data-state",
     );
     expect(screen.getByTestId("aq-option-1-1")).toHaveAttribute("data-state");
+  });
+
+  describe("document-level shortcuts stay in their pane", () => {
+    function renderInPane(onSubmit = vi.fn()) {
+      return render(
+        <>
+          <button type="button">Sidebar row</button>
+          <div data-agent-chat-pane="">
+            <div data-testid="transcript" tabIndex={-1}>
+              transcript
+            </div>
+            <div role="treeitem" tabIndex={0}>
+              tree row
+            </div>
+            <ComposerPendingInputPanel item={makeAskItem()} onSubmit={onSubmit} />
+          </div>
+          <div data-agent-chat-pane="">
+            <div data-testid="other-pane" tabIndex={-1}>
+              other pane
+            </div>
+          </div>
+        </>,
+      );
+    }
+    const send = () => screen.getByText("Send") as HTMLButtonElement;
+
+    it("ignores keys aimed at a focused control elsewhere in the app", () => {
+      renderInPane();
+      fireEvent.keyDown(screen.getByText("Sidebar row"), { key: "2" });
+      fireEvent.keyDown(screen.getByRole("treeitem"), { key: "2" });
+      expect(send()).toBeDisabled();
+    });
+
+    it("ignores keys from another pane", () => {
+      renderInPane();
+      fireEvent.keyDown(screen.getByTestId("other-pane"), { key: "2" });
+      expect(send()).toBeDisabled();
+    });
+
+    it("lets Enter on a focused button do its own job", () => {
+      const onSubmit = vi.fn().mockResolvedValue(undefined);
+      renderInPane(onSubmit);
+      fireEvent.keyDown(screen.getByTestId("transcript"), { key: "1" });
+      expect(send()).not.toBeDisabled();
+      fireEvent.keyDown(screen.getByText("Sidebar row"), { key: "Enter" });
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+
+    it("drives the form from a passive spot inside its own pane", () => {
+      const onSubmit = vi.fn().mockResolvedValue(undefined);
+      renderInPane(onSubmit);
+      fireEvent.keyDown(screen.getByTestId("transcript"), { key: "2" });
+      fireEvent.keyDown(screen.getByTestId("transcript"), { key: "Enter" });
+      expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          answers: { "Which framework should we use?": "Vue" },
+        }),
+      );
+    });
+  });
+
+  describe("Skip", () => {
+    it("is offered only when the pane can skip", () => {
+      const { rerender } = render(
+        <ComposerPendingInputPanel item={makeAskItem()} onSubmit={vi.fn()} />,
+      );
+      expect(screen.queryByTestId("aq-skip")).toBeNull();
+      rerender(
+        <ComposerPendingInputPanel
+          item={makeAskItem()}
+          onSubmit={vi.fn()}
+          onSkip={vi.fn()}
+        />,
+      );
+      expect(screen.getByTestId("aq-skip")).toHaveTextContent(
+        "Skip · answer in chat",
+      );
+      expect(screen.getByTestId("aq-hints")).toHaveTextContent("Esc skip");
+    });
+
+    it("skips on click and on Esc inside the form", () => {
+      const onSkip = vi.fn();
+      render(
+        <ComposerPendingInputPanel
+          item={makeAskItem()}
+          onSubmit={vi.fn()}
+          onSkip={onSkip}
+        />,
+      );
+      fireEvent.click(screen.getByTestId("aq-skip"));
+      fireEvent.keyDown(screen.getByText("React"), { key: "Escape" });
+      expect(onSkip).toHaveBeenCalledTimes(2);
+    });
+
+    it("skips on Esc from a focused choice input", () => {
+      const onSkip = vi.fn();
+      render(
+        <ComposerPendingInputPanel
+          item={makeAskItem()}
+          onSubmit={vi.fn()}
+          onSkip={onSkip}
+        />,
+      );
+      // The native radio covering the row carries the option label as its
+      // value; that must not read as typed text.
+      fireEvent.keyDown(screen.getByRole("radio", { name: /React/ }), {
+        key: "Escape",
+      });
+      expect(onSkip).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps typed free text: Esc there does not skip", () => {
+      const onSkip = vi.fn();
+      render(
+        <ComposerPendingInputPanel
+          item={makeAskItem()}
+          onSubmit={vi.fn()}
+          onSkip={onSkip}
+        />,
+      );
+      const free = screen.getByPlaceholderText("Something else…");
+      fireEvent.change(free, { target: { value: "neither" } });
+      fireEvent.keyDown(free, { key: "Escape" });
+      // Focus elsewhere in the form must not discard the text either.
+      fireEvent.keyDown(screen.getByRole("radio", { name: /React/ }), {
+        key: "Escape",
+      });
+      expect(onSkip).not.toHaveBeenCalled();
+    });
   });
 });

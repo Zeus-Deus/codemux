@@ -6,6 +6,7 @@ export type KeybindCategory =
   | "workspaces"
   | "tabs"
   | "panes"
+  | "chat"
   | "terminal";
 
 export interface KeybindEntry {
@@ -23,8 +24,11 @@ export interface KeybindEntry {
    *   kept out of the intercept list so the pty still receives the key (F2 in
    *   htop, mc or nano), and xterm stops the event before it reaches the window
    *   handler. Anywhere else — sidebar, chat, overview — the action fires.
+   * - `"composer"`: handled by a focused chat composer; the window handler
+   *   never dispatches it. The narrower scope is why it may share a combo with
+   *   a window action (Escape) without either one shadowing the other.
    */
-  when?: "always" | "terminal" | "non-terminal";
+  when?: "always" | "terminal" | "non-terminal" | "composer";
   /**
    * Handled by the desktop app itself (`src-tauri/src/webview_recovery.rs`),
    * before the page ever sees the key, so it still works when the interface is
@@ -41,7 +45,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "toggleRightPanel", label: "Toggle right panel", category: "general", defaultKeys: "Ctrl+Shift+B", description: "Show/hide the right panel (Files, Changes, Review, Orchestration)" },
   { id: "openSettings", label: "Open settings", category: "general", defaultKeys: "Ctrl+," },
   { id: "openProject", label: "Open project", category: "general", defaultKeys: "Ctrl+O", description: "Open an existing folder as a project" },
-  { id: "showShortcuts", label: "Keyboard shortcuts", category: "general", defaultKeys: "Ctrl+Shift+?", description: "Open Settings to the keyboard-shortcuts page" },
+  { id: "showShortcuts", label: "Keyboard shortcuts", category: "general", defaultKeys: "Ctrl+Shift+?", description: "Show every shortcut over the current view. Rebind them in Settings ▸ Shortcuts" },
   { id: "zoomIn", label: "Increase interface size", category: "general", defaultKeys: "Ctrl+=", description: "Make all interface text and chrome bigger" },
   { id: "zoomOut", label: "Decrease interface size", category: "general", defaultKeys: "Ctrl+-", description: "Make all interface text and chrome smaller" },
   { id: "zoomReset", label: "Reset interface size", category: "general", defaultKeys: "Ctrl+0" },
@@ -58,6 +62,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
 
   // ── Workspaces ──
   { id: "newAgent", label: "New agent", category: "workspaces", defaultKeys: "Ctrl+N", description: "New chat in home directory, or the New Workspace dialog (same as the sidebar's New agent button)" },
+  { id: "openLauncher", label: "Launch an agent", category: "workspaces", defaultKeys: "Ctrl+Shift+A", description: "Open the title bar's + launcher (agents, terminal, browser)" },
   { id: "newWorkspaceInProject", label: "New workspace in current project", category: "workspaces", defaultKeys: "Ctrl+Shift+N", description: "Quick-create a workspace/agent in the active workspace's project" },
   { id: "nextWorkspace", label: "Next workspace", category: "workspaces", defaultKeys: "Ctrl+]" },
   { id: "prevWorkspace", label: "Previous workspace", category: "workspaces", defaultKeys: "Ctrl+[" },
@@ -76,10 +81,14 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "workspaceJump7", label: "Jump to workspace 7", category: "workspaces", defaultKeys: "Alt+7" },
   { id: "workspaceJump8", label: "Jump to workspace 8", category: "workspaces", defaultKeys: "Alt+8" },
   { id: "workspaceJump9", label: "Jump to workspace 9", category: "workspaces", defaultKeys: "Alt+9" },
+  { id: "jumpToNeedsYou", label: "Jump to a workspace that needs you", category: "workspaces", defaultKeys: "Ctrl+Shift+J", description: "Cycles through workspaces waiting on you, longest-waiting first" },
 
   // ── Tabs ──
   { id: "newTab", label: "New terminal tab", category: "tabs", defaultKeys: "Ctrl+T" },
-  { id: "closeTab", label: "Close tab", category: "tabs", defaultKeys: "Ctrl+W" },
+  // `non-terminal`: Ctrl+W is delete-word in every shell, so a focused pty
+  // keeps it; the rest of the app still closes the tab on it.
+  { id: "closeTab", label: "Close tab", category: "tabs", defaultKeys: "Ctrl+W", when: "non-terminal" },
+  { id: "reopenClosedTab", label: "Reopen closed chat", category: "tabs", defaultKeys: "Ctrl+Shift+T", description: "Bring back the last agent chat you closed, with its transcript" },
   { id: "switchTab1", label: "Switch to tab 1", category: "tabs", defaultKeys: "Ctrl+1" },
   { id: "switchTab2", label: "Switch to tab 2", category: "tabs", defaultKeys: "Ctrl+2" },
   { id: "switchTab3", label: "Switch to tab 3", category: "tabs", defaultKeys: "Ctrl+3" },
@@ -89,16 +98,29 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "switchTab7", label: "Switch to tab 7", category: "tabs", defaultKeys: "Ctrl+7" },
   { id: "switchTab8", label: "Switch to tab 8", category: "tabs", defaultKeys: "Ctrl+8" },
   { id: "switchTab9", label: "Switch to tab 9", category: "tabs", defaultKeys: "Ctrl+9" },
+  // Ctrl+PageDown/PageUp, the browser and editor convention, rather than
+  // Ctrl+Tab, which stays with the programs running in a terminal.
+  { id: "nextTab", label: "Next tab", category: "tabs", defaultKeys: "Ctrl+PageDown" },
+  { id: "prevTab", label: "Previous tab", category: "tabs", defaultKeys: "Ctrl+PageUp" },
 
   // ── Panes ──
   { id: "splitPaneRight", label: "Split pane right", category: "panes", defaultKeys: "Ctrl+Shift+D" },
   { id: "splitPaneDown", label: "Split pane down", category: "panes", defaultKeys: "Ctrl+Shift+E" },
   { id: "closePane", label: "Close pane", category: "panes", defaultKeys: "Ctrl+Shift+W" },
+  { id: "focusPaneLeft", label: "Focus pane left", category: "panes", defaultKeys: "Alt+Shift+ArrowLeft" },
+  { id: "focusPaneRight", label: "Focus pane right", category: "panes", defaultKeys: "Alt+Shift+ArrowRight" },
+  { id: "focusPaneUp", label: "Focus pane above", category: "panes", defaultKeys: "Alt+Shift+ArrowUp" },
+  { id: "focusPaneDown", label: "Focus pane below", category: "panes", defaultKeys: "Alt+Shift+ArrowDown" },
+  { id: "togglePaneZoom", label: "Zoom pane", category: "panes", defaultKeys: "Ctrl+Shift+Enter", description: "Show only the active pane at full size. Press again to bring the split back" },
+
+  // ── Chat ──
+  { id: "interruptAgent", label: "Stop the agent", category: "chat", defaultKeys: "Escape", when: "composer", description: "From the chat composer while the agent works. Ctrl+C in an empty composer stops it too" },
 
   // ── Terminal (handled inside xterm) ──
   { id: "copySelection", label: "Copy selection", category: "terminal", defaultKeys: "Ctrl+Shift+C", when: "terminal" },
   { id: "pasteTerminal", label: "Paste", category: "terminal", defaultKeys: "Ctrl+Shift+V", when: "terminal" },
   { id: "backwardKillWord", label: "Backward kill word", category: "terminal", defaultKeys: "Ctrl+Backspace", when: "terminal" },
+  { id: "terminalFind", label: "Find in terminal", category: "terminal", defaultKeys: "Ctrl+F", when: "terminal", description: "Search the scrollback. Full-screen apps such as vim and less keep the key" },
 ] as const;
 
 const registryById = new Map(KEYBIND_REGISTRY.map((e) => [e.id, e]));
@@ -134,6 +156,7 @@ export const KEYBIND_CATEGORIES: readonly KeybindCategory[] = [
   "workspaces",
   "tabs",
   "panes",
+  "chat",
   "terminal",
 ];
 
@@ -144,5 +167,6 @@ export const CATEGORY_LABELS: Record<KeybindCategory, string> = {
   workspaces: "Workspaces",
   tabs: "Tabs",
   panes: "Panes",
+  chat: "Chat",
   terminal: "Terminal",
 };

@@ -14,11 +14,25 @@ import type {
   RevisionHeartbeat,
   TerminalStatusPayload,
   ThemeColors,
-  UserSettings,
+  SettingsPersistence,
 } from "./types";
 import type { AutomationRunView } from "./commands";
 
 export type EventCallback<T> = (payload: T) => void;
+
+/** Invalidation only: do not forward any event fields, even if a backend
+ * version includes its sanitized status. Read the authoritative native view. */
+export const onAgentConnectorChanged = (cb: EventCallback<null>): Promise<UnlistenFn> =>
+  listen<unknown>("agent-connector-changed", () => cb(null));
+
+export type UsageResumeBlockedReason =
+  | "disabled" | "unknown_reset" | "reset_passed" | "reset_too_far"
+  | "attempts_exhausted" | "cancelled" | "dispatch_failed" | "storage_failed";
+
+export const onCustomAcpChanged = (cb: () => void): Promise<UnlistenFn> =>
+  listen<unknown>("custom_acp_changed", () => cb());
+export const onCustomAcpCatalogChanged = (cb: EventCallback<{ thread_id: string; catalog: import("./custom-acp").AcpCatalog }>): Promise<UnlistenFn> =>
+  listen<{ thread_id: string; catalog: import("./custom-acp").AcpCatalog }>("custom_acp_catalog_changed", e => cb(e.payload));
 
 export const onAppStateChanged = (cb: EventCallback<AppStateSnapshot>): Promise<UnlistenFn> =>
   listen<AppStateSnapshot>("app-state-changed", (e) => cb(e.payload));
@@ -135,9 +149,9 @@ export const onGitCloneProgress = (
   listen<GitCloneProgress>(GIT_CLONE_PROGRESS_EVENT, (e) => cb(e.payload));
 
 export const onSettingsSynced = (
-  cb: EventCallback<UserSettings>,
+  cb: EventCallback<SettingsPersistence>,
 ): Promise<UnlistenFn> =>
-  listen<UserSettings>("settings-synced", (e) => cb(e.payload));
+  listen<SettingsPersistence>("settings-synced", (e) => cb(e.payload));
 
 export const onAuthStateChanged = (
   cb: EventCallback<AuthStatePayload>,
@@ -246,6 +260,10 @@ export interface SubagentSnapshot {
    *  every consumer treats as `"agent"`. */
   task_kind?: SubagentTaskKind | null;
   model?: string | null;
+  /** Requested effort / reasoning level. Only cross-provider delegations
+   *  (`subagent_id` "delegate:<child thread>") report it, and only when the
+   *  user named one. */
+  effort?: string | null;
   status: SubagentStatus;
   /** Live "currently doing X" line pushed by the provider. */
   activity?: string | null;
@@ -605,6 +623,7 @@ export type ProviderRuntimeEvent =
       /** When Codemux will resume the run on its own (unix ms); `null` when
        *  no automatic resume is armed. */
       auto_resume_at_ms?: number | null;
+      auto_resume_blocked_reason?: UsageResumeBlockedReason | null;
       /** Exhausted window, e.g. `five_hour`, `seven_day`, `seven_day_opus`. */
       window?: string | null;
     }
@@ -613,6 +632,7 @@ export type ProviderRuntimeEvent =
   | {
       type: "usage_resume_cancelled";
       thread_id: string;
+      reason?: UsageResumeBlockedReason | null;
     };
 
 /** Canonical provider event payload as delivered to the frontend —

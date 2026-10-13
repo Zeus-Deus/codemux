@@ -25,6 +25,7 @@ pub struct OpenCodeClientConfig {
     /// `http://127.0.0.1:34567`. Stored without a trailing slash so
     /// path joins land cleanly.
     pub base_url: String,
+    pub api: super::api::OpenCodeApi,
     /// Optional HTTP Basic password. The server username is always
     /// `opencode` (verified live against the `opencode` 1.14.31 CLI
     /// and at `/tmp/<reference>/apps/server/src/provider/opencodeRuntime.ts:499`),
@@ -46,6 +47,7 @@ impl OpenCodeClientConfig {
         }
         Self {
             base_url: url,
+            api: super::api::OpenCodeApi::Legacy,
             server_password: None,
             request_timeout: Duration::from_secs(5),
         }
@@ -122,6 +124,11 @@ impl OpenCodeClient {
     /// vocabulary as [`format_request_error`] so the UI can branch
     /// on them.
     pub async fn list_models(&self) -> Result<Vec<OpenCodeProviderEntry>, String> {
+        if self.config.api == super::api::OpenCodeApi::V2 {
+            let providers: Vec<V2Provider> = self.get_v2_data("/api/provider").await?;
+            let models: Vec<V2Model> = self.get_v2_data("/api/model").await?;
+            return Ok(flatten_v2_catalog(providers, models));
+        }
         let url = self.url("/provider");
         let request = self.attach_auth(self.http.get(&url));
         let response = request.send().await.map_err(format_request_error)?;
@@ -141,6 +148,14 @@ impl OpenCodeClient {
         &self,
         directory: &std::path::Path,
     ) -> Result<Vec<super::protocol::OpenCodeCommand>, String> {
+        if self.config.api == super::api::OpenCodeApi::V2 {
+            return self
+                .get_v2_data(&format!(
+                    "/api/command?location[directory]={}",
+                    urlencoding::encode(&directory.to_string_lossy())
+                ))
+                .await;
+        }
         let url = format!(
             "{}/command?directory={}",
             self.config.base_url,
@@ -165,6 +180,14 @@ impl OpenCodeClient {
         &self,
         directory: &std::path::Path,
     ) -> Result<Vec<OpenCodeSkill>, String> {
+        if self.config.api == super::api::OpenCodeApi::V2 {
+            return self
+                .get_v2_data(&format!(
+                    "/api/skill?location[directory]={}",
+                    urlencoding::encode(&directory.to_string_lossy())
+                ))
+                .await;
+        }
         let url = format!(
             "{}/skill?directory={}",
             self.config.base_url,
@@ -197,6 +220,26 @@ impl OpenCodeClient {
         session_id: &str,
         limit: Option<u64>,
     ) -> Result<Vec<SessionMessage>, String> {
+        if self.config.api == super::api::OpenCodeApi::V2 {
+            let order = if limit.is_some() { "desc" } else { "asc" };
+            let path = format!(
+                "/api/session/{}/message?order={order}",
+                urlencoding::encode(session_id)
+            );
+            let mut rows: Vec<serde_json::Value> = self.get_v2_pages(&path, limit).await?;
+            if limit.is_some() {
+                rows.reverse();
+            }
+            // The native message schema omits sessionID; bind projection to
+            // the resource requested rather than a guessed process directory.
+            for row in &mut rows {
+                row.as_object_mut().ok_or("invalid_native_message")?.insert(
+                    "sessionID".into(),
+                    serde_json::Value::String(session_id.into()),
+                );
+            }
+            return super::v2::decode_session_messages(serde_json::json!({"data": rows}));
+        }
         let mut url = format!(
             "{}/session/{}/message",
             self.config.base_url,
@@ -225,6 +268,14 @@ impl OpenCodeClient {
     /// [`get_session_messages`](Self::get_session_messages) for cold
     /// mid-session attach.
     pub async fn list_children(&self, session_id: &str) -> Result<Vec<SessionInfo>, String> {
+        if self.config.api == super::api::OpenCodeApi::V2 {
+            return self
+                .get_v2_pages(
+                    &format!("/api/session?parentID={}", urlencoding::encode(session_id)),
+                    None,
+                )
+                .await;
+        }
         let url = format!(
             "{}/session/{}/children",
             self.config.base_url,
@@ -240,6 +291,77 @@ impl OpenCodeClient {
             .json()
             .await
             .map_err(|err| format!("parse_error: {err}"))
+    }
+
+    async fn get_v2_pages<T: serde::de::DeserializeOwned>(
+        &self,
+        first_path: &str,
+        limit: Option<u64>,
+    ) -> Result<Vec<T>, String> {
+        let mut rows = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        let route = first_path.split('?').next().unwrap_or(first_path);
+        // Bound pathological cursors without silently returning truncated
+        // history. Native message pages accept at most 200 records.
+        for _ in 0..256 {
+            let remaining = limit.map(|limit| limit.saturating_sub(rows.len() as u64));
+            if remaining == Some(0) {
+                return Ok(rows);
+            }
+            let page_size = remaining.unwrap_or(200).min(200);
+            let path = match &cursor {
+                Some(cursor) => format!(
+                    "{route}?limit={page_size}&cursor={}",
+                    urlencoding::encode(cursor)
+                ),
+                None => format!(
+                    "{first_path}{}limit={page_size}",
+                    if first_path.contains('?') { '&' } else { '?' }
+                ),
+            };
+            let response = self
+                .attach_auth(self.http.get(self.url(&path)))
+                .send()
+                .await
+                .map_err(format_request_error)?;
+            if !response.status().is_success() {
+                return Err(format!("http_status_{}", response.status().as_u16()));
+            }
+            let mut page: V2Page<T> = response
+                .json()
+                .await
+                .map_err(|error| format!("parse_error: {error}"))?;
+            if let Some(remaining) = remaining {
+                page.data
+                    .truncate(remaining.min(usize::MAX as u64) as usize);
+            }
+            rows.extend(page.data);
+            let Some(next) = page.cursor.next else {
+                return Ok(rows);
+            };
+            if !seen.insert(next.clone()) {
+                return Err("repeated_pagination_cursor".into());
+            }
+            cursor = Some(next);
+        }
+        Err("pagination_page_limit_exceeded".into())
+    }
+
+    async fn get_v2_data<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+        let response = self
+            .attach_auth(self.http.get(self.url(path)))
+            .send()
+            .await
+            .map_err(format_request_error)?;
+        if !response.status().is_success() {
+            return Err(format!("http_status_{}", response.status().as_u16()));
+        }
+        let envelope: V2Data<T> = response
+            .json()
+            .await
+            .map_err(|error| format!("parse_error: {error}"))?;
+        Ok(envelope.data)
     }
 
     fn url(&self, path: &str) -> String {
@@ -260,6 +382,7 @@ pub struct OpenCodeSkill {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(alias = "path")]
     pub location: String,
     #[serde(default)]
     pub content: String,
@@ -367,6 +490,128 @@ pub struct OpenCodeModelCost {
 // The flatten step ([`flatten_provider_list`]) converts the wire
 // envelope into the Stage-1-locked public types above, which is what
 // the Tauri command surface actually returns to the frontend.
+
+#[derive(Default, Deserialize)]
+struct V2Cursor {
+    #[serde(default)]
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct V2Page<T> {
+    data: Vec<T>,
+    #[serde(default)]
+    cursor: V2Cursor,
+}
+
+#[derive(Deserialize)]
+struct V2Data<T> {
+    data: T,
+}
+
+#[derive(Deserialize)]
+struct V2Provider {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct V2Model {
+    id: String,
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    name: String,
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    variants: Vec<V2Variant>,
+    #[serde(default)]
+    capabilities: V2Modalities,
+    #[serde(default)]
+    limit: Option<RawModelLimit>,
+    #[serde(default)]
+    cost: Vec<V2Cost>,
+}
+
+#[derive(Deserialize)]
+struct V2Variant {
+    id: String,
+}
+
+#[derive(Default, Deserialize)]
+struct V2Modalities {
+    #[serde(default)]
+    input: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct V2Cost {
+    #[serde(default)]
+    tier: Option<serde_json::Value>,
+    #[serde(flatten)]
+    rate: RawModelCost,
+}
+
+fn flatten_v2_catalog(
+    providers: Vec<V2Provider>,
+    models: Vec<V2Model>,
+) -> Vec<OpenCodeProviderEntry> {
+    let names: std::collections::HashMap<_, _> = providers
+        .into_iter()
+        .map(|provider| (provider.id, provider.name))
+        .collect();
+    let mut entries = std::collections::BTreeMap::<String, OpenCodeProviderEntry>::new();
+    // /api/model is OpenCode's available-model snapshot. It includes public
+    // Zen models even when /api/provider has no entry for that provider.
+    for model in models.into_iter().filter(|model| model.enabled) {
+        let provider =
+            entries
+                .entry(model.provider_id.clone())
+                .or_insert_with(|| OpenCodeProviderEntry {
+                    id: model.provider_id.clone(),
+                    name: names
+                        .get(&model.provider_id)
+                        .cloned()
+                        .unwrap_or_else(|| model.provider_id.clone()),
+                    connected: true,
+                    models: Default::default(),
+                });
+        let cost = model
+            .cost
+            .iter()
+            .find(|cost| cost.tier.is_none())
+            .map(|cost| OpenCodeModelCost {
+                input: cost.rate.input,
+                output: cost.rate.output,
+                cache_read: cost.rate.cache.read,
+                cache_write: cost.rate.cache.write,
+            });
+        provider.models.insert(
+            model.id.clone(),
+            OpenCodeModel {
+                id: model.id,
+                name: model.name,
+                description: model.family,
+                variants: model
+                    .variants
+                    .into_iter()
+                    .map(|variant| variant.id)
+                    .collect(),
+                context_window: model.limit.and_then(|limit| limit.context),
+                supports_images: model
+                    .capabilities
+                    .input
+                    .iter()
+                    .any(|input| input == "image" || input.starts_with("image/")),
+                is_free: cost.is_some_and(|cost| cost.input == 0.0 && cost.output == 0.0),
+                cost,
+            },
+        );
+    }
+    entries.into_values().collect()
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct ProviderListResponse {
@@ -541,6 +786,206 @@ pub fn format_request_error(err: reqwest::Error) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn v2_history_paginates_recent_messages_and_installs_requested_identity() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server.mock("GET", "/api/session/root/message")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("limit".into(), "2".into()),
+                mockito::Matcher::UrlEncoded("order".into(), "desc".into()),
+            ]))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":[{"type":"assistant","id":"m2","content":[{"type":"text","text":"reply"}]}],"cursor":{"next":"page+/next"}}"#)
+            .create_async().await;
+        let next = server
+            .mock("GET", "/api/session/root/message")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("limit".into(), "1".into()),
+                mockito::Matcher::UrlEncoded("cursor".into(), "page+/next".into()),
+                mockito::Matcher::Regex("^[^?]*cursor.*$".into()),
+            ]))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":[{"type":"user","id":"m1","text":"hello"}],"cursor":{}}"#)
+            .create_async()
+            .await;
+        let mut config = OpenCodeClientConfig::new(server.url());
+        config.api = super::super::api::OpenCodeApi::V2;
+        let messages = OpenCodeClient::new(config)
+            .unwrap()
+            .get_session_messages("root", Some(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.info.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m1", "m2"]
+        );
+        for message in messages {
+            assert_eq!(message.info.session_id, "root");
+            match &message.parts[0] {
+                super::super::protocol::PartPayload::Text(part) => {
+                    assert_eq!(part.session_id, "root")
+                }
+                _ => panic!("Expected native text projection"),
+            }
+        }
+        first.assert_async().await;
+        next.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn v2_children_follow_opaque_cursors_without_repeating_first_page_filters() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock("GET", "/api/session")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("parentID".into(), "root".into()),
+                mockito::Matcher::UrlEncoded("limit".into(), "200".into()),
+            ]))
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":[{"id":"child1","parentID":"root"}],"cursor":{"next":"children-next"}}"#,
+            )
+            .create_async()
+            .await;
+        let next = server
+            .mock("GET", "/api/session")
+            .match_query("limit=200&cursor=children-next")
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":[{"id":"child2","parentID":"root"}],"cursor":{}}"#)
+            .create_async()
+            .await;
+        let mut config = OpenCodeClientConfig::new(server.url());
+        config.api = super::super::api::OpenCodeApi::V2;
+        let children = OpenCodeClient::new(config)
+            .unwrap()
+            .list_children("root")
+            .await
+            .unwrap();
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.id.as_str())
+                .collect::<Vec<_>>(),
+            ["child1", "child2"]
+        );
+        first.assert_async().await;
+        next.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn v2_history_rejects_repeated_cursor_without_returning_partial_success() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock("GET", "/api/session/root/message")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("limit".into(), "200".into()),
+                mockito::Matcher::UrlEncoded("order".into(), "asc".into()),
+            ]))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":[],"cursor":{"next":"again"}}"#)
+            .create_async()
+            .await;
+        let next = server
+            .mock("GET", "/api/session/root/message")
+            .match_query("limit=200&cursor=again")
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":[],"cursor":{"next":"again"}}"#)
+            .create_async()
+            .await;
+        let mut config = OpenCodeClientConfig::new(server.url());
+        config.api = super::super::api::OpenCodeApi::V2;
+        let error = OpenCodeClient::new(config)
+            .unwrap()
+            .get_session_messages("root", None)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "repeated_pagination_cursor");
+        first.assert_async().await;
+        next.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn v2_catalog_uses_available_models_and_preserves_opaque_ids() {
+        let mut server = mockito::Server::new_async().await;
+        let provider = server.mock("GET", "/api/provider")
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"location":{"directory":"fixture"},"data":[{"id":"local","name":"Local provider","activation":"enabled"}]}"#)
+            .create_async().await;
+        let models = server.mock("GET", "/api/model")
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({"location":{"directory":"fixture"},"data":[
+                {"id":"vendor/model-alias", "modelID":"underlying-model", "providerID":"local", "name":"Local model", "family":"fixture", "enabled":true,
+                 "capabilities":{"input":["text","image"],"output":["text"],"tools":true},
+                 "variants":[{"id":"medium"},{"id":"high"}], "limit":{"context":123456},
+                 "cost":[{"input":2.0,"output":3.0,"cache":{"read":0.5,"write":1.0}}],
+                 "settings":{"apiKey":"test-only-private"}},
+                {"id":"free", "providerID":"opencode", "name":"Free model", "enabled":true, "variants":[], "cost":[{"input":0.0,"output":0.0}]}
+            ]}).to_string()).create_async().await;
+        let mut config = OpenCodeClientConfig::new(server.url());
+        config.api = super::super::api::OpenCodeApi::V2;
+        let entries = OpenCodeClient::new(config)
+            .unwrap()
+            .list_models()
+            .await
+            .unwrap();
+        let local = entries.iter().find(|entry| entry.id == "local").unwrap();
+        assert!(local.connected);
+        assert_eq!(local.name, "Local provider");
+        let model = &local.models["vendor/model-alias"];
+        assert_eq!(model.id, "vendor/model-alias");
+        assert_eq!(model.variants, ["medium", "high"]);
+        assert!(model.supports_images);
+        assert_eq!(model.context_window, Some(123456));
+        assert_eq!(model.cost.unwrap().cache_read, 0.5);
+        assert!(
+            entries
+                .iter()
+                .find(|entry| entry.id == "opencode")
+                .unwrap()
+                .models["free"]
+                .is_free
+        );
+        assert!(!serde_json::to_string(&entries)
+            .unwrap()
+            .contains("test-only-private"));
+        provider.assert_async().await;
+        models.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn v2_commands_and_skills_use_location_scoped_envelopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let query = mockito::Matcher::UrlEncoded(
+            "location[directory]".into(),
+            cwd.to_string_lossy().into(),
+        );
+        let mut server = mockito::Server::new_async().await;
+        let commands = server
+            .mock("GET", "/api/command")
+            .match_query(query.clone())
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":[{"name":"fixture","description":"Native command"}]}"#)
+            .create_async()
+            .await;
+        let skills = server.mock("GET", "/api/skill").match_query(query)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({"data":[{"id":"fixture","name":"fixture","path":cwd.join("SKILL.md"),"content":"Fixture skill"}]}).to_string())
+            .create_async().await;
+        let mut config = OpenCodeClientConfig::new(server.url());
+        config.api = super::super::api::OpenCodeApi::V2;
+        let client = OpenCodeClient::new(config).unwrap();
+        assert_eq!(client.list_commands(cwd).await.unwrap()[0].name, "fixture");
+        let catalog = client.list_skills(cwd).await.unwrap();
+        assert_eq!(catalog[0].location, cwd.join("SKILL.md").to_string_lossy());
+        assert_eq!(catalog[0].content, "Fixture skill");
+        commands.assert_async().await;
+        skills.assert_async().await;
+    }
+
     #[test]
     fn config_strips_trailing_slashes_from_base_url() {
         let cfg = OpenCodeClientConfig::new("http://127.0.0.1:1234/");
@@ -698,7 +1143,10 @@ mod tests {
         let sonnet = anthropic.models.get("claude-sonnet-4-6").unwrap();
         assert_eq!(sonnet.context_window, Some(1_000_000));
         assert_eq!(sonnet.description, None, "no family → no description");
-        assert!(sonnet.variants.is_empty(), "no variants object → empty list");
+        assert!(
+            sonnet.variants.is_empty(),
+            "no variants object → empty list"
+        );
         assert!(
             !sonnet.supports_images,
             "no capabilities block → vision defaults false"
@@ -1065,6 +1513,7 @@ mod tests {
         // RFC 5737 documentation block — never routable.
         let cfg = OpenCodeClientConfig {
             base_url: "http://192.0.2.1:1".to_string(),
+            api: super::super::api::OpenCodeApi::Legacy,
             server_password: None,
             request_timeout: Duration::from_millis(200),
         };
@@ -1096,8 +1545,7 @@ mod tests {
                 }
             }
         });
-        let parsed: OpenCodeProviderEntry =
-            serde_json::from_value(json).expect("decodes");
+        let parsed: OpenCodeProviderEntry = serde_json::from_value(json).expect("decodes");
         assert_eq!(parsed.id, "openai");
         assert!(parsed.connected);
         assert!(parsed.models.contains_key("gpt-5"));

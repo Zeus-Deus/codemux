@@ -32,9 +32,11 @@ fn start_input(
         effort: Some("high".into()),
         context_window: None,
         fast_mode,
+        service_tier: None,
         additional_directories: vec![],
         env: None,
         workspace_id: None,
+        remote: None,
         extra: serde_json::Value::Null,
         recorded_usage_baseline: None,
     }
@@ -70,9 +72,11 @@ fn fixture_start_input(thread_id: &str) -> StartSessionInput {
         effort: None,
         context_window: None,
         fast_mode: false,
+        service_tier: None,
         additional_directories: vec![],
         env: None,
         workspace_id: None,
+        remote: None,
         extra: serde_json::Value::Null,
         recorded_usage_baseline: None,
     }

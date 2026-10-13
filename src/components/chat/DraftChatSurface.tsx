@@ -1,3 +1,4 @@
+import { resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { selectProviderCommands, useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { parseMessageDelivery } from "@/lib/agent-chat/message-delivery";
 import {
@@ -57,11 +58,13 @@ import {
   type ChatDraft,
 } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
+import { useHostsStore } from "@/stores/hosts-store";
 import {
   selectCapabilities,
   selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
+import { selectedAcpCatalog, useCustomAcp } from "@/stores/custom-acp-store";
 import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import {
   getGithubIssueByPath,
@@ -81,13 +84,19 @@ import type {
 } from "@/tauri/types";
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
+import { FullAccessNotice } from "./FullAccessNotice";
+import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
 import { ProviderUpdateNotice } from "./ProviderUpdateNotice";
 import { formatProviderError } from "@/lib/agent-chat/provider-error";
-import { useProviderHealth } from "@/stores/provider-health-store";
+import {
+  healthBlocksSend,
+  useProviderHealth,
+} from "@/stores/provider-health-store";
 import { Composer } from "./Composer";
 import { UserMessage } from "./UserMessage";
 import type { ActivePillMode } from "./pickers/ModePill";
+import { ProjectScopePopover } from "./pickers/ProjectScopePopover";
 import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
 import { cn } from "@/lib/utils";
 
@@ -131,6 +140,24 @@ export function DraftChatSurface() {
   );
 }
 
+/**
+ * A single 300ms ring around the composer card, for a "New agent" press that
+ * lands on the draft already on screen. Run through the Web Animations API so
+ * it never fights the classes the Composer owns, and skipped under reduced
+ * motion (the caret moving into the composer is feedback enough there).
+ */
+function pulseComposerCard(card: HTMLElement): void {
+  if (typeof card.animate !== "function") return;
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  card.animate(
+    [
+      { outline: "2px solid color-mix(in oklab, var(--ring) 60%, transparent)", outlineOffset: "2px" },
+      { outline: "2px solid transparent", outlineOffset: "2px" },
+    ],
+    { duration: 300, easing: "ease-out" },
+  );
+}
+
 function DraftChatSurfaceInner({
   draft,
   focusOnMount,
@@ -140,15 +167,25 @@ function DraftChatSurfaceInner({
   focusOnMount: boolean;
   onBackgroundStarted: (draftId: string) => void;
 }) {
-  const capabilities = useProviderCapabilities((s) =>
+  const nativeCapabilities = useProviderCapabilities((s) =>
     selectCapabilities(s, draft.provider),
   );
-  const activeModel = selectModel(capabilities, draft.model);
+  const acpCatalog = useCustomAcp(s => selectedAcpCatalog(s, draft.threadId));
+  const capabilities = draft.provider === "acp" ? acpCatalog?.capabilities ?? null : nativeCapabilities;
+  const activeModel = draft.provider === "acp" ? capabilities?.models.find(m => m.id === draft.model) ?? null : selectModel(capabilities, draft.model);
   const effortLabelMap = capabilities?.effort_label_map ?? {};
   const permissionModes = capabilities?.permission_modes ?? null;
 
   const updateDraftInput = useChatDraftStore((s) => s.updateDraftInput);
   const updateDraftConfig = useChatDraftStore((s) => s.updateDraftConfig);
+  useEffect(() => {
+    if (!activeModel || draft.promoting) return;
+    const resolved = resolveServiceTier(activeModel, draft.serviceTier);
+    if (resolved !== (draft.serviceTier ?? "default")) {
+      updateDraftConfig(draft.draftId, { serviceTier: resolved });
+    }
+  }, [activeModel, draft.draftId, draft.serviceTier, draft.promoting, updateDraftConfig]);
+
   const updateDraftTarget = useChatDraftStore((s) => s.updateDraftTarget);
   const setActiveDraft = useChatDraftStore((s) => s.setActiveDraft);
   const clearDraft = useChatDraftStore((s) => s.clearDraft);
@@ -196,8 +233,39 @@ function DraftChatSurfaceInner({
   // instead of reusing the active sidebar workspace.
   const appHomeDir = useAppStore((s) => s.homeDir);
 
-  const providerUpdatesRemote = useAppStore((s) => draft.target.kind === "existing_workspace" &&
-    !!s.appState?.workspaces.find((w) => draft.target.kind === "existing_workspace" && w.workspace_id === draft.target.workspaceId)?.host_id);
+  // Device of the workspace an `existing_workspace` draft targets; null when
+  // it's local (or not hydrated yet).
+  const existingWorkspaceHostId = useAppStore((s) => {
+    if (draft.target.kind !== "existing_workspace") return null;
+    const wsId = draft.target.workspaceId;
+    return (
+      s.appState?.workspaces.find((w) => w.workspace_id === wsId)?.host_id ??
+      null
+    );
+  });
+  // Where the thread will run: an existing workspace stays on its own
+  // device; anything the first send creates goes to the picked device.
+  const threadHostId =
+    draft.target.kind === "existing_workspace"
+      ? existingWorkspaceHostId
+      : (draft.hostId ?? null);
+
+  // A draft can outlive its device (removed here or on another machine).
+  // Fall back to this device once the list has loaded cleanly, rather than
+  // sending to a device that no longer exists. A retry in flight after a
+  // failed load clears the error but still holds the failed load's empty
+  // list, so wait for it to settle before reading the list as complete.
+  const hosts = useHostsStore((s) => s.hosts);
+  const hostsUsable = useHostsStore(
+    (s) => s.loaded && !s.loading && s.error === null,
+  );
+  useEffect(() => {
+    if (draft.hostId == null || !hostsUsable) return;
+    if (!hosts.some((h) => h.id === draft.hostId)) {
+      updateDraftConfig(draft.draftId, { hostId: null });
+    }
+  }, [draft.draftId, draft.hostId, hosts, hostsUsable, updateDraftConfig]);
+
   const existingWorkspaceCwd = useAppStore((s) => {
     if (draft.target.kind !== "existing_workspace") return null;
     const wsId = draft.target.workspaceId;
@@ -245,9 +313,12 @@ function DraftChatSurfaceInner({
   // raised by the sidebar's explicit "New agent" button, whose tooltip
   // promises "New chat in home directory". Honouring that beats
   // mirroring the sidebar context when the user has explicitly asked
-  // for the home landing.
+  // for the home landing. Also skipped once a device is picked:
+  // re-targeting to the active sidebar workspace would silently run the
+  // thread wherever that workspace lives instead of on the device.
   useEffect(() => {
     if (draft.lockedToHome) return;
+    if (draft.hostId != null) return;
     if (draft.target.kind !== "home") return;
     if (appHomeDir === null) return;
     if (!activeSidebarWorkspaceId || !activeSidebarProjectPath) return;
@@ -258,6 +329,7 @@ function DraftChatSurfaceInner({
     });
   }, [
     draft.lockedToHome,
+    draft.hostId,
     draft.target.kind,
     draft.draftId,
     activeSidebarWorkspaceId,
@@ -329,6 +401,23 @@ function DraftChatSurfaceInner({
   // ref pattern.
   const sendInFlightRef = useRef(false);
 
+  // The composer error a readiness block left behind. It describes the
+  // provider, not the message, so it clears itself once the provider
+  // recovers (Sign in, Re-check, or the focus re-probe) instead of
+  // lingering until the next send.
+  const readinessErrorRef = useRef<string | null>(null);
+  const providerBlocksSend = useProviderHealth((s) =>
+    healthBlocksSend(s.slots[draft.provider].report),
+  );
+  useEffect(() => {
+    const blockedWith = readinessErrorRef.current;
+    if (providerBlocksSend || blockedWith === null) return;
+    readinessErrorRef.current = null;
+    if (draft.lastSendError === blockedWith) {
+      useChatDraftStore.getState().clearSendError(draft.draftId);
+    }
+  }, [providerBlocksSend, draft.draftId, draft.lastSendError]);
+
   // Instant-feedback state (Bug 2 fix): once the user submits, we render
   // the just-sent conversation (their bubble + a phase status line) in
   // place of the landing, so the composer never sits dead for the
@@ -382,11 +471,11 @@ function DraftChatSurfaceInner({
     // we'd otherwise hit `createHomeRootedWorkspace` and mint a
     // duplicate workspace.
     //
-    // Skipped when `lockedToHome` is set — same rationale as the
-    // mount-time effect: explicit "New agent" clicks must materialise
-    // in the home directory regardless of sidebar context.
+    // Skipped when `lockedToHome` or a device is set — same rationale
+    // as the mount-time effect.
     if (
       !currentDraft.lockedToHome &&
+      currentDraft.hostId == null &&
       currentDraft.target.kind === "home" &&
       activeSidebarWorkspaceId !== null &&
       activeSidebarProjectPath !== null &&
@@ -402,6 +491,34 @@ function DraftChatSurfaceInner({
       const refreshed =
         useChatDraftStore.getState().draftsById[currentDraft.draftId];
       if (refreshed) currentDraft = refreshed;
+    }
+
+    // "New worktree" from a workspace on a device belongs on that device.
+    // Its project root is the local one, so forking it here would run the
+    // thread on this machine while the picker shows the device. Send it as
+    // a new thread for that project on the device instead. Only the copy
+    // handed to materialize changes: the stored draft keeps its target, so
+    // a failed send retries the same way.
+    let sendDraft = currentDraft;
+    if (
+      currentDraft.target.kind === "existing_workspace" &&
+      currentDraft.checkoutMode === "worktree"
+    ) {
+      const wsId = currentDraft.target.workspaceId;
+      const ws = useAppStore
+        .getState()
+        .appState?.workspaces.find((w) => w.workspace_id === wsId);
+      if (ws?.host_id != null) {
+        sendDraft =
+          ws.project_root && ws.project_root !== appHomeDir
+            ? {
+                ...currentDraft,
+                target: { kind: "project", projectPath: ws.project_root },
+                hostId: ws.host_id,
+              }
+            : // A device Home thread has no project to branch from.
+              { ...currentDraft, checkoutMode: "current" };
+      }
     }
 
     // Resolve the cwd the backend should launch under.
@@ -454,10 +571,10 @@ function DraftChatSurfaceInner({
     // fork), which keeps every pre-existing target-resolution path
     // byte-identical.
     const worktreeProjectPath =
-      currentDraft.checkoutMode === "worktree"
-        ? currentDraft.target.kind === "project"
-          ? currentDraft.target.projectPath
-          : currentDraft.target.kind === "existing_workspace"
+      sendDraft.checkoutMode === "worktree"
+        ? sendDraft.target.kind === "project"
+          ? sendDraft.target.projectPath
+          : sendDraft.target.kind === "existing_workspace"
             ? existingWorkspaceProjectRoot
             : null
         : null;
@@ -467,6 +584,17 @@ function DraftChatSurfaceInner({
     // work begins. The status line advances through the real phases via
     // `materializeAndSend`'s `onPhase` hook.
     const finalDraft = currentDraft;
+    const sendTarget = sendDraft.target;
+    const executionHostId =
+      sendTarget.kind === "existing_workspace"
+        ? (useAppStore.getState().appState?.workspaces.find(
+            (workspace) => workspace.workspace_id === sendTarget.workspaceId,
+          )?.host_id ?? null)
+        : (sendDraft.hostId ?? null);
+    const sendHostId =
+      sendDraft.target.kind !== "existing_workspace"
+        ? (sendDraft.hostId ?? null)
+        : null;
     if (background) {
       // Claim before clearing: the home slot must not reuse or discard the
       // sending draft while attachment preflight is still in flight.
@@ -475,7 +603,12 @@ function DraftChatSurfaceInner({
       setPending({
         text,
         images: imageDisplaySources,
-        phase: worktreeProjectPath ? "creating-worktree" : "creating-workspace",
+        phase: "checking-provider",
+        deviceName:
+          sendHostId !== null
+            ? (useHostsStore.getState().hosts.find((h) => h.id === sendHostId)
+                ?.name ?? null)
+            : null,
       });
     }
     updateDraftInput(finalDraft.draftId, "");
@@ -505,6 +638,41 @@ function DraftChatSurfaceInner({
     };
 
     void (async () => {
+      // Readiness first: a signed-out or missing CLI can never answer, so
+      // creating a worktree and workspace for it only leaves debris behind.
+      // The draft keeps its text and attachments; the banner carries the fix.
+      // Local health cannot establish readiness on another device.
+      const blocked = executionHostId === null
+        ? await useProviderHealth.getState().ensureReady(finalDraft.provider)
+        : null;
+      if (blocked) {
+        const reason = (blocked.message ?? "The agent isn't available").replace(
+          /\.$/,
+          "",
+        );
+        if (background) {
+          reportFailure(reason);
+          return;
+        }
+        setPending(null);
+        updateDraftInput(finalDraft.draftId, text);
+        readinessErrorRef.current = reason;
+        state.markSendFailed(finalDraft.draftId, reason);
+        sendInFlightRef.current = false;
+        return;
+      }
+      setPending((p) =>
+        p
+          ? {
+              ...p,
+              phase: sendHostId !== null
+                ? "creating-on-host"
+                : worktreeProjectPath
+                  ? "creating-worktree"
+                  : "creating-workspace",
+            }
+          : p,
+      );
       // A conversation in another tab can advance while this draft is open.
       // Refresh every staged handoff at the last responsible moment so the
       // first provider turn receives the newest visible progress.
@@ -589,7 +757,7 @@ function DraftChatSurfaceInner({
       const attachmentBlock = buildAttachmentBlock(activeFreshAttachments);
 
       const result = await materializeAndSend(
-        finalDraft,
+        sendDraft,
         text,
         cwdForSession,
         {
@@ -605,7 +773,7 @@ function DraftChatSurfaceInner({
           setSessionLaunchMode: chat.setSessionLaunchMode,
           setEffort: chat.setEffort,
           setContextWindow: chat.setContextWindow,
-          setFastMode: chat.setFastMode,
+          setServiceTier: chat.setServiceTier,
           setMode: chat.setMode,
           refreshSkillSelection: (selection, effectiveCwd) =>
             refreshSkillSelectionForCwd(
@@ -1021,7 +1189,7 @@ function DraftChatSurfaceInner({
   // permission-mode default differs between providers, so we seed a
   // sensible default whenever the provider flips.
   const handleProviderModelChange = useCallback(
-    (nextProvider: ChatDraft["provider"], nextModel: string) => {
+    (nextProvider: ChatDraft["provider"], nextModel: string | null) => {
       if (nextProvider === draft.provider) {
         updateDraftConfig(draft.draftId, { model: nextModel });
         return;
@@ -1041,7 +1209,7 @@ function DraftChatSurfaceInner({
         contextWindow: defaults.contextWindow,
         // Speed tiers are provider/model-scoped: never carry a Fast
         // selection across a provider switch.
-        fastMode: false,
+        serviceTier: "default",
       });
     },
     [draft.draftId, draft.mode, draft.provider, updateDraftConfig],
@@ -1052,12 +1220,10 @@ function DraftChatSurfaceInner({
       const nextModel = capabilities?.models.find((item) => item.id === next);
       updateDraftConfig(draft.draftId, {
         model: next,
-        ...(draft.fastMode && nextModel && !nextModel.supports_fast_mode
-          ? { fastMode: false }
-          : {}),
+        ...(nextModel ? { serviceTier: resolveServiceTier(nextModel, draft.serviceTier) } : {}),
       });
     },
-    [draft.draftId, draft.fastMode, capabilities, updateDraftConfig],
+    [draft.draftId, draft.serviceTier, capabilities, updateDraftConfig],
   );
   const handlePermissionModeChange = useCallback(
     (next: string) =>
@@ -1072,8 +1238,8 @@ function DraftChatSurfaceInner({
     (next: string) => updateDraftConfig(draft.draftId, { contextWindow: next }),
     [draft.draftId, updateDraftConfig],
   );
-  const handleFastModeChange = useCallback(
-    (next: boolean) => updateDraftConfig(draft.draftId, { fastMode: next }),
+  const handleServiceTierChange = useCallback(
+    (next: string) => updateDraftConfig(draft.draftId, { serviceTier: next }),
     [draft.draftId, updateDraftConfig],
   );
 
@@ -1110,8 +1276,66 @@ function DraftChatSurfaceInner({
   // the first message when the name is empty) as part of the same
   // submit that sends it.
   const handleChangeTarget = useCallback(
-    (target: ChatDraft["target"]) => updateDraftTarget(draft.draftId, target),
-    [draft.draftId, updateDraftTarget],
+    (target: ChatDraft["target"]) => {
+      // Picking Home is explicit: lock it first so the seed effect can't
+      // bounce the target back to the active sidebar workspace.
+      if (target.kind === "home") {
+        updateDraftConfig(draft.draftId, { lockedToHome: true });
+      }
+      // Leaving an existing workspace keeps the device the picker showed
+      // for it, rather than silently falling back to this one.
+      if (
+        draft.target.kind === "existing_workspace" &&
+        target.kind !== "existing_workspace"
+      ) {
+        updateDraftConfig(draft.draftId, { hostId: existingWorkspaceHostId });
+      }
+      updateDraftTarget(draft.draftId, target);
+    },
+    [
+      draft.draftId,
+      draft.target.kind,
+      existingWorkspaceHostId,
+      updateDraftConfig,
+      updateDraftTarget,
+    ],
+  );
+  const handleStartWithoutProject = useCallback(
+    () => handleChangeTarget({ kind: "home" }),
+    [handleChangeTarget],
+  );
+  const handleChangeHostId = useCallback(
+    (hostId: number | null) => {
+      // An existing workspace runs where it already lives. Picking another
+      // device means "start a new workspace there" for the same project.
+      if (
+        draft.target.kind === "existing_workspace" &&
+        hostId !== existingWorkspaceHostId
+      ) {
+        if (
+          existingWorkspaceProjectRoot &&
+          existingWorkspaceProjectRoot !== appHomeDir
+        ) {
+          updateDraftTarget(draft.draftId, {
+            kind: "project",
+            projectPath: existingWorkspaceProjectRoot,
+          });
+        } else {
+          handleChangeTarget({ kind: "home" });
+        }
+      }
+      updateDraftConfig(draft.draftId, { hostId });
+    },
+    [
+      draft.draftId,
+      draft.target.kind,
+      existingWorkspaceHostId,
+      existingWorkspaceProjectRoot,
+      appHomeDir,
+      handleChangeTarget,
+      updateDraftConfig,
+      updateDraftTarget,
+    ],
   );
   const handleChangeCheckoutMode = useCallback(
     (mode: "current" | "worktree") =>
@@ -1130,9 +1354,9 @@ function DraftChatSurfaceInner({
 
   const belowComposerSlot = (
     <ThreadScopeRow
-      target={draft.target}
-      onChangeTarget={handleChangeTarget}
       projectPath={scopeProjectPath}
+      hostId={threadHostId}
+      onChangeHostId={handleChangeHostId}
       checkoutMode={draft.checkoutMode ?? "current"}
       worktreeName={draft.worktreeName ?? ""}
       baseBranch={draft.baseBranch ?? ""}
@@ -1163,7 +1387,7 @@ function DraftChatSurfaceInner({
       permissionMode={draft.permissionMode}
       effort={draft.effort}
       contextWindow={draft.contextWindow}
-      fastMode={draft.fastMode ?? false}
+      serviceTier={draft.serviceTier ?? "default"}
       activeModel={activeModel}
       effortLabelMap={effortLabelMap}
       permissionModes={permissionModes}
@@ -1185,10 +1409,10 @@ function DraftChatSurfaceInner({
       showProviderPicker={true}
       showStopButton={false}
       errorMessage={draft.lastSendError}
-      // Thread Scope redesign — the cwd label above the composer moved
-      // into ThreadScopeRow's location control below it; `null` hides
-      // Composer's own zone-1 slot rather than falling back to a plain
-      // cwd string.
+      // Thread Scope redesign — the headline names the project and the
+      // strip below the composer carries the rest of the scope; `null`
+      // hides Composer's own zone-1 slot rather than falling back to a
+      // plain cwd string.
       zone1Override={null}
       belowComposerSlot={belowComposerSlot}
       mode={normalizedMode}
@@ -1210,7 +1434,7 @@ function DraftChatSurfaceInner({
       onAttachPr={handleAttachPr}
       onAttachSession={handleAttachSession}
       onAttachImage={handleAttachImage}
-      modelSupportsImages={activeModel?.supports_images ?? false}
+      modelSupportsImages={draft.provider === "acp" ? acpCatalog?.supports_images ?? false : activeModel?.supports_images ?? false}
       repoSupported={repoSupported}
       providerKind={existingWorkspaceProviderKind}
       providerCliInstalled={providerCliInstalled}
@@ -1224,7 +1448,7 @@ function DraftChatSurfaceInner({
       onPermissionModeChange={handlePermissionModeChange}
       onEffortChange={handleEffortChange}
       onContextWindowChange={handleContextWindowChange}
-      onFastModeChange={handleFastModeChange}
+      onServiceTierChange={handleServiceTierChange}
       onModeActivate={handleModeActivate}
       onModeRemove={handleModeRemove}
     />
@@ -1237,20 +1461,77 @@ function DraftChatSurfaceInner({
   // h-7 band so the draft doesn't look "naked" next to a real pane.
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
 
+  // "New agent" asked for this draft's composer. Consumed once, after the
+  // composer has mounted (child effects run first), so a repeat press on the
+  // draft already on screen still moves the caret into it, and the card
+  // pulses once so the press is visible even though the page is unchanged.
+  const surfaceRef = useRef<HTMLDivElement>(null);
+  const composerFocusRequest = useDraftComposerFocusStore((s) => s.request);
+  useEffect(() => {
+    if (composerFocusRequest?.draftId !== draft.draftId) return;
+    useDraftComposerFocusStore.getState().clear();
+    const card = surfaceRef.current?.querySelector<HTMLElement>(
+      '[data-testid="composer-wrapper"]',
+    );
+    card
+      ?.querySelector<HTMLTextAreaElement>("textarea")
+      ?.focus({ preventScroll: true });
+    if (card) pulseComposerCard(card);
+  }, [composerFocusRequest, draft.draftId]);
+
+  // Opening a project from the empty home points this draft at it, the same
+  // as picking it in the location control below the composer.
+  const handleProjectOpened = useCallback(
+    (projectPath: string) =>
+      updateDraftTarget(draft.draftId, { kind: "project", projectPath }),
+    [draft.draftId, updateDraftTarget],
+  );
+
   return (
-    <div className="relative flex h-full w-full flex-col bg-background">
+    <div
+      ref={surfaceRef}
+      className="relative flex h-full w-full flex-col bg-background"
+    >
       {!enableAgentChat && <DraftSurfaceHeader />}
       {/* Provider runtime health (probe-backed, TTL-cached): tell the
           user the selected provider can't run BEFORE they compose and
           send a first message into a session that will never start.
           Renders as a floating top overlay; needs `relative` above. */}
-      <ProviderStatusNotice provider={draft.provider} />
-      <ProviderUpdateNotice provider={draft.provider} threadId={draft.threadId} remote={providerUpdatesRemote} />
+      <ProviderStatusNotice
+        provider={draft.provider}
+        workspaceId={sessionWorkspaceId}
+      />
+      <ProviderUpdateNotice provider={draft.provider} threadId={draft.threadId} remote={threadHostId !== null} />
       <div className="flex-1 min-h-0 overflow-hidden">
         {pending ? (
           <DraftPendingConversation pending={pending} composer={composerEl} />
         ) : (
-          <ChatHomeLanding composer={composerEl} />
+          // The headline is this surface's only project picker. The
+          // pending view drops it, but a send is already in flight then,
+          // and a failed send brings the landing back.
+          <ChatHomeLanding
+            composer={composerEl}
+            notice={
+              <FullAccessNotice
+                permissionMode={draft.permissionMode}
+                permissionModes={permissionModes}
+              />
+            }
+            onProjectOpened={handleProjectOpened}
+            projectName={scopeProjectPath ? basename(scopeProjectPath) : null}
+            projectPicker={(trigger) => (
+              <ProjectScopePopover
+                trigger={trigger}
+                onChangeTarget={handleChangeTarget}
+                isHome={draft.target.kind === "home"}
+                activeProjectPath={scopeProjectPath}
+                disabled={draft.promoting}
+                side="bottom"
+                align="center"
+              />
+            )}
+            onStartWithoutProject={handleStartWithoutProject}
+          />
         )}
       </div>
     </div>
@@ -1261,10 +1542,14 @@ function DraftChatSurfaceInner({
 interface DraftPendingState {
   text: string;
   images: UserMessageImage[];
-  phase: MaterializePhase;
+  phase: MaterializePhase | "checking-provider";
+  /** Device the thread is being set up on, for the status line. */
+  deviceName?: string | null;
 }
 
-const PHASE_LABEL: Record<MaterializePhase, string> = {
+const PHASE_LABEL: Record<DraftPendingState["phase"], string> = {
+  "checking-provider": "Checking the agent…",
+  "creating-on-host": "Setting up on the device…",
   "creating-worktree": "Creating worktree…",
   "creating-workspace": "Setting up workspace…",
   "starting-session": "Starting session…",
@@ -1313,7 +1598,9 @@ function DraftPendingConversation({
               />
             </span>
             <span className="shimmer text-body font-semibold">
-              {PHASE_LABEL[pending.phase]}
+              {pending.phase === "creating-on-host" && pending.deviceName
+                ? `Setting up on ${pending.deviceName}…`
+                : PHASE_LABEL[pending.phase]}
             </span>
           </div>
         </div>

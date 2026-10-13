@@ -1,9 +1,10 @@
 import { LocalSessionImportEntry } from "@/components/chat/LocalSessionImportEntry";
 import { useMemo, useRef, useState } from "react";
 
-import { AlertTriangle, Archive, ArchiveRestore, Trash2 } from "lucide-react";
+import { AlertTriangle, Archive, ArchiveRestore, Search, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -80,6 +81,18 @@ function useArchivedWorkspaces(): ArchivedWorkspaceSnapshot[] {
     if (!sameIds) prevRef.current = next;
     return prevRef.current;
   });
+}
+
+/** Case-insensitive match on everything an entry row shows, plus its path,
+ *  so a half-remembered name, branch or directory all find it. */
+function archiveEntryMatches(
+  entry: ArchivedWorkspaceSnapshot,
+  projectLabel: string,
+  needle: string,
+): boolean {
+  if (needle === "") return true;
+  return [entry.title, entry.git_branch, projectLabel, entry.worktree_path ?? entry.cwd]
+    .some((field) => field?.toLowerCase().includes(needle));
 }
 
 function isRootEntry(entry: ArchivedWorkspaceSnapshot): boolean {
@@ -314,6 +327,8 @@ export function ArchiveSection() {
   const homeDir = useHomeDir();
   const [deleteTarget, setDeleteTarget] =
     useState<ArchivedWorkspaceSnapshot | null>(null);
+  const [search, setSearch] = useState("");
+  const needle = search.trim().toLowerCase();
 
   // Group keys and labels come from the store's shared helpers
   // (`resolveProjectRoot` / `projectDisplayName`) so this panel names
@@ -334,6 +349,19 @@ export function ArchiveSection() {
       entries: [...entries].sort((a, b) => b.archived_at - a.archived_at),
     }));
   }, [archived, homeDir]);
+
+  const shownGroups = useMemo(
+    () =>
+      groups
+        .map((group) => ({
+          ...group,
+          entries: group.entries.filter((entry) =>
+            archiveEntryMatches(entry, group.label, needle),
+          ),
+        }))
+        .filter((group) => group.entries.length > 0),
+    [groups, needle],
+  );
 
   if (archived.length === 0) {
     return (
@@ -356,7 +384,22 @@ export function ArchiveSection() {
   return (
     <div className="space-y-8">
       <LocalSessionImportEntry />
-      {groups.map((group, idx) => (
+      <div className="relative">
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground/60 pointer-events-none" />
+        <Input
+          placeholder="Search archived workspaces…"
+          aria-label="Search archived workspaces"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          className="h-9 pl-9 text-body"
+        />
+      </div>
+      {shownGroups.length === 0 && (
+        <p className="text-body text-muted-foreground" data-testid="archive-no-matches">
+          No archived workspaces match &ldquo;{search.trim()}&rdquo;
+        </p>
+      )}
+      {shownGroups.map((group, idx) => (
         <section key={group.path} className={cn(idx === 0 && "mt-0")}>
           <Eyebrow className="mb-3" title={group.path}>
             {group.label}

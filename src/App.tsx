@@ -5,6 +5,7 @@ import { ChatGptWelcome } from "@/components/auth/chatgpt-welcome";
 import { lazy, useCallback, useEffect, useRef } from "react";
 import { useAppStateInit } from "@/hooks/use-app-state";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
+import { useWorkspaceStatusTracking } from "@/hooks/use-workspace-status-tracking";
 import { useAsyncQuestionAttention } from "@/hooks/use-async-question-attention";
 import { useAuthEvents } from "@/hooks/use-auth-events";
 import { useTunnelStatusEvents } from "@/hooks/use-tunnel-status-events";
@@ -15,6 +16,7 @@ import { useTerminalThemeSync } from "@/hooks/use-terminal-theme-sync";
 import { useTerminalCwdPoll } from "@/hooks/use-terminal-cwd-poll";
 import { useAutomationFireToast } from "@/hooks/use-automation-fire-toast";
 import { useWebNotifications } from "@/hooks/use-web-notifications";
+import { useNotificationActivate } from "@/hooks/use-notification-activate";
 import { useSmoothScrollingInit } from "@/hooks/use-smooth-scrolling";
 import { useRendererModeInit } from "@/hooks/use-renderer-mode";
 import { AppShell } from "@/components/layout/app-shell";
@@ -22,17 +24,20 @@ import { RemoteConnectionBanner } from "@/components/remote/remote-connection-in
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { Toaster } from "@/components/ui/sonner";
 import { PrEventWatcher } from "@/components/pull-requests/pr-event-watcher";
+import { InterfaceSizeHud } from "@/components/overlays/interface-size-hud";
 import { UpdateToast } from "@/components/update/update-toast";
 import { LoginScreen } from "@/components/auth/login-screen";
 import { useAppStore } from "@/stores/app-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { useFeatureFlagsInit } from "@/stores/feature-flags";
 import { useEnsureDraftWhenEmpty } from "@/hooks/use-ensure-draft-when-empty";
+import { useReseedBootstrapDrafts } from "@/stores/chat-draft-store";
 import { useTranscriptSelectionHighlight } from "@/hooks/use-transcript-selection-highlight";
 import { getHomeDir, repairInactiveMcpConfigs } from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
 import { useRemotePathPickerStore } from "@/components/remote/remote-path-picker-store";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
+import { useCloseGuardStore } from "@/lib/close-guard";
 import { useActiveWorkspacePersistenceErrors } from "@/hooks/use-active-workspace-persistence-errors";
 import { markStartup } from "@/lib/perf/interaction-trace";
 import { usePostPaintPendingSessionRefresh } from "@/hooks/use-post-paint-session-refresh";
@@ -52,6 +57,17 @@ const RenameWorkspaceDialog = lazy(() =>
     default: module.RenameWorkspaceDialog,
   })),
 );
+const ShortcutsSheet = lazy(() =>
+  import("@/components/overlays/shortcuts-sheet").then((module) => ({
+    default: module.ShortcutsSheet,
+  })),
+);
+
+const CloseGuardDialog = lazy(() =>
+  import("@/components/overlays/close-guard-dialog").then((module) => ({
+    default: module.CloseGuardDialog,
+  })),
+);
 
 function App() {
   useAddonPlatform();
@@ -64,7 +80,9 @@ function App() {
   const sessionStatus = useAuthStore((s) => s.sessionStatus);
   const renameWorkspaceId = useUIStore((s) => s.renameWorkspaceId);
   const themeStudioRequest = useUIStore((s) => s.themeStudio);
+  const showShortcutsSheet = useUIStore((s) => s.showShortcutsSheet);
   const remotePathRequest = useRemotePathPickerStore((s) => s.request);
+  const closeGuardPrompt = useCloseGuardStore((s) => s.prompt);
   const postPaintStartupBegan = useRef(false);
 
   useEffect(() => {
@@ -145,16 +163,19 @@ function App() {
   // Only initialize app state and shortcuts when authenticated
   useAppStateInit(!(isAuthenticated || localMode));
   useKeyboardShortcuts();
+  // Ctrl+Shift+J ranks blocked workspaces by how long they have waited, so
+  // their status marks must keep updating while the sidebar is collapsed.
+  useWorkspaceStatusTracking();
   useScrollbackSerializer();
   useFeatureFlagsInit();
   useEnsureDraftWhenEmpty();
+  useReseedBootstrapDrafts();
   useTerminalCacheGc();
   useTerminalThemeSync();
   useTerminalCwdPoll();
   useAutomationFireToast();
   useActiveWorkspacePersistenceErrors();
-  // Re-apply a persisted "smooth scrolling: on" to the fresh webview once the
-  // machine-local settings have loaded. Off is the native default — no-op.
+  // Default short Linux wheel glides; native WebKit animation stays off.
   useSmoothScrollingInit();
   // Ask the backend which renderer it ended up on, so composited-only UI
   // effects (the transcript edge-fade) switch themselves off when the webview
@@ -166,6 +187,8 @@ function App() {
   // Web remote client only: bridge backend `notification` events into the
   // browser (Web Notifications API with a toast fallback). No-op on desktop.
   useWebNotifications();
+  // Desktop only: clicking a native agent notification opens that agent.
+  useNotificationActivate();
 
   if (isLoading || (!isAuthenticated && (!localReady || !localMode || cloudLogin))) {
     return <><LoginScreen /><ChatGptWelcome enterWorkbench /></>;
@@ -184,6 +207,16 @@ function App() {
           <RenameWorkspaceDialog />
         </LazyBoundary>
       )}
+      {/* App-level so it layers over Settings and the full-screen pages too. */}
+      {showShortcutsSheet && (
+        <LazyBoundary
+          label="keyboard shortcuts"
+          className="fixed inset-0 z-50 h-screen"
+          presentation="overlay"
+        >
+          <ShortcutsSheet />
+        </LazyBoundary>
+      )}
       {/* App-level, not a child of the Appearance page: both of its doors —
           the palette's create/paste rows and Appearance's Customize button —
           live on surfaces that replace each other. */}
@@ -194,6 +227,15 @@ function App() {
           presentation="overlay"
         >
           <ThemeStudio />
+        </LazyBoundary>
+      )}
+      {closeGuardPrompt && (
+        <LazyBoundary
+          label="close confirmation"
+          className="fixed inset-0 z-50 h-screen"
+          presentation="overlay"
+        >
+          <CloseGuardDialog />
         </LazyBoundary>
       )}
       <UpdateToast />
@@ -216,6 +258,9 @@ function App() {
           nothing, and sits above the full-screen destinations so it keeps
           watching from every screen. */}
       <PrEventWatcher />
+      {/* App-level so the size shortcuts answer on Settings and the other
+          full-screen pages too, which replace the shell. */}
+      <InterfaceSizeHud />
       <Toaster />
     </>
   );

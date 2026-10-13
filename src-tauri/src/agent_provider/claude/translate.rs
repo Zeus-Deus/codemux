@@ -747,6 +747,7 @@ fn translate_rate_limit_event(
         used_pct,
         resets_at_ms,
         label: raw_kind.map(|s| s.to_string()),
+        window_mins: kind.implied_window_mins(),
     }];
 
     // The overage bucket rides along on the same event when the account
@@ -769,6 +770,7 @@ fn translate_rate_limit_event(
                 .and_then(|v| v.as_f64())
                 .map(|secs| (secs * 1000.0) as i64),
             label: Some("overage".to_string()),
+            window_mins: None,
         });
     }
 
@@ -795,6 +797,7 @@ fn translate_rate_limit_event(
             provider: ProviderKind::Claude,
             resets_at_ms,
             auto_resume_at_ms: None,
+            auto_resume_blocked_reason: None,
             window: raw_kind.map(|s| s.to_string()),
         });
     }
@@ -822,8 +825,7 @@ fn warning(
 
 /// `type: "assistant"` — may carry text, thinking, and/or tool_use
 /// blocks. Each is emitted as an `ItemCompleted`. The assistant
-/// `error` field (7 enumerated kinds) is surfaced as a
-/// `RuntimeWarning`.
+/// `error` field identifies a usage-limit stop or a runtime warning.
 ///
 /// Subagent handling:
 /// * A top-level `Agent`/`Task` `tool_use` block (in a message with
@@ -870,13 +872,26 @@ fn translate_assistant(
             subagent: snapshot,
         });
     }
-    if let Some(err) = msg.get("error").and_then(|v| v.as_str()) {
-        out.push(ProviderRuntimeEvent::RuntimeWarning {
-            thread_id: Some(thread_id.clone()),
-            message: format!("assistant error: {err}"),
-            original_payload: Some(msg.clone()),
-        });
+    let error = msg.get("error").and_then(|v| v.as_str());
+    if let Some(err) = error {
+        // The SDK can omit rate_limit_event. The enumerated assistant error
+        // still identifies a limit; the backend can fill in a quota reset.
+        let notice = parent.is_none().then(|| crate::agent_provider::usage_limit::usage_limit_notice(
+            thread_id, ProviderKind::Claude, msg, err,
+        )).flatten();
+        if let Some(notice) = notice { out.push(notice); }
+        else {
+            out.push(ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(thread_id.clone()),
+                message: format!("assistant error: {err}"),
+                original_payload: Some(msg.clone()),
+            });
+        }
     }
+    // On a signed-out CLI the message text is the CLI's own "Please run
+    // /login" hint, which names a command the chat cannot run. The warning
+    // above already becomes a sign-in notice with a working action.
+    let suppress_text = error == Some("authentication_failed");
     let content = msg
         .get("message")
         .and_then(|m| m.get("content"))
@@ -887,6 +902,7 @@ fn translate_assistant(
                 continue;
             };
             match bty {
+                "text" if suppress_text => {}
                 "text" => {
                     if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                         out.push(ProviderRuntimeEvent::ItemCompleted {
@@ -1136,6 +1152,7 @@ fn snapshot_from_launch(tool_use_id: &str, input: &serde_json::Value) -> Subagen
         // demux re-stamps it onto every subsequent snapshot for this id.
         task_kind: None,
         model: get("model"),
+        effort: None,
         status: SubagentStatus::Running,
         activity: None,
         result_text: None,
@@ -1345,6 +1362,7 @@ fn base_snapshot(subagent_id: &str) -> SubagentSnapshot {
         description: None,
         task_kind: None,
         model: None,
+        effort: None,
         status: SubagentStatus::Running,
         activity: None,
         result_text: None,
@@ -1625,7 +1643,22 @@ fn translate_result(
         .get("subtype")
         .and_then(|v| v.as_str())
         .unwrap_or("success");
-    let status = match subtype {
+    // The SDK reports API failures (signed out, invalid key, no credit,
+    // overloaded) as a `success` result with `is_error: true` and the error
+    // text in `result`. Reading only the subtype would settle those turns as
+    // a clean success.
+    let api_error = subtype == "success"
+        && msg.get("is_error").and_then(|v| v.as_bool()) == Some(true);
+    let mut status = match subtype {
+        "success" if api_error => TurnStatus::Error {
+            subtype: "api_error".into(),
+            message: msg
+                .get("result")
+                .and_then(|v| v.as_str())
+                .map(|text| text.trim().chars().take(200).collect::<String>())
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| "API error".to_string()),
+        },
         "success" => TurnStatus::Success,
         "error_max_turns" => TurnStatus::MaxTurns,
         "error_max_budget_usd" => TurnStatus::MaxBudget,
@@ -1652,6 +1685,14 @@ fn translate_result(
     // Context usage first, so the meter is already correct by the time
     // the UI processes the turn settling.
     let mut out = result_context_usage(thread_id, msg, &mut demux.context);
+    if let TurnStatus::Error { subtype, message } = &mut status {
+        if let Some(notice) = crate::agent_provider::usage_limit::usage_limit_notice(
+            thread_id, ProviderKind::Claude, msg, message,
+        ) {
+            *subtype = crate::agent_provider::events::RATE_LIMIT_SUBTYPE.into();
+            out.push(notice);
+        }
+    }
     out.push(ProviderRuntimeEvent::TurnCompleted {
         thread_id: thread_id.clone(),
         turn_id,
@@ -2280,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_error_surfaces_as_warning_plus_content() {
+    fn usage_limit_assistant_error_surfaces_notice_without_reset_event() {
         let msg = json!({
             "type": "assistant",
             "error": "rate_limit",
@@ -2290,13 +2331,45 @@ mod tests {
         let events = translate_sdk_message(&tid(), &msg);
         assert!(events.iter().any(|e| matches!(
             e,
-            ProviderRuntimeEvent::RuntimeWarning { message, .. }
-                if message.contains("rate_limit")
+            ProviderRuntimeEvent::UsageLimitReached { resets_at_ms: None, .. }
         )));
+        assert!(!events.iter().any(|e| matches!(e, ProviderRuntimeEvent::RuntimeWarning { .. })));
         assert!(events.iter().any(|e| matches!(
             e,
             ProviderRuntimeEvent::ItemCompleted { .. }
         )));
+    }
+
+    #[test]
+    fn signed_out_error_drops_the_cli_login_hint_text() {
+        let msg = json!({
+            "type": "assistant",
+            "error": "authentication_failed",
+            "turn_id": "t",
+            "message": {"content": [{"type": "text", "text": "Not logged in · Please run /login"}]}
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProviderRuntimeEvent::RuntimeWarning { message, .. }
+                if message == "assistant error: authentication_failed"
+        )));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted { .. })));
+    }
+
+    #[test]
+    fn usage_limit_execution_error_preserves_reported_reset() {
+        let msg = json!({"type":"result", "subtype":"error_during_execution",
+            "errors":["You've hit your usage limit"], "reset_at_ms":1_800_000_000_000_i64});
+        let events = translate_sdk_message(&tid(), &msg);
+        assert!(events.iter().any(|e| matches!(e, ProviderRuntimeEvent::UsageLimitReached {
+            resets_at_ms: Some(1_800_000_000_000), ..
+        })));
+        assert!(events.iter().any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted {
+            status: TurnStatus::Error { subtype, .. }, ..
+        } if subtype == "rate_limit")));
     }
 
     #[test]
@@ -2356,6 +2429,44 @@ mod tests {
     }
 
     #[test]
+    fn result_success_with_is_error_emits_api_error() {
+        let long = "Invalid API key · Please run /login ".repeat(20);
+        let msg = json!({
+            "type": "result",
+            "subtype": "success",
+            "turn_id": "t",
+            "is_error": true,
+            "result": long,
+            "usage": {},
+            "modelUsage": {}
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        let Some(ProviderRuntimeEvent::TurnCompleted { status, .. }) = events
+            .iter()
+            .find(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. }))
+        else {
+            panic!("expected TurnCompleted");
+        };
+        match status {
+            TurnStatus::Error { subtype, message } => {
+                assert_eq!(subtype, "api_error");
+                assert!(message.starts_with("Invalid API key"));
+                assert_eq!(message.chars().count(), 200);
+            }
+            other => panic!("expected api_error, got {other:?}"),
+        }
+
+        // `is_error: false` (and an absent flag) stays a plain success.
+        let ok = json!({"type": "result", "subtype": "success", "turn_id": "t", "is_error": false, "result": "done"});
+        assert!(matches!(
+            translate_sdk_message(&tid(), &ok)
+                .iter()
+                .find(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. })),
+            Some(ProviderRuntimeEvent::TurnCompleted { status: TurnStatus::Success, .. })
+        ));
+    }
+
+    #[test]
     fn result_error_during_execution_emits_turn_error() {
         let msg = json!({
             "type": "result",
@@ -2374,6 +2485,30 @@ mod tests {
             }
         } else {
             panic!("expected TurnCompleted");
+        }
+    }
+
+    #[test]
+    fn result_success_subtype_with_error_flag_preserves_failure_and_usage() {
+        let msg = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "turn_id": "t",
+            "result": "API Error: response exceeded the output token maximum",
+            "total_cost_usd": 0.002,
+            "usage": {},
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        match &events[0] {
+            ProviderRuntimeEvent::TurnCompleted { turn_id, status, usage, .. } => {
+                assert_eq!(turn_id.0, "t");
+                assert!(matches!(status, TurnStatus::Error { subtype, message }
+                    if subtype == "api_error"
+                        && message == "API Error: response exceeded the output token maximum"));
+                assert_eq!(usage.as_ref().unwrap().total_cost_usd, Some(0.002));
+            }
+            _ => panic!("expected failed TurnCompleted"),
         }
     }
 
@@ -2693,6 +2828,7 @@ mod tests {
                 resets_at_ms: None,
                 window: None,
                 auto_resume_at_ms: None,
+                auto_resume_blocked_reason: None,
                 ..
             }
         ));

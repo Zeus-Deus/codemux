@@ -151,7 +151,7 @@ describe("ChatGPT connection ownership", () => {
     await useChatGptStore.getState().start(null);
     rpc.get.mockResolvedValue(connected);
     await useChatGptStore.getState().refresh();
-    await waitFor(() => expect(rpc.catalog).toHaveBeenCalledWith("codex"));
+    await waitFor(() => expect(rpc.catalog).toHaveBeenCalledWith("codex", true));
     await waitFor(() => expect(useProviderCapabilities.getState().loadedProviders.codex).toBe(true));
     expect(useProviderCapabilities.getState().codex).toEqual(caps);
   });

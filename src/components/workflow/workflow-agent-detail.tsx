@@ -1,5 +1,3 @@
-import { CheckCircle2 } from "lucide-react";
-
 import { AgentOrb } from "@/components/ui/agent-orb";
 import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import { Button } from "@/components/ui/button";
@@ -17,7 +15,8 @@ import type { SubagentView } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
-import { findingTone, workflowAgentTone } from "./workflow-tone";
+import { TerminalStatusIcon } from "./workflow-phase-list";
+import { findingTone, workflowAgentOutcome, workflowAgentTone } from "./workflow-tone";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** A label "looks like a file path" when it has no spaces and ends in a
@@ -98,7 +97,10 @@ export function WorkflowAgentDetail({
             <AgentOrb size={20} {...subagentOrbActivity(agent)} aria-hidden />
           </span>
         ) : (
-          <CheckCircle2 className={cn("size-4 shrink-0", tone.text)} aria-hidden />
+          <TerminalStatusIcon
+            outcome={workflowAgentOutcome(agent.status)}
+            className={cn("size-4 shrink-0", tone.text)}
+          />
         )}
         <div className="min-w-0 flex-1">
           <div className="truncate font-mono text-body-sm font-semibold text-foreground">{label}</div>
@@ -121,7 +123,7 @@ export function WorkflowAgentDetail({
 
       <section>
         <SectionLabel>Prompt</SectionLabel>
-        <div className="break-words rounded-md border border-border/60 bg-muted/30 px-2.5 py-2.5 text-body-sm leading-[1.55] text-foreground/90">
+        <div className="break-words rounded-md border border-hairline bg-surface-1 px-2.5 py-2.5 text-body-sm leading-[1.55] text-foreground/90">
           {derivePrompt(agent)}
         </div>
       </section>
@@ -152,14 +154,14 @@ export function WorkflowAgentDetail({
       <section>
         <SectionLabel>Result</SectionLabel>
         {running ? (
-          <div className="rounded-md border border-border/60 bg-muted/30 px-2.5 py-2.5 text-body-sm text-muted-foreground">
+          <div className="rounded-md border border-hairline bg-surface-1 px-2.5 py-2.5 text-body-sm text-muted-foreground">
             <span className="shimmer font-mono text-body-sm">{subagentActivityLine(agent)}</span>
           </div>
         ) : (
           <div
             className={cn(
               "break-words rounded-md border px-2.5 py-2.5 text-body-sm leading-[1.55] text-foreground/90",
-              badge?.tone === "red" ? cn(tone.softBg, tone.border) : "border-border/60 bg-muted/30",
+              badge?.tone === "red" ? cn(tone.softBg, tone.border) : "border-hairline bg-surface-1",
             )}
           >
             {agent.resultText ?? "No result yet."}

@@ -1,4 +1,6 @@
 use tauri::{Emitter, Listener, Manager};
+#[cfg(test)]
+extern crate self as codemux_lib;
 
 /// Subdirectory name used under XDG config/data dirs for all Codemux state
 /// (sqlite db, auth tokens, scrollback, presets, etc.). Debug builds use a
@@ -13,6 +15,7 @@ pub mod addons;
 pub mod agent_capability;
 pub mod active_workspace_persistence;
 pub mod agent_context;
+pub mod agent_control;
 pub mod agent_provider;
 pub mod ai;
 pub mod auth;
@@ -22,6 +25,7 @@ pub mod branch_name;
 pub mod json_rpc_child;
 pub mod local_session_import;
 pub mod mcp_server;
+pub mod mcp_connector;
 pub mod agent_browser;
 pub mod browser_viewport;
 pub mod cli;
@@ -79,6 +83,7 @@ pub mod hosts_inventory;
 pub mod workspace_paths;
 pub mod project_identity;
 pub mod workspaces_sync;
+pub mod workflows;
 pub mod state;
 pub mod hooks;
 pub mod stream_input;
@@ -90,6 +95,8 @@ pub mod trace;
 // WebKitGTK renderer transport + smooth-scrolling tuning (Linux). Also owns
 // the startup crash sentinel that picks the renderer flags for this process.
 pub mod webview_tuning;
+#[cfg(target_os = "linux")]
+mod precise_wheel;
 // Reloads the main window when its WebKitGTK web process dies (Linux).
 pub mod webview_recovery;
 // VS Code Marketplace theme import — search the public gallery and pull the
@@ -253,6 +260,180 @@ pub(crate) fn workspace_pr_rows(
         .collect()
 }
 
+/// Publish the answers from one completed batch. Count shape mismatches are
+/// non-authoritative and leave every workspace untouched.
+fn publish_workspace_pr_batch(
+    state: &state::AppStateStore,
+    targets: &[state::WorkspacePrLookup],
+    results: Vec<Result<Vec<github::SourcedPr>, String>>,
+) -> (bool, usize) {
+    if results.len() != targets.len() {
+        return (false, 0);
+    }
+    let mut changed = false;
+    let mut refreshed = 0;
+    for (target, lookup) in targets.iter().zip(results) {
+        if let Err(error) = &lookup {
+            eprintln!(
+                "[codemux::pr-poll] workspace PR lookup failed for {}: {error}",
+                target.workspace_id
+            );
+        }
+        let outcome = github::workspace_prs_outcome(lookup);
+        if !matches!(outcome, github::WorkspacePrsOutcome::Preserve) {
+            refreshed += 1;
+        }
+        changed |= state.publish_workspace_pr_lookup(target, outcome);
+    }
+    (changed, refreshed)
+}
+
+#[cfg(test)]
+mod pr_publication_wiring_tests {
+    use super::*;
+
+    fn rows(number: u32) -> Vec<github::SourcedPr> {
+        vec![github::SourcedPr {
+            pr: serde_json::from_value(serde_json::json!({
+                "number": number, "state": "OPEN", "title": "Synthetic PR",
+                "url": format!("https://example.test/pr/{number}"), "head_branch": "fixture",
+            }))
+            .unwrap(),
+            source: github::PrSource::Branch,
+            checkout_branch: Some("fixture".into()),
+        }]
+    }
+
+    fn delayed_batch(clear: bool) {
+        let store = std::sync::Arc::new(state::AppStateStore::default());
+        store.clear_workspaces();
+        let a = store.create_workspace().0;
+        let b = store.create_workspace().0;
+        store.update_workspace_cwd(&a, "/synthetic/a".into());
+        store.update_workspace_cwd(&b, "/synthetic/b".into());
+        let targets = store.workspace_pr_poll_lookups();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = store.clone();
+        let batch = std::thread::spawn(move || {
+            let answer_a = Ok(rows(10));
+            done_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            publish_workspace_pr_batch(&worker, &targets, vec![answer_a, Ok(rows(20))])
+        });
+        done_rx.recv().unwrap();
+        let fresh = store.begin_workspace_pr_refresh(&a).unwrap();
+        store.publish_workspace_pr_lookup(
+            &fresh,
+            if clear {
+                github::WorkspacePrsOutcome::Clear
+            } else {
+                github::WorkspacePrsOutcome::Write(rows(11))
+            },
+        );
+        release_tx.send(()).unwrap();
+        let (changed, _) = batch.join().unwrap();
+        assert!(changed, "unrelated B still opens the emit gate");
+        let snapshot = store.snapshot();
+        let ws_a = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == a)
+            .unwrap();
+        let expected = if clear { None } else { Some(11) };
+        assert_eq!(ws_a.pr_number, expected);
+        assert_eq!(ws_a.prs.first().map(|p| p.number), expected);
+        let ws_b = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == b)
+            .unwrap();
+        assert_eq!(ws_b.pr_number, Some(20));
+        assert_eq!(ws_b.prs[0].number, 20);
+    }
+
+    #[test]
+    fn actual_batch_publication_delayed_b_refuses_old_a_write() {
+        delayed_batch(false);
+    }
+
+    #[test]
+    fn actual_batch_publication_delayed_b_refuses_old_a_clear() {
+        delayed_batch(true);
+    }
+
+    #[test]
+    fn actual_batch_preserve_bad_count_and_emit_gate() {
+        let store = state::AppStateStore::default();
+        store.clear_workspaces();
+        let id = store.create_workspace().0;
+        let targets = store.workspace_pr_poll_lookups();
+        assert_eq!(
+            publish_workspace_pr_batch(&store, &targets, vec![]),
+            (false, 0)
+        );
+        assert_eq!(
+            publish_workspace_pr_batch(&store, &targets, vec![Err("fixture unavailable".into())]),
+            (false, 0)
+        );
+        assert_eq!(
+            publish_workspace_pr_batch(&store, &targets, vec![Ok(rows(11))]),
+            (true, 1)
+        );
+        assert_eq!(
+            publish_workspace_pr_batch(&store, &targets, vec![Ok(rows(11))]),
+            (false, 1)
+        );
+        assert_eq!(
+            publish_workspace_pr_batch(&store, &targets, vec![Ok(vec![])]),
+            (true, 1)
+        );
+        assert_eq!(
+            publish_workspace_pr_batch(&store, &targets, vec![Ok(vec![])]),
+            (false, 1)
+        );
+        assert!(store
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == id)
+            .unwrap()
+            .prs
+            .is_empty());
+    }
+
+    #[test]
+    fn actual_callers_capture_before_io_and_use_guarded_publication() {
+        let source = include_str!("lib.rs");
+        let source = &source[source.rfind("pub fn run() {").unwrap()..];
+        let poll = source
+            .split("let state: tauri::State<'_, state::AppStateStore> = pr_handle.state();")
+            .nth(1)
+            .unwrap();
+        let poll = poll
+            .split("if changed {\n                        // Coalesced")
+            .next()
+            .unwrap();
+        let poll: String = poll.chars().filter(|c| !c.is_whitespace()).collect();
+        let capture = poll
+            .find("letworkspaces=state.workspace_pr_poll_lookups();")
+            .unwrap();
+        assert!(capture < poll.find("spawn_blocking").unwrap());
+        assert!(poll.contains("publish_workspace_pr_batch(&state"));
+        assert!(poll.contains("state.publish_workspace_pr_lookup("));
+        assert!(!poll.contains("state.update_workspace_prs("));
+        let command = include_str!("commands/github.rs");
+        let refresh = command
+            .split("pub async fn refresh_workspace_pr<")
+            .nth(1)
+            .unwrap()
+            .split("/// List issues by repo path")
+            .next()
+            .unwrap();
+        assert!(refresh.contains("refresh_workspace_pr_with_lookup("));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     diagnostics::record_startup_milestone("startup.run-enter");
@@ -336,6 +517,21 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // Tauri may exit without dropping managed state. Close admission
+                // and await the owned OpenCode direct child before other cleanup.
+                if let Err(error) = tauri::async_runtime::block_on(
+                    app.state::<std::sync::Arc<
+                        crate::agent_provider::opencode::OpenCodeServerManager,
+                    >>()
+                    .shutdown(),
+                ) {
+                    eprintln!("[codemux::opencode] shutdown incomplete: {error}");
+                }
+                if let Err(error) = tauri::async_runtime::block_on(
+                    app.state::<commands::workflows::WorkflowState>().shutdown(),
+                ) {
+                    eprintln!("[codemux::workflows] shutdown incomplete: {error}");
+                }
                 if let Some(manager) = app.state::<commands::addons::AddonState>().existing() {
                     tauri::async_runtime::block_on(manager.shutdown());
                 }
@@ -417,6 +613,8 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(auth::AuthState::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
+        .manage(agent_control::NativeControlState::default())
+        .manage(commands::workflows::WorkflowState::open_default())
         // Per-thread live event channels for the chat pane: each
         // mounted pane attaches a tauri::ipc::Channel keyed by
         // thread_id; forward_event routes that thread's runtime
@@ -433,11 +631,15 @@ fn build_core_app<R: tauri::Runtime>(
         // forward_event → publish_pane_status. See agent_chat.rs.
         .manage(commands::agent_chat::SubagentTracker::default())
         .manage(commands::agent_chat::RunActivityTracker::default())
+        // Cross-provider delegation's in-memory task map. Managed here, not
+        // in the gated setup task, so its forward_event / stop hooks can
+        // always `try_state` it and return at once.
+        .manage(commands::delegation::DelegationState::default())
         // Step 12 Stage 2 — singleton supervisor for the lazily
         // spawned `opencode serve` child. `ensure_running()` is the
         // entry point used by `opencode_list_models`; the server is
-        // not spawned until the first call. Shutting Codemux down
-        // drops this state, which `kill_on_drop`-kills the child.
+        // not spawned until the first call. Normal GUI quit explicitly
+        // shuts this manager down in RunEvent::Exit; Drop is only a fallback.
         .manage(std::sync::Arc::new(
             crate::agent_provider::opencode::OpenCodeServerManager::new(),
         ))
@@ -497,6 +699,7 @@ fn build_core_app<R: tauri::Runtime>(
             database::DatabaseStore::new_in_memory()
         }))
         .manage(web_remote_state)
+        .manage(mcp_connector::McpConnectorState::default())
         // Reroute channel frames opened by a web-remote invoke to the
         // browser that opened them. Returns true only for server-allocated
         // channel ids (the router owns them); genuine desktop-webview
@@ -545,10 +748,9 @@ fn build_core_app<R: tauri::Runtime>(
     }
 
     builder
-        // Every finished page load re-applies the current smooth-scrolling
-        // preference, so windows created after `setup` (and any reload) get
-        // it without a separate window-created hook — each webview owns its
-        // own WebKitSettings object.
+        // Every finished page load configures precise wheel input and disables
+        // WebKit's native animation. New windows and reloads share the default
+        // app glide without a separate window-created hook.
         //
         // A finished load on the main window is also the app's first proof
         // that the webview came up, which clears the renderer crash sentinel
@@ -572,6 +774,25 @@ fn build_core_app<R: tauri::Runtime>(
         .setup(move |app| {
             commands::chatgpt::install(app.handle());
             diagnostics::record_startup_milestone("startup.setup-enter");
+            // Configuration and explicit connection probes remain available
+            // when chat is disabled. Constructing the aggregate starts no CLI.
+            let acp = std::sync::Arc::new(agent_provider::custom_acp::GenericAcpProvider::new(
+                std::sync::Arc::new(commands::custom_acp::AppAcpStore(app.handle().clone())),
+            ));
+            let mut catalogs = acp.catalog_updates();
+            let catalog_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    match catalogs.recv().await {
+                        Ok(update) => { let _ = catalog_handle.emit("custom_acp_catalog_changed", update); }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let _ = catalog_handle.emit("custom_acp_changed", ());
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+            app.manage(acp);
             // Reap chat-image staging files leaked by a crash or an
             // abandoned draft (best-effort, off the startup path).
             tauri::async_runtime::spawn(
@@ -771,12 +992,9 @@ fn build_core_app<R: tauri::Runtime>(
             // size, position, save, or float, so the whole block is skipped
             // there.
             if mode == AppMode::Gui {
-            // Turn WebKitGTK's smooth-scrolling animation off for every window
-            // that already exists. Its 200 ms eased retarget restarts on each
-            // high-resolution wheel event, so a fast flick scrolls *less* than
-            // a slow one (WebKit bug 258926). Windows created later pick the
-            // same setting up from the page-load hook, and the frontend can
-            // flip it at runtime via the `set_smooth_scrolling` command.
+            // Configure existing windows before wheel input starts. Later
+            // windows and reloads receive the same policy from the page-load
+            // hook; the frontend owns glides with native animation disabled.
             webview_tuning::refresh_all(&handle);
 
             // A dead or hung renderer leaves the window blank while the
@@ -1051,17 +1269,16 @@ fn build_core_app<R: tauri::Runtime>(
 
             control::spawn_control_server(app.handle().clone());
 
-            // Background host-upgrade poller. ~5s after app setup it
-            // walks every registered SSH host, version-checks its
+            // Startup pass of the device upgrader. ~5s after app setup
+            // it walks every registered device, version-checks its
             // codemux-remote against the one this build ships, and
-            // silently re-bootstraps any host that's behind. So when
-            // the user updates Codemux on the desktop, their hosts
-            // catch up on their own — no Test/Push click required.
-            // Safe to run on every app start: cheap when versions
-            // match (one SSH probe), idempotent re-provision on
-            // upgrade, never installs codemux-remote where it isn't
-            // already present (that still requires the Install
-            // button's consent).
+            // quietly upgrades any device that's behind. The inventory
+            // poller below repeats that whenever it sees an outdated
+            // device later (e.g. one that was offline now), so devices
+            // catch up with the desktop on their own. Never downgrades
+            // a newer device, never kills its terminals, never installs
+            // where codemux-remote isn't already present (that still
+            // takes the user's Connect / Set up again).
             #[cfg(unix)]
             crate::hosts_upgrade::spawn(app.handle().clone());
 
@@ -1077,6 +1294,11 @@ fn build_core_app<R: tauri::Runtime>(
             // keep their existing explicit push/pull.
             #[cfg(unix)]
             crate::hosts_inventory::spawn(app.handle().clone());
+
+            // Pull the account's device list once at startup so a freshly
+            // signed-in computer sees devices added elsewhere without
+            // editing one first. No-op when signed out.
+            crate::hosts_sync::spawn_startup_host_sync(app.handle().clone());
 
             // Resolve the bundled claude-agent sidecar and pin the path via
             // env var so the adapter (which has no AppHandle access at
@@ -1104,6 +1326,9 @@ fn build_core_app<R: tauri::Runtime>(
                     sidecar,
                 );
             }
+            if let Some(sidecar) = agent_provider::managed_bridge::resolve_sidecar(resource_dir.as_deref()) {
+                std::env::set_var(agent_provider::managed_bridge::SIDECAR_PATH_ENV, sidecar);
+            }
 
             // Agent-chat provider registry initialisation.
             //
@@ -1124,6 +1349,7 @@ fn build_core_app<R: tauri::Runtime>(
                     app.handle().state();
                 if observability.agent_chat_enabled() {
                     let registry_handle = app.handle().clone();
+                    let acp = app.state::<std::sync::Arc<agent_provider::custom_acp::GenericAcpProvider>>().inner().clone();
                     tauri::async_runtime::spawn(async move {
                         let registry: tauri::State<
                             '_,
@@ -1136,6 +1362,15 @@ fn build_core_app<R: tauri::Runtime>(
                         let mcp_registry: tauri::State<'_, mcp::registry::McpRegistry> =
                             registry_handle.state();
                         let mcp_registry = mcp_registry.inner().clone();
+
+                        // Delegated tasks the last run left open become
+                        // Stopped, and their children's usage resumes are
+                        // cancelled — before the resume scheduler's first
+                        // tick below can restart any of them.
+                        commands::delegation::drain_journal(&registry_handle);
+                        mcp_registry.set_host_tools(std::sync::Arc::new(
+                            commands::delegation::DelegationHost::new(registry_handle.clone()),
+                        ));
 
                         let mut claude_config =
                             agent_provider::claude::ClaudeProviderConfig::default();
@@ -1203,6 +1438,8 @@ fn build_core_app<R: tauri::Runtime>(
                         registry_handle.manage(hermes.clone());
                         registry.set_hermes(hermes).await;
 
+                        registry.set_acp(acp).await;
+
                         // OpenCode provider — Step 12 Stage 8. Shares
                         // the singleton OpenCodeServerManager held in
                         // Tauri-managed state (registered as
@@ -1252,6 +1489,9 @@ fn build_core_app<R: tauri::Runtime>(
                             registry_handle.clone(),
                         )
                         .await;
+                        // Delegation backstop: finalizes children whose turn
+                        // end was lost and retries due result deliveries.
+                        commands::delegation::spawn_sweep(registry_handle.clone());
                     });
                 }
             }
@@ -1839,11 +2079,10 @@ fn build_core_app<R: tauri::Runtime>(
             // workspace, so active and inactive rows share one cadence and one
             // preserve/write/clear decision matrix.
             //
-            // Sequential per tick on purpose — each branch PR query is a
-            // subprocess fork, and we'd rather take ~Nx longer than slam
-            // `gh` with N parallel children. Provider subprocess helpers own
-            // hard kill+reap deadlines; awaiting the blocking task itself
-            // prevents a timed-out task from overlapping the next workspace.
+            // Provider classification and auth stay sequential. GitHub siblings
+            // then share bounded lightweight branch batches; other providers use
+            // their existing per-workspace lookup. Await each blocking owner so
+            // a slow tick cannot overlap the next one.
             //
             // Skips a workspace whose provider CLI is missing or logged
             // out. The probe is per *instance* (product + host) rather
@@ -1884,7 +2123,7 @@ fn build_core_app<R: tauri::Runtime>(
                         std::collections::HashMap::new();
 
                     let state: tauri::State<'_, state::AppStateStore> = pr_handle.state();
-                    let workspaces = state.workspace_provider_poll_targets();
+                    let workspaces = state.workspace_pr_poll_lookups();
 
                     // `refreshed` counts workspaces this tick wrote to (the
                     // log's unit of work); `changed` is the narrower
@@ -1894,8 +2133,11 @@ fn build_core_app<R: tauri::Runtime>(
                     let mut refreshed = 0usize;
                     let mut skipped_unsupported = 0usize;
                     let mut skipped_unauthenticated = 0usize;
+                    let mut github_targets = Vec::new();
 
-                    for (workspace_id, cwd) in workspaces {
+                    for target in workspaces {
+                        let workspace_id = target.workspace_id.clone();
+                        let cwd = target.cwd.clone();
                         let path = std::path::PathBuf::from(&cwd);
 
                         // Classify from the local remote config, so a repo
@@ -1917,6 +2159,9 @@ fn build_core_app<R: tauri::Runtime>(
                             // not clear a last-known provider/PR pill.
                             Ok(Err(_)) | Err(_) => continue,
                         };
+                        if !github::workspace_pr_poll_target_is_current(
+                            &state.workspace_provider_poll_targets(), &workspace_id, &cwd,
+                        ) { continue; }
                         changed |= state.update_workspace_provider_kind(
                             &workspace_id,
                             git_provider::provider_kind_field(&detected),
@@ -1982,6 +2227,11 @@ fn build_core_app<R: tauri::Runtime>(
                             continue;
                         }
 
+                        if provider.kind() == git_provider::ProviderKind::GitHub {
+                            github_targets.push(target);
+                            continue;
+                        }
+
                         let path_for_pr = path.clone();
                         let provider_for_pr = provider.clone();
                         let queued_at = std::time::Instant::now();
@@ -1994,6 +2244,9 @@ fn build_core_app<R: tauri::Runtime>(
                         })
                         .await;
 
+                        if !github::workspace_pr_poll_target_is_current(
+                            &state.workspace_provider_poll_targets(), &workspace_id, &cwd,
+                        ) { continue; }
                         match pr_result {
                             Ok(lookup) => {
                                 if let Err(e) = &lookup {
@@ -2013,27 +2266,44 @@ fn build_core_app<R: tauri::Runtime>(
                                 // emits at most one snapshot per pass, so an
                                 // update that does not set the flag is an
                                 // update the renderer never hears about.
-                                match github::workspace_prs_outcome(lookup) {
-                                    github::WorkspacePrsOutcome::Write(prs) => {
-                                        changed |= state.update_workspace_prs(
-                                            &workspace_id,
-                                            workspace_pr_rows(prs),
-                                        );
-                                        refreshed += 1;
-                                    }
-                                    github::WorkspacePrsOutcome::Clear => {
-                                        changed |=
-                                            state.update_workspace_prs(&workspace_id, Vec::new());
-                                        refreshed += 1;
-                                    }
-                                    github::WorkspacePrsOutcome::Preserve => {}
+                                let outcome = github::workspace_prs_outcome(lookup);
+                                if !matches!(outcome, github::WorkspacePrsOutcome::Preserve) {
+                                    refreshed += 1;
                                 }
+                                changed |= state.publish_workspace_pr_lookup(&target, outcome);
                             }
                             Err(e) => {
                                 eprintln!(
                                     "[codemux::pr-poll] join error for {workspace_id}: {e}"
                                 );
                             }
+                        }
+                    }
+
+                    // GitHub siblings are resolved together after classification
+                    // and the per-instance auth gate. Other providers keep their
+                    // existing bounded per-workspace lookup.
+                    if !github_targets.is_empty() {
+                        let paths = github_targets
+                            .iter()
+                            .map(|target| std::path::PathBuf::from(&target.cwd))
+                            .collect::<Vec<_>>();
+                        let queued_at = std::time::Instant::now();
+                        let batch = tokio::task::spawn_blocking(move || {
+                            diagnostics::record_perf_timing("background.pr-poll.queue-delay", queued_at.elapsed());
+                            github::get_workspace_prs_batch(&paths)
+                        })
+                        .await;
+                        match batch {
+                            Ok(results) if results.len() == github_targets.len() => {
+                                let (batch_changed, batch_refreshed) = publish_workspace_pr_batch(&state, &github_targets, results);
+                                changed |= batch_changed;
+                                refreshed += batch_refreshed;
+                            }
+                            Ok(_) => {
+                                eprintln!("[codemux::pr-poll] invalid GitHub batch result count; preserving PRs")
+                            }
+                            Err(error) => eprintln!("[codemux::pr-poll] GitHub batch join error: {error}"),
                         }
                     }
 
@@ -2333,6 +2603,24 @@ fn build_core_app<R: tauri::Runtime>(
             commands::acknowledge_chatgpt_welcome,
             commands::get_local_workbench,
             commands::set_local_workbench,
+            commands::workflows::workflow_capabilities,
+            commands::workflows::workflow_list,
+            commands::workflows::workflow_get,
+            commands::workflows::workflow_create,
+            commands::workflows::workflow_script_execute,
+            commands::workflows::workflow_pause,
+            commands::workflows::workflow_resume,
+            commands::workflows::workflow_cancel,
+            commands::workflows::workflow_cancel_task,
+            commands::workflows::workflow_retry,
+            commands::workflows::workflow_reconcile,
+            commands::workflows::workflow_replace,
+            commands::workflows::workflow_retire,
+            commands::workflows::workflow_message,
+            commands::workflows::workflow_script_save,
+            commands::workflows::workflow_script_list,
+            commands::workflows::workflow_integrate_artifact,
+            commands::workflows::workflow_artifact_preview,
             commands::addons::addon_inventory,
             commands::addons::addon_import_review,
             commands::addons::addon_accept_review,
@@ -2422,7 +2710,6 @@ fn build_core_app<R: tauri::Runtime>(
             commands::resize_split,
             commands::resize_active_pane,
             commands::notify_attention,
-            commands::set_notification_sound_enabled,
             commands::set_ai_commit_message_enabled,
             commands::set_ai_commit_message_cli,
             commands::set_ai_commit_message_model,
@@ -2488,6 +2775,11 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_close_pane,
             commands::dev_agent_chat_spawn_test_pane,
             commands::agent_chat_start_session,
+            mcp_connector::agent_connector_status,
+            mcp_connector::agent_connector_set_config,
+            mcp_connector::agent_connector_approve,
+            mcp_connector::agent_connector_deny,
+            mcp_connector::agent_connector_revoke,
             commands::agent_chat_send_turn,
             commands::agent_chat_stage_image,
             commands::agent_chat_discard_staged_image,
@@ -2506,12 +2798,21 @@ fn build_core_app<R: tauri::Runtime>(
             commands::async_questions::agent_chat_question_attention,
             commands::agent_chat_set_model,
             commands::agent_chat_set_fast_mode,
+            commands::agent_chat_set_service_tier,
             commands::agent_chat_set_permission_mode,
             commands::list_chat_provider_capabilities,
             commands::hermes::hermes_profiles,
             commands::hermes::hermes_binding,
             commands::hermes::hermes_catalog,
             commands::hermes::hermes_disconnect,
+            commands::custom_acp::acp_agents,
+            commands::custom_acp::acp_save_agent,
+            commands::custom_acp::acp_delete_agent,
+            commands::custom_acp::acp_probe,
+            commands::custom_acp::acp_binding,
+            commands::custom_acp::acp_catalog,
+            commands::custom_acp::acp_thread_catalog,
+            commands::custom_acp::acp_set_config,
             commands::agent_chat_provider_health,
             commands::provider_updates::agent_chat_provider_update_check,
             commands::provider_updates::agent_chat_provider_update,
@@ -2538,6 +2839,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_restore_checkpoint,
             commands::agent_chat_list_turn_checkpoints,
             commands::agent_chat_revert_turn_checkpoint,
+            commands::agent_chat_undo_turn_revert,
             commands::attach_agent_chat_output,
             commands::detach_agent_chat_output,
             commands::opencode_check_availability,
@@ -2546,6 +2848,9 @@ fn build_core_app<R: tauri::Runtime>(
             commands::usage_summary,
             commands::usage_export_csv,
             commands::usage_scan_provider_history,
+            commands::usage_refresh_quota,
+            commands::usage_price_overrides,
+            commands::usage_set_price_override,
             commands::list_tool_permissions,
             commands::remove_tool_permission,
             commands::list_skills,
@@ -2565,6 +2870,7 @@ fn build_core_app<R: tauri::Runtime>(
             terminal::pause_pty_output,
             terminal::resume_pty_output,
             terminal::terminal_session_cwds,
+            terminal::terminal_foreground_jobs,
             terminal::write_to_pty,
             terminal::resize_pty,
             terminal::clear_agent_status,
@@ -2617,6 +2923,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::git_clone_repo,
             commands::check_claude_available,
             commands::generate_ai_commit_message,
+            commands::generate_ai_pr_description,
             commands::check_gh_available,
             commands::check_gh_status,
             commands::check_github_repo,
@@ -2661,6 +2968,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::refresh_workspace_pr,
             commands::suggest_issue_branch_name,
             commands::detect_package_manager,
+            commands::detect_run_candidates,
             commands::get_detected_ports,
             commands::kill_port,
             commands::get_presets,
@@ -2671,6 +2979,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::set_preset_bar_visible,
             commands::reorder_presets,
             commands::apply_preset,
+            commands::open_provider_login_terminal,
             commands::get_workspace_config,
             commands::has_codemuxinclude,
             commands::run_workspace_setup,
@@ -2679,6 +2988,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::search_in_files,
             commands::search_file_names,
             commands::file_exists,
+            commands::file_signature,
             commands::read_file,
             commands::write_file,
             commands::save_clipboard_image_bytes,
@@ -2690,6 +3000,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::signin_email,
             commands::signup_email,
             commands::forgot_password,
+            commands::resend_verification_email,
             commands::check_auth,
             commands::bootstrap_session,
             commands::refresh_session,
@@ -2713,6 +3024,9 @@ fn build_core_app<R: tauri::Runtime>(
             commands::hosts_test_connection,
             commands::hosts_bootstrap_install,
             commands::hosts_reinstall_remote,
+            commands::get_local_device_name,
+            commands::hosts_ssh_config_hosts,
+            commands::remote_workspace::create_workspace_on_host,
             commands::set_workspace_host,
             commands::workspace_push_to_host,
             commands::workspace_pull_back,
@@ -2760,11 +3074,10 @@ fn build_core_app<R: tauri::Runtime>(
             web_remote::web_remote_iroh_node_id,
             web_remote::web_remote_registration_status,
             web_remote::web_remote_retry,
-            // WebKitGTK smooth-scrolling toggle (Linux; no-op elsewhere).
-            webview_tuning::set_smooth_scrolling,
             // Which renderer this process ended up on, so the UI can drop
             // composited-only effects when running CPU-rendered.
             webview_tuning::get_renderer_mode,
+            webview_tuning::get_precise_wheel_available,
             // "Reload interface" in the command palette: reloads only the
             // main webview, like Ctrl+Alt+R and `codemux reload-ui`.
             webview_recovery::reload_interface,

@@ -1,19 +1,25 @@
 import { useMemo } from "react";
 import type { PermissionRequestItem } from "@/lib/agent-chat/types";
-import { QuestionForm, type Question } from "./QuestionForm";
+import { QuestionForm, type Question, type QuestionAnswer } from "./QuestionForm";
 
 export interface AskUserQuestionOutput {
   questions: unknown;
-  answers: Record<string, string>;
+  answers: Record<string, QuestionAnswer>;
 }
 
-/** Legacy callback wrapper: preserve each provider's existing answer shape. */
+/** What the agent is told when the user skips its question. */
+export const USER_INPUT_SKIPPED_MESSAGE =
+  "The user skipped this question and will answer in the chat instead. Stop and wait for their message.";
+
+/** Preserve structured selections until the provider's reply boundary. */
 export function ComposerPendingInputPanel({
   item,
   onSubmit,
+  onSkip,
 }: {
   item: PermissionRequestItem;
   onSubmit: (output: AskUserQuestionOutput) => void | Promise<void>;
+  onSkip?: () => void;
 }) {
   const questions = useMemo(
     () => extractQuestions(item.payload),
@@ -23,6 +29,7 @@ export function ComposerPendingInputPanel({
     <QuestionForm
       questions={questions}
       active={item.resolution.state === "pending"}
+      onSkip={onSkip}
       onSubmit={(answers) =>
         onSubmit({
           questions: isRecord(item.payload)

@@ -18,6 +18,21 @@ pub(super) async fn spawn_child(
     grant: Option<&ManagedGrant>,
     lease: Option<Arc<std::fs::File>>,
 ) -> Result<Arc<JsonRpcChild>, ProviderError> {
+    if let Some(remote) = spawn.remote.as_ref() {
+        #[cfg(unix)] {
+            let program = crate::ssh::sidecar::device_program(remote, &spawn.codex_binary).await?;
+            let config = crate::ssh::sidecar::device_spawn_config(remote, &program,
+                &["app-server".into()], &env, cwd, DEFAULT_RPC_TIMEOUT)?;
+            return JsonRpcChild::spawn(config).await.map(Arc::new)
+                .map_err(crate::ssh::sidecar::ssh_spawn_error);
+        }
+        #[cfg(not(unix))] {
+            let _ = remote;
+            return Err(ProviderError::ValidationError {
+                message: "Threads on another device need macOS or Linux on this computer".into(),
+            });
+        }
+    }
     let (args, env) = if let Some(grant) = grant {
         grant.launch(env)
     } else {
@@ -110,7 +125,7 @@ impl CodexSession {
     {
         Box::pin(async move {
             self.ensure_open().await?;
-            let Some(managed) = self.managed.as_ref() else {
+            let Some(managed) = self.chatgpt_runtime.as_ref() else {
                 return Ok(());
             };
             let lease = {
@@ -127,7 +142,7 @@ impl CodexSession {
             let grant = match managed.owner.usable().await {
                 Ok(Some(grant)) => grant,
                 result => {
-                    self.retire_managed_child().await;
+                    self.retire_managed_child().await?;
                     self.dead.store(true, Ordering::Release);
                     self.runtime_lease.lock().await.take();
                     return Err(ProviderError::NotAuthenticated {
@@ -145,7 +160,7 @@ impl CodexSession {
             {
                 return Ok(());
             }
-            let (thread, model, fast) = {
+            let (thread, model, service_tier) = {
                 let state = self.state.lock().await;
                 if state.active_turn.is_some() || !state.pending_approvals.is_empty() {
                     return Err(ProviderError::ValidationError {
@@ -157,20 +172,17 @@ impl CodexSession {
                 (
                     state.codex_thread_id.clone(),
                     state.model.clone(),
-                    state.fast_mode,
+                    state.service_tier.clone(),
                 )
             };
-            self.retire_managed_child().await;
+            self.retire_managed_child().await?;
             self.dead.store(true, Ordering::Release);
-            let child = match spawn_child(
-                &managed.spawn,
-                &self.cwd,
-                managed.env.clone(),
-                Some(&grant),
-                Some(lease),
-            )
-            .await
-            {
+            let spawned = if let Some(context) = self.managed.as_ref() {
+                spawn_managed_codex(&managed.spawn, &managed.env, &self.cwd, context, Some(&grant), Some(lease)).await
+            } else {
+                spawn_child(&managed.spawn, &self.cwd, managed.env.clone(), Some(&grant), Some(lease)).await
+            };
+            let child = match spawned {
                 Ok(child) => child,
                 Err(error) => {
                     self.runtime_lease.lock().await.take();
@@ -178,6 +190,7 @@ impl CodexSession {
                 }
             };
             let initialized: Result<(), ProviderError> = async {
+                if self.managed.is_none() {
                 child
                     .request(
                         "initialize",
@@ -198,33 +211,35 @@ impl CodexSession {
                         message: format!("Codex renewal initialized failed: {e}"),
                     }
                 })?;
+                }
                 let entries = read_model_catalog(&child)
                     .await
                     .map_err(|message| ProviderError::RpcError { message })?;
                 selected_model(&entries, model.as_deref())?;
+                let service_tier = resolve_catalog_service_tier(&entries, model.as_deref(), &service_tier);
                 let (approval_policy, sandbox) =
                     codex_permission_mode_to_policy_pair(managed.permission.as_deref())
                         .map(|(a, s)| (Some(a), Some(s)))
                         .unwrap_or((None, None));
-                let response = child
-                    .request(
-                        "thread/resume",
-                        serde_json::to_value(ThreadResumeParams {
+                let mut params = serde_json::to_value(ThreadResumeParams {
                             thread_id: thread.clone(),
                             model,
-                            service_tier: Some(fast.then(|| "fast".into())),
+                            service_tier: Some((service_tier != "default").then(|| service_tier.clone())),
                             cwd: Some(self.cwd.clone()),
                             collaboration_mode: None,
                             approval_policy,
                             sandbox,
                             experimental_raw_events: false,
-                        })
-                        .unwrap(),
-                    )
-                    .await
+                        }).unwrap();
+                if self.managed.is_some() { restrict_managed_codex_environment(&mut params); }
+                let response = child.request("thread/resume", params).await
                     .map_err(|e| ProviderError::RpcError {
                         message: format!("Codex renewal could not resume the original thread: {e}"),
                     })?;
+                if self.managed.is_some() {
+                    validate_managed_codex_thread(&response)
+                        .map_err(|message| ProviderError::ValidationError { message })?;
+                }
                 let resumed: ThreadStartResponse =
                     serde_json::from_value(response).map_err(|_| ProviderError::RpcError {
                         message: "Codex renewal returned an invalid thread".into(),
@@ -235,10 +250,13 @@ impl CodexSession {
                     });
                 }
                 *managed.models.lock().await = entries
-                    .into_iter()
+                    .iter()
                     .filter(|m| !m.hidden)
-                    .map(|m| m.id)
+                    .map(|m| m.id.clone())
                     .collect();
+                let mut state = self.state.lock().await;
+                state.tier_models = entries;
+                state.service_tier = service_tier;
                 Ok(())
             }
             .await;
@@ -284,7 +302,7 @@ impl CodexSession {
         })
     }
 
-    async fn retire_managed_child(&self) {
+    async fn retire_managed_child(&self) -> Result<(), ProviderError> {
         let _ = self.shutdown_tx.send(());
         let tasks = std::mem::take(&mut *self.tasks.lock().await);
         for task in &tasks {
@@ -293,6 +311,12 @@ impl CodexSession {
         for task in tasks {
             let _ = task.await;
         }
-        let _ = self.child().await.shutdown_owned().await;
+        let child = self.child().await;
+        let stopped = if self.managed.is_some() { child.shutdown_managed().await }
+            else { child.shutdown_owned().await };
+        stopped.map_err(|error| ProviderError::ProcessError {
+            message: "Codex child retirement could not be confirmed".into(),
+            source: Some(error.to_string()),
+        })
     }
 }

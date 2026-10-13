@@ -353,6 +353,13 @@ fn should_deliver(
     true
 }
 fn agent_event<R: Runtime>(app: &AppHandle<R>, source: &str, category: &'static str) {
+    // A delegated child's own finish is not news yet: the chat that started
+    // it reviews the report and notifies in turn. Its questions still do.
+    if matches!(category, "complete" | "failure")
+        && crate::commands::delegation::is_delegated_child(app, source)
+    {
+        return;
+    }
     if !should_deliver(
         &mut LAST_EVENT.get_or_init(Default::default).lock().unwrap(),
         source,

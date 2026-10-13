@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   Pin,
   PinOff,
@@ -22,12 +22,14 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { ShortcutTooltip } from "@/components/ui/tooltip";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { BAND_CONTROL_RADIUS } from "@/components/layout/titlebar-control-style";
 import { usePresetStore } from "@/hooks/use-preset-store";
 import { launchDraftWithPreset } from "@/lib/agent-chat/draft-preset-launch";
+import { draftHostId } from "@/lib/agent-chat/materialize";
 import { cn } from "@/lib/utils";
-import { toast } from "@/lib/toast";
+import { toast, reportFailure } from "@/lib/toast";
 import type { ChatDraft } from "@/stores/chat-draft-store";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { useUIStore } from "@/stores/ui-store";
@@ -287,6 +289,21 @@ function errorMessage(err: unknown): string {
 }
 
 /**
+ * Open the launcher when the `openLauncher` keybind fires. Only requests made
+ * after mount count, so switching workspaces (which remounts the launcher)
+ * never reopens it for an old press.
+ */
+function useLauncherOpenRequest(open: () => void, enabled: boolean) {
+  const request = useUIStore((s) => s.launcherOpenRequest);
+  const handled = useRef(request);
+  useEffect(() => {
+    if (request === handled.current) return;
+    handled.current = request;
+    if (enabled) open();
+  }, [request, enabled, open]);
+}
+
+/**
  * The `+` launcher popover in GUI chrome. Replaces the always-present
  * preset strip: every agent still launches from here (GUI chat presets +
  * CLI agents), plus Terminal / Browser panes and a "Manage presets"
@@ -307,6 +324,8 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
     shiftHeld.current = false;
     setOpen(next);
   };
+  // The mobile sheet's copy has no keyboard to answer to.
+  useLauncherOpenRequest(() => handleOpenChange(true), !mobile);
 
   const workspaceId = workspace.workspace_id;
 
@@ -346,7 +365,7 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
 
   const createTerminal = () => {
     setOpen(false);
-    createTab(workspaceId, "terminal").catch(console.error);
+    createTab(workspaceId, "terminal").catch(reportFailure("Couldn't open a terminal tab"));
   };
 
   const createBrowser = () => {
@@ -354,7 +373,7 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
     const surface = workspace.surfaces.find(
       (s) => s.surface_id === workspace.active_surface_id,
     );
-    if (surface) createBrowserPane(surface.active_pane_id).catch(console.error);
+    if (surface) createBrowserPane(surface.active_pane_id).catch(reportFailure("Couldn't open a browser pane"));
   };
 
   const managePresets = () => {
@@ -364,22 +383,24 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
 
   return (
     <Popover open={open} onOpenChange={handleOpenChange}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          aria-label="Launch an agent"
-          data-testid="agent-launcher-trigger"
-          className={cn(
-            "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
-            BAND_CONTROL_RADIUS,
-            open
-              ? "bg-accent text-foreground"
-              : "text-muted-foreground hover:bg-accent hover:text-foreground",
-          )}
-        >
-          <Plus className="size-4" />
-        </button>
-      </PopoverTrigger>
+      <ShortcutTooltip label="Launch an agent" shortcut="openLauncher">
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            aria-label="Launch an agent"
+            data-testid="agent-launcher-trigger"
+            className={cn(
+              "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
+              BAND_CONTROL_RADIUS,
+              open
+                ? "bg-accent text-foreground"
+                : "text-muted-foreground hover:bg-accent hover:text-foreground",
+            )}
+          >
+            <Plus className="size-4" />
+          </button>
+        </PopoverTrigger>
+      </ShortcutTooltip>
       <PopoverContent
         align="start"
         sideOffset={6}
@@ -504,7 +525,9 @@ interface DraftAgentLauncherProps {
  * would duplicate the chat being composed — picking a project via
  * Thread Scope makes it appear), and disabled while a materialise is
  * in flight so presets can't be swapped mid-flight. No Panes section
- * — there is no live surface to split or add tabs to yet.
+ * — there is no live surface to split or add tabs to yet. With a device
+ * picked, chat presets start on that device; CLI presets run in a local
+ * terminal, so they're disabled there.
  */
 export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
   const [open, setOpen] = useState(false);
@@ -515,9 +538,15 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
   const cliPresets = presets
     .filter((p) => p.kind === "cli")
     .sort((a, b) => Number(b.pinned) - Number(a.pinned));
+  const openForShortcut = useCallback(() => setOpen(true), []);
+  useLauncherOpenRequest(
+    openForShortcut,
+    draft.target.kind !== "home" && !draft.promoting,
+  );
 
   // Same gate as the legacy draft PresetBar (`isHomeDraft return null`).
   if (draft.target.kind === "home") return null;
+  const onDevice = draftHostId(draft) !== null;
 
   const launch = (preset: TerminalPreset) => {
     setOpen(false);
@@ -535,24 +564,26 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          aria-label="Launch an agent"
-          data-testid="draft-agent-launcher-trigger"
-          disabled={draft.promoting}
-          className={cn(
-            "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
-            BAND_CONTROL_RADIUS,
-            open
-              ? "bg-accent text-foreground"
-              : "text-muted-foreground hover:bg-accent hover:text-foreground",
-            draft.promoting && "opacity-40 pointer-events-none",
-          )}
-        >
-          <Plus className="size-4" />
-        </button>
-      </PopoverTrigger>
+      <ShortcutTooltip label="Launch an agent" shortcut="openLauncher">
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            aria-label="Launch an agent"
+            data-testid="draft-agent-launcher-trigger"
+            disabled={draft.promoting}
+            className={cn(
+              "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
+              BAND_CONTROL_RADIUS,
+              open
+                ? "bg-accent text-foreground"
+                : "text-muted-foreground hover:bg-accent hover:text-foreground",
+              draft.promoting && "opacity-40 pointer-events-none",
+            )}
+          >
+            <Plus className="size-4" />
+          </button>
+        </PopoverTrigger>
+      </ShortcutTooltip>
       <PopoverContent
         align="start"
         sideOffset={6}
@@ -596,6 +627,7 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
                     key={preset.id}
                     value={`cli ${preset.name}`}
                     onSelect={() => launch(preset)}
+                    disabled={onDevice}
                     data-testid={`draft-launcher-cli-${preset.id}`}
                     showCheckmark={false}
                     className={LAUNCHER_ITEM_CLASS}
@@ -603,7 +635,7 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
                     <PresetIcon icon={preset.icon} className="size-4" />
                     <span className="flex-1 truncate">{preset.name}</span>
                     <LauncherDestination presetId={`draft-${preset.id}`}>
-                      terminal
+                      {onDevice ? "local only" : "terminal"}
                     </LauncherDestination>
                   </CommandItem>
                 ))}

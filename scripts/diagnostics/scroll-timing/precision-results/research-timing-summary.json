@@ -1,0 +1,96 @@
+[
+  {
+    "profile": "short30",
+    "sample": [
+      {
+        "delta": 25.28786849975586,
+        "first_observed_movement_ms": 9,
+        "last_observed_movement_ms": 34,
+        "distinct_position_changes": 6
+      },
+      {
+        "delta": 119.4702377319336,
+        "first_observed_movement_ms": 16,
+        "last_observed_movement_ms": 196,
+        "distinct_position_changes": 37
+      },
+      {
+        "delta": 25.28786849975586,
+        "first_observed_movement_ms": 11,
+        "last_observed_movement_ms": 36,
+        "distinct_position_changes": 6
+      },
+      {
+        "delta": 25.28786849975586,
+        "first_observed_movement_ms": 11,
+        "last_observed_movement_ms": 36,
+        "distinct_position_changes": 6
+      },
+      {
+        "delta": 25.28786849975586,
+        "first_observed_movement_ms": 10.999999999999545,
+        "last_observed_movement_ms": 35.999999999999545,
+        "distinct_position_changes": 6
+      },
+      {
+        "delta": 25.28786849975586,
+        "first_observed_movement_ms": 11,
+        "last_observed_movement_ms": 36,
+        "distinct_position_changes": 6
+      },
+      {
+        "delta": 25.28786849975586,
+        "first_observed_movement_ms": 11,
+        "last_observed_movement_ms": 36,
+        "distinct_position_changes": 6
+      }
+    ]
+  },
+  {
+    "profile": "baseline200",
+    "sample": [
+      {
+        "delta": 25.28786849975586,
+        "first_observed_movement_ms": 32,
+        "last_observed_movement_ms": 197,
+        "distinct_position_changes": 25
+      },
+      {
+        "delta": 119.4702377319336,
+        "first_observed_movement_ms": 18,
+        "last_observed_movement_ms": 198,
+        "distinct_position_changes": 37
+      },
+      {
+        "delta": 25.28786849975586,
+        "first_observed_movement_ms": 28.999999999999545,
+        "last_observed_movement_ms": 48.999999999999545,
+        "distinct_position_changes": 3
+      },
+      {
+        "delta": 25.28786849975586,
+        "first_observed_movement_ms": 9,
+        "last_observed_movement_ms": 49,
+        "distinct_position_changes": 9
+      },
+      {
+        "delta": 25.28786849975586,
+        "first_observed_movement_ms": 4,
+        "last_observed_movement_ms": 49,
+        "distinct_position_changes": 10
+      },
+      {
+        "delta": 25.28786849975586,
+        "first_observed_movement_ms": 4,
+        "last_observed_movement_ms": 49,
+        "distinct_position_changes": 10
+      },
+      {
+        "delta": 25.28786849975586,
+        "first_observed_movement_ms": 4,
+        "last_observed_movement_ms": 199,
+        "distinct_position_changes": 38
+      }
+    ]
+  }
+]
