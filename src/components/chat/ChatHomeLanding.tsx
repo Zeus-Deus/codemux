@@ -1,5 +1,5 @@
 import { useRef, type ReactElement, type ReactNode } from "react";
-import { FolderOpen, GitBranch } from "lucide-react";
+import { ChevronDown, FolderOpen, GitBranch } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { MenuKeycap } from "@/components/ui/menu-chrome";
 import {
@@ -10,10 +10,12 @@ import {
 import { toast } from "@/lib/toast";
 import { useProjectActions } from "@/hooks/use-project-actions";
 import { useAppStore } from "@/stores/app-store";
+import { useProjectPickerHintStore } from "@/stores/project-picker-hint-store";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { AgentAvailabilityStrip } from "./AgentAvailabilityStrip";
 import { LocalSessionImportEntry } from "./LocalSessionImportEntry";
+import { ProjectPickerHint } from "./ProjectPickerHint";
 
 interface Props {
   composer: ReactNode;
@@ -69,38 +71,67 @@ export function ChatHomeLanding({
   // don't drop back to the document body.
   const focusNoProjectRef = useRef(false);
 
+  // Until the picker has been opened once, a dotted arrow points at it.
+  const hintSeen = useProjectPickerHintStore((s) => s.seen);
+  const markHintSeen = useProjectPickerHintStore((s) => s.markSeen);
+  const showHint = !!projectPicker && !hintSeen;
+
   let headline: ReactNode = "What should we do today?";
   let subline: ReactNode = null;
   if (projectName === null) {
     headline = "What should we work on?";
     if (projectPicker) {
-      subline = projectPicker(
-        <button
-          type="button"
-          ref={(el) => {
-            if (el && focusNoProjectRef.current) {
-              focusNoProjectRef.current = false;
-              el.focus();
-            }
-          }}
-          className="rounded-sm text-body-sm text-muted-foreground underline decoration-muted-foreground/50 decoration-dotted underline-offset-4 transition-colors duration-150 hover:text-foreground hover:decoration-foreground"
-        >
-          No project
-        </button>,
+      subline = (
+        <span className="relative inline-flex">
+          {projectPicker(
+            <button
+              type="button"
+              ref={(el) => {
+                if (el && focusNoProjectRef.current) {
+                  focusNoProjectRef.current = false;
+                  el.focus();
+                }
+              }}
+              onClick={markHintSeen}
+              className="inline-flex h-8 items-center gap-1.5 rounded-full border border-border/80 px-3 text-body text-muted-foreground transition-colors duration-150 hover:border-foreground/30 hover:bg-foreground/5 hover:text-foreground data-[state=open]:border-foreground/30 data-[state=open]:text-foreground"
+            >
+              <FolderOpen className="size-4" aria-hidden />
+              No project
+              <ChevronDown className="size-3.5 opacity-70" aria-hidden />
+            </button>,
+          )}
+          {showHint && <ProjectPickerHint placement="side" />}
+        </span>
       );
     }
   } else if (projectName !== undefined) {
     const name = (
       <button
         type="button"
-        className="rounded-sm underline decoration-muted-foreground/50 decoration-dotted decoration-2 underline-offset-[6px] transition-colors duration-150 hover:decoration-foreground"
+        onClick={markHintSeen}
+        className="group/project -ml-1 inline-flex items-baseline gap-0.5 rounded-lg pl-1 pr-0.5 transition-colors duration-150 hover:bg-foreground/5 data-[state=open]:bg-foreground/5"
       >
-        {projectName}
+        <span className="underline decoration-muted-foreground/50 decoration-dotted decoration-2 underline-offset-[6px] transition-colors duration-150 group-hover/project:decoration-foreground">
+          {projectName}
+        </span>
+        <ChevronDown
+          className="-mr-1.5 size-6 self-center text-muted-foreground transition-colors duration-150 group-hover/project:text-foreground"
+          aria-hidden
+        />
       </button>
     );
     headline = (
       <>
-        What should we build in {projectPicker ? projectPicker(name) : projectName}?
+        What should we build in{" "}
+        {projectPicker ? (
+          <span className="relative inline-block">
+            {projectPicker(name)}
+            {showHint && <ProjectPickerHint placement="below" />}
+          </span>
+        ) : (
+          projectName
+        )}
+        ?
       </>
     );
     if (onStartWithoutProject) {
@@ -123,7 +154,7 @@ export function ChatHomeLanding({
     // `my-auto` on the column centres it while it fits and lets it scroll
     // from the top in a short pane, where flex centring would clip the
     // headline off the top.
-    <div className="flex h-full w-full flex-col items-center overflow-y-auto">
+    <div className="@container flex h-full w-full flex-col items-center overflow-x-hidden overflow-y-auto">
       <div className="my-auto flex w-full flex-col items-center gap-8 pt-6 pb-12">
         <div className="flex flex-col items-center gap-2 px-4">
           <h1 className="text-3xl font-medium tracking-tight text-foreground text-center">
@@ -132,7 +163,7 @@ export function ChatHomeLanding({
           {/* Reserved on every project-scoped draft, so the heading stays
               put when the project is dropped or picked. */}
           {projectName !== undefined && (
-            <div className="flex h-6 items-center" data-testid="landing-subline">
+            <div className="flex h-8 items-center" data-testid="landing-subline">
               {subline}
             </div>
           )}
@@ -143,7 +174,9 @@ export function ChatHomeLanding({
           {/* The composer carries the shared column rails itself (see
               chat-column.ts), so the landing card lines up with the
               mid-conversation composer at every pane width. */}
-          <div className="flex w-full flex-col gap-2">
+          {/* No gap: the notice tucks under the composer card's top edge,
+              mirroring the scope strip under its bottom edge. */}
+          <div className="flex w-full flex-col">
             {notice}
             {composer}
           </div>

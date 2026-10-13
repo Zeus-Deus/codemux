@@ -30,6 +30,7 @@ import { ChatHomeLanding } from "./ChatHomeLanding";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
+import { useProjectPickerHintStore } from "@/stores/project-picker-hint-store";
 import { emptyHealthSlot, HEALTH_REPROBE_MS, useProviderHealth } from "@/stores/provider-health-store";
 import type { AgentChatProviderKind, ProviderHealthReport, AppStateSnapshot } from "@/tauri/types";
 afterEach(() => {
@@ -49,6 +50,7 @@ beforeEach(() => {
   toastErrorMock.mockReset();
   useFeatureFlags.setState({ enableAgentChat: true });
   useUIStore.setState({ showLocalSessionImport: false, localSessionImportOfferDismissed: false });
+  useProjectPickerHintStore.setState({ seen: false });
   delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
   openProjectMock.mockReset().mockResolvedValue({ success: false });
   openCloneDialogMock.mockReset();
@@ -130,7 +132,7 @@ describe("ChatHomeLanding", () => {
       />,
     );
     expect(screen.getByTestId("landing-subline").className).toBe(withProject);
-    expect(withProject).toContain("h-6");
+    expect(withProject).toContain("h-8");
     view.rerender(<ChatHomeLanding composer={<div />} />);
     expect(screen.queryByTestId("landing-subline")).toBeNull();
   });
@@ -155,6 +157,7 @@ describe("ChatHomeLanding", () => {
   });
 
   it("names the project through the picker and offers to drop it", () => {
+    useProjectPickerHintStore.setState({ seen: true });
     const onStartWithoutProject = vi.fn();
     const { container } = render(
       <ChatHomeLanding
@@ -173,6 +176,34 @@ describe("ChatHomeLanding", () => {
       screen.getByRole("button", { name: "or start without a project" }),
     );
     expect(onStartWithoutProject).toHaveBeenCalledTimes(1);
+  });
+
+  it("points at the picker until it has been opened once", () => {
+    const view = render(
+      <ChatHomeLanding
+        composer={<div />}
+        projectName="codemux"
+        projectPicker={(trigger) => trigger}
+      />,
+    );
+    expect(screen.getByTestId("project-picker-hint")).toHaveAttribute("aria-hidden");
+    fireEvent.click(screen.getByRole("button", { name: "codemux" }));
+    expect(screen.queryByTestId("project-picker-hint")).toBeNull();
+    expect(useProjectPickerHintStore.getState().seen).toBe(true);
+    // Stays gone on the no-project picker too.
+    view.rerender(
+      <ChatHomeLanding
+        composer={<div />}
+        projectName={null}
+        projectPicker={(trigger) => trigger}
+      />,
+    );
+    expect(screen.queryByTestId("project-picker-hint")).toBeNull();
+  });
+
+  it("shows no hint where there is no picker", () => {
+    render(<ChatHomeLanding composer={<div />} projectName="codemux" />);
+    expect(screen.queryByTestId("project-picker-hint")).toBeNull();
   });
 
   it("renders the composer passed via props", () => {
