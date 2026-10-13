@@ -314,7 +314,14 @@ impl JsonRpcChild {
         if isolated {
             cmd.env_clear();
             for key in ["HOME","USER","LOGNAME","PATH","SHELL","LANG","LC_ALL","LC_CTYPE","TERM","COLORTERM","TMPDIR","TMP","TEMP","XDG_RUNTIME_DIR","WAYLAND_DISPLAY","DISPLAY","DBUS_SESSION_BUS_ADDRESS"] {
-                if let Some(value)=std::env::var_os(key){cmd.env(key,value);}
+                if let Some(value) = std::env::var_os(key) {
+                    // Clearing the environment also cleared the AppImage fixups above.
+                    if key == "PATH" {
+                        cmd.env(key, crate::execution::sanitized_child_path());
+                    } else {
+                        cmd.env(key, value);
+                    }
+                }
             }
         }
         for (k, v) in &config.env {

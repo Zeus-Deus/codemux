@@ -27,6 +27,62 @@ fn config() -> SpawnConfig {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn isolated_spawn_keeps_appimage_path_sanitized() {
+    const PROBE: &str = "CODEMUX_RPC_APPIMAGE_PROBE";
+    if std::env::var_os(PROBE).is_none() {
+        // Keep the simulated AppImage environment out of parallel tests.
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "isolated_spawn_keeps_appimage_path_sanitized", "--nocapture"])
+            .env(PROBE, "1")
+            .env("APPDIR", "/tmp/codemux-test.AppDir")
+            .env("PATH", "/tmp/codemux-test.AppDir/usr/bin:/usr/local/bin:/usr/bin:/tmp/codemux-test.AppDir-extra/bin")
+            .env("LD_LIBRARY_PATH", "/tmp/codemux-test.AppDir/usr/lib:/opt/host/lib")
+            .output()
+            .expect("run isolated environment probe");
+        assert!(
+            output.status.success(),
+            "probe failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let child = JsonRpcChild::spawn_isolated(config()).await.expect("spawn");
+    let path = child
+        .request("read_env", json!({"key": "PATH"}))
+        .await
+        .expect("child PATH");
+    assert_eq!(
+        path,
+        json!("/usr/local/bin:/usr/bin:/tmp/codemux-test.AppDir-extra/bin")
+    );
+    for key in ["APPDIR", "LD_LIBRARY_PATH", PROBE] {
+        let value = child
+            .request("read_env", json!({"key": key}))
+            .await
+            .expect("child environment");
+        assert_eq!(value, Value::Null, "isolated child inherited {key}");
+    }
+    child.shutdown().await.expect("shutdown");
+
+    let mut overlay = config();
+    overlay
+        .env
+        .insert("PATH".into(), "/opt/explicit-host/bin".into());
+    let child = JsonRpcChild::spawn_isolated(overlay)
+        .await
+        .expect("spawn with overlay");
+    let path = child
+        .request("read_env", json!({"key": "PATH"}))
+        .await
+        .expect("explicit PATH");
+    assert_eq!(path, json!("/opt/explicit-host/bin"));
+    child.shutdown().await.expect("shutdown overlay");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_and_request_echo() {
     let child = JsonRpcChild::spawn(config()).await.expect("spawn");
