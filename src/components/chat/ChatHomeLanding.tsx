@@ -10,10 +10,20 @@ import {
 import { toast } from "@/lib/toast";
 import { useProjectActions } from "@/hooks/use-project-actions";
 import { useAppStore } from "@/stores/app-store";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
+import type { AgentChatProviderKind } from "@/tauri/types";
+import { AgentAvailabilityStrip } from "./AgentAvailabilityStrip";
 import { LocalSessionImportEntry } from "./LocalSessionImportEntry";
 
 interface Props {
   composer: ReactNode;
+  /** The composer's provider and how to switch it. Given only by the
+   *  draft surface; with it, a first run (no workspaces yet) shows which
+   *  agents are installed and signed in on this machine. */
+  agents?: {
+    selected: AgentChatProviderKind;
+    onSelect: (provider: AgentChatProviderKind) => void;
+  };
   /** Optional line above the composer (e.g. the Full access notice). */
   notice?: ReactNode;
   /** A project was opened from the zero-project actions below. */
@@ -44,6 +54,7 @@ interface Props {
  */
 export function ChatHomeLanding({
   composer,
+  agents,
   notice,
   onProjectOpened,
   projectName,
@@ -140,6 +151,9 @@ export function ChatHomeLanding({
             <FirstProjectActions onProjectOpened={onProjectOpened} />
           )}
         </div>
+        {agents && noWorkspaces && !isRemoteClient() && (
+          <AgentAvailabilityStrip selected={agents.selected} onSelect={agents.onSelect} />
+        )}
         <LocalSessionImportEntry firstRun />
       </div>
     </div>
