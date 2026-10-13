@@ -257,7 +257,8 @@ function VirtualRows({
   const rowHeight = 36;
   const start = Math.max(0, Math.floor(top / rowHeight) - 2);
   const end = Math.min(rows.length, start + 14);
-  // Spacer changes must not let browser anchoring undo the requested offset.
+  // Keep the total scroll extent fixed while the mounted row window changes.
+  // Otherwise an intermediate layout can clamp the browser back to the top.
   return (
     <div
       tabIndex={0}
@@ -296,29 +297,34 @@ function VirtualRows({
           ))}
         </div>
       )}
-      <div style={{ height: start * rowHeight }} aria-hidden />
-      {rows.slice(start, end).map((row, index) => (
-        <div
-          key={start + index}
-          role={headers ? "row" : "listitem"}
-          aria-rowindex={headers ? start + index + 2 : undefined}
-          aria-setsize={headers ? undefined : rows.length}
-          aria-posinset={headers ? undefined : start + index + 1}
-          className="flex h-9 items-center border-b text-label"
-        >
-          {row.map((cell, i) => (
-            <span
-              key={i}
-              role={headers ? "cell" : undefined}
-              className="min-w-0 flex-1 truncate px-2"
-              title={cell}
-            >
-              {cell}
-            </span>
-          ))}
-        </div>
-      ))}
-      <div style={{ height: (rows.length - end) * rowHeight }} aria-hidden />
+      <div
+        role={headers ? "rowgroup" : undefined}
+        className="relative"
+        style={{ height: rows.length * rowHeight }}
+      >
+        {rows.slice(start, end).map((row, index) => (
+          <div
+            key={start + index}
+            role={headers ? "row" : "listitem"}
+            aria-rowindex={headers ? start + index + 2 : undefined}
+            aria-setsize={headers ? undefined : rows.length}
+            aria-posinset={headers ? undefined : start + index + 1}
+            className="absolute inset-x-0 flex items-center border-b text-label"
+            style={{ top: (start + index) * rowHeight, height: rowHeight }}
+          >
+            {row.map((cell, i) => (
+              <span
+                key={i}
+                role={headers ? "cell" : undefined}
+                className="min-w-0 flex-1 truncate px-2"
+                title={cell}
+              >
+                {cell}
+              </span>
+            ))}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
