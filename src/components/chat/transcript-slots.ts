@@ -353,7 +353,7 @@ function buildPresentationEntries(
     if (segmentIndex === activeIndex) {
       for (let i = segment.items.length - 1; i >= 0; i--) {
         const item = segment.items[i];
-        if (item.kind === "turn_ended") continue;
+        if (item.kind === "turn_ended" || item.kind === "remote_task") continue;
         if (isWorkEntry(item)) workingEntryId = item.id;
         break;
       }
@@ -449,6 +449,13 @@ export function buildTranscriptSlots(
   // any other visible row end it.
   let run: WorkEntry[] = [];
   let runRevealed = false;
+  // App receipts anchored inside a run remain independent rows just after
+  // that run. They never settle/split provider work or own its disclosure.
+  let runReceipts: SlotBody[] = [];
+  const flushReceipts = () => {
+    bodies.push(...runReceipts);
+    runReceipts = [];
+  };
   let runTurnLive = false;
   const flush = () => {
     if (run.length === 0) return;
@@ -467,6 +474,7 @@ export function buildTranscriptSlots(
     ) {
       run = [];
       runRevealed = false;
+      flushReceipts();
       runTurnLive = false;
       return;
     }
@@ -485,6 +493,7 @@ export function buildTranscriptSlots(
     }
     run = [];
     runRevealed = false;
+    flushReceipts();
     runTurnLive = false;
   };
 
@@ -529,6 +538,10 @@ export function buildTranscriptSlots(
       run.push(item);
       if (entry.revealed) runRevealed = true;
       if (entry.turnLive) runTurnLive = true;
+      continue;
+    }
+    if (item.kind === "remote_task" && run.length > 0) {
+      runReceipts.push({ kind: "item", item });
       continue;
     }
     flush();

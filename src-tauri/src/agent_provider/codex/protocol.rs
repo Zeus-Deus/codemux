@@ -311,7 +311,19 @@ pub struct TurnStartResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TurnInfo {
     /// Turn identifier assigned by Codex.
+    #[serde(deserialize_with = "nonempty_turn_id")]
     pub id: String,
+}
+
+fn nonempty_turn_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let id = String::deserialize(deserializer)?;
+    if id.is_empty() {
+        return Err(serde::de::Error::custom(
+            "native turn acknowledgement has an empty identifier",
+        ));
+    }
+    // Provider identifiers are opaque: validate, never trim or repair.
+    Ok(id)
 }
 
 /// Parameters for `turn/interrupt`.

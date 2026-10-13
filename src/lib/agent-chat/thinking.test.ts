@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { shouldShowThinkingIndicator } from "./thinking";
+import { taskFixture } from "@/lib/delegation.test-fixtures";
 import type {
   AssistantMessageItem,
   ChatViewItem,
@@ -84,6 +85,15 @@ function reasoning(seq: number, streaming: boolean): ReasoningItem {
 }
 
 describe("shouldShowThinkingIndicator", () => {
+  it("keeps the parent heartbeat independent from a remote receipt's lifecycle", () => {
+    for (const status of ["running", "completed"] as const) {
+      const remote: ChatViewItem = { kind: "remote_task", id: "remote:t", seq: 2, task: taskFixture({ status }) };
+      expect(shouldShowThinkingIndicator([userMsg(0), remote], true)).toBe(true);
+      expect(shouldShowThinkingIndicator([userMsg(0), remote], false)).toBe(false);
+      expect(shouldShowThinkingIndicator([assistantMsg(1, true, "Working"), remote], true)).toBe(false);
+    }
+  });
+
   it("is false when not streaming", () => {
     expect(shouldShowThinkingIndicator([userMsg(0)], false)).toBe(false);
   });

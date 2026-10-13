@@ -52,7 +52,7 @@ fn start(thread_id: ThreadId, cwd: &std::path::Path) -> StartSessionInput {
 fn send(thread_id: ThreadId) -> SendTurnInput {
     SendTurnInput { thread_id, text: "Fixture only".into(), display_text: None, images: vec![],
         skill_invocations: vec![], model_override: None, effort_override: None,
-        permission_mode_override: None, client_nonce: None, turn_checkpoint: None }
+        permission_mode_override: None, client_nonce: None, turn_checkpoint: None, dispatch_guard: None }
 }
 
 async fn spawn(mode: &str, captured: Arc<Captured>) -> Result<(Arc<ManagedBridgeSession>, broadcast::Receiver<ProviderRuntimeEvent>), codemux_lib::agent_provider::ProviderError> {

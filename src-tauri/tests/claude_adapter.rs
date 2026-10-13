@@ -31,8 +31,8 @@ use codemux_lib::agent_provider::claude::{
     ClaudeAgentProvider, ClaudeProviderConfig,
 };
 use codemux_lib::agent_provider::{
-    AgentProvider, ApprovalDecision, ProviderError, ProviderRuntimeEvent, RequestId,
-    SendTurnInput, SessionStatus, StartSessionInput, SubagentStatus, ThreadId, TurnId, TurnStatus,
+    AgentProvider, ApprovalDecision, ProviderError, ProviderRuntimeEvent, RequestId, SendTurnInput,
+    SessionStatus, StartSessionInput, SubagentStatus, ThreadId, TurnId, TurnStatus,
 };
 
 fn fake_sidecar() -> PathBuf {
@@ -42,7 +42,11 @@ fn fake_sidecar() -> PathBuf {
 fn try_real_sidecar_binary() -> Option<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let triple = current_target_triple();
-    let ext = if triple.contains("windows") { ".exe" } else { "" };
+    let ext = if triple.contains("windows") {
+        ".exe"
+    } else {
+        ""
+    };
     let candidate = manifest
         .join("binaries")
         .join(format!("codemux-claude-sidecar-{triple}{ext}"));
@@ -276,12 +280,13 @@ async fn consecutive_turns_stamp_distinct_turn_ids_on_content_deltas() {
             }
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
-    provider.start_session(start_input("t-stamp")).await.unwrap();
+    provider
+        .start_session(start_input("t-stamp"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
 
     // Turn 1
@@ -297,6 +302,7 @@ async fn consecutive_turns_stamp_distinct_turn_ids_on_content_deltas() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap()
@@ -334,6 +340,7 @@ async fn consecutive_turns_stamp_distinct_turn_ids_on_content_deltas() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap()
@@ -359,12 +366,12 @@ async fn consecutive_turns_stamp_distinct_turn_ids_on_content_deltas() {
         Some(&turn2),
         "second turn's delta should carry a fresh send_turn turn_id"
     );
-    assert_ne!(delta1_turn, delta2_turn, "turn ids must differ across turns");
+    assert_ne!(
+        delta1_turn, delta2_turn,
+        "turn ids must differ across turns"
+    );
 
-    provider
-        .stop_session(ThreadId("t-stamp".into()))
-        .await
-        .ok();
+    provider.stop_session(ThreadId("t-stamp".into())).await.ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -392,6 +399,7 @@ async fn send_turn_emits_session_state_changed_running_with_matching_turn_id() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -432,10 +440,8 @@ async fn sdk_session_id_notification_is_translated_into_resume_cursor_updated() 
             }
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     let mut stream = provider.event_stream();
     provider
@@ -446,10 +452,7 @@ async fn sdk_session_id_notification_is_translated_into_resume_cursor_updated() 
     let mut saw_cursor = false;
     let _ = timeout(Duration::from_secs(3), async {
         while let Some(ev) = stream.next().await {
-            if let ProviderRuntimeEvent::ResumeCursorUpdated {
-                resume_cursor, ..
-            } = &ev
-            {
+            if let ProviderRuntimeEvent::ResumeCursorUpdated { resume_cursor, .. } = &ev {
                 let resume = resume_cursor.get("resume").and_then(|v| v.as_str());
                 assert_eq!(resume, Some("deadbeef-1234-5678-90ab-cdef12345678"));
                 saw_cursor = true;
@@ -483,10 +486,8 @@ async fn resume_fallback_notification_clears_cursor_and_warns() {
             }
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     let mut stream = provider.event_stream();
     provider
@@ -529,10 +530,7 @@ async fn resume_fallback_notification_clears_cursor_and_warns() {
 async fn interrupt_emits_session_state_changed_ready() {
     let wrapper = wrapper_with_env(&[]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
-    provider
-        .start_session(start_input("t-int"))
-        .await
-        .unwrap();
+    provider.start_session(start_input("t-int")).await.unwrap();
     let returned_turn = provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-int".into()),
@@ -545,12 +543,16 @@ async fn interrupt_emits_session_state_changed_ready() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
     let mut stream = provider.event_stream();
     provider
-        .interrupt_turn(ThreadId("t-int".into()), Some(returned_turn.turn_id.clone()))
+        .interrupt_turn(
+            ThreadId("t-int".into()),
+            Some(returned_turn.turn_id.clone()),
+        )
         .await
         .unwrap();
     let mut saw_ready = false;
@@ -623,10 +625,8 @@ async fn send_turn_three_times_in_a_row_succeeds_without_validation_error() {
             }
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     provider.start_session(start_input("t-3x")).await.unwrap();
     let mut stream = provider.event_stream();
@@ -644,6 +644,7 @@ async fn send_turn_three_times_in_a_row_succeeds_without_validation_error() {
                 display_text: None,
                 skill_invocations: vec![],
                 turn_checkpoint: None,
+                dispatch_guard: None,
             })
             .await
             .unwrap_or_else(|e| {
@@ -708,10 +709,8 @@ async fn send_turn_emits_content_deltas_then_item_completed_then_turn_completed(
             }
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     provider.start_session(start_input("t-seq")).await.unwrap();
     let mut stream = provider.event_stream();
@@ -727,6 +726,7 @@ async fn send_turn_emits_content_deltas_then_item_completed_then_turn_completed(
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -764,10 +764,8 @@ async fn unknown_notification_surfaces_as_runtime_warning() {
             "params": {"interesting": "data"}
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     provider.start_session(start_input("t-unk")).await.unwrap();
     let mut stream = provider.event_stream();
@@ -783,6 +781,7 @@ async fn unknown_notification_surfaces_as_runtime_warning() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -814,12 +813,13 @@ async fn unknown_sdk_message_variant_surfaces_as_runtime_warning() {
             }
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
-    provider.start_session(start_input("t-sdk-unk")).await.unwrap();
+    provider
+        .start_session(start_input("t-sdk-unk"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -833,6 +833,7 @@ async fn unknown_sdk_message_variant_surfaces_as_runtime_warning() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -849,7 +850,10 @@ async fn unknown_sdk_message_variant_surfaces_as_runtime_warning() {
     })
     .await;
     assert!(saw);
-    provider.stop_session(ThreadId("t-sdk-unk".into())).await.ok();
+    provider
+        .stop_session(ThreadId("t-sdk-unk".into()))
+        .await
+        .ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -867,10 +871,8 @@ async fn request_opened_for_command_tool_routes_to_request_opened_event() {
             }
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     provider.start_session(start_input("t-req")).await.unwrap();
     let mut stream = provider.event_stream();
@@ -886,6 +888,7 @@ async fn request_opened_for_command_tool_routes_to_request_opened_event() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -931,7 +934,9 @@ async fn respond_to_request_deny_forwards_to_sidecar() {
         .respond_to_request(
             ThreadId("t-deny".into()),
             RequestId("r-deny".into()),
-            ApprovalDecision::Deny { message: "no".into() },
+            ApprovalDecision::Deny {
+                message: "no".into(),
+            },
         )
         .await
         .unwrap();
@@ -955,6 +960,7 @@ async fn interrupt_turn_sends_interrupt_rpc() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -981,6 +987,7 @@ async fn interrupt_turn_with_wrong_turn_id_fails_validation() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1033,18 +1040,27 @@ async fn set_permission_mode_bypass_is_accepted() {
     // just forwards the mode string; the sidecar and SDK decide
     // whether the bypass requires a companion flag.
     let provider = provider_with_fake().await;
-    provider.start_session(start_input("t-bypass")).await.unwrap();
+    provider
+        .start_session(start_input("t-bypass"))
+        .await
+        .unwrap();
     provider
         .set_permission_mode(ThreadId("t-bypass".into()), "bypassPermissions".into())
         .await
         .unwrap();
-    provider.stop_session(ThreadId("t-bypass".into())).await.ok();
+    provider
+        .stop_session(ThreadId("t-bypass".into()))
+        .await
+        .ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_session_shuts_down_sidecar_and_removes_from_list() {
     let provider = provider_with_fake().await;
-    provider.start_session(start_input("t-close")).await.unwrap();
+    provider
+        .start_session(start_input("t-close"))
+        .await
+        .unwrap();
     assert_eq!(provider.list_sessions().await.unwrap().len(), 1);
     provider
         .stop_session(ThreadId("t-close".into()))
@@ -1057,7 +1073,10 @@ async fn stop_session_shuts_down_sidecar_and_removes_from_list() {
 async fn stop_session_is_idempotent() {
     let provider = provider_with_fake().await;
     provider.start_session(start_input("t-idem")).await.unwrap();
-    provider.stop_session(ThreadId("t-idem".into())).await.unwrap();
+    provider
+        .stop_session(ThreadId("t-idem".into()))
+        .await
+        .unwrap();
     let err = provider
         .stop_session(ThreadId("t-idem".into()))
         .await
@@ -1080,6 +1099,7 @@ async fn send_turn_on_nonexistent_thread_returns_session_not_found() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap_err();
@@ -1090,7 +1110,10 @@ async fn send_turn_on_nonexistent_thread_returns_session_not_found() {
 async fn duplicate_start_session_returns_validation_error() {
     let provider = provider_with_fake().await;
     provider.start_session(start_input("t-dup")).await.unwrap();
-    let err = provider.start_session(start_input("t-dup")).await.unwrap_err();
+    let err = provider
+        .start_session(start_input("t-dup"))
+        .await
+        .unwrap_err();
     assert!(matches!(err, ProviderError::ValidationError { .. }));
     provider.stop_session(ThreadId("t-dup".into())).await.ok();
 }
@@ -1115,6 +1138,7 @@ async fn concurrent_send_turn_queues_instead_of_erroring() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1132,6 +1156,7 @@ async fn concurrent_send_turn_queues_instead_of_erroring() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1190,10 +1215,8 @@ async fn queued_turns_dispatch_fifo_on_completion() {
             "type": "result", "subtype": "success", "turn_id": "r3",
             "duration_ms": 1, "num_turns": 1 } } }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     provider.start_session(start_input("t-fifo")).await.unwrap();
     let mut stream = provider.event_stream();
@@ -1211,6 +1234,7 @@ async fn queued_turns_dispatch_fifo_on_completion() {
                 display_text: None,
                 skill_invocations: vec![],
                 turn_checkpoint: None,
+                dispatch_guard: None,
             })
             .await
             .unwrap();
@@ -1259,6 +1283,7 @@ async fn cancel_queued_turn_removes_it() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1274,6 +1299,7 @@ async fn cancel_queued_turn_removes_it() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap()
@@ -1317,7 +1343,10 @@ async fn cancel_queued_turn_removes_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closing_session_cancels_queued_turns() {
     let provider = provider_with_fake().await;
-    provider.start_session(start_input("t-close")).await.unwrap();
+    provider
+        .start_session(start_input("t-close"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -1331,6 +1360,7 @@ async fn closing_session_cancels_queued_turns() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1346,6 +1376,7 @@ async fn closing_session_cancels_queued_turns() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap()
@@ -1393,12 +1424,12 @@ async fn multiple_concurrent_sessions_are_isolated() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sidecar_exit_mid_session_emits_error_state() {
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_EXIT_AFTER",
-        "send-turn",
-    )]);
+    let wrapper = wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_EXIT_AFTER", "send-turn")]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
-    provider.start_session(start_input("t-crash")).await.unwrap();
+    provider
+        .start_session(start_input("t-crash"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     // send-turn is answered, then the fixture exits. The Ok is guaranteed
     // by JsonRpcChild's exit-drain: the fixture writes the response BEFORE
@@ -1418,6 +1449,7 @@ async fn sidecar_exit_mid_session_emits_error_state() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .expect("send_turn must succeed: the response is written before the exit");
@@ -1466,8 +1498,14 @@ async fn dead_sidecar_is_evicted_and_start_session_rebuilds() {
     let wrapper = wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_EXIT_AFTER", "send-turn")]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     let thread = ThreadId("t-evict".into());
-    provider.start_session(start_input("t-evict")).await.unwrap();
-    assert!(provider.has_session(&thread).await, "session live after start");
+    provider
+        .start_session(start_input("t-evict"))
+        .await
+        .unwrap();
+    assert!(
+        provider.has_session(&thread).await,
+        "session live after start"
+    );
     // Deterministically Ok — the fixture answers send-turn before exiting
     // and JsonRpcChild's exit-drain routes that response (see
     // `sidecar_exit_mid_session_emits_error_state`).
@@ -1483,6 +1521,7 @@ async fn dead_sidecar_is_evicted_and_start_session_rebuilds() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .expect("send_turn must succeed: the response is written before the exit");
@@ -1534,10 +1573,8 @@ async fn turn_active_true_in_flight_then_false_after_settle() {
             }
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     provider.start_session(start_input("t-ta")).await.unwrap();
     assert!(
@@ -1556,6 +1593,7 @@ async fn turn_active_true_in_flight_then_false_after_settle() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1574,7 +1612,10 @@ async fn turn_active_true_in_flight_then_false_after_settle() {
         }
     })
     .await;
-    assert!(settled.is_ok(), "turn_active must return to false after settle");
+    assert!(
+        settled.is_ok(),
+        "turn_active must return to false after settle"
+    );
     assert!(
         provider.has_session(&ThreadId("t-ta".into())).await,
         "session stays live across the turn boundary"
@@ -1625,13 +1666,14 @@ async fn sdk_initiated_question_keeps_turn_active_and_queues_follow_ups() {
             }
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     let thread = ThreadId("t-auto-q".into());
-    provider.start_session(start_input("t-auto-q")).await.unwrap();
+    provider
+        .start_session(start_input("t-auto-q"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     let send = |text: &str| SendTurnInput {
         thread_id: thread.clone(),
@@ -1644,6 +1686,7 @@ async fn sdk_initiated_question_keeps_turn_active_and_queues_follow_ups() {
         display_text: None,
         skill_invocations: vec![],
         turn_checkpoint: None,
+        dispatch_guard: None,
     };
     provider.send_turn(send("first")).await.unwrap();
 
@@ -1704,7 +1747,10 @@ async fn turn_active_false_when_session_dead() {
     let wrapper = wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_EXIT_AFTER", "send-turn")]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     let thread = ThreadId("t-ta-dead".into());
-    provider.start_session(start_input("t-ta-dead")).await.unwrap();
+    provider
+        .start_session(start_input("t-ta-dead"))
+        .await
+        .unwrap();
     provider
         .send_turn(SendTurnInput {
             thread_id: thread.clone(),
@@ -1717,6 +1763,7 @@ async fn turn_active_false_when_session_dead() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .expect("send_turn must succeed: the response is written before the exit");
@@ -1747,12 +1794,13 @@ async fn session_ended_with_iteration_complete_emits_turn_completed_success() {
             "params": {"threadId": "t-end-ok", "reason": "iteration-complete"}
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
-    provider.start_session(start_input("t-end-ok")).await.unwrap();
+    provider
+        .start_session(start_input("t-end-ok"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -1766,6 +1814,7 @@ async fn session_ended_with_iteration_complete_emits_turn_completed_success() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1786,7 +1835,10 @@ async fn session_ended_with_iteration_complete_emits_turn_completed_success() {
     })
     .await;
     assert!(saw);
-    provider.stop_session(ThreadId("t-end-ok".into())).await.ok();
+    provider
+        .stop_session(ThreadId("t-end-ok".into()))
+        .await
+        .ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1798,12 +1850,13 @@ async fn session_ended_with_interrupted_emits_turn_error_interrupted() {
             "params": {"threadId": "t-end-int", "reason": "interrupted"}
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
-    provider.start_session(start_input("t-end-int")).await.unwrap();
+    provider
+        .start_session(start_input("t-end-int"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -1817,6 +1870,7 @@ async fn session_ended_with_interrupted_emits_turn_error_interrupted() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1833,7 +1887,10 @@ async fn session_ended_with_interrupted_emits_turn_error_interrupted() {
     })
     .await;
     assert!(saw);
-    provider.stop_session(ThreadId("t-end-int".into())).await.ok();
+    provider
+        .stop_session(ThreadId("t-end-int".into()))
+        .await
+        .ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1848,10 +1905,8 @@ async fn session_error_emits_session_state_changed_plus_warning() {
             }
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     provider.start_session(start_input("t-err")).await.unwrap();
     let mut stream = provider.event_stream();
@@ -1867,6 +1922,7 @@ async fn session_error_emits_session_state_changed_plus_warning() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1909,7 +1965,9 @@ async fn respond_to_unknown_request_id_returns_request_not_pending() {
         .respond_to_request(
             ThreadId("t-unkr".into()),
             RequestId("unknown-request".into()),
-            ApprovalDecision::Deny { message: "n".into() },
+            ApprovalDecision::Deny {
+                message: "n".into(),
+            },
         )
         .await
         .unwrap_err();
@@ -1958,12 +2016,13 @@ async fn event_ordering_across_rapid_bursts() {
         }));
     }
     let script = write_script(serde_json::Value::Array(entries));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
-    provider.start_session(start_input("t-burst")).await.unwrap();
+    provider
+        .start_session(start_input("t-burst"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -1977,6 +2036,7 @@ async fn event_ordering_across_rapid_bursts() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1985,8 +2045,7 @@ async fn event_ordering_across_rapid_bursts() {
     let _ = timeout(Duration::from_secs(5), async {
         while let Some(ev) = stream.next().await {
             if let ProviderRuntimeEvent::ContentDelta {
-                delta:
-                    codemux_lib::agent_provider::ContentDelta::Text { text },
+                delta: codemux_lib::agent_provider::ContentDelta::Text { text },
                 ..
             } = &ev
             {
@@ -2093,10 +2152,8 @@ async fn subagent_lifecycle_launch_progress_completion_flows_through_adapter() {
             }
         }
     ]));
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CLAUDE_SIDECAR_SCRIPT",
-        &script.path.to_string_lossy(),
-    )]);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     provider.start_session(start_input("t-sub")).await.unwrap();
     let mut stream = provider.event_stream();
@@ -2112,6 +2169,7 @@ async fn subagent_lifecycle_launch_progress_completion_flows_through_adapter() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -2137,10 +2195,7 @@ async fn subagent_lifecycle_launch_progress_completion_flows_through_adapter() {
                             assert_eq!(subagent.provider_ref.as_deref(), Some("agent_final"));
                             assert_eq!(subagent.total_tokens, Some(4200));
                             assert_eq!(subagent.tool_use_count, Some(5));
-                            assert_eq!(
-                                subagent.result_text.as_deref(),
-                                Some("Explored the tree")
-                            );
+                            assert_eq!(subagent.result_text.as_deref(), Some("Explored the tree"));
                         }
                         other => panic!("unexpected subagent status {other:?}"),
                     }
@@ -2266,6 +2321,7 @@ async fn claude_real_session() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();

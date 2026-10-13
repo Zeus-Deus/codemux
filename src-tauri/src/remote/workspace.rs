@@ -17,71 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Workspace {
-    /// UUID v4. Globally unique across hosts so the desktop can
-    /// import without collisions.
-    pub id: String,
-    /// Human-readable name. Defaults to the basename of `path` when
-    /// the caller doesn't supply one.
-    pub name: String,
-    /// Absolute path to the worktree on this host.
-    pub path: String,
-    /// Git branch checked out in the worktree. May be `None` for
-    /// non-git workspaces.
-    pub branch: Option<String>,
-    /// Originating project root if this workspace was created from
-    /// an existing repo (so we know where it was cloned/worktreed
-    /// from). May be `None` for blank workspaces.
-    pub project_root: Option<String>,
-    /// Stable, deterministic project identity — `UUIDv5(canonical
-    /// remote ?? project_root)`. Shared by a project's main checkout
-    /// and all its worktrees, and identical on every host/device that
-    /// has the same repo, so the desktop can group siblings without
-    /// coordination. See `crate::project_identity`.
-    #[serde(default)]
-    pub project_uid: Option<String>,
-    /// Human-readable project name (basename of `project_root`).
-    #[serde(default)]
-    pub project_name: Option<String>,
-    /// `"main"` for the repo root checkout, `"worktree"` for a
-    /// per-branch git worktree. Lets the desktop label and group
-    /// without inferring from path shape.
-    #[serde(default)]
-    pub kind: Option<String>,
-    /// Canonical git remote (`canonical_remote(...)`) when the repo has
-    /// one. Null for local-only repos. Lets other devices converge on
-    /// the same `project_uid` for an independently-cloned copy.
-    #[serde(default)]
-    pub repo_remote: Option<String>,
-    /// The repo's default branch (`origin/HEAD` → main/master → current),
-    /// resolved at registration via `crate::git::resolve_default_branch`.
-    /// Lets a pulling device land the repo ROOT on the right branch and
-    /// classify it as a protected root even when `branch` (the per-checkout
-    /// branch) is null — which it routinely is for a root an agent never
-    /// named. Advisory: the desktop re-resolves locally before protecting.
-    #[serde(default)]
-    pub default_branch: Option<String>,
-    /// RFC 3339 UTC timestamp.
-    pub created_at: String,
-    /// RFC 3339 UTC timestamp.
-    pub updated_at: String,
-    /// Always `None` in v1 — reserved for a future cloud relay
-    /// integration to record the authenticated user that created
-    /// the workspace. Nullable column today so populating it later
-    /// is not a destructive migration.
-    pub owner_id: Option<String>,
-    /// Hostname-derived id of the host that created this workspace.
-    /// Recorded so an imported workspace can show "from <host>" in
-    /// the desktop UI.
-    pub origin_host_id: String,
-    /// Free-form notes. Reserved for the desktop to attach context
-    /// when it pulls — empty in v1.
-    pub notes: Option<String>,
-}
+pub use crate::remote_task_protocol::Workspace;
 
 /// Connection pool of size 1. SQLite serialises writes anyway, and
 /// rusqlite's `Connection` is `!Send` if you don't pull in the

@@ -103,6 +103,7 @@ pub struct McpRegistry {
     /// Lazily-started authenticated loopback gateway shared by provider
     /// adapters that need a remote MCP URL (OpenCode and future providers).
     gateway: Arc<OnceCell<Arc<super::gateway::McpGatewayRuntime>>>,
+    native_delegation: Arc<std::sync::Mutex<Option<NativeDelegationHandler>>>,
     /// Tools Codemux serves itself, in-process, to its own Claude and Codex
     /// chats (see [`HostTools`]). Set once at startup.
     host: Arc<std::sync::OnceLock<Arc<dyn HostTools>>>,
@@ -194,12 +195,63 @@ impl Default for McpRegistry {
             status_tx,
             prime_lock: Arc::new(Mutex::new(())),
             gateway: Arc::new(OnceCell::new()),
+            native_delegation: Arc::new(std::sync::Mutex::new(None)),
             host: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
 
+pub(crate) type NativeDelegationHandler=Arc<dyn Fn(crate::delegation::app::NativeActor,String,serde_json::Value)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<serde_json::Value,String>>+Send>>+Send+Sync>;
 impl McpRegistry {
+    pub(crate) fn set_native_delegation_handler(&self,handler:NativeDelegationHandler){*self.native_delegation.lock().unwrap()=Some(handler);}
+    pub(crate) async fn dispatch_native_tool_call(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        actor: crate::delegation::app::NativeActor,
+    ) -> Result<serde_json::Value, String> {
+        let raw = {
+            let inner = self.inner.lock().await;
+            inner
+                .handles
+                .values()
+                .filter(|h| {
+                    h.config.id == "codemux-self"
+                        && h.config.sources.contains(&super::McpConfigSource::Codemux)
+                        && h.status.is_running()
+                })
+                .flat_map(|h| h.tools.iter())
+                .find(|t| t.prefixed_name == name)
+                .map(|t| t.name.clone())
+        };
+        if let Some(raw) = raw.filter(|r| {
+            matches!(
+                r.as_str(),
+                "delegation_targets"
+                    | crate::mcp_server::REMOTE_DELEGATE_TOOL
+                    | "task_status"
+                    | "task_cancel"
+            )
+        }) {
+            let handler = self
+                .native_delegation
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or("Native delegation coordinator is unavailable")?;
+            // Keep the coordinator/Tauri command stable while giving remote MCP
+            // launch a distinct identity from the local delegate_task host tool.
+            let command = if raw == crate::mcp_server::REMOTE_DELEGATE_TOOL {
+                "delegate_task"
+            } else {
+                raw.as_str()
+            };
+            let value = handler(actor, command.into(), arguments).await?;
+            return Ok(serde_json::json!({"content":[{"type":"text","text":value.to_string()}]}));
+        }
+        self.dispatch_tool_call(name, arguments, actor.workspace_id.as_deref())
+            .await
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -524,6 +576,14 @@ impl McpRegistry {
         tools
     }
 
+    #[cfg(test)]
+    pub(crate) async fn insert_native_delegation_tools_for_test(&self) {
+        let config = super::codemux_self::codemux_self_config();
+        let mut handle = McpServerHandle::discovered(config);
+        handle.tools = crate::mcp_server::remote_delegation_tools_for_test();
+        handle.status = McpServerStatus::Running { tool_count: handle.tools.len() };
+        self.inner.lock().await.handles.insert(handle.config.id.clone(), handle);
+    }
     /// Stage a running server with a single tool, for tests in sibling
     /// modules (the gateway) that need a populated registry without
     /// spawning real MCP children.
@@ -954,6 +1014,118 @@ mod tests {
             (prefixed_name == "mcp__codemux__echo")
                 .then(|| serde_json::json!({ "content": [{"type": "text", "text": caller.thread_id}] }))
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_and_remote_delegation_keep_distinct_real_prefixes_when_local_is_disabled() {
+        use crate::agent_provider::ProviderKind;
+        use crate::commands::delegation::{DelegationHost, DelegationState, DELEGATION_SETTING_KEY};
+        use tauri::Manager;
+        let app = tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(DelegationState::default());
+        let reg = McpRegistry::new();
+        reg.set_host_tools(Arc::new(DelegationHost::with_install_check(
+            app.handle().clone(),
+            |_| true,
+        )));
+        reg.insert_native_delegation_tools_for_test().await;
+        let caller = HostCaller {
+            thread_id: "catalog-routing-parent".into(),
+            provider: ProviderKind::Codex,
+            workspace_id: Some("workspace".into()),
+            permission_mode: Some("danger-full-access".into()),
+        };
+        let owner = crate::delegation::authority::NativeAuthority::new(&caller.thread_id);
+        let generation = owner.begin();
+        assert!(owner.bind(generation, "turn"));
+        let actor = crate::delegation::app::NativeActor {
+            thread_id: caller.thread_id.clone(),
+            provider: caller.provider,
+            workspace_id: caller.workspace_id.clone(),
+            session_id: "session".into(),
+            permission_mode: caller.permission_mode.clone(),
+            permit: owner.capture_for_turn("turn"),
+        };
+        let input = serde_json::json!({ "target_id": "remote-checkout", "prompt": "Inspect the checkout", "client_request_id": "request" });
+        let expected = input.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        reg.set_native_delegation_handler(Arc::new(move |actor, command, arguments| {
+            let expected = expected.clone();
+            let count = count.clone();
+            Box::pin(async move {
+                let _admission = actor.permit.admit()?;
+                assert_eq!(
+                    command, "delegate_task",
+                    "MCP rename must preserve the coordinator command"
+                );
+                assert_eq!(
+                    arguments, expected,
+                    "remote launch must bypass the local argument parser"
+                );
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!({ "id": "remote-receipt" }))
+            })
+        }));
+        for enabled in [true, false] {
+            app.state::<crate::database::DatabaseStore>()
+                .set_setting(
+                    DELEGATION_SETTING_KEY,
+                    if enabled { "true" } else { "false" },
+                )
+                .unwrap();
+            let local = reg.host_tools(&caller);
+            assert_eq!(local.len(), usize::from(enabled));
+            let remote = reg
+                .list_all_tools_excluding_source(McpConfigSource::CodexUser)
+                .await;
+            let names: HashSet<_> = local
+                .iter()
+                .chain(&remote)
+                .map(|tool| tool.prefixed_name.as_str())
+                .collect();
+            assert_eq!(
+                names.len(),
+                local.len() + remote.len(),
+                "combined native catalog must have unique names"
+            );
+            let launch = remote
+                .iter()
+                .find(|tool| tool.name == crate::mcp_server::REMOTE_DELEGATE_TOOL)
+                .unwrap();
+            assert_eq!(launch.prefixed_name, "mcp__codemux__delegate_remote_task");
+            assert!(launch.input_schema["properties"].get("target_id").is_some());
+            if enabled {
+                assert_eq!(local[0].prefixed_name, "mcp__codemux__delegate_task");
+                assert!(local[0].input_schema["properties"]
+                    .get("provider")
+                    .is_some());
+            }
+            assert!(
+                reg.host_call(&caller, &launch.prefixed_name, &input)
+                    .is_none(),
+                "local host must never claim remote launch, even when disabled"
+            );
+            let result = reg
+                .dispatch_native_tool_call(&launch.prefixed_name, input.clone(), actor.clone())
+                .await
+                .unwrap();
+            assert!(result.to_string().contains("remote-receipt"));
+            let local_result = reg
+                .host_call(
+                    &caller,
+                    "mcp__codemux__delegate_task",
+                    &serde_json::json!({}),
+                )
+                .unwrap();
+            assert_eq!(
+                local_result["isError"], true,
+                "local calls must keep their own validation/refusal path"
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

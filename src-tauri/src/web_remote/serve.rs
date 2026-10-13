@@ -135,6 +135,9 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     // Mirror the GUI's `RunEvent::Exit` cleanup, then let `app` drop normally
     // so managed provider/server state gets its destructors. A success-path
     // `process::exit` would skip those destructors and leak child processes.
+    if let Some(coordinator) = tauri::Manager::try_state::<crate::delegation::coordinator::Coordinator>(&app) {
+        tauri::async_runtime::block_on(coordinator.shutdown())?;
+    }
     if let Err(error) = crate::active_workspace_persistence::flush_latest(app.handle()) {
         eprintln!("[codemux::selection] headless shutdown flush failed: {error}");
     }
