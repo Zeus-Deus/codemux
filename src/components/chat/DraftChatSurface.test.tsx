@@ -1619,6 +1619,19 @@ describe("DraftChatSurface", () => {
   });
 
   describe("device", () => {
+    it("omits local agent readiness when a first-run draft targets another device", () => {
+      seedActiveProjectWorkspace();
+      const appState = useAppStore.getState().appState!;
+      useAppStore.setState({ appState: { ...appState, workspaces: [], active_workspace_id: "" } });
+      useFeatureFlags.setState({ enableAgentChat: true, enableLazyWorkspaceCreation: true });
+      const draft = useChatDraftStore.getState().getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftConfig(draft.draftId, { hostId: 2 });
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+      const { queryByTestId } = renderSurface();
+      expect(queryByTestId("agent-availability-strip")).toBeNull();
+    });
+
     it("passes the draft's device to the row and persists a pick", () => {
       const draft = useChatDraftStore
         .getState()

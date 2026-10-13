@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { RotateCw, TriangleAlert, X } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 
 import { signInToProvider } from "@/lib/agent-chat/provider-sign-in";
 
@@ -130,10 +131,11 @@ export function ProviderStatusNotice({
             onClick={() => void refresh(provider, { force: true })}
             className={cn(ACTION_CLASS, "p-0.5")}
           >
-            <RotateCw
-              className={cn("size-3.5", checking && "motion-safe:animate-spin")}
-              aria-hidden
-            />
+            {checking ? (
+              <Spinner className="size-3.5" aria-hidden />
+            ) : (
+              <RotateCw className="size-3.5" aria-hidden />
+            )}
           </button>
           <button
             type="button"

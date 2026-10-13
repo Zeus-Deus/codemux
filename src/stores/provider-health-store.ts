@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { create } from "zustand";
 
 import { agentChatProviderHealth } from "@/tauri/commands";
@@ -54,6 +54,9 @@ export function healthBlocksSend(report: ProviderHealthReport | null): boolean {
 interface ProviderHealthSlot {
   report: ProviderHealthReport | null;
   fetchedAt: number;
+  /** The last attempt failed at the command layer. Retain cached banner
+   *  data, but do not use it as a fresh answer for agent defaults. */
+  lastProbeFailed: boolean;
   /** Last settled attempt, including IPC failures, for the focus retry floor. */
   lastAttemptAt: number;
   /** In-flight probe, for single-flight coalescing. */
@@ -101,6 +104,7 @@ export function emptyHealthSlot(): ProviderHealthSlot {
   return {
     report: null,
     fetchedAt: 0,
+    lastProbeFailed: false,
     lastAttemptAt: 0,
     inFlight: null,
     queuedForce: null,
@@ -159,8 +163,9 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
       }));
       return queued;
     }
-    const fresh = Date.now() - slot.fetchedAt < HEALTH_TTL_MS;
-    if (fresh && !opts?.force) return slot.report;
+    const checkedAt = slot.lastProbeFailed ? slot.lastAttemptAt : slot.fetchedAt;
+    const fresh = Date.now() - checkedAt < HEALTH_TTL_MS;
+    if (fresh && !opts?.force) return slot.lastProbeFailed ? null : slot.report;
     const probe = agentChatProviderHealth(provider)
       .then((report) => {
         set((state) => {
@@ -176,6 +181,7 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
                 ...prev,
                 report,
                 fetchedAt: Date.now(),
+                lastProbeFailed: false,
                 lastAttemptAt: Date.now(),
                 inFlight: null,
                 dismissedKey,
@@ -196,6 +202,7 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
             ...state.slots,
             [provider]: {
               ...state.slots[provider],
+              lastProbeFailed: true,
               lastAttemptAt: Date.now(),
               inFlight: null,
             },
@@ -292,6 +299,62 @@ export function selectVisibleHealthReport(
   if (!slot.report || slot.report.status === "ready") return null;
   if (slot.dismissedKey === healthBannerKey(slot.report)) return null;
   return slot.report;
+}
+
+/** What a provider's report means for someone choosing an agent. A
+ *  `warning` is a probe that could not tell (sessions may still work), so
+ *  it is not treated as broken. */
+export type ProviderReadiness = "ready" | "unverified" | "not_ready" | "not_installed";
+
+export function providerReadiness(report: ProviderHealthReport): ProviderReadiness {
+  if (report.status === "ready") return "ready";
+  if (!report.installed) return "not_installed";
+  return report.status === "warning" ? "unverified" : "not_ready";
+}
+
+export interface ProbedProviderHealth {
+  report: ProviderHealthReport | null;
+  /** True while an opening needs a fresh answer, including an expired
+   *  cached report before its refresh starts. A settled probe with no
+   *  report failed at the IPC layer, so its readiness is unknown. */
+  pending: boolean;
+}
+
+/** Probe `providers` (TTL-cached) while `active`, and return each one's
+ *  latest report.
+ *
+ *  Only for surfaces where opening them IS the provider intent the store's
+ *  contract asks for: the automation form choosing an agent, and the
+ *  first-run agent strip on Home. Pass a stable `providers` array. */
+export function useProbedProviderHealth(
+  providers: readonly AgentChatProviderKind[],
+  active: boolean,
+): Partial<Record<AgentChatProviderKind, ProbedProviderHealth>> {
+  const refresh = useProviderHealth((s) => s.refresh);
+  const slots = useProviderHealth((s) => s.slots);
+  useEffect(() => {
+    if (!active) return;
+    for (const provider of providers) void refresh(provider);
+    // Another probe's completion can expose a cached answer that expired
+    // while this surface was open. Schedule that refresh too; the store
+    // still applies its TTL and single-flight guards.
+  }, [active, providers, refresh, slots]);
+  return useMemo(
+    () =>
+      Object.fromEntries(
+        providers.map((provider) => {
+          const slot = slots[provider];
+          const checkedAt = slot.lastProbeFailed ? slot.lastAttemptAt : slot.fetchedAt;
+          const pending =
+            slot.inFlight !== null ||
+            slot.queuedForce !== null ||
+            checkedAt === 0 ||
+            Date.now() - checkedAt >= HEALTH_TTL_MS;
+          return [provider, { report: slot.lastProbeFailed ? null : slot.report, pending }];
+        }),
+      ),
+    [active, providers, slots],
+  );
 }
 
 /** Poll an already-known unhealthy provider for recovery on the TTL

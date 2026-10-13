@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { AlertCircle, Check, CloudOff, Loader2 } from "lucide-react";
+import { AlertCircle, Check, CloudOff } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 
@@ -29,7 +30,7 @@ export function SettingsSyncIndicator() {
   if (isSyncing) {
     content = (
       <>
-        <Loader2 className="size-3.5 motion-safe:animate-spin" aria-hidden />
+        <Spinner className="size-3.5" aria-hidden />
         Saving…
       </>
     );

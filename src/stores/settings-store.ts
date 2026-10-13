@@ -25,6 +25,10 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // Spacing density — "comfortable" (default) or "compact". Scales card
   // padding, grid gaps, and group rhythm via the root `data-density` attr.
   "appearance.density": "comfortable",
+  // Force reduced motion regardless of the OS preference. Machine-local
+  // because what the webview reports depends on this desktop's toolkit
+  // settings. See ReducedMotionProvider.
+  "appearance.reduce_motion": "false",
   // Whether the sidebar inbox cards show the ↑ahead and +/− diff numbers on
   // their mono meta line. The branch name always shows. See sidebar-inbox.tsx.
   "sidebar.show_git_stats": "true",
@@ -203,6 +207,10 @@ export const selectPalette = (s: SettingsStore): AppearancePalette =>
 export const selectDensity = (s: SettingsStore): AppearanceDensity =>
   (s.settings["appearance.density"] ??
     SETTINGS_DEFAULTS["appearance.density"]!) as AppearanceDensity;
+
+export const selectReduceMotion = (s: SettingsStore): boolean =>
+  (s.settings["appearance.reduce_motion"] ??
+    SETTINGS_DEFAULTS["appearance.reduce_motion"]!) === "true";
 
 export const selectSidebarShowGitStats = (s: SettingsStore): boolean =>
   (s.settings["sidebar.show_git_stats"] ??

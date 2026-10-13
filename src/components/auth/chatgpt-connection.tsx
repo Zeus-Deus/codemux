@@ -1,7 +1,8 @@
-import { Check, ExternalLink, Loader2 } from "lucide-react";
+import { Check, ExternalLink } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ProviderLogo } from "@/components/chat/provider-logo";
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 
@@ -30,7 +31,7 @@ export function ChatGptConnection({ onboarding = false }: { onboarding?: boolean
       </div>}
       {pending ? <div className="rounded-lg border border-border bg-muted/30 p-4 space-y-3">
         <div className="flex items-center gap-2 text-body font-medium">
-          <Loader2 className="size-4 animate-spin" /> Finish in your browser
+          <Spinner className="size-4" aria-hidden /> Finish in your browser
         </div>
         <p className="text-body-sm leading-relaxed text-muted-foreground">
           Approve CodeMux and enable ChatGPT plan usage, then return here. This request expires after five minutes.
@@ -47,7 +48,7 @@ export function ChatGptConnection({ onboarding = false }: { onboarding?: boolean
           </div>}
       </div> : <>
         <Button className="w-full gap-2.5" size="lg" disabled={busy || loading} onClick={() => void start(null)}>
-          {busy || loading ? <Loader2 className="size-4 animate-spin" /> : <span aria-hidden="true"><ProviderLogo provider="codex" className="size-4 brightness-0 invert dark:invert-0" /></span>}
+          {busy || loading ? <Spinner className="size-4" aria-hidden /> : <span aria-hidden="true"><ProviderLogo provider="codex" className="size-4 brightness-0 invert dark:invert-0" /></span>}
           Continue with ChatGPT
         </Button>
         {onboarding && <p className="text-label leading-relaxed text-center text-muted-foreground">

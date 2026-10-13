@@ -9,8 +9,6 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { LoaderCircle } from "lucide-react";
-
 import { useAttachSessionHandoff } from "@/hooks/use-attach-session-handoff";
 import {
   buildAttachmentBlock,
@@ -65,7 +63,7 @@ import {
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
 import { selectedAcpCatalog, useCustomAcp } from "@/stores/custom-acp-store";
-import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
+import { capabilityDefaults, defaultModelId } from "@/lib/agent-chat/capability-defaults";
 import {
   getGithubIssueByPath,
   getGithubPrByPath,
@@ -103,6 +101,7 @@ import { cn } from "@/lib/utils";
 import { CHAT_COLUMN } from "./chat-column";
 import { randomUUID } from "@/lib/uuid";
 import { PanelHeader } from "@/components/ui/panel-header";
+import { Spinner } from "@/components/ui/spinner";
 
 /** Grace period between `markPromoted` and `clearDraft`. Gives any
  *  in-flight selector a chance to observe the promotion before the
@@ -1215,6 +1214,18 @@ function DraftChatSurfaceInner({
     [draft.draftId, draft.mode, draft.provider, updateDraftConfig],
   );
 
+  const landingAgents = useMemo(
+    () => ({
+      selected: draft.provider,
+      onSelect: (provider: ChatDraft["provider"]) => {
+        if (provider !== draft.provider) {
+          handleProviderModelChange(provider, defaultModelId(provider));
+        }
+      },
+    }),
+    [draft.provider, handleProviderModelChange],
+  );
+
   const handleModelChange = useCallback(
     (next: string) => {
       const nextModel = capabilities?.models.find((item) => item.id === next);
@@ -1511,6 +1522,7 @@ function DraftChatSurfaceInner({
           // and a failed send brings the landing back.
           <ChatHomeLanding
             composer={composerEl}
+            agents={threadHostId === null ? landingAgents : undefined}
             notice={
               <FullAccessNotice
                 permissionMode={draft.permissionMode}
@@ -1592,10 +1604,7 @@ function DraftPendingConversation({
             aria-label="Starting the agent"
           >
             <span className="flex w-[29px] shrink-0 justify-center">
-              <LoaderCircle
-                className="h-[15px] w-[15px] animate-spin text-accent-ember"
-                aria-hidden
-              />
+              <Spinner className="text-accent-ember" aria-hidden />
             </span>
             <span className="shimmer text-body font-semibold">
               {pending.phase === "creating-on-host" && pending.deviceName

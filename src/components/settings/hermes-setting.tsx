@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Loader2 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
 import {
   AlertDialog,
@@ -64,7 +64,7 @@ export function HermesSetting() {
   // target outlives the open flag so the title keeps its name while closing.
   const [disconnectOpen, setDisconnectOpen] = useState(false);
   const [disconnectTarget, setDisconnectTarget] = useState<HermesProfile | null>(null);
-  const spinner = <Loader2 className="size-3.5 motion-safe:animate-spin" aria-hidden />;
+  const spinner = <Spinner className="size-3.5" aria-hidden />;
   return <section className="space-y-3 rounded-lg border border-border p-4" aria-label="Hermes setup">
     <h3 className="text-body font-medium">Hermes · experimental ACP integration</h3>
     <p className="text-label text-muted-foreground">Use existing profiles. Create profiles, configure credentials and install ACP dependencies in Hermes. Use one active interface per profile.</p>

@@ -2746,28 +2746,87 @@ try {
         );
         await click(list);
         await wd("DELETE", "/actions");
-        await wd("POST", "/actions", {
-          actions: [
-            {
-              type: "key",
-              id: "list-keyboard",
-              actions: [
-                { type: "keyDown", value: "\ue010" },
-                { type: "keyUp", value: "\ue010" },
-              ],
-            },
-          ],
-        });
-        await until("keyboard reaches the final virtual row", async () =>
-          (await positions()).some((row) => row.position === 500),
-        );
-        assert.ok((await positions()).length <= 14);
-        evidence.virtualListAccessibility = {
-          label: "Add-on list",
-          setSize: 500,
-          keyboardEndPosition: 500,
-          boundedRows: true,
-        };
+        // A transient final row can pass before browser scroll anchoring
+        // moves the virtual window back. Observe real painted frames and keep
+        // focus, key delivery and scroll geometry in the failure evidence.
+        await script(`
+          const list = document.querySelector(arguments[0]);
+          const probe = window.__addonListKeyboardProbe = {
+            active: true, samples: [], keyEvents: [], stableFrames: 0, stableSince: null
+          };
+          probe.read = () => {
+            const rows = [...list.querySelectorAll('[role="listitem"]')];
+            return {
+              scrollTop: list.scrollTop,
+              maximum: list.scrollHeight - list.clientHeight,
+              focused: document.activeElement === list,
+              first: Number(rows[0]?.getAttribute('aria-posinset')),
+              last: Number(rows.at(-1)?.getAttribute('aria-posinset')),
+              mountedRows: rows.length
+            };
+          };
+          probe.keydown = event => {
+            probe.keyEvents.push({
+              key: event.key, defaultPrevented: event.defaultPrevented,
+              targetIsList: event.target === list, ...probe.read()
+            });
+          };
+          document.addEventListener('keydown', probe.keydown);
+          const tick = now => {
+            if (!probe.active) return;
+            const sample = probe.read();
+            const atEnd = sample.last === 500 && sample.focused &&
+              sample.mountedRows <= 14 && Math.abs(sample.scrollTop - sample.maximum) <= 1;
+            probe.stableFrames = atEnd ? probe.stableFrames + 1 : 0;
+            probe.stableSince = atEnd ? (probe.stableSince ?? now) : null;
+            probe.samples.push({ atMs: now, ...sample });
+            if (probe.samples.length > 120) probe.samples.shift();
+            probe.frame = requestAnimationFrame(tick);
+          };
+          probe.frame = requestAnimationFrame(tick);
+        `, list);
+        try {
+          await wd("POST", "/actions", {
+            actions: [
+              {
+                type: "key",
+                id: "list-keyboard",
+                actions: [
+                  { type: "keyDown", value: "\ue010" },
+                  { type: "keyUp", value: "\ue010" },
+                ],
+              },
+            ],
+          });
+          await until("keyboard stays at the final virtual row", () =>
+            script(`const p = window.__addonListKeyboardProbe;
+              return p.stableFrames >= 3 && p.stableSince !== null &&
+                performance.now() - p.stableSince >= 500`),
+          );
+          const destination = await script("return window.__addonListKeyboardProbe.read()");
+          assert.equal(destination.last, 500);
+          assert.equal(destination.focused, true);
+          assert.ok(destination.mountedRows <= 14);
+          assert.ok(Math.abs(destination.scrollTop - destination.maximum) <= 1);
+          evidence.virtualListAccessibility = {
+            label: "Add-on list",
+            setSize: 500,
+            keyboardEndPosition: 500,
+            boundedRows: true,
+            stableDestination: destination,
+          };
+        } finally {
+          evidence.virtualListKeyboard = await script(`
+            const p = window.__addonListKeyboardProbe;
+            p.active = false;
+            cancelAnimationFrame(p.frame);
+            document.removeEventListener('keydown', p.keydown);
+            delete window.__addonListKeyboardProbe;
+            return { samples: p.samples, keyEvents: p.keyEvents,
+              stableFrames: p.stableFrames, stableForMs: p.stableSince === null ? 0 :
+                performance.now() - p.stableSince };
+          `);
+        }
       },
       true,
     );

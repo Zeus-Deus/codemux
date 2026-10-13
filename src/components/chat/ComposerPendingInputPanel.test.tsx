@@ -58,6 +58,17 @@ function makeAskItem(
 }
 
 describe("ComposerPendingInputPanel", () => {
+  it("eases in when a request first shows, not when the panel remounts", () => {
+    const item = makeAskItem({ id: "req-ease-once", request_id: "req-ease-once" });
+    const first = render(<ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />);
+    expect(screen.getByTestId("pending-input-panel")).toHaveClass("animate-in");
+    first.unmount();
+
+    // Switching tabs away and back remounts the panel for the same request.
+    render(<ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />);
+    expect(screen.getByTestId("pending-input-panel")).not.toHaveClass("animate-in");
+  });
+
   it("renders header, question, options, and the free-text row", () => {
     render(
       <ComposerPendingInputPanel

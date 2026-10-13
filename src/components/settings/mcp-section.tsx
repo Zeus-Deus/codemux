@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { Info, Loader2, RotateCw, Server } from "lucide-react";
+import { Info, RotateCw, Server } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -32,6 +32,7 @@ import { OutsideAssistantsSection } from "./outside-assistants-section";
 import { McpToolModal } from "./mcp-tool-modal";
 import { SectionHeader } from "./settings-primitives";
 import { eyebrowVariants } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 /** Slow-start threshold (ms). Servers stuck in `starting` longer than
  *  this surface a "taking longer than usual" hint. 3 s matches
@@ -137,6 +138,7 @@ function OutboundMcpSection({ projectRoot }: Props) {
             size="sm"
             onClick={() => void load()}
             disabled={loading}
+            aria-busy={loading}
             aria-label="Refresh MCP servers"
           >
             <RotateCw
@@ -162,7 +164,7 @@ function OutboundMcpSection({ projectRoot }: Props) {
           data-testid="mcp-loading"
           className="flex items-center gap-2 py-6 text-body text-muted-foreground"
         >
-          <Loader2 className="size-4 animate-spin" aria-hidden />
+          <Spinner className="size-4" aria-hidden />
           Loading MCP servers…
         </div>
       ) : servers.length === 0 && !error ? (
@@ -456,7 +458,7 @@ function McpStatusBadge({
         data-testid={`mcp-row-${server.id}-status`}
         data-status={slow ? "starting-slow" : "starting"}
       >
-        <Loader2 className="size-3 animate-spin" aria-hidden />
+        <Spinner className="size-3" aria-hidden />
         {slow ? "slow start — taking longer than usual" : "starting…"}
       </span>
     );

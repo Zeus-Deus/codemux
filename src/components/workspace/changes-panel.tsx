@@ -16,7 +16,6 @@ import {
   TooltipContent,
 } from "@/components/ui/tooltip";
 import {
-  Loader2,
   Sparkles,
   GitBranch,
   ArrowUp,
@@ -81,6 +80,7 @@ import type {
   MergeState,
 } from "@/tauri/types";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 /** Which file sections the panel lists. Driven by the deck's pane-bar
  *  filter; `"all"` is the historic behavior. */
@@ -937,7 +937,7 @@ export function ChangesPanel({
                 onClick={() => finalizeCommit(generatedMsg)}
                 disabled={busy !== null}
               >
-                {busy === "commit" ? <Loader2 className="size-3 animate-spin" /> : "Commit"}
+                {busy === "commit" ? <Spinner className="size-3" /> : "Commit"}
               </Button>
               <Button
                 size="xs"
@@ -989,7 +989,7 @@ export function ChangesPanel({
                 onClick={() => finalizeCommit(editedMsg)}
                 disabled={!editedMsg.trim() || busy !== null}
               >
-                {busy === "commit" ? <Loader2 className="size-3 animate-spin" /> : "Commit"}
+                {busy === "commit" ? <Spinner className="size-3" /> : "Commit"}
               </Button>
               <Button
                 size="icon-xs"
@@ -1108,7 +1108,7 @@ export function SmartCommitButton({
     if (loading) {
       return {
         label: "Checking changes…",
-        icon: <Loader2 className="size-3 motion-safe:animate-spin" />,
+        icon: <Spinner className="size-3" aria-hidden />,
         action: () => {},
         disabled: true,
       };
@@ -1117,7 +1117,7 @@ export function SmartCommitButton({
     if (hasChanges) {
       return {
         label: isGenerating ? "Writing message…" : staged > 0 ? `Commit ${staged}` : "Commit",
-        icon: isGenerating ? <Loader2 className="size-3 animate-spin" /> : <Sparkles className="size-3" />,
+        icon: isGenerating ? <Spinner className="size-3" aria-hidden /> : <Sparkles className="size-3" />,
         action: onCommit,
         disabled: isGenerating || busy !== null,
       };
@@ -1140,7 +1140,7 @@ export function SmartCommitButton({
   const display = !primary
     ? null
     : inFlight
-      ? { label: inFlight, icon: <Loader2 className="size-3 motion-safe:animate-spin" /> }
+      ? { label: inFlight, icon: <Spinner className="size-3" aria-hidden /> }
       : justDone && !hasChanges
         ? {
             label: DONE_LABEL[justDone],

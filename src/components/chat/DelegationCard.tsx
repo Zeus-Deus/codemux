@@ -1,4 +1,4 @@
-import { ArrowUpRight, Bot, LoaderCircle } from "lucide-react";
+import { ArrowUpRight, Bot } from "lucide-react";
 import { memo, useEffect, useState } from "react";
 
 import {
@@ -12,6 +12,7 @@ import {
 import { delegationElapsedLabel, statusTone } from "@/lib/agent-chat/subagents";
 import type { SubagentViewStatus } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
+import { Spinner } from "@/components/ui/spinner";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
 import { openDelegatedChat, stopDelegatedTask } from "./delegation-actions";
@@ -192,7 +193,7 @@ function DelegationRowView({ entry, row }: RowModel) {
             )}
           >
             {row.phase === "starting" ? (
-              <LoaderCircle className="size-3 motion-safe:animate-spin" aria-hidden />
+              <Spinner className="size-3" aria-hidden />
             ) : (
               <span
                 className={cn("size-1.5 shrink-0 rounded-full", PHASE_DOT[row.phase])}

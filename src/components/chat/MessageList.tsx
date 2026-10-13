@@ -1472,7 +1472,7 @@ export const MessageList = memo(function MessageList({
             bottom: "calc(1rem + var(--composer-overlay-height, 0px))",
           }}
           className={cn(
-            "absolute left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border bg-card font-semibold shadow-lg hover:bg-card hover:text-foreground",
+            "absolute left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border bg-card font-semibold shadow-lg animate-in fade-in-0 slide-in-from-bottom-2 duration-150 ease-out hover:bg-card hover:text-foreground",
             approvalPending
               ? "border-status-working/50 text-foreground"
               : "border-border text-muted-foreground",
@@ -1558,6 +1558,7 @@ function landedOnAnchorTarget(
 /** Smooth scrolling is a comfort feature, not a contract — readers who ask
  *  the platform for reduced motion get the instant placement instead. */
 function prefersReducedMotion(): boolean {
+  if (document.documentElement.classList.contains("reduce-motion")) return true;
   return (
     typeof window.matchMedia === "function" &&
     window.matchMedia("(prefers-reduced-motion: reduce)").matches

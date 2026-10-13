@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { LoaderCircle, VideoOff } from "lucide-react";
+import { VideoOff } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 
 interface Props {
   filePath: string;
@@ -63,10 +64,7 @@ export function VideoViewer({ filePath }: Props) {
           data-testid="video-loading"
           className="pointer-events-none absolute inset-0 flex items-center justify-center"
         >
-          <LoaderCircle
-            className="size-[18px] animate-spin text-white/60"
-            aria-label="Loading video"
-          />
+          <Spinner className="text-white/60" label="Loading video" />
         </div>
       )}
       <video
@@ -80,7 +78,7 @@ export function VideoViewer({ filePath }: Props) {
         onLoadedData={markReady}
         onCanPlay={markReady}
         onError={() => setState("error")}
-        className={`max-h-full max-w-full rounded-md bg-black shadow-[0_16px_48px_rgba(0,0,0,0.45)] ring-1 ring-white/10 transition-opacity duration-250 ${
+        className={`max-h-full max-w-full rounded-md bg-black shadow-[0_16px_48px_rgba(0,0,0,0.45)] ring-1 ring-white/10 transition-opacity duration-150 ${
           state === "ready" ? "opacity-100" : "opacity-0"
         }`}
       >

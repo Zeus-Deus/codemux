@@ -25,6 +25,10 @@ import {
 import { ShortcutTooltip } from "@/components/ui/tooltip";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { BAND_CONTROL_RADIUS } from "@/components/layout/titlebar-control-style";
+import {
+  isPresetInstalled,
+  usePresetAvailability,
+} from "@/hooks/use-preset-availability";
 import { usePresetStore } from "@/hooks/use-preset-store";
 import { launchDraftWithPreset } from "@/lib/agent-chat/draft-preset-launch";
 import { draftHostId } from "@/lib/agent-chat/materialize";
@@ -132,6 +136,33 @@ function PresetPinnedBadge({ presetId }: { presetId: string }) {
     </span>
   );
 }
+
+/** Icon + name for a CLI preset row. A preset whose agent binary is not on
+ *  PATH stays selectable (picking it explains why it cannot launch) but is
+ *  dimmed so the installed agents read first. */
+function CliPresetLabel({
+  preset,
+  installed,
+}: {
+  preset: TerminalPreset;
+  installed: boolean;
+}) {
+  return (
+    <>
+      <PresetIcon
+        icon={preset.icon}
+        className={cn("size-4", !installed && "opacity-50")}
+      />
+      <span
+        className={cn("flex-1 truncate", !installed && "text-muted-foreground")}
+      >
+        {preset.name}
+      </span>
+    </>
+  );
+}
+
+const NOT_INSTALLED = "not installed";
 
 const LAUNCHER_ITEM_CLASS =
   "h-[30px] rounded-md px-2 py-0 text-body";
@@ -319,6 +350,7 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
   // release off the row, no select) can't leak a stale `true` into a later
   // keyboard selection.
   const shiftHeld = useRef(false);
+  const installed = usePresetAvailability(open && !mobile);
 
   const handleOpenChange = (next: boolean) => {
     shiftHeld.current = false;
@@ -459,26 +491,29 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
                 heading="CLI agents"
                 className={LAUNCHER_GROUP_CLASS}
               >
-                {cliPresets.map((preset) => (
-                  <CommandItem
-                    key={preset.id}
-                    value={`cli ${preset.name}`}
-                    onMouseDown={(e) => {
-                      shiftHeld.current = e.shiftKey;
-                    }}
-                    onSelect={() => launchCli(preset)}
-                    data-testid={`launcher-cli-${preset.id}`}
-                    showCheckmark={false}
-                    className={LAUNCHER_ITEM_CLASS}
-                  >
-                    <PresetIcon icon={preset.icon} className="size-4" />
-                    <span className="flex-1 truncate">{preset.name}</span>
-                    <TitlebarPinToggle
-                      presetId={preset.id}
-                      destination="terminal"
-                    />
-                  </CommandItem>
-                ))}
+                {cliPresets.map((preset) => {
+                  const ready = isPresetInstalled(installed, preset.id);
+                  return (
+                    <CommandItem
+                      key={preset.id}
+                      value={`cli ${preset.name}`}
+                      onMouseDown={(e) => {
+                        shiftHeld.current = e.shiftKey;
+                      }}
+                      onSelect={() => launchCli(preset)}
+                      data-testid={`launcher-cli-${preset.id}`}
+                      data-installed={ready}
+                      showCheckmark={false}
+                      className={LAUNCHER_ITEM_CLASS}
+                    >
+                      <CliPresetLabel preset={preset} installed={ready} />
+                      <TitlebarPinToggle
+                        presetId={preset.id}
+                        destination={ready ? "terminal" : NOT_INSTALLED}
+                      />
+                    </CommandItem>
+                  );
+                })}
               </CommandGroup>
             )}
             <CommandGroup heading="Panes" className={LAUNCHER_GROUP_CLASS}>
@@ -532,6 +567,7 @@ interface DraftAgentLauncherProps {
 export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
   const [open, setOpen] = useState(false);
   const presetStore = usePresetStore();
+  const installed = usePresetAvailability(open);
 
   const presets = presetStore?.presets ?? [];
   const chatPresets = presets.filter((p) => p.kind === "chat_agent");
@@ -622,23 +658,26 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
                 heading="CLI agents"
                 className={LAUNCHER_GROUP_CLASS}
               >
-                {cliPresets.map((preset) => (
-                  <CommandItem
-                    key={preset.id}
-                    value={`cli ${preset.name}`}
-                    onSelect={() => launch(preset)}
-                    disabled={onDevice}
-                    data-testid={`draft-launcher-cli-${preset.id}`}
-                    showCheckmark={false}
-                    className={LAUNCHER_ITEM_CLASS}
-                  >
-                    <PresetIcon icon={preset.icon} className="size-4" />
-                    <span className="flex-1 truncate">{preset.name}</span>
-                    <LauncherDestination presetId={`draft-${preset.id}`}>
-                      {onDevice ? "local only" : "terminal"}
-                    </LauncherDestination>
-                  </CommandItem>
-                ))}
+                {cliPresets.map((preset) => {
+                  const ready = isPresetInstalled(installed, preset.id);
+                  return (
+                    <CommandItem
+                      key={preset.id}
+                      value={`cli ${preset.name}`}
+                      onSelect={() => launch(preset)}
+                      disabled={onDevice}
+                      data-testid={`draft-launcher-cli-${preset.id}`}
+                      data-installed={ready}
+                      showCheckmark={false}
+                      className={LAUNCHER_ITEM_CLASS}
+                    >
+                      <CliPresetLabel preset={preset} installed={ready} />
+                      <LauncherDestination presetId={`draft-${preset.id}`}>
+                        {onDevice ? "local only" : ready ? "terminal" : NOT_INSTALLED}
+                      </LauncherDestination>
+                    </CommandItem>
+                  );
+                })}
               </CommandGroup>
             )}
           </LauncherCommandList>
