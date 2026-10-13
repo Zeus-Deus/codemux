@@ -89,6 +89,8 @@ export interface ThemeDefinition {
   managed?: boolean;
   seeds?: { background: string; accent: string };
   source?: "generated" | "shadcn" | "vscode" | "json";
+  /** Exact terminal cursor and selection from a desktop palette; derived when absent. */
+  terminal?: { cursor: string; selectionForeground: string; selectionBackground: string };
 }
 
 export interface ThemeFile {
@@ -138,7 +140,7 @@ const ANSI_VARIABLES: Readonly<Record<AnsiSlot, string>> = Object.fromEntries(
 ) as Record<AnsiSlot, string>;
 
 type Rgb = { r: number; g: number; b: number };
-type Oklch = { L: number; C: number; h: number };
+export type Oklch = { L: number; C: number; h: number };
 
 const DEFAULT_ANSI: AnsiPalette = {
   black: "#151110",
@@ -498,6 +500,14 @@ function parseOklch(value: string): (Rgb & { a: number }) | null {
   const a = match[6] === "%" ? alphaValue / 100 : alphaValue;
   if (!Number.isFinite(a)) return null;
   return { ...oklchToRgb({ L, C, h }), a: Math.max(0, Math.min(1, a)) };
+}
+
+export function hexToOklch(value: string): Oklch {
+  return rgbToOklch(parseHex(normalizeColor(value) ?? "#000000")!);
+}
+
+export function oklchToHex(color: Oklch): string {
+  return rgbToHex(oklchToRgb(color));
 }
 
 export function normalizeColor(value: string, backdrop = "#000000"): string | null {
@@ -1187,11 +1197,11 @@ export function themeToSyntaxColors(theme: ThemeDefinition): ThemeColors {
   const light = theme.scheme === "light";
   return {
     accent: normalizeColor(theme.roles.brandAccent) ?? theme.ansi.blue,
-    cursor: normalizeColor(theme.roles.sidebarPrimary) ?? theme.ansi.blue,
+    cursor: theme.terminal?.cursor ?? normalizeColor(theme.roles.sidebarPrimary) ?? theme.ansi.blue,
     foreground: normalizeColor(theme.roles.foreground) ?? theme.ansi.white,
     background: normalizeColor(theme.roles.background) ?? theme.ansi.black,
-    selection_foreground: light ? theme.ansi.black : theme.ansi.white,
-    selection_background: light ? theme.ansi.white : theme.ansi.brightBlack,
+    selection_foreground: theme.terminal?.selectionForeground ?? (light ? theme.ansi.black : theme.ansi.white),
+    selection_background: theme.terminal?.selectionBackground ?? (light ? theme.ansi.white : theme.ansi.brightBlack),
     color0: theme.ansi.black,
     color1: theme.ansi.red,
     color2: theme.ansi.green,
