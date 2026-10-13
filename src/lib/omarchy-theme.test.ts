@@ -84,6 +84,15 @@ it("keeps Omarchy's own terminal cursor and selection", () => {
   expect(terminal.cursor).toBe(colors.cursor);
   expect(terminal.selection_foreground).toBe(colors.selection_foreground);
   expect(terminal.selection_background).toBe(colors.selection_background);
+
+  // An exported copy carries the pair through import.
+  const theme = omarchyToTheme({ name: "Retro 82", scheme: "dark", colors });
+  const imported = parseCustomTheme(JSON.parse(serializeTheme({ ...theme, id: "custom-retro-copy" })));
+  expect(imported?.terminal).toEqual(theme.terminal);
+
+  // A partial pair falls back to derived colors rather than mixing the two.
+  const partial = parseCustomTheme({ ...JSON.parse(serializeTheme(theme)), terminal: { cursor: "#ffffff" } });
+  expect(partial?.terminal).toBeUndefined();
 });
 
 it("caps a loud Omarchy muted shade on control outlines", () => {

@@ -41,7 +41,9 @@ vi.mock("@/stores/synced-settings-store", () => {
 });
 
 import { ThemeStudio } from "./theme-studio";
-import { applyTheme, BUILT_IN_THEMES, createGeneratedTheme } from "@/lib/themes";
+import { applyTheme, BUILT_IN_THEMES, createGeneratedTheme, parseCustomThemes, themeToSyntaxColors } from "@/lib/themes";
+import { omarchyToTheme } from "@/lib/omarchy-theme";
+import { fallbackTheme } from "@/hooks/use-theme-colors";
 import { useUIStore, type ThemeStudioRequest } from "@/stores/ui-store";
 
 /** The studio is an app-level overlay now: it mounts on a store request
@@ -75,6 +77,21 @@ describe("ThemeStudio", () => {
     expect(saved.appearance.custom_themes).toHaveLength(1);
     expect(saved.appearance.custom_themes[0].id).toBe("custom-night-signal");
     expect(document.documentElement.dataset.themeId).toBe("custom-night-signal");
+  });
+
+  it("keeps Omarchy's terminal cursor and selection on a saved copy", async () => {
+    const colors = { ...fallbackTheme, cursor: "#f6dcac", selection_foreground: "#eeeeee", selection_background: "#134e5a" };
+    openStudio({ mode: "generate", copyTheme: omarchyToTheme({ name: "Retro 82", scheme: "dark", colors }) });
+    fireEvent.click(screen.getByRole("button", { name: /Save and apply/i }));
+
+    await waitFor(() => expect(mocks.updateSettings).toHaveBeenCalledTimes(1));
+    const saved = mocks.updateSettings.mock.calls[0]![0];
+    // Synced settings store the payload as JSON and parse it back on load.
+    const [reloaded] = parseCustomThemes(JSON.parse(JSON.stringify(saved.appearance.custom_themes)));
+    const terminal = themeToSyntaxColors(reloaded!);
+    expect(terminal.cursor).toBe(colors.cursor);
+    expect(terminal.selection_foreground).toBe(colors.selection_foreground);
+    expect(terminal.selection_background).toBe(colors.selection_background);
   });
 
   it("reopens generated themes from their seeds and preserves their stable id", async () => {

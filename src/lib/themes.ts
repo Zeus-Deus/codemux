@@ -104,6 +104,7 @@ export interface ThemeFile {
   managed?: boolean;
   seeds?: { background: string; accent: string };
   source?: ThemeDefinition["source"];
+  terminal?: ThemeDefinition["terminal"];
 }
 
 const ROLE_VARIABLES: Readonly<Record<ThemeRole, string>> = {
@@ -778,6 +779,16 @@ function validRadius(value: unknown): string | undefined {
   return /^\d*\.?\d+(?:px|rem|em)$/.test(value.trim()) ? value.trim() : undefined;
 }
 
+/** All three colors or none: a partial pair would mix desktop and derived terminal colors. */
+function validTerminal(value: unknown): ThemeDefinition["terminal"] {
+  if (!isRecord(value)) return undefined;
+  const [cursor, selectionForeground, selectionBackground] = [value.cursor, value.selectionForeground, value.selectionBackground]
+    .map((color) => (typeof color === "string" ? normalizeColor(color) : null));
+  return cursor && selectionForeground && selectionBackground
+    ? { cursor, selectionForeground, selectionBackground }
+    : undefined;
+}
+
 function completeThemeFile(file: ThemeFile): ThemeDefinition {
   const seedBackground = file.seeds?.background ?? file.roles.background ?? "#151110";
   const seedAccent = file.seeds?.accent ?? file.roles.brandAccent ?? file.roles.primary ?? "#e07850";
@@ -808,6 +819,7 @@ function completeThemeFile(file: ThemeFile): ThemeDefinition {
     radius: validRadius(file.radius),
     managed: file.managed === true,
     source: file.source ?? "json",
+    terminal: validTerminal(file.terminal),
   };
 }
 
@@ -829,6 +841,7 @@ export function parseCustomTheme(value: unknown): ThemeDefinition | null {
       source: value.source === "generated" || value.source === "shadcn" || value.source === "vscode" || value.source === "json"
         ? value.source
         : "json",
+      terminal: validTerminal(value.terminal),
     });
   } catch {
     return null;
@@ -857,6 +870,7 @@ export function serializeTheme(theme: ThemeDefinition): string {
     managed: theme.managed,
     seeds: theme.seeds,
     source: theme.source,
+    terminal: theme.terminal,
   };
   return `${JSON.stringify(file, null, 2)}\n`;
 }
