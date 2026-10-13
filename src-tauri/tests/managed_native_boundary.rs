@@ -142,6 +142,7 @@ fn send(id: ThreadId) -> SendTurnInput {
         permission_mode_override: None,
         client_nonce: None,
         turn_checkpoint: None,
+        dispatch_guard: None,
     }
 }
 fn transcript(path: &PathBuf) -> Vec<Value> {

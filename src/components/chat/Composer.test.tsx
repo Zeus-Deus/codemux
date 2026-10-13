@@ -84,6 +84,26 @@ function renderComposer(props: Partial<ComposerProps> = {}) {
 }
 
 describe("Composer", () => {
+  it("opens remote delegation without submitting or replacing the parent draft", async () => {
+    const onDelegateTask = vi.fn();
+    const onSubmit = vi.fn();
+    const onDraftChange = vi.fn();
+    const { getByRole, findByText, container } = renderComposer({
+      draft: "Keep this unsent draft",
+      onDelegateTask,
+      onSubmit,
+      onDraftChange,
+    } as Partial<ComposerProps>);
+
+    fireEvent.click(getByRole("button", { name: "Attach" }));
+    fireEvent.click(await findByText("Run on host…"));
+
+    expect(onDelegateTask).toHaveBeenCalledOnce();
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(onDraftChange).not.toHaveBeenCalled();
+    expect(container.querySelector("textarea")).toHaveValue("Keep this unsent draft");
+  });
+
   it("uses Ctrl+Enter for background send only when the surface supports it", () => {
     const onSubmit = vi.fn();
     const onBackgroundSubmit = vi.fn();

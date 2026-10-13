@@ -477,7 +477,7 @@ fn pane_claim_error(conflict: &PaneClaimConflict, requested: ProviderKind) -> St
     }
 }
 
-pub(super) async fn lookup_provider(
+pub(crate) async fn lookup_provider(
     registry: &ProviderRegistry,
     kind: ProviderKind,
 ) -> Result<Arc<dyn AgentProvider>, String> {
@@ -1742,8 +1742,7 @@ pub async fn agent_chat_restore_checkpoint<R: Runtime>(
 // ── Per-turn checkpoints with provider conversation rollback ────────
 
 pub const AGENT_CHAT_TURN_CHECKPOINT_EVENT: &str = "agent_chat_turn_checkpoint";
-pub const AGENT_CHAT_TURN_CHECKPOINT_REVERTED_EVENT: &str =
-    "agent_chat_turn_checkpoint_reverted";
+pub const AGENT_CHAT_TURN_CHECKPOINT_REVERTED_EVENT: &str = "agent_chat_turn_checkpoint_reverted";
 pub const AGENT_CHAT_TURN_CHECKPOINTS_INVALIDATED_EVENT: &str =
     "agent_chat_turn_checkpoints_invalidated";
 const TURN_CHECKPOINT_KEEP_PER_THREAD: usize = 500;
@@ -1913,9 +1912,7 @@ impl<R: Runtime> GitTurnDispatchCheckpoint<R> {
 #[async_trait::async_trait]
 impl<R: Runtime> TurnDispatchCheckpoint for GitTurnDispatchCheckpoint<R> {
     async fn prepare(&self) {
-        let guard = turn_checkpoint_lock_for(&self.thread_id)
-            .lock_owned()
-            .await;
+        let guard = turn_checkpoint_lock_for(&self.thread_id).lock_owned().await;
         let app = self.app.clone();
         let thread_id = self.thread_id.clone();
         let workspace_id = self.workspace_id.clone();
@@ -2210,9 +2207,7 @@ fn delete_orphaned_chat_images(removed_payloads: &[String], retained_payloads: &
                     }
                 }
             }
-            Err(error) => eprintln!(
-                "[codemux::agent_chat] skipped reverted image {path}: {error}"
-            ),
+            Err(error) => eprintln!("[codemux::agent_chat] skipped reverted image {path}: {error}"),
         }
     }
 }
@@ -2638,8 +2633,13 @@ struct HermesSendGate {
 }
 fn hermes_send_gate(thread_id: &str) -> Arc<HermesSendGate> {
     static GATES: OnceLock<Mutex<HashMap<String, Arc<HermesSendGate>>>> = OnceLock::new();
-    GATES.get_or_init(Default::default).lock().unwrap()
-        .entry(thread_id.into()).or_default().clone()
+    GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(thread_id.into())
+        .or_default()
+        .clone()
 }
 impl HermesSendGate {
     async fn before_dispatch(
@@ -3233,6 +3233,10 @@ pub async fn agent_chat_send_turn<R: Runtime>(
 }
 
 /// Who initiated a turn going through [`send_turn_with_origin`].
+pub(crate) fn delegation_activity_lock(thread: &str) -> Arc<tokio::sync::Mutex<()>> {
+    super::usage_resume::activity_lock(thread)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnOrigin {
     /// The user typed and sent it. Counts as user activity: any pending
@@ -3246,12 +3250,21 @@ pub enum TurnOrigin {
     /// round of results. Not user activity either — it must not start a new
     /// delegation round or forget a pending usage resume.
     Delegation,
+    /// App-owned, correlated remote result; idle-only and non-interrupting.
+    RemoteDelegation,
 }
 
 /// The one send path behind [`agent_chat_send_turn`] and the usage-limit
 /// resume dispatch: session ensure/resume, skill rendering, checkpointing,
 /// queue semantics, user-message persistence and fan-out are identical for
 /// both; only `origin` differs.
+#[cfg(test)]
+pub(crate) static DELEGATION_TEST_CHECKPOINTS: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<String, Arc<dyn crate::agent_provider::TurnDispatchCheckpoint>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
 pub async fn send_turn_with_origin<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
@@ -3298,6 +3311,11 @@ async fn send_turn_internal<R: Runtime>(
             control.verify_mode(Some(mode))?;
         }
     }
+    if origin == TurnOrigin::RemoteDelegation
+        && !matches!(provider, ProviderKind::Codex | ProviderKind::Claude)
+    {
+        return Err("Guarded remote result delivery is unsupported for this parent provider; result held without provider side effects".into());
+    }
     crate::local_session_import::require_live_session(&app, &input.thread_id.0)?;
     if provider == ProviderKind::Hermes && !input.skill_ids.is_empty() {
         return Err("unsupported: Hermes owns its native skills; projected Codemux skills cannot be injected".into());
@@ -3312,14 +3330,21 @@ async fn send_turn_internal<R: Runtime>(
     let hermes_gate = matches!(provider, ProviderKind::Hermes | ProviderKind::Acp).then(|| hermes_send_gate(&input.thread_id.0));
     let send_generation = hermes_gate.as_ref().map(|gate| gate.cancelled.load(Ordering::SeqCst));
     if origin == TurnOrigin::User {
+        crate::delegation::app::user_activity(&app, &input.thread_id.0, false)?;
         let db: State<'_, DatabaseStore> = app.state();
         super::usage_resume::forget_on_user_activity(&db, &input.thread_id.0);
         // A user message starts a new delegation round for this chat.
         super::delegation::on_user_turn(&app, &input.thread_id.0);
     }
-    // Resume and delegation callers already hold this lock. User sends
-    // disarm immediately, then wait for any already-claimed resume to finish
-    // dispatching.
+    if origin == TurnOrigin::RemoteDelegation {
+        crate::delegation::app::guard_wake(
+            &app,
+            &input.thread_id.0,
+            input.client_nonce.as_deref(),
+        )?;
+    }
+    // Resume callers already hold this lock. User sends disarm immediately,
+    // then wait for any already-claimed resume to finish dispatching.
     let _activity_guard = if origin == TurnOrigin::User {
         Some(
             super::usage_resume::activity_lock(&input.thread_id.0)
@@ -3517,6 +3542,12 @@ async fn send_turn_internal<R: Runtime>(
         None => turn_checkpoint,
     };
     // Build the provider's byte-carrying input from the command DTO.
+    #[cfg(test)]
+    let turn_checkpoint = DELEGATION_TEST_CHECKPOINTS
+        .lock()
+        .unwrap()
+        .remove(&input.thread_id.0)
+        .or(turn_checkpoint);
     let provider_input = SendTurnInput {
         thread_id: input.thread_id.clone(),
         text: rendered_text,
@@ -3528,6 +3559,15 @@ async fn send_turn_internal<R: Runtime>(
         permission_mode_override: input.permission_mode_override.clone(),
         client_nonce: input.client_nonce.clone(),
         turn_checkpoint,
+        dispatch_guard: if origin == TurnOrigin::RemoteDelegation {
+            Some(crate::delegation::app::dispatch_guard(
+                &app,
+                &input.thread_id.0,
+                input.client_nonce.as_deref(),
+            )?)
+        } else {
+            None
+        },
     };
     let dispatch_guard = match (&hermes_gate, send_generation) {
         (Some(gate), Some(generation)) => Some(gate.before_dispatch(generation).await?),
@@ -3544,6 +3584,18 @@ async fn send_turn_internal<R: Runtime>(
     // Register attachments before the provider can emit TurnQueued and
     // immediately dispatch it. The event bridge and RPC return race to
     // transfer this entry, so exactly one owns its deferred persistence.
+    if origin == TurnOrigin::RemoteDelegation {
+        crate::delegation::app::guard_wake(
+            &app,
+            &input.thread_id.0,
+            input.client_nonce.as_deref(),
+        )?;
+        if impl_.turn_active(&input.thread_id).await {
+            return Err(
+                "Parent became busy; remote result is held rather than interrupting".into(),
+            );
+        }
+    }
     let pending_key = (
         thread_id_for_persist.clone(),
         input.client_nonce.clone().unwrap(),
@@ -3748,6 +3800,7 @@ pub async fn agent_chat_send_queued_turn_now<R: Runtime>(
     let generation = gate.generation();
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    crate::delegation::app::user_activity(&app, &thread_id.0, false)?;
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
         .lock_owned()
         .await;
@@ -4560,6 +4613,7 @@ pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
     // provider must first match that identity; it is not a blanket Stop of
     // newer admitted sends, usage resumes or delegated tasks.
     if turn_id.is_none() {
+        crate::delegation::app::user_activity(&app, &thread_id.0, true)?;
         native_gate.cancel();
         // Before the lock: a delegated child's starter holds it while it starts,
         // and the task must read Stopped at once rather than after the start.
@@ -4919,11 +4973,18 @@ pub async fn agent_chat_set_model<R: Runtime>(
         let lock = resume_lock_for(&thread_id.0);
         let _guard = lock.lock().await;
         let hermes = app.state::<Arc<crate::agent_provider::hermes::HermesProvider>>();
-        hermes.validate_intent(&thread_id.0, Some(&model), None).map_err(provider_err)?;
+        hermes
+            .validate_intent(&thread_id.0, Some(&model), None)
+            .map_err(provider_err)?;
         if impl_.has_session(&thread_id).await {
-            impl_.set_model(thread_id.clone(), model.clone()).await.map_err(provider_err)?;
+            impl_
+                .set_model(thread_id.clone(), model.clone())
+                .await
+                .map_err(provider_err)?;
         }
-        return app.state::<DatabaseStore>().update_hermes_intent(&thread_id.0, Some(&model), None);
+        return app
+            .state::<DatabaseStore>()
+            .update_hermes_intent(&thread_id.0, Some(&model), None);
     }
 
     if provider == ProviderKind::Acp {
@@ -5060,11 +5121,18 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
         let lock = resume_lock_for(&thread_id.0);
         let _guard = lock.lock().await;
         let hermes = app.state::<Arc<crate::agent_provider::hermes::HermesProvider>>();
-        hermes.validate_intent(&thread_id.0, None, Some(&mode)).map_err(provider_err)?;
+        hermes
+            .validate_intent(&thread_id.0, None, Some(&mode))
+            .map_err(provider_err)?;
         if impl_.has_session(&thread_id).await {
-            impl_.set_permission_mode(thread_id.clone(), mode.clone()).await.map_err(provider_err)?;
+            impl_
+                .set_permission_mode(thread_id.clone(), mode.clone())
+                .await
+                .map_err(provider_err)?;
         }
-        return app.state::<DatabaseStore>().update_hermes_intent(&thread_id.0, None, Some(&mode));
+        return app
+            .state::<DatabaseStore>()
+            .update_hermes_intent(&thread_id.0, None, Some(&mode));
     }
     if provider == ProviderKind::Acp {
         let lock = resume_lock_for(&thread_id.0);
@@ -5291,7 +5359,10 @@ pub async fn agent_chat_hooks(
             dirs::home_dir().ok_or_else(|| "Cannot resolve your home directory.".to_string())?
         }
     };
-    lookup_provider(&registry, provider).await?.manage_hooks(&directory, thread_id, update).await
+    lookup_provider(&registry, provider)
+        .await?
+        .manage_hooks(&directory, thread_id, update)
+        .await
 }
 
 /// List the provider-native slash commands available to a chat thread
@@ -5329,12 +5400,18 @@ pub async fn list_chat_slash_commands(
 ) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, String> {
     let cwd = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
         Some(cwd) => cwd,
-        None => dirs::home_dir().ok_or_else(|| "Cannot resolve your home directory.".to_string())?.to_string_lossy().into_owned(),
+        None => dirs::home_dir()
+            .ok_or_else(|| "Cannot resolve your home directory.".to_string())?
+            .to_string_lossy()
+            .into_owned(),
     };
     if matches!(provider, ProviderKind::Cursor | ProviderKind::Grok) {
         if let Some(thread_id) = thread_id {
-            return lookup_provider(&registry, provider).await?
-                .session_slash_commands(thread_id, std::path::Path::new(&cwd)).await.map_err(provider_err);
+            return lookup_provider(&registry, provider)
+                .await?
+                .session_slash_commands(thread_id, std::path::Path::new(&cwd))
+                .await
+                .map_err(provider_err);
         }
     }
     let on_device = runs_on_device(
@@ -5444,6 +5521,7 @@ pub async fn agent_chat_stop_session_guarded<R: Runtime>(
     feature_flag_on(&observability)?;
     let native_gate = native_thread_gate(&app, &thread_id.0);
     native_gate.cancel();
+    crate::delegation::app::user_activity(&app, &thread_id.0, true)?;
     // A restart in place: a delegated child's task stops quietly, a
     // parent's tasks keep running (New Chat / history pick rebinds the
     // pane afterwards, and that rebind is what stops them).
@@ -6248,7 +6326,10 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     if db.hermes_binding(&thread_id)?.is_some() {
         let registry: State<'_, ProviderRegistry> = app.state();
         if let Some(provider) = registry.get(ProviderKind::Hermes).await {
-            provider.stop_session(ThreadId(thread_id.clone())).await.map_err(|e| e.to_string())?;
+            provider
+                .stop_session(ThreadId(thread_id.clone()))
+                .await
+                .map_err(|e| e.to_string())?;
         }
     }
     // Best-effort: drop the thread's on-disk image directory alongside the
@@ -8154,13 +8235,15 @@ fn publish_pane_status<R: Runtime>(
     }
     if matches!(
         event,
-        ProviderRuntimeEvent::SessionStateChanged { status: SessionStatus::Error { .. }, .. }
-            | ProviderRuntimeEvent::TurnCompleted {
-                status: crate::agent_provider::TurnStatus::Error { .. }
-                    | crate::agent_provider::TurnStatus::MaxTurns
-                    | crate::agent_provider::TurnStatus::MaxBudget,
-                ..
-            }
+        ProviderRuntimeEvent::SessionStateChanged {
+            status: SessionStatus::Error { .. },
+            ..
+        } | ProviderRuntimeEvent::TurnCompleted {
+            status: crate::agent_provider::TurnStatus::Error { .. }
+                | crate::agent_provider::TurnStatus::MaxTurns
+                | crate::agent_provider::TurnStatus::MaxBudget,
+            ..
+        }
     ) {
         crate::web_remote::push::agent_failure(app, &thread_id.0);
     }
@@ -8814,10 +8897,19 @@ mod tests {
         gate.cancelled.fetch_add(1, Ordering::SeqCst);
         assert!(gate.before_dispatch(pending_generation).await.is_err());
         // An explicit new send after Stop is allowed; another profile is independent.
-        assert!(gate.before_dispatch(gate.cancelled.load(Ordering::SeqCst)).await.is_ok());
-        assert!(hermes_send_gate("hermes-independent-send-test").before_dispatch(0).await.is_ok());
+        assert!(gate
+            .before_dispatch(gate.cancelled.load(Ordering::SeqCst))
+            .await
+            .is_ok());
+        assert!(hermes_send_gate("hermes-independent-send-test")
+            .before_dispatch(0)
+            .await
+            .is_ok());
         // Stop must order behind an enqueue that has already committed to dispatch.
-        let dispatch = gate.before_dispatch(gate.cancelled.load(Ordering::SeqCst)).await.unwrap();
+        let dispatch = gate
+            .before_dispatch(gate.cancelled.load(Ordering::SeqCst))
+            .await
+            .unwrap();
         gate.cancelled.fetch_add(1, Ordering::SeqCst);
         assert!(gate.dispatch.try_lock().is_err());
         drop(dispatch);
@@ -9856,7 +9948,10 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(text, "hi there");
-                    assert_eq!(steered_turn_id.as_ref().map(|id| id.0.as_str()), Some("active-turn"));
+                    assert_eq!(
+                        steered_turn_id.as_ref().map(|id| id.0.as_str()),
+                        Some("active-turn")
+                    );
                     assert_eq!(client_nonce.as_deref(), Some("nonce-1"));
                     assert_eq!(images.len(), 1);
                     assert_eq!(images[0].path, "/tmp/a.png");

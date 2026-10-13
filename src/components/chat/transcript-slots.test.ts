@@ -380,6 +380,29 @@ describe("buildTranscriptSlots — settled turn presentation", () => {
     if (expanded.kind === "turn_fold") expect(expanded.expanded).toBe(true);
   });
 
+  it("marks narration as commentary and only the settled final answer as the reply", () => {
+    const commentaryOf = (slots: ReturnType<typeof buildTranscriptSlots>) =>
+      slots.flatMap((slot) =>
+        slot.body.kind === "item" && slot.body.item.kind === "assistant_message"
+          ? [[slot.body.item.id, slot.body.commentary]]
+          : [],
+      );
+
+    expect(
+      commentaryOf(buildTranscriptSlots(settledTurn(), false, new Set(["t1"]))),
+    ).toEqual([
+      ["am-1", true],
+      ["am-4", false],
+    ]);
+
+    // While the turn runs, even its latest message is narration.
+    const live = settledTurn().slice(0, -1);
+    expect(commentaryOf(buildTranscriptSlots(live, true))).toEqual([
+      ["am-1", true],
+      ["am-4", true],
+    ]);
+  });
+
   it("settles expanded when the user had that turn's work log open", () => {
     // `re-2` is the first entry of the work log, pinned while the turn ran.
     const slots = buildTranscriptSlots(settledTurn(), false, new Set(["re-2"]));
@@ -553,6 +576,30 @@ describe("buildTranscriptSlots — subagent runs share the work log", () => {
 });
 
 describe("reuseTranscriptSlots — per-token slot-object reuse", () => {
+  it("refreshes an unchanged answer when a newer answer makes it commentary", () => {
+    const answer = assistantMsg(0, "First answer");
+    const prev = buildTranscriptSlots([answer]);
+    const next = buildTranscriptSlots([answer, assistantMsg(1, "Final answer")]);
+    const reused = reuseTranscriptSlots(prev, next);
+
+    expect(prev[0].body).toMatchObject({ item: answer, commentary: false });
+    expect(reused[0]).toBe(next[0]);
+    expect(reused[0]).not.toBe(prev[0]);
+    expect(reused[0].body).toMatchObject({ item: answer, commentary: true });
+  });
+
+  it("refreshes an unchanged tool when its turn stops being live", () => {
+    const call = tool(0, { approval_request_id: "request-1", status: "running" });
+    const prev = buildTranscriptSlots([call], true);
+    const next = buildTranscriptSlots([call], false);
+    const reused = reuseTranscriptSlots(prev, next);
+
+    expect(prev[0].body).toMatchObject({ item: call, turnLive: true });
+    expect(reused[0]).toBe(next[0]);
+    expect(reused[0]).not.toBe(prev[0]);
+    expect(reused[0].body).not.toHaveProperty("turnLive");
+  });
+
   it("(a) reuses every slot object except the changed one on a token delta", () => {
     const a0 = assistantMsg(0, "a");
     const a1 = assistantMsg(1, "b");

@@ -161,6 +161,7 @@ pub(crate) struct CodexSessionState {
     pub status: SessionStatus,
     /// Current model override (session-wide default).
     pub model: Option<String>,
+    pub permission_mode: Option<String>,
     /// Per-session reasoning-effort default. Applied to every
     /// `turn/start` whose caller does not provide an `effort_override`
     /// — mirrors the reference's `collaborationMode.settings.reasoning_effort`
@@ -179,7 +180,7 @@ pub(crate) struct CodexSessionState {
 
 #[derive(Default)]
 struct PendingTurnStart {
-    completed_turns: std::collections::HashSet<TurnId>,
+    completed_turns: VecDeque<TurnId>,
     failed: bool,
 }
 
@@ -285,6 +286,7 @@ pub(crate) struct CodexSession {
     /// session's workspace — the registry's shared MCP child cannot
     /// learn the caller from its env.
     workspace_id: Option<String>,
+    native_authority: Arc<crate::delegation::authority::NativeAuthority>,
     managed: Option<Arc<crate::agent_provider::managed::ManagedSession>>,
     /// This session as a host-tool caller. Its permission mode is the one
     /// the session started with: Codex cannot change mode mid-session, and
@@ -715,6 +717,7 @@ impl CodexSession {
             status: SessionStatus::Ready,
             model,
             default_effort: effort,
+            permission_mode: permission_mode.clone(),
             service_tier,
             tier_models,
             queued_turns: VecDeque::new(),
@@ -734,6 +737,7 @@ impl CodexSession {
             tasks: Mutex::new(Vec::new()),
             dead: Arc::new(AtomicBool::new(false)),
             workspace_id,
+            native_authority: crate::delegation::authority::NativeAuthority::new(&thread_id.0),
             managed: managed.clone(),
             host_caller,
         });
@@ -816,6 +820,11 @@ impl CodexSession {
         {
             let mut state = self.state.lock().await;
             if state.active_turn.is_some() {
+                if input.dispatch_guard.is_some() {
+                    return Err(ProviderError::ValidationError {
+                        message: "Guarded result cannot queue behind a busy parent".into(),
+                    });
+                }
                 let queued_id = mint_queued_id();
                 let text = input
                     .display_text
@@ -847,6 +856,7 @@ impl CodexSession {
                 input.skill_invocations,
                 input.model_override,
                 input.effort_override,
+                input.dispatch_guard,
                 checkpoint.clone(),
             )
             .await;
@@ -962,6 +972,7 @@ impl CodexSession {
                     input.skill_invocations.clone(),
                     input.model_override.clone(),
                     input.effort_override.clone(),
+                    input.dispatch_guard.clone(),
                     input.turn_checkpoint.clone(),
                 )
                 .await
@@ -973,6 +984,7 @@ impl CodexSession {
                     input.model_override.clone(),
                     input.effort_override.clone(),
                     input.client_nonce.clone(),
+                    input.dispatch_guard.clone(),
                     input.turn_checkpoint.clone(),
                 )
                 .await
@@ -1078,6 +1090,7 @@ impl CodexSession {
                     queued.input.skill_invocations,
                     queued.input.model_override,
                     queued.input.effort_override,
+                    queued.input.dispatch_guard,
                     checkpoint.clone(),
                 )
                 .await
@@ -1229,6 +1242,7 @@ impl CodexSession {
         skill_invocations: Vec<crate::skills::ResolvedSkillInvocation>,
         model_override: Option<String>,
         effort_override: Option<String>,
+        dispatch_guard: Option<Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard>>,
         checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) -> Result<TurnId, ProviderError> {
         self.ensure_managed_child().await?;
@@ -1236,6 +1250,11 @@ impl CodexSession {
         let native = super::slash_commands::request(&text, &thread_id)
             .map_err(|message| ProviderError::ValidationError { message })?;
         if let Some((method, params)) = native {
+            if dispatch_guard.is_some() {
+                return Err(ProviderError::ValidationError {
+                    message: "Guarded result must use the native turn/start path".into(),
+                });
+            }
             if !images.is_empty() || !skill_invocations.is_empty() {
                 return Err(ProviderError::ValidationError {
                     message: "Codex commands cannot include images or skills. Send them in a separate message.".into(),
@@ -1299,6 +1318,7 @@ impl CodexSession {
             model_override,
             effort_override,
             None,
+            dispatch_guard,
             checkpoint,
         )
         .await
@@ -1313,6 +1333,7 @@ impl CodexSession {
         model_override: Option<String>,
         effort_override: Option<String>,
         client_id: Option<String>,
+        dispatch_guard: Option<Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard>>,
         checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) -> Result<TurnId, TurnStartError> {
         self.ensure_managed_child().await.map_err(TurnStartError::Admission)?;
@@ -1372,16 +1393,40 @@ impl CodexSession {
                 crate::json_rpc_child::RpcChildError::RpcError(crate::json_rpc_child::RpcError {code:-32001,message:error.to_string(),data:None})
             ))?;
         }
-        self.state.lock().await.pending_turn_start = Some(PendingTurnStart::default());
-        let response = self.child().await.request("turn/start", params_value).await;
+        let generation = {
+            let mut state = self.state.lock().await;
+            let generation = self.native_authority.begin();
+            state.pending_turn_start = Some(PendingTurnStart::default());
+            generation
+        };
+        let child = self.child().await;
+        let response = match dispatch_guard.as_deref() {
+            Some(guard) => child.request_guarded("turn/start", params_value, guard).await,
+            None => child.request("turn/start", params_value).await,
+        };
         let parsed = response
             .map_err(TurnStartError::Rpc)
             .and_then(|value| serde_json::from_value::<TurnStartResponse>(value)
-                .map_err(TurnStartError::Malformed));
+                .map_err(TurnStartError::Malformed))
+            .and_then(|response| {
+                if let Some(guard) = dispatch_guard.as_ref() {
+                    guard.accepted().map_err(|error| TurnStartError::Rpc(
+                        crate::json_rpc_child::RpcChildError::ProtocolError(error)
+                    ))?;
+                }
+                Ok(response)
+            });
         let mut state = self.state.lock().await;
         let pending = state.pending_turn_start.take().unwrap_or_default();
-        let turn_id = TurnId(parsed?.turn.id);
-        if !pending.completed_turns.contains(&turn_id) && !pending.failed {
+        let parsed = parsed.map_err(|error| {
+            self.native_authority.finish_pending(generation);
+            error
+        })?;
+        let turn_id = TurnId(parsed.turn.id);
+        if pending.completed_turns.contains(&turn_id) || pending.failed {
+            self.native_authority.finish_pending(generation);
+        }
+        if self.native_authority.bind(generation, &turn_id.0) {
             state.active_turn = Some(turn_id.clone());
             state.status = SessionStatus::Running {
                 active_turn: turn_id.clone(),
@@ -1514,6 +1559,7 @@ impl CodexSession {
                         None,
                         None,
                         Some(input.submission_id.clone()),
+                        None,
                         input.checkpoint.clone(),
                     )
                     .await;
@@ -1567,28 +1613,32 @@ impl CodexSession {
     /// Interrupt the currently active turn. If `turn_id` is provided,
     /// only interrupt if it matches the live turn.
     pub async fn interrupt_turn(&self, turn_id: Option<TurnId>) -> Result<(), ProviderError> {
+        // Blanket Stop revokes authority synchronously, even while state is busy.
+        if turn_id.is_none() {
+            self.native_authority.invalidate();
+        }
         let (codex_thread_id, active_turn) = {
             let state = self.state.lock().await;
-            (state.codex_thread_id.clone(), state.active_turn.clone())
-        };
-        let active_turn = match active_turn {
-            Some(t) => t,
-            None => {
-                return Err(ProviderError::ValidationError {
+            let active_turn = state.active_turn.as_ref().ok_or_else(|| {
+                ProviderError::ValidationError {
                     message: "no active turn to interrupt".into(),
-                });
+                }
+            })?;
+            if let Some(requested) = turn_id.as_ref() {
+                if requested != active_turn {
+                    return Err(ProviderError::ValidationError {
+                        message: format!(
+                            "turn id mismatch: requested {}, active {}",
+                            requested.0, active_turn.0
+                        ),
+                    });
+                }
+                // Selection and revocation share the lifecycle lock: a stale
+                // selection must never revoke a subsequently active turn.
+                self.native_authority.invalidate();
             }
+            (state.codex_thread_id.clone(), active_turn.clone())
         };
-        if let Some(requested) = turn_id.as_ref() {
-            if requested != &active_turn {
-                return Err(ProviderError::ValidationError {
-                    message: format!(
-                        "turn id mismatch: requested {}, active {}",
-                        requested.0, active_turn.0
-                    ),
-                });
-            }
-        }
         let params = TurnInterruptParams {
             thread_id: codex_thread_id,
             turn_id: active_turn.0.clone(),
@@ -1714,8 +1764,9 @@ impl CodexSession {
     /// [`JsonRpcChild::shutdown`](crate::json_rpc_child::JsonRpcChild::shutdown)
     /// short-circuits on repeat calls, and the tasks list is drained, so
     /// later invocations are cheap no-ops.
-    pub async fn shutdown(&self) {
-        let _outbound=self.outbound.lock().await;
+    pub async fn shutdown(&self) -> Result<(), ProviderError> {
+        self.native_authority.revoke();
+        let _outbound = self.outbound.lock().await;
         // Cancel any queued follow-ups so the UI clears its greyed items.
         self.cancel_all_queued().await;
 
@@ -1724,10 +1775,19 @@ impl CodexSession {
         let _ = self.shutdown_tx.send(());
 
         // Close the JSON-RPC child cleanly (EOF → 2s grace → kill).
-        let child=self.child().await;
-        if self.runtime_lease.lock().await.is_some(){
-            if child.shutdown_owned().await.is_err(){let _=self.event_tx.send(ProviderRuntimeEvent::RuntimeWarning{thread_id:Some(self.thread_id.clone()),message:"Codex is still stopping. Wait before changing the ChatGPT connection.".into(),original_payload:None});}
-        }else{let _=child.shutdown().await;}
+        let child = self.child().await;
+        let stopped = if self.runtime_lease.lock().await.is_some() {
+            child.shutdown_owned().await
+        } else {
+            child.shutdown().await
+        };
+        if stopped.is_err() && self.chatgpt_runtime.is_some() {
+            let _ = self.event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(self.thread_id.clone()),
+                message: "Codex is still stopping. Wait before changing the ChatGPT connection.".into(),
+                original_payload: None,
+            });
+        }
 
         // Abort any tasks that haven't exited on their own.
         let tasks: Vec<_> = {
@@ -1736,6 +1796,7 @@ impl CodexSession {
         };
         for t in tasks {
             t.abort();
+            let _ = t.await;
         }
         self.runtime_lease.lock().await.take();
         // Flip internal status so concurrent callers see Closed without
@@ -1745,6 +1806,10 @@ impl CodexSession {
             state.status = SessionStatus::Closed;
             state.active_turn = None;
         }
+        stopped.map_err(|e| ProviderError::ProcessError {
+            message: "Native owned child teardown was not acknowledged".into(),
+            source: Some(e.to_string()),
+        })
     }
 
     pub async fn shutdown_managed(&self) -> Result<(), ProviderError> {
@@ -1770,8 +1835,8 @@ impl CodexSession {
                     source: Some(error),
                 })?;
         }
-        self.shutdown().await;
-        Ok(())
+        self.shutdown().await
+
     }
 }
 
@@ -2323,11 +2388,27 @@ fn spawn_incoming_requests_task(
                             });
                             continue;
                         }
-                        let result = handle_dynamic_tool_call(
+                        let actor = {
+                            let state = session.state.lock().await;
+                            let turn = params.get("turnId").and_then(Value::as_str);
+                            let owned = params.get("threadId").and_then(Value::as_str) == Some(state.codex_thread_id.as_str())
+                                && turn.is_some_and(|turn| state.active_turn.as_ref().is_some_and(|active| active.0 == turn)
+                                    || state.pending_turn_start.is_some());
+                            owned.then(|| crate::delegation::app::NativeActor {
+                                thread_id: session.thread_id.0.clone(), provider: crate::agent_provider::ProviderKind::Codex,
+                                workspace_id: session.workspace_id.clone(), session_id: session.provider_session_id.0.clone(),
+                                permission_mode: state.permission_mode.clone(),
+                                permit: session.native_authority.capture_for_turn(turn.unwrap()),
+                            })
+                        };
+                        if let Some(actor) = &actor {
+                            let _ = actor.permit.wait_ready().await;
+                        }
+                        let result = handle_dynamic_tool_call_native(
                             mcp_registry.as_ref(),
                             session.workspace_id.as_deref(),
                             Some((&session.host_caller, session.provider_session_id.0.as_str())),
-                            params,
+                            params, actor,
                         )
                         .await;
                         if let Err(error) = child.respond(req.id, Ok(result)).await {
@@ -2388,12 +2469,23 @@ async fn dynamic_tool_specs(
 /// translate the MCP content envelope into Codex's input-content shape. With
 /// no registry (a session on a device, which must not reach this computer's
 /// tools whatever name it sends) the call fails without dispatching.
+#[cfg(test)]
 async fn handle_dynamic_tool_call(
     registry: Option<&McpRegistry>,
     workspace_id: Option<&str>,
     // The root chat's caller and its Codex thread id.
     host: Option<(&crate::mcp::registry::HostCaller, &str)>,
     raw: Value,
+) -> Value {
+    handle_dynamic_tool_call_native(registry, workspace_id, host, raw, None).await
+}
+
+async fn handle_dynamic_tool_call_native(
+    registry: Option<&McpRegistry>,
+    workspace_id: Option<&str>,
+    host: Option<(&crate::mcp::registry::HostCaller, &str)>,
+    raw: Value,
+    actor: Option<crate::delegation::app::NativeActor>,
 ) -> Value {
     let parsed = serde_json::from_value::<DynamicToolCallParams>(raw);
     let dispatched = match (registry, parsed) {
@@ -2422,10 +2514,9 @@ async fn handle_dynamic_tool_call(
             });
             match host {
                 Some(result) => Ok(result),
-                None => {
-                    registry
-                        .dispatch_tool_call(&name, call.arguments, workspace_id)
-                        .await
+                None => match actor {
+                    Some(actor) => registry.dispatch_native_tool_call(&name, call.arguments, actor).await,
+                    None => registry.dispatch_tool_call(&name, call.arguments, workspace_id).await,
                 }
             }
         }
@@ -2567,7 +2658,14 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
             // Only the parent thread drives the session's active turn;
             // a sub-agent's turn must never touch parent turn state.
             if p.thread_id == state.codex_thread_id {
-                state.active_turn = Some(TurnId(p.turn_id.clone()));
+                if session.native_authority.observe_start(&p.turn_id)
+                    || state
+                        .active_turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.0.starts_with("native-"))
+                {
+                    state.active_turn = Some(TurnId(p.turn_id.clone()));
+                }
             }
         }
         NotificationMessage::TurnCompleted(p) => {
@@ -2577,8 +2675,14 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
             if p.thread_id != state.codex_thread_id {
                 return;
             }
+            if state.active_turn.as_ref().is_some_and(|t| t.0 != p.turn_id) {
+                return;
+            }
             if let Some(pending) = state.pending_turn_start.as_mut() {
-                pending.completed_turns.insert(TurnId(p.turn_id.clone()));
+                if pending.completed_turns.len() == 64 {
+                    pending.completed_turns.pop_front();
+                }
+                pending.completed_turns.push_back(TurnId(p.turn_id.clone()));
             }
             if state
                 .active_turn
@@ -2586,6 +2690,7 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
                 .map(|t| t.0 == p.turn_id)
                 .unwrap_or(false)
             {
+                session.native_authority.finish(&p.turn_id);
                 state.active_turn = None;
             }
             // Status update follows from translate_turn_completed()
@@ -2805,6 +2910,7 @@ mod tests {
                 permission_mode_override: None,
                 client_nonce: None,
                 turn_checkpoint: None,
+                dispatch_guard: None,
             },
         }
     }

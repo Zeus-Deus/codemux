@@ -2275,6 +2275,7 @@ pub(crate) mod tests {
             permission_mode_override: None,
             client_nonce: Some(text.into()),
             turn_checkpoint: None,
+            dispatch_guard: None,
         }
     }
 

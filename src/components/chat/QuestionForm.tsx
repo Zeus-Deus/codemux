@@ -271,7 +271,11 @@ export function QuestionForm({
 
     const handler = (e: globalThis.KeyboardEvent) => {
       if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
-      if (!ownsGlobalKeystroke(e.target, formRef.current)) return;
+      const form = formRef.current;
+      // A foreign modal owns shortcuts even when the key targets the document.
+      const modal = document.querySelector('[role="dialog"]:not([aria-hidden="true"]):not([data-state="closed"]), [role="alertdialog"]:not([aria-hidden="true"]):not([data-state="closed"])');
+      if (modal && (!form || !modal.contains(form))) return;
+      if (!ownsGlobalKeystroke(e.target, form)) return;
 
       // Digit 1-9 → toggle Nth option on the current question.
       const digit = Number.parseInt(e.key, 10);

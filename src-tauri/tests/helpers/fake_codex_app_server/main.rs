@@ -66,6 +66,9 @@ struct IncomingMessage {
 #[derive(Debug, Clone, Deserialize)]
 struct ScriptEntry {
     after: String,
+    /// Restrict a turn/start fixture to its actual acknowledged turn number.
+    #[serde(default)]
+    on_turn: Option<u64>,
     #[serde(default)]
     delay_ms: u64,
     emit: String,
@@ -105,9 +108,10 @@ fn fire_script_entries_for(
     script: &[ScriptEntry],
     pending_server: &Arc<Mutex<HashMap<String, Value>>>,
 ) {
+    let turn = (method == "turn/start").then(|| TURN_COUNTER.load(Ordering::Relaxed) - 1);
     let matches: Vec<_> = script
         .iter()
-        .filter(|e| e.after == method)
+        .filter(|e| e.after == method && e.on_turn.is_none_or(|expected| turn == Some(expected)))
         .cloned()
         .collect();
     if matches.is_empty() {
@@ -182,9 +186,11 @@ fn main() {
     let capture_turn = std::env::var("FAKE_CODEX_CAPTURE_TURN").ok();
     let async_mode = std::env::var("FAKE_CODEX_ASYNC_MODE").ok();
     let trace = std::env::var("FAKE_CODEX_TRACE").ok();
-    let mut hooks: Vec<Value> = std::env::var("FAKE_CODEX_HOOKS").ok()
+    let mut hooks: Vec<Value> = std::env::var("FAKE_CODEX_HOOKS")
+        .ok()
         .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default();
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
     let history_file = std::env::var("FAKE_CODEX_HISTORY").ok();
     let mut async_turns: Vec<Value> = history_file
         .as_ref()
@@ -251,12 +257,18 @@ fn main() {
                 for edit in msg.params["edits"].as_array().into_iter().flatten() {
                     for (key, state) in edit["value"].as_object().into_iter().flatten() {
                         if let Some(hook) = hooks.iter_mut().find(|hook| hook["key"] == *key) {
-                            if state["trusted_hash"] == hook["currentHash"] { hook["trustStatus"] = json!("trusted"); }
-                            if let Some(enabled) = state["enabled"].as_bool() { hook["enabled"] = json!(enabled); }
+                            if state["trusted_hash"] == hook["currentHash"] {
+                                hook["trustStatus"] = json!("trusted");
+                            }
+                            if let Some(enabled) = state["enabled"].as_bool() {
+                                hook["enabled"] = json!(enabled);
+                            }
                         }
                     }
                 }
-                if let Some(id) = id { write_line(&json!({"id": id, "result": {}})); }
+                if let Some(id) = id {
+                    write_line(&json!({"id": id, "result": {}}));
+                }
             }
             "initialize" => {
                 if let Some(id) = id {
@@ -348,6 +360,15 @@ fn main() {
                 }
                 let t = TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
                 let tid = format!("t-{t}");
+                let ack_gate = std::env::var("FAKE_CODEX_FIRST_ACK_GATE")
+                    .ok()
+                    .filter(|_| t == 1);
+                if let Some(gate) = &ack_gate {
+                    fire_script_entries_for(method, &script, &pending_server_requests);
+                    while !std::path::Path::new(gate).exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
                 if async_mode.is_some() {
                     for turn in &mut async_turns {
                         turn["status"] = json!("completed");
@@ -358,10 +379,12 @@ fn main() {
                     write_line(&json!({
                         "jsonrpc":"2.0",
                         "id": id,
-                        "result": {"turn": {"id": tid }},
+                        "result": if t==1 && env_truthy("FAKE_CODEX_FIRST_ACK_EMPTY") { json!({"turn":{"id":""}}) } else if t==1 && env_truthy("FAKE_CODEX_FIRST_ACK_MALFORM") { json!({}) } else { json!({"turn": {"id": tid }}) },
                     }));
                 }
-                fire_script_entries_for(method, &script, &pending_server_requests);
+                if ack_gate.is_none() {
+                    fire_script_entries_for(method, &script, &pending_server_requests);
+                }
             }
             "turn/steer" if async_mode.is_some() => {
                 steer_attempts += 1;

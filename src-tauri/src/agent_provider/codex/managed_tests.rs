@@ -815,6 +815,85 @@ async fn chatgpt_queued_completion_before_start_response_does_not_strand_followu
     );
 }
 
+#[tokio::test]
+async fn chatgpt_guarded_dispatch_cleans_rejection_and_binds_native_authority() {
+    use crate::json_rpc_child::dispatch::{DispatchGuard, WritePoll};
+
+    #[derive(Debug)]
+    struct Guard {
+        reject: bool,
+        writes: std::sync::atomic::AtomicUsize,
+        accepted: std::sync::atomic::AtomicUsize,
+    }
+    impl DispatchGuard for Guard {
+        fn poll_first(&self, write: &mut dyn FnMut() -> WritePoll) -> Result<WritePoll, String> {
+            if self.reject {
+                return Err("fixture dispatch revoked".into());
+            }
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(write())
+        }
+        fn accepted(&self) -> Result<(), String> {
+            self.accepted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let owner = super::super::chatgpt::Owner::testing(dir.path().join("chatgpt"));
+    let thread = ThreadId(format!("plan-guard-{}", uuid::Uuid::new_v4()));
+    let (events, _) = broadcast::channel(128);
+    let session = CodexSession::spawn_and_initialize(
+        thread.clone(), dir.path().into(), None, None, None,
+        "default".into(), None, None, None,
+        CodexSpawnConfig {
+            codex_binary: fixture_binary(dir.path()),
+            chatgpt_owner: Some(owner.clone()),
+            codex_home: None,
+            client_info: ClientInfo {
+                name: "codemux".into(),
+                title: "Codemux".into(),
+                version: "fixture".into(),
+            },
+            mcp_registry: None,
+            remote: None,
+        },
+        events, None,
+    ).await.unwrap();
+    let rejected = Arc::new(Guard {
+        reject: true,
+        writes: std::sync::atomic::AtomicUsize::new(0),
+        accepted: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut input = super::tests::queued("rejected").input;
+    input.thread_id = thread.clone();
+    input.dispatch_guard = Some(rejected.clone());
+    assert!(session.enqueue_or_send(input).await.is_err());
+    assert_eq!(rejected.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(rejected.accepted.load(Ordering::SeqCst), 0);
+    assert!(session.state.lock().await.pending_turn_start.is_none());
+    assert!(!wire(dir.path()).iter().any(|v| v["rpc"] == "turn/start"));
+
+    let admitted = Arc::new(Guard {
+        reject: false,
+        writes: std::sync::atomic::AtomicUsize::new(0),
+        accepted: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut input = super::tests::queued("accepted").input;
+    input.thread_id = thread;
+    input.dispatch_guard = Some(admitted.clone());
+    let started = session.enqueue_or_send(input).await.unwrap();
+    assert!(matches!(started, SendOutcome::Started(TurnId(id)) if id == "turn-1"));
+    assert!(admitted.writes.load(Ordering::SeqCst) > 0);
+    assert_eq!(admitted.accepted.load(Ordering::SeqCst), 1);
+    assert!(session.state.lock().await.pending_turn_start.is_none());
+    tokio::time::timeout(Duration::from_secs(1), session.native_authority.capture().wait_ready())
+        .await.unwrap().unwrap();
+    assert_eq!(wire(dir.path()).iter().filter(|v| v["rpc"] == "turn/start").count(), 1);
+    session.shutdown().await.unwrap();
+    assert!(owner.acquire_runtime().is_ok());
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn chatgpt_workflow_uses_owned_grant_and_containment_through_renewal() {

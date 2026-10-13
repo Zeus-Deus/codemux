@@ -57,6 +57,7 @@ import { TurnChangesChip } from "./TurnChangesChip";
 import { AsyncQuestionRecord } from "./AsyncQuestionPanel";
 import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
+import { RemoteTaskRow } from "./remote-task-context";
 import { WorkflowRunCard } from "./WorkflowRunCard";
 import { ChatFileLinkContext } from "./chat-file-link-context";
 import { resolveConversationSearchTargetIndex } from "./conversation-search-target";
@@ -322,7 +323,7 @@ export const MessageList = memo(function MessageList({
   // separate shimmer marker is suppressed when one is the transcript tail
   // (no double indicators). The marker still fills the gap before any step
   // arrives (e.g. right after send), which is not a working Activity tail.
-  const tailBody = slots.length > 0 ? slots[slots.length - 1].body : null;
+  const tailBody = [...slots].reverse().find(slot => !(slot.body.kind === 'item' && slot.body.item.kind === 'remote_task'))?.body ?? null;
   const tailIsWorkingActivity =
     tailBody?.kind === "activity" && tailBody.working;
   // `shouldShowThinkingIndicator` steps back for a running tool / streaming
@@ -331,7 +332,7 @@ export const MessageList = memo(function MessageList({
   // into a settled turn, or dropped as a quiet observational read — and
   // the thread would show nothing live while the agent is mid-command.
   // Reinstate the marker whenever the live tail item is invisible.
-  const tailItem = ordered.length > 0 ? ordered[ordered.length - 1] : null;
+  const tailItem = [...ordered].reverse().find(item => item.kind !== 'remote_task') ?? null;
   const tailItemIsLive =
     tailItem != null &&
     ((tailItem.kind === "tool_call" && tailItem.status === "running") ||
@@ -1814,6 +1815,7 @@ function transcriptSlotType(slot: TranscriptSlot): string {
 
 function ItemRow({
   item,
+  commentary,
   turnLive = false,
   approval,
   subagentName,
@@ -1832,6 +1834,7 @@ function ItemRow({
   referencePaths,
 }: {
   item: ChatViewItem;
+  commentary?: boolean;
   /** The item's turn is still running; gates a tool card's live timer. */
   turnLive?: boolean;
   approval: PermissionRequestItem | null;
@@ -1912,6 +1915,10 @@ function ItemRow({
     return null;
   }
 
+  if (item.kind === "remote_task") {
+    return <RemoteTaskRow task={item.task} />;
+  }
+
   // Same full-width, no-gutter treatment for a Workflow tool run.
   if (item.kind === "workflow_run") {
     return (
@@ -1925,6 +1932,7 @@ function ItemRow({
   }
 
   return renderAssistantBody(item, {
+    commentary,
     turnLive,
     approval,
     subagentName,
@@ -1941,6 +1949,7 @@ function ItemRow({
 function renderAssistantBody(
   item: Exclude<ChatViewItem, { kind: "user_message" }>,
   handlers: {
+    commentary?: boolean;
     turnLive: boolean;
     approval: PermissionRequestItem | null;
     subagentName: string | null;
@@ -1960,6 +1969,7 @@ function renderAssistantBody(
       return (
         <AssistantMessage
           item={item}
+          commentary={handlers.commentary}
           workspaceId={handlers.workspaceId}
           cwd={handlers.cwd}
           referenceCwd={handlers.referenceCwd}
@@ -2259,6 +2269,7 @@ function SlotRow({
       ) : (
         <ItemRowMemo
           item={slot.body.item}
+          commentary={slot.body.commentary}
           turnLive={slot.body.turnLive}
           approval={approval}
           subagentName={subagentName}

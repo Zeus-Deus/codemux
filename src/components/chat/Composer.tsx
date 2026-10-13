@@ -316,6 +316,8 @@ interface Props {
   onAttachPr?: (pr: PullRequestInfo) => void;
   /** Attach one persisted GUI conversation as a safe, budgeted handoff. */
   onAttachSession?: (session: AgentChatSessionMention) => void;
+  /** Open the host-task consent dialog without sending or changing the draft. */
+  onDelegateTask?: () => void;
   /** Step 8 Stage 6 — invoked when the user attaches an image via
    *  paste, drag-drop, or the `+ → Image…` picker. Composer just
    *  forwards the raw File; the parent runs the allowlist check and
@@ -512,6 +514,7 @@ export function Composer({
   onAttachIssue,
   onAttachPr,
   onAttachSession,
+  onDelegateTask,
   onAttachImage,
   modelSupportsImages = false,
   repoSupported = null,
@@ -2007,6 +2010,17 @@ export function Composer({
           group: "INTEGRATIONS",
           onSelect: () => {},
         },
+        ...(onDelegateTask ? [{
+          id: "delegate:host",
+          label: "Run on host…",
+          description: "Delegate a coding task to another machine",
+          command: "",
+          icon: Server,
+          tone: "sky" as const,
+          group: "INTEGRATIONS",
+          disabled: readOnly || !sessionReady || remoteDisconnected,
+          onSelect: () => {},
+        }] : []),
         ...addonActions,
       ];
     }
@@ -2106,6 +2120,10 @@ export function Composer({
     modelSupportsImages,
     workflowCommand,
     configurationEnabled,
+    onDelegateTask,
+    readOnly,
+    sessionReady,
+    remoteDisconnected,
   ]);
 
   const attachPopupFooter = useMemo(() => {
@@ -2189,6 +2207,12 @@ export function Composer({
     (item: SlashCommandItem) => {
       if (item.disabled) return;
       if (item.id.startsWith("addon:")) { item.onSelect(); closeAttachPopup(); return; }
+      if (item.id === "delegate:host") {
+        if (readOnly || !sessionReady || remoteDisconnected) return;
+        closeAttachPopup();
+        onDelegateTask?.();
+        return;
+      }
       // Submode pivots
       if (item.id === "attach:file") {
         setAttachSubmode("file");
@@ -2334,6 +2358,10 @@ export function Composer({
       onAttachFile,
       onAttachFolder,
       onAttachSession,
+      onDelegateTask,
+      readOnly,
+      sessionReady,
+      remoteDisconnected,
       onModeActivate,
     ],
   );

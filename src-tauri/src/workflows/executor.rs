@@ -390,6 +390,7 @@ impl LiveWorkflowDriver {
             permission_mode_override: None,
             client_nonce: None,
             turn_checkpoint: None,
+            dispatch_guard: None,
         };
         let sent = tokio::select! {
             result=provider.send_turn(turn_input)=>result,

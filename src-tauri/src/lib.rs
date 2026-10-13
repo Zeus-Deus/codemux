@@ -31,6 +31,7 @@ pub mod browser_viewport;
 pub mod cli;
 pub mod commands;
 pub mod database;
+pub mod delegation;
 pub mod config;
 pub mod git;
 pub mod git_provider;
@@ -62,6 +63,9 @@ pub mod project;
 pub mod pty_daemon;
 #[cfg(unix)]
 pub mod remote;
+// Wire DTOs are shared by portable delegation clients and the Unix receiver.
+#[path = "remote/tasks/types.rs"]
+pub mod remote_task_protocol;
 // SSH transport for the cloud-push feature. Unix-only — relies on
 // the system `ssh` + `scp` binaries (with the user's existing
 // `~/.ssh/config`, agent, and known_hosts).
@@ -517,6 +521,11 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                if let Some(coordinator) = app.try_state::<delegation::coordinator::Coordinator>() {
+                    if let Err(error) = tauri::async_runtime::block_on(coordinator.shutdown()) {
+                        log::error!("Delegation shutdown could not join its owners: {error}");
+                    }
+                }
                 // Tauri may exit without dropping managed state. Close admission
                 // and await the owned OpenCode direct child before other cleanup.
                 if let Err(error) = tauri::async_runtime::block_on(
@@ -915,6 +924,9 @@ fn build_core_app<R: tauri::Runtime>(
                     if ids.is_empty() {Ok(())} else {state.persist_local_import_layout(&db,&ids)}
                 }) {log::warn!("Local import layout recovery remains pending: {error}");}
             }
+            // Reconciliation checks canonical pane/workspace ownership. Starting
+            // it before layout restore can incorrectly hold a saved child result.
+            delegation::coordinator::install(app.handle()).map_err(std::io::Error::other)?;
             // Headless (`codemux serve`) deliberately keeps the CWD workspace
             // `default_app_state()` creates. The clear above exists purely to
             // show the GUI's splash screen, and there is no splash screen to
@@ -2798,6 +2810,16 @@ fn build_core_app<R: tauri::Runtime>(
             commands::async_questions::agent_chat_question_attention,
             commands::agent_chat_set_model,
             commands::agent_chat_set_fast_mode,
+            delegation::commands::delegation_host_info,
+            delegation::commands::delegation_grants,
+            delegation::commands::delegation_authorize,
+            delegation::commands::delegation_revoke,
+            delegation::commands::delegate_task,
+            delegation::commands::delegation_list,
+            delegation::commands::delegation_read,
+            delegation::commands::delegation_cancel,
+            delegation::commands::delegation_respond,
+            delegation::commands::delegation_deliver,
             commands::agent_chat_set_service_tier,
             commands::agent_chat_set_permission_mode,
             commands::list_chat_provider_capabilities,

@@ -106,7 +106,10 @@ async fn live_codex_app_server_accepts_shared_dynamic_tools() {
         .start_session(start_input("live-codex-mcp"))
         .await
         .expect("real Codex app-server should accept registry dynamicTools");
-    assert_eq!(session.provider, codemux_lib::agent_provider::ProviderKind::Codex);
+    assert_eq!(
+        session.provider,
+        codemux_lib::agent_provider::ProviderKind::Codex
+    );
     provider
         .stop_session(ThreadId("live-codex-mcp".into()))
         .await
@@ -155,22 +158,73 @@ async fn native_hooks_use_catalogue_and_exact_config_updates_without_inference()
     let probe_calls = std::fs::read_to_string(trace.path()).unwrap();
     assert!(!probe_calls.contains("thread/start"));
     assert!(!probe_calls.contains("turn/start"));
-    start_session_resilient(&provider, start_input("hooks-live")).await.unwrap();
+    start_session_resilient(&provider, start_input("hooks-live"))
+        .await
+        .unwrap();
     let thread = Some(ThreadId("hooks-live".into()));
     let key = catalogue.hooks[0]["key"].as_str().unwrap().to_string();
-    assert!(provider.manage_hooks(&cwd, thread.clone(), Some(HookUpdate::Trust { key: key.clone(), hash: "stale".into() })).await.is_err());
-    assert!(!std::fs::read_to_string(trace.path()).unwrap().contains("config/batchWrite"));
-    let trusted = provider.manage_hooks(&cwd, thread.clone(), Some(HookUpdate::Trust { key: key.clone(), hash: "reviewed".into() })).await.unwrap();
+    assert!(provider
+        .manage_hooks(
+            &cwd,
+            thread.clone(),
+            Some(HookUpdate::Trust {
+                key: key.clone(),
+                hash: "stale".into()
+            })
+        )
+        .await
+        .is_err());
+    assert!(!std::fs::read_to_string(trace.path())
+        .unwrap()
+        .contains("config/batchWrite"));
+    let trusted = provider
+        .manage_hooks(
+            &cwd,
+            thread.clone(),
+            Some(HookUpdate::Trust {
+                key: key.clone(),
+                hash: "reviewed".into(),
+            }),
+        )
+        .await
+        .unwrap();
     assert_eq!(trusted.hooks[0]["trustStatus"], "trusted");
-    let enabled = provider.manage_hooks(&cwd, thread, Some(HookUpdate::SetEnabled { key: key.clone(), hash: "reviewed".into(), enabled: true })).await.unwrap();
+    let enabled = provider
+        .manage_hooks(
+            &cwd,
+            thread,
+            Some(HookUpdate::SetEnabled {
+                key: key.clone(),
+                hash: "reviewed".into(),
+                enabled: true,
+            }),
+        )
+        .await
+        .unwrap();
     assert_eq!(enabled.hooks[0]["enabled"], true);
-    let calls: Vec<Value> = std::fs::read_to_string(trace.path()).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-    let writes: Vec<_> = calls.iter().filter(|call| call["method"] == "config/batchWrite").collect();
+    let calls: Vec<Value> = std::fs::read_to_string(trace.path())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let writes: Vec<_> = calls
+        .iter()
+        .filter(|call| call["method"] == "config/batchWrite")
+        .collect();
     assert_eq!(writes.len(), 2);
-    assert_eq!(writes[0]["params"]["edits"][0]["value"], json!({key.clone(): {"trusted_hash": "reviewed"}}));
-    assert_eq!(writes[1]["params"]["edits"][0]["value"], json!({key: {"enabled": true}}));
+    assert_eq!(
+        writes[0]["params"]["edits"][0]["value"],
+        json!({key.clone(): {"trusted_hash": "reviewed"}})
+    );
+    assert_eq!(
+        writes[1]["params"]["edits"][0]["value"],
+        json!({key: {"enabled": true}})
+    );
     assert!(calls.iter().all(|call| call["method"] != "turn/start"));
-    provider.stop_session(ThreadId("hooks-live".into())).await.unwrap();
+    provider
+        .stop_session(ThreadId("hooks-live".into()))
+        .await
+        .unwrap();
 }
 
 #[derive(Debug, Default)]
@@ -383,6 +437,7 @@ async fn send_turn_emits_turn_started_then_delta_then_completed() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -455,6 +510,7 @@ async fn send_turn_emits_structured_skill_item_on_the_wire() {
                 invocation: SkillInvocationKind::CodexSkillItem,
             }],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -515,6 +571,7 @@ async fn native_commands_use_rpc_and_release_the_active_turn() {
                 permission_mode_override: None,
                 client_nonce: None,
                 turn_checkpoint: None,
+                dispatch_guard: None,
             })
             .await
             .unwrap();
@@ -573,6 +630,7 @@ async fn fast_mode_changes_apply_to_turns_without_restarting_the_thread() {
                 display_text: None,
                 skill_invocations: vec![],
                 turn_checkpoint: None,
+                dispatch_guard: None,
             })
             .await
             .unwrap();
@@ -602,10 +660,7 @@ async fn rollback_conversation_uses_codex_thread_rollback_contract() {
     let capture_dir = tempfile::tempdir().unwrap();
     let capture_path = capture_dir.path().join("rollback.json");
     let capture_path_string = capture_path.to_string_lossy().to_string();
-    let wrapper = wrapper_with_env(&[(
-        "FAKE_CODEX_CAPTURE_ROLLBACK",
-        &capture_path_string,
-    )]);
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_CAPTURE_ROLLBACK", &capture_path_string)]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
     start_session_resilient(&provider, start_input("t-rollback"))
         .await
@@ -663,6 +718,7 @@ async fn rollback_conversation_refuses_an_active_turn_without_calling_codex() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -774,6 +830,7 @@ async fn unknown_notification_surfaces_as_runtime_warning() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -824,6 +881,7 @@ async fn command_approval_request_roundtrip() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -884,6 +942,7 @@ async fn command_approval_deny_roundtrip() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -938,6 +997,7 @@ async fn interrupt_turn_sends_turn_interrupt() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -976,6 +1036,7 @@ async fn interrupt_turn_with_wrong_turn_id_fails_validation() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1004,11 +1065,13 @@ async fn turn_active_true_in_flight_then_false_after_settle() {
     // `turn/started` arms `active_turn`; `turn/completed` clears it. The
     // frontend hydrate path reads turn_active to tell "run still in flight"
     // apart from "run died mid-turn".
+    // Each fresh checked-in helper acknowledges its first turn/start as t-1.
+    let fixture_turn_id = "t-1";
     let script = write_script(json!([
         {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
-         "params":{"threadId":"c-1","turnId":"t-ta-1"}},
+         "params":{"threadId":"c-1","turnId":fixture_turn_id}},
         {"after":"turn/start","delay_ms":250,"emit":"notification","method":"turn/completed",
-         "params":{"threadId":"c-1","turnId":"t-ta-1","status":"succeeded"}}
+         "params":{"threadId":"c-1","turnId":fixture_turn_id,"status":"succeeded"}}
     ]));
     let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
@@ -1019,7 +1082,7 @@ async fn turn_active_true_in_flight_then_false_after_settle() {
         !provider.turn_active(&ThreadId("t-ta".into())).await,
         "no turn yet => false"
     );
-    provider
+    let acknowledgement = provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-ta".into()),
             text: "hi".into(),
@@ -1031,10 +1094,15 @@ async fn turn_active_true_in_flight_then_false_after_settle() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
-    // `active_turn` is armed asynchronously by the scripted turn/started.
+    assert_eq!(
+        acknowledgement.turn_id.0, fixture_turn_id,
+        "legitimate scripted completion must match the helper's actual first-turn acknowledgement"
+    );
+    // The acknowledgement and matching scripted turn/started arm active_turn.
     let armed = timeout(Duration::from_secs(3), async {
         loop {
             if provider.turn_active(&ThreadId("t-ta".into())).await {
@@ -1060,6 +1128,100 @@ async fn turn_active_true_in_flight_then_false_after_settle() {
         "turn_active must return to false after settle"
     );
     provider.stop_session(ThreadId("t-ta".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_completion_after_ack_keeps_the_acknowledged_turn_active() {
+    for (wire_thread, wire_turn) in [("c-1", "t-ta-1"), ("foreign-thread", "t-1")] {
+        // Trigger only after send_turn has returned its actual acknowledgement.
+        // A later warning on the same notification stream proves the foreign
+        // start/completion reached the state owner; no startup sleep is needed.
+        let script = write_script(json!([
+            {"after":"turn/steer","emit":"notification","method":"turn/started",
+             "params":{"threadId":wire_thread,"turnId":wire_turn}},
+            {"after":"turn/steer","emit":"notification","method":"turn/completed",
+             "params":{"threadId":wire_thread,"turnId":wire_turn,"status":"succeeded"}},
+            {"after":"turn/steer","emit":"notification","method":"fixture/foreign-completion-consumed",
+             "params":{"threadId":wire_thread,"turnId":wire_turn}}
+        ]));
+        let trace = tempfile::NamedTempFile::new().unwrap();
+        let wrapper = wrapper_with_env(&[
+            ("FAKE_CODEX_ASYNC_MODE", "running"),
+            ("FAKE_CODEX_SCRIPT", script.path().to_str().unwrap()),
+            ("FAKE_CODEX_TRACE", trace.path().to_str().unwrap()),
+        ]);
+        let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+        let thread = ThreadId("foreign-completion-after-ack".into());
+        start_session_resilient(&provider, start_input(&thread.0))
+            .await
+            .unwrap();
+        let mut events = provider.event_stream();
+        let acknowledgement = provider
+            .send_turn(guidance_input(&thread.0, "first"))
+            .await
+            .unwrap();
+        assert_eq!(acknowledgement.turn_id.0, "t-1");
+        assert!(provider.turn_active(&thread).await);
+        let steered = provider
+            .steer_turn(guidance_input(&thread.0, "continue"))
+            .await
+            .unwrap();
+        assert_eq!(steered.turn_id, acknowledgement.turn_id);
+        timeout(Duration::from_secs(3), async {
+            while let Some(event) = events.next().await {
+                if let ProviderRuntimeEvent::RuntimeWarning {
+                    message,
+                    original_payload: Some(payload),
+                    ..
+                } = event
+                {
+                    if message == "unknown codex notification: fixture/foreign-completion-consumed"
+                    {
+                        assert_eq!(payload["threadId"], wire_thread);
+                        assert_eq!(payload["turnId"], wire_turn);
+                        return;
+                    }
+                }
+            }
+            panic!("foreign completion observation stream closed");
+        })
+        .await
+        .expect("must observe the notification following the foreign completion");
+        assert!(
+            provider.turn_active(&thread).await,
+            "foreign completion must not settle the parent"
+        );
+        let session = provider
+            .list_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|session| session.thread_id == thread)
+            .unwrap();
+        assert!(
+            matches!(session.status, SessionStatus::Running { active_turn } if active_turn == acknowledgement.turn_id),
+            "foreign start/completion must not replace the acknowledged parent turn"
+        );
+        let checkpoint = Arc::new(RecordingTurnCheckpoint::default());
+        let mut next = guidance_input(&thread.0, "queued followup");
+        next.turn_checkpoint = Some(checkpoint.clone());
+        assert!(
+            provider.send_turn(next).await.unwrap().queued_id.is_some(),
+            "foreign completion must not dispatch a successor"
+        );
+        assert!(checkpoint.snapshot().is_empty());
+        let calls = std::fs::read_to_string(trace.path()).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(
+                    |line| serde_json::from_str::<Value>(line).unwrap()["method"] == "turn/start"
+                )
+                .count(),
+            1
+        );
+        provider.stop_session(thread).await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1100,6 +1262,7 @@ async fn set_model_updates_session_state() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1152,6 +1315,7 @@ async fn send_turn_on_nonexistent_thread_returns_session_not_found() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap_err();
@@ -1199,6 +1363,7 @@ async fn child_process_crash_emits_error_state() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .expect("send_turn must succeed: the response is written before the exit");
@@ -1269,6 +1434,7 @@ async fn dead_child_is_evicted_and_start_session_rebuilds() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .expect("send_turn must succeed: the response is written before the exit");
@@ -1296,9 +1462,9 @@ async fn concurrent_send_turn_queues_instead_of_erroring() {
     // dispatch, rather than capturing while the first turn is still active.
     let script = write_script(json!([
         {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
-         "params":{"threadId":"c-1","turnId":"t-busy"}},
+         "params":{"threadId":"c-1","turnId":"t-1"}},
         {"after":"turn/start","delay_ms":250,"emit":"notification","method":"turn/completed",
-         "params":{"threadId":"c-1","turnId":"t-busy","status":"succeeded"}}
+         "params":{"threadId":"c-1","turnId":"t-1","status":"succeeded"}}
     ]));
     let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
@@ -1318,6 +1484,7 @@ async fn concurrent_send_turn_queues_instead_of_erroring() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1336,6 +1503,7 @@ async fn concurrent_send_turn_queues_instead_of_erroring() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: Some(queued_checkpoint.clone()),
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1404,6 +1572,7 @@ async fn cancel_queued_turn_removes_it_codex() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1420,6 +1589,7 @@ async fn cancel_queued_turn_removes_it_codex() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap()
@@ -1448,7 +1618,10 @@ async fn cancel_queued_turn_removes_it_codex() {
         .cancel_queued_turn(ThreadId("t-cq".into()), queued)
         .await
         .unwrap();
-    assert!(!removed_again, "an already-cancelled id should report false");
+    assert!(
+        !removed_again,
+        "an already-cancelled id should report false"
+    );
     provider.stop_session(ThreadId("t-cq".into())).await.ok();
 }
 
@@ -1534,6 +1707,7 @@ async fn translate_turn_completed_error_emits_both_events_end_to_end() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1597,6 +1771,7 @@ async fn thread_token_usage_reaches_the_event_stream_end_to_end() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1749,6 +1924,7 @@ async fn bogus_response_to_unknown_jsonrpc_id_does_not_crash_adapter() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -1863,6 +2039,7 @@ async fn subagent_lifecycle_spawn_child_thread_items_wait_flows_through_adapter(
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -2017,6 +2194,7 @@ async fn shutdown_during_event_streaming_does_not_panic() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -2086,6 +2264,7 @@ async fn async_question_streams_before_answer_and_steers_same_turn() {
             permission_mode_override: None,
             client_nonce: None,
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -2193,6 +2372,7 @@ async fn async_question_idle_and_completion_race_start_followup() {
                     permission_mode_override: None,
                     client_nonce: None,
                     turn_checkpoint: None,
+                    dispatch_guard: None,
                 })
                 .await
                 .unwrap();
@@ -2256,6 +2436,7 @@ async fn async_question_rejections_never_fall_back_to_interrupt_or_start() {
                 permission_mode_override: None,
                 client_nonce: None,
                 turn_checkpoint: None,
+                dispatch_guard: None,
             })
             .await
             .unwrap();
@@ -2308,6 +2489,7 @@ async fn async_question_lost_ack_is_uncertain_and_reconciles_after_reconnect() {
             permission_mode_override: None,
             client_nonce: None,
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -2355,6 +2537,7 @@ fn guidance_input(thread: &str, text: &str) -> SendTurnInput {
         permission_mode_override: None,
         client_nonce: Some(format!("nonce-{text}")),
         turn_checkpoint: None,
+        dispatch_guard: None,
     }
 }
 
@@ -2471,16 +2654,37 @@ async fn gui_queued_steer_failure_keeps_message_cancellable() {
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
     let mut events = provider.event_stream();
     let thread = ThreadId("gui-queued-reject".into());
-    start_session_resilient(&provider, start_input(&thread.0)).await.unwrap();
-    provider.send_turn(guidance_input(&thread.0, "Build")).await.unwrap();
+    start_session_resilient(&provider, start_input(&thread.0))
+        .await
+        .unwrap();
+    provider
+        .send_turn(guidance_input(&thread.0, "Build"))
+        .await
+        .unwrap();
     timeout(Duration::from_secs(5), async {
         while let Some(event) = events.next().await {
-            if matches!(event, ProviderRuntimeEvent::SessionStateChanged { status: SessionStatus::Running { .. }, .. }) { break; }
+            if matches!(
+                event,
+                ProviderRuntimeEvent::SessionStateChanged {
+                    status: SessionStatus::Running { .. },
+                    ..
+                }
+            ) {
+                break;
+            }
         }
-    }).await.unwrap();
-    let queued = provider.send_turn(guidance_input(&thread.0, "Later")).await.unwrap();
+    })
+    .await
+    .unwrap();
+    let queued = provider
+        .send_turn(guidance_input(&thread.0, "Later"))
+        .await
+        .unwrap();
     let id = queued.queued_id.expect("busy send must queue");
-    assert!(provider.steer_queued_turn(thread.clone(), id.clone()).await.is_err());
+    assert!(provider
+        .steer_queued_turn(thread.clone(), id.clone())
+        .await
+        .is_err());
     assert!(provider.cancel_queued_turn(thread, id).await.unwrap());
 }
 
@@ -2503,13 +2707,19 @@ async fn service_tier_ultrafast_roundtrips_and_rejects_unavailable_choices() {
         .unwrap(),
     )
     .unwrap();
-    let script = write_script(json!([{
-        "after": "turn/start", "delay_ms": 5, "emit": "notification", "method": "turn/started",
-        "params": {"threadId": "c-1", "turnId": "tier-test"}
-    }, {
-        "after": "turn/start", "delay_ms": 20, "emit": "notification", "method": "turn/completed",
-        "params": {"threadId": "c-1", "turnId": "tier-test", "status": "succeeded"}
-    }]));
+    let completions: Vec<_> = (1..=5).flat_map(|turn| {
+        let turn_id = format!("t-{turn}");
+        [json!({
+            "after": "turn/start", "on_turn": turn, "delay_ms": 5,
+            "emit": "notification", "method": "turn/started",
+            "params": {"threadId": "c-1", "turnId": turn_id}
+        }), json!({
+            "after": "turn/start", "on_turn": turn, "delay_ms": 20,
+            "emit": "notification", "method": "turn/completed",
+            "params": {"threadId": "c-1", "turnId": turn_id, "status": "succeeded"}
+        })]
+    }).collect();
+    let script = write_script(json!(completions));
     let wrapper = wrapper_with_env(&[
         ("FAKE_CODEX_SCRIPT", script.path.to_str().unwrap()),
         ("FAKE_CODEX_MODELS", catalog_path.to_str().unwrap()),
@@ -2541,6 +2751,7 @@ async fn service_tier_ultrafast_roundtrips_and_rejects_unavailable_choices() {
                 display_text: None,
                 skill_invocations: vec![],
                 turn_checkpoint: None,
+                dispatch_guard: None,
             })
             .await
             .unwrap();
@@ -2661,6 +2872,7 @@ async fn service_tier_startup_fallback_reports_catalog_errors_and_downgrades() {
                 display_text: None,
                 skill_invocations: vec![],
                 turn_checkpoint: None,
+                dispatch_guard: None,
             })
             .await
             .unwrap();
