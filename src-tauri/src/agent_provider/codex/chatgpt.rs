@@ -76,6 +76,50 @@ struct Identity {
     #[serde(default)]
     nonce: Option<String>,
 }
+enum IdentityError {
+    Transient(String),
+    Invalid(String),
+}
+impl IdentityError {
+    fn message(self) -> String {
+        match self {
+            Self::Transient(message) | Self::Invalid(message) => message,
+        }
+    }
+}
+
+// TCP reads need not align with the HTTP request line. Bound the entire read,
+// rather than extending the timeout each time another fragment arrives.
+async fn callback_target(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut line = Vec::new();
+        let mut buffer = [0; 512];
+        loop {
+            let remaining = 8192usize.checked_sub(line.len())?;
+            if remaining == 0 {
+                return None;
+            }
+            let limit = remaining.min(buffer.len());
+            let count = stream.read(&mut buffer[..limit]).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            line.extend_from_slice(&buffer[..count]);
+            if let Some(end) = line.windows(2).position(|pair| pair == b"\r\n") {
+                return std::str::from_utf8(&line[..end])
+                    .ok()?
+                    .strip_prefix("GET ")?
+                    .strip_suffix(" HTTP/1.1")
+                    .map(str::to_owned);
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 fn sharing(scopes: &[String]) -> bool {
     ["resource.invoke", "chatgpt.tokens.use.direct"]
         .iter()
@@ -489,26 +533,12 @@ impl Owner {
                         .await;
                     return;
                 };
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = vec![0; 8192];
-                let count = match tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    stream.read(&mut buf),
-                )
-                .await
-                {
-                    Ok(Ok(n)) => n,
-                    _ => continue,
-                };
-                let target = std::str::from_utf8(&buf[..count])
-                    .ok()
-                    .and_then(|s| s.lines().next())
-                    .and_then(|line| line.strip_prefix("GET "))
-                    .and_then(|s| s.strip_suffix(" HTTP/1.1"));
+                use tokio::io::AsyncWriteExt;
+                let target = callback_target(&mut stream).await;
                 // Never drop an exchange on cancellation. The final attempt fence
                 // decides publication; a late issued renewable grant is revoked.
                 let accepted = match target {
-                    Some(target) => owner.accept_callback(&attempt, target).await,
+                    Some(target) => owner.accept_callback(&attempt, &target).await,
                     _ => false,
                 };
                 let (status, body) = if accepted {
@@ -627,7 +657,7 @@ impl Owner {
                 .ok_or("ChatGPT identity token is missing")?;
             let identity = self
                 .identity(&http, &endpoints, id_token, &client, Some(&nonce))
-                .await?;
+                .await.map_err(IdentityError::message)?;
             let credentials = credentials(tokens, None)?;
             let _op = self.operation.lock().await;
             let _file = self.disk_lock().await?;
@@ -744,20 +774,20 @@ impl Owner {
         token: &str,
         client: &str,
         nonce: Option<&str>,
-    ) -> Result<Identity, String> {
+    ) -> Result<Identity, IdentityError> {
         let response = http
             .get(&endpoints.jwks_uri)
             .send()
             .await
-            .map_err(|_| "Cannot verify ChatGPT identity")?;
+            .map_err(|_| IdentityError::Transient("Cannot verify ChatGPT identity".into()))?;
         if response.status() != reqwest::StatusCode::OK {
-            return Err("Cannot verify ChatGPT identity".into());
+            return Err(IdentityError::Transient("Cannot verify ChatGPT identity".into()));
         }
         let keys: jsonwebtoken::jwk::JwkSet = response
             .json()
             .await
-            .map_err(|_| "Invalid ChatGPT signing keys")?;
-        verify_identity(token, &keys, client, nonce)
+            .map_err(|_| IdentityError::Transient("Invalid ChatGPT signing keys".into()))?;
+        verify_identity(token, &keys, client, nonce).map_err(IdentityError::Invalid)
     }
     fn runtime_lock(&self, shared: bool) -> Result<std::fs::File, String> {
         self.prepare()?;
@@ -910,24 +940,30 @@ impl Owner {
                             );
                         }
                         if pending.verify_identity {
-                            let identity = self
-                                .identity(
-                                    &http,
-                                    &endpoints,
-                                    &pending.credentials.id_token,
-                                    &client,
-                                    None,
-                                )
-                                .await?;
-                            if disk
-                                .profiles
-                                .get(&client)
-                                .is_none_or(|p| p.subject != identity.sub)
-                            {
-                                return Err(
-                                    "ChatGPT renewal identity did not match the saved account"
-                                        .into(),
-                                );
+                            let verified = self.identity(
+                                &http, &endpoints, &pending.credentials.id_token, &client, None,
+                            ).await.and_then(|identity| {
+                                if disk.profiles.get(&client).is_none_or(|p| p.subject != identity.sub) {
+                                    Err(IdentityError::Invalid("ChatGPT renewal identity did not match the saved account".into()))
+                                } else { Ok(identity) }
+                            });
+                            match verified {
+                                Ok(_) => {},
+                                Err(IdentityError::Transient(message)) => return Err(message),
+                                Err(IdentityError::Invalid(_)) => {
+                                    // This rotating candidate can never authorize inference.
+                                    // Retain the registration for explicit reconnection, and
+                                    // never retry its already-consumed predecessor.
+                                    disk.pending_refresh.remove(&client);
+                                    disk.sessions.remove(&client);
+                                    disk.welcome_pending = false;
+                                    disk.epoch = disk.epoch.wrapping_add(1);
+                                    self.write(&disk)?;
+                                    let _ = self.revoke(&client, &pending.credentials.refresh_token).await;
+                                    let message = "ChatGPT renewal identity could not be verified. Reconnect your saved account.";
+                                    *self.error.lock().await = Some(message.into());
+                                    return Err(message.into());
+                                }
                             }
                         }
                         let fresh = pending.credentials;
@@ -1393,6 +1429,54 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn chatgpt_fragmented_callback_waits_for_complete_request_line() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = fixture().await;
+        let mut value = Owner::at(dir.path().join("chatgpt"));
+        value.fixture_endpoints = Some(fixture.endpoints.clone());
+        let owner = std::sync::Arc::new(value);
+        let start = owner.begin(None).await.unwrap();
+        let params: std::collections::HashMap<_, _> = url::Url::parse(&start.url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        *fixture.nonce.lock().await = params["nonce"].clone();
+        let redirect = url::Url::parse(&params["redirect_uri"]).unwrap();
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", redirect.port().unwrap()))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /auth/callback?state=")
+            .await
+            .unwrap();
+        let mut buffer = [0; 1024];
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            stream.read(&mut buffer),
+        )
+        .await;
+        if early.is_ok() {
+            owner
+                .cancel(start.status.attempt_id.as_deref().unwrap())
+                .await
+                .unwrap();
+            panic!("a fragmented request must not be rejected before its line is complete");
+        }
+        stream.write_all(format!("{}&code=synthetic-code&client_id=oaiapp_fixture HTTP/1.1\r\nHost: localhost\r\n\r\n", params["state"]).as_bytes()).await.unwrap();
+        let count = tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&buffer[..count])
+            .unwrap()
+            .starts_with("HTTP/1.1 200"));
+        assert_eq!(owner.status().await.unwrap().phase, "connected");
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn chatgpt_attempt_rejects_wrong_state_without_consuming_listener() {
         let dir = tempfile::tempdir().unwrap();
@@ -1925,6 +2009,48 @@ mod tests {
         );
         assert_eq!(reopened.status().await.unwrap().phase, "connected");
     }
+    #[tokio::test]
+    async fn chatgpt_expired_pending_identity_requires_reconnect_without_predecessor_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = fixture().await;
+        // Retain a valid rotating candidate after a transient key-fetch
+        // failure, then reopen the owner after its signed identity expires.
+        let expires = now() + 1;
+        *fixture.override_claims.lock().await = serde_json::json!({"exp": expires});
+        fixture
+            .jwks_fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let root = dir.path().join("chatgpt");
+        let mut value = Owner::at(root.clone());
+        value.fixture_endpoints = Some(fixture.endpoints.clone());
+        seeded(&value);
+        assert!(value.usable().await.is_err());
+        assert!(value
+            .read()
+            .unwrap()
+            .pending_refresh
+            .contains_key("oaiapp_fixture"));
+        while now() <= expires {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let mut reopened = Owner::at(root);
+        reopened.fixture_endpoints = Some(fixture.endpoints.clone());
+        let error = reopened.usable().await.err().unwrap();
+        assert!(error.contains("Reconnect"));
+        let disk = reopened.read().unwrap();
+        assert!(!disk.pending_refresh.contains_key("oaiapp_fixture"));
+        assert!(!disk.sessions.contains_key("oaiapp_fixture"));
+        assert!(disk.profiles.contains_key("oaiapp_fixture"));
+        assert!(!disk.welcome_pending);
+        assert_eq!(
+            *fixture.refresh_inputs.lock().await,
+            vec!["synthetic-old-refresh"]
+        );
+        assert_eq!(fixture.revoked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(reopened.status().await.unwrap().phase, "error");
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn chatgpt_status_restores_renewable_account_without_provider_discovery() {
         let dir = tempfile::tempdir().unwrap();

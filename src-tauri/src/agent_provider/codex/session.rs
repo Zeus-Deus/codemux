@@ -119,6 +119,8 @@ pub(crate) struct CodexSessionState {
     /// The turn currently in flight, if any. `Option::None` means
     /// the session is idle and ready for a new turn.
     pub active_turn: Option<TurnId>,
+    // Notifications can finish a turn before its start response is consumed.
+    pending_turn_start: Option<PendingTurnStart>,
     /// Map from synthesised [`RequestId`] to the raw JSON-RPC id we need
     /// to reply to.
     pub pending_approvals: HashMap<RequestId, Value>,
@@ -139,6 +141,12 @@ pub(crate) struct CodexSessionState {
     /// dispatch order. Drained one-at-a-time as the session returns to
     /// idle (see [`CodexSession::drain_queue`]).
     pub queued_turns: VecDeque<QueuedTurn>,
+}
+
+#[derive(Default)]
+struct PendingTurnStart {
+    completed_turns: std::collections::HashSet<TurnId>,
+    failed: bool,
 }
 
 /// A user turn parked in the follow-up queue behind the active turn.
@@ -516,6 +524,7 @@ impl CodexSession {
         let state = Mutex::new(CodexSessionState {
             codex_thread_id: codex_thread_id.clone(),
             active_turn: None,
+            pending_turn_start: None,
             pending_approvals: HashMap::new(),
             status: SessionStatus::Ready,
             model,
@@ -607,6 +616,7 @@ impl CodexSession {
         input: SendTurnInput,
     ) -> Result<SendOutcome, ProviderError> {
         let _outbound = self.outbound.lock().await;
+        self.ensure_open().await?;
         {
             let mut state = self.state.lock().await;
             if state.active_turn.is_some() {
@@ -677,6 +687,7 @@ impl CodexSession {
         self: &Arc<Self>,
         input: SendTurnInput,
     ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
+        self.ensure_open().await?;
         let root = self.state.lock().await.codex_thread_id.clone();
         for attempt in 0..2 {
             // Native state, rather than a potentially delayed notification,
@@ -883,7 +894,9 @@ impl CodexSession {
                             turn_id,
                             text,
                         });
-                    return;
+                    // A terminal notification may have arrived before the RPC
+                    // response. Recheck idle so the following item is not stranded.
+                    continue;
                 }
                 Err(err) => {
                     if let Some(checkpoint) = checkpoint.as_ref() {
@@ -1131,21 +1144,32 @@ impl CodexSession {
         if let Some(id) = client_id {
             params_value["clientUserMessageId"] = json!(id);
         }
-        let resp = self.child().await
-            .request("turn/start", params_value)
-            .await
-            .map_err(TurnStartError::Rpc)?;
-        let parsed: TurnStartResponse =
-            serde_json::from_value(resp).map_err(TurnStartError::Malformed)?;
-        let turn_id = TurnId(parsed.turn.id);
-        {
-            let mut state = self.state.lock().await;
+        self.state.lock().await.pending_turn_start = Some(PendingTurnStart::default());
+        let response = self.child().await.request("turn/start", params_value).await;
+        let parsed = response
+            .map_err(TurnStartError::Rpc)
+            .and_then(|value| serde_json::from_value::<TurnStartResponse>(value)
+                .map_err(TurnStartError::Malformed));
+        let mut state = self.state.lock().await;
+        let pending = state.pending_turn_start.take().unwrap_or_default();
+        let turn_id = TurnId(parsed?.turn.id);
+        if !pending.completed_turns.contains(&turn_id) && !pending.failed {
             state.active_turn = Some(turn_id.clone());
             state.status = SessionStatus::Running {
                 active_turn: turn_id.clone(),
             };
         }
         Ok(turn_id)
+    }
+
+    // Called with outbound held, so explicit shutdown cannot race admission.
+    async fn ensure_open(&self) -> Result<(), ProviderError> {
+        if matches!(self.state.lock().await.status, SessionStatus::Closed) {
+            return Err(ProviderError::ValidationError {
+                message: "This Codex session has been stopped. Start a new session to continue.".into(),
+            });
+        }
+        Ok(())
     }
 
     /// Whether the child-exit watchdog has declared this session's
@@ -1181,6 +1205,7 @@ impl CodexSession {
     ) -> Result<crate::agent_provider::QuestionDelivery, crate::agent_provider::QuestionDeliveryError>
     {
         use crate::agent_provider::{QuestionDelivery as Delivery, QuestionDeliveryError as Error};
+        self.ensure_open().await.map_err(|error| Error::Rejected(error.to_string()))?;
         let text = input
             .question
             .answer_text(&input.answers)
@@ -1864,6 +1889,9 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
             if p.thread_id != state.codex_thread_id {
                 return;
             }
+            if let Some(pending) = state.pending_turn_start.as_mut() {
+                pending.completed_turns.insert(TurnId(p.turn_id.clone()));
+            }
             if state
                 .active_turn
                 .as_ref()
@@ -1895,6 +1923,9 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
                 .as_deref()
                 .map_or(true, |t| t == state.codex_thread_id)
             {
+                if let Some(pending) = state.pending_turn_start.as_mut() {
+                    pending.failed = true;
+                }
                 state.status = SessionStatus::Error {
                     message: e.message.clone(),
                 };

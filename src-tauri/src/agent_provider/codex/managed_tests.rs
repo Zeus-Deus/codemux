@@ -40,6 +40,11 @@ for line in sys.stdin:
  elif method in ['thread/start','thread/resume']: result={'thread':{'id':'fixture-thread'}}
  elif method=='turn/start':
   count+=1;result={'turn':{'id':'turn-'+str(count),'status':'inProgress'}}
+  if count==2 and (root/'fast-queue').exists():
+   output({'method':'turn/started','params':{'threadId':'fixture-thread','turn':{'id':'turn-2','status':'inProgress'}}})
+   output({'method':'turn/completed','params':{'threadId':'fixture-thread','turn':{'id':'turn-2','status':'completed'}}})
+   (root/'queued-completed').write_text('yes')
+   while not (root/'queued-response-release').exists(): time.sleep(.01)
  else: result={}
  output({'id':m['id'],'result':result})
  if method=='turn/start' and (root/'close-stdout-live').exists():
@@ -686,4 +691,118 @@ async fn chatgpt_duplicate_start_retries_removed_binding_while_stop_waits() {
     assert_eq!(captured.iter().filter(|v| v.get("spawn").is_some()).count(), 2);
     assert_eq!(captured.iter().filter(|v| v["rpc"] == "thread/resume").count(), 1);
     assert!(owner.acquire_runtime().is_ok(), "final Stop must release all managed runtime ownership");
+}
+
+#[tokio::test]
+async fn chatgpt_retained_send_cannot_revive_session_after_stop() {
+    use super::super::{CodexAgentProvider, CodexProviderConfig};
+    use crate::agent_provider::AgentProvider;
+    use std::task::Poll;
+    let dir = tempfile::tempdir().unwrap();
+    let owner = super::super::chatgpt::Owner::testing(dir.path().join("chatgpt"));
+    let mut provider = CodexAgentProvider::new(CodexProviderConfig {
+        codex_binary: fixture_binary(dir.path()),
+        ..Default::default()
+    });
+    provider.chatgpt_owner = Some(owner.clone());
+    let thread = ThreadId("retained-send-stop".into());
+    provider
+        .start_session(timeline_start_input(dir.path(), &thread))
+        .await
+        .unwrap();
+    let retained = provider.sessions.read().await.get(&thread).unwrap().clone();
+    let outbound = retained.lifecycle_guard().await;
+    let mut stop = Box::pin(provider.stop_session(thread.clone()));
+    assert!(matches!(futures_util::poll!(stop.as_mut()), Poll::Pending));
+    // This send already holds the old Arc and waits behind shutdown's gate.
+    let mut send = Box::pin(retained.enqueue_or_send(super::tests::queued("late").input));
+    assert!(matches!(futures_util::poll!(send.as_mut()), Poll::Pending));
+    drop(outbound);
+    let (stopped, sent) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(stop, send) })
+            .await
+            .unwrap();
+    stopped.unwrap();
+    let captured = wire(dir.path());
+    let closed = matches!(retained.state.lock().await.status, SessionStatus::Closed);
+    let lease_released = retained.runtime_lease.lock().await.is_none();
+    let child_dead = !retained.child().await.is_alive();
+    // Clean up even if the regression has resurrected an unmapped session.
+    retained.shutdown().await;
+    assert!(sent.is_err() && closed && lease_released && child_dead);
+    assert!(!provider.sessions.read().await.contains_key(&thread));
+    assert_eq!(
+        captured.iter().filter(|v| v.get("spawn").is_some()).count(),
+        1
+    );
+    assert!(!captured.iter().any(|v| v["rpc"] == "turn/start"));
+    assert!(owner.acquire_runtime().is_ok());
+}
+
+#[tokio::test]
+async fn chatgpt_queued_completion_before_start_response_does_not_strand_followup() {
+    use super::super::{CodexAgentProvider, CodexProviderConfig};
+    use crate::agent_provider::AgentProvider;
+    let dir = tempfile::tempdir().unwrap();
+    let owner = super::super::chatgpt::Owner::testing(dir.path().join("chatgpt"));
+    std::fs::write(dir.path().join("fast-queue"), "yes").unwrap();
+    let mut provider = CodexAgentProvider::new(CodexProviderConfig {
+        codex_binary: fixture_binary(dir.path()),
+        ..Default::default()
+    });
+    provider.chatgpt_owner = Some(owner);
+    let thread = ThreadId("early-queue-completion".into());
+    provider
+        .start_session(timeline_start_input(dir.path(), &thread))
+        .await
+        .unwrap();
+    let session = provider.sessions.read().await.get(&thread).unwrap().clone();
+    let mut events = provider.event_tx.subscribe();
+    session
+        .enqueue_or_send(super::tests::queued("first").input)
+        .await
+        .unwrap();
+    session
+        .enqueue_or_send(super::tests::queued("second").input)
+        .await
+        .unwrap();
+    session
+        .enqueue_or_send(super::tests::queued("third").input)
+        .await
+        .unwrap();
+    std::fs::write(dir.path().join("finish"), "yes").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let ProviderRuntimeEvent::TurnCompleted { turn_id, .. } =
+                events.recv().await.unwrap()
+            {
+                if turn_id.0 == "turn-2" {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("queued completion must be consumed before the held start response");
+    std::fs::write(dir.path().join("queued-response-release"), "yes").unwrap();
+    let next_dispatched = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if wire(dir.path())
+                .iter()
+                .filter(|v| v["rpc"] == "turn/start")
+                .count()
+                == 3
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    provider.stop_session(thread).await.unwrap();
+    assert!(
+        next_dispatched,
+        "a completed queued turn must not be resurrected by its late start response"
+    );
 }

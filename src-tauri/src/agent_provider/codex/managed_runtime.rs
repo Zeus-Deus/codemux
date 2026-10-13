@@ -109,6 +109,7 @@ impl CodexSession {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProviderError>> + Send + '_>>
     {
         Box::pin(async move {
+            self.ensure_open().await?;
             let Some(managed) = self.managed.as_ref() else {
                 return Ok(());
             };
