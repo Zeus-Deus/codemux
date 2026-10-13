@@ -95,6 +95,8 @@ pub mod trace;
 // WebKitGTK renderer transport + smooth-scrolling tuning (Linux). Also owns
 // the startup crash sentinel that picks the renderer flags for this process.
 pub mod webview_tuning;
+#[cfg(target_os = "linux")]
+mod precise_wheel;
 // Reloads the main window when its WebKitGTK web process dies (Linux).
 pub mod webview_recovery;
 // VS Code Marketplace theme import — search the public gallery and pull the
@@ -515,6 +517,16 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // Tauri may exit without dropping managed state. Close admission
+                // and await the owned OpenCode direct child before other cleanup.
+                if let Err(error) = tauri::async_runtime::block_on(
+                    app.state::<std::sync::Arc<
+                        crate::agent_provider::opencode::OpenCodeServerManager,
+                    >>()
+                    .shutdown(),
+                ) {
+                    eprintln!("[codemux::opencode] shutdown incomplete: {error}");
+                }
                 if let Err(error) = tauri::async_runtime::block_on(
                     app.state::<commands::workflows::WorkflowState>().shutdown(),
                 ) {
@@ -626,8 +638,8 @@ fn build_core_app<R: tauri::Runtime>(
         // Step 12 Stage 2 — singleton supervisor for the lazily
         // spawned `opencode serve` child. `ensure_running()` is the
         // entry point used by `opencode_list_models`; the server is
-        // not spawned until the first call. Shutting Codemux down
-        // drops this state, which `kill_on_drop`-kills the child.
+        // not spawned until the first call. Normal GUI quit explicitly
+        // shuts this manager down in RunEvent::Exit; Drop is only a fallback.
         .manage(std::sync::Arc::new(
             crate::agent_provider::opencode::OpenCodeServerManager::new(),
         ))
@@ -736,10 +748,9 @@ fn build_core_app<R: tauri::Runtime>(
     }
 
     builder
-        // Every finished page load re-applies the current smooth-scrolling
-        // preference, so windows created after `setup` (and any reload) get
-        // it without a separate window-created hook — each webview owns its
-        // own WebKitSettings object.
+        // Every finished page load configures precise wheel input and disables
+        // WebKit's native animation. New windows and reloads share the default
+        // app glide without a separate window-created hook.
         //
         // A finished load on the main window is also the app's first proof
         // that the webview came up, which clears the renderer crash sentinel
@@ -980,12 +991,9 @@ fn build_core_app<R: tauri::Runtime>(
             // size, position, save, or float, so the whole block is skipped
             // there.
             if mode == AppMode::Gui {
-            // Turn WebKitGTK's smooth-scrolling animation off for every window
-            // that already exists. Its 200 ms eased retarget restarts on each
-            // high-resolution wheel event, so a fast flick scrolls *less* than
-            // a slow one (WebKit bug 258926). Windows created later pick the
-            // same setting up from the page-load hook, and the frontend can
-            // flip it at runtime via the `set_smooth_scrolling` command.
+            // Configure existing windows before wheel input starts. Later
+            // windows and reloads receive the same policy from the page-load
+            // hook; the frontend owns glides with native animation disabled.
             webview_tuning::refresh_all(&handle);
 
             // A dead or hung renderer leaves the window blank while the
@@ -2854,6 +2862,7 @@ fn build_core_app<R: tauri::Runtime>(
             terminal::pause_pty_output,
             terminal::resume_pty_output,
             terminal::terminal_session_cwds,
+            terminal::terminal_foreground_jobs,
             terminal::write_to_pty,
             terminal::resize_pty,
             terminal::clear_agent_status,
@@ -2951,9 +2960,11 @@ fn build_core_app<R: tauri::Runtime>(
             commands::refresh_workspace_pr,
             commands::suggest_issue_branch_name,
             commands::detect_package_manager,
+            commands::detect_run_candidates,
             commands::get_detected_ports,
             commands::kill_port,
             commands::get_presets,
+            commands::get_preset_availability,
             commands::create_preset,
             commands::update_preset,
             commands::delete_preset,
@@ -2961,6 +2972,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::set_preset_bar_visible,
             commands::reorder_presets,
             commands::apply_preset,
+            commands::open_provider_login_terminal,
             commands::get_workspace_config,
             commands::has_codemuxinclude,
             commands::run_workspace_setup,
@@ -3055,11 +3067,10 @@ fn build_core_app<R: tauri::Runtime>(
             web_remote::web_remote_iroh_node_id,
             web_remote::web_remote_registration_status,
             web_remote::web_remote_retry,
-            // WebKitGTK smooth-scrolling toggle (Linux; no-op elsewhere).
-            webview_tuning::set_smooth_scrolling,
             // Which renderer this process ended up on, so the UI can drop
             // composited-only effects when running CPU-rendered.
             webview_tuning::get_renderer_mode,
+            webview_tuning::get_precise_wheel_available,
             // "Reload interface" in the command palette: reloads only the
             // main webview, like Ctrl+Alt+R and `codemux reload-ui`.
             webview_recovery::reload_interface,

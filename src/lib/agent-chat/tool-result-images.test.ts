@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import nativeImageResultRaw from "./__fixtures__/opencode-native-image-tool-result.json?raw";
 import {
   extractToolResultImages,
   hasToolResultImages,
@@ -7,6 +8,31 @@ import {
 } from "./tool-result-images";
 
 describe("extractToolResultImages", () => {
+  it("renders the native image file payload preserved by the OpenCode adapter", () => {
+    const fixture: { data: { content: unknown[] } } =
+      JSON.parse(nativeImageResultRaw);
+    const images = extractToolResultImages(fixture.data.content);
+    expect(images).toHaveLength(1);
+    expect(images[0]).toMatchObject({ mediaType: "image/png" });
+    expect(images[0]?.src).toMatch(/^data:image\/png;base64,/);
+    expect(isRenderableImageBlock(fixture.data.content[1])).toBe(true);
+    expect(hasToolResultImages(fixture.data.content)).toBe(true);
+  });
+
+  it.each([
+    { type: "file", mime: "image/png", uri: "javascript:alert(1)" },
+    { type: "file", mime: "image/png", uri: "file:///etc/passwd" },
+    { type: "file", mime: "image/png", uri: "data:text/html;base64,AAAA" },
+    { type: "file", mime: "application/pdf", uri: "https://example.com/x.pdf" },
+    { type: "file", mime: "image/png" },
+  ])(
+    "keeps unsafe or non-image native file blocks in the text fallback: %j",
+    (block) => {
+      expect(extractToolResultImages([block])).toEqual([]);
+      expect(isRenderableImageBlock(block)).toBe(false);
+    },
+  );
+
   it("pulls an Anthropic base64 image block into a data: URL", () => {
     const content = [
       {

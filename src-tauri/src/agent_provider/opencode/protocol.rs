@@ -162,6 +162,7 @@ pub struct SessionResponse {
 #[serde(untagged)]
 pub enum OpenCodeEvent {
     Known(KnownEvent),
+    V2(super::v2::Event),
     Other(serde_json::Value),
 }
 
@@ -303,11 +304,12 @@ impl OpenCodeApiError {
                 _ => "unknown error".into(),
             });
         let payload = serde_json::json!({"name": self.name, "data": self.data});
-        let subtype = if crate::agent_provider::usage_limit::is_usage_limit_error(&message, &payload) {
-            crate::agent_provider::events::RATE_LIMIT_SUBTYPE.into()
-        } else {
-            self.name.clone()
-        };
+        let subtype =
+            if crate::agent_provider::usage_limit::is_usage_limit_error(&message, &payload) {
+                crate::agent_provider::events::RATE_LIMIT_SUBTYPE.into()
+            } else {
+                self.name.clone()
+            };
         (subtype, message)
     }
 }
@@ -729,6 +731,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_v2_envelope_is_not_an_unknown_legacy_event() {
+        let event: OpenCodeEvent = serde_json::from_value(serde_json::json!({
+            "id":"evt_1", "type":"session.text.delta",
+            "data":{"sessionID":"ses_1","assistantMessageID":"msg_1","ordinal":0,"delta":"hello"}
+        }))
+        .unwrap();
+        assert!(
+            !matches!(event, OpenCodeEvent::Other(_)),
+            "native data envelope must have its own decoder"
+        );
+    }
+
+    #[test]
     fn session_create_request_serialises_only_set_fields() {
         let req = SessionCreateRequest {
             parent_id: None,
@@ -748,9 +763,7 @@ mod tests {
             }),
             agent: None,
             variant: None,
-            parts: vec![PartInput::Text {
-                text: "hi".into(),
-            }],
+            parts: vec![PartInput::Text { text: "hi".into() }],
         };
         let json = serde_json::to_value(&req).unwrap();
         // `variant: None` is omitted from the body.

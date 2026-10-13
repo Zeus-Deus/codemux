@@ -471,6 +471,21 @@ jobs:
         timeout-minutes: 15
         run: cargo test --manifest-path src-tauri/Cargo.toml ${{ inputs.claude_install_only && '-j 2 --test claude_windows_install -- --test-threads=2' || '' }}
 
+      - name: Real OpenCode 1.x and 2.x native protocol
+        if: ${{ !inputs.claude_install_only }}
+        timeout-minutes: 12
+        shell: bash
+        env:
+          CODEMUX_OPENCODE_EVIDENCE: opencode-native-evidence
+        run: node scripts/e2e/opencode-native-smoke.mjs
+
+      - uses: actions/upload-artifact@v4
+        if: always() && !inputs.claude_install_only
+        with:
+          name: opencode-native-${{ matrix.os }}
+          path: opencode-native-evidence/
+          if-no-files-found: warn
+
       - name: Build independent add-on examples
         if: ${{ !inputs.claude_install_only }}
         shell: bash

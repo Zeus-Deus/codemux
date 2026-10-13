@@ -795,6 +795,40 @@ import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store
 import { toast } from "sonner";
 import type { ChatModelInfo } from "@/tauri/types";
 
+describe("AgentChatPane question selection replies", () => {
+  beforeEach(() => {
+    currentThreadsMap = {};
+    currentSliceOverrides = {};
+    currentMessages = [{
+      kind: "permission_request", id: "form-question", request_id: "form-question",
+      seq: 1, turn_id: "turn-question", request_kind: "user-input",
+      resolution: { state: "pending" },
+      payload: { questions: [{ question: "Features?", multiSelect: true,
+        options: [{ label: "with, comma", description: "" }, { label: "B", description: "" }],
+      }] },
+    }];
+    vi.mocked(agentChatRespondToRequest).mockClear();
+  });
+
+  it.each(["opencode", "claude", "cursor"] as const)(
+    "preserves the %s provider's answer contract at IPC",
+    async (provider) => {
+      const view = render(<TooltipProvider><AgentChatPane pane={{ ...pane, provider }} /></TooltipProvider>);
+      fireEvent.click(await view.findByText("with, comma"));
+      fireEvent.click(view.getByText("B"));
+      fireEvent.click(view.getByText("Send"));
+      await waitFor(() => expect(agentChatRespondToRequest).toHaveBeenCalledWith(
+        provider, "thread-x", "form-question", expect.objectContaining({
+          decision: "allow",
+          updated_input: expect.objectContaining({ answers: {
+            "Features?": provider === "opencode" ? ["with, comma", "B"] : "with, comma, B",
+          } }),
+        }),
+      ));
+    },
+  );
+});
+
 const pane = {
   kind: "agent_chat" as const,
   pane_id: "pane-1",
@@ -2756,9 +2790,9 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
     expect(agentChatGetSession).toHaveBeenCalledWith("thread-x");
     const [threadId, model] = setModelMock.mock.calls[0];
     expect(threadId).toBe("thread-x");
-    // defaultModelForProvider("claude") falls back to "claude-opus-4-8"
-    // when capabilities aren't in the test environment.
-    expect(model).toBe("claude-opus-4-8");
+    // defaultModelForProvider("claude") falls back to the CLI's
+    // "default" alias when capabilities aren't in the test environment.
+    expect(model).toBe("default");
   });
 
   it("seeds the persisted model over the Opus default", async () => {

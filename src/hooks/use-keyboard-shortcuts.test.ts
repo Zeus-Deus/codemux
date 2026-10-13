@@ -7,6 +7,7 @@ vi.mock("@/tauri/commands", () => ({
   createTab: vi.fn().mockResolvedValue(undefined),
   closeTab: vi.fn().mockResolvedValue(undefined),
   activateTab: vi.fn().mockResolvedValue(undefined),
+  activatePane: vi.fn().mockResolvedValue(undefined),
   createEmptyWorkspace: vi.fn().mockResolvedValue("ws-new"),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   runProjectDevCommand: vi.fn().mockResolvedValue(undefined),
@@ -16,18 +17,29 @@ vi.mock("sonner", () => ({
   toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn(), dismiss: vi.fn() },
 }));
 
+vi.mock("@/components/overlays/interface-size-hud", () => ({
+  announceInterfaceSize: vi.fn(),
+}));
+
 import { toast } from "sonner";
 import { dispatch } from "./use-keyboard-shortcuts";
+import { announceInterfaceSize } from "@/components/overlays/interface-size-hud";
+import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
+import { TYPOGRAPHY_RANGES } from "@/lib/typography";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store";
 import {
+  activatePane,
+  activateTab,
   activateWorkspace,
   runProjectDevCommand,
   undockBrowserFromRightPanel,
 } from "@/tauri/commands";
+import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
+import { usePaneZoomStore } from "@/stores/pane-zoom-store";
 import {
   setJumpTargets,
 } from "@/components/layout/sidebar-inbox-jump";
@@ -154,6 +166,19 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
     expect(handled).toBe(false);
   });
 
+  it("leaves Settings open when a dialog inside it already handled the Escape", () => {
+    useUIStore.setState({ showSettings: true });
+    const consumed = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    consumed.preventDefault();
+
+    expect(dispatch("closeOverlay", consumed)).toBe(false);
+    expect(useUIStore.getState().showSettings).toBe(true);
+
+    // A plain Escape still closes it.
+    expect(dispatch("closeOverlay", FAKE_EVENT)).toBe(true);
+    expect(useUIStore.getState().showSettings).toBe(false);
+  });
+
   it("returns false for an unknown actionId", () => {
     // Sanity check — dispatch should not swallow unrelated actions even when
     // state that closeOverlay cares about is set.
@@ -238,6 +263,15 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       expect(s.showSettings).toBe(true);
     });
 
+    it("closes a lone shortcuts sheet even when its dialog has prevented Escape", () => {
+      useUIStore.setState({ showShortcutsSheet: true });
+      const event = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+      event.preventDefault();
+      expect(dispatch("closeOverlay", event)).toBe(true);
+      expect(useUIStore.getState().showShortcutsSheet).toBe(false);
+      expect(useUIStore.getState().showSettings).toBe(false);
+    });
+
     it("closes the rename dialog before settings", () => {
       // The rename dialog opts out of Radix's own Escape dismissal so this
       // ladder is the single closer: one press must take exactly one layer.
@@ -255,6 +289,32 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       useUIStore.setState({ showSettings: true });
       const handled = dispatch("closeOverlay", FAKE_EVENT);
       expect(handled).toBe(true);
+      expect(useUIStore.getState().showSettings).toBe(false);
+    });
+
+    it("leaves settings open when a layer inside it already took the Escape", () => {
+      useUIStore.setState({ showSettings: true });
+      const claimed = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+      claimed.preventDefault();
+
+      expect(dispatch("closeOverlay", claimed)).toBe(false);
+      expect(useUIStore.getState().showSettings).toBe(true);
+    });
+
+    it("leaves settings open while a sheet inside it is open", () => {
+      useUIStore.setState({ showSettings: true });
+      const sheet = document.createElement("div");
+      sheet.setAttribute("role", "dialog");
+      sheet.setAttribute("data-state", "open");
+      document.body.appendChild(sheet);
+      try {
+        expect(dispatch("closeOverlay", FAKE_EVENT)).toBe(false);
+        expect(useUIStore.getState().showSettings).toBe(true);
+      } finally {
+        sheet.remove();
+      }
+      // The next press, with nothing left on top, leaves Settings.
+      expect(dispatch("closeOverlay", FAKE_EVENT)).toBe(true);
       expect(useUIStore.getState().showSettings).toBe(false);
     });
 
@@ -369,6 +429,22 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       expect(dispatch("openLauncher", FAKE_EVENT)).toBe(true);
       expect(useUIStore.getState().launcherOpenRequest).toBe(before + 1);
     });
+
+    it("announces an interface-size press even when it is already at the limit", () => {
+      const { max } = TYPOGRAPHY_RANGES.interface;
+      const updateSetting = vi.fn().mockResolvedValue(undefined);
+      const state = useSyncedSettingsStore.getState();
+      useSyncedSettingsStore.setState({
+        settings: { ...state.settings, appearance: { ...state.settings.appearance, interface_font_size: max } },
+        updateSetting,
+      });
+      expect(dispatch("zoomIn", FAKE_EVENT)).toBe(true);
+      expect(updateSetting).not.toHaveBeenCalled();
+      expect(announceInterfaceSize).toHaveBeenLastCalledWith(max, "in", false);
+      expect(dispatch("zoomOut", FAKE_EVENT)).toBe(true);
+      expect(updateSetting).toHaveBeenCalledWith("appearance", "interface_font_size", max - 1);
+      expect(announceInterfaceSize).toHaveBeenLastCalledWith(max - 1, "out", true);
+    });
   });
 
   describe("workspace jump shortcuts", () => {
@@ -384,12 +460,194 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       expect(activateWorkspace).toHaveBeenCalledWith("ws-b");
     });
 
-    it("consumes the combo but activates nothing when the slot is empty", () => {
+    it("leaves the combo unhandled when the slot is empty", () => {
+      // Not swallowed: a jump that resolves nowhere shouldn't eat the key.
       setJumpTargets(["ws-a"]);
       const handled = dispatch("workspaceJump5", FAKE_EVENT);
-      expect(handled).toBe(true);
+      expect(handled).toBe(false);
       expect(activateWorkspace).not.toHaveBeenCalled();
     });
+  });
+});
+
+type AppState = NonNullable<ReturnType<typeof useAppStore.getState>["appState"]>;
+
+describe("use-keyboard-shortcuts dispatch — jump to needs-you", () => {
+  function seed(activeId: string, blocked: string[]) {
+    const ids = ["ws-a", "ws-b", "ws-c"];
+    useAppStore.setState({
+      appState: {
+        active_workspace_id: activeId,
+        workspaces: ids.map((workspace_id) => ({
+          workspace_id,
+          surfaces: [
+            {
+              surface_id: `s-${workspace_id}`,
+              root: { kind: "terminal", pane_id: `p-${workspace_id}` },
+            },
+          ],
+        })),
+        pane_statuses: Object.fromEntries(
+          ids.map((id) => [`p-${id}`, blocked.includes(id) ? "permission" : "idle"]),
+        ),
+      } as unknown as AppState,
+      pendingActiveWorkspaceId: null,
+    });
+  }
+
+  beforeEach(() => {
+    useSidebarDensityStore.setState({ statusSince: {} });
+  });
+
+  it("goes to the longest-waiting blocked workspace, then the next one", () => {
+    seed("ws-a", ["ws-b", "ws-c"]);
+    useSidebarDensityStore.setState({
+      statusSince: {
+        "ws-b": { status: "permission", at: 200 },
+        "ws-c": { status: "permission", at: 100 },
+      },
+    });
+    expect(dispatch("jumpToNeedsYou", FAKE_EVENT)).toBe(true);
+    expect(activateWorkspace).toHaveBeenLastCalledWith("ws-c");
+    expect(dispatch("jumpToNeedsYou", FAKE_EVENT)).toBe(true);
+    expect(activateWorkspace).toHaveBeenLastCalledWith("ws-b");
+  });
+
+  it("leaves the key alone when nothing needs the user", () => {
+    seed("ws-a", []);
+    expect(dispatch("jumpToNeedsYou", FAKE_EVENT)).toBe(false);
+    expect(activateWorkspace).not.toHaveBeenCalled();
+  });
+});
+
+describe("use-keyboard-shortcuts dispatch — tabs and panes", () => {
+  const split = {
+    kind: "split",
+    pane_id: "split-1",
+    direction: "horizontal",
+    child_sizes: [0.5, 0.5],
+    children: [
+      { kind: "terminal", pane_id: "p-left" },
+      { kind: "terminal", pane_id: "p-right" },
+    ],
+  };
+
+  function seed(
+    opts: { activeTab?: string; activePane?: string; root?: unknown; tabs?: string[] } = {},
+  ) {
+    useAppStore.setState({
+      appState: {
+        active_workspace_id: "ws-1",
+        workspaces: [
+          {
+            workspace_id: "ws-1",
+            tabs: (opts.tabs ?? ["t-1", "t-2", "t-3"]).map((tab_id) => ({ tab_id })),
+            active_tab_id: opts.activeTab ?? "t-1",
+            active_surface_id: "s-1",
+            surfaces: [
+              {
+                surface_id: "s-1",
+                active_pane_id: opts.activePane ?? "p-left",
+                root: opts.root ?? split,
+              },
+            ],
+          },
+        ],
+        pane_statuses: {},
+      } as unknown as AppState,
+      pendingActiveWorkspaceId: null,
+    });
+  }
+
+  beforeEach(() => {
+    usePaneZoomStore.setState({ zoomedPaneBySurface: {} });
+    document.body.innerHTML = "";
+  });
+
+  it("cycles tabs forward and back, wrapping at either end", () => {
+    seed({ activeTab: "t-3" });
+    expect(dispatch("nextTab", FAKE_EVENT)).toBe(true);
+    expect(activateTab).toHaveBeenLastCalledWith("ws-1", "t-1");
+    seed({ activeTab: "t-1" });
+    expect(dispatch("prevTab", FAKE_EVENT)).toBe(true);
+    expect(activateTab).toHaveBeenLastCalledWith("ws-1", "t-3");
+  });
+
+  it("leaves the tab keys alone with a single tab", () => {
+    seed({ tabs: ["t-1"] });
+    vi.mocked(activateTab).mockClear();
+    expect(dispatch("nextTab", FAKE_EVENT)).toBe(false);
+    expect(dispatch("prevTab", FAKE_EVENT)).toBe(false);
+    expect(activateTab).not.toHaveBeenCalled();
+  });
+
+  it("toggles a zoom on the active pane of a split", () => {
+    seed({ activePane: "p-right" });
+    dispatch("togglePaneZoom", FAKE_EVENT);
+    expect(usePaneZoomStore.getState().zoomedPaneBySurface).toEqual({ "s-1": "p-right" });
+    dispatch("togglePaneZoom", FAKE_EVENT);
+    expect(usePaneZoomStore.getState().zoomedPaneBySurface).toEqual({});
+  });
+
+  it("does not zoom a lone pane, and leaves the key unclaimed", () => {
+    seed({ activePane: "p-only", root: { kind: "terminal", pane_id: "p-only" } });
+    expect(dispatch("togglePaneZoom", FAKE_EVENT)).toBe(false);
+    expect(usePaneZoomStore.getState().zoomedPaneBySurface).toEqual({});
+  });
+
+  const place = (id: string, left: number, right: number) => {
+    const el = document.createElement("div");
+    el.dataset.paneDropId = id;
+    el.getBoundingClientRect = () =>
+      ({ left, right, top: 0, bottom: 100, width: right - left, height: 100 }) as DOMRect;
+    document.body.appendChild(el);
+    return el;
+  };
+
+  it("moves keyboard focus into a chat pane's composer", () => {
+    const left = place("p-left", 0, 100);
+    const right = place("p-right", 101, 200);
+    const terminalInput = document.createElement("textarea");
+    left.appendChild(terminalInput);
+    const composer = document.createElement("textarea");
+    composer.setAttribute("data-composer-input", "");
+    right.appendChild(composer);
+    terminalInput.focus();
+    seed({ activePane: "p-left" });
+
+    dispatch("focusPaneRight", FAKE_EVENT);
+
+    expect(activatePane).toHaveBeenLastCalledWith("p-right");
+    expect(document.activeElement).toBe(composer);
+  });
+
+  it("drops focus left in the pane being left when the target has no composer", () => {
+    const left = place("p-left", 0, 100);
+    place("p-right", 101, 200);
+    const composer = document.createElement("textarea");
+    composer.setAttribute("data-composer-input", "");
+    left.appendChild(composer);
+    composer.focus();
+    seed({ activePane: "p-left" });
+
+    dispatch("focusPaneRight", FAKE_EVENT);
+
+    // The target terminal focuses itself once active; until then, typing
+    // must not keep landing in the chat that was left.
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it("focuses the pane on screen in the pressed direction", () => {
+    place("p-left", 0, 100);
+    place("p-right", 101, 200);
+    seed({ activePane: "p-left" });
+
+    expect(dispatch("focusPaneRight", FAKE_EVENT)).toBe(true);
+    expect(activatePane).toHaveBeenLastCalledWith("p-right");
+
+    vi.mocked(activatePane).mockClear();
+    expect(dispatch("focusPaneLeft", FAKE_EVENT)).toBe(true);
+    expect(activatePane).not.toHaveBeenCalled();
   });
 });
 

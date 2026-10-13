@@ -23,6 +23,7 @@ setting (and its `Ctrl+=` / `Ctrl+-` shortcuts) scales the whole app.
 | `text-body-sm`  | 0.8125rem | 13px — dense rows, menus             |
 | `text-body`     | 0.875rem  | 14px — primary UI text               |
 | `text-body-lg`  | 0.9375rem | 15px — emphasized UI text            |
+| `text-title`    | 1.3125rem | 21px — page titles (`SectionHeader`) |
 
 10px is the floor. Anything smaller is unreadable on a 1× desktop display.
 

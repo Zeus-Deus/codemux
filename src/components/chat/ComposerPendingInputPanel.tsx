@@ -1,18 +1,18 @@
 import { useMemo } from "react";
 import type { PermissionRequestItem } from "@/lib/agent-chat/types";
 import { useEaseInOnce } from "@/hooks/use-ease-in-once";
-import { QuestionForm, type Question } from "./QuestionForm";
+import { QuestionForm, type Question, type QuestionAnswer } from "./QuestionForm";
 
 export interface AskUserQuestionOutput {
   questions: unknown;
-  answers: Record<string, string>;
+  answers: Record<string, QuestionAnswer>;
 }
 
 /** What the agent is told when the user skips its question. */
 export const USER_INPUT_SKIPPED_MESSAGE =
   "The user skipped this question and will answer in the chat instead. Stop and wait for their message.";
 
-/** Legacy callback wrapper: preserve each provider's existing answer shape. */
+/** Preserve structured selections until the provider's reply boundary. */
 export function ComposerPendingInputPanel({
   item,
   onSubmit,

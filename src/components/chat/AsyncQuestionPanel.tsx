@@ -10,7 +10,7 @@ import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useEaseInOnce } from "@/hooks/use-ease-in-once";
 import { agentChatAnswerQuestion, type QuestionAction } from "@/tauri/commands";
-import { QuestionForm, type Question } from "./QuestionForm";
+import { QuestionForm, questionAnswerText, type Question, type QuestionAnswer } from "./QuestionForm";
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
 import { COMPOSER_OVERLAY_CARD } from "./composer-overlay";
 import { cn } from "@/lib/utils";
@@ -259,9 +259,9 @@ function QuestionCard({
 }) {
   const key = draftKey(threadId, item.question.id);
   const save = useCallback(
-    (answers: string[]) => {
+    (answers: QuestionAnswer[]) => {
       try {
-        localStorage.setItem(key, JSON.stringify(answers));
+        localStorage.setItem(key, JSON.stringify(answers.map(questionAnswerText)));
       } catch {
         /* Form remains usable without storage. */
       }
@@ -343,7 +343,7 @@ function QuestionCard({
       onSubmit={(answers) =>
         act(item.question.id, {
           action: "answer",
-          answers,
+          answers: answers.map(questionAnswerText),
           submission_id: randomUUID(),
         })
       }

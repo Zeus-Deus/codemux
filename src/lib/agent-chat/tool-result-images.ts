@@ -2,7 +2,7 @@
  * Pull renderable images out of a tool-result `content` payload.
  *
  * Agents return screenshots and other images inside a `tool_result`
- * whose `content` is an array of blocks. Two shapes occur in the wild:
+ * whose `content` is an array of blocks. Supported shapes include:
  *
  *   1. Anthropic-standard base64 image block (what `Read` on a PNG and
  *      most screenshot tools emit):
@@ -12,6 +12,9 @@
  *   2. URL image block (Anthropic `source.type: "url"`, or the
  *      OpenAI-style `{ type: "image_url", image_url: { url } }`):
  *        { type: "image", source: { type: "url", url: "https://…" } }
+ *
+ *   3. OpenCode native file block:
+ *        { type: "file", uri: "data:image/png;base64,…", mime: "image/png" }
  *
  * The backend forwards these blocks through verbatim (tool-result
  * content is opaque JSON), so the data is already client-side — the
@@ -60,6 +63,14 @@ function imageFromEntry(entry: unknown): ToolResultImage | null {
     if (!url) return null;
     const safe = safeImageSrc(url);
     return safe ? { src: safe } : null;
+  }
+
+  if (entry.type === "file") {
+    const mediaType = str(entry.mime);
+    const uri = str(entry.uri);
+    if (!mediaType || !/^image\//i.test(mediaType) || !uri) return null;
+    const safe = safeImageSrc(uri);
+    return safe ? { src: safe, mediaType } : null;
   }
 
   if (entry.type !== "image") return null;

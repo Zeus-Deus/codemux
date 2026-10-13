@@ -166,7 +166,7 @@ describe("ComposerPendingInputPanel", () => {
     );
   });
 
-  it("multi-select answers are comma-joined under the question text key", () => {
+  it("multi-select answers remain arrays under the question text key", () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     const item = makeAskItem({
       payload: {
@@ -190,9 +190,52 @@ describe("ComposerPendingInputPanel", () => {
     fireEvent.click(screen.getByText("Send"));
     expect(onSubmit).toHaveBeenCalledWith(
       expect.objectContaining({
-        answers: { "Which features do you want?": "Auth, Analytics" },
+        answers: { "Which features do you want?": ["Auth", "Analytics"] },
       }),
     );
+  });
+
+  it.each([
+    { options: ["with, comma", "B"], selected: ["with, comma", "B"] },
+    { options: ["A", "B", "A, B"], selected: ["A", "B"] },
+  ])("preserves multiselect identities for $selected", ({ options, selected }) => {
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ComposerPendingInputPanel
+        item={makeAskItem({ payload: { questions: [{
+          question: "Features?",
+          multiSelect: true,
+          options: options.map((label) => ({ label, description: "" })),
+        }] } })}
+        onSubmit={onSubmit}
+      />,
+    );
+    for (const label of selected) fireEvent.click(screen.getByText(label));
+    fireEvent.click(screen.getByText("Send"));
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      answers: { "Features?": selected },
+    }));
+  });
+
+  it("keeps a custom multiselect answer containing commas as one value", () => {
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ComposerPendingInputPanel
+        item={makeAskItem({ payload: { questions: [{
+          question: "Features?", multiSelect: true,
+          options: [{ label: "A", description: "" }],
+        }] } })}
+        onSubmit={onSubmit}
+      />,
+    );
+    fireEvent.click(screen.getByText("A"));
+    fireEvent.change(screen.getByPlaceholderText("Something else…"), {
+      target: { value: "custom, answer" },
+    });
+    fireEvent.click(screen.getByText("Send"));
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      answers: { "Features?": ["A", "custom, answer"] },
+    }));
   });
 
   it("multi-question: Next button advances, pagination label updates, Send appears on the last question", () => {

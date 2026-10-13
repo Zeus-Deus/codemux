@@ -19,6 +19,7 @@ import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { eyebrowVariants } from "@/components/ui/eyebrow";
 import { Spinner } from "@/components/ui/spinner";
+import { SectionHeader } from "./settings-primitives";
 
 interface Props {
   /** Active workspace's project root, or null when no project is
@@ -264,15 +265,6 @@ function BehaviorIcon({ behavior }: { behavior: PermissionRule["behavior"] }) {
         />
       );
   }
-}
-
-function SectionHeader({ title, description }: { title: string; description: string }) {
-  return (
-    <div className="mb-6">
-      <h2 className="text-body-lg font-semibold tracking-tight">{title}</h2>
-      <p className="text-body text-muted-foreground mt-1">{description}</p>
-    </div>
-  );
 }
 
 function groupRules(rules: PermissionRule[], projectRoot: string | null): Group[] {

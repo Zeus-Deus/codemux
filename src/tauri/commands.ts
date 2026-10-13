@@ -22,6 +22,7 @@ import type {
 import type { AgentChatEventPayload, ApprovalDecision } from "./events";
 import type {
   UserSettings,
+  SettingsPersistence,
   PresetLaunchConfig,
   AppStateSnapshot,
   AuthResponse,
@@ -77,6 +78,7 @@ import type {
   WorktreeInfo,
   ProjectScripts,
   DetectedSetup,
+  RunCandidate,
   WebRemoteStatus,
   WebRemoteEndpoint,
   WebRemoteSessionView,
@@ -283,16 +285,16 @@ export const importSkillsFromFile = (filePath: string) =>
 // ── Settings Sync ──
 
 export const getSyncedSettings = () =>
-  invoke<UserSettings>("get_synced_settings");
+  invoke<SettingsPersistence>("get_synced_settings");
 
 export const updateSyncedSettings = (settings: UserSettings) =>
-  invoke<UserSettings>("update_synced_settings", { settings });
+  invoke<SettingsPersistence>("update_synced_settings", { settings });
 
 export const updateSetting = (section: string, key: string, value: unknown) =>
-  invoke<UserSettings>("update_setting", { section, key, value });
+  invoke<SettingsPersistence>("update_setting", { section, key, value });
 
 export const resetSyncedSettings = () =>
-  invoke<UserSettings>("reset_synced_settings");
+  invoke<SettingsPersistence>("reset_synced_settings");
 
 // ── Resource Monitor ──
 
@@ -412,6 +414,13 @@ export const listChatProviderCapabilities = (
 export const agentChatProviderHealth = (provider: AgentChatProviderKind) =>
   invoke<ProviderHealthReport>("agent_chat_provider_health", { provider });
 
+/** Open a terminal tab in `workspaceId` running `provider`'s sign-in
+ *  command. The backend picks the command; callers only name the provider. */
+export const openProviderLoginTerminal = (
+  workspaceId: string,
+  provider: AgentChatProviderKind,
+) => invoke("open_provider_login_terminal", { workspaceId, provider });
+
 /** Gemini launch-time model list. Backend serves a live harvest when
  *  `GEMINI_API_KEY` is set, otherwise the maintained fallback. Either
  *  way it returns quickly; failure inside the live path is caught by
@@ -501,6 +510,10 @@ export const cyclePane = (step: number) =>
 
 export const closePane = (paneId: string) =>
   invoke<string | null>("close_pane", { paneId });
+
+/** Capture and shut down the provider session before removing its pane. */
+export const agentChatClosePane = (paneId: string) =>
+  invoke<void>("agent_chat_close_pane", { paneId });
 
 export const swapPanes = (sourcePaneId: string, targetPaneId: string) =>
   invoke("swap_panes", { sourcePaneId, targetPaneId });
@@ -712,6 +725,9 @@ export const runProjectDevCommand = (workspaceId: string, forceNew?: boolean) =>
 
 export const detectPackageManager = (projectPath: string) =>
   invoke<DetectedSetup[]>("detect_package_manager", { projectPath });
+
+export const detectRunCandidates = (projectPath: string) =>
+  invoke<RunCandidate[]>("detect_run_candidates", { projectPath });
 
 export const reorderWorkspaces = (workspaceIds: string[]) =>
   invoke("reorder_workspaces", { workspaceIds });
@@ -1314,6 +1330,11 @@ export const getShellAppearance = () =>
 export const getPresets = () =>
   invoke<PresetStoreSnapshot>("get_presets");
 
+/** Whether each CLI preset's agent binary is installed, keyed by preset id.
+ *  The same PATH check `apply_preset` runs before launching. */
+export const getPresetAvailability = () =>
+  invoke<Record<string, boolean>>("get_preset_availability");
+
 export const createPreset = (params: {
   name: string;
   description: string | null;
@@ -1416,6 +1437,12 @@ export const resumePtyOutput = (sessionId: string, generation?: number) =>
  *  they already had rather than clearing. See `terminal_session_cwds`. */
 export const terminalSessionCwds = (sessionIds: string[]) =>
   invoke<Record<string, string>>("terminal_session_cwds", { sessionIds });
+
+/** `session_id -> command name` for the sessions whose shell is running a
+ *  foreground job (a dev server, a build, an agent CLI). Idle shells, remote
+ *  panes and non-Linux hosts are omitted. See `terminal_foreground_jobs`. */
+export const terminalForegroundJobs = (sessionIds: string[]) =>
+  invoke<Record<string, string>>("terminal_foreground_jobs", { sessionIds });
 
 /** Attach an output subscriber to a session's PTY stream. Resolves with the
  *  subscriber generation token, which must be handed to `detachPtyOutput` /

@@ -35,6 +35,29 @@ pub struct UserSettings {
     pub browser: BrowserSettings,
 }
 
+/// Whether the exact settings snapshot reached the account or remains queued locally.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct SettingsPersistence {
+    pub settings: UserSettings,
+    pub synced: bool,
+}
+
+impl SettingsPersistence {
+    pub fn synced(settings: UserSettings) -> Self {
+        Self {
+            settings,
+            synced: true,
+        }
+    }
+
+    pub fn queued(settings: UserSettings) -> Self {
+        Self {
+            settings,
+            synced: false,
+        }
+    }
+}
+
 /// Agent-browser behavior knobs.
 ///
 /// `default_viewport` is the user's preferred starting viewport for
@@ -584,9 +607,7 @@ pub fn load_cache() -> Option<UserSettings> {
 /// The generation lets the fetch that follows prove no local write landed
 /// between this snapshot and the moment the server response is installed —
 /// see [`install_fetched_settings`].
-fn load_dirty_cache_for_scope(
-    scope: &CacheScope,
-) -> Result<(u64, Option<UserSettings>), String> {
+fn load_dirty_cache_for_scope(scope: &CacheScope) -> Result<(u64, Option<UserSettings>), String> {
     let owner = CACHE_OWNER
         .lock()
         .map_err(|_| "settings cache owner lock poisoned".to_string())?;
@@ -689,7 +710,7 @@ async fn push_settings_in_scope(
     settings: &UserSettings,
     scope: &CacheScope,
     accept_offline_local_write: bool,
-) -> Result<UserSettings, String> {
+) -> Result<SettingsPersistence, String> {
     ensure_scope_current(scope)?;
     let base = crate::auth::api_base_url();
     let client = settings_client()?;
@@ -711,7 +732,7 @@ async fn push_settings_in_scope(
                 return Err("Settings account changed while update was in flight".into());
             }
             clear_dirty_for_scope(scope);
-            Ok(saved)
+            Ok(SettingsPersistence::synced(saved))
         }
         Ok(r) => Err(format!("API error: {}", r.status())),
         Err(error) => {
@@ -720,7 +741,7 @@ async fn push_settings_in_scope(
                 return Err("Settings account changed while update was in flight".into());
             }
             if accept_offline_local_write {
-                Ok(settings.clone())
+                Ok(SettingsPersistence::queued(settings.clone()))
             } else {
                 Err(format!("Network error: {error}"))
             }
@@ -732,7 +753,7 @@ pub async fn push_settings_for_owner(
     token: &str,
     user_id: &str,
     settings: &UserSettings,
-) -> Result<UserSettings, String> {
+) -> Result<SettingsPersistence, String> {
     let scope = cache_scope_for_owner(user_id);
     push_settings_in_scope(token, settings, &scope, true).await
 }
@@ -875,7 +896,7 @@ async fn sync_settings_once(token: &str, scope: CacheScope) -> Result<UserSettin
     // Flush offline changes now that we know we're online.
     if let Some(local) = post_fetch_dirty.or(dirty_snapshot) {
         match push_settings_in_scope(token, &local, &scope, false).await {
-            Ok(pushed) => return Ok(pushed),
+            Ok(pushed) => return Ok(pushed.settings),
             Err(error) => {
                 // The GET may have installed the server snapshot. Restore the
                 // unflushed local edit and its dirty marker so a transient
@@ -1568,6 +1589,78 @@ mod tests {
     fn mock_api_response(settings: &UserSettings) -> String {
         let val = serde_json::to_value(settings).unwrap();
         serde_json::json!({ "settings": val, "updatedAt": null }).to_string()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_persistence_reports_online_success() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        set_cache_owner(None);
+        clear_cache();
+        let mut settings = UserSettings::default();
+        settings.appearance.theme = "online-edit".into();
+        let push = server
+            .mock("PUT", "/api/settings")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(mock_api_response(&settings))
+            .create_async()
+            .await;
+
+        let result = push_settings_in_scope("token", &settings, &cache_scope(), true)
+            .await
+            .unwrap();
+        assert_eq!(result.settings, settings);
+        assert!(result.synced);
+        assert!(!is_dirty());
+        push.assert_async().await;
+        clear_cache();
+        std::env::remove_var("CODEMUX_API_URL");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_persistence_reports_offline_queue_until_reconciliation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable = listener.local_addr().unwrap();
+        drop(listener);
+        std::env::set_var("CODEMUX_API_URL", format!("http://{unavailable}"));
+        set_cache_owner(None);
+        clear_cache();
+        let mut settings = UserSettings::default();
+        settings.appearance.theme = "offline-edit".into();
+
+        let result = push_settings_in_scope("token", &settings, &cache_scope(), true)
+            .await
+            .unwrap();
+        assert_eq!(result.settings, settings);
+        assert!(!result.synced);
+        assert_eq!(load_cache(), Some(settings.clone()));
+        assert!(is_dirty());
+
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let fetch = server
+            .mock("GET", "/api/settings")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(mock_api_response(&UserSettings::default()))
+            .create_async()
+            .await;
+        let push = server
+            .mock("PUT", "/api/settings")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(mock_api_response(&settings))
+            .create_async()
+            .await;
+        assert_eq!(sync_settings("token").await.unwrap(), settings);
+        assert!(!is_dirty());
+        fetch.assert_async().await;
+        push.assert_async().await;
+        clear_cache();
+        std::env::remove_var("CODEMUX_API_URL");
     }
 
     #[tokio::test]

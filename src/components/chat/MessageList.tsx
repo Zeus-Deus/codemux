@@ -50,6 +50,7 @@ import { PlanProposalBlock } from "./PlanProposalBlock";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { StreamingMarker } from "./StreamingMarker";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
+import { SignInNotice } from "./SignInNotice";
 import { HtmlRenderFrame } from "./HtmlRenderFrame";
 import { ToolCallCard } from "./ToolCallCard";
 import { TurnChangesChip } from "./TurnChangesChip";
@@ -2056,6 +2057,15 @@ function renderAssistantBody(
         </div>
       );
     case "runtime_notice":
+      if (item.signIn) {
+        return (
+          <SignInNotice
+            provider={item.signIn}
+            message={item.message}
+            workspaceId={handlers.workspaceId ?? null}
+          />
+        );
+      }
       // Compact inline notice — a left-bordered line in the assistant
       // gutter. Amber for advisories the run may recover from (provider
       // rate-limit rejection, enumerated assistant error); red for

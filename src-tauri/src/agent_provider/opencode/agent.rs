@@ -127,8 +127,8 @@ impl OpenCodeAgentProvider {
 /// Reaps every live session on drop. Mirrors the Claude/Codex
 /// pattern — sessions own their SSE listener tasks and an HTTP
 /// client; both wind down cleanly when their `Arc` count hits zero,
-/// but we additionally call `shutdown()` to DELETE the OpenCode-side
-/// session and free its server-side memory.
+/// but we additionally interrupt/detach each live attachment. Durable native
+/// sessions remain addressable for resume.
 impl Drop for OpenCodeAgentProvider {
     fn drop(&mut self) {
         let sessions = Arc::clone(&self.sessions);
@@ -140,7 +140,7 @@ impl Drop for OpenCodeAgentProvider {
                     std::mem::take(&mut *guard)
                 };
                 for (_, session) in map {
-                    session.shutdown().await;
+                    let _ = session.shutdown().await;
                 }
                 for (_, session) in std::mem::take(&mut *managed_sessions.write().await) {
                     let _ = session.shutdown_managed().await;
@@ -216,36 +216,34 @@ impl AgentProvider for OpenCodeAgentProvider {
                 message: "OpenCode thread already has a managed session".into(),
             });
         }
-        // Evict a corpse before rebuilding: if the SSE listener gave up on an
-        // unreachable server it flipped the session's `dead` flag but left the
-        // entry in the map (only `stop_session` removes). Without this, the
-        // rebuild `ensure_live_session` drives after `has_session` reports the
-        // dead session absent would hit the `contains_key` guard below and fail
-        // permanently. Remove the dead entry under the write lock (atomic
-        // check→remove against a concurrent rebuild) and shut it down cleanly
-        // below. A still-live session for this thread is a genuine double-start
-        // and stays a ValidationError.
-        let dead_evicted = {
-            let mut sessions = self.sessions.write().await;
-            match sessions.get(&thread_id) {
-                Some(existing) if existing.is_dead() => sessions.remove(&thread_id),
-                Some(_) => {
-                    return Err(ProviderError::ValidationError {
-                        message: format!(
-                            "opencode session already exists for thread {:?}",
-                            thread_id.0
-                        ),
-                    });
-                }
-                None => None,
+        // Keep unknown native admission registered until its fence completes,
+        // without holding the registry lock during network teardown.
+        let existing = self.sessions.read().await.get(&thread_id).cloned();
+        if let Some(existing) = existing {
+            if !existing.is_dead() {
+                return Err(ProviderError::ValidationError {
+                    message: format!(
+                        "opencode session already exists for thread {:?}",
+                        thread_id.0
+                    ),
+                });
             }
-        };
-        // Drop the corpse WITHOUT calling `shutdown()`: its SSE listener task
-        // has already exited (the give-up path returns after flipping `dead`),
-        // so there is nothing to abort, and `shutdown()` would
-        // `DELETE /session/{id}` — destroying the very server-side session the
-        // resume below wants to readopt. Just let the Arc drop.
-        drop(dead_evicted);
+            if existing.has_unconfirmed_native_admissions().await {
+                existing.shutdown().await?;
+            }
+            existing.handoff_dead_attachment().await?;
+            let mut sessions = self.sessions.write().await;
+            if sessions
+                .get(&thread_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &existing))
+            {
+                sessions.remove(&thread_id);
+            } else if sessions.contains_key(&thread_id) {
+                return Err(ProviderError::ValidationError {
+                    message: "OpenCode session was replaced during rebuild".into(),
+                });
+            }
+        }
         // Best-effort resume: `ensure_live_session` passes
         // `{"resume": <opencode_session_id>}` when the persisted row carries the
         // server-side session id. OpenCode keeps sessions on disk, so a rebuilt
@@ -387,8 +385,7 @@ impl AgentProvider for OpenCodeAgentProvider {
 
     async fn set_model(&self, thread_id: ThreadId, model: String) -> Result<(), ProviderError> {
         let session = self.lookup(&thread_id).await?;
-        session.set_model(model).await;
-        Ok(())
+        session.set_model(model).await
     }
 
     async fn set_permission_mode(
@@ -409,23 +406,35 @@ impl AgentProvider for OpenCodeAgentProvider {
         if self.managed_sessions.read().await.contains_key(&thread_id) {
             return self.stop_managed_session(thread_id).await;
         }
-        let session = {
-            let mut sessions = self.sessions.write().await;
-            sessions.remove(&thread_id)
-        };
-        let session = session.ok_or_else(|| ProviderError::SessionNotFound {
-            thread_id: thread_id.clone(),
-        })?;
-        // Drop the carried usage state too — this is an explicit teardown,
-        // not the dead-session eviction the carry-over exists for, and the
-        // shutdown below closes the server session, so nothing survives
-        // that could be re-broadcast. Keeps `usage_states` bounded by live
-        // sessions rather than by everything the app has ever opened.
+        let session = self
+            .sessions
+            .read()
+            .await
+            .get(&thread_id)
+            .cloned()
+            .ok_or_else(|| ProviderError::SessionNotFound {
+                thread_id: thread_id.clone(),
+            })?;
+        // Failed teardown keeps the ACK owner available for a later retry.
+        session.shutdown().await?;
+        let mut sessions = self.sessions.write().await;
+        let removed = if sessions
+            .get(&thread_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &session))
         {
-            let mut usage_states = self.usage_states.write().await;
-            usage_states.remove(&session.provider_session_id.0);
+            sessions.remove(&thread_id);
+            true
+        } else {
+            false
+        };
+        drop(sessions);
+        if removed {
+            self.usage_states
+                .write()
+                .await
+                .remove(&session.provider_session_id.0);
         }
-        session.shutdown().await;
+
         Ok(())
     }
 
@@ -542,17 +551,52 @@ mod tests {
     #[tokio::test]
     async fn review_l4_opencode_selected_old_turn_does_not_abort_newer_turn() {
         let mut server = mockito::Server::new_async().await;
-        let prompt = server.mock("POST", "/session/sess_1/prompt_async").with_status(204).create_async().await;
-        let abort = server.mock("POST", "/session/sess_1/abort").with_status(200).with_body("true").expect(2).create_async().await;
-        let (session, _, _) = super::super::session::tests::mock_session(server.url(), "pw".into(), "sess_1").await;
-        let input = serde_json::from_value(serde_json::json!({"thread_id":"thread-1","text":"newer turn B","model_override":null})).unwrap();
+        let prompt = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .with_status(204)
+            .create_async()
+            .await;
+        let abort = server
+            .mock("POST", "/session/sess_1/abort")
+            .with_status(200)
+            .with_body("true")
+            .expect(2)
+            .create_async()
+            .await;
+        let (session, _, _) =
+            super::super::session::tests::mock_session(server.url(), "pw".into(), "sess_1").await;
+        let input = serde_json::from_value(
+            serde_json::json!({"thread_id":"thread-1","text":"newer turn B","model_override":null}),
+        )
+        .unwrap();
         let newer = session.enqueue_or_send(input).await.unwrap();
-        let provider = OpenCodeAgentProvider::new(Arc::new(OpenCodeServerManager::new()), OpenCodeProviderConfig::default());
-        provider.sessions.write().await.insert(ThreadId("thread-1".into()), session);
-        let result = provider.interrupt_turn(ThreadId("thread-1".into()), Some(TurnId("retired-a".into()))).await;
-        assert!(result.is_err(), "selected old turn must be checked before session-scoped HTTP abort: {result:?}");
-        provider.interrupt_turn(ThreadId("thread-1".into()), Some(newer.turn_id)).await.unwrap();
-        provider.interrupt_turn(ThreadId("thread-1".into()), None).await.unwrap();
+        let provider = OpenCodeAgentProvider::new(
+            Arc::new(OpenCodeServerManager::new()),
+            OpenCodeProviderConfig::default(),
+        );
+        provider
+            .sessions
+            .write()
+            .await
+            .insert(ThreadId("thread-1".into()), session);
+        let result = provider
+            .interrupt_turn(
+                ThreadId("thread-1".into()),
+                Some(TurnId("retired-a".into())),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "selected old turn must be checked before session-scoped HTTP abort: {result:?}"
+        );
+        provider
+            .interrupt_turn(ThreadId("thread-1".into()), Some(newer.turn_id))
+            .await
+            .unwrap();
+        provider
+            .interrupt_turn(ThreadId("thread-1".into()), None)
+            .await
+            .unwrap();
         prompt.assert_async().await;
         abort.assert_async().await;
     }

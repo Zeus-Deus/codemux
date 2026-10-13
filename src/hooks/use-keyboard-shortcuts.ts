@@ -1,15 +1,19 @@
 import { useEffect, useRef } from "react";
 import {
   splitPane,
-  closePane,
   createTab,
-  closeTab,
   activateTab,
+  activatePane,
   activateWorkspace,
   createEmptyWorkspace,
   runProjectDevCommand,
 } from "@/tauri/commands";
 import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
+import {
+  reopenClosedTab,
+  requestClosePane,
+  requestCloseTab,
+} from "@/lib/close-guard";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -18,12 +22,24 @@ import { startNewHomeAgent } from "@/lib/agent-chat/new-home-agent";
 import { openProjectFlow } from "@/hooks/use-project-actions";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { normalizeKeyCombo } from "@/lib/keybind-utils";
+import { escapeClaimedElsewhere } from "@/lib/escape-guard";
 import { stepInterfaceSize } from "@/lib/typography";
+import { announceInterfaceSize } from "@/components/overlays/interface-size-hud";
 import { getRegistryEntry } from "@/lib/keybind-registry";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
+import { isAppShortcutApplicable } from "@/lib/app-shortcut-applicability";
 import { getJumpTarget } from "@/components/layout/sidebar-inbox-jump";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { selectWorkspaceNavigationTarget } from "@/lib/workspace-navigation";
+import { jumpToNextNeedsYou } from "@/lib/needs-you";
+import {
+  findPaneInDirection,
+  focusPaneContent,
+  leafPaneIds,
+  measurePaneRects,
+  type PaneDirection,
+} from "@/lib/pane-navigation";
+import { usePaneZoomStore } from "@/stores/pane-zoom-store";
 import {
   useSyncedSettingsStore,
   selectKeyboardShortcuts,
@@ -58,10 +74,11 @@ export function useKeyboardShortcuts() {
       const actionIds = reverseMapRef.current.get(combo);
       if (!actionIds || actionIds.length === 0) return;
 
-      // Find the first window-level action (skip terminal-only actions)
+      // Find the first window-level action (skip actions a focused terminal or
+      // chat composer handles itself)
       const actionId = actionIds.find((id) => {
         const entry = getRegistryEntry(id);
-        return !entry || entry.when !== "terminal";
+        return !entry || (entry.when !== "terminal" && entry.when !== "composer");
       });
       if (!actionId) return;
 
@@ -84,7 +101,8 @@ export function useKeyboardShortcuts() {
  * event; the command palette calls it without one, so a palette row and its
  * shortcut always execute the exact same code path.
  */
-export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
+export function dispatch(actionId: string, event?: KeyboardEvent): boolean {
+  if (!isAppShortcutApplicable(actionId)) return false;
   const ui = useUIStore.getState();
   const appState = useAppStore.getState().appState;
 
@@ -101,7 +119,7 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     // A dialog or popover open on top of an overlay (Radix marks the Escape
     // it dismissed on) owns this press; closing the overlay beneath it too
     // would throw away the page the user was returning to.
-    if (_e?.defaultPrevented) return false;
+    if (event?.defaultPrevented) return false;
     // Onboarding is a full-view replacement, not a modal — prioritize it over
     // dismissible overlays so Escape always provides an escape hatch.
     if (ui.onboardingProjectDir) {
@@ -117,6 +135,9 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
       return true;
     }
     if (ui.showSettings) {
+      // Settings hosts sheets, selects, dialogs and its own command palette.
+      // Escape belongs to the innermost of those; a second press leaves.
+      if (event && escapeClaimedElsewhere(event)) return false;
       ui.setShowSettings(false);
       return true;
     }
@@ -162,9 +183,11 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     const current = settings.settings.appearance.interface_font_size;
     const step = actionId === "zoomIn" ? "in" : actionId === "zoomOut" ? "out" : "reset";
     const next = stepInterfaceSize(current, step);
-    if (next !== current) {
+    const changed = next !== current;
+    if (changed) {
       void settings.updateSetting("appearance", "interface_font_size", next).catch(console.error);
     }
+    announceInterfaceSize(next, step, changed);
     return true;
   }
 
@@ -243,11 +266,16 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   const jumpMatch = actionId.match(/^workspaceJump([1-9])$/);
   if (jumpMatch) {
     const target = getJumpTarget(parseInt(jumpMatch[1], 10));
-    if (target) {
-      activateWorkspaceInteraction(target).catch(console.error);
-    }
-    // Consume the combo regardless so a held Alt+digit never leaks to the page.
+    if (!target) return false;
+    activateWorkspaceInteraction(target).catch(console.error);
     return true;
+  }
+
+  // ── Jump to the next workspace that needs you ──
+  // The keyboard twin of the sidebar's "Needs you" strip, reachable from
+  // anywhere, including with the sidebar collapsed.
+  if (actionId === "jumpToNeedsYou") {
+    return jumpToNextNeedsYou();
   }
 
   if (!appState) return false;
@@ -322,8 +350,11 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     return true;
   }
   if (actionId === "closeTab") {
-    if (ws.tabs.length > 0)
-      closeTab(ws.workspace_id, ws.active_tab_id).catch(reportFailure("Couldn't close the tab"));
+    if (ws.tabs.length > 0) void requestCloseTab(ws.workspace_id, ws.active_tab_id);
+    return true;
+  }
+  if (actionId === "reopenClosedTab") {
+    reopenClosedTab();
     return true;
   }
 
@@ -333,6 +364,15 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     const idx = parseInt(tabMatch[1], 10) - 1;
     const tab = ws.tabs[idx];
     if (tab) activateTab(ws.workspace_id, tab.tab_id).catch(console.error);
+    return true;
+  }
+
+  // Next / previous tab, wrapping at either end
+  if (actionId === "nextTab" || actionId === "prevTab") {
+    const at = ws.tabs.findIndex((t) => t.tab_id === ws.active_tab_id);
+    const step = actionId === "nextTab" ? 1 : -1;
+    const next = ws.tabs[(at + step + ws.tabs.length) % ws.tabs.length];
+    activateTab(ws.workspace_id, next.tab_id).catch(console.error);
     return true;
   }
 
@@ -346,7 +386,42 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     return true;
   }
   if (actionId === "closePane") {
-    if (activePaneId) closePane(activePaneId).catch(reportFailure("Couldn't close the pane"));
+    if (activePaneId) void requestClosePane(activePaneId);
+    return true;
+  }
+
+  // Move focus to the neighbouring pane on screen
+  const focusMatch = actionId.match(/^focusPane(Left|Right|Up|Down)$/);
+  if (focusMatch) {
+    if (!surface || !activePaneId || surface.root.kind !== "split") return true;
+    const direction = focusMatch[1].toLowerCase() as PaneDirection;
+    const move = () => {
+      const rects = measurePaneRects(leafPaneIds(surface.root));
+      const active = rects.get(activePaneId);
+      if (!active) return;
+      const candidates = [...rects]
+        .filter(([id]) => id !== activePaneId)
+        .map(([id, rect]) => ({ id, rect }));
+      const target = findPaneInDirection(active, candidates, direction);
+      if (!target) return;
+      activatePane(target).catch(console.error);
+      focusPaneContent(target);
+    };
+    // A zoom hides the neighbours, so leave it first (as tmux does) and
+    // measure once the split has painted again.
+    const zoom = usePaneZoomStore.getState();
+    if (zoom.zoomedPaneBySurface[surface.surface_id]) {
+      zoom.clear(surface.surface_id);
+      requestAnimationFrame(() => requestAnimationFrame(move));
+    } else {
+      move();
+    }
+    return true;
+  }
+
+  if (actionId === "togglePaneZoom") {
+    if (!surface || !activePaneId) return false;
+    usePaneZoomStore.getState().toggle(surface.surface_id, activePaneId);
     return true;
   }
 

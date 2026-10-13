@@ -37,14 +37,21 @@ import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
 import { COMPOSER_OVERLAY_CARD } from "./composer-overlay";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
+export type QuestionAnswer = string | string[];
+
+/** Text-only provider contracts retain their existing display representation. */
+export function questionAnswerText(answer: QuestionAnswer): string {
+  return Array.isArray(answer) ? answer.join(", ") : answer;
+}
+
 interface Props {
   questions: Question[];
-  onSubmit: (answers: string[]) => void | Promise<void>;
+  onSubmit: (answers: QuestionAnswer[]) => void | Promise<void>;
   idPrefix?: string;
   active?: boolean;
   globalShortcuts?: boolean;
   initialAnswers?: string[];
-  onAnswersChange?: (answers: string[]) => void;
+  onAnswersChange?: (answers: QuestionAnswer[]) => void;
   /** Dismiss the whole prompt so the user can answer in the chat instead.
    *  Absent: no Skip action is offered. */
   onSkip?: () => void;
@@ -178,16 +185,16 @@ export function QuestionForm({
   );
   const currentAnswered = questionAnswered(qi);
 
-  const collectAnswers = useCallback((): string[] => {
+  const collectAnswers = useCallback((): QuestionAnswer[] => {
     // Preserve question order; duplicate question titles are valid.
-    const answers: string[] = [];
+    const answers: QuestionAnswer[] = [];
     questions.forEach((q, i) => {
       const p = picks[i] ?? new Set<string>();
       const free = q.allowOther ? (otherText[i] ?? "").trim() : "";
       if (q.multiSelect) {
         const labels = [...p].filter((l) => l !== OTHER_LABEL);
         if (free) labels.push(free);
-        answers[i] = labels.join(", ");
+        answers[i] = labels;
       } else if (free) {
         answers[i] = free;
       } else {
