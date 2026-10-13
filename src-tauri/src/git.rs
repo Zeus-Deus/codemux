@@ -900,6 +900,33 @@ pub fn git_commits_ahead(
     Ok(commits)
 }
 
+/// What a pull request from HEAD against `base` would contain, as text
+/// an agent can read: the commit messages, the per-file stat and the
+/// patch. Measured from the merge base, the same range the host shows.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BranchChangeText {
+    pub log: String,
+    pub stat: String,
+    pub diff: String,
+}
+
+pub fn git_branch_change_text(repo_path: &Path, base: &str) -> Result<BranchChangeText, String> {
+    let base_ref = resolve_base_ref(repo_path, base)?;
+    let merge_base = run_git(repo_path, &["merge-base", "HEAD", &base_ref])?;
+    if merge_base.is_empty() {
+        return Err("No common ancestor found".to_string());
+    }
+    let range = format!("{merge_base}..HEAD");
+    Ok(BranchChangeText {
+        log: run_git(
+            repo_path,
+            &["log", "--no-merges", "--format=- %s%n%w(0,2,2)%b", "-n", "50", &range],
+        )?,
+        stat: run_git(repo_path, &["diff", "--stat", &range])?,
+        diff: run_git(repo_path, &["diff", &range])?,
+    })
+}
+
 pub fn git_log(repo_path: &Path, count: usize) -> Result<Vec<GitLogEntry>, String> {
     let count_str = count.to_string();
     let output = run_git(
@@ -2542,6 +2569,30 @@ mod repo_root_tests {
             (Ok(x), Ok(y)) => x == y,
             _ => a == b,
         }
+    }
+
+    /// The text an agent drafts a PR description from covers exactly the
+    /// branch's own work: its commits, stat and patch, nothing from base.
+    #[test]
+    fn branch_change_text_covers_only_the_branch() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        run(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("feature.txt"), "new line\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-m", "feat: add the feature file", "-m", "Checked by hand."]);
+
+        let text = git_branch_change_text(&repo, "main").expect("change text");
+        assert!(text.log.contains("- feat: add the feature file"), "log: {}", text.log);
+        assert!(text.log.contains("Checked by hand."), "log: {}", text.log);
+        assert!(!text.log.contains("init"), "base commits stay out: {}", text.log);
+        assert!(text.stat.contains("feature.txt"), "stat: {}", text.stat);
+        assert!(text.diff.contains("+new line"), "diff: {}", text.diff);
+        assert!(!text.diff.contains("README.md"), "diff: {}", text.diff);
+
+        assert!(git_branch_change_text(&repo, "no-such-base").is_err());
     }
 
     #[test]

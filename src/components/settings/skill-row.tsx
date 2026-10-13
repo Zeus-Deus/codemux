@@ -64,7 +64,7 @@ export function SkillRow({
       data-enabled={enabled}
       className={cn(
         "group flex items-center gap-3 px-3 py-2 transition-colors duration-150",
-        "hover:bg-accent/30",
+        "hover:bg-surface-2",
         // Disabled skills render at half-opacity so users can see
         // they're still discovered but won't fire — the per-row
         // switch is the affordance to bring them back.

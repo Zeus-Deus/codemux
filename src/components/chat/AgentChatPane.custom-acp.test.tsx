@@ -110,7 +110,7 @@ it.each(["draft", "preset"].flatMap(path => ["ultrathink", null].map(effort => (
   const draft: ChatDraft = { draftId: "draft" as ChatDraft["draftId"], createdAt: "2026-01-01", target: path === "preset" ? { kind: "project", projectPath: "/repo" } : { kind: "existing_workspace", workspaceId: "ws" }, provider: "acp", model: null, effort, contextWindow: null, permissionMode: null, mode: "default", inputDraft: "user ultrathink", threadId: "draft-thread", promoting: false, promotedTo: null, materializedTo: null, lastSendError: null };
   useCustomAcp.getState().select(draft.threadId, agent.id);
   const store = useAgentChatStore.getState();
-  const actions: MaterializeActions = { markPromoting: vi.fn(), markMaterialized: vi.fn(), markPromoted: vi.fn(), markSendFailed: vi.fn(), ensureThread: store.ensureThread, appendUserMessage: store.appendUserMessage, removeUserMessageByNonce: store.removeUserMessageByNonce, setModel: store.setModel, setPermissionMode: store.setPermissionMode, setSessionLaunchMode: store.setSessionLaunchMode, setEffort: store.setEffort, setContextWindow: store.setContextWindow, setFastMode: store.setFastMode, setMode: store.setMode };
+  const actions: MaterializeActions = { markPromoting: vi.fn(), markMaterialized: vi.fn(), markPromoted: vi.fn(), markSendFailed: vi.fn(), ensureThread: store.ensureThread, appendUserMessage: store.appendUserMessage, removeUserMessageByNonce: store.removeUserMessageByNonce, setModel: store.setModel, setPermissionMode: store.setPermissionMode, setSessionLaunchMode: store.setSessionLaunchMode, setEffort: store.setEffort, setContextWindow: store.setContextWindow, setServiceTier: store.setServiceTier, setMode: store.setMode };
   const preset: TerminalPreset = { id: "test", name: "Test", description: null, commands: [], working_directory: null, launch_mode: "new_tab", icon: null, pinned: false, is_builtin: false, auto_run_on_workspace: false, auto_run_on_new_tab: false, kind: "chat_agent" };
   const result = path === "draft" ? await materializeAndSend(draft, draft.inputDraft, "/repo", actions, null, "Attached raw context") : await materializeWithPreset(draft, preset, draft.inputDraft, actions);
   expect(result.success).toBe(true);
@@ -296,6 +296,8 @@ it.each((["model", "config"] as const).flatMap(kind => [false, true].flatMap(ctr
   useAgentChatStore.getState().ensureThread(record.thread_id);
   useAgentChatStore.getState().setInputDraft(record.thread_id, "retain racing draft");
   const { container } = render(<TooltipProvider><AgentChatPane pane={pane} /></TooltipProvider>);
+  // The pane swaps its composer in once history loads; open the picker after that.
+  await waitFor(() => expect(screen.queryByTestId("transcript-skeleton")).toBeNull());
   await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
   fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
   const controls = within(await screen.findByRole("dialog"));

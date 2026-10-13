@@ -16,7 +16,6 @@ import {
   TooltipContent,
 } from "@/components/ui/tooltip";
 import {
-  Loader2,
   Sparkles,
   GitBranch,
   ArrowUp,
@@ -72,7 +71,7 @@ import { useAppStore, useHomeDir } from "@/stores/app-store";
 import { useAiCommitStore } from "@/stores/ai-commit-store";
 import { showNoGitState, useInitializeGit } from "@/hooks/use-initialize-git";
 import { cn } from "@/lib/utils";
-import { utilitySelectionFromStores } from "@/lib/utility-agent";
+import { aiTextCliSelection, utilitySelectionFromStores } from "@/lib/utility-agent";
 import { PanelHeader } from "@/components/ui/panel-header";
 import type {
   WorkspaceSnapshot,
@@ -81,6 +80,7 @@ import type {
   MergeState,
 } from "@/tauri/types";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 /** Which file sections the panel lists. Driven by the deck's pane-bar
  *  filter; `"all"` is the historic behavior. */
@@ -169,7 +169,7 @@ function FileRow({
       else await gitStageFiles(cwd, [file.path]);
       onRefresh();
     } catch (err) {
-      toast.error(String(err));
+      toast.failure(staged ? "Couldn't unstage the file" : "Couldn't stage the file", err);
     }
   };
 
@@ -187,7 +187,7 @@ function FileRow({
       await gitDiscardFile(cwd, file.path);
       onRefresh();
     } catch (err) {
-      toast.error(String(err));
+      toast.failure("Couldn't discard the changes", err);
     }
     setConfirmDiscard(false);
   };
@@ -327,7 +327,7 @@ function FileSection({
       else await gitUnstageFiles(cwd, paths);
       onRefresh();
     } catch (err) {
-      toast.error(String(err));
+      toast.failure(bulkAction === "stage" ? "Couldn't stage the files" : "Couldn't unstage the files", err);
     }
   };
   return (
@@ -434,10 +434,12 @@ export function ChangesPanel({
   }, [loaded, returnFocusPath]);
   const [branchInfo, setBranchInfo] = useState<GitBranchInfo | null>(null);
   const [mergeState, setMergeState] = useState<MergeState | null>(null);
-  const [busy, setBusy] = useState<"commit" | "push" | "pull" | "sync" | "fetch" | "merge" | "amend" | "undo" | "stash" | null>(null);
+  const [busy, setBusy] = useState<"commit" | "push" | "pull" | "sync" | "fetch" | "merge" | "amend" | "undo" | "stash" | "stash-pop" | null>(null);
   const [editing, setEditing] = useState(false);
   const [editedMsg, setEditedMsg] = useState("");
   const [pushAfterCommit, setPushAfterCommit] = useState(false);
+  const [justDone, setJustDone] = useState<RemoteAction | null>(null);
+  const justDoneTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [claudeReady, setClaudeReady] = useState<boolean | null>(null);
   const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -559,19 +561,11 @@ export function ChangesPanel({
         await gitStageFiles(cwd, unstaged.map((f) => f.path));
         refresh();
       } catch (err) {
-        toast.error(`Stage failed: ${err}`);
+        toast.failure("Stage failed", err);
         return;
       }
     }
-    // An explicit commit-message CLI wins; otherwise the Utility agent
-    // supplies the provider. Its model only rides along when the provider
-    // matches, so an override CLI is never handed another provider's model
-    // name (`claude --model <codex model>` fails every commit).
-    const utility = utilitySelectionFromStores();
-    const cli = config?.ai_commit_message_cli ?? utility?.provider ?? "claude";
-    const model =
-      config?.ai_commit_message_model ??
-      (utility?.provider === cli ? utility.model : null);
+    const { cli, model } = aiTextCliSelection(config, utilitySelectionFromStores());
     // Only claude has an availability preflight; when it says "missing" we
     // fall back to the manual textarea instead of a doomed spawn.
     const canUseAi = aiEnabled && (cli !== "claude" || claudeReady !== false);
@@ -597,32 +591,55 @@ export function ChangesPanel({
         try {
           await gitPushChanges(cwd, branchInfo ? !branchInfo.has_upstream : false);
         } catch (err) {
-          toast.error(`Push after commit failed: ${err}`);
+          toast.failure("Push after commit failed", err);
         }
         setPushAfterCommit(false);
       }
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Commit failed: ${err}`);
+      toast.failure("Commit failed", err);
     } finally {
       setBusy(null);
     }
   };
 
+  // Push, Pull and Sync confirm on the button itself — a brief check
+  // where the spinner was — instead of a toast for something you just
+  // watched happen.
+  const flashDone = useCallback((action: RemoteAction) => {
+    if (justDoneTimer.current) clearTimeout(justDoneTimer.current);
+    setJustDone(action);
+    justDoneTimer.current = setTimeout(() => setJustDone(null), DONE_FLASH_MS);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (justDoneTimer.current) clearTimeout(justDoneTimer.current);
+    },
+    [],
+  );
+
   const handleAmend = async () => {
     if (busy) return;
     setBusy("amend");
     try {
-      if (unstaged.length > 0 && staged.length === 0) {
+      // Nothing staged means "amend with everything", and the menu item
+      // says so; the toast repeats it so the scope is never a surprise.
+      const stagedAll = unstaged.length > 0 && staged.length === 0;
+      if (stagedAll) {
         await gitStageFiles(cwd, unstaged.map((f) => f.path));
       }
       await gitAmendCommit(cwd, null);
-      toast.success("Amended last commit");
+      toast.success(
+        stagedAll
+          ? `Amended last commit with ${unstaged.length} ${unstaged.length === 1 ? "file" : "files"}`
+          : "Amended last commit",
+      );
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Amend failed: ${err}`);
+      toast.failure("Amend failed", err);
     } finally {
       setBusy(null);
     }
@@ -637,7 +654,7 @@ export function ChangesPanel({
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Undo failed: ${err}`);
+      toast.failure("Undo failed", err);
     } finally {
       setBusy(null);
     }
@@ -651,7 +668,7 @@ export function ChangesPanel({
       toast.success("Stashed changes");
       refresh();
     } catch (err) {
-      toast.error(`Stash failed: ${err}`);
+      toast.failure("Stash failed", err);
     } finally {
       setBusy(null);
     }
@@ -659,13 +676,13 @@ export function ChangesPanel({
 
   const handleStashPop = async () => {
     if (busy) return;
-    setBusy("stash");
+    setBusy("stash-pop");
     try {
       await gitStashPop(cwd);
       toast.success("Popped stash");
       refresh();
     } catch (err) {
-      toast.error(`Stash pop failed: ${err}`);
+      toast.failure("Stash pop failed", err);
     } finally {
       setBusy(null);
     }
@@ -688,8 +705,9 @@ export function ChangesPanel({
       await gitPushChanges(cwd, branchInfo ? !branchInfo.has_upstream : false);
       refresh();
       invalidateReviewQueries();
+      flashDone("push");
     } catch (err) {
-      toast.error(`Push failed: ${err}`);
+      toast.failure("Push failed", err);
     } finally {
       setBusy(null);
     }
@@ -702,8 +720,9 @@ export function ChangesPanel({
       await gitPullChanges(cwd);
       refresh();
       invalidateReviewQueries();
+      flashDone("pull");
     } catch (err) {
-      toast.error(`Pull failed: ${err}`);
+      toast.failure("Pull failed", err);
     } finally {
       setBusy(null);
     }
@@ -717,8 +736,9 @@ export function ChangesPanel({
       await gitPushChanges(cwd, false);
       refresh();
       invalidateReviewQueries();
+      flashDone("sync");
     } catch (err) {
-      toast.error(`Sync failed: ${err}`);
+      toast.failure("Sync failed", err);
     } finally {
       setBusy(null);
     }
@@ -731,7 +751,7 @@ export function ChangesPanel({
       await gitFetchChanges(cwd);
       refresh();
     } catch (err) {
-      toast.error(`Fetch failed: ${err}`);
+      toast.failure("Fetch failed", err);
     } finally {
       setBusy(null);
     }
@@ -744,7 +764,7 @@ export function ChangesPanel({
       await abortMerge(cwd);
       refresh();
     } catch (err) {
-      toast.error(`Abort failed: ${err}`);
+      toast.failure("Abort failed", err);
     } finally {
       setBusy(null);
     }
@@ -758,7 +778,7 @@ export function ChangesPanel({
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Continue failed: ${err}`);
+      toast.failure("Continue failed", err);
     } finally {
       setBusy(null);
     }
@@ -917,7 +937,7 @@ export function ChangesPanel({
                 onClick={() => finalizeCommit(generatedMsg)}
                 disabled={busy !== null}
               >
-                {busy === "commit" ? <Loader2 className="size-3 animate-spin" /> : "Commit"}
+                {busy === "commit" ? <Spinner className="size-3" /> : "Commit"}
               </Button>
               <Button
                 size="xs"
@@ -969,7 +989,7 @@ export function ChangesPanel({
                 onClick={() => finalizeCommit(editedMsg)}
                 disabled={!editedMsg.trim() || busy !== null}
               >
-                {busy === "commit" ? <Loader2 className="size-3 animate-spin" /> : "Commit"}
+                {busy === "commit" ? <Spinner className="size-3" /> : "Commit"}
               </Button>
               <Button
                 size="icon-xs"
@@ -993,6 +1013,7 @@ export function ChangesPanel({
             isGenerating={isGenerating ?? false}
             isMerging={isMerging}
             busy={busy}
+            justDone={justDone}
             onCommit={() => beginCommit(false)}
             onCommitAndPush={() => beginCommit(true)}
             onAmend={handleAmend}
@@ -1013,19 +1034,42 @@ export function ChangesPanel({
   );
 }
 
+type RemoteAction = "push" | "pull" | "sync";
+
+const DONE_FLASH_MS = 1200;
+
+/** What the primary says while an action from it or its menu runs. */
+const IN_FLIGHT_LABEL: Partial<Record<string, string>> = {
+  push: "Pushing…",
+  pull: "Pulling…",
+  sync: "Syncing…",
+  fetch: "Fetching…",
+  amend: "Amending…",
+  undo: "Undoing…",
+  stash: "Stashing…",
+  "stash-pop": "Popping…",
+};
+
+const DONE_LABEL: Record<RemoteAction, string> = {
+  push: "Pushed",
+  pull: "Pulled",
+  sync: "Synced",
+};
+
 // ── SmartCommitButton ──
 //
 // Primary action morphs with state: Commit when there's something to
 // commit, Push when ahead, Pull when behind, Sync when both, Fetch when
 // clean and even. Dropdown always exposes every action so power users
 // aren't trapped by the heuristic.
-function SmartCommitButton({
+export function SmartCommitButton({
   loading,
   hasChanges,
   staged,
   isGenerating,
   isMerging,
   busy,
+  justDone,
   onCommit,
   onCommitAndPush,
   onAmend,
@@ -1046,6 +1090,7 @@ function SmartCommitButton({
   isGenerating: boolean;
   isMerging: boolean;
   busy: string | null;
+  justDone: RemoteAction | null;
   onCommit: () => void;
   onCommitAndPush: () => void;
   onAmend: () => void;
@@ -1063,7 +1108,7 @@ function SmartCommitButton({
     if (loading) {
       return {
         label: "Checking changes…",
-        icon: <Loader2 className="size-3 motion-safe:animate-spin" />,
+        icon: <Spinner className="size-3" aria-hidden />,
         action: () => {},
         disabled: true,
       };
@@ -1072,7 +1117,7 @@ function SmartCommitButton({
     if (hasChanges) {
       return {
         label: isGenerating ? "Writing message…" : staged > 0 ? `Commit ${staged}` : "Commit",
-        icon: isGenerating ? <Loader2 className="size-3 animate-spin" /> : <Sparkles className="size-3" />,
+        icon: isGenerating ? <Spinner className="size-3" aria-hidden /> : <Sparkles className="size-3" />,
         action: onCommit,
         disabled: isGenerating || busy !== null,
       };
@@ -1089,7 +1134,23 @@ function SmartCommitButton({
     return { label: "Fetch", icon: <Download className="size-3" />, action: onFetch, disabled: busy !== null };
   })();
 
-  if (!primary) {
+  // A running action (from the primary or the menu) takes over the
+  // primary's label in place, then briefly confirms; the box never moves.
+  const inFlight = busy ? IN_FLIGHT_LABEL[busy] : undefined;
+  const display = !primary
+    ? null
+    : inFlight
+      ? { label: inFlight, icon: <Spinner className="size-3" aria-hidden /> }
+      : justDone && !hasChanges
+        ? {
+            label: DONE_LABEL[justDone],
+            icon: (
+              <Check className="size-3 text-status-open motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-150" />
+            ),
+          }
+        : primary;
+
+  if (!primary || !display) {
     return (
       <div className="text-caption text-muted-foreground/60 text-center py-1">
         Resolve or abort the merge above.
@@ -1116,9 +1177,10 @@ function SmartCommitButton({
         )}
         onClick={primary.action}
         disabled={primary.disabled}
+        aria-busy={inFlight ? true : undefined}
       >
-        {primary.icon}
-        {primary.label}
+        {display.icon}
+        {display.label}
       </Button>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
@@ -1148,7 +1210,7 @@ function SmartCommitButton({
               </DropdownMenuItem>
               <DropdownMenuItem onClick={onAmend}>
                 <Pencil className="size-3 mr-2" />
-                Amend last commit
+                {staged > 0 ? "Amend last commit" : "Amend with all changes"}
               </DropdownMenuItem>
               <DropdownMenuSeparator />
             </>

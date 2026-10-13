@@ -65,6 +65,7 @@ pub async fn harvest_opencode_capabilities(
 ) -> Result<ProviderChatCapabilities, String> {
     let handle = manager.ensure_running().await?;
     let mut config = OpenCodeClientConfig::new(handle.base_url);
+    config.api = handle.api;
     config.server_password = Some(handle.server_password);
     let client = OpenCodeClient::new(config)?;
     let providers = client.list_models().await?;
@@ -174,6 +175,7 @@ fn flatten_model(
         // OpenCode's models are vision-capable and the set shifts as
         // upstreams add models.
         supports_fast_mode: false,
+        service_tiers: vec![],
         supports_images: model.supports_images,
         sub_provider: Some(provider.id.clone()),
         // Only OpenCode Zen's own free-tier signal makes it onto the

@@ -797,6 +797,7 @@ fn translate_rate_limit_event(
             provider: ProviderKind::Claude,
             resets_at_ms,
             auto_resume_at_ms: None,
+            auto_resume_blocked_reason: None,
             window: raw_kind.map(|s| s.to_string()),
         });
     }
@@ -824,8 +825,7 @@ fn warning(
 
 /// `type: "assistant"` — may carry text, thinking, and/or tool_use
 /// blocks. Each is emitted as an `ItemCompleted`. The assistant
-/// `error` field (7 enumerated kinds) is surfaced as a
-/// `RuntimeWarning`.
+/// `error` field identifies a usage-limit stop or a runtime warning.
 ///
 /// Subagent handling:
 /// * A top-level `Agent`/`Task` `tool_use` block (in a message with
@@ -872,13 +872,26 @@ fn translate_assistant(
             subagent: snapshot,
         });
     }
-    if let Some(err) = msg.get("error").and_then(|v| v.as_str()) {
-        out.push(ProviderRuntimeEvent::RuntimeWarning {
-            thread_id: Some(thread_id.clone()),
-            message: format!("assistant error: {err}"),
-            original_payload: Some(msg.clone()),
-        });
+    let error = msg.get("error").and_then(|v| v.as_str());
+    if let Some(err) = error {
+        // The SDK can omit rate_limit_event. The enumerated assistant error
+        // still identifies a limit; the backend can fill in a quota reset.
+        let notice = parent.is_none().then(|| crate::agent_provider::usage_limit::usage_limit_notice(
+            thread_id, ProviderKind::Claude, msg, err,
+        )).flatten();
+        if let Some(notice) = notice { out.push(notice); }
+        else {
+            out.push(ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(thread_id.clone()),
+                message: format!("assistant error: {err}"),
+                original_payload: Some(msg.clone()),
+            });
+        }
     }
+    // On a signed-out CLI the message text is the CLI's own "Please run
+    // /login" hint, which names a command the chat cannot run. The warning
+    // above already becomes a sign-in notice with a working action.
+    let suppress_text = error == Some("authentication_failed");
     let content = msg
         .get("message")
         .and_then(|m| m.get("content"))
@@ -889,6 +902,7 @@ fn translate_assistant(
                 continue;
             };
             match bty {
+                "text" if suppress_text => {}
                 "text" => {
                     if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                         out.push(ProviderRuntimeEvent::ItemCompleted {
@@ -1138,6 +1152,7 @@ fn snapshot_from_launch(tool_use_id: &str, input: &serde_json::Value) -> Subagen
         // demux re-stamps it onto every subsequent snapshot for this id.
         task_kind: None,
         model: get("model"),
+        effort: None,
         status: SubagentStatus::Running,
         activity: None,
         result_text: None,
@@ -1347,6 +1362,7 @@ fn base_snapshot(subagent_id: &str) -> SubagentSnapshot {
         description: None,
         task_kind: None,
         model: None,
+        effort: None,
         status: SubagentStatus::Running,
         activity: None,
         result_text: None,
@@ -1633,7 +1649,7 @@ fn translate_result(
     // a clean success.
     let api_error = subtype == "success"
         && msg.get("is_error").and_then(|v| v.as_bool()) == Some(true);
-    let status = match subtype {
+    let mut status = match subtype {
         "success" if api_error => TurnStatus::Error {
             subtype: "api_error".into(),
             message: msg
@@ -1669,6 +1685,14 @@ fn translate_result(
     // Context usage first, so the meter is already correct by the time
     // the UI processes the turn settling.
     let mut out = result_context_usage(thread_id, msg, &mut demux.context);
+    if let TurnStatus::Error { subtype, message } = &mut status {
+        if let Some(notice) = crate::agent_provider::usage_limit::usage_limit_notice(
+            thread_id, ProviderKind::Claude, msg, message,
+        ) {
+            *subtype = crate::agent_provider::events::RATE_LIMIT_SUBTYPE.into();
+            out.push(notice);
+        }
+    }
     out.push(ProviderRuntimeEvent::TurnCompleted {
         thread_id: thread_id.clone(),
         turn_id,
@@ -2297,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_error_surfaces_as_warning_plus_content() {
+    fn usage_limit_assistant_error_surfaces_notice_without_reset_event() {
         let msg = json!({
             "type": "assistant",
             "error": "rate_limit",
@@ -2307,13 +2331,45 @@ mod tests {
         let events = translate_sdk_message(&tid(), &msg);
         assert!(events.iter().any(|e| matches!(
             e,
-            ProviderRuntimeEvent::RuntimeWarning { message, .. }
-                if message.contains("rate_limit")
+            ProviderRuntimeEvent::UsageLimitReached { resets_at_ms: None, .. }
         )));
+        assert!(!events.iter().any(|e| matches!(e, ProviderRuntimeEvent::RuntimeWarning { .. })));
         assert!(events.iter().any(|e| matches!(
             e,
             ProviderRuntimeEvent::ItemCompleted { .. }
         )));
+    }
+
+    #[test]
+    fn signed_out_error_drops_the_cli_login_hint_text() {
+        let msg = json!({
+            "type": "assistant",
+            "error": "authentication_failed",
+            "turn_id": "t",
+            "message": {"content": [{"type": "text", "text": "Not logged in · Please run /login"}]}
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProviderRuntimeEvent::RuntimeWarning { message, .. }
+                if message == "assistant error: authentication_failed"
+        )));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted { .. })));
+    }
+
+    #[test]
+    fn usage_limit_execution_error_preserves_reported_reset() {
+        let msg = json!({"type":"result", "subtype":"error_during_execution",
+            "errors":["You've hit your usage limit"], "reset_at_ms":1_800_000_000_000_i64});
+        let events = translate_sdk_message(&tid(), &msg);
+        assert!(events.iter().any(|e| matches!(e, ProviderRuntimeEvent::UsageLimitReached {
+            resets_at_ms: Some(1_800_000_000_000), ..
+        })));
+        assert!(events.iter().any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted {
+            status: TurnStatus::Error { subtype, .. }, ..
+        } if subtype == "rate_limit")));
     }
 
     #[test]
@@ -2429,6 +2485,30 @@ mod tests {
             }
         } else {
             panic!("expected TurnCompleted");
+        }
+    }
+
+    #[test]
+    fn result_success_subtype_with_error_flag_preserves_failure_and_usage() {
+        let msg = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "turn_id": "t",
+            "result": "API Error: response exceeded the output token maximum",
+            "total_cost_usd": 0.002,
+            "usage": {},
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        match &events[0] {
+            ProviderRuntimeEvent::TurnCompleted { turn_id, status, usage, .. } => {
+                assert_eq!(turn_id.0, "t");
+                assert!(matches!(status, TurnStatus::Error { subtype, message }
+                    if subtype == "api_error"
+                        && message == "API Error: response exceeded the output token maximum"));
+                assert_eq!(usage.as_ref().unwrap().total_cost_usd, Some(0.002));
+            }
+            _ => panic!("expected failed TurnCompleted"),
         }
     }
 
@@ -2748,6 +2828,7 @@ mod tests {
                 resets_at_ms: None,
                 window: None,
                 auto_resume_at_ms: None,
+                auto_resume_blocked_reason: None,
                 ..
             }
         ));

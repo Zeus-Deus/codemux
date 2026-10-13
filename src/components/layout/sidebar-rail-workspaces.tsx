@@ -11,6 +11,7 @@ import { useHosts } from "@/stores/hosts-store";
 import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { compareNewestFirst, isWorkspaceUnread } from "./sidebar-inbox";
+import { workspaceDeviceName } from "./sidebar-inbox-card";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import {
   getWorkspaceStatus,
@@ -20,11 +21,16 @@ import {
 import { useProjectAppearance } from "./use-project-appearance";
 import { cn } from "@/lib/utils";
 import type { WorkspaceSnapshot } from "@/tauri/types";
-import { Pin } from "lucide-react";
+import { Pin, Server } from "lucide-react";
 import {
   buildSidebarDraftCatalog,
   SidebarRailDrafts,
 } from "./sidebar-draft-block";
+import { MAX_JUMP_HINTS, setJumpTargets } from "./sidebar-inbox-jump";
+import { useJumpHintsVisible } from "./use-jump-hints-visible";
+import { jumpToNextNeedsYou } from "@/lib/needs-you";
+import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
+import { formatKeyCombo } from "@/components/ui/menu-chrome";
 
 interface RailItemRepo {
   name: string;
@@ -49,13 +55,19 @@ function RailWorkspaceItem({
   workspace,
   repo,
   isActive,
+  jumpHint,
   showMonogram,
+  deviceName,
 }: {
   workspace: WorkspaceSnapshot;
   repo: RailItemRepo;
   isActive: boolean;
+  /** The Alt+digit that jumps here, shown while the jump modifier is held. */
+  jumpHint: number | null;
   /** Another rail item shares this project, so the avatar alone is ambiguous. */
   showMonogram: boolean;
+  /** The device this thread runs on, or null for this machine. */
+  deviceName: string | null;
 }) {
   const { customColor, imageUrl, imageVersion } = useProjectAppearance(
     repo.path,
@@ -149,6 +161,18 @@ function RailWorkspaceItem({
               className="absolute bottom-0.5 left-0.5 size-3 rounded-sm bg-sidebar p-px text-muted-foreground"
             />
           )}
+          {/* The corner opposite the pin, so a device thread still reads as
+              one while collapsed. */}
+          {deviceName && (
+            <span
+              role="img"
+              aria-label={`Runs on ${deviceName}`}
+              title={`Runs on ${deviceName}`}
+              className="absolute bottom-0.5 right-0.5 flex size-3 rounded-sm bg-sidebar p-px text-muted-foreground"
+            >
+              <Server aria-hidden className="size-full" />
+            </span>
+          )}
           {status && (
             <span
               aria-hidden
@@ -157,6 +181,19 @@ function RailWorkspaceItem({
                 STATUS_DOT_CLASS[status],
               )}
             />
+          )}
+          {jumpHint != null && (
+            <kbd
+              aria-hidden="true"
+              data-rail-jump-hint
+              className={cn(
+                "absolute -bottom-1 -right-1 inline-flex h-3.5 min-w-3.5 items-center justify-center rounded-sm px-0.5",
+                "border border-border/80 bg-background font-mono text-micro font-semibold leading-none tabular-nums text-foreground/80",
+                "animate-in fade-in-0 zoom-in-95 duration-100 motion-reduce:animate-none",
+              )}
+            >
+              {jumpHint}
+            </kbd>
           )}
         </button>
     </WorkspaceHoverCard>
@@ -268,7 +305,18 @@ export function SidebarRailWorkspaces() {
       const pinPriority = Number(b.ws.pinned_at != null) - Number(a.ws.pinned_at != null);
       return pinPriority || compareNewestFirst(a, b);
     })
-    .map(({ ws }) => ws);
+    .map(({ ws }) => ws)
+    .filter((ws) => repoByWorkspace.has(ws.workspace_id));
+
+  // While collapsed, the rail is what Alt+1..9 count through: publish its
+  // buttons in on-screen order, exactly as the expanded inbox publishes its
+  // cards, so the jump keys keep working with the sidebar folded away.
+  const railIdsKey = railWorkspaces.map((ws) => ws.workspace_id).join(" ");
+  useEffect(() => {
+    setJumpTargets(railIdsKey ? railIdsKey.split(" ") : []);
+  }, [railIdsKey]);
+  useEffect(() => () => setJumpTargets([]), []);
+  const jumpHintsVisible = useJumpHintsVisible();
 
   const railCountByProject = new Map<string, number>();
   for (const ws of railWorkspaces) {
@@ -277,21 +325,70 @@ export function SidebarRailWorkspaces() {
   }
 
   return (
-    <div className="no-scrollbar flex flex-1 min-h-0 flex-col items-center gap-1.5 overflow-y-auto py-1">
-      <SidebarRailDrafts catalog={sidebarDraftCatalog} />
-      {railWorkspaces.map((ws) => {
-        const repo = repoByWorkspace.get(ws.workspace_id);
-        if (!repo) return null;
-        return (
-          <RailWorkspaceItem
-            key={ws.workspace_id}
-            workspace={ws}
-            repo={repo}
-            isActive={ws.workspace_id === activeWorkspaceId}
-            showMonogram={(railCountByProject.get(repo.path) ?? 0) > 1}
-          />
-        );
-      })}
+    <div className="flex flex-1 min-h-0 flex-col items-center">
+      <RailNeedsYouChip />
+      <div className="no-scrollbar flex w-full flex-1 min-h-0 flex-col items-center gap-1.5 overflow-y-auto py-1">
+        <SidebarRailDrafts catalog={sidebarDraftCatalog} />
+        {railWorkspaces.map((ws, index) => {
+          const repo = repoByWorkspace.get(ws.workspace_id);
+          if (!repo) return null;
+          return (
+            <RailWorkspaceItem
+              key={ws.workspace_id}
+              workspace={ws}
+              repo={repo}
+              isActive={ws.workspace_id === activeWorkspaceId}
+              showMonogram={(railCountByProject.get(repo.path) ?? 0) > 1}
+              deviceName={workspaceDeviceName(ws.host_id, hosts)}
+              jumpHint={
+                jumpHintsVisible && index < MAX_JUMP_HINTS ? index + 1 : null
+              }
+            />
+          );
+        })}
+      </div>
     </div>
+  );
+}
+
+/**
+ * The collapsed rail's stand-in for the expanded inbox's "Needs you" strip: a
+ * pinned chip above the avatars counting the workspaces waiting on the user.
+ * A 7px corner dot is easy to miss in a column of avatars; this is not. Each
+ * click (or Ctrl+Shift+J) moves to the next one, longest-waiting first.
+ */
+function RailNeedsYouChip() {
+  const count = useAppStore((s) => {
+    const app = s.appState;
+    if (!app) return 0;
+    let n = 0;
+    for (const ws of app.workspaces) {
+      if (getWorkspaceStatus(ws.surfaces, app.pane_statuses) === "permission") n += 1;
+    }
+    return n;
+  });
+  const { getKeysForAction } = useResolvedKeybinds();
+  if (count === 0) return null;
+  const keys = getKeysForAction("jumpToNeedsYou");
+  const label = `${count} ${count === 1 ? "workspace needs" : "workspaces need"} you`;
+  return (
+    <button
+      type="button"
+      onClick={() => jumpToNextNeedsYou()}
+      aria-label={`${label}. Jump to the longest waiting`}
+      title={keys ? `${label} (${formatKeyCombo(keys)})` : label}
+      data-rail-needs-you
+      className={cn(
+        "mb-1 flex h-6 w-7 shrink-0 items-center justify-center gap-1 rounded-md",
+        "border border-status-attention/30 bg-status-attention/10 font-mono text-caption font-semibold tabular-nums text-status-attention",
+        "transition-colors duration-100 hover:bg-status-attention/20",
+      )}
+    >
+      <span
+        aria-hidden
+        className="size-1.5 shrink-0 rounded-full bg-status-attention motion-safe:animate-pulse"
+      />
+      {count}
+    </button>
   );
 }

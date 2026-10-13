@@ -103,6 +103,8 @@ interface Category {
   why?: string;
   /** Narrow the text each file contributes (default: its string literals). */
   scan?: (contents: string) => string[];
+  /** Only count files whose repo-relative path matches. */
+  path?: RegExp;
 }
 
 const CATEGORIES: Category[] = [
@@ -173,6 +175,30 @@ const CATEGORIES: Category[] = [
       "clone/sweep bars (300ms)",
   },
   {
+    label: "hand-rolled spinners (use <Spinner />, which carries role=status and the reduced-motion hook)",
+    pattern: /\banimate-spin\b/g,
+    budget: 29,
+    why:
+      "the primitive itself and sonner's toast loader; refresh icons that " +
+      "spin in place inside a button carrying aria-busy (9); the review " +
+      "folder's 6-10px border-ring status glyphs (7) and the terminal " +
+      "overlay's ring; the slow decorative spin on the sidebar creating " +
+      "card; and spinners in files with open PRs at the time of the sweep " +
+      "(TasksPanel, ComposerFooter, pr-row, pr-list, usage-section x2, " +
+      "right-panel, sidebar-inbox, sidebar-workspace-row)",
+  },
+  {
+    label: "settings page titles styled by hand (use SectionHeader)",
+    pattern: /<h2\b[^>]*className=/g,
+    scan: (contents) => [contents],
+    // SectionHeader itself is the one place that styles the title.
+    path: /^src\/components\/settings\/(?!settings-primitives\.tsx)/,
+    budget: 2,
+    why:
+      "the Usage page (usage-section.tsx, owned by an open PR) and an " +
+      "add-on's own detail page title (addon-detail.tsx)",
+  },
+  {
     label: "per-icon strokeWidth (one base-layer rule owns icon weight)",
     pattern: /strokeWidth/g,
     scan: (contents) => [contents],
@@ -181,6 +207,19 @@ const CATEGORIES: Category[] = [
       "hand-written <svg> glyphs and chart geometry, which are not lucide " +
       "icons: two device glyphs, two goal glyphs, the context meter's two " +
       "arcs and the usage chart's five strokes",
+  },
+  {
+    label: "raw errors as toast titles (use toast.failure(title, err))",
+    pattern: /toast\.error\(\s*(?:String\(|`[^`]*\$\{String\()/g,
+    scan: (contents) => [contents],
+    budget: 0,
+  },
+  {
+    label: "raw errors folded into a toast title (use toast.failure(title, err))",
+    pattern: /toast\.error\(\s*`[^`]*\$\{(?:err|error|e)\}/g,
+    scan: (contents) => [contents],
+    budget: 12,
+    why: "AgentChatPane.tsx's turn, plan and picker failures, not yet migrated",
   },
 ];
 
@@ -201,6 +240,9 @@ describe("UI token contract", () => {
   it.each(CATEGORIES)("stays within budget: $label", (category) => {
     const offenders: string[] = [];
     for (const file of files) {
+      if (category.path && !category.path.test(relative(root, file).split("\\").join("/"))) {
+        continue;
+      }
       const contents = readFileSync(file, "utf8");
       const chunks = category.scan
         ? category.scan(contents)
@@ -231,5 +273,20 @@ describe("UI token contract", () => {
     expect(rule).toMatch(/outline:\s*\d/);
     expect(rule).toMatch(/outline-offset/);
     expect(css).not.toMatch(/@apply[^;]*outline-ring/);
+  });
+
+  it("reduces motion app-wide, from the OS and from the in-app setting", () => {
+    // Per-class gates left the status ping, every spinner and every Radix
+    // overlay animating; one global rule is what makes the setting mean it.
+    const css = readFileSync(resolve(root, "src/globals.css"), "utf8");
+    const media = css.match(
+      /@media \(prefers-reduced-motion: reduce\) \{\s*\*,[\s\S]*?\n\}/,
+    )?.[0];
+    expect(media).toMatch(/animation-duration:\s*0\.01ms !important/);
+    expect(media).toMatch(/transition-duration:\s*0\.01ms !important/);
+    expect(media).toMatch(/\[data-slot="spinner"\]/);
+    const forced = css.match(/:root\.reduce-motion \*,[\s\S]*?\}/)?.[0];
+    expect(forced).toMatch(/animation-iteration-count:\s*1 !important/);
+    expect(css).toMatch(/:root\.reduce-motion \[data-slot="spinner"\]/);
   });
 });

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { AlertTriangle, Check, HelpCircle, Loader2, Trash2, X } from "lucide-react";
+import { AlertTriangle, Check, HelpCircle, Trash2, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -18,6 +18,8 @@ import type { PermissionRule } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { eyebrowVariants } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
+import { SectionHeader } from "./settings-primitives";
 
 interface Props {
   /** Active workspace's project root, or null when no project is
@@ -131,7 +133,7 @@ export function PermissionsSection({ projectRoot }: Props) {
 
       {rules === null ? (
         <div className="flex items-center gap-2 py-6 text-body text-muted-foreground">
-          <Loader2 className="size-4 animate-spin" aria-hidden />
+          <Spinner className="size-4" aria-hidden />
           Loading rules…
         </div>
       ) : (
@@ -263,15 +265,6 @@ function BehaviorIcon({ behavior }: { behavior: PermissionRule["behavior"] }) {
         />
       );
   }
-}
-
-function SectionHeader({ title, description }: { title: string; description: string }) {
-  return (
-    <div className="mb-6">
-      <h2 className="text-body-lg font-semibold tracking-tight">{title}</h2>
-      <p className="text-body text-muted-foreground mt-1">{description}</p>
-    </div>
-  );
 }
 
 function groupRules(rules: PermissionRule[], projectRoot: string | null): Group[] {

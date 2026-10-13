@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { runtimeNoticeFromWarning } from "./runtime-notice";
+import {
+  runtimeNoticeFromWarning,
+  signedOutProviderFromWarning,
+} from "./runtime-notice";
 
 describe("runtimeNoticeFromWarning", () => {
   it("still promotes a legacy rejected rate-limit event row", () => {
@@ -43,6 +46,17 @@ describe("runtimeNoticeFromWarning", () => {
     ).toBe("Provider error: overloaded_error");
   });
 
+  it("turns a signed-out assistant error into one plain sentence", () => {
+    const warning = "assistant error: authentication_failed";
+    expect(runtimeNoticeFromWarning(warning, null)).toBe(
+      "Claude Code isn't signed in.",
+    );
+    expect(signedOutProviderFromWarning(warning)).toBe("claude");
+    expect(
+      signedOutProviderFromWarning("assistant error: overloaded_error"),
+    ).toBeNull();
+  });
+
   it("leaves a rate_limit assistant error to the usage-limit record", () => {
     // `usage_limit_reached` writes the transcript row and drives the resume
     // affordance; a second "Provider error: rate_limit" line would be noise.
@@ -59,6 +73,12 @@ describe("runtimeNoticeFromWarning", () => {
     );
   });
 
+  it("shows a saved service-tier downgrade inline", () => {
+    const text = "Saved service tier could not be verified; using Standard.";
+    expect(runtimeNoticeFromWarning("service-tier-fallback: " + text, null)).toBe(text);
+    expect(runtimeNoticeFromWarning("model/list decode failed: invalid data", null)).toBeNull();
+  });
+
   it("keeps SDK debug chatter console-only", () => {
     expect(
       runtimeNoticeFromWarning("stream_event message_start", {
@@ -66,5 +86,11 @@ describe("runtimeNoticeFromWarning", () => {
       }),
     ).toBeNull();
     expect(runtimeNoticeFromWarning("unknown sdk variant", {})).toBeNull();
+  });
+
+  it("shows the explicit Hermes restriction without inferring errors from prose", () => {
+    const text = "Automatic resume after usage limits is unavailable with this Hermes version. Continue manually once your provider limit resets.";
+    expect(runtimeNoticeFromWarning("hermes-usage-limit-recovery: " + text, null)).toBe(text);
+    expect(runtimeNoticeFromWarning(text, null)).toBeNull();
   });
 });

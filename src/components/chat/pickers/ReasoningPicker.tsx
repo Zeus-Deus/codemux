@@ -1,3 +1,4 @@
+import { serviceTierOptions, resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { useState } from "react";
 import { Brain, Check, ChevronDown, Zap } from "lucide-react";
 
@@ -20,6 +21,7 @@ import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import {
   FOOTER_SEPARATOR,
   FOOTER_TRIGGER,
+  FOOTER_TRIGGER_ICON_ONLY,
   PICKER_COLLISION_PADDING,
   PICKER_COMMAND,
   PICKER_CONTENT,
@@ -61,15 +63,15 @@ interface Props {
   /** True when the composer's draft text contains "ultrathink" outside
    *  the canonical prefix — disables the effort section. */
   ultrathinkInBodyText: boolean;
-  /** Premium service tier for models that advertise fast-mode support. */
-  fastMode: boolean;
+  /** Premium service tier for models that advertise service tiers. */
+  serviceTier: string;
   /** Fires when the user picks an effort row. `"ultrathink"` carries
    *  the special meaning of "prepend to the prompt"; caller handles that. */
   onEffortChange: (nextValue: string) => void;
   /** Fires when the user picks a context-window row. */
   onContextWindowChange: (nextValue: string) => void;
-  /** Fires when the user picks Standard or Fast service tier. */
-  onFastModeChange: (fastMode: boolean) => void;
+  /** Fires when the user picks a service tier. */
+  onServiceTierChange: (serviceTier: string) => void;
   disabled?: boolean;
   /** Render a leading hairline pipe. Lives inside the picker (not the
    *  footer) so the pipe disappears together with the control when the
@@ -124,10 +126,10 @@ export function ReasoningPicker({
   contextWindowValue,
   labelMap,
   ultrathinkInBodyText,
-  fastMode,
+  serviceTier,
   onEffortChange,
   onContextWindowChange,
-  onFastModeChange,
+  onServiceTierChange,
   disabled,
   withSeparator,
   iconOnly = false,
@@ -143,7 +145,11 @@ export function ReasoningPicker({
   const contextOptions = model.context_window_options;
   const hasEffortSection = effortLevels.length > 0;
   const hasContextSection = contextOptions.length > 1;
-  const hasServiceTierSection = model.supports_fast_mode;
+  const tiers = serviceTierOptions(model);
+  const hasServiceTierSection = tiers.length > 1;
+  const currentTier = resolveServiceTier(model, serviceTier);
+  const tierLabel = tiers.find((tier) => tier.value === currentTier)?.label ?? "Standard";
+  const accelerated = ["fast", "priority", "ultrafast"].includes(currentTier);
 
   // Haiku and other models without any configurable runtime choice: hide.
   if (!hasEffortSection && !hasContextSection && !hasServiceTierSection) {
@@ -188,10 +194,12 @@ export function ReasoningPicker({
     }
     return effortLabelText ?? contextLabelText ?? null;
   })();
-  const triggerLabel = reasoningLabel ?? (fastMode ? "Fast" : "Standard");
+  const triggerLabel = reasoningLabel ?? tierLabel;
+  // Plain "Standard" has no icon to fall back to, so it keeps its text.
+  const showIconOnly = iconOnly && (accelerated || !!reasoningLabel);
   const triggerAriaLabel = reasoningLabel
-    ? `Reasoning: ${reasoningLabel}; service tier: ${fastMode ? "Fast" : "Standard"}`
-    : `Service tier: ${fastMode ? "Fast" : "Standard"}`;
+    ? `Reasoning: ${reasoningLabel}; service tier: ${tierLabel}`
+    : `Service tier: ${tierLabel}`;
 
   // Every row shares one recipe: title over a muted description (wraps
   // rather than truncating, so provider blurbs stay readable), check on
@@ -235,9 +243,9 @@ export function ReasoningPicker({
             disabled={disabled}
             aria-label={triggerAriaLabel}
             title={triggerAriaLabel}
-            className={FOOTER_TRIGGER}
+            className={cn(FOOTER_TRIGGER, showIconOnly && FOOTER_TRIGGER_ICON_ONLY)}
           >
-            {fastMode ? (
+            {accelerated ? (
               <Zap
                 aria-hidden
                 data-testid="fast-mode-indicator"
@@ -246,10 +254,12 @@ export function ReasoningPicker({
             ) : reasoningLabel ? (
               <Brain className="size-3.5" />
             ) : null}
-            {!(iconOnly && (fastMode || reasoningLabel)) && (
-              <span className="max-w-[200px] truncate">{triggerLabel}</span>
+            {!showIconOnly && (
+              <>
+                <span className="max-w-[200px] truncate">{triggerLabel}</span>
+                <ChevronDown className="size-3 opacity-50" />
+              </>
             )}
-            <ChevronDown className="size-3 opacity-50" />
           </button>
         </PopoverTrigger>
         <PopoverContent
@@ -267,7 +277,7 @@ export function ReasoningPicker({
                 ? `effort:${currentEffort}`
                 : hasContextSection && currentContextWindow
                   ? `ctx:${currentContextWindow}`
-                  : `service-tier:${fastMode ? "fast" : "standard"}`
+                  : `service-tier:${currentTier}`
             }
           >
             {hasEffortSection && ultrathinkInBodyText ? (
@@ -336,32 +346,22 @@ export function ReasoningPicker({
 
               {hasServiceTierSection && (
                 <CommandGroup heading="Service tier" className={PICKER_GROUP}>
-                  <CommandItem
-                    value="service-tier:standard"
-                    onSelect={() => onFastModeChange(false)}
-                    className={PICKER_ROW}
-                    showCheckmark={false}
-                  >
-                    {optionRow(
-                      "Standard",
-                      "Normal speed and usage rate",
-                      !fastMode,
-                      true,
-                    )}
-                  </CommandItem>
-                  <CommandItem
-                    value="service-tier:fast"
-                    onSelect={() => onFastModeChange(true)}
-                    className={PICKER_ROW}
-                    showCheckmark={false}
-                  >
-                    {optionRow(
-                      "Fast",
-                      "Faster output at a premium usage rate",
-                      fastMode,
-                      false,
-                    )}
-                  </CommandItem>
+                  {tiers.map((tier) => (
+                    <CommandItem
+                      key={tier.value}
+                      value={`service-tier:${tier.value}`}
+                      onSelect={() => onServiceTierChange(tier.value)}
+                      className={PICKER_ROW}
+                      showCheckmark={false}
+                    >
+                      {optionRow(
+                        tier.label,
+                        tier.description,
+                        currentTier === tier.value,
+                        tier.value === "default",
+                      )}
+                    </CommandItem>
+                  ))}
                 </CommandGroup>
               )}
             </CommandList>

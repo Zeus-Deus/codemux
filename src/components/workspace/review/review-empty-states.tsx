@@ -2,7 +2,16 @@ import type { ReactNode } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
-import { btnCard, btnEmberSolid, plural, tzBody, tzMetaNum, tzRowTitle } from "./review-ui";
+import { Empty, EmptyActions, EmptyDescription, EmptyTitle } from "@/components/ui/empty";
+import {
+  btnCard,
+  btnEmberSolid,
+  plural,
+  spinnerRing,
+  tzBody,
+  tzMetaNum,
+  tzRowTitle,
+} from "./review-ui";
 import type { ProviderPresentation } from "@/lib/source-control";
 
 /**
@@ -23,13 +32,17 @@ interface EmptyStateProps {
   testId: string;
 }
 
+/** The shared `Empty` primitive at the review pane's density: left-aligned
+ *  in a narrow column, on the review type tokens. */
 function EmptyState({ title, body, actions, testId }: EmptyStateProps) {
   return (
-    <div className="flex flex-col gap-2.5 px-3.5 py-4" data-testid={testId}>
-      <span className={cn("font-semibold text-foreground", tzRowTitle)}>{title}</span>
-      <p className={cn("leading-relaxed text-foreground/75", tzBody)}>{body}</p>
-      <div className="flex flex-wrap items-center gap-1.5">{actions}</div>
-    </div>
+    <Empty align="start" className="gap-2.5 px-3.5 py-4" data-testid={testId}>
+      <EmptyTitle className={cn("font-semibold", tzRowTitle)}>{title}</EmptyTitle>
+      <EmptyDescription className={cn("max-w-none text-foreground/75", tzBody)}>
+        {body}
+      </EmptyDescription>
+      <EmptyActions className="mt-0 gap-1.5">{actions}</EmptyActions>
+    </Empty>
   );
 }
 
@@ -89,6 +102,7 @@ export function BranchLocalOnlyState({
   onCommitAndPush,
   onOpenChanges,
   pushOnly,
+  pushing = false,
 }: {
   changedFiles: number;
   onCommitAndPush: () => void;
@@ -96,6 +110,8 @@ export function BranchLocalOnlyState({
   /** Nothing to commit — the branch just needs pushing, so the primary
    *  says so instead of sending you to a Changes pane with no work. */
   pushOnly: boolean;
+  /** The push is in flight; the button shows it and takes no second click. */
+  pushing?: boolean;
 }) {
   return (
     <EmptyState
@@ -109,8 +125,22 @@ export function BranchLocalOnlyState({
       }
       actions={
         <>
-          <button type="button" className={btnEmberSolid} onClick={onCommitAndPush}>
-            {pushOnly ? "Push branch" : "Commit and push"}
+          <button
+            type="button"
+            className={btnEmberSolid}
+            onClick={onCommitAndPush}
+            disabled={pushing}
+          >
+            {pushing ? (
+              <>
+                <span aria-hidden className={spinnerRing} />
+                Pushing
+              </>
+            ) : pushOnly ? (
+              "Push branch"
+            ) : (
+              "Commit and push"
+            )}
           </button>
           <button type="button" className={btnCard} onClick={onOpenChanges}>
             Changes
@@ -207,7 +237,7 @@ export function CliMissingState({
                 const url = /^https?:\/\//.test(provider.installUrl!)
                   ? provider.installUrl!
                   : `https://${provider.installUrl}`;
-                openUrl(url).catch((err) => toast.error(String(err)));
+                openUrl(url).catch((err) => toast.failure("Couldn't open the link", err));
               }}
             >
               Install {provider.cli}
@@ -321,7 +351,7 @@ export function UnsupportedHostState({
             type="button"
             className={btnCard}
             onClick={() => {
-              openUrl(url).catch((err) => toast.error(String(err)));
+              openUrl(url).catch((err) => toast.failure("Couldn't open the link", err));
             }}
           >
             Open in browser

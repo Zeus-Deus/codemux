@@ -7,7 +7,6 @@ import {
   ChevronRight,
   Cloud,
   GitBranch,
-  Loader2,
   Settings2,
 } from "lucide-react";
 
@@ -38,6 +37,7 @@ import { useHostsStore } from "@/stores/hosts-store";
 
 import { remoteProjectName } from "./use-device-cards";
 import { eyebrowVariants } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 interface Props {
   /** The synced row the user wants to adopt. Null = dialog closed. */
@@ -329,7 +329,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
             <ErrorBlock message={previewError} />
           ) : !preview ? (
             <div className="flex items-center gap-2 py-3 text-body-sm text-muted-foreground">
-              <Loader2 className="size-3.5 animate-spin" />
+              <Spinner className="size-3.5" />
               Checking…
             </div>
           ) : alreadyAdopted ? (
@@ -383,7 +383,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
                   disabled={submitting}
                 >
                   {submitting ? (
-                    <Loader2 className="size-3 animate-spin" />
+                    <Spinner className="size-3" aria-hidden />
                   ) : (
                     <ArrowDownToLine className="size-3" />
                   )}

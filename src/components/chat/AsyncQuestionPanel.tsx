@@ -4,12 +4,13 @@ import {
   ChevronLeft,
   ChevronRight,
 } from "lucide-react";
-import { createContext, useCallback, useContext, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
 import type { AsyncQuestionItem } from "@/lib/agent-chat/types";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
+import { useEaseInOnce } from "@/hooks/use-ease-in-once";
 import { agentChatAnswerQuestion, type QuestionAction } from "@/tauri/commands";
-import { QuestionForm, type Question } from "./QuestionForm";
+import { QuestionForm, questionAnswerText, type Question, type QuestionAnswer } from "./QuestionForm";
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
 import { COMPOSER_OVERLAY_CARD } from "./composer-overlay";
 import { cn } from "@/lib/utils";
@@ -65,7 +66,7 @@ export function AsyncQuestionPanel({
   // reopened; the panel above the composer is only for open questions.
   if (!selected) return null;
   return (
-    <section aria-label="Agent questions" className="pb-2">
+    <QuestionsSection entryId={selected.question.id}>
       <div className={CHAT_COLUMN_OUTER}>
         <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
           {selected && (
@@ -142,6 +143,29 @@ export function AsyncQuestionPanel({
         threadId={threadId}
         act={act}
       />
+    </QuestionsSection>
+  );
+}
+
+/** Mounts when the panel appears, so the entry eases in when a question first
+ *  arrives but not when the pane remounts on a tab or session switch. */
+function QuestionsSection({
+  entryId,
+  children,
+}: {
+  entryId: string;
+  children: ReactNode;
+}) {
+  const ease = useEaseInOnce(entryId);
+  return (
+    <section
+      aria-label="Agent questions"
+      className={cn(
+        "pb-2",
+        ease && "animate-in fade-in-0 slide-in-from-bottom-2 duration-150 ease-out",
+      )}
+    >
+      {children}
     </section>
   );
 }
@@ -235,9 +259,9 @@ function QuestionCard({
 }) {
   const key = draftKey(threadId, item.question.id);
   const save = useCallback(
-    (answers: string[]) => {
+    (answers: QuestionAnswer[]) => {
       try {
-        localStorage.setItem(key, JSON.stringify(answers));
+        localStorage.setItem(key, JSON.stringify(answers.map(questionAnswerText)));
       } catch {
         /* Form remains usable without storage. */
       }
@@ -319,7 +343,7 @@ function QuestionCard({
       onSubmit={(answers) =>
         act(item.question.id, {
           action: "answer",
-          answers,
+          answers: answers.map(questionAnswerText),
           submission_id: randomUUID(),
         })
       }

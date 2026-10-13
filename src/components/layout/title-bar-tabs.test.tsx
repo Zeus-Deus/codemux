@@ -21,6 +21,8 @@ const mocks = vi.hoisted(() => ({
   activateTab: vi.fn().mockResolvedValue(undefined),
   closeTab: vi.fn().mockResolvedValue(undefined),
   reorderTabs: vi.fn().mockResolvedValue(undefined),
+  renameTab: vi.fn().mockResolvedValue(undefined),
+  splitPane: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@/tauri/commands", () => ({
@@ -29,6 +31,8 @@ vi.mock("@/tauri/commands", () => ({
   activateTab: (...a: unknown[]) => mocks.activateTab(...a),
   closeTab: (...a: unknown[]) => mocks.closeTab(...a),
   reorderTabs: (...a: unknown[]) => mocks.reorderTabs(...a),
+  renameTab: (...a: unknown[]) => mocks.renameTab(...a),
+  splitPane: (...a: unknown[]) => mocks.splitPane(...a),
   // Resume/new-chat SDK calls — unused in these tests but imported by the
   // shared session-actions hook.
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
@@ -38,8 +42,10 @@ vi.mock("@/tauri/commands", () => ({
 
 vi.mock("@/lib/toast", () => ({
   toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
+  reportFailure: () => vi.fn(),
 }));
 
+import { useEditorStore } from "@/stores/editor-store";
 import { TitleBarTabs } from "./title-bar-tabs";
 
 function makeSession(
@@ -121,6 +127,8 @@ beforeEach(() => {
   mocks.activateTab.mockClear();
   mocks.closeTab.mockClear();
   mocks.reorderTabs.mockClear();
+  mocks.renameTab.mockClear();
+  mocks.splitPane.mockClear();
 });
 
 // Stubs a tab pill's on-screen box so `useTabReorder`'s midpoint math
@@ -408,5 +416,277 @@ describe("TitleBarTabs", () => {
       fireEvent.click(screen.getByText("zsh"));
     });
     expect(mocks.activateTab).toHaveBeenCalledWith("ws-1", "tab-term");
+  });
+});
+
+describe("TitleBarTabs tab actions", () => {
+  const pillFor = (title: string) =>
+    screen.getByText(title).closest("[data-tab-id]") as HTMLElement;
+
+  it("closes a tab on middle-click", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    const pill = pillFor("term-b");
+    const down = new MouseEvent("mousedown", {
+      button: 1,
+      bubbles: true,
+      cancelable: true,
+    });
+    pill.dispatchEvent(down);
+    // Cancelled so the webview's middle-button autoscroll never engages.
+    expect(down.defaultPrevented).toBe(true);
+    fireEvent(pill, new MouseEvent("auxclick", { button: 1, bubbles: true }));
+    expect(mocks.closeTab).toHaveBeenCalledWith("ws-1", "tab-b");
+    expect(mocks.activateTab).not.toHaveBeenCalled();
+  });
+
+  it("offers the shared context menu and closes the other tabs from it", async () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.contextMenu(pillFor("term-b"));
+    expect(await screen.findByText("Close tabs to the right")).toBeInTheDocument();
+    expect(screen.getByText("Split right")).toBeInTheDocument();
+    expect(screen.getByText("Rename tab")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("Close other tabs"));
+    await waitFor(() => expect(mocks.closeTab).toHaveBeenCalledTimes(2));
+    expect(mocks.closeTab).toHaveBeenNthCalledWith(1, "ws-1", "tab-a");
+    expect(mocks.closeTab).toHaveBeenNthCalledWith(2, "ws-1", "tab-c");
+  });
+
+  it("closes the tabs to the right, rightmost first", async () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.contextMenu(pillFor("term-a"));
+    fireEvent.click(await screen.findByText("Close tabs to the right"));
+    await waitFor(() => expect(mocks.closeTab).toHaveBeenCalledTimes(2));
+    expect(mocks.closeTab).toHaveBeenNthCalledWith(1, "ws-1", "tab-c");
+    expect(mocks.closeTab).toHaveBeenNthCalledWith(2, "ws-1", "tab-b");
+  });
+
+  it("renames inline from the context menu and commits on Enter", async () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.contextMenu(pillFor("term-b"));
+    fireEvent.click(await screen.findByText("Rename tab"));
+
+    const input = await screen.findByLabelText("Tab name");
+    expect(input).toHaveValue("term-b");
+    await waitFor(() => expect(input).toHaveFocus());
+    fireEvent.change(input, { target: { value: "  server  " } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(mocks.renameTab).toHaveBeenCalledTimes(1);
+    expect(mocks.renameTab).toHaveBeenCalledWith("ws-1", "tab-b", "server");
+    expect(screen.queryByLabelText("Tab name")).not.toBeInTheDocument();
+  });
+
+  it("renames on double-click and cancels on Escape", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.doubleClick(screen.getByText("term-a"));
+
+    const input = screen.getByLabelText("Tab name");
+    fireEvent.change(input, { target: { value: "discarded" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(mocks.renameTab).not.toHaveBeenCalled();
+    expect(screen.getByText("term-a")).toBeInTheDocument();
+  });
+
+  it("marks an editor tab with unsaved changes", () => {
+    const ws = makeThreeTabWorkspace();
+    ws.tabs[1] = { ...ws.tabs[1], kind: "editor", title: "main.rs" };
+    render(<TitleBarTabs workspace={ws} />);
+    expect(screen.queryByLabelText("Unsaved changes")).not.toBeInTheDocument();
+
+    act(() => useEditorStore.getState().setDirty("tab-b", true));
+    expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
+    act(() => useEditorStore.getState().setDirty("tab-b", false));
+  });
+
+  it("gives the active chat tab the same context menu", async () => {
+    mocks.listSessions.mockResolvedValue([]);
+    render(<TitleBarTabs workspace={makeWorkspace(chatPane("thread-1"))} />);
+    fireEvent.contextMenu(pillFor("Agent Chat"));
+    fireEvent.click(await screen.findByText("Rename tab"));
+    const input = await screen.findByLabelText("Tab name");
+    fireEvent.change(input, { target: { value: "Review bot" } });
+    fireEvent.blur(input);
+    expect(mocks.renameTab).toHaveBeenCalledWith("ws-1", "tab-chat", "Review bot");
+  });
+
+  it("returns focus to the tab's label after a keyboard rename", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.doubleClick(screen.getByText("term-b"));
+    fireEvent.keyDown(screen.getByLabelText("Tab name"), { key: "Escape" });
+    expect(screen.getByTitle("term-b")).toHaveFocus();
+  });
+
+  it("leaves Enter and Escape to an IME composition", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.doubleClick(screen.getByText("term-a"));
+    const input = screen.getByLabelText("Tab name");
+    fireEvent.change(input, { target: { value: "にほ" } });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(input, { key: "Escape", isComposing: true });
+    expect(mocks.renameTab).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("Tab name")).toBeInTheDocument();
+  });
+
+  it("ignores a whitespace-only rename", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.doubleClick(screen.getByText("term-a"));
+    const input = screen.getByLabelText("Tab name");
+    fireEvent.change(input, { target: { value: "   " } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.renameTab).not.toHaveBeenCalled();
+    expect(screen.getByText("term-a")).toBeInTheDocument();
+  });
+
+  it("splits the active pane and disables the close items for a lone tab", async () => {
+    const root: PaneNodeSnapshot = {
+      kind: "terminal",
+      pane_id: "pane-term",
+      session_id: "sess-1",
+      title: "zsh",
+    };
+    render(<TitleBarTabs workspace={makeWorkspace(root)} />);
+    const pill = pillFor("Agent Chat");
+
+    fireEvent.contextMenu(pill);
+    expect(
+      (await screen.findByText("Close other tabs")).closest("[role=menuitem]"),
+    ).toHaveAttribute("data-disabled");
+    expect(
+      screen.getByText("Close tabs to the right").closest("[role=menuitem]"),
+    ).toHaveAttribute("data-disabled");
+    fireEvent.click(screen.getByText("Split right"));
+    expect(mocks.splitPane).toHaveBeenLastCalledWith("pane-term", "horizontal");
+
+    fireEvent.contextMenu(pill);
+    fireEvent.click(await screen.findByText("Split down"));
+    expect(mocks.splitPane).toHaveBeenLastCalledWith("pane-term", "vertical");
+  });
+});
+
+// Overflowing tabs used to vanish past the island's edge with nothing to
+// say they exist, and a tab activated by shortcut could stay clipped.
+describe("TitleBarTabs overflow", () => {
+  afterEach(() => {
+    cleanup();
+    delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+  });
+
+  it("fades whichever edge has tabs scrolled past it", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    const scroller = screen.getByTestId("titlebar-tabs-scroll");
+    expect(scroller).not.toHaveAttribute("data-overflow-start");
+    expect(scroller).not.toHaveAttribute("data-overflow-end");
+
+    Object.defineProperty(scroller, "scrollWidth", { value: 800, configurable: true });
+    Object.defineProperty(scroller, "clientWidth", { value: 400, configurable: true });
+    Object.defineProperty(scroller, "scrollLeft", { value: 0, writable: true, configurable: true });
+    fireEvent.scroll(scroller);
+    expect(scroller).not.toHaveAttribute("data-overflow-start");
+    expect(scroller).toHaveAttribute("data-overflow-end");
+
+    scroller.scrollLeft = 200;
+    fireEvent.scroll(scroller);
+    expect(scroller).toHaveAttribute("data-overflow-start");
+    expect(scroller).toHaveAttribute("data-overflow-end");
+
+    scroller.scrollLeft = 400;
+    fireEvent.scroll(scroller);
+    expect(scroller).toHaveAttribute("data-overflow-start");
+    expect(scroller).not.toHaveAttribute("data-overflow-end");
+  });
+
+  it("scrolls a tab activated from outside the strip into view", () => {
+    const scrolled: Element[] = [];
+    Object.defineProperty(Element.prototype, "scrollIntoView", {
+      value(this: Element) {
+        scrolled.push(this);
+      },
+      configurable: true,
+    });
+    const ws = makeThreeTabWorkspace();
+    const view = render(<TitleBarTabs workspace={ws} />);
+    scrolled.length = 0;
+
+    view.rerender(<TitleBarTabs workspace={{ ...ws, active_tab_id: "tab-c" }} />);
+    expect(scrolled).toHaveLength(1);
+    expect(scrolled[0]).toHaveAttribute("data-tab-id", "tab-c");
+  });
+
+  // A panel or sidebar growing narrows the strip after activation, which
+  // used to leave the selected pill clipped or pushed out of view.
+  it("re-reveals the active tab when the strip changes width", () => {
+    const scrolled: Element[] = [];
+    Object.defineProperty(Element.prototype, "scrollIntoView", {
+      value(this: Element) {
+        scrolled.push(this);
+      },
+      configurable: true,
+    });
+    const callbacks: ResizeObserverCallback[] = [];
+    const Original = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      constructor(cb: ResizeObserverCallback) {
+        callbacks.push(cb);
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    try {
+      const ws = makeThreeTabWorkspace();
+      const view = render(<TitleBarTabs workspace={ws} />);
+      view.rerender(<TitleBarTabs workspace={{ ...ws, active_tab_id: "tab-b" }} />);
+      scrolled.length = 0;
+
+      act(() => {
+        for (const cb of callbacks) cb([], {} as ResizeObserver);
+      });
+      expect(scrolled).toHaveLength(1);
+      expect(scrolled[0]).toHaveAttribute("data-tab-id", "tab-b");
+    } finally {
+      globalThis.ResizeObserver = Original;
+    }
+  });
+
+  // At the island's width cap the scroller's box stops changing, so a pill
+  // that widens (rename, chat chevron) must be observed on its own or the
+  // end fade goes stale.
+  it("re-measures the edge fade when a tab pill changes width", () => {
+    const observed: Element[] = [];
+    const callbacks: ResizeObserverCallback[] = [];
+    const Original = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      constructor(cb: ResizeObserverCallback) {
+        callbacks.push(cb);
+      }
+      observe(el: Element) {
+        observed.push(el);
+      }
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    try {
+      render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+      const scroller = screen.getByTestId("titlebar-tabs-scroll");
+      const pill = scroller.querySelector("[data-tab-id='tab-c']");
+      expect(observed).toContain(pill);
+
+      Object.defineProperty(scroller, "scrollWidth", { value: 800, configurable: true });
+      Object.defineProperty(scroller, "clientWidth", { value: 400, configurable: true });
+      expect(scroller).not.toHaveAttribute("data-overflow-end");
+      act(() => {
+        for (const cb of callbacks) cb([], {} as ResizeObserver);
+      });
+      expect(scroller).toHaveAttribute("data-overflow-end");
+    } finally {
+      globalThis.ResizeObserver = Original;
+    }
+  });
+
+  it("keeps a revealed tab clear of the edge fade", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    expect(screen.getByTestId("titlebar-tabs-scroll")).toHaveClass("scroll-px-4");
   });
 });

@@ -63,7 +63,7 @@ import type {
   TerminalPreset,
 } from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
-import { toast } from "@/lib/toast";
+import { toast, errorMessage } from "@/lib/toast";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { PresetIcon } from "@/components/icons/preset-icon";
 
@@ -369,9 +369,9 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
           removePendingWorkspace(tempId);
           const message = `The workspace was created but couldn't be opened: ${String(err)}`;
           if (mounted.current) setError(message);
-          else toast.error(message);
+          else toast.failure("The workspace was created but couldn't be opened", err);
         } else {
-          failPendingWorkspace(tempId, String(err));
+          failPendingWorkspace(tempId, errorMessage(err));
           setTimeout(() => removePendingWorkspace(tempId), 5000);
           setError(`Couldn't create the workspace: ${String(err)}`);
         }
@@ -440,7 +440,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
     // The wizard is usually gone by now (the imports dismiss it), so a
     // failed open is reported as a toast rather than inline.
     await activateWorkspace(imported[imported.length - 1]).catch((err) => {
-      toast.error(`Imported, but couldn't open the workspace: ${String(err)}`);
+      toast.failure("Imported, but couldn't open the workspace", err);
     });
     await closeWorkspace(tempWorkspaceId, false).catch(() => {});
     const pName = basename(projectDir);

@@ -1,5 +1,10 @@
-import type { AgentChatSessionRecord, LocalChatSession } from "@/tauri/commands";
-import type { AgentChatProviderKind } from "@/tauri/types";
+import type {
+  AgentChatSessionRecord,
+  HostStatusView,
+  HostView,
+  LocalChatSession,
+} from "@/tauri/commands";
+import type { AgentChatProviderKind, ProjectScripts } from "@/tauri/types";
 /**
  * Dev-only Tauri runtime shim.
  *
@@ -35,8 +40,21 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * falls through to a logged, shape-safe default.
  */
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
+import { createAgentConnectorMock } from "./agent-connector-mock";
+import { workflowMockHandlers } from "./workflow-mock";
 import { createCustomAcpMock } from "./custom-acp-mock";
 import { addonMockHandlers } from "./addon-mock";
+import {
+  delegationScenarioFromSearch,
+  mockDelegatedChild,
+  mockDelegatedChildParent,
+  mockDelegatedChildTranscript,
+  stopMockDelegatedChild,
+  stopMockDelegationParent,
+  streamDelegatedTask,
+  type DelegatedTaskOptions,
+  type MockDelegatedChild,
+} from "./delegation-mock";
 import { clearPrOverviewSnapshot } from "@/lib/pr-overview-snapshot";
 
 import {
@@ -147,9 +165,37 @@ console.log(
 
 let appState: AppStateSnapshot = createSeedAppState();
 // Synthetic, browser-only histories: never reads native provider files.
+const serviceTierFixture = new URLSearchParams(window.location.search).get("fixture") === "service-tiers";
 const sessionImportFixture = new URLSearchParams(window.location.search).get("fixture") === "session-import";
 if (sessionImportFixture) {
   appState = { ...appState, workspaces: [], active_workspace_id: "", archived_workspaces: [], pane_statuses: {} };
+}
+const MOCK_RECENT_PROJECTS = [
+  { path: `${MOCK_HOME_DIR}/code/parser`, name: "parser", last_opened_at: "2026-10-05T09:12:00Z" },
+  { path: `${MOCK_HOME_DIR}/code/field-notes`, name: "field-notes", last_opened_at: "2026-10-03T16:40:00Z" },
+  { path: `${MOCK_HOME_DIR}/code/api-gateway`, name: "api-gateway", last_opened_at: "2026-09-29T11:05:00Z" },
+];
+// `?mockScenario=delegation…`: the seeded chat starts empty, as a Claude chat
+// in Full access, and plays the delegation flow once its channel attaches.
+const delegationScenario = delegationScenarioFromSearch(window.location.search);
+let delegationScenarioStarted = false;
+if (delegationScenario) {
+  const asClaude = (node: PaneNodeSnapshot): PaneNodeSnapshot =>
+    node.kind === "split"
+      ? { ...node, children: node.children.map(asClaude) }
+      : node.kind === "agent_chat" && node.thread_id === MOCK_CHAT_THREAD_ID
+        ? { ...node, provider: "claude" }
+        : node;
+  appState = {
+    ...appState,
+    workspaces: appState.workspaces.map((workspace) => ({
+      ...workspace,
+      surfaces: workspace.surfaces.map((surface) => ({
+        ...surface,
+        root: asClaude(surface.root),
+      })),
+    })),
+  };
 }
 const mockLocalSessions: LocalChatSession[] = [
   { source_id: "claude:synthetic-parser", provider: "claude", title: "Fix the parser edge case", cwd: "/demo/parser", last_active_at: "2026-09-29T10:00:00Z", message_count: 2, already_imported: false },
@@ -590,6 +636,57 @@ function emitAppState(): void {
   emitEvent("app-state-changed", appState);
 }
 
+/** The surface whose tree holds `paneId`, as a leaf or a split node. */
+function findSurfaceForPane(
+  paneId: unknown,
+): { workspace: WorkspaceSnapshot; surface: SurfaceSnapshot } | null {
+  const holds = (node: PaneNodeSnapshot): boolean =>
+    node.pane_id === paneId ||
+    (node.kind === "split" && node.children.some(holds));
+  for (const workspace of appState.workspaces) {
+    for (const surface of workspace.surfaces) {
+      if (holds(surface.root)) return { workspace, surface };
+    }
+  }
+  return null;
+}
+
+/** Publish a new snapshot with one surface patched, keeping every other
+ *  object's reference so the store sees exactly what changed. */
+function patchSurface(
+  target: SurfaceSnapshot,
+  patch: Partial<SurfaceSnapshot>,
+): void {
+  appState = {
+    ...appState,
+    workspaces: appState.workspaces.map((ws) =>
+      ws.surfaces.includes(target)
+        ? {
+            ...ws,
+            surfaces: ws.surfaces.map((surface) =>
+              surface === target ? { ...surface, ...patch } : surface,
+            ),
+          }
+        : ws,
+    ),
+  };
+  emitAppState();
+}
+
+/** `node` with the subtree rooted at `paneId` swapped for `replace(it)`. */
+function replacePaneNode(
+  node: PaneNodeSnapshot,
+  paneId: unknown,
+  replace: (found: PaneNodeSnapshot) => PaneNodeSnapshot,
+): PaneNodeSnapshot {
+  if (node.pane_id === paneId) return replace(node);
+  if (node.kind !== "split") return node;
+  return {
+    ...node,
+    children: node.children.map((child) => replacePaneNode(child, paneId, replace)),
+  };
+}
+
 /** One revision counter for every mock delta (activation and the stress
  *  driver alike), because the store requires deltas to be contiguous: two
  *  independent counters would hand it the same revision twice. The mock's
@@ -601,6 +698,21 @@ function emitAppStateDelta(delta: AppStateDelta): void {
   mockDeltaRevision += 1;
   const payload: RevisionedDelta = { revision: mockDeltaRevision, delta };
   emitEvent("app-state-delta", payload);
+}
+
+/** Replace a workspace with an updated copy. The renderer shares structure
+ *  with the snapshot it already holds, so mutating that object in place would
+ *  leave the next emit looking unchanged. */
+function replaceWorkspace(
+  workspaceId: string,
+  update: (ws: WorkspaceSnapshot) => Partial<WorkspaceSnapshot>,
+): void {
+  appState = {
+    ...appState,
+    workspaces: appState.workspaces.map((w) =>
+      w.workspace_id === workspaceId ? { ...w, ...update(w) } : w,
+    ),
+  };
 }
 
 /** Every leaf pane id under `node`, in tree order. */
@@ -1085,6 +1197,13 @@ let floodCounter = 0;
  *
  *   window.__codemuxTerminalMock.emitOsc7("/home/zeus/proj/src-tauri")
  */
+/** Per-session overrides for `terminal_foreground_jobs` (null = idle). */
+const mockForegroundJobs = new Map<string, string | null>();
+
+function setForegroundJob(sessionId: string, job: string | null): void {
+  mockForegroundJobs.set(sessionId, job);
+}
+
 function emitOsc7(cwd: string, sessionId?: string): void {
   // `ESC ] 7 ; file://<host>/<path> BEL` — the form vte, fish, and
   // kitty's shell integration all emit.
@@ -1183,13 +1302,16 @@ const FEATURE_FLAGS: FeatureFlags = {
   // Scope row below the composer) is a primary dev-iteration surface —
   // "New thread"/"New agent" render the draft composer with the
   // location · checkout · from-branch controls instead of eagerly
-  // creating a workspace.
-  enable_lazy_workspace_creation: true,
+  // creating a workspace. `?lazy=0` turns it off to reach the legacy
+  // full-screen Open Project page (with `?fixture=session-import`).
+  enable_lazy_workspace_creation:
+    new URLSearchParams(location.search).get("lazy") !== "0",
 };
 
 const SYNCED_SETTINGS: UserSettings = {
   appearance: {
-    theme: "system",
+    // `?mockTheme=graphite-light` (any theme id) for light-scheme screenshots.
+    theme: new URLSearchParams(location.search).get("mockTheme") ?? "system",
     shell_font: null,
     typography_mode: "simple",
     interface_font_family: null,
@@ -1587,6 +1709,33 @@ const CODEX_UTILITY_CAPABILITIES: ProviderChatCapabilities = {
   permission_granularity: "per_session",
 };
 
+/** Synthetic entitlement fixture for service-tier UI verification. */
+const CODEX_SERVICE_TIER_CAPABILITIES: ProviderChatCapabilities = {
+  ...CODEX_UTILITY_CAPABILITIES,
+  models: [
+    {
+      ...CODEX_UTILITY_CAPABILITIES.models[0],
+      id: "gpt-6-astra",
+      label: "GPT-6 Astra",
+      description: "Synthetic model with Ultrafast access",
+      default_effort: "medium",
+      supports_fast_mode: true,
+      service_tiers: [
+        { value: "priority", label: "Fast", description: "Faster output at a premium usage rate" },
+        { value: "ultrafast", label: "Ultrafast", description: "Even faster output at a higher usage rate" },
+      ],
+    },
+    {
+      ...CODEX_UTILITY_CAPABILITIES.models[0],
+      id: "gpt-6-sol",
+      label: "GPT-6 Sol",
+      description: "Synthetic model with Fast access",
+      supports_fast_mode: true,
+      service_tiers: [{ value: "priority", label: "Fast", description: "Faster output at a premium usage rate" }],
+    },
+  ],
+};
+
 /** Mirrors Cursor's ACP `cursor/list_available_models` extension: options
  * are per model, not provider-wide. This keeps browser-dev useful for
  * verifying that controls appear and disappear as the selected row changes. */
@@ -1723,6 +1872,9 @@ const mockThreadRowCache = new Map<string, MockMessageRow[]>();
 function mockThreadPayloads(threadId: string): string[] {
   const imported = mockImportedPayloads.get(threadId);
   if (imported) return imported;
+  const delegated = mockDelegatedChildTranscript(threadId);
+  if (delegated) return delegated;
+  if (delegationScenario && threadId === MOCK_CHAT_THREAD_ID) return [];
   // Under a stress fixture the generated threads AND the seeded thread serve
   // the synthetic transcript — hydration cost is one of the things being
   // measured, and the curated 520-turn showcase is not that profile.
@@ -2776,7 +2928,19 @@ function streamMockWorkLog(
     ["Grep", { pattern: "unread", path: "src/components/layout" }, "sidebar-inbox-card.tsx:42: unread"],
     ["Edit", { file_path: "src/components/layout/sidebar-inbox-card.tsx", old_string: "dot", new_string: "" }, "Applied edit"],
     bash("npm run check"),
-    bash("npm run test -- src/components/layout/sidebar-inbox-card.test.tsx"),
+    // Long enough to trim, so the step's "Show all N lines" footer shows.
+    bash(
+      "npm run test -- src/components/layout/sidebar-inbox-card.test.tsx",
+      [
+        " RUN  v3.2.6 /home/zeus/Projects/codemux",
+        ...Array.from(
+          { length: 20 },
+          (_, i) => ` ✓ sidebar-inbox-card > case ${i + 1} ${2 + (i % 5)}ms`,
+        ),
+        " Test Files  1 passed (1)",
+        "      Tests  20 passed (20)",
+      ].join("\n"),
+    ),
   ]);
   subagents([
     { id: `${turnId}-review`, name: "review diff", tools: 6, ms: 22_000 },
@@ -3076,6 +3240,16 @@ const mockProviderHealth: Partial<
   Record<MockProviderKind, ProviderHealthReport>
 > = {};
 
+// `?providerHealth=mixed` seeds a machine with one signed-out and two
+// missing agents, for the first-run agent strip and the automation form.
+if (new URLSearchParams(location.search).get("providerHealth") === "mixed") {
+  Object.assign(mockProviderHealth, {
+    codex: { provider: "codex", status: "error", installed: true, message: "Codex CLI is not authenticated. Run `codex login` and retry.", version: "0.0.0-mock" },
+    cursor: { provider: "cursor", status: "error", installed: false, message: "Cursor Agent CLI (`cursor-agent`) is not installed or not on PATH.", version: null },
+    grok: { provider: "grok", status: "error", installed: false, message: "Grok CLI (`grok`) is not installed or not on PATH.", version: null },
+  } satisfies Partial<Record<MockProviderKind, ProviderHealthReport>>);
+}
+
 /** Inject (or clear, with `null`) a provider health failure, then nudge
  *  the frontend store to re-probe immediately so the chat surfaces'
  *  status banner reflects it without waiting out the TTL. */
@@ -3119,6 +3293,31 @@ function sessionErrorMockRun(
   });
 }
 
+/** Signed-out QA: the turn a signed-out Claude CLI produces. The SDK
+ *  reports `authentication_failed` on the assistant message, which the
+ *  transcript renders as the "isn't signed in" card with its actions. */
+function signedOutMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
+  const turnId = `signed-out-turn-${Date.now()}`;
+  emitChatEvent(threadId, {
+    type: "session_state_changed",
+    thread_id: threadId,
+    status: { status: "running", active_turn: turnId },
+  });
+  emitChatEvent(threadId, {
+    type: "runtime_warning",
+    thread_id: threadId,
+    message: "assistant error: authentication_failed",
+    original_payload: null,
+  });
+  emitChatEvent(threadId, {
+    type: "turn_completed",
+    thread_id: threadId,
+    turn_id: turnId,
+    status: { kind: "success" },
+    usage: null,
+  });
+}
+
 /** Dead-run detection QA (issue #154): settle a live turn with a synthetic
  *  `child_exited` error — exactly what the provider watchdogs emit when a
  *  sidecar/server dies mid-turn. Drives the "Run interrupted" divider and
@@ -3143,6 +3342,95 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
   });
 }
 
+/** The chat in the active workspace's focused pane, else the seeded one. */
+function activeMockChatThreadId(): string {
+  const workspace = findWorkspace(appState.active_workspace_id);
+  const surface = workspace?.surfaces.find(
+    (candidate) => candidate.surface_id === workspace.active_surface_id,
+  );
+  const pane = surface
+    ? leafPaneNodes(surface.root).find((node) => node.pane_id === surface.active_pane_id)
+    : undefined;
+  return (pane?.kind === "agent_chat" && pane.thread_id) || MOCK_CHAT_THREAD_ID;
+}
+
+let mockDelegatedTabSeq = 0;
+
+/** Mirror of the backend's `create_background_chat_tab`: the child's chat
+ *  tab lands after the parent's tab and its earlier delegated children,
+ *  and focus stays where it was. */
+function openMockDelegatedTab(parentThreadId: string, child: MockDelegatedChild): void {
+  if (findChatPaneLocation(child.threadId)) return;
+  const location = findChatPaneLocation(parentThreadId);
+  if (!location) return;
+  const { workspace, surface: parentSurface } = location;
+  const n = ++mockDelegatedTabSeq;
+  const title = `${child.label} · ${child.title}`;
+  const parentRoot = parentSurface.root;
+  const pane: PaneNodeSnapshot = {
+    kind: "agent_chat",
+    pane_id: `pane-delegated-${n}`,
+    title,
+    thread_id: child.threadId,
+    provider: child.provider,
+    cwd: parentRoot.kind === "agent_chat" ? parentRoot.cwd : null,
+  };
+  const surface: SurfaceSnapshot = {
+    surface_id: `surface-delegated-${n}`,
+    title,
+    root: pane,
+    active_pane_id: pane.pane_id,
+  };
+  const tab: TabSnapshot = {
+    tab_id: `tab-delegated-${n}`,
+    kind: "terminal",
+    title,
+    surface_id: surface.surface_id,
+    browser_id: null,
+    icon: null,
+  };
+  const tabs = [...workspace.tabs];
+  const parentIndex = tabs.findIndex(
+    (candidate) => candidate.surface_id === parentSurface.surface_id,
+  );
+  // After the parent's earlier children too, so tabs read in the order the
+  // tasks were handed off, like the card.
+  const isSiblingTab = (candidate: TabSnapshot) => {
+    const root = workspace.surfaces.find(
+      (s) => s.surface_id === candidate.surface_id,
+    )?.root;
+    return (
+      root?.kind === "agent_chat" &&
+      root.thread_id != null &&
+      mockDelegatedChildParent(root.thread_id) === parentThreadId
+    );
+  };
+  let at = parentIndex + 1;
+  while (at < tabs.length && isSiblingTab(tabs[at])) at += 1;
+  tabs.splice(at, 0, tab);
+  const next = { ...workspace, tabs, surfaces: [...workspace.surfaces, surface] };
+  appState = {
+    ...appState,
+    workspaces: appState.workspaces.map((candidate) =>
+      candidate === workspace ? next : candidate,
+    ),
+  };
+  emitAppState();
+}
+
+/** Script the cross-provider delegation flow (see `delegation-mock.ts`) on
+ *  the active chat, or on `threadId` when given. */
+function streamMockDelegatedTask(
+  opts: DelegatedTaskOptions = {},
+  threadId: string = activeMockChatThreadId(),
+) {
+  return streamDelegatedTask(
+    { emit: emitChatEvent, openChildTab: openMockDelegatedTab },
+    threadId,
+    opts,
+  );
+}
+
 // Expose the stream triggers for browser-console / automation use.
 (
   window as unknown as {
@@ -3150,11 +3438,13 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
       threadId: string;
       streamReply: typeof streamMockChatReply;
       streamSubagents: typeof streamMockSubagents;
+      streamDelegatedTask: typeof streamMockDelegatedTask;
       streamBackgroundWait: typeof streamMockBackgroundWait;
       streamWorkLog: typeof streamMockWorkLog;
       streamRunStalled: typeof streamMockRunStalled;
       interruptRun: typeof interruptMockRun;
       sessionError: typeof sessionErrorMockRun;
+      signedOut: typeof signedOutMockRun;
       setProviderHealth: typeof setMockProviderHealth;
     };
   }
@@ -3162,11 +3452,13 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
   threadId: MOCK_CHAT_THREAD_ID,
   streamReply: streamMockChatReply,
   streamSubagents: streamMockSubagents,
+  streamDelegatedTask: streamMockDelegatedTask,
   streamBackgroundWait: streamMockBackgroundWait,
   streamWorkLog: streamMockWorkLog,
   streamRunStalled: streamMockRunStalled,
   interruptRun: interruptMockRun,
   sessionError: sessionErrorMockRun,
+  signedOut: signedOutMockRun,
   setProviderHealth: setMockProviderHealth,
 };
 
@@ -3178,12 +3470,14 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
       flood: typeof floodTerminals;
       emitSerializeBuffers: typeof emitSerializeBuffers;
       emitOsc7: typeof emitOsc7;
+      setForegroundJob: typeof setForegroundJob;
     };
   }
 ).__codemuxTerminalMock = {
   flood: floodTerminals,
   emitSerializeBuffers,
   emitOsc7,
+  setForegroundJob,
 };
 
 // ── Editor disk overlay ──────────────────────────────────────────────
@@ -3530,6 +3824,7 @@ function buildWebRemoteStatus(): WebRemoteStatus {
 
 function emitWebRemoteState(): void {
   emitEvent("web-remote-state-changed", buildWebRemoteStatus());
+  emitEvent("agent-connector-changed", null);
 }
 
 // Console/automation hooks: inject devices so the live "device wants to
@@ -3630,6 +3925,9 @@ function emitWebRemoteState(): void {
 
 type Args = Record<string, unknown>;
 type Handler = (args: Args) => unknown;
+
+/** Per-project scripts saved through `set_project_scripts`, keyed by path. */
+const mockProjectScripts = new Map<string, ProjectScripts>();
 
 /** In-memory staging store for `agent_chat_stage_image` (keyed by the
  *  fake absolute path returned to the frontend). Serves `agent_chat_read_image`
@@ -3762,9 +4060,126 @@ const mockHooks = [{
   enabled: false, isManaged: false, trustStatus: "untrusted", timeoutSec: 30, matcher: null,
 }];
 
+/** The repo-shaped file list behind both search dialogs in browser dev. */
+const MOCK_SEARCH_PATHS = [
+  "AGENTS.md",
+  "README.md",
+  "CLAUDE.md",
+  "package.json",
+  "CONTRIBUTING.md",
+  "src/components/layout/right-panel.tsx",
+  "src/stores/ui-store.ts",
+  "src-tauri/Cargo.toml",
+  // No real filesystem backs browser dev, so an opened image always
+  // 404s — which is exactly what makes the ImageViewer failure card
+  // reachable here.
+  "docs/screenshots/dashboard.png",
+];
+
+// ── Devices (SSH hosts) ─────────────────────────────────────────────
+//
+// Mutable so Settings → Devices can add, rename, set up and remove devices
+// end to end. Reachability is what the inventory poller last saw: zeus is
+// up with Remote Control serving, pandora has been unreachable for two
+// days, and nas answers SSH but has no helper — the "Needs setup" state.
+
+const mockHosts: HostView[] = [
+  { id: 1, server_id: "srv-pandora", name: "pandora", ssh_target: "deus@pandora" },
+  { id: 2, server_id: "srv-zeus", name: "zeus", ssh_target: "deus@zeus" },
+  { id: 3, server_id: "srv-nas", name: "nas", ssh_target: "deus@nas" },
+].map((host) => ({
+  ...host,
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-01-01T00:00:00Z",
+  dirty: false,
+}));
+
+const mockHostStatus = new Map<number, HostStatusView>([
+  [1, {
+    host_id: 1,
+    probed: true,
+    reachable: false,
+    last_seen_at: "2026-08-25T18:00:00Z",
+    last_error: "unreachable: connection timed out",
+    disk_bytes: null,
+    remote_control_serving: false,
+  }],
+  [2, {
+    host_id: 2,
+    probed: true,
+    reachable: true,
+    last_seen_at: "2026-08-27T18:44:00Z",
+    last_error: null,
+    disk_bytes: 4_402_341_478,
+    remote_control_serving: true,
+  }],
+  [3, {
+    host_id: 3,
+    probed: true,
+    reachable: true,
+    last_seen_at: "2026-08-27T18:44:00Z",
+    last_error: "codemux-remote is not installed on this host",
+    disk_bytes: null,
+    remote_control_serving: false,
+  }],
+]);
+
+/** Devices with codemux-remote installed. */
+const mockInstalledHosts = new Set<number>([1, 2]);
+
+const MOCK_REMOTE_VERSION = "0.23.1";
+const MOCK_REMOTE_HOME = "/home/deus";
+
+function mockHostStatusRows(): HostStatusView[] {
+  return mockHosts.map((host) => ({
+    ...(mockHostStatus.get(host.id) ?? {
+      host_id: host.id,
+      probed: false,
+      reachable: false,
+      last_seen_at: null,
+      last_error: null,
+      disk_bytes: null,
+      remote_control_serving: false,
+    }),
+  }));
+}
+
+function findMockHost(id: unknown): HostView {
+  const host = mockHosts.find((h) => h.id === Number(id));
+  if (!host) throw `Host not found: ${String(id)}`;
+  return host;
+}
+
+/** What a finished install leaves behind: the helper is there and the
+ *  device answers cleanly. Pushed like a poller round. */
+function markMockHostInstalled(id: number): void {
+  mockInstalledHosts.add(id);
+  const status = mockHostStatus.get(id);
+  if (status) {
+    mockHostStatus.set(id, {
+      ...status,
+      probed: true,
+      reachable: true,
+      last_error: null,
+      last_seen_at: new Date().toISOString(),
+    });
+  }
+  emitEvent("hosts-status-changed", mockHostStatusRows());
+}
+
 const customAcpMock = createCustomAcpMock(emitEvent);
+
+const agentConnectorMock = createAgentConnectorMock(
+  () => ({ running: webRemoteLanRunning(), port: webRemotePort }),
+  () => emitEvent("agent-connector-changed", null),
+);
+
+// Dev-only console hook for the outside-assistant approval screenshots.
+(window as unknown as { __codemuxAgentConnectorMock: typeof agentConnectorMock }).__codemuxAgentConnectorMock = agentConnectorMock;
+
 const handlers: Record<string, Handler> = {
   ...customAcpMock.handlers,
+  ...agentConnectorMock.handlers,
   agent_chat_hooks: (a) => {
     const update = a.update as { action: string; key: string; hash: string; enabled?: boolean } | null;
     if (update) {
@@ -3933,22 +4348,26 @@ const handlers: Record<string, Handler> = {
   // Empty by default: plugins never alter a clean core-only UI. Synthetic
   // manager states are opt-in with `?addons=…` (see ./addon-mock).
   ...addonMockHandlers(),
-  get_package_format: () => "AppImage",
+  ...workflowMockHandlers((event) => emitEvent("workflow-changed", event)),
+  get_package_format: () =>
+    updateMockScenario === "pacman" || updateMockScenario === "other"
+      ? updateMockScenario
+      : "appimage",
 
   // ── Settings ──
-  get_synced_settings: () => structuredClone(SYNCED_SETTINGS),
+  get_synced_settings: () => ({ settings: structuredClone(SYNCED_SETTINGS), synced: true }),
   update_synced_settings: (a) => {
     if (a.settings) Object.assign(SYNCED_SETTINGS, structuredClone(a.settings as UserSettings));
-    return structuredClone(SYNCED_SETTINGS);
+    return { settings: structuredClone(SYNCED_SETTINGS), synced: true };
   },
   update_setting: (a) => {
     const section = a.section as keyof UserSettings;
     const key = String(a.key ?? "");
     const target = SYNCED_SETTINGS[section] as unknown as Record<string, unknown> | undefined;
     if (target && key) target[key] = structuredClone(a.value);
-    return structuredClone(SYNCED_SETTINGS);
+    return { settings: structuredClone(SYNCED_SETTINGS), synced: true };
   },
-  reset_synced_settings: () => structuredClone(SYNCED_SETTINGS),
+  reset_synced_settings: () => ({ settings: structuredClone(SYNCED_SETTINGS), synced: true }),
   db_get_all_settings: () => ({}),
   // The sidebar's settled shelf. Three settled worktrees so the Devices
   // page's "Sweep N settled" chip has something to offer.
@@ -3969,8 +4388,36 @@ const handlers: Record<string, Handler> = {
   db_set_setting: () => undefined,
   db_get_setting: () => null,
   db_delete_setting: () => undefined,
-  db_get_recent_projects: () => [],
+  // A few folders "opened before", so the zero-project landings (try
+  // `?fixture=session-import`) and the project picker have recents to show.
+  db_get_recent_projects: (a) =>
+    MOCK_RECENT_PROJECTS.slice(0, typeof a.limit === "number" ? a.limit : undefined),
   db_add_recent_project: () => undefined,
+  // Opening a project (folder picker or a recent row) adds a main-checkout
+  // workspace for that folder and returns its id, like the backend.
+  create_empty_workspace: (a) => {
+    const cwd = String(a.cwd ?? "");
+    const existing = appState.workspaces.find((w) => w.cwd === cwd);
+    if (existing) return existing.workspace_id;
+    const id = `ws-opened-${appState.workspaces.length + 1}`;
+    const workspace = buildRestoredWorkspace({
+      archive_id: id,
+      workspace_id: id,
+      title: cwd.split("/").pop() || cwd,
+      cwd,
+      project_root: cwd,
+      project_uid: null,
+      workspace_kind: "main",
+      worktree_path: null,
+      git_branch: "main",
+      is_git: true,
+      protected: true,
+      archived_at: 0,
+    });
+    appState = { ...appState, workspaces: [...appState.workspaces, workspace] };
+    emitAppState();
+    return id;
+  },
 
   // ── File dialogs ──
   // Default: resolve as a cancel (null / empty) like the previous
@@ -4007,6 +4454,8 @@ const handlers: Record<string, Handler> = {
     // and the generic listing would hand the form a stack of unrelated
     // `.md` files to mistake for one.
     if (path.includes("merge_request_templates")) return [];
+    // The seeded recent projects must probe as folders so a recent row opens.
+    if (MOCK_RECENT_PROJECTS.some((p) => p.path === path)) return [];
     return mockListDirectory(path, Boolean(a.showHidden));
   },
 
@@ -4016,21 +4465,44 @@ const handlers: Record<string, Handler> = {
   // in browser dev.
   search_file_names: (a) => {
     const query = String(a.query ?? "").toLowerCase();
-    const paths = [
-      "AGENTS.md",
-      "README.md",
-      "CLAUDE.md",
-      "package.json",
-      "CONTRIBUTING.md",
-      "src/components/layout/right-panel.tsx",
-      "src/stores/ui-store.ts",
-      "src-tauri/Cargo.toml",
-      // No real filesystem backs browser dev, so an opened image always
-      // 404s — which is exactly what makes the ImageViewer failure card
-      // reachable here.
-      "docs/screenshots/dashboard.png",
-    ];
+    const paths = MOCK_SEARCH_PATHS;
     return query ? paths.filter((p) => p.toLowerCase().includes(query)) : paths;
+  },
+
+  // Searches the same synthetic contents `read_file` serves, so opening a
+  // hit lands on a line that really holds the match in the mock editor.
+  // Mirrors the real command: literal unless `regex`, case-insensitive
+  // unless `caseSensitive`, absolute paths, UTF-16 offsets, and a rejected
+  // promise for an invalid pattern.
+  search_in_files: (a) => {
+    const root = String(a.path ?? "");
+    const query = String(a.query ?? "");
+    if (!query) return [];
+    const source = a.regex ? query : query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    let pattern: RegExp;
+    try {
+      pattern = new RegExp(source, a.caseSensitive ? "" : "i");
+    } catch (err) {
+      return Promise.reject(err instanceof Error ? err.message : String(err));
+    }
+    const limit = Number(a.maxResults ?? 100);
+    const results: Array<Record<string, unknown>> = [];
+    for (const rel of MOCK_SEARCH_PATHS) {
+      if (rel.endsWith(".png")) continue;
+      const lines = mockReadFile(`${root}/${rel}`).split("\n");
+      lines.forEach((line, i) => {
+        const hit = pattern.exec(line);
+        if (!hit || hit[0].length === 0 || results.length >= limit) return;
+        results.push({
+          file_path: `${root}/${rel}`,
+          line_number: i + 1,
+          line_content: line,
+          match_start: hit.index,
+          match_end: hit.index + hit[0].length,
+        });
+      });
+    }
+    return results;
   },
 
   // Enough content for the editor surfaces (main-area tab and the right
@@ -4108,7 +4580,8 @@ const handlers: Record<string, Handler> = {
     ({ ... (a.provider === "claude"
       ? CLAUDE_CAPABILITIES
       : a.provider === "codex"
-        ? CODEX_UTILITY_CAPABILITIES
+        ? (serviceTierFixture
+          ? CODEX_SERVICE_TIER_CAPABILITIES : CODEX_UTILITY_CAPABILITIES)
         : a.provider === "cursor"
           ? CURSOR_CAPABILITIES
           : a.provider === "grok"
@@ -4638,6 +5111,26 @@ const handlers: Record<string, Handler> = {
   agent_chat_get_session: (a) => {
     const threadId = a.threadId as string;
     if (mockImportedRecords.has(threadId)) return mockImportedRecords.get(threadId);
+    // A delegated child's row holds what the backend wrote at hand-off:
+    // the requested model and effort, the task title, full access.
+    const delegated = mockDelegatedChild(threadId);
+    if (delegated || (delegationScenario && threadId === MOCK_CHAT_THREAD_ID)) {
+      const provider = delegated?.provider ?? "claude";
+      return {
+        thread_id: threadId,
+        sdk_session_id: `sdk-${threadId}`,
+        workspace_id: "ws-codemux-chat",
+        cwd: `${MOCK_HOME_DIR}/projects/codemux`,
+        provider,
+        title: delegated?.title ?? "agent-chat-demo",
+        created_at: new Date().toISOString(),
+        last_active_at: new Date().toISOString(),
+        model: delegated ? delegated.model : "claude-opus-4-8",
+        effort: delegated?.effort ?? null,
+        context_window: null,
+        permission_mode: provider === "codex" ? "danger-full-access" : "bypassPermissions",
+      };
+    }
     if (threadId === MOCK_CHAT_THREAD_ID) {
       return {
         thread_id: MOCK_CHAT_THREAD_ID,
@@ -4711,6 +5204,18 @@ const handlers: Record<string, Handler> = {
     await new Promise(resolve => setTimeout(resolve, 1800));
     if (new URLSearchParams(location.search).get("providerUpdate") === "error") throw new Error("Update failed: the package registry could not be reached. Check your connection and try again.");
     return { provider: a.provider, installed_version: "0.158.0", latest_version: "0.158.0", available: false, manager: "Omarchy · mise", can_update: true, message: null };
+  },
+  // Opens the sign-in terminal tab like the backend, then treats the
+  // sign-in as done: the next probe (Re-check, window focus, or a send)
+  // reports ready, which is the recovery path QA needs to see.
+  open_provider_login_terminal: (a) => {
+    const tabId = handlers.create_tab({ workspaceId: a.workspaceId, kind: "terminal" });
+    const ws = findWorkspace(a.workspaceId);
+    const tab = ws?.tabs.find((t) => t.tab_id === tabId);
+    if (tab) tab.title = "Sign in";
+    delete mockProviderHealth[String(a.provider) as MockProviderKind];
+    emitAppState();
+    return undefined;
   },
   agent_chat_provider_health: (a) => {
     const provider = String(a.provider) as MockProviderKind;
@@ -4875,11 +5380,17 @@ const handlers: Record<string, Handler> = {
     emitChatEvent(threadId, {
       type: "usage_resume_cancelled",
       thread_id: threadId,
+      reason: "cancelled",
     });
     return undefined;
   },
   agent_chat_interrupt_turn: (a) => {
     const { threadId } = a as { threadId: string };
+    // Before touching the provider, the backend reads the interrupt as
+    // "stop this task quietly" on a delegated child, and as "stop every
+    // running task, report nothing" on its parent.
+    if (stopMockDelegatedChild(threadId)) return true;
+    stopMockDelegationParent(threadId);
     return interruptMockChatTurn(threadId);
   },
   // The composer strip's monitoring Stop. Mirrors the real backend closely
@@ -4983,7 +5494,7 @@ const handlers: Record<string, Handler> = {
     return undefined;
   },
   agent_chat_set_model: (a) => { if (a.provider === "acp") customAcpMock.setModel(String(a.threadId), String(a.model)); },
-  agent_chat_set_fast_mode: () => undefined,
+  agent_chat_set_service_tier: () => undefined,
   agent_chat_set_permission_mode: () => undefined,
   agent_chat_stop_session: (a) => customAcpMock.handlers.agent_chat_stop_session(a),
   agent_chat_rename_session: () => undefined,
@@ -5010,6 +5521,14 @@ const handlers: Record<string, Handler> = {
       remaining_checkpoints: [],
     });
     return [];
+  },
+  // The mock has no workspace files; restoring them leaves the rewound
+  // transcript as it is, like the real command.
+  agent_chat_undo_turn_revert: (a) => {
+    if (a.threadId !== MOCK_CHAT_THREAD_ID || mockChatRevertCutoff === null) {
+      throw new Error("There is no revert to undo for this chat.");
+    }
+    return undefined;
   },
   grep_count_pattern: () => 0,
 
@@ -5038,6 +5557,18 @@ const handlers: Record<string, Handler> = {
     seedPendingAskQuestion(threadId);
     seedPendingApproval(threadId);
     seedAsyncQuestion(threadId);
+    if (
+      delegationScenario &&
+      !delegationScenarioStarted &&
+      threadId === MOCK_CHAT_THREAD_ID
+    ) {
+      delegationScenarioStarted = true;
+      // Past the empty hydrate, so the first event lands on a mounted pane.
+      window.setTimeout(
+        () => streamMockDelegatedTask(delegationScenario, threadId),
+        400,
+      );
+    }
     return generation;
   },
   detach_agent_chat_output: (a) => {
@@ -5051,6 +5582,17 @@ const handlers: Record<string, Handler> = {
 
   // ── Presets ──
   get_presets: () => presetState,
+  // Gemini and Copilot play the agents this machine doesn't have, so the
+  // launcher's "not installed" rows show up in dev.
+  get_preset_availability: () =>
+    Object.fromEntries(
+      presetState.presets
+        .filter((p) => p.kind === "cli")
+        .map((p) => [
+          p.id,
+          p.id !== "builtin-gemini" && p.id !== "builtin-copilot",
+        ]),
+    ),
   create_preset: (a) => {
     const id = `custom-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
     presetState.presets.push(
@@ -5145,6 +5687,11 @@ const handlers: Record<string, Handler> = {
 
   // ── Editors / tooling ──
   detect_editors: () => [],
+  // No mock project configures a run command, so answer the way the backend
+  // does then (Ctrl+Shift+G shows the failure toast).
+  run_project_dev_command: () => {
+    throw "No run command configured. Set one in Settings > Projects.";
+  },
 
   // ── GitHub / PRs (pre-seeded; never hit a real API) ──
   check_gh_available: () => true,
@@ -5405,6 +5952,21 @@ const handlers: Record<string, Handler> = {
 
   /** The commits the form drafts a title and a description from. */
   git_commits_ahead: (a) => MOCK_COMMITS_AHEAD[String(a.path ?? "")] ?? [],
+  // A beat of latency so the form's "writing" state is visible.
+  generate_ai_pr_description: async (a) => {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const commits = MOCK_COMMITS_AHEAD[String(a.path ?? "")] ?? [];
+    return {
+      title: "feat(chat): stream replies through one channel",
+      body: [
+        "Replies arrived only once the whole turn had finished, so long answers sat blank for seconds.",
+        "",
+        "This streams each reply through a single channel as it is produced.",
+        "",
+        ...commits.map((c) => `- ${c.subject}`),
+      ].join("\n"),
+    };
+  },
 
   /**
    * Create, for real as far as the rest of the mock is concerned.
@@ -5721,73 +6283,25 @@ const handlers: Record<string, Handler> = {
     return undefined;
   },
 
-  // ── Hosts (remote devices) ──
+  // ── Automations ──
+  // Empty list, so the Automations page opens on its "create" state
+  // instead of crashing on a null list.
+  automations_list: () => [],
+  automations_runs: () => [],
+  automations_check_repo_access: () => ({
+    ok: true,
+    message: "This host can reach the repository.",
+  }),
+
+  // ── Devices (SSH hosts) ──
   //
-  // Seed one host so the Settings → Hosts detail pane (Test connection,
-  // Reinstall agent, Edit/Remove) renders in the browser dev runtime.
-  // The mutating commands echo back plausible payloads — nothing here
-  // touches a real SSH target.
-  hosts_list: () => [
-    {
-      id: 1,
-      server_id: "srv-pandora",
-      name: "pandora",
-      ssh_target: "deus@pandora",
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-01T00:00:00Z",
-      dirty: false,
-    },
-    {
-      id: 2,
-      server_id: "srv-zeus",
-      name: "zeus",
-      ssh_target: "deus@zeus",
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-01T00:00:00Z",
-      dirty: false,
-    },
-    {
-      id: 3,
-      server_id: "srv-nas",
-      name: "nas",
-      ssh_target: "deus@nas",
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-01T00:00:00Z",
-      dirty: false,
-    },
-  ],
-  // Reachability as the inventory poller last saw it: zeus is up with
-  // Remote Control serving, pandora has been unreachable for two days, and
-  // nas answers SSH but has no host agent — the degraded state.
-  hosts_status_list: () => [
-    {
-      host_id: 1,
-      probed: true,
-      reachable: false,
-      last_seen_at: "2026-08-25T18:00:00Z",
-      last_error: "unreachable: connection timed out",
-      disk_bytes: null,
-      remote_control_serving: false,
-    },
-    {
-      host_id: 2,
-      probed: true,
-      reachable: true,
-      last_seen_at: "2026-08-27T18:44:00Z",
-      last_error: null,
-      disk_bytes: 4_402_341_478,
-      remote_control_serving: true,
-    },
-    {
-      host_id: 3,
-      probed: true,
-      reachable: true,
-      last_seen_at: "2026-08-27T18:44:00Z",
-      last_error: "codemux-remote is not installed on this host",
-      disk_bytes: null,
-      remote_control_serving: false,
-    },
-  ],
+  // Backed by the mutable `mockHosts` state above. Nothing here touches a
+  // real SSH target; install and test take a moment so the Add device
+  // step list is visible in the browser.
+  hosts_list: () => mockHosts.map((host) => ({ ...host })),
+  hosts_status_list: () => mockHostStatusRows(),
+  get_local_device_name: () => "ai-node",
+  hosts_ssh_config_hosts: () => ["homelab", "deus@zeus", "pi@raspberrypi.local"],
   // Every requested id qualifies; the last one has no measurable size so
   // the chip's "~X GB" fragment sums only the known ones.
   workspaces_worktree_sizes: (a) => {
@@ -5796,37 +6310,92 @@ const handlers: Record<string, Handler> = {
       ids.map((id, i) => [id, i === ids.length - 1 ? null : 120_000_000 + i * 37_000_000]),
     );
   },
-  hosts_add: (a) => ({
-    id: Date.now(),
-    server_id: null,
-    name: String(a.name ?? "new-device"),
-    ssh_target: String(a.sshTarget ?? "user@host"),
-    created_at: "2026-01-01T00:00:00Z",
-    updated_at: "2026-01-01T00:00:00Z",
-    dirty: true,
-  }),
-  hosts_update: (a) => ({
-    id: Number(a.id ?? 1),
-    server_id: null,
-    name: String(a.name ?? "homelab"),
-    ssh_target: String(a.sshTarget ?? "deus@homelab.local"),
-    created_at: "2026-01-01T00:00:00Z",
-    updated_at: "2026-01-01T00:00:00Z",
-    dirty: true,
-  }),
-  hosts_delete: () => undefined,
-  hosts_test_connection: () => ({
-    ok: true,
-    message: "Connected. codemux-remote v0.9.5 is installed (Linux x86_64)",
-    needs_install: false,
-    uname: null,
-  }),
-  hosts_reinstall_remote: () => ({
-    ok: true,
-    message:
-      "codemux-remote v0.9.5 reinstalled on pandora — daemon restarted; " +
-      "the next push uses the fresh binary.",
-  }),
+  // A new device answers SSH but has no helper yet, so Add device walks
+  // through the install step.
+  hosts_add: (a) => {
+    const now = new Date().toISOString();
+    const host: HostView = {
+      id: Math.max(0, ...mockHosts.map((h) => h.id)) + 1,
+      server_id: null,
+      name: String(a.name ?? "new-device").trim(),
+      ssh_target: String(a.sshTarget ?? "user@host").trim(),
+      created_at: now,
+      updated_at: now,
+      dirty: true,
+    };
+    mockHosts.push(host);
+    mockHostStatus.set(host.id, {
+      host_id: host.id,
+      probed: true,
+      reachable: true,
+      last_seen_at: now,
+      last_error: "codemux-remote is not installed on this host",
+      disk_bytes: null,
+      remote_control_serving: false,
+    });
+    return { ...host };
+  },
+  hosts_update: (a) => {
+    const host = findMockHost(a.id);
+    host.name = String(a.name ?? host.name).trim();
+    host.ssh_target = String(a.sshTarget ?? host.ssh_target).trim();
+    host.updated_at = new Date().toISOString();
+    host.dirty = true;
+    return { ...host };
+  },
+  hosts_delete: (a) => {
+    const id = findMockHost(a.id).id;
+    mockHosts.splice(mockHosts.findIndex((h) => h.id === id), 1);
+    mockHostStatus.delete(id);
+    mockInstalledHosts.delete(id);
+    return undefined;
+  },
+  hosts_test_connection: async (a) => {
+    const host = findMockHost(a.id);
+    await new Promise((r) => setTimeout(r, 400));
+    if (mockHostStatus.get(host.id)?.reachable === false) {
+      return {
+        ok: false,
+        message: `ssh: connect to host ${host.ssh_target.split("@").pop()} port 22: Connection timed out`,
+        needs_install: false,
+        uname: null,
+      };
+    }
+    if (!mockInstalledHosts.has(host.id)) {
+      return {
+        ok: false,
+        message: "Reachable, but codemux-remote isn't installed yet (Linux x86_64)",
+        needs_install: true,
+        uname: "Linux x86_64",
+      };
+    }
+    return {
+      ok: true,
+      message: `Connected. codemux-remote v${MOCK_REMOTE_VERSION} is installed (Linux x86_64)`,
+      needs_install: false,
+      uname: null,
+    };
+  },
+  hosts_bootstrap_install: async (a) => {
+    const host = findMockHost(a.id);
+    await new Promise((r) => setTimeout(r, 1200));
+    markMockHostInstalled(host.id);
+    return {
+      ok: true,
+      message: `codemux-remote v${MOCK_REMOTE_VERSION} installed on ${host.name}`,
+    };
+  },
+  hosts_reinstall_remote: async (a) => {
+    const host = findMockHost(a.id);
+    await new Promise((r) => setTimeout(r, 1200));
+    markMockHostInstalled(host.id);
+    return {
+      ok: true,
+      message:
+        `codemux-remote v${MOCK_REMOTE_VERSION} reinstalled on ${host.name} — daemon restarted; ` +
+        "the next push uses the fresh binary.",
+    };
+  },
 
   // ── Web Remote Access ──
   //
@@ -6226,19 +6795,28 @@ const handlers: Record<string, Handler> = {
   // ── Workspace config / scripts (sidebar setup banner, default-branch
   //    cache) ──
   get_default_branch: () => "main",
-  get_workspace_config: () => ({
-    setup: [],
-    teardown: [],
-    run: null,
-    worktree_includes: [],
-  }),
-  get_project_scripts: () => ({
-    setup: [],
-    teardown: [],
-    run: null,
-    worktree_includes: [],
-  }),
-
+  // No mock project has a `.codemux/config.json`; like the backend, that
+  // reads as null, so the DB scripts below are the effective config.
+  get_workspace_config: () => null,
+  get_project_scripts: (a) =>
+    mockProjectScripts.get(a.path as string) ?? {
+      setup: [],
+      teardown: [],
+      run: null,
+      worktree_includes: [],
+    },
+  // Kept in memory so the titlebar Run button flips from "Set Run" to
+  // "Run" after a command is picked in its popover.
+  set_project_scripts: (a) => {
+    mockProjectScripts.set(a.path as string, a.scripts as ProjectScripts);
+    return null;
+  },
+  detect_run_candidates: () => [
+    { command: "npm run dev", source: "package.json" },
+    { command: "npm run start", source: "package.json" },
+    { command: "npm run tauri:dev", source: "package.json" },
+    { command: "cargo run", source: "Cargo.toml" },
+  ],
   // ── Terminal (the body is out of scope per issue #40, but the mount
   //    MUST NOT crash). `get_terminal_status` is the load-bearing one:
   //    TerminalPane writes whatever it returns into a ref that the next
@@ -6315,6 +6893,30 @@ const handlers: Record<string, Handler> = {
       if (ids.has(session.session_id) && session.cwd) {
         out[session.session_id] = session.cwd;
       }
+    }
+    return out;
+  },
+  // Twin of `terminal_foreground_jobs`. There is no shell here, so the
+  // port-detection workspace's terminal plays a running dev server and every
+  // other session sits at its prompt. Override per session with
+  // `window.__codemuxTerminalMock.setForegroundJob(sessionId, "cargo" | null)`.
+  terminal_foreground_jobs: (a) => {
+    const out: Record<string, string> = {};
+    const ports = findWorkspace("ws-codemux-ports");
+    const portsSessions = new Set(
+      (ports?.surfaces ?? []).flatMap((surface) =>
+        leafPaneNodes(surface.root).flatMap((node) =>
+          node.kind === "terminal" ? [node.session_id] : [],
+        ),
+      ),
+    );
+    for (const id of (a.sessionIds as string[]) ?? []) {
+      const job = mockForegroundJobs.has(id)
+        ? mockForegroundJobs.get(id)
+        : portsSessions.has(id)
+          ? "node"
+          : null;
+      if (job) out[id] = job;
     }
     return out;
   },
@@ -6507,7 +7109,53 @@ const handlers: Record<string, Handler> = {
     emitAppState();
     return { workspace_id: ws.workspace_id, cwd, adopted: false };
   },
+  // A thread that runs on a device: the checkout and worktree live there,
+  // and the local workspace is an attach-only window onto that path.
+  create_workspace_on_host: (a) => {
+    const projectPath = a.projectPath == null ? null : String(a.projectPath);
+    const branch = a.branch == null ? "main" : String(a.branch);
+    const projectName = projectPath?.split("/").filter(Boolean).pop() ?? null;
+    const cwd = projectName
+      ? `${MOCK_REMOTE_HOME}/.codemux/worktrees/${projectName}/${branch}`
+      : MOCK_REMOTE_HOME;
+    const ws = buildWorktreeWorkspace(projectPath ?? cwd, projectName ? branch : "Home");
+    ws.cwd = cwd;
+    ws.project_root = projectPath;
+    ws.worktree_path = null;
+    ws.git_branch = projectName ? branch : null;
+    ws.workspace_kind = projectName ? (a.newBranch ? "worktree" : "main") : null;
+    ws.host_id = Number(a.hostId);
+    ws.attach_only = true;
+    ws.remote_cwd = cwd;
+    const root = ws.surfaces[0].root;
+    if (root.kind === "agent_chat") {
+      root.cwd = cwd;
+      const chat = a.initialChat as
+        | { provider: AgentChatProviderKind; thread_id: string }
+        | undefined;
+      if (chat) {
+        root.provider = chat.provider;
+        root.thread_id = chat.thread_id;
+      }
+    }
+    appState = { ...appState, workspaces: [...appState.workspaces, ws] };
+    emitAppState();
+    return { workspace_id: ws.workspace_id, cwd, adopted: false };
+  },
   create_worktree_workspace: (a) => {
+    // Mirror the backend's rejections so the New Workspace dialog's
+    // failure recovery can be exercised: a non-git folder always fails,
+    // and `?worktreeFail=1` makes every worktree create fail like git does
+    // when the target path is already taken.
+    const repoPath = String(a.repoPath ?? "");
+    if (repoPath.endsWith("/scratchpad")) {
+      throw new Error(`Not a git repository: ${repoPath}`);
+    }
+    if (new URLSearchParams(location.search).get("worktreeFail") === "1") {
+      throw new Error(
+        `fatal: '${MOCK_HOME_DIR}/.codemux/worktrees/codemux/${String(a.branch ?? "")}' already exists`,
+      );
+    }
     const ws = buildWorktreeWorkspace(
       String(a.repoPath ?? `${MOCK_HOME_DIR}/projects/codemux`),
       String(a.branch ?? "mock-branch"),
@@ -6524,6 +7172,25 @@ const handlers: Record<string, Handler> = {
     setTimeout(() => emitAppState(), 0);
     return ws.workspace_id;
   },
+  // Reuses the Home workspace or adds one rooted at the mock home dir, so
+  // flows that open something "in Home" (the provider sign-in terminal)
+  // work in `npm run dev`.
+  get_or_create_home_workspace: () => {
+    const existing = appState.workspaces.find((w) => w.workspace_type === "home");
+    if (existing) return existing.workspace_id;
+    const ws: WorkspaceSnapshot = {
+      ...buildWorktreeWorkspace(MOCK_HOME_DIR, "main"),
+      title: "Home",
+      workspace_type: "home",
+      cwd: MOCK_HOME_DIR,
+      worktree_path: null,
+      project_root: MOCK_HOME_DIR,
+      workspace_kind: null,
+    };
+    appState = { ...appState, workspaces: [...appState.workspaces, ws] };
+    setTimeout(() => emitAppState(), 0);
+    return ws.workspace_id;
+  },
   activate_tab: (a) => {
     const ws = findWorkspace(a.workspaceId);
     const tab = ws?.tabs.find((candidate) => candidate.tab_id === a.tabId);
@@ -6533,6 +7200,82 @@ const handlers: Record<string, Handler> = {
       workspaces: appState.workspaces.map((candidate) => candidate.workspace_id === ws.workspace_id
         ? { ...candidate, active_tab_id: tab.tab_id, active_surface_id: tab.surface_id ?? candidate.active_surface_id }
         : candidate),
+    };
+    emitAppState();
+    return undefined;
+  },
+  reorder_tabs: (a) => {
+    const order = (a.tabIds as string[]) ?? [];
+    replaceWorkspace(a.workspaceId as string, (ws) => ({
+      tabs: [...ws.tabs].sort(
+        (x, y) => order.indexOf(x.tab_id) - order.indexOf(y.tab_id),
+      ),
+    }));
+    emitAppState();
+    return undefined;
+  },
+  // Both replace the workspace object rather than mutating it, so the
+  // store's structural sharing sees the change.
+  rename_tab: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    if (!ws?.tabs.some((t) => t.tab_id === a.tabId)) {
+      throw new Error(`No tab found for ${a.tabId}`);
+    }
+    const next: WorkspaceSnapshot = {
+      ...ws,
+      tabs: ws.tabs.map((t) => (t.tab_id === a.tabId ? { ...t, title: String(a.title) } : t)),
+    };
+    appState = {
+      ...appState,
+      workspaces: appState.workspaces.map((w) => (w === ws ? next : w)),
+    };
+    emitAppState();
+    return undefined;
+  },
+  close_tab: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    if (!ws) throw new Error(`No workspace found for ${a.workspaceId}`);
+    const idx = ws.tabs.findIndex((t) => t.tab_id === a.tabId);
+    if (idx < 0) throw new Error(`No tab found for ${a.tabId}`);
+    const closed = ws.tabs[idx];
+    const tabs = ws.tabs.filter((t) => t !== closed);
+    // Like the backend, drop the terminal and browser sessions the tab owned.
+    const removedSessions = new Set<string>();
+    const removedBrowsers = new Set<string>(closed.browser_id ? [closed.browser_id] : []);
+    const removedPaneIds = new Set<string>();
+    for (const surface of ws.surfaces) {
+      if (surface.surface_id !== closed.surface_id) continue;
+      for (const node of leafPaneNodes(surface.root)) {
+        removedPaneIds.add(node.pane_id);
+        if (node.kind === "terminal") removedSessions.add(node.session_id);
+        if (node.kind === "browser") removedBrowsers.add(node.browser_id);
+      }
+    }
+    const next: WorkspaceSnapshot = {
+      ...ws,
+      tabs,
+      surfaces: ws.surfaces.filter((s) => s.surface_id !== closed.surface_id),
+    };
+    // Same successor rule as the backend: the next tab, else the previous.
+    if (ws.active_tab_id === closed.tab_id) {
+      const successor = tabs[Math.min(idx, tabs.length - 1)];
+      next.active_tab_id = successor?.tab_id ?? "";
+      next.active_surface_id = successor
+        ? (successor.surface_id ?? ws.active_surface_id)
+        : "";
+    }
+    appState = {
+      ...appState,
+      workspaces: appState.workspaces.map((w) => (w === ws ? next : w)),
+      terminal_sessions: appState.terminal_sessions.filter(
+        (s) => !removedSessions.has(s.session_id),
+      ),
+      browser_sessions: appState.browser_sessions.filter(
+        (b) => !removedBrowsers.has(b.browser_id),
+      ),
+      pane_statuses: Object.fromEntries(
+        Object.entries(appState.pane_statuses).filter(([id]) => !removedPaneIds.has(id)),
+      ),
     };
     emitAppState();
     return undefined;
@@ -6594,6 +7337,52 @@ const handlers: Record<string, Handler> = {
     emitAppState();
     return tabId;
   },
+  /** Splits beside the pane with a fresh terminal, so split layouts (the
+   *  active-pane border, the seam handles) can be exercised in dev. */
+  split_pane: (a) => {
+    const loc = findSurfaceForPane(a.paneId);
+    if (!loc) return null;
+    const n = ++mockTabSeq;
+    const paneId = `pane-mock-split-${n}`;
+    const sessionId = `sess-mock-split-${n}`;
+    const direction = a.direction === "vertical" ? "vertical" : "horizontal";
+    const root = replacePaneNode(loc.surface.root, a.paneId, (found) => ({
+      kind: "split",
+      pane_id: `split-mock-${n}`,
+      direction,
+      child_sizes: [0.5, 0.5],
+      children: [
+        found,
+        { kind: "terminal", pane_id: paneId, session_id: sessionId, title: "Terminal" },
+      ],
+    }));
+    appState.terminal_sessions.push({
+      session_id: sessionId,
+      title: "Terminal",
+      shell: "/bin/bash",
+      cwd: loc.workspace.cwd,
+      cols: 120,
+      rows: 32,
+      state: "ready",
+      last_message: null,
+      exit_code: null,
+      original_command: null,
+      adapter_captures: {},
+    });
+    patchSurface(loc.surface, { root, active_pane_id: paneId });
+    return paneId;
+  },
+  resize_split: (a) => {
+    const loc = findSurfaceForPane(a.paneId);
+    if (!loc || !Array.isArray(a.childSizes)) return undefined;
+    const childSizes = a.childSizes as number[];
+    patchSurface(loc.surface, {
+      root: replacePaneNode(loc.surface.root, a.paneId, (found) =>
+        found.kind === "split" ? { ...found, child_sizes: childSizes } : found,
+      ),
+    });
+    return undefined;
+  },
   agent_chat_create_pane: (a) => {
     const ws = findWorkspace(a.workspaceId);
     const threadId = typeof a.threadId === "string" ? a.threadId : null;
@@ -6628,6 +7417,50 @@ const handlers: Record<string, Handler> = {
         }
       }
     }
+    // `NewTab` gets its own tab, as in the backend (reopening a closed chat
+    // lands here with the chat's old thread id).
+    if (ws && a.launchMode === "new_tab") {
+      const n = ++mockTabSeq;
+      const paneId = `pane-mock-chat-${n}`;
+      const surfaceId = `surface-mock-chat-${n}`;
+      const tabId = `tab-mock-chat-${n}`;
+      replaceWorkspace(ws.workspace_id, () => ({
+        surfaces: [
+          ...ws.surfaces,
+          {
+            surface_id: surfaceId,
+            title: "Agent Chat",
+            active_pane_id: paneId,
+            root: {
+              kind: "agent_chat",
+              pane_id: paneId,
+              title: "Agent Chat",
+              thread_id: threadId,
+              provider: (a.provider as AgentChatProviderKind | null) ?? null,
+              cwd: (a.cwd as string | null) ?? null,
+            },
+          },
+        ],
+        tabs: [
+          ...ws.tabs,
+          {
+            tab_id: tabId,
+            kind: "terminal",
+            title: "Agent Chat",
+            surface_id: surfaceId,
+            browser_id: null,
+            icon: null,
+          },
+        ],
+        active_tab_id: tabId,
+        active_surface_id: surfaceId,
+      }));
+      if (a.select !== false) {
+        appState = { ...appState, active_workspace_id: ws.workspace_id };
+      }
+      emitAppState();
+      return paneId;
+    }
     // The deferred worktree workspace already carries a fresh
     // agent_chat pane (empty thread); bind the session to it. Falls
     // back to a synthetic id for any other workspace.
@@ -6661,11 +7494,11 @@ const handlers: Record<string, Handler> = {
       const surface = workspace.surfaces.find((s) => leafPaneIds(s.root).includes(paneId));
       if (!surface) continue;
       workspace.active_surface_id = surface.surface_id;
-      surface.active_pane_id = paneId;
       const tab = workspace.tabs.find((t) => t.surface_id === surface.surface_id);
       if (tab) workspace.active_tab_id = tab.tab_id;
-      appState = { ...appState };
-      emitAppState();
+      // Fresh workspace and surface objects, so a split's active-pane border
+      // re-renders: the store keeps references that did not change.
+      patchSurface(surface, { active_pane_id: paneId });
       return undefined;
     }
     return undefined;
@@ -7076,6 +7909,58 @@ async function showOpenerToast(url: unknown): Promise<void> {
   }
 }
 
+// ── Updater scenarios ──────────────────────────────────────────────
+//
+// Dev builds never run the update check. `?updateMock=` opts in so the toast
+// and app-menu footer states can be exercised (screenshots, manual QA):
+//   appimage — in-app install; the download streams progress and succeeds
+//   fail     — in-app install; the download stops at ~60% with a 404
+//   pacman   — AUR install; the toast shows the yay command
+//   other    — deb/rpm install; the toast points at the release page
+// The check runs after the checker's usual 5s initial delay.
+const updateMockScenario = new URLSearchParams(location.search).get("updateMock");
+if (updateMockScenario) {
+  (window as { __CODEMUX_MOCK_UPDATER__?: boolean }).__CODEMUX_MOCK_UPDATER__ = true;
+}
+
+async function mockUpdaterDownload(channel: unknown): Promise<void> {
+  const id = (channel as { id?: number } | undefined)?.id;
+  let index = 0;
+  const send = (message: unknown) => {
+    const cb = typeof id === "number" ? callbacks.get(id) : undefined;
+    cb?.fn({ index: index++, message } as unknown as never);
+  };
+  const total = 48_000_000;
+  const chunk = total / 20;
+  send({ event: "Started", data: { contentLength: total } });
+  for (let i = 0; i < 20; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    if (updateMockScenario === "fail" && i === 12) {
+      throw "Download request failed with status: 404 Not Found";
+    }
+    send({ event: "Progress", data: { chunkLength: chunk } });
+  }
+  send({ event: "Finished" });
+}
+
+function routeUpdater(cmd: string, args: Args): unknown {
+  if (!updateMockScenario) return null;
+  if (cmd === "plugin:updater|check") {
+    return {
+      rid: 1,
+      currentVersion: "0.23.1",
+      version: "0.24.0",
+      date: null,
+      body: "Mock release",
+      rawJson: {},
+    };
+  }
+  if (cmd === "plugin:updater|download_and_install") {
+    return mockUpdaterDownload(args.onEvent);
+  }
+  return null;
+}
+
 function routePlugin(cmd: string, args: Args): unknown {
   // Event system — the backbone of listen()/emit()/once().
   if (cmd === "plugin:event|listen") {
@@ -7116,14 +8001,20 @@ function routePlugin(cmd: string, args: Args): unknown {
   if (cmd === "plugin:app|identifier") return "dev.codemux.mock";
   if (cmd.startsWith("plugin:app|")) return undefined;
 
+  // Path resolution — a fixed fake tree, enough for "Show log file".
+  if (cmd === "plugin:path|resolve_directory") {
+    return "/home/mock/.local/share/dev.codemux.mock/logs";
+  }
+  if (cmd === "plugin:path|join") return (args.paths as string[]).join("/");
+
   // Process control — log the intent, do nothing.
   if (cmd.startsWith("plugin:process|")) {
     console.log(`[dev mock] ${cmd} (no-op in browser)`);
     return undefined;
   }
 
-  // Updater — always "no update available".
-  if (cmd.startsWith("plugin:updater|")) return null;
+  // Updater — "no update available" unless `?updateMock=` picks a scenario.
+  if (cmd.startsWith("plugin:updater|")) return routeUpdater(cmd, args);
 
   // Dialogs — cancelled (null) so file pickers resolve cleanly.
   if (cmd.startsWith("plugin:dialog|")) return null;

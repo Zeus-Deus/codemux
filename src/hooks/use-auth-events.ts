@@ -8,7 +8,7 @@ import {
 } from "@/tauri/events";
 import { useAuthStore } from "@/stores/auth-store";
 import { useSyncedSettingsStore, DEFAULT_SETTINGS } from "@/stores/synced-settings-store";
-import type { AuthStatePayload, UserSettings } from "@/tauri/types";
+import type { AuthStatePayload, SettingsPersistence } from "@/tauri/types";
 
 /**
  * Listens to "auth-state-changed" Tauri events (from OAuth callback, token expiry, etc.)
@@ -59,8 +59,8 @@ export function useAuthEvents() {
 
   // Handle settings-synced events from the Rust backend
   const handleSettingsSynced = useCallback(
-    (settings: UserSettings) => {
-      applySettings(settings);
+    (result: SettingsPersistence) => {
+      applySettings(result.settings, result.synced);
     },
     [applySettings],
   );

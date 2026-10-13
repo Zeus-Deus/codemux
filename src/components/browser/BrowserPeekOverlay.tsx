@@ -149,11 +149,14 @@ export function BrowserPeekOverlay() {
     return () => window.removeEventListener("resize", onResize);
   }, [open]);
 
-  // Escape closes.
+  // Escape closes. Marking the key handled keeps the same press from also
+  // stopping the agent when the chat composer still has focus.
   useEffect(() => {
     if (!open || !activeWorkspaceId) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close(activeWorkspaceId);
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      close(activeWorkspaceId);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);

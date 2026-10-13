@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { Button } from "@/components/ui/button";
+import { MenuKeycap } from "@/components/ui/menu-chrome";
 import { parseCustomThemes } from "@/lib/themes";
 import { useAppTheme } from "@/hooks/use-app-theme";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
@@ -51,7 +52,7 @@ export function ThemeSettings() {
         onClick={() => openCommandPaletteWith("theme")}
       >
         Change
-        <span className="font-mono text-caption text-muted-foreground/70">⌘K</span>
+        <MenuKeycap actionId="commandPalette" className="ml-0" />
       </Button>
       <Button
         type="button"

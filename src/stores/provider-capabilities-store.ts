@@ -138,7 +138,11 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>()(
         const startedEpoch = providerResetEpoch;
         const request = (async () => {
           try {
-            const caps = await listChatProviderCapabilities(provider);
+            // A refresh must re-check Codex entitlements rather than returning
+            // the native process's memoized catalog.
+            const caps = await (provider === "codex"
+              ? listChatProviderCapabilities(provider, true)
+              : listChatProviderCapabilities(provider));
             if (providerResetEpoch !== startedEpoch) return;
             set((state) => storeOk(state, provider, caps));
           } catch (err) {
@@ -204,7 +208,7 @@ export function refreshProviderCapabilitiesForIntent(
   // same explicit-intent boundary. The health store's TTL handles later
   // picker openings without another process spawn.
   if (provider === "acp") return Promise.resolve(); // Explicit per-instance probe only.
-  const healthRefresh = useProviderHealth.getState().refresh(provider);
+  const healthRefresh = useProviderHealth.getState().refresh(provider).then(() => {});
   const lastRefresh = providerIntentRefreshedAt.get(provider);
   // The Cursor and Grok catalogs are owned by their installed CLIs and used
   // to refresh on an app-level timer. Capability startup is now intent-driven,

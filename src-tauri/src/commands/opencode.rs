@@ -109,6 +109,7 @@ pub async fn opencode_list_models<R: Runtime>(
     feature_flag_on(&observability)?;
     let handle = manager.ensure_running().await?;
     let mut config = OpenCodeClientConfig::new(handle.base_url);
+    config.api = handle.api;
     config.server_password = Some(handle.server_password);
     let client = OpenCodeClient::new(config)?;
     client.list_models().await

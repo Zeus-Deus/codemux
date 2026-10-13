@@ -68,6 +68,8 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { WorkflowPanel, WorkflowsPaneActions } from "@/components/workflows/workflow-panel";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { OrchestrationPanel } from "@/components/workflow/orchestration-panel";
 import { useWorkspaceWorkflow } from "@/components/workflow/use-workspace-workflow";
 import {
@@ -263,6 +265,7 @@ export const RightPanel = memo(function RightPanel({
   const titlebarOverlay = useTitlebarOverlay();
 
   const workspaceWorkflow = useWorkspaceWorkflow(workspace);
+  const enableAgentChat = useFeatureFlags((state) => state.enableAgentChat);
   const {
     threadId,
     tasks: activeChatTasks,
@@ -347,6 +350,8 @@ export const RightPanel = memo(function RightPanel({
       if (isAddonPane(id)) return addonPanels.some(panel => panel.pane === id);
       if (!isCorePane(id)) return id.startsWith("doc:");
       switch (id) {
+        case "workflows":
+          return enableAgentChat && !isRemoteClient() && !workspace.host_id && !workspace.attach_only;
         case "tasks":
           return tasksSnapshot != null;
         case "orchestration":
@@ -357,7 +362,7 @@ export const RightPanel = memo(function RightPanel({
           return true;
       }
     },
-    [tasksSnapshot, workflowRun, subagentSummary.groups, addonPanels],
+    [tasksSnapshot, workflowRun, subagentSummary.groups, addonPanels, enableAgentChat, workspace.host_id, workspace.attach_only],
   );
 
   // Availability-gated panes join the strip on their own when their data
@@ -713,6 +718,9 @@ export const RightPanel = memo(function RightPanel({
           tab.badge = subagentSummary.running;
         }
         break;
+      case "workflows":
+        tab.testId = "workflows-tab";
+        break;
       case "orchestration":
         tab.testId = "orchestration-tab";
         break;
@@ -913,6 +921,9 @@ export const RightPanel = memo(function RightPanel({
           <BrowserPaneActions sessionName={browserSessionName} />
         ) : null;
         break;
+      case "workflows":
+        actions = <WorkflowsPaneActions workspaceId={workspaceId} />;
+        break;
       case "tasks":
         actions = tasksSnapshot ? (
           <TasksPaneActions snapshot={tasksSnapshot} />
@@ -1034,6 +1045,8 @@ export const RightPanel = memo(function RightPanel({
             session={browserDocked ? browserSession : null}
             workspaceId={workspaceId}
           />
+        ) : activePane === "workflows" ? (
+          <WorkflowPanel key={workspaceId} workspaceId={workspaceId} />
         ) : activePane === "tasks" && tasksSnapshot ? (
           <TasksPanel snapshot={tasksSnapshot} updatedAt={tasksUpdatedAt} />
         ) : activePane === "orchestration" && workflowRun ? (

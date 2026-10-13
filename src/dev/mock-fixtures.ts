@@ -895,6 +895,11 @@ const wsLedgerRates = makeWorkspace({
   git_additions: 128,
   git_deletions: 19,
   git_changed_files: 4,
+  // Runs on the zeus device (mock host id 2), so the sidebar shows a
+  // remote thread.
+  host_id: 2,
+  attach_only: true,
+  remote_cwd: "/home/deus/.codemux/worktrees/ledger-api/feat-fx-rates-cache",
 });
 
 const siteRoot = `${PROJECTS}/personal-site`;
@@ -3565,6 +3570,38 @@ export const MOCK_PR_REVIEW_THREADS: Record<number, PrReviewThread[]> = {
           author: OTHER_AUTHOR,
           body: "Good, thanks.",
           created_at: minutesAgo(128),
+        },
+      ],
+    },
+    {
+      // A bot's review, as bots write them: Markdown and a two-line
+      // suggestion, so the rendered body and the suggestion diff are
+      // both reachable from the mock.
+      id: "PRRT_rail-suggestion",
+      is_resolved: false,
+      is_outdated: false,
+      is_resolvable: true,
+      path: "src/components/sidebar/draft-rail.tsx",
+      line: 132,
+      side: "RIGHT",
+      start_line: 131,
+      comments: [
+        {
+          id: "PRRC_8401",
+          database_id: 8401,
+          author: "review-bot",
+          body: [
+            "**Nit:** the comment restates the code. Say *why* the cap exists:",
+            "",
+            "```suggestion",
+            "  // More rows than this and the rail scrolls, hiding the newest draft.",
+            "  const recent = entries.slice(0, MAX_RAIL_ENTRIES);",
+            "```",
+            "",
+            "- keeps `MAX_RAIL_ENTRIES` as the single source",
+            "- see [the rail spec](https://example.com/rail)",
+          ].join("\n"),
+          created_at: minutesAgo(9),
         },
       ],
     },

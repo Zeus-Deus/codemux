@@ -55,6 +55,9 @@ vi.mock("@/stores/workspaces-sync-store", () => ({
   ),
 }));
 
+let showPullRequestsFlag = false;
+const closeUtilityPagesMock = vi.fn();
+const setShowUsageMock = vi.fn();
 vi.mock("@/stores/ui-store", () => ({
   useUIStore: vi.fn((selector) => {
     const state = {
@@ -62,6 +65,9 @@ vi.mock("@/stores/ui-store", () => ({
       toggleCommandPalette: toggleCommandPaletteMock,
       setShowAutomations: setShowAutomationsMock,
       setShowDevices: setShowDevicesMock,
+      showPullRequests: showPullRequestsFlag,
+      closeUtilityPages: closeUtilityPagesMock,
+      setShowUsage: setShowUsageMock,
     };
     return selector(state);
   }),
@@ -89,6 +95,7 @@ import { useFooterPinsStore } from "@/stores/footer-pins-store";
 import { FOOTER_ACTIONS } from "@/lib/footer-actions";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { SidebarFooterBar } from "./sidebar-footer-bar";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   useUpdateStatusStore,
   __resetUpdateStatusStoreForTests,
@@ -155,14 +162,14 @@ describe("SidebarFooterBar — expanded", () => {
       Array.from(footer.querySelectorAll("button")).map((el) =>
         el.getAttribute("aria-label"),
       ),
-    ).toEqual(["Menu", "Automations", "Devices", "Pull requests", "Ports"]);
+    ).toEqual(["Menu", "Automations", "Devices", "Pull requests", "Usage", "Ports"]);
     // The menu is pinned first and is not a drag handle; every destination is.
     expect(footer.firstElementChild?.getAttribute("aria-label")).toBe("Menu");
     expect(
       Array.from(footer.querySelectorAll('[data-testid^="footer-pin-"]')).map(
         (el) => el.querySelector("button")?.getAttribute("aria-label"),
       ),
-    ).toEqual(["Automations", "Devices", "Pull requests", "Ports"]);
+    ).toEqual(["Automations", "Devices", "Pull requests", "Usage", "Ports"]);
     // Nothing pushes a group to the right, so the strip stays left-aligned.
     expect(footer.querySelector(".ml-auto")).toBeNull();
   });
@@ -264,9 +271,15 @@ describe("AppMenuFooter — update strip", () => {
       updateVersion: null,
       downloadProgress: 0,
       isRemote: false,
+      canAutoUpdate: true,
+      packageFormat: "appimage",
+      errorMessage: null,
       startDownload: null,
       installAndRestart: null,
+      retry: null,
       requestDesktopUpdate: null,
+      checkNow: null,
+      lastCheck: null,
       ...overrides,
     });
   }
@@ -298,6 +311,48 @@ describe("AppMenuFooter — update strip", () => {
       ) as HTMLElement,
     );
     expect(startDownload).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the release page instead of downloading on a package-manager install", async () => {
+    // The in-app updater cannot replace a pacman/deb/rpm binary; calling
+    // `startDownload` there used to end in a reasonless "Update failed".
+    const startDownload = vi.fn();
+    publish({
+      state: "update-available",
+      updateVersion: "9.9.9",
+      canAutoUpdate: false,
+      packageFormat: "pacman",
+      startDownload,
+    });
+    const menuEl = await openMenu();
+
+    const button = Array.from(menuEl.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Update available"),
+    ) as HTMLElement;
+    expect(button.title).toBe("Version 9.9.9. Run: yay -S codemux-bin");
+    await userEvent.click(button);
+    expect(openUrl).toHaveBeenCalledWith(
+      "https://github.com/Zeus-Deus/codemux/releases/tag/v9.9.9",
+    );
+    expect(startDownload).not.toHaveBeenCalled();
+  });
+
+  it("says why an update failed and retries it from the strip", async () => {
+    const retry = vi.fn();
+    publish({
+      state: "error",
+      updateVersion: "9.9.9",
+      errorMessage: "404 Not Found",
+      retry,
+    });
+    const menuEl = await openMenu();
+
+    const button = Array.from(menuEl.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Retry update"),
+    ) as HTMLElement;
+    expect(button.title).toBe("Update failed: 404 Not Found");
+    await userEvent.click(button);
+    expect(retry).toHaveBeenCalledTimes(1);
   });
 
   it("asks the desktop to update when the remote client clicks the strip", async () => {
@@ -343,6 +398,7 @@ describe("SidebarFooterBar — collapsed", () => {
       "Menu",
       "Automations",
       "Pull requests",
+      "Usage",
       "Ports",
     ]);
   });
@@ -355,6 +411,7 @@ describe("SidebarFooterBar — collapsed", () => {
       "Automations",
       "Devices",
       "Pull requests",
+      "Usage",
       "Ports",
     ]);
   });
@@ -406,7 +463,7 @@ describe("footer customization", () => {
     await userEvent.click(screen.getByRole("button", { name: "Menu" }));
     await userEvent.click(screen.getByRole("menuitem", { name: "Customize footer" }));
     await userEvent.click(screen.getByRole("button", { name: "Move Ports up" }));
-    expect(useFooterPinsStore.getState().pins[2].id).toBe("codemux.ports.open");
+    expect(useFooterPinsStore.getState().pins[3].id).toBe("codemux.ports.open");
     await userEvent.click(screen.getByRole("button", { name: "Remove Automations" }));
     expect(useFooterPinsStore.getState().pins.some((pin) => pin.id === "codemux.automations.open")).toBe(false);
     await userEvent.click(screen.getByRole("button", { name: "Restore defaults" }));
@@ -441,5 +498,35 @@ describe("footer customization", () => {
     await userEvent.click(screen.getByRole("menuitem", { name: "Customize footer" }));
     expect(screen.getByText("Hidden until available")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Pin Settings · Permissions" })).toBeNull();
+  });
+});
+
+describe("SidebarFooterBar — Usage", () => {
+  it("opens the Usage page beside the sidebar rather than Settings", () => {
+    setShowUsageMock.mockClear();
+    setShowSettingsMock.mockClear();
+    renderFooter(true);
+    fireEvent.click(screen.getByRole("button", { name: "Usage" }));
+    expect(setShowUsageMock).toHaveBeenCalledWith(true);
+    expect(setShowSettingsMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("SidebarFooterBar — while a utility page is open", () => {
+  afterEach(() => {
+    showPullRequestsFlag = false;
+    closeUtilityPagesMock.mockClear();
+  });
+
+  it("swaps the destinations for a Back button that leaves the page", () => {
+    showPullRequestsFlag = true;
+    const { getByTestId, container } = renderFooter(true);
+
+    expect(container.querySelector('button[aria-label="Automations"]')).toBeNull();
+    const back = getByTestId("sidebar-back");
+    expect(back).toHaveTextContent("Back");
+
+    fireEvent.click(back);
+    expect(closeUtilityPagesMock).toHaveBeenCalledTimes(1);
   });
 });

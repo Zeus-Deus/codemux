@@ -106,6 +106,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "agent_chat_resume_after_usage_limit"
             | "agent_chat_cancel_usage_resume"
             | "agent_chat_set_fast_mode"
+            | "agent_chat_set_service_tier"
             | "agent_chat_set_model"
             | "agent_chat_set_permission_mode"
             | "agent_chat_stage_image"
@@ -152,6 +153,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "detach_pty_output"
             | "detect_editors"
             | "detect_package_manager"
+            | "detect_run_candidates"
             | "discover_source_control"
             | "dock_browser_in_right_panel"
             | "flush_scrollback_cache"
@@ -191,6 +193,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "get_pr_review_threads"
             | "get_pr_timeline"
             | "get_presets"
+            | "get_preset_availability"
             | "get_project_index_status"
             | "get_project_memory_snapshot"
             | "get_project_scripts"
@@ -208,6 +211,8 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "has_codemuxinclude"
             | "hosts_list"
             | "hosts_status_list"
+            | "get_local_device_name"
+            | "create_workspace_on_host"
             | "list_branches"
             | "list_branches_detailed"
             | "list_chat_provider_capabilities"
@@ -258,6 +263,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "start_skills_watcher"
             | "stop_skills_watcher"
             | "swap_panes"
+            | "terminal_foreground_jobs"
             | "terminal_session_cwds"
             | "touch_workspace"
             | "uncache_terminal_scrollback"
@@ -331,9 +337,12 @@ mod tests {
             "agent_chat_resume_after_usage_limit",
             "agent_chat_cancel_usage_resume",
             "materialize_chat_workspace",
+            "create_workspace_on_host",
+            "get_local_device_name",
             "submit_pr_review_with_comments",
             "automations_create",
             "unarchive_workspace",
+            "detect_run_candidates",
         ] {
             assert!(allowed(cmd), "{cmd}");
         }
@@ -348,6 +357,8 @@ mod tests {
             "git_discard_file",
             "get_auth_token",
             "web_remote_disable",
+            "hosts_add",
+            "hosts_ssh_config_hosts",
             "plugin:shell|execute",
             "future_command",
         ] {

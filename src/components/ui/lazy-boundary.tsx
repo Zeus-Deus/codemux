@@ -14,6 +14,13 @@ interface LazyBoundaryProps {
   className?: string;
   /** Overlay chunks retain the visible shell and load inside a compact card. */
   presentation?: "surface" | "overlay";
+  /**
+   * For an overlay kept mounted while closed: its loading and error states
+   * show only while open, and closing clears a failure so the next open
+   * retries. Without this, a dialog that threw would leave its full-screen
+   * error over the app after Escape.
+   */
+  open?: boolean;
 }
 
 interface ChunkErrorBoundaryProps extends LazyBoundaryProps {}
@@ -34,12 +41,19 @@ class ChunkErrorBoundary extends Component<
     return { error };
   }
 
+  componentDidUpdate(prevProps: ChunkErrorBoundaryProps) {
+    if (this.state.error && prevProps.open && this.props.open === false) {
+      this.setState({ error: null });
+    }
+  }
+
   componentDidCatch(error: Error, info: ErrorInfo) {
     console.error(`[lazy-boundary] Failed to load ${this.props.label}`, error, info);
   }
 
   render() {
     if (!this.state.error) return this.props.children;
+    if (this.props.open === false) return null;
     const overlay = this.props.presentation === "overlay";
     return (
       <div
@@ -73,6 +87,7 @@ export function LazyBoundary({
   label,
   className,
   presentation = "surface",
+  open,
 }: LazyBoundaryProps) {
   const overlay = presentation === "overlay";
   const loading = (
@@ -109,8 +124,9 @@ export function LazyBoundary({
       label={label}
       className={className}
       presentation={presentation}
+      open={open}
     >
-      <Suspense fallback={loading}>{children}</Suspense>
+      <Suspense fallback={open === false ? null : loading}>{children}</Suspense>
     </ChunkErrorBoundary>
   );
 }

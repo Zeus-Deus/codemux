@@ -684,6 +684,173 @@ describe("MessageList activity blocks", () => {
     fireEvent.click(screen.getByRole("button", { name: "Worked for 5s" }));
     expect(screen.getByText("I’ll inspect the implementation first.")).toBeInTheDocument();
     expect(screen.getByText("src/components/chat/MessageList.tsx")).toBeInTheDocument();
+    // A read-only turn has nothing to review.
+    expect(screen.queryByTestId("turn-changes-chip")).toBeNull();
+  });
+
+  it("closes a turn that edited files with a changed-files summary", () => {
+    renderList([
+      { kind: "user_message", id: "user-edit", seq: 0, text: "Fix it", created_at: 1_000 },
+      {
+        kind: "tool_call",
+        id: "edit-1",
+        seq: 1,
+        turn_id: "turn-edit",
+        tool_use_id: "edit-use-1",
+        tool_name: "Edit",
+        input: { file_path: "/repo/a.ts", old_string: "a", new_string: "b\nc" },
+        status: "done",
+        result_content: null,
+        approval_request_id: null,
+      },
+      {
+        kind: "assistant_message",
+        id: "final-edit",
+        seq: 2,
+        turn_id: "turn-edit",
+        text: "Fixed.",
+        streaming: false,
+      },
+      {
+        kind: "turn_ended",
+        id: "ended-edit",
+        seq: 3,
+        turn_id: "turn-edit",
+        status: { kind: "success" },
+        completed_at: 6_000,
+      },
+    ]);
+
+    expect(screen.getByTestId("turn-changes-chip")).toHaveTextContent(
+      "1 file changed+2 −1",
+    );
+  });
+
+  it("keeps a work log the user opened mid-run on screen when the turn settles", () => {
+    const running: ChatViewItem[] = [
+      { kind: "user_message", id: "user-live", seq: 0, text: "Check it", created_at: 1_000 },
+      { ...readCall(1, "/a"), turn_id: "turn-live" },
+      { ...readCall(2, "/b"), turn_id: "turn-live" },
+    ];
+    const settled: ChatViewItem[] = [
+      ...running,
+      {
+        kind: "assistant_message",
+        id: "final-live",
+        seq: 3,
+        turn_id: "turn-live",
+        text: "All good.",
+        streaming: false,
+      },
+      {
+        kind: "turn_ended",
+        id: "ended-live",
+        seq: 4,
+        turn_id: "turn-live",
+        status: { kind: "success" },
+        completed_at: 6_000,
+      },
+    ];
+    const view = render(<MessageList messages={running} streaming {...noopHandlers} />);
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    expect(screen.getByText("/a")).toBeInTheDocument();
+
+    view.rerender(<MessageList messages={settled} streaming={false} {...noopHandlers} />);
+    expect(screen.getByRole("button", { name: "Worked for 5s" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByText("/a")).toBeInTheDocument();
+
+    // Collapsing the fold releases the pin, and it stays collapsed.
+    fireEvent.click(screen.getByRole("button", { name: "Worked for 5s" }));
+    expect(screen.queryByText("/a")).toBeNull();
+    expect(screen.getByRole("button", { name: "Worked for 5s" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  // A live turn often reads: work, a short message, more work. Each log in
+  // that turn is the user's to keep open, not only the one with the live row.
+  function multiStretchTurn(): { running: ChatViewItem[]; settled: ChatViewItem[] } {
+    const running: ChatViewItem[] = [
+      { kind: "user_message", id: "user-multi", seq: 0, text: "Check it", created_at: 1_000 },
+      { ...readCall(1, "/a"), turn_id: "turn-multi" },
+      { ...readCall(2, "/b"), turn_id: "turn-multi" },
+      {
+        kind: "assistant_message",
+        id: "between-multi",
+        seq: 3,
+        turn_id: "turn-multi",
+        text: "Now more.",
+        streaming: false,
+      },
+      { ...readCall(4, "/c"), turn_id: "turn-multi" },
+      { ...readCall(5, "/d"), turn_id: "turn-multi", status: "running" },
+    ];
+    const settled: ChatViewItem[] = [
+      ...running.slice(0, -1),
+      { ...readCall(5, "/d"), turn_id: "turn-multi" },
+      {
+        kind: "assistant_message",
+        id: "final-multi",
+        seq: 6,
+        turn_id: "turn-multi",
+        text: "All good.",
+        streaming: false,
+      },
+      {
+        kind: "turn_ended",
+        id: "ended-multi",
+        seq: 7,
+        turn_id: "turn-multi",
+        status: { kind: "success" },
+        completed_at: 6_000,
+      },
+    ];
+    return { running, settled };
+  }
+
+  it("keeps an earlier work log of a live turn open when the turn settles", () => {
+    const { running, settled } = multiStretchTurn();
+    const view = render(<MessageList messages={running} streaming {...noopHandlers} />);
+    // The first log sits above the intermediate message, away from the live
+    // row; collapsed, it shows its last step.
+    fireEvent.click(screen.getByRole("button", { name: /\/b/ }));
+    expect(screen.getByText("/a")).toBeInTheDocument();
+
+    view.rerender(<MessageList messages={settled} streaming={false} {...noopHandlers} />);
+    expect(screen.getByRole("button", { name: "Worked for 5s" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByText("/a")).toBeInTheDocument();
+  });
+
+  it("collapses a fold pinned by two open logs in one click", () => {
+    const { running, settled } = multiStretchTurn();
+    // Open the first log while it still holds the live row, then the second
+    // one once the agent has written a message and started more work.
+    const view = render(
+      <MessageList messages={running.slice(0, 3)} streaming {...noopHandlers} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /\/b/ }));
+    expect(screen.getByText("/a")).toBeInTheDocument();
+    view.rerender(<MessageList messages={running} streaming {...noopHandlers} />);
+    fireEvent.click(screen.getByRole("button", { name: /\/d/ }));
+    expect(screen.getByText("/c")).toBeInTheDocument();
+
+    view.rerender(<MessageList messages={settled} streaming={false} {...noopHandlers} />);
+    const fold = () => screen.getByRole("button", { name: "Worked for 5s" });
+    expect(fold()).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("/a")).toBeInTheDocument();
+    expect(screen.getByText("/c")).toBeInTheDocument();
+
+    fireEvent.click(fold());
+    expect(fold()).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("/a")).toBeNull();
+    expect(screen.queryByText("/c")).toBeNull();
   });
 
   it("shows only the newest completed tool call until earlier work is requested", () => {
@@ -700,7 +867,7 @@ describe("MessageList activity blocks", () => {
     fireEvent.click(screen.getByText("/c"));
     expect(screen.getByText("/a")).toBeInTheDocument();
     expect(screen.getByText("/c")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Work log/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /\/b/ })).toBeInTheDocument();
   });
 
   it("keeps a lone successful observational call silent", () => {
@@ -1074,6 +1241,47 @@ describe("MessageList dead-run detection (issue #154)", () => {
       );
     });
 
+    it("offers Stop, wired to the turn's stop handler", () => {
+      const onStop = vi.fn();
+      render(
+        <MessageList
+          messages={[userTurn]}
+          streaming
+          stalled={{ silentForSecs: 700 }}
+          onStop={onStop}
+          {...noopHandlers}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+      expect(onStop).toHaveBeenCalledTimes(1);
+    });
+
+    it("hides on Keep waiting until another full stall passes, and resets on activity", () => {
+      const tree = (stalled: { silentForSecs: number } | null) => (
+        <MessageList
+          messages={[userTurn]}
+          streaming
+          stalled={stalled}
+          {...noopHandlers}
+        />
+      );
+      const view = render(tree({ silentForSecs: 700 }));
+      // No stop handler (a read-only pane): only the snooze is offered.
+      expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Keep waiting" }));
+      expect(screen.queryByTestId("run-stalled-notice")).toBeNull();
+
+      view.rerender(tree({ silentForSecs: 1_270 }));
+      expect(screen.queryByTestId("run-stalled-notice")).toBeNull();
+      view.rerender(tree({ silentForSecs: 1_300 }));
+      expect(screen.getByTestId("run-stalled-notice")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Keep waiting" }));
+      view.rerender(tree(null));
+      view.rerender(tree({ silentForSecs: 600 }));
+      expect(screen.getByTestId("run-stalled-notice")).toBeInTheDocument();
+    });
+
     it("does not render when the thread is not streaming", () => {
       // A stale `stalled` value on a settled thread (e.g. the terminal
       // event raced the sweep) must not show a mid-turn notice.
@@ -1185,6 +1393,67 @@ describe("MessageList usage limit", () => {
     fireEvent.click(toggle);
     expect(screen.getByTestId("auto-resume-divider-text")).toHaveTextContent(text);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("renders the delegated-results turn as its divider, not a user bubble", () => {
+    const text =
+      '[Codemux: delegated task results]\nCodemux posted this message, not the user.\n\n<task provider="codex" status="completed" title="Add slugify helper" duration="6m 12s" thread="c1">\n<report>Done.</report>\n</task>';
+    renderList([userTurn, { kind: "user_message", id: "um-2", seq: 1, text }]);
+    expect(screen.getByTestId("delegation-results-divider")).toHaveTextContent(
+      "Delegated results · Codex · completed",
+    );
+    expect(screen.queryByText(/Codemux posted this message/)).toBeNull();
+  });
+
+  it("renders a delegate_task call as the delegation card, not a tool row", () => {
+    const delegateCall: ToolCallItem = {
+      kind: "tool_call",
+      id: "tc-delegate",
+      seq: 1,
+      turn_id: "t1",
+      tool_use_id: "tu-delegate",
+      tool_name: "mcp__codemux__delegate_task",
+      input: {
+        provider: "codex",
+        title: "Add slugify helper",
+        task: "Add slugify(text) with table tests.",
+      },
+      status: "done",
+      result_content: [
+        {
+          type: "text",
+          text: JSON.stringify({ started: { provider: "codex", thread: "child-1" } }),
+        },
+      ],
+      approval_request_id: null,
+    };
+    renderList([
+      userTurn,
+      delegateCall,
+      {
+        kind: "subagent_run",
+        id: "sr-1",
+        seq: 2,
+        turn_id: "t1",
+        subagents: [
+          {
+            id: "delegate:child-1",
+            name: "Codex",
+            agentType: "codex",
+            description: "Add slugify helper",
+            status: "running",
+            activity: "Working in its tab",
+            items: [],
+            toneIndex: 0,
+          },
+        ],
+      },
+    ]);
+    const cards = screen.getAllByTestId("delegation-card");
+    expect(cards).toHaveLength(1);
+    expect(screen.getAllByTestId("delegation-row")).toHaveLength(1);
+    expect(screen.getByTestId("delegation-row-line")).toHaveTextContent("Working in its tab");
+    expect(screen.queryByText("mcp__codemux__delegate_task")).toBeNull();
   });
 });
 

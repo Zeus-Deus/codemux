@@ -3,7 +3,7 @@ import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { AddonsSettings } from "./addons-settings";
 import { HermesDefaultProfileSetting, HermesSetting } from "./hermes-setting";
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { formatBytes } from "@/lib/format-bytes";
 import { Button } from "@/components/ui/button";
@@ -15,6 +15,8 @@ import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { basename } from "@/lib/path";
+import { toast } from "@/lib/toast";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
   Sheet,
   SheetContent,
@@ -33,6 +35,8 @@ import {
 } from "@/components/ui/select";
 import {
   ArrowLeft,
+  Check,
+  FolderOpen,
   Trash2,
   X,
   Plus,
@@ -40,7 +44,12 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
-import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
+import {
+  groupWorkspacesByProject,
+  selectActiveWorkspaceId,
+  useAppStore,
+} from "@/stores/app-store";
+import { openProjectFlow } from "@/hooks/use-project-actions";
 import { useAuthStore } from "@/stores/auth-store";
 import {
   useSyncedSettingsStore,
@@ -54,16 +63,29 @@ import {
   selectTerminalColorTheme,
   selectDensity,
   selectChatCodeWrap,
+  selectReduceMotion,
   SETTINGS_DEFAULTS,
   selectSidebarShowGitStats,
   selectAutoResumeUsageLimit,
+  selectCrossProviderDelegation,
   selectOrbMatchActivity,
+  selectNewChatCheckout,
+  selectDiffLayoutPreference,
+  selectHideWhitespacePreference,
+  selectDiffFileState,
+  selectTimeFormat,
   type AppearanceDensity,
   type AutoSettleDays,
+  type DiffFileState,
+  type DiffLayoutPreference,
+  type NewChatCheckout,
+  type TimeFormat,
 } from "@/stores/settings-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { ThemeSettings } from "./theme-settings";
 import { CustomAcpSettings } from "./custom-acp-settings";
 import { UtilityAgentSetting } from "./utility-agent-setting";
+import { NewChatModelSetting } from "./new-chat-model-setting";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { NON_INTERACTIVE_CLI_PROVIDERS } from "@/lib/agent-chat/capability-defaults";
 import { CommandPalette } from "@/components/overlays/command-palette";
@@ -159,44 +181,27 @@ import { ArchiveSection } from "./archive-section";
 import { InterfaceSection } from "./interface-section";
 import { HostsSection } from "./hosts-section";
 import { SourceControlSection } from "./source-control-section";
-import { SegmentedControl, SubsectionHeader } from "./settings-primitives";
+import {
+  SectionHeader,
+  SegmentedControl,
+  SettingsCard,
+  SettingRow,
+  SubsectionHeader,
+} from "./settings-primitives";
+import { SettingsSyncIndicator } from "./settings-sync-indicator";
+import { AboutSection } from "./about-section";
+import { SettingsNavSearch, revealSettingsAnchor } from "./settings-search";
+import type { SettingsSearchResult } from "@/lib/settings-search";
 import { RemoteAccessSection } from "./remote-access-section";
 import { McpSection } from "./mcp-section";
 import { PermissionsSection } from "./permissions-section";
 import { UsageSection } from "./usage-section";
 import { SkillsSection } from "./skills-section";
-import { SmoothScrollingSection } from "./smooth-scrolling-section";
 import { TypographySettings } from "./typography-settings";
 import { SyncSection } from "./sync-section";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { Eyebrow } from "@/components/ui/eyebrow";
-
-function SettingRow({ label, description, children }: {
-  label: string;
-  description?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-8 py-4">
-      <div className="min-w-0 space-y-1">
-        <p className="text-body-lg leading-tight font-semibold text-foreground">{label}</p>
-        {description && (
-          <p className="text-body-sm leading-relaxed text-muted-foreground/80">{description}</p>
-        )}
-      </div>
-      <div className="shrink-0">{children}</div>
-    </div>
-  );
-}
-
-function SectionHeader({ title, description }: { title: string; description: string }) {
-  return (
-    <div className="mb-7">
-      <h2 className="text-[1.3125rem] font-bold tracking-tight text-foreground">{title}</h2>
-      <p className="text-body-lg text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">{description}</p>
-    </div>
-  );
-}
+import { useShortcutLabel } from "@/components/ui/menu-chrome";
 
 
 /** Section break — adds breathing room between subsections inside a
@@ -213,28 +218,6 @@ function SectionGroup({
   );
 }
 
-/** Calm grouped surface for things like environment-variable lists,
- *  test-connection panels, info banners. Subtle border, very soft
- *  bg — should never compete with content inside it. */
-function SettingsCard({
-  children,
-  className,
-}: {
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <div
-      className={cn(
-        "rounded-lg border border-border/60 bg-muted/30 p-4",
-        className,
-      )}
-    >
-      {children}
-    </div>
-  );
-}
-
 /** Form field with label + helper + content. Used by any section
  *  that has free-form inputs (textareas, multi-input forms). Keeps
  *  label/helper rhythm identical across Projects, Git AI agent
@@ -243,6 +226,7 @@ function FormField({
   label,
   helper,
   caption,
+  status,
   htmlFor,
   children,
   className,
@@ -250,6 +234,8 @@ function FormField({
   label: string;
   helper?: React.ReactNode;
   caption?: React.ReactNode;
+  /** Right of the label: a save confirmation or similar. */
+  status?: React.ReactNode;
   htmlFor?: string;
   children: React.ReactNode;
   className?: string;
@@ -257,12 +243,15 @@ function FormField({
   return (
     <div className={cn("space-y-2", className)}>
       <div className="space-y-1">
-        <label
-          htmlFor={htmlFor}
-          className="text-body font-medium text-foreground leading-none block"
-        >
-          {label}
-        </label>
+        <div className="flex items-center justify-between gap-4">
+          <label
+            htmlFor={htmlFor}
+            className="text-body font-medium text-foreground leading-none block"
+          >
+            {label}
+          </label>
+          {status}
+        </div>
         {helper && (
           <p className="text-body-sm text-muted-foreground/85 leading-relaxed">
             {helper}
@@ -317,7 +306,7 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cn(
-        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-md text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
         active
           ? "bg-surface-3 text-foreground"
           : "text-muted-foreground/90 hover:bg-surface-2 hover:text-foreground",
@@ -325,7 +314,7 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
     >
       <Icon
         className={cn(
-          "h-[15px] w-[15px] shrink-0 transition-colors duration-150",
+          "size-4 shrink-0 transition-colors duration-150",
           active
             ? "text-foreground/85"
             : "text-muted-foreground/70 group-hover/nav:text-foreground/80",
@@ -333,6 +322,84 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
       />
       <span className="truncate">{label}</span>
     </button>
+  );
+}
+
+/** Synced text setting that writes once per edit (blur or Enter) rather than
+ *  per keystroke, so other devices never see a half-typed branch name. An
+ *  empty value is refused and the saved one comes back. */
+function BaseBranchInput({ value, onCommit }: { value: string; onCommit: (v: string) => void }) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+  const empty = !draft.trim();
+  const commit = () => {
+    const next = draft.trim();
+    if (!next) {
+      setDraft(value);
+      return;
+    }
+    if (next !== draft) setDraft(next);
+    if (next !== value) onCommit(next);
+  };
+  return (
+    <Input
+      aria-label="Default base branch"
+      // Flags a blank draft while typing; leaving the field restores the saved branch.
+      aria-invalid={empty || undefined}
+      title={empty ? "A base branch is required" : undefined}
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+        else if (e.key === "Escape" && draft !== value) {
+          // Escape discards the unsaved edit.
+          e.preventDefault();
+          setDraft(value);
+        }
+      }}
+      placeholder="main"
+      className="w-36 h-9 font-mono"
+    />
+  );
+}
+
+/** Slider whose value reads live beside it while dragging but persists only
+ *  when the drag ends — one synced write instead of one per tick. */
+function CommitSlider({
+  value,
+  format,
+  onCommit,
+  min,
+  max,
+  step,
+}: {
+  value: number;
+  format: (v: number) => string;
+  onCommit: (v: number) => void;
+  min: number;
+  max: number;
+  step: number;
+}) {
+  const [live, setLive] = useState(value);
+  useEffect(() => setLive(value), [value]);
+  return (
+    <div className="flex items-center gap-3">
+      <span className="min-w-[6.5rem] text-right font-mono text-label tabular-nums text-muted-foreground">
+        {format(live)}
+      </span>
+      <Slider
+        value={[live]}
+        onValueChange={([v]) => setLive(v)}
+        onValueCommit={([v]) => {
+          if (v !== value) onCommit(v);
+        }}
+        min={min}
+        max={max}
+        step={step}
+        className="w-36"
+      />
+    </div>
   );
 }
 
@@ -350,7 +417,8 @@ const DEFAULT_VIEWPORT_OPTIONS = [
 function BrowserSection() {
   const [dataSize, setDataSize] = useState<number | null>(null);
   const [clearing, setClearing] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
+  const [message, setMessage] = useState<{ text: string; failed: boolean } | null>(null);
+  const { confirm, dialog: confirmDialog } = useConfirm();
   const defaultViewport = useSyncedSettingsStore(selectBrowserDefaultViewport);
   const updateSyncedSetting = useSyncedSettingsStore((s) => s.updateSetting);
 
@@ -361,30 +429,44 @@ function BrowserSection() {
   useEffect(() => { refreshSize(); }, []);
 
   const handleClearCookies = async () => {
-    if (!confirm("This will clear all saved cookies and site data. You'll need to re-accept cookie consent pages. Continue?")) return;
+    const confirmed = await confirm({
+      title: "Clear cookies and site data?",
+      description:
+        "Saved cookies and session storage are removed from the built-in browser. You'll need to sign in to sites and accept cookie consent pages again.",
+      confirmLabel: "Clear cookies",
+      destructive: true,
+    });
+    if (!confirmed) return;
     setClearing("cookies");
     setMessage(null);
     try {
       await clearBrowserCookies();
-      setMessage("Cookies and site data cleared.");
+      setMessage({ text: "Cookies and site data cleared.", failed: false });
       refreshSize();
     } catch (e) {
-      setMessage(`Failed: ${e}`);
+      setMessage({ text: `Couldn't clear cookies: ${e}`, failed: true });
     } finally {
       setClearing(null);
     }
   };
 
   const handleClearAll = async () => {
-    if (!confirm("This will completely reset the browser. All cookies, cache, and saved data will be deleted. Continue?")) return;
+    const confirmed = await confirm({
+      title: "Clear all browser data?",
+      description:
+        "This resets the built-in browser profile. Cookies, cache, screenshots and all saved data are deleted.",
+      confirmLabel: "Clear all data",
+      destructive: true,
+    });
+    if (!confirmed) return;
     setClearing("all");
     setMessage(null);
     try {
       await clearAllBrowserData();
-      setMessage("All browser data cleared.");
+      setMessage({ text: "All browser data cleared.", failed: false });
       refreshSize();
     } catch (e) {
-      setMessage(`Failed: ${e}`);
+      setMessage({ text: `Couldn't clear browser data: ${e}`, failed: true });
     } finally {
       setClearing(null);
     }
@@ -469,11 +551,20 @@ function BrowserSection() {
         </SettingRow>
       </div>
       {message && (
-        <SettingsCard className="mt-4 flex items-start gap-3 border-border/50 bg-muted/40">
-          <div className="size-1.5 rounded-full bg-success shrink-0 mt-1.5" />
-          <p className="text-body-sm text-muted-foreground/90 leading-relaxed">{message}</p>
+        <SettingsCard
+          role={message.failed ? "alert" : "status"}
+          className="mt-4 flex items-start gap-3"
+        >
+          <div
+            className={cn(
+              "size-1.5 rounded-full shrink-0 mt-1.5",
+              message.failed ? "bg-destructive" : "bg-success",
+            )}
+          />
+          <p className="text-body-sm text-muted-foreground/90 leading-relaxed">{message.text}</p>
         </SettingsCard>
       )}
+      {confirmDialog}
     </div>
   );
 }
@@ -496,6 +587,63 @@ function quotePrompt(value: string): string {
 function structuredCommandFor(agentCommand: string, prompt: string): string {
   const p = prompt.trim();
   return p ? `${agentCommand} ${quotePrompt(p)}` : agentCommand;
+}
+
+/** Report a failed write the user would otherwise never hear about. */
+function reportFailure(message: string) {
+  return (error: unknown) => {
+    console.error(`[settings] ${message}:`, error);
+    toast.error(message, { description: String(error) });
+  };
+}
+
+/** Deleting a custom preset cannot be undone, from the list or the editor. */
+function confirmPresetDelete(
+  confirm: ReturnType<typeof useConfirm>["confirm"],
+  name: string,
+): Promise<boolean> {
+  return confirm({
+    title: `Delete "${name}"?`,
+    description: "The preset is removed from Settings and the preset bar. This can't be undone.",
+    confirmLabel: "Delete preset",
+    destructive: true,
+  });
+}
+
+type ProjectField = "includes" | "setup" | "teardown" | "run";
+
+/** Shape the Projects form into what `setProjectScripts` stores: one entry
+ *  per non-blank line. */
+function projectScriptsFrom(
+  setup: string,
+  teardown: string,
+  run: string,
+  includes: string,
+) {
+  const lines = (text: string) =>
+    text.trim() ? text.trim().split("\n").filter((l) => l.trim()) : [];
+  return {
+    setup: lines(setup),
+    teardown: lines(teardown),
+    run: run.trim() || null,
+    worktree_includes: lines(includes),
+  };
+}
+
+/** A brief "Saved" beside a Projects field after its blur-save lands. */
+function SavedNote({ visible }: { visible: boolean }) {
+  return (
+    <span
+      aria-hidden={!visible || undefined}
+      className={cn(
+        "flex items-center gap-1 text-label text-muted-foreground transition-opacity duration-150 motion-reduce:transition-none",
+        visible ? "opacity-100" : "opacity-0",
+      )}
+    >
+      <Check className="size-3" aria-hidden />
+      Saved
+    </span>
+  );
 }
 
 function PresetEditorSheet({
@@ -540,7 +688,7 @@ function PresetEditorSheet({
     context: null,
   });
   const [prompt, setPrompt] = useState("");
-  const [confirmDelete, setConfirmDelete] = useState(false);
+  const { confirm, dialog: confirmDialog } = useConfirm();
 
   // Sync when preset changes
   useEffect(() => {
@@ -559,7 +707,6 @@ function PresetEditorSheet({
       lc?.model_selection ?? { model: null, reasoning: null, context: null },
     );
     setPrompt(lc?.prompt ?? "");
-    setConfirmDelete(false);
   }, [preset]);
 
   // ── Launch model/reasoning sourcing (mirrors new-workspace-dialog) ──
@@ -679,7 +826,7 @@ function PresetEditorSheet({
         autoRunOnWorkspace: aw,
         autoRunOnNewTab: an,
         launchConfig: { agent_command: ac, model_selection: ms, prompt: pr },
-      }).catch(console.error);
+      }).catch(reportFailure("Couldn't save the preset"));
     } else {
       updatePreset({
         id: preset.id,
@@ -691,7 +838,7 @@ function PresetEditorSheet({
         icon: preset.icon,
         autoRunOnWorkspace: aw,
         autoRunOnNewTab: an,
-      }).catch(console.error);
+      }).catch(reportFailure("Couldn't save the preset"));
     }
   };
 
@@ -751,7 +898,7 @@ function PresetEditorSheet({
           launchMode,
           icon: opt?.icon ?? preset.icon,
           launchConfig: { agent_command: ac, model_selection: ms, prompt },
-        }).catch(console.error);
+        }).catch(reportFailure("Couldn't save the preset"));
       }
     } else if (mode === "raw" && structured) {
       const cmd = structuredCommandFor(agentCommand, prompt);
@@ -768,20 +915,34 @@ function PresetEditorSheet({
           launchMode,
           icon: preset.icon,
           clearLaunchConfig: true,
-        }).catch(console.error);
+        }).catch(reportFailure("Couldn't save the preset"));
       }
     }
   };
 
-  const handleDelete = () => {
-    deletePreset(preset.id).catch(console.error);
+  const handleDelete = async () => {
+    if (!(await confirmPresetDelete(confirm, preset.name))) return;
+    deletePreset(preset.id).catch(reportFailure("Couldn't delete the preset"));
     onOpenChange(false);
+  };
+
+  // Text fields save on blur, but Escape or Done can close the sheet while one
+  // still has focus, and the unmount never blurs it. Flush those edits first.
+  const textEdited =
+    name !== preset.name ||
+    description !== (preset.description ?? "") ||
+    (structured
+      ? prompt !== (preset.launch_config?.prompt ?? "")
+      : commands.filter((c) => c.trim()).join("\n") !== preset.commands.join("\n"));
+  const handleOpenChange = (next: boolean) => {
+    if (!next && textEdited) save();
+    onOpenChange(next);
   };
 
   const handlePinnedChange = (checked: boolean) => {
     setPinned(checked);
     if (isDraft) return;
-    setPresetPinned(preset.id, checked).catch(console.error);
+    setPresetPinned(preset.id, checked).catch(reportFailure("Couldn't pin the preset"));
   };
 
   // Snapshot of local editor state shaped for `createPreset` — used when a
@@ -834,7 +995,7 @@ function PresetEditorSheet({
   };
 
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
+    <Sheet open={open} onOpenChange={handleOpenChange}>
       <SheetContent
         side="right"
         className="sm:max-w-xl w-full flex flex-col gap-0 p-0"
@@ -1114,25 +1275,14 @@ function PresetEditorSheet({
               Cancel
             </Button>
           ) : !preset.is_builtin ? (
-            confirmDelete ? (
-              <div className="flex items-center gap-2">
-                <Button variant="destructive" size="sm" onClick={handleDelete}>
-                  Confirm Delete
-                </Button>
-                <Button variant="ghost" size="sm" onClick={() => setConfirmDelete(false)}>
-                  Cancel
-                </Button>
-              </div>
-            ) : (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setConfirmDelete(true)}
-                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-              >
-                Delete Preset
-              </Button>
-            )
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void handleDelete()}
+              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+            >
+              Delete preset
+            </Button>
           ) : (
             <div />
           )}
@@ -1142,13 +1292,14 @@ function PresetEditorSheet({
             onClick={
               isDraft
                 ? () => onCreate?.(buildCreatePayload())
-                : () => onOpenChange(false)
+                : () => handleOpenChange(false)
             }
           >
             {isDraft ? "Create preset" : "Done"}
           </Button>
         </SheetFooter>
       </SheetContent>
+      {confirmDialog}
     </Sheet>
   );
 }
@@ -1191,9 +1342,10 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
         provider={provider}
         model={model}
         onProviderModelChange={(nextProvider, nextModel) => {
-          setAiCommitMessageCli(nextProvider).catch(console.error);
+          const failed = reportFailure("Couldn't save the commit message agent");
+          setAiCommitMessageCli(nextProvider).catch(failed);
           storeSet("ai_commit_message_cli", nextProvider);
-          setAiCommitMessageModel(nextModel ?? "").catch(console.error);
+          setAiCommitMessageModel(nextModel ?? "").catch(failed);
           storeSet("ai_commit_message_model", nextModel ?? "");
         }}
         disabled={disabled}
@@ -1204,9 +1356,10 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
           size="sm"
           className="text-muted-foreground"
           onClick={() => {
-            setAiCommitMessageCli(null).catch(console.error);
+            const failed = reportFailure("Couldn't reset the commit message agent");
+            setAiCommitMessageCli(null).catch(failed);
             storeSet("ai_commit_message_cli", "");
-            setAiCommitMessageModel(null).catch(console.error);
+            setAiCommitMessageModel(null).catch(failed);
             storeSet("ai_commit_message_model", "");
           }}
         >
@@ -1238,6 +1391,7 @@ export function SettingsView() {
   const density = useSettingsStore(selectDensity);
   const showGitStats = useSettingsStore(selectSidebarShowGitStats);
   const chatCodeWrap = useSettingsStore(selectChatCodeWrap);
+  const reduceMotion = useSettingsStore(selectReduceMotion);
   const autoSettleDays = useSettingsStore(
     (s) =>
       (s.settings["sidebar.auto_settle_days"] ??
@@ -1245,22 +1399,44 @@ export function SettingsView() {
   );
   const orbMatchActivity = useSettingsStore(selectOrbMatchActivity);
   const autoResumeUsageLimit = useSettingsStore(selectAutoResumeUsageLimit);
+  const crossProviderDelegation = useSettingsStore(selectCrossProviderDelegation);
+  const newChatCheckout = useSettingsStore(selectNewChatCheckout);
+  const diffLayout = useSettingsStore(selectDiffLayoutPreference);
+  const hideWhitespace = useSettingsStore(selectHideWhitespacePreference);
+  const diffFileState = useSettingsStore(selectDiffFileState);
+  const timeFormat = useSettingsStore(selectTimeFormat);
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
 
   const authUser = useAuthStore((s) => s.user);
   const signOut = useAuthStore((s) => s.signOut);
   const syncedSettings = useSyncedSettingsStore((s) => s.settings);
   const updateSyncedSetting = useSyncedSettingsStore((s) => s.updateSetting);
-  const liveRadius = typeof document === "undefined"
-    ? "0.625rem"
-    : getComputedStyle(document.documentElement).getPropertyValue("--radius").trim() || "0.625rem";
 
   const activeWorkspace = useAppStore((s) => {
     const st = s.appState;
     return st?.workspaces.find((w) => w.workspace_id === selectActiveWorkspaceId(s));
   });
   const projectRoot = activeWorkspace?.project_root ?? null;
-  const projectName = projectRoot ? basename(projectRoot) || "Project" : "Project";
+  // Projects edits any known project, defaulting to the active one, so a
+  // Settings visit from Home or another project still has a target.
+  const workspaces = useAppStore((s) => s.appState?.workspaces);
+  const knownProjects = useMemo(
+    () =>
+      groupWorkspacesByProject(
+        (workspaces ?? []).filter(
+          (w) => w.project_root && w.workspace_type !== "home",
+        ),
+        null,
+      ),
+    [workspaces],
+  );
+  const [chosenProject, setChosenProject] = useState<string | null>(null);
+  const scriptsRoot =
+    knownProjects.find((p) => p.projectPath === chosenProject)?.projectPath ??
+    projectRoot ??
+    knownProjects[0]?.projectPath ??
+    null;
+  const { confirm, dialog: confirmDialog } = useConfirm();
 
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const navGroups = buildNavGroups(enableAgentChat);
@@ -1271,6 +1447,63 @@ export function SettingsView() {
     if (settingsSection !== null) setActiveSection(settingsSection);
   }, [settingsSection, settingsNavigationVersion]);
   const sectionAvailable = isSettingsSectionAvailable(activeSection, enableAgentChat);
+  const contentScrollRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    // Repeated Settings requests should scroll to the top while preserving
+    // local editor state, including unsaved preset fields in the sheet.
+    const viewport = contentScrollRef.current?.querySelector<HTMLElement>(
+      '[data-slot="scroll-area-viewport"]',
+    );
+    if (viewport) {
+      viewport.scrollTop = 0;
+      viewport.scrollLeft = 0;
+    }
+  }, [activeSection, settingsNavigationVersion]);
+
+  // Settings search: a result opens its page, then lights the row it named.
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [revealRequest, setRevealRequest] = useState<{ anchor: string | null } | null>(null);
+  const navigateToSearchResult = useCallback((result: SettingsSearchResult) => {
+    setActiveSection(result.section);
+    setRevealRequest({ anchor: result.anchor });
+  }, []);
+  useEffect(() => {
+    if (!revealRequest) return;
+    // After paint, so the destination page is the one being searched.
+    const frame = requestAnimationFrame(() => {
+      const root = contentRef.current;
+      if (!root) return;
+      if (revealRequest.anchor && revealSettingsAnchor(root, revealRequest.anchor)) return;
+      root.scrollIntoView?.({ block: "start" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [revealRequest]);
+
+  // Ctrl+F anywhere, or "/" outside a text field, jumps to the search field.
+  const commandPaletteOpenRef = useRef(commandPaletteOpen);
+  commandPaletteOpenRef.current = commandPaletteOpen;
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const input = searchInputRef.current;
+      if (!input || e.defaultPrevented || commandPaletteOpenRef.current) return;
+      const target = e.target instanceof HTMLElement ? e.target : null;
+      if (target?.closest('[role="dialog"], [role="alertdialog"]')) return;
+      const editing =
+        !!target &&
+        (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName));
+      const find =
+        (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f";
+      const slash = e.key === "/" && !e.ctrlKey && !e.metaKey && !e.altKey && !editing;
+      if (!find && !slash) return;
+      e.preventDefault();
+      input.focus();
+      input.select();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   const editors = useDetectedEditors();
   const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
@@ -1347,36 +1580,102 @@ export function SettingsView() {
   const setTerminalThemeMode = (v: string) => storeSet("terminal.color_theme", v);
   const setAutoMcpConfig = (v: boolean) => storeSet("auto_mcp_config", v ? "true" : "false");
 
+  // What the backend last confirmed for `scriptsRoot`, so a blur with no
+  // edits does not write, and a failed save stays dirty for the next blur.
+  const savedScripts = useRef<{ root: string; generation: number; snapshot: string } | null>(null);
+  const scriptsGeneration = useRef(0);
+  const scriptSaveGeneration = useRef(0);
+  const currentScriptsRoot = useRef(scriptsRoot);
+  currentScriptsRoot.current = scriptsRoot;
+  const [loadedScriptsRoot, setLoadedScriptsRoot] = useState<string | null>(null);
+  const [scriptsLoadError, setScriptsLoadError] = useState<string | null>(null);
+  const scriptsReady = loadedScriptsRoot === scriptsRoot && savedScripts.current?.root === scriptsRoot;
+  const [savedField, setSavedField] = useState<ProjectField | null>(null);
+  const [savedVisible, setSavedVisible] = useState(false);
+  const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (savedTimer.current) clearTimeout(savedTimer.current);
+  }, []);
+
   // Load project scripts when switching to the projects section
   useEffect(() => {
-    if (activeSection !== "projects" || !projectRoot) return;
-    getProjectScripts(projectRoot).then((scripts) => {
-      if (scripts) {
-        setSetupScripts(scripts.setup.join("\n"));
-        setTeardownScripts(scripts.teardown.join("\n"));
-        setRunCommand(scripts.run ?? "");
-        setWorktreeIncludes(scripts.worktree_includes.join("\n"));
-      } else {
-        setSetupScripts("");
-        setTeardownScripts("");
-        setRunCommand("");
-        setWorktreeIncludes("");
-      }
+    const generation = ++scriptsGeneration.current;
+    ++scriptSaveGeneration.current;
+    savedScripts.current = null;
+    setLoadedScriptsRoot(null);
+    setScriptsLoadError(null);
+    setSetupScripts("");
+    setTeardownScripts("");
+    setRunCommand("");
+    setWorktreeIncludes("");
+    setHasConfigFile(false);
+    setHasIncludeFile(false);
+    setSavedVisible(false);
+    if (savedTimer.current) clearTimeout(savedTimer.current);
+    if (activeSection !== "projects" || !scriptsRoot) return;
+    // A slow answer for the previously chosen project must not land in
+    // the form after the user picked another one.
+    let stale = false;
+    getProjectScripts(scriptsRoot).then((scripts) => {
+      if (stale) return;
+      const setup = scripts?.setup.join("\n") ?? "";
+      const teardown = scripts?.teardown.join("\n") ?? "";
+      const run = scripts?.run ?? "";
+      const includes = scripts?.worktree_includes.join("\n") ?? "";
+      setSetupScripts(setup);
+      setTeardownScripts(teardown);
+      setRunCommand(run);
+      setWorktreeIncludes(includes);
+      savedScripts.current = {
+        root: scriptsRoot,
+        generation,
+        snapshot: JSON.stringify(projectScriptsFrom(setup, teardown, run, includes)),
+      };
+      setLoadedScriptsRoot(scriptsRoot);
+    }).catch((error) => {
+      if (!stale) setScriptsLoadError(String(error));
+    });
+    getWorkspaceConfig(scriptsRoot).then((config) => {
+      if (!stale) setHasConfigFile(config !== null);
     }).catch(console.error);
-    getWorkspaceConfig(projectRoot).then((config) => {
-      setHasConfigFile(config !== null);
-    }).catch(console.error);
-    hasCodemuxinclude(projectRoot).then(setHasIncludeFile).catch(() => setHasIncludeFile(false));
-  }, [activeSection, projectRoot]);
+    hasCodemuxinclude(scriptsRoot)
+      .then((has) => { if (!stale) setHasIncludeFile(has); })
+      .catch(() => { if (!stale) setHasIncludeFile(false); });
+    return () => {
+      stale = true;
+      ++scriptsGeneration.current;
+      ++scriptSaveGeneration.current;
+    };
+  }, [activeSection, scriptsRoot]);
 
-  const saveProjectSettings = () => {
-    if (!projectRoot) return;
-    setProjectScripts(projectRoot, {
-      setup: setupScripts.trim() ? setupScripts.trim().split("\n").filter((l) => l.trim()) : [],
-      teardown: teardownScripts.trim() ? teardownScripts.trim().split("\n").filter((l) => l.trim()) : [],
-      run: runCommand.trim() || null,
-      worktree_includes: worktreeIncludes.trim() ? worktreeIncludes.trim().split("\n").filter((l) => l.trim()) : [],
-    }).catch(console.error);
+  const saveProjectSettings = (field: ProjectField) => {
+    const owner = savedScripts.current;
+    if (!scriptsRoot || !scriptsReady || owner?.root !== scriptsRoot) return;
+    const root = scriptsRoot;
+    const generation = owner.generation;
+    const scripts = projectScriptsFrom(
+      setupScripts,
+      teardownScripts,
+      runCommand,
+      worktreeIncludes,
+    );
+    const snapshot = JSON.stringify(scripts);
+    if (snapshot === owner.snapshot) return;
+    const saveGeneration = ++scriptSaveGeneration.current;
+    const stillCurrent = () => currentScriptsRoot.current === root &&
+      scriptsGeneration.current === generation && scriptSaveGeneration.current === saveGeneration;
+    setProjectScripts(root, scripts)
+      .then(() => {
+        if (!stillCurrent()) return;
+        savedScripts.current = { root, generation, snapshot };
+        setSavedField(field);
+        setSavedVisible(true);
+        if (savedTimer.current) clearTimeout(savedTimer.current);
+        savedTimer.current = setTimeout(() => setSavedVisible(false), 1500);
+      })
+      .catch((error) => {
+        if (stillCurrent()) reportFailure(`Couldn't save ${basename(root)}'s scripts`)(error);
+      });
   };
 
   useEffect(() => {
@@ -1522,7 +1821,7 @@ export function SettingsView() {
       case "appearance":
         // Unchanged from before the Theming handoff, with one exception: the
         // theme *grid* is gone. Picking a theme now lives in the command
-        // palette (⌘K → "theme"), where the whole app repaints behind the list
+        // palette (open it, type "theme"), where the whole app repaints behind the list
         // — so `ThemeSettings` is a single row stating what is on, and the
         // studio it opens is an app-level overlay. Everything else on this
         // page stayed exactly where it was.
@@ -1534,10 +1833,6 @@ export function SettingsView() {
             />
             <TypographySettings />
             <div className="mt-10 space-y-1">
-              <SettingRow label="Border radius" description="Fixed across themes so a palette can't change the geometry.">
-                <span className="font-mono text-body-sm text-muted-foreground">{liveRadius}</span>
-              </SettingRow>
-              <Separator />
               <SettingRow
                 label="Resource monitor"
                 description="Show the CPU/memory monitor icon in the title bar."
@@ -1553,18 +1848,32 @@ export function SettingsView() {
                   }}
                 />
               </SettingRow>
+              <Separator />
+              <SettingRow
+                label="Reduce motion"
+                description="Stop looping and sliding animations, and swap spinners for a slow fade. Always on when your system asks for reduced motion."
+              >
+                <Switch
+                  aria-label="Reduce motion"
+                  checked={reduceMotion}
+                  onCheckedChange={(checked) =>
+                    storeSet("appearance.reduce_motion", checked ? "true" : "false")
+                  }
+                />
+              </SettingRow>
             </div>
 
             <SectionGroup>
               <SubsectionHeader
                 title="Theme"
-                description="One palette drives the app shell, terminal ANSI colors, chat code, and the file editor. Pick one from the command palette — ⌘K, then type a theme name — where the whole app repaints as you arrow through the list. Your selection and custom themes sync between devices."
+                description="One palette drives the app shell, terminal ANSI colors, chat code, and the file editor. Pick one from the command palette — open it, then type a theme name — where the whole app repaints as you arrow through the list. Your selection and custom themes sync between devices."
               />
               <ThemeSettings />
               <div className="mt-4 space-y-1">
                 <SettingRow
                   label="Density"
                   description="Comfortable gives cards and lists more breathing room. Compact tightens padding and gaps to fit more on screen."
+                  scope="device"
                 >
                   <SegmentedControl<AppearanceDensity>
                     ariaLabel="Spacing density"
@@ -1579,6 +1888,7 @@ export function SettingsView() {
                 <SettingRow
                   label="Wrap code in chat"
                   description="Soft-wrap long lines in agent chat code blocks. Off keeps each line intact behind a horizontal scroll, which is easier to read for diffs and command output."
+                  scope="device"
                 >
                   <Switch
                     checked={chatCodeWrap}
@@ -1587,11 +1897,23 @@ export function SettingsView() {
                     }
                   />
                 </SettingRow>
+                <SettingRow
+                  label="Time format"
+                  description={`How clock times read in chats, tasks, pull requests and snooze menus. System follows your locale (it reads ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} right now).`}
+                >
+                  <SegmentedControl<TimeFormat>
+                    ariaLabel="Time format"
+                    value={timeFormat}
+                    onChange={(value) => storeSet("appearance.time_format", value)}
+                    options={[
+                      { value: "system", label: "System" },
+                      { value: "12h", label: "12-hour" },
+                      { value: "24h", label: "24-hour" },
+                    ]}
+                  />
+                </SettingRow>
               </div>
             </SectionGroup>
-
-            {/* Linux WebKitGTK only — renders null everywhere else. */}
-            <SmoothScrollingSection />
 
             <SectionGroup>
               <SubsectionHeader
@@ -1602,6 +1924,7 @@ export function SettingsView() {
                 <SettingRow
                   label="Show git stats"
                   description="Show the ↑ahead and +/− diff numbers on workspace cards. The branch name always shows."
+                  scope="device"
                 >
                   <Switch
                     checked={showGitStats}
@@ -1613,6 +1936,7 @@ export function SettingsView() {
                 <SettingRow
                   label="Auto-settle idle work"
                   description="Sweep a workspace card into the Settled section after this many days without agent activity. Cards whose PR merges or closes settle once the agent has also been idle for an hour, so follow-up work stays visible while it is warm. Un-settling a card keeps it active until its agent runs again."
+                  scope="device"
                 >
                   <SegmentedControl<AutoSettleDays>
                     ariaLabel="Auto-settle idle work"
@@ -1641,6 +1965,7 @@ export function SettingsView() {
                 <SettingRow
                   label="Match the orb to the activity"
                   description="The orb changes with what the agent is doing — searching the repo, solving a failure, talking to GitHub. Off shows the same working orb everywhere."
+                  scope="device"
                 >
                   <Switch
                     checked={orbMatchActivity}
@@ -1661,7 +1986,7 @@ export function SettingsView() {
                 <Eyebrow className="mb-1.5">
                   Preview
                 </Eyebrow>
-                <div className="flex max-w-[300px] flex-col gap-0.5 rounded-lg border border-border/60 bg-muted/30 p-1.5">
+                <div className="flex max-w-[300px] flex-col gap-0.5 rounded-md border border-hairline bg-surface-1 p-1.5">
                   <OrbPreviewRow
                     activity={{ toolName: "Grep" }}
                     label="Fix scroll pinning on send"
@@ -1772,7 +2097,7 @@ export function SettingsView() {
                 </Select>
               </SettingRow>
               <Separator />
-              <SettingRow label="Color theme" description="How the terminal gets its colors.">
+              <SettingRow label="Color theme" description="How the terminal gets its colors." scope="device">
                 <Select value={terminalThemeMode} onValueChange={setTerminalThemeMode}>
                   <SelectTrigger className="h-9 w-44">
                     <SelectValue />
@@ -1797,10 +2122,12 @@ export function SettingsView() {
             />
             <div className="space-y-1">
               {presetStore && (
-                <SettingRow label="Show preset bar" description="Display the preset quick-launch bar below the tab bar.">
+                <SettingRow label="Show preset bar" description="Display the preset quick-launch bar below the tab bar." scope="device">
                   <Switch
                     checked={presetStore.bar_visible}
-                    onCheckedChange={(checked) => setPresetBarVisible(checked).catch(console.error)}
+                    onCheckedChange={(checked) =>
+                      setPresetBarVisible(checked).catch(reportFailure("Couldn't update the preset bar"))
+                    }
                   />
                 </SettingRow>
               )}
@@ -1827,7 +2154,7 @@ export function SettingsView() {
                     items={presetStore.presets.map((p) => p.id)}
                     strategy={verticalListSortingStrategy}
                   >
-                    <div className="overflow-hidden rounded-lg border border-border/60">
+                    <div className="overflow-hidden rounded-md border border-hairline">
                       {presetStore.presets.map((preset) => (
                         <SortablePresetRow
                           key={preset.id}
@@ -1835,10 +2162,13 @@ export function SettingsView() {
                           selected={selectedPresetId === preset.id}
                           onSelect={() => setSelectedPresetId(preset.id)}
                           onTogglePin={() =>
-                            setPresetPinned(preset.id, !preset.pinned).catch(console.error)
+                            setPresetPinned(preset.id, !preset.pinned).catch(
+                              reportFailure("Couldn't pin the preset"),
+                            )
                           }
-                          onDelete={() => {
-                            deletePreset(preset.id).catch(console.error);
+                          onDelete={async () => {
+                            if (!(await confirmPresetDelete(confirm, preset.name))) return;
+                            deletePreset(preset.id).catch(reportFailure("Couldn't delete the preset"));
                             if (selectedPresetId === preset.id) setSelectedPresetId(null);
                           }}
                         />
@@ -1886,13 +2216,57 @@ export function SettingsView() {
             />
             <div className="space-y-1">
               <SettingRow label="Default base branch" description="Used as the default when creating new feature branches.">
-                <Input
-                  value={baseBranch}
-                  onChange={(e) => setBaseBranch(e.target.value)}
-                  className="w-36 h-9"
-                />
+                <BaseBranchInput value={baseBranch} onCommit={setBaseBranch} />
               </SettingRow>
             </div>
+
+            <SectionGroup>
+              <SubsectionHeader
+                title="Diffs"
+                description="Starting state for diff tabs and the pull request Code tab. Toggles in a diff toolbar update these too."
+              />
+              <div className="space-y-1">
+                <SettingRow
+                  label="Diff layout"
+                  description="Unified stacks old and new lines in one column. Split shows them side by side."
+                >
+                  <SegmentedControl<DiffLayoutPreference>
+                    ariaLabel="Diff layout"
+                    value={diffLayout}
+                    onChange={(value) => storeSet("diff.layout", value)}
+                    options={[
+                      { value: "unified", label: "Unified" },
+                      { value: "split", label: "Split" },
+                    ]}
+                  />
+                </SettingRow>
+                <SettingRow
+                  label="Hide whitespace changes"
+                  description="Skip lines that only change indentation or spacing when reviewing a pull request."
+                >
+                  <Switch
+                    checked={hideWhitespace}
+                    onCheckedChange={(checked) =>
+                      storeSet("diff.hide_whitespace", checked ? "true" : "false")
+                    }
+                  />
+                </SettingRow>
+                <SettingRow
+                  label="Files start"
+                  description="Whether each file of a pull request diff opens expanded or collapsed to its header. Files you mark viewed always collapse."
+                >
+                  <SegmentedControl<DiffFileState>
+                    ariaLabel="Diff file state"
+                    value={diffFileState}
+                    onChange={(value) => storeSet("diff.file_state", value)}
+                    options={[
+                      { value: "expanded", label: "Expanded" },
+                      { value: "collapsed", label: "Collapsed" },
+                    ]}
+                  />
+                </SettingRow>
+              </div>
+            </SectionGroup>
 
             <SectionGroup>
               <SubsectionHeader
@@ -1900,11 +2274,11 @@ export function SettingsView() {
                 description="AI-assisted git workflows. Requires the Claude CLI."
               />
               <div className="space-y-1">
-                <SettingRow label="AI commit messages" description="Show the generate button next to the commit input.">
+                <SettingRow label="AI commit messages" description="Show the generate button next to the commit input." scope="device">
                   <Switch
                     checked={config?.ai_commit_message_enabled ?? true}
                     onCheckedChange={(checked) => {
-                      setAiCommitMessageEnabled(checked).catch(console.error);
+                      setAiCommitMessageEnabled(checked).catch(reportFailure("Couldn't save AI commit messages"));
                       storeSet("ai_commit_message_enabled", String(checked));
                     }}
                   />
@@ -1922,7 +2296,7 @@ export function SettingsView() {
                     model anywhere (chat composer, this row, the resolver
                     row) and it's starred everywhere via the shared
                     `picker-favorites-store`. */}
-                <SettingRow label="Agent override" description="Uses the Utility agent by default. Set an override only when commit messages need a different model.">
+                <SettingRow label="Agent override" description="Uses the Utility agent by default. Set an override only when commit messages need a different model." scope="device">
                   <AiCommitMessageAgentRow
                     disabled={!(config?.ai_commit_message_enabled ?? true)}
                   />
@@ -1950,6 +2324,7 @@ export function SettingsView() {
                 <SettingRow
                   label="Agent"
                   description="Which AI agent (and model) resolves conflicts."
+                  scope="device"
                 >
                   <MultiProviderModelPicker
                     // Same `build_resolver_argv` constraint as the
@@ -1958,18 +2333,19 @@ export function SettingsView() {
                     provider={(config?.ai_resolver_cli ?? "claude") as AgentChatProviderKind}
                     model={config?.ai_resolver_model ?? null}
                     onProviderModelChange={(provider, model) => {
-                      setAiResolverCli(provider).catch(console.error);
+                      const failed = reportFailure("Couldn't save the conflict resolver agent");
+                      setAiResolverCli(provider).catch(failed);
                       storeSet("ai_resolver_cli", provider);
-                      setAiResolverModel(model ?? "").catch(console.error);
+                      setAiResolverModel(model ?? "").catch(failed);
                       storeSet("ai_resolver_model", model ?? "");
                     }}
                   />
                 </SettingRow>
-                <SettingRow label="Strategy" description="How the AI should approach conflict resolution.">
+                <SettingRow label="Strategy" description="How the AI should approach conflict resolution." scope="device">
                   <Select
                     value={config?.ai_resolver_strategy ?? "smart_merge"}
                     onValueChange={(v) => {
-                      setAiResolverStrategy(v).catch(console.error);
+                      setAiResolverStrategy(v).catch(reportFailure("Couldn't save the conflict strategy"));
                       storeSet("ai_resolver_strategy", v);
                     }}
                   >
@@ -1999,96 +2375,158 @@ export function SettingsView() {
               title="Agent"
               description="Configure how Codemux integrates with AI coding agents."
             />
-            <div className="space-y-1">
-              <SettingRow
-                label="Utility agent"
-                description="One inexpensive default for conversation handoffs and lightweight generation. Automatic prefers Codex Luna, then Claude Haiku; individual features can still offer an override when it matters."
-              >
-                <UtilityAgentSetting />
-              </SettingRow>
-              <Separator />
-              <div className="py-4">
-                <HermesSetting />
-              </div>
-              <Separator />
-              <SettingRow
-                label="Default Hermes profile"
-                description="New Hermes chats start with this profile. Automatic uses the only installed profile; a profile you pick in a project's chat is remembered for that project."
-              >
-                <HermesDefaultProfileSetting />
-              </SettingRow>
-              <div className="pb-4">
-                <HermesSetting />
-              </div>
-              <Separator />
-              <CustomAcpSettings />
-              <Separator />
-              <SettingRow
-                label="Auto-configure MCP for workspaces"
-                description="Automatically write .mcp.json so agents discover Codemux tools. Disable if you manage MCP config manually."
-              >
-                <Switch
-                  checked={autoMcpConfig}
-                  onCheckedChange={(checked) => {
-                    setAutoMcpConfig(checked);
-                    storeSet("auto_mcp_config", String(checked));
-                  }}
+            {/* Chat drafts are an Agent Chat surface; the CLI interface
+                launches agents from presets instead. */}
+            {enableAgentChat && (
+              <SectionGroup>
+                <SubsectionHeader
+                  title="New chats"
+                  description="What a new chat starts with. You can still change any of it in the composer before sending."
                 />
-              </SettingRow>
-              {/* True turn checkpoints are an Agent Chat affordance. */}
+                <div className="space-y-1">
+                  <SettingRow
+                    label="Default model"
+                    description="Automatic starts on Claude's default model. Custom picks the provider, model and reasoning level for every new chat."
+                  >
+                    <NewChatModelSetting />
+                  </SettingRow>
+                  <SettingRow
+                    label="Workspace"
+                    description="New worktree gives each chat its own branch and checkout. Current checkout works directly on the project's checked-out branch."
+                  >
+                    <SegmentedControl<NewChatCheckout>
+                      ariaLabel="Where new chats run"
+                      value={newChatCheckout}
+                      onChange={(value) => {
+                        storeSet("chat.default_checkout", value);
+                        useChatDraftStore.getState().applyNewChatDefaults();
+                      }}
+                      options={[
+                        { value: "worktree", label: "New worktree" },
+                        { value: "current", label: "Current checkout" },
+                      ]}
+                    />
+                  </SettingRow>
+                </div>
+              </SectionGroup>
+            )}
+            <SectionGroup>
               {enableAgentChat && (
-                <>
-                  <Separator />
-                  <SettingRow
-                    label="Per-turn revert checkpoints"
-                    description="Before each supported agent turn, snapshot the workspace so Revert can rewind files, the provider conversation, and the transcript together. Currently available for Codex."
-                  >
-                    <Switch
-                      checked={syncedSettings.agent_chat?.checkpoints_enabled ?? false}
-                      onCheckedChange={(checked) => {
-                        updateSyncedSetting("agent_chat", "checkpoints_enabled", checked).catch(console.error);
-                      }}
-                    />
-                  </SettingRow>
-                  <Separator />
-                  <SettingRow
-                    label="Resume automatically after usage limits reset"
-                    description="When a provider reports when your usage limit resets, continue the interrupted run then. At most two automatic attempts before it waits for you."
-                  >
-                    <Switch
-                      checked={autoResumeUsageLimit}
-                      onCheckedChange={(checked) =>
-                        storeSet(
-                          "agents.auto_resume_usage_limit",
-                          checked ? "true" : "false",
-                        )
-                      }
-                    />
-                  </SettingRow>
-                  <Separator />
-                  {/* GUI-mode background browser viewport pin. Like the
-                      checkpoint toggle, only meaningful with the Agent
-                      Chat GUI on — the peek popover it affects is a
-                      GUI-chrome surface. */}
-                  <SettingRow
-                    label="Desktop-size background browser"
-                    description="Pin the agent's background browser to a real desktop viewport (the Browser section's default viewport, 1280×800 out of the box) so pages render at full size in the peek popover, scaled to fit."
-                  >
-                    <Switch
-                      checked={syncedSettings.agent_chat?.background_browser_desktop_viewport ?? true}
-                      onCheckedChange={(checked) => {
-                        updateSyncedSetting("agent_chat", "background_browser_desktop_viewport", checked).catch(console.error);
-                      }}
-                    />
-                  </SettingRow>
-                </>
+                <SubsectionHeader
+                  title="Tools & runtime"
+                  description="Background helpers, provider setup, and how agent sessions behave."
+                />
               )}
-            </div>
+              <div className="space-y-1">
+                <SettingRow
+                  label="Utility agent"
+                  description="One inexpensive default for conversation handoffs and lightweight generation. Automatic prefers Codex Luna, then Claude Haiku; individual features can still offer an override when it matters."
+                scope="device"
+                  >
+                  <UtilityAgentSetting />
+                </SettingRow>
+                <Separator />
+                <div className="py-4">
+                  <HermesSetting />
+                </div>
+                <Separator />
+                <SettingRow
+                  label="Default Hermes profile"
+                  description="New Hermes chats start with this profile. Automatic uses the only installed profile; a profile you pick in a project's chat is remembered for that project."
+                scope="device"
+                  >
+                  <HermesDefaultProfileSetting />
+                </SettingRow>
+                <Separator />
+                <CustomAcpSettings />
+                <Separator />
+                <SettingRow
+                  label="Auto-configure MCP for workspaces"
+                  description="Automatically write .mcp.json so agents discover Codemux tools. Disable if you manage MCP config manually."
+                scope="device"
+                  >
+                  <Switch
+                    checked={autoMcpConfig}
+                    onCheckedChange={(checked) => {
+                      setAutoMcpConfig(checked);
+                      storeSet("auto_mcp_config", String(checked));
+                    }}
+                  />
+                </SettingRow>
+                {/* True turn checkpoints are an Agent Chat affordance. */}
+                {enableAgentChat && (
+                  <>
+                    <Separator />
+                    <SettingRow
+                      label="Per-turn revert checkpoints"
+                      description="Before each supported agent turn, snapshot the workspace so Revert can rewind files, the provider conversation, and the transcript together. Currently available for Codex."
+                    >
+                      <Switch
+                        checked={syncedSettings.agent_chat?.checkpoints_enabled ?? false}
+                        onCheckedChange={(checked) => {
+                          updateSyncedSetting("agent_chat", "checkpoints_enabled", checked).catch(console.error);
+                        }}
+                      />
+                    </SettingRow>
+                    <Separator />
+                    <SettingRow
+                      label="Resume automatically after usage limits reset"
+                      description="When a provider reports when your usage limit resets, continue the interrupted run then. At most two automatic attempts before it waits for you."
+                    scope="device"
+                  >
+                      <Switch
+                        checked={autoResumeUsageLimit}
+                        onCheckedChange={(checked) =>
+                          storeSet(
+                            "agents.auto_resume_usage_limit",
+                            checked ? "true" : "false",
+                          )
+                        }
+                      />
+                    </SettingRow>
+                    <Separator />
+                    <SettingRow
+                      label="Delegate to other agents"
+                      description="When you ask for it, a Full-access Claude or Codex chat can hand a task to another installed agent, e.g. “have Codex implement X, then review it”. Each task opens as a tab next to the chat and shares its folder. Turning this off hides the tool from Claude chats right away and from new Codex chats."
+                    >
+                      <Switch
+                        checked={crossProviderDelegation}
+                        onCheckedChange={(checked) =>
+                          storeSet(
+                            "agents.cross_provider_delegation",
+                            checked ? "true" : "false",
+                          )
+                        }
+                      />
+                    </SettingRow>
+                    <Separator />
+                    {/* GUI-mode background browser viewport pin. Like the
+                        checkpoint toggle, only meaningful with the Agent
+                        Chat GUI on — the peek popover it affects is a
+                        GUI-chrome surface. */}
+                    <SettingRow
+                      label="Desktop-size background browser"
+                      description="Pin the agent's background browser to a real desktop viewport (the Browser section's default viewport, 1280×800 out of the box) so pages render at full size in the peek popover, scaled to fit."
+                    >
+                      <Switch
+                        checked={syncedSettings.agent_chat?.background_browser_desktop_viewport ?? true}
+                        onCheckedChange={(checked) => {
+                          updateSyncedSetting("agent_chat", "background_browser_desktop_viewport", checked).catch(console.error);
+                        }}
+                      />
+                    </SettingRow>
+                  </>
+                )}
+              </div>
+            </SectionGroup>
           </div>
         );
 
       case "interface":
         return <InterfaceSection />;
+
+      case "about":
+        return <AboutSection />;
 
       case "usage":
         // Same defensive guard as Permissions below: the nav row is
@@ -2115,11 +2553,7 @@ export function SettingsView() {
         );
 
       case "mcp":
-        return enableAgentChat ? (
-          <McpSection projectRoot={projectRoot} />
-        ) : (
-          <InterfaceSection />
-        );
+        return <McpSection projectRoot={projectRoot} />;
 
       case "archive":
         return (
@@ -2140,7 +2574,7 @@ export function SettingsView() {
           <div>
             <SectionHeader
               title="Devices"
-              description="Any machine you can SSH into — a home desktop, an always-on box, a cloud server. Push a workspace to any device, pull it back from any device. SSH credentials stay on your machine; only the device name and SSH target sync across your account."
+              description="Run threads on your other machines — a home server, a desktop, a cloud VM. Codemux connects over SSH and sets everything up for you."
             />
             <HostsSection />
           </div>
@@ -2169,14 +2603,68 @@ export function SettingsView() {
           ["$CODEMUX_WORKSPACE_NAME", "Workspace title"],
           ["$CODEMUX_WORKSPACE_ID", "Workspace ID"],
         ];
+        if (!scriptsRoot) {
+          return (
+            <div>
+              <SectionHeader
+                title="Projects"
+                description="Lifecycle scripts and worktree files for each project."
+              />
+              <SettingsCard className="flex flex-col items-start gap-3">
+                <p className="text-body text-muted-foreground">
+                  Open a project to configure its lifecycle scripts.
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    openProjectFlow().catch(reportFailure("Couldn't open the project"));
+                  }}
+                >
+                  <FolderOpen className="size-3.5" />
+                  Open project…
+                </Button>
+              </SettingsCard>
+            </div>
+          );
+        }
+        const savedNote = (field: ProjectField) => (
+          <SavedNote visible={scriptsReady && savedVisible && savedField === field} />
+        );
         return (
           <div>
             <SectionHeader
               title="Projects"
-              description={`Automate your workspace lifecycle for ${projectName}. Changes are saved automatically.`}
+              description="Lifecycle scripts and worktree files for each project. Changes save when you leave a field."
+              action={
+                <Select value={scriptsRoot} onValueChange={setChosenProject}>
+                  <SelectTrigger aria-label="Project" className="h-9 w-48">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {knownProjects.map((p) => (
+                      <SelectItem key={p.projectPath} value={p.projectPath}>
+                        {p.projectName}
+                      </SelectItem>
+                    ))}
+                    {/* The active workspace's project, even when no other
+                        workspace lists it, so the trigger never goes blank. */}
+                    {!knownProjects.some((p) => p.projectPath === scriptsRoot) && (
+                      <SelectItem value={scriptsRoot}>{basename(scriptsRoot)}</SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+              }
             />
+            {!scriptsReady && (
+              <SettingsCard className="mb-6">
+                <p role={scriptsLoadError ? "alert" : "status"} className="text-body text-muted-foreground">
+                  {scriptsLoadError ? `Couldn't load ${basename(scriptsRoot)}'s scripts: ${scriptsLoadError}` : "Loading project scripts…"}
+                </p>
+              </SettingsCard>
+            )}
             {hasConfigFile && (
-              <SettingsCard className="mb-6 flex items-start gap-3 border-border/50 bg-muted/40">
+              <SettingsCard className="mb-6 flex items-start gap-3">
                 <div className="size-1.5 rounded-full bg-warning shrink-0 mt-1.5" />
                 <p className="text-body-sm text-muted-foreground/90 leading-relaxed">
                   A <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemux/config.json</code> file was found.
@@ -2188,6 +2676,7 @@ export function SettingsView() {
             <div className="space-y-8">
               <FormField
                 label="Worktree includes"
+                status={savedNote("includes")}
                 helper="Files matching these patterns are copied from the main project into new worktrees. One pattern per line."
                 caption={
                   <>
@@ -2199,7 +2688,7 @@ export function SettingsView() {
                 }
               >
                 {hasIncludeFile && (
-                  <SettingsCard className="border-border/50 bg-muted/40 py-2.5 px-3 mb-2">
+                  <SettingsCard className="py-2.5 px-3 mb-2">
                     <p className="text-body-sm text-muted-foreground/90 leading-relaxed">
                       This project has a <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemuxinclude</code> file —
                       those patterns take priority over the settings below.
@@ -2210,43 +2699,48 @@ export function SettingsView() {
                   className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder={".env\n.env.*\n.env.local"}
                   value={worktreeIncludes}
+                  disabled={!scriptsReady}
                   onChange={(e) => setWorktreeIncludes(e.target.value)}
-                  onBlur={saveProjectSettings}
+                  onBlur={() => saveProjectSettings("includes")}
                 />
               </FormField>
 
               <FormField
                 label="Setup"
+                status={savedNote("setup")}
                 helper="Runs when a new workspace is created. One command per line."
               >
                 <Textarea
                   className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder="e.g. npm install"
                   value={setupScripts}
+                  disabled={!scriptsReady}
                   onChange={(e) => setSetupScripts(e.target.value)}
-                  onBlur={saveProjectSettings}
+                  onBlur={() => saveProjectSettings("setup")}
                 />
               </FormField>
 
               <FormField
                 label="Teardown"
+                status={savedNote("teardown")}
                 helper="Runs when a workspace is deleted. One command per line."
               >
                 <Textarea
                   className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder="e.g. docker compose down"
                   value={teardownScripts}
+                  disabled={!scriptsReady}
                   onChange={(e) => setTeardownScripts(e.target.value)}
-                  onBlur={saveProjectSettings}
+                  onBlur={() => saveProjectSettings("teardown")}
                 />
               </FormField>
 
               <FormField
                 label="Run"
+                status={savedNote("run")}
                 helper={
                   <>
-                    A command to start your dev server, triggered via{" "}
-                    <kbd className="text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm font-mono">Ctrl+Shift+G</kbd>.
+                    A command to start your dev server<RunShortcutHint />.
                   </>
                 }
               >
@@ -2254,8 +2748,9 @@ export function SettingsView() {
                   className="font-mono text-body h-9"
                   placeholder="e.g. npm run dev"
                   value={runCommand}
+                  disabled={!scriptsReady}
                   onChange={(e) => setRunCommand(e.target.value)}
-                  onBlur={saveProjectSettings}
+                  onBlur={() => saveProjectSettings("run")}
                 />
               </FormField>
             </div>
@@ -2331,7 +2826,7 @@ export function SettingsView() {
           <div>
             <SectionHeader
               title="Session Restore"
-              description="Restore terminal scrollback and agent sessions when reopening Codemux."
+              description="Restore terminal scrollback when reopening Codemux."
             />
             <div className="space-y-1">
               <SettingRow
@@ -2348,33 +2843,33 @@ export function SettingsView() {
               <Separator />
               <SettingRow
                 label="Scrollback lines"
-                description={`${syncedSettings.session_restore.scrollback_lines.toLocaleString()} lines saved per terminal pane.`}
+                description="Lines saved per terminal pane."
               >
-                <Slider
-                  value={[syncedSettings.session_restore.scrollback_lines]}
-                  onValueChange={([v]) => {
+                <CommitSlider
+                  value={syncedSettings.session_restore.scrollback_lines}
+                  format={(v) => `${v.toLocaleString()} lines`}
+                  onCommit={(v) => {
                     updateSyncedSetting("session_restore", "scrollback_lines", v).catch(console.error);
                   }}
                   min={1000}
                   max={50000}
                   step={1000}
-                  className="w-36"
                 />
               </SettingRow>
               <Separator />
               <SettingRow
                 label="Max disk usage"
-                description={`${syncedSettings.session_restore.max_total_mb} MB maximum for all saved scrollback.`}
+                description="Maximum for all saved scrollback."
               >
-                <Slider
-                  value={[syncedSettings.session_restore.max_total_mb]}
-                  onValueChange={([v]) => {
+                <CommitSlider
+                  value={syncedSettings.session_restore.max_total_mb}
+                  format={(v) => `${v} MB`}
+                  onCommit={(v) => {
                     updateSyncedSetting("session_restore", "max_total_mb", v).catch(console.error);
                   }}
                   min={10}
                   max={500}
                   step={10}
-                  className="w-36"
                 />
               </SettingRow>
             </div>
@@ -2420,6 +2915,9 @@ export function SettingsView() {
             </>
           )}
         </div>
+        <div className="ml-2">
+          <SettingsSyncIndicator />
+        </div>
         {sectionAvailable && !mobile && <SettingsFooterPin section={activeSection} />}
       </div>
 
@@ -2431,41 +2929,55 @@ export function SettingsView() {
             dividers) so the nav reads as one continuous list. Mono
             group captions echo the design system's metadata voice. */}
         {mobile && <select aria-label="Settings section" className="mobile-pane-picker" value={activeSection} onChange={e => setActiveSection(e.target.value as Section)}>{navGroups.map(group => <optgroup key={group.label} label={group.label}>{group.items.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</optgroup>)}</select>}
-        <nav className={cn("w-60 shrink-0 border-r border-border bg-background py-4", mobile && "hidden")}>
-          <div className="space-y-5">
-            {navGroups.map((group) => (
-              <div key={group.label}>
-                <Eyebrow className="px-4 pb-1.5">
-                  {group.label}
-                </Eyebrow>
-                <div className="space-y-px px-3">
-                  {group.items.map((item) => (
-                    <SettingsNavItem
-                      key={item.id}
-                      icon={item.icon}
-                      label={item.label}
-                      active={activeSection === item.id}
-                      onClick={() => setActiveSection(item.id)}
-                    />
-                  ))}
-                </div>
+        {!mobile && (
+          <nav className="flex w-60 shrink-0 flex-col border-r border-border bg-background pt-4">
+            <SettingsNavSearch
+              agentChatEnabled={enableAgentChat}
+              signedIn={!!authUser}
+              activeSection={activeSection}
+              inputRef={searchInputRef}
+              onNavigate={navigateToSearchResult}
+            >
+              <div className="space-y-5">
+                {navGroups.map((group) => (
+                  <div key={group.label}>
+                    <Eyebrow className="px-4 pb-1.5">
+                      {group.label}
+                    </Eyebrow>
+                    <div className="space-y-px px-3">
+                      {group.items.map((item) => (
+                        <SettingsNavItem
+                          key={item.id}
+                          icon={item.icon}
+                          label={item.label}
+                          active={activeSection === item.id}
+                          onClick={() => setActiveSection(item.id)}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-        </nav>
+            </SettingsNavSearch>
+          </nav>
+        )}
 
         {/* Content */}
-        <ScrollArea className="flex-1 bg-card">
+        <ScrollArea ref={contentScrollRef} className="flex-1 bg-card">
           <div
+            ref={contentRef}
             className={cn(
+              "animate-in fade-in-0 slide-in-from-bottom-1 duration-150 motion-reduce:animate-none",
               mobile ? "mx-auto min-w-0 px-4 pt-5 pb-20" : "mx-auto px-11 pt-8 pb-20",
               WIDE_SECTIONS.has(activeSection as Section) ? "max-w-[1400px]" : "max-w-3xl",
             )}
           >
             {sectionAvailable ? renderSection() : (
-              <div role="status" className="space-y-2">
-                <h2 className="text-lg font-semibold">Settings section unavailable</h2>
-                <p className="text-body text-muted-foreground">This section is hidden or no longer available. Choose a section from Settings.</p>
+              <div role="status">
+                <SectionHeader
+                  title="Settings section unavailable"
+                  description="This section is hidden or no longer available. Choose a section from Settings."
+                />
               </div>
             )}
           </div>
@@ -2477,6 +2989,7 @@ export function SettingsView() {
           must not eject you from the page you were reading — so Settings
           carries its own instance and the picker layers over it. */}
       <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
+      {confirmDialog}
     </div>
   );
 }
@@ -2487,6 +3000,19 @@ interface SortablePresetRowProps {
   onSelect: () => void;
   onTogglePin: () => void;
   onDelete: () => void;
+}
+
+/** The Run field's ", triggered via <keys>" tail, following the user's rebind
+ *  and dropped when the action is unbound. */
+function RunShortcutHint() {
+  const keys = useShortcutLabel("runDevCommand");
+  if (!keys) return null;
+  return (
+    <>
+      , triggered via{" "}
+      <kbd className="text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm font-mono">{keys}</kbd>
+    </>
+  );
 }
 
 function SortablePresetRow({
@@ -2517,25 +3043,32 @@ function SortablePresetRow({
       ref={setNodeRef}
       style={style}
       className={cn(
-        "group/preset flex items-center gap-3 pl-2 pr-2.5 py-2.5 border-b border-border/40 last:border-b-0 cursor-pointer transition-colors duration-150",
-        selected ? "bg-muted/60" : "hover:bg-muted/30",
+        "group/preset flex items-center gap-3 pl-2 pr-2.5 border-b border-hairline last:border-b-0 transition-colors duration-150",
+        selected ? "bg-surface-3" : "hover:bg-surface-2",
       )}
-      onClick={onSelect}
     >
       <button
         type="button"
-        className="p-1 rounded-sm text-muted-foreground/30 hover:text-muted-foreground hover:bg-muted/60 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 transition-opacity duration-150"
-        aria-label="Drag to reorder"
+        className="p-1 rounded-sm text-muted-foreground/30 hover:text-muted-foreground hover:bg-surface-2 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 group-focus-within/preset:opacity-100 transition-opacity duration-150"
         title="Drag to reorder"
-        onClick={(e) => e.stopPropagation()}
         {...attributes}
         {...listeners}
+        aria-label={`Reorder ${preset.name}`}
       >
         <GripVertical className="size-3.5" />
       </button>
+      {/* The row body is one button, so Tab reaches it and Enter or Space
+          opens the editor. */}
+      <button
+        type="button"
+        onClick={onSelect}
+        aria-label={`Edit ${preset.name}`}
+        // Inset ring: the list clips anything drawn outside a row.
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-sm py-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
+      >
       {/* Glyph tile — the agent icon seated in a rounded tile, per the
           design's preset rows. */}
-      <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-muted/60">
+      <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-surface-2">
         <PresetIcon icon={preset.icon} className="size-3.5" />
       </span>
       <div className="flex-1 min-w-0">
@@ -2553,6 +3086,7 @@ function SortablePresetRow({
           </code>
         )}
       </div>
+      </button>
       <div className="flex items-center gap-0.5 shrink-0">
         {/* Delete sits to the LEFT of the pin so the pin stays anchored to
             the row's right edge — keeping it aligned across builtin rows
@@ -2562,11 +3096,9 @@ function SortablePresetRow({
             variant="ghost"
             size="icon-sm"
             title="Delete preset"
-            className="opacity-0 group-hover/preset:opacity-100 transition-opacity duration-150 hover:bg-destructive/10 hover:text-destructive"
-            onClick={(e) => {
-              e.stopPropagation();
-              onDelete();
-            }}
+            aria-label={`Delete preset ${preset.name}`}
+            className="opacity-0 group-hover/preset:opacity-100 group-focus-within/preset:opacity-100 transition-opacity duration-150 hover:bg-destructive/10 hover:text-destructive"
+            onClick={onDelete}
           >
             <Trash2 className="size-3.5" />
           </Button>
@@ -2575,14 +3107,15 @@ function SortablePresetRow({
           variant="ghost"
           size="icon-sm"
           title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
+          aria-label={`Pin ${preset.name} to the preset bar`}
+          aria-pressed={preset.pinned}
           className={cn(
             "transition-opacity duration-150",
-            preset.pinned ? "opacity-100" : "opacity-60 group-hover/preset:opacity-100",
+            preset.pinned
+              ? "opacity-100"
+              : "opacity-60 group-hover/preset:opacity-100 group-focus-within/preset:opacity-100",
           )}
-          onClick={(e) => {
-            e.stopPropagation();
-            onTogglePin();
-          }}
+          onClick={onTogglePin}
         >
           {preset.pinned ? (
             <Star className="size-3.5 fill-current text-foreground" />

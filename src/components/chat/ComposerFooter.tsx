@@ -2,6 +2,7 @@ import type { MessageDelivery } from "@/lib/agent-chat/message-delivery";
 import { MessageDeliveryPicker } from "./MessageDeliveryPicker";
 import {
   ArrowUp,
+  Network,
   Check,
   CornerDownRight,
   ListEnd,
@@ -10,7 +11,7 @@ import {
   Plus,
   Square,
 } from "lucide-react";
-import type { PointerEvent as ReactPointerEvent, ReactNode } from "react";
+import type { PointerEvent as ReactPointerEvent, ReactNode, Ref } from "react";
 
 import { cn } from "@/lib/utils";
 import type { ChatMode } from "@/stores/agent-chat-store";
@@ -22,6 +23,7 @@ import type {
 } from "@/tauri/types";
 
 import { ContextUsageMeter } from "./ContextUsageMeter";
+import { useStopTooltip } from "./composer-interrupt";
 import { FOOTER_SEPARATOR } from "./pickers/footer-trigger";
 import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
@@ -54,7 +56,7 @@ interface Props {
   permissionMode: string | null;
   effort: string | null;
   contextWindow: string | null;
-  fastMode?: boolean;
+  serviceTier?: string;
   activeModel: ChatModelInfo | null;
   effortLabelMap: Record<string, string>;
   permissionModes: PermissionModeOption[] | null;
@@ -84,7 +86,7 @@ interface Props {
   onPermissionModeChange: (mode: string) => void;
   onEffortChange: (effort: string) => void;
   onContextWindowChange: (value: string) => void;
-  onFastModeChange?: (fastMode: boolean) => void;
+  onServiceTierChange?: (serviceTier: string) => void;
   onSubmit: () => void;
   onBackgroundSubmit?: () => void;
   onStop: () => void;
@@ -108,19 +110,25 @@ interface Props {
   tasks?: { completed: number; total: number; running?: boolean } | null;
   tasksOpen?: boolean;
   onTasksClick?: () => void;
+  onWorkflowsClick?: () => void;
+  workflowsOpen?: boolean;
   /** Content for the flexible gap between the attach button and the
    *  right-pinned controls: the placeholder while the pill is collapsed,
    *  "Enter to queue" while expanded. */
   gap?: ReactNode;
   /** Pointer-down on the gap — the composer focuses its textarea. */
   onGapPointerDown?: (e: ReactPointerEvent<HTMLDivElement>) => void;
+  /** The gap element, measured by the composer to fit the row. */
+  gapRef?: Ref<HTMLDivElement>;
   /** The context ring lives in the expanded card only. Defaults to true. */
   showContextMeter?: boolean;
   /** Width ladder: model label shortens to its leaf name. */
   modelLeafLabel?: boolean;
+  /** Width ladder: provider/model control keeps only its provider mark. */
+  modelIconOnly?: boolean;
   /** Width ladder: effort drops its text label. */
   effortIconOnly?: boolean;
-  /** Width ladder: access drops its text label. */
+  /** Width ladder: access, tasks and delivery drop their text labels. */
   accessIconOnly?: boolean;
   /** Width ladder: effort + access leave the row for the `+` menu. */
   configInMenu?: boolean;
@@ -139,7 +147,7 @@ export function ComposerFooter({
   permissionMode,
   effort,
   contextWindow,
-  fastMode = false,
+  serviceTier = "default",
   activeModel,
   effortLabelMap,
   permissionModes,
@@ -158,7 +166,7 @@ export function ComposerFooter({
   onPermissionModeChange,
   onEffortChange,
   onContextWindowChange,
-  onFastModeChange = () => {},
+  onServiceTierChange = () => {},
   onSubmit,
   onBackgroundSubmit,
   onStop,
@@ -174,15 +182,20 @@ export function ComposerFooter({
   tasks = null,
   tasksOpen = false,
   onTasksClick,
+  onWorkflowsClick,
+  workflowsOpen = false,
   gap = null,
   onGapPointerDown,
+  gapRef,
   showContextMeter = true,
   modelLeafLabel = false,
+  modelIconOnly = false,
   effortIconOnly = false,
   accessIconOnly = false,
   configInMenu = false,
 }: Props) {
   const modeIsActive = mode !== "default";
+  const stopTooltip = useStopTooltip();
 
   return (
     <div
@@ -214,6 +227,7 @@ export function ComposerFooter({
       )}
 
       <div
+        ref={gapRef}
         data-testid="composer-gap"
         onPointerDown={onGapPointerDown}
         // Reserve the meter's space even while collapsed, so it cannot
@@ -240,6 +254,9 @@ export function ComposerFooter({
       </div>
 
       <div className="flex min-w-0 items-center gap-1">
+        {onWorkflowsClick && (
+          <button type="button" data-testid="composer-workflows-toggle" aria-label="Open dynamic workflows" aria-pressed={workflowsOpen} title="Dynamic workflows" onClick={onWorkflowsClick} className={cn("inline-flex size-[28px] shrink-0 items-center justify-center rounded-lg transition-colors duration-100", workflowsOpen ? "bg-surface-3 text-foreground" : "text-muted-foreground hover:bg-muted/60 hover:text-foreground")}><Network className="size-3.5" aria-hidden /></button>
+        )}
         {tasks && tasks.total > 0 && onTasksClick && (
           <>
             {/* Reports run state rather than reading as a setting: amber +
@@ -251,13 +268,13 @@ export function ComposerFooter({
               data-testid="composer-tasks-toggle"
               aria-pressed={tasksOpen}
               aria-label={
-                modelLeafLabel
+                accessIconOnly
                   ? `Tasks: ${tasks.completed} of ${tasks.total} complete`
                   : undefined
               }
               className={cn(
                 "inline-flex h-[30px] shrink-0 items-center gap-1.5 rounded-md border-0 px-2 text-body-sm font-medium leading-none transition-colors duration-150",
-                modelLeafLabel && "w-[30px] justify-center px-0",
+                accessIconOnly && "w-[30px] justify-center px-0",
                 tasks.running
                   ? "bg-status-working/8 text-status-working hover:bg-status-working/15"
                   : tasks.completed === tasks.total
@@ -275,7 +292,7 @@ export function ComposerFooter({
               ) : (
                 <ListTodo className="size-3.5" aria-hidden />
               )}
-              {!modelLeafLabel && (
+              {!accessIconOnly && (
                 <>
                   <span>Tasks</span>
                   <span className="text-label tabular-nums opacity-70">
@@ -299,6 +316,7 @@ export function ComposerFooter({
             disabled={configurationDisabled}
             openSignal={modelPickerOpenSignal}
             leafLabel={modelLeafLabel}
+            iconOnly={modelIconOnly}
           />
         ) : (
           <ModelPicker
@@ -308,6 +326,7 @@ export function ComposerFooter({
             disabled={configurationDisabled}
             openSignal={modelPickerOpenSignal}
             leafLabel={modelLeafLabel}
+            iconOnly={modelIconOnly}
           />
         )}
         {!configInMenu && provider !== "acp" && (
@@ -318,10 +337,10 @@ export function ComposerFooter({
               contextWindowValue={contextWindow}
               labelMap={effortLabelMap}
               ultrathinkInBodyText={ultrathinkInBodyText}
-              fastMode={fastMode}
+              serviceTier={serviceTier}
               onEffortChange={onEffortChange}
               onContextWindowChange={onContextWindowChange}
-              onFastModeChange={onFastModeChange}
+              onServiceTierChange={onServiceTierChange}
               disabled={configurationDisabled}
               withSeparator
               iconOnly={effortIconOnly}
@@ -340,7 +359,7 @@ export function ComposerFooter({
           </>
         )}
 
-        {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} />}
+        {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} iconOnly={accessIconOnly} />}
         {streaming && onDeliveryChange && hasDraft ? (
           // One action slot, as in t3code: with a draft, the slot sends it
           // (queue / steer / interrupt); otherwise it's Stop.
@@ -369,7 +388,7 @@ export function ComposerFooter({
               "transition-[transform,background-color,color] duration-150 hover:scale-105 hover:bg-destructive active:scale-100",
             )}
             aria-label="Stop"
-            title="Stop"
+            title={stopTooltip}
           >
             <Square className="size-3" fill="currentColor" />
           </button>

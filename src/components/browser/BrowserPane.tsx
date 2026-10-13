@@ -7,7 +7,7 @@ import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
 import { Button } from "@/components/ui/button";
 import { BrowserToolbar } from "./BrowserToolbar";
 import { InspectorPanel } from "./InspectorPanel";
-import { Loader2, Globe, RotateCw, Copy } from "lucide-react";
+import { Globe, RotateCw, Copy } from "lucide-react";
 import type { AgentTarget, ElementInfo } from "./inspector";
 import {
   INSPECTOR_INJECT_SCRIPT,
@@ -45,6 +45,8 @@ import {
 } from "./stream-protocol";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
+import { Spinner } from "@/components/ui/spinner";
+import { isAppShortcut } from "@/lib/app-shortcuts";
 
 interface Props {
   browserId: string;
@@ -179,6 +181,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   const lastPointRef = useRef({ x: 0, y: 0 });
   const clickStateRef = useRef<ClickState | null>(null);
   const downButtonsRef = useRef<Set<CdpButton>>(new Set());
+  const appShortcutKeysRef = useRef(new Set<string>());
 
   // Cursor probe state
   const httpBaseRef = useRef<string | null>(null);
@@ -923,6 +926,8 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    const keyId = e.code || e.key.toLowerCase();
+    appShortcutKeysRef.current.delete(keyId);
     // Ctrl+Shift+I toggles element inspector
     if (e.ctrlKey && e.shiftKey && e.key === "I") {
       e.preventDefault();
@@ -930,7 +935,6 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       toggleInspector();
       return;
     }
-    if (e.ctrlKey && (e.key === "t" || e.key === "w" || e.key === "k")) return;
 
     const combo = (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey;
     const key = e.key.toLowerCase();
@@ -950,6 +954,13 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       e.preventDefault();
       e.stopPropagation();
       runBrowserNav(effectiveSessionId, shortcut).catch(console.error);
+      return;
+    }
+
+    // Browser chrome keeps its own controls, including page reload, ahead
+    // of app bindings such as the guard against reloading the interface.
+    if (isAppShortcut(e.nativeEvent)) {
+      appShortcutKeysRef.current.add(keyId);
       return;
     }
 
@@ -975,7 +986,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   };
 
   const handleKeyUp = (e: React.KeyboardEvent) => {
-    if (e.ctrlKey && (e.key === "t" || e.key === "w" || e.key === "k")) return;
+    // The action may change focus/state and modifiers may be released first.
+    // Match the keydown we yielded rather than rechecking applicability.
+    if (appShortcutKeysRef.current.delete(e.code || e.key.toLowerCase())) return;
     e.preventDefault();
     // handleKeyDown kept these from the page, so the page must not see a
     // release it never got a press for. Ctrl+L without a toolbar (the
@@ -1090,7 +1103,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
               </>
             ) : (
               <>
-                <Loader2 className="size-6 motion-safe:animate-spin text-muted-foreground mb-2" />
+                <Spinner className="size-6 text-muted-foreground mb-2" />
                 <p className="text-label text-muted-foreground">
                   {status === "starting" && "Starting browser..."}
                   {status === "connecting" && "Connecting to stream..."}
@@ -1124,7 +1137,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
               </>
             ) : (
               <>
-                <Loader2 className="size-3 motion-safe:animate-spin text-muted-foreground" />
+                <Spinner className="size-3 text-muted-foreground" />
                 <span className="text-label text-muted-foreground">Reconnecting…</span>
               </>
             )}

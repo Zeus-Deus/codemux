@@ -91,4 +91,13 @@ describe("resolveRightPanelWidth", () => {
     expect(resolveRightPanelWidth(700, 990)).toBe(700);
     expect(resolveRightPanelWidth(5000, 990)).toBe(maxRightPanelWidth(990));
   });
+
+  it("caps a stored width that would squeeze the content", () => {
+    // min(800 * 0.75, 800 - 240) = 560
+    expect(resolveRightPanelWidth(3000, 800)).toBe(560);
+  });
+
+  it("uses the stored width until the row is measured", () => {
+    expect(resolveRightPanelWidth(900, 0)).toBe(900);
+  });
 });

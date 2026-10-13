@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Loader2, Search } from "lucide-react";
+import { Search } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ThemeSchemeBadge } from "./theme-swatches";
 import {
@@ -8,6 +8,7 @@ import {
   type MarketplaceTheme,
   type MarketplaceThemeVariant,
 } from "@/tauri/commands";
+import { Spinner } from "@/components/ui/spinner";
 
 const DEBOUNCE_MS = 350;
 
@@ -109,7 +110,7 @@ export function ThemeMarketplacePanel({
           aria-label="Search the VS Code Marketplace"
           className="min-w-0 flex-1 bg-transparent text-body-sm text-foreground outline-none placeholder:text-muted-foreground/60"
         />
-        {searching && <Loader2 className="size-3 flex-none animate-spin text-muted-foreground" />}
+        {searching && <Spinner className="size-3 flex-none text-muted-foreground" />}
       </label>
 
       {error && (
@@ -148,7 +149,7 @@ export function ThemeMarketplacePanel({
                     </span>
                   </span>
                   {open && loadingVariants && (
-                    <Loader2 className="size-3 flex-none animate-spin text-muted-foreground" />
+                    <Spinner className="size-3 flex-none text-muted-foreground" />
                   )}
                   {open && variants && (
                     <span className="flex-none font-mono text-caption text-muted-foreground">

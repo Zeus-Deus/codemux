@@ -1,6 +1,11 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render as rtlRender, screen } from "@testing-library/react";
+import { TooltipProvider } from "@/components/ui/tooltip";
+
+// Tooltips need the provider `main.tsx` mounts around the whole app.
+const render = (ui: Parameters<typeof rtlRender>[0]) =>
+  rtlRender(ui, { wrapper: TooltipProvider });
 
 import type {
   PresetStoreSnapshot,
@@ -15,7 +20,11 @@ const mocks = vi.hoisted(() => ({
   applyPreset: vi.fn().mockResolvedValue(undefined),
   createTab: vi.fn().mockResolvedValue("tab-new"),
   createBrowserPane: vi.fn().mockResolvedValue("pane-b"),
+  getPresetAvailability: vi
+    .fn<() => Promise<Record<string, boolean>>>()
+    .mockResolvedValue({}),
   setShowSettings: vi.fn(),
+  launcherOpenRequest: 0,
   launchDraftWithPreset: vi.fn().mockResolvedValue({
     success: true,
     workspaceId: "ws-new",
@@ -33,6 +42,7 @@ vi.mock("@/tauri/commands", () => ({
   applyPreset: (...a: unknown[]) => mocks.applyPreset(...a),
   createTab: (...a: unknown[]) => mocks.createTab(...a),
   createBrowserPane: (...a: unknown[]) => mocks.createBrowserPane(...a),
+  getPresetAvailability: () => mocks.getPresetAvailability(),
 }));
 
 vi.mock("@/lib/agent-chat/draft-preset-launch", () => ({
@@ -41,15 +51,19 @@ vi.mock("@/lib/agent-chat/draft-preset-launch", () => ({
 
 vi.mock("@/lib/toast", () => ({
   toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
+  reportFailure: () => vi.fn(),
 }));
 
 vi.mock("@/stores/ui-store", () => ({
-  useUIStore: Object.assign(vi.fn(), {
-    getState: () => ({ setShowSettings: mocks.setShowSettings }),
-  }),
+  useUIStore: Object.assign(
+    (select: (s: { launcherOpenRequest: number }) => unknown) =>
+      select({ launcherOpenRequest: mocks.launcherOpenRequest }),
+    { getState: () => ({ setShowSettings: mocks.setShowSettings }) },
+  ),
 }));
 
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
+import { usePresetAvailabilityStore } from "@/hooks/use-preset-availability";
 import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
 import { AgentLauncher, DraftAgentLauncher } from "./agent-launcher";
 
@@ -169,6 +183,9 @@ beforeEach(() => {
   mocks.createBrowserPane.mockClear();
   mocks.launchDraftWithPreset.mockClear();
   mocks.setShowSettings.mockClear();
+  mocks.getPresetAvailability.mockReset().mockResolvedValue({});
+  usePresetAvailabilityStore.setState({ installed: {} });
+  mocks.launcherOpenRequest = 0;
   localStorage.clear();
   useTitlebarPinsStore.setState({ pinnedIds: [] });
 });
@@ -180,6 +197,23 @@ afterEach(() => {
 });
 
 describe("AgentLauncher", () => {
+  it("opens for a launcher shortcut pressed after mount, not for an older one", () => {
+    mocks.launcherOpenRequest = 3;
+    const view = render(<AgentLauncher workspace={makeWorkspace()} />);
+    expect(screen.queryByTestId("agent-launcher-popover")).not.toBeInTheDocument();
+
+    mocks.launcherOpenRequest = 4;
+    view.rerender(<AgentLauncher workspace={makeWorkspace()} />);
+    expect(screen.getByTestId("agent-launcher-popover")).toBeInTheDocument();
+  });
+
+  it("ignores the launcher shortcut in the mobile sheet", () => {
+    const view = render(<AgentLauncher workspace={makeWorkspace()} mobile />);
+    mocks.launcherOpenRequest = 1;
+    view.rerender(<AgentLauncher workspace={makeWorkspace()} mobile />);
+    expect(screen.queryByTestId("agent-launcher-popover")).not.toBeInTheDocument();
+  });
+
   it("offers chat and utility panes on mobile without CLI presets or titlebar controls", async () => {
     render(<AgentLauncher workspace={makeWorkspace()} mobile />);
     openLauncher();
@@ -205,6 +239,62 @@ describe("AgentLauncher", () => {
     expect(screen.getByText("Terminal")).toBeInTheDocument();
     expect(screen.getByText("Browser")).toBeInTheDocument();
     expect(screen.getByText("Manage presets…")).toBeInTheDocument();
+  });
+
+  it("marks CLI agents that are not installed, re-checking on every open", async () => {
+    mocks.getPresetAvailability.mockResolvedValue({
+      "builtin-claude": true,
+      "builtin-codex": false,
+    });
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    await act(async () => {
+      openLauncher();
+    });
+
+    expect(mocks.getPresetAvailability).toHaveBeenCalledTimes(1);
+    const codex = screen.getByTestId("launcher-cli-builtin-codex");
+    expect(codex).toHaveAttribute("data-installed", "false");
+    expect(
+      screen.getByTestId("launcher-destination-builtin-codex"),
+    ).toHaveTextContent("not installed");
+    expect(screen.getByTestId("launcher-cli-builtin-claude")).toHaveAttribute(
+      "data-installed",
+      "true",
+    );
+    expect(
+      screen.getByTestId("launcher-destination-builtin-claude"),
+    ).toHaveTextContent("terminal");
+
+    // Still selectable: launching explains why it cannot start.
+    act(() => {
+      fireEvent.click(codex);
+    });
+    expect(mocks.applyPreset).toHaveBeenCalledWith(
+      "ws-1",
+      "builtin-codex",
+      "new_tab",
+      null,
+      null,
+    );
+
+    await act(async () => {
+      openLauncher();
+    });
+    expect(mocks.getPresetAvailability).toHaveBeenCalledTimes(2);
+  });
+
+  it("treats an unchecked preset as installed when the probe fails", async () => {
+    mocks.getPresetAvailability.mockRejectedValue(new Error("ipc"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    await act(async () => {
+      openLauncher();
+    });
+    expect(screen.getByTestId("launcher-cli-builtin-codex")).toHaveAttribute(
+      "data-installed",
+      "true",
+    );
+    warn.mockRestore();
   });
 
   it("uses the 1a trailing slot, scrollbar, fades, and sticky footer", () => {
@@ -449,6 +539,23 @@ describe("DraftAgentLauncher", () => {
     expect(mocks.setShowSettings).toHaveBeenCalledWith(true, "presets");
   });
 
+  it("marks CLI agents that are not installed in the draft launcher", async () => {
+    mocks.getPresetAvailability.mockResolvedValue({ "builtin-codex": false });
+    render(<DraftAgentLauncher draft={makeDraft()} />);
+    await act(async () => {
+      openDraftLauncher();
+    });
+    expect(
+      screen.getByTestId("draft-launcher-cli-builtin-codex"),
+    ).toHaveAttribute("data-installed", "false");
+    expect(
+      screen.getByTestId("launcher-destination-draft-builtin-codex"),
+    ).toHaveTextContent("not installed");
+    expect(
+      screen.getByTestId("launcher-destination-draft-builtin-claude"),
+    ).toHaveTextContent("terminal");
+  });
+
   it("materialises the draft with the chosen CLI preset", () => {
     render(<DraftAgentLauncher draft={makeDraft()} />);
     openDraftLauncher();
@@ -486,6 +593,27 @@ describe("DraftAgentLauncher", () => {
   it("disables the trigger while the draft is promoting", () => {
     render(<DraftAgentLauncher draft={makeDraft({ promoting: true })} />);
     expect(screen.getByTestId("draft-agent-launcher-trigger")).toBeDisabled();
+  });
+
+  it("keeps chat presets but disables CLI presets for a draft on a device", () => {
+    render(<DraftAgentLauncher draft={makeDraft({ hostId: 2 })} />);
+    openDraftLauncher();
+    const cli = screen.getByTestId("draft-launcher-cli-builtin-claude");
+    expect(cli).toHaveAttribute("data-disabled", "true");
+    expect(
+      screen.getByTestId("launcher-destination-draft-builtin-claude"),
+    ).toHaveTextContent("local only");
+    act(() => {
+      fireEvent.click(cli);
+    });
+    expect(mocks.launchDraftWithPreset).not.toHaveBeenCalled();
+
+    act(() => {
+      fireEvent.click(
+        screen.getByTestId("draft-launcher-gui-builtin-chat-agent"),
+      );
+    });
+    expect(mocks.launchDraftWithPreset).toHaveBeenCalledTimes(1);
   });
 });
 

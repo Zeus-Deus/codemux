@@ -22,6 +22,7 @@ import type {
 import type { AgentChatEventPayload, ApprovalDecision } from "./events";
 import type {
   UserSettings,
+  SettingsPersistence,
   PresetLaunchConfig,
   AppStateSnapshot,
   AuthResponse,
@@ -45,6 +46,7 @@ import type {
   GitLogEntry,
   CommitFileEntry,
   CommitSummary,
+  PrDescriptionDraft,
   HandoffPacket,
   LaunchMode,
   ProviderDiagnostic,
@@ -76,6 +78,7 @@ import type {
   WorktreeInfo,
   ProjectScripts,
   DetectedSetup,
+  RunCandidate,
   WebRemoteStatus,
   WebRemoteEndpoint,
   WebRemoteSessionView,
@@ -84,6 +87,31 @@ import type {
   WebRemoteRegistrationStatus,
   NativePerformanceDiagnostics,
 } from "./types";
+
+// ── Outside-assistant MCP connector ──
+
+async function invokeAgentConnector<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (isRemoteClient()) throw new Error("Manage connections from the desktop.");
+  return args ? invoke<T>(command, args) : invoke<T>(command);
+}
+
+export const agentConnectorStatus = () =>
+  invokeAgentConnector<import("./types").AgentConnectorStatus>("agent_connector_status");
+
+export const agentConnectorSetConfig = (config: { enabled: boolean; publicOrigin: string | null }) =>
+  invokeAgentConnector<import("./types").AgentConnectorStatus>("agent_connector_set_config", {
+    enabled: config.enabled,
+    publicOrigin: config.publicOrigin,
+  });
+
+export const agentConnectorApprove = (requestId: string, access: import("./types").AgentConnectorAccess) =>
+  invokeAgentConnector<void>("agent_connector_approve", { requestId, access });
+
+export const agentConnectorDeny = (requestId: string) =>
+  invokeAgentConnector<void>("agent_connector_deny", { requestId });
+
+export const agentConnectorRevoke = (clientId: string) =>
+  invokeAgentConnector<void>("agent_connector_revoke", { clientId });
 
 /** Bounded, identifier-free native latency summaries for support reports. */
 export const getPerformanceDiagnostics = () =>
@@ -257,16 +285,16 @@ export const importSkillsFromFile = (filePath: string) =>
 // ── Settings Sync ──
 
 export const getSyncedSettings = () =>
-  invoke<UserSettings>("get_synced_settings");
+  invoke<SettingsPersistence>("get_synced_settings");
 
 export const updateSyncedSettings = (settings: UserSettings) =>
-  invoke<UserSettings>("update_synced_settings", { settings });
+  invoke<SettingsPersistence>("update_synced_settings", { settings });
 
 export const updateSetting = (section: string, key: string, value: unknown) =>
-  invoke<UserSettings>("update_setting", { section, key, value });
+  invoke<SettingsPersistence>("update_setting", { section, key, value });
 
 export const resetSyncedSettings = () =>
-  invoke<UserSettings>("reset_synced_settings");
+  invoke<SettingsPersistence>("reset_synced_settings");
 
 // ── Resource Monitor ──
 
@@ -371,9 +399,11 @@ export const getOrCreateHomeWorkspace = () =>
 
 export const listChatProviderCapabilities = (
   provider: AgentChatProviderKind,
+  force?: boolean,
 ) =>
   invoke<ProviderChatCapabilities>("list_chat_provider_capabilities", {
     provider,
+    force,
   });
 
 /** Probe the health of a chat provider's local runtime (installed /
@@ -383,6 +413,13 @@ export const listChatProviderCapabilities = (
  *  store rather than invoking per render. */
 export const agentChatProviderHealth = (provider: AgentChatProviderKind) =>
   invoke<ProviderHealthReport>("agent_chat_provider_health", { provider });
+
+/** Open a terminal tab in `workspaceId` running `provider`'s sign-in
+ *  command. The backend picks the command; callers only name the provider. */
+export const openProviderLoginTerminal = (
+  workspaceId: string,
+  provider: AgentChatProviderKind,
+) => invoke("open_provider_login_terminal", { workspaceId, provider });
 
 /** Gemini launch-time model list. Backend serves a live harvest when
  *  `GEMINI_API_KEY` is set, otherwise the maintained fallback. Either
@@ -473,6 +510,10 @@ export const cyclePane = (step: number) =>
 
 export const closePane = (paneId: string) =>
   invoke<string | null>("close_pane", { paneId });
+
+/** Capture and shut down the provider session before removing its pane. */
+export const agentChatClosePane = (paneId: string) =>
+  invoke<void>("agent_chat_close_pane", { paneId });
 
 export const swapPanes = (sourcePaneId: string, targetPaneId: string) =>
   invoke("swap_panes", { sourcePaneId, targetPaneId });
@@ -684,6 +725,9 @@ export const runProjectDevCommand = (workspaceId: string, forceNew?: boolean) =>
 
 export const detectPackageManager = (projectPath: string) =>
   invoke<DetectedSetup[]>("detect_package_manager", { projectPath });
+
+export const detectRunCandidates = (projectPath: string) =>
+  invoke<RunCandidate[]>("detect_run_candidates", { projectPath });
 
 export const reorderWorkspaces = (workspaceIds: string[]) =>
   invoke("reorder_workspaces", { workspaceIds });
@@ -1162,6 +1206,23 @@ export const generateAiCommitMessage = (
   model: string | null = null,
 ) => invoke<string>("generate_ai_commit_message", { path, cli, model });
 
+/** Drafts a pull request title and description from the branch's
+ *  commits and diff against `base`, through the utility CLI. */
+export const generateAiPrDescription = (
+  path: string,
+  base: string,
+  template: string | null,
+  cli: string | null = null,
+  model: string | null = null,
+) =>
+  invoke<PrDescriptionDraft>("generate_ai_pr_description", {
+    path,
+    base,
+    template,
+    cli,
+    model,
+  });
+
 export const setAiCommitMessageEnabled = (enabled: boolean) =>
   invoke("set_ai_commit_message_enabled", { enabled });
 
@@ -1269,6 +1330,11 @@ export const getShellAppearance = () =>
 export const getPresets = () =>
   invoke<PresetStoreSnapshot>("get_presets");
 
+/** Whether each CLI preset's agent binary is installed, keyed by preset id.
+ *  The same PATH check `apply_preset` runs before launching. */
+export const getPresetAvailability = () =>
+  invoke<Record<string, boolean>>("get_preset_availability");
+
 export const createPreset = (params: {
   name: string;
   description: string | null;
@@ -1371,6 +1437,12 @@ export const resumePtyOutput = (sessionId: string, generation?: number) =>
  *  they already had rather than clearing. See `terminal_session_cwds`. */
 export const terminalSessionCwds = (sessionIds: string[]) =>
   invoke<Record<string, string>>("terminal_session_cwds", { sessionIds });
+
+/** `session_id -> command name` for the sessions whose shell is running a
+ *  foreground job (a dev server, a build, an agent CLI). Idle shells, remote
+ *  panes and non-Linux hosts are omitted. See `terminal_foreground_jobs`. */
+export const terminalForegroundJobs = (sessionIds: string[]) =>
+  invoke<Record<string, string>>("terminal_foreground_jobs", { sessionIds });
 
 /** Attach an output subscriber to a session's PTY stream. Resolves with the
  *  subscriber generation token, which must be handed to `detachPtyOutput` /
@@ -1600,7 +1672,7 @@ export interface AgentChatStartSessionInput {
   /** Claude only — context-window selector (e.g. "1m" adds [1m] bracket). */
   context_window?: string | null;
   /** Premium provider speed tier. Capability-gated by the active model. */
-  fast_mode?: boolean;
+  service_tier?: string;
   additional_directories: string[];
   env: Record<string, string> | null;
   extra?: unknown;
@@ -1944,11 +2016,11 @@ export const agentChatSetModel = (
   model: string | null,
 ) => invoke<void>("agent_chat_set_model", { provider, threadId, model });
 
-export const agentChatSetFastMode = (
+export const agentChatSetServiceTier = (
   provider: AgentChatProviderKind,
   threadId: string,
-  fastMode: boolean,
-) => invoke<void>("agent_chat_set_fast_mode", { provider, threadId, fastMode });
+  serviceTier: string,
+) => invoke<void>("agent_chat_set_service_tier", { provider, threadId, serviceTier });
 
 export const agentChatSetPermissionMode = (
   provider: AgentChatProviderKind,
@@ -1994,7 +2066,7 @@ export interface AgentChatSessionRecord {
   effort: string | null;
   context_window: string | null;
   permission_mode: string | null;
-  fast_mode?: boolean;
+  service_tier?: string;
 }
 
 /** Provider-neutral conversation row for the composer's `@session:` picker.
@@ -2069,7 +2141,7 @@ export interface AgentChatSessionConfigUpdate {
   effort?: string | null;
   context_window?: string | null;
   permission_mode?: string | null;
-  fast_mode?: boolean;
+  service_tier?: string;
 }
 
 export const agentChatListSessions = (
@@ -2303,6 +2375,12 @@ export const agentChatRevertTurnCheckpoint = (
     "agent_chat_revert_turn_checkpoint",
     { threadId, turnIndex },
   );
+
+/** Bring back the workspace files the last turn revert replaced, from its
+ *  safety snapshot. The conversation stays rewound. Refused once a newer turn
+ *  has started. */
+export const agentChatUndoTurnRevert = (threadId: string) =>
+  invoke<void>("agent_chat_undo_turn_revert", { threadId });
 
 /**
  * Register a per-thread `Channel` that receives every live
@@ -2975,9 +3053,9 @@ export interface HostStatusView {
   reachable: boolean;
   /** ISO timestamp of the last successful probe; null if never reached. */
   last_seen_at: string | null;
-  /** Last probe problem: the unreachable reason, or — while reachable — a
-   *  degraded note such as the host agent being missing or the inventory
-   *  failing. Null when clean. */
+  /** Last probe problem: the unreachable reason, or — while reachable —
+   *  why the device needs setup (host agent missing, damaged or out of
+   *  date). Null when clean. */
   last_error: string | null;
   /** Sum of the host's workspace directories in bytes; null if unknown. */
   disk_bytes: number | null;
@@ -3031,6 +3109,13 @@ export const hostsBootstrapInstall = (id: number, uname: string) =>
  *  Test connection is required. */
 export const hostsReinstallRemote = (id: number) =>
   invoke<HostBootstrapResult>("hosts_reinstall_remote", { id });
+
+/** This machine's hostname, shown as the local device ("ai-node"). */
+export const getLocalDeviceName = () => invoke<string>("get_local_device_name");
+
+/** Host aliases from `~/.ssh/config`, offered as suggestions when adding a
+ *  device. Wildcard patterns are skipped. */
+export const hostsSshConfigHosts = () => invoke<string[]>("hosts_ssh_config_hosts");
 
 // ── Automations (scheduled agent runs) ──
 //
@@ -3333,6 +3418,38 @@ export interface OpenOnHostOutcome {
  *  re-activates the existing local view. */
 export const workspaceOpenOnHost = (syncRowId: number) =>
   invoke<OpenOnHostOutcome>("workspace_open_on_host", { syncRowId });
+
+export interface CreateWorkspaceOnHostRequest {
+  hostId: number;
+  /** Local project root that identifies the repo. The device gets its own
+   *  checkout from the project's git remote (cloned on first use). `null`
+   *  starts in the device's home directory. */
+  projectPath: string | null;
+  /** Worktree branch to create on the device when `newBranch`. */
+  branch: string | null;
+  /** Create a new worktree; false works in the device's checkout. */
+  newBranch: boolean;
+  /** Branch the new worktree starts from; null = the repo default. */
+  baseBranch: string | null;
+  initialChat?: InitialChatPane;
+  select?: boolean;
+}
+
+/** Create a workspace that lives on a device: the checkout, terminals and
+ *  agent all run there. Returns the workspace id and its path on the
+ *  device. */
+export const createWorkspaceOnHost = (
+  req: CreateWorkspaceOnHostRequest,
+): Promise<WorkspaceCreateResult> =>
+  invoke<unknown>("create_workspace_on_host", {
+    hostId: req.hostId,
+    projectPath: req.projectPath,
+    branch: req.branch,
+    newBranch: req.newBranch,
+    baseBranch: req.baseBranch,
+    ...(req.initialChat ? { initialChat: req.initialChat } : {}),
+    ...(req.select !== undefined ? { select: req.select } : {}),
+  }).then(normalizeWorkspaceCreate);
 
 // ── Web Remote Access ──
 //

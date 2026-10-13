@@ -1,14 +1,25 @@
+import { useEffect } from "react";
 import { create } from "zustand";
 import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
 import {
   capabilityDefaults,
   defaultModelId,
 } from "@/lib/agent-chat/capability-defaults";
+import {
+  NEW_CHAT_SETTING_KEYS,
+  resolveNewChatModelDefaults,
+} from "@/lib/agent-chat/new-chat-defaults";
+import { getNewChatCheckout, useSettingsStore } from "@/stores/settings-store";
+import { useAppStore } from "@/stores/app-store";
 import { discardStagedImage } from "@/lib/agent-chat/image-staging";
 import {
   useAgentChatStore,
   type ChatMode,
 } from "@/stores/agent-chat-store";
+import {
+  selectCapabilities,
+  useProviderCapabilities,
+} from "@/stores/provider-capabilities-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
 
@@ -28,9 +39,13 @@ export interface ChatDraft {
   target: DraftTarget;
   provider: AgentChatProviderKind;
   model: string | null;
+  /** True only for an automatic model seeded before capabilities loaded.
+   *  Explicit picks clear this persisted marker. Missing means a legacy
+   *  draft of unknown provenance, whose model must be preserved. */
+  bootstrapModel?: boolean;
   effort: string | null;
   contextWindow: string | null;
-  fastMode?: boolean;
+  serviceTier?: string;
   permissionMode: string | null;
   /** Composer mode pill carried through draft → slice on materialise.
    *  `default` renders no pill. Drafts can pre-select a mode before
@@ -109,6 +124,11 @@ export interface ChatDraft {
    *  it once branches load, mirroring the branch popover's
    *  main/master/first-branch heuristic). */
   baseBranch?: string;
+  /** Device (`HostView.id`) the first send creates the thread on; null =
+   *  this device. Ignored for `existing_workspace` targets, whose own
+   *  `host_id` decides. Optional so older persisted drafts deserialize
+   *  unchanged. */
+  hostId?: number | null;
 }
 
 export interface ChatDraftStore {
@@ -142,12 +162,14 @@ export interface ChatDraftStore {
         | "model"
         | "effort"
         | "contextWindow"
-        | "fastMode"
+        | "serviceTier"
         | "permissionMode"
         | "mode"
         | "checkoutMode"
         | "worktreeName"
         | "baseBranch"
+        | "hostId"
+        | "lockedToHome"
       >
     >,
   ) => void;
@@ -177,6 +199,10 @@ export interface ChatDraftStore {
    *  inherit them. */
   discardDraft: (draftId: DraftId) => void;
   clearDraft: (draftId: DraftId) => void;
+  /** Re-seed every untouched draft (no text, no attachments, not sent)
+   *  from the current new-chat settings, so changing the default in
+   *  Settings shows up in the composer that is already open. */
+  applyNewChatDefaults: () => void;
   /** When `projectPath === homeDir`, also sweeps home-target
    *  drafts so closing the sidebar's Home group clears the draft
    *  that would otherwise respawn on next "+" click. Pass `null`
@@ -190,7 +216,8 @@ const STORAGE_KEY = "codemux:chat-drafts:v1";
 // the pre-flip `contextWindow: "200k"` seed. On v1→v2 we drop the
 // persisted draft set so the next `getOrCreate*Draft` call re-seeds
 // from the current `capabilityDefaults` (1M on multi-option models).
-const STORAGE_VERSION = 2;
+// v3 preserves draft contents while migrating the legacy Fast flag to a tier.
+const STORAGE_VERSION = 3;
 
 function newDraftId(): DraftId {
   return randomUUID() as DraftId;
@@ -262,30 +289,59 @@ function discardDraftRuntime(draft: ChatDraft): void {
   chat.resetThread(draft.threadId);
 }
 
+type NewChatConfig = Pick<
+  ChatDraft,
+  | "provider"
+  | "model"
+  | "bootstrapModel"
+  | "effort"
+  | "contextWindow"
+  | "serviceTier"
+  | "permissionMode"
+  | "checkoutMode"
+>;
+
+function newChatConfig(): NewChatConfig {
+  // The user's Settings → Agent → New chats choice (Claude on its default
+  // model when unset), then fully configured from the capabilities store:
+  // the model's `default_effort` unless a saved effort applies, its
+  // default context-window option and the provider's default permission
+  // mode. Drafts entering the composer with non-null effort/contextWindow
+  // means the Effort and ContextWindow pickers render from minute zero —
+  // and the slice materialize seeds inherits the same values, so pickers
+  // stay visible post-first-send too (Stage C Effort-lock fix).
+  const choice = resolveNewChatModelDefaults();
+  const defaults = capabilityDefaults(choice.provider, choice.model);
+  const settings = useSettingsStore.getState().settings;
+  const savedModel =
+    settings[NEW_CHAT_SETTING_KEYS.provider] === choice.provider
+      ? settings[NEW_CHAT_SETTING_KEYS.model]
+      : null;
+  const roster = selectCapabilities(
+    useProviderCapabilities.getState(),
+    choice.provider,
+  )?.models;
+  return {
+    provider: choice.provider,
+    model: defaults.model,
+    bootstrapModel: !savedModel && !roster?.length,
+    effort: choice.effort ?? defaults.effort,
+    contextWindow: defaults.contextWindow,
+    serviceTier: "default",
+    permissionMode: defaults.permissionMode,
+    checkoutMode: getNewChatCheckout(),
+  };
+}
+
 function makeDraft(
   target: DraftTarget,
   opts: { lockedToHome?: boolean } = {},
 ): ChatDraft {
-  const provider: AgentChatProviderKind = "claude";
-  // Fully-configure the draft from the capabilities store: default
-  // model + its `default_effort` + its default context-window option
-  // + the provider's default permission mode. Drafts entering the
-  // composer with non-null effort/contextWindow means the Effort and
-  // ContextWindow pickers render from minute zero — and the slice
-  // materialize seeds inherits the same values, so pickers stay
-  // visible post-first-send too (Stage C Effort-lock fix).
-  const modelId = defaultModelId(provider);
-  const defaults = capabilityDefaults(provider, modelId);
   return {
+    ...newChatConfig(),
     draftId: newDraftId(),
     createdAt: new Date().toISOString(),
     target,
-    provider,
-    model: defaults.model,
-    effort: defaults.effort,
-    contextWindow: defaults.contextWindow,
-    fastMode: false,
-    permissionMode: defaults.permissionMode,
     mode: "default",
     inputDraft: "",
     threadId: newThreadId(),
@@ -294,9 +350,9 @@ function makeDraft(
     promoting: false,
     lastSendError: null,
     lockedToHome: opts.lockedToHome ?? false,
-    checkoutMode: "worktree",
     worktreeName: "",
     baseBranch: "",
+    hostId: null,
   };
 }
 
@@ -490,10 +546,31 @@ export const useChatDraftStore = create<ChatDraftStore>()(
         set((s) => {
           const existing = s.draftsById[draftId];
           if (!existing) return s;
+          // A provider-only switch chooses its automatic default. A model
+          // field is an explicit pick, even if its id equals the fallback.
+          const automaticProvider =
+            config.provider && config.provider !== existing.provider &&
+            !("model" in config) ? config.provider : null;
+          const automaticConfig = automaticProvider
+            ? {
+                ...capabilityDefaults(automaticProvider, defaultModelId(automaticProvider)),
+                bootstrapModel: !selectCapabilities(
+                  useProviderCapabilities.getState(),
+                  automaticProvider,
+                )?.models.length,
+              }
+            : {};
           return {
             draftsById: {
               ...s.draftsById,
-              [draftId]: { ...existing, ...config },
+              [draftId]: {
+                ...existing,
+                ...automaticConfig,
+                ...config,
+                ...("model" in config
+                  ? { bootstrapModel: false }
+                  : {}),
+              },
             },
           };
         }),
@@ -616,6 +693,21 @@ export const useChatDraftStore = create<ChatDraftStore>()(
         });
       },
 
+      applyNewChatDefaults: () =>
+        set((s) => {
+          const untouched = Object.values(s.draftsById).filter(
+            (draft) =>
+              isReusableDraft(draft) && !draftHasLiveUserContent(draft),
+          );
+          if (untouched.length === 0) return s;
+          const config = newChatConfig();
+          const draftsById = { ...s.draftsById };
+          for (const draft of untouched) {
+            draftsById[draft.draftId] = { ...draft, ...config };
+          }
+          return { draftsById };
+        }),
+
       clearDraft: (draftId) =>
         set((s) => {
           const existing = s.draftsById[draftId];
@@ -703,12 +795,88 @@ export const useChatDraftStore = create<ChatDraftStore>()(
             activeDraftId: null,
           } as ChatDraftStore;
         }
-        return persistedState as ChatDraftStore;
+        const state = persistedState as ChatDraftStore & {
+          draftsById: Record<DraftId, ChatDraft & { fastMode?: boolean }>;
+        };
+        return {
+          ...state,
+          draftsById: Object.fromEntries(Object.entries(state.draftsById ?? {}).map(([id, draft]) => {
+            const { fastMode, ...rest } = draft;
+            return [id, { ...rest, serviceTier: draft.serviceTier ?? (fastMode ? "fast" : "default") }];
+          })),
+        } as ChatDraftStore;
       },
       partialize: partializeChatDraftStoreState,
     },
   ),
 );
+
+/** Hydrate confirmed automatic local drafts once a roster becomes available.
+ *  A model id cannot tell a bootstrap seed from an explicit or legacy pick.
+ *  Device drafts keep their native defaults because this catalog describes
+ *  only this computer's CLI, not the device that will launch the thread. */
+export function reseedBootstrapDrafts(): void {
+  const capabilities = useProviderCapabilities.getState();
+  const appState = useAppStore.getState().appState;
+  useChatDraftStore.setState((state) => {
+    let draftsById: Record<DraftId, ChatDraft> | null = null;
+    for (const draft of Object.values(state.draftsById)) {
+      if (draft.promoting || draft.promotedTo || draft.materializedTo) continue;
+      if (draft.bootstrapModel !== true) continue;
+      if (draft.target.kind === "existing_workspace") {
+        const workspaceId = draft.target.workspaceId;
+        const workspace = appState?.workspaces.find(
+          (w) => w.workspace_id === workspaceId,
+        );
+        // Until the workspace hydrates, its execution device is unknown.
+        if (!workspace || workspace.host_id != null) continue;
+      } else if (draft.hostId != null) {
+        continue;
+      }
+      const roster = selectCapabilities(capabilities, draft.provider)?.models;
+      if (!roster?.length) continue;
+      const model = roster.find((m) => m.id === draft.model) ?? roster[0];
+      const defaults = capabilityDefaults(draft.provider, model.id);
+      // New-chat settings can seed an effort before capabilities arrive.
+      // Keep supported choices while filling the missing bootstrap values.
+      const effort = draft.effort && (
+        model.effort_levels.includes(draft.effort) ||
+        model.prompt_injected_effort_levels.includes(draft.effort)
+      ) ? draft.effort : defaults.effort;
+      const contextWindow = model.context_window_options.some(
+        (option) => option.value === draft.contextWindow,
+      ) ? draft.contextWindow : defaults.contextWindow;
+      draftsById ??= { ...state.draftsById };
+      draftsById[draft.draftId] = {
+        ...draft,
+        model: defaults.model,
+        bootstrapModel: false,
+        effort,
+        contextWindow,
+      };
+    }
+    return draftsById ? { draftsById } : state;
+  });
+}
+
+/** Keep placeholder drafts in step with the capability roster for the
+ *  lifetime of the app shell: once for a roster already restored from
+ *  storage, then on every harvest. */
+export function useReseedBootstrapDrafts(): void {
+  useEffect(() => {
+    reseedBootstrapDrafts();
+    const unsubscribeCapabilities = useProviderCapabilities.subscribe(
+      reseedBootstrapDrafts,
+    );
+    const unsubscribeApp = useAppStore.subscribe((state, previous) => {
+      if (state.appState !== previous.appState) reseedBootstrapDrafts();
+    });
+    return () => {
+      unsubscribeCapabilities();
+      unsubscribeApp();
+    };
+  }, []);
+}
 
 export type PersistedChatDraftStoreState = Pick<
   ChatDraftStore,

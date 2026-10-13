@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { Info, Loader2, RotateCw, Server } from "lucide-react";
+import { Info, RotateCw, Server } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,6 +15,7 @@ import { useMcpRuntime } from "@/hooks/use-mcp-runtime";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { useMcpStore } from "@/stores/mcp-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import {
   listMcpServers,
   MCP_CODEMUX_SELF_ID,
@@ -27,8 +28,11 @@ import {
   type McpServerRuntime,
 } from "@/tauri/commands";
 
+import { OutsideAssistantsSection } from "./outside-assistants-section";
 import { McpToolModal } from "./mcp-tool-modal";
+import { SectionHeader } from "./settings-primitives";
 import { eyebrowVariants } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 /** Slow-start threshold (ms). Servers stuck in `starting` longer than
  *  this surface a "taking longer than usual" hint. 3 s matches
@@ -64,6 +68,14 @@ interface Props {
  * updates so the UI never polls.
  */
 export function McpSection({ projectRoot }: Props) {
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  return <div>
+    {enableAgentChat && <OutboundMcpSection projectRoot={projectRoot} />}
+    <OutsideAssistantsSection />
+  </div>;
+}
+
+function OutboundMcpSection({ projectRoot }: Props) {
   const [servers, setServers] = useState<McpServerConfig[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -117,31 +129,26 @@ export function McpSection({ projectRoot }: Props) {
 
   return (
     <div>
-      <div className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <h2 className="text-body-lg font-semibold tracking-tight">
-            MCP Servers
-          </h2>
-          <p className="mt-1 text-body text-muted-foreground">
-            Model Context Protocol servers expose tools to your agent.
-            Servers spawn lazily on first chat session start; toggle a
-            row off to stop it. Codemux's own MCP is always on.
-          </p>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => void load()}
-          disabled={loading}
-          aria-label="Refresh MCP servers"
-        >
-          <RotateCw
-            className={cn("mr-1 size-3", loading && "animate-spin")}
-            aria-hidden
-          />
-          Refresh
-        </Button>
-      </div>
+      <SectionHeader
+        title="MCP Servers"
+        description="Model Context Protocol servers expose tools to your agent. Servers spawn lazily on first chat session start; toggle a row off to stop it. Codemux's own MCP is always on."
+        action={
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void load()}
+            disabled={loading}
+            aria-busy={loading}
+            aria-label="Refresh MCP servers"
+          >
+            <RotateCw
+              className={cn("mr-1 size-3", loading && "animate-spin")}
+              aria-hidden
+            />
+            Refresh
+          </Button>
+        }
+      />
 
       {error && (
         <p
@@ -157,7 +164,7 @@ export function McpSection({ projectRoot }: Props) {
           data-testid="mcp-loading"
           className="flex items-center gap-2 py-6 text-body text-muted-foreground"
         >
-          <Loader2 className="size-4 animate-spin" aria-hidden />
+          <Spinner className="size-4" aria-hidden />
           Loading MCP servers…
         </div>
       ) : servers.length === 0 && !error ? (
@@ -451,7 +458,7 @@ function McpStatusBadge({
         data-testid={`mcp-row-${server.id}-status`}
         data-status={slow ? "starting-slow" : "starting"}
       >
-        <Loader2 className="size-3 animate-spin" aria-hidden />
+        <Spinner className="size-3" aria-hidden />
         {slow ? "slow start — taking longer than usual" : "starting…"}
       </span>
     );

@@ -1,6 +1,7 @@
-import { Gauge, Loader2, TrendingDown, TrendingUp, TriangleAlert } from "lucide-react";
+import { Gauge, TrendingDown, TrendingUp, TriangleAlert } from "lucide-react";
 
 import { ProviderLogo } from "@/components/chat/provider-logo";
+import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type {
   PlanUsageWindow,
@@ -377,7 +378,7 @@ export function UsageLimitsView({
     if (errorNotice && !loading) return errorNotice;
     return loading ? (
       <div className="flex items-center gap-2 py-6 text-body text-muted-foreground">
-        <Loader2 className="size-4 animate-spin" aria-hidden />
+        <Spinner className="size-4" aria-hidden />
         Reading plan limits…
       </div>
     ) : (

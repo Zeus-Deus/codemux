@@ -6,7 +6,7 @@ import { extendTailwindMerge } from "tailwind-merge"
  * knows Tailwind's stock sizes, so without this `text-label` would be read as a
  * text colour and `cn("text-label", "text-muted-foreground")` would drop it.
  */
-export const UI_TEXT_SIZES = ["micro", "caption", "label", "body-sm", "body", "body-lg"] as const
+export const UI_TEXT_SIZES = ["micro", "caption", "label", "body-sm", "body", "body-lg", "title"] as const
 
 const twMerge = extendTailwindMerge({
   extend: { theme: { text: [...UI_TEXT_SIZES] } },

@@ -4,13 +4,13 @@ import {
   ArrowDownToLine,
   ChevronRight,
   Folder,
-  Loader2,
   Plus,
   Trash2,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { cn } from "@/lib/utils";
+import { Empty, EmptyDescription, EmptyTitle } from "@/components/ui/empty";
 import { toast } from "@/lib/toast";
 import { formatBytes } from "@/lib/format-bytes";
 import { useElapsedSeconds } from "@/hooks/use-elapsed-seconds";
@@ -34,6 +34,7 @@ import {
   type DeviceTone,
 } from "./use-device-cards";
 import { useSweepCandidates } from "./use-sweep-candidates";
+import { Spinner } from "@/components/ui/spinner";
 
 /** The hosted web client; the user picks the device there. */
 const HOSTED_CLIENT_URL = "https://app.codemux.org";
@@ -103,7 +104,7 @@ export function DevicesSection() {
   if (!loaded) {
     return (
       <div className="flex h-full items-center justify-center text-body text-muted-foreground">
-        <Loader2 className="mr-2 size-4 animate-spin" />
+        <Spinner className="mr-2 size-4" aria-hidden />
         Loading devices…
       </div>
     );
@@ -191,6 +192,7 @@ function ThisDeviceRow({ workspaceCount }: { workspaceCount: number }) {
 
 const TONE_DOT: Record<DeviceTone, string> = {
   online: "bg-status-open ring-[3px] ring-status-open/15",
+  updating: "bg-status-remote motion-safe:animate-pulse",
   attention: "bg-status-working ring-[3px] ring-status-working/15",
   offline: "bg-muted-foreground/60",
   checking: "bg-muted-foreground/40",
@@ -198,6 +200,7 @@ const TONE_DOT: Record<DeviceTone, string> = {
 
 const TONE_TEXT: Record<DeviceTone, string> = {
   online: "text-status-open",
+  updating: "text-status-remote",
   attention: "text-status-working",
   offline: "text-muted-foreground/70",
   checking: "text-muted-foreground/60",
@@ -417,9 +420,9 @@ function ProjectCluster({
             className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-[3px] text-caption font-semibold text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:opacity-60"
           >
             {pulling ? (
-              <Loader2 className="size-[9px] animate-spin" aria-hidden />
+              <Spinner className="size-3" aria-hidden />
             ) : (
-              <ArrowDownToLine className="size-[9px]" aria-hidden />
+              <ArrowDownToLine className="size-3" aria-hidden />
             )}
             Pull project
           </button>
@@ -516,7 +519,7 @@ function WorkspaceRow({
       <span className="inline-flex items-center gap-1">
         {pullStartedAt !== null ? (
           <span className="inline-flex items-center gap-1.5 px-2 text-caption font-semibold text-muted-foreground">
-            <Loader2 className="size-3 animate-spin" aria-hidden />
+            <Spinner className="size-3" aria-hidden />
             Pulling
             {elapsedSec !== null && (
               <span className="font-mono tabular-nums">{elapsedSec}s</span>
@@ -527,7 +530,7 @@ function WorkspaceRow({
             {canOpenOnHost && (
               <RowAction onClick={() => void handleOpen()} disabled={opening}>
                 {opening ? (
-                  <Loader2 className="size-3 animate-spin" aria-hidden />
+                  <Spinner className="size-3" aria-hidden />
                 ) : (
                   `Open on ${card.name}`
                 )}
@@ -579,13 +582,13 @@ function AddDeviceRow({ onClick }: { onClick: () => void }) {
 
 function EmptyDevices() {
   return (
-    <div className="px-6 py-8 text-center">
-      <p className="text-body font-semibold text-foreground">No devices yet</p>
-      <p className="mx-auto mt-1.5 max-w-[420px] text-body-sm leading-relaxed text-muted-foreground/80">
+    <Empty className="px-6">
+      <EmptyTitle>No devices yet</EmptyTitle>
+      <EmptyDescription>
         Add a device — your home desktop, an always-on box, or a cloud server
         — then push work to it from any workspace's menu.
-      </p>
-    </div>
+      </EmptyDescription>
+    </Empty>
   );
 }
 

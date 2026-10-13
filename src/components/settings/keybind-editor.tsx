@@ -19,6 +19,7 @@ import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { normalizeKeyCombo, isModifierOnly } from "@/lib/keybind-utils";
 import { useResolvedKeybinds, type ResolvedEntry } from "@/hooks/use-resolved-keybinds";
 import { setKeybindRecordingMode } from "@/hooks/use-keyboard-shortcuts";
+import { SectionHeader } from "./settings-primitives";
 import {
   useSyncedSettingsStore,
   selectKeyboardShortcuts,
@@ -160,27 +161,18 @@ export function KeybindEditor() {
 
   return (
     <div>
-      <div className="mb-8 flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <h2 className="text-[1.0625rem] font-semibold tracking-tight text-foreground">
-            Keyboard Shortcuts
-          </h2>
-          <p className="text-body text-muted-foreground/85 mt-1.5 leading-relaxed max-w-prose">
-            Click a shortcut to rebind it. Press Escape to cancel.
-          </p>
-        </div>
-        {hasAnyOverrides && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={resetAll}
-            className="shrink-0"
-          >
-            <RotateCcw className="size-3.5" />
-            Reset all
-          </Button>
-        )}
-      </div>
+      <SectionHeader
+        title="Keyboard Shortcuts"
+        description="Click a shortcut to rebind it. Press Escape to cancel."
+        action={
+          hasAnyOverrides && (
+            <Button variant="outline" size="sm" onClick={resetAll}>
+              <RotateCcw className="size-3.5" />
+              Reset all
+            </Button>
+          )
+        }
+      />
 
       <div className="relative mb-6">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground/60 pointer-events-none" />

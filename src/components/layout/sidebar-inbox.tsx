@@ -1,14 +1,12 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlarmClock,
-  AlertCircle,
   ChevronDown,
   ChevronRight,
   Folder,
   FolderOpen,
   FolderPlus,
   Layers,
-  Loader2,
   Undo2,
 } from "lucide-react";
 import { openExternalUrl } from "@/lib/open-url";
@@ -43,6 +41,7 @@ import {
   useSettingsStore,
   selectSidebarShowGitStats,
   selectSidebarAutoSettleDays,
+  getTimeFormat,
 } from "@/stores/settings-store";
 import { formatElapsed } from "@/stores/sidebar-density-store";
 import { getWorkspaceProviders, getWorkspaceStatus } from "@/lib/pane-status";
@@ -55,6 +54,7 @@ import {
   type InboxRepo,
 } from "./sidebar-inbox-card";
 import { SidebarNeedsYouStrip } from "./sidebar-needs-you-strip";
+import { PendingWorkspaceRow } from "./pending-workspace-row";
 import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
 import {
   computeSnoozePresets,
@@ -70,8 +70,6 @@ import {
   prStatusTextClass,
   type PrStatusState,
 } from "@/components/github/pr-status-icon";
-import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
-import { parseKeyCombo } from "@/lib/keybind-utils";
 import { useChatDraftStore, type ChatDraft } from "@/stores/chat-draft-store";
 import { useShallow } from "zustand/react/shallow";
 import { SidebarCreatingCard } from "./sidebar-creating-card";
@@ -79,10 +77,8 @@ import {
   promotionStartedAt,
   selectNewWorkspaceDraftsInFlight,
 } from "./new-workspace-sends";
-import {
-  setJumpTargets,
-  DEFAULT_JUMP_MODIFIER,
-} from "./sidebar-inbox-jump";
+import { setJumpTargets, MAX_JUMP_HINTS } from "./sidebar-inbox-jump";
+import { useJumpHintsVisible } from "./use-jump-hints-visible";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import {
   providerForWorkspace,
@@ -106,9 +102,6 @@ import {
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { SidebarEmptyState } from "./sidebar-empty-state";
 import { SidebarHeaderActions } from "./sidebar-action-row";
-
-/** How many leading cards get a jump badge — the digit shortcuts only reach 1-9. */
-const MAX_JUMP_HINTS = 9;
 
 /** How long the settle collapse runs before the card actually moves below
  *  the divider. Matches the card wrapper's `duration-250`. */
@@ -1883,46 +1876,8 @@ export function SidebarInbox() {
     setJumpTargets(activeCardIdsKey ? activeCardIdsKey.split(" ") : []);
   }, [activeCardIdsKey]);
   useEffect(() => () => setJumpTargets([]), []);
-
-  // Which physical modifier reveals the jump badges. Respect the user's actual
-  // resolved binding for slot 1 (so a rebind to Ctrl/Alt tracks the right key);
-  // fall back to the default modifier. A rebind to a non-Alt/Ctrl chord (e.g.
-  // Shift-only) simply shows no held-modifier hints.
-  const { keybindMap } = useResolvedKeybinds();
-  const jumpModifierKey = useMemo(() => {
-    const keys =
-      keybindMap.get("workspaceJump1")?.activeKeys ??
-      `${DEFAULT_JUMP_MODIFIER}+1`;
-    const parsed = parseKeyCombo(keys);
-    if (parsed.ctrl) return "Control";
-    if (parsed.alt) return "Alt";
-    return null;
-  }, [keybindMap]);
-
-  // Show the badges only while the modifier is physically held. Clear on keyup,
-  // blur, and visibilitychange so the hints can never get stuck open.
-  const [jumpHintsVisible, setJumpHintsVisible] = useState(false);
-  useEffect(() => {
-    if (!jumpModifierKey) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === jumpModifierKey) setJumpHintsVisible(true);
-    };
-    const onKeyUp = (e: KeyboardEvent) => {
-      if (e.key === jumpModifierKey) setJumpHintsVisible(false);
-    };
-    const clear = () => setJumpHintsVisible(false);
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-    window.addEventListener("blur", clear);
-    document.addEventListener("visibilitychange", clear);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
-      window.removeEventListener("blur", clear);
-      document.removeEventListener("visibilitychange", clear);
-      setJumpHintsVisible(false);
-    };
-  }, [jumpModifierKey]);
+  // Show the badges only while the jump modifier is physically held.
+  const jumpHintsVisible = useJumpHintsVisible();
 
   // Whether the project filter dropdown is open — drives the trigger chevron
   // rotation.
@@ -2171,52 +2126,40 @@ export function SidebarInbox() {
         {topTier.map((ws, index) => renderCard(ws, pinnedCards.length + index))}
 
         {filteredPending.map((pw) => (
-          <div
-            key={pw.id}
-            className={cn(
-              "flex items-center gap-2 px-2 py-2 text-body",
-              pw.status === "failed" ? "opacity-60" : "motion-safe:animate-pulse opacity-70",
-            )}
-          >
-            {pw.status === "creating" ? (
-              <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
-            ) : (
-              <AlertCircle className="size-3.5 shrink-0 text-destructive" />
-            )}
-            <span className="truncate text-label text-muted-foreground">
-              {pw.status === "failed" ? pw.errorMessage || "Failed" : pw.name}
-            </span>
-          </div>
+          <PendingWorkspaceRow key={pw.id} pending={pw} className="gap-2 px-2 py-2" />
         ))}
 
-        {/* The wind-down tier. Same full card, same actions — only its place
-            in the list changed, and only while the rule above holds. No
-            header at all when nothing qualifies: an empty section header
-            would imply a category the list isn't currently using. */}
-        {wrappingUpTier.length > 0 && (
-          <>
-            <ShelfHeader
-              label="Wrapping up"
-              count={wrappingUpTier.length}
-              showCount={wrappingUpCollapsed}
-              collapsed={wrappingUpCollapsed}
-              onToggle={() => setWrappingUpCollapsed((c) => !c)}
-              marker="data-wrapping-up-divider"
-            />
-            {visibleWrappingUp.map((ws, index) =>
-              renderCard(ws, pinnedCards.length + topTier.length + index),
-            )}
-          </>
-        )}
-
-        {/* The parked shelves sit on the floor of the sidebar, not under
-            the last active card. `mt-auto` soaks up the free space above
-            them, so a short active list keeps its breathing room and parked
-            work reads as a separate, out-of-the-way drawer. Once the list
-            outgrows the viewport the margin collapses to zero and everything
-            scrolls as one column. */}
-        {(snoozedRows.length > 0 || settledRows.length > 0) && (
+        {/* Wrapping up, Snoozed and Settled sit on the floor of the sidebar,
+            not under the last active card. `mt-auto` soaks up the free space
+            above them, so the top of the list belongs to live work and
+            everything waiting on someone else reads as a separate drawer.
+            Once the list outgrows the viewport the margin collapses to zero
+            and everything scrolls as one column. */}
+        {(wrappingUpTier.length > 0 ||
+          snoozedRows.length > 0 ||
+          settledRows.length > 0) && (
           <div data-parked-shelves className="mt-auto flex flex-col">
+            {/* The wind-down tier. Same full card, same actions — only its
+                place in the list changed, and only while the rule above
+                holds. No header at all when nothing qualifies: an empty
+                section header would imply a category the list isn't
+                currently using. */}
+            {wrappingUpTier.length > 0 && (
+              <>
+                <ShelfHeader
+                  label="Wrapping up"
+                  count={wrappingUpTier.length}
+                  showCount={wrappingUpCollapsed}
+                  collapsed={wrappingUpCollapsed}
+                  onToggle={() => setWrappingUpCollapsed((c) => !c)}
+                  marker="data-wrapping-up-divider"
+                />
+                {visibleWrappingUp.map((ws, index) =>
+                  renderCard(ws, pinnedCards.length + topTier.length + index),
+                )}
+              </>
+            )}
+
             {snoozedRows.length > 0 && (
               <>
                 <ShelfHeader
@@ -2339,7 +2282,7 @@ export function SidebarInbox() {
             {canBulkSnooze && (
               <DropdownMenuSub
                 onOpenChange={(open) => {
-                  if (open) setBulkSnoozePresets(computeSnoozePresets(Date.now()));
+                  if (open) setBulkSnoozePresets(computeSnoozePresets(Date.now(), getTimeFormat()));
                 }}
               >
                 <DropdownMenuSubTrigger className="text-label">

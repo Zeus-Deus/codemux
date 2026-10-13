@@ -61,7 +61,7 @@ function ToolResultThumbnail({
   if (failed) {
     return (
       <div
-        className="flex h-20 w-28 items-center justify-center rounded-lg border border-border/60 bg-muted/40 text-muted-foreground"
+        className="flex h-20 w-28 items-center justify-center rounded-lg border border-hairline bg-surface-1 text-muted-foreground"
         aria-label="Image failed to load"
       >
         <ImageOff className="size-5 opacity-40" aria-hidden />
@@ -74,7 +74,7 @@ function ToolResultThumbnail({
       type="button"
       onClick={onOpen}
       aria-label="Open image"
-      className="cursor-pointer overflow-hidden rounded-lg border border-border/60 transition-opacity duration-150 hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+      className="cursor-pointer overflow-hidden rounded-lg border border-hairline transition-opacity duration-150 hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
     >
       <img
         src={image.src}

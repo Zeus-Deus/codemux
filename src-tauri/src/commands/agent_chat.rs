@@ -23,6 +23,7 @@ use tauri::ipc::{Channel, InvokeBody, Request};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::io::AsyncReadExt;
 
+use crate::agent_control::{NativeControlGuard, NativeControlState, ThreadGate};
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, CostSource, ProviderChatCapabilities, ProviderError,
     ProviderKind, ProviderRuntimeEvent, RequestId, RequestResponseFailureReason, SendTurnInput,
@@ -654,10 +655,13 @@ pub fn dev_agent_chat_spawn_test_pane<R: Runtime>(
 /// * entries already present in `existing` are never overwritten — an env
 ///   value the caller explicitly supplied always wins over the workspace
 ///   default.
+/// * a session on a device names paths there, never this computer's:
+///   `device_dir` is the absolute directory it runs in on the device.
 fn workspace_env_overlay(
     ws: Option<&crate::state::WorkspaceSnapshot>,
     pane_id: &str,
     existing: Option<HashMap<String, String>>,
+    device_dir: Option<&str>,
 ) -> Option<HashMap<String, String>> {
     let Some(ws) = ws else {
         return existing;
@@ -678,13 +682,16 @@ fn workspace_env_overlay(
             ws.workspace_id.0.clone(),
         ),
         ("CODEMUX_PANE_ID".to_string(), pane_id.to_string()),
-        (
+    ];
+    // A device has no `codemux browser` to route to, only `codemux-remote`.
+    if ws.host_id.is_none() {
+        defaults.push((
             "CODEMUX_BROWSER_CMD".to_string(),
             "codemux browser".to_string(),
-        ),
-        ("BROWSER".to_string(), "codemux browser open".to_string()),
-    ];
-    defaults.extend(crate::terminal::workspace_pty_env(ws));
+        ));
+        defaults.push(("BROWSER".to_string(), "codemux browser open".to_string()));
+    }
+    defaults.extend(crate::terminal::workspace_pty_env_at(ws, device_dir));
 
     for (key, val) in defaults {
         // Insert-if-absent so a caller-provided entry always wins.
@@ -702,11 +709,13 @@ fn workspace_env_overlay(
 /// from the IPC caller. An orphaned pane (no workspace) yields `existing`
 /// untouched and `None`. Shared by `agent_chat_start_session` and the
 /// `ensure_live_session` rebuild so the two session-minting paths stay in
-/// lockstep.
+/// lockstep. `device_dir` is where a device session runs (see
+/// [`workspace_env_overlay`]).
 pub fn pane_workspace_context(
     state: &AppStateStore,
     pane_id: &str,
     existing: Option<HashMap<String, String>>,
+    device_dir: Option<&std::path::Path>,
 ) -> (Option<HashMap<String, String>>, Option<String>) {
     let workspace_id = state.workspace_id_for_pane(pane_id);
     let snapshot = state.snapshot();
@@ -714,9 +723,198 @@ pub fn pane_workspace_context(
         .as_ref()
         .and_then(|id| snapshot.workspaces.iter().find(|w| &w.workspace_id.0 == id));
     (
-        workspace_env_overlay(ws, pane_id, existing),
+        workspace_env_overlay(
+            ws,
+            pane_id,
+            existing,
+            device_dir.and_then(std::path::Path::to_str),
+        ),
         ws.map(|w| w.workspace_id.0.clone()),
     )
+}
+
+/// A workspace that lives on a device: the configured host its provider
+/// processes run on, and its working directory there (may start with `~`).
+#[derive(Debug, Clone, PartialEq)]
+struct DeviceWorkspace {
+    remote: crate::agent_provider::types::RemoteSpawnTarget,
+    cwd: String,
+}
+
+/// The device `ws` lives on, or `None` for a local workspace. Fails closed
+/// when the device is no longer configured so the thread never quietly
+/// falls back to running on this computer.
+fn device_workspace(
+    ws: &crate::state::WorkspaceSnapshot,
+    hosts: &[crate::database::HostRecord],
+) -> Result<Option<DeviceWorkspace>, String> {
+    let Some(host_id) = ws.host_id else {
+        return Ok(None);
+    };
+    let host = hosts
+        .iter()
+        .find(|host| host.id == host_id)
+        .ok_or_else(|| {
+            format!("This thread's device (id {host_id}) is no longer configured on this computer")
+        })?;
+    Ok(Some(DeviceWorkspace {
+        remote: crate::agent_provider::types::RemoteSpawnTarget {
+            host_id,
+            ssh_target: host.ssh_target.clone(),
+            host_name: host.name.clone(),
+        },
+        cwd: crate::terminal::device_workspace_dir(ws),
+    }))
+}
+
+/// [`device_workspace`] for a workspace id from the pane binding or the
+/// thread's persisted row — never from the IPC caller.
+fn device_for_workspace<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace_id: Option<&str>,
+) -> Result<Option<DeviceWorkspace>, String> {
+    let (Some(workspace_id), Some(state)) = (workspace_id, app.try_state::<AppStateStore>()) else {
+        return Ok(None);
+    };
+    let snapshot = state.snapshot();
+    let Some(ws) = snapshot
+        .workspaces
+        .iter()
+        .find(|ws| ws.workspace_id.0 == workspace_id && ws.host_id.is_some())
+    else {
+        return Ok(None);
+    };
+    let hosts = app
+        .try_state::<DatabaseStore>()
+        .map(|db| db.list_hosts())
+        .unwrap_or_default();
+    device_workspace(ws, &hosts)
+}
+
+/// Refuse providers that can't run on a device yet: Hermes needs a local
+/// profile install, OpenCode runs one shared local server, and custom ACP
+/// agents launch from this desktop's instance configuration.
+fn ensure_provider_runs_on_devices(provider: ProviderKind) -> Result<(), String> {
+    let name = match provider {
+        ProviderKind::Hermes => "Hermes",
+        ProviderKind::OpenCode => "OpenCode",
+        ProviderKind::Acp => {
+            return Err("Custom ACP agents run on this desktop's local workspaces. Connect to the target desktop to run an agent there.".into())
+        }
+        ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Cursor | ProviderKind::Grok => {
+            return Ok(())
+        }
+    };
+    Err(format!(
+        "unsupported: {name} can't run on another device yet"
+    ))
+}
+
+/// Ready a device for a provider session and return the absolute working
+/// directory there. Claude also needs Codemux's runtime installed on it.
+async fn prepare_device_session(
+    provider: ProviderKind,
+    device: &DeviceWorkspace,
+) -> Result<std::path::PathBuf, String> {
+    #[cfg(unix)]
+    {
+        let target = &device.remote.ssh_target;
+        let cwd = if device.cwd == "~" || device.cwd.starts_with("~/") {
+            let home = crate::ssh::exec::remote_home(target)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Couldn't reach {} over SSH: {error}",
+                        device.remote.host_name
+                    )
+                })?;
+            crate::ssh::exec::expand_remote_tilde(&device.cwd, &home)
+        } else {
+            device.cwd.clone()
+        };
+        if provider == ProviderKind::Claude {
+            crate::ssh::sidecar::ensure_claude_sidecar(target).await?;
+        }
+        Ok(std::path::PathBuf::from(cwd))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (provider, device);
+        Err("Threads on another device need macOS or Linux on this computer".into())
+    }
+}
+
+/// Whether a thread lives on a device. Local-only work (git checkpoints,
+/// skill files, hook and command probes) can't see a device's files.
+///
+/// The thread's own workspace decides when there is one (its persisted row
+/// or bound pane). Callers that only know a folder fall back to the path,
+/// but a path counts as a device's only when no local workspace and not the
+/// local home use it: a device folder can share its path with a local one
+/// (same user name on both machines). Anything else is local.
+fn runs_on_device(
+    state: &AppStateStore,
+    db: Option<&DatabaseStore>,
+    thread_id: Option<&str>,
+    cwd: Option<&str>,
+) -> bool {
+    let thread_workspace = thread_id.and_then(|thread_id| {
+        db.and_then(|db| db.get_agent_chat_session(thread_id))
+            .map(|record| record.workspace_id)
+            .or_else(|| {
+                state
+                    .agent_chat_pane_id_for_thread(thread_id)
+                    .and_then(|pane_id| state.workspace_id_for_pane(&pane_id))
+            })
+    });
+    let local_home = dirs::home_dir().map(|home| home.to_string_lossy().into_owned());
+    workspace_runs_on_device(
+        &state.snapshot().workspaces,
+        thread_workspace.as_deref(),
+        cwd,
+        local_home.as_deref(),
+    )
+}
+
+/// [`runs_on_device`] once the thread's workspace (if any) is known.
+fn workspace_runs_on_device(
+    workspaces: &[crate::state::WorkspaceSnapshot],
+    thread_workspace: Option<&str>,
+    cwd: Option<&str>,
+    local_home: Option<&str>,
+) -> bool {
+    if let Some(workspace_id) = thread_workspace {
+        return workspaces
+            .iter()
+            .any(|ws| ws.workspace_id.0 == workspace_id && ws.host_id.is_some());
+    }
+    let Some(cwd) = cwd else {
+        return false;
+    };
+    if local_home == Some(cwd) {
+        return false;
+    }
+    let mut on_device = false;
+    for ws in workspaces {
+        let uses_path = ws.cwd == cwd
+            || ws.remote_cwd.as_deref() == Some(cwd)
+            || ws.worktree_path.as_deref() == Some(cwd);
+        if !uses_path {
+            continue;
+        }
+        if ws.host_id.is_none() {
+            return false;
+        }
+        on_device = true;
+    }
+    on_device
+}
+
+fn thread_runs_on_device<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> bool {
+    app.try_state::<AppStateStore>().is_some_and(|state| {
+        let db = app.try_state::<DatabaseStore>();
+        runs_on_device(&state, db.as_deref(), Some(thread_id), None)
+    })
 }
 
 fn should_recover_persisted_resume_cursor(
@@ -747,14 +945,66 @@ pub async fn agent_chat_start_session<R: Runtime>(
     app: AppHandle<R>,
     pane_id: String,
     provider: ProviderKind,
-    mut input: StartSessionInput,
+    input: StartSessionInput,
     expected_thread: Option<String>,
 ) -> Result<ThreadId, String> {
+    agent_chat_start_session_guarded(app, pane_id, provider, input, expected_thread, None).await
+}
+
+pub async fn agent_chat_start_session_guarded<R: Runtime>(
+    app: AppHandle<R>,
+    pane_id: String,
+    provider: ProviderKind,
+    mut input: StartSessionInput,
+    expected_thread: Option<String>,
+    control: Option<NativeControlGuard>,
+) -> Result<ThreadId, String> {
+    let native_gate = native_thread_gate(&app, &input.thread_id.0);
+    let generation = native_gate.generation();
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        generation,
+    )?;
+    let _native_guard = native_gate.dispatch.clone().lock_owned().await;
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        generation,
+    )?;
+    if let Some(tier) = input.service_tier.as_deref() {
+        input.fast_mode = match tier {
+            "default" => false,
+            "fast" => true,
+            _ if provider == ProviderKind::Codex => false,
+            _ => {
+                return Err("validation_error: provider does not support this service tier".into())
+            }
+        };
+    }
     crate::local_session_import::require_live_session(&app, &input.thread_id.0)?;
     if let Some(state) = app.try_state::<AppStateStore>() {
         if let Some(thread) = state.agent_chat_thread_id(&pane_id) {
             crate::local_session_import::require_live_session(&app, &thread)?;
         }
+    }
+    // The device comes from the pane's workspace, never from the caller.
+    // Resolved only once a push / pull of that workspace has finished, and
+    // the gate stays held until the session has started there, so a move
+    // can't begin in between (see `migration_gate_for`).
+    let workspace = app
+        .try_state::<AppStateStore>()
+        .and_then(|state| state.workspace_id_for_pane(&pane_id));
+    let placement = wait_for_workspace_placement(workspace.as_deref()).await;
+    let device = device_for_workspace(&app, workspace.as_deref())?;
+    if device.is_some() {
+        ensure_provider_runs_on_devices(provider)?;
     }
     if provider == ProviderKind::Acp {
         let state: State<'_, AppStateStore> = app.state();
@@ -776,11 +1026,6 @@ pub async fn agent_chat_start_session<R: Runtime>(
         input.permission_mode = None;
     }
     if provider == ProviderKind::Hermes {
-        let state: State<'_, AppStateStore> = app.state();
-        let workspace = state.workspace_id_for_pane(&pane_id);
-        if state.snapshot().workspaces.iter().any(|w| Some(&w.workspace_id.0) == workspace.as_ref() && w.host_id.is_some()) {
-            return Err("unsupported: Hermes v1 runs on local workspaces only".into());
-        }
         // A new chat binds the caller's profile; an existing binding is host-owned.
         let db: State<'_, DatabaseStore> = app.state();
         if db.hermes_binding(&input.thread_id.0)?.is_none() {
@@ -793,6 +1038,18 @@ pub async fn agent_chat_start_session<R: Runtime>(
     }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    // Explicit UI starts and automatic rebuilds own the same native launch
+    // transaction. A pane claim alone cannot serialize a same-thread start.
+    let resume_lock = resume_lock_for(&input.thread_id.0);
+    let _resume_guard = resume_lock.lock().await;
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        generation,
+    )?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     // Extract the cwd for persistence BEFORE moving input into the
@@ -815,6 +1072,14 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // `healed_permission_mode`) so BOTH session-minting entry points are immune
     // to a null-passing caller. OpenCode has no permission modes, so its
     // fallback is `None` and this is a no-op there.
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        generation,
+    )?;
     let requested_permission_mode = input.permission_mode.take();
     let resolved_permission_mode =
         resolve_start_permission_mode(provider, requested_permission_mode.clone());
@@ -848,6 +1113,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
         context_window: Some(input.context_window.clone()),
         permission_mode: Some(input.permission_mode.clone()),
         fast_mode: Some(input.fast_mode),
+        service_tier: input.service_tier.clone(),
     };
     // A restart of an existing durable CodeMux thread must not depend solely
     // on the frontend's in-memory cursor. That slice can be cold after sleep,
@@ -893,8 +1159,10 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // pick / restart). If the CLI's on-disk session JSONL is confirmed
     // gone, drop the cursor so the session starts fresh instead of wedging
     // on a dead id, and best-effort clear the persisted column. Codex /
-    // OpenCode carry their own cursor shapes and are untouched.
-    if provider == ProviderKind::Claude {
+    // OpenCode carry their own cursor shapes and are untouched. A device
+    // keeps its session files there, so this computer can't judge them; the
+    // runtime falls back to a fresh session on a stale resume by itself.
+    if provider == ProviderKind::Claude && device.is_none() {
         if let Some(stale) = input
             .resume_cursor
             .as_ref()
@@ -930,15 +1198,59 @@ pub async fn agent_chat_start_session<R: Runtime>(
             })
     };
     if pane_already_runs_thread && impl_.has_session(&input.thread_id).await {
-        if provider == ProviderKind::Acp {
-            let acp: State<'_, Arc<crate::agent_provider::custom_acp::GenericAcpProvider>> = app.state();
-            let db: State<'_, DatabaseStore> = app.state();
-            let exact_cwd = db.acp_binding(&input.thread_id.0)?.is_some_and(|b| b.cwd == input.cwd.to_string_lossy());
-            if !exact_cwd || acp.live_catalog(&input.thread_id).await.is_none() {
-                return Err("The live ACP process does not match this durable workspace binding.".into());
+        let host_now = device.as_ref().map(|device| device.remote.host_id);
+        if !session_moved(&requested_thread_id, host_now) {
+            if provider == ProviderKind::Acp {
+                let acp: State<'_, Arc<crate::agent_provider::custom_acp::GenericAcpProvider>> = app.state();
+                let db: State<'_, DatabaseStore> = app.state();
+                let exact_cwd = db.acp_binding(&input.thread_id.0)?.is_some_and(|b| b.cwd == input.cwd.to_string_lossy());
+                if !exact_cwd || acp.live_catalog(&input.thread_id).await.is_none() {
+                    return Err("The live ACP process does not match this durable workspace binding.".into());
+                }
             }
+            verify_native_control(
+                &app,
+                provider,
+                &input.thread_id.0,
+                control.as_ref(),
+                &native_gate,
+                generation,
+            )?;
+            if let Some(control) = &control {
+                control.verify_start(&app, &input)?;
+            }
+            return Ok(input.thread_id);
         }
-        return Ok(input.thread_id);
+        // Its workspace moved to another machine since (push / pull): stop
+        // it and start it there. The resume lock taken above already
+        // serializes this with an auto-resume rebuild.
+        verify_native_control(
+            &app,
+            provider,
+            &input.thread_id.0,
+            control.as_ref(),
+            &native_gate,
+            generation,
+        )?;
+        stop_moved_session(&app, impl_.as_ref(), &input.thread_id).await?;
+    }
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        generation,
+    )?;
+    if let Some(control) = &control {
+        control.verify_start(&app, &input)?;
+        let state = app.state::<AppStateStore>();
+        if state.agent_chat_pane_thread(&pane_id) != Some((provider, input.thread_id.0.clone()))
+            || state.workspace_id_for_pane(&pane_id).as_deref()
+                != Some(control.workspace_id.as_str())
+        {
+            return Err("stale_thread_binding: guarded start targets another pane".into());
+        }
     }
     // Launch eligibility belongs only to new/rebuilt processes. A live child
     // deliberately keeps its admitted revision even after definition edits.
@@ -953,6 +1265,11 @@ pub async fn agent_chat_start_session<R: Runtime>(
             return Err("This ACP launch configuration changed. Restore it or start a new chat; the existing conversation will not be replaced.".into());
         }
     }
+    // Run the provider on the workspace's device, in its folder there.
+    if let Some(device) = device.as_ref() {
+        input.cwd = prepare_device_session(provider, device).await?;
+    }
+    input.remote = device.as_ref().map(|device| device.remote.clone());
     // Claim the pane BEFORE anything spawns. Desktop and remote clients
     // share one backend, so between "create pane" and "start session" a
     // second client can mount the pane and auto-start its own thread on it.
@@ -979,6 +1296,40 @@ pub async fn agent_chat_start_session<R: Runtime>(
         crate::state::emit_app_state(&app);
     }
 
+    let handoff = async {
+        if let (Some(old_provider), Some(old_thread)) = &claim.previous {
+            if *old_provider != provider && old_thread == &requested_thread_id {
+                if let Some(old_impl) = registry.get(*old_provider).await {
+                    verify_native_control(
+                        &app, provider, &input.thread_id.0, control.as_ref(),
+                        &native_gate, generation,
+                    )?;
+                    match old_impl.stop_session(ThreadId(old_thread.clone())).await {
+                        Ok(()) | Err(ProviderError::SessionNotFound { .. })
+                        | Err(ProviderError::SessionClosed { .. }) => {}
+                        Err(error) => return Err(provider_err(error)),
+                    }
+                }
+            }
+        }
+        verify_native_control(
+            &app, provider, &input.thread_id.0, control.as_ref(),
+            &native_gate, generation,
+        )?;
+        if let Some(control) = &control {
+            control.verify_start(&app, &input)?;
+        }
+        Ok::<(), String>(())
+    }.await;
+    if let Err(error) = handoff {
+        let state = app.state::<AppStateStore>();
+        if claim.changed && state.release_agent_chat_pane_claim(
+            &pane_id, provider, &requested_thread_id, claim.previous.clone(),
+        ) {
+            crate::state::emit_app_state(&app);
+        }
+        return Err(error);
+    }
     // Lazy MCP spawn: first chat session triggers child-process startup
     // for every enabled (non-disabled) MCP server discovered for this
     // workspace. Stage 3 needs the spawn to COMPLETE before
@@ -991,11 +1342,16 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // registered with whatever has come up so far; servers that
     // finish later only become visible to the agent on the next
     // session start (Stage 4 polish will wire `setMcpServers` for
-    // dynamic registration).
+    // dynamic registration). A session on a device gets none of this
+    // computer's tools, so there is nothing to start for it.
+    //
+    // Skipped when no registry is managed (headless tests): priming spawns
+    // the `codemux mcp` child from the current executable.
+    if let Some(mcp_registry) = app
+        .try_state::<crate::mcp::registry::McpRegistry>()
+        .filter(|_| device.is_none())
     {
-        use crate::mcp::registry::McpRegistry;
         use std::time::Duration;
-        let mcp_registry: State<'_, McpRegistry> = app.state();
         let registry = mcp_registry.inner().clone_handle();
         let project_path = input.cwd.clone();
         const MCP_PRIME_BUDGET: Duration = Duration::from_secs(8);
@@ -1021,11 +1377,43 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // workspace) injects nothing, matching the terminal path's behavior.
     {
         let state: State<'_, AppStateStore> = app.state();
-        let (env, workspace_id) = pane_workspace_context(&state, &pane_id, input.env.take());
+        let (env, workspace_id) = pane_workspace_context(
+            &state,
+            &pane_id,
+            input.env.take(),
+            device.as_ref().map(|_| input.cwd.as_path()),
+        );
         input.env = env;
         input.workspace_id = workspace_id;
     }
-    let session = match impl_.start_session(input).await {
+    let validation = verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        generation,
+    )
+    .and_then(|_| match &control {
+        Some(control) => control.verify_start(&app, &input),
+        None => Ok(()),
+    });
+    if let Err(error) = validation {
+        let state = app.state::<AppStateStore>();
+        if claim.changed
+            && state.release_agent_chat_pane_claim(
+                &pane_id,
+                provider,
+                &requested_thread_id,
+                claim.previous.clone(),
+            )
+        {
+            crate::state::emit_app_state(&app);
+        }
+        return Err(error);
+    }
+    let cancellation = Arc::new(crate::agent_control::NativeStartCancellation {gate:native_gate.clone(),generation});
+    let session = match impl_.start_session_with_cancellation(input, Some(cancellation)).await {
         Ok(session) => session,
         Err(error) => {
             // The claim outlived its reason to exist: put the pane back the
@@ -1059,6 +1447,20 @@ pub async fn agent_chat_start_session<R: Runtime>(
             return Err(provider_err(error));
         }
     };
+    if let Some(control_state) = app.try_state::<NativeControlState>() {
+        control_state.record_worker_mode(
+            &session.thread_id.0,
+            provider,
+            config_for_persist.permission_mode.clone().flatten(),
+        );
+        control_state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {thread_id:session.thread_id.clone(),status:session.status.clone()});
+    }
+    record_session_host(
+        &session.thread_id.0,
+        device.as_ref().map(|device| device.remote.host_id),
+    );
+    // The session runs where its workspace does; a move from here on stops it.
+    drop(placement);
     let state: State<'_, AppStateStore> = app.state();
     // Providers are expected to honour the requested thread id; re-claim if
     // one ever mints its own so the pane follows the session that exists.
@@ -1074,7 +1476,9 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // An explicit rebind (provider handoff / New Chat on a live pane) leaves
     // the previous thread's CLI child running with no pane pointing at it.
     // Callers already stop it themselves and `stop_session` is idempotent,
-    // so this is a best-effort backstop against an orphaned process.
+    // so this is a best-effort backstop against an orphaned process. It is
+    // also what closes the old thread's delegated tasks: a chat that left its
+    // pane can no longer receive their reports.
     if let (Some(previous_provider), Some(previous_thread)) = claim.previous.clone() {
         if previous_thread != session.thread_id.0 {
             shutdown_agent_chat_threads(&app, vec![(previous_provider, previous_thread)]);
@@ -1380,6 +1784,24 @@ fn turn_checkpoint_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// for a freshly-minted replacement.
 fn forget_turn_checkpoint_lock(thread_id: &str) {
     turn_checkpoint_locks().lock().unwrap().remove(thread_id);
+    revert_undos().lock().unwrap().remove(thread_id);
+}
+
+/// The safety snapshot a successful turn revert took of the workspace, kept so
+/// the user can bring those files back right after reverting. The provider
+/// conversation rewind is durable, so only the files can be restored.
+#[derive(Clone)]
+struct TurnRevertUndo {
+    repo_path: String,
+    safety: crate::git::GitCheckpoint,
+    /// Checkpoints left after the revert. Any later turn changes this list,
+    /// and restoring files under a newer turn would clobber its work.
+    remaining_turns: Vec<i64>,
+}
+
+fn revert_undos() -> &'static Mutex<HashMap<String, TurnRevertUndo>> {
+    static UNDOS: OnceLock<Mutex<HashMap<String, TurnRevertUndo>>> = OnceLock::new();
+    UNDOS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn prepare_turn_checkpoint_blocking(
@@ -1552,9 +1974,9 @@ impl<R: Runtime> TurnDispatchCheckpoint for GitTurnDispatchCheckpoint<R> {
                             );
                         }
                     }
-                    Err(error) => eprintln!(
-                        "[codemux::agent_chat] failed to prune turn checkpoints: {error}"
-                    ),
+                    Err(error) => {
+                        eprintln!("[codemux::agent_chat] failed to prune turn checkpoints: {error}")
+                    }
                 }
                 let payload = AgentChatTurnCheckpointEventPayload {
                     thread_id: ThreadId(self.thread_id.clone()),
@@ -1701,6 +2123,19 @@ fn restore_turn_checkpoint_workspace_blocking(
         target.branch.as_deref(),
     )?;
     Ok(safety)
+}
+
+/// Put the workspace back to the safety snapshot a turn revert took. The
+/// current (reverted) state is snapshotted first, so this is itself undoable
+/// through the same pre-restore ref.
+fn restore_reverted_files_blocking(thread_id: &str, undo: &TurnRevertUndo) -> Result<(), String> {
+    crate::git::git_checkpoint_restore(
+        std::path::Path::new(&undo.repo_path),
+        &undo.safety.snapshot_commit,
+        &undo.safety.head_commit,
+        undo.safety.branch.as_deref(),
+        &crate::git::pre_restore_ref_name(thread_id),
+    )
 }
 
 fn compensate_failed_provider_rollback(
@@ -1866,10 +2301,9 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
         )?
     };
     for (repo_path, ref_name) in outcome.removed_refs {
-        if let Err(error) = crate::git::git_checkpoint_delete_ref(
-            std::path::Path::new(&repo_path),
-            &ref_name,
-        ) {
+        if let Err(error) =
+            crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
+        {
             eprintln!("[codemux::agent_chat] failed to delete reverted ref: {error}");
         }
     }
@@ -1881,6 +2315,17 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
         let db: State<'_, DatabaseStore> = app.state();
         db.list_agent_chat_turn_checkpoints(&thread_id)
     };
+    revert_undos().lock().unwrap().insert(
+        thread_id.clone(),
+        TurnRevertUndo {
+            repo_path: target.repo_path.clone(),
+            safety,
+            remaining_turns: remaining_checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.turn_index)
+                .collect(),
+        },
+    );
     let payload = AgentChatTurnCheckpointRevertedEventPayload {
         thread_id: ThreadId(thread_id),
         turn_index,
@@ -1892,6 +2337,53 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
         eprintln!("[codemux::agent_chat] failed to emit turn revert: {error}");
     }
     Ok(remaining_checkpoints)
+}
+
+/// Restore the workspace files a turn revert replaced. Only offered right
+/// after the revert: once another turn has started, its work would be lost.
+#[tauri::command]
+pub async fn agent_chat_undo_turn_revert<R: Runtime>(
+    app: AppHandle<R>,
+    thread_id: String,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let _timeline_guard = turn_checkpoint_lock_for(&thread_id).lock_owned().await;
+    let undo = revert_undos()
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .cloned()
+        .ok_or_else(|| "There is no revert to undo for this chat.".to_string())?;
+    let (session, current_turns) = {
+        let db: State<'_, DatabaseStore> = app.state();
+        let session = db
+            .get_agent_chat_session(&thread_id)
+            .ok_or_else(|| "Chat session not found.".to_string())?;
+        let turns: Vec<i64> = db
+            .list_agent_chat_turn_checkpoints(&thread_id)
+            .iter()
+            .map(|checkpoint| checkpoint.turn_index)
+            .collect();
+        (session, turns)
+    };
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let provider = lookup_provider(&registry, stored_provider_kind(&session.provider)?).await?;
+    if current_turns != undo.remaining_turns
+        || provider.turn_active(&ThreadId(thread_id.clone())).await
+    {
+        revert_undos().lock().unwrap().remove(&thread_id);
+        return Err(
+            "A newer turn has started since the revert, so those files can no longer be restored safely."
+                .to_string(),
+        );
+    }
+    let restore_thread = thread_id.clone();
+    tokio::task::spawn_blocking(move || restore_reverted_files_blocking(&restore_thread, &undo))
+        .await
+        .map_err(|error| format!("file restore task failed: {error}"))??;
+    revert_undos().lock().unwrap().remove(&thread_id);
+    Ok(())
 }
 
 // ── Backend auto-resume ──────────────────────────────────────────────
@@ -1925,6 +2417,217 @@ pub(super) fn resume_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+fn native_thread_gate<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Arc<ThreadGate> {
+    if let Some(state) = app.try_state::<NativeControlState>() {
+        return state.thread_gate(thread_id);
+    }
+    // Older bounded unit fixtures predate this managed state.
+    static LEGACY: OnceLock<NativeControlState> = OnceLock::new();
+    LEGACY.get_or_init(Default::default).thread_gate(thread_id)
+}
+
+fn verify_native_control<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: ProviderKind,
+    thread: &str,
+    control: Option<&NativeControlGuard>,
+    gate: &ThreadGate,
+    generation: u64,
+) -> Result<(), String> {
+    gate.verify(generation)?;
+    if let Some(control) = control {
+        control.verify_target(provider, thread)?;
+        control.verify(app)?;
+    }
+    Ok(())
+}
+
+fn record_native_worker_mode<R: Runtime>(
+    app: &AppHandle<R>,
+    thread: &str,
+    provider: ProviderKind,
+    mode: Option<String>,
+) {
+    if let Some(state) = app.try_state::<NativeControlState>() {
+        state.record_worker_mode(thread, provider, mode);
+    }
+}
+
+/// Per-workspace gate between push / pull and chat session starts.
+///
+/// A move stops the workspace's chats before copying it, but a send or a new
+/// pane during the copy would otherwise place its session from the
+/// still-current `host_id`, start it on the machine being left, and keep
+/// editing there after the move succeeds. Push / pull hold the gate for
+/// writing from before they stop the chats until the destination is
+/// committed ([`begin_workspace_migration`]); every session start holds it
+/// for reading from resolving its placement until the provider has started
+/// ([`wait_for_workspace_placement`]), so it waits out a move and then starts
+/// where the workspace runs.
+///
+/// Lock order: this gate, then a thread's [`resume_lock_for`] lock. A move
+/// takes resume locks while it holds the gate, so waiting for the gate with
+/// a resume lock held would deadlock. Never take the gate twice in one task
+/// either: it is write-preferring, so a second read queued behind a waiting
+/// move never returns.
+fn migration_gate_for(workspace_id: &str) -> Arc<tokio::sync::RwLock<()>> {
+    static GATES: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>> = OnceLock::new();
+    GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(workspace_id.to_string())
+        .or_default()
+        .clone()
+}
+
+/// Wait out any push / pull of `workspace_id`, then keep the next one from
+/// starting until the guard drops. `None` (a thread with no workspace) has
+/// nothing to wait for.
+async fn wait_for_workspace_placement(
+    workspace_id: Option<&str>,
+) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+    Some(migration_gate_for(workspace_id?).read_owned().await)
+}
+
+/// The machine each live chat session runs on, by thread: `None` for this
+/// computer, `Some(host_id)` for a device. Recorded when a session starts,
+/// because the session keeps running where it began while push / pull move
+/// its workspace to another machine.
+fn session_hosts() -> &'static Mutex<HashMap<String, Option<i64>>> {
+    static HOSTS: OnceLock<Mutex<HashMap<String, Option<i64>>>> = OnceLock::new();
+    HOSTS.get_or_init(Default::default)
+}
+
+fn record_session_host(thread_id: &str, host_id: Option<i64>) {
+    session_hosts()
+        .lock()
+        .unwrap()
+        .insert(thread_id.to_string(), host_id);
+}
+
+/// Whether the live session of `thread_id` runs somewhere other than
+/// `host_now`, the machine its workspace runs on now. A session this
+/// process never recorded is left alone.
+fn session_moved(thread_id: &str, host_now: Option<i64>) -> bool {
+    session_hosts()
+        .lock()
+        .unwrap()
+        .get(thread_id)
+        .is_some_and(|started_on| *started_on != host_now)
+}
+
+/// The workspace a thread runs in: its pane's, else the one its persisted
+/// row names.
+fn thread_workspace_id<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Option<String> {
+    let state = app.try_state::<AppStateStore>()?;
+    state
+        .agent_chat_pane_id_for_thread(thread_id)
+        .and_then(|pane_id| state.workspace_id_for_pane(&pane_id))
+        .or_else(|| {
+            app.try_state::<DatabaseStore>()?
+                .get_agent_chat_session(thread_id)
+                .map(|record| record.workspace_id)
+        })
+}
+
+/// [`session_moved`] against the thread's workspace ([`thread_workspace_id`]).
+/// Looked up only for a recorded session, and a thread whose workspace is
+/// gone is left alone: there is nowhere better to run it.
+fn live_session_moved<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> bool {
+    if !session_hosts().lock().unwrap().contains_key(thread_id) {
+        return false;
+    }
+    let Some(state) = app.try_state::<AppStateStore>() else {
+        return false;
+    };
+    thread_workspace_id(app, thread_id)
+        .and_then(|workspace_id| state.find_workspace(&workspace_id))
+        .is_some_and(|ws| session_moved(thread_id, ws.host_id))
+}
+
+/// Stop a live session that runs on another machine than its workspace now
+/// does, so the caller starts it again there. The thread stays, but its
+/// in-flight run ends here, so its run tracking goes too: the `Closed`
+/// event that would clear it can be lost (see [`shutdown_agent_chat_threads`]).
+async fn stop_moved_session<R: Runtime>(
+    app: &AppHandle<R>,
+    impl_: &dyn AgentProvider,
+    thread_id: &ThreadId,
+) -> Result<(), String> {
+    eprintln!(
+        "[codemux::agent_chat] stopping thread={}: its workspace is moving to another machine",
+        thread_id.0
+    );
+    if let Some(tracker) = app.try_state::<SubagentTracker>() {
+        tracker.clear_thread(&thread_id.0);
+    }
+    if let Some(activity) = app.try_state::<RunActivityTracker>() {
+        activity.clear_thread(&thread_id.0);
+    }
+    match impl_.stop_session(thread_id.clone()).await {
+        Ok(()) | Err(ProviderError::SessionNotFound { .. }) => {}
+        Err(error) => return Err(provider_err(error)),
+    }
+    session_hosts().lock().unwrap().remove(&thread_id.0);
+    Ok(())
+}
+
+/// Start moving a workspace to another machine (push / pull): close its
+/// migration gate ([`migration_gate_for`]), then stop its live chats.
+///
+/// Until the returned guard drops no chat session in the workspace starts,
+/// so none can begin on the machine being left. Hold it until the new
+/// `host_id` is committed and the conversations have travelled with the
+/// files; dropping it on failure lets chats start where the workspace still
+/// runs.
+pub async fn begin_workspace_migration<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace_id: &str,
+) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+    let gate = migration_gate_for(workspace_id).write_owned().await;
+    stop_workspace_chat_sessions(app, workspace_id).await;
+    gate
+}
+
+/// Stop every live chat session in a workspace that push / pull is about to
+/// move to another machine, and wait for them. Done before the copy, so no
+/// agent keeps editing the files being copied and each provider's session
+/// files are final when they travel with it. The next send rebuilds each
+/// session where the workspace runs then, resuming its conversation where
+/// the provider can. Runs under the migration gate, so no thread starts
+/// meanwhile; the moved check in [`ensure_live_session`] still catches a
+/// session that outlives a move.
+async fn stop_workspace_chat_sessions<R: Runtime>(app: &AppHandle<R>, workspace_id: &str) {
+    let threads = app
+        .try_state::<AppStateStore>()
+        .and_then(|state| state.find_workspace(workspace_id))
+        .map(|ws| crate::state::collect_agent_chat_threads(&ws.surfaces))
+        .unwrap_or_default();
+    let Some(registry) = app.try_state::<ProviderRegistry>() else {
+        return;
+    };
+    for (kind, thread_id) in threads {
+        let Some(impl_) = registry.get(kind).await else {
+            continue;
+        };
+        let thread_id = ThreadId(thread_id);
+        // Wait out a rebuild already under way, so its session is stopped
+        // too rather than coming up after this pass.
+        let resume_lock = resume_lock_for(&thread_id.0);
+        let _resume_guard = resume_lock.lock().await;
+        if !impl_.has_session(&thread_id).await {
+            continue;
+        }
+        if let Err(error) = stop_moved_session(app, impl_.as_ref(), &thread_id).await {
+            eprintln!(
+                "[codemux::agent_chat] failed to stop {kind:?} thread={} before moving its workspace: {error}",
+                thread_id.0
+            );
+        }
+    }
+}
+
 // Stop must also cancel a send waiting for lazy resume, before a provider turn
 // exists. Keep the final enqueue and interrupt ordered, without holding this
 // gate during startup (which may wait behind another chat's approval).
@@ -1939,7 +2642,10 @@ fn hermes_send_gate(thread_id: &str) -> Arc<HermesSendGate> {
         .entry(thread_id.into()).or_default().clone()
 }
 impl HermesSendGate {
-    async fn before_dispatch(&self, generation: u64) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+    async fn before_dispatch(
+        &self,
+        generation: u64,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
         let guard = self.dispatch.lock().await;
         if self.cancelled.load(Ordering::SeqCst) != generation {
             return Err("cancelled: send stopped before dispatch".into());
@@ -1969,7 +2675,7 @@ impl HermesSendGate {
 /// duplicated here as a cheap `&'static str` rather than building the full
 /// capabilities bundle (which allocates the model list) just to read one
 /// field. OpenCode has no permission modes, so it stays `None`.
-fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
+pub(super) fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
     match provider {
         ProviderKind::Claude => Some("bypassPermissions"),
         ProviderKind::Codex => Some("danger-full-access"),
@@ -2000,7 +2706,7 @@ fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
 /// user explicitly picked a mode). OpenCode's fallback is `None`, so a
 /// `None` request stays `None` — it has no permission modes and there is
 /// nothing to heal.
-fn resolve_start_permission_mode(
+pub(super) fn resolve_start_permission_mode(
     provider: ProviderKind,
     requested: Option<String>,
 ) -> Option<String> {
@@ -2097,15 +2803,49 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
     thread_id: &ThreadId,
     require_original: bool,
 ) -> Result<(), String> {
-    crate::local_session_import::require_live_session(app,&thread_id.0)?;
+    let gate = native_thread_gate(app, &thread_id.0);
+    let generation = gate.generation();
+    let _native_guard = gate.dispatch.clone().lock_owned().await;
+    ensure_live_session_locked(
+        app,
+        provider_kind,
+        thread_id,
+        require_original,
+        None,
+        &gate,
+        generation,
+    )
+    .await
+}
+
+async fn ensure_live_session_locked<R: Runtime>(
+    app: &AppHandle<R>,
+    provider_kind: ProviderKind,
+    thread_id: &ThreadId,
+    require_original: bool,
+    control: Option<&NativeControlGuard>,
+    gate: &ThreadGate,
+    generation: u64,
+) -> Result<(), String> {
+    verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
+    crate::local_session_import::require_live_session(app, &thread_id.0)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider_kind).await?;
     // Fast path: a live session already exists, so no need to serialize
-    // — this is the common case (every send after the first).
-    if impl_.has_session(thread_id).await {
+    // — this is the common case (every send after the first). Unless its
+    // workspace moved to another machine since the session started.
+    if impl_.has_session(thread_id).await && !live_session_moved(app, &thread_id.0) {
+        verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
         return Ok(());
     }
+    verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
 
+    // Wait out a push / pull of the thread's workspace, and keep the next
+    // one from starting until the rebuild below has placed the session (see
+    // `migration_gate_for`). Taken before the resume lock: that is the lock
+    // order.
+    let _placement =
+        wait_for_workspace_placement(thread_workspace_id(app, &thread_id.0).as_deref()).await;
     // Serialize the check→rebuild across concurrent callers on the same
     // thread so two auto-resumes can't each spawn a sidecar (see
     // `resume_locks`). Held for the whole rebuild below.
@@ -2114,8 +2854,16 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
     // Re-check under the lock: another task may have rebuilt the session
     // while we were waiting to acquire it.
     if impl_.has_session(thread_id).await {
-        return Ok(());
+        if !live_session_moved(app, &thread_id.0) {
+            verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
+            return Ok(());
+        }
+        // Push / pull moved the workspace: rebuild the session where it is
+        // now, resuming the conversation like any other rebuild.
+        verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
+        stop_moved_session(app, impl_.as_ref(), thread_id).await?;
     }
+    verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
 
     // No live session — try to rebuild from the persisted row.
     let record = {
@@ -2129,40 +2877,70 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         return Ok(());
     };
 
-    if matches!(provider_kind, ProviderKind::Hermes | ProviderKind::Acp) {
+    // Resolve the pane from the thread. An orphaned thread (no pane) still
+    // runs where its workspace lives, so fall back to the persisted row's
+    // workspace for the device. Read under the migration gate, so this is
+    // where the workspace runs once any move has finished.
+    let (pane_id, pane_workspace) = {
         let state: State<'_, AppStateStore> = app.state();
-        if state.snapshot().workspaces.iter().any(|w| w.workspace_id.0 == record.workspace_id && w.host_id.is_some()) {
-            return Err("This ACP integration runs on local workspaces only; connect to the target desktop to resume it there.".into());
+        let pane_id = state.agent_chat_pane_id_for_thread(&thread_id.0);
+        let workspace = pane_id
+            .as_deref()
+            .and_then(|pane_id| state.workspace_id_for_pane(pane_id));
+        (pane_id, workspace)
+    };
+    let device = device_for_workspace(
+        app,
+        Some(pane_workspace.as_deref().unwrap_or(&record.workspace_id)),
+    )?;
+    let (cwd, remote) = match device.as_ref() {
+        Some(device) => {
+            ensure_provider_runs_on_devices(provider_kind)?;
+            (
+                prepare_device_session(provider_kind, device).await?,
+                Some(device.remote.clone()),
+            )
         }
-    }
-
-    let cwd = record
-        .cwd
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        None => (
+            record
+                .cwd
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+            None,
+        ),
+    };
 
     // Rebuild the workspace env overlay and owning workspace id so the
     // resumed agent's browser / CLI subprocesses and MCP dispatches route
     // to its OWN workspace, exactly like `agent_chat_start_session`
-    // (`pane_workspace_context`). Resolve the pane from the thread; an
-    // orphaned thread (no pane) injects nothing.
-    let (env, workspace_id) = {
-        let state: State<'_, AppStateStore> = app.state();
-        match state.agent_chat_pane_id_for_thread(&thread_id.0) {
-            Some(pane_id) => pane_workspace_context(&state, &pane_id, None),
-            None => (None, None),
+    // (`pane_workspace_context`). An orphaned thread injects nothing.
+    let (env, workspace_id) = match pane_id {
+        Some(pane_id) => {
+            let state: State<'_, AppStateStore> = app.state();
+            pane_workspace_context(
+                &state,
+                &pane_id,
+                None,
+                device.as_ref().map(|_| cwd.as_path()),
+            )
         }
+        None => (None, None),
     };
 
     // Build the resume cursor from the persisted id, but for Claude run a
     // preflight: if the CLI's on-disk session JSONL is confirmed gone,
     // skip the cursor and start fresh rather than wedging the rebuild on a
     // dead id. Best-effort clear the column so no later rebuild reuses it.
-    // Codex / OpenCode carry their own cursor shapes and are untouched.
+    // Codex / OpenCode carry their own cursor shapes and are untouched, and
+    // a device's session files aren't on this computer to check.
     let resume_cursor = match record.sdk_session_id.as_ref() {
-        Some(id) if provider_kind == ProviderKind::Claude && claude_session_file_missing(id) => {
+        Some(id)
+            if provider_kind == ProviderKind::Claude
+                && device.is_none()
+                && claude_session_file_missing(id) =>
+        {
             eprintln!(
                 "[codemux::agent_chat] dropping stale resume cursor for thread={} \
                  (Claude session file for {id} is gone); starting fresh",
@@ -2216,6 +2994,9 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         }
     }
 
+    if let Some(control) = control {
+        control.verify_mode(permission_mode.as_deref())?;
+    }
     let build_input = |resume_cursor: Option<serde_json::Value>| StartSessionInput {
         thread_id: thread_id.clone(),
         cwd: cwd.clone(),
@@ -2228,9 +3009,11 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         effort: if provider_kind == ProviderKind::Acp { None } else { record.effort.clone() },
         context_window: record.context_window.clone(),
         fast_mode: record.fast_mode,
+        service_tier: Some(record.service_tier.clone()),
         additional_directories: vec![],
         env: env.clone(),
         workspace_id: workspace_id.clone(),
+        remote: remote.clone(),
         extra: serde_json::Value::Null,
         recorded_usage_baseline: None,
     };
@@ -2243,11 +3026,17 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         record.model,
     );
 
-    match impl_
-        .start_session(build_input(resume_cursor.clone()))
-        .await
-    {
-        Ok(_) => Ok(()),
+    verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
+    let resume_input = build_input(resume_cursor.clone());
+    if let Some(control) = control {
+        control.verify_start(app, &resume_input)?;
+    }
+    let cancellation = Arc::new(crate::agent_control::NativeStartCancellation {gate:native_thread_gate(app, &thread_id.0),generation});
+    match impl_.start_session_with_cancellation(resume_input, Some(cancellation.clone())).await {
+        Ok(session) => {
+            record_native_worker_mode(app, &thread_id.0, provider_kind, permission_mode.clone());
+            if let Some(state) = app.try_state::<NativeControlState>() {state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {thread_id:session.thread_id,status:session.status});}
+        }
         Err(err)
             if resume_cursor.is_some()
                 && !require_original
@@ -2261,14 +3050,19 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
                  retrying as a fresh session",
                 thread_id.0,
             );
-            impl_
-                .start_session(build_input(None))
-                .await
-                .map_err(provider_err)?;
-            Ok(())
+            verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
+            let fresh = build_input(None);
+            if let Some(control) = control {
+                control.verify_start(app, &fresh)?;
+            }
+            let session = impl_.start_session_with_cancellation(fresh, Some(cancellation)).await.map_err(provider_err)?;
+            record_native_worker_mode(app, &thread_id.0, provider_kind, permission_mode.clone());
+            if let Some(state) = app.try_state::<NativeControlState>() {state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {thread_id:session.thread_id,status:session.status});}
         }
-        Err(err) => Err(provider_err(err)),
+        Err(err) => return Err(provider_err(err)),
     }
+    record_session_host(&thread_id.0, remote.as_ref().map(|remote| remote.host_id));
+    Ok(())
 }
 
 /// Command-layer input for [`agent_chat_send_turn`].
@@ -2448,6 +3242,10 @@ pub enum TurnOrigin {
     /// NOT count as user activity, or the scheduler's own dispatch would
     /// reset the attempt cap it is bounded by.
     UsageResume,
+    /// Cross-provider delegation: a delegated child's task, or a parent's
+    /// round of results. Not user activity either — it must not start a new
+    /// delegation round or forget a pending usage resume.
+    Delegation,
 }
 
 /// The one send path behind [`agent_chat_send_turn`] and the usage-limit
@@ -2457,12 +3255,57 @@ pub enum TurnOrigin {
 pub async fn send_turn_with_origin<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
-    mut input: SendTurnCommandInput,
+    input: SendTurnCommandInput,
     origin: TurnOrigin,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
-    crate::local_session_import::require_live_session(&app,&input.thread_id.0)?;
+    send_turn_internal(app, provider, input, origin, None).await
+}
+
+pub async fn send_turn_with_control<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    input: SendTurnCommandInput,
+    control: Option<NativeControlGuard>,
+) -> Result<crate::agent_provider::TurnStartResult, String> {
+    send_turn_internal(app, provider, input, TurnOrigin::User, control).await
+}
+
+async fn send_turn_internal<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    mut input: SendTurnCommandInput,
+    origin: TurnOrigin,
+    control: Option<NativeControlGuard>,
+) -> Result<crate::agent_provider::TurnStartResult, String> {
+    let native_gate = native_thread_gate(&app, &input.thread_id.0);
+    let native_generation = native_gate.generation();
+    // ACP applies this option to the whole live session (including queued
+    // turns), not a turn sandbox. The existing permission setter owns that
+    // mutation and its live/persisted witness.
+    if input.permission_mode_override.is_some() && matches!(provider, ProviderKind::Cursor | ProviderKind::Grok) {
+        return Err("unsupported_permission_override: use the native session permission setter for ACP providers".into());
+    }
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
+    if let Some(control) = &control {
+        if let Some(mode) = &input.permission_mode_override {
+            control.verify_mode(Some(mode))?;
+        }
+    }
+    crate::local_session_import::require_live_session(&app, &input.thread_id.0)?;
     if provider == ProviderKind::Hermes && !input.skill_ids.is_empty() {
         return Err("unsupported: Hermes owns its native skills; projected Codemux skills cannot be injected".into());
+    }
+    // Skills resolve against files on this computer; a device thread's
+    // files are on the device.
+    if !input.skill_ids.is_empty() && thread_runs_on_device(&app, &input.thread_id.0) {
+        return Err("Skills aren't available for threads on another device yet".into());
     }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
@@ -2471,9 +3314,12 @@ pub async fn send_turn_with_origin<R: Runtime>(
     if origin == TurnOrigin::User {
         let db: State<'_, DatabaseStore> = app.state();
         super::usage_resume::forget_on_user_activity(&db, &input.thread_id.0);
+        // A user message starts a new delegation round for this chat.
+        super::delegation::on_user_turn(&app, &input.thread_id.0);
     }
-    // Resume callers already hold this lock. User sends disarm immediately,
-    // then wait for any already-claimed resume to finish dispatching.
+    // Resume and delegation callers already hold this lock. User sends
+    // disarm immediately, then wait for any already-claimed resume to finish
+    // dispatching.
     let _activity_guard = if origin == TurnOrigin::User {
         Some(
             super::usage_resume::activity_lock(&input.thread_id.0)
@@ -2483,6 +3329,25 @@ pub async fn send_turn_with_origin<R: Runtime>(
     } else {
         None
     };
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
+    // Lock order is activity -> native lifecycle -> resume -> checkpoint.
+    // Usage-resume already owns activity; never reacquire it below this gate.
+    let _native_guard = native_gate.dispatch.clone().lock_owned().await;
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
     if origin == TurnOrigin::User {
         // A previously claimed resume may have hit another limit while this
         // user send waited for its dispatch to finish.
@@ -2493,9 +3358,34 @@ pub async fn send_turn_with_origin<R: Runtime>(
     // this thread (e.g. the app was restarted), rebuild it from the
     // persisted row before the turn so the user never sees a
     // `session_not_found`. No-op when a session is already live.
-    ensure_live_session(&app, provider, &input.thread_id).await?;
+    ensure_live_session_locked(
+        &app,
+        provider,
+        &input.thread_id,
+        false,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )
+    .await?;
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
     use crate::agent_provider::types::MessageDelivery;
     if input.client_nonce.as_deref().is_none_or(str::is_empty) {
         input.client_nonce = Some(uuid::Uuid::new_v4().to_string());
@@ -2524,9 +3414,20 @@ pub async fn send_turn_with_origin<R: Runtime>(
     // image fs failure is logged and skipped inside the helper.
     let (saved_images, image_inputs) =
         finalize_chat_images(&thread_id_for_persist, &input.images).await?;
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
     let db: State<'_, DatabaseStore> = app.state();
+    // Checkpoints snapshot the repo with local git, which can't reach a
+    // device thread's files.
     let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = if run_checkpoints_enabled()
         && impl_.capabilities().supports_conversation_rollback
+        && !thread_runs_on_device(&app, &thread_id_for_persist)
     {
             db.get_agent_chat_session(&thread_id_for_persist)
                 .and_then(|session| {
@@ -2567,6 +3468,14 @@ pub async fn send_turn_with_origin<R: Runtime>(
             )
             .await?
     };
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
     let rendered_text = render_skill_invocations(
         &input.text,
         input.skill_text.as_deref(),
@@ -2589,10 +3498,9 @@ pub async fn send_turn_with_origin<R: Runtime>(
     if turn_checkpoint.is_none() && db.has_agent_chat_turn_checkpoints(&thread_id_for_persist) {
         let stale_refs = db.clear_agent_chat_turn_checkpoints(&thread_id_for_persist)?;
         for (repo_path, ref_name) in stale_refs {
-            if let Err(error) = crate::git::git_checkpoint_delete_ref(
-                std::path::Path::new(&repo_path),
-                &ref_name,
-            ) {
+            if let Err(error) =
+                crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
+            {
                 eprintln!("[codemux::agent_chat] failed to delete stale turn ref: {error}");
             }
         }
@@ -2602,6 +3510,12 @@ pub async fn send_turn_with_origin<R: Runtime>(
         );
     }
     drop(invalidation_guard);
+    let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = match &control {
+        Some(control) => Some(Arc::new(crate::agent_control::GuardedTurnCheckpoint {
+            app: app.clone(), control: control.clone().retain_admission(&app), inner: turn_checkpoint,
+        })),
+        None => turn_checkpoint,
+    };
     // Build the provider's byte-carrying input from the command DTO.
     let provider_input = SendTurnInput {
         thread_id: input.thread_id.clone(),
@@ -2619,6 +3533,14 @@ pub async fn send_turn_with_origin<R: Runtime>(
         (Some(gate), Some(generation)) => Some(gate.before_dispatch(generation).await?),
         _ => None,
     };
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
     // Register attachments before the provider can emit TurnQueued and
     // immediately dispatch it. The event bridge and RPC return race to
     // transfer this entry, so exactly one owns its deferred persistence.
@@ -2638,6 +3560,17 @@ pub async fn send_turn_with_origin<R: Runtime>(
     if input.delivery != MessageDelivery::Steer {
         let tracker: State<'_, SubagentTracker> = app.state();
         tracker.begin_turn(&thread_id_for_persist);
+    }
+    if let Err(error) = verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    ) {
+        pending_send_images().lock().unwrap().remove(&pending_key);
+        return Err(error);
     }
     let sent = match input.delivery {
         MessageDelivery::Steer => impl_.steer_turn(provider_input).await,
@@ -2661,6 +3594,14 @@ pub async fn send_turn_with_origin<R: Runtime>(
     }
     drop(dispatch_guard);
     let result = sent.map_err(provider_err)?;
+    if let Some(queued_id) = &result.queued_id {
+        // Do not acknowledge queued acceptance without durable evidence.
+        // The event bridge may lag, or dispatch/cancellation may beat this ACK.
+        db.control_record_queue_admission(&input.thread_id.0, queued_id)?;
+    }
+    if let Some(state) = app.try_state::<NativeControlState>() {
+        state.record_accepted_turn(&input.thread_id.0, &result);
+    }
     if input.delivery == MessageDelivery::Steer && !result.steered {
         let tracker: State<'_, SubagentTracker> = app.state();
         tracker.begin_turn(&thread_id_for_persist);
@@ -2691,7 +3632,8 @@ pub async fn send_turn_with_origin<R: Runtime>(
                 &user_text_for_persist,
                 &saved_images,
                 input.client_nonce.as_deref(),
-                result.steered.then_some(&result.turn_id),
+                &result.turn_id,
+                result.steered,
             );
             bind_turn_checkpoint_transcript(
                 &app,
@@ -2727,10 +3669,21 @@ pub async fn send_turn_with_origin<R: Runtime>(
 
     if input.delivery == MessageDelivery::Interrupt {
         if let Some(queued_id) = &result.queued_id {
-            if let Err(error) = impl_
-                .send_queued_turn_now(input.thread_id.clone(), queued_id.clone())
-                .await
-            {
+            let promotion = match verify_native_control(
+                &app,
+                provider,
+                &input.thread_id.0,
+                control.as_ref(),
+                &native_gate,
+                native_generation,
+            ) {
+                Ok(()) => impl_
+                    .send_queued_turn_now(input.thread_id.clone(), queued_id.clone())
+                    .await
+                    .map_err(provider_err),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = promotion {
                 // The message is accepted and still queued. Reporting a send
                 // failure would restore the draft and invite a duplicate.
                 let payload = AgentChatEventPayload {
@@ -2791,6 +3744,8 @@ pub async fn agent_chat_send_queued_turn_now<R: Runtime>(
     queued_id: String,
     delivery: Option<crate::agent_provider::types::MessageDelivery>,
 ) -> Result<(), String> {
+    let gate = native_thread_gate(&app, &thread_id.0);
+    let generation = gate.generation();
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
@@ -2801,8 +3756,11 @@ pub async fn agent_chat_send_queued_turn_now<R: Runtime>(
         let db: State<'_, DatabaseStore> = app.state();
         super::usage_resume::forget_on_user_activity(&db, &thread_id.0);
     }
+    let _native_guard = gate.dispatch.clone().lock_owned().await;
+    gate.verify(generation)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
+    gate.verify(generation)?;
     use crate::agent_provider::types::MessageDelivery;
     match delivery.unwrap_or(MessageDelivery::Interrupt) {
         MessageDelivery::Steer => impl_.steer_queued_turn(thread_id, queued_id).await,
@@ -3430,6 +4388,8 @@ pub async fn agent_chat_prime_mcp<R: Runtime>(app: AppHandle<R>) -> Result<(), S
             .workspaces
             .iter()
             .find(|w| w.workspace_id == snapshot.active_workspace_id)
+            // A device workspace's project config isn't on this computer.
+            .filter(|w| w.host_id.is_none())
             .map(|w| std::path::PathBuf::from(&w.cwd))
             .filter(|p| !p.as_os_str().is_empty())
     };
@@ -3500,14 +4460,15 @@ fn persist_user_message(
     text: &str,
     images: &[PersistedChatImage],
     client_nonce: Option<&str>,
-    steered_turn_id: Option<&TurnId>,
+    turn_id: &TurnId,
+    steered: bool,
 ) -> Option<i64> {
     let mut user_msg = serde_json::json!({
         "type": "user_message",
         "thread_id": thread_id,
         "text": text,
     });
-    if let Some(turn_id) = steered_turn_id {
+    if steered {
         user_msg["steered_turn_id"] = serde_json::json!(turn_id);
     }
     if let Some(nonce) = client_nonce.filter(|n| !n.is_empty()) {
@@ -3526,7 +4487,7 @@ fn persist_user_message(
         user_msg["images"] = serde_json::Value::Array(images_json);
     }
     let payload = serde_json::to_string(&user_msg).ok()?;
-    db.append_agent_chat_message(thread_id, &payload)
+    db.control_append_user_message(thread_id, &payload, &turn_id.0, steered)
         .ok()
         .flatten()
 }
@@ -3578,21 +4539,54 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
     thread_id: ThreadId,
     turn_id: Option<TurnId>,
 ) -> Result<bool, String> {
+    agent_chat_interrupt_turn_guarded(app, provider, thread_id, turn_id, None).await
+}
+
+pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    turn_id: Option<TurnId>,
+    control: Option<NativeControlGuard>,
+) -> Result<bool, String> {
+    if let Some(control) = &control {
+        control.verify_target(provider, &thread_id.0)?;
+        control.verify(&app)?;
+    }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
-    super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
+    let native_gate = native_thread_gate(&app, &thread_id.0);
+    // A selected interrupt applies only to an already-running turn. The
+    // provider must first match that identity; it is not a blanket Stop of
+    // newer admitted sends, usage resumes or delegated tasks.
+    if turn_id.is_none() {
+        native_gate.cancel();
+        // Before the lock: a delegated child's starter holds it while it starts,
+        // and the task must read Stopped at once rather than after the start.
+        super::delegation::on_thread_stopped(&app, &thread_id.0, super::delegation::StopKind::Stop);
+        super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
+    }
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
         .lock_owned()
         .await;
-    super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
+    if turn_id.is_none() { super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0); }
+    let _native_guard = native_gate.dispatch.clone().lock_owned().await;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
+    if let Some(control) = &control {
+        control.verify(&app)?;
+    }
     let hermes_gate = (matches!(provider, ProviderKind::Hermes | ProviderKind::Acp) && turn_id.is_none())
         .then(|| hermes_send_gate(&thread_id.0));
     let _dispatch_guard = if let Some(gate) = hermes_gate.as_ref() {
         gate.cancelled.fetch_add(1, Ordering::SeqCst);
         Some(gate.dispatch.lock().await)
-    } else { None };
+    } else {
+        None
+    };
+    if let Some(control) = &control {
+        control.verify(&app)?;
+    }
     let reached = match impl_.interrupt_turn(thread_id.clone(), turn_id).await {
         Ok(()) => true,
         Err(ProviderError::SessionNotFound { .. }) | Err(ProviderError::SessionClosed { .. }) => {
@@ -3678,14 +4672,13 @@ pub async fn agent_chat_stop_monitoring<R: Runtime>(
     // Best-effort: a dead session (`SessionNotFound`) or a provider that
     // declines the call must not stop the state from clearing.
     if let Some(thread_id) = thread_id.as_ref() {
-        let registry: State<'_, ProviderRegistry> = app.state();
-        if let Ok(impl_) = lookup_provider(&registry, provider).await {
-            if let Err(error) = impl_.interrupt_turn(thread_id.clone(), None).await {
-                eprintln!(
-                    "[codemux::agent_chat] stop_monitoring: interrupt was not accepted \
-                     (state cleared anyway): {error:?}"
-                );
-            }
+        if let Err(error) =
+            agent_chat_interrupt_turn(app.clone(), provider, thread_id.clone(), None).await
+        {
+            eprintln!(
+                "[codemux::agent_chat] stop_monitoring: interrupt was not accepted \
+                 (state cleared anyway): {error:?}"
+            );
         }
     }
 
@@ -3775,6 +4768,32 @@ pub async fn agent_chat_respond_to_request<R: Runtime>(
     request_id: RequestId,
     decision: ApprovalDecision,
 ) -> Result<(), String> {
+    agent_chat_respond_to_request_guarded(app, provider, thread_id, request_id, decision, None)
+        .await
+}
+
+pub async fn agent_chat_respond_to_request_guarded<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    request_id: RequestId,
+    decision: ApprovalDecision,
+    control: Option<NativeControlGuard>,
+) -> Result<(), String> {
+    if let Some(control) = &control {
+        control.verify_target(provider, &thread_id.0)?;
+        control.verify(&app)?;
+        if control.caller.access != crate::agent_control::ControlAccess::FullAccess
+            && !matches!(
+                decision,
+                ApprovalDecision::Deny { .. } | ApprovalDecision::Cancel
+            )
+        {
+            return Err(
+                "permission_ceiling: supervised clients cannot approve worker requests".into(),
+            );
+        }
+    }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
@@ -3787,18 +4806,47 @@ pub async fn agent_chat_respond_to_request<R: Runtime>(
     // orphan instead. OpenCode opts into resume because its permission
     // request lives in the external HTTP server rather than this process.
     if !impl_.has_session(&thread_id).await {
-        if !impl_.pending_requests_survive_session_restart() {
+        if control.is_some() || !impl_.pending_requests_survive_session_restart() {
             emit_stale_request_failure(&app, thread_id, request_id);
-            return Ok(());
+            return if control.is_some() {
+                Err("stale_provider_callback: request is not pending in the current provider process".into())
+            } else {
+                Ok(())
+            };
         }
         ensure_live_session(&app, provider, &thread_id).await?;
     }
 
+    if let Some(control) = &control {
+        control.verify(&app)?;
+        if !app
+            .try_state::<NativeControlState>()
+            .is_some_and(|state| state.request_is_current(&thread_id.0, &request_id.0))
+        {
+            emit_stale_request_failure(&app, thread_id, request_id);
+            return Err(
+                "stale_provider_callback: no current-process request matches this ID".into(),
+            );
+        }
+    }
+    let dispatch_decision = if control.is_some() && matches!(provider, ProviderKind::Cursor | ProviderKind::Grok) {
+        app.state::<NativeControlState>().exact_acp_decision(&thread_id.0, &request_id.0, &decision)?
+    } else { decision.clone() };
     match impl_
-        .respond_to_request(thread_id.clone(), request_id.clone(), decision)
+        .respond_to_request(thread_id.clone(), request_id.clone(), dispatch_decision)
         .await
     {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            super::delegation::on_request_answered(&app, &thread_id.0, &request_id.0);
+            if let Some(state) = app.try_state::<NativeControlState>() {
+                state.observe_event(&ProviderRuntimeEvent::RequestResolved {
+                    thread_id,
+                    request_id,
+                    decision,
+                });
+            }
+            Ok(())
+        }
         // A provider can lose the callback between the liveness check and
         // the response, or a recovered external session may no longer know
         // the request. Persist one terminal failure so remount/hydration
@@ -3807,7 +4855,11 @@ pub async fn agent_chat_respond_to_request<R: Runtime>(
         | Err(ProviderError::SessionNotFound { .. })
         | Err(ProviderError::SessionClosed { .. }) => {
             emit_stale_request_failure(&app, thread_id, request_id);
-            Ok(())
+            if control.is_some() {
+                Err("stale_provider_callback: request is no longer pending".into())
+            } else {
+                Ok(())
+            }
         }
         Err(err) => Err(provider_err(err)),
     }
@@ -3850,6 +4902,14 @@ pub async fn agent_chat_set_model<R: Runtime>(
     thread_id: ThreadId,
     model: Option<String>,
 ) -> Result<(), String> {
+    let native_gate = native_thread_gate(&app, &thread_id.0);
+    // Custom ACP orders a model change against its own turns: sends stay
+    // admissible while the change awaits the agent's acknowledgement.
+    let _native_guard = if provider == ProviderKind::Acp {
+        None
+    } else {
+        Some(native_gate.dispatch.clone().lock_owned().await)
+    };
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
@@ -3870,9 +4930,13 @@ pub async fn agent_chat_set_model<R: Runtime>(
         // Resume takes this same lock. Finish it before locking the mutation;
         // a missing session is never acknowledgement of a model request.
         ensure_live_session(&app, provider, &thread_id).await?;
+        // The live session orders the change against its own turns. Lock only
+        // after the agent acknowledges it: starts and settings take this lock
+        // under the native gate, so holding it here would queue sends,
+        // interrupts and Stop behind the acknowledgement.
+        impl_.set_model(thread_id.clone(), model).await.map_err(provider_err)?;
         let lock = resume_lock_for(&thread_id.0);
         let _guard = lock.lock().await;
-        impl_.set_model(thread_id.clone(), model).await.map_err(provider_err)?;
         let acp = app.state::<Arc<crate::agent_provider::custom_acp::GenericAcpProvider>>();
         let catalog = acp.catalog(&thread_id).await.map_err(provider_err)?;
         return super::custom_acp::persist_catalog(&app.state::<DatabaseStore>(), &thread_id.0, &catalog);
@@ -3910,6 +4974,8 @@ pub async fn agent_chat_set_fast_mode<R: Runtime>(
     thread_id: ThreadId,
     fast_mode: bool,
 ) -> Result<(), String> {
+    let native_gate = native_thread_gate(&app, &thread_id.0);
+    let _native_guard = native_gate.dispatch.clone().lock_owned().await;
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
@@ -3935,6 +5001,37 @@ pub async fn agent_chat_set_fast_mode<R: Runtime>(
     Ok(())
 }
 
+/// Apply and persist a provider-native service tier without replacing the thread.
+#[tauri::command]
+pub async fn agent_chat_set_service_tier<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    service_tier: String,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    let lock = resume_lock_for(&thread_id.0);
+    let _guard = lock.lock().await;
+    match impl_
+        .set_service_tier(thread_id.clone(), service_tier.clone())
+        .await
+    {
+        Ok(()) | Err(ProviderError::SessionNotFound { .. }) => {}
+        Err(err) => return Err(provider_err(err)),
+    }
+    let db: State<'_, DatabaseStore> = app.state();
+    db.update_agent_chat_session_config(
+        &thread_id.0,
+        &AgentChatSessionConfig {
+            service_tier: Some(service_tier),
+            ..Default::default()
+        },
+    )
+}
+
 /// Change a session's permission mode (accept-edits, bypass, plan,
 /// etc.). The mode is passed through as a string; providers reject
 /// unknown values via `ProviderError::ValidationError`.
@@ -3953,6 +5050,8 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
     thread_id: ThreadId,
     mode: String,
 ) -> Result<(), String> {
+    let native_gate = native_thread_gate(&app, &thread_id.0);
+    let _native_guard = native_gate.dispatch.clone().lock_owned().await;
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
@@ -3976,6 +5075,9 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
         });
     }
     // Persist first so the value survives a restart / next auto-resume.
+    if let Some(state) = app.try_state::<NativeControlState>() {
+        state.mark_worker_mode_uncertain(&thread_id.0);
+    }
     {
         let db: State<'_, DatabaseStore> = app.state();
         let config = AgentChatSessionConfig {
@@ -3986,9 +5088,20 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
             eprintln!("[codemux::agent_chat] failed to persist permission_mode config: {error}");
         }
     }
-    match impl_.set_permission_mode(thread_id, mode).await {
-        Ok(()) => Ok(()),
-        Err(ProviderError::SessionNotFound { .. }) => Ok(()),
+    match impl_
+        .set_permission_mode(thread_id.clone(), mode.clone())
+        .await
+    {
+        Ok(()) => {
+            record_native_worker_mode(&app, &thread_id.0, provider, Some(mode));
+            Ok(())
+        }
+        Err(ProviderError::SessionNotFound { .. }) => {
+            if let Some(state) = app.try_state::<NativeControlState>() {
+                state.clear_worker(&thread_id.0);
+            }
+            Ok(())
+        }
         Err(err) => Err(provider_err(err)),
     }
 }
@@ -4025,6 +5138,7 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
 pub async fn list_chat_provider_capabilities<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
+    force: Option<bool>,
     codex_cache: tauri::State<
         '_,
         std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>,
@@ -4041,7 +5155,10 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
         '_,
         std::sync::Arc<crate::agent_provider::claude::capabilities::ClaudeCapabilityCache>,
     >,
-    opencode_manager: State<'_, std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>>,
+    opencode_manager: State<
+        '_,
+        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
+    >,
 ) -> Result<ProviderChatCapabilities, String> {
     // Note: `feature_flag_on(&observability)?;` was deliberately
     // removed when settings began consuming capabilities. See the
@@ -4081,6 +5198,9 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
                 }
                 .to_command_string()
             })?;
+            if force.unwrap_or(false) {
+                codex_cache.invalidate().await;
+            }
             codex_cache
                 .get_or_harvest(&binary_path, None)
                 .await
@@ -4152,11 +5272,24 @@ pub async fn agent_chat_hooks(
     update: Option<crate::agent_provider::codex::hooks::HookUpdate>,
     registry: tauri::State<'_, ProviderRegistry>,
     observability: tauri::State<'_, ObservabilityStore>,
+    state: tauri::State<'_, AppStateStore>,
+    db: tauri::State<'_, DatabaseStore>,
 ) -> Result<crate::agent_provider::codex::hooks::HooksList, String> {
     feature_flag_on(&observability)?;
+    // Hook discovery reads and writes the folder on this computer.
+    if runs_on_device(
+        &state,
+        Some(db.inner()),
+        thread_id.as_ref().map(|thread| thread.0.as_str()),
+        cwd.as_deref(),
+    ) {
+        return Err("Hooks aren't available for threads on another device yet".into());
+    }
     let directory = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
         Some(cwd) => std::path::PathBuf::from(cwd),
-        None => dirs::home_dir().ok_or_else(|| "Cannot resolve your home directory.".to_string())?,
+        None => {
+            dirs::home_dir().ok_or_else(|| "Cannot resolve your home directory.".to_string())?
+        }
     };
     lookup_provider(&registry, provider).await?.manage_hooks(&directory, thread_id, update).await
 }
@@ -4184,10 +5317,15 @@ pub async fn list_chat_slash_commands(
         '_,
         std::sync::Arc<crate::agent_provider::acp::slash_commands::AcpSlashCommandCache>,
     >,
-    opencode_manager: tauri::State<'_, std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>>,
+    opencode_manager: tauri::State<
+        '_,
+        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
+    >,
     force: Option<bool>,
     thread_id: Option<ThreadId>,
     registry: tauri::State<'_, ProviderRegistry>,
+    state: tauri::State<'_, AppStateStore>,
+    db: tauri::State<'_, DatabaseStore>,
 ) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, String> {
     let cwd = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
         Some(cwd) => cwd,
@@ -4199,8 +5337,28 @@ pub async fn list_chat_slash_commands(
                 .session_slash_commands(thread_id, std::path::Path::new(&cwd)).await.map_err(provider_err);
         }
     }
+    let on_device = runs_on_device(
+        &state,
+        Some(db.inner()),
+        thread_id.as_ref().map(|thread| thread.0.as_str()),
+        Some(cwd.as_str()),
+    );
     match provider {
+        // The harvest runs this computer's `claude` in the folder, which
+        // only exists on the device and would list this computer's
+        // commands. The composer still accepts typed `/commands`.
+        ProviderKind::Claude if on_device => Ok(Vec::new()),
         ProviderKind::Claude => slash_cache.get_or_harvest_with_refresh(&cwd, force.unwrap_or(false)).await,
+        // The probe would spawn a local `grok` in a folder that only exists
+        // on the device; serve what a session there already published.
+        ProviderKind::Grok if on_device => {
+            Ok(acp_slash_cache
+                .cached(
+                    crate::agent_provider::acp::session::AcpDialect::Grok,
+                    std::path::Path::new(&cwd),
+                )
+                .await)
+        }
         ProviderKind::Grok => {
             let binary_path = which::which("grok").map_err(|_| {
                 crate::agent_provider::grok::capabilities::HarvestError::NotInstalled {
@@ -4230,20 +5388,25 @@ pub async fn list_chat_slash_commands(
         ProviderKind::OpenCode => {
             let handle = opencode_manager.ensure_running().await?;
             let mut config = crate::agent_provider::opencode::OpenCodeClientConfig::new(handle.base_url);
-            config.server_password = Some(handle.server_password);
+            config.api = handle.api;
+    config.server_password = Some(handle.server_password);
             let client = crate::agent_provider::opencode::OpenCodeClient::new(config)?;
-            let mut commands = vec![crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
-                name: "compact".into(),
-                description: "Summarize conversation history to free up context".into(),
-                argument_hint: String::new(),
-            }];
+            let mut commands = vec![
+                crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
+                    name: "compact".into(),
+                    description: "Summarize conversation history to free up context".into(),
+                    argument_hint: String::new(),
+                },
+            ];
             for command in client.list_commands(std::path::Path::new(&cwd)).await? {
                 if command.name != "compact" && command.source.as_deref() != Some("skill") {
-                    commands.push(crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
-                        name: command.name,
-                        description: command.description.unwrap_or_default(),
-                        argument_hint: command.hints.join(" "),
-                    });
+                    commands.push(
+                        crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
+                            name: command.name,
+                            description: command.description.unwrap_or_default(),
+                            argument_hint: command.hints.join(" "),
+                        },
+                    );
                 }
             }
             Ok(commands)
@@ -4264,17 +5427,49 @@ pub async fn agent_chat_stop_session<R: Runtime>(
     provider: ProviderKind,
     thread_id: ThreadId,
 ) -> Result<(), String> {
+    agent_chat_stop_session_guarded(app, provider, thread_id, None).await
+}
+
+pub async fn agent_chat_stop_session_guarded<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    control: Option<NativeControlGuard>,
+) -> Result<(), String> {
+    if let Some(control) = &control {
+        control.verify_target(provider, &thread_id.0)?;
+        control.verify(&app)?;
+    }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    let native_gate = native_thread_gate(&app, &thread_id.0);
+    native_gate.cancel();
+    // A restart in place: a delegated child's task stops quietly, a
+    // parent's tasks keep running (New Chat / history pick rebinds the
+    // pane afterwards, and that rebind is what stops them).
+    super::delegation::on_thread_stopped(&app, &thread_id.0, super::delegation::StopKind::Restart);
     super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
         .lock_owned()
         .await;
     super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
+    let _native_guard = native_gate.dispatch.clone().lock_owned().await;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
-    match impl_.stop_session(thread_id).await {
-        Ok(()) | Err(ProviderError::SessionNotFound { .. }) => Ok(()),
+    if let Some(control) = &control {
+        control.verify(&app)?;
+    }
+    match impl_.stop_session(thread_id.clone()).await {
+        Ok(()) | Err(ProviderError::SessionNotFound { .. }) => {
+            if let Some(state) = app.try_state::<NativeControlState>() {
+                state.clear_worker(&thread_id.0);
+                state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id,
+                    status: SessionStatus::Closed,
+                });
+            }
+            Ok(())
+        }
         Err(err) => Err(provider_err(err)),
     }
 }
@@ -4314,15 +5509,25 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
     for (_, thread_id) in &threads {
         tracker.clear_thread(thread_id);
         super::usage_resume::cancel_for_stopped_thread(app, thread_id);
+        super::delegation::on_thread_stopped(app, thread_id, super::delegation::StopKind::Close);
     }
+    let threads: Vec<_> = threads
+        .into_iter()
+        .map(|(kind, thread_id)| {
+            let gate = native_thread_gate(app, &thread_id);
+            gate.cancel();
+            (kind, thread_id, gate)
+        })
+        .collect();
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let registry: State<'_, ProviderRegistry> = app_handle.state();
-        for (kind, thread_id) in threads {
+        for (kind, thread_id, gate) in threads {
             let _activity_guard = super::usage_resume::activity_lock(&thread_id)
                 .lock_owned()
                 .await;
             super::usage_resume::cancel_for_stopped_thread(&app_handle, &thread_id);
+            let _native_guard = gate.dispatch.clone().lock_owned().await;
             let Some(impl_) = registry.get(kind).await else {
                 continue;
             };
@@ -4330,6 +5535,12 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
                 eprintln!(
                     "[agent_chat] cleanup stop_session failed for {kind:?} {thread_id}: {error:?}"
                 );
+            } else if let Some(state) = app_handle.try_state::<NativeControlState>() {
+                state.clear_worker(&thread_id);
+                state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: ThreadId(thread_id.clone()),
+                    status: SessionStatus::Closed,
+                });
             }
         }
     });
@@ -4985,12 +6196,25 @@ pub async fn agent_chat_get_session(
 /// Not gated on the feature flag, same rationale as
 /// [`agent_chat_get_session`].
 #[tauri::command]
-pub async fn agent_chat_update_session_config(
+pub async fn agent_chat_update_session_config<R: Runtime>(
+    app: AppHandle<R>,
     db: State<'_, DatabaseStore>,
     thread_id: String,
     config: AgentChatSessionConfig,
 ) -> Result<(), String> {
-    db.update_agent_chat_session_config(&thread_id, &config)
+    let gate = native_thread_gate(&app, &thread_id);
+    let _native_guard = gate.dispatch.clone().lock_owned().await;
+    let permission_changed = config.permission_mode.is_some()
+        && db
+            .get_agent_chat_session(&thread_id)
+            .is_some_and(|record| config.permission_mode.as_ref() != Some(&record.permission_mode));
+    db.update_agent_chat_session_config(&thread_id, &config)?;
+    if permission_changed {
+        if let Some(state) = app.try_state::<NativeControlState>() {
+            state.mark_worker_mode_uncertain(&thread_id);
+        }
+    }
+    Ok(())
 }
 
 /// Rename a persisted chat session. Used by the dropdown's per-row
@@ -5018,6 +6242,9 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     db: State<'_, DatabaseStore>,
     thread_id: String,
 ) -> Result<(), String> {
+    let gate = native_thread_gate(&app, &thread_id);
+    gate.cancel();
+    let _native_guard = gate.dispatch.clone().lock_owned().await;
     if db.hermes_binding(&thread_id)?.is_some() {
         let registry: State<'_, ProviderRegistry> = app.state();
         if let Some(provider) = registry.get(ProviderKind::Hermes).await {
@@ -5055,8 +6282,14 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     }
     checkpoint_refs.extend(safety_repos.into_iter().flat_map(|repo_path| {
         [
-            (repo_path.clone(), crate::git::pre_restore_ref_name(&thread_id)),
-            (repo_path, crate::git::pre_restore_failed_ref_name(&thread_id)),
+            (
+                repo_path.clone(),
+                crate::git::pre_restore_ref_name(&thread_id),
+            ),
+            (
+                repo_path,
+                crate::git::pre_restore_failed_ref_name(&thread_id),
+            ),
         ]
     }));
     db.delete_agent_chat_session(&thread_id)?;
@@ -5064,10 +6297,9 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     // The thread is gone; its dispatch lock can never be contended again.
     forget_turn_checkpoint_lock(&thread_id);
     for (repo_path, ref_name) in checkpoint_refs {
-        if let Err(error) = crate::git::git_checkpoint_delete_ref(
-            std::path::Path::new(&repo_path),
-            &ref_name,
-        ) {
+        if let Err(error) =
+            crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
+        {
             eprintln!("[codemux::agent_chat] failed to delete session checkpoint ref: {error}");
         }
     }
@@ -5091,16 +6323,21 @@ fn cleanup_collapsed_session_resources(cleanup: crate::database::AgentChatSessio
             .into_iter()
             .flat_map(|(thread_id, repo_path)| {
                 [
-                    (repo_path.clone(), crate::git::pre_restore_ref_name(&thread_id)),
-                    (repo_path, crate::git::pre_restore_failed_ref_name(&thread_id)),
+                    (
+                        repo_path.clone(),
+                        crate::git::pre_restore_ref_name(&thread_id),
+                    ),
+                    (
+                        repo_path,
+                        crate::git::pre_restore_failed_ref_name(&thread_id),
+                    ),
                 ]
             }),
     );
     for (repo_path, ref_name) in refs {
-        if let Err(error) = crate::git::git_checkpoint_delete_ref(
-            std::path::Path::new(&repo_path),
-            &ref_name,
-        ) {
+        if let Err(error) =
+            crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
+        {
             eprintln!(
                 "[codemux::agent_chat] failed to delete merged-session checkpoint ref: {error}"
             );
@@ -5353,6 +6590,16 @@ fn is_renderable_image_entry(entry: &serde_json::Value) -> bool {
                 None => iu.as_str(),
             })
             .is_some_and(is_safe_image_src),
+        Some("file") => {
+            entry
+                .get("mime")
+                .and_then(|mime| mime.as_str())
+                .is_some_and(|mime| mime.to_ascii_lowercase().starts_with("image/"))
+                && entry
+                    .get("uri")
+                    .and_then(|uri| uri.as_str())
+                    .is_some_and(is_safe_image_src)
+        }
         Some("image") => {
             let Some(source) = entry.get("source").and_then(|s| s.as_object()) else {
                 return false;
@@ -5684,6 +6931,15 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             }
         }
     }
+    // Queue events contain prompt text for LIVE rendering only. Persist a
+    // control-only ID/disposition journal instead of replayable actor events.
+    if matches!(&event, ProviderRuntimeEvent::TurnQueued { .. }
+        | ProviderRuntimeEvent::QueuedTurnDispatched { .. } | ProviderRuntimeEvent::QueuedTurnCancelled { .. }) {
+        let db: State<'_, DatabaseStore> = app.state();
+        if let Err(error) = db.control_record_queue_event(&event) {
+            eprintln!("[codemux::agent_chat] failed to persist queue disposition: {error}");
+        }
+    }
     if let ProviderRuntimeEvent::TurnQueued {
         thread_id,
         client_nonce: Some(nonce),
@@ -5737,7 +6993,8 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                 text,
                 &pending.images,
                 pending.client_nonce.as_deref(),
-                (*steered).then_some(turn_id),
+                turn_id,
+                *steered,
             );
             bind_turn_checkpoint_transcript(
                 app,
@@ -5812,6 +7069,9 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         }
         super::usage_resume::end_turn(thread_id);
     }
+    if let Some(state) = app.try_state::<NativeControlState>() {
+        state.observe_event(&event);
+    }
     // Best-effort transcript persistence so the SessionSelector resume
     // path can replay the visible conversation. We only persist events
     // that mutate the rendered transcript; partial deltas, lifecycle
@@ -5840,16 +7100,28 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     // and PaneNode borders reflect chat agents exactly like terminal
     // agents (whose status flows in through hooks.rs). This is the whole
     // reason chat workspaces previously showed no status dot.
-    let tracker: State<'_, SubagentTracker> = app.state();
-    publish_pane_status(app, &tracker, &event);
+    //
+    // A delegated task's card is the exception: it reports another chat's
+    // work, so it must not hold this pane's status, settle its turn or count
+    // as liveness for the stall watchdog.
+    let delegated_card = matches!(
+        &event,
+        ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
+            if super::delegation::is_delegated_row(&subagent.subagent_id)
+    );
+    if !delegated_card {
+        let tracker: State<'_, SubagentTracker> = app.state();
+        publish_pane_status(app, &tracker, &event);
 
-    // Record last-activity for the stall watchdog. Keyed on the event's
-    // thread; thread-less events (global warnings) and the transient
-    // `RunStalled` itself are no-ops inside the tracker.
-    if let Some(activity_thread) = thread_id_for_event(&event) {
-        let activity: State<'_, RunActivityTracker> = app.state();
-        activity.record(&activity_thread.0, &event, SystemTime::now());
+        // Record last-activity for the stall watchdog. Keyed on the event's
+        // thread; thread-less events (global warnings) and the transient
+        // `RunStalled` itself are no-ops inside the tracker.
+        if let Some(activity_thread) = thread_id_for_event(&event) {
+            let activity: State<'_, RunActivityTracker> = app.state();
+            activity.record(&activity_thread.0, &event, SystemTime::now());
+        }
     }
+    super::delegation::observe(app, &event, persisted_id);
 
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are
@@ -7187,7 +8459,8 @@ impl RunActivityTracker {
 
     /// Snapshot the threads that have been mid-turn and silent for at
     /// least `threshold`, with how long (seconds) each has been silent.
-    fn stalled(&self, now: SystemTime, threshold: Duration) -> Vec<(String, u64)> {
+    /// Public so integration tests can see which threads would stall.
+    pub fn stalled(&self, now: SystemTime, threshold: Duration) -> Vec<(String, u64)> {
         let threads = self.threads.lock().expect("activity tracker poisoned");
         threads
             .iter()
@@ -7319,6 +8592,12 @@ pub async fn spawn_stall_watchdog<R: Runtime>(app: AppHandle<R>) {
 /// `agent_chat_messages`. Extracted so the policy is unit-testable
 /// without an `AppHandle`.
 pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
+    // This explicit adapter restriction belongs in the reopened transcript.
+    // General runtime warnings remain transient SDK diagnostics.
+    if let ProviderRuntimeEvent::RuntimeWarning { thread_id, message, .. } = event {
+        return thread_id.is_some()
+            && message == crate::agent_provider::hermes::USAGE_LIMIT_RECOVERY_WARNING;
+    }
     matches!(
         event,
         ProviderRuntimeEvent::ItemCompleted { .. }
@@ -7511,7 +8790,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::PlanUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::RunStalled { thread_id, .. }
         | ProviderRuntimeEvent::UsageLimitReached { thread_id, .. }
-        | ProviderRuntimeEvent::UsageResumeCancelled { thread_id } => Some(thread_id.clone()),
+        | ProviderRuntimeEvent::UsageResumeCancelled { thread_id, .. } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
     }
 }
@@ -7623,6 +8902,64 @@ mod tests {
                 .unwrap();
             assert!(!status.success(), "{ref_name} should be deleted");
         }
+    }
+
+    #[test]
+    fn undo_turn_revert_brings_back_the_reverted_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("code.txt"), "before turn").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+
+        let thread_id = "undo-thread";
+        let ref_name = crate::git::turn_checkpoint_ref_name(thread_id, 1);
+        let baseline = crate::git::git_checkpoint_create(repo, &ref_name, "turn 1")
+            .unwrap()
+            .unwrap();
+        // The turn's work: an edit and a new file.
+        std::fs::write(repo.join("code.txt"), "after turn").unwrap();
+        std::fs::write(repo.join("new.txt"), "created by turn").unwrap();
+
+        let target = AgentChatTurnCheckpointRecord {
+            thread_id: thread_id.to_string(),
+            workspace_id: "ws".to_string(),
+            repo_path: repo.to_string_lossy().to_string(),
+            turn_index: 1,
+            client_nonce: None,
+            transcript_cutoff_id: 0,
+            ref_name,
+            snapshot_commit: baseline.snapshot_commit,
+            head_commit: baseline.head_commit,
+            branch: baseline.branch,
+            created_at: String::new(),
+        };
+        let safety = restore_turn_checkpoint_workspace_blocking(&target).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(), "before turn");
+        assert!(!repo.join("new.txt").exists());
+
+        let undo = TurnRevertUndo {
+            repo_path: target.repo_path.clone(),
+            safety,
+            remaining_turns: Vec::new(),
+        };
+        restore_reverted_files_blocking(thread_id, &undo).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(), "after turn");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("new.txt")).unwrap(),
+            "created by turn"
+        );
     }
 
     #[test]
@@ -7882,6 +9219,20 @@ mod tests {
     }
 
     #[test]
+    fn shape_never_stubs_native_image_tool_result_fixture() {
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../src/lib/agent-chat/__fixtures__/opencode-native-image-tool-result.json"
+        ))
+        .unwrap();
+        fixture["data"]["content"][1]["uri"] = json!(format!(
+            "data:image/png;base64,{}",
+            "A".repeat(LAZY_TOOL_RESULT_THRESHOLD_BYTES + 5_000)
+        ));
+        let payload = tool_result_payload(fixture["data"]["content"].clone());
+        assert_eq!(shape_persisted_payload(9, &payload), payload);
+    }
+
+    #[test]
     fn shape_stubs_entries_the_frontend_would_never_render_as_images() {
         // The heaviest payloads used to ride through unstubbed on nothing
         // but a `type` prefix. None of these draw anything.
@@ -7901,6 +9252,11 @@ mod tests {
             json!([{ "type": "image_url", "image_url": { "url": format!("file:///{data}.png") } }]),
             // Prefix-matching junk type.
             json!([{ "type": "imagemagick", "text": data }]),
+            // Native file blocks must obey the renderer's same image/scheme guards.
+            json!([{ "type": "file", "mime": "application/pdf", "uri": format!("https://example.test/{data}") }]),
+            json!([{ "type": "file", "mime": "image/png", "uri": format!("file:///{data}.png") }]),
+            json!([{ "type": "file", "mime": "image/png", "uri": format!("data:text/html;base64,{data}") }]),
+            json!([{ "type": "file", "mime": "image/png", "note": data }]),
         ];
         for content in cases {
             let payload = tool_result_payload(content.clone());
@@ -8669,6 +10025,7 @@ mod tests {
             surfaces: Vec::new(),
             host_id: None,
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             last_active_at: None,
@@ -8679,7 +10036,7 @@ mod tests {
     #[test]
     fn workspace_env_overlay_injects_workspace_surface() {
         let ws = test_workspace("ws-123");
-        let env = workspace_env_overlay(Some(&ws), "pane-7", None)
+        let env = workspace_env_overlay(Some(&ws), "pane-7", None, None)
             .expect("a resolved workspace must yield an env map");
 
         assert_eq!(env["CODEMUX"], "1");
@@ -8704,7 +10061,7 @@ mod tests {
         existing.insert("BROWSER".to_string(), "custom-browser".to_string());
         existing.insert("MY_VAR".to_string(), "keep-me".to_string());
 
-        let env = workspace_env_overlay(Some(&ws), "pane-7", Some(existing))
+        let env = workspace_env_overlay(Some(&ws), "pane-7", Some(existing), None)
             .expect("a resolved workspace must yield an env map");
 
         // Caller-provided entries win over the workspace defaults …
@@ -8718,16 +10075,625 @@ mod tests {
     #[test]
     fn workspace_env_overlay_no_workspace_injects_nothing() {
         // Orphaned pane, no existing env → stays None (no injection).
-        assert!(workspace_env_overlay(None, "pane-7", None).is_none());
+        assert!(workspace_env_overlay(None, "pane-7", None, None).is_none());
 
         // Orphaned pane WITH a caller env → returned untouched.
         let mut existing = HashMap::new();
         existing.insert("MY_VAR".to_string(), "keep-me".to_string());
-        let env = workspace_env_overlay(None, "pane-7", Some(existing))
+        let env = workspace_env_overlay(None, "pane-7", Some(existing), None)
             .expect("caller env must be preserved");
         assert_eq!(env.len(), 1);
         assert_eq!(env["MY_VAR"], "keep-me");
         assert!(!env.contains_key("CODEMUX_WORKSPACE_ID"));
+    }
+
+    #[test]
+    fn workspace_env_overlay_skips_the_browser_on_a_device() {
+        let mut ws = test_workspace("ws-remote");
+        ws.host_id = Some(3);
+        let env = workspace_env_overlay(Some(&ws), "pane-7", None, None).unwrap();
+        assert!(!env.contains_key("BROWSER"));
+        assert!(!env.contains_key("CODEMUX_BROWSER_CMD"));
+        assert_eq!(env["CODEMUX_WORKSPACE_ID"], "ws-remote");
+    }
+
+    // ── device workspaces ──
+
+    fn test_host(id: i64) -> crate::database::HostRecord {
+        crate::database::HostRecord {
+            id,
+            server_id: None,
+            name: "ai-node".to_string(),
+            ssh_target: "deus@ai-node".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            deleted_at: None,
+            dirty: false,
+            last_seen_at: None,
+            disk_bytes: None,
+            disk_measured_at: None,
+        }
+    }
+
+    #[test]
+    fn device_workspace_is_none_for_local_workspaces() {
+        let ws = test_workspace("ws-local");
+        assert_eq!(device_workspace(&ws, &[test_host(3)]), Ok(None));
+    }
+
+    #[test]
+    fn device_workspace_fails_closed_without_the_host() {
+        let mut ws = test_workspace("ws-remote");
+        ws.host_id = Some(9);
+        assert_eq!(
+            device_workspace(&ws, &[test_host(3)]),
+            Err("This thread's device (id 9) is no longer configured on this computer".to_string())
+        );
+    }
+
+    #[test]
+    fn device_workspace_uses_the_folder_on_the_device() {
+        let mut ws = test_workspace("ws-remote");
+        ws.host_id = Some(3);
+        ws.attach_only = true;
+        ws.cwd = "/home/deus/.codemux/worktrees/repo/feat".to_string();
+        let device = device_workspace(&ws, &[test_host(3)]).unwrap().unwrap();
+        assert_eq!(device.cwd, ws.cwd);
+        assert_eq!(
+            device.remote,
+            crate::agent_provider::types::RemoteSpawnTarget {
+                host_id: 3,
+                ssh_target: "deus@ai-node".to_string(),
+                host_name: "ai-node".to_string(),
+            }
+        );
+
+        // An explicit host path wins over the local-looking cwd.
+        ws.remote_cwd = Some("/srv/checkouts/repo".to_string());
+        assert_eq!(
+            device_workspace(&ws, &[test_host(3)]).unwrap().unwrap().cwd,
+            "/srv/checkouts/repo"
+        );
+
+        // A pushed workspace runs where the push put it, like its terminals.
+        ws.remote_cwd = None;
+        ws.attach_only = false;
+        assert_eq!(
+            device_workspace(&ws, &[test_host(3)]).unwrap().unwrap().cwd,
+            "~/.codemux/worktrees/repo/feat-my-feature"
+        );
+
+        // A pushed repo root lands in the projects tree, not a worktree.
+        ws.workspace_kind = Some("main".to_string());
+        assert_eq!(
+            device_workspace(&ws, &[test_host(3)]).unwrap().unwrap().cwd,
+            "~/.codemux/projects/repo"
+        );
+        ws.worktree_path = Some("/home/user/.codemux/worktrees/repo/main".to_string());
+        assert_eq!(
+            device_workspace(&ws, &[test_host(3)]).unwrap().unwrap().cwd,
+            "~/.codemux/worktrees/repo/feat-my-feature"
+        );
+    }
+
+    #[test]
+    fn only_device_capable_providers_run_on_devices() {
+        for provider in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::Cursor,
+            ProviderKind::Grok,
+        ] {
+            assert!(ensure_provider_runs_on_devices(provider).is_ok());
+        }
+        assert_eq!(
+            ensure_provider_runs_on_devices(ProviderKind::Hermes),
+            Err("unsupported: Hermes can't run on another device yet".to_string())
+        );
+        assert_eq!(
+            ensure_provider_runs_on_devices(ProviderKind::OpenCode),
+            Err("unsupported: OpenCode can't run on another device yet".to_string())
+        );
+        assert!(ensure_provider_runs_on_devices(ProviderKind::Acp).is_err());
+    }
+
+    /// A push keeps this computer's paths on the workspace; a chat running
+    /// on the device must still be told the directory it runs in there.
+    #[test]
+    fn workspace_env_overlay_names_the_device_folder_of_a_pushed_workspace() {
+        let mut ws = test_workspace("ws-pushed");
+        ws.host_id = Some(3);
+        let local = "/home/user/projects/repo";
+        let device_dir = "/home/deus/.codemux/worktrees/repo/feat-my-feature";
+
+        let env = workspace_env_overlay(Some(&ws), "pane-7", None, Some(device_dir)).unwrap();
+        assert_eq!(env["CODEMUX_WORKSPACE_PATH"], device_dir);
+        assert_eq!(env["CODEMUX_ROOT_PATH"], device_dir);
+        for (key, value) in &env {
+            assert!(!value.contains(local), "{key}={value}");
+        }
+
+        // Without a resolved directory it names where the push put it.
+        let env = workspace_env_overlay(Some(&ws), "pane-7", None, None).unwrap();
+        assert_eq!(
+            env["CODEMUX_WORKSPACE_PATH"],
+            "~/.codemux/worktrees/repo/feat-my-feature"
+        );
+        assert!(!env["CODEMUX_AGENT_CONTEXT"].contains(local));
+    }
+
+    // ── sessions follow their workspace between machines ──
+
+    #[test]
+    fn a_session_moved_once_its_workspace_runs_elsewhere() {
+        record_session_host("moved-on-device", Some(3));
+        assert!(!session_moved("moved-on-device", Some(3)));
+        assert!(session_moved("moved-on-device", None), "pulled back");
+        assert!(session_moved("moved-on-device", Some(4)), "another device");
+
+        record_session_host("moved-local", None);
+        assert!(!session_moved("moved-local", None));
+        assert!(session_moved("moved-local", Some(3)), "pushed");
+
+        // A session this process never started is left alone.
+        assert!(!session_moved("moved-unrecorded", Some(3)));
+    }
+
+    /// Tracks only which threads are live and where each session started.
+    #[derive(Default)]
+    struct PlacementProvider {
+        live: Mutex<std::collections::HashSet<String>>,
+        stopped: Mutex<Vec<String>>,
+        started_on: Mutex<Vec<Option<i64>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentProvider for PlacementProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+        fn capabilities(&self) -> crate::agent_provider::ProviderCapabilities {
+            unimplemented!()
+        }
+        async fn start_session(
+            &self,
+            input: StartSessionInput,
+        ) -> Result<crate::agent_provider::ProviderSession, ProviderError> {
+            self.started_on
+                .lock()
+                .unwrap()
+                .push(input.remote.map(|remote| remote.host_id));
+            self.live.lock().unwrap().insert(input.thread_id.0.clone());
+            Ok(crate::agent_provider::ProviderSession {
+                thread_id: input.thread_id,
+                provider: ProviderKind::Codex,
+                session_id: crate::agent_provider::ProviderSessionId("session".into()),
+                status: SessionStatus::Ready,
+                resume_cursor: None,
+            })
+        }
+        async fn send_turn(
+            &self,
+            _input: SendTurnInput,
+        ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
+            unimplemented!()
+        }
+        async fn interrupt_turn(
+            &self,
+            _thread_id: ThreadId,
+            _turn_id: Option<TurnId>,
+        ) -> Result<(), ProviderError> {
+            unimplemented!()
+        }
+        async fn respond_to_request(
+            &self,
+            _thread_id: ThreadId,
+            _request_id: RequestId,
+            _decision: ApprovalDecision,
+        ) -> Result<(), ProviderError> {
+            unimplemented!()
+        }
+        async fn set_model(
+            &self,
+            _thread_id: ThreadId,
+            _model: String,
+        ) -> Result<(), ProviderError> {
+            unimplemented!()
+        }
+        async fn set_permission_mode(
+            &self,
+            _thread_id: ThreadId,
+            _mode: String,
+        ) -> Result<(), ProviderError> {
+            unimplemented!()
+        }
+        async fn stop_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+            self.stopped.lock().unwrap().push(thread_id.0.clone());
+            self.live.lock().unwrap().remove(&thread_id.0);
+            Ok(())
+        }
+        async fn list_sessions(
+            &self,
+        ) -> Result<Vec<crate::agent_provider::ProviderSession>, ProviderError> {
+            Ok(Vec::new())
+        }
+        async fn has_session(&self, thread_id: &ThreadId) -> bool {
+            self.live.lock().unwrap().contains(&thread_id.0)
+        }
+        fn event_stream(&self) -> crate::agent_provider::ProviderEventStream {
+            Box::pin(futures_util::stream::empty())
+        }
+    }
+
+    /// A chat pane bound to `thread` in the active workspace (on `host_id`),
+    /// its persisted row, and `provider` registered for Codex.
+    async fn placement_app(
+        thread: &str,
+        host_id: Option<i64>,
+        provider: Arc<PlacementProvider>,
+    ) -> (tauri::App<tauri::test::MockRuntime>, String) {
+        let db = DatabaseStore::new_in_memory();
+        let host = db.insert_host("ai-node", "deus@ai-node").unwrap();
+        let state = AppStateStore::default();
+        let workspace = state.snapshot().active_workspace_id.0;
+        state
+            .create_agent_chat_pane(
+                &workspace,
+                Some(ProviderKind::Codex),
+                None,
+                None,
+                Some(thread.to_string()),
+            )
+            .unwrap();
+        state
+            .set_workspace_host_id(&workspace, host_id.map(|_| host.id))
+            .unwrap();
+        db.upsert_agent_chat_session(thread, &workspace, Some("/tmp"), "codex")
+            .unwrap();
+        let registry = ProviderRegistry::new();
+        registry.set_codex(provider).await;
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        app.manage(state);
+        app.manage(registry);
+        (app, workspace)
+    }
+
+    /// Pulling a workspace back must not leave its chat editing the device
+    /// copy: the next send stops that session and starts it on this
+    /// computer, while sends to a session that hasn't moved stay untouched.
+    #[tokio::test]
+    async fn a_pulled_workspace_restarts_its_device_chat_here() {
+        let thread = "moved-pull-thread";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, Some(1), provider.clone()).await;
+        let handle = app.handle().clone();
+        let host_id = handle
+            .state::<AppStateStore>()
+            .find_workspace(&workspace)
+            .unwrap()
+            .host_id;
+        // A session running on the device, where the workspace is.
+        provider.live.lock().unwrap().insert(thread.to_string());
+        record_session_host(thread, host_id);
+
+        ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
+            .await
+            .unwrap();
+        assert!(provider.stopped.lock().unwrap().is_empty());
+
+        handle
+            .state::<AppStateStore>()
+            .set_workspace_host_id(&workspace, None)
+            .unwrap();
+        ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
+            .await
+            .unwrap();
+        assert_eq!(*provider.stopped.lock().unwrap(), vec![thread.to_string()]);
+        assert_eq!(*provider.started_on.lock().unwrap(), vec![None]);
+
+        // Now it runs where the workspace does.
+        ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
+            .await
+            .unwrap();
+        assert_eq!(provider.stopped.lock().unwrap().len(), 1);
+        assert_eq!(provider.started_on.lock().unwrap().len(), 1);
+    }
+
+    /// Push / pull stop the workspace's live chats before copying it.
+    #[tokio::test]
+    async fn moving_a_workspace_stops_its_live_chats() {
+        let thread = "moved-push-thread";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, None, provider.clone()).await;
+        let handle = app.handle().clone();
+        provider.live.lock().unwrap().insert(thread.to_string());
+        provider
+            .live
+            .lock()
+            .unwrap()
+            .insert("other-workspace-thread".into());
+        record_session_host(thread, None);
+
+        stop_workspace_chat_sessions(&handle, &workspace).await;
+
+        assert_eq!(*provider.stopped.lock().unwrap(), vec![thread.to_string()]);
+        assert!(provider
+            .live
+            .lock()
+            .unwrap()
+            .contains("other-workspace-thread"));
+        assert!(!session_hosts().lock().unwrap().contains_key(thread));
+    }
+
+    /// Give `workspace` an absolute folder on its device, so a session can
+    /// start there without asking the device over SSH where `~` is.
+    fn set_device_dir(state: &AppStateStore, workspace: &str, dir: &str) {
+        let mut snapshot = state.snapshot();
+        snapshot
+            .workspaces
+            .iter_mut()
+            .find(|ws| ws.workspace_id.0 == workspace)
+            .unwrap()
+            .remote_cwd = Some(dir.to_string());
+        state.replace_snapshot(snapshot);
+    }
+
+    /// Let spawned tasks run until they block.
+    async fn settle() {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A send while push copies the workspace must not restart its chat on
+    /// this computer, which the workspace is leaving: it waits for the push
+    /// and then starts the session on the host.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_send_during_push_starts_its_chat_on_the_host() {
+        let thread = "migrating-push-send";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, None, provider.clone()).await;
+        let handle = app.handle().clone();
+        let host_id = handle.state::<DatabaseStore>().list_hosts()[0].id;
+        set_device_dir(&handle.state::<AppStateStore>(), &workspace, "/srv/repo");
+        provider.live.lock().unwrap().insert(thread.to_string());
+        record_session_host(thread, None);
+
+        let migration = begin_workspace_migration(&handle, &workspace).await;
+        assert_eq!(*provider.stopped.lock().unwrap(), vec![thread.to_string()]);
+        let send = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into())).await
+            }
+        });
+        settle().await;
+        assert!(!send.is_finished(), "the send waits out the copy");
+        assert!(provider.started_on.lock().unwrap().is_empty());
+
+        handle
+            .state::<AppStateStore>()
+            .set_workspace_host_id(&workspace, Some(host_id))
+            .unwrap();
+        drop(migration);
+        send.await.unwrap().unwrap();
+        assert_eq!(*provider.started_on.lock().unwrap(), vec![Some(host_id)]);
+    }
+
+    /// Same during pull: the send waits, then starts the chat on this
+    /// computer instead of on the host the workspace is leaving.
+    #[tokio::test]
+    async fn a_send_during_pull_starts_its_chat_here() {
+        let thread = "migrating-pull-send";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, Some(1), provider.clone()).await;
+        let handle = app.handle().clone();
+        let host_id = handle.state::<DatabaseStore>().list_hosts()[0].id;
+        set_device_dir(&handle.state::<AppStateStore>(), &workspace, "/srv/repo");
+        provider.live.lock().unwrap().insert(thread.to_string());
+        record_session_host(thread, Some(host_id));
+
+        let migration = begin_workspace_migration(&handle, &workspace).await;
+        assert_eq!(*provider.stopped.lock().unwrap(), vec![thread.to_string()]);
+        let send = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into())).await
+            }
+        });
+        settle().await;
+        assert!(!send.is_finished(), "the send waits out the copy");
+        assert!(provider.started_on.lock().unwrap().is_empty());
+
+        handle
+            .state::<AppStateStore>()
+            .set_workspace_host_id(&workspace, None)
+            .unwrap();
+        drop(migration);
+        send.await.unwrap().unwrap();
+        assert_eq!(*provider.started_on.lock().unwrap(), vec![None]);
+    }
+
+    /// A failed move leaves the workspace where it was, and a send waiting
+    /// on it starts the chat there.
+    #[tokio::test]
+    async fn a_send_after_a_failed_move_starts_where_the_workspace_still_runs() {
+        let thread = "migrating-failed-send";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, None, provider.clone()).await;
+        let handle = app.handle().clone();
+
+        let migration = begin_workspace_migration(&handle, &workspace).await;
+        let send = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into())).await
+            }
+        });
+        settle().await;
+        assert!(!send.is_finished());
+        drop(migration);
+        send.await.unwrap().unwrap();
+        assert_eq!(*provider.started_on.lock().unwrap(), vec![None]);
+    }
+
+    /// An explicit start (a new pane, or a restart) during push waits for it
+    /// too, then places the session on the host.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_session_start_during_push_starts_on_the_host() {
+        let thread = "migrating-push-start";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, None, provider.clone()).await;
+        app.manage(ObservabilityStore::default());
+        let handle = app.handle().clone();
+        let host_id = handle.state::<DatabaseStore>().list_hosts()[0].id;
+        set_device_dir(&handle.state::<AppStateStore>(), &workspace, "/srv/repo");
+        let pane = handle
+            .state::<AppStateStore>()
+            .agent_chat_pane_id_for_thread(thread)
+            .unwrap();
+        let input: StartSessionInput = serde_json::from_value(json!({
+            "thread_id": thread,
+            "cwd": "/tmp",
+            "additional_directories": [],
+        }))
+        .unwrap();
+
+        let migration = begin_workspace_migration(&handle, &workspace).await;
+        let start = tokio::spawn({
+            let handle = handle.clone();
+            async move { agent_chat_start_session(handle, pane, ProviderKind::Codex, input, None).await }
+        });
+        settle().await;
+        assert!(!start.is_finished(), "the start waits out the copy");
+        assert!(provider.started_on.lock().unwrap().is_empty());
+
+        handle
+            .state::<AppStateStore>()
+            .set_workspace_host_id(&workspace, Some(host_id))
+            .unwrap();
+        drop(migration);
+        start.await.unwrap().unwrap();
+        assert_eq!(*provider.started_on.lock().unwrap(), vec![Some(host_id)]);
+    }
+
+    // ── runs_on_device ──
+
+    const HOME: &str = "/home/zeus";
+    const DEVICE_PROJECT: &str = "/home/zeus/.codemux/projects/app";
+
+    fn device_ws(id: &str, cwd: &str) -> crate::state::WorkspaceSnapshot {
+        let mut ws = test_workspace(id);
+        ws.host_id = Some(3);
+        ws.cwd = cwd.to_string();
+        ws.remote_cwd = Some(cwd.to_string());
+        ws
+    }
+
+    /// [`workspace_runs_on_device`] over `workspaces`, from this computer
+    /// whose home is [`HOME`].
+    fn on_device(
+        workspaces: &[crate::state::WorkspaceSnapshot],
+        thread_workspace: Option<&str>,
+        cwd: Option<&str>,
+    ) -> bool {
+        workspace_runs_on_device(workspaces, thread_workspace, cwd, Some(HOME))
+    }
+
+    #[test]
+    fn a_thread_runs_where_its_workspace_lives() {
+        let workspaces = [
+            device_ws("ws-remote", DEVICE_PROJECT),
+            test_workspace("ws-local"),
+        ];
+        assert!(on_device(&workspaces, Some("ws-remote"), None));
+        // The thread's workspace decides, whatever folder the caller passes.
+        assert!(!on_device(
+            &workspaces,
+            Some("ws-local"),
+            Some(DEVICE_PROJECT)
+        ));
+        // Without a thread, a folder only a device workspace uses is the
+        // device's.
+        assert!(on_device(&workspaces, None, Some(DEVICE_PROJECT)));
+        assert!(!on_device(&workspaces, None, None));
+    }
+
+    #[test]
+    fn a_local_folder_with_the_same_path_as_a_device_folder_stays_local() {
+        // Same user name on both machines: a local worktree and a device
+        // worktree of the same branch share their path.
+        let path = "/home/zeus/.codemux/worktrees/app/feat";
+        let mut local = test_workspace("ws-local");
+        local.cwd = "/home/zeus/projects/app".to_string();
+        local.worktree_path = Some(path.to_string());
+        let workspaces = [device_ws("ws-remote", path), local];
+        assert!(!on_device(&workspaces, None, Some(path)));
+        let reversed = [workspaces[1].clone(), workspaces[0].clone()];
+        assert!(!on_device(&reversed, None, Some(path)));
+    }
+
+    #[test]
+    fn the_local_home_is_never_a_device_folder() {
+        // A device Home workspace whose home has the same path as this one.
+        let workspaces = [device_ws("ws-device-home", HOME)];
+        assert!(!on_device(&workspaces, None, Some(HOME)));
+        // Its own threads still run on the device.
+        assert!(on_device(&workspaces, Some("ws-device-home"), Some(HOME)));
+    }
+
+    /// The Claude and Grok `/` menus for a device folder never run this
+    /// computer's CLI there: they show no provider commands rather than an
+    /// error or this computer's commands.
+    #[tokio::test]
+    async fn device_slash_menus_do_not_probe_this_computer() {
+        let app = tauri::test::mock_app();
+        app.manage(Arc::new(
+            crate::agent_provider::claude::slash_commands::ClaudeSlashCommandCache::new(),
+        ));
+        app.manage(Arc::new(
+            crate::agent_provider::acp::slash_commands::AcpSlashCommandCache::new(),
+        ));
+        app.manage(Arc::new(
+            crate::agent_provider::opencode::OpenCodeServerManager::new(),
+        ));
+        app.manage(ProviderRegistry::new());
+        app.manage(AppStateStore::default());
+        app.manage(DatabaseStore::new_in_memory());
+        let handle = app.handle().clone();
+        let device_cwd = "/srv/codemux-device-only/app";
+        let state: State<'_, AppStateStore> = handle.state();
+        state.create_remote_attach_workspace(
+            "app".to_string(),
+            3,
+            device_cwd.to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        for provider in [ProviderKind::Claude, ProviderKind::Grok] {
+            let commands = list_chat_slash_commands(
+                provider,
+                Some(device_cwd.to_string()),
+                handle.state(),
+                handle.state(),
+                handle.state(),
+                None,
+                None,
+                handle.state(),
+                handle.state(),
+                handle.state(),
+            )
+            .await;
+            assert!(
+                commands.as_ref().is_ok_and(|commands| commands.is_empty()),
+                "{provider:?}: {commands:?}"
+            );
+        }
     }
 
     // ── should_persist_event policy ──
@@ -9124,6 +11090,17 @@ mod tests {
             original_payload: None,
         };
         assert!(!should_persist_event(&e));
+    }
+
+    #[test]
+    fn should_persist_hermes_usage_limit_recovery_warning_only_for_a_thread() {
+        let warning = |thread_id| ProviderRuntimeEvent::RuntimeWarning {
+            thread_id,
+            message: crate::agent_provider::hermes::USAGE_LIMIT_RECOVERY_WARNING.into(),
+            original_payload: None,
+        };
+        assert!(should_persist_event(&warning(Some(tid()))));
+        assert!(!should_persist_event(&warning(None)));
     }
 
     // ── AgentChatChannelRegistry ──

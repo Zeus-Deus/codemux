@@ -21,8 +21,10 @@ vi.mock("@/tauri/commands", () => ({
   dbSetUiState: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Per-test device list; reset in `beforeEach`.
+let hosts: { id: number; name: string }[] = [];
 vi.mock("@/stores/hosts-store", () => ({
-  useHosts: () => [],
+  useHosts: () => hosts,
 }));
 
 // App store: a plain object driven per-test. The rail derives everything
@@ -89,6 +91,7 @@ import {
   useSidebarInboxStore,
 } from "@/stores/sidebar-inbox-store";
 import { activateWorkspace } from "@/tauri/commands";
+import { getJumpTarget } from "./sidebar-inbox-jump";
 
 let wsCounter = 0;
 function makeWorkspace(
@@ -150,6 +153,7 @@ beforeEach(() => {
   activeWorkspaceId = "";
   pendingActiveWorkspaceId = null;
   wsCounter = 0;
+  hosts = [];
 });
 
 afterEach(async () => {
@@ -329,6 +333,26 @@ describe("SidebarRailWorkspaces", () => {
     expect(dotIn("ws-4")).toBeNull();
   });
 
+  it("marks a device thread with the device it runs on", async () => {
+    hosts = [{ id: 7, name: "zeus" }];
+    workspaces = [
+      makeWorkspace({ title: "Local" }),
+      makeWorkspace({ title: "On zeus", host_id: 7 }),
+    ];
+    const { container } = await renderRail();
+
+    const glyph = container
+      .querySelector('[data-rail-ws="ws-2"]')!
+      .querySelector('[aria-label="Runs on zeus"]');
+    expect(glyph).toHaveAttribute("role", "img");
+    expect(glyph).toHaveAttribute("title", "Runs on zeus");
+    expect(
+      container
+        .querySelector('[data-rail-ws="ws-1"]')!
+        .querySelector('[aria-label^="Runs on"]'),
+    ).toBeNull();
+  });
+
   it("marks the active workspace's button with the neutral selection fill", async () => {
     workspaces = [
       makeWorkspace({ title: "Alpha" }),
@@ -473,5 +497,64 @@ describe("SidebarRailWorkspaces", () => {
 
     fireEvent.click(container.querySelector('[data-rail-ws="ws-1"]')!);
     expect(activateWorkspace).toHaveBeenCalledWith("ws-1");
+  });
+});
+
+describe("SidebarRailWorkspaces — keyboard jumps while collapsed", () => {
+  it("publishes its buttons as the Alt+1..9 targets, and clears them on unmount", async () => {
+    workspaces = [
+      makeWorkspace({ title: "Alpha" }),
+      makeWorkspace({ title: "Beta" }),
+    ];
+    const { unmount } = await renderRail();
+
+    // Same order as the buttons on screen: newest first.
+    expect(getJumpTarget(1)).toBe("ws-2");
+    expect(getJumpTarget(2)).toBe("ws-1");
+
+    unmount();
+    expect(getJumpTarget(1)).toBeNull();
+  });
+
+  it("shows each button's digit while Alt is held", async () => {
+    workspaces = [makeWorkspace({ title: "Alpha" }), makeWorkspace({ title: "Beta" })];
+    const { container } = await renderRail();
+    const hints = () =>
+      [...container.querySelectorAll("[data-rail-jump-hint]")].map((el) => el.textContent);
+
+    expect(hints()).toEqual([]);
+    act(() => {
+      fireEvent.keyDown(window, { key: "Alt" });
+    });
+    expect(hints()).toEqual(["1", "2"]);
+    act(() => {
+      fireEvent.keyUp(window, { key: "Alt" });
+    });
+    expect(hints()).toEqual([]);
+  });
+
+  it("pins a needs-you chip above the avatars that jumps to the waiting workspace", async () => {
+    workspaces = [
+      makeWorkspace({ title: "Blocked", surfaces: surfaceWithPane("p-1") }),
+      makeWorkspace({ title: "Busy", surfaces: surfaceWithPane("p-2") }),
+    ];
+    paneStatuses = { "p-1": "permission", "p-2": "working" };
+    activeWorkspaceId = "ws-2";
+    const { container } = await renderRail();
+
+    const chip = container.querySelector<HTMLButtonElement>("[data-rail-needs-you]");
+    expect(chip).not.toBeNull();
+    expect(chip!.textContent).toBe("1");
+    expect(chip!.getAttribute("aria-label")).toContain("1 workspace needs you");
+
+    fireEvent.click(chip!);
+    expect(activateWorkspace).toHaveBeenCalledWith("ws-1");
+  });
+
+  it("shows no chip when nothing is waiting", async () => {
+    workspaces = [makeWorkspace({ surfaces: surfaceWithPane("p-1") })];
+    paneStatuses = { "p-1": "working" };
+    const { container } = await renderRail();
+    expect(container.querySelector("[data-rail-needs-you]")).toBeNull();
   });
 });

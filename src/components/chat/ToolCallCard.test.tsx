@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 vi.mock("@/lib/toast", () => ({
@@ -55,9 +55,62 @@ function makePendingApproval(
   };
 }
 
+/** The `data-state` each Reveal held before it changed while `run` ran. A
+ *  body mounted already open never changes, so it records nothing. */
+function revealStatesBefore(run: () => void): (string | null)[] {
+  const observer = new MutationObserver(() => {});
+  observer.observe(document.body, {
+    subtree: true,
+    attributeFilter: ["data-state"],
+    attributeOldValue: true,
+  });
+  run();
+  const records = observer.takeRecords();
+  observer.disconnect();
+  return records.map((record) => record.oldValue);
+}
+
 describe("ToolCallCard", () => {
   beforeEach(() => {
     vi.mocked(toast.success).mockReset();
+  });
+
+  it("eases the body in only when the user expands it", () => {
+    render(
+      <ToolCallCard
+        item={makeTool({ status: "done", result_content: "total 0" })}
+        approval={null}
+        onDecide={() => {}}
+      />,
+    );
+    const toggle = screen.getByRole("button", { expanded: false });
+    // Reveal commits a freshly opened body collapsed, then flips it open,
+    // so the height eases in instead of landing in one frame.
+    expect(revealStatesBefore(() => fireEvent.click(toggle))).toEqual(["closed"]);
+    const body = document.getElementById(toggle.getAttribute("aria-controls") ?? "");
+    expect(body).toHaveAttribute("data-state", "open");
+    expect(body).toHaveClass("duration-150");
+  });
+
+  it("does not replay the ease on a card that mounts expanded", () => {
+    const states = revealStatesBefore(() =>
+      render(
+        <ToolCallCard
+          item={makeTool({
+            status: "error",
+            result_content: "boom",
+          })}
+          approval={null}
+          onDecide={() => {}}
+        />,
+      ),
+    );
+    // Mounted open: no collapsed frame for the height to ease out of.
+    expect(states).toEqual([]);
+    const toggle = screen.getByRole("button", { expanded: true });
+    expect(
+      document.getElementById(toggle.getAttribute("aria-controls") ?? ""),
+    ).toHaveAttribute("data-state", "open");
   });
 
   it("pending_approval state renders the approval controls and input preview", () => {
@@ -395,11 +448,113 @@ describe("ToolCallCard", () => {
     // Body collapsed by default on success.
     expect(container.textContent).not.toContain("line1");
 
-    // Expand via the chevron button.
-    const toggle = container.querySelector('button[aria-label="Expand"]');
-    expect(toggle).toBeTruthy();
-    fireEvent.click(toggle as HTMLElement);
+    // The whole header row is the toggle, named by the command it ran.
+    const toggle = screen.getByRole("button", { name: /Ran\s+ls -la/ });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    // Nothing to point at until the body mounts on first open.
+    expect(toggle).not.toHaveAttribute("aria-controls");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(container.textContent).toContain("line1");
+    const body = document.getElementById(
+      toggle.getAttribute("aria-controls") ?? "",
+    );
+    expect(body).toHaveAttribute("data-state", "open");
+    expect(body?.className).toContain("motion-reduce:transition-none");
+
+    // Collapsing keeps the body mounted so it can ease shut, but hides it
+    // from assistive tech and the tab order.
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(body).toHaveAttribute("data-state", "closed");
+    expect(body).toHaveAttribute("aria-hidden", "true");
+    expect(body).toHaveAttribute("inert");
+  });
+
+  it("keeps the header a plain row while an approval is pending", () => {
+    render(
+      <ToolCallCard
+        item={makeTool({ approval_request_id: "req-1" })}
+        approval={makePendingApproval()}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: /Ran\s+ls -la/ })).toBeNull();
+  });
+
+  it("shows how long a settled call took", () => {
+    render(
+      <ToolCallCard
+        item={makeTool({
+          status: "done",
+          result_content: "ok",
+          started_at: 1_000,
+          completed_at: 4_200,
+        })}
+        approval={null}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.getByText("3s")).toBeInTheDocument();
+  });
+
+  it("ticks elapsed time while a call runs", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(10_000);
+      render(
+        <ToolCallCard
+          item={makeTool({ started_at: 10_000 })}
+          turnLive
+          approval={null}
+          onDecide={() => {}}
+        />,
+      );
+      const elapsed = screen.getByTestId("step-elapsed");
+      expect(elapsed.textContent).toBe("");
+      act(() => {
+        vi.advanceTimersByTime(65_000);
+      });
+      expect(elapsed.textContent).toBe("1m 5s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not tick a call left running in a settled transcript", () => {
+    // Allowed, then the app quit before the call reported back.
+    render(
+      <ToolCallCard
+        item={makeTool({ approval_request_id: "req-1", started_at: 10_000 })}
+        approval={makePendingApproval({
+          resolution: { state: "resolved", decision: { decision: "allow" } },
+        })}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.queryByTestId("step-elapsed")).toBeNull();
+  });
+
+  it("times an approval-gated call from its approval, not its request", () => {
+    // Raised at 1s, allowed at 121s, finished at 126s: the call ran for 5s.
+    render(
+      <ToolCallCard
+        item={makeTool({
+          status: "done",
+          result_content: "ok",
+          approval_request_id: "req-1",
+          started_at: 1_000,
+          approved_at: 121_000,
+          completed_at: 126_000,
+        })}
+        approval={makePendingApproval({
+          resolution: { state: "resolved", decision: { decision: "allow" } },
+        })}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.getByText("5s")).toBeInTheDocument();
+    expect(screen.queryByText("2m 5s")).toBeNull();
   });
 
   it("opens when an image arrives asynchronously and respects a later manual collapse", () => {
@@ -430,7 +585,7 @@ describe("ToolCallCard", () => {
       "src",
       "data:image/png;base64,AAAA",
     );
-    fireEvent.click(screen.getByRole("button", { name: "Collapse" }));
+    fireEvent.click(screen.getByRole("button", { expanded: true }));
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
 
     rerender(

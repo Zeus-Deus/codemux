@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { Loader2, RotateCw } from "lucide-react";
+import { RotateCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -28,8 +28,10 @@ import { listen } from "@tauri-apps/api/event";
 
 import { SkillRow } from "./skill-row";
 import { SkillViewModal } from "./skill-view-modal";
+import { SectionHeader } from "./settings-primitives";
 import { eyebrowVariants } from "@/components/ui/eyebrow";
 import { cn } from "@/lib/utils";
+import { Spinner } from "@/components/ui/spinner";
 
 interface Props {
   /** Active workspace's project root (or null when no project is
@@ -156,31 +158,34 @@ export function SkillsSection({ projectRoot }: Props) {
 
   return (
     <div>
-      <div className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <h2 className="text-body-lg font-semibold tracking-tight">Skills</h2>
-          <p className="mt-1 text-body text-muted-foreground">
+      <SectionHeader
+        title="Skills"
+        description={
+          <>
             Skills are reusable instruction sets you can select with{" "}
             <code className="font-mono text-label">/skill-name</code>. Discovered
             from your installed providers (Claude, Codex, OpenCode) and
             Codemux's own skills folder. Provider-native automatic discovery
             remains controlled by each provider.
-          </p>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => loadSkills(projectRoot, true)}
-          disabled={loading}
-          aria-label="Refresh skills"
-        >
-          <RotateCw
-            className={loading ? "mr-1 size-3 animate-spin" : "mr-1 size-3"}
-            aria-hidden
-          />
-          Refresh
-        </Button>
-      </div>
+          </>
+        }
+        action={
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => loadSkills(projectRoot, true)}
+            disabled={loading}
+            aria-busy={loading}
+            aria-label="Refresh skills"
+          >
+            <RotateCw
+              className={loading ? "mr-1 size-3 animate-spin" : "mr-1 size-3"}
+              aria-hidden
+            />
+            Refresh
+          </Button>
+        }
+      />
 
       <div className="mb-4 flex items-center justify-between rounded-md border border-border/50 p-3">
         <div className="min-w-0 flex-1">
@@ -235,7 +240,7 @@ export function SkillsSection({ projectRoot }: Props) {
           data-testid="skills-loading"
           className="flex items-center gap-2 py-6 text-body text-muted-foreground"
         >
-          <Loader2 className="size-4 animate-spin" aria-hidden />
+          <Spinner className="size-4" aria-hidden />
           Loading skills…
         </div>
       ) : skills.length === 0 && !error ? (

@@ -23,7 +23,7 @@ export async function openConversationSearchResult(
     if (isRemoteClient()) await activateWorkspaceInteraction(opened.workspace_id);
   } catch (error) {
     useConversationSearchStore.getState().clearHandled(target.nonce);
-    toast.error(`Failed to open conversation: ${error}`);
+    toast.failure("Failed to open conversation", error);
     throw error;
   }
 }

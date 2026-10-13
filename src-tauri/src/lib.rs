@@ -1,4 +1,6 @@
 use tauri::{Emitter, Listener, Manager};
+#[cfg(test)]
+extern crate self as codemux_lib;
 
 /// Subdirectory name used under XDG config/data dirs for all Codemux state
 /// (sqlite db, auth tokens, scrollback, presets, etc.). Debug builds use a
@@ -13,6 +15,7 @@ pub mod addons;
 pub mod agent_capability;
 pub mod active_workspace_persistence;
 pub mod agent_context;
+pub mod agent_control;
 pub mod agent_provider;
 pub mod ai;
 pub mod auth;
@@ -22,6 +25,7 @@ pub mod branch_name;
 pub mod json_rpc_child;
 pub mod local_session_import;
 pub mod mcp_server;
+pub mod mcp_connector;
 pub mod agent_browser;
 pub mod browser_viewport;
 pub mod cli;
@@ -79,6 +83,7 @@ pub mod hosts_inventory;
 pub mod workspace_paths;
 pub mod project_identity;
 pub mod workspaces_sync;
+pub mod workflows;
 pub mod state;
 pub mod hooks;
 pub mod stream_input;
@@ -90,6 +95,8 @@ pub mod trace;
 // WebKitGTK renderer transport + smooth-scrolling tuning (Linux). Also owns
 // the startup crash sentinel that picks the renderer flags for this process.
 pub mod webview_tuning;
+#[cfg(target_os = "linux")]
+mod precise_wheel;
 // Reloads the main window when its WebKitGTK web process dies (Linux).
 pub mod webview_recovery;
 // VS Code Marketplace theme import — search the public gallery and pull the
@@ -510,6 +517,21 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // Tauri may exit without dropping managed state. Close admission
+                // and await the owned OpenCode direct child before other cleanup.
+                if let Err(error) = tauri::async_runtime::block_on(
+                    app.state::<std::sync::Arc<
+                        crate::agent_provider::opencode::OpenCodeServerManager,
+                    >>()
+                    .shutdown(),
+                ) {
+                    eprintln!("[codemux::opencode] shutdown incomplete: {error}");
+                }
+                if let Err(error) = tauri::async_runtime::block_on(
+                    app.state::<commands::workflows::WorkflowState>().shutdown(),
+                ) {
+                    eprintln!("[codemux::workflows] shutdown incomplete: {error}");
+                }
                 if let Some(manager) = app.state::<commands::addons::AddonState>().existing() {
                     tauri::async_runtime::block_on(manager.shutdown());
                 }
@@ -591,6 +613,8 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(auth::AuthState::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
+        .manage(agent_control::NativeControlState::default())
+        .manage(commands::workflows::WorkflowState::open_default())
         // Per-thread live event channels for the chat pane: each
         // mounted pane attaches a tauri::ipc::Channel keyed by
         // thread_id; forward_event routes that thread's runtime
@@ -607,11 +631,15 @@ fn build_core_app<R: tauri::Runtime>(
         // forward_event → publish_pane_status. See agent_chat.rs.
         .manage(commands::agent_chat::SubagentTracker::default())
         .manage(commands::agent_chat::RunActivityTracker::default())
+        // Cross-provider delegation's in-memory task map. Managed here, not
+        // in the gated setup task, so its forward_event / stop hooks can
+        // always `try_state` it and return at once.
+        .manage(commands::delegation::DelegationState::default())
         // Step 12 Stage 2 — singleton supervisor for the lazily
         // spawned `opencode serve` child. `ensure_running()` is the
         // entry point used by `opencode_list_models`; the server is
-        // not spawned until the first call. Shutting Codemux down
-        // drops this state, which `kill_on_drop`-kills the child.
+        // not spawned until the first call. Normal GUI quit explicitly
+        // shuts this manager down in RunEvent::Exit; Drop is only a fallback.
         .manage(std::sync::Arc::new(
             crate::agent_provider::opencode::OpenCodeServerManager::new(),
         ))
@@ -671,6 +699,7 @@ fn build_core_app<R: tauri::Runtime>(
             database::DatabaseStore::new_in_memory()
         }))
         .manage(web_remote_state)
+        .manage(mcp_connector::McpConnectorState::default())
         // Reroute channel frames opened by a web-remote invoke to the
         // browser that opened them. Returns true only for server-allocated
         // channel ids (the router owns them); genuine desktop-webview
@@ -719,10 +748,9 @@ fn build_core_app<R: tauri::Runtime>(
     }
 
     builder
-        // Every finished page load re-applies the current smooth-scrolling
-        // preference, so windows created after `setup` (and any reload) get
-        // it without a separate window-created hook — each webview owns its
-        // own WebKitSettings object.
+        // Every finished page load configures precise wheel input and disables
+        // WebKit's native animation. New windows and reloads share the default
+        // app glide without a separate window-created hook.
         //
         // A finished load on the main window is also the app's first proof
         // that the webview came up, which clears the renderer crash sentinel
@@ -963,12 +991,9 @@ fn build_core_app<R: tauri::Runtime>(
             // size, position, save, or float, so the whole block is skipped
             // there.
             if mode == AppMode::Gui {
-            // Turn WebKitGTK's smooth-scrolling animation off for every window
-            // that already exists. Its 200 ms eased retarget restarts on each
-            // high-resolution wheel event, so a fast flick scrolls *less* than
-            // a slow one (WebKit bug 258926). Windows created later pick the
-            // same setting up from the page-load hook, and the frontend can
-            // flip it at runtime via the `set_smooth_scrolling` command.
+            // Configure existing windows before wheel input starts. Later
+            // windows and reloads receive the same policy from the page-load
+            // hook; the frontend owns glides with native animation disabled.
             webview_tuning::refresh_all(&handle);
 
             // A dead or hung renderer leaves the window blank while the
@@ -1243,17 +1268,16 @@ fn build_core_app<R: tauri::Runtime>(
 
             control::spawn_control_server(app.handle().clone());
 
-            // Background host-upgrade poller. ~5s after app setup it
-            // walks every registered SSH host, version-checks its
+            // Startup pass of the device upgrader. ~5s after app setup
+            // it walks every registered device, version-checks its
             // codemux-remote against the one this build ships, and
-            // silently re-bootstraps any host that's behind. So when
-            // the user updates Codemux on the desktop, their hosts
-            // catch up on their own — no Test/Push click required.
-            // Safe to run on every app start: cheap when versions
-            // match (one SSH probe), idempotent re-provision on
-            // upgrade, never installs codemux-remote where it isn't
-            // already present (that still requires the Install
-            // button's consent).
+            // quietly upgrades any device that's behind. The inventory
+            // poller below repeats that whenever it sees an outdated
+            // device later (e.g. one that was offline now), so devices
+            // catch up with the desktop on their own. Never downgrades
+            // a newer device, never kills its terminals, never installs
+            // where codemux-remote isn't already present (that still
+            // takes the user's Connect / Set up again).
             #[cfg(unix)]
             crate::hosts_upgrade::spawn(app.handle().clone());
 
@@ -1269,6 +1293,11 @@ fn build_core_app<R: tauri::Runtime>(
             // keep their existing explicit push/pull.
             #[cfg(unix)]
             crate::hosts_inventory::spawn(app.handle().clone());
+
+            // Pull the account's device list once at startup so a freshly
+            // signed-in computer sees devices added elsewhere without
+            // editing one first. No-op when signed out.
+            crate::hosts_sync::spawn_startup_host_sync(app.handle().clone());
 
             // Resolve the bundled claude-agent sidecar and pin the path via
             // env var so the adapter (which has no AppHandle access at
@@ -1295,6 +1324,9 @@ fn build_core_app<R: tauri::Runtime>(
                     agent_provider::claude::sidecar_path::SIDECAR_PATH_ENV,
                     sidecar,
                 );
+            }
+            if let Some(sidecar) = agent_provider::managed_bridge::resolve_sidecar(resource_dir.as_deref()) {
+                std::env::set_var(agent_provider::managed_bridge::SIDECAR_PATH_ENV, sidecar);
             }
 
             // Agent-chat provider registry initialisation.
@@ -1329,6 +1361,15 @@ fn build_core_app<R: tauri::Runtime>(
                         let mcp_registry: tauri::State<'_, mcp::registry::McpRegistry> =
                             registry_handle.state();
                         let mcp_registry = mcp_registry.inner().clone();
+
+                        // Delegated tasks the last run left open become
+                        // Stopped, and their children's usage resumes are
+                        // cancelled — before the resume scheduler's first
+                        // tick below can restart any of them.
+                        commands::delegation::drain_journal(&registry_handle);
+                        mcp_registry.set_host_tools(std::sync::Arc::new(
+                            commands::delegation::DelegationHost::new(registry_handle.clone()),
+                        ));
 
                         let mut claude_config =
                             agent_provider::claude::ClaudeProviderConfig::default();
@@ -1447,6 +1488,9 @@ fn build_core_app<R: tauri::Runtime>(
                             registry_handle.clone(),
                         )
                         .await;
+                        // Delegation backstop: finalizes children whose turn
+                        // end was lost and retries due result deliveries.
+                        commands::delegation::spawn_sweep(registry_handle.clone());
                     });
                 }
             }
@@ -2551,6 +2595,24 @@ fn build_core_app<R: tauri::Runtime>(
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::workflows::workflow_capabilities,
+            commands::workflows::workflow_list,
+            commands::workflows::workflow_get,
+            commands::workflows::workflow_create,
+            commands::workflows::workflow_script_execute,
+            commands::workflows::workflow_pause,
+            commands::workflows::workflow_resume,
+            commands::workflows::workflow_cancel,
+            commands::workflows::workflow_cancel_task,
+            commands::workflows::workflow_retry,
+            commands::workflows::workflow_reconcile,
+            commands::workflows::workflow_replace,
+            commands::workflows::workflow_retire,
+            commands::workflows::workflow_message,
+            commands::workflows::workflow_script_save,
+            commands::workflows::workflow_script_list,
+            commands::workflows::workflow_integrate_artifact,
+            commands::workflows::workflow_artifact_preview,
             commands::addons::addon_inventory,
             commands::addons::addon_import_review,
             commands::addons::addon_accept_review,
@@ -2705,6 +2767,11 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_close_pane,
             commands::dev_agent_chat_spawn_test_pane,
             commands::agent_chat_start_session,
+            mcp_connector::agent_connector_status,
+            mcp_connector::agent_connector_set_config,
+            mcp_connector::agent_connector_approve,
+            mcp_connector::agent_connector_deny,
+            mcp_connector::agent_connector_revoke,
             commands::agent_chat_send_turn,
             commands::agent_chat_stage_image,
             commands::agent_chat_discard_staged_image,
@@ -2723,6 +2790,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::async_questions::agent_chat_question_attention,
             commands::agent_chat_set_model,
             commands::agent_chat_set_fast_mode,
+            commands::agent_chat_set_service_tier,
             commands::agent_chat_set_permission_mode,
             commands::list_chat_provider_capabilities,
             commands::hermes::hermes_profiles,
@@ -2763,6 +2831,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_restore_checkpoint,
             commands::agent_chat_list_turn_checkpoints,
             commands::agent_chat_revert_turn_checkpoint,
+            commands::agent_chat_undo_turn_revert,
             commands::attach_agent_chat_output,
             commands::detach_agent_chat_output,
             commands::opencode_check_availability,
@@ -2793,6 +2862,7 @@ fn build_core_app<R: tauri::Runtime>(
             terminal::pause_pty_output,
             terminal::resume_pty_output,
             terminal::terminal_session_cwds,
+            terminal::terminal_foreground_jobs,
             terminal::write_to_pty,
             terminal::resize_pty,
             terminal::clear_agent_status,
@@ -2845,6 +2915,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::git_clone_repo,
             commands::check_claude_available,
             commands::generate_ai_commit_message,
+            commands::generate_ai_pr_description,
             commands::check_gh_available,
             commands::check_gh_status,
             commands::check_github_repo,
@@ -2889,9 +2960,11 @@ fn build_core_app<R: tauri::Runtime>(
             commands::refresh_workspace_pr,
             commands::suggest_issue_branch_name,
             commands::detect_package_manager,
+            commands::detect_run_candidates,
             commands::get_detected_ports,
             commands::kill_port,
             commands::get_presets,
+            commands::get_preset_availability,
             commands::create_preset,
             commands::update_preset,
             commands::delete_preset,
@@ -2899,6 +2972,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::set_preset_bar_visible,
             commands::reorder_presets,
             commands::apply_preset,
+            commands::open_provider_login_terminal,
             commands::get_workspace_config,
             commands::has_codemuxinclude,
             commands::run_workspace_setup,
@@ -2943,6 +3017,9 @@ fn build_core_app<R: tauri::Runtime>(
             commands::hosts_test_connection,
             commands::hosts_bootstrap_install,
             commands::hosts_reinstall_remote,
+            commands::get_local_device_name,
+            commands::hosts_ssh_config_hosts,
+            commands::remote_workspace::create_workspace_on_host,
             commands::set_workspace_host,
             commands::workspace_push_to_host,
             commands::workspace_pull_back,
@@ -2990,11 +3067,10 @@ fn build_core_app<R: tauri::Runtime>(
             web_remote::web_remote_iroh_node_id,
             web_remote::web_remote_registration_status,
             web_remote::web_remote_retry,
-            // WebKitGTK smooth-scrolling toggle (Linux; no-op elsewhere).
-            webview_tuning::set_smooth_scrolling,
             // Which renderer this process ended up on, so the UI can drop
             // composited-only effects when running CPU-rendered.
             webview_tuning::get_renderer_mode,
+            webview_tuning::get_precise_wheel_available,
             // "Reload interface" in the command palette: reloads only the
             // main webview, like Ctrl+Alt+R and `codemux reload-ui`.
             webview_recovery::reload_interface,

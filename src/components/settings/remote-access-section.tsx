@@ -8,7 +8,6 @@ import {
   Globe,
   Laptop,
   Link2,
-  Loader2,
   MonitorSmartphone,
   RefreshCw,
   Server,
@@ -65,6 +64,7 @@ import type {
 } from "@/tauri/types";
 
 import { useQrSvg } from "./use-qr-svg";
+import { SectionHeader } from "./settings-primitives";
 import {
   approvedSessions,
   BIND_SCOPE_OPTIONS,
@@ -90,6 +90,7 @@ import {
   type EndpointGroupView,
 } from "./remote-access-utils";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 // ── Small presentational bits ────────────────────────────────────────
 
@@ -419,6 +420,7 @@ function PairingPanel({
               variant="outline"
               size="sm"
               disabled={regenerating}
+              aria-busy={regenerating}
               onClick={onRegenerate}
             >
               <RefreshCw
@@ -644,7 +646,7 @@ function LiveState({ tone, children }: { tone: LiveTone; children: React.ReactNo
       )}
     >
       {tone === "pending" ? (
-        <Loader2 className="size-3 animate-spin" />
+        <Spinner className="size-3" />
       ) : (
         <span
           className={cn(
@@ -698,6 +700,7 @@ function FailureCallout({
         size="sm"
         className="shrink-0"
         disabled={retrying}
+        aria-busy={retrying}
         onClick={onRetry}
         aria-label={retryLabel}
       >
@@ -1047,7 +1050,7 @@ export function RemoteAccessSection() {
         );
       } catch (err) {
         console.error("[remote-access] toggle failed:", err);
-        toast.error(`Couldn't ${next ? "enable" : "disable"} remote access: ${String(err)}`);
+        toast.failure(`Couldn't ${next ? "enable" : "disable"} remote access`, err);
       } finally {
         setTogglePending(false);
       }
@@ -1081,7 +1084,7 @@ export function RemoteAccessSection() {
       } catch (err) {
         console.error("[remote-access] retry failed:", err);
         if (what === "server") {
-          toast.error(`Still couldn't start the server: ${String(err)}`);
+          toast.failure("Still couldn't start the server", err);
         } else {
           // The rejection is about the listener; registration was retried
           // regardless and reports back through the live status.
@@ -1122,7 +1125,7 @@ export function RemoteAccessSection() {
           console.error("[remote-access] set port failed:", err);
           setPortDraft(String(status?.port ?? nextPort));
           setRebindPhase(null);
-          toast.error(`Couldn't change the port: ${String(err)}`);
+          toast.failure("Couldn't change the port", err);
         }
       } finally {
         setPortPending(false);
@@ -1141,7 +1144,7 @@ export function RemoteAccessSection() {
       reportLanOutcome(result, `Port set to ${result.port}.`);
     } catch (err) {
       console.error("[remote-access] set port failed:", err);
-      toast.error(`Couldn't change the port: ${String(err)}`);
+      toast.failure("Couldn't change the port", err);
     } finally {
       setPortPending(false);
     }
@@ -1178,7 +1181,7 @@ export function RemoteAccessSection() {
           console.error("[remote-access] set scope failed:", err);
           setScopeOverride(null);
           setRebindPhase(null);
-          toast.error(`Couldn't change where the server is visible: ${String(err)}`);
+          toast.failure("Couldn't change where the server is visible", err);
         }
       } finally {
         setScopePending(false);
@@ -1220,7 +1223,7 @@ export function RemoteAccessSection() {
         console.error("[remote-access] set scope failed:", err);
         // The backend keeps the previous, working scope on failure and the
         // status it broadcasts reflects that, so the control snaps back.
-        toast.error(`Couldn't change where the server is visible: ${String(err)}`);
+        toast.failure("Couldn't change where the server is visible", err);
       } finally {
         setScopePending(false);
       }
@@ -1243,7 +1246,7 @@ export function RemoteAccessSection() {
         else toast.success("Stopped listening on your network.");
       } catch (err) {
         console.error("[remote-access] set LAN listener failed:", err);
-        toast.error(`Couldn't change network access: ${String(err)}`);
+        toast.failure("Couldn't change network access", err);
       } finally {
         setLanPending(false);
       }
@@ -1275,7 +1278,7 @@ export function RemoteAccessSection() {
         );
       } catch (err) {
         console.error("[remote-access] set approval failed:", err);
-        toast.error(`Couldn't change approval mode: ${String(err)}`);
+        toast.failure("Couldn't change approval mode", err);
       } finally {
         setApprovalPending(false);
       }
@@ -1296,7 +1299,7 @@ export function RemoteAccessSection() {
         );
       } catch (err) {
         console.error("[remote-access] set account mode failed:", err);
-        toast.error(`Couldn't change account sign-in: ${String(err)}`);
+        toast.failure("Couldn't change account sign-in", err);
       } finally {
         setAccountModePending(false);
       }
@@ -1321,7 +1324,7 @@ export function RemoteAccessSection() {
         );
       } catch (err) {
         console.error("[remote-access] set trust-account failed:", err);
-        toast.error(`Couldn't change account approval: ${String(err)}`);
+        toast.failure("Couldn't change account approval", err);
       } finally {
         setTrustAccountPending(false);
       }
@@ -1346,7 +1349,7 @@ export function RemoteAccessSection() {
         }
       } catch (err) {
         console.error("[remote-access] set relay mode failed:", err);
-        toast.error(`Couldn't change from-anywhere access: ${String(err)}`);
+        toast.failure("Couldn't change from-anywhere access", err);
       } finally {
         setRelayModePending(false);
       }
@@ -1381,7 +1384,7 @@ export function RemoteAccessSection() {
       setPairing(await webRemoteCreatePairing());
     } catch (err) {
       console.error("[remote-access] create pairing failed:", err);
-      toast.error(`Couldn't create a pairing link: ${String(err)}`);
+      toast.failure("Couldn't create a pairing link", err);
     } finally {
       setPairingPending(false);
     }
@@ -1394,7 +1397,7 @@ export function RemoteAccessSection() {
         setStatus(await webRemoteApproveSession(id));
         toast.success("Browser approved.");
       } catch (err) {
-        toast.error(`Couldn't approve the browser: ${String(err)}`);
+        toast.failure("Couldn't approve the browser", err);
       } finally {
         setSessionBusy(null);
       }
@@ -1409,7 +1412,7 @@ export function RemoteAccessSection() {
         setStatus(await webRemoteRejectSession(id));
         toast.success("Request rejected.");
       } catch (err) {
-        toast.error(`Couldn't reject the browser: ${String(err)}`);
+        toast.failure("Couldn't reject the browser", err);
       } finally {
         setSessionBusy(null);
       }
@@ -1424,7 +1427,7 @@ export function RemoteAccessSection() {
         setStatus(await webRemoteRevokeSession(id));
         toast.success("Browser revoked. Its access is now blocked.");
       } catch (err) {
-        toast.error(`Couldn't revoke the browser: ${String(err)}`);
+        toast.failure("Couldn't revoke the browser", err);
       } finally {
         setSessionBusy(null);
       }
@@ -1442,7 +1445,7 @@ export function RemoteAccessSection() {
       if (last) setStatus(last);
       toast.success("Revoked every browser.");
     } catch (err) {
-      toast.error(`Couldn't revoke every browser: ${String(err)}`);
+      toast.failure("Couldn't revoke every browser", err);
     } finally {
       setRevokingAll(false);
     }
@@ -1500,6 +1503,7 @@ export function RemoteAccessSection() {
             size="sm"
             className="shrink-0"
             disabled={retryPending}
+            aria-busy={retryPending}
             onClick={() => void handleRetry("registration")}
             aria-label="Retry registering this device"
           >
@@ -1550,16 +1554,20 @@ export function RemoteAccessSection() {
     <div className="space-y-8 [contain:inline-size]">
       {/* Header + kill switch */}
       <div className="space-y-4">
-        <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <MonitorSmartphone className="size-4 text-accent-ember" />
-              <h2 className="text-[1.3125rem] font-bold tracking-tight text-foreground">
-                Remote Access
-              </h2>
-            </div>
-            <p className="mt-1.5 max-w-prose text-body-lg leading-relaxed text-muted-foreground/80">
-              {enabled ? (
+        <SectionHeader
+          title="Remote Access"
+          icon={<MonitorSmartphone className="size-4 text-accent-ember" />}
+          action={
+            <Switch
+              checked={enabled}
+              onCheckedChange={handleToggle}
+              disabled={togglePending}
+              aria-label="Toggle remote access"
+              className="mt-1.5"
+            />
+          }
+          description={
+            enabled ? (
                 <>
                   {machineName ? (
                     <>
@@ -1574,17 +1582,9 @@ export function RemoteAccessSection() {
                 </>
               ) : (
                 "Open this desktop in a browser on your phone or another computer, and drive the same projects, sessions, and agents from there."
-              )}
-            </p>
-          </div>
-          <Switch
-            checked={enabled}
-            onCheckedChange={handleToggle}
-            disabled={togglePending}
-            aria-label="Toggle remote access"
-            className="mt-1.5"
-          />
-        </div>
+              )
+          }
+        />
 
         {/* Exposure — what this configuration actually opens. */}
         <div className="flex items-start gap-2.5 rounded-lg border border-warning/30 bg-warning/5 px-3.5 py-3">
@@ -1621,7 +1621,7 @@ export function RemoteAccessSection() {
                 role="status"
                 className="flex items-center gap-2.5 rounded-lg border border-status-working/40 bg-status-working/[0.08] px-3.5 py-3 text-body text-status-working"
               >
-                <Loader2 className="size-4 shrink-0 animate-spin" />
+                <Spinner className="size-4 shrink-0" />
                 <span>Applying change — reconnecting to this device…</span>
               </div>
             )

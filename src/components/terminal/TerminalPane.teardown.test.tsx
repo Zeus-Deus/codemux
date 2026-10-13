@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
-import { attachPtyOutput, createBrowserPane, resizePty } from "@/tauri/commands";
+import { attachPtyOutput, createBrowserPane, resizePty, writeToPty } from "@/tauri/commands";
+import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import {
   flushAllTeardowns,
   setTeardownScheduler,
@@ -19,11 +20,13 @@ import {
  */
 const h = vi.hoisted(() => ({
   log: [] as string[],
-  terminals: [] as { index: number; disposed: number }[],
+  terminals: [] as { index: number; disposed: number; input: HTMLTextAreaElement }[],
   webgls: [] as { index: number; disposed: number }[],
   serializeCalls: 0,
   serializeAddons: 0,
   mobile: false,
+  tabCount: 1,
+  split: false,
   status: {
     state: "ready" as string,
     message: null as string | null,
@@ -50,6 +53,9 @@ vi.mock("@xterm/xterm", () => {
     cols = 80;
     rows = 24;
     options: Record<string, unknown>;
+    input = document.createElement("textarea");
+    keyHandler: (event: KeyboardEvent) => boolean = () => true;
+    dataHandler: (data: string) => void = () => {};
     buffer = {
       active: {
         type: "normal",
@@ -78,9 +84,27 @@ vi.mock("@xterm/xterm", () => {
       h.log.push(`create:${this.index}`);
     }
     loadAddon() {}
-    open() {}
-    attachCustomKeyEventHandler() {}
-    onData() {
+    open(container: HTMLElement) {
+      container.appendChild(this.input);
+      // Model xterm's delivery after the real custom handler accepts a key.
+      // Modified Enter is encoded by TerminalPane before it reaches xterm.
+      const handle = (event: KeyboardEvent) => {
+        if (!this.keyHandler(event)) return;
+        if (event.type === "keydown") {
+          if (event.key === "PageDown") this.dataHandler("\x1b[6;5~");
+          if (event.key === "PageUp") this.dataHandler("\x1b[5;5~");
+        }
+        event.preventDefault();
+        event.stopPropagation();
+      };
+      this.input.addEventListener("keydown", handle);
+      this.input.addEventListener("keyup", handle);
+    }
+    attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean) {
+      this.keyHandler = handler;
+    }
+    onData(handler: (data: string) => void) {
+      this.dataHandler = handler;
       return { dispose: () => {} };
     }
     onResize() {
@@ -94,7 +118,7 @@ vi.mock("@xterm/xterm", () => {
       this.cols = cols;
       this.rows = rows;
     }
-    focus() {}
+    focus() { this.input.focus(); }
     getSelection() {
       return "";
     }
@@ -208,14 +232,6 @@ vi.mock("@/hooks/use-tauri-event", () => ({ useTauriEvent: () => {} }));
 vi.mock("@/hooks/use-scrollback-serializer", () => ({
   registerTerminalForSerialize: () => () => {},
 }));
-vi.mock("@/hooks/use-resolved-keybinds", () => ({
-  // `keybindMap` is read at module load by `app-shortcuts`.
-  resolveKeybinds: () => ({
-    keybindMap: new Map(),
-    getKeysForAction: () => null,
-  }),
-}));
-
 let restoreEnabled = true;
 vi.mock("@/stores/synced-settings-store", () => {
   const state = () => ({
@@ -260,6 +276,12 @@ vi.mock("@/stores/app-store", () => ({
     getState: () => ({
       appState: {
         pane_statuses: {},
+        workspaces: [{
+          workspace_id: "ws-1",
+          tabs: Array.from({ length: h.tabCount }, (_, index) => ({ tab_id: `tab-${index}` })),
+          active_surface_id: "surface-1",
+          surfaces: [{ surface_id: "surface-1", active_pane_id: "pane-1", root: { kind: h.split ? "split" : "terminal" } }],
+        }],
         terminal_sessions: [
           {
             session_id: "sess-a",
@@ -285,6 +307,7 @@ vi.mock("@/stores/app-store", () => ({
     }),
   }),
   getSessionWorkspaceId: () => "ws-1",
+  selectActiveWorkspaceId: () => "ws-1",
 }));
 
 vi.mock("@/stores/terminal-cwd-store", () => ({
@@ -394,6 +417,25 @@ describe("TerminalPane deferred teardown", () => {
     fireEvent.click(view.getByRole("button", { name: "Follow desktop size" }));
     await act(async () => {});
     expect(resizePty).not.toHaveBeenCalled();
+  });
+
+  // A split or panel change made while the pane was hidden left the shell at
+  // its old width until the next resize event, so the first keystrokes after
+  // showing it wrapped at the stale width.
+  it("re-syncs the PTY size as soon as a hidden pane is shown", async () => {
+    schedulerHarness();
+    const pane = (visible: boolean) => (
+      <TerminalPane sessionId="sess-a" paneId="pane-1" focused={false} visible={visible} title="term" />
+    );
+    const view = render(pane(false));
+    await act(async () => {});
+    vi.mocked(resizePty).mockClear();
+
+    view.rerender(pane(true));
+    await act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    });
+    expect(resizePty).toHaveBeenCalledWith("sess-a", 80, 24);
   });
 
   it("does not serialize, persist or dispose during unmount", async () => {
@@ -653,5 +695,60 @@ describe("TerminalPane links", () => {
       link.activate(new MouseEvent("click", { ctrlKey: true }));
     });
     expect(openRightPanelDoc).toHaveBeenCalledWith("ws-1", "/tmp/a/src/App.tsx", 12, 5);
+  });
+});
+
+describe("TerminalPane conditional shortcut input", () => {
+  beforeEach(() => {
+    h.terminals.length = 0;
+    h.tabCount = 1;
+    h.split = false;
+    vi.mocked(writeToPty).mockClear();
+    updateAppShortcuts({});
+    schedulerHarness();
+  });
+
+  afterEach(() => {
+    cleanup();
+    flushAllTeardowns();
+    setTeardownScheduler(null);
+  });
+
+  it.each([
+    { key: "PageDown", ctrlKey: true, shiftKey: false, data: "\x1b[6;5~" },
+    { key: "PageUp", ctrlKey: true, shiftKey: false, data: "\x1b[5;5~" },
+    { key: "Enter", ctrlKey: true, shiftKey: true, data: "\x1b[13;6u" },
+  ])("delivers no-op $key to a focused lone terminal", async ({ data, ...event }) => {
+    render(<TerminalPane sessionId="sess-a" paneId="pane-1" focused visible title="Terminal" />);
+    await act(async () => {});
+    const input = h.terminals[0].input;
+    expect(document.activeElement).toBe(input);
+    fireEvent.keyDown(input, event);
+    fireEvent.keyUp(input, event);
+    expect(writeToPty).toHaveBeenCalledExactlyOnceWith("sess-a", data);
+    await act(async () => {});
+  });
+
+  it.each([
+    { key: "PageDown", ctrlKey: true, shiftKey: false },
+    { key: "PageUp", ctrlKey: true, shiftKey: false },
+    { key: "Enter", ctrlKey: true, shiftKey: true },
+  ])("yields actionable $key to the app without terminal input", async (event) => {
+    h.tabCount = 2;
+    h.split = true;
+    render(<TerminalPane sessionId="sess-a" paneId="pane-1" focused visible title="Terminal" />);
+    await act(async () => {});
+    const input = h.terminals[0].input;
+    expect(document.activeElement).toBe(input);
+    const appKeydown = vi.fn();
+    window.addEventListener("keydown", appKeydown);
+    try {
+      fireEvent.keyDown(input, event);
+      fireEvent.keyUp(input, event);
+      expect(appKeydown).toHaveBeenCalledOnce();
+      expect(writeToPty).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("keydown", appKeydown);
+    }
   });
 });
