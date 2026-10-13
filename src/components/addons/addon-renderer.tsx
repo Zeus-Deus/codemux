@@ -257,13 +257,14 @@ function VirtualRows({
   const rowHeight = 36;
   const start = Math.max(0, Math.floor(top / rowHeight) - 2);
   const end = Math.min(rows.length, start + 14);
+  // Spacer changes must not let browser anchoring undo the requested offset.
   return (
     <div
       tabIndex={0}
       role={headers ? "table" : "list"}
       aria-label={label || (headers ? "Add-on table" : "Add-on list")}
       aria-rowcount={headers ? rows.length + 1 : undefined}
-      className="max-h-72 overflow-auto rounded-md border"
+      className="max-h-72 overflow-auto rounded-md border [overflow-anchor:none]"
       onScroll={(e) => setTop(e.currentTarget.scrollTop)}
       onKeyDown={(e) => {
         if (e.key !== "Home" && e.key !== "End") return;
