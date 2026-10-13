@@ -1056,6 +1056,32 @@ describe("AgentChatPane real startup composer", () => {
     expect(textarea.value).toBe("keep my draft");
     expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([2, 5]);
   });
+  it("keeps remote task polling quiet until successful startup persists its parent", async () => {
+    const { delegationList } = await import("@/lib/delegation");
+    vi.mocked(delegationList).mockClear();
+    let finish!: (id: string) => void;
+    let persisted = false;
+    vi.mocked(agentChatStartSession).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    vi.mocked(delegationList).mockImplementation(async () => {
+      if (!persisted) throw new Error("Parent is missing from the canonical session database");
+      return [];
+    });
+    const tree = (threadId: string | null) => <TooltipProvider><AgentChatPane pane={{ ...pane, thread_id: threadId }} /></TooltipProvider>;
+    const view = render(tree(null));
+    expect(view.queryByText("Remote tasks unavailable")).toBeNull();
+    expect(delegationList).not.toHaveBeenCalled();
+    act(() => view.getByRole("textbox").focus());
+    await waitFor(() => expect(agentChatStartSession).toHaveBeenCalledOnce());
+    const requested = vi.mocked(agentChatStartSession).mock.calls[0][2].thread_id;
+    view.rerender(tree(requested));
+    await waitFor(() => expect(agentChatGetSession).toHaveBeenCalledWith(requested));
+    await act(async () => Promise.resolve());
+    persisted = true;
+    await act(async () => finish(requested));
+    expect(view.queryByText("Remote tasks unavailable")).toBeNull();
+    await waitFor(() => expect(delegationList).toHaveBeenCalled());
+    vi.mocked(delegationList).mockResolvedValue([]);
+  });
   it("preserves focus and draft when the backend publishes its binding before startup completes", async () => {
     let start!: (id: string) => void;
     let metadata!: (record: AgentChatSessionRecord | null) => void;

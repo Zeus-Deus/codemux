@@ -738,7 +738,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (paneWorkspaceId) toggleRightPanel?.(paneWorkspaceId, "tasks");
   }, [paneWorkspaceId, toggleRightPanel]);
 
-  const remoteTasks = useDelegationTasks(conversationWritable ? pane.pane_id : null, conversationWritable ? threadId : null);
+  // A new pane binding is published before startup persists its canonical
+  // session. Existing/hydrating threads keep their task subscription intact.
+  const remoteParentReady = conversationWritable && !(starting && startupThreadRef.current === threadId);
+  const remoteTasks = useDelegationTasks(remoteParentReady ? pane.pane_id : null, remoteParentReady ? threadId : null);
   const [delegateDialogThread, setDelegateDialogThread] = useState<string | null>(null);
   const [remoteTaskView, setRemoteTaskView] = useState<{ threadId: string; taskId: string } | null>(null);
   const openRemoteTask = useCallback((taskId: string) => {
