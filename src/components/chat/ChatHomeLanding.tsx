@@ -93,7 +93,7 @@ export function ChatHomeLanding({
                 }
               }}
               onClick={markHintSeen}
-              className="inline-flex h-8 items-center gap-1.5 rounded-full border border-border/80 px-3 text-body text-muted-foreground transition-colors duration-150 hover:border-foreground/30 hover:bg-foreground/5 hover:text-foreground data-[state=open]:border-foreground/30 data-[state=open]:text-foreground"
+              className="inline-flex h-8 items-center gap-1.5 rounded-full border border-border/80 px-3 text-body text-muted-foreground transition-colors duration-150 hover:border-foreground/30 hover:bg-surface-2 hover:text-foreground data-[state=open]:border-foreground/30 data-[state=open]:text-foreground"
             >
               <FolderOpen className="size-4" aria-hidden />
               No project
@@ -109,7 +109,7 @@ export function ChatHomeLanding({
       <button
         type="button"
         onClick={markHintSeen}
-        className="group/project -ml-1 inline-flex items-baseline gap-0.5 rounded-lg pl-1 pr-0.5 transition-colors duration-150 hover:bg-foreground/5 data-[state=open]:bg-foreground/5"
+        className="group/project -ml-1 inline-flex items-baseline gap-0.5 rounded-lg pl-1 pr-0.5 transition-colors duration-150 hover:bg-surface-2 data-[state=open]:bg-surface-2"
       >
         <span className="underline decoration-muted-foreground/50 decoration-dotted decoration-2 underline-offset-[6px] transition-colors duration-150 group-hover/project:decoration-foreground">
           {projectName}

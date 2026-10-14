@@ -4,23 +4,6 @@ import { cn } from "@/lib/utils";
 /** Where the hint sits relative to its picker trigger. */
 export type ProjectPickerHintPlacement = "below" | "side";
 
-// Dots, not dashes: a near-zero dash with round caps draws a dot.
-const DOTTED = {
-  fill: "none",
-  stroke: "currentColor",
-  strokeWidth: 1.8,
-  strokeLinecap: "round",
-  strokeDasharray: "0.01 5",
-} as const;
-
-const HEAD = {
-  fill: "none",
-  stroke: "currentColor",
-  strokeWidth: 1.6,
-  strokeLinecap: "round",
-  strokeLinejoin: "round",
-} as const;
-
 // Each tail starts by the note and its head lands on the trigger: up-left
 // under the headline's chevron ("below"), or left onto the "No project"
 // button ("side"). Heads follow each curve's final tangent.
@@ -61,15 +44,26 @@ export function ProjectPickerHint({
       className={cn(
         // Only where the pane has room beside the headline.
         "pointer-events-none absolute left-full hidden text-muted-foreground/70 @[46rem]:flex",
-        "animate-in fade-in duration-700 delay-300 fill-mode-backwards motion-reduce:animate-none",
+        "animate-in fade-in duration-250 delay-300 fill-mode-backwards motion-reduce:animate-none",
         placement === "below"
           ? "top-[85%] -ml-5 items-end"
           : "top-1/2 ml-1 -translate-y-1/2 items-center",
       )}
     >
-      <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} className="shrink-0">
-        <path d={tail} {...DOTTED} />
-        <path d={head} {...HEAD} />
+      <svg
+        width={w}
+        height={h}
+        viewBox={`0 0 ${w} ${h}`}
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={1.7}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className="shrink-0"
+      >
+        {/* Dots, not dashes: a near-zero dash with round caps draws a dot. */}
+        <path d={tail} strokeDasharray="0.01 5" />
+        <path d={head} />
       </svg>
       <span
         // The note is CSS content so it stays out of the headline's text
