@@ -386,7 +386,7 @@ impl ClaudeSession {
                 .and_then(|v| v.as_str())
                 .map(String::from)
         });
-        let params = StartSessionParams {
+        let mut params = StartSessionParams {
             thread_id: thread_id.0.clone(),
             cwd: input.cwd.clone(),
             model: resolved_model,
@@ -463,7 +463,11 @@ impl ClaudeSession {
                     .await
                 }
             },
+            append_system_prompt: None,
         };
+        if managed.is_none() {
+            params.append_system_prompt = system_prompt_append(&params.mcp_tools);
+        }
         let mut params_value =
             serde_json::to_value(&params).map_err(|e| ProviderError::ProcessError {
                 message: "failed to serialize start-session params".into(),
@@ -1692,6 +1696,17 @@ async fn push_mcp_refresh(
     }
 }
 
+/// Codemux's instructions for the tools this chat can call, appended to
+/// Claude Code's system prompt. Claude lists MCP tools by name only until it
+/// searches for one, so a tool's description alone does not tell the agent
+/// when to reach for it.
+fn system_prompt_append(tools: &[super::protocol::McpToolEntry]) -> Option<String> {
+    tools
+        .iter()
+        .any(|tool| tool.prefixed_name == crate::mcp_server::HTML_RENDER_REGISTRY_NAME)
+        .then(|| crate::mcp_server::HTML_RENDER_GUIDANCE.to_string())
+}
+
 /// Snapshot every running MCP tool from the registry into the wire
 /// shape the sidecar expects. Returns an empty `Vec` when no registry
 /// is configured or no tools are running — both fine, the sidecar
@@ -2215,5 +2230,23 @@ mod tests {
         .await;
         assert_eq!(payload["isError"], true);
         assert!(!call.matched_async().await);
+    }
+
+    #[test]
+    fn system_prompt_guides_visuals_only_when_html_render_is_listed() {
+        let tool = |prefixed_name: &str| super::super::protocol::McpToolEntry {
+            name: "html_render".into(),
+            prefixed_name: prefixed_name.into(),
+            description: None,
+            input_schema: json!({}),
+            server_id: "codemux-self".into(),
+        };
+        assert_eq!(
+            system_prompt_append(&[tool("mcp__codemux__browser_click"), tool("mcp__codemux__html_render")]).as_deref(),
+            Some(crate::mcp_server::HTML_RENDER_GUIDANCE)
+        );
+        // No Codemux tools, or a same-named tool on another server.
+        assert!(system_prompt_append(&[]).is_none());
+        assert!(system_prompt_append(&[tool("mcp__other__html_render")]).is_none());
     }
 }

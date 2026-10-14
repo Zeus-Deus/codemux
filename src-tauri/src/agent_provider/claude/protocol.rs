@@ -79,6 +79,10 @@ pub struct StartSessionParams {
     /// constructed without an `mcp_registry`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_tools: Vec<McpToolEntry>,
+    /// Codemux instructions the sidecar appends to Claude Code's system
+    /// prompt. See `session::system_prompt_append`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub append_system_prompt: Option<String>,
 }
 
 /// Method name for Stage 4 dynamic tool refresh. The Claude session
@@ -551,6 +555,7 @@ mod tests {
             path_to_claude_code_executable: "/usr/bin/claude".into(),
             extra_args: None,
             mcp_tools: Vec::new(),
+            append_system_prompt: None,
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["threadId"], "t1");
@@ -559,6 +564,7 @@ mod tests {
         assert!(v.get("effort").is_none());
         assert_eq!(v["fastMode"], true);
         assert!(v.get("permissionMode").is_none());
+        assert!(v.get("appendSystemPrompt").is_none());
     }
 
     #[test]
