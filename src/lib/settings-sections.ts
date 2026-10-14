@@ -23,6 +23,7 @@ import {
   MonitorSmartphone,
   GitPullRequest,
   ChartColumn,
+  CircleArrowUp,
 } from "lucide-react";
 
 export type Section =
@@ -44,6 +45,7 @@ export type Section =
   | "mcp"
   | "hosts"
   | "remote_access"
+  | "updates"
   | "browser"
   | "shortcuts"
   | "notifications"
@@ -137,6 +139,8 @@ export function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
         // built in, and remote access is default-off behind its own toggle.
         { id: "hosts", label: "Devices", icon: Laptop },
         { id: "remote_access", label: "Remote Access", icon: MonitorSmartphone },
+        // Codemux and every coding agent, here and on each device.
+        { id: "updates", label: "Updates", icon: CircleArrowUp },
         { id: "about", label: "About", icon: Info },
       ],
     },

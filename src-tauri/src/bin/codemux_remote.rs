@@ -116,6 +116,37 @@ enum Command {
         #[command(subcommand)]
         subcommand: WorktreeSubcommand,
     },
+    /// Agent CLIs installed on this device, and updates for them through
+    /// the installer that owns each one (mise/Omarchy, npm, pnpm, bun,
+    /// Homebrew or the provider's own updater).
+    Providers {
+        #[command(subcommand)]
+        subcommand: ProvidersSubcommand,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum ProvidersSubcommand {
+    /// Report every installed provider's version and update status.
+    ///
+    /// Stable contract: the last stdout line is one JSON object
+    /// `{"providers":[<ProviderUpdate>,...]}`.
+    Check {
+        /// Ignore this process's cache. Each run is a new process, so
+        /// accepted for symmetry with the desktop command only.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Update one provider, then verify the new version.
+    ///
+    /// Stable contract: the last stdout line is the `ProviderUpdate` after
+    /// the update. On failure: non-zero exit and the reason on stderr.
+    Update {
+        /// claude, codex, cursor, grok, opencode or hermes.
+        #[arg(long)]
+        provider: String,
+    },
 }
 
 #[cfg(unix)]
@@ -333,6 +364,53 @@ fn main() -> ExitCode {
                 branch,
             } => run_worktree_setup(path, workspace_id, name, branch),
         },
+        Some(Command::Providers { subcommand }) => run_providers(subcommand),
+    }
+}
+
+#[cfg(unix)]
+fn run_providers(command: ProvidersSubcommand) -> ExitCode {
+    use codemux_lib::commands::provider_updates as updates;
+    // The Claude runtime the desktop uploads beside this binary reads the
+    // version the same way the desktop does; without it, `--version`.
+    codemux_lib::remote::tasks::initialize_runtime();
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("[codemux-remote] tokio runtime: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    match command {
+        ProvidersSubcommand::Check { force } => {
+            let providers = runtime.block_on(updates::check_installed(force));
+            println!("{}", serde_json::json!({ "providers": providers }));
+            ExitCode::SUCCESS
+        }
+        ProvidersSubcommand::Update { provider } => {
+            let kind = match serde_json::from_value::<codemux_lib::agent_provider::ProviderKind>(
+                serde_json::Value::String(provider.clone()),
+            ) {
+                Ok(kind) if updates::MAINTAINED.contains(&kind) => kind,
+                _ => {
+                    eprintln!("Unknown provider {provider:?}");
+                    return ExitCode::from(2);
+                }
+            };
+            match runtime.block_on(updates::update_provider(kind, None)) {
+                Ok(report) => {
+                    println!("{}", serde_json::json!(report));
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(1)
+                }
+            }
+        }
     }
 }
 

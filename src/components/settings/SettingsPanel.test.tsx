@@ -197,6 +197,9 @@ vi.mock("@/tauri/commands", () => ({
   primeMcpRuntime: vi.fn().mockResolvedValue([]),
   usageRefreshQuota: vi.fn().mockResolvedValue({ quota: {}, statuses: [], refreshed_at_ms: 0 }),
   usagePriceOverrides: vi.fn().mockResolvedValue({}),
+  // Updates section: no devices, so only this computer is checked.
+  hostsList: vi.fn().mockResolvedValue([]),
+  getLocalDeviceName: vi.fn().mockResolvedValue("this-computer"),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));

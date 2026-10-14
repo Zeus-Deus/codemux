@@ -18,6 +18,15 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "set_preset_pinned"
             | "refresh_workspace_issue"
             | "agent_chat_provider_health"
+            // Settings → Updates from a paired browser or phone. Each command
+            // only picks a provider or a configured device; the installer is
+            // detected on the machine that owns the CLI, never sent by the caller.
+            | "agent_chat_provider_update_check"
+            | "agent_chat_provider_update"
+            | "provider_updates_local"
+            | "provider_updates_device"
+            | "provider_update_device"
+            | "device_helper_update"
             | "hermes_profiles"
             | "hermes_catalog"
             | "hermes_binding"

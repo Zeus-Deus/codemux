@@ -4107,6 +4107,30 @@ const mockHosts: HostView[] = [
   dirty: false,
 }));
 
+type MockProviderReport = {
+  provider: string; installed_version: string | null; latest_version: string | null;
+  available: boolean; manager: string; can_update: boolean; message: string | null;
+};
+const mockReport = (provider: string, installed: string, latest: string, manager: string, can_update = true, message: string | null = null): MockProviderReport => ({
+  provider, installed_version: installed, latest_version: latest, available: installed !== latest, manager, can_update, message,
+});
+const mockLocalProviders: MockProviderReport[] = [
+  mockReport("claude", "2.3.11", "2.3.14", "Omarchy · mise"),
+  mockReport("codex", "0.162.1", "0.163.0", "Omarchy · mise"),
+  mockReport("cursor", "2026.09.28-6e1f2a4", "2026.09.28-6e1f2a4", "Omarchy system package", false, "This provider is owned by the system. Run `omarchy update` in a terminal, then restart Codemux."),
+  mockReport("opencode", "1.18.35", "1.18.35", "Omarchy · mise"),
+];
+const mockDeviceProviders = new Map<number, { helper: string; providers: MockProviderReport[] }>([
+  [2, { helper: "0.23.2", providers: [
+    mockReport("claude", "2.3.9", "2.3.14", "Claude updater"),
+    mockReport("codex", "0.161.0", "0.163.0", "npm"),
+    mockReport("opencode", "1.18.30", "1.18.35", "npm"),
+  ] }],
+  [3, { helper: "0.24.0", providers: [
+    mockReport("codex", "0.163.0", "0.163.0", "npm"),
+  ] }],
+]);
+
 const mockHostStatus = new Map<number, HostStatusView>([
   [1, {
     host_id: 1,
@@ -5239,8 +5263,42 @@ const handlers: Record<string, Handler> = {
   }),
   agent_chat_provider_update: async (a) => {
     await new Promise(resolve => setTimeout(resolve, 1800));
+    const local = mockLocalProviders.find((p) => p.provider === a.provider);
+    if (local && !new URLSearchParams(location.search).get("providerUpdate")) {
+      Object.assign(local, { installed_version: local.latest_version, available: false });
+      return { ...local };
+    }
     if (new URLSearchParams(location.search).get("providerUpdate") === "error") throw new Error("Update failed: the package registry could not be reached. Check your connection and try again.");
     return { provider: a.provider, installed_version: "0.158.0", latest_version: "0.158.0", available: false, manager: "Omarchy · mise", can_update: true, message: null };
+  },
+  // Settings → Updates. Synthetic per-machine inventories; `?updateAll=fail`
+  // makes one device update fail so the partial-failure summary shows.
+  provider_updates_local: () => mockLocalProviders.map((p) => ({ ...p })),
+  provider_updates_device: (a) => {
+    const hostId = Number(a.hostId);
+    const host = mockHosts.find((h) => h.id === hostId);
+    if (!host || hostId === 1) {
+      return { host_id: hostId, helper_version: null, app_version: "0.24.0", providers: null, error: `couldn't connect to ${host?.name ?? "the device"} over SSH` };
+    }
+    const device = mockDeviceProviders.get(hostId)!;
+    return { host_id: hostId, helper_version: device.helper, app_version: "0.24.0", providers: device.providers.map((p) => ({ ...p })), error: null };
+  },
+  provider_update_device: async (a) => {
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    if (new URLSearchParams(location.search).get("updateAll") === "fail" && a.provider === "opencode") {
+      throw new Error("npm exited with exit status: 1: EACCES: permission denied, rename '/usr/lib/node_modules/opencode-ai'");
+    }
+    const device = mockDeviceProviders.get(Number(a.hostId))!;
+    const report = device.providers.find((p) => p.provider === a.provider)!;
+    Object.assign(report, { installed_version: report.latest_version, available: false });
+    return { ...report };
+  },
+  device_helper_update: async (a) => {
+    await new Promise((resolve) => setTimeout(resolve, 1400));
+    const device = mockDeviceProviders.get(Number(a.hostId))!;
+    const from = device.helper;
+    device.helper = "0.24.0";
+    return { host_id: a.hostId, status: "upgraded", from, to: "0.24.0", message: null };
   },
   // Opens the sign-in terminal tab like the backend, then treats the
   // sign-in as done: the next probe (Re-check, window focus, or a send)
