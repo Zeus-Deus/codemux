@@ -160,6 +160,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "flush_scrollback_cache"
             | "generate_branch_name"
             | "generate_random_branch_name"
+            | "generate_workspace_title"
             | "get_adapter_info"
             | "get_app_state"
             | "get_base_branch_diff"
@@ -332,6 +333,19 @@ mod tests {
             "usage_refresh_quota",
             "usage_price_overrides",
             "usage_set_price_override",
+        ] {
+            assert!(allowed(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn workspace_naming_commands_are_explicitly_allowed() {
+        // Paired clients create workspaces too, so they need the same branch
+        // and title naming as the desktop; both run on the Utility model.
+        for cmd in [
+            "generate_branch_name",
+            "generate_random_branch_name",
+            "generate_workspace_title",
         ] {
             assert!(allowed(cmd), "{cmd}");
         }
