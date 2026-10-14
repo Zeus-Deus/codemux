@@ -1876,7 +1876,6 @@ export function Composer({
               : "Plan and design before coding",
           command: "/plan",
           icon: ListTodo,
-          tone: "sky",
           group: "MODES",
           disabled:
             !configurationEnabled ||
@@ -1890,7 +1889,6 @@ export function Composer({
           description: "Add diagnostic logs to find bugs",
           command: "/debug",
           icon: Bug,
-          tone: "amber",
           group: "MODES",
           disabled: !configurationEnabled || mode === "debug",
           onSelect: () => {},
@@ -1904,7 +1902,6 @@ export function Composer({
               : "Read-only conversational mode",
           command: "/ask",
           icon: MessageCircleQuestion,
-          tone: "violet",
           group: "MODES",
           disabled:
             !configurationEnabled ||
@@ -1923,7 +1920,6 @@ export function Composer({
           description: "Pick a file from your project",
           command: "",
           icon: FileIcon,
-          tone: "muted",
           group: "ATTACH",
           onSelect: () => {},
         },
@@ -1933,7 +1929,6 @@ export function Composer({
           description: "Attach a directory tree",
           command: "",
           icon: FolderOpen,
-          tone: "muted",
           group: "ATTACH",
           onSelect: () => {},
         },
@@ -1948,7 +1943,6 @@ export function Composer({
             : "Current model doesn't support images",
           command: "",
           icon: ImageIcon,
-          tone: "muted",
           group: "ATTACH",
           disabled: !modelSupportsImages,
           onSelect: () => {},
@@ -1964,7 +1958,6 @@ export function Composer({
             : "Open a workspace to attach a conversation",
           command: "",
           icon: MessagesSquare,
-          tone: "muted",
           group: "ATTACH",
           disabled: !workspaceId,
           onSelect: () => {},
@@ -1982,7 +1975,6 @@ export function Composer({
           description: hostingBlockedHint ?? "Pick an issue from this repo",
           command: "",
           icon: CircleDot,
-          tone: "muted",
           group: "ATTACH",
           disabled: hostingAttachDisabled,
           onSelect: () => {},
@@ -1994,7 +1986,6 @@ export function Composer({
             hostingBlockedHint ?? `Pick a ${scProvider.noun} from this repo`,
           command: "",
           icon: GitPullRequest,
-          tone: "muted",
           group: "ATTACH",
           disabled: hostingAttachDisabled,
           onSelect: () => {},
@@ -2006,7 +1997,6 @@ export function Composer({
           disabled: provider === "acp",
           command: "",
           icon: Server,
-          tone: "green",
           group: "INTEGRATIONS",
           onSelect: () => {},
         },
@@ -2016,7 +2006,6 @@ export function Composer({
           description: "Delegate a coding task to another machine",
           command: "",
           icon: Server,
-          tone: "sky" as const,
           group: "INTEGRATIONS",
           disabled: readOnly || !sessionReady || remoteDisconnected,
           onSelect: () => {},
@@ -2037,7 +2026,6 @@ export function Composer({
             : formatMcpRowStatus(runtime, isOff),
           command: "",
           icon: Server,
-          tone: "green",
           group: "MCP SERVERS",
           // The Switch in `rightAdornment` owns the click; the row's
           // own onSelect is intentionally a no-op so users don't
@@ -2062,7 +2050,6 @@ export function Composer({
         description: "View tools and manage servers",
         command: "",
         icon: Settings,
-        tone: "muted",
         group: "MCP SERVERS",
         onSelect: () => {},
       });
@@ -2082,7 +2069,6 @@ export function Composer({
         label: match.path,
         command: "",
         icon: FileIcon,
-        tone: "muted",
         group: "FILES",
         onSelect: () => {},
       }));
@@ -2096,7 +2082,6 @@ export function Composer({
       description: `${match.item_count} item${match.item_count === 1 ? "" : "s"}`,
       command: "",
       icon: FolderOpen,
-      tone: "muted",
       group: "FOLDERS",
       onSelect: () => {},
     }));

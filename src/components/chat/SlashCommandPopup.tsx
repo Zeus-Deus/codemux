@@ -4,6 +4,12 @@ import { memo, useCallback, useLayoutEffect, useMemo, useRef, type SyntheticEven
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { CommandSourceIcon } from "./CommandSourceIcon";
+import {
+  COMMAND_MENU_GROUP_HEADING,
+  COMMAND_MENU_ICON,
+  COMMAND_MENU_ROW,
+  COMMAND_MENU_SURFACE,
+} from "./command-menu-styles";
 import { usePopupHighlight, type PopupHighlightStore } from "./popup-highlight-store";
 import {
   groupSlashItems,
@@ -192,9 +198,8 @@ export function SlashCommandPopup({
     <div
       data-testid="slash-command-popup"
       className={cn(
-        "absolute bottom-full left-0 right-0 mb-2 z-50",
-        "rounded-lg border border-hairline bg-popover shadow-md",
-        "overflow-hidden",
+        "absolute bottom-full left-0 right-0 mb-2 z-50 overflow-hidden",
+        COMMAND_MENU_SURFACE,
       )}
       onPointerLeave={() => {
         pointerPositionRef.current = null;
@@ -281,17 +286,7 @@ const CommandRows = memo(function CommandRows({ items, onSelect }: Pick<Props, "
               <CommandPrimitive.Group
                 key={group}
                 heading={group}
-                className={cn(
-                  "p-1",
-                  "**:[[cmdk-group-heading]]:px-2",
-                  "**:[[cmdk-group-heading]]:pt-1.5",
-                  "**:[[cmdk-group-heading]]:pb-1",
-                  "**:[[cmdk-group-heading]]:text-caption",
-                  "**:[[cmdk-group-heading]]:font-semibold",
-                  "**:[[cmdk-group-heading]]:uppercase",
-                  "**:[[cmdk-group-heading]]:tracking-wider",
-                  "**:[[cmdk-group-heading]]:text-muted-foreground/70",
-                )}
+                className={cn("p-1", COMMAND_MENU_GROUP_HEADING)}
               >
                 {groupItems.map((item) => {
                   const Icon = item.icon;
@@ -314,11 +309,9 @@ const CommandRows = memo(function CommandRows({ items, onSelect }: Pick<Props, "
                       data-testid={`slash-item-${item.id}`}
                       data-disabled={disabled || undefined}
                       className={cn(
-                        "flex items-center gap-2 rounded-sm px-2 py-1.5 text-body",
-                        item.stacked && "gap-2.5 py-2",
-                        "cursor-pointer outline-none select-none",
-                        "data-[selected=true]:bg-muted",
-                        "data-[selected=true]:text-foreground",
+                        COMMAND_MENU_ROW,
+                        "py-1.5 text-body",
+                        item.stacked && "py-2",
                         disabled && "opacity-50 cursor-not-allowed",
                       )}
                     >
@@ -334,8 +327,8 @@ const CommandRows = memo(function CommandRows({ items, onSelect }: Pick<Props, "
                           className={cn(
                             "size-3.5 shrink-0",
                             // Per-item override (e.g. green for open
-                            // issues) wins; otherwise default muted.
-                            item.iconClassName ?? "text-muted-foreground",
+                            // issues) wins over the default.
+                            item.iconClassName ?? COMMAND_MENU_ICON,
                           )}
                           aria-hidden
                         />
@@ -394,7 +387,7 @@ const CommandRows = memo(function CommandRows({ items, onSelect }: Pick<Props, "
                           {item.rightAdornment}
                         </span>
                       ) : (
-                        <span className="ml-auto max-w-[30%] shrink-0 truncate font-mono text-label text-muted-foreground/70" title={item.command}>
+                        <span className="ml-auto max-w-[30%] shrink-0 truncate font-mono text-label text-muted-foreground/60 group-data-[selected=true]/row:text-foreground" title={item.command}>
                           {item.command}
                         </span>
                       )}

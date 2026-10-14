@@ -20,21 +20,6 @@ import type { ActivePillMode } from "@/components/chat/pickers/ModePill";
 import { type GoalSubcommandWord } from "./goal";
 
 /**
- * Tone applied to a command-menu row's icon chip (redesigned `+`
- * command menu). Maps to the app's token utilities in
- * `ComposerCommandMenu` — never a raw colour. `muted` is the neutral
- * default so rows that don't opt in stay quiet.
- */
-export type CommandTone =
-  | "sky"
-  | "amber"
-  | "violet"
-  | "green"
-  | "red"
-  | "muted"
-  | "ember";
-
-/**
  * One row in the slash-command popup. The popup component renders these
  * generically — no hard-coded knowledge of modes — so Step 7 (skills)
  * can append its own items without touching the popup.
@@ -95,10 +80,6 @@ export interface SlashCommandItem {
    *  label. Useful for entity results (such as conversations) whose
    *  names and previews need independent truncation. */
   stacked?: boolean;
-  /** Redesigned `+` command menu — tone of the row's 24px icon chip.
-   *  Optional; the menu falls back to `muted` when unset. Ignored by
-   *  the legacy `SlashCommandPopup` (slash / mention surfaces). */
-  tone?: CommandTone;
   /** Provider-supplied argument hint (e.g. `<pr-url>`), kept verbatim so
    *  the popup can show it after the label. Only set on commands without
    *  registered subcommands — those list their arguments instead. */
@@ -595,7 +576,6 @@ export function buildWorkflowCommand({
       : "Only available with Claude models",
     command: "/workflow",
     icon: Workflow,
-    tone: "ember",
     group: "WORKFLOWS",
     disabled: !isClaude,
     onSelect: () => {},
