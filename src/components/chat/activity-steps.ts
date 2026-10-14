@@ -130,6 +130,76 @@ export function toStepView(step: ActivityStep): StepView {
   return { id: step.id, verb, summary, meta, status: stepStatus(step) };
 }
 
+/** Trace-line wording: the verb is a sentence fragment in the step's tense —
+ *  "Running", "Ran", "Failed to run" — so the line says what happened without
+ *  a status glyph or an `ok`/`done` tag. */
+const TRACE_VERBS: Record<string, { running: string; done: string; error: string }> = {
+  Read: { running: "Reading", done: "Read", error: "Failed to read" },
+  Write: { running: "Writing", done: "Wrote", error: "Failed to write" },
+  Edit: { running: "Editing", done: "Edited", error: "Failed to edit" },
+  MultiEdit: { running: "Editing", done: "Edited", error: "Failed to edit" },
+  NotebookEdit: { running: "Editing", done: "Edited", error: "Failed to edit" },
+  Bash: { running: "Running", done: "Ran", error: "Failed to run" },
+  Glob: { running: "Listing", done: "Listed", error: "Failed to list" },
+  Grep: { running: "Searching for", done: "Searched for", error: "Failed to search for" },
+  WebFetch: { running: "Fetching", done: "Fetched", error: "Failed to fetch" },
+  WebSearch: {
+    running: "Searching the web for",
+    done: "Searched the web for",
+    error: "Failed to search the web for",
+  },
+  TodoWrite: { running: "Updating tasks", done: "Updated tasks", error: "Failed to update tasks" },
+};
+
+export interface TraceStepTitle {
+  verb: string;
+  /** Path, command or pattern, rendered in mono. */
+  target: string | null;
+  /** Secondary argument (line range, search path), dimmed. */
+  argument: string | null;
+}
+
+/** Sentence-style title for a step's Trace line. Reasoning lines carry the
+ *  thought's first line as their title and no verb. */
+export function traceStepTitle(step: ActivityStep): TraceStepTitle {
+  if (isReasoning(step)) {
+    return { verb: "", target: firstLine(step.text) || null, argument: null };
+  }
+  const described = describeToolCall(step);
+  const status = stepStatus(step);
+  const verbs = TRACE_VERBS[step.tool_name];
+  let verb: string;
+  if (verbs) {
+    verb = status === "running" ? verbs.running : status === "error" ? verbs.error : verbs.done;
+  } else if (!described.verb.startsWith("Called ")) {
+    // A provider-specific label (Hermes learning steps) already reads as a
+    // sentence; keep it.
+    verb = described.verb;
+  } else {
+    verb =
+      status === "running"
+        ? `Calling ${step.tool_name}`
+        : status === "error"
+          ? `Failed to call ${step.tool_name}`
+          : `Called ${step.tool_name}`;
+  }
+  return { verb, target: described.target, argument: described.argument };
+}
+
+/** Trace-line description: the step's own figures (`+9 −1`, `2 hits`) and
+ *  duration. `ok`/`done`/`failed` are dropped because the title's tense and
+ *  the line's colour already carry them. `running` stays: a live line swaps
+ *  it for the ticking elapsed time, and a call left hanging in a settled
+ *  transcript needs it said plainly. */
+export function traceStepDescription(step: ActivityStep): string {
+  const meta = stepMeta(step);
+  const keep = meta === "ok" || meta === "done" || meta === "failed" ? "" : meta;
+  const duration = stepDurationMs(step);
+  return [keep, duration != null ? formatActivityDuration(duration) : ""]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 export function isSubagentRun(entry: WorkEntry): entry is SubagentRunItem {
   return entry.kind === "subagent_run";
 }

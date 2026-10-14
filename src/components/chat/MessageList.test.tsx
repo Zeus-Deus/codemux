@@ -898,8 +898,7 @@ describe("MessageList activity blocks", () => {
       showThinking: false,
     });
     expect(container.querySelector('canvas[data-orb-state="working"]')).not.toBeNull();
-    expect(screen.getByText("run")).toBeInTheDocument();
-    expect(screen.getByText("cargo test")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Running cargo test/ })).toBeInTheDocument();
     expect(screen.getByText("2 tools")).toBeInTheDocument();
   });
 

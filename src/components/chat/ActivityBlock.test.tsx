@@ -89,8 +89,8 @@ function openLog(container: HTMLElement) {
 describe("ActivityBlock — one-line work log", () => {
   it("collapses a stretch to the newest action plus totals", () => {
     renderBlock([read(0, "/a"), bash(1, "cargo test", { status: "running" })], true);
-    expect(screen.getByText("run")).toBeInTheDocument();
-    expect(screen.getByText("cargo test")).toBeInTheDocument();
+    // Trace lines read as a sentence in the step's tense.
+    expect(screen.getByRole("button", { name: /Running cargo test/ })).toBeInTheDocument();
     expect(screen.getByText("2 tools")).toBeInTheDocument();
     expect(screen.queryByText("/a")).toBeNull();
     expect(screen.queryByText(/previous/)).toBeNull();
@@ -104,7 +104,7 @@ describe("ActivityBlock — one-line work log", () => {
     openLog(container);
     expect(screen.getByText("/a")).toBeInTheDocument();
     expect(screen.getByText("cargo test")).toBeInTheDocument();
-    expect(screen.getByText("done")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Read \/a/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Work log/ }));
     expect(screen.queryByText("/a")).toBeNull();
     expect(screen.getByText("cargo test")).toBeInTheDocument();
@@ -186,7 +186,8 @@ describe("ActivityBlock — step timing", () => {
       false,
     );
     openLog(container);
-    expect(screen.getByText("ok · 3s")).toBeInTheDocument();
+    // The tense carries "ok"; only the duration remains.
+    expect(screen.getByRole("button", { name: /Ran cargo build/ })).toHaveTextContent(/3s$/);
   });
 
   it("ticks a running step inside an open log while its turn runs", () => {
@@ -286,7 +287,7 @@ describe("ActivityBlock — subagent runs", () => {
       true,
       "ws-1",
     );
-    expect(screen.getByText("agents")).toBeInTheDocument();
+    expect(screen.getByText(/Running subagents/)).toBeInTheDocument();
     expect(screen.getByText("screenshot pass")).toBeInTheDocument();
     expect(document.querySelectorAll("canvas")).toHaveLength(1);
   });

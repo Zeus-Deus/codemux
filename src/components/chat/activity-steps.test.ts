@@ -12,6 +12,8 @@ import {
   stepElapsedLabel,
   stepMeta,
   toStepView,
+  traceStepDescription,
+  traceStepTitle,
 } from "./activity-steps";
 
 function tool(name: string, overrides: Partial<ToolCallItem> = {}): ToolCallItem {
@@ -146,6 +148,36 @@ describe("stepMeta / toStepView", () => {
   it("leaves the live elapsed label empty for the first second", () => {
     expect(stepElapsedLabel(10_000, 10_400)).toBe("");
     expect(stepElapsedLabel(10_000, 72_000)).toBe("1m 2s");
+  });
+});
+
+describe("traceStepTitle / traceStepDescription", () => {
+  it("puts the verb in the step's tense", () => {
+    const cmd = { input: { command: "cargo test" } };
+    expect(traceStepTitle(tool("Bash", { ...cmd, status: "running" })).verb).toBe("Running");
+    expect(traceStepTitle(tool("Bash", cmd)).verb).toBe("Ran");
+    expect(traceStepTitle(tool("Bash", { ...cmd, status: "error" })).verb).toBe("Failed to run");
+    expect(traceStepTitle(tool("Bash", cmd)).target).toBe("cargo test");
+  });
+  it("names unknown tools and keeps a thought's first line as its title", () => {
+    expect(traceStepTitle(tool("mcp__linear__get_issue")).verb).toBe("Called mcp__linear__get_issue");
+    expect(traceStepTitle(tool("mcp__x", { status: "running" })).verb).toBe("Calling mcp__x");
+    expect(traceStepTitle(think({ text: "first line\nsecond" }))).toEqual({
+      verb: "",
+      target: "first line",
+      argument: null,
+    });
+  });
+  it("drops status words the tense already says, keeping figures and time", () => {
+    expect(traceStepDescription(tool("Bash", { started_at: 1_000, completed_at: 4_200 }))).toBe("3s");
+    expect(traceStepDescription(tool("Bash", { status: "error" }))).toBe("");
+    expect(traceStepDescription(tool("Read"))).toBe("");
+    const edit = tool("Edit", {
+      input: { file_path: "/a", old_string: "one", new_string: "one\ntwo" },
+    });
+    expect(traceStepDescription(edit)).toBe("+1 −0");
+    // A call left hanging in a settled transcript still says so.
+    expect(traceStepDescription(tool("Bash", { status: "running" }))).toBe("running");
   });
 });
 

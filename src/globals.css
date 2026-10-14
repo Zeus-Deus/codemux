@@ -1185,7 +1185,8 @@ body.pane-resizing iframe {
     background-position: -200% 0;
   }
 }
-.shimmer {
+.shimmer,
+[data-slot="trace-line"][data-status="running"] > [data-slot="trace-title"] {
   background: linear-gradient(
     90deg,
     var(--muted-foreground) 20%,
@@ -1200,7 +1201,8 @@ body.pane-resizing iframe {
   animation: cm-shimmer 2.1s linear infinite;
 }
 @media (prefers-reduced-motion: reduce) {
-  .shimmer {
+  .shimmer,
+  [data-slot="trace-line"][data-status="running"] > [data-slot="trace-title"] {
     animation: none;
   }
 }

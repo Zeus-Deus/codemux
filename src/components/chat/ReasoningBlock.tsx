@@ -1,21 +1,27 @@
-import { ChevronDown, Lightbulb } from "lucide-react";
+import { Lightbulb } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
-import { cn } from "@/lib/utils";
+import {
+  Trace,
+  TraceCollapsible,
+  TraceCollapsibleContent,
+  TraceCollapsibleTrigger,
+  TraceIcon,
+  TraceLine,
+  TraceTitle,
+} from "@/components/ui/trace";
 import type { ReasoningItem } from "@/lib/agent-chat/types";
 
 /**
- * Collapsible thinking row. Driven entirely by the
- * reducer's `ReasoningItem`:
+ * Collapsible thinking line, drawn with shadcn's Trace so it matches the work
+ * log. Driven entirely by the reducer's `ReasoningItem`:
  *
- *  - While `streaming`: header shimmers "Thinking…", the block auto-opens
+ *  - While `streaming`: the title shimmers "Thinking…", the line auto-opens
  *    and the body streams the thinking text live.
- *  - Once sealed: header reads "Thought for Ns" (from `duration_ms`) and
- *    the block auto-collapses once — the user can still toggle it back.
+ *  - Once sealed: the title reads "Thought for Ns" (from `duration_ms`) and
+ *    the line auto-collapses once — the user can still toggle it back.
  *
- * The flat row follows the compact work-log treatment: no surrounding card,
- * a single 20px glyph slot, quiet metadata, and inline detail on a hairline.
  * The body remains plain italic prose (thinking traces are not trusted
  * markdown and we don't want a shiki/markdown pass on a hot streaming row);
  * inline `code`-fenced spans are left verbatim.
@@ -45,52 +51,39 @@ export const ReasoningBlock = memo(function ReasoningBlock({
     prevStreaming.current = item.streaming;
   }, [item.streaming, open]);
 
-  const label = deriveLabel(item);
-
   return (
     <div className="-mx-1 select-text px-1 py-0.5">
-      <button
-        type="button"
-        onClick={() => {
-          userTouched.current = true;
-          setOpen((v) => !v);
-        }}
-        aria-expanded={open}
-        className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-body-sm leading-5 transition-colors duration-150 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
-      >
-        <span className="flex size-5 shrink-0 items-center justify-center">
-          {live ? (
-            <AgentOrb size={20} aria-hidden />
-          ) : (
-            <Lightbulb
-              className="size-3.5 text-accent-violet"
-              aria-hidden
-            />
-          )}
-        </span>
-        <span
-          className={cn(
-            "min-w-0 flex-1 truncate font-medium text-muted-foreground",
-            item.streaming && "shimmer",
-          )}
+      <Trace>
+        <TraceCollapsible
+          open={open}
+          onOpenChange={(next) => {
+            userTouched.current = true;
+            setOpen(next);
+          }}
         >
-          {label}
-        </span>
-        <ChevronDown
-          className={cn(
-            "size-3 shrink-0 text-muted-foreground/45 transition-transform duration-150",
-            open && "rotate-180",
+          <TraceCollapsibleTrigger>
+            <TraceLine status={item.streaming ? "running" : undefined}>
+              {live ? (
+                <TraceIcon className="size-5 -mx-0.5">
+                  <AgentOrb size={20} aria-hidden />
+                </TraceIcon>
+              ) : (
+                <TraceIcon>
+                  <Lightbulb />
+                </TraceIcon>
+              )}
+              <TraceTitle>{deriveLabel(item)}</TraceTitle>
+            </TraceLine>
+          </TraceCollapsibleTrigger>
+          {item.text.length > 0 && (
+            <TraceCollapsibleContent>
+              <p className="whitespace-pre-wrap break-words text-body italic leading-[1.6] text-muted-foreground">
+                {item.text}
+              </p>
+            </TraceCollapsibleContent>
           )}
-          aria-hidden
-        />
-      </button>
-      {open && item.text.length > 0 && (
-        <div className="ml-[10px] mt-0.5 border-l border-hairline py-1.5 pl-3">
-          <p className="whitespace-pre-wrap break-words text-body italic leading-[1.6] text-muted-foreground">
-            {item.text}
-          </p>
-        </div>
-      )}
+        </TraceCollapsible>
+      </Trace>
     </div>
   );
 });
