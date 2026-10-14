@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { initialThemeSource, omarchyToTheme } from "./omarchy-theme";
 import { fallbackTheme } from "@/hooks/use-theme-colors";
-import { applyTheme, contrastRatio, parseCustomTheme, serializeTheme } from "./themes";
+import { applyTheme, contrastRatio, hexToOklch, parseCustomTheme, serializeTheme, themeToSyntaxColors } from "./themes";
 
 it("follows a detected desktop on first launch, but preserves explicit and existing choices", () => {
   const fresh = { available: true, savedSource: undefined, hasPreviousTheme: false, manualThemeId: "default", legacyPalette: undefined };
@@ -50,14 +50,49 @@ it("layers the shell with Omarchy's own shades and derives them when absent", ()
     expect(contrastRatio(roles.mutedForeground, surface)).toBeGreaterThanOrEqual(4.5);
   }
   expect(contrastRatio(roles.sidebarAccentForeground, roles.sidebarAccent)).toBeGreaterThanOrEqual(4.5);
-  // Raised surfaces step away from the canvas in order: card < popover < muted.
+  // Raised surfaces climb T3 Code's ramp off the canvas: card < muted < popover < secondary < accent.
   const lift = (color: string) => contrastRatio(color, roles.background);
-  expect(lift(roles.card)).toBeLessThan(lift(roles.popover));
-  expect(lift(roles.popover)).toBeLessThan(lift(roles.muted));
+  expect(lift(roles.card)).toBeLessThan(lift(roles.muted));
+  expect(lift(roles.muted)).toBeLessThan(lift(roles.popover));
+  expect(lift(roles.popover)).toBeLessThan(lift(roles.secondary));
+  expect(lift(roles.secondary)).toBeLessThan(lift(roles.accent));
 
   const derived = omarchyToTheme({ name: "Bare", scheme: "dark", colors }).roles;
   expect(derived.sidebar).not.toBe(derived.background);
   expect(contrastRatio(derived.sidebar, "#000000")).toBeLessThan(contrastRatio(derived.background, "#000000"));
+});
+
+it("tints raised surfaces with the accent's hue, as T3 Code does", () => {
+  // Retro 82: a warm orange accent on a navy canvas gives warm cards, not navy ones.
+  const colors = { ...fallbackTheme, background: "#05182e", foreground: "#f6dcac", accent: "#faa968" };
+  const { roles } = omarchyToTheme({ name: "Retro 82", scheme: "dark", colors });
+  const accentHue = hexToOklch(colors.accent).h;
+  for (const surface of [roles.card, roles.popover, roles.secondary, roles.accent]) {
+    expect(Math.abs(hexToOklch(surface).h - accentHue)).toBeLessThan(8);
+  }
+  expect(roles.background).toBe(colors.background);
+  expect(roles.foreground).toBe(colors.foreground);
+
+  // A neutral accent has no hue to carry, so surfaces stay in the canvas's family.
+  const neutral = omarchyToTheme({ name: "Mono", scheme: "dark", colors: { ...colors, accent: "#8d8d8d" } }).roles;
+  expect(Math.abs(hexToOklch(neutral.card).h - hexToOklch(colors.background).h)).toBeLessThan(8);
+});
+
+it("keeps Omarchy's own terminal cursor and selection", () => {
+  const colors = { ...fallbackTheme, cursor: "#f6dcac", selection_foreground: "#f6dcac", selection_background: "#134e5a", color8: "#2a6b78" };
+  const terminal = themeToSyntaxColors(omarchyToTheme({ name: "Retro 82", scheme: "dark", colors }));
+  expect(terminal.cursor).toBe(colors.cursor);
+  expect(terminal.selection_foreground).toBe(colors.selection_foreground);
+  expect(terminal.selection_background).toBe(colors.selection_background);
+
+  // An exported copy carries the pair through import.
+  const theme = omarchyToTheme({ name: "Retro 82", scheme: "dark", colors });
+  const imported = parseCustomTheme(JSON.parse(serializeTheme({ ...theme, id: "custom-retro-copy" })));
+  expect(imported?.terminal).toEqual(theme.terminal);
+
+  // A partial pair falls back to derived colors rather than mixing the two.
+  const partial = parseCustomTheme({ ...JSON.parse(serializeTheme(theme)), terminal: { cursor: "#ffffff" } });
+  expect(partial?.terminal).toBeUndefined();
 });
 
 it("caps a loud Omarchy muted shade on control outlines", () => {

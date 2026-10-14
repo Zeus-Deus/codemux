@@ -6,6 +6,8 @@ import {
   contrastRatio,
   type AnsiPalette,
   type ThemeDefinition,
+  hexToOklch,
+  oklchToHex,
 } from "./themes";
 
 /** Loudest a control outline may get: clearly visible, never a heavy rule. */
@@ -84,27 +86,38 @@ function capContrast(color: string, surface: string, max: number): string {
 }
 
 /**
- * Keep the desktop's palette and layer the shell the way Omarchy's own app
- * themes do: a recessed sidebar (`dark_background`), selection-colored
- * sidebar highlights, `muted` control outlines, and raised surfaces stepped
- * toward an accent-tinted foreground. Missing shades fall back to derived ones.
+ * Keep the desktop's palette and layer the shell the way Omarchy's own T3 Code
+ * theme does (`default/themed/t3code.json.tpl`): the desktop's exact canvas,
+ * text, recessed sidebar (`dark_background`), and selection-colored sidebar
+ * highlights, over raised surfaces generated the way T3 Code generates them.
+ * Those surfaces climb an OKLCH lightness ramp off the canvas carrying the
+ * *accent's* hue, so a warm accent on a cool canvas gives warm cards, menus,
+ * and composer instead of a monochrome shell. Missing shades fall back to
+ * derived ones.
  */
 export function omarchyToTheme({ name, scheme, colors: c, surfaces = {} }: OmarchyTheme): ThemeDefinition {
   const dark = scheme === "dark";
   const background = c.background;
   const foreground = readable(background, c.foreground);
-  const ink = mix(foreground, c.accent, 0.3);
-  const card = mix(background, ink, 0.05);
-  const popover = mix(background, ink, 0.09);
-  const secondary = mix(background, ink, 0.1);
-  const muted = mix(background, ink, 0.16);
+  const canvas = hexToOklch(background);
+  const tone = hexToOklch(c.accent);
+  // A neutral accent has no hue worth carrying; stay in the canvas's family.
+  const hue = tone.C < 0.02 ? canvas.h : tone.h;
+  const tint = Math.min(0.045, Math.max(0.008, tone.C * 0.22));
+  const step = dark ? 1 : -1;
+  const surfaceAt = (delta: number, chroma = tint) =>
+    oklchToHex({ L: Math.min(0.98, Math.max(0.05, canvas.L + step * delta)), C: chroma, h: hue });
+  const card = surfaceAt(0.05);
+  const popover = surfaceAt(0.075);
+  const secondary = surfaceAt(dark ? 0.1 : 0.06, Math.min(0.09, tone.C * 0.5));
+  const muted = surfaceAt(dark ? 0.06 : 0.04, Math.min(0.06, tone.C * 0.35));
+  const accent = surfaceAt(dark ? 0.13 : 0.08, Math.min(0.11, tone.C * 0.55));
   // Omarchy's `muted` is a secondary *text* shade (vantablack sets #7a7a7a on
   // black), so as a structural hairline it reads as a heavy rule. Dividers
   // stand a fixed contrast off the canvas instead; inputs keep `muted` so
   // form controls stay clearly outlined, capped so they never shout.
   const border = dividerOn(background, foreground, DIVIDER_CONTRAST);
   const input = capContrast(surfaces.muted ?? mix(background, foreground, 0.19), background, MAX_CONTROL_OUTLINE_CONTRAST);
-  const accent = mix(background, c.accent, 0.18);
   const sidebar = surfaces.dark_background ?? mix(background, dark ? "#000000" : foreground, dark ? 0.25 : 0.05);
   const sidebarForeground = readableOn([sidebar], foreground, dark ? "#ffffff" : "#000000");
   // Stepped off the sidebar itself: light palettes recess it *darker* than the
@@ -119,6 +132,9 @@ export function omarchyToTheme({ name, scheme, colors: c, surfaces = {} }: Omarc
     label: `Omarchy · ${name}`,
     scheme,
     ansi,
+    // Omarchy's own terminal pair (`cursor`/`bright_foreground`, `selection`),
+    // as its T3 Code template publishes them.
+    terminal: { cursor: c.cursor, selectionForeground: c.selection_foreground, selectionBackground: c.selection_background },
     roles: {
       background, foreground,
       card, cardForeground: readable(card, foreground),
