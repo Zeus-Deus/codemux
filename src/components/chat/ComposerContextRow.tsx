@@ -28,7 +28,7 @@ export interface ContextRowLadder {
   hideBranch: boolean;
   /** Effort drops its context window; access drops its label. */
   hideSecondary: boolean;
-  /** Ahead / behind / issue fold into the details popover. */
+  /** Ahead / behind fold into the details popover. */
   hideGitCounts: boolean;
   hideProject: boolean;
   /** Effort keeps only its icon. */

@@ -41,6 +41,8 @@ import { Composer } from "./Composer";
 import { addonInvoke } from "@/lib/addons/bridge";
 import { executeAddon } from "@/lib/addons/platform";
 import { useAddonsStore } from "@/stores/addons-store";
+import { useAppStore } from "@/stores/app-store";
+import { useUIStore } from "@/stores/ui-store";
 import type { AddonInstallation, AddonManifest } from "@/lib/addons/types";
 import {
   agentChatListSessionMentions,
@@ -749,6 +751,38 @@ describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
   });
 });
 
+
+describe("+ menu → Workflows panel", () => {
+  afterEach(() => useAppStore.setState({ appState: null }));
+
+  function seedLocalWorkspace() {
+    useAppStore.setState({
+      appState: {
+        workspaces: [{ workspace_id: "ws-local", host_id: null, attach_only: false }],
+        active_workspace_id: "ws-local",
+      } as never,
+    });
+  }
+
+  it("opens the workflows panel even before the chat session is ready", () => {
+    seedLocalWorkspace();
+    const setRightPanelTab = vi.spyOn(useUIStore.getState(), "setRightPanelTab");
+    const { getByTestId } = renderControlled({ workspaceId: "ws-local", sessionReady: false });
+    const plus = getByTestId("composer-attach-button");
+    expect(plus).not.toBeDisabled();
+    fireEvent.click(plus);
+    // Chat actions need the session; workspace navigation doesn't.
+    expect(getByTestId("slash-item-attach:file")).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(getByTestId("slash-item-workflows:panel"));
+    expect(setRightPanelTab).toHaveBeenCalledWith("ws-local", "workflows");
+    setRightPanelTab.mockRestore();
+  });
+
+  it("keeps + disabled without a session when workflows aren't available", () => {
+    const { getByTestId } = renderControlled({ sessionReady: false });
+    expect(getByTestId("composer-attach-button")).toBeDisabled();
+  });
+});
 
 describe("+ menu → Chat…", () => {
   const WORKSPACE = { workspaceId: "workspace-1", threadId: "current-thread" };

@@ -97,6 +97,9 @@ interface Props {
   configurationDisabled?: boolean;
   /** Toggles the attach popup. When omitted the `+` button is hidden. */
   onAttachClick?: () => void;
+  /** Disables the `+` button. Defaults to `controlsDisabled`; the menu can
+   *  stay reachable for entries that don't need a ready session. */
+  attachDisabled?: boolean;
   /** Whether the attach popup is currently open. */
   attachOpen?: boolean;
   /** Imperative model-picker open request from `/model`. */
@@ -175,6 +178,7 @@ export function ComposerFooter({
   controlsDisabled,
   configurationDisabled = controlsDisabled,
   onAttachClick,
+  attachDisabled = controlsDisabled,
   attachOpen = false,
   modelPickerOpenSignal,
   permissionPickerOpenSignal,
@@ -207,7 +211,7 @@ export function ComposerFooter({
         <button
           type="button"
           onClick={onAttachClick}
-          disabled={controlsDisabled}
+          disabled={attachDisabled}
           data-testid="composer-attach-button"
           data-open={attachOpen || undefined}
           className={cn(

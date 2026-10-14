@@ -463,6 +463,8 @@ describe("WorkspaceStatusCluster", () => {
     render(<WorkspaceStatusCluster />);
     const chip = screen.getByText("Issue #146").closest("button")!;
     expect(chip).toBeInTheDocument();
+    // It never folds away: the details popover can't open the issue.
+    expect(chip.closest('[class*="hide-git-counts"]')).toBeNull();
     await userEvent.click(chip);
     const content = await waitFor(() => {
       const el = document.querySelector(

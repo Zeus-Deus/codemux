@@ -1872,7 +1872,7 @@ export function Composer({
       // double-activate it. ATTACH follows; the disabled coming-soon
       // entries (Issue/PR/Image) stay for discoverability ahead of
       // Stages 4–6.
-      return [
+      const mainRows: SlashCommandItem[] = [
         // MODES — design tones (sky / amber / violet) on the icon
         // chips; the lucide icons stay in sync with MODE_CONFIG /
         // ModePill so the picked mode's pill shows the same glyph.
@@ -2049,6 +2049,13 @@ export function Composer({
         }] : []),
         ...addonActions,
       ];
+      // Without a ready chat session nothing here can act on the chat,
+      // but the workflows panel is workspace navigation and still works.
+      return sessionReady
+        ? mainRows
+        : mainRows.map((row) =>
+            row.id === "workflows:panel" ? row : { ...row, disabled: true },
+          );
     }
     if (attachSubmode === "mcp") {
       const rows: SlashCommandItem[] = attachMcpServers.map((server) => {
@@ -3784,6 +3791,8 @@ export function Composer({
             controlsDisabled={!sessionReady}
             configurationDisabled={!configurationEnabled}
             onAttachClick={handleAttachClick}
+            // The workflows panel in the `+` menu works without a session.
+            attachDisabled={!sessionReady && !(workspaceId && workflowsAvailable)}
             attachOpen={attachOpen}
             modelPickerOpenSignal={modelPickerOpenSignal}
             permissionPickerOpenSignal={permissionPickerOpenSignal}

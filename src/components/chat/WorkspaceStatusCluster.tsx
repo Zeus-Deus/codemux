@@ -202,9 +202,8 @@ export function WorkspaceStatusCluster() {
 
       {gitBranch && (
         <>
-          {/* In a full context row the counts and the issue chip fold
-              into the details popover, which lists them too; a dot on its
-              button says so. */}
+          {/* In a full context row the counts fold into the details
+              popover, which lists them too; a dot on its button says so. */}
           {showBehind && (
             <span
               className={cn(
@@ -259,11 +258,8 @@ export function WorkspaceStatusCluster() {
             </button>
           )}
 
-          {issueChip && (
-            <span className={cn("inline-flex", CONTEXT_ROW_HIDE_GIT_COUNTS)}>
-              {issueChip}
-            </span>
-          )}
+          {/* Never folds: the details popover can't open the issue. */}
+          {issueChip}
 
           <Popover open={open} onOpenChange={setOpen}>
             <PopoverTrigger asChild>
@@ -276,17 +272,13 @@ export function WorkspaceStatusCluster() {
                   open && "bg-surface-3",
                 )}
               >
-                {(showBehind || showAhead || workspace.linked_issue) && (
+                {(showBehind || showAhead) && (
                   <span
                     aria-hidden
                     data-testid="workspace-details-git-dot"
                     className={cn(
                       "absolute right-1 top-0.5 size-1.5 rounded-full",
-                      showBehind
-                        ? "bg-warning"
-                        : showAhead
-                          ? "bg-success"
-                          : "bg-muted-foreground",
+                      showBehind ? "bg-warning" : "bg-success",
                       CONTEXT_ROW_SHOW_GIT_DOT,
                     )}
                   />
