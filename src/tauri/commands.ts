@@ -642,8 +642,23 @@ export const createWorktreeWorkspace = (
     modelSelection,
   ).then((r) => r.workspaceId);
 
-export const generateBranchName = (prompt: string, projectPath: string) =>
-  invoke<string>("generate_branch_name", { prompt, projectPath });
+/** Naming runs on the Utility agent's model only. Pass
+ *  `utilitySelectionFromStores()`; `null` yields a random branch name rather
+ *  than a provider's default (possibly expensive) model. */
+export const generateBranchName = (
+  prompt: string,
+  projectPath: string,
+  utilitySelection: UtilityModelSelection | null,
+) =>
+  invoke<string>("generate_branch_name", { prompt, projectPath, utilitySelection });
+
+/** Human-readable sidebar title from a workspace's first message, on the
+ *  Utility agent's model. `null` when no model resolves or generation fails. */
+export const generateWorkspaceTitle = (
+  prompt: string,
+  utilitySelection: UtilityModelSelection | null,
+) =>
+  invoke<string | null>("generate_workspace_title", { prompt, utilitySelection });
 
 export const generateRandomBranchName = (projectPath: string) =>
   invoke<string>("generate_random_branch_name", { projectPath });

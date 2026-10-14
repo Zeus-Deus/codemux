@@ -10,6 +10,7 @@ import {
   createWorktreeWorkspaceResult,
   generateBranchName,
   generateRandomBranchName,
+  generateWorkspaceTitle,
   getHomeDir,
   renameWorkspace,
   type WorkspaceCreateResult,
@@ -17,6 +18,7 @@ import {
 } from "@/tauri/commands";
 import { type ChatMode } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
+import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
 import type { TerminalPreset } from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
@@ -867,10 +869,9 @@ async function createDraftWorkspaceOnHost(
   });
   const workspaceId = created.workspaceId;
   const cwd = created.cwd ?? (await waitForWorkspaceCwd(workspaceId));
-  // A new worktree is named after its branch; otherwise name the
-  // workspace after the first message, like the local paths do.
-  if (cwd && !newBranch) {
-    if (projectPath) autoNameWorkspace(workspaceId, projectPath, firstMessage);
+  // Title the workspace after the first message, like the local paths do.
+  if (cwd) {
+    if (projectPath) autoNameWorkspace(workspaceId, firstMessage);
     else await applyFirstMessageTitle(workspaceId, firstMessage);
   }
   return { workspaceId, cwd };
@@ -925,47 +926,39 @@ async function createProjectWorkspace(
     projectPath,
     initialChat || select !== undefined ? opts : undefined,
   );
-  autoNameWorkspace(workspaceId, projectPath, firstMessage);
+  autoNameWorkspace(workspaceId, firstMessage);
   return workspaceId;
 }
 
-/** Name a `checkoutMode === "current"` workspace after its first message,
- *  in the background.
+/** Give a workspace a human-readable title from its first message, in the
+ *  background.
  *
- *  **Why this exists.** The `"worktree"` path gets a human-readable name
- *  for free: `createDeferredWorktree` resolves an AI branch name and the
- *  backend's `set_workspace_worktree` overwrites the workspace title with
- *  that branch. The current-checkout path creates no branch, so nothing
- *  ever named it and it kept the backend default
- *  (`state_impl.rs::default_workspace_title` — the directory's own name,
- *  or `Workspace {n}` for anything created before that) forever.
+ *  **Title, not branch.** The sidebar shows the title above the branch, so
+ *  the two are generated separately, as T3 Code does: the branch stays a
+ *  git slug (`fix-workflow-panel-ui`) and the title reads like a person
+ *  wrote it ("Fix Workflow Panel Layout"). Worktree workspaces start out
+ *  titled by their branch (`set_workspace_worktree`) and current-checkout
+ *  ones by their directory; both count as unnamed and get replaced.
  *
- *  **Why the AI name and not the cheap truncated message.** These titles
- *  sit side by side in the sidebar. Deriving from message text would
- *  produce `take a look at this image, when i make a…` directly above
- *  `sidebar-workspace-ordering`, so the list would read as two different
- *  products. Routing through `generateBranchName` — the exact call the
- *  worktree path and the CLI use — means the app has ONE naming pipeline
- *  and every workspace title has the same shape.
+ *  **Model.** `generateWorkspaceTitle` runs on the Utility agent — the same
+ *  small model as branch names, commit messages, and summaries — so naming
+ *  never spends a provider's default model. With no Utility model it
+ *  returns `null` and the truncated message is used instead.
  *
- *  **Why fire-and-forget.** `generateBranchName` shells out to
- *  `claude --print` (5-9s warm, 30s timeout). Awaiting it would put that
- *  on the critical path of a send that otherwise makes no extra backend
- *  calls. Instead the send proceeds immediately and the sidebar card
- *  re-titles itself a few seconds later — the same "the conversation
- *  names itself shortly after you send" behavior chat UIs use. The
- *  alternative of renaming twice (instant truncation, then upgrade to the
- *  slug) was rejected: two visible title changes per workspace is churn,
- *  and the intermediate value is the ugly one.
+ *  **Why fire-and-forget.** The utility CLI takes a few seconds (30s
+ *  timeout). Awaiting it would put that on the critical path of a send
+ *  that otherwise makes no extra backend calls. Instead the send proceeds
+ *  immediately and the sidebar card re-titles itself a few seconds later —
+ *  the same "the conversation names itself shortly after you send"
+ *  behavior chat UIs use.
  *
  *  Never rejects — naming is cosmetic and must not surface as a send
  *  failure. */
 export function autoNameWorkspace(
   workspaceId: string,
-  projectPath: string,
   firstMessage: string,
 ): void {
-  void resolveAndApplyWorkspaceName(workspaceId, projectPath, firstMessage)
+  void resolveAndApplyWorkspaceName(workspaceId, firstMessage)
     .catch((err) => {
       console.warn(
         "[materialize] workspace auto-name failed (non-fatal):",
@@ -976,7 +969,6 @@ export function autoNameWorkspace(
 
 async function resolveAndApplyWorkspaceName(
   workspaceId: string,
-  projectPath: string,
   firstMessage: string,
 ): Promise<void> {
   // An empty / whitespace-only message has nothing to name from — leave
@@ -984,16 +976,18 @@ async function resolveAndApplyWorkspaceName(
   const fallback = deriveTitleFromFirstMessage(firstMessage);
   if (!fallback) return;
 
-  // `generate_ai_name` degrades internally (bad output / timeout / no
-  // CLI → `generate_random_name`), so a resolved value is always usable
-  // and this catch only covers the IPC itself failing. In that case the
-  // truncated message still beats leaving the backend default.
+  // `generate_workspace_title` returns `null` for every failure (no
+  // Utility model, bad output, timeout); this catch only covers the IPC
+  // itself failing. Either way the truncated message beats leaving the
+  // backend default.
   let title: string;
   try {
-    title = (await generateBranchName(firstMessage, projectPath)).trim() || fallback;
+    title =
+      (await generateWorkspaceTitle(firstMessage, utilitySelectionFromStores()))?.trim() ||
+      fallback;
   } catch (err) {
     console.warn(
-      "[materialize] generateBranchName failed, naming from message text:",
+      "[materialize] generateWorkspaceTitle failed, naming from message text:",
       errorMessage(err),
     );
     title = fallback;
@@ -1002,12 +996,15 @@ async function resolveAndApplyWorkspaceName(
   // Re-read the title HERE, not at call time: we just spent seconds in
   // the AI call, and on the pane path the workspace may have existed for
   // days. Only a workspace still wearing a backend-assigned title gets
-  // renamed — a name the user chose (or one a worktree branch supplied)
-  // is never clobbered. A workspace missing from the store is one we
-  // just created whose `app-state-changed` hasn't landed yet, so absence
-  // is not evidence of a user-chosen name and naming proceeds.
+  // renamed — a name the user chose is never clobbered. A workspace
+  // missing from the store is one we just created whose
+  // `app-state-changed` hasn't landed yet, so absence is not evidence of
+  // a user-chosen name and naming proceeds.
   const current = currentWorkspace(workspaceId);
-  if (current && !isDefaultWorkspaceTitle(current.title, current.dirPath)) {
+  if (
+    current &&
+    !isDefaultWorkspaceTitle(current.title, current.dirPath, current.branch)
+  ) {
     return;
   }
 
@@ -1019,26 +1016,30 @@ async function resolveAndApplyWorkspaceName(
   });
 }
 
-/** Current title + directory of `workspaceId` per the app store, or
- *  `null` when the store has no such workspace (not yet hydrated, or
- *  already closed). Both are needed because a backend-assigned title can
- *  BE the directory name — see `isDefaultWorkspaceTitle`. */
+/** Current title, directory, and branch of `workspaceId` per the app
+ *  store, or `null` when the store has no such workspace (not yet
+ *  hydrated, or already closed). All three are needed because a
+ *  backend-assigned title can BE the directory or branch name — see
+ *  `isDefaultWorkspaceTitle`. */
 function currentWorkspace(
   workspaceId: string,
-): { title: string; dirPath: string | null } | null {
+): { title: string; dirPath: string | null; branch: string | null } | null {
   const appState = useAppStore.getState().appState;
   if (!appState) return null;
   const ws = appState.workspaces.find((w) => w.workspace_id === workspaceId);
   if (!ws) return null;
-  return { title: ws.title, dirPath: ws.project_root ?? ws.cwd ?? null };
+  return {
+    title: ws.title,
+    dirPath: ws.project_root ?? ws.cwd ?? null,
+    branch: ws.git_branch,
+  };
 }
 
 /** Best-effort "label this workspace with the first message" rename.
  *
  *  The Home path's naming, kept separate from `autoNameWorkspace`: a
- *  home-rooted workspace is not a project checkout, so there is no repo
- *  to name a branch against and `generateBranchName`'s deconfliction
- *  would have nothing to deconflict. Home titles stay message-derived.
+ *  home-rooted workspace is not a project checkout, and its titles have
+ *  always stayed message-derived.
  *
  *  Never throws: a rename failure leaves the workspace with its
  *  backend-default title rather than aborting a send that has already
@@ -1063,10 +1064,9 @@ async function applyFirstMessageTitle(
  *
  *  Naming order matches the design's "like the CLI does" promise:
  *   1. The user's typed name (trimmed), if non-empty — used verbatim.
- *   2. Otherwise `generateBranchName(firstMessage, projectPath)` — the
- *      same AI/first-message naming the CLI uses. Any failure (network,
- *      no API key, empty result) falls through to (3) rather than
- *      aborting the send.
+ *   2. Otherwise `generateBranchName(firstMessage, projectPath)` on the
+ *      Utility agent's model. Any failure (network, no API key, empty
+ *      result) falls through to (3) rather than aborting the send.
  *   3. `generateRandomBranchName(projectPath)` — the existing
  *      adjective-noun random-name fallback. */
 export async function resolveWorktreeBranchName(
@@ -1078,7 +1078,9 @@ export async function resolveWorktreeBranchName(
   if (typed) return typed;
   let name = "";
   try {
-    name = (await generateBranchName(firstMessage, projectPath)).trim();
+    name = (
+      await generateBranchName(firstMessage, projectPath, utilitySelectionFromStores())
+    ).trim();
   } catch (err) {
     console.warn(
       "[materialize] generateBranchName failed, falling back to a random name:",
@@ -1114,7 +1116,7 @@ export async function createDeferredWorktree(
   // Returns `{ workspaceId, cwd }`: `cwd` is non-null when the backend
   // carries it (letting first-send callers skip `waitForWorkspaceCwd`),
   // null on older backends (callers fall back to the poll).
-  return await createWorktreeWorkspaceResult(
+  const created = await createWorktreeWorkspaceResult(
     projectPath,
     name,
     true,
@@ -1129,6 +1131,9 @@ export async function createDeferredWorktree(
     initialChat,
     ...(select !== undefined ? [select] : []),
   );
+  // An adopted workspace already existed and keeps whatever it is called.
+  if (!created.adopted) autoNameWorkspace(created.workspaceId, firstMessage);
+  return created;
 }
 
 /** Resolve the cwd a fresh session / terminal should launch under.

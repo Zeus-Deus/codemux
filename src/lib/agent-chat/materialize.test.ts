@@ -30,6 +30,7 @@ vi.mock("@/tauri/commands", () => ({
   }),
   generateBranchName: vi.fn().mockResolvedValue("ai-named-branch"),
   generateRandomBranchName: vi.fn().mockResolvedValue("random-branch"),
+  generateWorkspaceTitle: vi.fn().mockResolvedValue("AI Workspace Title"),
   getHomeDir: vi.fn().mockResolvedValue("/home/user"),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
   // `waitForWorkspaceCwd` (worktree arm) polls this on its direct-fetch
@@ -46,6 +47,17 @@ vi.mock("@/tauri/commands", () => ({
     ),
   ),
 }));
+
+// Naming must run on the Utility agent's model; pin a known selection so the
+// tests can assert it is the one handed to the naming IPC.
+vi.mock("@/lib/utility-agent", () => ({
+  utilitySelectionFromStores: vi.fn(() => ({
+    provider: "claude",
+    model: "claude-haiku-4-5",
+    effort: null,
+  })),
+}));
+const UTILITY = { provider: "claude", model: "claude-haiku-4-5", effort: null };
 
 import {
   autoNameWorkspace,
@@ -65,6 +77,7 @@ import {
   createWorktreeWorkspaceResult,
   generateBranchName,
   generateRandomBranchName,
+  generateWorkspaceTitle,
   getHomeDir,
   renameWorkspace,
 } from "@/tauri/commands";
@@ -95,9 +108,9 @@ function makeActions(): SpyActions {
 }
 
 /** Workspace auto-naming is fire-and-forget by design (it must not add
- *  `claude --print` latency to a send), so it settles AFTER
+ *  utility-model latency to a send), so it settles AFTER
  *  `materializeAndSend` resolves. Yield to the macrotask queue to let
- *  its promise chain — generateBranchName → title re-check → rename —
+ *  its promise chain — generateWorkspaceTitle → title re-check → rename —
  *  run to completion before asserting on it. */
 function flushAutoName(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
@@ -145,6 +158,9 @@ describe("materializeAndSend", () => {
     vi.mocked(generateRandomBranchName)
       .mockClear()
       .mockResolvedValue("random-branch");
+    vi.mocked(generateWorkspaceTitle)
+      .mockClear()
+      .mockResolvedValue("AI Workspace Title");
     vi.mocked(getHomeDir).mockClear().mockResolvedValue("/home/user");
     vi.mocked(renameWorkspace).mockClear().mockResolvedValue(undefined);
     vi.mocked(createWorkspaceOnHost).mockClear().mockResolvedValue({
@@ -279,25 +295,24 @@ describe("materializeAndSend", () => {
       );
       // A current-checkout workspace creates no branch, so nothing else
       // would ever name it — without this it keeps the backend default
-      // (`Workspace 58`) forever, unlike the worktree path which
-      // inherits its branch name. It routes through the SAME namer the
-      // worktree path uses, so titles share one shape.
+      // (`Workspace 58`) forever. The title comes from the Utility agent.
       await flushAutoName();
-      expect(generateBranchName).toHaveBeenCalledWith("hello", "/projects/foo");
+      expect(generateWorkspaceTitle).toHaveBeenCalledWith("hello", UTILITY);
+      expect(generateBranchName).not.toHaveBeenCalled();
       expect(renameWorkspace).toHaveBeenCalledWith(
         "ws-project",
-        "ai-named-branch",
+        "AI Workspace Title",
       );
     });
 
     it("auto-naming does not block the send", async () => {
-      // The namer shells out to `claude --print` (5-9s warm). If the send
+      // The namer shells out to the utility CLI (seconds). If the send
       // awaited it, first-send latency on the most common flow would
       // regress by seconds — so a namer that never settles must still
       // let the whole send complete.
       const actions = makeActions();
-      vi.mocked(generateBranchName).mockReturnValueOnce(
-        new Promise(() => {}) as Promise<string>,
+      vi.mocked(generateWorkspaceTitle).mockReturnValueOnce(
+        new Promise(() => {}) as Promise<string | null>,
       );
       const draft = makeDraft({
         target: { kind: "project", projectPath: "/projects/foo" },
@@ -325,7 +340,7 @@ describe("materializeAndSend", () => {
 
       await flushAutoName();
       expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo", { initialChat: { provider: "claude", thread_id: draft.threadId } });
-      expect(generateBranchName).not.toHaveBeenCalled();
+      expect(generateWorkspaceTitle).not.toHaveBeenCalled();
       expect(renameWorkspace).not.toHaveBeenCalled();
     });
 
@@ -883,6 +898,7 @@ describe("materializeAndSend", () => {
       expect(generateBranchName).toHaveBeenCalledWith(
         "fix the login bug",
         "/projects/foo",
+        UTILITY,
       );
       expect(generateRandomBranchName).not.toHaveBeenCalled();
       expect(createWorktreeWorkspaceResult).toHaveBeenCalledWith(
@@ -910,6 +926,10 @@ describe("materializeAndSend", () => {
       );
       const [, , startInput] = vi.mocked(agentChatStartSession).mock.calls[0];
       expect(startInput.cwd).toBe("/projects/foo-ai-named-branch");
+      // The branch stays a slug; the workspace gets its own readable title.
+      await flushAutoName();
+      expect(generateWorkspaceTitle).toHaveBeenCalledWith("fix the login bug", UTILITY);
+      expect(renameWorkspace).toHaveBeenCalledWith("ws-worktree", "AI Workspace Title");
     });
 
     it("refreshes path-derived skill ids before starting the worktree session", async () => {
@@ -1090,10 +1110,9 @@ describe("materializeAndSend", () => {
       expect(generateRandomBranchName).not.toHaveBeenCalled();
       // Falls through to the ordinary project-target path.
       expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo", { initialChat: { provider: "claude", thread_id: draft.threadId } });
-      // `generateBranchName` IS called here now — but only to title the
-      // workspace, never to cut a branch. The no-worktree assertion above
-      // is the invariant; the namer is no longer a proxy for it.
+      // No branch is cut, so the branch namer never runs.
       await flushAutoName();
+      expect(generateBranchName).not.toHaveBeenCalled();
       expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
     });
 
@@ -1327,7 +1346,7 @@ describe("materializeAndSend", () => {
       );
 
       expect(result.success).toBe(true);
-      expect(generateBranchName).toHaveBeenCalledWith("fix the login bug", "/projects/foo");
+      expect(generateBranchName).toHaveBeenCalledWith("fix the login bug", "/projects/foo", UTILITY);
       expect(createWorkspaceOnHost).toHaveBeenCalledWith({
         hostId: 2,
         projectPath: "/projects/foo",
@@ -1342,6 +1361,9 @@ describe("materializeAndSend", () => {
       expect(createEmptyWorkspace).not.toHaveBeenCalled();
       const [, , startInput] = vi.mocked(agentChatStartSession).mock.calls[0];
       expect(startInput.cwd).toBe("/home/deus/.codemux/workspaces/foo/main");
+      // The device worktree gets a readable title separate from its branch.
+      await flushAutoName();
+      expect(renameWorkspace).toHaveBeenCalledWith("ws-device", "AI Workspace Title");
     });
 
     it("works in the device's checkout for a current-checkout draft", async () => {
@@ -1360,7 +1382,7 @@ describe("materializeAndSend", () => {
       );
       // Named after the first message, like a local current-checkout thread.
       await flushAutoName();
-      expect(renameWorkspace).toHaveBeenCalledWith("ws-device", "ai-named-branch");
+      expect(renameWorkspace).toHaveBeenCalledWith("ws-device", "AI Workspace Title");
     });
 
     it("ignores the device for an existing workspace", async () => {
@@ -2205,12 +2227,14 @@ describe("materializeWithPreset", () => {
 
 describe("autoNameWorkspace", () => {
   /** Seed the store with one workspace wearing `title`, so the
-   *  apply-time guard has something real to read. `dirPath` matters
-   *  because the backend's default title IS the directory name. */
+   *  apply-time guard has something real to read. `dirPath` and `branch`
+   *  matter because a backend default title IS the directory name, or the
+   *  branch for a worktree workspace. */
   function seedWorkspace(
     workspaceId: string,
     title: string,
     dirPath = "/projects/foo",
+    branch: string | null = null,
   ) {
     useAppStore.setState({
       appState: {
@@ -2222,6 +2246,7 @@ describe("autoNameWorkspace", () => {
             title,
             project_root: dirPath,
             cwd: dirPath,
+            git_branch: branch,
           },
         ],
       } as never,
@@ -2230,34 +2255,44 @@ describe("autoNameWorkspace", () => {
 
   beforeEach(() => {
     vi.mocked(renameWorkspace).mockClear().mockResolvedValue(undefined);
-    vi.mocked(generateBranchName)
+    vi.mocked(generateWorkspaceTitle)
       .mockClear()
-      .mockResolvedValue("ai-named-branch");
+      .mockResolvedValue("Fix Sidebar Ordering");
     useAppStore.setState({ appState: null });
   });
 
-  it("renames a workspace still carrying the backend default title", async () => {
+  it("titles a workspace still carrying the backend default title", async () => {
     seedWorkspace("ws-58", "Workspace 58");
-    autoNameWorkspace("ws-58", "/projects/foo", "fix the sidebar");
+    autoNameWorkspace("ws-58", "fix the sidebar");
     await flushAutoName();
-    expect(renameWorkspace).toHaveBeenCalledWith("ws-58", "ai-named-branch");
+    expect(generateWorkspaceTitle).toHaveBeenCalledWith("fix the sidebar", UTILITY);
+    expect(renameWorkspace).toHaveBeenCalledWith("ws-58", "Fix Sidebar Ordering");
   });
 
   it("renames a workspace still wearing the directory-name default", async () => {
     // The current backend default. "Open project" / "Clone" workspaces
     // land here, so a first prompt must still be able to upgrade them.
     seedWorkspace("ws-58", "foo", "/projects/foo");
-    autoNameWorkspace("ws-58", "/projects/foo", "fix the sidebar");
+    autoNameWorkspace("ws-58", "fix the sidebar");
     await flushAutoName();
-    expect(renameWorkspace).toHaveBeenCalledWith("ws-58", "ai-named-branch");
+    expect(renameWorkspace).toHaveBeenCalledWith("ws-58", "Fix Sidebar Ordering");
   });
 
-  it("never clobbers a user-chosen or branch-derived title", async () => {
+  it("titles a worktree workspace still named after its branch", async () => {
+    // The backend titles a worktree workspace with its branch; the title
+    // and branch are meant to differ, so the branch slug is replaceable.
+    seedWorkspace("ws-58", "fix-sidebar", "/projects/foo", "fix-sidebar");
+    autoNameWorkspace("ws-58", "fix the sidebar");
+    await flushAutoName();
+    expect(renameWorkspace).toHaveBeenCalledWith("ws-58", "Fix Sidebar Ordering");
+  });
+
+  it("never clobbers a user-chosen title", async () => {
     // The pane path runs against workspaces that may have existed for
-    // days — a name the user (or a worktree branch) already set is the
-    // one signal we must not destroy.
-    seedWorkspace("ws-58", "my important work");
-    autoNameWorkspace("ws-58", "/projects/foo", "hello");
+    // days — a name the user already set is the one signal we must not
+    // destroy.
+    seedWorkspace("ws-58", "my important work", "/projects/foo", "fix-sidebar");
+    autoNameWorkspace("ws-58", "hello");
     await flushAutoName();
     expect(renameWorkspace).not.toHaveBeenCalled();
   });
@@ -2267,18 +2302,18 @@ describe("autoNameWorkspace", () => {
     // that window. Reading the guard at call time would race and
     // overwrite them.
     seedWorkspace("ws-58", "Workspace 58");
-    let release!: (name: string) => void;
-    vi.mocked(generateBranchName).mockReturnValueOnce(
-      new Promise<string>((r) => {
+    let release!: (title: string) => void;
+    vi.mocked(generateWorkspaceTitle).mockReturnValueOnce(
+      new Promise<string | null>((r) => {
         release = r;
       }),
     );
 
-    autoNameWorkspace("ws-58", "/projects/foo", "hello");
+    autoNameWorkspace("ws-58", "hello");
     await flushAutoName();
     // User renames mid-flight.
     seedWorkspace("ws-58", "my important work");
-    release("ai-named-branch");
+    release("Fix Sidebar Ordering");
     await flushAutoName();
 
     expect(renameWorkspace).not.toHaveBeenCalled();
@@ -2288,20 +2323,31 @@ describe("autoNameWorkspace", () => {
     // A just-created workspace reaches the store via the async
     // `app-state-changed` event. Absence is not evidence of a
     // user-chosen name, so naming must still proceed.
-    autoNameWorkspace("ws-brand-new", "/projects/foo", "hello");
+    autoNameWorkspace("ws-brand-new", "hello");
     await flushAutoName();
     expect(renameWorkspace).toHaveBeenCalledWith(
       "ws-brand-new",
-      "ai-named-branch",
+      "Fix Sidebar Ordering",
     );
   });
 
+  it("falls back to the message text when no title is generated", async () => {
+    // `null` covers no Utility model, a timeout, or an unusable reply.
+    vi.mocked(generateWorkspaceTitle).mockResolvedValueOnce(null);
+    seedWorkspace("ws-58", "Workspace 58");
+
+    autoNameWorkspace("ws-58", "fix the sidebar");
+    await flushAutoName();
+
+    expect(renameWorkspace).toHaveBeenCalledWith("ws-58", "fix the sidebar");
+  });
+
   it("falls back to the message text when the namer IPC rejects", async () => {
-    vi.mocked(generateBranchName).mockRejectedValueOnce(new Error("no ipc"));
+    vi.mocked(generateWorkspaceTitle).mockRejectedValueOnce(new Error("no ipc"));
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     seedWorkspace("ws-58", "Workspace 58");
 
-    autoNameWorkspace("ws-58", "/projects/foo", "fix the sidebar");
+    autoNameWorkspace("ws-58", "fix the sidebar");
     await flushAutoName();
 
     // Truncated message text still beats leaving `Workspace 58`.
@@ -2311,9 +2357,9 @@ describe("autoNameWorkspace", () => {
 
   it("skips an empty first message rather than blanking the title", async () => {
     seedWorkspace("ws-58", "Workspace 58");
-    autoNameWorkspace("ws-58", "/projects/foo", "   ");
+    autoNameWorkspace("ws-58", "   ");
     await flushAutoName();
-    expect(generateBranchName).not.toHaveBeenCalled();
+    expect(generateWorkspaceTitle).not.toHaveBeenCalled();
     expect(renameWorkspace).not.toHaveBeenCalled();
   });
 
@@ -2323,7 +2369,7 @@ describe("autoNameWorkspace", () => {
     seedWorkspace("ws-58", "Workspace 58");
 
     // Returns void — a naming failure must never reach the send path.
-    expect(autoNameWorkspace("ws-58", "/projects/foo", "hello")).toBeUndefined();
+    expect(autoNameWorkspace("ws-58", "hello")).toBeUndefined();
     await flushAutoName();
 
     warnSpy.mockRestore();

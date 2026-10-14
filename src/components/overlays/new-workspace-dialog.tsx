@@ -70,6 +70,8 @@ import {
 import { fetchProviderAuth } from "@/lib/provider-auth";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { pickFiles } from "@/lib/file-dialog";
+import { autoNameWorkspace } from "@/lib/agent-chat/materialize";
+import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import type { TerminalPreset, WorktreeInfo, BranchDetail, PullRequestInfo, GitHubIssue, LinkedIssue, ModelSelection, NewWorkspaceDraft } from "@/tauri/types";
 import { LaunchModelPicker } from "./launch-model-picker";
 import { LaunchReasoningPicker } from "./launch-reasoning-picker";
@@ -1039,7 +1041,11 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       if (!resolvedBranch) {
         if (fullPrompt) {
           // AI-generated branch name from prompt
-          resolvedBranch = await generateBranchName(prompt, projectDir);
+          resolvedBranch = await generateBranchName(
+            prompt,
+            projectDir,
+            utilitySelectionFromStores(),
+          );
         } else {
           // Random branch name
           resolvedBranch = await generateRandomBranchName(projectDir);
@@ -1127,7 +1133,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       const { wsId, agentHandled, adopted } = placed;
 
       if (!adopted) {
-        await applyTypedWorkspaceName(wsId, workspaceName);
+        // A typed name wins; otherwise the prompt titles the workspace in
+        // the background, separately from its branch.
+        if (workspaceName.trim()) {
+          await applyTypedWorkspaceName(wsId, workspaceName);
+        } else if (fullPrompt) {
+          autoNameWorkspace(wsId, fullPrompt);
+        }
       }
 
       // Launch agent for paths that don't handle it internally

@@ -7129,6 +7129,14 @@ const handlers: Record<string, Handler> = {
   },
   generate_random_branch_name: () =>
     `mock-worktree-${Math.random().toString(36).slice(2, 8)}`,
+  generate_workspace_title: (a) => {
+    const words = String(a.prompt ?? "").match(/[A-Za-z0-9]+/g) ?? [];
+    const title = words
+      .slice(0, 5)
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(" ");
+    return title || null;
+  },
   materialize_chat_workspace: (a) => {
     const cwd = String(a.cwd);
     const ws = buildWorktreeWorkspace(cwd, cwd.split("/").pop() ?? "Chat");

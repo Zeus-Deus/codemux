@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::utility_ai::{generate_utility_text, UtilityModelSelection};
+
 const ADJECTIVES: &[&str] = &[
     "swift", "bold", "calm", "dark", "eager", "fair", "glad", "keen",
     "lean", "mild", "neat", "pale", "rare", "safe", "tall", "vast",
@@ -110,27 +112,43 @@ pub fn generate_random_name(repo_path: &Path) -> String {
     deconflict_branch_name(&name, repo_path)
 }
 
-/// System prompt for the AI naming call. Kept terse and imperative so the
+/// Instructions for the branch-name call. Kept terse and imperative so the
 /// model returns a bare token rather than a chatty sentence — models otherwise
 /// prepend prose ("Branch name only, as requested:\n\n...") that used to leak
 /// straight into the branch name.
-const AI_NAME_SYSTEM_PROMPT: &str = "You generate git branch names. Reply with ONLY a short lowercase hyphenated branch name of 2-4 words describing the task. No prose, no explanation, no punctuation other than hyphens, no code formatting or markdown.";
+const BRANCH_NAME_INSTRUCTIONS: &str = "You generate git branch names. Reply with ONLY a short lowercase hyphenated branch name of 2-4 words describing the task. No prose, no explanation, no punctuation other than hyphens, no code formatting or markdown.";
 
-/// Cap on how much of the user's first message we embed in the naming prompt.
-/// The branch name only needs the gist; an overlong message wastes tokens and
-/// distracts the model.
+/// Instructions for the workspace-title call. The title is what the sidebar
+/// shows above the branch, so it is written for a person to scan weeks later
+/// rather than for git. Adapted from T3 Code's thread-title prompt.
+const WORKSPACE_TITLE_INSTRUCTIONS: &str = "Generate a title that will help the user recognize this coding workspace weeks later. Reply with ONLY the title on a single line: no quotes, no markdown, no explanation.
+
+Rules:
+- 3-8 words, fewer than 40 characters, in Title Case.
+- Name the subject and the outcome the user wants. Discard instructions about how the agent should work, such as models, tools, output formats, or monitoring.
+- Capture the umbrella goal when the request lists several symptoms or steps.
+- Name the product change, not the mock, plan, report, branch, or PR used to produce it.
+- Do not copy and truncate the user's message.
+- Do not claim the work is complete.
+- Avoid project names, quotes, filler, and trailing punctuation.";
+
+/// Cap on how much of the user's first message we embed in the branch-name
+/// prompt. The branch name only needs the gist; an overlong message wastes
+/// tokens and distracts the model.
 const TASK_PROMPT_MAX_CHARS: usize = 400;
 
-/// Nested-session env vars the desktop app's own Claude Code session exports.
-/// We scrub them from the spawned naming CLI so it doesn't treat itself as a
-/// child of that session (which would pull in the parent's context).
-const NESTED_SESSION_ENV_VARS: &[&str] = &[
-    "CLAUDECODE",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SSE_PORT",
-];
+/// The title gets more of the message than the branch: it has to capture the
+/// umbrella goal, which long requests often state only after the details.
+const TITLE_PROMPT_MAX_CHARS: usize = 2_000;
+
+/// Longest title we accept from the model. The prompt asks for under 40
+/// characters; anything far past that is prose, not a title.
+const TITLE_MAX_CHARS: usize = 60;
+
+/// Naming timeout. Branch naming sits on the critical path of creating a
+/// worktree, so it must not inherit the Utility agent's long summarisation
+/// timeout. Dropping the generation future kills the CLI child.
+const AI_NAME_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Truncate `s` to at most `max_chars` characters on a char boundary,
 /// appending an ellipsis when truncation happened. Uses `char_indices` so we
@@ -174,35 +192,68 @@ pub fn extract_branch_candidate(raw: &str) -> Option<String> {
     candidate
 }
 
-/// Use an AI CLI to generate a branch name from a prompt.
-/// Falls back to random on any failure.
-pub async fn generate_ai_name(prompt: &str, repo_path: &Path) -> String {
+/// Clean a model's reply into a sidebar title, or `None` when it isn't one.
+///
+/// Takes the last non-empty line (any preamble comes first), strips markdown
+/// and quote decoration plus a leading `Title:` label, collapses whitespace,
+/// and drops trailing punctuation. A reply longer than `TITLE_MAX_CHARS` is
+/// rejected rather than truncated: it is prose, and a cut sentence reads worse
+/// than the caller's fallback.
+pub fn sanitize_workspace_title(raw: &str) -> Option<String> {
+    let line = raw.lines().map(str::trim).rev().find(|l| !l.is_empty())?;
+    let mut title = line
+        .trim_matches(|c: char| matches!(c, '`' | '*' | '_' | '#' | '"' | '\'' | '“' | '”'))
+        .trim();
+    if let Some(rest) = title
+        .get(..6)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("title:"))
+        .map(|_| &title[6..])
+    {
+        title = rest.trim_matches(|c: char| matches!(c, '`' | '*' | '"' | '\'' | ' '));
+    }
+    let title = title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(['.', ',', ':', ';', '!'])
+        .to_string();
+    let len = title.chars().count();
+    if len < 2 || len > TITLE_MAX_CHARS {
+        return None;
+    }
+    Some(title)
+}
+
+/// Run one naming prompt through the Utility agent, bounded by
+/// `AI_NAME_TIMEOUT`. `Err` carries a reason for the log.
+async fn run_naming_prompt(
+    selection: &UtilityModelSelection,
+    prompt: &str,
+) -> Result<String, String> {
+    tokio::time::timeout(AI_NAME_TIMEOUT, generate_utility_text(selection, prompt))
+        .await
+        .map_err(|_| format!("timed out after {}s", AI_NAME_TIMEOUT.as_secs()))?
+}
+
+/// Generate a branch name from a prompt with the Utility agent's model.
+///
+/// Falls back to a random name on any failure, and also when no Utility model
+/// is resolved: naming must never fall through to a provider's default model,
+/// which can be its most expensive one.
+pub async fn generate_ai_name(
+    prompt: &str,
+    repo_path: &Path,
+    selection: Option<&UtilityModelSelection>,
+) -> String {
+    let Some(selection) = selection else {
+        return generate_random_name(repo_path);
+    };
     let task = truncate_on_char_boundary(prompt, TASK_PROMPT_MAX_CHARS);
-    let meta_prompt = format!("Generate a git branch name for this task: {task}");
+    let naming_prompt = format!(
+        "{BRANCH_NAME_INSTRUCTIONS}\n\nGenerate a git branch name for this task: {task}"
+    );
 
-    // Run hermetically: a neutral cwd, no inherited settings/memory/CLAUDE.md,
-    // no tools, no session persistence. Without this the CLI ran a full session
-    // in the app's cwd and pulled that directory's auto-memory/CLAUDE.md into
-    // the name, producing branch names about unrelated topics. Per-flag "why"
-    // follows in the args list.
-    let cwd = std::env::temp_dir();
-    let args = [
-        "--print",
-        // Load no user/project settings: no CLAUDE.md, auto-memory, skills,
-        // plugins, or MCP servers can bleed into the branch name.
-        "--setting-sources",
-        "",
-        // Don't write a transcript into ~/.claude/projects for these throwaway
-        // calls.
-        "--no-session-persistence",
-        // The model only needs to emit text; deny all tools.
-        "--disallowedTools",
-        "*",
-        "--system-prompt",
-        AI_NAME_SYSTEM_PROMPT,
-    ];
-
-    match try_ai_cli("claude", &args, &meta_prompt, NESTED_SESSION_ENV_VARS, &cwd).await {
+    match run_naming_prompt(selection, &naming_prompt).await {
         Ok(raw) => match extract_branch_candidate(&raw) {
             Some(candidate) => {
                 let sanitized = sanitize_branch_name(&candidate);
@@ -222,84 +273,37 @@ pub async fn generate_ai_name(prompt: &str, repo_path: &Path) -> String {
         }
     }
 
-    // Fallback to random
     generate_random_name(repo_path)
 }
 
-/// AI naming timeout. Warm `claude --print` calls measured at 5-9s on this
-/// machine; 30s gives real headroom for cold starts / network latency while
-/// still bounding a hung CLI (the child is killed on timeout, see
-/// `kill_on_drop` below).
-const AI_CLI_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Number of stderr bytes to keep in failure logs (claude CLI's error
-/// reasons are usually short; this avoids dumping huge output into logs).
-const STDERR_EXCERPT_LEN: usize = 200;
-
-/// Run an AI CLI with `prompt` on stdin. Returns the trimmed stdout on
-/// success, or `Err(reason)` describing why it failed (spawn error, timeout,
-/// non-zero exit, empty output) so callers can log a diagnosable reason.
-///
-/// `env_scrub` names env vars to remove from the child (e.g. inherited
-/// nested-session markers), and `cwd` sets its working directory — both keep
-/// the call from picking up context from the desktop app's environment.
-async fn try_ai_cli(
-    binary: &str,
-    args: &[&str],
+/// Generate a human-readable workspace title from the user's first message
+/// with the Utility agent's model. `None` when no Utility model is resolved
+/// or the reply isn't usable; the caller keeps its own fallback.
+pub async fn generate_ai_title(
     prompt: &str,
-    env_scrub: &[&str],
-    cwd: &Path,
-) -> Result<String, String> {
-    let mut cmd = tokio::process::Command::new(binary);
-    cmd.args(args);
-    cmd.current_dir(cwd);
-    for var in env_scrub {
-        cmd.env_remove(var);
+    selection: Option<&UtilityModelSelection>,
+) -> Option<String> {
+    let selection = selection?;
+    let message = truncate_on_char_boundary(prompt.trim(), TITLE_PROMPT_MAX_CHARS);
+    if message.is_empty() {
+        return None;
     }
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    // Reap the child if we time out below, rather than leaking it.
-    cmd.kill_on_drop(true);
+    let naming_prompt = format!("{WORKSPACE_TITLE_INSTRUCTIONS}\n\nUser message:\n{message}");
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn `{binary}`: {e}"))?;
-
-    // Write prompt to stdin
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        let _ = stdin.write_all(prompt.as_bytes()).await;
-        drop(stdin);
-    }
-
-    let result = tokio::time::timeout(AI_CLI_TIMEOUT, child.wait_with_output()).await;
-
-    let output = match result {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(format!("`{binary}` process error: {e}")),
-        Err(_) => {
-            return Err(format!(
-                "`{binary}` timed out after {}s",
-                AI_CLI_TIMEOUT.as_secs()
-            ));
+    match run_naming_prompt(selection, &naming_prompt).await {
+        Ok(raw) => {
+            let title = sanitize_workspace_title(&raw);
+            if title.is_none() {
+                let excerpt: String = raw.trim().chars().take(120).collect();
+                log::warn!("AI workspace title produced no usable title: {excerpt:?}");
+            }
+            title
         }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let excerpt: String = stderr.trim().chars().take(STDERR_EXCERPT_LEN).collect();
-        return Err(format!(
-            "`{binary}` exited with {}: {excerpt}",
-            output.status
-        ));
+        Err(reason) => {
+            log::warn!("AI workspace title failed: {reason}");
+            None
+        }
     }
-
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        return Err(format!("`{binary}` produced empty output"));
-    }
-    Ok(text)
 }
 
 /// Escape a string for safe embedding in double-quoted shell arguments.
@@ -584,20 +588,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_ai_cli_reports_spawn_failure_reason() {
-        // No network/real-CLI dependency: this binary should never exist.
-        let result = try_ai_cli(
-            "codemux-definitely-not-a-real-binary",
-            &["--print"],
-            "prompt",
-            &[],
-            &std::env::temp_dir(),
-        )
-        .await;
-        let err = result.expect_err("nonexistent binary must fail to spawn");
-        assert!(
-            err.contains("failed to spawn"),
-            "expected spawn-failure reason, got: {err}"
+    async fn ai_naming_without_utility_model_never_calls_a_cli() {
+        // No resolved Utility model must not fall through to a provider's
+        // default (possibly expensive) model: branch → random, title → none.
+        let repo = std::env::temp_dir();
+        let name = generate_ai_name("Fix the login bug", &repo, None).await;
+        assert!(name.contains('-'), "expected a random adjective-noun name, got {name}");
+        assert_eq!(generate_ai_title("Fix the login bug", None).await, None);
+    }
+
+    #[test]
+    fn title_plain_line_unchanged() {
+        assert_eq!(
+            sanitize_workspace_title("Collapse Settled Workspaces by Default"),
+            Some("Collapse Settled Workspaces by Default".into())
+        );
+    }
+
+    #[test]
+    fn title_strips_preamble_decoration_and_punctuation() {
+        assert_eq!(
+            sanitize_workspace_title("Here is a title:\n\n**\"Hide Unconfigured   Agents.\"**"),
+            Some("Hide Unconfigured Agents".into())
+        );
+        assert_eq!(
+            sanitize_workspace_title("Title: Seamless HTML Previews"),
+            Some("Seamless HTML Previews".into())
+        );
+    }
+
+    #[test]
+    fn title_rejects_empty_and_prose() {
+        assert_eq!(sanitize_workspace_title("  \n "), None);
+        assert_eq!(
+            sanitize_workspace_title(
+                "I would suggest naming this workspace after the sidebar naming change you described"
+            ),
+            None
         );
     }
 

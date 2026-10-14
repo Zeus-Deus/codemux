@@ -556,6 +556,7 @@ vi.mock("@/tauri/commands", () => ({
     .mockResolvedValue({ workspaceId: "ws-new", cwd: null, adopted: false }),
   generateBranchName: vi.fn().mockResolvedValue("ai-named-branch"),
   generateRandomBranchName: vi.fn().mockResolvedValue("random-branch"),
+  generateWorkspaceTitle: vi.fn().mockResolvedValue("AI Workspace Title"),
   getHomeDir: vi.fn().mockResolvedValue("/home/user"),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
   // MCP warmup fired on the empty-state mount; no-op in tests.
@@ -2607,26 +2608,21 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
     const [, sendInput] = vi.mocked(agentChatSendTurn).mock.calls[0];
     expect(sendInput.thread_id).toBe("thread-x");
     // The invariant is "no worktree, no second workspace, no relocation".
-    // `generateBranchName` NOT being called used to stand in for that, but
-    // it no longer can: the first send legitimately runs the namer to
-    // TITLE this workspace (see the auto-naming test below), it just never
-    // cuts a branch off it.
     expect(vi.mocked(createWorktreeWorkspaceResult)).not.toHaveBeenCalled();
+    expect(vi.mocked(generateBranchName)).not.toHaveBeenCalled();
     expect(vi.mocked(activateWorkspace)).not.toHaveBeenCalled();
   });
 
   it("names the workspace off the first message, without blocking the send", async () => {
-    // The reported asymmetry: a worktree first send got a real name for
-    // free (the backend overwrites the title with the new branch), while
-    // a pane sending into its own checkout cuts no branch and so kept the
-    // backend default forever.
+    // A pane sending into its own checkout creates no workspace, so
+    // nothing else would ever title it and it kept the backend default.
     const projectPane = seedProjectWorkspace({ title: "Workspace 58" });
     currentSliceOverrides = {
       "thread-x": { inputDraft: "fix the login bug" },
     };
-    const { agentChatSendTurn, generateBranchName, renameWorkspace } =
+    const { agentChatSendTurn, generateWorkspaceTitle, renameWorkspace } =
       await import("@/tauri/commands");
-    vi.mocked(generateBranchName).mockClear();
+    vi.mocked(generateWorkspaceTitle).mockClear();
     vi.mocked(renameWorkspace).mockClear();
     vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({
       turn_id: "turn-1",
@@ -2638,18 +2634,17 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
       container.querySelector('[data-testid="composer-submit"]')!,
     );
     // The send lands first — naming is fire-and-forget behind it, so a
-    // slow `claude --print` can never delay the turn.
+    // slow utility-model call can never delay the turn.
     await waitFor(() => {
       expect(vi.mocked(agentChatSendTurn)).toHaveBeenCalledTimes(1);
     });
-    expect(vi.mocked(generateBranchName)).toHaveBeenCalledWith(
+    expect(vi.mocked(generateWorkspaceTitle).mock.calls[0]?.[0]).toBe(
       "fix the login bug",
-      "/projects/foo",
     );
     await waitFor(() => {
       expect(vi.mocked(renameWorkspace)).toHaveBeenCalledWith(
         "ws-foo",
-        "ai-named-branch",
+        "AI Workspace Title",
       );
     });
   });
@@ -2658,17 +2653,17 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
     // `messages.length === 0` (the gate that selects the naming handler)
     // only flips once the optimistic bubble lands, so both presses see an
     // empty thread. Only the send-in-flight ref rules the second one out,
-    // and it has to do so BEFORE the namer runs — two `claude --print`
+    // and it has to do so BEFORE the namer runs — two utility-model
     // calls would otherwise race two different titles into the workspace,
     // the second landing before the first reached the store.
     const projectPane = seedProjectWorkspace({ title: "Workspace 58" });
     currentSliceOverrides = {
       "thread-x": { inputDraft: "fix the login bug" },
     };
-    const { agentChatSendTurn, generateBranchName } = await import(
+    const { agentChatSendTurn, generateWorkspaceTitle } = await import(
       "@/tauri/commands"
     );
-    vi.mocked(generateBranchName).mockClear();
+    vi.mocked(generateWorkspaceTitle).mockClear();
     vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({
       turn_id: "turn-1",
       queued_id: null,
@@ -2681,7 +2676,7 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
     await waitFor(() => {
       expect(vi.mocked(agentChatSendTurn)).toHaveBeenCalledTimes(1);
     });
-    expect(vi.mocked(generateBranchName)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(generateWorkspaceTitle)).toHaveBeenCalledTimes(1);
   });
 
   it("does not clobber a title the user already chose", async () => {
@@ -2714,15 +2709,15 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
   });
 
   it("does not name a home-rooted pane from its first message", async () => {
-    // Home workspaces are not project checkouts — `generateBranchName`
-    // has no repo to name a branch against or deconflict within.
+    // Home workspaces are not project checkouts; their titles stay
+    // message-derived on the Home creation path.
     currentSliceOverrides = {
       "thread-x": { inputDraft: "fix the login bug" },
     };
-    const { agentChatSendTurn, generateBranchName } = await import(
+    const { agentChatSendTurn, generateWorkspaceTitle } = await import(
       "@/tauri/commands"
     );
-    vi.mocked(generateBranchName).mockClear();
+    vi.mocked(generateWorkspaceTitle).mockClear();
     vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({
       turn_id: "turn-1",
       queued_id: null,
@@ -2736,7 +2731,7 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
     await waitFor(() => {
       expect(vi.mocked(agentChatSendTurn)).toHaveBeenCalledTimes(1);
     });
-    expect(vi.mocked(generateBranchName)).not.toHaveBeenCalled();
+    expect(vi.mocked(generateWorkspaceTitle)).not.toHaveBeenCalled();
   });
 
   it("renders no strip at all when appState is null (early-boot fallback)", async () => {

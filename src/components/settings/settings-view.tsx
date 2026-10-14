@@ -2427,7 +2427,7 @@ export function SettingsView() {
               <div className="space-y-1">
                 <SettingRow
                   label="Utility agent"
-                  description="One inexpensive default for conversation handoffs and lightweight generation. Automatic prefers Codex Luna, then Claude Haiku; individual features can still offer an override when it matters."
+                  description="One inexpensive default for conversation handoffs, workspace and branch names, and lightweight generation. Automatic prefers Codex Luna, then Claude Haiku; individual features can still offer an override when it matters."
                 scope="device"
                   >
                   <UtilityAgentSetting />
