@@ -140,7 +140,7 @@ function WorkflowHome({ runs, loading, onSelect, onCustomScript }: { runs: Workf
     return <Empty className="px-6 py-14" data-testid="workflow-empty">
       <span className="mb-2 flex size-10 items-center justify-center rounded-lg bg-accent-ember/12 text-accent-ember"><WorkflowIcon className="size-5" aria-hidden /></span>
       <EmptyTitle>No workflows yet</EmptyTitle>
-      <EmptyDescription className="max-w-72">Type <code className="rounded bg-surface-2 px-1 py-px font-mono text-label text-foreground">/workflow</code> and a goal in any chat. A planner splits the work, agents run it in parallel, and the report comes back to the chat.</EmptyDescription>
+      <EmptyDescription className="max-w-72">Type <code className="rounded-sm bg-surface-2 px-1 py-px font-mono text-label text-foreground">/workflow</code> and a goal in any chat. A planner splits the work, agents run it in parallel, and the report comes back to the chat.</EmptyDescription>
       <EmptyActions className="mt-3">
         <Button variant="outline" size="sm" onClick={openWorkflowSettings}><Settings2 />Workflow settings</Button>
         <Button variant="ghost" size="sm" onClick={onCustomScript}><Code2 />Custom script</Button>
@@ -149,7 +149,7 @@ function WorkflowHome({ runs, loading, onSelect, onCustomScript }: { runs: Workf
   }
   const now = new Date();
   return <div className="py-1.5" data-testid="workflow-runs">
-    <p className="px-3.5 pb-2 pt-1.5 text-label text-muted-foreground">Start a new one with <code className="rounded bg-surface-2 px-1 py-px font-mono text-caption text-foreground">/workflow</code> in a chat.</p>
+    <p className="px-3.5 pb-2 pt-1.5 text-label text-muted-foreground">Start a new one with <code className="rounded-sm bg-surface-2 px-1 py-px font-mono text-caption text-foreground">/workflow</code> in a chat.</p>
     <ul className="px-1.5">
       {runs.map((item) => <li key={item.id}>
         <button type="button" data-testid={`workflow-run-${item.id}`} onClick={() => onSelect(item.id)} className="grid w-full min-w-0 grid-cols-[16px_minmax(0,1fr)_auto] items-center gap-x-2.5 rounded-md px-2 py-2 text-left hover:bg-surface-2 focus-visible:outline-2 focus-visible:outline-ring">

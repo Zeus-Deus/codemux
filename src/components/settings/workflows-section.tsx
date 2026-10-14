@@ -106,7 +106,7 @@ export function WorkflowsSection() {
     <SectionHeader
       title="Workflows"
       icon={<WorkflowIcon className="size-5 text-muted-foreground" aria-hidden />}
-      description={<>Split big tasks across agents working in parallel. Type <code className="rounded bg-surface-2 px-1 py-px font-mono text-body-sm text-foreground">/workflow</code> and a goal in any chat: a planner splits the work, agents run it, and the report comes back to the chat. Everything here is optional.</>}
+      description={<>Split big tasks across agents working in parallel. Type <code className="rounded-sm bg-surface-2 px-1 py-px font-mono text-body-sm text-foreground">/workflow</code> and a goal in any chat: a planner splits the work, agents run it, and the report comes back to the chat. Everything here is optional.</>}
     />
 
     <section className="mt-2">

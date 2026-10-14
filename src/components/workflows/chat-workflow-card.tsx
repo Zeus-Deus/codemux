@@ -202,7 +202,7 @@ export function ChatWorkflowCard({ runId, workspaceId, threadId }: { runId: stri
         <ChatMarkdown workspaceId={workspaceId}>{report}</ChatMarkdown>
       </div>
       <Button variant="ghost" size="xs" className="mt-1 ml-5 text-muted-foreground" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
-        <ChevronDown className={cn("transition-transform", expanded && "rotate-180")} />{expanded ? "Show less" : "Show full report"}
+        <ChevronDown className={cn("transition-transform duration-150", expanded && "rotate-180")} />{expanded ? "Show less" : "Show full report"}
       </Button>
     </div>}
 
