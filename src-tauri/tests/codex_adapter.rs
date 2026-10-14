@@ -528,6 +528,51 @@ async fn send_turn_emits_structured_skill_item_on_the_wire() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turns_carry_instructions_when_the_chat_names_no_model() {
+    // A chat on Codex's configured default model still gets its runtime
+    // identity and tool guidance, which collaboration-mode settings carry
+    // only alongside a model.
+    let capture_dir = tempfile::tempdir().unwrap();
+    let capture_path = capture_dir.path().join("turn.json");
+    let capture_path_string = capture_path.to_string_lossy().to_string();
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_CAPTURE_TURN", &capture_path_string),
+        ("FAKE_CODEX_THREAD_MODEL", "gpt-config-default"),
+    ]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("t-default-model"))
+        .await
+        .unwrap();
+
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-default-model".into()),
+            text: "hello".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
+            turn_checkpoint: None,
+            dispatch_guard: None,
+        })
+        .await
+        .unwrap();
+
+    let captured: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    let settings = &captured["collaborationMode"]["settings"];
+    assert_eq!(settings["model"], "gpt-config-default");
+    assert!(settings["developer_instructions"]
+        .as_str()
+        .unwrap()
+        .contains("as gpt-config-default"));
+    provider.stop_session(ThreadId("t-default-model".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_commands_use_rpc_and_release_the_active_turn() {
     for (text, method, expected) in [
         (

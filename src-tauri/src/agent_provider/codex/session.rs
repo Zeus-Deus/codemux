@@ -89,6 +89,7 @@ In Default mode, strongly prefer making reasonable assumptions and executing the
 fn runtime_collaboration_mode(
     model: Option<&str>,
     effort: Option<&str>,
+    guidance: Option<&str>,
 ) -> Option<CollaborationMode> {
     let model = model?.split_whitespace().collect::<Vec<_>>().join(" ");
     if model.is_empty() {
@@ -101,8 +102,11 @@ fn runtime_collaboration_mode(
         .as_deref()
         .map(|value| format!(" with {value} reasoning effort"))
         .unwrap_or_default();
+    let guidance = guidance
+        .map(|text| format!("{text}\n\n"))
+        .unwrap_or_default();
     let developer_instructions = format!(
-        "{CODEX_DEFAULT_MODE_INSTRUCTIONS}\n\n<runtime_info>In case you're asked: you are running in CodeMux through the Codex harness, as {model}{effort_text}. No need to mention this otherwise.</runtime_info>"
+        "{CODEX_DEFAULT_MODE_INSTRUCTIONS}\n\n{guidance}<runtime_info>In case you're asked: you are running in CodeMux through the Codex harness, as {model}{effort_text}. No need to mention this otherwise.</runtime_info>"
     );
 
     Some(CollaborationMode {
@@ -292,6 +296,9 @@ pub(crate) struct CodexSession {
     /// the session started with: Codex cannot change mode mid-session, and
     /// the host tools it lists are fixed at `thread/start`.
     host_caller: crate::mcp::registry::HostCaller,
+    /// Codemux instructions for the tools listed at `thread/start`, added to
+    /// every turn's developer instructions.
+    guidance: Option<&'static str>,
 }
 
 impl CodexSession {
@@ -615,7 +622,7 @@ impl CodexSession {
             .and_then(|v| v.get("requireOriginal"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let codex_thread_id = match &resume_cursor {
+        let thread = match &resume_cursor {
             Some(cursor) => {
                 let resume_id = codex_thread_id_from_resume_cursor(cursor);
                 match resume_id {
@@ -641,7 +648,7 @@ impl CodexSession {
                         let params_value = serde_json::to_value(&params).unwrap();
                         match child.request("thread/resume", params_value).await {
                             Ok(resp) => match serde_json::from_value::<ThreadStartResponse>(resp) {
-                                Ok(r) => r.thread_id().to_string(),
+                                Ok(r) => r,
                                 Err(e) => {
                                     return Err(ProviderError::RpcError {
                                         message: format!("malformed thread/resume response: {e}"),
@@ -704,6 +711,11 @@ impl CodexSession {
                 .await?
             }
         };
+        let codex_thread_id = thread.thread_id().to_string();
+        // A chat that names no model runs on Codex's configured default. Keep
+        // the model Codex reports, since each turn's runtime identity and tool
+        // guidance ride on collaboration-mode settings, which require one.
+        let model = model.or_else(|| thread.model().map(str::to_owned));
 
         // --- assemble session handle ----------------------------------------
         let mut demux=CodexSubagentDemux::new(codex_thread_id.clone());demux.set_recorded_usage_baseline(recorded_usage_baseline.unwrap_or_default());
@@ -740,6 +752,7 @@ impl CodexSession {
             native_authority: crate::delegation::authority::NativeAuthority::new(&thread_id.0),
             managed: managed.clone(),
             host_caller,
+            guidance: dynamic_tools.as_deref().and_then(developer_guidance),
         });
 
         // Emit SessionConfigured up front so subscribers see the thread
@@ -1368,7 +1381,8 @@ impl CodexSession {
 
         let model = model_override.or(model_default);
         let effort = effort_override.or(effort_default);
-        let collaboration_mode = runtime_collaboration_mode(model.as_deref(), effort.as_deref());
+        let collaboration_mode =
+            runtime_collaboration_mode(model.as_deref(), effort.as_deref(), self.guidance);
         let params = TurnStartParams {
             thread_id: codex_thread_id,
             input: input_items,
@@ -2174,7 +2188,7 @@ async fn start_fresh_thread(
     permission_mode: Option<String>,
     service_tier: String,
     dynamic_tools: Option<Vec<DynamicToolSpec>>,
-) -> Result<String, ProviderError> {
+) -> Result<ThreadStartResponse, ProviderError> {
     let managed = permission_mode.as_deref() == Some("managed-read-only");
     let (approval_policy, sandbox) =
         match codex_permission_mode_to_policy_pair(permission_mode.as_deref()) {
@@ -2205,13 +2219,12 @@ async fn start_fresh_thread(
         if managed {
             validate_managed_codex_thread(&resp)?;
         }
-        let parsed: ThreadStartResponse = serde_json::from_value(resp)
-            .map_err(|e| format!("malformed thread/start response: {e}"))?;
-        Ok::<_, String>(parsed.thread_id().to_owned())
+        serde_json::from_value::<ThreadStartResponse>(resp)
+            .map_err(|e| format!("malformed thread/start response: {e}"))
     }
     .await;
     match started {
-        Ok(id) => Ok(id),
+        Ok(thread) => Ok(thread),
         Err(message) if managed => {
             // No turn has been started. Refuse older/unknown APIs instead of
             // falling back to native file access, and prove process shutdown.
@@ -2463,6 +2476,16 @@ async fn dynamic_tool_specs(
             })
             .collect(),
     )
+}
+
+/// Codemux's instructions for the dynamic tools a thread starts with, so the
+/// agent knows to show a page inline rather than only write it to a file.
+fn developer_guidance(tools: &[DynamicToolSpec]) -> Option<&'static str> {
+    let html_render = codex_dynamic_tool_name(crate::mcp_server::HTML_RENDER_REGISTRY_NAME);
+    tools
+        .iter()
+        .any(|DynamicToolSpec::Function { name, .. }| *name == html_render)
+        .then_some(crate::mcp_server::HTML_RENDER_GUIDANCE)
 }
 
 /// Execute a Codex dynamic-tool request through the process-wide registry and
@@ -2817,7 +2840,7 @@ mod tests {
 
     #[test]
     fn runtime_identity_uses_the_resolved_turn_settings() {
-        let mode = runtime_collaboration_mode(Some("gpt-5.6-sol"), Some("high")).unwrap();
+        let mode = runtime_collaboration_mode(Some("gpt-5.6-sol"), Some("high"), None).unwrap();
         assert_eq!(mode.mode, "default");
         assert_eq!(mode.settings.model, "gpt-5.6-sol");
         assert_eq!(mode.settings.reasoning_effort.as_deref(), Some("high"));
@@ -2825,7 +2848,29 @@ mod tests {
             "<runtime_info>In case you're asked: you are running in CodeMux through the Codex harness, as gpt-5.6-sol with high reasoning effort. No need to mention this otherwise.</runtime_info>"
         ));
 
-        assert!(runtime_collaboration_mode(None, Some("high")).is_none());
+        assert!(runtime_collaboration_mode(None, Some("high"), None).is_none());
+    }
+
+    #[test]
+    fn developer_instructions_guide_visuals_only_when_html_render_is_listed() {
+        let tool = |registry_name: &str| DynamicToolSpec::Function {
+            name: codex_dynamic_tool_name(registry_name),
+            description: String::new(),
+            input_schema: json!({}),
+            defer_loading: None,
+        };
+        let guidance = developer_guidance(&[
+            tool("mcp__codemux__browser_click"),
+            tool("mcp__codemux__html_render"),
+        ]);
+        assert_eq!(guidance, Some(crate::mcp_server::HTML_RENDER_GUIDANCE));
+        assert!(developer_guidance(&[]).is_none());
+        assert!(developer_guidance(&[tool("mcp__other__html_render")]).is_none());
+
+        let mode = runtime_collaboration_mode(Some("gpt-5.6-sol"), None, guidance).unwrap();
+        let instructions = mode.settings.developer_instructions;
+        assert!(instructions.contains(crate::mcp_server::HTML_RENDER_GUIDANCE));
+        assert!(instructions.ends_with("</runtime_info>"), "runtime identity stays last");
     }
 
     #[test]
