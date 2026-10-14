@@ -622,7 +622,7 @@ impl CodexSession {
             .and_then(|v| v.get("requireOriginal"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let codex_thread_id = match &resume_cursor {
+        let thread = match &resume_cursor {
             Some(cursor) => {
                 let resume_id = codex_thread_id_from_resume_cursor(cursor);
                 match resume_id {
@@ -648,7 +648,7 @@ impl CodexSession {
                         let params_value = serde_json::to_value(&params).unwrap();
                         match child.request("thread/resume", params_value).await {
                             Ok(resp) => match serde_json::from_value::<ThreadStartResponse>(resp) {
-                                Ok(r) => r.thread_id().to_string(),
+                                Ok(r) => r,
                                 Err(e) => {
                                     return Err(ProviderError::RpcError {
                                         message: format!("malformed thread/resume response: {e}"),
@@ -711,6 +711,11 @@ impl CodexSession {
                 .await?
             }
         };
+        let codex_thread_id = thread.thread_id().to_string();
+        // A chat that names no model runs on Codex's configured default. Keep
+        // the model Codex reports, since each turn's runtime identity and tool
+        // guidance ride on collaboration-mode settings, which require one.
+        let model = model.or_else(|| thread.model().map(str::to_owned));
 
         // --- assemble session handle ----------------------------------------
         let mut demux=CodexSubagentDemux::new(codex_thread_id.clone());demux.set_recorded_usage_baseline(recorded_usage_baseline.unwrap_or_default());
@@ -2183,7 +2188,7 @@ async fn start_fresh_thread(
     permission_mode: Option<String>,
     service_tier: String,
     dynamic_tools: Option<Vec<DynamicToolSpec>>,
-) -> Result<String, ProviderError> {
+) -> Result<ThreadStartResponse, ProviderError> {
     let managed = permission_mode.as_deref() == Some("managed-read-only");
     let (approval_policy, sandbox) =
         match codex_permission_mode_to_policy_pair(permission_mode.as_deref()) {
@@ -2214,13 +2219,12 @@ async fn start_fresh_thread(
         if managed {
             validate_managed_codex_thread(&resp)?;
         }
-        let parsed: ThreadStartResponse = serde_json::from_value(resp)
-            .map_err(|e| format!("malformed thread/start response: {e}"))?;
-        Ok::<_, String>(parsed.thread_id().to_owned())
+        serde_json::from_value::<ThreadStartResponse>(resp)
+            .map_err(|e| format!("malformed thread/start response: {e}"))
     }
     .await;
     match started {
-        Ok(id) => Ok(id),
+        Ok(thread) => Ok(thread),
         Err(message) if managed => {
             // No turn has been started. Refuse older/unknown APIs instead of
             // falling back to native file access, and prove process shutdown.
