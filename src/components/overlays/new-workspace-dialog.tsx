@@ -1,3 +1,4 @@
+import { Kbd } from "@/components/ui/kbd";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { cn } from "@/lib/utils";
@@ -1625,9 +1626,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           )}
 
           <span className="ml-auto flex shrink-0 items-center gap-1 text-caption text-muted-foreground select-none">
-            <kbd className="rounded-sm bg-surface-2 px-1 font-mono text-micro text-foreground/80">
-              Ctrl+Enter
-            </kbd>{" "}
+            <Kbd>Ctrl+Enter</Kbd>{" "}
             to create
           </span>
         </div>

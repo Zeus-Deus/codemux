@@ -1,7 +1,8 @@
+import { Kbd } from "@/components/ui/kbd";
 import { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { modEnterLabel } from "@/lib/keybind-utils";
-import { btnCard, btnCardStrong, kbdChip, tzBodyLg, tzMeta, underRowInset } from "./review-ui";
+import { btnCard, btnCardStrong, tzBodyLg, tzMeta, underRowInset } from "./review-ui";
 
 interface Props {
   /** "line 43" or "lines 43–44". */
@@ -135,7 +136,7 @@ export function ReviewLineComposer({
             </button>
           )}
           <span className="flex-1" />
-          <kbd className={kbdChip}>{modEnterLabel()}</kbd>
+          <Kbd>{modEnterLabel()}</Kbd>
         </div>
       </div>
     </div>

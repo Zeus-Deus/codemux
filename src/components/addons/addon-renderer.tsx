@@ -1,3 +1,5 @@
+import { NativeSelect } from "@/components/ui/native-select";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Fragment,
   useCallback,
@@ -491,8 +493,7 @@ export function AddonRenderer({
         return (
           <label className={cn(className, "grid gap-1")}>
             {text("label")}
-            <select
-              className="rounded-md border bg-background p-2"
+            <NativeSelect
               value={text("value")}
               disabled={disabled}
               onChange={(e) => change(e.currentTarget.value)}
@@ -504,17 +505,16 @@ export function AddonRenderer({
                   </option>
                 ),
               )}
-            </select>
+            </NativeSelect>
           </label>
         );
       case "cmx-checkbox":
         return (
           <label className={cn(className, "flex items-center gap-2")}>
-            <input
-              type="checkbox"
+            <Checkbox
               checked={p.checked === true}
               disabled={disabled}
-              onChange={(e) => change(e.currentTarget.checked)}
+              onCheckedChange={(checked) => change(checked === true)}
             />
             {text("label")}
             {children}

@@ -119,10 +119,6 @@ export const btnQuiet = `${BASE} bg-transparent text-muted-foreground hover:text
 export const spinnerRing =
   "size-2.5 shrink-0 rounded-full border-[1.6px] border-current border-r-transparent motion-safe:animate-spin";
 
-/** Keycap chip for a shortcut hint ("Ctrl+↵"). */
-export const kbdChip =
-  "rounded-sm bg-muted/60 px-1 py-px font-mono text-caption text-muted-foreground";
-
 /**
  * Comment-sized ember tint, for actions that sit inside a quoted thread.
  *

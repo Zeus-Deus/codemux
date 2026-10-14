@@ -1,3 +1,4 @@
+import { Kbd } from "@/components/ui/kbd";
 import { HermesPermissionOptions, isHermesPermission, hermesPermissionAllowed } from "./HermesPermissionOptions";
 import { memo, useEffect, useId, useMemo, useRef, useState, type ComponentType } from "react";
 import {
@@ -605,14 +606,6 @@ function RuleScopeGroup({
         </DropdownMenuItem>
       ))}
     </DropdownMenuGroup>
-  );
-}
-
-function Kbd({ children }: { children: React.ReactNode }) {
-  return (
-    <kbd className="rounded-sm bg-muted/60 px-1 py-[1px] font-mono text-caption text-muted-foreground/80">
-      {children}
-    </kbd>
   );
 }
 

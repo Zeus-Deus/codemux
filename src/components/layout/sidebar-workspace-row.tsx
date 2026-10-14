@@ -1,3 +1,4 @@
+import { Checkbox } from "@/components/ui/checkbox";
 import { AgentQuestionBadge } from "./agent-question-badge";
 import { useEffect, useState } from "react";
 import {
@@ -223,11 +224,9 @@ export function DeleteWorktreeDialog({
         )}
 
         <label className="flex items-center gap-2 cursor-pointer select-none">
-          <input
-            type="checkbox"
+          <Checkbox
             checked={deleteBranch}
-            onChange={(e) => setDeleteBranch(e.target.checked)}
-            className="rounded-sm border-border"
+            onCheckedChange={(checked) => setDeleteBranch(checked === true)}
           />
           <span className="text-label text-muted-foreground">
             Also delete local branch

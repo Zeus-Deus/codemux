@@ -1,4 +1,6 @@
+import { CodeBlock, CodeBlockContent, CodeBlockCopyButton, CodeBlockHeader } from "@/components/ui/code-block";
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { NativeSelect } from "@/components/ui/native-select";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Check, ChevronLeft, Code2, Pause, Play, RotateCw, Settings2, Square, Workflow as WorkflowIcon, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -28,7 +30,6 @@ import { checkpointGroups, currentTaskAttempt, isSnapshotArtifact, taskRouteLabe
 
 export { WORKFLOW_STARTER } from "./workflow-starter";
 
-const SELECT = "h-8 min-w-0 rounded-md border border-border bg-background px-2 text-body-sm text-foreground focus-visible:outline-2 focus-visible:outline-ring";
 const TASK_PAGE = 100;
 
 function initialDraft(): WorkflowDraft {
@@ -396,7 +397,7 @@ function TaskIcon({ status }: { status: WorkflowTaskStatus }) {
 }
 function Output({ value }: { value: unknown }) {
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2) ?? "";
-  return <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md bg-surface-2 p-2 font-mono text-label leading-relaxed text-muted-foreground">{text.slice(0, 65536)}{text.length > 65536 ? "\n…output truncated in this view" : ""}</pre>;
+  return <CodeBlock className="mt-2"><CodeBlockHeader className="justify-end pt-1.5"><CodeBlockCopyButton value={text} /></CodeBlockHeader><CodeBlockContent className="max-h-80 whitespace-pre-wrap break-words pt-0 text-muted-foreground">{text.slice(0, 65536)}{text.length > 65536 ? "\n…output truncated in this view" : ""}</CodeBlockContent></CodeBlock>;
 }
 
 function Artifact({ runId, taskId, attemptId, current, canApply, artifact }: { runId: string; taskId: string; attemptId: string; current: boolean; canApply: boolean; artifact: unknown }) {
@@ -426,7 +427,7 @@ function Artifact({ runId, taskId, attemptId, current, canApply, artifact }: { r
       {snapshot.changed_paths.length > 100 && <p className="mt-1 text-label text-muted-foreground">{snapshot.changed_paths.length - 100} additional changed paths retained in the manifest.</p>}
       {snapshot.changed_paths.length > 0 && <Button variant="ghost" size="xs" className="mt-2" data-testid="workflow-review-artifact" aria-expanded={review} onClick={() => setReview((value) => !value)}>{review ? "Hide file review" : "Review file changes"}</Button>}
       {review && <div className="mt-3 space-y-3" data-testid="workflow-artifact-review">
-        <label className="block space-y-1"><Eyebrow>Changed file</Eyebrow><select aria-label="Review changed file" data-testid="workflow-artifact-file" className={cn(SELECT, "w-full font-mono text-label")} value={path} onChange={(event) => setSelectedPath(event.target.value)}>{snapshot.changed_paths.slice(0, visibleFiles).map((file) => <option key={file} value={file}>{file}</option>)}</select></label>
+        <label className="block space-y-1"><Eyebrow>Changed file</Eyebrow><NativeSelect size="sm" aria-label="Review changed file" data-testid="workflow-artifact-file" selectClassName="font-mono text-label" value={path} onChange={(event) => setSelectedPath(event.target.value)}>{snapshot.changed_paths.slice(0, visibleFiles).map((file) => <option key={file} value={file}>{file}</option>)}</NativeSelect></label>
         {snapshot.changed_paths.length > visibleFiles && <Button variant="ghost" size="xs" onClick={() => setVisibleFiles((count) => count + 100)}>Show more files</Button>}
         {preview.isFetching && <p role="status" className="text-label text-muted-foreground">Loading retained file…</p>}
         {preview.error && <div role="alert"><p className="break-words text-body-sm text-status-attention">{workflowError(preview.error)}</p><Button variant="ghost" size="xs" onClick={() => { void preview.refetch(); }}>Retry file review</Button></div>}
