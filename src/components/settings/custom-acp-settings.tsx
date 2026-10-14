@@ -6,6 +6,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { ProviderLogo } from "@/components/chat/provider-logo";
 import { acpDeleteAgent, acpSaveAgent, type AcpAgent, type AcpAgentInput } from "@/tauri/custom-acp";
 import { acpCatalogKey, useCustomAcp } from "@/stores/custom-acp-store";
+import { runAcpMutation, useAcpMutating } from "@/stores/acp-mutation-lock";
 import { DetailHeader, DetailRow, DetailSection, type ProviderStatus } from "./provider-parts";
 
 const emptyAgent = (): AcpAgentInput => ({ name: "", executable: "", args: [], environment: {}, enabled: true, auth_method: null });
@@ -18,17 +19,14 @@ export function CustomAcpDetail({
   agentId,
   onSaved,
   onCancelNew,
-  onLockChange,
-  switchLocked = false,
+  onEditingChange,
 }: {
   agentId: string | null;
   onSaved: (id: string) => void;
   onCancelNew: () => void;
-  /** Reports while this agent is being edited or mutated, so the page can
-   *  keep its list switch from saving over the editor. */
-  onLockChange?: (locked: boolean) => void;
-  /** Another save of an agent (from the list) is still in flight. */
-  switchLocked?: boolean;
+  /** Reports while this agent's editor is open, so the page keeps its list
+   *  switch from saving a definition the editor is about to replace. */
+  onEditingChange?: (editing: boolean) => void;
 }) {
   const agents = useCustomAcp(s => s.agents);
   const catalogs = useCustomAcp(s => s.catalogs);
@@ -40,11 +38,17 @@ export function CustomAcpDetail({
   const [error, setError] = useState<string | null>(null);
   const [probeError, setProbeError] = useState<string | null>(null);
   useEffect(() => { let alive = true; void useCustomAcp.getState().loadAgents().catch(e => { if (alive) setError(String(e)); }); return () => { alive = false; }; }, []);
-  const locked = editor !== null || busy !== null;
+  // Any write to this agent from anywhere (list switch, this panel), held
+  // until its readback settles even if this panel unmounts.
+  const mutating = useAcpMutating(agentId);
+  const editing = editor !== null && !!agentId;
+  const inert = !!busy || mutating;
   useEffect(() => {
-    onLockChange?.(locked);
-  }, [locked, onLockChange]);
-  useEffect(() => () => onLockChange?.(false), [onLockChange]);
+    onEditingChange?.(editing);
+  }, [editing, onEditingChange]);
+  // An unmounted editor is discarded, so it no longer holds the list switch.
+  useEffect(() => () => onEditingChange?.(false), [onEditingChange]);
+  const BUSY_ELSEWHERE = "Another change to this agent is still saving. Try again in a moment.";
   const edit = (a: AcpAgent) => {
     setError(null);
     setEditor({ id: a.id, name: a.name, executable: a.executable, args: [...a.args], environment: {}, enabled: a.enabled, auth_method: a.auth_method });
@@ -59,12 +63,18 @@ export function CustomAcpDetail({
     const keys = env.map(row => row.key);
     if (keys.some(key => !key || key.includes("=") || key.includes("\0")) || new Set(keys).size !== keys.length) { setError("Environment keys must be nonempty, unique, and contain no equals sign or NUL."); return; }
     setBusy("save"); setError(null);
-    try {
+    const write = async () => {
       const result = await acpSaveAgent({ ...input, environment: Object.fromEntries(env.map(row => [row.key, row.value])) });
       const listed = await useCustomAcp.getState().loadAgents(true);
       const stored = listed.find(a => a.id === result.id);
       const publicIdentity = (a: AcpAgent) => JSON.stringify([a.id, a.revision, a.name, a.executable, a.args, a.enabled, a.auth_method, Object.keys(a.environment).sort()]);
       if (!stored || publicIdentity(stored) !== publicIdentity(result)) throw new Error("Could not verify the saved agent. Refresh and retry.");
+      return result;
+    };
+    try {
+      // A new agent has no id yet, so nothing else can be writing it.
+      const result = input.id ? await runAcpMutation(input.id, write) : await write();
+      if (!result) { setError(BUSY_ELSEWHERE); return; }
       setEditor(null); setEnvironment([]);
       onSaved(result.id);
     } catch (e) { setError(String(e)); }
@@ -78,17 +88,25 @@ export function CustomAcpDetail({
     if (editor || busy) return;
     setBusy("toggle"); setError(null);
     try {
-      await acpSaveAgent({ id: a.id, name: a.name, executable: a.executable, args: a.args, environment: Object.fromEntries(Object.keys(a.environment).map(key => [key, null])), enabled, auth_method: a.auth_method });
-      await useCustomAcp.getState().loadAgents(true);
+      const done = await runAcpMutation(a.id, async () => {
+        await acpSaveAgent({ id: a.id, name: a.name, executable: a.executable, args: a.args, environment: Object.fromEntries(Object.keys(a.environment).map(key => [key, null])), enabled, auth_method: a.auth_method });
+        await useCustomAcp.getState().loadAgents(true);
+        return true;
+      });
+      if (!done) setError(BUSY_ELSEWHERE);
     } catch (e) { setError(String(e)); }
     finally { setBusy(null); }
   };
   const remove = async (id: string) => {
     setBusy(id); setError(null);
     try {
-      await acpDeleteAgent(id);
-      const listed = await useCustomAcp.getState().loadAgents(true);
-      if (listed.some(a => a.id === id)) throw new Error("Could not verify agent deletion. Refresh and retry.");
+      const done = await runAcpMutation(id, async () => {
+        await acpDeleteAgent(id);
+        const listed = await useCustomAcp.getState().loadAgents(true);
+        if (listed.some(a => a.id === id)) throw new Error("Could not verify agent deletion. Refresh and retry.");
+        return true;
+      });
+      if (!done) { setError(BUSY_ELSEWHERE); return; }
       setDeleting(false);
     } catch (e) { setError(String(e)); }
     finally { setBusy(null); }
@@ -119,9 +137,9 @@ export function CustomAcpDetail({
       status={status}
       enabled={agent?.enabled}
       onEnabledChange={agent ? (on => void setEnabled(agent, on)) : undefined}
-      switchDisabled={locked || switchLocked}
+      switchDisabled={editor !== null || inert}
       switchTitle={editor ? "Save or cancel your edits first." : undefined}
-      actions={agent && !editor && <Button variant="ghost" size="sm" className="text-muted-foreground" aria-label={`Probe ${agent.name}`} disabled={!!busy || !agent.enabled} onClick={() => void probe(agent.id)}>
+      actions={agent && !editor && <Button variant="ghost" size="sm" className="text-muted-foreground" aria-label={`Probe ${agent.name}`} disabled={inert || !agent.enabled} onClick={() => void probe(agent.id)}>
         {busy === agent.id ? <Spinner className="size-3.5" aria-hidden /> : <FlaskConical />}Test
       </Button>}
     />
@@ -131,7 +149,7 @@ export function CustomAcpDetail({
       setEditor={setEditor}
       environment={environment}
       setEnvironment={setEnvironment}
-      busy={busy}
+      busy={busy ?? (mutating ? "elsewhere" : null)}
       existing={!!editor.id}
       authMethods={catalog?.auth_methods ?? []}
       onCancel={cancel}
@@ -139,7 +157,7 @@ export function CustomAcpDetail({
     /> : agent && <>
       <DetailSection
         title="Launch"
-        action={<Button variant="ghost" size="xs" aria-label={`Edit ${agent.name}`} disabled={!!busy} onClick={() => edit(agent)}><Pencil />Edit</Button>}
+        action={<Button variant="ghost" size="xs" aria-label={`Edit ${agent.name}`} disabled={inert} onClick={() => edit(agent)}><Pencil />Edit</Button>}
       >
         <DetailRow>
           <code className="min-w-0 flex-1 truncate font-mono text-label text-foreground" title={[agent.executable, ...agent.args].join(" ")}>
@@ -160,9 +178,9 @@ export function CustomAcpDetail({
         {deleting
           ? <div className="space-y-2">
             <p className="text-body-sm">Delete {agent.name}? Active sessions will disconnect. Chat history remains, but this agent's chats cannot resume.</p>
-            <div className="flex gap-2"><Button size="sm" variant="destructive" disabled={!!busy} onClick={() => void remove(agent.id)}>Confirm delete</Button><Button size="sm" variant="ghost" disabled={!!busy} onClick={() => setDeleting(false)}>Cancel</Button></div>
+            <div className="flex gap-2"><Button size="sm" variant="destructive" disabled={inert} onClick={() => void remove(agent.id)}>Confirm delete</Button><Button size="sm" variant="ghost" disabled={!!busy} onClick={() => setDeleting(false)}>Cancel</Button></div>
           </div>
-          : <Button variant="ghost" size="sm" className="text-destructive" aria-label={`Delete ${agent.name}`} disabled={!!busy} onClick={() => setDeleting(true)}><Trash2 />Remove custom agent</Button>}
+          : <Button variant="ghost" size="sm" className="text-destructive" aria-label={`Delete ${agent.name}`} disabled={inert} onClick={() => setDeleting(true)}><Trash2 />Remove custom agent</Button>}
       </DetailSection>
     </>}
     <p className="border-t border-hairline px-5 py-3 text-label text-muted-foreground">ACP approvals stay supervised. Agent modes are not a sandbox. Codemux-specific MCP injection, delegation and host-managed skills are unavailable for custom harnesses.</p>

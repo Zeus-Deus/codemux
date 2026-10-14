@@ -65,8 +65,8 @@ it("the switch saves only the enabled flag and keeps saved secrets", async () =>
 });
 it("keeps the switch inert while the editor has unsaved edits", async () => {
   agents = [saved];
-  const onLockChange = vi.fn();
-  render(<CustomAcpDetail agentId={saved.id} onSaved={() => {}} onCancelNew={() => {}} onLockChange={onLockChange} />);
+  const onEditingChange = vi.fn();
+  render(<CustomAcpDetail agentId={saved.id} onSaved={() => {}} onCancelNew={() => {}} onEditingChange={onEditingChange} />);
   fireEvent.click(await screen.findByRole("button", { name: "Edit Custom" }));
   fireEvent.change(screen.getByLabelText("Executable"), { target: { value: "/edited" } });
   const toggle = screen.getByRole("switch", { name: "Use Custom" });
@@ -75,9 +75,9 @@ it("keeps the switch inert while the editor has unsaved edits", async () => {
   expect(invoke).not.toHaveBeenCalledWith("acp_save_agent", expect.anything());
   expect(screen.getByLabelText("Executable")).toHaveValue("/edited");
   // The page hears the lock so it can disable the list switch too.
-  expect(onLockChange).toHaveBeenLastCalledWith(true);
+  expect(onEditingChange).toHaveBeenLastCalledWith(true);
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-  await waitFor(() => expect(onLockChange).toHaveBeenLastCalledWith(false));
+  await waitFor(() => expect(onEditingChange).toHaveBeenLastCalledWith(false));
   expect(screen.getByRole("switch", { name: "Use Custom" })).toBeEnabled();
 });
 it("keeps the switch inert while a save is pending", async () => {

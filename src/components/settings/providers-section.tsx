@@ -12,6 +12,7 @@ import { CHATGPT_USAGE_URL } from "@/components/auth/chatgpt-connection";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { isLastDefaultProvider, setProviderEnabled, useDisabledProviders } from "@/lib/agent-chat/provider-enablement";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { runAcpMutation, useAcpMutationLock } from "@/stores/acp-mutation-lock";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { useCustomAcp, acpCatalogKey } from "@/stores/custom-acp-store";
 import { useHermes } from "@/stores/hermes-store";
@@ -84,16 +85,17 @@ export function ProvidersSection() {
   const catalogs = useCustomAcp((s) => s.catalogs);
   const acpWarning = useCustomAcpEvents();
   const [selected, setSelected] = useState<Selected>({ kind: "builtin", id: "claude" });
-  // A custom agent whose detail panel is editing or saving it, or whose
-  // list switch is saving. Its switches stay inert until that settles, so a
-  // flag-only save cannot discard or race the editor.
+  // A custom agent whose editor is open: its list switch stays inert so a
+  // flag-only save cannot replace the definition being edited. Writes in
+  // flight are locked per agent in `useAcpMutationLock`, independent of
+  // which panel is mounted.
   const [editingAgent, setEditingAgent] = useState<string | null>(null);
-  const [savingAgent, setSavingAgent] = useState<string | null>(null);
+  const mutatingAgents = useAcpMutationLock((s) => s.pending);
   const selectedAgentId = selected.kind === "acp" ? selected.id : null;
-  const onAgentLock = useCallback(
-    (locked: boolean) =>
+  const onAgentEditing = useCallback(
+    (editing: boolean) =>
       setEditingAgent((current) =>
-        locked ? selectedAgentId : current === selectedAgentId ? null : current,
+        editing ? selectedAgentId : current === selectedAgentId ? null : current,
       ),
     [selectedAgentId],
   );
@@ -185,12 +187,9 @@ export function ProvidersSection() {
                     selected={sameSelection(selected, { kind: "acp", id: agent.id })}
                     onSelect={() => setSelected({ kind: "acp", id: agent.id })}
                     enabled={agent.enabled}
-                    switchDisabled={editingAgent === agent.id || savingAgent !== null}
+                    switchDisabled={editingAgent === agent.id || !!mutatingAgents[agent.id]}
                     onEnabledChange={(on) => {
-                      setSavingAgent(agent.id);
-                      setCustomAgentEnabled(agent, on)
-                        .catch((e) => toast.failure(`Couldn't update ${agent.name}`, e))
-                        .finally(() => setSavingAgent(null));
+                      setCustomAgentEnabled(agent, on).catch((e) => toast.failure(`Couldn't update ${agent.name}`, e));
                     }}
                   />
                 ))}
@@ -234,8 +233,7 @@ export function ProvidersSection() {
                 agentId={selected.kind === "acp" ? selected.id : null}
                 onSaved={(id) => setSelected({ kind: "acp", id })}
                 onCancelNew={() => setSelected({ kind: "builtin", id: "claude" })}
-                onLockChange={onAgentLock}
-                switchLocked={savingAgent !== null}
+                onEditingChange={onAgentEditing}
               />
             )}
           </div>
@@ -247,16 +245,18 @@ export function ProvidersSection() {
 
 /** Flip a custom agent's own enabled flag, retaining every saved value. */
 async function setCustomAgentEnabled(agent: AcpAgent, enabled: boolean) {
-  await acpSaveAgent({
-    id: agent.id,
-    name: agent.name,
-    executable: agent.executable,
-    args: agent.args,
-    environment: Object.fromEntries(Object.keys(agent.environment).map((k) => [k, null])),
-    enabled,
-    auth_method: agent.auth_method,
+  await runAcpMutation(agent.id, async () => {
+    await acpSaveAgent({
+      id: agent.id,
+      name: agent.name,
+      executable: agent.executable,
+      args: agent.args,
+      environment: Object.fromEntries(Object.keys(agent.environment).map((k) => [k, null])),
+      enabled,
+      auth_method: agent.auth_method,
+    });
+    await useCustomAcp.getState().loadAgents(true);
   });
-  await useCustomAcp.getState().loadAgents(true);
 }
 
 function ProviderListRow({
