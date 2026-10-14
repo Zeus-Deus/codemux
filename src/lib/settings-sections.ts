@@ -23,6 +23,7 @@ import {
   MonitorSmartphone,
   GitPullRequest,
   ChartColumn,
+  Workflow,
 } from "lucide-react";
 
 export type Section =
@@ -39,6 +40,7 @@ export type Section =
   | "git"
   | "source_control"
   | "agent"
+  | "workflows"
   | "permissions"
   | "skills"
   | "mcp"
@@ -96,6 +98,8 @@ export function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
         { id: "mcp", label: "MCP Servers", icon: Plug },
         ...(agentChatEnabled
           ? ([
+              // Workflows run chat-launched agents, so they need the GUI too.
+              { id: "workflows", label: "Workflows", icon: Workflow },
               { id: "permissions", label: "Permissions", icon: ShieldCheck },
               { id: "skills", label: "Skills", icon: BookOpen },
               // Reads the agent-chat usage ledger, which only fills when

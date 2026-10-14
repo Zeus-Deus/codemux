@@ -1,17 +1,28 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Check, ChevronLeft, Code2, Pause, Play, Plus, RotateCw, Square, X } from "lucide-react";
+import { Check, ChevronLeft, Code2, Pause, Play, RotateCw, Settings2, Square, Workflow as WorkflowIcon, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Empty, EmptyActions, EmptyDescription, EmptyTitle } from "@/components/ui/empty";
 import { Spinner } from "@/components/ui/spinner";
+import { modelLabel, modelsForProvider } from "@/lib/agent-chat/capability-defaults";
+import { relativeTime } from "@/lib/relative-time";
 import { cn } from "@/lib/utils";
+import {
+  WORKFLOW_PROVIDERS,
+  buildWorkflowRoutes,
+  useWorkflowSettings,
+  workflowLimits,
+  workflowRouteId,
+} from "@/lib/workflows/workflow-settings";
+import { useUIStore } from "@/stores/ui-store";
 import { useWorkflowUIStore, type WorkflowDraft } from "@/stores/workflow-ui-store";
-import { DEFAULT_WORKFLOW_LIMITS, workflowArtifactPreview, workflowError, workflowIntegrateArtifact, type WorkflowRunSnapshot, type WorkflowTaskSnapshot, type WorkflowTaskStatus } from "@/tauri/workflows";
+import { workflowArtifactPreview, workflowError, workflowIntegrateArtifact, type WorkflowRoute, type WorkflowRunSnapshot, type WorkflowRunSummary, type WorkflowTaskSnapshot, type WorkflowTaskStatus } from "@/tauri/workflows";
 import { useWorkflowRuntime } from "./use-workflow-runtime";
 import { DEFAULT_WORKFLOW_INSPECTOR, useWorkflowInspectorStore } from "@/stores/workflow-inspector-store";
 
-import { WorkflowSetup } from "./workflow-setup";
+import { WorkflowScriptEditor } from "./workflow-script-editor";
 import { WORKFLOW_STARTER } from "./workflow-starter";
 import { checkpointGroups, currentTaskAttempt, isSnapshotArtifact, taskRouteLabel, taskStatusLabel, runStatusLabel, taskVerification, workflowCapacity } from "./workflow-presentation";
 
@@ -25,9 +36,6 @@ function initialDraft(): WorkflowDraft {
     title: "Workspace review",
     goal: "Review this workspace and identify concrete improvements.",
     source: WORKFLOW_STARTER,
-    allowWrites: false,
-    routes: [{ id: "claude", provider: "claude" }, { id: "codex", provider: "codex" }],
-    limits: { ...DEFAULT_WORKFLOW_LIMITS },
   };
 }
 
@@ -38,49 +46,121 @@ function statusClass(status: string) {
   return "text-muted-foreground";
 }
 
+function openWorkflowSettings() {
+  useUIStore.getState().setShowSettings(true, "workflows");
+}
+
+/**
+ * The Workflows pane shows runs: a history list, one run's live inspector,
+ * and an optional custom-script editor. Who runs a workflow, file access and
+ * limits live in Settings → Workflows; everyday runs start with `/workflow`.
+ */
 export function WorkflowPanel({ workspaceId }: { workspaceId: string }) {
   const runtime = useWorkflowRuntime(workspaceId);
+  const settings = useWorkflowSettings();
   const saved = useWorkflowUIStore((state) => state.drafts[workspaceId]);
   const setDraft = useWorkflowUIStore((state) => state.setDraft);
-  const draft = useMemo(() => saved ?? initialDraft(), [saved]);
+  const editorOpen = useWorkflowUIStore((state) => state.scriptEditor[workspaceId] ?? false);
+  const setScriptEditor = useWorkflowUIStore((state) => state.setScriptEditor);
+  const draft = useMemo(() => ({ ...initialDraft(), ...saved }), [saved]);
   const update = (patch: Partial<WorkflowDraft>) => setDraft(workspaceId, { ...draft, ...patch });
+  const capabilities = runtime.capabilities.data;
+  const live = useMemo(() => buildWorkflowRoutes({
+    settings,
+    capabilities: capabilities ?? [],
+    chat: null,
+    models: (provider) => modelsForProvider(provider),
+    modelLabel: (provider, model) => modelLabel(provider, model),
+  }), [settings, capabilities]);
   const run = runtime.snapshot.data;
-  const launch = (mode: "dry_run" | "live") => runtime.launch.mutate({
-    source: draft.source,
-    spec: { workspace_id: workspaceId, title: draft.title.trim(), goal: draft.goal.trim(), mode, allow_writes: draft.allowWrites ?? false, routes: draft.routes.map((route) => ({ ...route, model: route.model?.trim() || null, effort: route.effort?.trim() || null })), limits: draft.limits, tasks: [] },
-  });
-  const errors = [runtime.launch.error, runtime.control.error, runtime.save.error, runtime.runs.error, runtime.snapshot.error, ...(!runtime.selectedId ? [runtime.capabilities.error, runtime.scripts.error] : [])].filter(Boolean);
+  const launch = (mode: "dry_run" | "live") => {
+    // A dry run calls no model, so it may use any enabled provider.
+    const enabled: WorkflowRoute[] = WORKFLOW_PROVIDERS.filter((provider) => settings.providers[provider].enabled).map((provider) => {
+      const model = settings.providers[provider].model.trim() || null;
+      return { id: workflowRouteId(provider, model), provider, model, effort: null };
+    });
+    const routes = mode === "live" || live.routes.length > 0 ? live.routes : enabled.length ? enabled : [{ id: "claude", provider: "claude" as const, model: null, effort: null }];
+    runtime.launch.mutate({
+      source: draft.source,
+      spec: { workspace_id: workspaceId, title: draft.title.trim(), goal: draft.goal.trim(), mode, allow_writes: settings.allowWrites, routes, limits: workflowLimits(settings), tasks: [] },
+    });
+  };
+  const view = runtime.selectedId ? "run" : editorOpen ? "editor" : "home";
+  const errors = [runtime.launch.error, runtime.control.error, runtime.save.error, runtime.runs.error, runtime.snapshot.error, ...(view === "editor" ? [runtime.capabilities.error, runtime.scripts.error] : [])].filter(Boolean);
+  const home = () => { runtime.selectRun(null); setScriptEditor(workspaceId, false); };
 
   return (
-    <section className="flex h-full min-h-0 min-w-0 flex-col bg-background" data-testid="workflow-panel" aria-label="Dynamic workflows">
-      <div className="flex shrink-0 items-center gap-2 border-b border-border/60 px-3 py-2">
-        <select aria-label="Workflow run" data-testid="workflow-run-picker" className={cn(SELECT, "flex-1")} value={runtime.selectedId ?? ""} onChange={(event) => runtime.selectRun(event.target.value || null)}>
-          <option value="">New workflow</option>
-          {(runtime.runs.data ?? []).map((item) => <option key={item.id} value={item.id}>{item.spec.title} · {runStatusLabel(item.status)}</option>)}
-        </select>
-        <Button variant="ghost" size="icon-sm" aria-label="New workflow" data-testid="workflow-new" onClick={() => runtime.selectRun(null)}><Plus /></Button>
+    <section className="flex h-full min-h-0 min-w-0 flex-col bg-background" data-testid="workflow-panel" aria-label="Workflows">
+      <div className="flex h-10 shrink-0 items-center gap-1.5 border-b border-border/60 px-2.5">
+        {view === "home"
+          ? <span className="px-1 text-body-sm font-semibold text-foreground">Runs</span>
+          : <Button variant="ghost" size="xs" data-testid="workflow-back" onClick={home}><ChevronLeft />All runs</Button>}
+        <span className="flex-1" />
+        {view === "home" && <Button variant="ghost" size="xs" data-testid="workflow-custom-script" onClick={() => setScriptEditor(workspaceId, true)}><Code2 />Custom script</Button>}
+        <Button variant="ghost" size="icon-xs" aria-label="Workflow settings" title="Workflow settings" onClick={openWorkflowSettings}><Settings2 /></Button>
       </div>
       {errors.length > 0 && <div role="alert" className="shrink-0 border-b border-status-attention/30 bg-status-attention/8 px-3 py-2 break-words text-body-sm text-status-attention">{workflowError(errors[0])}</div>}
       <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
-        {runtime.selectedId ? (
-          run ? <RunInspector key={run.id} run={run} busy={runtime.control.isPending} onEditScript={() => { update({ title: run.spec.title, goal: run.spec.goal, source: run.spec.script?.source ?? draft.source, routes: run.spec.routes, limits: run.spec.limits, allowWrites: run.spec.allow_writes }); runtime.selectRun(null); }} onControl={(action, taskId, text) => runtime.control.mutate({ action, runId: run.id, taskId, text })} />
-            : <p role="status" className="p-4 text-body-sm text-muted-foreground">{runtime.snapshot.isLoading ? "Loading workflow…" : "This run could not be loaded. Choose another run or create a new workflow."}</p>
-        ) : (
-          <WorkflowSetup
+        {view === "run" ? (
+          run ? <RunInspector key={run.id} run={run} busy={runtime.control.isPending} onEditScript={() => { update({ title: run.spec.title, goal: run.spec.goal, source: run.spec.script?.source ?? draft.source }); setScriptEditor(workspaceId, true); }} onControl={(action, taskId, text) => runtime.control.mutate({ action, runId: run.id, taskId, text })} />
+            : <p role="status" className="p-4 text-body-sm text-muted-foreground">{runtime.snapshot.isLoading ? "Loading workflow…" : "This run could not be loaded. Choose another run."}</p>
+        ) : view === "editor" ? (
+          <WorkflowScriptEditor
             draft={draft}
-            capabilities={runtime.capabilities.data ?? []}
             scripts={runtime.scripts.data ?? []}
+            settings={settings}
+            live={capabilities ? live : { ...live, problem: "Checking which providers can run workflows…" }}
             pending={runtime.launch.isPending}
             saving={runtime.save.isPending}
             saved={runtime.save.isSuccess}
             onChange={update}
             onLaunch={launch}
             onSave={() => runtime.save.mutate({ name: draft.title.trim(), source: draft.source })}
+            onOpenSettings={openWorkflowSettings}
           />
+        ) : (
+          <WorkflowHome runs={runtime.runs.data} loading={runtime.runs.isLoading} onSelect={runtime.selectRun} onCustomScript={() => setScriptEditor(workspaceId, true)} />
         )}
       </div>
     </section>
   );
+}
+
+function RunStatusIcon({ status }: { status: WorkflowRunSummary["status"] }) {
+  if (status === "completed") return <Check className="size-3.5 text-status-open" aria-hidden />;
+  if (status === "running" || status === "stopping") return <Spinner className="size-3.5 text-status-working" aria-hidden />;
+  if (status === "failed" || status === "unknown") return <X className="size-3.5 text-status-attention" aria-hidden />;
+  if (status === "paused") return <Pause className="size-3.5 text-muted-foreground" aria-hidden />;
+  return <Square className="size-3 text-muted-foreground" aria-hidden />;
+}
+
+function WorkflowHome({ runs, loading, onSelect, onCustomScript }: { runs: WorkflowRunSummary[] | undefined; loading: boolean; onSelect: (id: string) => void; onCustomScript: () => void }) {
+  if (loading && !runs) return <p role="status" className="flex items-center gap-2 p-4 text-body-sm text-muted-foreground"><Spinner className="size-3.5" />Loading runs…</p>;
+  if (!runs?.length) {
+    return <Empty className="px-6 py-14" data-testid="workflow-empty">
+      <span className="mb-2 flex size-10 items-center justify-center rounded-lg bg-accent-ember/12 text-accent-ember"><WorkflowIcon className="size-5" aria-hidden /></span>
+      <EmptyTitle>No workflows yet</EmptyTitle>
+      <EmptyDescription className="max-w-72">Type <code className="rounded-sm bg-surface-2 px-1 py-px font-mono text-label text-foreground">/workflow</code> and a goal in any chat. A planner splits the work, agents run it in parallel, and the report comes back to the chat.</EmptyDescription>
+      <EmptyActions className="mt-3">
+        <Button variant="outline" size="sm" onClick={openWorkflowSettings}><Settings2 />Workflow settings</Button>
+        <Button variant="ghost" size="sm" onClick={onCustomScript}><Code2 />Custom script</Button>
+      </EmptyActions>
+    </Empty>;
+  }
+  const now = new Date();
+  return <div className="py-1.5" data-testid="workflow-runs">
+    <p className="px-3.5 pb-2 pt-1.5 text-label text-muted-foreground">Start a new one with <code className="rounded-sm bg-surface-2 px-1 py-px font-mono text-caption text-foreground">/workflow</code> in a chat.</p>
+    <ul className="px-1.5">
+      {runs.map((item) => <li key={item.id}>
+        <button type="button" data-testid={`workflow-run-${item.id}`} onClick={() => onSelect(item.id)} className="grid w-full min-w-0 grid-cols-[16px_minmax(0,1fr)_auto] items-center gap-x-2.5 rounded-md px-2 py-2 text-left hover:bg-surface-2 focus-visible:outline-2 focus-visible:outline-ring">
+          <span className="flex justify-center"><RunStatusIcon status={item.status} /></span>
+          <span className="min-w-0 truncate text-body-sm font-medium text-foreground">{item.spec.title}</span>
+          <span className={cn("text-label", statusClass(item.status))}>{runStatusLabel(item.status)}</span>
+          <span className="col-start-2 col-end-4 truncate text-label text-muted-foreground">{item.spec.mode === "dry_run" ? "Dry run · " : ""}{relativeTime(new Date(item.created_at_ms), now)}</span>
+        </button>
+      </li>)}
+    </ul>
+  </div>;
 }
 
 type ControlAction = "pause" | "resume" | "cancel" | "retry" | "retire" | "message" | "cancel_task" | "reconcile";
@@ -317,11 +397,6 @@ function TaskIcon({ status }: { status: WorkflowTaskStatus }) {
 function Output({ value }: { value: unknown }) {
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2) ?? "";
   return <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md bg-surface-2 p-2 font-mono text-label leading-relaxed text-muted-foreground">{text.slice(0, 65536)}{text.length > 65536 ? "\n…output truncated in this view" : ""}</pre>;
-}
-
-export function WorkflowsPaneActions({ workspaceId }: { workspaceId: string }) {
-  const selectRun = useWorkflowUIStore((state) => state.selectRun);
-  return <Button variant="ghost" size="icon-xs" title="New workflow" aria-label="New workflow" onClick={() => selectRun(workspaceId, null)}><Plus className="size-3" /></Button>;
 }
 
 function Artifact({ runId, taskId, attemptId, current, canApply, artifact }: { runId: string; taskId: string; attemptId: string; current: boolean; canApply: boolean; artifact: unknown }) {

@@ -32,6 +32,7 @@ const SECTION_KEYWORDS: Partial<Record<Section, string>> = {
   notifications: "alerts sounds",
   shortcuts: "keyboard keybinds keybindings hotkeys bindings",
   agent: "ai claude codex models",
+  workflows: "orchestration parallel agents subagents /workflow planner",
   interface: "agent chat gui classic cli mode",
   permissions: "allow deny ask tool rules approvals",
   skills: "skill sync import export",
@@ -81,6 +82,12 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
   { section: "agent", label: "Per-turn revert checkpoints", keywords: "checkpoints undo rewind snapshot", agentChatOnly: true },
   { section: "agent", label: "Resume automatically after usage limits reset", keywords: "auto resume rate limit", agentChatOnly: true },
   { section: "agent", label: "Desktop-size background browser", keywords: "viewport peek screenshot", agentChatOnly: true },
+  // Workflows
+  { section: "workflows", label: "Which agents can be used", keywords: "providers same mix models planner", agentChatOnly: true },
+  { section: "workflows", label: "File changes", keywords: "edits writes read-only review apply", agentChatOnly: true },
+  { section: "workflows", label: "Run size", keywords: "parallel agents limits time concurrency", agentChatOnly: true },
+  { section: "workflows", label: "Token budget", keywords: "cost limit cap", agentChatOnly: true },
+  { section: "workflows", label: "Workflow button in the composer", keywords: "shortcut icon message box", agentChatOnly: true },
 
   // Interface
   { section: "interface", label: "Agent Chat GUI", keywords: "classic cli terminal mode" },

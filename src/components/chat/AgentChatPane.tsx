@@ -149,6 +149,12 @@ import { ChatTranscript } from "./ChatTranscript";
 import { DelegateTaskDialog } from "./DelegateTaskDialog";
 import { RemoteTaskDetail } from "./RemoteTaskDetail";
 import { projectRemoteTasks } from "./remote-task-projection";
+import { latestTranscriptEventId, projectChatWorkflows } from "./chat-workflow-projection";
+import { launchChatWorkflow } from "@/components/workflows/launch-chat-workflow";
+import { workflowAttachmentProblem } from "@/lib/workflows/workflow-attachments";
+import { useWorkflowsAvailable } from "@/components/workflows/use-workflows-available";
+import { parseWorkflowCommand } from "@/lib/workflows/workflow-settings";
+import { useWorkflowUIStore, type ChatWorkflowLink } from "@/stores/workflow-ui-store";
 import type { RemoteTaskScope } from "./remote-task-context";
 import { useDelegationTasks } from "@/stores/delegation-store";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
@@ -572,6 +578,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const paneWorkspaceId = useAppStore(
     (s) => workspaceIdForPane ?? selectActiveWorkspaceId(s) ?? null,
   );
+  const workflowsAvailable = useWorkflowsAvailable(paneWorkspaceId);
   useEffect(() => {
     // A brand-new conversation has no transcript to hydrate; its composer is
     // usable as soon as the pane mounts. Scope this to its owning workspace so
@@ -752,7 +759,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const remoteTaskScope = useMemo<RemoteTaskScope>(() => ({
     paneId: pane.pane_id, writable: conversationWritable, onOpen: openRemoteTask,
   }), [pane.pane_id, conversationWritable, openRemoteTask]);
-  const transcriptMessages = useMemo(() => projectRemoteTasks(messages, remoteTasks.tasks), [messages, remoteTasks.tasks]);
+  const chatWorkflowLinks = useWorkflowUIStore((state) => (threadId ? state.chatRuns[threadId] : undefined) ?? NO_CHAT_WORKFLOWS);
+  const transcriptMessages = useMemo(
+    () => projectChatWorkflows(projectRemoteTasks(messages, remoteTasks.tasks), chatWorkflowLinks, threadId),
+    [messages, remoteTasks.tasks, chatWorkflowLinks, threadId],
+  );
   const viewedRemoteTask = remoteTaskView?.threadId === threadId
     ? remoteTasks.tasks.find(task => task.id === remoteTaskView.taskId) ?? null : null;
   useEffect(() => {
@@ -1624,6 +1635,24 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const delivery = parseMessageDelivery(originalDraft);
       const rawText = delivery.text;
       if (!rawText) return;
+      // `/workflow <goal>` starts a CodeMux workflow beside the chat instead
+      // of a provider turn; it launches below, once attachments resolve.
+      const workflowCommand = isContinue ? null : parseWorkflowCommand(rawText);
+      if (workflowCommand) {
+        if (!workflowCommand.goal) {
+          toast.error("Add a goal after /workflow", { description: "For example: /workflow review the auth module for security issues" });
+          return;
+        }
+        if (!paneWorkspaceId || !workflowsAvailable) {
+          toast.error("Workflows need a local workspace", { description: "Open this chat in a project on this machine to run a workflow." });
+          return;
+        }
+        const staged = useAgentChatStore.getState().threads[threadId]?.stagedAttachments ?? [];
+        if (staged.some((attachment) => attachment.kind === "image")) {
+          toast.error("Workflows can't use images yet", { description: "Remove the image, or send it as a normal message." });
+          return;
+        }
+      }
       if (delivery.delivery === "steer" && useAgentChatStore.getState().threads[threadId]?.streaming && !capabilities?.supports_steering) {
         toast.error(STEERING_UNAVAILABLE);
         return;
@@ -1792,6 +1821,36 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         return;
       }
       const attachmentBlock = buildAttachmentBlock(activeLiveAttachments);
+      if (workflowCommand && paneWorkspaceId) {
+        const problem = workflowAttachmentProblem(activeLiveAttachments);
+        if (problem) {
+          toast.error(problem.title, { description: problem.description });
+          sendInFlightRef.current = false;
+          setIsSending(false);
+          return;
+        }
+        try {
+          await launchChatWorkflow({
+            workspaceId: paneWorkspaceId,
+            threadId,
+            goal: workflowCommand.goal,
+            context: attachmentBlock,
+            provider,
+            model,
+            anchorEventId: latestTranscriptEventId(useAgentChatStore.getState().threads[threadId]?.messages ?? []),
+          });
+          setInputDraft(threadId, "");
+          for (const attachment of liveAttachments) {
+            useAgentChatStore.getState().removeStagedAttachment(threadId, attachment.id);
+          }
+        } catch (error) {
+          toast.failure("Couldn't start the workflow", error);
+        } finally {
+          sendInFlightRef.current = false;
+          setIsSending(false);
+        }
+        return;
+      }
       // Images travel as native multimodal content blocks at the SDK
       // layer, NOT inside the text body. They were staged to disk at
       // attach time (`agent_chat_stage_image`), so the turn carries only
@@ -1945,6 +2004,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     requestSendAnchor,
     clearSendAnchor,
     paneWorkspaceId,
+    model,
+    workflowsAvailable,
   ],
   );
 
@@ -4391,3 +4452,4 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 const EMPTY_MESSAGES = Object.freeze([]) as unknown as ChatViewItem[];
 const EMPTY_REQUESTS = Object.freeze([]) as unknown as PermissionRequestItem[];
 const EMPTY_ATTACHMENTS = Object.freeze([]) as unknown as Attachment[];
+const NO_CHAT_WORKFLOWS: ChatWorkflowLink[] = [];

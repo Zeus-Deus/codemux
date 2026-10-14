@@ -5,6 +5,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { DEFAULT_WORKFLOW_LIMITS, type WorkflowChangeEvent, type WorkflowRunSnapshot, type WorkflowTaskSnapshot } from "@/tauri/workflows";
 import { useWorkflowUIStore } from "@/stores/workflow-ui-store";
 import { useWorkflowInspectorStore } from "@/stores/workflow-inspector-store";
+import { useSettingsStore } from "@/stores/settings-store";
+import { useUIStore } from "@/stores/ui-store";
 
 const mocks = vi.hoisted(() => ({
   listen: vi.fn(),
@@ -55,7 +57,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   changeListener = undefined;
   mocks.listen.mockImplementation((_name: string, listener: typeof changeListener) => { changeListener = listener; return Promise.resolve(() => {}); });
-  useWorkflowUIStore.setState({ drafts: {}, selectedRuns: {} });
+  useWorkflowUIStore.setState({ drafts: {}, selectedRuns: {}, scriptEditor: {} });
+  useSettingsStore.setState({ settings: {} });
+  useUIStore.setState({ showSettings: false, settingsSection: null });
   useWorkflowInspectorStore.setState({ runs: {} });
   mocks.list.mockResolvedValue([]); mocks.get.mockResolvedValue(run()); mocks.scripts.mockResolvedValue([]);
   mocks.capabilities.mockResolvedValue(["claude", "codex"].map((provider) => ({ provider, live: true, read_only: true, write: true, reason: null })));
@@ -67,89 +71,61 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe("dynamic workflow panel", () => {
-  it("launches an executable mixed-provider script with auto concurrency and no write permission", async () => {
+  it("starts on an empty runs list that points to /workflow and Settings", async () => {
     mount();
-    openSection("workflow-script-settings");
-    openSection("workflow-limit-settings");
-    openSection("workflow-route-settings");
+    const empty = await screen.findByTestId("workflow-empty");
+    expect(empty).toHaveTextContent("No workflows yet");
+    expect(empty).toHaveTextContent("/workflow");
+    expect(screen.queryByTestId("workflow-script-editor")).not.toBeInTheDocument();
+    fireEvent.click(within(empty).getByRole("button", { name: /Workflow settings/ }));
+    expect(useUIStore.getState().showSettings).toBe(true);
+    expect(useUIStore.getState().settingsSection).toBe("workflows");
+  });
+
+  it("lists past runs and opens one in the inspector", async () => {
+    const snapshot = run();
+    mocks.list.mockResolvedValue([{ id: snapshot.id, status: "completed", revision: 4, created_at_ms: Date.now(), updated_at_ms: Date.now(), spec: { workspace_id: "fixture-workspace", title: "Fixture review", mode: "live" } }]);
+    mount();
+    fireEvent.click(await screen.findByTestId(`workflow-run-${snapshot.id}`));
+    await screen.findByTestId("workflow-run-inspector");
+    fireEvent.click(screen.getByTestId("workflow-back"));
+    await screen.findByTestId("workflow-runs");
+  });
+
+  it("launches a custom script with the providers, size and file access from Settings", async () => {
+    useSettingsStore.setState({ settings: { "workflows.size": "small", "workflows.file_changes": "allow", "workflows.token_budget": "9000" } });
+    mount();
+    fireEvent.click(await screen.findByTestId("workflow-custom-script"));
     expect(screen.getByLabelText("Workflow JavaScript")).toHaveValue(WORKFLOW_STARTER);
-    expect(screen.getByLabelText("Worker ceiling")).toHaveValue("0");
-    fireEvent.change(screen.getByLabelText("Codex model"), { target: { value: "custom-model" } });
-    fireEvent.click(screen.getByTestId("workflow-dry-run"));
+    await screen.findByText(/Runs on Claude \(default model\), Codex \(default model\)/);
+    expect(screen.getByTestId("workflow-script-routes")).toHaveTextContent("edits isolated for review · small (2 at once, 15 min)");
+    fireEvent.click(screen.getByTestId("workflow-live-run"));
     await waitFor(() => expect(mocks.launch).toHaveBeenCalledOnce());
-    expect(mocks.launch.mock.calls[0][0]).toMatchObject({ mode: "dry_run", allow_writes: false, limits: { concurrency: 0 }, routes: [{ provider: "claude" }, { provider: "codex", model: "custom-model" }], tasks: [] });
+    expect(mocks.launch.mock.calls[0][0]).toMatchObject({
+      mode: "live", allow_writes: true, tasks: [],
+      limits: { concurrency: 2, wall_time_ms: 15 * 60_000, token_budget: 9000 },
+      routes: [{ id: "claude", provider: "claude", model: null }, { id: "codex", provider: "codex", model: null }],
+    });
     expect(mocks.launch.mock.calls[0][1]).toBe(WORKFLOW_STARTER);
     await screen.findByTestId("workflow-run-inspector");
   });
 
-  it("exposes unsupported routes without enabling live execution", async () => {
-    mocks.capabilities.mockResolvedValue([{ provider: "claude", live: true, read_only: true, write: true, reason: null }, { provider: "codex", live: false, read_only: false, write: false, reason: "Adapter unavailable" }]);
+  it("explains when no provider can run live while still allowing a dry run", async () => {
+    mocks.capabilities.mockResolvedValue([{ provider: "claude", live: false, read_only: false, write: false, reason: "Adapter unavailable" }, { provider: "codex", live: false, read_only: false, write: false, reason: "Adapter unavailable" }]);
     mount();
-    await screen.findByText("Adapter unavailable");
+    fireEvent.click(await screen.findByTestId("workflow-custom-script"));
+    await screen.findByText(/No workflow provider is ready/);
     expect(screen.getByTestId("workflow-live-run")).toBeDisabled();
-    expect(screen.getByTestId("workflow-dry-run")).toBeEnabled();
-  });
-
-  it.each(["opencode", "review-route"])("requires a model on OpenCode route %s before live execution without restricting dry runs", async (routeId) => {
-    mocks.capabilities.mockResolvedValue([{ provider: "opencode", live: true, read_only: true, write: true, requires_model: true, effort_supported: true, reason: null }]);
-    useWorkflowUIStore.getState().setDraft("fixture-workspace", { title: "OpenCode review", goal: "Review the fixture", source: WORKFLOW_STARTER, allowWrites: false, limits: DEFAULT_WORKFLOW_LIMITS, routes: [{ id: routeId, provider: "opencode" }] });
-    mount();
-    await screen.findByText("OpenCode model required");
-    expect(screen.getByTestId("workflow-route-settings")).not.toHaveAttribute("open");
-    expect(screen.getByTestId("workflow-live-run")).toBeDisabled();
-    expect(screen.getByTestId("workflow-dry-run")).toBeEnabled();
-    fireEvent.click(screen.getByTestId("workflow-live-run"));
-    expect(mocks.launch).not.toHaveBeenCalled();
-    openSection("workflow-route-settings");
-    const model = screen.getByTestId(`workflow-model-${routeId}`);
-    expect(model).toHaveAttribute("placeholder", "provider/model");
-    expect(model).toHaveAccessibleDescription("Model required for live execution. Use provider/model.");
-    fireEvent.change(model, { target: { value: "   " } });
-    expect(screen.getByTestId("workflow-live-run")).toBeDisabled();
-    for (const value of ["model-only", "provider/", "bad provider/model", "provider/model name"]) {
-      fireEvent.change(model, { target: { value } });
-      expect(model).toHaveAttribute("aria-invalid", "true");
-      expect(screen.getByTestId("workflow-live-run")).toBeDisabled();
-    }
-    fireEvent.change(model, { target: { value: "  fixture-provider/fixture-model  " } });
-    expect(model).toHaveValue("  fixture-provider/fixture-model  ");
-    expect(model).not.toHaveAttribute("aria-invalid");
-    expect(screen.getByTestId("workflow-route-settings")).toHaveAttribute("open");
-    expect(screen.getByTestId("workflow-live-run")).toBeEnabled();
-    fireEvent.click(screen.getByTestId("workflow-live-run"));
+    fireEvent.click(screen.getByTestId("workflow-dry-run"));
     await waitFor(() => expect(mocks.launch).toHaveBeenCalledOnce());
-    expect(mocks.launch.mock.calls[0][0]).toMatchObject({ mode: "live", routes: [{ id: routeId, provider: "opencode", model: "fixture-provider/fixture-model" }] });
+    expect(mocks.launch.mock.calls[0][0]).toMatchObject({ mode: "dry_run", routes: [{ provider: "claude" }, { provider: "codex" }] });
   });
 
-  it("allows clearing a restored unsupported effort before starting a Cursor route", async () => {
-    mocks.capabilities.mockResolvedValue([{ provider: "cursor", live: true, read_only: true, write: true, requires_model: false, effort_supported: false, reason: null }]);
-    useWorkflowUIStore.getState().setDraft("fixture-workspace", { title: "Cursor review", goal: "Review the fixture", source: WORKFLOW_STARTER, allowWrites: false, limits: DEFAULT_WORKFLOW_LIMITS, routes: [{ id: "cursor", provider: "cursor", effort: "high" }] });
+  it("persists the edited script draft and saves it", async () => {
     mount();
-    await screen.findByText("Cursor uses its default effort. Leave effort empty.");
-    expect(screen.getByTestId("workflow-live-run")).toBeDisabled();
-    expect(screen.getByTestId("workflow-dry-run")).toBeEnabled();
-    openSection("workflow-route-settings");
-    const effort = screen.getByLabelText("Cursor effort");
-    expect(effort).toBeEnabled();
-    expect(effort).toHaveValue("high");
-    fireEvent.change(effort, { target: { value: "   " } });
-    expect(effort).toHaveValue("   ");
-    expect(screen.getByTestId("workflow-route-settings")).toHaveAttribute("open");
-    expect(screen.getByTestId("workflow-live-run")).toBeEnabled();
-    fireEvent.click(screen.getByTestId("workflow-live-run"));
-    await waitFor(() => expect(mocks.launch).toHaveBeenCalledOnce());
-    expect(mocks.launch.mock.calls[0][0]).toMatchObject({ mode: "live", routes: [{ provider: "cursor", effort: null }] });
-  });
-
-  it("adds a second model route and persists the editable script draft", async () => {
-    mount();
-    openSection("workflow-route-settings");
-    openSection("workflow-script-settings");
-    fireEvent.click(screen.getByTestId("workflow-add-route"));
-    fireEvent.change(screen.getByLabelText("Model for route-1"), { target: { value: "small-model" } });
+    fireEvent.click(await screen.findByTestId("workflow-custom-script"));
     fireEvent.change(screen.getByLabelText("Workflow JavaScript"), { target: { value: "return await agent(goal);" } });
-    expect(useWorkflowUIStore.getState().drafts["fixture-workspace"].routes).toHaveLength(3);
-    expect(useWorkflowUIStore.getState().drafts["fixture-workspace"].routes[2].model).toBe("small-model");
+    expect(useWorkflowUIStore.getState().drafts["fixture-workspace"].source).toBe("return await agent(goal);");
     fireEvent.click(screen.getByTestId("workflow-save-script"));
     await waitFor(() => expect(mocks.save).toHaveBeenCalledWith("fixture-workspace", "Workspace review", "return await agent(goal);"));
   });
@@ -213,7 +189,6 @@ describe("dynamic workflow panel", () => {
     useWorkflowUIStore.getState().selectRun("fixture-workspace", selected.id);
     mount();
     await screen.findByTestId("workflow-run-inspector");
-    await screen.findByRole("option", { name: "Other review · Running" });
     await waitFor(() => expect(changeListener).toBeDefined());
     // Wait for the initial terminal selection's history invalidation to settle.
     await waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(2));
@@ -223,10 +198,9 @@ describe("dynamic workflow panel", () => {
     act(() => {
       for (let count = 0; count < 10; count++) changeListener!({ payload: { run_id: null, revision: count % 2 ? other.revision + 1 : null } });
     });
-    await screen.findByRole("option", { name: "Other review · Completed" });
-    expect(mocks.list).toHaveBeenCalledTimes(historyRequests + 1);
+    await waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(historyRequests + 1));
     expect(mocks.get).toHaveBeenCalledTimes(snapshotRequests + 1);
-    expect(screen.getByTestId("workflow-run-picker")).toHaveValue(selected.id);
+    expect(useWorkflowUIStore.getState().selectedRuns["fixture-workspace"]).toBe(selected.id);
     expect(screen.getByTestId("workflow-run-status")).toHaveAttribute("data-status", "completed");
   });
 
@@ -289,15 +263,6 @@ describe("dynamic workflow panel", () => {
     expect(screen.queryByTestId("workflow-apply-artifact")).not.toBeInTheDocument();
     expect(mocks.retry).not.toHaveBeenCalled();
     expect(mocks.integrate).not.toHaveBeenCalled();
-  });
-
-  it("keeps advanced setup and completed evidence folded until requested", async () => {
-    mount();
-    expect(screen.getByTestId("workflow-script-settings")).not.toHaveAttribute("open");
-    expect(screen.getByTestId("workflow-limit-settings")).not.toHaveAttribute("open");
-    expect(screen.getByTestId("workflow-route-settings")).not.toHaveAttribute("open");
-    expect(screen.getByLabelText("Workflow goal")).toBeVisible();
-    expect(screen.getByTestId("workflow-dry-run")).toBeVisible();
   });
 
   it("puts actionable tasks before ongoing work and keeps settled history collapsed", async () => {
@@ -487,12 +452,13 @@ describe("dynamic workflow panel", () => {
     expect(screen.getByTestId("workflow-more-in-flight")).toBeInTheDocument();
   });
 
-  it("clears a failed launch when starting a new setup without changing run selection", async () => {
+  it("clears a failed launch when returning to all runs", async () => {
     mocks.launch.mockRejectedValue(new Error("Old launch failure"));
     mount();
+    fireEvent.click(await screen.findByTestId("workflow-custom-script"));
     fireEvent.click(screen.getByTestId("workflow-dry-run"));
     await screen.findByText("Old launch failure");
-    fireEvent.click(screen.getByTestId("workflow-new"));
+    fireEvent.click(screen.getByTestId("workflow-back"));
     await waitFor(() => expect(screen.queryByText("Old launch failure")).not.toBeInTheDocument());
   });
 

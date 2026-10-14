@@ -13,9 +13,10 @@ use codemux_lib::{
     workflows::{
         artifacts::ArtifactStore,
         executor::{LiveWorkflowDriver, ProviderLookup},
+        scripts::{WorkflowScriptRuntime, SCRIPT_API_VERSION},
         tools::graph_tools,
-        AttemptStatus, RouteSpec, RunMode, RunSpec, RunStatus, TaskAccess, TaskSpec, TaskStatus,
-        WorkflowLimits, WorkflowService,
+        AttemptStatus, RouteSpec, RunMode, RunSpec, RunStatus, ScriptSpec, ScriptStatus, TaskAccess,
+        TaskSpec, TaskStatus, WorkflowLimits, WorkflowService,
     },
 };
 use futures_util::StreamExt;
@@ -579,4 +580,152 @@ async fn workflow_live_native_coordination() {
         final_run.usage.cost_usd.unwrap_or(0.0) < 2.0,
         "observed charge exceeded authorization"
     );
+}
+
+const CHAT_WORKFLOW_SCRIPT: &str =
+    include_str!("../../src/lib/workflows/chat-workflow.script.js");
+
+/// Paid end-to-end check of `/workflow`: the app's planner program on the
+/// production script engine, scheduler, live driver and Claude adapter. A
+/// planner splits a tiny review goal, at most two workers run it, and a report
+/// agent writes the result. Four native sessions at most, each capped by
+/// `BoundedClaude`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Paid native canary: requires explicit user authorization and CODEMUX_PAID_CANARY=yes"]
+async fn workflow_live_chat_planner() {
+    assert_eq!(
+        std::env::var("CODEMUX_PAID_CANARY").as_deref(),
+        Ok("yes"),
+        "paid canary not authorized"
+    );
+    let sidecar = PathBuf::from(
+        std::env::var("CODEMUX_CANARY_SIDECAR").expect("explicit built sidecar path"),
+    );
+    let cli =
+        PathBuf::from(std::env::var("CODEMUX_CANARY_CLAUDE").expect("explicit installed CLI path"));
+    let model = std::env::var("CODEMUX_CANARY_MODEL").unwrap_or_else(|_| "claude-haiku-5-5".into());
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("auth.py"),
+        "SESSIONS = {}\n\ndef login(user, token):\n    SESSIONS[token] = user\n    return token\n\ndef logout(token):\n    # Bug: the session is never removed.\n    return True\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.join("README.md"), "# Auth fixture\nNo tests exist yet.\n").unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&workspace)
+        .status()
+        .unwrap()
+        .success());
+    let baseline = std::fs::read(workspace.join("auth.py")).unwrap();
+    let service = WorkflowService::open(directory.path().join("run.sqlite"), 2).unwrap();
+    let provider = Arc::new(BoundedClaude {
+        inner: ClaudeAgentProvider::new(ClaudeProviderConfig {
+            sidecar_binary: Some(sidecar),
+            claude_binary: Some(cli),
+            event_channel_capacity: 4096,
+            mcp_registry: None,
+        })
+        .await
+        .unwrap(),
+        starts: AtomicUsize::new(0),
+        native_starts: AtomicUsize::new(0),
+        metadata_only: false,
+        trace: Arc::new(Mutex::new(Vec::new())),
+    });
+    let lookup: ProviderLookup = Arc::new({
+        let provider = provider.clone();
+        move |kind| {
+            let provider = provider.clone();
+            Box::pin(async move {
+                (kind == ProviderKind::Claude).then(|| provider as Arc<dyn AgentProvider>)
+            })
+        }
+    });
+    let artifacts = Arc::new(ArtifactStore::new(directory.path().join("artifacts")));
+    let driver = Arc::new(LiveWorkflowDriver::new(
+        Arc::new({
+            let workspace = workspace.clone();
+            move |_| Ok(workspace.clone())
+        }),
+        lookup,
+        Arc::new(graph_tools),
+        artifacts.clone(),
+    ));
+    let routes = vec![
+        RouteSpec { id: "claude-main".into(), provider: "claude".into(), model: Some(model.clone()), effort: None },
+        RouteSpec { id: "claude-light".into(), provider: "claude".into(), model: Some(model.clone()), effort: None },
+    ];
+    let (run, _) = service
+        .create_paused(
+            RunSpec {
+                workspace_id: "isolated-chat-canary".into(),
+                title: "Review auth.py".into(),
+                goal: "Review auth.py for security bugs and missing tests. Keep it brief.".into(),
+                mode: RunMode::Live,
+                allow_writes: false,
+                routes,
+                limits: WorkflowLimits { concurrency: 2, max_tasks: 8, max_attempts: 8, max_depth: 2, token_budget: Some(400_000), max_output_bytes: 256 * 1024, wall_time_ms: 240_000 },
+                tasks: vec![],
+                script: Some(ScriptSpec {
+                    source: CHAT_WORKFLOW_SCRIPT.into(),
+                    args: json!({"max_workers": 2, "route_labels": {"claude-main": "Claude (chat model)", "claude-light": "Claude (light)"}}),
+                    api_version: SCRIPT_API_VERSION,
+                }),
+            },
+            "chat-canary",
+        )
+        .unwrap();
+    artifacts.pin_run(&run.id, &workspace).unwrap();
+    service.resume(&run.id).unwrap();
+    let runtime = tokio::spawn({
+        let service = service.clone();
+        async move { service.run_driver(driver).await }
+    });
+    let scripts = WorkflowScriptRuntime::default();
+    scripts.start(service.clone(), &run.id).unwrap();
+    let terminal = tokio::time::timeout(Duration::from_secs(280), async {
+        loop {
+            let run = service.snapshot(&run.id).unwrap();
+            let script_done = run.script.as_ref().is_some_and(|script| matches!(script.status, ScriptStatus::Completed | ScriptStatus::Failed));
+            if script_done && matches!(run.status, RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Unknown) {
+                break run;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if terminal.is_err() {
+        service.cancel(&run.id).unwrap();
+    }
+    service.shutdown_signal().unwrap();
+    let runtime_stopped = matches!(tokio::time::timeout(Duration::from_secs(30), runtime).await, Ok(Ok(Ok(()))));
+    let _ = tokio::time::timeout(Duration::from_secs(10), scripts.drain_active()).await;
+    let final_run = service.snapshot(&run.id).unwrap();
+    for session in provider.list_sessions().await.unwrap() {
+        let _ = tokio::time::timeout(Duration::from_secs(15), provider.stop_managed_session(session.thread_id.clone())).await;
+    }
+    let sessions = provider.list_sessions().await.unwrap();
+    let summary = json!({
+        "status": final_run.status,
+        "error": final_run.error,
+        "script": final_run.script,
+        "tasks": final_run.tasks.iter().map(|task| json!({"id": task.spec.id, "title": task.spec.title, "route": task.spec.route_id, "status": task.status, "error": task.error})).collect::<Vec<_>>(),
+        "native_starts": provider.native_starts.load(Ordering::SeqCst),
+        "usage": final_run.usage,
+    });
+    eprintln!("{}", serde_json::to_string_pretty(&summary).unwrap());
+    assert!(runtime_stopped, "native runtime failed to stop");
+    assert!(sessions.is_empty(), "native session still registered");
+    assert_eq!(std::fs::read(workspace.join("auth.py")).unwrap(), baseline, "read-only run changed the source");
+    assert_eq!(final_run.status, RunStatus::Completed, "chat workflow failed; see summary above");
+    let ids: Vec<&str> = final_run.tasks.iter().map(|task| task.spec.id.as_str()).collect();
+    assert_eq!(ids.first(), Some(&"plan"));
+    assert_eq!(ids.last(), Some(&"report"));
+    assert!(ids.iter().any(|id| id.starts_with("work-")), "planner produced no subtasks");
+    let report = final_run.script.as_ref().and_then(|script| script.result.as_ref()).and_then(|result| result.get("summary")).and_then(Value::as_str).unwrap_or_default();
+    assert!(!report.trim().is_empty(), "report missing");
+    assert!(final_run.usage.cost_usd.unwrap_or(0.0) < 2.0, "observed charge exceeded authorization");
 }

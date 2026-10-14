@@ -13,6 +13,11 @@ import { useState, type ComponentProps } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { FolderMatch, FileMatch } from "@/tauri/types";
 
+const workflowAvailability = vi.hoisted(() => ({ available: true }));
+vi.mock("@/components/workflows/use-workflows-available", () => ({
+  useWorkflowsAvailable: () => workflowAvailability.available,
+}));
+
 vi.mock("@/tauri/commands", async (importActual) => {
   const actual = (await importActual()) as Record<string, unknown>;
   return {
@@ -268,21 +273,23 @@ describe("Composer + button + attach popup (Step 8 Stage 3)", () => {
     expect(getByText("File…")).toBeInTheDocument();
   });
 
-  it("shows /workflow enabled for the Claude provider in the + popup", () => {
-    const { getByTestId, getByText } = renderControlled({ provider: "claude" });
+  it.each(["claude", "codex"] as const)("shows /workflow enabled for the %s provider in the + popup", (provider) => {
+    workflowAvailability.available = true;
+    const { getByTestId, getByText } = renderControlled({ provider });
     fireEvent.click(getByTestId("composer-attach-button"));
     const row = getByTestId("slash-item-workflow");
     // cmdk emits `data-disabled="false"` for enabled items; either a
     // missing attribute or "false" both mean "enabled".
     const attr = row.getAttribute("data-disabled");
     expect(attr === null || attr === "false").toBe(true);
-    expect(getByText("Orchestrate this task with many subagents")).toBeInTheDocument();
+    expect(getByText("Split a task across agents working in parallel")).toBeInTheDocument();
   });
 
   it("picking /workflow from the + popup inserts the literal /workflow token", () => {
+    workflowAvailability.available = true;
     const onDraftChange = vi.fn();
     const { getByTestId } = renderControlled({
-      provider: "claude",
+      provider: "codex",
       onDraftChange,
     });
     fireEvent.click(getByTestId("composer-attach-button"));
@@ -292,22 +299,21 @@ describe("Composer + button + attach popup (Step 8 Stage 3)", () => {
     expect(finalText).toBe("/workflow ");
   });
 
-  it.each(["codex", "opencode"] as const)(
-    "shows /workflow disabled with a reason for the %s provider, and picking it is a no-op",
-    (provider) => {
-      const onDraftChange = vi.fn();
-      const { getByTestId, getByText } = renderControlled({
-        provider,
-        onDraftChange,
-      });
-      fireEvent.click(getByTestId("composer-attach-button"));
-      const row = getByTestId("slash-item-workflow");
-      expect(row.getAttribute("data-disabled")).toBe("true");
-      expect(getByText("Only available with Claude models")).toBeInTheDocument();
-      fireEvent.click(row);
-      expect(onDraftChange).not.toHaveBeenCalled();
-    },
-  );
+  it("shows /workflow disabled with a reason outside a local workspace, and picking it is a no-op", () => {
+    workflowAvailability.available = false;
+    const onDraftChange = vi.fn();
+    const { getByTestId, getByText } = renderControlled({
+      provider: "claude",
+      onDraftChange,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    const row = getByTestId("slash-item-workflow");
+    expect(row.getAttribute("data-disabled")).toBe("true");
+    expect(getByText("Needs a local workspace on this device")).toBeInTheDocument();
+    fireEvent.click(row);
+    expect(onDraftChange).not.toHaveBeenCalled();
+    workflowAvailability.available = true;
+  });
 
   it("picking File… pivots to the file submode and fetches files", async () => {
     listProjectFilesMock.mockResolvedValue([makeFile()]);

@@ -13,6 +13,11 @@ import type { ComponentProps } from "react";
 import type { Skill } from "@/tauri/commands";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
+const workflowAvailability = vi.hoisted(() => ({ available: true }));
+vi.mock("@/components/workflows/use-workflows-available", () => ({
+  useWorkflowsAvailable: () => workflowAvailability.available,
+}));
+
 vi.mock("@/tauri/commands", async (importActual) => {
   const actual = (await importActual()) as Record<string, unknown>;
   return {
@@ -500,19 +505,18 @@ describe("Composer · skills slash integration (Step 7 Stage 2)", () => {
   });
 });
 
-describe("Composer · /workflow slash entry (Claude-gated)", () => {
+describe("Composer · /workflow slash entry", () => {
   beforeEach(() => {
     resetSkillsStore();
     listSkillsMock.mockReset();
     listSkillsMock.mockResolvedValue([]);
+    workflowAvailability.available = true;
   });
 
   afterEach(() => cleanup());
 
-  it("shows /workflow enabled with the orchestration hint when the Claude provider is active", async () => {
-    const { container, queryByTestId, getByText } = renderComposer({
-      provider: "claude",
-    });
+  it.each(["claude", "codex", "opencode"] as const)("shows /workflow enabled for the %s provider in a local workspace", async (provider) => {
+    const { container, queryByTestId, getByText } = renderComposer({ provider });
     type(getTextarea(container), "/");
 
     await waitFor(() => {
@@ -524,13 +528,13 @@ describe("Composer · /workflow slash entry (Claude-gated)", () => {
     // precedent in Composer.attach.test.tsx).
     const attr = row.getAttribute("data-disabled");
     expect(attr === null || attr === "false").toBe(true);
-    expect(getByText("Orchestrate this task with many subagents")).toBeInTheDocument();
+    expect(getByText("Split a task across agents working in parallel")).toBeInTheDocument();
   });
 
-  it("clicking /workflow (Claude) expands the typed query into a literal /workflow token", async () => {
+  it("clicking /workflow expands the typed query into a literal /workflow token", async () => {
     const onDraftChange = vi.fn();
     const { container, queryByTestId, getByTestId } = renderComposer({
-      provider: "claude",
+      provider: "codex",
       onDraftChange,
     });
     type(getTextarea(container), "/");
@@ -550,30 +554,28 @@ describe("Composer · /workflow slash entry (Claude-gated)", () => {
     expect(queryByTestId("slash-command-popup")).toBeNull();
   });
 
-  it.each(["codex", "opencode"] as const)(
-    "shows /workflow disabled with a reason for the %s provider, and clicking is a no-op",
-    async (provider) => {
-      const onDraftChange = vi.fn();
-      const { container, queryByTestId, getByTestId, getByText } = renderComposer({
-        provider,
-        onDraftChange,
-      });
-      type(getTextarea(container), "/");
+  it("shows /workflow disabled with a reason outside a local workspace, and clicking is a no-op", async () => {
+    workflowAvailability.available = false;
+    const onDraftChange = vi.fn();
+    const { container, queryByTestId, getByTestId, getByText } = renderComposer({
+      provider: "claude",
+      onDraftChange,
+    });
+    type(getTextarea(container), "/");
 
-      await waitFor(() => {
-        expect(queryByTestId("slash-item-workflow")).not.toBeNull();
-      });
-      const row = getByTestId("slash-item-workflow");
-      expect(row.getAttribute("data-disabled")).toBe("true");
-      expect(getByText("Only available with Claude models")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(queryByTestId("slash-item-workflow")).not.toBeNull();
+    });
+    const row = getByTestId("slash-item-workflow");
+    expect(row.getAttribute("data-disabled")).toBe("true");
+    expect(getByText("Needs a local workspace on this device")).toBeInTheDocument();
 
-      // Typing "/" itself already reports the draft once; only assert
-      // no *additional* calls come from clicking the disabled row.
-      const callsBeforeClick = onDraftChange.mock.calls.length;
-      fireEvent.click(row);
-      expect(onDraftChange.mock.calls.length).toBe(callsBeforeClick);
-      // Popup stays open — a disabled row click is a no-op, not a select.
-      expect(queryByTestId("slash-command-popup")).not.toBeNull();
-    },
-  );
+    // Typing "/" itself already reports the draft once; only assert
+    // no *additional* calls come from clicking the disabled row.
+    const callsBeforeClick = onDraftChange.mock.calls.length;
+    fireEvent.click(row);
+    expect(onDraftChange.mock.calls.length).toBe(callsBeforeClick);
+    // Popup stays open — a disabled row click is a no-op, not a select.
+    expect(queryByTestId("slash-command-popup")).not.toBeNull();
+  });
 });

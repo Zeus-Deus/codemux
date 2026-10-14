@@ -445,8 +445,26 @@ export interface RemoteTaskItem {
   task: LocalTask;
 }
 
+/** View projection of a `/workflow` run started from this chat. The run
+ *  lives in the CodeMux workflow engine, never in the provider transcript. */
+export interface ChatWorkflowItem {
+  kind: "chat_workflow";
+  id: ChatItemId;
+  seq: number;
+  runId: string;
+  workspaceId: string;
+  threadId: string;
+}
+
+/** App-owned rows projected into the transcript. They run on their own clock,
+ *  so they neither start nor end a provider turn's live indicators. */
+export function isAppReceipt(item: ChatViewItem): item is RemoteTaskItem | ChatWorkflowItem {
+  return item.kind === "remote_task" || item.kind === "chat_workflow";
+}
+
 export type ChatViewItem =
   | RemoteTaskItem
+  | ChatWorkflowItem
   | AsyncQuestionItem
   | UserMessageItem
   | AssistantMessageItem
