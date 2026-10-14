@@ -121,11 +121,12 @@ const CATEGORIES: Category[] = [
   {
     label: "arbitrary pixel radii (use the sm/md/lg ladder)",
     pattern: /rounded(?:-[tblrse]{1,2})?-\[[0-9]/g,
-    budget: 6,
+    budget: 7,
     why:
-      "the five sanctioned carve-outs: the two asymmetric chat-bubble tail " +
+      "the sanctioned carve-outs: the two asymmetric chat-bubble tail " +
       "radii (3 sites) and the composer strip/pill seam (the 22px pill plus " +
-      "the two 14px seam halves above and below it)",
+      "the two 14px seam halves above and below it, and the new-chat Full " +
+      "access notice tucked under its top edge)",
   },
   {
     label: "improvised surface alphas (use bg-surface-1/2/3)",
@@ -202,11 +203,12 @@ const CATEGORIES: Category[] = [
     label: "per-icon strokeWidth (one base-layer rule owns icon weight)",
     pattern: /strokeWidth/g,
     scan: (contents) => [contents],
-    budget: 13,
+    budget: 14,
     why:
       "hand-written <svg> glyphs and chart geometry, which are not lucide " +
       "icons: two device glyphs, two goal glyphs, the context meter's two " +
-      "arcs and the usage chart's five strokes",
+      "arcs, the usage chart's five strokes and the project-picker hint's " +
+      "dotted arrow",
   },
   {
     label: "raw errors as toast titles (use toast.failure(title, err))",
