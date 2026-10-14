@@ -169,7 +169,11 @@ export function traceStepTitle(step: ActivityStep): TraceStepTitle {
   const status = stepStatus(step);
   const verbs = TRACE_VERBS[step.tool_name];
   let verb: string;
-  if (verbs) {
+  if (status === "unconfirmed") {
+    // The call started but never reported back, so the title must not claim
+    // it finished ("Wrote") or failed.
+    verb = `Started ${verbs ? verbs.running.toLowerCase() : `calling ${step.tool_name}`}`;
+  } else if (verbs) {
     verb = status === "running" ? verbs.running : status === "error" ? verbs.error : verbs.done;
   } else if (!described.verb.startsWith("Called ")) {
     // A provider-specific label (Hermes learning steps) already reads as a

@@ -286,6 +286,9 @@ function CollapsedLine({
     <TraceLine status={traceStatus(stepStatus(entry))}>
       <StepIcon step={entry} live={live} orbActivity={orbActivity} />
       <StepTitle step={entry} />
+      {stepStatus(entry) === "unconfirmed" ? (
+        <TraceDescription className={META_CLASS}>outcome unconfirmed</TraceDescription>
+      ) : null}
       {live ? (
         <StepElapsed step={entry} className={cn(META_CLASS, "text-muted-foreground/60")} separated />
       ) : null}

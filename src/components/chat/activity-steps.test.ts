@@ -159,6 +159,11 @@ describe("traceStepTitle / traceStepDescription", () => {
     expect(traceStepTitle(tool("Bash", { ...cmd, status: "error" })).verb).toBe("Failed to run");
     expect(traceStepTitle(tool("Bash", cmd)).target).toBe("cargo test");
   });
+  it("never claims an unconfirmed call finished or failed", () => {
+    const write = tool("Write", { status: "unconfirmed", input: { file_path: "/a" } });
+    expect(traceStepTitle(write).verb).toBe("Started writing");
+    expect(traceStepTitle(tool("memory", { status: "unconfirmed" })).verb).toBe("Started calling memory");
+  });
   it("names unknown tools and keeps a thought's first line as its title", () => {
     expect(traceStepTitle(tool("mcp__linear__get_issue")).verb).toBe("Called mcp__linear__get_issue");
     expect(traceStepTitle(tool("mcp__x", { status: "running" })).verb).toBe("Calling mcp__x");
@@ -176,6 +181,7 @@ describe("traceStepTitle / traceStepDescription", () => {
       input: { file_path: "/a", old_string: "one", new_string: "one\ntwo" },
     });
     expect(traceStepDescription(edit)).toBe("+1 −0");
+    expect(traceStepDescription(tool("memory", { status: "unconfirmed" }))).toBe("outcome unconfirmed");
     // A call left hanging in a settled transcript still says so.
     expect(traceStepDescription(tool("Bash", { status: "running" }))).toBe("running");
   });

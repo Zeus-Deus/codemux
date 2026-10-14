@@ -135,6 +135,18 @@ describe("ActivityBlock — one-line work log", () => {
     expect(screen.getByText("/f0")).toBeInTheDocument();
   });
 
+  it("keeps an unconfirmed outcome visible collapsed and opened", () => {
+    const unconfirmed = read(1, "/maybe", { tool_name: "Write", status: "unconfirmed" });
+    const { container } = renderBlock([read(0, "/a"), unconfirmed], false);
+    const line = screen.getByRole("button", { name: /Started writing \/maybe/ });
+    expect(line).toHaveTextContent("outcome unconfirmed");
+    expect(screen.queryByText(/Wrote/)).toBeNull();
+    openLog(container);
+    expect(
+      screen.getByRole("button", { name: /^Started writing \/maybe/ }),
+    ).toHaveTextContent("outcome unconfirmed");
+  });
+
   it("flags failures in the totals while the line shows a later success", () => {
     renderBlock([bash(0, "cargo test", { status: "error" }), read(1, "/fixed")], false);
     expect(screen.getByText("/fixed")).toBeInTheDocument();
