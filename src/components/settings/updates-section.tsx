@@ -125,7 +125,7 @@ export function UpdatesSection() {
               onClick={() => void refreshAll(hostIds, true)}
               aria-label="Check for updates"
             >
-              <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
+              {loading ? <Spinner className="size-3.5" aria-hidden /> : <RefreshCw className="size-3.5" />}
               Check
             </Button>
             <Button

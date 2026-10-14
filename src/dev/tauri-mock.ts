@@ -5263,11 +5263,6 @@ const handlers: Record<string, Handler> = {
   }),
   agent_chat_provider_update: async (a) => {
     await new Promise(resolve => setTimeout(resolve, 1800));
-    const local = mockLocalProviders.find((p) => p.provider === a.provider);
-    if (local && !new URLSearchParams(location.search).get("providerUpdate")) {
-      Object.assign(local, { installed_version: local.latest_version, available: false });
-      return { ...local };
-    }
     if (new URLSearchParams(location.search).get("providerUpdate") === "error") throw new Error("Update failed: the package registry could not be reached. Check your connection and try again.");
     return { provider: a.provider, installed_version: "0.158.0", latest_version: "0.158.0", available: false, manager: "Omarchy · mise", can_update: true, message: null };
   },
@@ -5282,6 +5277,12 @@ const handlers: Record<string, Handler> = {
     }
     const device = mockDeviceProviders.get(hostId)!;
     return { host_id: hostId, helper_version: device.helper, app_version: "0.24.0", providers: device.providers.map((p) => ({ ...p })), error: null };
+  },
+  provider_update_local: async (a) => {
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    const local = mockLocalProviders.find((p) => p.provider === a.provider)!;
+    Object.assign(local, { installed_version: local.latest_version, available: false });
+    return { ...local };
   },
   provider_update_device: async (a) => {
     await new Promise((resolve) => setTimeout(resolve, 1600));

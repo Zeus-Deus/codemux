@@ -2839,6 +2839,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::provider_updates::agent_chat_provider_update_check,
             commands::provider_updates::agent_chat_provider_update,
             commands::provider_updates::provider_updates_local,
+            commands::provider_updates::provider_update_local,
             commands::provider_updates::provider_updates_device,
             commands::provider_updates::provider_update_device,
             commands::provider_updates::device_helper_update,

@@ -226,7 +226,7 @@ export const useUpdateAll = create<Store>((set, get) => {
           patchItem(key, { phase: "updated", message: result.message ?? undefined });
           patchMachine(machine, { helperVersion: result.to ?? get().machines[machine]?.appVersion });
         } else if (machine === LOCAL) {
-          replaceReport(machine, await invoke<ProviderUpdateReport>("agent_chat_provider_update", { provider: item }));
+          replaceReport(machine, await invoke<ProviderUpdateReport>("provider_update_local", { provider: item }));
           patchItem(key, { phase: "updated" });
         } else {
           const hostId = Number(machine.slice(5));

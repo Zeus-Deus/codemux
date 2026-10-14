@@ -249,10 +249,12 @@ async fn detect(
         if let Some(tool) = &wrapper {
             // Omarchy writes a wrapper for every tool it offers; mise installs
             // the tool on first run. Until then there is nothing to update.
-            let installed = run(&mise, &args(&["ls", "--installed", "--json", tool]), 15, true)
+            // Only a successful answer with nothing installed means "not
+            // installed"; a failed query must still show the agent's row.
+            let raw = run(&mise, &args(&["ls", "--installed", "--json", tool]), 15, true)
                 .await
-                .is_ok_and(|raw| raw.contains("install_path"));
-            if !installed {
+                .map_err(|e| format!("Could not ask mise about this installation: {e}"))?;
+            if !raw.contains("install_path") {
                 return Err(NOT_INSTALLED.into());
             }
             // mise answers through its `installs/<tool>/latest` alias; the
@@ -637,6 +639,17 @@ pub async fn agent_chat_provider_update(
 #[tauri::command]
 pub async fn provider_updates_local(force: Option<bool>) -> Vec<ProviderUpdate> {
     check_installed(force.unwrap_or(false)).await
+}
+
+/// Settings → Updates: update one provider on this computer. Unlike the
+/// chat notice's command it takes no executable path, so a paired browser
+/// can only name a provider; the CLI is the one this machine resolves.
+#[tauri::command]
+pub async fn provider_update_local(provider: ProviderKind) -> Result<ProviderUpdate, String> {
+    if !MAINTAINED.contains(&provider) {
+        return Err("Codemux does not update this provider".into());
+    }
+    update_provider(provider, None).await
 }
 
 // ── Devices ─────────────────────────────────────────────────────────
