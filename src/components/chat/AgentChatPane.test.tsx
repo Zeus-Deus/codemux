@@ -45,6 +45,7 @@ type SliceOverrides = {
   lastPersistedEventId?: number | null;
   interrupted?: boolean;
   usageLimit?: import("@/lib/agent-chat/types").UsageLimitState | null;
+  stagedAttachments?: unknown[];
 };
 let currentSliceOverrides: Record<string, SliceOverrides> = {};
 let currentDraftsById: Record<
@@ -689,6 +690,7 @@ vi.mock("@/stores/agent-chat-store", () => {
       lastPersistedEventId: overrides.lastPersistedEventId ?? null,
       interrupted: overrides.interrupted ?? false,
       usageLimit: overrides.usageLimit ?? null,
+      stagedAttachments: overrides.stagedAttachments ?? [],
     };
   }
   function buildThreads() {
@@ -4682,6 +4684,36 @@ describe("AgentChatPane /workflow", () => {
     workflowMocks.available = false;
     cleanup();
     await submit("/workflow review auth");
+    expect(workflowMocks.launch).not.toHaveBeenCalled();
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    expect(setInputDraftMock).not.toHaveBeenCalledWith("thread-x", "");
+  });
+
+  it("passes resolved attachments to the workflow as context", async () => {
+    currentMessages = [];
+    currentSliceOverrides = { "thread-x": {
+      inputDraft: "/workflow review @auth.ts",
+      stagedAttachments: [{ id: "a1", kind: "file", ref: "/repo/auth.ts", metadata: { label: "auth.ts" }, resolvedContent: "export const auth = 1;" }],
+    } };
+    const view = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+    fireEvent.click(view.container.querySelector('[data-testid="composer-submit"]')!);
+    await waitFor(() => expect(workflowMocks.launch).toHaveBeenCalledOnce());
+    const input = workflowMocks.launch.mock.calls[0][0];
+    expect(input.goal).toBe("review @auth.ts");
+    expect(input.context).toContain("export const auth = 1;");
+  });
+
+  it("refuses image attachments and keeps the draft", async () => {
+    currentMessages = [];
+    currentSliceOverrides = { "thread-x": {
+      inputDraft: "/workflow review this screenshot",
+      stagedAttachments: [{ id: "img", kind: "image", ref: "shot.png", metadata: { label: "shot.png" } }],
+    } };
+    const view = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+    fireEvent.click(view.container.querySelector('[data-testid="composer-submit"]')!);
+    await act(async () => {});
     expect(workflowMocks.launch).not.toHaveBeenCalled();
     expect(agentChatSendTurn).not.toHaveBeenCalled();
     expect(setInputDraftMock).not.toHaveBeenCalledWith("thread-x", "");

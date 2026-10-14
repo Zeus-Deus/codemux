@@ -23,11 +23,14 @@ export interface ChatWorkflowLaunch {
 export function buildChatWorkflowLaunch({
   workspaceId,
   goal,
+  title,
   settings,
   plan,
 }: {
   workspaceId: string;
   goal: string;
+  /** Text to name the run from; defaults to the goal. */
+  title?: string;
   settings: WorkflowSettings;
   plan: WorkflowRoutePlan;
 }): ChatWorkflowLaunch {
@@ -36,7 +39,7 @@ export function buildChatWorkflowLaunch({
     args: { max_workers: WORKFLOW_SIZES[settings.size].workers, route_labels: plan.labels },
     spec: {
       workspace_id: workspaceId,
-      title: workflowTitleFromGoal(goal),
+      title: workflowTitleFromGoal(title ?? goal),
       goal,
       mode: "live",
       allow_writes: settings.allowWrites,

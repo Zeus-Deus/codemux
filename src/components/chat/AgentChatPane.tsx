@@ -1635,7 +1635,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const rawText = delivery.text;
       if (!rawText) return;
       // `/workflow <goal>` starts a CodeMux workflow beside the chat instead
-      // of a provider turn. Its card joins the transcript once it launches.
+      // of a provider turn; it launches below, once attachments resolve.
       const workflowCommand = isContinue ? null : parseWorkflowCommand(rawText);
       if (workflowCommand) {
         if (!workflowCommand.goal) {
@@ -1646,26 +1646,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           toast.error("Workflows need a local workspace", { description: "Open this chat in a project on this machine to run a workflow." });
           return;
         }
-        sendInFlightRef.current = true;
-        setIsSending(true);
-        const launchThreadId = threadId;
-        void launchChatWorkflow({
-          workspaceId: paneWorkspaceId,
-          threadId: launchThreadId,
-          goal: workflowCommand.goal,
-          provider,
-          model,
-          anchorEventId: latestTranscriptEventId(useAgentChatStore.getState().threads[launchThreadId]?.messages ?? []),
-        })
-          .then(() => {
-            if (typeof textOverride !== "string") setInputDraft(launchThreadId, "");
-          })
-          .catch((error: unknown) => toast.failure("Couldn't start the workflow", error))
-          .finally(() => {
-            sendInFlightRef.current = false;
-            setIsSending(false);
-          });
-        return;
+        const staged = useAgentChatStore.getState().threads[threadId]?.stagedAttachments ?? [];
+        if (staged.some((attachment) => attachment.kind === "image")) {
+          toast.error("Workflows can't use images yet", { description: "Remove the image, or send it as a normal message." });
+          return;
+        }
       }
       if (delivery.delivery === "steer" && useAgentChatStore.getState().threads[threadId]?.streaming && !capabilities?.supports_steering) {
         toast.error(STEERING_UNAVAILABLE);
@@ -1835,6 +1820,29 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         return;
       }
       const attachmentBlock = buildAttachmentBlock(activeLiveAttachments);
+      if (workflowCommand && paneWorkspaceId) {
+        try {
+          await launchChatWorkflow({
+            workspaceId: paneWorkspaceId,
+            threadId,
+            goal: workflowCommand.goal,
+            context: attachmentBlock,
+            provider,
+            model,
+            anchorEventId: latestTranscriptEventId(useAgentChatStore.getState().threads[threadId]?.messages ?? []),
+          });
+          setInputDraft(threadId, "");
+          for (const attachment of liveAttachments) {
+            useAgentChatStore.getState().removeStagedAttachment(threadId, attachment.id);
+          }
+        } catch (error) {
+          toast.failure("Couldn't start the workflow", error);
+        } finally {
+          sendInFlightRef.current = false;
+          setIsSending(false);
+        }
+        return;
+      }
       // Images travel as native multimodal content blocks at the SDK
       // layer, NOT inside the text body. They were staged to disk at
       // attach time (`agent_chat_stage_image`), so the turn carries only

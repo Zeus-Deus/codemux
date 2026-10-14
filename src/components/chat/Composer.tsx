@@ -318,6 +318,9 @@ interface Props {
   onAttachSession?: (session: AgentChatSessionMention) => void;
   /** Open the host-task consent dialog without sending or changing the draft. */
   onDelegateTask?: () => void;
+  /** Overrides whether `/workflow` is offered. A new-chat draft has no
+   *  workspace yet but can still start one when it targets this machine. */
+  workflowsAvailable?: boolean;
   /** Step 8 Stage 6 — invoked when the user attaches an image via
    *  paste, drag-drop, or the `+ → Image…` picker. Composer just
    *  forwards the raw File; the parent runs the allowlist check and
@@ -535,10 +538,12 @@ export function Composer({
   onServiceTierChange = () => {},
   onModeActivate,
   onModeRemove,
+  workflowsAvailable: workflowsAvailableOverride,
 }: Props) {
   const connectionStatus = useRemoteConnectionStore(s => s.status);
   const remoteDisconnected = connectionStatus === "offline" || connectionStatus === "reconnecting";
-  const workflowsAvailable = useWorkflowsAvailable(workspaceId);
+  const workspaceWorkflowsAvailable = useWorkflowsAvailable(workspaceId);
+  const workflowsAvailable = workflowsAvailableOverride ?? workspaceWorkflowsAvailable;
   // The composer shortcut is opt-in (Settings → Workflows); `/workflow`
   // and the + menu always work.
   const workflowButton = useWorkflowSettings().composerButton;
@@ -1913,10 +1918,9 @@ export function Composer({
             !isChatModeSupported(provider, "ask"),
           onSelect: () => {},
         },
-        // WORKFLOWS — single row, gated to the Claude provider. Kept
-        // visible-but-disabled for other providers (design D-parity
-        // with the `attach:image` capability gate) so the affordance
-        // stays discoverable rather than vanishing.
+        // WORKFLOWS — single row. Kept visible-but-disabled outside a
+        // local workspace (design D-parity with the `attach:image`
+        // capability gate) so the affordance stays discoverable.
         workflowCommand,
         {
           id: "attach:file",
