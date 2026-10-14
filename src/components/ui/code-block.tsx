@@ -2,6 +2,8 @@ import { CheckIcon, CopyIcon } from "lucide-react";
 import * as React from "react";
 
 import { Button } from "@/components/ui/button";
+import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
+import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
 /**
@@ -63,10 +65,12 @@ function CodeBlockCopyButton({ value }: { value: string }) {
       aria-label={copied ? "Copied" : "Copy"}
       className="ms-auto -me-1.5 -my-1"
       onClick={() => {
-        navigator.clipboard
-          .writeText(value)
-          .then(() => setCopied(true))
-          .catch(() => {});
+        // The shared helper covers the plain-HTTP remote client, where
+        // `navigator.clipboard` does not exist.
+        void copyToClipboard(value).then((ok) => {
+          if (ok) setCopied(true);
+          else toast.error(COPY_FAILED_MESSAGE);
+        });
       }}
     >
       {copied ? <CheckIcon /> : <CopyIcon />}

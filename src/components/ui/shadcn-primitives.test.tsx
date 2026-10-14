@@ -2,7 +2,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
+import { COPY_FAILED_MESSAGE } from "@/lib/clipboard";
+
 import { Checkbox } from "./checkbox";
+
+const { copyToClipboard, toastError } = vi.hoisted(() => ({
+  copyToClipboard: vi.fn(),
+  toastError: vi.fn(),
+}));
+vi.mock("@/lib/clipboard", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/clipboard")>()),
+  copyToClipboard,
+}));
+vi.mock("@/lib/toast", () => ({ toast: { error: toastError } }));
 import { CodeBlock, CodeBlockContent, CodeBlockCopyButton, CodeBlockHeader } from "./code-block";
 import { KbdKeys, splitKeyCombo } from "./kbd";
 import { NativeSelect } from "./native-select";
@@ -61,9 +73,7 @@ describe("NativeSelect", () => {
 });
 
 describe("CodeBlock", () => {
-  it("copies its value and announces it", async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.assign(navigator, { clipboard: { writeText } });
+  const block = () =>
     render(
       <CodeBlock>
         <CodeBlockHeader>
@@ -72,8 +82,20 @@ describe("CodeBlock", () => {
         <CodeBlockContent>npm test</CodeBlockContent>
       </CodeBlock>,
     );
+
+  it("copies through the shared clipboard helper and announces it", async () => {
+    copyToClipboard.mockResolvedValueOnce(true);
+    block();
     fireEvent.click(screen.getByRole("button", { name: "Copy" }));
-    expect(writeText).toHaveBeenCalledWith("npm test");
+    expect(copyToClipboard).toHaveBeenCalledWith("npm test");
     expect(await screen.findByRole("button", { name: "Copied" })).toBeInTheDocument();
+  });
+
+  it("says so when the copy fails instead of claiming success", async () => {
+    copyToClipboard.mockResolvedValueOnce(false);
+    block();
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    await vi.waitFor(() => expect(toastError).toHaveBeenCalledWith(COPY_FAILED_MESSAGE));
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
   });
 });
