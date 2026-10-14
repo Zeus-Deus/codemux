@@ -31,7 +31,8 @@ try {
   await page.setViewport({ width: 1440, height: 1000, deviceScaleFactor: 1 });
   await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
   await page.goto(`${appUrl}${appUrl.includes('?') ? '&' : '?'}workflowDelay=10`, { waitUntil: 'networkidle0' });
-  await page.locator('[data-testid="composer-workflows-toggle"]').click();
+  await page.click('[data-testid="composer-attach-button"]');
+  await page.click('[data-testid="slash-item-workflows:panel"]');
   await page.waitForSelector('[data-testid="workflow-panel"]');
 
   const click = async selector => {
@@ -220,7 +221,7 @@ try {
   for (const width of [1023, 768, 375]) {
     await page.setViewport({ width, height: 844, deviceScaleFactor: 1 });
     const panel = await page.$('[data-testid="workflow-panel"]');
-    const boundary = await page.evaluate(() => ({ mobile: document.documentElement.dataset.mobile === 'true', browserClient: document.documentElement.dataset.browserClient === 'true', workflowVisible: !!document.querySelector('[data-testid="workflow-panel"]')?.getClientRects().length, hasWorkflowComposerEntry: !!document.querySelector('[data-testid="composer-workflows-toggle"]'), documentOverflow: document.documentElement.scrollWidth > innerWidth + 1 }));
+    const boundary = await page.evaluate(() => ({ mobile: document.documentElement.dataset.mobile === 'true', browserClient: document.documentElement.dataset.browserClient === 'true', workflowVisible: !!document.querySelector('[data-testid="workflow-panel"]')?.getClientRects().length, hasWorkflowComposerEntry: !!document.querySelector('[data-testid="slash-item-workflows:panel"]'), documentOverflow: document.documentElement.scrollWidth > innerWidth + 1 }));
     results.push({ name: `browser-mobile-${width}`, viewport: { width, height: 844 }, boundary });
     assert.equal(boundary.documentOverflow, false, `Mobile shell overflows at ${width}px`);
     assert.equal(boundary.hasWorkflowComposerEntry, false, 'Mobile shell does not imply local managed-worker support');
@@ -238,7 +239,10 @@ try {
     observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-mobile"] });
   });
   await page.setViewport({ width: 1440, height: 1000, deviceScaleFactor: 1 });
-  if (!await page.$('[data-testid="workflow-panel"]')) await click('[data-testid="composer-workflows-toggle"]');
+  if (!await page.$('[data-testid="workflow-panel"]')) {
+    await click('[data-testid="composer-attach-button"]');
+    await click('[data-testid="slash-item-workflows:panel"]');
+  }
   await page.waitForSelector('[data-testid="workflow-panel"]');
   await click('[aria-label="Toggle sidebar"]');
   const maximized = await page.$eval('[data-testid="right-panel-maximize"]', element => element.getAttribute('aria-pressed') === 'true');

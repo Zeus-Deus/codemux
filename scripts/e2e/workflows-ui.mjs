@@ -30,11 +30,14 @@ try {
   await page.goto(`${appUrl}${appUrl.includes('?') ? '&' : '?'}workflowDelay=3000`, { waitUntil: 'networkidle0' });
   await page.evaluate(() => document.fonts.ready);
   if (process.argv.includes('--before')) {
-    await page.locator('[data-testid="composer-workflows-toggle"]').click();
+    await page.click('[data-testid="composer-attach-button"]');
+    await page.click('[data-testid="slash-item-workflows:panel"]');
     await page.waitForSelector('[data-testid="workflow-panel"]');
     await page.screenshot({ path: new URL('before.png', evidence).pathname });
   } else {
-    const entry = await page.waitForSelector('[data-testid="composer-workflows-toggle"]');
+    // The panel opens from the composer's + menu.
+    await page.click('[data-testid="composer-attach-button"]');
+    const entry = await page.waitForSelector('[data-testid="slash-item-workflows:panel"]');
     assert.ok(entry);
     await entry.click();
     await page.waitForSelector('[data-testid="workflow-panel"]');
