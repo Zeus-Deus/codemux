@@ -171,6 +171,28 @@ describe("WorkspaceStatusCluster", () => {
     expect(chip.closest("span")).toHaveClass("text-warning");
   });
 
+  it("shows the ahead chip next to behind, both foldable in a full context row", () => {
+    mocks.workspace = makeWorkspace({ git_behind: 5, git_ahead: 2 });
+    render(<WorkspaceStatusCluster />);
+    const ahead = screen.getByTitle("2 commits ahead");
+    expect(ahead).toHaveClass("text-success");
+    expect(ahead).toHaveClass("group-data-[hide-git-counts]/ctx:hidden");
+    expect(screen.getByTitle("5 commits behind")).toHaveClass(
+      "group-data-[hide-git-counts]/ctx:hidden",
+    );
+    // The dot that stands in for them only shows once they fold away.
+    expect(screen.getByTestId("workspace-details-git-dot")).toHaveClass(
+      "hidden",
+      "group-data-[hide-git-counts]/ctx:block",
+    );
+  });
+
+  it("has no details dot when there is nothing to fold away", () => {
+    mocks.workspace = makeWorkspace({ git_behind: 0, git_ahead: 0 });
+    render(<WorkspaceStatusCluster />);
+    expect(screen.queryByTestId("workspace-details-git-dot")).toBeNull();
+  });
+
   it("hides the behind chip when behind is 0", () => {
     mocks.workspace = makeWorkspace({ git_behind: 0 });
     render(<WorkspaceStatusCluster />);

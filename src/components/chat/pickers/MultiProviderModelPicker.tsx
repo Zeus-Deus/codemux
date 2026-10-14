@@ -49,9 +49,13 @@ import type {
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import {
+  CONTEXT_ROW_HIDE_SECONDARY,
+  CONTEXT_ROW_POPOVER,
+  CONTEXT_ROW_TRIGGER,
   FOOTER_TRIGGER,
   FOOTER_TRIGGER_ICON_ONLY,
   leafModelName,
+  type PickerPlacement,
 } from "./footer-trigger";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
@@ -213,6 +217,8 @@ interface Props {
   /** Tight composer: only the provider mark; the model name moves to the
    *  tooltip and accessible name. */
   iconOnly?: boolean;
+  /** Footer row (default) or the context row under the composer. */
+  placement?: PickerPlacement;
 }
 
 interface ResolvedRow {
@@ -244,7 +250,9 @@ export function MultiProviderModelPicker({
   openSignal,
   leafLabel = false,
   iconOnly = false,
+  placement = "footer",
 }: Props) {
+  const inContextRow = placement === "context-row";
   const acpFixed = useCustomAcp(s => hermesThreadId ? !!s.bindings[hermesThreadId] : false);
   const [open, setOpen] = useState(false);
   const [railKey, setRailKey] = useState<RailKey>(provider);
@@ -485,10 +493,14 @@ export function MultiProviderModelPicker({
           // FOOTER_TRIGGER recipe), the leading ProviderLogo standing
           // in for a tinted dot. Hairline pipes between footer
           // controls — not per-pill borders — carry the separation.
-          className={cn(
-            FOOTER_TRIGGER,
-            iconOnly ? FOOTER_TRIGGER_ICON_ONLY : "min-w-[60px] shrink",
-          )}
+          className={
+            inContextRow
+              ? cn(CONTEXT_ROW_TRIGGER, "shrink")
+              : cn(
+                  FOOTER_TRIGGER,
+                  iconOnly ? FOOTER_TRIGGER_ICON_ONLY : "min-w-[60px] shrink",
+                )
+          }
           aria-label={iconOnly ? `Model: ${triggerLabel}` : undefined}
         >
           <ProviderLogo provider={provider} className="size-3.5 shrink-0" />
@@ -499,9 +511,11 @@ export function MultiProviderModelPicker({
                   leafModelName(triggerLabel)
                 ) : triggerSubtitle ? (
                   <>
-                    <span className="opacity-70">{triggerSubtitle}</span>
-                    <span aria-hidden className="mx-1 opacity-40">
-                      ·
+                    <span className={cn(inContextRow && CONTEXT_ROW_HIDE_SECONDARY)}>
+                      <span className="opacity-70">{triggerSubtitle}</span>
+                      <span aria-hidden className="mx-1 opacity-40">
+                        ·
+                      </span>
                     </span>
                     <span>{triggerLabel}</span>
                   </>
@@ -509,7 +523,9 @@ export function MultiProviderModelPicker({
                   triggerLabel
                 )}
               </span>
-              <ChevronDown className="size-3 shrink-0 opacity-50" />
+              {!inContextRow && (
+                <ChevronDown className="size-3 shrink-0 opacity-50" />
+              )}
             </>
           )}
         </button>
@@ -518,7 +534,7 @@ export function MultiProviderModelPicker({
         // Compact popup: 400px wide (48px provider rail + fluid list),
         // 384px tall — a scannable column instead of a wide panel.
         className="w-[400px] max-w-[calc(100vw-2rem)] p-0"
-        align="start"
+        {...(inContextRow ? CONTEXT_ROW_POPOVER : { align: "start" as const })}
         onOpenAutoFocus={focusCmdkOnOpen}
       >
         {/* `minmax(0,1fr)` (not bare `1fr`): grid items default to

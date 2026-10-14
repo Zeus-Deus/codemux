@@ -20,6 +20,7 @@ import {
   ListTodo,
   MessageCircleQuestion,
   MessagesSquare,
+  Network,
   RotateCw,
   Server,
   Settings,
@@ -118,7 +119,7 @@ import { HooksManager } from "./HooksManager";
 import { ProviderCommandsDialog } from "./ProviderCommandsDialog";
 import { useUIStore } from "@/stores/ui-store";
 import { ComposerCommandMenu } from "./ComposerCommandMenu";
-import { ComposerFooter } from "./ComposerFooter";
+import { ComposerFooter, ComposerSettings } from "./ComposerFooter";
 import { ModePill, type ActivePillMode } from "./pickers/ModePill";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
@@ -255,6 +256,11 @@ interface Props {
    *  (the default) renders nothing — existing non-draft call sites are
    *  unaffected. */
   belowComposerSlot?: React.ReactNode;
+  /** Context row under the composer that hosts the model, effort and
+   *  access pickers. Receives them as `settings`; the controls row then
+   *  drops them. Takes precedence over `belowComposerSlot`. Omit it to
+   *  keep the pickers in the controls row. */
+  renderContextRow?: (settings: React.ReactNode) => React.ReactNode;
   /** Shared strip docked ABOVE the composer pill (`ComposerStrip`):
    *  subagents, monitoring, queued messages, session errors. Detached from
    *  the card in every state; its bottom seam tucks under the pill, which
@@ -440,19 +446,22 @@ export interface FooterFit {
 }
 
 /** One fit step from measured widths. Returns `prev` when nothing changes,
- *  so a no-op measurement never re-renders the composer. */
+ *  so a no-op measurement never re-renders the composer. The context row
+ *  reuses it with its own gap floor and step count. */
 export function nextFooterFit(
   prev: FooterFit,
   key: string,
   pillWidth: number,
   gapWidth: number,
+  minGap = FOOTER_MIN_GAP_PX,
+  steps = FOOTER_COMPACT_STEPS,
 ): FooterFit {
   if (prev.key !== key) return { key, level: 0, fitWidths: [] };
-  if (gapWidth < FOOTER_MIN_GAP_PX && prev.level < FOOTER_COMPACT_STEPS) {
+  if (gapWidth < minGap && prev.level < steps) {
     return {
       key,
       level: prev.level + 1,
-      fitWidths: [...prev.fitWidths, pillWidth + FOOTER_MIN_GAP_PX - gapWidth],
+      fitWidths: [...prev.fitWidths, pillWidth + minGap - gapWidth],
     };
   }
   if (prev.level > 0 && pillWidth >= prev.fitWidths[prev.level - 1]) {
@@ -497,6 +506,7 @@ export function Composer({
   showStopButton = true,
   zone1Override,
   belowComposerSlot,
+  renderContextRow,
   stripSlot,
   minTextareaPx,
   paneDragActive = false,
@@ -541,7 +551,6 @@ export function Composer({
   const workflowsEnabled = useFeatureFlags((state) => state.enableAgentChat);
   const workflowWorkspace = useAppStore((state) => workspaceId ? state.appState?.workspaces.find((workspace) => workspace.workspace_id === workspaceId) : undefined);
   const workflowsAvailable = workflowsEnabled && !!workflowWorkspace && !workflowWorkspace.host_id && !workflowWorkspace.attach_only && !isRemoteClient();
-  const workflowsOpen = useUIStore((state) => workspaceId ? state.rightPanelTabs[workspaceId] === "workflows" : false);
   const addonComposer = useAddonComposerAdapter(workspaceId, threadId, draft, onDraftChange);
   const addonActions = useAddonComposerActions(addonComposer);
   const customAgentsAllowed = useAppStore(s => {
@@ -1917,6 +1926,23 @@ export function Composer({
         // with the `attach:image` capability gate) so the affordance
         // stays discoverable rather than vanishing.
         workflowCommand,
+        // The workflows panel used to have its own button in the controls
+        // row; it lives here so the resting composer stays uncluttered.
+        ...(workspaceId && workflowsAvailable
+          ? [
+              {
+                id: "workflows:panel",
+                label: "Workflows panel",
+                description: "Set up and follow workflow runs",
+                command: "",
+                icon: Network,
+                tone: "muted" as const,
+                group: "WORKFLOWS",
+                onSelect: () =>
+                  useUIStore.getState().setRightPanelTab(workspaceId, "workflows"),
+              },
+            ]
+          : []),
         {
           id: "attach:file",
           label: "File…",
@@ -2119,6 +2145,7 @@ export function Composer({
     scProvider,
     modelSupportsImages,
     workflowCommand,
+    workflowsAvailable,
     configurationEnabled,
     onDelegateTask,
     readOnly,
@@ -2206,7 +2233,7 @@ export function Composer({
   const handleAttachPopupSelect = useCallback(
     (item: SlashCommandItem) => {
       if (item.disabled) return;
-      if (item.id.startsWith("addon:")) { item.onSelect(); closeAttachPopup(); return; }
+      if (item.id.startsWith("addon:") || item.id === "workflows:panel") { item.onSelect(); closeAttachPopup(); return; }
       if (item.id === "delegate:host") {
         if (readOnly || !sessionReady || remoteDisconnected) return;
         closeAttachPopup();
@@ -2837,6 +2864,8 @@ export function Composer({
     permissionMode,
     busy,
     delivery.delivery,
+    streaming && draft.trim().length > 0,
+    !!renderContextRow,
     tasks ? `${tasks.completed}/${tasks.total}` : "",
   ].join("|");
   // Layout effect: each fit step re-renders and re-measures before paint,
@@ -3240,7 +3269,7 @@ export function Composer({
               footerNote={attachPopupFooter}
               submode={attachSubmode}
               headerSlot={
-                footerLadder.configInMenu && provider !== "acp" && attachSubmode === "main" ? (
+                footerLadder.configInMenu && !renderContextRow && provider !== "acp" && attachSubmode === "main" ? (
                   <>
                     <ReasoningPicker
                       model={activeModel}
@@ -3732,7 +3761,9 @@ export function Composer({
             streaming={busy}
             delivery={delivery.delivery}
             supportsSteering={supportsSteering}
-            onDeliveryChange={streaming ? (value) => {
+            // Queue / steer / interrupt only matters once there is
+            // something to send, so the resting pill stays quiet.
+            onDeliveryChange={streaming && draft.trim().length > 0 ? (value) => {
               onDraftChange(withMessageDelivery(draft, value));
               requestAnimationFrame(() => textareaRef.current?.focus());
             } : undefined}
@@ -3762,8 +3793,6 @@ export function Composer({
             tasks={tasks}
             tasksOpen={tasksOpen}
             onTasksClick={onTasksClick}
-            workflowsOpen={workflowsOpen}
-            onWorkflowsClick={workspaceId && workflowsAvailable ? () => useUIStore.getState().setRightPanelTab(workspaceId, "workflows") : undefined}
             gap={
               !expanded ? (
                 <span
@@ -3791,13 +3820,44 @@ export function Composer({
             effortIconOnly={footerLadder.effortIconOnly}
             accessIconOnly={footerLadder.accessIconOnly}
             configInMenu={footerLadder.configInMenu}
+            settingsInContextRow={!!renderContextRow}
           />
         </div>
         {/* No gap here — the scope strip / context strip attaches
             flush to the card's bottom edge so it reads as a layer
             sliding out from beneath the card. Slot content owns any
             spacing it needs below itself. */}
-        {belowComposerSlot ?? null}
+        {renderContextRow
+          ? renderContextRow(
+              <ComposerSettings
+                hermesThreadId={threadId}
+                hermesProjectPath={cwd}
+                customAgentsAllowed={customAgentsAllowed}
+                provider={provider}
+                model={model}
+                permissionMode={permissionMode}
+                effort={effort}
+                contextWindow={contextWindow}
+                serviceTier={serviceTier}
+                activeModel={activeModel}
+                effortLabelMap={effortLabelMap}
+                permissionModes={permissionModes}
+                ultrathinkInBodyText={ultrathinkInBodyText}
+                showProviderPicker={showProviderPicker}
+                mode={mode}
+                onProviderModelChange={onProviderModelChange}
+                onModelChange={onModelChange}
+                onPermissionModeChange={onPermissionModeChange}
+                onEffortChange={onEffortChange}
+                onContextWindowChange={onContextWindowChange}
+                onServiceTierChange={onServiceTierChange}
+                configurationDisabled={!configurationEnabled}
+                modelPickerOpenSignal={modelPickerOpenSignal}
+                permissionPickerOpenSignal={permissionPickerOpenSignal}
+                placement="context-row"
+              />,
+            )
+          : (belowComposerSlot ?? null)}
       </div>
       {provider === "codex" && <HooksManager open={hooksOpen} onOpenChange={setHooksOpen} cwd={cwd ?? null} threadId={threadId ?? null} />}
       <ProviderCommandsDialog open={helpOpen} onOpenChange={setHelpOpen} providerLabel={sessionProviderLabel(provider)} items={allSlashItems} loading={skillsLoading || providerCommandsEntry.loading} error={providerCommandsEntry.error ?? skillsError ?? skillAdapterError ?? null} onSelect={(item) => {
