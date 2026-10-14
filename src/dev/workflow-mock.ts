@@ -103,11 +103,30 @@ function create(spec: WorkflowRunSpec, key: string) {
   schedule(run);
   return run;
 }
+const PREVIEW_SUBTASKS = [
+  ["Map the session lifecycle", "Trace how sessions are created, refreshed and revoked."],
+  ["Audit token storage", "Check where tokens and secrets are stored and logged."],
+  ["Find missing tests", "List auth paths without test coverage."],
+];
+/** Shape synthetic results like the task's declared schema, so preview runs of
+ *  the `/workflow` planner exercise the same plan → work → report path. */
+function syntheticResult(run: WorkflowRunSnapshot, task: WorkflowTaskSnapshot): unknown {
+  const schema = task.spec.output_schema as { properties?: Record<string, { items?: { properties?: { route_id?: { enum?: string[] } } } }> } | null | undefined;
+  const routeIds = schema?.properties?.tasks?.items?.properties?.route_id?.enum ?? run.spec.routes.map((route) => route.id);
+  if (schema?.properties?.tasks) {
+    return { tasks: PREVIEW_SUBTASKS.map(([title, prompt], index) => ({ title, prompt, route_id: routeIds[index % routeIds.length], edits: false })) };
+  }
+  if (task.spec.id === "report") {
+    return { summary: "**Preview report.** No provider was called.\n\n- Refresh tokens survive logout in `session.rs`.\n- Secrets are written to debug logs in `auth/log.ts`.\n- Token rotation has no tests.\n\n**Next steps:** revoke refresh tokens on logout, scrub secrets from logs, and add rotation tests." };
+  }
+  if (schema?.properties?.summary) return { summary: `Synthetic finding for ${task.spec.title}. No provider was called.` };
+  return { dry_run: true, task_id: task.spec.id, route_id: task.current_attempt?.route_id, summary: `Completed ${task.spec.title}. No provider was called.` };
+}
 function finishTask(run: WorkflowRunSnapshot, task: WorkflowTaskSnapshot) {
   const fail = task.spec.prompt.includes("[mock:fail]");
   task.status = fail ? "failed" : "succeeded";
   task.error = fail ? "Synthetic dry-run failure. Edit the prompt or retry this task." : null;
-  task.result = fail ? null : { dry_run: true, task_id: task.spec.id, route_id: task.current_attempt?.route_id, summary: `Completed ${task.spec.title}. No provider was called.` };
+  task.result = fail ? null : syntheticResult(run, task);
   if (task.current_attempt) {
     task.current_attempt.status = fail ? "failed" : "succeeded";
     task.current_attempt.finished_at_ms = Date.now();
@@ -238,7 +257,10 @@ function replaceTask(run: WorkflowRunSnapshot, id: string, spec: WorkflowTaskSpe
   schedule(run);
 }
 
-const capabilities: WorkflowCapability[] = ["claude", "codex", "hermes", "opencode", "cursor", "grok"].map((provider) => ({ provider: provider as WorkflowCapability["provider"], live: false, read_only: true, write: false, requires_model: provider === "opencode", effort_supported: provider !== "cursor", reason: "Browser preview runs only synthetic tasks. No provider is called." }));
+// Claude and Codex report live so `/workflow` can be previewed end to end;
+// every preview task is still synthetic and never calls a provider.
+const PREVIEW_LIVE = new Set(["claude", "codex"]);
+const capabilities: WorkflowCapability[] = ["claude", "codex", "hermes", "opencode", "cursor", "grok"].map((provider) => ({ provider: provider as WorkflowCapability["provider"], live: PREVIEW_LIVE.has(provider), read_only: true, write: false, requires_model: provider === "opencode", effort_supported: provider !== "cursor", reason: PREVIEW_LIVE.has(provider) ? null : "Browser preview runs only synthetic tasks. No provider is called." }));
 
 export function workflowMockHandlers(listener?: (event: WorkflowChangeEvent) => void): Record<string, Handler> {
   onChange = listener;

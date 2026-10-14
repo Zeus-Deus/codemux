@@ -68,7 +68,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { WorkflowPanel, WorkflowsPaneActions } from "@/components/workflows/workflow-panel";
+import { WorkflowPanel } from "@/components/workflows/workflow-panel";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { OrchestrationPanel } from "@/components/workflow/orchestration-panel";
 import { useWorkspaceWorkflow } from "@/components/workflow/use-workspace-workflow";
@@ -920,9 +920,6 @@ export const RightPanel = memo(function RightPanel({
         actions = browserSessionName ? (
           <BrowserPaneActions sessionName={browserSessionName} />
         ) : null;
-        break;
-      case "workflows":
-        actions = <WorkflowsPaneActions workspaceId={workspaceId} />;
         break;
       case "tasks":
         actions = tasksSnapshot ? (

@@ -23,7 +23,7 @@ import {
 } from "@/tauri/workflows";
 import { useWorkflowUIStore } from "@/stores/workflow-ui-store";
 
-function pollingInterval(run: WorkflowRunSnapshot | undefined): number | false {
+export function pollingInterval(run: WorkflowRunSnapshot | undefined): number | false {
   if (!run) return false;
   if (run.status === "unknown") return 5000;
   if (["running", "stopping"].includes(run.status)) return 1000;

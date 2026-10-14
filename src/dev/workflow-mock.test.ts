@@ -16,10 +16,11 @@ beforeEach(() => { vi.useFakeTimers(); resetWorkflowMock(); });
 afterEach(() => { resetWorkflowMock(); vi.useRealTimers(); });
 
 describe("token-free workflow preview", () => {
-  it("exposes provider setup requirements while refusing live execution for every preview adapter", () => {
+  it("exposes provider setup requirements and previews only Claude and Codex as synthetic live routes", () => {
     const capabilities = handlers.workflow_capabilities({}) as WorkflowCapability[];
     expect(capabilities.map((item) => item.provider)).toEqual(["claude", "codex", "hermes", "opencode", "cursor", "grok"]);
-    expect(capabilities.every((item) => !item.live && !item.write)).toBe(true);
+    expect(capabilities.filter((item) => item.live).map((item) => item.provider)).toEqual(["claude", "codex"]);
+    expect(capabilities.every((item) => !item.write)).toBe(true);
     expect(capabilities.filter((item) => item.requires_model).map((item) => item.provider)).toEqual(["opencode"]);
     expect(capabilities.filter((item) => !item.effort_supported).map((item) => item.provider)).toEqual(["cursor"]);
   });

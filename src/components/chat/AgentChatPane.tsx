@@ -149,6 +149,11 @@ import { ChatTranscript } from "./ChatTranscript";
 import { DelegateTaskDialog } from "./DelegateTaskDialog";
 import { RemoteTaskDetail } from "./RemoteTaskDetail";
 import { projectRemoteTasks } from "./remote-task-projection";
+import { latestTranscriptEventId, projectChatWorkflows } from "./chat-workflow-projection";
+import { launchChatWorkflow } from "@/components/workflows/launch-chat-workflow";
+import { useWorkflowsAvailable } from "@/components/workflows/use-workflows-available";
+import { parseWorkflowCommand } from "@/lib/workflows/workflow-settings";
+import { useWorkflowUIStore, type ChatWorkflowLink } from "@/stores/workflow-ui-store";
 import type { RemoteTaskScope } from "./remote-task-context";
 import { useDelegationTasks } from "@/stores/delegation-store";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
@@ -572,6 +577,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const paneWorkspaceId = useAppStore(
     (s) => workspaceIdForPane ?? selectActiveWorkspaceId(s) ?? null,
   );
+  const workflowsAvailable = useWorkflowsAvailable(paneWorkspaceId);
   useEffect(() => {
     // A brand-new conversation has no transcript to hydrate; its composer is
     // usable as soon as the pane mounts. Scope this to its owning workspace so
@@ -752,7 +758,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const remoteTaskScope = useMemo<RemoteTaskScope>(() => ({
     paneId: pane.pane_id, writable: conversationWritable, onOpen: openRemoteTask,
   }), [pane.pane_id, conversationWritable, openRemoteTask]);
-  const transcriptMessages = useMemo(() => projectRemoteTasks(messages, remoteTasks.tasks), [messages, remoteTasks.tasks]);
+  const chatWorkflowLinks = useWorkflowUIStore((state) => (threadId ? state.chatRuns[threadId] : undefined) ?? NO_CHAT_WORKFLOWS);
+  const transcriptMessages = useMemo(
+    () => projectChatWorkflows(projectRemoteTasks(messages, remoteTasks.tasks), chatWorkflowLinks, threadId),
+    [messages, remoteTasks.tasks, chatWorkflowLinks, threadId],
+  );
   const viewedRemoteTask = remoteTaskView?.threadId === threadId
     ? remoteTasks.tasks.find(task => task.id === remoteTaskView.taskId) ?? null : null;
   useEffect(() => {
@@ -1624,6 +1634,39 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const delivery = parseMessageDelivery(originalDraft);
       const rawText = delivery.text;
       if (!rawText) return;
+      // `/workflow <goal>` starts a CodeMux workflow beside the chat instead
+      // of a provider turn. Its card joins the transcript once it launches.
+      const workflowCommand = isContinue ? null : parseWorkflowCommand(rawText);
+      if (workflowCommand) {
+        if (!workflowCommand.goal) {
+          toast.error("Add a goal after /workflow", { description: "For example: /workflow review the auth module for security issues" });
+          return;
+        }
+        if (!paneWorkspaceId || !workflowsAvailable) {
+          toast.error("Workflows need a local workspace", { description: "Open this chat in a project on this machine to run a workflow." });
+          return;
+        }
+        sendInFlightRef.current = true;
+        setIsSending(true);
+        const launchThreadId = threadId;
+        void launchChatWorkflow({
+          workspaceId: paneWorkspaceId,
+          threadId: launchThreadId,
+          goal: workflowCommand.goal,
+          provider,
+          model,
+          anchorEventId: latestTranscriptEventId(useAgentChatStore.getState().threads[launchThreadId]?.messages ?? []),
+        })
+          .then(() => {
+            if (typeof textOverride !== "string") setInputDraft(launchThreadId, "");
+          })
+          .catch((error: unknown) => toast.failure("Couldn't start the workflow", error))
+          .finally(() => {
+            sendInFlightRef.current = false;
+            setIsSending(false);
+          });
+        return;
+      }
       if (delivery.delivery === "steer" && useAgentChatStore.getState().threads[threadId]?.streaming && !capabilities?.supports_steering) {
         toast.error(STEERING_UNAVAILABLE);
         return;
@@ -1945,6 +1988,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     requestSendAnchor,
     clearSendAnchor,
     paneWorkspaceId,
+    model,
+    workflowsAvailable,
   ],
   );
 
@@ -4391,3 +4436,4 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 const EMPTY_MESSAGES = Object.freeze([]) as unknown as ChatViewItem[];
 const EMPTY_REQUESTS = Object.freeze([]) as unknown as PermissionRequestItem[];
 const EMPTY_ATTACHMENTS = Object.freeze([]) as unknown as Attachment[];
+const NO_CHAT_WORKFLOWS: ChatWorkflowLink[] = [];

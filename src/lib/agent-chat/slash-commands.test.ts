@@ -448,20 +448,20 @@ describe("buildProviderCommands", () => {
 });
 
 describe("buildWorkflowCommand", () => {
-  it("is enabled with the orchestration description when isClaude is true", () => {
-    const item = buildWorkflowCommand({ isClaude: true });
+  it("is enabled for any provider when the chat can run workflows", () => {
+    const item = buildWorkflowCommand({ available: true });
     expect(item.id).toBe("workflow");
     expect(item.command).toBe("/workflow");
     expect(item.disabled).toBe(false);
     expect(item.description).toBe(
-      "Orchestrate this task with many subagents",
+      "Split a task across agents working in parallel",
     );
   });
 
-  it("is disabled with a reason when isClaude is false", () => {
-    const item = buildWorkflowCommand({ isClaude: false });
+  it("is disabled with a reason outside a local workspace", () => {
+    const item = buildWorkflowCommand({ available: false });
     expect(item.disabled).toBe(true);
-    expect(item.description).toBe("Only available with Claude models");
+    expect(item.description).toBe("Needs a local workspace on this device");
   });
 });
 

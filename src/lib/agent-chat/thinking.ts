@@ -1,5 +1,5 @@
 import { isDelegatedRow } from "./delegation";
-import type { ChatViewItem, RemoteTaskItem } from "./types";
+import { isAppReceipt, type ChatViewItem, type ChatWorkflowItem, type RemoteTaskItem } from "./types";
 
 /**
  * Decide whether to render the transcript-tail "thinking" pulse.
@@ -22,10 +22,10 @@ export function shouldShowThinkingIndicator(
   if (!streaming) return false;
   // App-owned remote receipts have a separate execution clock. They neither
   // create nor suppress the local provider's heartbeat.
-  let last: Exclude<ChatViewItem, RemoteTaskItem> | undefined;
+  let last: Exclude<ChatViewItem, RemoteTaskItem | ChatWorkflowItem> | undefined;
   for (let index = messages.length - 1; index >= 0; index--) {
     const item = messages[index];
-    if (item.kind !== "remote_task") { last = item; break; }
+    if (!isAppReceipt(item)) { last = item; break; }
   }
   if (!last) return true;
   switch (last.kind) {
