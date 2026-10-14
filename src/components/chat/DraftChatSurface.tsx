@@ -3,6 +3,7 @@ import { selectProviderCommands, useProviderCommandsStore } from "@/stores/provi
 import { parseMessageDelivery } from "@/lib/agent-chat/message-delivery";
 import { parseWorkflowCommand } from "@/lib/workflows/workflow-settings";
 import { launchChatWorkflow } from "@/components/workflows/launch-chat-workflow";
+import { workflowAttachmentProblem } from "@/lib/workflows/workflow-attachments";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import {
   useCallback,
@@ -785,6 +786,13 @@ function DraftChatSurfaceInner({
           `Remove ${unavailableSession.metadata.label} or try again.`,
         );
         return;
+      }
+      if (workflowCommand) {
+        const problem = workflowAttachmentProblem(activeFreshAttachments);
+        if (problem) {
+          reportFailure(problem.title, problem.description);
+          return;
+        }
       }
       const attachmentBlock = buildAttachmentBlock(activeFreshAttachments);
 

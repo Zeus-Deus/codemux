@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { workflowGoalWithContext } from "./launch-chat-workflow";
 
+
+
 describe("workflowGoalWithContext", () => {
   it("appends resolved context after the typed goal", () => {
     expect(workflowGoalWithContext("review auth", null)).toBe("review auth");

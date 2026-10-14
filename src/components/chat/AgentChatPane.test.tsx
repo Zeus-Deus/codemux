@@ -4719,6 +4719,21 @@ describe("AgentChatPane /workflow", () => {
     expect(setInputDraftMock).not.toHaveBeenCalledWith("thread-x", "");
   });
 
+  it("refuses an attachment that is still loading instead of dropping it", async () => {
+    currentMessages = [];
+    currentSliceOverrides = { "thread-x": {
+      inputDraft: "/workflow review @!509",
+      stagedAttachments: [{ id: "pr", kind: "pr", ref: "!509", metadata: { label: "#509", isLoading: true, fetchedAt: Date.now() } }],
+    } };
+    const view = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+    fireEvent.click(view.container.querySelector('[data-testid="composer-submit"]')!);
+    await act(async () => {});
+    expect(workflowMocks.launch).not.toHaveBeenCalled();
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    expect(setInputDraftMock).not.toHaveBeenCalledWith("thread-x", "");
+  });
+
   it("keeps the draft when the workflow cannot start", async () => {
     workflowMocks.launch.mockRejectedValue(new Error("Grok can't run workflows here"));
     await submit("/workflow review auth");

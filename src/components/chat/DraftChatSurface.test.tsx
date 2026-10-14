@@ -454,6 +454,18 @@ describe("DraftChatSurface", () => {
       }));
     });
 
+    it("refuses an attachment that failed to load without creating anything", async () => {
+      workflowLaunch.mockReset();
+      const { draft, textarea } = await projectDraft("/workflow review @!509");
+      act(() => useAgentChatStore.getState().addStagedAttachment(draft.threadId, {
+        id: "pr", kind: "pr", ref: "!509", metadata: { label: "#509", error: "gh failed" },
+      }));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await vi.waitFor(() => expect(toast.error).toHaveBeenCalledWith("An attachment couldn't be loaded", expect.anything()));
+      expect(materializeAndSend).not.toHaveBeenCalled();
+      expect(workflowLaunch).not.toHaveBeenCalled();
+    });
+
     it("asks for a goal without creating anything", async () => {
       // A trailing space closes the slash popup, as after picking the row.
       const { textarea } = await projectDraft("/workflow ");

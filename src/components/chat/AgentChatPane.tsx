@@ -151,6 +151,7 @@ import { RemoteTaskDetail } from "./RemoteTaskDetail";
 import { projectRemoteTasks } from "./remote-task-projection";
 import { latestTranscriptEventId, projectChatWorkflows } from "./chat-workflow-projection";
 import { launchChatWorkflow } from "@/components/workflows/launch-chat-workflow";
+import { workflowAttachmentProblem } from "@/lib/workflows/workflow-attachments";
 import { useWorkflowsAvailable } from "@/components/workflows/use-workflows-available";
 import { parseWorkflowCommand } from "@/lib/workflows/workflow-settings";
 import { useWorkflowUIStore, type ChatWorkflowLink } from "@/stores/workflow-ui-store";
@@ -1821,6 +1822,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       }
       const attachmentBlock = buildAttachmentBlock(activeLiveAttachments);
       if (workflowCommand && paneWorkspaceId) {
+        const problem = workflowAttachmentProblem(activeLiveAttachments);
+        if (problem) {
+          toast.error(problem.title, { description: problem.description });
+          sendInFlightRef.current = false;
+          setIsSending(false);
+          return;
+        }
         try {
           await launchChatWorkflow({
             workspaceId: paneWorkspaceId,
