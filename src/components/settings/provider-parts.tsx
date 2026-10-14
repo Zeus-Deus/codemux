@@ -102,6 +102,8 @@ export function DetailHeader({
   actions,
   enabled,
   onEnabledChange,
+  switchDisabled,
+  switchTitle,
 }: {
   logo: React.ReactNode;
   name: string;
@@ -111,6 +113,8 @@ export function DetailHeader({
   actions?: React.ReactNode;
   enabled?: boolean;
   onEnabledChange?: (enabled: boolean) => void;
+  switchDisabled?: boolean;
+  switchTitle?: string;
 }) {
   return (
     <div className="flex items-center gap-3 px-5 py-4">
@@ -127,7 +131,7 @@ export function DetailHeader({
       </div>
       {actions}
       {onEnabledChange && (
-        <Switch checked={!!enabled} aria-label={`Use ${name}`} onCheckedChange={onEnabledChange} />
+        <Switch checked={!!enabled} aria-label={`Use ${name}`} title={switchTitle} disabled={switchDisabled} onCheckedChange={onEnabledChange} />
       )}
     </div>
   );

@@ -18,10 +18,17 @@ export function CustomAcpDetail({
   agentId,
   onSaved,
   onCancelNew,
+  onLockChange,
+  switchLocked = false,
 }: {
   agentId: string | null;
   onSaved: (id: string) => void;
   onCancelNew: () => void;
+  /** Reports while this agent is being edited or mutated, so the page can
+   *  keep its list switch from saving over the editor. */
+  onLockChange?: (locked: boolean) => void;
+  /** Another save of an agent (from the list) is still in flight. */
+  switchLocked?: boolean;
 }) {
   const agents = useCustomAcp(s => s.agents);
   const catalogs = useCustomAcp(s => s.catalogs);
@@ -33,6 +40,11 @@ export function CustomAcpDetail({
   const [error, setError] = useState<string | null>(null);
   const [probeError, setProbeError] = useState<string | null>(null);
   useEffect(() => { let alive = true; void useCustomAcp.getState().loadAgents().catch(e => { if (alive) setError(String(e)); }); return () => { alive = false; }; }, []);
+  const locked = editor !== null || busy !== null;
+  useEffect(() => {
+    onLockChange?.(locked);
+  }, [locked, onLockChange]);
+  useEffect(() => () => onLockChange?.(false), [onLockChange]);
   const edit = (a: AcpAgent) => {
     setError(null);
     setEditor({ id: a.id, name: a.name, executable: a.executable, args: [...a.args], environment: {}, enabled: a.enabled, auth_method: a.auth_method });
@@ -59,11 +71,18 @@ export function CustomAcpDetail({
     finally { setBusy(null); }
   };
   // The switch saves only the enabled flag; saved environment values stay
-  // redacted and are retained by sending null.
-  const setEnabled = (a: AcpAgent, enabled: boolean) => void save(
-    { id: a.id, name: a.name, executable: a.executable, args: a.args, environment: {}, enabled, auth_method: a.auth_method },
-    Object.keys(a.environment).map(key => ({ key, value: null })),
-  );
+  // redacted and are retained by sending null. It is disabled while the
+  // editor is open or anything is saving, so it never overwrites or clears
+  // unsaved edits.
+  const setEnabled = async (a: AcpAgent, enabled: boolean) => {
+    if (editor || busy) return;
+    setBusy("toggle"); setError(null);
+    try {
+      await acpSaveAgent({ id: a.id, name: a.name, executable: a.executable, args: a.args, environment: Object.fromEntries(Object.keys(a.environment).map(key => [key, null])), enabled, auth_method: a.auth_method });
+      await useCustomAcp.getState().loadAgents(true);
+    } catch (e) { setError(String(e)); }
+    finally { setBusy(null); }
+  };
   const remove = async (id: string) => {
     setBusy(id); setError(null);
     try {
@@ -99,7 +118,9 @@ export function CustomAcpDetail({
       tag="Custom ACP"
       status={status}
       enabled={agent?.enabled}
-      onEnabledChange={agent ? (on => setEnabled(agent, on)) : undefined}
+      onEnabledChange={agent ? (on => void setEnabled(agent, on)) : undefined}
+      switchDisabled={locked || switchLocked}
+      switchTitle={editor ? "Save or cancel your edits first." : undefined}
       actions={agent && !editor && <Button variant="ghost" size="sm" className="text-muted-foreground" aria-label={`Probe ${agent.name}`} disabled={!!busy || !agent.enabled} onClick={() => void probe(agent.id)}>
         {busy === agent.id ? <Spinner className="size-3.5" aria-hidden /> : <FlaskConical />}Test
       </Button>}

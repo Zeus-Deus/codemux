@@ -7,7 +7,7 @@ import { useSettingsStore } from "@/stores/settings-store";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { defaultModelId } from "./capability-defaults";
-import { disabledProviders } from "./provider-enablement";
+import { DEFAULT_CAPABLE_PROVIDERS, disabledProviders } from "./provider-enablement";
 
 /** The provider a new chat uses when no default is chosen. */
 export const AUTOMATIC_NEW_CHAT_PROVIDER: AgentChatProviderKind = "claude";
@@ -17,13 +17,8 @@ export const AUTOMATIC_NEW_CHAT_PROVIDER: AgentChatProviderKind = "claude";
  * models are scoped to a profile, and Settings → Agent already has a
  * "Default Hermes profile" row for that.
  */
-export const NEW_CHAT_DEFAULT_PROVIDERS: ReadonlyArray<AgentChatProviderKind> = [
-  "claude",
-  "codex",
-  "cursor",
-  "grok",
-  "opencode",
-];
+export const NEW_CHAT_DEFAULT_PROVIDERS: ReadonlyArray<AgentChatProviderKind> =
+  DEFAULT_CAPABLE_PROVIDERS;
 
 export const NEW_CHAT_SETTING_KEYS = {
   provider: "chat.default_provider",
@@ -66,6 +61,8 @@ export function resolveNewChatModelDefaults(): NewChatModelDefaults {
         effort: null,
       };
     }
+    // Settings keeps at least one of these on (`setProviderEnabled`), so the
+    // final fallback is reachable only through a hand-edited setting.
     const fallback = off.has(AUTOMATIC_NEW_CHAT_PROVIDER)
       ? NEW_CHAT_DEFAULT_PROVIDERS.find((p) => !off.has(p)) ?? AUTOMATIC_NEW_CHAT_PROVIDER
       : AUTOMATIC_NEW_CHAT_PROVIDER;

@@ -63,6 +63,39 @@ it("the switch saves only the enabled flag and keeps saved secrets", async () =>
     input: { id: saved.id, name: saved.name, executable: saved.executable, args: saved.args, environment: { TOKEN: null }, enabled: false, auth_method: null },
   }));
 });
+it("keeps the switch inert while the editor has unsaved edits", async () => {
+  agents = [saved];
+  const onLockChange = vi.fn();
+  render(<CustomAcpDetail agentId={saved.id} onSaved={() => {}} onCancelNew={() => {}} onLockChange={onLockChange} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Edit Custom" }));
+  fireEvent.change(screen.getByLabelText("Executable"), { target: { value: "/edited" } });
+  const toggle = screen.getByRole("switch", { name: "Use Custom" });
+  expect(toggle).toBeDisabled();
+  fireEvent.click(toggle);
+  expect(invoke).not.toHaveBeenCalledWith("acp_save_agent", expect.anything());
+  expect(screen.getByLabelText("Executable")).toHaveValue("/edited");
+  // The page hears the lock so it can disable the list switch too.
+  expect(onLockChange).toHaveBeenLastCalledWith(true);
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(onLockChange).toHaveBeenLastCalledWith(false));
+  expect(screen.getByRole("switch", { name: "Use Custom" })).toBeEnabled();
+});
+it("keeps the switch inert while a save is pending", async () => {
+  agents = [saved];
+  let finish: () => void = () => {};
+  render(<CustomAcpDetail agentId={saved.id} onSaved={() => {}} onCancelNew={() => {}} />);
+  const toggle = await screen.findByRole("switch", { name: "Use Custom" });
+  invoke.mockImplementation(async (cmd: string, payload?: { input: AcpAgentInput }) => {
+    if (cmd === "acp_agents") return agents;
+    if (cmd === "acp_save_agent") { await new Promise<void>(r => { finish = r; }); agents = [{ ...saved, ...payload!.input, id: saved.id }]; return agents[0]; }
+  });
+  fireEvent.click(toggle);
+  await waitFor(() => expect(toggle).toBeDisabled());
+  fireEvent.click(toggle);
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "acp_save_agent")).toHaveLength(1);
+  finish();
+  await waitFor(() => expect(screen.getByRole("switch", { name: "Use Custom" })).toBeEnabled());
+});
 it("requires explicit delete confirmation and verifies removal", async () => {
   agents = [saved];
   render(<CustomAcpDetail agentId={saved.id} onSaved={() => {}} onCancelNew={() => {}} />);

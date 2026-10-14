@@ -34,11 +34,32 @@ export function isProviderEnabled(provider: AgentChatProviderKind): boolean {
   return !disabledProviders().has(provider);
 }
 
-export function setProviderEnabled(provider: AgentChatProviderKind, enabled: boolean): void {
+/** Providers a brand-new chat can start on. At least one of them stays on,
+ *  so there is always an enabled default to fall back to. Kept in step with
+ *  `NEW_CHAT_DEFAULT_PROVIDERS`, which imports from here. */
+export const DEFAULT_CAPABLE_PROVIDERS: readonly AgentChatProviderKind[] = [
+  "claude", "codex", "cursor", "grok", "opencode",
+];
+
+/** Whether turning `provider` off would leave no provider a new chat can
+ *  start on. */
+export function isLastDefaultProvider(
+  provider: AgentChatProviderKind,
+  disabled: ReadonlySet<AgentChatProviderKind> = disabledProviders(),
+): boolean {
+  return DEFAULT_CAPABLE_PROVIDERS.includes(provider) &&
+    DEFAULT_CAPABLE_PROVIDERS.every((p) => p === provider || disabled.has(p));
+}
+
+/** Returns false, changing nothing, when turning `provider` off would
+ *  leave no provider for new chats. */
+export function setProviderEnabled(provider: AgentChatProviderKind, enabled: boolean): boolean {
   const next = new Set(disabledProviders());
+  if (!enabled && isLastDefaultProvider(provider, next)) return false;
   if (enabled) next.delete(provider);
   else next.add(provider);
   useSettingsStore.getState().set(DISABLED_PROVIDERS_SETTING, [...next].sort().join(","));
+  return true;
 }
 
 export function useDisabledProviders(): ReadonlySet<AgentChatProviderKind> {

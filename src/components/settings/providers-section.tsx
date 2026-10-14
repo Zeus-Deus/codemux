@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ExternalLink, Plus, RefreshCw } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ProviderLogo } from "@/components/chat/provider-logo";
@@ -10,7 +10,8 @@ import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
 import { CHATGPT_USAGE_URL } from "@/components/auth/chatgpt-connection";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
-import { setProviderEnabled, useDisabledProviders } from "@/lib/agent-chat/provider-enablement";
+import { isLastDefaultProvider, setProviderEnabled, useDisabledProviders } from "@/lib/agent-chat/provider-enablement";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { useCustomAcp, acpCatalogKey } from "@/stores/custom-acp-store";
 import { useHermes } from "@/stores/hermes-store";
@@ -37,6 +38,16 @@ const BUILT_IN: readonly { id: AgentChatProviderKind; name: string }[] = [
   { id: "grok", name: "Grok" },
 ];
 const PROBED: readonly AgentChatProviderKind[] = BUILT_IN.map((p) => p.id);
+
+/** Turn a provider on or off. Untouched new-chat drafts sitting on a
+ *  provider that was just turned off move to the next default, so an open
+ *  empty composer cannot start a chat on it. */
+function toggleProvider(id: AgentChatProviderKind, on: boolean) {
+  if (!setProviderEnabled(id, on)) return;
+  if (!on) useChatDraftStore.getState().applyNewChatDefaults(new Set([id]));
+}
+
+const LAST_PROVIDER_HINT = "New chats need at least one of Claude, Codex, OpenCode, Cursor or Grok.";
 
 /** Selection: a built-in provider, Hermes, a saved custom agent, or the
  *  editor for a new one. */
@@ -73,6 +84,19 @@ export function ProvidersSection() {
   const catalogs = useCustomAcp((s) => s.catalogs);
   const acpWarning = useCustomAcpEvents();
   const [selected, setSelected] = useState<Selected>({ kind: "builtin", id: "claude" });
+  // A custom agent whose detail panel is editing or saving it, or whose
+  // list switch is saving. Its switches stay inert until that settles, so a
+  // flag-only save cannot discard or race the editor.
+  const [editingAgent, setEditingAgent] = useState<string | null>(null);
+  const [savingAgent, setSavingAgent] = useState<string | null>(null);
+  const selectedAgentId = selected.kind === "acp" ? selected.id : null;
+  const onAgentLock = useCallback(
+    (locked: boolean) =>
+      setEditingAgent((current) =>
+        locked ? selectedAgentId : current === selectedAgentId ? null : current,
+      ),
+    [selectedAgentId],
+  );
 
   useEffect(() => {
     if (!useHermes.getState().profiles) useHermes.getState().loadProfiles().catch(() => {});
@@ -136,7 +160,8 @@ export function ProvidersSection() {
                 selected={sameSelection(selected, { kind: "builtin", id: p.id })}
                 onSelect={() => setSelected({ kind: "builtin", id: p.id })}
                 enabled={!disabled.has(p.id)}
-                onEnabledChange={(on) => setProviderEnabled(p.id, on)}
+                onEnabledChange={(on) => toggleProvider(p.id, on)}
+                lockedReason={isLastDefaultProvider(p.id, disabled) ? LAST_PROVIDER_HINT : undefined}
               />
             ))}
             <ProviderListRow
@@ -146,7 +171,7 @@ export function ProvidersSection() {
               selected={selected.kind === "hermes"}
               onSelect={() => setSelected({ kind: "hermes" })}
               enabled={!disabled.has("hermes")}
-              onEnabledChange={(on) => setProviderEnabled("hermes", on)}
+              onEnabledChange={(on) => toggleProvider("hermes", on)}
             />
             {!remote && (
               <>
@@ -160,8 +185,12 @@ export function ProvidersSection() {
                     selected={sameSelection(selected, { kind: "acp", id: agent.id })}
                     onSelect={() => setSelected({ kind: "acp", id: agent.id })}
                     enabled={agent.enabled}
+                    switchDisabled={editingAgent === agent.id || savingAgent !== null}
                     onEnabledChange={(on) => {
-                      setCustomAgentEnabled(agent, on).catch((e) => toast.failure(`Couldn't update ${agent.name}`, e));
+                      setSavingAgent(agent.id);
+                      setCustomAgentEnabled(agent, on)
+                        .catch((e) => toast.failure(`Couldn't update ${agent.name}`, e))
+                        .finally(() => setSavingAgent(null));
                     }}
                   />
                 ))}
@@ -189,13 +218,14 @@ export function ProvidersSection() {
                 report={health[selected.id]?.report ?? null}
                 status={statusFor(selected.id)}
                 enabled={!disabled.has(selected.id)}
+                lockedReason={isLastDefaultProvider(selected.id, disabled) ? LAST_PROVIDER_HINT : undefined}
               />
             )}
             {selected.kind === "hermes" && (
               <HermesProviderDetail
                 status={hermesStatus}
                 enabled={!disabled.has("hermes")}
-                onEnabledChange={(on) => setProviderEnabled("hermes", on)}
+                onEnabledChange={(on) => toggleProvider("hermes", on)}
               />
             )}
             {(selected.kind === "acp" || selected.kind === "acp-new") && (
@@ -204,6 +234,8 @@ export function ProvidersSection() {
                 agentId={selected.kind === "acp" ? selected.id : null}
                 onSaved={(id) => setSelected({ kind: "acp", id })}
                 onCancelNew={() => setSelected({ kind: "builtin", id: "claude" })}
+                onLockChange={onAgentLock}
+                switchLocked={savingAgent !== null}
               />
             )}
           </div>
@@ -235,6 +267,8 @@ function ProviderListRow({
   onSelect,
   enabled,
   onEnabledChange,
+  switchDisabled,
+  lockedReason,
 }: {
   name: string;
   logo: React.ReactNode;
@@ -243,6 +277,9 @@ function ProviderListRow({
   onSelect: () => void;
   enabled: boolean;
   onEnabledChange: (enabled: boolean) => void;
+  switchDisabled?: boolean;
+  /** Why the provider cannot be turned off right now. */
+  lockedReason?: string;
 }) {
   return (
     <div
@@ -263,7 +300,14 @@ function ProviderListRow({
           <StatusLine status={status} className="flex" />
         </span>
       </button>
-      <Switch size="sm" checked={enabled} aria-label={`Use ${name}`} onCheckedChange={onEnabledChange} />
+      <Switch
+        size="sm"
+        checked={enabled}
+        aria-label={`Use ${name}`}
+        title={lockedReason}
+        disabled={switchDisabled || (enabled && !!lockedReason)}
+        onCheckedChange={onEnabledChange}
+      />
     </div>
   );
 }
@@ -274,12 +318,14 @@ function BuiltInDetail({
   report,
   status,
   enabled,
+  lockedReason,
 }: {
   id: AgentChatProviderKind;
   name: string;
   report: ProviderHealthReport | null;
   status: ProviderStatus;
   enabled: boolean;
+  lockedReason?: string;
 }) {
   const refresh = useProviderHealth((s) => s.refresh);
   const caps = useProviderCapabilities((s) => selectCapabilities(s, id));
@@ -302,7 +348,9 @@ function BuiltInDetail({
         status={status}
         version={enabled ? report?.version : null}
         enabled={enabled}
-        onEnabledChange={(on) => setProviderEnabled(id, on)}
+        onEnabledChange={(on) => toggleProvider(id, on)}
+        switchDisabled={enabled && !!lockedReason}
+        switchTitle={lockedReason}
         actions={enabled && (
           <Button variant="ghost" size="sm" className="text-muted-foreground" disabled={checking} onClick={check}>
             {checking ? <Spinner className="size-3.5" aria-hidden /> : <RefreshCw />}
@@ -310,6 +358,9 @@ function BuiltInDetail({
           </Button>
         )}
       />
+      {lockedReason && enabled && (
+        <p className="-mt-2 px-5 pb-3 text-label text-muted-foreground">{lockedReason}</p>
+      )}
       {!enabled ? (
         <DetailSection title="Turned off">
           <p className="text-body-sm text-muted-foreground">

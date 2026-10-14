@@ -8,6 +8,7 @@ vi.mock("@/tauri/commands", () => ({
 import { useSettingsStore } from "@/stores/settings-store";
 import {
   DISABLED_PROVIDERS_SETTING,
+  isLastDefaultProvider,
   isProviderEnabled,
   parseDisabledProviders,
   setProviderEnabled,
@@ -28,6 +29,17 @@ describe("provider enablement", () => {
     expect(isProviderEnabled("grok")).toBe(false);
     setProviderEnabled("grok", true);
     expect(useSettingsStore.getState().settings[DISABLED_PROVIDERS_SETTING]).toBe("cursor");
+  });
+
+  it("refuses to turn off the last provider a new chat can start on", () => {
+    for (const p of ["codex", "cursor", "grok", "opencode"] as const) expect(setProviderEnabled(p, false)).toBe(true);
+    expect(isLastDefaultProvider("claude")).toBe(true);
+    expect(setProviderEnabled("claude", false)).toBe(false);
+    expect(isProviderEnabled("claude")).toBe(true);
+    // Hermes and custom agents can still be turned off freely.
+    expect(setProviderEnabled("hermes", false)).toBe(true);
+    expect(setProviderEnabled("acp", false)).toBe(true);
+    expect(isLastDefaultProvider("hermes")).toBe(false);
   });
 
   it("ignores unknown or blank entries", () => {
