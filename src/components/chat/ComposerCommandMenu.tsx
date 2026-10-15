@@ -2,32 +2,20 @@ import { Command as CommandPrimitive } from "cmdk";
 import { Search } from "lucide-react";
 import { useEffect, useRef, type SyntheticEvent } from "react";
 
+import { KeyHint } from "@/components/ui/key-hint";
 import { cn } from "@/lib/utils";
 import {
   groupSlashItems,
-  type CommandTone,
   type SlashCommandItem,
 } from "@/lib/agent-chat/slash-commands";
 
+import {
+  COMMAND_MENU_GROUP_HEADING,
+  COMMAND_MENU_ICON,
+  COMMAND_MENU_ROW,
+  COMMAND_MENU_SURFACE,
+} from "./command-menu-styles";
 import type { SlashCommandFooterNote } from "./SlashCommandPopup";
-
-/**
- * Tone → token-utility map for the 24px icon chip. Chip background is
- * the tone at 15%; the icon is the tone at full strength. Every value
- * routes through an app colour token (no hex / oklch literals) so the
- * menu re-skins with the theme. Sky reuses the `status-remote` token,
- * amber the `warning` token, and so on — the design's palette expressed
- * in Codemux's own vocabulary.
- */
-const TONE_CLASSES: Record<CommandTone, { chip: string; icon: string }> = {
-  sky: { chip: "bg-status-remote/15", icon: "text-status-remote" },
-  amber: { chip: "bg-warning/15", icon: "text-warning" },
-  violet: { chip: "bg-accent-violet/15", icon: "text-accent-violet" },
-  green: { chip: "bg-success/15", icon: "text-success" },
-  red: { chip: "bg-danger/15", icon: "text-danger" },
-  muted: { chip: "bg-muted-foreground/15", icon: "text-muted-foreground" },
-  ember: { chip: "bg-accent-ember/15", icon: "text-accent-ember" },
-};
 
 /** Shared handler so the three interactive-adornment listeners stay
  *  identical. */
@@ -64,9 +52,10 @@ interface Props {
 }
 
 /**
- * Redesigned composer command menu (the `+` button's popup). Anchored
- * bottom-left to the trigger, content-width (360px), with a search
- * header, tone-tinted icon-chip rows, and mono tag chips.
+ * Composer command menu (the `+` button's popup). Anchored bottom-left
+ * to the trigger, content-width (380px), on the composer's own surface:
+ * a search header, one-line rows with plain icons, and a keyboard-hint
+ * footer. Only the highlighted row uses the accent colour.
  *
  * Unlike {@link SlashCommandPopup} (slash / mention surfaces, which
  * keep the textarea focused and are driven from the parent), this menu
@@ -108,9 +97,8 @@ export function ComposerCommandMenu({
       className={cn(
         // Anchored bottom-left to the `+` trigger, 8px above the
         // composer card, content-width — never stretched across it.
-        "absolute bottom-full left-2 z-[60] mb-2 w-[360px]",
-        "overflow-hidden rounded-lg border border-border",
-        "bg-popover text-popover-foreground shadow-2xl",
+        "absolute bottom-full left-2 z-[60] mb-2 w-[380px] overflow-hidden",
+        COMMAND_MENU_SURFACE,
         "rise-in",
       )}
       // Escape lives on the wrapper (outside cmdk's root) so it never
@@ -130,7 +118,7 @@ export function ComposerCommandMenu({
         loop
         className="flex flex-col"
       >
-        <div className="flex items-center gap-2.5 border-b border-hairline px-3 py-2.5">
+        <div className="flex items-center gap-2.5 px-3.5 pt-3 pb-2">
           <Search
             className="size-3.5 shrink-0 text-muted-foreground"
             aria-hidden
@@ -142,8 +130,8 @@ export function ComposerCommandMenu({
             placeholder={placeholder}
             data-testid="composer-command-search"
             className={cn(
-              "flex-1 bg-transparent text-body text-foreground",
-              "outline-none placeholder:text-muted-foreground",
+              "flex-1 bg-transparent text-body text-foreground caret-accent-ember",
+              "outline-none placeholder:text-muted-foreground/70",
             )}
           />
         </div>
@@ -156,12 +144,12 @@ export function ComposerCommandMenu({
             onKeyDown={(e) => {
               if (e.key !== "Escape" || e.defaultPrevented) e.stopPropagation();
             }}
-            className="flex items-center gap-0.5 border-b border-hairline px-1.5 py-1"
+            className="flex items-center gap-0.5 border-y border-hairline px-1.5 py-1"
           >
             {headerSlot}
           </div>
         )}
-        <CommandPrimitive.List className="max-h-[340px] overflow-x-hidden overflow-y-auto p-1.5 outline-none">
+        <CommandPrimitive.List className="thin-scrollbar max-h-[340px] overflow-x-hidden overflow-y-auto px-1.5 pb-1.5 outline-none">
           {items.length === 0 ? (
             <div className="px-3 py-6 text-center text-label text-muted-foreground">
               No matches
@@ -171,21 +159,11 @@ export function ComposerCommandMenu({
               <CommandPrimitive.Group
                 key={group}
                 heading={group}
-                className={cn(
-                  "**:[[cmdk-group-heading]]:px-2",
-                  "**:[[cmdk-group-heading]]:pt-2 **:[[cmdk-group-heading]]:pb-1",
-                  "**:[[cmdk-group-heading]]:font-mono",
-                  "**:[[cmdk-group-heading]]:text-caption",
-                  "**:[[cmdk-group-heading]]:font-semibold",
-                  "**:[[cmdk-group-heading]]:uppercase",
-                  "**:[[cmdk-group-heading]]:tracking-[0.09em]",
-                  "**:[[cmdk-group-heading]]:text-muted-foreground",
-                )}
+                className={COMMAND_MENU_GROUP_HEADING}
               >
                 {groupItems.map((item) => {
                   const Icon = item.icon;
                   const disabled = item.disabled === true;
-                  const tone = TONE_CLASSES[item.tone ?? "muted"];
                   return (
                     <CommandPrimitive.Item
                       key={item.id}
@@ -201,43 +179,69 @@ export function ComposerCommandMenu({
                       }}
                       data-testid={`slash-item-${item.id}`}
                       data-disabled={disabled || undefined}
+                      // Truncated descriptions (and disabled rows'
+                      // reasons) stay readable on hover.
+                      title={item.description}
                       className={cn(
-                        "flex items-center gap-2.5 rounded-md px-2 py-1.5",
-                        "cursor-pointer outline-none select-none",
-                        "data-[selected=true]:bg-surface-3",
+                        COMMAND_MENU_ROW,
+                        "min-h-8 py-1.5",
                         // Disabled rows stay VISIBLE (dimmed) with their
                         // reason in the description slot.
                         disabled && "cursor-not-allowed opacity-[0.42]",
                       )}
                     >
-                      <span
-                        className={cn(
-                          "flex size-6 shrink-0 items-center justify-center rounded-sm",
-                          tone.chip,
-                        )}
-                      >
-                        {Icon && (
-                          <Icon
-                            className={cn(
-                              "size-3.5",
-                              // Per-item override (e.g. state-coloured
-                              // issue icons) wins; else the row's tone.
-                              item.iconClassName ?? tone.icon,
-                            )}
-                            aria-hidden
-                          />
-                        )}
-                      </span>
-                      <span className="flex min-w-0 flex-1 flex-col gap-px">
-                        <span className="truncate text-body font-semibold leading-tight text-foreground">
-                          {item.label}
-                        </span>
-                        {item.description && (
-                          <span className="truncate text-label leading-tight text-muted-foreground">
-                            {item.description}
+                      {Icon && (
+                        <Icon
+                          className={cn(
+                            "size-3.5 shrink-0",
+                            // Per-item override (e.g. state-coloured
+                            // issue icons) wins over the default.
+                            item.iconClassName ?? COMMAND_MENU_ICON,
+                          )}
+                          aria-hidden
+                        />
+                      )}
+                      {item.stacked ? (
+                        // Entity rows (conversations) keep name and
+                        // preview on separate lines so each truncates
+                        // on its own.
+                        <span className="flex min-w-0 flex-1 flex-col gap-px">
+                          <span className="truncate text-body font-medium leading-tight text-foreground">
+                            {item.label}
                           </span>
-                        )}
-                      </span>
+                          {item.description && (
+                            <span className="truncate text-label leading-tight text-muted-foreground">
+                              {item.description}
+                            </span>
+                          )}
+                        </span>
+                      ) : (
+                        <span className="flex min-w-0 flex-1 items-baseline gap-2">
+                          <span
+                            className={cn(
+                              "truncate text-body font-medium text-foreground",
+                              item.description
+                                ? "max-w-[55%] shrink-0"
+                                : "min-w-0 flex-1",
+                            )}
+                          >
+                            {item.label}
+                          </span>
+                          {item.description && (
+                            <span
+                              className={cn(
+                                "min-w-0 flex-1 truncate text-label text-muted-foreground/70",
+                                // The highlighted row shows its whole
+                                // description instead of an ellipsis.
+                                "group-data-[selected=true]/row:whitespace-normal",
+                                "group-data-[selected=true]/row:text-muted-foreground",
+                              )}
+                            >
+                              {item.description}
+                            </span>
+                          )}
+                        </span>
+                      )}
                       {item.rightAdornment ? (
                         <span
                           className="ml-auto shrink-0"
@@ -258,7 +262,7 @@ export function ComposerCommandMenu({
                           {item.rightAdornment}
                         </span>
                       ) : item.command ? (
-                        <span className="ml-auto shrink-0 rounded-sm bg-surface-2 px-1.5 py-0.5 font-mono text-label text-muted-foreground">
+                        <span className="ml-auto shrink-0 font-mono text-label text-muted-foreground/60 group-data-[selected=true]/row:text-foreground">
                           {item.command}
                         </span>
                       ) : null}
@@ -283,6 +287,14 @@ export function ComposerCommandMenu({
             </div>
           )}
         </CommandPrimitive.List>
+        <div
+          aria-hidden
+          className="flex items-center gap-4 border-t border-hairline px-3.5 py-2"
+        >
+          <KeyHint keys="↑↓" label="move" />
+          <KeyHint keys="↵" label="select" />
+          <KeyHint keys="esc" label={submode === "main" ? "close" : "back"} />
+        </div>
       </CommandPrimitive>
     </div>
   );

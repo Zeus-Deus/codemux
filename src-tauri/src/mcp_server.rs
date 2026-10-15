@@ -938,6 +938,20 @@ fn register_tools() -> Vec<McpTool> {
 const HTML_RENDER_MAX_BYTES: usize = 512 * 1024;
 const HTML_RENDER_MAX_TITLE_CHARS: usize = 200;
 
+/// `html_render` as the MCP registry lists it to agent chats: Codemux's own
+/// server runs under the name `codemux` (see `mcp::codemux_self`).
+pub const HTML_RENDER_REGISTRY_NAME: &str = "mcp__codemux__html_render";
+
+/// Session instructions for agent chats that can call `html_render`. The tool
+/// description alone is not enough: Claude lists MCP tools by name only until
+/// it searches for one, so without this an agent writes the page to a file
+/// and never shows it.
+pub const HTML_RENDER_GUIDANCE: &str = "## Showing visuals in Codemux\n\n\
+This chat can show HTML pages inline. When a chart, table, diagram, or mockup would say more than prose, \
+or the user wants to see a page, build a self-contained HTML page and show it with Codemux's `html_render` tool \
+(listed with an MCP prefix) before your final reply, rather than only pointing the user at an HTML file. \
+The reader sees the page above that reply, so don't announce or restate it; add only what it doesn't say.";
+
 /// Agent-facing contract for `html_render`. The variable names mirror
 /// `htmlRenderThemeVariables` in `src/lib/agent-chat/html-render.ts`, which
 /// injects them into the page; keep the two lists in sync.

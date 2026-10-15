@@ -193,6 +193,7 @@ import {
 import { SettingsSyncIndicator } from "./settings-sync-indicator";
 import { AboutSection } from "./about-section";
 import { UpdatesSection } from "./updates-section";
+import { WorkflowsSection } from "./workflows-section";
 import { SettingsNavSearch, revealSettingsAnchor } from "./settings-search";
 import type { SettingsSearchResult } from "@/lib/settings-search";
 import { RemoteAccessSection } from "./remote-access-section";
@@ -2541,6 +2542,9 @@ export function SettingsView() {
         // hidden when the Agent Chat GUI is off, but a stale URL hash
         // can still route here.
         return enableAgentChat ? <UsageSection /> : <InterfaceSection />;
+
+      case "workflows":
+        return enableAgentChat ? <WorkflowsSection /> : <InterfaceSection />;
 
       case "permissions":
         // Defensive guard: the nav row is hidden when the Agent Chat

@@ -13,6 +13,7 @@ import type {
   UserMessageItem,
   WorkflowRunItem,
 } from "@/lib/agent-chat/types";
+import { isAppReceipt } from "@/lib/agent-chat/types";
 import { isInlineHtmlRender } from "@/lib/agent-chat/html-render";
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 
@@ -353,7 +354,7 @@ function buildPresentationEntries(
     if (segmentIndex === activeIndex) {
       for (let i = segment.items.length - 1; i >= 0; i--) {
         const item = segment.items[i];
-        if (item.kind === "turn_ended" || item.kind === "remote_task") continue;
+        if (item.kind === "turn_ended" || isAppReceipt(item)) continue;
         if (isWorkEntry(item)) workingEntryId = item.id;
         break;
       }
@@ -540,7 +541,7 @@ export function buildTranscriptSlots(
       if (entry.turnLive) runTurnLive = true;
       continue;
     }
-    if (item.kind === "remote_task" && run.length > 0) {
+    if (isAppReceipt(item) && run.length > 0) {
       runReceipts.push({ kind: "item", item });
       continue;
     }

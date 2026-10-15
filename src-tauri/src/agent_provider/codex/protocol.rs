@@ -206,6 +206,10 @@ pub enum ThreadStartResponse {
     Nested {
         /// Nested thread info.
         thread: ThreadInfo,
+        /// The model the thread runs on, which the server resolves from its
+        /// own config when the request names none.
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Legacy shape: flat `threadId` string.
     Flat {
@@ -220,8 +224,16 @@ impl ThreadStartResponse {
     /// shape.
     pub fn thread_id(&self) -> &str {
         match self {
-            Self::Nested { thread } => &thread.id,
+            Self::Nested { thread, .. } => &thread.id,
             Self::Flat { thread_id } => thread_id,
+        }
+    }
+
+    /// The model the thread runs on, when the server reports it.
+    pub fn model(&self) -> Option<&str> {
+        match self {
+            Self::Nested { model, .. } => model.as_deref(),
+            Self::Flat { .. } => None,
         }
     }
 }
@@ -1432,6 +1444,11 @@ mod tests {
         let v = json!({ "thread": { "id": "t-123" } });
         let r: ThreadStartResponse = serde_json::from_value(v).unwrap();
         assert_eq!(r.thread_id(), "t-123");
+        assert_eq!(r.model(), None);
+
+        let v = json!({ "thread": { "id": "t-123" }, "model": "gpt-5.6-sol" });
+        let r: ThreadStartResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(r.model(), Some("gpt-5.6-sol"));
     }
 
     #[test]

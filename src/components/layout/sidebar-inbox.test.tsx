@@ -282,6 +282,14 @@ async function rerenderInbox(rerender: (ui: React.ReactElement) => void) {
   }
 }
 
+/** Settled starts collapsed; open it so a test can reach its rows. */
+async function expandSettled() {
+  const header = screen.getByRole("button", { name: /^Settled \(/ });
+  if (header.getAttribute("aria-expanded") === "false") {
+    fireEvent.click(header);
+  }
+}
+
 /** Open the project filter dropdown. Radix menus react to pointer events, so
  *  use userEvent rather than fireEvent. */
 async function openFilterMenu() {
@@ -670,6 +678,7 @@ describe("SidebarInbox — cards", () => {
         : workspace,
     );
     await rerenderInbox(rerender);
+    await expandSettled();
     expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
     expect(container.querySelector('[data-inbox-card="ws-2"]')).not.toBeNull();
 
@@ -772,6 +781,7 @@ describe("SidebarInbox — project filter", () => {
     // All: both actives + the settled row visible.
     expect(screen.getByText("In myapp")).toBeInTheDocument();
     expect(screen.getByText("In vexis")).toBeInTheDocument();
+    await expandSettled();
     expect(screen.getByText("Settled myapp thing")).toBeInTheDocument();
 
     // Filter to vexis → myapp card + myapp settled row disappear.
@@ -797,6 +807,7 @@ describe("SidebarInbox — project filter", () => {
     await pickFilter("vexis");
     expect(screen.getByText(/Nothing running in/)).toBeInTheDocument();
     // The settled vexis row still shows under the divider.
+    await expandSettled();
     expect(screen.getByText("In vexis")).toBeInTheDocument();
   });
 
@@ -860,6 +871,7 @@ describe("SidebarInbox — settle / un-settle", () => {
       });
 
       expect(screen.getByText("Settled")).toBeInTheDocument();
+      await expandSettled();
       const row = screen
         .getByText("Ship it")
         .closest("[data-settled-row]") as HTMLElement;
@@ -894,6 +906,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     ];
     const { container } = await flushRender();
 
+    await expandSettled();
     const row = container.querySelector(
       '[data-settled-row="ws-1"]',
     ) as HTMLElement;
@@ -965,6 +978,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     });
     const { container } = await flushRender();
 
+    await expandSettled();
     const rows = [...container.querySelectorAll("[data-settled-row]")];
     fireEvent.click(rows[0], { ctrlKey: true });
 
@@ -1001,6 +1015,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     paneStatuses = { p1: "review" };
     const { container } = await flushRender();
 
+    await expandSettled();
     const row = container.querySelector(
       '[data-settled-row="ws-1"]',
     ) as HTMLElement;
@@ -1028,6 +1043,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     ];
     const { container } = await flushRender();
 
+    await expandSettled();
     const row = container.querySelector(
       '[data-settled-row="ws-1"]',
     ) as HTMLElement;
@@ -1106,6 +1122,7 @@ describe("SidebarInbox — settle / un-settle", () => {
 
     // A finished card must stick under the divider — otherwise the guardrail
     // and auto-un-settle would fight each other.
+    await expandSettled();
     expect(
       container.querySelector('[data-settled-row="ws-1"]'),
     ).not.toBeNull();
@@ -1129,6 +1146,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     const { container } = await flushRender();
 
     expect(screen.getByText("Settled")).toBeInTheDocument();
+    await expandSettled();
     expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
   });
 
@@ -1144,6 +1162,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     const { container } = await flushRender();
 
     expect(screen.getByText("Settled")).toBeInTheDocument();
+    await expandSettled();
     expect(
       container.querySelector('[data-settled-row="ws-1"]'),
     ).not.toBeNull();
@@ -1238,6 +1257,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     ];
     const { container } = await flushRender();
 
+    await expandSettled();
     expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
   });
 
@@ -1257,6 +1277,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     ];
     const { container } = await flushRender();
 
+    await expandSettled();
     expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
   });
 
@@ -1273,6 +1294,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     paneStatuses = { p1: "review" };
     const { container } = await flushRender();
 
+    await expandSettled();
     expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
     expect(hoverCardStatus["ws-1"]).toBe("review");
   });
@@ -1354,6 +1376,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     const { container, rerender } = await flushRender();
 
     // It auto-settles first…
+    await expandSettled();
     const row = container.querySelector(
       '[data-settled-row="ws-1"]',
     ) as HTMLElement;
@@ -1454,6 +1477,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     paneStatuses = { p1: "review" };
     const { container, rerender } = await flushRender();
 
+    await expandSettled();
     const row = container.querySelector(
       '[data-settled-row="ws-1"]',
     ) as HTMLElement;
@@ -1563,6 +1587,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     });
 
     expect(screen.getByText("Settled")).toBeInTheDocument();
+    await expandSettled();
     expect(
       container.querySelector('[data-settled-row="ws-1"]'),
     ).not.toBeNull();
@@ -1624,6 +1649,7 @@ describe("SidebarInbox — settle / un-settle", () => {
       await Promise.resolve();
     });
 
+    await expandSettled();
     expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
     expect(hoverCardStatus["ws-1"]).toBe("review");
   });
@@ -1637,6 +1663,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     workspaces = [makeWorkspace({ title: "Swept aside" })];
     await renderInbox();
 
+    await expandSettled();
     const row = screen
       .getByText("Swept aside")
       .closest("[data-settled-row]") as HTMLElement;
@@ -1696,6 +1723,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     await renderInbox();
 
     expect(screen.getByText("Settled")).toBeInTheDocument();
+    await expandSettled();
     const row = screen
       .getByText("Implement sidebar v2")
       .closest("[data-settled-row]") as HTMLElement;
@@ -1757,6 +1785,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     ];
     await renderInbox();
 
+    await expandSettled();
     const row = screen
       .getByText("Implement sidebar v2")
       .closest("[data-settled-row]") as HTMLElement;
@@ -1846,6 +1875,7 @@ describe("SidebarInbox — parked shelves anchor to the bottom", () => {
     expect(shelves).not.toBeNull();
     // `mt-auto` pushes the group to the floor of the sidebar's flex column.
     expect(shelves).toHaveClass("mt-auto");
+    await expandSettled();
     expect(shelves!.querySelector("[data-settled-row]")).not.toBeNull();
     // The active card stays outside the parked group.
     const card = container.querySelector(`[data-inbox-card="${active.workspace_id}"]`);
@@ -1890,6 +1920,7 @@ describe("SidebarInbox — settled-tail pagination", () => {
     });
     const { container } = await renderInbox();
 
+    await expandSettled();
     // Only the initial head renders; the tail hides behind the button.
     expect(container.querySelectorAll("[data-settled-row]").length).toBe(10);
     const more = screen.getByRole("button", {
@@ -1920,6 +1951,7 @@ describe("SidebarInbox — settled-tail pagination", () => {
     });
     const { container } = await renderInbox();
 
+    await expandSettled();
     // All (12 settled): the head plus a Show-more button.
     expect(container.querySelectorAll("[data-settled-row]").length).toBe(10);
     fireEvent.click(
@@ -2231,6 +2263,7 @@ describe("SidebarInbox — wrapping-up tier", () => {
     // The two rules read different PR states on purpose; a merged PR is a
     // finished claim, not a winding-down one.
     expect(divider(container)).toBeNull();
+    await expandSettled();
     expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
   });
 
@@ -2268,6 +2301,7 @@ describe("SidebarInbox — idle-clock seeding", () => {
     ];
     const { container } = await flushRender();
 
+    await expandSettled();
     expect(
       container.querySelector('[data-settled-row="ws-1"]'),
     ).not.toBeNull();
@@ -2297,6 +2331,7 @@ describe("SidebarInbox — idle-clock seeding", () => {
     ];
     const { container } = await flushRender();
 
+    await expandSettled();
     expect(
       container.querySelector('[data-settled-row="ws-1"]'),
     ).not.toBeNull();
@@ -2512,6 +2547,7 @@ describe("SidebarInbox — settled shelf polish", () => {
     ];
     const { container } = await flushRender();
 
+    await expandSettled();
     // Sweep time would have put ws-1 first; work-end time is the honest order.
     expect(settledOrder(container)).toEqual(["ws-2", "ws-1"]);
     const oldRow = container.querySelector(
@@ -2524,7 +2560,7 @@ describe("SidebarInbox — settled shelf polish", () => {
     expect(within(recentRow).getByText("10m")).toBeInTheDocument();
   });
 
-  it("shows a count in the Settled header and collapses on click", async () => {
+  it("shows a count in the Settled header and starts collapsed until clicked", async () => {
     const base = Date.now();
     workspaces = Array.from({ length: 3 }, () => makeWorkspace());
     persistInbox({
@@ -2532,12 +2568,29 @@ describe("SidebarInbox — settled shelf polish", () => {
     });
     const { container } = await flushRender();
 
+    // Starts collapsed so finished history doesn't crowd the live work.
     const header = screen.getByRole("button", { name: "Settled (3)" });
-    expect(header).toHaveAttribute("aria-expanded", "true");
-    expect(container.querySelectorAll("[data-settled-row]").length).toBe(3);
+    expect(header).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelectorAll("[data-settled-row]").length).toBe(0);
 
     fireEvent.click(header);
-    expect(container.querySelectorAll("[data-settled-row]").length).toBe(0);
+    expect(header).toHaveAttribute("aria-expanded", "true");
+    expect(container.querySelectorAll("[data-settled-row]").length).toBe(3);
+  });
+
+  it("keeps the open workspace's settled row visible while the shelf is collapsed", async () => {
+    const base = Date.now();
+    workspaces = Array.from({ length: 3 }, () => makeWorkspace());
+    persistInbox({
+      settled: workspaces.map((w, i) => ({ id: w.workspace_id, at: base - i })),
+    });
+    activeWorkspaceId = "ws-2";
+    const { container } = await flushRender();
+
+    expect(
+      screen.getByRole("button", { name: "Settled (3)" }),
+    ).toHaveAttribute("aria-expanded", "false");
+    expect(settledOrder(container)).toEqual(["ws-2"]);
   });
 
   it("forces the open workspace's settled row past the Show-more cut", async () => {
@@ -2553,6 +2606,7 @@ describe("SidebarInbox — settled shelf polish", () => {
     activeWorkspaceId = "ws-14";
     const { container } = await flushRender();
 
+    await expandSettled();
     const rows = settledOrder(container);
     expect(rows).toHaveLength(11);
     expect(rows).toContain("ws-14");
@@ -2627,6 +2681,7 @@ describe("SidebarInbox — multi-select + bulk actions", () => {
     });
     const { container } = await flushRender();
 
+    await expandSettled();
     const rows = [...container.querySelectorAll("[data-settled-row]")];
     expect(rows).toHaveLength(10);
     clickRow(rows[0]);
@@ -2684,6 +2739,7 @@ describe("SidebarInbox — multi-select + bulk actions", () => {
     });
     const { container } = await flushRender();
 
+    await expandSettled();
     const rows = [...container.querySelectorAll("[data-settled-row]")];
     clickRow(rows[0], { ctrlKey: true });
     clickRow(rows[1], { ctrlKey: true });
@@ -2705,6 +2761,7 @@ describe("SidebarInbox — multi-select + bulk actions", () => {
     });
     const { container } = await flushRender();
 
+    await expandSettled();
     const rows = [...container.querySelectorAll("[data-settled-row]")];
     clickRow(rows[0], { ctrlKey: true });
     clickRow(rows[1], { ctrlKey: true });
@@ -2758,6 +2815,7 @@ describe("SidebarInbox — multi-select + bulk actions", () => {
     });
     const { container } = await flushRender();
 
+    await expandSettled();
     const rows = [...container.querySelectorAll("[data-settled-row]")];
     clickRow(rows[0], { ctrlKey: true });
     clickRow(rows[1], { ctrlKey: true });
@@ -2792,6 +2850,7 @@ describe("SidebarInbox — multi-select + bulk actions", () => {
     // reaching for either is looking for more rows to add to the selection, so
     // dropping it here would make building a bulk action across a long shelf
     // impossible.
+    await expandSettled();
     fireEvent.click(
       screen.getByRole("button", { name: /^Show 2 more settled/ }),
     );
@@ -2813,6 +2872,7 @@ describe("SidebarInbox — multi-select + bulk actions", () => {
     });
     const { container } = await flushRender();
 
+    await expandSettled();
     const rows = [...container.querySelectorAll("[data-settled-row]")];
     clickRow(rows[0], { ctrlKey: true });
     clickRow(rows[1], { ctrlKey: true });
