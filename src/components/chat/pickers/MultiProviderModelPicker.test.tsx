@@ -17,6 +17,10 @@ vi.mock("@/tauri/commands", async (importOriginal) => ({
     version: null,
   })),
 }));
+vi.mock("@/tauri/custom-acp", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/tauri/custom-acp")>()),
+  acpAgents: vi.fn(() => new Promise(() => {})),
+}));
 
 import type {
   ChatModelInfo,
@@ -28,6 +32,8 @@ import {
   useProviderHealth,
 } from "@/stores/provider-health-store";
 import { usePickerFavorites } from "@/stores/picker-favorites-store";
+import { useCustomAcp } from "@/stores/custom-acp-store";
+import { useSettingsStore } from "@/stores/settings-store";
 
 import { MultiProviderModelPicker } from "./MultiProviderModelPicker";
 
@@ -154,6 +160,7 @@ function seedStore(opts: {
 }
 
 beforeEach(() => {
+  useSettingsStore.setState({ settings: {} });
   resetHealthStore();
   seedStore({
     claude: CLAUDE_CAPS,
@@ -167,10 +174,12 @@ beforeEach(() => {
   // assertions start from a known sort order.
   localStorage.clear();
   usePickerFavorites.setState({ favorites: [] });
+  useCustomAcp.setState({ agents: null, bindings: {} });
 });
 
 afterEach(() => {
   cleanup();
+  useSettingsStore.setState({ settings: {} });
   resetHealthStore();
   localStorage.clear();
   usePickerFavorites.setState({ favorites: [] });
@@ -339,6 +348,56 @@ describe("MultiProviderModelPicker — provider rail", () => {
     expect(screen.getByTestId("provider-rail-cursor")).toBeInTheDocument();
     expect(screen.getByTestId("provider-rail-grok")).toBeInTheDocument();
     expect(screen.getByTestId("provider-rail-opencode")).toBeInTheDocument();
+  });
+
+  it("hides custom agents until one is configured", async () => {
+    const user = userEvent.setup();
+    useCustomAcp.setState({ agents: [] });
+    renderPicker();
+    await openPicker(user);
+    expect(screen.queryByTestId(/^provider-rail-acp/)).not.toBeInTheDocument();
+  });
+
+  it("lists each enabled custom agent as its own rail entry", async () => {
+    const user = userEvent.setup();
+    const acpAgent = { executable: "agent", args: [], environment: {}, auth_method: null, revision: "1" };
+    useCustomAcp.setState({
+      agents: [
+        { ...acpAgent, id: "a1", name: "Agent One", enabled: true },
+        { ...acpAgent, id: "a2", name: "Agent Two", enabled: true },
+        { ...acpAgent, id: "off", name: "Disabled", enabled: false },
+      ],
+    });
+    renderPicker();
+    await openPicker(user);
+    expect(screen.getByTestId("provider-rail-acp-a1")).toHaveAccessibleName("Agent One");
+    expect(screen.getByTestId("provider-rail-acp-a2")).toHaveAccessibleName("Agent Two");
+    expect(screen.queryByTestId("provider-rail-acp-off")).not.toBeInTheDocument();
+    // Each agent adds an entry, so the rail must scroll inside the fixed-height popup.
+    expect(screen.getByTestId("multi-provider-rail")).toHaveClass("min-h-0", "overflow-y-auto");
+    await user.click(screen.getByTestId("provider-rail-acp-a2"));
+    expect(screen.getByTestId("custom-acp-models")).toHaveTextContent("Agent Two");
+  });
+
+  it.each(["claude", "acp"] as const)("preserves the current %s provider while hiding disabled choices", async (provider) => {
+    const user = userEvent.setup();
+    useSettingsStore.setState({ settings: { "providers.disabled": "claude,codex,acp" } });
+    useCustomAcp.setState({
+      agents: [{ id: "a1", name: "Agent One", executable: "agent", args: [], environment: {}, auth_method: null, revision: "1", enabled: true }],
+      selections: { draft: "a1" },
+    });
+    renderPicker({ provider, hermesThreadId: "draft" });
+    await user.click(screen.getByTestId("multi-provider-model-picker-trigger"));
+    await screen.findByTestId("multi-provider-rail");
+
+    expect(screen.queryByTestId("provider-rail-codex")).not.toBeInTheDocument();
+    if (provider === "acp") {
+      expect(screen.getByTestId("provider-rail-acp-a1")).toHaveAccessibleName("Agent One");
+      expect(screen.queryByTestId("provider-rail-claude")).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByTestId("provider-rail-claude")).toBeInTheDocument();
+      expect(screen.queryByTestId("provider-rail-acp-a1")).not.toBeInTheDocument();
+    }
   });
 
   it("marks the active provider as selected", async () => {

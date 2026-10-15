@@ -15,7 +15,7 @@ beforeEach(() => {
 afterEach(cleanup);
 it("offers the agent default as null even with an empty authoritative catalog and never auto-probes", async () => {
   const onSelect = vi.fn();
-  render(<CustomAcpModels threadId="draft" model={null} onSelect={onSelect} />);
+  render(<CustomAcpModels agentId={agent.id} active threadId="draft" model={null} onSelect={onSelect} />);
   fireEvent.click(await screen.findByRole("button", { name: "Use agent default" }));
   expect(onSelect).toHaveBeenCalledWith(null);
   expect(invoke).not.toHaveBeenCalledWith("acp_probe", expect.anything());
@@ -24,7 +24,7 @@ it("uses exact opaque model IDs without interpreting the native default alias", 
   const model = { id: " Default /A:B ", label: "Opaque model", description: null, effort_levels: [], default_effort: null, prompt_injected_effort_levels: [], context_window_options: [], supports_adaptive_thinking: false, supports_thinking_toggle: false, supports_fast_mode: false, supports_images: false, sub_provider: null, is_free: false };
   useCustomAcp.setState({ catalogs: { [acpCatalogKey(agent.id, agent.revision)]: { ...catalog, capabilities: { ...catalog.capabilities, models: [model] } } } });
   const onSelect = vi.fn();
-  render(<CustomAcpModels threadId="draft" model={null} onSelect={onSelect} />);
+  render(<CustomAcpModels agentId={agent.id} active threadId="draft" model={null} onSelect={onSelect} />);
   fireEvent.click(await screen.findByRole("button", { name: /Opaque model/ }));
   expect(onSelect).toHaveBeenCalledWith(model.id);
 });
@@ -32,8 +32,8 @@ it("locks backend-bound identity and applies exact runtime reasoning/config valu
   const live = { ...catalog, config_options: [{ id: "Reason /Case", category: "thought_level", name: "Reasoning", description: null, type: "select" as const, current_value: "low", options: [{ value: " Exact:HIGH ", name: "High", description: null }, { value: "low", name: "Low", description: null }] }, { id: "toggle", category: null, name: "Thinking", description: null, type: "boolean" as const, current_value: false, options: [] }] };
   const binding = { thread_id: "bound", agent_id: agent.id, revision: agent.revision, cwd: "/repo", session_id: "session", catalog: live, config_values: {} };
   invoke.mockImplementation(async (cmd: string) => cmd === "acp_agents" ? [agent] : cmd === "acp_binding" ? binding : cmd === "acp_thread_catalog" ? { catalog: live, live: true } : live);
-  render(<CustomAcpModels threadId="bound" model={null} onSelect={vi.fn()} />);
-  await waitFor(() => expect(screen.getByLabelText("Custom agent")).toBeDisabled());
+  render(<CustomAcpModels agentId={agent.id} active threadId="bound" model={null} onSelect={vi.fn()} />);
+  expect(await screen.findByText("Fixed for this chat")).toBeInTheDocument();
   fireEvent.change(await screen.findByLabelText("Reasoning"), { target: { value: " Exact:HIGH " } });
   await waitFor(() => expect(invoke).toHaveBeenCalledWith("acp_set_config", { threadId: "bound", configId: "Reason /Case", value: " Exact:HIGH " }));
   await waitFor(() => expect(screen.getByLabelText("Thinking")).not.toBeDisabled());
@@ -57,7 +57,7 @@ it("retains accepted effort and exposes rejected configuration without a generic
     if (cmd === "acp_set_config") { expect(args).toEqual({ threadId: "bound", configId: " effort /Case ", value: "ultrathink" }); throw new Error("effort retired"); }
     return fallback(cmd, args);
   });
-  render(<CustomAcpModels threadId="bound" model={null} onSelect={vi.fn()} />);
+  render(<CustomAcpModels agentId={agent.id} active threadId="bound" model={null} onSelect={vi.fn()} />);
   await waitFor(() => expect(screen.getByLabelText("Agent effort")).not.toBeDisabled());
   const reads = invoke.mock.calls.filter(([cmd]) => cmd === "acp_thread_catalog").length;
   fireEvent.change(screen.getByLabelText("Agent effort"), { target: { value: "ultrathink" } });
@@ -80,7 +80,7 @@ it("waits for setter acknowledgement and catalog readback instead of painting a 
     if (cmd === "acp_thread_catalog" && accepted) return new Promise<AcpCatalog>(r => { readback = r; }).then(catalog => ({ catalog, live: true }));
     return fallback(cmd, args);
   });
-  render(<CustomAcpModels threadId="bound" model={null} onSelect={vi.fn()} />);
+  render(<CustomAcpModels agentId={agent.id} active threadId="bound" model={null} onSelect={vi.fn()} />);
   await waitFor(() => expect(screen.getByLabelText("Agent effort")).not.toBeDisabled());
   fireEvent.change(screen.getByLabelText("Agent effort"), { target: { value: "ultrathink" } });
   expect(screen.getByLabelText("Agent effort")).toHaveValue("low");
