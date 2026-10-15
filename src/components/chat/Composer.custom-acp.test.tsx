@@ -39,7 +39,7 @@ it("F3: successful manual catalog refresh recovers every mounted consumer after 
     return [];
   });
   const p = props();
-  const { container } = render(<TooltipProvider><Composer {...p} /><CustomAcpModels threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
+  const { container } = render(<TooltipProvider><Composer {...p} /><CustomAcpModels agentId={agent.id} active threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
   const textarea = container.querySelector("textarea")!;
   await waitFor(() => expect(screen.getAllByText(/catalog read unavailable/)).toHaveLength(2));
   expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
@@ -74,7 +74,7 @@ it.each(["enabled", "revision"] as const)("F3: retries failed initial reads afte
     return [];
   });
   const p = props();
-  render(<TooltipProvider><Composer {...p} /><CustomAcpModels threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
+  render(<TooltipProvider><Composer {...p} /><CustomAcpModels agentId={agent.id} active threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
   await waitFor(() => expect(screen.getAllByText(/saved agent unavailable/)).toHaveLength(2));
   const initialReads = reads;
   changed = true;
@@ -101,7 +101,7 @@ it.each((["enabled", "revision"] as const).flatMap(change => [false, true].map(r
     return [];
   });
   const p = props();
-  const content = <TooltipProvider><Composer {...p} /><CustomAcpModels threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>;
+  const content = <TooltipProvider><Composer {...p} /><CustomAcpModels agentId={agent.id} active threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>;
   const view = render(content);
   const textarea = view.container.querySelector("textarea")!;
   try {
@@ -157,7 +157,7 @@ it.each((["enabled", "revision"] as const).flatMap(change => [false, true].map(r
     return [];
   });
   const p = props();
-  const view = render(<TooltipProvider><Composer {...p} /><CustomAcpModels threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
+  const view = render(<TooltipProvider><Composer {...p} /><CustomAcpModels agentId={agent.id} active threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
   const textarea = view.container.querySelector("textarea")!;
   try {
     await waitFor(() => expect(pending).toHaveLength(1));
@@ -205,7 +205,7 @@ it.each([false, true])("FE3 Composer: latest listing completes delayed binding b
   });
   useCustomAcp.setState({ catalogs: {} });
   const p = props();
-  const view = render(<TooltipProvider><Composer {...p} /><CustomAcpModels threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
+  const view = render(<TooltipProvider><Composer {...p} /><CustomAcpModels agentId={agent.id} active threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
   const textarea = view.container.querySelector("textarea")!;
   try {
     await waitFor(() => expect(restoreBinding).toBeTypeOf("function"));
@@ -247,7 +247,7 @@ it("F3: deferred null binding and explicit model probe retain the fresh selectio
     return [];
   });
   const p = props();
-  const { container } = render(<TooltipProvider><Composer {...p} /><CustomAcpModels threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
+  const { container } = render(<TooltipProvider><Composer {...p} /><CustomAcpModels agentId={agent.id} active threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
   const textarea = container.querySelector("textarea")!;
   expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
   await act(async () => restoreNull(null));
@@ -424,7 +424,7 @@ it("does not offer local custom harnesses for an attached remote-host workspace"
   useAppStore.setState({ appState: { workspaces: [{ workspace_id: "remote", host_id: 7, attach_only: true }], active_workspace_id: "remote" } as never });
   render(<TooltipProvider><Composer {...props()} workspaceId="remote" provider="claude" /></TooltipProvider>);
   fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
-  expect(screen.queryByRole("button", { name: /Custom agents/ })).not.toBeInTheDocument();
+  expect(screen.queryByTestId(`provider-rail-acp-${agent.id}`)).not.toBeInTheDocument();
 });
 it("blocks Enter until backend identity restoration finishes without replacing the textarea", async () => {
   let resolve!: (value: null) => void;
@@ -496,7 +496,7 @@ it("selects a custom instance and its null default through the actual unified pi
   const onChange = vi.fn();
   render(<TooltipProvider><MultiProviderModelPicker hermesThreadId="draft-thread" provider="claude" model={null} onProviderModelChange={onChange} /></TooltipProvider>);
   fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
-  fireEvent.click(await screen.findByRole("button", { name: /Custom agents/ }));
+  fireEvent.click(await screen.findByTestId(`provider-rail-acp-${agent.id}`));
   fireEvent.click(await screen.findByRole("button", { name: "Use agent default" }));
   expect(onChange).toHaveBeenCalledWith("acp", null);
   expect(invoke).not.toHaveBeenCalledWith("acp_probe", expect.anything());

@@ -17,6 +17,10 @@ vi.mock("@/tauri/commands", async (importOriginal) => ({
     version: null,
   })),
 }));
+vi.mock("@/tauri/custom-acp", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/tauri/custom-acp")>()),
+  acpAgents: vi.fn(() => new Promise(() => {})),
+}));
 
 import type {
   ChatModelInfo,
@@ -28,6 +32,7 @@ import {
   useProviderHealth,
 } from "@/stores/provider-health-store";
 import { usePickerFavorites } from "@/stores/picker-favorites-store";
+import { useCustomAcp } from "@/stores/custom-acp-store";
 
 import { MultiProviderModelPicker } from "./MultiProviderModelPicker";
 
@@ -167,6 +172,7 @@ beforeEach(() => {
   // assertions start from a known sort order.
   localStorage.clear();
   usePickerFavorites.setState({ favorites: [] });
+  useCustomAcp.setState({ agents: null, bindings: {} });
 });
 
 afterEach(() => {
@@ -339,6 +345,33 @@ describe("MultiProviderModelPicker — provider rail", () => {
     expect(screen.getByTestId("provider-rail-cursor")).toBeInTheDocument();
     expect(screen.getByTestId("provider-rail-grok")).toBeInTheDocument();
     expect(screen.getByTestId("provider-rail-opencode")).toBeInTheDocument();
+  });
+
+  it("hides custom agents until one is configured", async () => {
+    const user = userEvent.setup();
+    useCustomAcp.setState({ agents: [] });
+    renderPicker();
+    await openPicker(user);
+    expect(screen.queryByTestId(/^provider-rail-acp/)).not.toBeInTheDocument();
+  });
+
+  it("lists each enabled custom agent as its own rail entry", async () => {
+    const user = userEvent.setup();
+    const acpAgent = { executable: "agent", args: [], environment: {}, auth_method: null, revision: "1" };
+    useCustomAcp.setState({
+      agents: [
+        { ...acpAgent, id: "a1", name: "Agent One", enabled: true },
+        { ...acpAgent, id: "a2", name: "Agent Two", enabled: true },
+        { ...acpAgent, id: "off", name: "Disabled", enabled: false },
+      ],
+    });
+    renderPicker();
+    await openPicker(user);
+    expect(screen.getByTestId("provider-rail-acp-a1")).toHaveAccessibleName("Agent One");
+    expect(screen.getByTestId("provider-rail-acp-a2")).toHaveAccessibleName("Agent Two");
+    expect(screen.queryByTestId("provider-rail-acp-off")).not.toBeInTheDocument();
+    await user.click(screen.getByTestId("provider-rail-acp-a2"));
+    expect(screen.getByTestId("custom-acp-models")).toHaveTextContent("Agent Two");
   });
 
   it("marks the active provider as selected", async () => {
