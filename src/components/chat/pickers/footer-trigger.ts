@@ -57,10 +57,15 @@ export const FOOTER_TRIGGER_ICON_ONLY = "w-[30px] justify-center px-0";
 
 /** A model label's leaf name — what the composer's narrow width ladder
  *  shows instead of the full label: the last `/` segment of routed ids
- *  ("openrouter/qwen3-coder" → "qwen3-coder"); plain labels pass through. */
-export function leafModelName(label: string): string {
-  const leaf = label.split("/").pop()?.trim();
-  return leaf ? leaf : label;
+ *  ("openrouter/qwen3-coder" → "qwen3-coder"), without a leading `brand`
+ *  word the provider logo beside it already shows ("Claude Opus 4.8" →
+ *  "Opus 4.8"). A bare version keeps its brand ("Grok 4" stays). */
+export function leafModelName(label: string, brand?: string): string {
+  const leaf = label.split("/").pop()?.trim() || label;
+  if (!brand) return leaf;
+  const prefix = `${brand.toLowerCase()} `;
+  const rest = leaf.slice(prefix.length);
+  return leaf.toLowerCase().startsWith(prefix) && /^\p{L}/u.test(rest) ? rest : leaf;
 }
 
 /** Where a session-config picker sits: the composer's controls row, or

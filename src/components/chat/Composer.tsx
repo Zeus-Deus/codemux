@@ -409,6 +409,22 @@ export function collapseDisabledFor(pillWidth: number): boolean {
  *  least this wide, so the placeholder stays readable. */
 export const FOOTER_MIN_GAP_PX = 96;
 
+/** Below `COLLAPSE_DISABLED_BELOW_PX` the card never folds to the pill, so
+ *  the gap never shows the placeholder — only short, truncating hints. The
+ *  controls keep their labels until the gap is this narrow instead, which
+ *  is what lets a phone show "Opus 5.5" rather than a lone provider mark. */
+export const FOOTER_MIN_GAP_EXPANDED_PX = 8;
+
+/** The gap the controls row must leave before it stops compacting.
+ *  `gapFloorPx` is the narrowest the gap can get (its CSS min-width — room
+ *  for the context ring on desktop — or its padding): an overflowing row
+ *  measures exactly that floor, so the target stays above it or the row
+ *  would overflow without ever stepping down. */
+export function footerMinGapFor(pillWidth: number, gapFloorPx = 0): number {
+  if (!collapseDisabledFor(pillWidth)) return FOOTER_MIN_GAP_PX;
+  return Math.max(FOOTER_MIN_GAP_EXPANDED_PX, gapFloorPx + 4);
+}
+
 /** What the controls row gives up, one step at a time, while its gap is
  *  narrower than `FOOTER_MIN_GAP_PX`. The steps key on the measured gap
  *  rather than fixed pill widths, so a short label ("gpt-5.4") keeps its
@@ -2759,13 +2775,30 @@ export function Composer({
   // Resize callbacks omit `key` and keep the current content signature.
   const fitFooter = useCallback((key?: string) => {
     const pill = wrapperRef.current?.getBoundingClientRect().width ?? 0;
-    const gap = footerGapRef.current?.getBoundingClientRect().width ?? 0;
+    const gapEl = footerGapRef.current;
+    // Content that can't shrink (the context ring) may spill out of a gap
+    // with no min-width — on a phone, over the model control.
+    const spill = gapEl ? Math.max(0, gapEl.scrollWidth - gapEl.clientWidth) : 0;
+    const gap = gapEl?.getBoundingClientRect().width ?? 0;
     // No layout yet (or jsdom): stay at full width.
     if (pill <= 0) return;
     setCollapseDisabled(collapseDisabledFor(pill));
+    // An overflowing row squeezes the gap to its min-width or, without
+    // one, to its own padding — never to zero.
+    const gapStyle = gapEl ? getComputedStyle(gapEl) : null;
+    const gapFloor = gapStyle
+      ? Math.max(
+          parseFloat(gapStyle.minWidth) || 0,
+          (parseFloat(gapStyle.paddingLeft) || 0) + (parseFloat(gapStyle.paddingRight) || 0),
+        )
+      : 0;
+    // Any remaining overflow must advance the ladder, even if the gap
+    // already exceeds the small phone minimum. Record the width needed
+    // to fit all its contents before allowing labels to expand again.
+    const minGap = Math.max(footerMinGapFor(pill, gapFloor), gap + spill);
     const measured = committedFitRef.current;
     setFooterFit((prev) =>
-      prev === measured ? nextFooterFit(prev, key ?? prev.key, pill, gap) : prev,
+      prev === measured ? nextFooterFit(prev, key ?? prev.key, pill, gap, minGap) : prev,
     );
   }, []);
   useEffect(() => {
@@ -2863,6 +2896,9 @@ export function Composer({
     streaming && draft.trim().length > 0,
     !!renderContextRow,
     tasks ? `${tasks.completed}/${tasks.total}` : "",
+    // The ring appearing adds width inside the gap without resizing it,
+    // so no observer would notice.
+    contextUsage ? "ring" : "",
   ].join("|");
   // Layout effect: each fit step re-renders and re-measures before paint,
   // so the row never flashes an overflowing intermediate state.

@@ -14,6 +14,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
+import { sessionProviderLabel } from "@/lib/agent-chat/session-mentions";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
@@ -141,7 +142,7 @@ export function ModelPicker({
             <>
               <span className="max-w-[140px] truncate">
                 {leafLabel
-                  ? leafModelName(modelLabel(provider, current))
+                  ? leafModelName(modelLabel(provider, current), sessionProviderLabel(provider))
                   : modelLabel(provider, current)}
               </span>
               {!inContextRow && (

@@ -25,12 +25,18 @@
  * handles navigation keys — focusing the root on an input-bearing
  * popover leaves printable keystrokes with nowhere to go until the user
  * clicks the search box.
+ *
+ * Touch screens are the exception: focusing the input there raises the
+ * on-screen keyboard, which covers half the screen and squeezes the
+ * popover down to a sliver of its list. They focus the root, and the
+ * search field stays one tap away for anyone who wants to type.
  */
 export function focusCmdkOnOpen(event: Event): void {
   event.preventDefault();
   const content = event.currentTarget as HTMLElement | null;
+  const touch = window.matchMedia?.("(pointer: coarse)").matches ?? false;
   const target =
-    content?.querySelector<HTMLElement>("[cmdk-input]") ??
+    (touch ? null : content?.querySelector<HTMLElement>("[cmdk-input]")) ??
     content?.querySelector<HTMLElement>("[cmdk-root]");
   target?.focus();
 }

@@ -333,12 +333,16 @@ html[data-mobile] .mobile-shell button:focus-visible {
 .mobile-panel-actions > * {
   flex-shrink: 0;
 }
-/* Stays one line: the composer's fit ladder measures the gap beside the
-   placeholder, and a wrapped row leaves that gap full width, so the
-   controls never compact and overflow the card instead. */
+/* One row, never wrapped: the composer's width ladder shortens labels to
+   fit, and a wrapped row would hide the overflow it measures. The padding
+   keeps the 44px attach/send circles inside the card's rounded corners. */
 html[data-mobile] [data-testid="composer-controls-row"] {
   height: auto;
-  min-height: 48px;
+  min-height: 56px;
+  padding: 6px;
+}
+html[data-mobile] [data-testid="composer-gap"] {
+  min-width: 0;
 }
 html[data-mobile] .mobile-browser-dialog {
   display: flex;

@@ -15,6 +15,7 @@ import {
   COMMAND_MENU_ROW,
   COMMAND_MENU_SURFACE,
 } from "./command-menu-styles";
+import { useRoomAbove } from "./command-menu-room";
 import type { SlashCommandFooterNote } from "./SlashCommandPopup";
 
 /** Shared handler so the three interactive-adornment listeners stay
@@ -77,12 +78,15 @@ export function ComposerCommandMenu({
   headerSlot = null,
 }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const room = useRoomAbove(rootRef, open);
 
   // Reclaim focus on open and after every submode pivot. Clicking a
   // drill-in row blurs the input; re-focusing keeps cmdk's keyboard nav
-  // live for the freshly-swapped list.
+  // live for the freshly-swapped list. Not on touch screens: there the
+  // focus would raise the on-screen keyboard over the menu just opened.
   useEffect(() => {
-    if (!open) return;
+    if (!open || window.matchMedia?.("(pointer: coarse)").matches) return;
     const raf = requestAnimationFrame(() => inputRef.current?.focus());
     return () => cancelAnimationFrame(raf);
   }, [open, submode]);
@@ -93,11 +97,16 @@ export function ComposerCommandMenu({
 
   return (
     <div
+      ref={rootRef}
       data-testid="composer-command-menu"
+      // Shrinks to the room above the card (a phone's landing page has
+      // little), scrolling its list rather than sliding under the header.
+      style={room === undefined ? undefined : { maxHeight: room }}
       className={cn(
         // Anchored bottom-left to the `+` trigger, 8px above the
-        // composer card, content-width — never stretched across it.
-        "absolute bottom-full left-2 z-[60] mb-2 w-[380px] overflow-hidden",
+        // composer card, content-width — never stretched across it, nor
+        // past its far edge on a narrow card.
+        "absolute bottom-full left-2 z-[60] mb-2 flex w-[380px] max-w-[calc(100%-1rem)] flex-col overflow-hidden",
         COMMAND_MENU_SURFACE,
         "rise-in",
       )}
@@ -116,9 +125,9 @@ export function ComposerCommandMenu({
         // rows survive the filter); cmdk just renders + navigates them.
         shouldFilter={false}
         loop
-        className="flex flex-col"
+        className="flex min-h-0 flex-col"
       >
-        <div className="flex items-center gap-2.5 px-3.5 pt-3 pb-2">
+        <div className="flex shrink-0 items-center gap-2.5 px-3.5 pt-3 pb-2">
           <Search
             className="size-3.5 shrink-0 text-muted-foreground"
             aria-hidden
@@ -144,12 +153,12 @@ export function ComposerCommandMenu({
             onKeyDown={(e) => {
               if (e.key !== "Escape" || e.defaultPrevented) e.stopPropagation();
             }}
-            className="flex items-center gap-0.5 border-y border-hairline px-1.5 py-1"
+            className="flex shrink-0 items-center gap-0.5 border-y border-hairline px-1.5 py-1"
           >
             {headerSlot}
           </div>
         )}
-        <CommandPrimitive.List className="thin-scrollbar max-h-[340px] overflow-x-hidden overflow-y-auto px-1.5 pb-1.5 outline-none">
+        <CommandPrimitive.List className="thin-scrollbar max-h-[340px] min-h-0 overflow-x-hidden overflow-y-auto px-1.5 pb-1.5 outline-none">
           {items.length === 0 ? (
             <div className="px-3 py-6 text-center text-label text-muted-foreground">
               No matches
@@ -287,9 +296,10 @@ export function ComposerCommandMenu({
             </div>
           )}
         </CommandPrimitive.List>
+        {/* Keyboard hints are noise on a touch screen. */}
         <div
           aria-hidden
-          className="flex items-center gap-4 border-t border-hairline px-3.5 py-2"
+          className="flex shrink-0 items-center gap-4 border-t border-hairline px-3.5 py-2 pointer-coarse:hidden"
         >
           <KeyHint keys="↑↓" label="move" />
           <KeyHint keys="↵" label="select" />

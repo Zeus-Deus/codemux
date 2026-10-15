@@ -20,7 +20,9 @@ import {
   Composer,
   composerFooterLadder,
   FOOTER_COMPACT_STEPS,
+  FOOTER_MIN_GAP_EXPANDED_PX,
   FOOTER_MIN_GAP_PX,
+  footerMinGapFor,
   MIN_TEXTAREA_PX,
   nextFooterFit,
   type FooterFit,
@@ -80,6 +82,7 @@ const USAGE = { used_tokens: 44_000, max_tokens: 200_000 };
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 describe("Composer pill collapse", () => {
@@ -106,6 +109,39 @@ describe("Composer pill collapse", () => {
     expect(wrapper()).toHaveAttribute("data-expanded");
     expect(wrapper().className).toContain("rounded-[22px]");
     expect(getByTestId("context-usage-trigger")).toBeInTheDocument();
+  });
+
+  it("compacts until a newly visible context ring fits a 40px gap with 60px of content", () => {
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    const gapWidth = (element: HTMLElement) =>
+      element.parentElement?.querySelector('[aria-label^="Model:"]') ? 64 : 40;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.dataset.testid === "composer-wrapper") return new DOMRect(0, 0, 358, 100);
+      if (this.dataset.testid === "composer-gap") return new DOMRect(0, 0, gapWidth(this), 44);
+      return originalRect.call(this);
+    });
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.dataset.testid === "composer-gap" ? gapWidth(this) : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockImplementation(function (this: HTMLElement) {
+      if (this.dataset.testid !== "composer-gap") return 0;
+      return this.querySelector('[data-testid="context-usage-trigger"]')
+        ? Math.max(60, gapWidth(this))
+        : gapWidth(this);
+    });
+
+    const props = { draft: "next", model: "claude-opus-4-8" };
+    const result = renderComposer(props);
+    const gap = result.getByTestId("composer-gap");
+    gap.style.minWidth = "0px";
+    gap.style.paddingLeft = "8px";
+    // Without the ring, the small phone gap leaves the model label intact.
+    expect(result.getByTitle("Claude Opus 4.8")).toHaveTextContent("Claude Opus 4.8");
+
+    result.rerender(ui({ ...props, contextUsage: USAGE }));
+    expect(result.getByTestId("context-usage-trigger")).toBeInTheDocument();
+    expect(result.getByRole("button", { name: "Model: Claude Opus 4.8" })).toBeInTheDocument();
+    expect(gap.scrollWidth).toBeLessThanOrEqual(gap.clientWidth);
   });
 
   it("turns the gap into 'Enter to queue' while a turn streams", () => {
@@ -323,11 +359,34 @@ describe("nextFooterFit", () => {
     expect(nextFooterFit(prev, "k", 300, 10)).toBe(prev);
   });
 
+  it("measures against the given minimum gap", () => {
+    // A phone's card leaves only 30px of gap: enough there, not on desktop.
+    const prev = fit(0);
+    expect(nextFooterFit(prev, "k", 358, 30, 12)).toBe(prev);
+    expect(nextFooterFit(prev, "k", 358, 10, 12)).toEqual(fit(1, [360]));
+  });
+
   it("re-fits from step 0 when the content changes", () => {
     expect(nextFooterFit(fit(3, [500, 520, 540]), "k2", 400, 10)).toEqual({
       key: "k2",
       level: 0,
       fitWidths: [],
     });
+  });
+});
+
+describe("footerMinGapFor", () => {
+  it("keeps room for the placeholder while the card can still collapse", () => {
+    expect(footerMinGapFor(400)).toBe(FOOTER_MIN_GAP_PX);
+  });
+
+  it("only asks for a sliver of gap once the card never collapses", () => {
+    expect(footerMinGapFor(358)).toBe(FOOTER_MIN_GAP_EXPANDED_PX);
+  });
+
+  it("stays above the gap's own floor, so an overflowing row still steps", () => {
+    // Desktop reserves 50px for the context ring; a phone only has padding.
+    expect(footerMinGapFor(358, 50)).toBe(54);
+    expect(footerMinGapFor(358, 8)).toBe(12);
   });
 });

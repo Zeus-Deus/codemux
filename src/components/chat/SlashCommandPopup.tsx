@@ -10,6 +10,7 @@ import {
   COMMAND_MENU_ROW,
   COMMAND_MENU_SURFACE,
 } from "./command-menu-styles";
+import { useRoomAbove } from "./command-menu-room";
 import { usePopupHighlight, type PopupHighlightStore } from "./popup-highlight-store";
 import {
   groupSlashItems,
@@ -85,6 +86,8 @@ export function SlashCommandPopup({
   footerNote = null,
 }: Props) {
   const listRef = useRef<HTMLDivElement | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const room = useRoomAbove(rootRef, open);
   const pointerHighlightRef = useRef<string | null>(null);
   const pointerPositionRef = useRef<{ x: number; y: number } | null>(null);
   const selectRef = useRef(onSelect);
@@ -140,7 +143,11 @@ export function SlashCommandPopup({
         <ScrollArea
           type="always"
           className={cn(
-            "max-h-80 w-full",
+            // `min-h-0` + column: the area and its viewport shrink below
+            // the 20rem cap when the popup is held to the room above the
+            // card (see below), so the last rows stay reachable.
+            "flex max-h-80 min-h-0 w-full flex-col",
+            "[&>[data-slot=scroll-area-viewport]]:min-h-0",
             // Viewport: cap height + force the inner div cmdk renders
             // to sit on a single block (cmdk's <Command> spreads
             // multi-children inside CommandList; the viewport's
@@ -196,9 +203,14 @@ export function SlashCommandPopup({
 
   return (
     <div
+      ref={rootRef}
       data-testid="slash-command-popup"
+      // Held to the room above the card, so a phone's landing page never
+      // slides it under the header: the list shrinks and scrolls, the
+      // source footer keeps its height.
+      style={room === undefined ? undefined : { maxHeight: room }}
       className={cn(
-        "absolute bottom-full left-0 right-0 mb-2 z-50 overflow-hidden",
+        "absolute bottom-full left-0 right-0 mb-2 z-50 flex flex-col overflow-hidden",
         COMMAND_MENU_SURFACE,
       )}
       onPointerLeave={() => {
@@ -251,10 +263,10 @@ export function SlashCommandPopup({
         onValueChange={(id) => {
           if (id) onHighlightChange(id, "list");
         }}
-        className="text-popover-foreground"
+        className="flex min-h-0 flex-col text-popover-foreground"
       >
         {list}
-        {items.find((item) => item.id === highlightedId)?.identity && <div data-testid="slash-item-source" className="border-t border-hairline px-3 py-2 text-label text-muted-foreground">
+        {items.find((item) => item.id === highlightedId)?.identity && <div data-testid="slash-item-source" className="shrink-0 border-t border-hairline px-3 py-2 text-label text-muted-foreground">
           {items.find((item) => item.id === highlightedId)?.identity?.label}
         </div>}
       </CommandPrimitive>
