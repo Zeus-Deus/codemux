@@ -124,12 +124,38 @@ test("session starts with minimal options and emits session-configured", () => {
     "local",
   ]);
   expect(fake.capturedOptions?.includePartialMessages).toBe(true);
+  expect(fake.capturedOptions?.systemPrompt).toEqual({
+    type: "preset",
+    preset: "claude_code",
+  });
+});
+
+test("start-session RPC appends Codemux instructions to Claude Code's prompt", async () => {
+  const { emit } = recordingEmitter();
+  const methods = buildMethods(emit);
+  try {
+    await methods["start-session"]!({
+      threadId: "append-rpc",
+      cwd: "/tmp/fake-checkout",
+      pathToClaudeCodeExecutable: "/fake/claude",
+      appendSystemPrompt: "## Showing visuals",
+    });
+    expect(fake.capturedOptions?.systemPrompt).toEqual({
+      type: "preset",
+      preset: "claude_code",
+      append: "## Showing visuals",
+    });
+    await methods["stop-session"]!({ threadId: "append-rpc" });
+  } finally {
+    _resetSessionsForTests();
+  }
 });
 
 test("managed workflows expose only virtual tools and ignore native settings", async () => {
   const { emit } = recordingEmitter();
   const session = new ClaudeSession(minimalInput({
     managed: true,
+    appendSystemPrompt: "## Showing visuals",
     effort: "ultracode",
     settings: { hooks: { PreToolUse: ["unsafe"] }, ultracode: true },
     extraArgs: { tools: "Bash,Agent", "plugin-dir": "/tmp/plugin" },
@@ -152,6 +178,7 @@ test("managed workflows expose only virtual tools and ignore native settings", a
   expect(options?.permissionMode).toBe("default");
   expect(options?.settings).toEqual({ disableAllHooks: true, ultracode: false });
   expect(options?.allowedTools).toEqual(["mcp__codemux__workflow_submit_result"]);
+  expect(options?.systemPrompt).toBeUndefined();
   expect((await options!.canUseTool!("Bash", { command: "unsafe" }, { signal: new AbortController().signal, toolUseID: "native" })).behavior).toBe("deny");
   expect((await options!.canUseTool!("mcp__codemux__workflow_submit_result", { output: true }, { signal: new AbortController().signal, toolUseID: "virtual" })).behavior).toBe("allow");
   await session.close();

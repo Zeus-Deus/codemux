@@ -5,6 +5,9 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 
 // ── Module mocks ──
 
+const workflowLaunch = vi.hoisted(() => vi.fn());
+vi.mock("@/components/workflows/launch-chat-workflow", () => ({ launchChatWorkflow: workflowLaunch }));
+
 vi.mock("@/tauri/commands", () => ({
   listSkills: vi.fn().mockResolvedValue({ skills: [], errors: [] }),
   listChatSlashCommands: vi.fn().mockResolvedValue([]),
@@ -417,6 +420,61 @@ describe("DraftChatSurface", () => {
       expect(call[8]).toBe("/projects/foo");
     },
   );
+
+  describe("/workflow as the first message", () => {
+    async function projectDraft(text: string) {
+      const store = useChatDraftStore.getState();
+      const draft = store.getOrCreateHomeDraft();
+      store.updateDraftConfig(draft.draftId, { provider: "codex", checkoutMode: "current" });
+      store.updateDraftTarget(draft.draftId, { kind: "project", projectPath: "/projects/foo" });
+      store.setActiveDraft(draft.draftId);
+      const view = renderSurface();
+      const textarea = view.container.querySelector("textarea")!;
+      fireEvent.change(textarea, { target: { value: text } });
+      // A leading-slash message waits for the provider's command catalog.
+      await vi.waitFor(() => expect(listChatSlashCommands).toHaveBeenCalled());
+      await act(async () => {});
+      return { draft, textarea };
+    }
+
+    it("creates the chat and launches the workflow in it instead of sending a turn", async () => {
+      workflowLaunch.mockReset().mockResolvedValue({ id: "run-1" });
+      vi.mocked(materializeAndSend).mockResolvedValueOnce({ success: false, error: "test stops here" });
+      const { draft, textarea } = await projectDraft("/workflow review the auth module");
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await vi.waitFor(() => expect(materializeAndSend).toHaveBeenCalledOnce());
+      const call = vi.mocked(materializeAndSend).mock.calls[0];
+      // The goal names the new workspace; the command prefix does not.
+      expect(call[1]).toBe("review the auth module");
+      const firstTurn = call[10]?.firstTurn;
+      expect(firstTurn).toBeTypeOf("function");
+      await firstTurn!({ workspaceId: "ws-new", paneId: "pane-new", threadId: draft.threadId });
+      expect(workflowLaunch).toHaveBeenCalledWith(expect.objectContaining({
+        workspaceId: "ws-new", threadId: draft.threadId, goal: "review the auth module", provider: "codex", anchorEventId: null,
+      }));
+    });
+
+    it("refuses an attachment that failed to load without creating anything", async () => {
+      workflowLaunch.mockReset();
+      const { draft, textarea } = await projectDraft("/workflow review @!509");
+      act(() => useAgentChatStore.getState().addStagedAttachment(draft.threadId, {
+        id: "pr", kind: "pr", ref: "!509", metadata: { label: "#509", error: "gh failed" },
+      }));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await vi.waitFor(() => expect(toast.error).toHaveBeenCalledWith("An attachment couldn't be loaded", expect.anything()));
+      expect(materializeAndSend).not.toHaveBeenCalled();
+      expect(workflowLaunch).not.toHaveBeenCalled();
+    });
+
+    it("asks for a goal without creating anything", async () => {
+      // A trailing space closes the slash popup, as after picking the row.
+      const { textarea } = await projectDraft("/workflow ");
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await act(async () => {});
+      expect(materializeAndSend).not.toHaveBeenCalled();
+      expect(toast.error).toHaveBeenCalledWith("Add a goal after /workflow", expect.anything());
+    });
+  });
 
   describe("rendering", () => {
     it("renders nothing when no draft is active", () => {

@@ -1,6 +1,10 @@
 import { resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { selectProviderCommands, useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { parseMessageDelivery } from "@/lib/agent-chat/message-delivery";
+import { parseWorkflowCommand } from "@/lib/workflows/workflow-settings";
+import { launchChatWorkflow } from "@/components/workflows/launch-chat-workflow";
+import { workflowAttachmentProblem } from "@/lib/workflows/workflow-attachments";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import {
   useCallback,
   useEffect,
@@ -394,6 +398,15 @@ function DraftChatSurfaceInner({
     draft.target.kind === "existing_workspace"
       ? draft.target.workspaceId
       : null;
+  // `/workflow` runs against this machine's checkouts: a draft that will run
+  // on another device, an attach-only workspace, or a remote client can't.
+  const agentChatEnabled = useFeatureFlags((state) => state.enableAgentChat);
+  const targetAttachOnly = useAppStore((state) =>
+    draft.target.kind === "existing_workspace"
+      ? !!state.appState?.workspaces.find((workspace) => workspace.workspace_id === sessionWorkspaceId)?.attach_only
+      : false,
+  );
+  const draftWorkflowsAvailable = agentChatEnabled && threadHostId === null && !targetAttachOnly && !isRemoteClient();
 
   // Synchronous guard against duplicate submissions while a single
   // materialise is in flight. Mirrors AgentChatPane's send-in-flight
@@ -459,6 +472,13 @@ function DraftChatSurfaceInner({
     if (currentDraft.promoting) return;
     const text = parseMessageDelivery(currentDraft.inputDraft).text;
     if (!text) return;
+    // `/workflow <goal>` creates the chat, then starts a CodeMux workflow in
+    // it instead of sending a first provider turn.
+    const workflowCommand = parseWorkflowCommand(text);
+    if (workflowCommand && !workflowCommand.goal) {
+      toast.error("Add a goal after /workflow", { description: "For example: /workflow review the auth module for security issues" });
+      return;
+    }
 
     // Submit-time salvage: if we're about to send a "home" draft while
     // a project-rooted sidebar workspace is active, silently re-route
@@ -594,6 +614,20 @@ function DraftChatSurfaceInner({
       sendDraft.target.kind !== "existing_workspace"
         ? (sendDraft.hostId ?? null)
         : null;
+    if (workflowCommand) {
+      const attachOnly = sendTarget.kind === "existing_workspace"
+        && !!useAppStore.getState().appState?.workspaces.find((workspace) => workspace.workspace_id === sendTarget.workspaceId)?.attach_only;
+      if (executionHostId !== null || attachOnly || isRemoteClient()) {
+        toast.error("Workflows need a local workspace", { description: "Pick a project on this machine to run a workflow." });
+        sendInFlightRef.current = false;
+        return;
+      }
+      if (liveAttachments.some((attachment) => attachment.kind === "image")) {
+        toast.error("Workflows can't use images yet", { description: "Remove the image, or send it as a normal message." });
+        sendInFlightRef.current = false;
+        return;
+      }
+    }
     if (background) {
       // Claim before clearing: the home slot must not reuse or discard the
       // sending draft while attachment preflight is still in flight.
@@ -753,11 +787,18 @@ function DraftChatSurfaceInner({
         );
         return;
       }
+      if (workflowCommand) {
+        const problem = workflowAttachmentProblem(activeFreshAttachments);
+        if (problem) {
+          reportFailure(problem.title, problem.description);
+          return;
+        }
+      }
       const attachmentBlock = buildAttachmentBlock(activeFreshAttachments);
 
       const result = await materializeAndSend(
         sendDraft,
-        text,
+        workflowCommand ? workflowCommand.goal : text,
         cwdForSession,
         {
           markPromoting: state.markPromoting,
@@ -790,7 +831,20 @@ function DraftChatSurfaceInner({
         imageDisplaySources,
         worktreeProjectPath,
         (phase) => setPending((p) => (p ? { ...p, phase } : p)),
-        { background },
+        {
+          background,
+          firstTurn: workflowCommand
+            ? ({ workspaceId, threadId }) => launchChatWorkflow({
+              workspaceId,
+              threadId,
+              goal: workflowCommand.goal,
+              context: attachmentBlock,
+              provider: finalDraft.provider,
+              model: finalDraft.model,
+              anchorEventId: null,
+            }).then(() => undefined)
+            : undefined,
+        },
       );
       if (result.success) {
         // The provider started a session and took the turn — retire any
@@ -1409,6 +1463,7 @@ function DraftChatSurfaceInner({
       // Drafts do not need a backend session to be considered ready —
       // Enter-to-send is always available as long as text is present.
       sessionReady={true}
+      workflowsAvailable={draftWorkflowsAvailable}
       // No live session yet — drives the draft-variant placeholder copy and
       // keeps the prompt card open. Once the first prompt is sent, the
       // docked composer behaves like the live pane's: it folds to the pill,

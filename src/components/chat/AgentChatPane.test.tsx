@@ -2,6 +2,10 @@
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
+const workflowMocks = vi.hoisted(() => ({ launch: vi.fn(), available: true }));
+vi.mock("@/components/workflows/launch-chat-workflow", () => ({ launchChatWorkflow: workflowMocks.launch }));
+vi.mock("@/components/workflows/use-workflows-available", () => ({ useWorkflowsAvailable: () => workflowMocks.available }));
+
 // Native IPC seam only: keep the real pane subscription and task components.
 vi.mock("@/lib/delegation", async (importOriginal) => ({
   ...await importOriginal<typeof import("@/lib/delegation")>(),
@@ -41,6 +45,7 @@ type SliceOverrides = {
   lastPersistedEventId?: number | null;
   interrupted?: boolean;
   usageLimit?: import("@/lib/agent-chat/types").UsageLimitState | null;
+  stagedAttachments?: unknown[];
 };
 let currentSliceOverrides: Record<string, SliceOverrides> = {};
 let currentDraftsById: Record<
@@ -691,6 +696,7 @@ vi.mock("@/stores/agent-chat-store", () => {
       lastPersistedEventId: overrides.lastPersistedEventId ?? null,
       interrupted: overrides.interrupted ?? false,
       usageLimit: overrides.usageLimit ?? null,
+      stagedAttachments: overrides.stagedAttachments ?? [],
     };
   }
   function buildThreads() {
@@ -4649,4 +4655,97 @@ it("refreshes the Codex catalog when startup falls back from a saved tier", asyn
   } finally {
     refresh.mockRestore();
   }
+});
+
+describe("AgentChatPane /workflow", () => {
+  beforeEach(() => {
+    workflowMocks.launch.mockReset();
+    workflowMocks.launch.mockResolvedValue({ id: "run-1" });
+    workflowMocks.available = true;
+    vi.mocked(agentChatSendTurn).mockClear();
+    setInputDraftMock.mockClear();
+  });
+  afterEach(() => cleanup());
+
+  async function submit(draft: string) {
+    currentMessages = [{ kind: "user_message", id: "m1", seq: 1, source_event_id: 7 }];
+    currentSliceOverrides = { "thread-x": { inputDraft: draft } };
+    const view = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+    fireEvent.click(view.container.querySelector('[data-testid="composer-submit"]')!);
+    await act(async () => {});
+    return view;
+  }
+
+  it("starts a workflow beside the chat instead of sending a provider turn", async () => {
+    await submit("/workflow  review the auth module");
+    await waitFor(() => expect(workflowMocks.launch).toHaveBeenCalledOnce());
+    expect(workflowMocks.launch.mock.calls[0][0]).toMatchObject({ threadId: "thread-x", goal: "review the auth module", anchorEventId: 7 });
+    await waitFor(() => expect(setInputDraftMock).toHaveBeenCalledWith("thread-x", ""));
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+  });
+
+  it("keeps the draft and sends nothing when the goal is missing or workflows are unavailable", async () => {
+    await submit("/workflow");
+    workflowMocks.available = false;
+    cleanup();
+    await submit("/workflow review auth");
+    expect(workflowMocks.launch).not.toHaveBeenCalled();
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    expect(setInputDraftMock).not.toHaveBeenCalledWith("thread-x", "");
+  });
+
+  it("passes resolved attachments to the workflow as context", async () => {
+    currentMessages = [];
+    currentSliceOverrides = { "thread-x": {
+      inputDraft: "/workflow review @auth.ts",
+      stagedAttachments: [{ id: "a1", kind: "file", ref: "/repo/auth.ts", metadata: { label: "auth.ts" }, resolvedContent: "export const auth = 1;" }],
+    } };
+    const view = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+    fireEvent.click(view.container.querySelector('[data-testid="composer-submit"]')!);
+    await waitFor(() => expect(workflowMocks.launch).toHaveBeenCalledOnce());
+    const input = workflowMocks.launch.mock.calls[0][0];
+    expect(input.goal).toBe("review @auth.ts");
+    expect(input.context).toContain("export const auth = 1;");
+  });
+
+  it("refuses image attachments and keeps the draft", async () => {
+    currentMessages = [];
+    currentSliceOverrides = { "thread-x": {
+      inputDraft: "/workflow review this screenshot",
+      stagedAttachments: [{ id: "img", kind: "image", ref: "shot.png", metadata: { label: "shot.png" } }],
+    } };
+    const view = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+    fireEvent.click(view.container.querySelector('[data-testid="composer-submit"]')!);
+    await act(async () => {});
+    expect(workflowMocks.launch).not.toHaveBeenCalled();
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    expect(setInputDraftMock).not.toHaveBeenCalledWith("thread-x", "");
+  });
+
+  it("refuses an attachment that is still loading instead of dropping it", async () => {
+    currentMessages = [];
+    currentSliceOverrides = { "thread-x": {
+      inputDraft: "/workflow review @!509",
+      stagedAttachments: [{ id: "pr", kind: "pr", ref: "!509", metadata: { label: "#509", isLoading: true, fetchedAt: Date.now() } }],
+    } };
+    const view = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+    fireEvent.click(view.container.querySelector('[data-testid="composer-submit"]')!);
+    await act(async () => {});
+    expect(workflowMocks.launch).not.toHaveBeenCalled();
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    expect(setInputDraftMock).not.toHaveBeenCalledWith("thread-x", "");
+  });
+
+  it("keeps the draft when the workflow cannot start", async () => {
+    workflowMocks.launch.mockRejectedValue(new Error("Grok can't run workflows here"));
+    await submit("/workflow review auth");
+    await waitFor(() => expect(workflowMocks.launch).toHaveBeenCalledOnce());
+    await act(async () => {});
+    expect(setInputDraftMock).not.toHaveBeenCalledWith("thread-x", "");
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+  });
 });

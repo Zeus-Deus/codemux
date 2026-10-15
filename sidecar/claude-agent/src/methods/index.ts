@@ -158,6 +158,8 @@ function makeStartSession(emit: EventEmitter): MethodHandler {
     if (resume !== undefined) input.resume = resume;
     const sessionId = optString(p["sessionId"], "sessionId");
     if (sessionId !== undefined) input.sessionId = sessionId;
+    const appendSystemPrompt = optString(p["appendSystemPrompt"], "appendSystemPrompt");
+    if (appendSystemPrompt !== undefined) input.appendSystemPrompt = appendSystemPrompt;
     const extraArgs = optRecord(p["extraArgs"], "extraArgs");
     if (extraArgs !== undefined) {
       input.extraArgs = Object.fromEntries(

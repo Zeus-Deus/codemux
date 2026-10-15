@@ -93,6 +93,8 @@ export interface SessionStartInput {
    *  tool's prefixed name (`mcp__<server>__<tool>`) is what the
    *  agent sees and what permission rules key on. */
   mcpTools?: RegisteredMcpTool[];
+  /** Codemux instructions appended to Claude Code's system prompt. */
+  appendSystemPrompt?: string;
 }
 
 /** Parameters for `send-turn`. */
@@ -185,8 +187,8 @@ function isAbortLikeError(err: unknown): boolean {
 }
 
 /** Build the full SDK `Options` object from our public `SessionStartInput`.
- *  Every field is set conditionally except the two hardcoded
- *  infrastructure flags (`settingSources`, `includePartialMessages`) and
+ *  Every field is set conditionally except the hardcoded infrastructure
+ *  flags (`settingSources`, `includePartialMessages`, `systemPrompt`) and
  *  the two always-required ones (`pathToClaudeCodeExecutable`, `env`). */
 function buildQueryOptions(
   input: SessionStartInput,
@@ -197,6 +199,13 @@ function buildQueryOptions(
     cwd: input.cwd,
     pathToClaudeCodeExecutable: input.pathToClaudeCodeExecutable,
     settingSources: ["user", "project", "local"],
+    // The SDK sends an empty system prompt unless asked for Claude Code's,
+    // which chats need for the same tool and safety guidance as the CLI.
+    systemPrompt: {
+      type: "preset",
+      preset: "claude_code",
+      ...(input.appendSystemPrompt ? { append: input.appendSystemPrompt } : {}),
+    },
     includePartialMessages: true,
     // Ask the SDK to emit human-readable `summary` fields on
     // `task_progress` events so the subagent card's activity line can
@@ -280,6 +289,9 @@ function buildQueryOptions(
     opts.env = { ...opts.env, ENABLE_TOOL_SEARCH: "false", MCP_CONNECTION_NONBLOCKING: "0", ENABLE_CLAUDEAI_MCP_SERVERS: "false" };
     opts.disallowedTools = ["Bash", "Agent", "Task", "Workflow"];
     opts.settingSources = [];
+    // Attempts keep the bare prompt they were built against; Claude Code's
+    // guidance describes tools they cannot use.
+    delete opts.systemPrompt;
     opts.strictMcpConfig = true;
     opts.plugins = [];
     const managedSettings = { disableAllHooks: true, ultracode: false };
