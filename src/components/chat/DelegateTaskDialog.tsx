@@ -2,6 +2,9 @@ import { useEffect, useId, useRef, useState } from 'react';
 import { Server, ShieldCheck } from 'lucide-react';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DIALOG_CRISP_POSITION } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
+import { NativeSelect } from '@/components/ui/native-select';
+import { Textarea } from '@/components/ui/textarea';
 import { useHostsStore } from '@/stores/hosts-store';
 import { delegateTask, delegationAuthorize, delegationGrants, delegationHostInfo, delegationRead, type DelegateTaskInput, type DelegationHostInfo, type DelegationProvider, type LocalTask } from '@/lib/delegation';
 import { isDelegationPaneOwner, upsertDelegationTask } from '@/stores/delegation-store';
@@ -16,7 +19,6 @@ export interface DelegateTaskDialogProps {
   onLaunched: (task: LocalTask) => void;
   writable: boolean;
 }
-const fieldClass = 'w-full rounded-md border border-border bg-background px-3 py-2 text-body outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50';
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 export function DelegateTaskDialog(props: DelegateTaskDialogProps) {
   const { open, onOpenChange, paneId, threadId, writable } = props;
@@ -168,7 +170,7 @@ export function DelegateTaskDialog(props: DelegateTaskDialogProps) {
   };
   const select = (label: string, value: string, onChange: (value: string) => void, children: React.ReactNode, disabled = false) => (
     <label className="grid gap-1.5 text-body-sm" htmlFor={`${id}-${label}`}><span className="font-medium">{label}</span>
-      <select id={`${id}-${label}`} className={fieldClass} value={value} disabled={disabled || !writable || locked} onChange={event => { if (locked) return; attempt.current = null; onChange(event.target.value); setConsent(false); }}>{children}</select>
+      <NativeSelect id={`${id}-${label}`} value={value} disabled={disabled || !writable || locked} onChange={event => { if (locked) return; attempt.current = null; onChange(event.target.value); setConsent(false); }}>{children}</NativeSelect>
     </label>
   );
   return <Dialog open={open} onOpenChange={close}>
@@ -196,12 +198,12 @@ export function DelegateTaskDialog(props: DelegateTaskDialogProps) {
         {select('Permission', permission, setPermission, <><option value="">Choose permission…</option>{caps?.permission_modes.map(mode => <option key={mode.value} value={mode.value}>{mode.label}</option>)}</>, !caps)}
         {selectedPermission && <p className="-mt-2 text-body-sm text-muted-foreground">{selectedPermission.description}</p>}
         {!!selectedModel?.effort_levels.length && select('Reasoning effort', effort, setEffort, <><option value="">Runtime default</option>{selectedModel.effort_levels.map(level => <option key={level} value={level}>{caps?.effort_label_map[level] ?? level}</option>)}</>)}
-        <label className="grid gap-1.5 text-body-sm" htmlFor={`${id}-task`}><span className="font-medium">Task</span><textarea id={`${id}-task`} className={`${fieldClass} min-h-28 resize-y`} value={prompt} readOnly={locked || !writable} onChange={event => { if (locked || !writable) return; attempt.current = null; setPrompt(event.target.value); }} placeholder="Describe the task and the result you need. Do not include credentials." /></label>
+        <label className="grid gap-1.5 text-body-sm" htmlFor={`${id}-task`}><span className="font-medium">Task</span><Textarea id={`${id}-task`} className="min-h-28 resize-y" value={prompt} readOnly={locked || !writable} onChange={event => { if (locked || !writable) return; attempt.current = null; setPrompt(event.target.value); }} placeholder="Describe the task and the result you need. Do not include credentials." /></label>
         {new TextEncoder().encode(prompt).length > 32000 && <p role="alert" className="text-body-sm text-destructive">Task exceeds 32,000 UTF-8 bytes. Shorten it before running.</p>}
         <div className="grid gap-2 rounded-lg border border-border bg-surface-1 p-3">
           <p className="flex items-center gap-2 text-body-sm font-medium"><ShieldCheck className="size-4" aria-hidden />Explicit remote access</p>
           <p className="text-body-sm text-muted-foreground">The agent runs as the remote OS user and can access that user’s files and services under the selected permission mode. It may edit this checkout’s working tree. This is not a sandbox. Only this task prompt is forwarded, not your full parent transcript or credentials.</p>
-          <label className="flex items-start gap-2 text-body-sm"><input type="checkbox" className="mt-0.5" checked={consent} disabled={!selectedHost || !workspace || !selectedModel || !selectedPermission || !writable || phase !== 'idle'} onChange={event => setConsent(event.target.checked)} /><span>Authorize this host and checkout for {provider === 'codex' ? 'Codex' : 'Claude'} with {selectedPermission?.label ?? 'the selected permission'} and run this task. This grants future delegation from conversations in this workspace, within their permission ceilings. Cancel stops this launch, but does not revoke a grant already saved.</span></label>
+          <label className="flex items-start gap-2 text-body-sm"><Checkbox className="mt-0.5" checked={consent} disabled={!selectedHost || !workspace || !selectedModel || !selectedPermission || !writable || phase !== 'idle'} onCheckedChange={checked => setConsent(checked === true)} /><span>Authorize this host and checkout for {provider === 'codex' ? 'Codex' : 'Claude'} with {selectedPermission?.label ?? 'the selected permission'} and run this task. This grants future delegation from conversations in this workspace, within their permission ceilings. Cancel stops this launch, but does not revoke a grant already saved.</span></label>
         </div>
         {!writable && <p role="status" className="text-body-sm text-muted-foreground">This conversation is read-only. Remote actions are unavailable.</p>}
         {error && <p role="alert" className="text-body-sm text-destructive">{error}</p>}

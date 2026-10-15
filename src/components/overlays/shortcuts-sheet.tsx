@@ -1,3 +1,4 @@
+import { KbdKeys } from "@/components/ui/kbd";
 import { useMemo, useRef, useState } from "react";
 import { Keyboard, Search, X } from "lucide-react";
 
@@ -210,9 +211,7 @@ export function ShortcutsSheet() {
                         <span className="min-w-0 leading-snug text-foreground/85">
                           {row.label}
                         </span>
-                        <kbd className="shrink-0 rounded-sm border border-hairline-strong bg-surface-1 px-1.5 py-0.5 font-mono text-caption leading-none text-muted-foreground">
-                          {row.keys}
-                        </kbd>
+                        <KbdKeys keys={row.keys} className="shrink-0" />
                       </li>
                     ))}
                   </ul>

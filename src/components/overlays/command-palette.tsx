@@ -1,3 +1,4 @@
+import { Kbd } from "@/components/ui/kbd";
 import { useAddonsStore } from "@/stores/addons-store";
 import { addonEnabled } from "@/lib/addons/types";
 import { executeAddon } from "@/lib/addons/platform";
@@ -1282,9 +1283,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           placeholder={`Search workspaces, conversations, commands…  (${COMMAND_MODE_PREFIX} for commands)`}
           className="h-8 min-w-0 flex-1 bg-transparent text-body outline-none placeholder:text-muted-foreground/70"
         />
-        <kbd className="flex-none rounded-sm border border-hairline-strong px-1.5 py-0.5 font-mono text-caption text-muted-foreground/70">
-          esc
-        </kbd>
+        <Kbd>esc</Kbd>
       </div>
 
       {/* Results */}

@@ -1,3 +1,4 @@
+import { Checkbox } from "@/components/ui/checkbox";
 import { useState } from "react";
 import { ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -233,10 +234,9 @@ function ReviewBody({
       <code className="break-all text-label">SHA-256 {review.digest}</code>
       {review.replacesSource && (
         <label className="flex items-start gap-2 text-body">
-          <input
-            type="checkbox"
+          <Checkbox
             checked={replace}
-            onChange={(e) => setReplace(e.target.checked)}
+            onCheckedChange={(checked) => setReplace(checked === true)}
           />
           Replace the existing source with this package. Its previous grants
           and private data will not carry over.
@@ -244,10 +244,9 @@ function ReviewBody({
       )}
       {review.retainedData && (
         <label className="flex items-start gap-2 text-body">
-          <input
-            type="checkbox"
+          <Checkbox
             checked={restoreData}
-            onChange={(e) => setRestoreData(e.target.checked)}
+            onCheckedChange={(checked) => setRestoreData(checked === true)}
           />
           Restore private data retained from version{" "}
           {review.retainedData.version} of this same source. Credentials are

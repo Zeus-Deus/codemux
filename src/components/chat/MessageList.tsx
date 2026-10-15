@@ -4,10 +4,12 @@ import {
   ArrowDown,
   ChevronDown,
   ChevronRight,
+  CirclePause,
   Hourglass,
   RotateCw,
   TriangleAlert,
 } from "lucide-react";
+import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
 import {
   LegendList,
   type AnchoredEndSpaceConfig,
@@ -1698,16 +1700,16 @@ function RunStalledNotice({
  *  died without cleanly settling and no turn is in flight. */
 function RunInterruptedDivider() {
   return (
-    <div
+    <Marker
+      variant="separator"
       data-testid="run-interrupted-divider"
-      className="flex items-center gap-3 text-warning"
+      className="text-label text-warning before:bg-warning/40 after:bg-warning/40"
     >
-      <span className="h-px flex-1 bg-warning/40" />
-      <span className="font-mono text-label font-medium tracking-wide">
-        Run interrupted
-      </span>
-      <span className="h-px flex-1 bg-warning/40" />
-    </div>
+      <MarkerIcon className="size-3.5">
+        <CirclePause />
+      </MarkerIcon>
+      <MarkerContent className="font-medium">Run interrupted</MarkerContent>
+    </Marker>
   );
 }
 
@@ -1752,13 +1754,12 @@ function AutoResumedTurnDivider({ text }: { text: string }) {
 
 function SessionStartMarker({ startedAt }: { startedAt?: number }) {
   return (
-    <div className="flex items-center gap-3 text-muted-foreground/70">
-      <span className="h-px flex-1 bg-border/60" />
-      <span className="font-mono text-label font-medium tracking-wide">
-        {formatSessionStart(startedAt)}
-      </span>
-      <span className="h-px flex-1 bg-border/60" />
-    </div>
+    <Marker
+      variant="separator"
+      className="font-mono text-label font-medium tracking-wide text-muted-foreground/70 before:bg-border/60 after:bg-border/60"
+    >
+      <MarkerContent>{formatSessionStart(startedAt)}</MarkerContent>
+    </Marker>
   );
 }
 

@@ -1,3 +1,4 @@
+import { NativeSelect } from "@/components/ui/native-select";
 import { useEffect, useState } from "react";
 import { Search, RefreshCw, ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -144,9 +145,10 @@ export function AddonCatalog({
                   {plugin.description}
                 </p>
                 <div className="flex flex-wrap items-center gap-2">
-                  <select
+                  <NativeSelect
+                    size="sm"
+                    className="w-auto"
                     aria-label={`Release of ${plugin.name}`}
-                    className="rounded-sm border bg-background px-2 py-1 text-body"
                     value={versions[plugin.id] ?? ""}
                     onChange={(e) =>
                       setVersions({ ...versions, [plugin.id]: e.target.value })
@@ -159,7 +161,7 @@ export function AddonCatalog({
                         {release.platforms.map(platformLabel).join(", ")}
                       </option>
                     ))}
-                  </select>
+                  </NativeSelect>
                   <Button
                     size="sm"
                     variant="outline"

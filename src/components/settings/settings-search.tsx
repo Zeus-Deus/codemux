@@ -1,3 +1,4 @@
+import { Kbd } from "@/components/ui/kbd";
 import { useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Search, X } from "lucide-react";
 
@@ -133,9 +134,7 @@ export function SettingsNavSearch({
               <X className="size-3" />
             </button>
           ) : (
-            <kbd className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 rounded-sm border border-hairline-strong px-1 font-mono text-micro text-muted-foreground/70">
-              /
-            </kbd>
+            <Kbd className="absolute top-1/2 right-2 -translate-y-1/2">/</Kbd>
           )}
         </div>
       </div>

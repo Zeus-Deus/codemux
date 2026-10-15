@@ -1,3 +1,4 @@
+import { NativeSelect } from "@/components/ui/native-select";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Copy } from "lucide-react";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
@@ -251,11 +252,10 @@ function PendingConnection({ request, locked, canApprove, onApprove, onDeny }: {
       </div>}
       {request.phase === "denied" && <p className="text-label text-muted-foreground">Denied · no access was granted. The request will clear when the browser continues or it expires.</p>}
       {undecided && <div className="flex flex-wrap items-center gap-2">
-        <select aria-label={`Access for ${request.clientName}`} value={access} disabled={locked}
-          className="h-8 rounded-md border border-input bg-background px-2 text-label focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        <NativeSelect size="sm" className="w-auto" aria-label={`Access for ${request.clientName}`} value={access} disabled={locked}
           onChange={(event) => setAccess(event.target.value as AgentConnectorAccess)}>
           {Object.entries(ACCESS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-        </select>
+        </NativeSelect>
         <Button variant="outline" size="sm" disabled={locked || !canApprove} onClick={() => onApprove(access)}>Approve</Button>
         <Button variant="ghost" size="sm" disabled={locked} onClick={onDeny}>Deny</Button>
       </div>}

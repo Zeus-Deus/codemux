@@ -1,3 +1,4 @@
+import { Checkbox } from "@/components/ui/checkbox";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
@@ -304,11 +305,10 @@ export function RemotePathPicker() {
           {/* Footer */}
           <div className="flex items-center justify-between pt-1">
             <label className="flex select-none items-center gap-1.5 text-label text-muted-foreground">
-              <input
-                type="checkbox"
+              <Checkbox
                 checked={showHidden}
-                onChange={toggleHidden}
-                className="size-3 accent-primary"
+                onCheckedChange={toggleHidden}
+                className="size-3.5"
               />
               Show hidden
             </label>
