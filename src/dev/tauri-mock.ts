@@ -45,6 +45,7 @@ import { createAgentConnectorMock } from "./agent-connector-mock";
 import { workflowMockHandlers } from "./workflow-mock";
 import { createCustomAcpMock } from "./custom-acp-mock";
 import { pluginMockHandlers } from "./plugin-mock";
+import { seedEnvironmentsFromSearch } from "./environments-mock";
 import {
   delegationScenarioFromSearch,
   mockDelegatedChild,
@@ -180,6 +181,7 @@ const MOCK_RECENT_PROJECTS = [
   { path: `${MOCK_HOME_DIR}/code/field-notes`, name: "field-notes", last_opened_at: "2026-10-03T16:40:00Z" },
   { path: `${MOCK_HOME_DIR}/code/api-gateway`, name: "api-gateway", last_opened_at: "2026-09-29T11:05:00Z" },
 ];
+seedEnvironmentsFromSearch(window.location.search);
 // `?mockScenario=delegation…`: the seeded chat starts empty, as a Claude chat
 // in Full access, and plays the delegation flow once its channel attaches.
 const delegationScenario = delegationScenarioFromSearch(window.location.search);
