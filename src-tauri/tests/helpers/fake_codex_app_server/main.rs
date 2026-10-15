@@ -30,6 +30,8 @@
 //!   recoverable real-world "no rollout found" error.
 //! * `FAKE_CODEX_THREAD_ID` — override the id returned from
 //!   `thread/start` (default `"c-1"`).
+//! * `FAKE_CODEX_THREAD_MODEL` — report this model in `thread/start` and
+//!   `thread/resume` responses, as Codex does for its configured default.
 //! * `FAKE_CODEX_EXIT_AFTER=<method>` — exit the fixture 0 after
 //!   responding to the named method (used to simulate crashes).
 //! * `FAKE_CODEX_UNAUTHENTICATED=1` — return no account from `account/read`
@@ -181,6 +183,10 @@ fn main() {
     }]);
     let fail_resume = env_truthy("FAKE_CODEX_FAIL_RESUME");
     let thread_id = std::env::var("FAKE_CODEX_THREAD_ID").unwrap_or_else(|_| "c-1".to_string());
+    let thread_result = match std::env::var("FAKE_CODEX_THREAD_MODEL") {
+        Ok(model) => json!({"thread": {"id": thread_id}, "model": model}),
+        Err(_) => json!({"thread": {"id": thread_id}}),
+    };
     let exit_after = std::env::var("FAKE_CODEX_EXIT_AFTER").ok();
     let unauthenticated = env_truthy("FAKE_CODEX_UNAUTHENTICATED");
     let capture_turn = std::env::var("FAKE_CODEX_CAPTURE_TURN").ok();
@@ -316,7 +322,7 @@ fn main() {
                     write_line(&json!({
                         "jsonrpc":"2.0",
                         "id": id,
-                        "result": {"thread": {"id": thread_id }},
+                        "result": thread_result,
                     }));
                 }
                 fire_script_entries_for(method, &script, &pending_server_requests);
@@ -334,7 +340,7 @@ fn main() {
                     write_line(&json!({
                         "jsonrpc":"2.0",
                         "id": id,
-                        "result": {"thread": {"id": thread_id}},
+                        "result": thread_result,
                     }));
                 }
                 fire_script_entries_for(method, &script, &pending_server_requests);

@@ -983,11 +983,13 @@ export function SidebarInbox() {
   const [justSettledId, setJustSettledId] = useState<string | null>(null);
   const [justUnsettledId, setJustUnsettledId] = useState<string | null>(null);
 
-  // Shelf disclosure. Settled stays open — it is the history the user sweeps
-  // into and reads back. Snoozed starts closed: its rows are, by definition,
-  // work the user said they did not want to see right now, so re-showing them
-  // every launch would undo the gesture.
-  const [settledCollapsed, setSettledCollapsed] = useState(false);
+  // Shelf disclosure. Settled starts closed: it is finished history that
+  // grows without bound, so an open shelf buries the live work above it. The
+  // open workspace's row still shows through (see `visibleSettled`). Snoozed
+  // starts closed too: its rows are, by definition, work the user said they
+  // did not want to see right now, so re-showing them every launch would undo
+  // the gesture.
+  const [settledCollapsed, setSettledCollapsed] = useState(true);
   // Wrapping up starts open: its rows are still active work, so hiding them
   // is only ever the user's explicit choice.
   const [wrappingUpCollapsed, setWrappingUpCollapsed] = useState(false);

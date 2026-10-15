@@ -26,9 +26,10 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { isInlineHtmlRender } from "@/lib/agent-chat/html-render";
-import type {
-  ChatViewItem,
-  PermissionRequestItem,
+import {
+  isAppReceipt,
+  type ChatViewItem,
+  type PermissionRequestItem,
 } from "@/lib/agent-chat/types";
 import { isDelegationResultsText } from "@/lib/agent-chat/delegation";
 import {
@@ -58,6 +59,7 @@ import { AsyncQuestionRecord } from "./AsyncQuestionPanel";
 import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
 import { RemoteTaskRow } from "./remote-task-context";
+import { ChatWorkflowCard } from "@/components/workflows/chat-workflow-card";
 import { WorkflowRunCard } from "./WorkflowRunCard";
 import { ChatFileLinkContext } from "./chat-file-link-context";
 import { resolveConversationSearchTargetIndex } from "./conversation-search-target";
@@ -323,7 +325,7 @@ export const MessageList = memo(function MessageList({
   // separate shimmer marker is suppressed when one is the transcript tail
   // (no double indicators). The marker still fills the gap before any step
   // arrives (e.g. right after send), which is not a working Activity tail.
-  const tailBody = [...slots].reverse().find(slot => !(slot.body.kind === 'item' && slot.body.item.kind === 'remote_task'))?.body ?? null;
+  const tailBody = [...slots].reverse().find(slot => !(slot.body.kind === 'item' && isAppReceipt(slot.body.item)))?.body ?? null;
   const tailIsWorkingActivity =
     tailBody?.kind === "activity" && tailBody.working;
   // `shouldShowThinkingIndicator` steps back for a running tool / streaming
@@ -332,7 +334,7 @@ export const MessageList = memo(function MessageList({
   // into a settled turn, or dropped as a quiet observational read — and
   // the thread would show nothing live while the agent is mid-command.
   // Reinstate the marker whenever the live tail item is invisible.
-  const tailItem = [...ordered].reverse().find(item => item.kind !== 'remote_task') ?? null;
+  const tailItem = [...ordered].reverse().find(item => !isAppReceipt(item)) ?? null;
   const tailItemIsLive =
     tailItem != null &&
     ((tailItem.kind === "tool_call" && tailItem.status === "running") ||
@@ -1917,6 +1919,10 @@ function ItemRow({
 
   if (item.kind === "remote_task") {
     return <RemoteTaskRow task={item.task} />;
+  }
+
+  if (item.kind === "chat_workflow") {
+    return <ChatWorkflowCard runId={item.runId} workspaceId={item.workspaceId} threadId={item.threadId} />;
   }
 
   // Same full-width, no-gutter treatment for a Workflow tool run.

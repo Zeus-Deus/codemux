@@ -43,7 +43,7 @@ export function CustomAcpModels({ threadId, projectPath, model, onSelect, disabl
     </label>
     {warning && <p role="status" className="rounded-md bg-muted/50 p-2 text-label text-muted-foreground">{warning}</p>}
     {(error || actionError) && <p role="alert" className="rounded-md border border-destructive/30 p-2 text-destructive">{actionError ?? error}</p>}
-    {!agents?.length && !loading && <p className="text-muted-foreground">Add a custom agent in Settings → Agent.</p>}
+    {!agents?.length && !loading && <p className="text-muted-foreground">Add a custom agent in Settings → Providers.</p>}
     {agent && <button type="button" className="flex items-center justify-end gap-1.5 text-label text-muted-foreground hover:text-foreground disabled:opacity-40" disabled={loading || busy || probing || !agent.enabled} onClick={() => {
       setActionError(null); setProbing(true);
       void (fixed && threadId ? useCustomAcp.getState().refreshThread(threadId) : useCustomAcp.getState().probe(agent.id, projectPath)).catch(e => setActionError(String(e))).finally(() => setProbing(false));

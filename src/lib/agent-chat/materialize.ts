@@ -195,8 +195,14 @@ export async function materializeAndSend(
    *  tracks the actual work instead of a bare spinner. Optional; a
    *  no-op by default. */
   onPhase: (phase: MaterializePhase) => void = () => {},
-  /** Create and send without selecting the workspace or its pane. */
-  options: { background?: boolean } = {},
+  /** Create and send without selecting the workspace or its pane.
+   *  `firstTurn` replaces the provider turn: the workspace, pane and
+   *  session are still created, but no user bubble is appended and no
+   *  turn is sent; the hook runs instead (used by `/workflow`). */
+  options: {
+    background?: boolean;
+    firstTurn?: (target: { workspaceId: string; paneId: string; threadId: string }) => Promise<void>;
+  } = {},
 ): Promise<MaterializeResult> {
   actions.markPromoting(draft.draftId);
 
@@ -217,12 +223,14 @@ export async function materializeAndSend(
   const clientNonce = randomUUID();
   actions.ensureThread(draft.threadId);
   seedSliceFromDraft(draft, actions);
-  actions.appendUserMessage(
-    draft.threadId,
-    text,
-    clientNonce,
-    imageDisplaySources,
-  );
+  if (!options.firstTurn) {
+    actions.appendUserMessage(
+      draft.threadId,
+      text,
+      clientNonce,
+      imageDisplaySources,
+    );
+  }
   const hostId = draftHostId(draft);
   onPhase(
     hostId !== null
@@ -420,7 +428,9 @@ export async function materializeAndSend(
   //    parsed by the caller and arrive via `skillBodies`.
   onPhase("sending");
   try {
-    await agentChatSendTurn(draft.provider, {
+    if (options.firstTurn) {
+      await options.firstTurn({ workspaceId, paneId, threadId: draft.threadId });
+    } else await agentChatSendTurn(draft.provider, {
       thread_id: draft.threadId,
       text: applyAllPrefixes(
         exactSkillSelection?.text ?? text,

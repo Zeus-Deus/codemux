@@ -20,21 +20,6 @@ import type { ActivePillMode } from "@/components/chat/pickers/ModePill";
 import { type GoalSubcommandWord } from "./goal";
 
 /**
- * Tone applied to a command-menu row's icon chip (redesigned `+`
- * command menu). Maps to the app's token utilities in
- * `ComposerCommandMenu` — never a raw colour. `muted` is the neutral
- * default so rows that don't opt in stay quiet.
- */
-export type CommandTone =
-  | "sky"
-  | "amber"
-  | "violet"
-  | "green"
-  | "red"
-  | "muted"
-  | "ember";
-
-/**
  * One row in the slash-command popup. The popup component renders these
  * generically — no hard-coded knowledge of modes — so Step 7 (skills)
  * can append its own items without touching the popup.
@@ -95,10 +80,6 @@ export interface SlashCommandItem {
    *  label. Useful for entity results (such as conversations) whose
    *  names and previews need independent truncation. */
   stacked?: boolean;
-  /** Redesigned `+` command menu — tone of the row's 24px icon chip.
-   *  Optional; the menu falls back to `muted` when unset. Ignored by
-   *  the legacy `SlashCommandPopup` (slash / mention surfaces). */
-  tone?: CommandTone;
   /** Provider-supplied argument hint (e.g. `<pr-url>`), kept verbatim so
    *  the popup can show it after the label. Only set on commands without
    *  registered subcommands — those list their arguments instead. */
@@ -569,35 +550,31 @@ export function buildModeCommands({
 }
 
 interface BuildWorkflowCommandArgs {
-  /** True when the active model is a Claude model. `/workflow` only
-   *  runs through the Claude Code runtime's server-side orchestration
-   *  (it fans a task out to many subagents), so other providers keep
-   *  the row visible but disabled with a reason rather than hiding it
-   *  outright — mirrors the `attach:image` capability-gate pattern. */
-  isClaude: boolean;
+  /** Whether this chat can start a CodeMux workflow: Agent Chat is on and
+   *  the chat belongs to a local workspace in the desktop client. Otherwise
+   *  the row stays visible but disabled with the reason. */
+  available: boolean;
 }
 
 /**
  * Build the single `/workflow` row shared by both command surfaces
- * (the typed `/` popup and the `+` menu). Selecting it only ever
- * inserts the literal text `/workflow ` into the draft — the runtime
- * parses that prefix server-side and drives the orchestration; there
- * is no frontend workflow-start logic here.
+ * (the typed `/` popup and the `+` menu). Selecting it only inserts
+ * `/workflow ` into the draft; sending `/workflow <goal>` starts a
+ * CodeMux workflow from the chat pane instead of a provider turn.
  */
 export function buildWorkflowCommand({
-  isClaude,
+  available,
 }: BuildWorkflowCommandArgs): SlashCommandItem {
   return {
     id: "workflow",
     label: "Workflow",
-    description: isClaude
-      ? "Orchestrate this task with many subagents"
-      : "Only available with Claude models",
+    description: available
+      ? "Split a task across agents working in parallel"
+      : "Needs a local workspace on this device",
     command: "/workflow",
     icon: Workflow,
-    tone: "ember",
     group: "WORKFLOWS",
-    disabled: !isClaude,
+    disabled: !available,
     onSelect: () => {},
   };
 }

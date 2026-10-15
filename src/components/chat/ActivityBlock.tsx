@@ -1,46 +1,55 @@
-import { Check, ChevronDown, ChevronRight, X } from "lucide-react";
+import { ArrowRight, Bot, HelpCircle, Lightbulb, ListTree } from "lucide-react";
 import { memo, useState } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
+import {
+  Trace,
+  TraceCollapsible,
+  TraceCollapsibleContent,
+  TraceCollapsibleTrigger,
+  TraceDescription,
+  TraceIcon,
+  TraceLine,
+  TraceTitle,
+  type TraceStatus,
+} from "@/components/ui/trace";
 import { turnOrbActivity } from "@/lib/agent-chat/orb-activity";
 import type { SubagentRunItem } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 import { useUIStore } from "@/stores/ui-store";
 
 import type { ActivityStep, WorkEntry } from "./transcript-slots";
-import { Reveal } from "./Reveal";
 import { StepElapsed } from "./StepElapsed";
 import { TickingText } from "./TickingText";
 import { ToolCallBody } from "./ToolCallBodies";
 import {
   isSubagentRun,
+  stepStatus,
   subagentPreview,
   subagentRunMeta,
   subagentRunStatus,
-  toStepView,
+  traceStepDescription,
+  traceStepTitle,
   workLogTotals,
   type StepStatus,
   type WorkLogTotals,
 } from "./activity-steps";
-import { Spinner } from "@/components/ui/spinner";
+import { toolIcon } from "./tool-visuals";
 
 /** The opened history shows this many recent entries before "Show earlier". */
 export const WORK_LOG_HISTORY_WINDOW = 10;
 
-const ROW_CLASS =
-  "flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-body-sm leading-5 transition-colors duration-150 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
-
-const META_CLASS =
-  "shrink-0 whitespace-nowrap font-mono text-caption text-muted-foreground/55";
+const META_CLASS = "font-mono text-caption";
 
 type OrbActivity = ReturnType<typeof turnOrbActivity>;
 
 /**
  * One line for one uninterrupted stretch of mechanical work: tool calls,
- * thoughts and subagent runs alike. Collapsed, the line is the newest entry
- * plus stretch totals; pressing it opens the chronological history. There is
- * deliberately no surrounding card, status banner or settled header—the turn
- * fold owns completion and the final assistant answer owns the hierarchy.
+ * thoughts and subagent runs alike, drawn with shadcn's Trace. Collapsed, the
+ * line is the newest entry plus stretch totals; pressing it opens the
+ * chronological history as nested Trace lines. There is deliberately no
+ * surrounding card, status banner or settled header—the turn fold owns
+ * completion and the final assistant answer owns the hierarchy.
  *
  * Every disclosure here is the user's own choice, so the block never closes
  * itself when the turn ends: someone reading a diff mid-run keeps reading it.
@@ -85,7 +94,7 @@ export const ActivityBlock = memo(function ActivityBlock({
     const live = working && entry.id === latest.id;
     if (isSubagentRun(entry)) {
       return (
-        <SubagentRunRow
+        <SubagentRunLine
           key={entry.id}
           run={entry}
           live={live}
@@ -94,15 +103,14 @@ export const ActivityBlock = memo(function ActivityBlock({
       );
     }
     return (
-      <StepRow
+      <StepLine
         key={entry.id}
         step={entry}
         live={live}
         ticking={working || turnLive}
         orbActivity={live ? orbActivity : undefined}
         expanded={expandedStepId === entry.id}
-        onToggle={() => {
-          const expanding = expandedStepId !== entry.id;
+        onToggle={(expanding) => {
           setExpandedStepId(expanding ? entry.id : null);
           // A lone step is the whole log, so its detail is what to keep.
           if (items.length === 1) keepOpen(expanding);
@@ -114,58 +122,53 @@ export const ActivityBlock = memo(function ActivityBlock({
   let body: React.ReactNode;
   if (items.length === 1) {
     body = renderEntry(latest);
-  } else if (!open) {
-    body = (
-      <CollapsedLine
-        entry={latest}
-        live={working}
-        orbActivity={orbActivity}
-        totals={workLogTotals(items)}
-        onOpen={() => {
-          setOpen(true);
-          keepOpen(true);
-        }}
-      />
-    );
   } else {
-    const hiddenCount = showAll
-      ? 0
-      : Math.max(0, items.length - WORK_LOG_HISTORY_WINDOW);
+    const hiddenCount =
+      open && !showAll ? Math.max(0, items.length - WORK_LOG_HISTORY_WINDOW) : 0;
+    const totals = workLogTotals(items);
     body = (
-      <>
-        <button
-          type="button"
-          aria-expanded
-          onClick={() => {
-            setOpen(false);
+      <TraceCollapsible
+        open={open}
+        onOpenChange={(next) => {
+          setOpen(next);
+          if (!next) {
             setShowAll(false);
             setExpandedStepId(null);
-            keepOpen(false);
-          }}
-          className={ROW_CLASS}
-        >
-          <span className="flex size-5 shrink-0 items-center justify-center text-muted-foreground/65">
-            <ChevronDown className="size-3.5 rotate-180" aria-hidden />
-          </span>
-          <span className="min-w-0 flex-1 font-medium text-foreground/80">
-            Work log
-          </span>
-          <TotalsLabel totals={workLogTotals(items)} />
-        </button>
-        {hiddenCount > 0 && (
-          <button
-            type="button"
-            onClick={() => setShowAll(true)}
-            className={cn(ROW_CLASS, "text-muted-foreground")}
-          >
-            <span className="size-5 shrink-0" aria-hidden />
-            Show {hiddenCount} earlier
-          </button>
-        )}
-        <div className="space-y-px">
-          {items.slice(hiddenCount).map(renderEntry)}
-        </div>
-      </>
+          }
+          keepOpen(next);
+        }}
+      >
+        <TraceCollapsibleTrigger>
+          {open ? (
+            <TraceLine>
+              <TraceIcon>
+                <ListTree />
+              </TraceIcon>
+              <TraceTitle className="font-medium text-foreground/80">Work log</TraceTitle>
+              <TotalsLabel totals={totals} />
+            </TraceLine>
+          ) : (
+            <CollapsedLine
+              entry={latest}
+              live={working}
+              orbActivity={orbActivity}
+              totals={totals}
+            />
+          )}
+        </TraceCollapsibleTrigger>
+        <TraceCollapsibleContent>
+          <Trace>
+            {hiddenCount > 0 && (
+              <button type="button" onClick={() => setShowAll(true)}>
+                <TraceLine className="text-muted-foreground/70">
+                  <TraceTitle>Show {hiddenCount} earlier</TraceTitle>
+                </TraceLine>
+              </button>
+            )}
+            {items.slice(hiddenCount).map(renderEntry)}
+          </Trace>
+        </TraceCollapsibleContent>
+      </TraceCollapsible>
     );
   }
 
@@ -179,65 +182,125 @@ export const ActivityBlock = memo(function ActivityBlock({
       {runs.map((run) => (
         <span key={run.id} data-subagent-run-id={run.id} className="hidden" />
       ))}
-      {body}
+      <Trace>{body}</Trace>
     </div>
   );
 });
+
+function traceStatus(status: StepStatus): TraceStatus | undefined {
+  if (status === "running") return "running";
+  if (status === "error") return "error";
+  return undefined;
+}
+
+/** Icon slot for a step: the turn's one live orb on the live line, the
+ *  tool's own glyph everywhere else. */
+function StepIcon({
+  step,
+  live,
+  orbActivity,
+}: {
+  step: ActivityStep;
+  live: boolean;
+  orbActivity?: OrbActivity;
+}) {
+  if (live) {
+    return (
+      <TraceIcon className="size-5 -mx-0.5">
+        <AgentOrb size={20} {...(orbActivity ?? {})} aria-hidden />
+      </TraceIcon>
+    );
+  }
+  if (step.kind !== "reasoning" && step.status === "unconfirmed") {
+    return (
+      <TraceIcon title="Hermes did not report a completion result">
+        <HelpCircle />
+      </TraceIcon>
+    );
+  }
+  const Icon = step.kind === "reasoning" ? Lightbulb : toolIcon(step.tool_name);
+  return (
+    <TraceIcon>
+      <Icon />
+    </TraceIcon>
+  );
+}
+
+/** Verb in prose, target in mono, argument dimmed: "Ran `cargo test`". */
+function StepTitle({ step }: { step: ActivityStep }) {
+  const { verb, target, argument } = traceStepTitle(step);
+  return (
+    <TraceTitle>
+      {verb}
+      {target ? (
+        <>
+          {verb ? " " : null}
+          <span className={cn(step.kind === "reasoning" ? "italic" : "font-mono text-label")}>
+            {target}
+          </span>
+        </>
+      ) : null}
+      {argument ? (
+        <>
+          {" "}
+          <span className="font-mono text-label opacity-60">{argument}</span>
+        </>
+      ) : null}
+    </TraceTitle>
+  );
+}
 
 function CollapsedLine({
   entry,
   live,
   orbActivity,
   totals,
-  onOpen,
 }: {
   entry: WorkEntry;
   live: boolean;
   orbActivity?: OrbActivity;
   totals: WorkLogTotals;
-  onOpen: () => void;
 }) {
-  const { verb, summary, status } = isSubagentRun(entry)
-    ? {
-        verb: "agents",
-        summary: subagentPreview(entry.subagents),
-        status: subagentRunStatus(entry),
-      }
-    : toStepView(entry);
-  return (
-    <button
-      type="button"
-      aria-expanded={false}
-      onClick={onOpen}
-      className={ROW_CLASS}
-    >
-      <span className="flex size-5 shrink-0 items-center justify-center">
+  if (isSubagentRun(entry)) {
+    const status = subagentRunStatus(entry);
+    return (
+      <TraceLine status={traceStatus(status)}>
         {live ? (
-          <AgentOrb size={20} {...(orbActivity ?? {})} aria-hidden />
+          <TraceIcon className="size-5 -mx-0.5">
+            <AgentOrb size={20} {...(orbActivity ?? {})} aria-hidden />
+          </TraceIcon>
         ) : (
-          <StepGlyph status={status} />
+          <TraceIcon>
+            <Bot />
+          </TraceIcon>
         )}
-      </span>
-      <span className="shrink-0 text-muted-foreground/65">{verb}</span>
-      <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
-        {summary}
-      </span>
-      {live && !isSubagentRun(entry) ? (
-        <StepElapsed step={entry} className={META_CLASS} separated />
+        <TraceTitle>
+          {status === "running" ? "Running subagents" : "Ran subagents"}{" "}
+          <span className="font-mono text-label">{subagentPreview(entry.subagents)}</span>
+        </TraceTitle>
+        <TotalsLabel totals={totals} />
+      </TraceLine>
+    );
+  }
+  return (
+    <TraceLine status={traceStatus(stepStatus(entry))}>
+      <StepIcon step={entry} live={live} orbActivity={orbActivity} />
+      <StepTitle step={entry} />
+      {stepStatus(entry) === "unconfirmed" ? (
+        <TraceDescription className={META_CLASS}>outcome unconfirmed</TraceDescription>
+      ) : null}
+      {live ? (
+        <StepElapsed step={entry} className={cn(META_CLASS, "text-muted-foreground/60")} separated />
       ) : null}
       <TotalsLabel totals={totals} />
-      <ChevronDown
-        className="size-3 shrink-0 text-muted-foreground/45"
-        aria-hidden
-      />
-    </button>
+    </TraceLine>
   );
 }
 
 function TotalsLabel({ totals }: { totals: WorkLogTotals }) {
   if (!totals.label && totals.failed === 0) return null;
   return (
-    <span className="shrink-0 font-mono text-caption text-muted-foreground/55">
+    <TraceDescription className={META_CLASS}>
       {totals.label}
       {totals.failed > 0 ? (
         <span className="text-status-attention">
@@ -245,11 +308,11 @@ function TotalsLabel({ totals }: { totals: WorkLogTotals }) {
           {totals.failed} failed
         </span>
       ) : null}
-    </span>
+    </TraceDescription>
   );
 }
 
-function StepRow({
+function StepLine({
   step,
   live,
   ticking,
@@ -266,66 +329,40 @@ function StepRow({
   ticking: boolean;
   orbActivity?: OrbActivity;
   expanded: boolean;
-  onToggle: () => void;
+  onToggle: (expanding: boolean) => void;
 }) {
-  const view = toStepView(step);
+  const status = stepStatus(step);
+  const description = traceStepDescription(step);
+  const tickingNow = ticking && status === "running" && step.started_at != null;
   return (
-    <div>
-      <button
-        type="button"
-        onClick={onToggle}
-        aria-expanded={expanded}
-        className={ROW_CLASS}
-      >
-        <span className="flex size-5 shrink-0 items-center justify-center">
-          {live ? (
-            <AgentOrb size={20} {...(orbActivity ?? {})} aria-hidden />
-          ) : (
-            <StepGlyph status={view.status} />
-          )}
-        </span>
-        <span className="shrink-0 text-muted-foreground/65">{view.verb}</span>
-        <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
-          {view.summary}
-        </span>
-        {ticking && view.status === "running" && step.started_at != null ? (
-          <StepElapsed step={step} className={META_CLASS} />
-        ) : view.meta && !live ? (
-          <span
-            className={cn(
-              META_CLASS,
-              view.status === "error" && "text-status-attention",
-            )}
-          >
-            {view.meta}
-          </span>
-        ) : null}
-        <ChevronDown
-          className={cn(
-            "size-3 shrink-0 text-muted-foreground/45 transition-transform duration-150",
-            expanded && "rotate-180",
-          )}
-          aria-hidden
-        />
-      </button>
-      <Reveal open={expanded}>
-        <div className="ml-[10px] mt-0.5 border-l border-border/60 py-1.5 pl-3">
-          {step.kind === "reasoning" ? (
-            <p className="whitespace-pre-wrap break-words text-body italic leading-[1.6] text-muted-foreground">
-              {step.text}
-            </p>
-          ) : (
-            <ToolCallBody item={step} />
-          )}
-        </div>
-      </Reveal>
-    </div>
+    <TraceCollapsible open={expanded} onOpenChange={onToggle}>
+      <TraceCollapsibleTrigger>
+        <TraceLine status={traceStatus(status)}>
+          <StepIcon step={step} live={live} orbActivity={orbActivity} />
+          <StepTitle step={step} />
+          {tickingNow ? (
+            <StepElapsed step={step} className={cn(META_CLASS, "text-muted-foreground/60")} />
+          ) : description && !live ? (
+            <TraceDescription className={META_CLASS}>{description}</TraceDescription>
+          ) : null}
+        </TraceLine>
+      </TraceCollapsibleTrigger>
+      <TraceCollapsibleContent>
+        {step.kind === "reasoning" ? (
+          <p className="whitespace-pre-wrap break-words text-body italic leading-[1.6] text-muted-foreground">
+            {step.text}
+          </p>
+        ) : (
+          <ToolCallBody item={step} />
+        )}
+      </TraceCollapsibleContent>
+    </TraceCollapsible>
   );
 }
 
 /** A subagent run inside the work log. Its detail lives in the Subagents
- *  panel, so the row opens that panel instead of expanding inline. */
-function SubagentRunRow({
+ *  panel, so the line opens that panel instead of expanding inline. */
+function SubagentRunLine({
   run,
   live,
   workspaceId,
@@ -349,44 +386,31 @@ function SubagentRunRow({
       disabled={!workspaceId}
       aria-pressed={selected}
       aria-label={`View ${count} subagent${count === 1 ? "" : "s"}`}
-      className={cn(
-        ROW_CLASS,
-        "group/subagents disabled:cursor-default",
-        selected && "bg-surface-3",
-      )}
+      className={cn("group/subagents disabled:cursor-default", selected && "text-foreground")}
     >
-      <span className="flex size-5 shrink-0 items-center justify-center">
-        {live ? <AgentOrb size={20} aria-hidden /> : <StepGlyph status={status} />}
-      </span>
-      <span className="shrink-0 text-muted-foreground/65">agents</span>
-      <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
-        {subagentPreview(run.subagents)}
-      </span>
-      <TickingText
-        active={status === "running"}
-        className="shrink-0 whitespace-nowrap font-mono text-caption text-muted-foreground/55"
-        compute={(now) => subagentRunMeta(run, now)}
-      />
-      <span className="flex shrink-0 items-center gap-0.5 text-caption font-medium text-foreground/70">
-        View
-        <ChevronRight
-          className="size-3 transition-transform duration-150 group-hover/subagents:translate-x-0.5"
-          aria-hidden
+      <TraceLine status={traceStatus(status)} className={cn(selected && "text-foreground")}>
+        {live ? (
+          <TraceIcon className="size-5 -mx-0.5">
+            <AgentOrb size={20} aria-hidden />
+          </TraceIcon>
+        ) : (
+          <TraceIcon>
+            <Bot />
+          </TraceIcon>
+        )}
+        <TraceTitle>
+          {status === "running" ? "Running" : "Ran"} {count} subagent{count === 1 ? "" : "s"}{" "}
+          <span className="font-mono text-label">{subagentPreview(run.subagents)}</span>
+        </TraceTitle>
+        <TickingText
+          active={status === "running"}
+          className={cn(META_CLASS, "shrink-0 whitespace-nowrap text-muted-foreground/60 tabular-nums")}
+          compute={(now) => subagentRunMeta(run, now)}
         />
-      </span>
+        <TraceIcon>
+          <ArrowRight className="size-3 transition-transform duration-150 group-hover/subagents:translate-x-0.5" />
+        </TraceIcon>
+      </TraceLine>
     </button>
   );
-}
-
-function StepGlyph({ status }: { status: StepStatus }) {
-  if (status === "unconfirmed") return <span title="Hermes did not report a completion result" className="size-3 text-muted-foreground">?</span>;
-  if (status === "running") {
-    return (
-      <Spinner className="size-3 text-muted-foreground/70" aria-hidden />
-    );
-  }
-  if (status === "error") {
-    return <X className="size-3 text-status-attention" aria-hidden />;
-  }
-  return <Check className="size-3 text-status-open" aria-hidden />;
 }

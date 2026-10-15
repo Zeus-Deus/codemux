@@ -211,6 +211,32 @@ describe("materializeAndSend", () => {
       },
     );
 
+    it("runs a firstTurn hook instead of a provider turn, after the session starts", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({ target: { kind: "project", projectPath: "/projects/foo" } });
+      const firstTurn = vi.fn().mockResolvedValue(undefined);
+      const result = await materializeAndSend(draft, "review auth", "/projects/foo", actions,
+        null, null, [], [], null, undefined, { firstTurn });
+      expect(result.success).toBe(true);
+      expect(agentChatStartSession).toHaveBeenCalled();
+      expect(firstTurn).toHaveBeenCalledWith({ workspaceId: "ws-project", paneId: "pane-new", threadId: draft.threadId });
+      expect(agentChatSendTurn).not.toHaveBeenCalled();
+      // The workflow card is the record of this send, not a user bubble.
+      expect(actions.appendUserMessage).not.toHaveBeenCalled();
+      expect(activateWorkspace).toHaveBeenCalledWith("ws-project");
+      expect(actions.markPromoted).toHaveBeenCalled();
+    });
+
+    it("fails the send, keeping the draft, when the firstTurn hook rejects", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({ target: { kind: "project", projectPath: "/projects/foo" } });
+      const result = await materializeAndSend(draft, "review auth", "/projects/foo", actions,
+        null, null, [], [], null, undefined, { firstTurn: () => Promise.reject(new Error("Grok can't run workflows here")) });
+      expect(result).toEqual({ success: false, error: "Grok can't run workflows here" });
+      expect(actions.markSendFailed).toHaveBeenCalledWith(draft.draftId, "Grok can't run workflows here");
+      expect(agentChatSendTurn).not.toHaveBeenCalled();
+    });
+
     it("creates a fresh workspace at $HOME with a message-derived title for a home draft", async () => {
       const actions = makeActions();
       const draft = makeDraft();

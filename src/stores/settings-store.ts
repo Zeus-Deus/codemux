@@ -83,6 +83,15 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // Clock style for timestamps: "system" follows the locale, "12h"/"24h"
   // force it. See src/lib/time-format.ts.
   "appearance.time_format": "system",
+  // Settings → Workflows. Machine-local because workflows only run against
+  // this machine's local workspaces. See src/lib/workflows/workflow-settings.ts.
+  "workflows.agents": "same_provider",
+  // JSON map of provider → { enabled, model }. Empty means the defaults.
+  "workflows.providers": "",
+  "workflows.file_changes": "read_only",
+  "workflows.size": "standard",
+  "workflows.token_budget": "",
+  "workflows.composer_button": "false",
 };
 
 /** Color palette variant. */

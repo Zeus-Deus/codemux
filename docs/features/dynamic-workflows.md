@@ -8,20 +8,21 @@ is independent of a provider's reasoning effort and native orchestration pane.
 
 ## Use it
 
-1. Enable Agent Chat and open **Workflows** from the composer or right panel.
-2. Set the goal and select a provider pool. The read-only starter reviews three
-   areas and synthesizes their results. **Workflow script** and **Models and
-   routes** expose optional customization, including multiple models per provider.
-   OpenCode requires an explicit `provider/model`; Cursor SDK routes require
-   standalone effort to be empty. These requirements are shown before live launch.
-3. Optionally open **Limits** to set worker, task, attempt, depth, output, token
-   and time limits. **Auto** uses a safe host ceiling; the program chooses how
-   many tasks to add.
-4. Choose **Dry run** to exercise the production scheduler without calling any
-   provider. The browser development preview has a separate synthetic runtime.
-5. Choose **Run with agents** only when every selected route reports live support.
-   Writing requires the separate **Allow file changes** opt-in and an explicit
-   task scope. Changes stay in retained snapshots until reviewed and applied.
+1. In any Agent Chat on a local workspace, type `/workflow` and a goal, for
+   example `/workflow review the auth module for security issues`. The message
+   starts a workflow beside the chat instead of a provider turn.
+2. A planner agent reads the workspace and splits the goal into independent
+   subtasks, choosing a model for each. The subtasks run in parallel, then a
+   final agent writes a report. The chat shows a live card with the plan, the
+   agents and the report; **Continue in chat** puts the report in the message
+   box so the chat's agent can act on it.
+3. By default a run stays on the chat's provider: the chat's model plus a couple
+   of that provider's other models, so it works without setup. **Settings →
+   Workflows** can mix in other providers, allow file changes (isolated until
+   reviewed and applied), and set the run size and token budget.
+4. The **Workflows** pane lists runs. Open one for task details, file review and
+   controls, or choose **Custom script** to run your own program with the same
+   Settings. **Dry run** exercises a custom script without calling any provider.
 
 Managed execution requires **Linux and a local Git workspace**. Claude and Codex
 use their existing native harnesses. Cursor, OpenCode and Hermes now have separate
@@ -355,15 +356,15 @@ Also run the `managed_` Rust filter for adapter policy and owned process-group
 shutdown checks, and `bun run typecheck` plus `bun test test/session.test.ts` in
 `sidecar/claude-agent` for the fake Claude SDK boundary.
 
-For browser verification, start `npm run dev -- --host 127.0.0.1`, then run
-`node scripts/e2e/workflows-ui.mjs`. It uses local Chromium and Puppeteer Core from
-the global Puppeteer installation; `CODEMUX_CHROMIUM` and
-`CODEMUX_PUPPETEER_MODULE` override those locations. External requests are blocked.
-The test covers dynamic mixed routes, worker ceilings, saved scripts, pause/drain,
-reload replay, synthesis, task results, cancellation/retry, write refusal, file
-review, uncertain worker holds, keyboard focus and responsive layouts. Its fixture
-includes synthetic provider labels; this does not indicate live support for those
-adapters.
+Frontend coverage lives in `src/lib/workflows/*.test.ts` (route selection and
+the `/workflow` planner program run against a fake engine),
+`src/components/workflows/*.test.tsx` (chat card, runs list, custom scripts,
+inspector), `src/components/settings/workflows-section.test.tsx` and the
+`/workflow` cases in `AgentChatPane.test.tsx`. For a browser check, run
+`npm run dev`, open a chat and send `/workflow <goal>`: the token-free preview
+reports Claude and Codex as synthetic live routes and returns schema-shaped
+results, so the plan → work → report card runs without calling a provider.
+Add `?workflowDelay=20000` to slow the synthetic agents down.
 
 **Before**
 

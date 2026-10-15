@@ -31,7 +31,9 @@ const SECTION_KEYWORDS: Partial<Record<Section, string>> = {
   appearance: "theme look style colors",
   notifications: "alerts sounds",
   shortcuts: "keyboard keybinds keybindings hotkeys bindings",
-  agent: "ai claude codex models",
+  workflows: "orchestration parallel agents subagents /workflow planner",
+  providers: "agents claude codex cursor grok opencode hermes acp accounts chatgpt sign in install",
+  agent: "ai models defaults behaviour",
   interface: "agent chat gui classic cli mode",
   permissions: "allow deny ask tool rules approvals",
   skills: "skill sync import export",
@@ -74,13 +76,26 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
   { section: "notifications", label: "Notification sounds", keywords: "sound audio chime" },
   { section: "notifications", label: "Desktop notifications", keywords: "alert popup" },
 
+  // Providers
+  { section: "providers", label: "Codex", keywords: "chatgpt plan accounts sign in subscription openai" },
+  { section: "providers", label: "Claude", keywords: "anthropic sign in" },
+  { section: "providers", label: "Hermes", keywords: "hermes acp profiles default profile" },
+  { section: "providers", label: "Add custom agent", keywords: "custom acp harness executable kimi gemini" },
+
   // Agent
+  { section: "agent", label: "Default model", keywords: "new chat provider effort", agentChatOnly: true },
   { section: "agent", label: "Utility agent", keywords: "handoff model haiku luna cheap" },
-  { section: "agent", label: "Default Hermes profile", keywords: "hermes acp" },
+  { section: "agent", label: "Delegate to other agents", keywords: "delegation handoff tasks", agentChatOnly: true },
   { section: "agent", label: "Auto-configure MCP for workspaces", keywords: ".mcp.json mcp config" },
   { section: "agent", label: "Per-turn revert checkpoints", keywords: "checkpoints undo rewind snapshot", agentChatOnly: true },
   { section: "agent", label: "Resume automatically after usage limits reset", keywords: "auto resume rate limit", agentChatOnly: true },
   { section: "agent", label: "Desktop-size background browser", keywords: "viewport peek screenshot", agentChatOnly: true },
+  // Workflows
+  { section: "workflows", label: "Which agents can be used", keywords: "providers same mix models planner", agentChatOnly: true },
+  { section: "workflows", label: "File changes", keywords: "edits writes read-only review apply", agentChatOnly: true },
+  { section: "workflows", label: "Run size", keywords: "parallel agents limits time concurrency", agentChatOnly: true },
+  { section: "workflows", label: "Token budget", keywords: "cost limit cap", agentChatOnly: true },
+  { section: "workflows", label: "Workflow button in the composer", keywords: "shortcut icon message box", agentChatOnly: true },
 
   // Interface
   { section: "interface", label: "Agent Chat GUI", keywords: "classic cli terminal mode" },

@@ -204,8 +204,10 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() =
 vi.mock("@/tauri/events", () => ({
   onPresetsChanged: vi.fn().mockReturnValue(Promise.resolve(() => {})),
   onAgentConnectorChanged: vi.fn().mockResolvedValue(() => {}),
+  onCustomAcpChanged: vi.fn().mockResolvedValue(() => {}),
+  onCustomAcpCatalogChanged: vi.fn().mockResolvedValue(() => {}),
 }));
-vi.mock("./custom-acp-settings", () => ({ CustomAcpSettings: () => null }));
+vi.mock("./custom-acp-settings", () => ({ CustomAcpDetail: () => null }));
 
 // ── Model picker mock ──
 //
@@ -721,10 +723,15 @@ describe("Settings footer navigation", () => {
     useFeatureFlags.setState({ enableAgentChat: true });
   });
 
-  it("renders the Hermes setup card once on the Agent page", () => {
+  it("renders the Hermes setup once on the Providers page, not on Agent", async () => {
     requestedSection = "agent";
+    const agent = render(<SettingsView />);
+    expect(agent.queryByRole("region", { name: "Hermes setup" })).toBeNull();
+    agent.unmount();
+    requestedSection = "providers";
     const view = render(<SettingsView />);
-    expect(view.getAllByRole("region", { name: "Hermes setup" })).toHaveLength(1);
+    fireEvent.click(view.getByRole("button", { name: /^Hermes/ }));
+    expect(await view.findAllByRole("region", { name: "Hermes setup" })).toHaveLength(1);
     view.unmount();
   });
 
