@@ -109,6 +109,9 @@ pub mod vscode_marketplace;
 // Embedded web remote-access server (default-off HTTP+WebSocket). Lets a
 // browser on another device drive this running instance as a second frontend.
 pub mod web_remote;
+// Identity of this backend and native client connections to the account's
+// other Codemux backends (docs/plans/environments.md).
+pub mod environments;
 
 /// Which surface the app is booting. The GUI desktop build runs
 /// [`AppMode::Gui`] on Wry; the headless `codemux serve` daemon boots the
@@ -708,6 +711,7 @@ fn build_core_app<R: tauri::Runtime>(
             database::DatabaseStore::new_in_memory()
         }))
         .manage(web_remote_state)
+        .manage(std::sync::Arc::new(environments::EnvironmentStreams::default()))
         .manage(mcp_connector::McpConnectorState::default())
         // Reroute channel frames opened by a web-remote invoke to the
         // browser that opened them. Returns true only for server-allocated
@@ -3096,6 +3100,11 @@ fn build_core_app<R: tauri::Runtime>(
             web_remote::web_remote_request_update,
             web_remote::web_remote_iroh_node_id,
             web_remote::web_remote_registration_status,
+            environments::environment_info,
+            environments::environment_account_request,
+            environments::environment_dial,
+            environments::environment_stream_write,
+            environments::environment_stream_close,
             web_remote::web_remote_retry,
             // Which renderer this process ended up on, so the UI can drop
             // composited-only effects when running CPU-rendered.

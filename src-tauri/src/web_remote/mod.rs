@@ -1178,7 +1178,7 @@ async fn bind_retry_loop<R: Runtime>(app: AppHandle<R>, shared: Arc<Shared>) {
 
 /// Whether the relay transport should be running under `cfg`. Deliberately
 /// ignores `lan_enabled`: a relay-only setup is a supported way in.
-fn relay_wanted(cfg: &WebRemoteConfig) -> bool {
+pub(crate) fn relay_wanted(cfg: &WebRemoteConfig) -> bool {
     cfg.enabled && cfg.relay_mode_enabled
 }
 
