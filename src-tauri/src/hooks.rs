@@ -1009,6 +1009,8 @@ export const CodemuxNotifyPlugin = async () => {
 /// State is re-derived from the terminal's client cache on every tick, not
 /// only when the route changes: a session's status and open requests hydrate
 /// asynchronously after the route switches, and hydration replays no events.
+/// Events still outrank the cache, because a list read already in flight can
+/// land after an event and write back an older snapshot.
 #[cfg(not(target_os = "windows"))]
 const OPENCODE_TUI_PLUGIN_TEMPLATE: &str = r#"// Codemux OpenCode terminal plugin (OpenCode 2.x)
 // Installed by Codemux — bridges the session shown in this terminal to the
@@ -1032,11 +1034,15 @@ export default {
     let running = false;
     // Open requests on the selected session family: "<kind>:<id>" → owner.
     let blockers = new Map();
-    // Event-reported changes not yet reflected in the client cache. Events
-    // can arrive before or after the cache hydrates, so each change holds
-    // until the cache agrees and the cache is authoritative after that.
-    let runningChange;
-    const requestChanges = new Map();
+    // The cache seeds the run state only until this terminal sees the run's
+    // own lifecycle event: a late list read can still carry an older status.
+    let runningFromEvents = false;
+    // Request events outrank the cache: an in-flight list read can land
+    // after an event with an older snapshot. Asked requests are held until
+    // answered or the run ends; answered ids are unique, so they stay
+    // settled for as long as this session is selected.
+    const heldRequests = new Map();
+    const settledRequests = new Set();
     // Last canonical event sent; "idle" until the first one.
     let reported = "idle";
 
@@ -1067,49 +1073,34 @@ export default {
     const changeRequest = (owner, kind, requestID, present) => {
       if (typeof requestID !== "string") return;
       const key = `${kind}:${requestID}`;
-      requestChanges.set(key, { owner, kind, present });
-      if (present) blockers.set(key, owner);
-      else blockers.delete(key);
+      if (!present) {
+        settledRequests.add(key);
+        heldRequests.delete(key);
+      } else if (!settledRequests.has(key)) {
+        heldRequests.set(key, owner);
+      }
     };
 
     // Re-derive the selected session's state from the client cache, which
     // also picks up a run or request that was already open when this
     // terminal attached and only hydrates after the route changed.
     const reconcile = () => {
-      const cached = api.data.session.status(selected) === "running";
-      if (runningChange === undefined) running = cached;
-      else if (runningChange === cached) runningChange = undefined;
+      if (!runningFromEvents) running = api.data.session.status(selected) === "running";
 
       let family = [];
       try {
         family = api.data.session.family(selected) ?? [];
       } catch {}
-      const next = new Map();
-      const hydrated = new Set();
-      for (const member of new Set([selected, ...family, ...blockers.values()])) {
+      const next = new Map(heldRequests);
+      for (const member of new Set([selected, ...family])) {
         if (root(member) !== selected) continue;
         for (const kind of REQUEST_KINDS) {
-          const items = listRequests(kind, member);
-          if (items === undefined) {
-            // Not loaded yet: keep what events have told us about it.
-            for (const [key, owner] of blockers) {
-              if (owner === member && key.startsWith(`${kind}:`)) next.set(key, owner);
-            }
-            continue;
+          for (const item of listRequests(kind, member) ?? []) {
+            next.set(`${kind}:${item.id}`, member);
           }
-          hydrated.add(`${kind}:${member}`);
-          for (const item of items) next.set(`${kind}:${item.id}`, member);
         }
       }
-      for (const [key, change] of requestChanges) {
-        if (hydrated.has(`${change.kind}:${change.owner}`) && next.has(key) === change.present) {
-          requestChanges.delete(key);
-        } else if (change.present) {
-          next.set(key, change.owner);
-        } else {
-          next.delete(key);
-        }
-      }
+      for (const key of settledRequests) next.delete(key);
       blockers = next;
     };
 
@@ -1129,8 +1120,9 @@ export default {
         selected = id;
         running = false;
         blockers = new Map();
-        runningChange = undefined;
-        requestChanges.clear();
+        runningFromEvents = false;
+        heldRequests.clear();
+        settledRequests.clear();
       }
       publish();
     };
@@ -1148,14 +1140,16 @@ export default {
         case "session.execution.started":
           if (data.sessionID !== selected) return;
           running = true;
-          runningChange = true;
+          runningFromEvents = true;
           break;
         case "session.execution.succeeded":
         case "session.execution.interrupted":
         case "session.execution.failed":
           if (data.sessionID !== selected) return;
           running = false;
-          runningChange = false;
+          runningFromEvents = true;
+          // The run is over; the cache alone decides what is still open.
+          heldRequests.clear();
           break;
         case "permission.asked":
           if (root(data.sessionID) !== selected) return;
@@ -1652,8 +1646,8 @@ mod tests {
 
     /// Drives the rendered 2.x plugin under Node against a fake terminal API
     /// whose cache hydrates only after the route already shows the session,
-    /// with events arriving before the cache catches up. Skipped when `node`
-    /// is not installed.
+    /// with events arriving both before the cache catches up and before an
+    /// older snapshot lands. Skipped when `node` is not installed.
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn opencode_v2_plugin_follows_late_cache_hydration() {
@@ -1694,12 +1688,21 @@ cache.status.ses_root = "running";
 cache.permission.ses_root = [{ id: "per_1" }];
 cache.form.ses_root = [];
 await settle(); // Hydration alone surfaces the open request.
-emit("permission.replied", { sessionID: "ses_root", requestID: "per_1", reply: "once" });
-await settle(); // The reply wins over the stale cached request.
 cache.permission.ses_root = [];
+emit("permission.replied", { sessionID: "ses_root", requestID: "per_1", reply: "once" });
+await settle(); // Cache and event agree: back to working.
+cache.permission.ses_root = [{ id: "per_1" }];
+await settle(); // A pre-reply snapshot landing late must not reopen it.
+emit("permission.asked", { id: "per_2", sessionID: "ses_root" });
+await settle(); // An ask the cache has not caught up with still blocks.
+emit("permission.replied", { sessionID: "ses_root", requestID: "per_2", reply: "once" });
+await settle();
 emit("session.execution.succeeded", { sessionID: "ses_root" });
 await settle(); // The end wins over the stale cached "running".
 cache.status.ses_root = "idle";
+await settle();
+cache.status.ses_root = "running";
+await settle(); // Nor does a late pre-end status snapshot restart it.
 emit("session.execution.started", { sessionID: "ses_other" });
 emit("permission.asked", { id: "per_x", sessionID: "ses_other" });
 await settle(); // Another terminal's session never reaches this pane.
@@ -1737,7 +1740,7 @@ console.log(JSON.stringify(reported));
         );
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).trim(),
-            r#"["PermissionRequest","Start","Stop"]"#
+            r#"["PermissionRequest","Start","PermissionRequest","Start","Stop"]"#
         );
     }
 
