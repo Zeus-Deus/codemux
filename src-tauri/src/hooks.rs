@@ -1005,6 +1005,10 @@ export const CodemuxNotifyPlugin = async () => {
 /// succeeded,interrupted,failed}` and `permission.replied` carry
 /// `sessionID`; `permission.asked` carries `id`, its reply `requestID`;
 /// `form.created` carries `form.{id,sessionID}`, its reply/cancel `id`.
+///
+/// State is re-derived from the terminal's client cache on every tick, not
+/// only when the route changes: a session's status and open requests hydrate
+/// asynchronously after the route switches, and hydration replays no events.
 #[cfg(not(target_os = "windows"))]
 const OPENCODE_TUI_PLUGIN_TEMPLATE: &str = r#"// Codemux OpenCode terminal plugin (OpenCode 2.x)
 // Installed by Codemux — bridges the session shown in this terminal to the
@@ -1013,6 +1017,7 @@ const OPENCODE_TUI_PLUGIN_TEMPLATE: &str = r#"// Codemux OpenCode terminal plugi
 
 {{TRANSPORT}}
 const SYNC_INTERVAL_MS = 250;
+const REQUEST_KINDS = ["permission", "form"];
 
 export default {
   id: "codemux.notify",
@@ -1025,7 +1030,13 @@ export default {
     // home screen, so a run they navigated away from still reports its end.
     let selected;
     let running = false;
-    let blockers = new Set();
+    // Open requests on the selected session family: "<kind>:<id>" → owner.
+    let blockers = new Map();
+    // Event-reported changes not yet reflected in the client cache. Events
+    // can arrive before or after the cache hydrates, so each change holds
+    // until the cache agrees and the cache is authoritative after that.
+    let runningChange;
+    const requestChanges = new Map();
     // Last canonical event sent; "idle" until the first one.
     let reported = "idle";
 
@@ -1045,7 +1056,66 @@ export default {
       return route?.type === "session" ? root(route.sessionID) : undefined;
     };
 
+    const listRequests = (kind, member) => {
+      try {
+        return api.data.session[kind].list(member);
+      } catch {
+        return undefined;
+      }
+    };
+
+    const changeRequest = (owner, kind, requestID, present) => {
+      if (typeof requestID !== "string") return;
+      const key = `${kind}:${requestID}`;
+      requestChanges.set(key, { owner, kind, present });
+      if (present) blockers.set(key, owner);
+      else blockers.delete(key);
+    };
+
+    // Re-derive the selected session's state from the client cache, which
+    // also picks up a run or request that was already open when this
+    // terminal attached and only hydrates after the route changed.
+    const reconcile = () => {
+      const cached = api.data.session.status(selected) === "running";
+      if (runningChange === undefined) running = cached;
+      else if (runningChange === cached) runningChange = undefined;
+
+      let family = [];
+      try {
+        family = api.data.session.family(selected) ?? [];
+      } catch {}
+      const next = new Map();
+      const hydrated = new Set();
+      for (const member of new Set([selected, ...family, ...blockers.values()])) {
+        if (root(member) !== selected) continue;
+        for (const kind of REQUEST_KINDS) {
+          const items = listRequests(kind, member);
+          if (items === undefined) {
+            // Not loaded yet: keep what events have told us about it.
+            for (const [key, owner] of blockers) {
+              if (owner === member && key.startsWith(`${kind}:`)) next.set(key, owner);
+            }
+            continue;
+          }
+          hydrated.add(`${kind}:${member}`);
+          for (const item of items) next.set(`${kind}:${item.id}`, member);
+        }
+      }
+      for (const [key, change] of requestChanges) {
+        if (hydrated.has(`${change.kind}:${change.owner}`) && next.has(key) === change.present) {
+          requestChanges.delete(key);
+        } else if (change.present) {
+          next.set(key, change.owner);
+        } else {
+          next.delete(key);
+        }
+      }
+      blockers = next;
+    };
+
     const publish = () => {
+      if (!selected) return;
+      reconcile();
       const next = blockers.size ? "PermissionRequest" : running ? "Start" : "Stop";
       // A pane that has not run anything stays clear instead of reading "done".
       if (next === reported || (next === "Stop" && reported === "idle")) return;
@@ -1053,27 +1123,14 @@ export default {
       notify(next);
     };
 
-    // Adopt a newly shown session from the client cache, which also covers
-    // a run that was already going when this terminal attached.
     const sync = () => {
       const id = shownRoot();
-      if (!id || id === selected) return;
-      selected = id;
-      running = api.data.session.status(id) === "running";
-      blockers = new Set();
-      let members = [id];
-      try {
-        members = [id, ...(api.data.session.family(id) ?? [])];
-      } catch {}
-      for (const member of members) {
-        try {
-          for (const request of api.data.session.permission.list(member) ?? []) {
-            blockers.add(`permission:${request.id}`);
-          }
-          for (const form of api.data.session.form.list(member) ?? []) {
-            blockers.add(`form:${form.id}`);
-          }
-        } catch {}
+      if (id && id !== selected) {
+        selected = id;
+        running = false;
+        blockers = new Map();
+        runningChange = undefined;
+        requestChanges.clear();
       }
       publish();
     };
@@ -1084,35 +1141,41 @@ export default {
       if (event.type === "session.created" && data.parentID) {
         parents.set(data.sessionID, data.parentID);
       }
-      sync();
+      const id = shownRoot();
+      if (id && id !== selected) sync();
       if (!selected) return;
       switch (event.type) {
         case "session.execution.started":
           if (data.sessionID !== selected) return;
           running = true;
+          runningChange = true;
           break;
         case "session.execution.succeeded":
         case "session.execution.interrupted":
         case "session.execution.failed":
           if (data.sessionID !== selected) return;
           running = false;
-          blockers.clear();
+          runningChange = false;
           break;
         case "permission.asked":
           if (root(data.sessionID) !== selected) return;
-          blockers.add(`permission:${data.id}`);
+          changeRequest(data.sessionID, "permission", data.id, true);
           break;
         case "permission.replied":
-          blockers.delete(`permission:${data.requestID}`);
+          if (root(data.sessionID) !== selected) return;
+          changeRequest(data.sessionID, "permission", data.requestID, false);
           break;
         case "form.created":
           if (root(data.form?.sessionID) !== selected) return;
-          blockers.add(`form:${data.form.id}`);
+          changeRequest(data.form.sessionID, "form", data.form.id, true);
           break;
         case "form.replied":
-        case "form.cancelled":
-          blockers.delete(`form:${data.id}`);
+        case "form.cancelled": {
+          const owner = blockers.get(`form:${data.id}`) ?? data.sessionID;
+          if (root(owner) !== selected) return;
+          changeRequest(owner, "form", data.id, false);
           break;
+        }
         default:
           return;
       }
@@ -1121,7 +1184,7 @@ export default {
 
     const unsubscribe = api.data.listen(receive);
     sync();
-    // Switching sessions in the terminal emits no event; poll the route.
+    // Session switches and cache hydration emit no plugin event; poll both.
     const timer = setInterval(sync, SYNC_INTERVAL_MS);
     return () => {
       clearInterval(timer);
@@ -1585,6 +1648,97 @@ mod tests {
         // The shared service streams every terminal's sessions; the plugin
         // must scope itself to the session shown in this one.
         assert!(plugin.contains("api.ui.router.current()"));
+    }
+
+    /// Drives the rendered 2.x plugin under Node against a fake terminal API
+    /// whose cache hydrates only after the route already shows the session,
+    /// with events arriving before the cache catches up. Skipped when `node`
+    /// is not installed.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn opencode_v2_plugin_follows_late_cache_hydration() {
+        const HARNESS: &str = r#"
+import http from "node:http";
+const reported = [];
+const server = http.createServer((req, res) => {
+  reported.push(new URL(req.url, "http://hook").searchParams.get("eventType"));
+  res.end();
+});
+await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+process.env.CODEMUX_SESSION_ID = "pane-1";
+process.env.CODEMUX_HOOK_PORT = String(server.address().port);
+const { default: plugin } = await import(process.argv[2]);
+
+const cache = { status: {}, permission: {}, form: {} };
+let emit;
+const dispose = plugin.setup({
+  ui: { router: { current: () => ({ type: "session", sessionID: "ses_root" }) } },
+  data: {
+    listen: (handler) => {
+      emit = (type, data) => handler({ details: { type, data } });
+      return () => {};
+    },
+    session: {
+      get: () => undefined,
+      family: () => [],
+      status: (id) => cache.status[id],
+      permission: { list: (id) => cache.permission[id] },
+      form: { list: (id) => cache.form[id] },
+    },
+  },
+});
+const settle = () => new Promise((resolve) => setTimeout(resolve, 400));
+
+await settle(); // Route selected, cache still empty: nothing to report.
+cache.status.ses_root = "running";
+cache.permission.ses_root = [{ id: "per_1" }];
+cache.form.ses_root = [];
+await settle(); // Hydration alone surfaces the open request.
+emit("permission.replied", { sessionID: "ses_root", requestID: "per_1", reply: "once" });
+await settle(); // The reply wins over the stale cached request.
+cache.permission.ses_root = [];
+emit("session.execution.succeeded", { sessionID: "ses_root" });
+await settle(); // The end wins over the stale cached "running".
+cache.status.ses_root = "idle";
+emit("session.execution.started", { sessionID: "ses_other" });
+emit("permission.asked", { id: "per_x", sessionID: "ses_other" });
+await settle(); // Another terminal's session never reaches this pane.
+
+dispose();
+server.close();
+console.log(JSON.stringify(reported));
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_path = dir.path().join("tui.mjs");
+        let harness_path = dir.path().join("harness.mjs");
+        std::fs::write(
+            &plugin_path,
+            render_opencode_plugin(OPENCODE_TUI_PLUGIN_TEMPLATE, "/nonexistent/active-port"),
+        )
+        .unwrap();
+        std::fs::write(&harness_path, HARNESS).unwrap();
+
+        let output = match std::process::Command::new("node")
+            .arg(&harness_path)
+            .arg(format!("file://{}", plugin_path.display()))
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping: node is not installed");
+                return;
+            }
+            Err(error) => panic!("failed to run node: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "harness failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            r#"["PermissionRequest","Start","Stop"]"#
+        );
     }
 
     #[cfg(not(target_os = "windows"))]
