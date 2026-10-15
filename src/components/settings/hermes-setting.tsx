@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ChevronRight, MoreHorizontal, RefreshCw } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
 import {
@@ -12,10 +13,21 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { ProviderLogo } from "@/components/chat/provider-logo";
+import { cn } from "@/lib/utils";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useHermes, hermesProfileKey, HERMES_DEFAULT_PROFILE_SETTING, type HermesProfile } from "@/stores/hermes-store";
+import { DetailHeader, DetailRow, DetailSection, StatusLine, type ProviderStatus } from "./provider-parts";
 
 const AUTOMATIC = "__automatic__";
 
@@ -35,7 +47,7 @@ export function HermesDefaultProfileSetting() {
   const profiles = useHermesProfiles();
   const unlisted = id && !profiles?.some(p => p.id === id);
   return <Select value={id || AUTOMATIC} onValueChange={v => set(HERMES_DEFAULT_PROFILE_SETTING, v === AUTOMATIC ? "" : v)}>
-    <SelectTrigger aria-label="Default Hermes profile" className="h-9 w-48">
+    <SelectTrigger aria-label="Default Hermes profile" className="h-8 w-44">
       <SelectValue />
     </SelectTrigger>
     <SelectContent>
@@ -46,12 +58,51 @@ export function HermesDefaultProfileSetting() {
   </Select>;
 }
 
+type CatalogSlot = ReturnType<typeof useHermes.getState>["catalogs"][string];
+
+function profileStatus(slot: CatalogSlot | undefined): ProviderStatus | null {
+  if (!slot) return null;
+  if (slot.loading) return { tone: "pending", label: "Checking…" };
+  if (slot.error) return { tone: "error", label: "Not working" };
+  if (slot.value?.state === "ready") return { tone: "ok", label: "Ready" };
+  if (slot.value) return { tone: "warn", label: "Unsupported" };
+  return null;
+}
+
+/** Settings → Providers → Hermes: its profiles, the default one, and where
+ *  Hermes is installed. */
+export function HermesProviderDetail({
+  status,
+  enabled,
+  onEnabledChange,
+}: {
+  status: ProviderStatus;
+  enabled: boolean;
+  onEnabledChange: (enabled: boolean) => void;
+}) {
+  return <div>
+    <DetailHeader
+      logo={<ProviderLogo provider="hermes" className="size-5" />}
+      name="Hermes"
+      tag="Experimental"
+      status={status}
+      enabled={enabled}
+      onEnabledChange={onEnabledChange}
+    />
+    {enabled ? <HermesSetting /> : <DetailSection title="Turned off">
+      <p className="text-body-sm text-muted-foreground">Hermes is hidden from the model picker and new chats. Chats that already use it keep working.</p>
+    </DetailSection>}
+  </div>;
+}
+
 export function HermesSetting() {
   const settings = useSettingsStore(s => s.settings);
   const set = useSettingsStore(s => s.set);
   const [installation, setInstallation] = useState(settings["hermes.installation"] ?? "hermes");
   const [root, setRoot] = useState(settings["hermes.root"] ?? "");
   const profiles = useHermesProfiles();
+  const catalogs = useHermes(s => s.catalogs);
+  const defaultId = settings[HERMES_DEFAULT_PROFILE_SETTING] ?? "";
   const [status, setStatus] = useState("");
   // Which action is in flight ("save" or a profile key), so a slow Hermes
   // probe reads as working and cannot be fired twice.
@@ -60,29 +111,78 @@ export function HermesSetting() {
     setBusy(key);
     void action().catch(e => setStatus(String(e))).finally(() => setBusy(null));
   };
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   // Disconnecting can cut off background learning, so it asks first. The
   // target outlives the open flag so the title keeps its name while closing.
   const [disconnectOpen, setDisconnectOpen] = useState(false);
   const [disconnectTarget, setDisconnectTarget] = useState<HermesProfile | null>(null);
   const spinner = <Spinner className="size-3.5" aria-hidden />;
-  return <section className="space-y-3 rounded-lg border border-border p-4" aria-label="Hermes setup">
-    <h3 className="text-body font-medium">Hermes · experimental ACP integration</h3>
-    <p className="text-label text-muted-foreground">Use existing profiles. Create profiles, configure credentials and install ACP dependencies in Hermes. Use one active interface per profile.</p>
-    <label className="block text-label">Hermes executable<Input className="mt-1" value={installation} onChange={e => setInstallation(e.target.value)} /></label>
-    <label className="block text-label">Hermes root<Input className="mt-1" placeholder="Default Hermes root" value={root} onChange={e => setRoot(e.target.value)} /></label>
-    <Button type="button" variant="outline" size="sm" disabled={busy !== null} onClick={() => run("save", async () => {
-      await set("hermes.installation", installation);
-      await set("hermes.root", root);
-      useHermes.setState({catalogs:{}});
-      const values = await useHermes.getState().loadProfiles(true);
-      setStatus(`${values.length} profiles found.`);
-    })}>{busy === "save" && spinner}Save and refresh</Button>
-    <p role="status" className="text-label text-muted-foreground">{status}</p>
-    {profiles?.map(p => <div key={p.home} className="flex items-center justify-between text-label"><span>{p.id}</span><Button type="button" variant="ghost" size="xs" disabled={busy !== null} onClick={() => run(hermesProfileKey(p), async () => {
-      await useHermes.getState().refresh(p);
-      const slot = useHermes.getState().catalogs[hermesProfileKey(p)];
-      setStatus(slot.error ?? slot.value?.message ?? `${p.id}: ${slot.value?.state ?? "unknown"}. External authentication and compressed-history recovery are not certified.`);
-    })}>{busy === hermesProfileKey(p) && spinner}Check runtime</Button><Button type="button" variant="ghost" size="xs" disabled={busy !== null} onClick={() => { setDisconnectTarget(p); setDisconnectOpen(true); }}>Disconnect</Button></div>)}
+  const check = (p: HermesProfile) => run(hermesProfileKey(p), async () => {
+    await useHermes.getState().refresh(p);
+    const slot = useHermes.getState().catalogs[hermesProfileKey(p)];
+    setStatus(slot.error ?? slot.value?.message ?? `${p.id}: ${slot.value?.state ?? "unknown"}. External authentication and compressed-history recovery are not certified.`);
+  });
+  return <section aria-label="Hermes setup">
+    <DetailSection
+      title="Profiles"
+      description="Create profiles, credentials and ACP dependencies in Hermes. Use one active interface per profile."
+    >
+      <div className="space-y-2">
+        {profiles === null && <p className="text-body-sm text-muted-foreground">Looking for profiles…</p>}
+        {profiles?.length === 0 && <p className="text-body-sm text-muted-foreground">No Hermes profiles found. Check where Hermes is installed under Advanced.</p>}
+        {profiles?.map(p => {
+          const key = hermesProfileKey(p);
+          const ps = profileStatus(catalogs[key]);
+          return <DetailRow key={p.home}>
+            <div className="flex min-w-0 flex-1 items-center gap-2 text-body font-medium">
+              <span className="truncate">{p.id}</span>
+              {defaultId === p.id && <span className="rounded-full border border-border px-2 text-label font-normal text-muted-foreground">Default</span>}
+            </div>
+            {busy === key ? spinner : ps && <StatusLine status={ps} />}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button type="button" variant="ghost" size="icon-xs" aria-label={`${p.id} actions`} disabled={busy !== null}>
+                  <MoreHorizontal />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onSelect={() => check(p)}>Check runtime</DropdownMenuItem>
+                <DropdownMenuItem disabled={defaultId === p.id} onSelect={() => set(HERMES_DEFAULT_PROFILE_SETTING, p.id)}>Make default</DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem variant="destructive" onSelect={() => { setDisconnectTarget(p); setDisconnectOpen(true); }}>Disconnect…</DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </DetailRow>;
+        })}
+        <div className="flex items-center justify-between gap-4 pt-2">
+          <div className="min-w-0">
+            <div className="text-body font-medium">Default profile</div>
+            <div className="text-label text-muted-foreground">New Hermes chats start here. A project remembers the profile you last picked.</div>
+          </div>
+          <HermesDefaultProfileSetting />
+        </div>
+        <p role="status" className="text-label text-muted-foreground empty:hidden">{status}</p>
+      </div>
+    </DetailSection>
+    <DetailSection title="Advanced">
+      <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+        <CollapsibleTrigger className="-mt-1 flex items-center gap-1.5 text-body-sm text-muted-foreground transition-colors duration-100 hover:text-foreground">
+          <ChevronRight className={cn("size-3.5 transition-transform duration-150", advancedOpen && "rotate-90")} />
+          {advancedOpen ? "Hide" : "Executable and Hermes root"}
+        </CollapsibleTrigger>
+        <CollapsibleContent className="mt-3 space-y-3">
+          <label className="block text-label text-muted-foreground">Hermes executable<Input className="mt-1 font-mono" value={installation} onChange={e => setInstallation(e.target.value)} /></label>
+          <label className="block text-label text-muted-foreground">Hermes root<Input className="mt-1 font-mono" placeholder="Default Hermes root" value={root} onChange={e => setRoot(e.target.value)} /></label>
+          <Button type="button" variant="outline" size="sm" disabled={busy !== null} onClick={() => run("save", async () => {
+            await set("hermes.installation", installation);
+            await set("hermes.root", root);
+            useHermes.setState({catalogs:{}});
+            const values = await useHermes.getState().loadProfiles(true);
+            setStatus(`${values.length} profiles found.`);
+          })}>{busy === "save" ? spinner : <RefreshCw />}Save and refresh</Button>
+        </CollapsibleContent>
+      </Collapsible>
+    </DetailSection>
     <AlertDialog open={disconnectOpen} onOpenChange={setDisconnectOpen}>
       <AlertDialogContent>
         <AlertDialogHeader>

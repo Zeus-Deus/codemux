@@ -25,6 +25,6 @@ export function useCustomAcpThread(threadId: string | null | undefined, active: 
   const unavailable = customAcpUnavailable(binding, state.agents);
   const changedLiveSession = !!threadId && !!state.live[threadId] && !!binding && !!agent?.enabled && binding.revision !== agent.revision;
   const effectiveWarning = [warning, changedLiveSession ? unavailable : null].filter(Boolean).join("\n") || null;
-  const error = read?.error ?? (threadId ? state.errors[threadId] : null) ?? (changedLiveSession ? null : unavailable) ?? (active && read?.ready && (!agent || !agent.enabled) ? "Choose an enabled custom agent in the model picker. Configure missing agents in Settings → Agent." : null);
+  const error = read?.error ?? (threadId ? state.errors[threadId] : null) ?? (changedLiveSession ? null : unavailable) ?? (active && read?.ready && (!agent || !agent.enabled) ? "Choose an enabled custom agent in the model picker. Configure missing agents in Settings → Providers." : null);
   return { warning: effectiveWarning, catalog, binding, agent, error, loading: active && !read?.ready && !read?.error, ready: !active || (!!threadId && !!read?.ready && !error), busy: threadId ? state.busy[threadId] ?? false : false };
 }
