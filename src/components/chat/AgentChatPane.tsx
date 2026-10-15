@@ -3726,11 +3726,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     </div>
   ) : undefined;
 
-  // A worktree first-send gets a human-readable workspace name for free
-  // (the backend overwrites the title with the new branch name). A
-  // workspace-bound pane never cuts a branch — it always sends into the
-  // checkout it is already on — so without this the workspace keeps the
-  // backend default title forever.
+  // A workspace-bound pane sends into a workspace that already exists, so
+  // nothing else titles it: without this it keeps the backend default
+  // (its directory, or its branch for a worktree) forever.
   //
   // `autoNameWorkspace` is fire-and-forget and re-checks the
   // still-default-title guard itself, so this wrapper only resolves the
@@ -3743,7 +3741,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // `sendInFlightRef` check matters most: `messages.length === 0`
       // (which selects this handler) only flips once the optimistic
       // bubble lands, so two Enter presses in one tick would otherwise
-      // both reach here and race two `claude --print` calls into two
+      // both reach here and race two utility-model calls into two
       // renames — the second landing before the first's title reached
       // the store, so the late guard couldn't stop it either.
       if (sendInFlightRef.current) return;
@@ -3755,7 +3753,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       ).trim();
       if (!rawText) return;
       if (paneWorkspaceId && workspaceProjectRoot) {
-        autoNameWorkspace(paneWorkspaceId, workspaceProjectRoot, rawText);
+        autoNameWorkspace(paneWorkspaceId, rawText);
       }
       handleSubmit(textOverride, options);
     },

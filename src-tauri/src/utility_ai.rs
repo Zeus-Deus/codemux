@@ -24,8 +24,20 @@ struct UtilityInvocation {
     program: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
+    env_remove: &'static [&'static str],
     output_file: Option<PathBuf>,
 }
+
+/// Nested-session markers Claude Code exports. When Codemux itself runs under
+/// a Claude session they would make the utility CLI treat itself as that
+/// session's child and pull in the parent's context.
+const CLAUDE_NESTED_SESSION_ENV_VARS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SSE_PORT",
+];
 
 /// Every provider receives the prompt on stdin, so the argv stays small
 /// enough for Windows' ~32k command-line limit regardless of transcript size.
@@ -67,6 +79,7 @@ fn build_invocation(
                 program: "codex".into(),
                 args,
                 env: Vec::new(),
+                env_remove: &[],
                 output_file: Some(output_file),
             })
         }
@@ -74,6 +87,10 @@ fn build_invocation(
             let mut args = vec![
                 "--print".into(),
                 "--no-session-persistence".into(),
+                // Load no user/project settings: CLAUDE.md, auto-memory,
+                // skills, and plugins would otherwise bleed into the output.
+                "--setting-sources".into(),
+                "".into(),
                 "--output-format".into(),
                 "text".into(),
                 "--strict-mcp-config".into(),
@@ -89,6 +106,7 @@ fn build_invocation(
                 program: "claude".into(),
                 args,
                 env: Vec::new(),
+                env_remove: CLAUDE_NESTED_SESSION_ENV_VARS,
                 output_file: None,
             })
         }
@@ -121,6 +139,7 @@ fn build_invocation(
                     "OPENCODE_CONFIG_CONTENT".into(),
                     r#"{"permission":{"*":"deny"},"tools":{"*":false},"mcp":{}}"#.into(),
                 )],
+                env_remove: &[],
                 output_file: None,
             })
         }
@@ -165,6 +184,9 @@ pub async fn generate_utility_text(
         .kill_on_drop(true);
     for (key, value) in &invocation.env {
         command.env(key, value);
+    }
+    for key in invocation.env_remove {
+        command.env_remove(key);
     }
     let mut child = command
         .spawn()
@@ -243,6 +265,8 @@ mod tests {
         .unwrap();
         assert!(inv.args.iter().any(|a| a == "--no-session-persistence"));
         assert!(inv.args.windows(2).any(|a| a == ["--tools", ""]));
+        assert!(inv.args.windows(2).any(|a| a == ["--setting-sources", ""]));
+        assert!(inv.env_remove.contains(&"CLAUDECODE"));
         assert!(!inv.args.iter().any(|a| a.contains("dangerously")));
     }
 

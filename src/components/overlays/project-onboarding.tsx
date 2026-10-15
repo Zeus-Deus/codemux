@@ -63,6 +63,8 @@ import type {
   TerminalPreset,
 } from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
+import { autoNameWorkspace } from "@/lib/agent-chat/materialize";
+import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast, errorMessage } from "@/lib/toast";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { PresetIcon } from "@/components/icons/preset-icon";
@@ -222,7 +224,11 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
     }
     branchGenTimeout.current = setTimeout(async () => {
       try {
-        const name = await generateBranchName(value, projectDir);
+        const name = await generateBranchName(
+          value,
+          projectDir,
+          utilitySelectionFromStores(),
+        );
         setGeneratedBranch(name);
       } catch {
         setGeneratedBranch("");
@@ -335,7 +341,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         let branch = generatedBranch;
         if (!branch) {
           branch = task.trim()
-            ? await generateBranchName(task, projectDir)
+            ? await generateBranchName(task, projectDir, utilitySelectionFromStores())
             : await generateRandomBranchName(projectDir);
         }
 
@@ -355,6 +361,10 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         // the prompt rather than type into a running session; say so.
         if (created.adopted && prompt) {
           toast.info(`"${branch}" already has a live workspace — switched to it. Your task wasn't sent.`);
+        }
+        // Title the new workspace from the task, separately from its branch.
+        if (!created.adopted && task.trim()) {
+          autoNameWorkspace(created.workspaceId, task);
         }
 
         const pName = basename(projectDir);

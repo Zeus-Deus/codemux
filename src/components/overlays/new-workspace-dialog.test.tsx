@@ -50,6 +50,7 @@ vi.mock("@/tauri/commands", () => ({
   dbAddRecentProject: vi.fn().mockResolvedValue(undefined),
   dbGetRecentProjects: vi.fn().mockResolvedValue([]),
   generateBranchName: vi.fn().mockResolvedValue("fix-login-bug"),
+  generateWorkspaceTitle: vi.fn().mockResolvedValue("Fix Login Bug"),
   generateRandomBranchName: vi.fn().mockResolvedValue("swift-bolt"),
   checkProviderAuth: vi.fn().mockResolvedValue({
     kind: "unknown",
@@ -524,11 +525,12 @@ describe("Submit flow", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
 
     await waitFor(() => {
-      expect(generateBranchName).toHaveBeenCalledWith(
+      expect(vi.mocked(generateBranchName).mock.calls[0]?.slice(0, 2)).toEqual([
         "Fix the login bug",
         "/path/to/project",
-      );
+      ]);
     });
+
   });
 
   it("applies the typed workspace name to the created workspace", async () => {
@@ -555,7 +557,7 @@ describe("Submit flow", () => {
     });
   });
 
-  it("leaves the backend title alone when no workspace name is typed", async () => {
+  it("titles the workspace from the prompt when no workspace name is typed", async () => {
     setAppState("/path/to/project");
     renderDialog(true);
 
@@ -569,9 +571,14 @@ describe("Submit flow", () => {
     await waitFor(() => {
       expect(createWorktreeWorkspaceResult).toHaveBeenCalled();
     });
-    // Worktree paths are titled from the branch by the backend; an
-    // untouched name input must not overwrite that with anything.
-    expect(renameWorkspace).not.toHaveBeenCalled();
+    // The backend titles a worktree workspace with its branch slug; the
+    // prompt replaces that with a readable title, leaving the branch as is.
+    await waitFor(() => {
+      expect(renameWorkspace).toHaveBeenCalledWith(
+        expect.any(String),
+        "Fix Login Bug",
+      );
+    });
   });
 
   it("uses explicit branch name when provided", async () => {
