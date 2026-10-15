@@ -2744,10 +2744,9 @@ export function Composer({
     const pill = wrapperRef.current?.getBoundingClientRect().width ?? 0;
     const gapEl = footerGapRef.current;
     // Content that can't shrink (the context ring) may spill out of a gap
-    // with no min-width — on a phone, over the model control. Count the
-    // spill against the gap so the row compacts until it fits.
+    // with no min-width — on a phone, over the model control.
     const spill = gapEl ? Math.max(0, gapEl.scrollWidth - gapEl.clientWidth) : 0;
-    const gap = (gapEl?.getBoundingClientRect().width ?? 0) - spill;
+    const gap = gapEl?.getBoundingClientRect().width ?? 0;
     // No layout yet (or jsdom): stay at full width.
     if (pill <= 0) return;
     setCollapseDisabled(collapseDisabledFor(pill));
@@ -2760,7 +2759,10 @@ export function Composer({
           (parseFloat(gapStyle.paddingLeft) || 0) + (parseFloat(gapStyle.paddingRight) || 0),
         )
       : 0;
-    const minGap = footerMinGapFor(pill, gapFloor);
+    // Any remaining overflow must advance the ladder, even if the gap
+    // already exceeds the small phone minimum. Record the width needed
+    // to fit all its contents before allowing labels to expand again.
+    const minGap = Math.max(footerMinGapFor(pill, gapFloor), gap + spill);
     const measured = committedFitRef.current;
     setFooterFit((prev) =>
       prev === measured ? nextFooterFit(prev, key ?? prev.key, pill, gap, minGap) : prev,

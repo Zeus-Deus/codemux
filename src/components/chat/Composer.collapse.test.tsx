@@ -82,6 +82,7 @@ const USAGE = { used_tokens: 44_000, max_tokens: 200_000 };
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 describe("Composer pill collapse", () => {
@@ -108,6 +109,39 @@ describe("Composer pill collapse", () => {
     expect(wrapper()).toHaveAttribute("data-expanded");
     expect(wrapper().className).toContain("rounded-[22px]");
     expect(getByTestId("context-usage-trigger")).toBeInTheDocument();
+  });
+
+  it("compacts until a newly visible context ring fits a 40px gap with 60px of content", () => {
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    const gapWidth = (element: HTMLElement) =>
+      element.parentElement?.querySelector('[aria-label^="Model:"]') ? 64 : 40;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.dataset.testid === "composer-wrapper") return new DOMRect(0, 0, 358, 100);
+      if (this.dataset.testid === "composer-gap") return new DOMRect(0, 0, gapWidth(this), 44);
+      return originalRect.call(this);
+    });
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.dataset.testid === "composer-gap" ? gapWidth(this) : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockImplementation(function (this: HTMLElement) {
+      if (this.dataset.testid !== "composer-gap") return 0;
+      return this.querySelector('[data-testid="context-usage-trigger"]')
+        ? Math.max(60, gapWidth(this))
+        : gapWidth(this);
+    });
+
+    const props = { draft: "next", model: "claude-opus-4-8" };
+    const result = renderComposer(props);
+    const gap = result.getByTestId("composer-gap");
+    gap.style.minWidth = "0px";
+    gap.style.paddingLeft = "8px";
+    // Without the ring, the small phone gap leaves the model label intact.
+    expect(result.getByTitle("Claude Opus 4.8")).toHaveTextContent("Claude Opus 4.8");
+
+    result.rerender(ui({ ...props, contextUsage: USAGE }));
+    expect(result.getByTestId("context-usage-trigger")).toBeInTheDocument();
+    expect(result.getByRole("button", { name: "Model: Claude Opus 4.8" })).toBeInTheDocument();
+    expect(gap.scrollWidth).toBeLessThanOrEqual(gap.clientWidth);
   });
 
   it("turns the gap into 'Enter to queue' while a turn streams", () => {
