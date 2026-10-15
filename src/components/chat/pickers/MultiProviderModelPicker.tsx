@@ -236,6 +236,11 @@ interface ResolvedRow {
  *  uniform. */
 type RailKey = AgentChatProviderKind | "favorites";
 
+interface AcpRailEntry {
+  id: string;
+  name: string;
+}
+
 /** Platform check for the jump-shortcut modifier and its chip label
  *  ("⌘1" on macOS, "Ctrl+1" elsewhere). */
 const IS_MAC =
@@ -255,9 +260,16 @@ export function MultiProviderModelPicker({
   placement = "footer",
 }: Props) {
   const inContextRow = placement === "context-row";
-  const acpFixed = useCustomAcp(s => hermesThreadId ? !!s.bindings[hermesThreadId] : false);
+  const acpBinding = useCustomAcp(s => hermesThreadId ? s.bindings[hermesThreadId] : undefined);
+  const acpSelection = useCustomAcp(s => hermesThreadId ? s.selections[hermesThreadId] : undefined);
+  const acpAgents = useCustomAcp(s => s.agents);
+  const acpFixed = !!acpBinding;
+  const activeAcpAgentId = provider === "acp" ? acpBinding?.agent_id ?? acpSelection ?? null : null;
   const [open, setOpen] = useState(false);
   const [railKey, setRailKey] = useState<RailKey>(provider);
+  // Which custom agent the "acp" rail key points at — each agent is its
+  // own rail entry, so the kind alone doesn't identify the selection.
+  const [railAcpAgentId, setRailAcpAgentId] = useState<string | null>(activeAcpAgentId);
   const [query, setQuery] = useState("");
 
   // Consume the open signal exactly once per increment. Tracking the
@@ -284,6 +296,28 @@ export function MultiProviderModelPicker({
       .filter(p => p.kind === provider || !disabledProviders.has(p.kind)),
     [allowedProviders, provider, acpFixed, customAgentsAllowed, disabledProviders],
   );
+  const acpAllowed = customAgentsAllowed && visibleProviders.some(p => p.kind === "acp");
+  // Like T3 Code's provider instances, every configured custom agent is its
+  // own rail entry, so a fresh install shows none. A chat bound to an agent
+  // only offers that agent; a disabled agent stays visible while selected.
+  const acpRailEntries = useMemo<ReadonlyArray<AcpRailEntry>>(() => {
+    if (!acpAllowed) return [];
+    if (acpBinding) {
+      const agent = acpAgents?.find(a => a.id === acpBinding.agent_id);
+      return [{ id: acpBinding.agent_id, name: agent?.name ?? acpBinding.catalog.agent_name }];
+    }
+    return (acpAgents ?? [])
+      .filter(a => a.enabled || a.id === activeAcpAgentId)
+      .map(a => ({ id: a.id, name: a.name }));
+  }, [acpAllowed, acpBinding, acpAgents, activeAcpAgentId]);
+  const railProviders = useMemo(
+    () => visibleProviders.filter(p => p.kind !== "acp"),
+    [visibleProviders],
+  );
+
+  useEffect(() => {
+    if (open && acpAllowed) void useCustomAcp.getState().loadAgents().catch(() => {});
+  }, [open, acpAllowed]);
 
   useEffect(() => {
     if (!open) return;
@@ -300,9 +334,10 @@ export function MultiProviderModelPicker({
   useEffect(() => {
     if (open) {
       setRailKey(provider);
+      setRailAcpAgentId(activeAcpAgentId);
       setQuery("");
     }
-  }, [open, provider]);
+  }, [open, provider, activeAcpAgentId]);
 
   const allCaps = useProviderCapabilities();
   const acpCatalog = useCustomAcp(s => selectedAcpCatalog(s, hermesThreadId));
@@ -552,7 +587,14 @@ export function MultiProviderModelPicker({
             clip the rows against the rail. */}
         <div className="grid grid-cols-[48px_minmax(0,1fr)] h-[384px] overflow-hidden">
           <ProviderRail
-            providers={visibleProviders}
+            providers={railProviders}
+            acpEntries={acpRailEntries}
+            selectedAcpAgentId={railAcpAgentId}
+            onSelectAcp={(agentId) => {
+              setRailKey("acp");
+              setRailAcpAgentId(agentId);
+              setQuery("");
+            }}
             selected={railKey}
             favoritesCount={visibleFavoritesCount}
             getCount={(kind) => rowsByProvider[kind]?.length ?? 0}
@@ -582,7 +624,7 @@ export function MultiProviderModelPicker({
             }}
           />
           <div className="flex min-h-0 min-w-0 flex-col">
-            {railKey === "acp" && customAgentsAllowed ? <CustomAcpModels disabled={disabled} threadId={hermesThreadId} projectPath={hermesProjectPath} model={provider === "acp" ? model : null} onSelect={value => { onProviderModelChange("acp", value); }} /> : railKey === "hermes" ? <HermesProfileModels onProfileChange={() => onProviderModelChange("hermes", "profile_default")} threadId={hermesThreadId} projectPath={hermesProjectPath} model={provider === "hermes" ? model : null} onSelect={(model) => { onProviderModelChange("hermes", model); setOpen(false); }} /> : <Command shouldFilter={false}>
+            {railKey === "acp" && acpAllowed ? <CustomAcpModels disabled={disabled} agentId={railAcpAgentId} threadId={hermesThreadId} projectPath={hermesProjectPath} active={provider === "acp" && activeAcpAgentId === railAcpAgentId} model={provider === "acp" ? model : null} onSelect={value => { onProviderModelChange("acp", value); }} /> : railKey === "hermes" ? <HermesProfileModels onProfileChange={() => onProviderModelChange("hermes", "profile_default")} threadId={hermesThreadId} projectPath={hermesProjectPath} model={provider === "hermes" ? model : null} onSelect={(model) => { onProviderModelChange("hermes", model); setOpen(false); }} /> : <Command shouldFilter={false}>
               <CommandInput
                 placeholder="Search models..."
                 value={query}
@@ -682,6 +724,9 @@ export function MultiProviderModelPicker({
 
 function ProviderRail({
   providers,
+  acpEntries,
+  selectedAcpAgentId,
+  onSelectAcp,
   selected,
   favoritesCount,
   getCount,
@@ -689,6 +734,9 @@ function ProviderRail({
   onSelect,
 }: {
   providers: ReadonlyArray<{ kind: AgentChatProviderKind; label: string }>;
+  acpEntries: ReadonlyArray<AcpRailEntry>;
+  selectedAcpAgentId: string | null;
+  onSelectAcp: (agentId: string) => void;
   selected: RailKey;
   favoritesCount: number;
   getCount: (kind: AgentChatProviderKind) => number;
@@ -698,7 +746,9 @@ function ProviderRail({
   return (
     <TooltipProvider delayDuration={200}>
       <div
-        className="flex flex-col gap-1 border-r bg-muted/30 p-1"
+        // Custom agents add one entry each, so the rail scrolls once it
+        // outgrows the fixed-height popup instead of clipping entries.
+        className="flex min-h-0 flex-col gap-1 overflow-y-auto overflow-x-hidden border-r bg-muted/30 p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         data-testid="multi-provider-rail"
       >
         {/* Favorites pseudo-tab — sits above the driver entries with
@@ -708,7 +758,7 @@ function ProviderRail({
             fresh install. */}
         {favoritesCount > 0 ? (
           <>
-            <div className="relative">
+            <div className="relative shrink-0">
               {selected === "favorites" && (
                 <span
                   className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
@@ -762,7 +812,7 @@ function ProviderRail({
           const parsedError = parseProviderError(error);
           const isUnavailable = parsedError !== null;
           return (
-            <div key={p.kind} className="relative">
+            <div key={p.kind} className="relative shrink-0">
               {isSelected && (
                 <span
                   className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
@@ -806,6 +856,41 @@ function ProviderRail({
                       {providerErrorTooltipLabel(parsedError)}
                     </div>
                   ) : null}
+                </TooltipContent>
+              </Tooltip>
+            </div>
+          );
+        })}
+        {acpEntries.map((agent) => {
+          const isSelected = selected === "acp" && selectedAcpAgentId === agent.id;
+          return (
+            <div key={`acp:${agent.id}`} className="relative shrink-0">
+              {isSelected && (
+                <span
+                  className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
+                  aria-hidden
+                />
+              )}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={() => onSelectAcp(agent.id)}
+                    data-testid={`provider-rail-acp-${agent.id}`}
+                    data-selected={isSelected || undefined}
+                    aria-label={agent.name}
+                    aria-pressed={isSelected}
+                    className={cn(
+                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
+                      "hover:bg-muted",
+                      isSelected && "bg-background text-foreground shadow-sm",
+                    )}
+                  >
+                    <ProviderLogo provider="acp" className="size-5 shrink-0" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="right" sideOffset={8}>
+                  {agent.name}
                 </TooltipContent>
               </Tooltip>
             </div>
