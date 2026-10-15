@@ -100,6 +100,7 @@ import {
   useVisibleSidebarDraftCount,
 } from "./sidebar-draft-block";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { SidebarOtherMachines } from "./sidebar-other-machines";
 import { SidebarEmptyState } from "./sidebar-empty-state";
 import { SidebarHeaderActions } from "./sidebar-action-row";
 
@@ -2243,6 +2244,7 @@ export function SidebarInbox() {
             )}
           </div>
         )}
+        <SidebarOtherMachines />
       </div>
 
       {/* Bulk right-click menu. Anchored to a zero-size element parked at the
