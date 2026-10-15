@@ -2743,7 +2743,11 @@ export function Composer({
   const fitFooter = useCallback((key?: string) => {
     const pill = wrapperRef.current?.getBoundingClientRect().width ?? 0;
     const gapEl = footerGapRef.current;
-    const gap = gapEl?.getBoundingClientRect().width ?? 0;
+    // Content that can't shrink (the context ring) may spill out of a gap
+    // with no min-width — on a phone, over the model control. Count the
+    // spill against the gap so the row compacts until it fits.
+    const spill = gapEl ? Math.max(0, gapEl.scrollWidth - gapEl.clientWidth) : 0;
+    const gap = (gapEl?.getBoundingClientRect().width ?? 0) - spill;
     // No layout yet (or jsdom): stay at full width.
     if (pill <= 0) return;
     setCollapseDisabled(collapseDisabledFor(pill));
@@ -2855,6 +2859,9 @@ export function Composer({
     busy,
     delivery.delivery,
     tasks ? `${tasks.completed}/${tasks.total}` : "",
+    // The ring appearing adds width inside the gap without resizing it,
+    // so no observer would notice.
+    contextUsage ? "ring" : "",
   ].join("|");
   // Layout effect: each fit step re-renders and re-measures before paint,
   // so the row never flashes an overflowing intermediate state.

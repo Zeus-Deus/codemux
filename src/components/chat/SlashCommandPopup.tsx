@@ -1,5 +1,5 @@
 import { Command as CommandPrimitive } from "cmdk";
-import { memo, useCallback, useLayoutEffect, useMemo, useRef, type CSSProperties, type SyntheticEvent } from "react";
+import { memo, useCallback, useLayoutEffect, useMemo, useRef, type SyntheticEvent } from "react";
 
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
@@ -88,8 +88,6 @@ export function SlashCommandPopup({
   const listRef = useRef<HTMLDivElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const room = useRoomAbove(rootRef, open);
-  const roomStyle: (CSSProperties & { "--menu-room": string }) | undefined =
-    room === undefined ? undefined : { "--menu-room": `${room - 2}px` };
   const pointerHighlightRef = useRef<string | null>(null);
   const pointerPositionRef = useRef<{ x: number; y: number } | null>(null);
   const selectRef = useRef(onSelect);
@@ -145,13 +143,16 @@ export function SlashCommandPopup({
         <ScrollArea
           type="always"
           className={cn(
-            // `--menu-room`: the space above the card (see below).
-            "max-h-[min(20rem,var(--menu-room,20rem))] w-full",
+            // `min-h-0` + column: the area and its viewport shrink below
+            // the 20rem cap when the popup is held to the room above the
+            // card (see below), so the last rows stay reachable.
+            "flex max-h-80 min-h-0 w-full flex-col",
+            "[&>[data-slot=scroll-area-viewport]]:min-h-0",
             // Viewport: cap height + force the inner div cmdk renders
             // to sit on a single block (cmdk's <Command> spreads
             // multi-children inside CommandList; the viewport's
             // default flex layout otherwise stretches a single child).
-            "[&>[data-slot=scroll-area-viewport]]:max-h-[min(20rem,var(--menu-room,20rem))]",
+            "[&>[data-slot=scroll-area-viewport]]:max-h-80",
             "[&>[data-slot=scroll-area-viewport]]:overscroll-contain",
             // Radix's viewport wraps children in a `display: table;
             // min-width: 100%` div (inline styles). A table box is
@@ -204,11 +205,12 @@ export function SlashCommandPopup({
     <div
       ref={rootRef}
       data-testid="slash-command-popup"
-      // Caps the list to the room above the card, less the 2px border, so
-      // a phone's landing page never slides it under the header.
-      style={roomStyle}
+      // Held to the room above the card, so a phone's landing page never
+      // slides it under the header: the list shrinks and scrolls, the
+      // source footer keeps its height.
+      style={room === undefined ? undefined : { maxHeight: room }}
       className={cn(
-        "absolute bottom-full left-0 right-0 mb-2 z-50 overflow-hidden",
+        "absolute bottom-full left-0 right-0 mb-2 z-50 flex flex-col overflow-hidden",
         COMMAND_MENU_SURFACE,
       )}
       onPointerLeave={() => {
@@ -261,10 +263,10 @@ export function SlashCommandPopup({
         onValueChange={(id) => {
           if (id) onHighlightChange(id, "list");
         }}
-        className="text-popover-foreground"
+        className="flex min-h-0 flex-col text-popover-foreground"
       >
         {list}
-        {items.find((item) => item.id === highlightedId)?.identity && <div data-testid="slash-item-source" className="border-t border-hairline px-3 py-2 text-label text-muted-foreground">
+        {items.find((item) => item.id === highlightedId)?.identity && <div data-testid="slash-item-source" className="shrink-0 border-t border-hairline px-3 py-2 text-label text-muted-foreground">
           {items.find((item) => item.id === highlightedId)?.identity?.label}
         </div>}
       </CommandPrimitive>
