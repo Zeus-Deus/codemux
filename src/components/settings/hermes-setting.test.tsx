@@ -25,9 +25,15 @@ describe("HermesSetting", () => {
   });
   afterEach(cleanup);
 
+  const openMenu = async () => {
+    // Radix opens its menu on pointerdown, not click.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "coding actions" }), { button: 0, ctrlKey: false });
+    return screen.findByRole("menu");
+  };
+
   it("asks before disconnecting a profile", async () => {
     render(<HermesSetting />);
-    fireEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+    fireEvent.click(within(await openMenu()).getByRole("menuitem", { name: "Disconnect…" }));
     expect(invoke).not.toHaveBeenCalledWith("hermes_disconnect", expect.anything());
 
     const dialog = await screen.findByRole("alertdialog");
@@ -41,7 +47,7 @@ describe("HermesSetting", () => {
 
   it("cancelling the confirmation leaves the profile connected", async () => {
     render(<HermesSetting />);
-    fireEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+    fireEvent.click(within(await openMenu()).getByRole("menuitem", { name: "Disconnect…" }));
     fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
     await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
     expect(invoke).not.toHaveBeenCalledWith("hermes_disconnect", expect.anything());
@@ -53,6 +59,8 @@ describe("HermesSetting", () => {
       cmd === "hermes_profiles" ? new Promise((r) => { finish = r; }) : Promise.resolve(null),
     );
     render(<HermesSetting />);
+    // The executable and root live under Advanced.
+    fireEvent.click(screen.getByRole("button", { name: "Executable and Hermes root" }));
     const save = screen.getByRole("button", { name: "Save and refresh" });
     fireEvent.click(save);
     await waitFor(() => expect(save).toBeDisabled());

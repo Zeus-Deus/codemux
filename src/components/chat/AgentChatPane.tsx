@@ -157,6 +157,7 @@ import { parseWorkflowCommand } from "@/lib/workflows/workflow-settings";
 import { useWorkflowUIStore, type ChatWorkflowLink } from "@/stores/workflow-ui-store";
 import type { RemoteTaskScope } from "./remote-task-context";
 import { useDelegationTasks } from "@/stores/delegation-store";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { TranscriptSkeleton } from "./TranscriptSkeleton";
@@ -747,7 +748,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   // A new pane binding is published before startup persists its canonical
   // session. Existing/hydrating threads keep their task subscription intact.
-  const remoteParentReady = conversationWritable && !(starting && startupThreadRef.current === threadId);
+  // The web remote refuses every delegation command, so a browser client
+  // never subscribes rather than surfacing that refusal as an error.
+  const delegationAvailable = !isRemoteClient();
+  const remoteParentReady = delegationAvailable && conversationWritable && !(starting && startupThreadRef.current === threadId);
   const remoteTasks = useDelegationTasks(remoteParentReady ? pane.pane_id : null, remoteParentReady ? threadId : null);
   const [delegateDialogThread, setDelegateDialogThread] = useState<string | null>(null);
   const [remoteTaskView, setRemoteTaskView] = useState<{ threadId: string; taskId: string } | null>(null);
@@ -4246,7 +4250,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onAttachIssue={conversationWritable ? handleAttachIssue : undefined}
       onAttachPr={conversationWritable ? handleAttachPr : undefined}
       onAttachSession={conversationWritable ? handleAttachSession : undefined}
-      onDelegateTask={conversationWritable && threadId ? () => setDelegateDialogThread(threadId) : undefined}
+      onDelegateTask={delegationAvailable && conversationWritable && threadId ? () => setDelegateDialogThread(threadId) : undefined}
       onAttachImage={conversationWritable ? handleAttachImage : undefined}
       modelSupportsImages={provider === "acp" ? acpCatalog?.supports_images ?? false : activeModel?.supports_images ?? false}
       repoSupported={repoSupported}

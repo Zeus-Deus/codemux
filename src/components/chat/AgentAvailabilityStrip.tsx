@@ -7,6 +7,8 @@ import {
 } from "@/stores/provider-health-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { ProviderLogo } from "./provider-logo";
+import { useDisabledProviders } from "@/lib/agent-chat/provider-enablement";
+import { useMemo } from "react";
 
 /** Hermes is left out: its readiness depends on which profile is chosen,
  *  and the model picker already handles that. */
@@ -59,9 +61,15 @@ export function AgentAvailabilityStrip({
   selected: AgentChatProviderKind;
   onSelect: (provider: AgentChatProviderKind) => void;
 }) {
-  const health = useProbedProviderHealth(STRIP_PROVIDERS, true);
-  const settled = STRIP_PROVIDERS.every((p) => health[p]?.pending === false);
-  const answered = STRIP_PROVIDERS.flatMap((provider) => {
+  // A provider turned off in Settings → Providers is neither probed nor shown.
+  const disabled = useDisabledProviders();
+  const providers = useMemo(
+    () => STRIP_PROVIDERS.filter((p) => !disabled.has(p)),
+    [disabled],
+  );
+  const health = useProbedProviderHealth(providers, true);
+  const settled = providers.every((p) => health[p]?.pending === false);
+  const answered = providers.flatMap((provider) => {
     const report = health[provider]?.report;
     return report ? [{ provider, report }] : [];
   });

@@ -55,6 +55,7 @@ import {
   leafModelName,
 } from "./footer-trigger";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { useDisabledProviders } from "@/lib/agent-chat/provider-enablement";
 
 /**
  * Step 12 Stage 4 — unified provider + model picker.
@@ -266,9 +267,14 @@ export function MultiProviderModelPicker({
   // Filter the providers list once per render. Memoized via the
   // identity of `allowedProviders` so consumers passing a stable
   // array reference (the common case) don't churn the rail.
+  // Providers turned off in Settings → Providers leave the rail, except the
+  // one this chat already runs on, so its current model stays visible.
+  const disabledProviders = useDisabledProviders();
   const visibleProviders = useMemo(
-    () => filterProviders(provider === "acp" && acpFixed ? ["acp"] : allowedProviders).filter(p => p.kind !== "acp" || customAgentsAllowed),
-    [allowedProviders, provider, acpFixed, customAgentsAllowed],
+    () => filterProviders(provider === "acp" && acpFixed ? ["acp"] : allowedProviders)
+      .filter(p => p.kind !== "acp" || customAgentsAllowed)
+      .filter(p => p.kind === provider || !disabledProviders.has(p.kind)),
+    [allowedProviders, provider, acpFixed, customAgentsAllowed, disabledProviders],
   );
 
   useEffect(() => {

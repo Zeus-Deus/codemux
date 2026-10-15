@@ -120,6 +120,21 @@ describe("resolveNewChatModelDefaults", () => {
     });
   });
 
+  it("never starts a new chat on a provider turned off in Settings → Providers", () => {
+    choose({ "chat.default_provider": "codex", "chat.default_model": "gpt-a", "providers.disabled": "codex" });
+    expect(resolveNewChatModelDefaults().provider).toBe("claude");
+    // Automatic skips a connected ChatGPT plan when Codex is off.
+    useChatGptStore.setState({ status: {
+      phase: "connected", attemptId: null, email: null, error: null,
+      profiles: [], activeProfileId: "plan", welcomePending: false, installed: true,
+    } });
+    choose({ "providers.disabled": "codex" });
+    expect(resolveNewChatModelDefaults().provider).toBe("claude");
+    // With Claude off too, the next enabled provider takes over.
+    choose({ "providers.disabled": "claude,codex" });
+    expect(resolveNewChatModelDefaults().provider).toBe("cursor");
+  });
+
   it("ignores providers that cannot be a new-chat default", () => {
     choose({
       "chat.default_provider": "hermes",

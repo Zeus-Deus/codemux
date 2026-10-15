@@ -926,6 +926,28 @@ describe("chat-draft-store", () => {
         checkoutMode: "worktree",
       });
     });
+
+    it("moves an empty draft off a provider that was turned off, and only those", () => {
+      useSettingsStore.setState({ settings: {} });
+      const store = useChatDraftStore.getState();
+      const empty = store.getOrCreateHomeDraft();
+      expect(empty.provider).toBe("claude");
+      // Pretend another untouched draft was manually put on Codex.
+      const other = store.getOrCreateProjectDraft("/repo");
+      useChatDraftStore.setState((s) => ({
+        draftsById: { ...s.draftsById, [other.draftId]: { ...s.draftsById[other.draftId], provider: "codex" } },
+      }));
+
+      useSettingsStore.setState({ settings: { "providers.disabled": "claude" } });
+      useChatDraftStore.getState().applyNewChatDefaults(new Set(["claude"]));
+
+      const { draftsById } = useChatDraftStore.getState();
+      expect(draftsById[empty.draftId].provider).not.toBe("claude");
+      // Reusing the home draft (New agent) now starts on an enabled provider.
+      expect(useChatDraftStore.getState().getOrCreateHomeDraft().provider).not.toBe("claude");
+      // Untouched drafts on other providers keep their pick.
+      expect(draftsById[other.draftId].provider).toBe("codex");
+    });
   });
 
   it("migrates legacy Fast drafts without losing their text or identity", async () => {
