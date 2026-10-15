@@ -37,6 +37,8 @@ const h = vi.hoisted(() => ({
   sessionRows: 24,
   parse: null as (() => void) | null,
   holdParse: false,
+  fitCols: 80,
+  fitRows: 24,
   linkProviders: [] as {
     provideLinks: (
       line: number,
@@ -143,7 +145,14 @@ vi.mock("@xterm/xterm", () => {
 
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: class {
-    fit() { h.log.push("fit"); }
+    fit() {
+      h.log.push("fit");
+      const terminal = h.terminals[h.terminals.length - 1];
+      if (terminal) {
+        terminal.cols = h.fitCols;
+        terminal.rows = h.fitRows;
+      }
+    }
   },
 }));
 
@@ -405,6 +414,8 @@ describe("TerminalPane deferred teardown", () => {
     h.sessionRows = 24;
     h.parse = null;
     h.holdParse = false;
+    h.fitCols = 80;
+    h.fitRows = 24;
     vi.mocked(resizePty).mockReset().mockResolvedValue(undefined);
     vi.mocked(getTerminalScrollback).mockReset().mockResolvedValue(null);
     vi.mocked(attachPtyOutput).mockClear();
@@ -451,19 +462,24 @@ describe("TerminalPane deferred teardown", () => {
     expect(attachPtyOutput).toHaveBeenCalledOnce();
   });
 
-  it("waits for the initial PTY resize before attaching its output", async () => {
+  it("sequentially applies geometry changed during the initial resize before attaching", async () => {
     schedulerHarness();
     let finishResize!: () => void;
     const resizing = new Promise<void>(resolve => { finishResize = resolve; });
-    vi.mocked(resizePty).mockReturnValue(resizing);
+    vi.mocked(resizePty).mockReturnValueOnce(resizing);
     renderPane("sess-a");
     await act(async () => {});
     expect(resizePty).toHaveBeenCalledOnce();
     expect(attachPtyOutput).not.toHaveBeenCalled();
+    h.fitCols = 100;
+    h.fitRows = 40;
     fireEvent(window, new Event("resize"));
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 130)); });
     expect(resizePty).toHaveBeenCalledOnce();
     await act(async () => { finishResize(); });
+    expect(vi.mocked(resizePty).mock.calls).toEqual([
+      ["sess-a", 80, 24], ["sess-a", 100, 40],
+    ]);
     expect(attachPtyOutput).toHaveBeenCalledExactlyOnceWith("sess-a", expect.anything());
   });
 

@@ -151,6 +151,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const replayReadyRef = useRef(false);
+  const pendingSizeSyncRef = useRef(false);
   const serializeAddonRef = useRef<SerializeAddon | null>(null);
   const webglAddonRef = useRef<WebglAddon | null>(null);
   const attachedSessionRef = useRef<string | null>(null);
@@ -225,7 +226,11 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   const syncTerminalSize = useCallback(async () => {
     const term = termRef.current;
     const fitAddon = fitAddonRef.current;
-    if (!term || !fitAddon || !visibleRef.current || !replayReadyRef.current) return;
+    if (!term || !fitAddon || !visibleRef.current) return;
+    if (!replayReadyRef.current) {
+      pendingSizeSyncRef.current = true;
+      return;
+    }
 
     if (mobileRef.current && !phoneControlRef.current) {
       const session = useAppStore.getState().appState?.terminal_sessions.find(s => s.session_id === sessionIdRef.current);
@@ -356,6 +361,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     if (!containerEl) return;
 
     replayReadyRef.current = false;
+    pendingSizeSyncRef.current = false;
     // Replay contains cursor positions for the saved PTY geometry. Starting
     // xterm at its 80×24 default can parse a restored narrow prompt at the
     // wrong coordinates before the first fit runs.
@@ -940,16 +946,22 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       // output, including ConPTY's absolute cursor positions. A spawning PTY
       // may not have its master yet; retain the subscription in that case so
       // its first output can still arrive when startup completes.
-      if (mobileRef.current && !phoneControlRef.current) {
-        const session = useAppStore.getState().appState?.terminal_sessions.find(s => s.session_id === sid);
-        if (session) term.resize(Math.max(2, session.cols), Math.max(1, session.rows));
-      } else if (visibleRef.current) {
-        fitAddon.fit();
-        if (term.cols > 0 && term.rows > 0) {
-          await resizePty(sid, term.cols, term.rows).catch(console.error);
+      do {
+        pendingSizeSyncRef.current = false;
+        if (mobileRef.current && !phoneControlRef.current) {
+          const session = useAppStore.getState().appState?.terminal_sessions.find(s => s.session_id === sid);
+          if (session) term.resize(Math.max(2, session.cols), Math.max(1, session.rows));
+        } else if (visibleRef.current) {
+          fitAddon.fit();
+          if (term.cols > 0 && term.rows > 0) {
+            await resizePty(sid, term.cols, term.rows).catch(console.error);
+          }
         }
-      }
-      if (cancelled) return false;
+        if (cancelled) return false;
+        // A resize may have arrived while this IPC was pending. Refit the
+        // latest geometry before exposing output; never issue concurrent
+        // startup resizes or require another event to recover the new size.
+      } while (pendingSizeSyncRef.current);
       replayReadyRef.current = true;
       // Attach only after scrollback parsing and the initial size sync. The
       // callback advances the kitty stack synchronously (the input handler
@@ -1019,6 +1031,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       attachedSessionRef.current = null;
       attachedGenerationRef.current = null;
       replayReadyRef.current = false;
+      pendingSizeSyncRef.current = false;
       flowPaused = false;
       kittyStackRef.current = [];
       kittyLevelRef.current = 0;
