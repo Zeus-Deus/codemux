@@ -46,6 +46,9 @@ import { Composer } from "./Composer";
 import { addonInvoke } from "@/lib/addons/bridge";
 import { executeAddon } from "@/lib/addons/platform";
 import { useAddonsStore } from "@/stores/addons-store";
+import { useAppStore } from "@/stores/app-store";
+import { useUIStore } from "@/stores/ui-store";
+import { useSettingsStore } from "@/stores/settings-store";
 import type { AddonInstallation, AddonManifest } from "@/lib/addons/types";
 import {
   agentChatListSessionMentions,
@@ -755,6 +758,62 @@ describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
   });
 });
 
+
+describe("+ menu → Workflows panel", () => {
+  let originalSettings: Record<string, string>;
+
+  beforeEach(() => {
+    originalSettings = useSettingsStore.getState().settings;
+    workflowAvailability.available = true;
+  });
+
+  afterEach(() => {
+    useAppStore.setState({ appState: null });
+    useSettingsStore.setState({ settings: originalSettings });
+  });
+
+  function seedLocalWorkspace() {
+    useAppStore.setState({
+      appState: {
+        workspaces: [{ workspace_id: "ws-local", host_id: null, attach_only: false }],
+        active_workspace_id: "ws-local",
+      } as never,
+    });
+  }
+
+  it.each([false, true])("keeps panel navigation in + with the optional shortcut set to %s", (enabled) => {
+    useSettingsStore.setState({
+      settings: { ...originalSettings, "workflows.composer_button": String(enabled) },
+    });
+    const { getByTestId, queryByTestId } = renderControlled({ workspaceId: "ws-local", sessionReady: false });
+    expect(!!queryByTestId("composer-workflows-toggle")).toBe(enabled);
+    if (enabled) {
+      fireEvent.click(getByTestId("composer-workflows-toggle"));
+      expect(useUIStore.getState().rightPanelTabs["ws-local"]).toBe("workflows");
+    }
+    fireEvent.click(getByTestId("composer-attach-button"));
+    expect(getByTestId("slash-item-workflows:panel")).not.toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("opens the workflows panel even before the chat session is ready", () => {
+    seedLocalWorkspace();
+    const setRightPanelTab = vi.spyOn(useUIStore.getState(), "setRightPanelTab");
+    const { getByTestId } = renderControlled({ workspaceId: "ws-local", sessionReady: false });
+    const plus = getByTestId("composer-attach-button");
+    expect(plus).not.toBeDisabled();
+    fireEvent.click(plus);
+    // Chat actions need the session; workspace navigation doesn't.
+    expect(getByTestId("slash-item-attach:file")).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(getByTestId("slash-item-workflows:panel"));
+    expect(setRightPanelTab).toHaveBeenCalledWith("ws-local", "workflows");
+    setRightPanelTab.mockRestore();
+  });
+
+  it("keeps + disabled without a session when workflows aren't available", () => {
+    const { getByTestId } = renderControlled({ sessionReady: false });
+    expect(getByTestId("composer-attach-button")).toBeDisabled();
+  });
+});
 
 describe("+ menu → Chat…", () => {
   const WORKSPACE = { workspaceId: "workspace-1", threadId: "current-thread" };

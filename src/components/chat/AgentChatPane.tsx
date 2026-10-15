@@ -3,8 +3,7 @@ import { resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { parseMessageDelivery, STEERING_UNAVAILABLE } from "@/lib/agent-chat/message-delivery";
 import { AsyncQuestionPanel } from "./AsyncQuestionPanel";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Folder, GitBranch, Home } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
 import { useAgentChatTurnCheckpoints } from "@/hooks/use-agent-chat-turn-checkpoints";
@@ -196,8 +195,7 @@ import { questionAnswerText } from "./QuestionForm";
 import type { SendAnchorRequest } from "./send-scroll-state";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
-import { SCOPE_STRIP, SCOPE_STRIP_INSET } from "./pickers/ThreadScopeRow";
-import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
+import { ComposerContextRow } from "./ComposerContextRow";
 import { MobileComposerChips } from "@/components/mobile/mobile-composer-chips";
 import { RevertTurnDialog } from "./revert-turn-dialog";
 import {
@@ -3680,57 +3678,23 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // root) keeps the Composer's default cwd label as before.
   const zone1Override = workspaceProjectRoot ? null : undefined;
 
-  const belowComposerSlot = workspaceProjectRoot ? (
-    // Context Row (design: `.design-import/Context Row.dc.html`) —
-    // static project/branch labels on the left, plus the passive git/PR
-    // status cluster on the right that survived the retired workspace
-    // context bar. Rendered at every message count:
-    // an empty thread has nothing to choose either (see above), so the
-    // strip never changes shape across the first send.
-    <div className={`${SCOPE_STRIP_INSET} @container`}>
-      <div className={SCOPE_STRIP} data-mobile-scope-strip>
-        {/* As the pane narrows the branch goes first, then the project:
-            the status cluster on the right is what's actionable. Labels
-            truncate in between rather than spill under the cluster. */}
-        <div className="flex min-w-0 items-center gap-0.5 overflow-hidden text-label font-medium text-muted-foreground @max-[450px]:hidden">
-          <span
-            className="inline-flex h-6 min-w-0 items-center gap-1.5 rounded-md px-2"
-            title={workspaceProjectRoot}
-          >
-            {isHomeWorkspace ? (
-              <Home className="size-3.5 shrink-0 text-status-remote" />
-            ) : (
-              <Folder className="size-3.5 shrink-0 text-muted-foreground" />
-            )}
-            <span className="max-w-[140px] truncate">
-              {isHomeWorkspace ? "Home" : basename(workspaceProjectRoot)}
-            </span>
-          </span>
-          {paneWorkspaceBranch && (
-            <>
-              <span className="shrink-0 select-none text-muted-foreground/50 @max-[500px]:hidden">·</span>
-              <span
-                className="inline-flex h-6 min-w-0 shrink-[2] items-center gap-1.5 rounded-md px-2 font-mono @max-[500px]:hidden"
-                title={`Branch: ${paneWorkspaceBranch}`}
-              >
-                <GitBranch className="size-3 shrink-0 text-muted-foreground" />
-                <span className="max-w-[160px] truncate">
-                  {paneWorkspaceBranch}
-                </span>
-              </span>
-            </>
-          )}
-        </div>
-        <WorkspaceStatusCluster />
-      </div>
-    </div>
-  ) : undefined;
+  // Context Row under the composer: project/branch, the composer's
+  // pickers, and git/PR status. Rendered at every message count, so the
+  // strip never changes shape across the first send.
+  const renderContextRow = workspaceProjectRoot
+    ? (settings: ReactNode) => (
+        <ComposerContextRow
+          projectRoot={workspaceProjectRoot}
+          isHomeWorkspace={isHomeWorkspace}
+          branch={paneWorkspaceBranch ?? null}
+          settings={settings}
+        />
+      )
+    : undefined;
 
-  // A worktree first-send gets a human-readable workspace name for free
-  // (the backend overwrites the title with the new branch name). A
-  // workspace-bound pane never cuts a branch — it always sends into the
-  // checkout it is already on — so without this the workspace keeps the
-  // backend default title forever.
+  // A workspace-bound pane sends into a workspace that already exists, so
+  // nothing else titles it: without this it keeps the backend default
+  // (its directory, or its branch for a worktree) forever.
   //
   // `autoNameWorkspace` is fire-and-forget and re-checks the
   // still-default-title guard itself, so this wrapper only resolves the
@@ -3743,7 +3707,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // `sendInFlightRef` check matters most: `messages.length === 0`
       // (which selects this handler) only flips once the optimistic
       // bubble lands, so two Enter presses in one tick would otherwise
-      // both reach here and race two `claude --print` calls into two
+      // both reach here and race two utility-model calls into two
       // renames — the second landing before the first's title reached
       // the store, so the late guard couldn't stop it either.
       if (sendInFlightRef.current) return;
@@ -3755,7 +3719,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       ).trim();
       if (!rawText) return;
       if (paneWorkspaceId && workspaceProjectRoot) {
-        autoNameWorkspace(paneWorkspaceId, workspaceProjectRoot, rawText);
+        autoNameWorkspace(paneWorkspaceId, rawText);
       }
       handleSubmit(textOverride, options);
     },
@@ -4186,7 +4150,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       }
       hasActiveGoal={hasGoal}
       zone1Override={zone1Override}
-      belowComposerSlot={mobile ? null : belowComposerSlot}
+      renderContextRow={mobile ? undefined : renderContextRow}
       stripSlot={conversationWritable ? <>
         {stripEl}
         {(remoteTasks.error || remoteTasks.subscriptionError) && <div role="status" className="pointer-events-auto mb-2 flex items-start gap-3 rounded-lg border border-border bg-surface-1 px-3 py-2 text-body-sm">

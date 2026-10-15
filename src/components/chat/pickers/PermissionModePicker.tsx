@@ -17,6 +17,9 @@ import { cn } from "@/lib/utils";
 import type { PermissionModeOption } from "@/tauri/types";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import {
+  CONTEXT_ROW_HIDE_SECONDARY,
+  CONTEXT_ROW_POPOVER,
+  CONTEXT_ROW_TRIGGER,
   FOOTER_SEPARATOR,
   FOOTER_TRIGGER,
   FOOTER_TRIGGER_ICON_ONLY,
@@ -29,6 +32,7 @@ import {
   PICKER_ROW_CHECK,
   PICKER_ROW_DESCRIPTION,
   PICKER_ROW_TITLE,
+  type PickerPlacement,
 } from "./footer-trigger";
 
 /**
@@ -57,6 +61,8 @@ interface Props {
   /** Narrow composer: keep the lock icon, drop the text label (kept as
    *  the tooltip and accessible name). */
   iconOnly?: boolean;
+  /** Footer row (default) or the context row under the composer. */
+  placement?: PickerPlacement;
 }
 
 function modeLabel(modes: PermissionModeOption[], value: string): string {
@@ -71,7 +77,9 @@ export function PermissionModePicker({
   openSignal,
   withSeparator,
   iconOnly = false,
+  placement = "footer",
 }: Props) {
+  const inContextRow = placement === "context-row";
   const [open, setOpen] = useState(false);
   const lastSignal = useRef(openSignal);
   useEffect(() => {
@@ -98,12 +106,20 @@ export function PermissionModePicker({
           <button
             type="button"
             disabled={disabled}
-            className={cn(FOOTER_TRIGGER, iconOnly && FOOTER_TRIGGER_ICON_ONLY)}
-            aria-label={iconOnly ? `Access: ${label}` : undefined}
-            title={iconOnly ? `Access: ${label}` : undefined}
+            className={
+              inContextRow
+                ? CONTEXT_ROW_TRIGGER
+                : cn(FOOTER_TRIGGER, iconOnly && FOOTER_TRIGGER_ICON_ONLY)
+            }
+            aria-label={iconOnly || inContextRow ? `Access: ${label}` : undefined}
+            title={iconOnly || inContextRow ? `Access: ${label}` : undefined}
           >
             <Lock className="size-3.5" />
-            {!iconOnly && (
+            {inContextRow ? (
+              <span className={cn("max-w-[140px] truncate", CONTEXT_ROW_HIDE_SECONDARY)}>
+                {label}
+              </span>
+            ) : !iconOnly && (
               <>
                 <span className="max-w-[140px] truncate">{label}</span>
                 <ChevronDown className="size-3 opacity-50" />
@@ -113,7 +129,7 @@ export function PermissionModePicker({
         </PopoverTrigger>
         <PopoverContent
           className={PICKER_CONTENT}
-          align="start"
+          {...(inContextRow ? CONTEXT_ROW_POPOVER : { align: "start" as const })}
           collisionPadding={PICKER_COLLISION_PADDING}
           onOpenAutoFocus={focusCmdkOnOpen}
         >

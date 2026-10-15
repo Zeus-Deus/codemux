@@ -14,6 +14,8 @@ vi.mock("@/tauri/commands", () => ({
   listWorktrees: vi.fn().mockResolvedValue([]),
   getDefaultBranch: vi.fn().mockResolvedValue("main"),
   generateBranchName: vi.fn().mockResolvedValue("some-branch"),
+  generateWorkspaceTitle: vi.fn().mockResolvedValue("Some Title"),
+  renameWorkspace: vi.fn().mockResolvedValue(undefined),
   generateRandomBranchName: vi.fn().mockResolvedValue("random-branch"),
   createWorktreeWorkspaceResult: vi
     .fn()

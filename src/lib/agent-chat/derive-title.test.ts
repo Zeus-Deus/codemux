@@ -105,7 +105,7 @@ describe("isDefaultWorkspaceTitle", () => {
     expect(isDefaultWorkspaceTitle("codemux")).toBe(false);
   });
 
-  it("never claims a user-chosen or branch-derived name as default", () => {
+  it("never claims a user-chosen name as default", () => {
     // These are the names auto-renaming must never clobber.
     expect(isDefaultWorkspaceTitle("sidebar-workspace-ordering")).toBe(false);
     expect(isDefaultWorkspaceTitle("Workspace")).toBe(false);
@@ -113,9 +113,26 @@ describe("isDefaultWorkspaceTitle", () => {
     expect(isDefaultWorkspaceTitle("My Workspace 58")).toBe(false);
     expect(isDefaultWorkspaceTitle("workspace 58")).toBe(false);
     expect(isDefaultWorkspaceTitle("Workspace 58b")).toBe(false);
-    // A branch-named worktree workspace, whose dirPath is the repo root.
+    // A slug the user typed, on a workspace whose branch differs.
     expect(
-      isDefaultWorkspaceTitle("fix-login-bug", "/home/u/projects/codemux"),
+      isDefaultWorkspaceTitle(
+        "fix-login-bug",
+        "/home/u/projects/codemux",
+        "feature/login",
+      ),
     ).toBe(false);
+  });
+
+  it("treats a worktree workspace still titled by its branch as default", () => {
+    // `set_workspace_worktree` titles a worktree workspace after its branch
+    // until it gets a real title; the dirPath is the repo root.
+    expect(
+      isDefaultWorkspaceTitle(
+        "fix-login-bug",
+        "/home/u/projects/codemux",
+        "fix-login-bug",
+      ),
+    ).toBe(true);
+    expect(isDefaultWorkspaceTitle("fix-login-bug", null, null)).toBe(false);
   });
 });

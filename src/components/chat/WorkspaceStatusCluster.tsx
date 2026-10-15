@@ -1,7 +1,11 @@
 import { useEffect, useState, type MouseEvent } from "react";
-import { AppWindow, ArrowDown, ChevronUp } from "lucide-react";
+import { AppWindow, ArrowDown, ArrowUp, ChevronUp } from "lucide-react";
 import { openExternalUrl, type LinkGesture } from "@/lib/open-url";
 import { cn } from "@/lib/utils";
+import {
+  CONTEXT_ROW_HIDE_GIT_COUNTS,
+  CONTEXT_ROW_SHOW_GIT_DOT,
+} from "./pickers/footer-trigger";
 import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
 import { useActiveWorkspace, useHomeDir } from "@/stores/app-store";
@@ -198,13 +202,30 @@ export function WorkspaceStatusCluster() {
 
       {gitBranch && (
         <>
+          {/* In a full context row the counts fold into the details
+              popover, which lists them too; a dot on its button says so. */}
           {showBehind && (
             <span
-              className="inline-flex h-[26px] items-center gap-1 rounded-md px-2 font-mono text-label tabular-nums text-warning"
+              className={cn(
+                "inline-flex h-[26px] items-center gap-1 rounded-md px-2 font-mono text-label tabular-nums text-warning",
+                CONTEXT_ROW_HIDE_GIT_COUNTS,
+              )}
               title={`${workspace.git_behind} commit${workspace.git_behind === 1 ? "" : "s"} behind`}
             >
               <ArrowDown className="size-3" />
               {workspace.git_behind}
+            </span>
+          )}
+          {showAhead && (
+            <span
+              className={cn(
+                "inline-flex h-[26px] items-center gap-1 rounded-md px-2 font-mono text-label tabular-nums text-success",
+                CONTEXT_ROW_HIDE_GIT_COUNTS,
+              )}
+              title={`${workspace.git_ahead} commit${workspace.git_ahead === 1 ? "" : "s"} ahead`}
+            >
+              <ArrowUp className="size-3" />
+              {workspace.git_ahead}
             </span>
           )}
 
@@ -237,6 +258,7 @@ export function WorkspaceStatusCluster() {
             </button>
           )}
 
+          {/* Never folds: the details popover can't open the issue. */}
           {issueChip}
 
           <Popover open={open} onOpenChange={setOpen}>
@@ -246,10 +268,21 @@ export function WorkspaceStatusCluster() {
                 aria-label="Workspace details"
                 title="Workspace details"
                 className={cn(
-                  "inline-flex h-[26px] shrink-0 items-center gap-1 rounded-md px-2 text-body-sm font-semibold text-foreground/80 transition-colors duration-150 hover:bg-surface-2",
+                  "relative inline-flex h-[26px] shrink-0 items-center gap-1 rounded-md px-2 text-body-sm font-semibold text-foreground/80 transition-colors duration-150 hover:bg-surface-2",
                   open && "bg-surface-3",
                 )}
               >
+                {(showBehind || showAhead) && (
+                  <span
+                    aria-hidden
+                    data-testid="workspace-details-git-dot"
+                    className={cn(
+                      "absolute right-1 top-0.5 size-1.5 rounded-full",
+                      showBehind ? "bg-warning" : "bg-success",
+                      CONTEXT_ROW_SHOW_GIT_DOT,
+                    )}
+                  />
+                )}
                 <AppWindow className="size-3.5" />
                 <ChevronUp className="size-3 opacity-50" />
               </button>

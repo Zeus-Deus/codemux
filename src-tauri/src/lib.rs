@@ -2713,6 +2713,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::delete_archived_workspace,
             commands::generate_branch_name,
             commands::generate_random_branch_name,
+            commands::generate_workspace_title,
             commands::reorder_workspaces,
             commands::split_pane,
             commands::activate_pane,

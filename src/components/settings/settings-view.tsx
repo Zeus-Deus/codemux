@@ -2425,7 +2425,7 @@ export function SettingsView() {
               <div className="space-y-1">
                 <SettingRow
                   label="Utility agent"
-                  description="A cheap model for handoff summaries and other small jobs. Automatic prefers Codex Luna, then Claude Haiku."
+                  description="A cheap model for handoff summaries, workspace and branch names, and other small jobs. Automatic prefers Codex Luna, then Claude Haiku."
                   scope="device"
                 >
                   <UtilityAgentSetting />
