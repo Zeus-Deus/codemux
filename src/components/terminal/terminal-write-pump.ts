@@ -94,6 +94,10 @@ export interface TerminalWritePump {
    *  further `enqueue`/`enqueueString` calls are ignored. Does NOT fire the
    *  watermark callbacks — the caller owns resume-on-teardown. */
   cancel(): void;
+  /** Resolve once every item queued before this call has reached the writer.
+   *  An asynchronous writer must still acknowledge its own parse completion.
+   *  Cancellation releases pending flushes without writing dropped data. */
+  flush(): Promise<void>;
   /** True once `cancel()` has been called. */
   readonly cancelled: boolean;
   /** Number of items still waiting to be written. Test/debug helper. */
@@ -123,7 +127,7 @@ export function createWritePump(
   const onHighWatermark = options.onHighWatermark;
   const onLowWatermark = options.onLowWatermark;
 
-  const queue: Array<Uint8Array | string> = [];
+  const queue: Array<Uint8Array | string | (() => void)> = [];
   let pumpRunning = false;
   let cancelled = false;
   // Running total of `queue` item byte lengths, kept in lockstep with the
@@ -162,6 +166,10 @@ export function createWritePump(
         let budget = budgetBytes;
         while (queue.length > 0 && budget > 0 && !cancelled) {
           const next = queue.shift()!;
+          if (typeof next === "function") {
+            next();
+            continue;
+          }
           budget -= next.length;
           // Account for the chunk leaving the queue before writing, so the
           // watermark reflects only bytes still waiting on us.
@@ -206,8 +214,16 @@ export function createWritePump(
       checkHighWatermark();
       void drain();
     },
+    flush(): Promise<void> {
+      if (cancelled) return Promise.resolve();
+      return new Promise(resolve => {
+        queue.push(resolve);
+        void drain();
+      });
+    },
     cancel(): void {
       cancelled = true;
+      for (const item of queue) if (typeof item === "function") item();
       queue.length = 0;
       queuedBytes = 0;
       // Leave `overHigh` as-is: the caller inspects `flowPaused` on teardown to

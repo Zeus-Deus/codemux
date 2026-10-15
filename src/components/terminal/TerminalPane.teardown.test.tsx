@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
-import { attachPtyOutput, createBrowserPane, resizePty, writeToPty } from "@/tauri/commands";
+import { attachPtyOutput, createBrowserPane, getTerminalScrollback, resizePty, writeToPty } from "@/tauri/commands";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import {
   flushAllTeardowns,
@@ -20,7 +20,7 @@ import {
  */
 const h = vi.hoisted(() => ({
   log: [] as string[],
-  terminals: [] as { index: number; disposed: number; input: HTMLTextAreaElement }[],
+  terminals: [] as { index: number; disposed: number; input: HTMLTextAreaElement; cols: number; rows: number; options: Record<string, unknown> }[],
   webgls: [] as { index: number; disposed: number }[],
   serializeCalls: 0,
   serializeAddons: 0,
@@ -33,6 +33,12 @@ const h = vi.hoisted(() => ({
     exit_code: null as number | null,
   },
   sessionState: "ready",
+  sessionCols: 80,
+  sessionRows: 24,
+  parse: null as (() => void) | null,
+  holdParse: false,
+  fitCols: 80,
+  fitRows: 24,
   linkProviders: [] as {
     provideLinks: (
       line: number,
@@ -79,6 +85,8 @@ vi.mock("@xterm/xterm", () => {
     clearSelection() {}
     constructor(options: Record<string, unknown>) {
       this.options = options;
+      this.cols = Number(options.cols ?? 80);
+      this.rows = Number(options.rows ?? 24);
       this.index = h.terminals.length;
       h.terminals.push(this);
       h.log.push(`create:${this.index}`);
@@ -113,7 +121,11 @@ vi.mock("@xterm/xterm", () => {
     onWriteParsed() {
       return { dispose: () => {} };
     }
-    write() {}
+    write(_data: unknown, callback?: () => void) {
+      if (!callback) return;
+      if (h.holdParse) h.parse = callback;
+      else callback();
+    }
     resize(cols: number, rows: number) {
       this.cols = cols;
       this.rows = rows;
@@ -133,7 +145,14 @@ vi.mock("@xterm/xterm", () => {
 
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: class {
-    fit() {}
+    fit() {
+      h.log.push("fit");
+      const terminal = h.terminals[h.terminals.length - 1];
+      if (terminal) {
+        terminal.cols = h.fitCols;
+        terminal.rows = h.fitRows;
+      }
+    }
   },
 }));
 
@@ -174,8 +193,12 @@ vi.mock("./webgl-renderer-probe", () => ({
 vi.mock("./terminal-write-pump", () => ({
   createWritePump: () => ({
     enqueue: () => {},
-    enqueueString: () => {},
+    enqueueString: () => {
+      const terminal = h.terminals[h.terminals.length - 1]!;
+      h.log.push(`restore:${terminal.cols}x${terminal.rows}`);
+    },
     cancel: () => h.log.push("pump-cancel"),
+    flush: async () => {},
   }),
 }));
 
@@ -290,16 +313,16 @@ vi.mock("@/stores/app-store", () => ({
             exit_code: null,
             cwd: "/tmp/a",
             original_command: null,
-            cols: 80,
-            rows: 24,
+            cols: h.sessionCols,
+            rows: h.sessionRows,
             adapter_captures: {},
           },
           {
             session_id: "sess-b",
             cwd: "/tmp/b",
             original_command: null,
-            cols: 80,
-            rows: 24,
+            cols: h.sessionCols,
+            rows: h.sessionRows,
             adapter_captures: {},
           },
         ],
@@ -387,7 +410,14 @@ describe("TerminalPane deferred teardown", () => {
     h.mobile = false;
     h.status = { state: "ready", message: null, exit_code: null };
     h.sessionState = "ready";
-    vi.mocked(resizePty).mockClear();
+    h.sessionCols = 80;
+    h.sessionRows = 24;
+    h.parse = null;
+    h.holdParse = false;
+    h.fitCols = 80;
+    h.fitRows = 24;
+    vi.mocked(resizePty).mockReset().mockResolvedValue(undefined);
+    vi.mocked(getTerminalScrollback).mockReset().mockResolvedValue(null);
     vi.mocked(attachPtyOutput).mockClear();
     cacheTerminalScrollback.mockClear();
     detachPtyOutput.mockClear();
@@ -398,6 +428,80 @@ describe("TerminalPane deferred teardown", () => {
     cleanup();
     flushAllTeardowns();
     setTeardownScheduler(null);
+  });
+
+  it("starts restored output at the saved PTY size before replay", async () => {
+    schedulerHarness();
+    vi.mocked(getTerminalScrollback).mockResolvedValueOnce({
+      data: "saved narrow prompt",
+      meta: {
+        pane_id: "pane-1", session_id: "sess-a", workspace_id: "ws-1",
+        working_directory: "/tmp/a", original_command: null,
+        cols: 35, rows: 38, adapter_captures: {}, adapter_id: null,
+        alternate_buffer: false, saved_at: 0,
+      },
+    });
+    renderPane("sess-a");
+    await act(async () => {});
+    expect(h.log).toContain("restore:35x38");
+  });
+
+  it("does not fit or attach until xterm has parsed restored output", async () => {
+    schedulerHarness();
+    h.holdParse = true;
+    h.sessionCols = 35;
+    h.sessionRows = 38;
+    renderPane("sess-a");
+    await act(async () => {});
+    expect(h.terminals[0].options).toMatchObject({ cols: 35, rows: 38 });
+    expect(h.parse).not.toBeNull();
+    expect(h.log).not.toContain("fit");
+    expect(attachPtyOutput).not.toHaveBeenCalled();
+    await act(async () => { h.parse!(); });
+    expect(h.log).toContain("fit");
+    expect(attachPtyOutput).toHaveBeenCalledOnce();
+  });
+
+  it("sequentially applies geometry changed during the initial resize before attaching", async () => {
+    schedulerHarness();
+    let finishResize!: () => void;
+    const resizing = new Promise<void>(resolve => { finishResize = resolve; });
+    vi.mocked(resizePty).mockReturnValueOnce(resizing);
+    renderPane("sess-a");
+    await act(async () => {});
+    expect(resizePty).toHaveBeenCalledOnce();
+    expect(attachPtyOutput).not.toHaveBeenCalled();
+    h.fitCols = 100;
+    h.fitRows = 40;
+    fireEvent(window, new Event("resize"));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 130)); });
+    expect(resizePty).toHaveBeenCalledOnce();
+    await act(async () => { finishResize(); });
+    expect(vi.mocked(resizePty).mock.calls).toEqual([
+      ["sess-a", 80, 24], ["sess-a", 100, 40],
+    ]);
+    expect(attachPtyOutput).toHaveBeenCalledExactlyOnceWith("sess-a", expect.anything());
+  });
+
+  it("still subscribes when the spawning PTY cannot resize yet", async () => {
+    schedulerHarness();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(resizePty).mockRejectedValue(new Error("Terminal shell is not currently resizable"));
+    renderPane("sess-a");
+    await act(async () => {});
+    expect(attachPtyOutput).toHaveBeenCalledExactlyOnceWith("sess-a", expect.anything());
+    errors.mockRestore();
+  });
+
+  it("does not attach after unmount while its initial resize is pending", async () => {
+    schedulerHarness();
+    let finishResize!: () => void;
+    vi.mocked(resizePty).mockReturnValue(new Promise<void>(resolve => { finishResize = resolve; }));
+    const view = renderPane("sess-a");
+    await act(async () => {});
+    view.unmount();
+    await act(async () => { finishResize(); });
+    expect(attachPtyOutput).not.toHaveBeenCalled();
   });
 
   it("preserves the shared PTY size on mobile until the user chooses Fit to phone", async () => {
