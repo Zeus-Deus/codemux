@@ -24,6 +24,7 @@ import {
   GitPullRequest,
   ChartColumn,
   Workflow,
+  Boxes,
 } from "lucide-react";
 
 export type Section =
@@ -41,6 +42,7 @@ export type Section =
   | "source_control"
   | "agent"
   | "workflows"
+  | "providers"
   | "permissions"
   | "skills"
   | "mcp"
@@ -92,6 +94,9 @@ export function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
     {
       label: "AGENTS",
       items: [
+        // Which agents exist, their accounts and setup. Agent covers how
+        // chats behave once an agent is chosen.
+        { id: "providers", label: "Providers", icon: Boxes },
         { id: "agent", label: "Agent", icon: Bot },
         { id: "interface", label: "Interface", icon: Sparkles },
         // Inbound administration stays available in the CLI interface too.

@@ -1,11 +1,10 @@
 import { Kbd } from "@/components/ui/kbd";
 import { MobileInstall } from "@/components/mobile/mobile-install";
-import { ChatGptConnection } from "@/components/auth/chatgpt-connection";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { AddonsSettings } from "./addons-settings";
-import { HermesDefaultProfileSetting, HermesSetting } from "./hermes-setting";
+import { ProvidersSection } from "./providers-section";
 import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { formatBytes } from "@/lib/format-bytes";
@@ -86,7 +85,6 @@ import {
 } from "@/stores/settings-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { ThemeSettings } from "./theme-settings";
-import { CustomAcpSettings } from "./custom-acp-settings";
 import { UtilityAgentSetting } from "./utility-agent-setting";
 import { NewChatModelSetting } from "./new-chat-model-setting";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
@@ -178,6 +176,9 @@ import { SettingsFooterPin } from "./settings-footer-pin";
  *  windows simply behave as before, and capped rather than fluid so an
  *  ultrawide monitor doesn't stretch the bars into abstraction. */
 const WIDE_SECTIONS: ReadonlySet<Section> = new Set<Section>(["usage"]);
+/** Sections laid out as a list beside a detail panel: wider than the
+ *  reading measure so both columns fit, narrower than the dashboard. */
+const SPLIT_SECTIONS: ReadonlySet<Section> = new Set<Section>(["providers"]);
 
 import { KeybindEditor } from "./keybind-editor";
 import { ArchiveSection } from "./archive-section";
@@ -2376,32 +2377,32 @@ export function SettingsView() {
       case "shortcuts":
         return <KeybindEditor />;
 
+      case "providers":
+        return <ProvidersSection />;
+
       case "agent":
         return (
           <div>
             <SectionHeader
               title="Agent"
-              description="Configure how Codemux integrates with AI coding agents."
+              description={<>How chats start and behave. Set up agents and accounts in{" "}
+                <button type="button" className="text-foreground underline-offset-4 hover:underline" onClick={() => setActiveSection("providers")}>Providers</button>.</>}
             />
-            <div className="mb-7"><ChatGptConnection /></div>
             {/* Chat drafts are an Agent Chat surface; the CLI interface
                 launches agents from presets instead. */}
             {enableAgentChat && (
               <SectionGroup>
-                <SubsectionHeader
-                  title="New chats"
-                  description="What a new chat starts with. You can still change any of it in the composer before sending."
-                />
+                <SubsectionHeader title="New chats" />
                 <div className="space-y-1">
                   <SettingRow
                     label="Default model"
-                    description="Automatic prefers your connected ChatGPT plan, otherwise Claude's default model. Custom picks the provider, model and reasoning level for every new chat."
+                    description="Automatic uses your ChatGPT plan when connected, otherwise Claude."
                   >
                     <NewChatModelSetting />
                   </SettingRow>
                   <SettingRow
                     label="Workspace"
-                    description="New worktree gives each chat its own branch and checkout. Current checkout works directly on the project's checked-out branch."
+                    description="A new worktree gives each chat its own branch and checkout."
                   >
                     <SegmentedControl<NewChatCheckout>
                       ariaLabel="Where new chats run"
@@ -2420,69 +2421,23 @@ export function SettingsView() {
               </SectionGroup>
             )}
             <SectionGroup>
-              {enableAgentChat && (
-                <SubsectionHeader
-                  title="Tools & runtime"
-                  description="Background helpers, provider setup, and how agent sessions behave."
-                />
-              )}
+              <SubsectionHeader title={enableAgentChat ? "Background work" : "Agents"} />
               <div className="space-y-1">
                 <SettingRow
                   label="Utility agent"
-                  description="One inexpensive default for conversation handoffs and lightweight generation. Automatic prefers Codex Luna, then Claude Haiku; individual features can still offer an override when it matters."
-                scope="device"
-                  >
+                  description="A cheap model for handoff summaries and other small jobs. Automatic prefers Codex Luna, then Claude Haiku."
+                  scope="device"
+                >
                   <UtilityAgentSetting />
                 </SettingRow>
-                <Separator />
-                <div className="py-4">
-                  <HermesSetting />
-                </div>
-                <Separator />
-                <SettingRow
-                  label="Default Hermes profile"
-                  description="New Hermes chats start with this profile. Automatic uses the only installed profile; a profile you pick in a project's chat is remembered for that project."
-                scope="device"
-                  >
-                  <HermesDefaultProfileSetting />
-                </SettingRow>
-                <Separator />
-                <CustomAcpSettings />
-                <Separator />
-                <SettingRow
-                  label="Auto-configure MCP for workspaces"
-                  description="Automatically write .mcp.json so agents discover Codemux tools. Disable if you manage MCP config manually."
-                scope="device"
-                  >
-                  <Switch
-                    checked={autoMcpConfig}
-                    onCheckedChange={(checked) => {
-                      setAutoMcpConfig(checked);
-                      storeSet("auto_mcp_config", String(checked));
-                    }}
-                  />
-                </SettingRow>
-                {/* True turn checkpoints are an Agent Chat affordance. */}
                 {enableAgentChat && (
                   <>
                     <Separator />
                     <SettingRow
-                      label="Per-turn revert checkpoints"
-                      description="Before each supported agent turn, snapshot the workspace so Revert can rewind files, the provider conversation, and the transcript together. Currently available for Codex."
-                    >
-                      <Switch
-                        checked={syncedSettings.agent_chat?.checkpoints_enabled ?? false}
-                        onCheckedChange={(checked) => {
-                          updateSyncedSetting("agent_chat", "checkpoints_enabled", checked).catch(console.error);
-                        }}
-                      />
-                    </SettingRow>
-                    <Separator />
-                    <SettingRow
                       label="Resume automatically after usage limits reset"
-                      description="When a provider reports when your usage limit resets, continue the interrupted run then. At most two automatic attempts before it waits for you."
-                    scope="device"
-                  >
+                      description="Continue an interrupted run when the limit resets. Retries at most twice."
+                      scope="device"
+                    >
                       <Switch
                         checked={autoResumeUsageLimit}
                         onCheckedChange={(checked) =>
@@ -2496,7 +2451,7 @@ export function SettingsView() {
                     <Separator />
                     <SettingRow
                       label="Delegate to other agents"
-                      description="When you ask for it, a Full-access Claude or Codex chat can hand a task to another installed agent, e.g. “have Codex implement X, then review it”. Each task opens as a tab next to the chat and shares its folder. Turning this off hides the tool from Claude chats right away and from new Codex chats."
+                      description="When you ask, a Full-access Claude or Codex chat can hand a task to another agent. It opens as a tab next to the chat."
                     >
                       <Switch
                         checked={crossProviderDelegation}
@@ -2508,14 +2463,47 @@ export function SettingsView() {
                         }
                       />
                     </SettingRow>
+                    {/* True turn checkpoints are an Agent Chat affordance. */}
                     <Separator />
-                    {/* GUI-mode background browser viewport pin. Like the
-                        checkpoint toggle, only meaningful with the Agent
-                        Chat GUI on — the peek popover it affects is a
-                        GUI-chrome surface. */}
+                    <SettingRow
+                      label="Per-turn revert checkpoints"
+                      description="Snapshot the workspace before each turn so Revert can undo files, conversation and transcript together. Codex only for now."
+                    >
+                      <Switch
+                        checked={syncedSettings.agent_chat?.checkpoints_enabled ?? false}
+                        onCheckedChange={(checked) => {
+                          updateSyncedSetting("agent_chat", "checkpoints_enabled", checked).catch(console.error);
+                        }}
+                      />
+                    </SettingRow>
+                  </>
+                )}
+              </div>
+            </SectionGroup>
+            <SectionGroup>
+              <SubsectionHeader title="Tools" />
+              <div className="space-y-1">
+                <SettingRow
+                  label="Auto-configure MCP for workspaces"
+                  description="Write .mcp.json in each workspace so agents find Codemux tools. Turn off if you manage MCP config yourself."
+                  scope="device"
+                >
+                  <Switch
+                    checked={autoMcpConfig}
+                    onCheckedChange={(checked) => {
+                      setAutoMcpConfig(checked);
+                      storeSet("auto_mcp_config", String(checked));
+                    }}
+                  />
+                </SettingRow>
+                {/* GUI-mode background browser viewport pin: the peek
+                    popover it affects is a GUI-chrome surface. */}
+                {enableAgentChat && (
+                  <>
+                    <Separator />
                     <SettingRow
                       label="Desktop-size background browser"
-                      description="Pin the agent's background browser to a real desktop viewport (the Browser section's default viewport, 1280×800 out of the box) so pages render at full size in the peek popover, scaled to fit."
+                      description="Render the agent's background browser at the Browser section's default size (1280×800) and scale it to fit the peek."
                     >
                       <Switch
                         checked={syncedSettings.agent_chat?.background_browser_desktop_viewport ?? true}
@@ -2981,7 +2969,9 @@ export function SettingsView() {
             className={cn(
               "animate-in fade-in-0 slide-in-from-bottom-1 duration-150 motion-reduce:animate-none",
               mobile ? "mx-auto min-w-0 px-4 pt-5 pb-20" : "mx-auto px-11 pt-8 pb-20",
-              WIDE_SECTIONS.has(activeSection as Section) ? "max-w-[1400px]" : "max-w-3xl",
+              WIDE_SECTIONS.has(activeSection as Section)
+                ? "max-w-[1400px]"
+                : SPLIT_SECTIONS.has(activeSection as Section) ? "max-w-5xl" : "max-w-3xl",
             )}
           >
             {sectionAvailable ? renderSection() : (

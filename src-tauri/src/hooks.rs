@@ -840,88 +840,351 @@ pub fn register_gemini_hooks() {
 #[cfg(target_os = "windows")]
 pub fn register_gemini_hooks() {}
 
-/// OpenCode notify plugin. OpenCode has no hook-config file like Claude or
-/// Codex — instead it loads JS plugins from its plugin directory. This
-/// plugin watches OpenCode's `session.status` busy/idle transitions and
-/// `permission.ask` events and shells out to `notify.sh`, normalizing to
-/// the canonical `Start` / `Stop` / `PermissionRequest` vocabulary.
+/// JS shared by both OpenCode plugins: reports a canonical event straight to
+/// the hook server.
 ///
-/// `{{NOTIFY_PATH}}` is substituted with the absolute `notify.sh` path at
-/// install time. The plugin is a no-op unless `CODEMUX_SESSION_ID` is in
-/// the environment, so a user running OpenCode outside Codemux is
-/// unaffected.
+/// Reports are chained and each one is awaited: the hook server only answers
+/// after it has applied the status, so a quick `Start` → `Stop` can never
+/// land reversed (detached `notify.sh` runs give no such ordering). Like
+/// `notify.sh`, it tries the inherited port first, then the port the running
+/// app published — persistent PTYs keep a stale `CODEMUX_HOOK_PORT` across
+/// app restarts.
+///
+/// `{{ACTIVE_PORT_PATH}}` is substituted with a JSON string literal.
 #[cfg(not(target_os = "windows"))]
-const OPENCODE_PLUGIN_TEMPLATE: &str = r#"// Codemux OpenCode notify plugin
+const OPENCODE_TRANSPORT_JS: &str = r#"import { readFile } from "node:fs/promises";
+
+const ACTIVE_PORT_PATH = {{ACTIVE_PORT_PATH}};
+
+let reports = Promise.resolve();
+
+const postHook = async (port, eventType) => {
+  if (!port) return false;
+  const sessionId = encodeURIComponent(process.env.CODEMUX_SESSION_ID ?? "");
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${port}/hook?sessionId=${sessionId}&eventType=${eventType}`,
+      { signal: AbortSignal.timeout(2000) },
+    );
+    return response.ok;
+  } catch {
+    return false;
+  }
+};
+
+const notify = (eventType) => {
+  reports = reports.then(async () => {
+    const inherited = process.env.CODEMUX_HOOK_PORT;
+    if (await postHook(inherited, eventType)) return;
+    let active = "";
+    try {
+      active = (await readFile(ACTIVE_PORT_PATH, "utf8")).trim();
+    } catch {}
+    // Best-effort — never break the agent over a status ping.
+    if (active && active !== inherited) await postHook(active, eventType);
+  });
+};
+"#;
+
+/// OpenCode 1.x notify plugin. OpenCode has no hook-config file like Claude
+/// or Codex — instead it loads JS plugins from its plugin directory, inside
+/// the terminal's own process tree. This plugin watches `session.status`
+/// busy/idle transitions plus permission and question requests, normalizing
+/// to the canonical `Start` / `Stop` / `PermissionRequest` vocabulary.
+///
+/// OpenCode 2 never loads this file (see [`OPENCODE_TUI_PLUGIN_TEMPLATE`]).
+/// Event shapes verified against OpenCode 1.19.0: `permission.asked` /
+/// `question.asked` carry `id`, their replies carry `requestID`. The
+/// `permission.ask` hook is kept for older 1.x releases; 1.19 never calls it.
+///
+/// The plugin is a no-op unless `CODEMUX_SESSION_ID` is in the environment,
+/// so a user running OpenCode outside Codemux is unaffected.
+#[cfg(not(target_os = "windows"))]
+const OPENCODE_PLUGIN_TEMPLATE: &str = r#"// Codemux OpenCode notify plugin (OpenCode 1.x)
 // Installed by Codemux — bridges OpenCode session lifecycle to the
 // Codemux agent status indicator (the working/idle/needs-input dot).
+// OpenCode 2 ignores this file and loads plugins/codemux/tui.js instead.
 // Safe to delete: Codemux rewrites it on startup.
 
-export const CodemuxNotifyPlugin = async ({ $ }) => {
+{{TRANSPORT}}
+export const CodemuxNotifyPlugin = async () => {
   // Only active inside a Codemux-managed terminal.
   if (!process?.env?.CODEMUX_SESSION_ID) return {};
-
-  const notifyPath = "{{NOTIFY_PATH}}";
 
   let currentState = "idle"; // "idle" | "busy"
   let rootSessionID = null;
   let stopSent = false;
-
-  const notify = async (eventType) => {
-    try {
-      // Event type is the literal argv arg; stdin is closed so notify.sh's
-      // session-id capture returns empty without blocking.
-      await $`bash ${notifyPath} ${eventType} < /dev/null`.quiet();
-    } catch {
-      // Best-effort — never break the agent over a status ping.
-    }
-  };
+  // Open permission/question requests. Any session's request blocks the
+  // run, including a subagent's.
+  const pending = new Set();
 
   const isChildSession = (event) =>
     Boolean(event?.properties?.info?.parentID);
 
-  const handleBusy = async (sessionID) => {
+  const handleBusy = (sessionID) => {
     if (!rootSessionID) rootSessionID = sessionID;
     if (sessionID !== rootSessionID) return;
     if (currentState === "idle") {
       currentState = "busy";
       stopSent = false;
-      await notify("Start");
+      notify("Start");
     }
   };
 
-  const handleStop = async (sessionID) => {
+  const handleStop = (sessionID) => {
     if (rootSessionID && sessionID !== rootSessionID) return;
     if (currentState === "busy" && !stopSent) {
       currentState = "idle";
       stopSent = true;
       rootSessionID = null;
-      await notify("Stop");
+      pending.clear();
+      notify("Stop");
     }
+  };
+
+  const handleAsked = (requestID) => {
+    pending.add(requestID ?? "unknown");
+    notify("PermissionRequest");
+  };
+
+  // Answering the last open request hands the dot back to the run.
+  const handleReplied = (requestID) => {
+    pending.delete(requestID);
+    if (pending.size === 0 && currentState === "busy") notify("Start");
   };
 
   return {
     event: async ({ event }) => {
-      const sessionID =
-        event?.properties?.sessionID ?? event?.properties?.info?.id ?? null;
+      const properties = event?.properties;
+      switch (event?.type) {
+        case "permission.asked":
+        case "question.asked":
+          handleAsked(properties?.id);
+          return;
+        case "permission.replied":
+        case "question.replied":
+        case "question.rejected":
+          handleReplied(properties?.requestID);
+          return;
+      }
 
       // Ignore subagent/child sessions so background spawns don't flip the dot.
       if (isChildSession(event)) return;
+      const sessionID = properties?.sessionID ?? properties?.info?.id ?? null;
 
       // Verified against @opencode-ai/sdk: session.status carries
       // { properties: { sessionID, status: { type: "idle"|"busy"|"retry" } } };
       // session.idle / session.error carry { properties: { sessionID } }.
       if (event.type === "session.status") {
-        const status = event.properties?.status?.type;
-        if (status === "busy") await handleBusy(sessionID);
-        else if (status === "idle") await handleStop(sessionID);
+        const status = properties?.status?.type;
+        if (status === "busy") handleBusy(sessionID);
+        else if (status === "idle") handleStop(sessionID);
       }
-      if (event.type === "session.idle") await handleStop(sessionID);
-      if (event.type === "session.error") await handleStop(sessionID);
+      if (event.type === "session.idle") handleStop(sessionID);
+      if (event.type === "session.error") handleStop(sessionID);
     },
     "permission.ask": async () => {
-      await notify("PermissionRequest");
+      notify("PermissionRequest");
     },
   };
+};
+"#;
+
+/// OpenCode 2.x terminal plugin.
+///
+/// OpenCode 2 runs server plugins inside a shared background service
+/// (`opencode serve --service`) that every terminal connects to. That
+/// process never carries a pane's `CODEMUX_SESSION_ID`, and it no longer
+/// loads 1.x-style plugins at all, so 2.x status has to be reported from
+/// the terminal side. OpenCode 2 loads `plugins/<name>/tui.js` into each
+/// terminal's own process, where the pane environment is intact.
+///
+/// The service streams every session's events to every terminal, so the
+/// plugin follows only the root session this terminal shows. Event shapes
+/// verified against OpenCode 2.0.29: `session.execution.{started,
+/// succeeded,interrupted,failed}` and `permission.replied` carry
+/// `sessionID`; `permission.asked` carries `id`, its reply `requestID`;
+/// `form.created` carries `form.{id,sessionID}`, its reply/cancel `id`.
+///
+/// State is re-derived from the terminal's client cache on every tick, not
+/// only when the route changes: a session's status and open requests hydrate
+/// asynchronously after the route switches, and hydration replays no events.
+/// Events still outrank the cache, because a list read already in flight can
+/// land after an event and write back an older snapshot.
+#[cfg(not(target_os = "windows"))]
+const OPENCODE_TUI_PLUGIN_TEMPLATE: &str = r#"// Codemux OpenCode terminal plugin (OpenCode 2.x)
+// Installed by Codemux — bridges the session shown in this terminal to the
+// Codemux agent status indicator (the working/idle/needs-input dot).
+// Safe to delete: Codemux rewrites it on startup.
+
+{{TRANSPORT}}
+const SYNC_INTERVAL_MS = 250;
+const REQUEST_KINDS = ["permission", "form"];
+
+export default {
+  id: "codemux.notify",
+  setup(api) {
+    // Only active inside a Codemux-managed terminal.
+    if (!process.env.CODEMUX_SESSION_ID) return;
+
+    const parents = new Map();
+    // The root session this pane last showed. Kept while the user is on the
+    // home screen, so a run they navigated away from still reports its end.
+    let selected;
+    let running = false;
+    // Open requests on the selected session family: "<kind>:<id>" → owner.
+    let blockers = new Map();
+    // The cache seeds the run state only until this terminal sees the run's
+    // own lifecycle event: a late list read can still carry an older status.
+    let runningFromEvents = false;
+    // Request events outrank the cache: an in-flight list read can land
+    // after an event with an older snapshot. Asked requests are held until
+    // answered or the run ends; answered ids are unique, so they stay
+    // settled for as long as this session is selected.
+    const heldRequests = new Map();
+    const settledRequests = new Set();
+    // Last canonical event sent; "idle" until the first one.
+    let reported = "idle";
+
+    const root = (id) => {
+      const seen = new Set();
+      while (typeof id === "string" && !seen.has(id)) {
+        seen.add(id);
+        const parentID = api.data.session.get(id)?.parentID ?? parents.get(id);
+        if (!parentID) return id;
+        id = parentID;
+      }
+      return undefined;
+    };
+
+    const shownRoot = () => {
+      const route = api.ui.router.current();
+      return route?.type === "session" ? root(route.sessionID) : undefined;
+    };
+
+    const listRequests = (kind, member) => {
+      try {
+        return api.data.session[kind].list(member);
+      } catch {
+        return undefined;
+      }
+    };
+
+    const changeRequest = (owner, kind, requestID, present) => {
+      if (typeof requestID !== "string") return;
+      const key = `${kind}:${requestID}`;
+      if (!present) {
+        settledRequests.add(key);
+        heldRequests.delete(key);
+      } else if (!settledRequests.has(key)) {
+        heldRequests.set(key, owner);
+      }
+    };
+
+    // Re-derive the selected session's state from the client cache, which
+    // also picks up a run or request that was already open when this
+    // terminal attached and only hydrates after the route changed.
+    const reconcile = () => {
+      if (!runningFromEvents) running = api.data.session.status(selected) === "running";
+
+      let family = [];
+      try {
+        family = api.data.session.family(selected) ?? [];
+      } catch {}
+      const next = new Map(heldRequests);
+      for (const member of new Set([selected, ...family])) {
+        if (root(member) !== selected) continue;
+        for (const kind of REQUEST_KINDS) {
+          for (const item of listRequests(kind, member) ?? []) {
+            next.set(`${kind}:${item.id}`, member);
+          }
+        }
+      }
+      for (const key of settledRequests) next.delete(key);
+      blockers = next;
+    };
+
+    const publish = () => {
+      if (!selected) return;
+      reconcile();
+      const next = blockers.size ? "PermissionRequest" : running ? "Start" : "Stop";
+      // A pane that has not run anything stays clear instead of reading "done".
+      if (next === reported || (next === "Stop" && reported === "idle")) return;
+      reported = next;
+      notify(next);
+    };
+
+    const sync = () => {
+      const id = shownRoot();
+      if (id && id !== selected) {
+        selected = id;
+        running = false;
+        blockers = new Map();
+        runningFromEvents = false;
+        heldRequests.clear();
+        settledRequests.clear();
+      }
+      publish();
+    };
+
+    const receive = ({ details: event }) => {
+      const data = event?.data;
+      if (!data) return;
+      if (event.type === "session.created" && data.parentID) {
+        parents.set(data.sessionID, data.parentID);
+      }
+      const id = shownRoot();
+      if (id && id !== selected) sync();
+      if (!selected) return;
+      switch (event.type) {
+        case "session.execution.started":
+          if (data.sessionID !== selected) return;
+          running = true;
+          runningFromEvents = true;
+          break;
+        case "session.execution.succeeded":
+        case "session.execution.interrupted":
+        case "session.execution.failed":
+          if (data.sessionID !== selected) return;
+          running = false;
+          runningFromEvents = true;
+          // The run is over; the cache alone decides what is still open.
+          heldRequests.clear();
+          break;
+        case "permission.asked":
+          if (root(data.sessionID) !== selected) return;
+          changeRequest(data.sessionID, "permission", data.id, true);
+          break;
+        case "permission.replied":
+          if (root(data.sessionID) !== selected) return;
+          changeRequest(data.sessionID, "permission", data.requestID, false);
+          break;
+        case "form.created":
+          if (root(data.form?.sessionID) !== selected) return;
+          changeRequest(data.form.sessionID, "form", data.form.id, true);
+          break;
+        case "form.replied":
+        case "form.cancelled": {
+          const owner = blockers.get(`form:${data.id}`) ?? data.sessionID;
+          if (root(owner) !== selected) return;
+          changeRequest(owner, "form", data.id, false);
+          break;
+        }
+        default:
+          return;
+      }
+      publish();
+    };
+
+    const unsubscribe = api.data.listen(receive);
+    sync();
+    // Session switches and cache hydration emit no plugin event; poll both.
+    const timer = setInterval(sync, SYNC_INTERVAL_MS);
+    return () => {
+      clearInterval(timer);
+      unsubscribe();
+    };
+  },
 };
 "#;
 
@@ -936,40 +1199,53 @@ fn opencode_config_dir() -> Option<std::path::PathBuf> {
     Some(config_home.join("opencode"))
 }
 
-/// Render the OpenCode plugin JS with the notify script path inlined.
+/// Render an OpenCode plugin template with the shared transport and the
+/// absolute `active-port` path inlined.
 #[cfg(not(target_os = "windows"))]
-fn build_opencode_plugin(notify_script_path: &str) -> String {
-    OPENCODE_PLUGIN_TEMPLATE.replace("{{NOTIFY_PATH}}", notify_script_path)
+fn render_opencode_plugin(template: &str, active_port_path: &str) -> String {
+    let path_literal = serde_json::to_string(active_port_path).unwrap_or_else(|_| "\"\"".into());
+    template
+        .replace("{{TRANSPORT}}", OPENCODE_TRANSPORT_JS)
+        .replace("{{ACTIVE_PORT_PATH}}", &path_literal)
 }
 
-/// Install the OpenCode notify plugin into OpenCode's plugin directory.
+/// Install the OpenCode notify plugins into OpenCode's config directory:
+/// the 1.x plugin at `plugin/codemux-notify.js` and the 2.x terminal plugin
+/// at `plugins/codemux/tui.js`. Each OpenCode major ignores the other's file.
 ///
 /// Only runs if OpenCode's config dir already exists — i.e. the user
-/// actually has OpenCode. Unix-only (the plugin shells out to `notify.sh`).
+/// actually has OpenCode. Unix-only, like the other agent hooks.
 #[cfg(not(target_os = "windows"))]
 pub fn register_opencode_plugin() {
     let Some(config_dir) = opencode_config_dir() else { return };
     if !config_dir.exists() {
         return; // OpenCode not installed — don't create stray config.
     }
+    let Some(home) = user_home_dir() else { return };
+    let active_port_path = std::path::PathBuf::from(home)
+        .join(".codemux/hooks")
+        .join(ACTIVE_HOOK_PORT_FILE);
+    let active_port_path = active_port_path.to_string_lossy();
 
-    let Some(script_path) = ensure_hook_script() else {
-        eprintln!("[codemux::hooks] Failed to create hook script");
-        return;
-    };
-
-    let plugin_dir = config_dir.join("plugin");
-    if std::fs::create_dir_all(&plugin_dir).is_err() {
-        eprintln!("[codemux::hooks] Failed to create OpenCode plugin dir");
-        return;
+    let plugins = [
+        ("plugin", OPENCODE_PLUGIN_TEMPLATE),
+        ("plugins/codemux", OPENCODE_TUI_PLUGIN_TEMPLATE),
+    ];
+    for (dir, template) in plugins {
+        let plugin_dir = config_dir.join(dir);
+        if std::fs::create_dir_all(&plugin_dir).is_err() {
+            eprintln!("[codemux::hooks] Failed to create OpenCode plugin dir {dir}");
+            continue;
+        }
+        let file = if dir == "plugin" { "codemux-notify.js" } else { "tui.js" };
+        let _ = std::fs::write(
+            plugin_dir.join(file),
+            render_opencode_plugin(template, &active_port_path),
+        );
     }
-
-    let plugin_path = plugin_dir.join("codemux-notify.js");
-    let content = build_opencode_plugin(&script_path);
-    let _ = std::fs::write(&plugin_path, content);
 }
 
-/// No-op on Windows — the OpenCode plugin shells out to a POSIX script.
+/// No-op on Windows, like the other agent hook registrations.
 #[cfg(target_os = "windows")]
 pub fn register_opencode_plugin() {}
 
@@ -1289,31 +1565,182 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn opencode_plugin_inlines_notify_path_and_guards_env() {
-        let plugin = build_opencode_plugin("/home/test/.codemux/hooks/notify.sh");
-        assert!(
-            plugin.contains("/home/test/.codemux/hooks/notify.sh"),
-            "plugin must inline the notify script path"
-        );
-        assert!(
-            !plugin.contains("{{NOTIFY_PATH}}"),
-            "plugin must not leave the placeholder unsubstituted"
-        );
-        assert!(
-            plugin.contains("CODEMUX_SESSION_ID"),
-            "plugin must no-op unless running inside a Codemux terminal"
-        );
-        // Normalizes to the canonical vocabulary map_event_type understands.
-        for token in ["\"Start\"", "\"Stop\"", "\"PermissionRequest\""] {
+    fn opencode_plugins_inline_transport_and_guard_env() {
+        let path = "/home/test/.codemux/hooks/active-port";
+        for template in [OPENCODE_PLUGIN_TEMPLATE, OPENCODE_TUI_PLUGIN_TEMPLATE] {
+            let plugin = render_opencode_plugin(template, path);
             assert!(
-                plugin.contains(token),
-                "plugin must emit the {token} canonical event"
+                plugin.contains(&format!("const ACTIVE_PORT_PATH = \"{path}\";")),
+                "plugin must inline the active-port path as a JS string"
+            );
+            assert!(
+                !plugin.contains("{{"),
+                "plugin must not leave a placeholder unsubstituted"
+            );
+            assert!(
+                plugin.contains("CODEMUX_SESSION_ID") && plugin.contains("CODEMUX_HOOK_PORT"),
+                "plugin must report this pane and no-op outside Codemux"
+            );
+            // Normalizes to the canonical vocabulary map_event_type understands.
+            for token in ["\"Start\"", "\"Stop\"", "\"PermissionRequest\""] {
+                assert!(plugin.contains(token), "plugin must emit the {token} canonical event");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn opencode_plugin_paths_are_json_escaped() {
+        let plugin = render_opencode_plugin(OPENCODE_TUI_PLUGIN_TEMPLATE, "/home/o\"brien/x");
+        assert!(plugin.contains(r#"const ACTIVE_PORT_PATH = "/home/o\"brien/x";"#));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn opencode_v1_plugin_uses_verified_events() {
+        // OpenCode 1.19 never calls the `permission.ask` hook; requests
+        // arrive as events, and answering one must hand the dot back.
+        for event in [
+            "session.status",
+            "session.idle",
+            "permission.asked",
+            "permission.replied",
+            "question.asked",
+            "question.replied",
+            "question.rejected",
+        ] {
+            assert!(
+                OPENCODE_PLUGIN_TEMPLATE.contains(&format!("\"{event}\"")),
+                "1.x plugin must handle {event}"
             );
         }
-        // session.busy is not a real OpenCode event — must not be referenced.
         assert!(
-            !plugin.contains("session.busy"),
-            "plugin must not reference the non-existent session.busy event"
+            !OPENCODE_PLUGIN_TEMPLATE.contains("session.busy"),
+            "session.busy is not a real OpenCode event"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn opencode_v2_plugin_is_a_terminal_plugin_on_verified_events() {
+        let plugin = OPENCODE_TUI_PLUGIN_TEMPLATE;
+        // OpenCode 2 calls `setup` on a default export in the terminal.
+        assert!(plugin.contains("export default {") && plugin.contains("setup(api)"));
+        for event in [
+            "session.execution.started",
+            "session.execution.succeeded",
+            "session.execution.interrupted",
+            "session.execution.failed",
+            "permission.asked",
+            "permission.replied",
+            "form.created",
+            "form.replied",
+            "form.cancelled",
+        ] {
+            assert!(plugin.contains(&format!("\"{event}\"")), "2.x plugin must handle {event}");
+        }
+        // The shared service streams every terminal's sessions; the plugin
+        // must scope itself to the session shown in this one.
+        assert!(plugin.contains("api.ui.router.current()"));
+    }
+
+    /// Drives the rendered 2.x plugin under Node against a fake terminal API
+    /// whose cache hydrates only after the route already shows the session,
+    /// with events arriving both before the cache catches up and before an
+    /// older snapshot lands. Skipped when `node` is not installed.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn opencode_v2_plugin_follows_late_cache_hydration() {
+        const HARNESS: &str = r#"
+import http from "node:http";
+const reported = [];
+const server = http.createServer((req, res) => {
+  reported.push(new URL(req.url, "http://hook").searchParams.get("eventType"));
+  res.end();
+});
+await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+process.env.CODEMUX_SESSION_ID = "pane-1";
+process.env.CODEMUX_HOOK_PORT = String(server.address().port);
+const { default: plugin } = await import(process.argv[2]);
+
+const cache = { status: {}, permission: {}, form: {} };
+let emit;
+const dispose = plugin.setup({
+  ui: { router: { current: () => ({ type: "session", sessionID: "ses_root" }) } },
+  data: {
+    listen: (handler) => {
+      emit = (type, data) => handler({ details: { type, data } });
+      return () => {};
+    },
+    session: {
+      get: () => undefined,
+      family: () => [],
+      status: (id) => cache.status[id],
+      permission: { list: (id) => cache.permission[id] },
+      form: { list: (id) => cache.form[id] },
+    },
+  },
+});
+const settle = () => new Promise((resolve) => setTimeout(resolve, 400));
+
+await settle(); // Route selected, cache still empty: nothing to report.
+cache.status.ses_root = "running";
+cache.permission.ses_root = [{ id: "per_1" }];
+cache.form.ses_root = [];
+await settle(); // Hydration alone surfaces the open request.
+cache.permission.ses_root = [];
+emit("permission.replied", { sessionID: "ses_root", requestID: "per_1", reply: "once" });
+await settle(); // Cache and event agree: back to working.
+cache.permission.ses_root = [{ id: "per_1" }];
+await settle(); // A pre-reply snapshot landing late must not reopen it.
+emit("permission.asked", { id: "per_2", sessionID: "ses_root" });
+await settle(); // An ask the cache has not caught up with still blocks.
+emit("permission.replied", { sessionID: "ses_root", requestID: "per_2", reply: "once" });
+await settle();
+emit("session.execution.succeeded", { sessionID: "ses_root" });
+await settle(); // The end wins over the stale cached "running".
+cache.status.ses_root = "idle";
+await settle();
+cache.status.ses_root = "running";
+await settle(); // Nor does a late pre-end status snapshot restart it.
+emit("session.execution.started", { sessionID: "ses_other" });
+emit("permission.asked", { id: "per_x", sessionID: "ses_other" });
+await settle(); // Another terminal's session never reaches this pane.
+
+dispose();
+server.close();
+console.log(JSON.stringify(reported));
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_path = dir.path().join("tui.mjs");
+        let harness_path = dir.path().join("harness.mjs");
+        std::fs::write(
+            &plugin_path,
+            render_opencode_plugin(OPENCODE_TUI_PLUGIN_TEMPLATE, "/nonexistent/active-port"),
+        )
+        .unwrap();
+        std::fs::write(&harness_path, HARNESS).unwrap();
+
+        let output = match std::process::Command::new("node")
+            .arg(&harness_path)
+            .arg(format!("file://{}", plugin_path.display()))
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping: node is not installed");
+                return;
+            }
+            Err(error) => panic!("failed to run node: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "harness failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            r#"["PermissionRequest","Start","PermissionRequest","Start","Stop"]"#
         );
     }
 

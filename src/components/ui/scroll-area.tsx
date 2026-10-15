@@ -37,7 +37,11 @@ function ScrollArea({
   return (
     <ScrollAreaPrimitive.Root
       data-slot="scroll-area"
-      className={cn("relative", className)}
+      // Clip here as well as in the viewport: the viewport is not a
+      // positioned element, so absolutely positioned descendants (sr-only
+      // labels, popover anchors) resolve against this root. Unclipped, they
+      // extend the document and the whole window scrolls past the app.
+      className={cn("relative overflow-hidden", className)}
       {...props}
     >
       <ScrollAreaPrimitive.Viewport

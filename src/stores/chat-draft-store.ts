@@ -201,8 +201,10 @@ export interface ChatDraftStore {
   clearDraft: (draftId: DraftId) => void;
   /** Re-seed every untouched draft (no text, no attachments, not sent)
    *  from the current new-chat settings, so changing the default in
-   *  Settings shows up in the composer that is already open. */
-  applyNewChatDefaults: () => void;
+   *  Settings shows up in the composer that is already open. `onProviders`
+   *  limits it to untouched drafts on those providers (one just turned off
+   *  in Settings → Providers), leaving other untouched picks alone. */
+  applyNewChatDefaults: (onProviders?: ReadonlySet<AgentChatProviderKind>) => void;
   /** When `projectPath === homeDir`, also sweeps home-target
    *  drafts so closing the sidebar's Home group clears the draft
    *  that would otherwise respawn on next "+" click. Pass `null`
@@ -693,11 +695,12 @@ export const useChatDraftStore = create<ChatDraftStore>()(
         });
       },
 
-      applyNewChatDefaults: () =>
+      applyNewChatDefaults: (onProviders) =>
         set((s) => {
           const untouched = Object.values(s.draftsById).filter(
             (draft) =>
-              isReusableDraft(draft) && !draftHasLiveUserContent(draft),
+              isReusableDraft(draft) && !draftHasLiveUserContent(draft) &&
+              (!onProviders || onProviders.has(draft.provider)),
           );
           if (untouched.length === 0) return s;
           const config = newChatConfig();
