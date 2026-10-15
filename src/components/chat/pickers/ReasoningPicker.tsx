@@ -19,6 +19,10 @@ import { cn } from "@/lib/utils";
 import type { ChatModelInfo } from "@/tauri/types";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import {
+  CONTEXT_ROW_HIDE_EFFORT,
+  CONTEXT_ROW_HIDE_SECONDARY,
+  CONTEXT_ROW_POPOVER,
+  CONTEXT_ROW_TRIGGER,
   FOOTER_SEPARATOR,
   FOOTER_TRIGGER,
   FOOTER_TRIGGER_ICON_ONLY,
@@ -32,6 +36,7 @@ import {
   PICKER_ROW_DESCRIPTION,
   PICKER_ROW_TITLE,
   PICKER_SEPARATOR,
+  type PickerPlacement,
 } from "./footer-trigger";
 
 // Short description lines for each effort level. Verbs match
@@ -80,6 +85,8 @@ interface Props {
   /** Narrow composer: keep the icon, drop the text label (the label stays
    *  in the tooltip / accessible name). Ignored when there is no icon. */
   iconOnly?: boolean;
+  /** Footer row (default) or the context row under the composer. */
+  placement?: PickerPlacement;
 }
 
 function effortLabel(labelMap: Record<string, string>, id: string): string {
@@ -133,7 +140,9 @@ export function ReasoningPicker({
   disabled,
   withSeparator,
   iconOnly = false,
+  placement = "footer",
 }: Props) {
+  const inContextRow = placement === "context-row";
   const [open, setOpen] = useState(false);
 
   if (!model) return null;
@@ -243,7 +252,11 @@ export function ReasoningPicker({
             disabled={disabled}
             aria-label={triggerAriaLabel}
             title={triggerAriaLabel}
-            className={cn(FOOTER_TRIGGER, showIconOnly && FOOTER_TRIGGER_ICON_ONLY)}
+            className={
+              inContextRow
+                ? CONTEXT_ROW_TRIGGER
+                : cn(FOOTER_TRIGGER, showIconOnly && FOOTER_TRIGGER_ICON_ONLY)
+            }
           >
             {accelerated ? (
               <Zap
@@ -254,17 +267,40 @@ export function ReasoningPicker({
             ) : reasoningLabel ? (
               <Brain className="size-3.5" />
             ) : null}
-            {!showIconOnly && (
-              <>
-                <span className="max-w-[200px] truncate">{triggerLabel}</span>
-                <ChevronDown className="size-3 opacity-50" />
-              </>
+            {inContextRow ? (
+              // The context row sheds the window size first, then the
+              // effort itself; a label with no icon keeps its text.
+              <span
+                className={cn(
+                  "max-w-[200px] truncate",
+                  (accelerated || reasoningLabel) && CONTEXT_ROW_HIDE_EFFORT,
+                )}
+              >
+                {effortLabelText && contextLabelText ? (
+                  <>
+                    {effortLabelText}
+                    <span className={CONTEXT_ROW_HIDE_SECONDARY}>
+                      {" · "}
+                      {contextLabelText}
+                    </span>
+                  </>
+                ) : (
+                  triggerLabel
+                )}
+              </span>
+            ) : (
+              !showIconOnly && (
+                <>
+                  <span className="max-w-[200px] truncate">{triggerLabel}</span>
+                  <ChevronDown className="size-3 opacity-50" />
+                </>
+              )
             )}
           </button>
         </PopoverTrigger>
         <PopoverContent
           className={PICKER_CONTENT}
-          align="start"
+          {...(inContextRow ? CONTEXT_ROW_POPOVER : { align: "start" as const })}
           collisionPadding={PICKER_COLLISION_PADDING}
           onOpenAutoFocus={focusCmdkOnOpen}
         >

@@ -257,6 +257,7 @@ vi.mock("./Composer", async (importOriginal) => {
   const StubComposer = ({
     zone1Override,
     belowComposerSlot,
+    renderContextRow,
     stripSlot,
     onSubmit,
     onStop,
@@ -282,6 +283,7 @@ vi.mock("./Composer", async (importOriginal) => {
   }: {
     zone1Override?: React.ReactNode;
     belowComposerSlot?: React.ReactNode;
+    renderContextRow?: (settings: React.ReactNode) => React.ReactNode;
     stripSlot?: React.ReactNode;
     onSubmit: () => void;
     onStop: () => void;
@@ -335,7 +337,11 @@ vi.mock("./Composer", async (importOriginal) => {
           be observable. */}
       <div data-testid="composer-top-strip">{stripSlot}</div>
       <div data-testid="zone1">{zone1Override}</div>
-      <div data-testid="below-composer">{belowComposerSlot}</div>
+      <div data-testid="below-composer">
+        {renderContextRow
+          ? renderContextRow(<span data-testid="composer-settings-stub" />)
+          : belowComposerSlot}
+      </div>
       <button data-testid="composer-submit" onClick={() => onSubmit()} />
       <button data-testid="composer-stop" onClick={() => onStop()} />
       <button
