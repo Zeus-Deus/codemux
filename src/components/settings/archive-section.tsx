@@ -1,3 +1,4 @@
+import { Checkbox } from "@/components/ui/checkbox";
 import { LocalSessionImportEntry } from "@/components/chat/LocalSessionImportEntry";
 import { useMemo, useRef, useState } from "react";
 
@@ -179,11 +180,9 @@ function DeleteArchivedDialog({
         {hasWorktree && (
           <div className="space-y-2">
             <label className="flex items-center gap-2 cursor-pointer select-none">
-              <input
-                type="checkbox"
+              <Checkbox
                 checked={deleteWorktree}
-                onChange={(e) => setDeleteWorktree(e.target.checked)}
-                className="rounded-sm border-border"
+                onCheckedChange={(checked) => setDeleteWorktree(checked === true)}
               />
               <span className="text-label text-muted-foreground">
                 Also delete worktree from disk
@@ -191,11 +190,9 @@ function DeleteArchivedDialog({
             </label>
             {deleteWorktree && (
               <label className="ml-6 flex items-center gap-2 cursor-pointer select-none">
-                <input
-                  type="checkbox"
+                <Checkbox
                   checked={deleteBranch}
-                  onChange={(e) => setDeleteBranch(e.target.checked)}
-                  className="rounded-sm border-border"
+                  onCheckedChange={(checked) => setDeleteBranch(checked === true)}
                 />
                 <span className="text-label text-muted-foreground">
                   Also delete local branch

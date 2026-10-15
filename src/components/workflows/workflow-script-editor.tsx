@@ -1,4 +1,5 @@
 import { Code2, Play, RotateCw, Save } from "lucide-react";
+import { NativeSelect } from "@/components/ui/native-select";
 import { Button } from "@/components/ui/button";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { Input } from "@/components/ui/input";
@@ -8,7 +9,6 @@ import type { WorkflowDraft } from "@/stores/workflow-ui-store";
 import type { WorkflowScript } from "@/tauri/workflows";
 import { WORKFLOW_STARTER } from "./workflow-starter";
 
-const SELECT = "h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-body-sm text-foreground focus-visible:outline-2 focus-visible:outline-ring";
 
 export interface WorkflowScriptEditorProps {
   draft: WorkflowDraft;
@@ -47,7 +47,7 @@ export function WorkflowScriptEditor({ draft, scripts, settings, live, pending, 
       <div className="space-y-1.5">
         <div className="flex items-center justify-between gap-2">
           <Eyebrow tone="strong">Script</Eyebrow>
-          {scripts.length > 0 && <select aria-label="Saved workflow script" data-testid="workflow-saved-script" className={`${SELECT} w-auto max-w-[60%]`} value="" onChange={(event) => { const script = scripts.find((item) => item.id === event.target.value); if (script) onChange({ source: script.source, title: script.title }); }}><option value="">Load saved…</option>{scripts.map((script) => <option key={script.id} value={script.id}>{script.title}</option>)}</select>}
+          {scripts.length > 0 && <NativeSelect size="sm" aria-label="Saved workflow script" data-testid="workflow-saved-script" className="w-auto max-w-[60%]" value="" onChange={(event) => { const script = scripts.find((item) => item.id === event.target.value); if (script) onChange({ source: script.source, title: script.title }); }}><option value="">Load saved…</option>{scripts.map((script) => <option key={script.id} value={script.id}>{script.title}</option>)}</NativeSelect>}
         </div>
         <Textarea aria-label="Workflow JavaScript" data-testid="workflow-script" value={draft.source} onChange={(event) => onChange({ source: event.target.value })} spellCheck={false} rows={12} className="min-h-64 resize-y whitespace-pre font-mono text-label leading-relaxed" maxLength={128000} />
         <div className="flex flex-wrap items-center gap-1.5">

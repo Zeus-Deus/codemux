@@ -1,3 +1,4 @@
+import { Checkbox } from "@/components/ui/checkbox";
 import { useEffect, useRef, useState } from "react";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
@@ -181,23 +182,21 @@ function ImportDialog() {
           <div className="space-y-2">
             {available.length > 0 && (
               <label className="flex items-center gap-3 px-3 py-2 text-body">
-                <input
-                  type="checkbox"
+                <Checkbox
                   disabled={busy !== null}
                   checked={selected.length === available.length}
-                  onChange={(event) => setSelected(event.target.checked ? available.map((s) => s.source_id) : [])}
+                  onCheckedChange={(checked) => setSelected(checked === true ? available.map((s) => s.source_id) : [])}
                 />
                 Select all available chats
               </label>
             )}
             {sessions.map((session) => (
               <label key={session.source_id} className="flex items-start gap-3 rounded-lg border border-border p-3">
-                <input
-                  type="checkbox"
-                  className="mt-1"
+                <Checkbox
+                  className="mt-0.5"
                   disabled={busy !== null || session.already_imported}
                   checked={selected.includes(session.source_id)}
-                  onChange={(event) => setSelected((ids) => event.target.checked ? [...ids, session.source_id] : ids.filter((id) => id !== session.source_id))}
+                  onCheckedChange={(checked) => setSelected((ids) => checked === true ? [...ids, session.source_id] : ids.filter((id) => id !== session.source_id))}
                 />
                 <span className="min-w-0 space-y-1">
                   <span className="block text-body font-medium break-words">{session.title}</span>

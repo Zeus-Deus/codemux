@@ -1,3 +1,4 @@
+import { Kbd } from "@/components/ui/kbd";
 import { MobileInstall } from "@/components/mobile/mobile-install";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
@@ -2424,7 +2425,7 @@ export function SettingsView() {
               <div className="space-y-1">
                 <SettingRow
                   label="Utility agent"
-                  description="A cheap model for handoff summaries and other small jobs. Automatic prefers Codex Luna, then Claude Haiku."
+                  description="A cheap model for handoff summaries, workspace and branch names, and other small jobs. Automatic prefers Codex Luna, then Claude Haiku."
                   scope="device"
                 >
                   <UtilityAgentSetting />
@@ -3011,7 +3012,7 @@ function RunShortcutHint() {
   return (
     <>
       , triggered via{" "}
-      <kbd className="text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm font-mono">{keys}</kbd>
+      <Kbd>{keys}</Kbd>
     </>
   );
 }

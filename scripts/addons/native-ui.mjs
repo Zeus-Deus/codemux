@@ -540,12 +540,12 @@ async function checkNativeUpdateRollback() {
     );
   assert.deepEqual(await installButtons(true), ["Install", "Install & enable"]);
   const replace = await script(
-    `return [...document.querySelectorAll('[role="dialog"] label')].find(e => e.innerText.includes('Replace the existing source')).querySelector('input')`,
+    `return [...document.querySelectorAll('[role="dialog"] label')].find(e => e.innerText.includes('Replace the existing source')).querySelector('[role="checkbox"]')`,
   );
   const chooseReplace = async (checked) => {
     await wd("POST", `/element/${elementId(replace)}/click`, {});
     await until(`replace choice ${checked ? "made" : "withdrawn"}`, () =>
-      script("return arguments[0].checked === arguments[1]", replace, checked),
+      script("return (arguments[0].getAttribute('aria-checked') === 'true') === arguments[1]", replace, checked),
     );
     await installButtons(!checked);
   };
@@ -571,11 +571,11 @@ async function checkNativeUpdateRollback() {
   await click('[aria-label="Close settings"]');
   await openCommand("Open Project Brief");
   await hasText("Branch: main");
-  const checkbox = `${briefView} input[type="checkbox"]`;
+  const checkbox = `${briefView} [role="checkbox"]`;
   await click(checkbox);
   await until("private preference off", () =>
     script(
-      `return document.querySelector(arguments[0])?.checked === false`,
+      `return document.querySelector(arguments[0])?.getAttribute('aria-checked') === 'false'`,
       checkbox,
     ),
   );
@@ -584,7 +584,7 @@ async function checkNativeUpdateRollback() {
   await openCommand("Open Project Brief");
   await until("private preference persisted", () =>
     script(
-      `return document.querySelector(arguments[0])?.checked === false`,
+      `return document.querySelector(arguments[0])?.getAttribute('aria-checked') === 'false'`,
       checkbox,
     ),
   );
@@ -661,14 +661,14 @@ async function checkNativeUpdateRollback() {
   await openCommand("Open Project Brief");
   await until("updated release has previous preference", () =>
     script(
-      `return document.querySelector(arguments[0])?.checked === false`,
+      `return document.querySelector(arguments[0])?.getAttribute('aria-checked') === 'false'`,
       checkbox,
     ),
   );
   await click(checkbox);
   await until("updated private preference on", () =>
     script(
-      `return document.querySelector(arguments[0])?.checked === true`,
+      `return document.querySelector(arguments[0])?.getAttribute('aria-checked') === 'true'`,
       checkbox,
     ),
   );
@@ -676,7 +676,7 @@ async function checkNativeUpdateRollback() {
   await openCommand("Open Project Brief");
   await until("updated preference persisted", () =>
     script(
-      `return document.querySelector(arguments[0])?.checked === true`,
+      `return document.querySelector(arguments[0])?.getAttribute('aria-checked') === 'true'`,
       checkbox,
     ),
   );
@@ -701,7 +701,7 @@ async function checkNativeUpdateRollback() {
   await openCommand("Open Project Brief");
   await until("rollback restores matching private snapshot", () =>
     script(
-      `return document.querySelector(arguments[0])?.checked === false`,
+      `return document.querySelector(arguments[0])?.getAttribute('aria-checked') === 'false'`,
       checkbox,
     ),
   );
@@ -795,10 +795,10 @@ async function checkCredentialSettings() {
     "password",
   );
   const sessionOption = await script(
-    `return [...document.querySelectorAll('label')].find(e => e.innerText.includes('Store new values for this session only')).querySelector('input')`,
+    `return [...document.querySelectorAll('label')].find(e => e.innerText.includes('Store new values for this session only')).querySelector('[role="checkbox"]')`,
   );
   assert.equal(
-    await script("return arguments[0].checked", sessionOption),
+    await script("return arguments[0].getAttribute('aria-checked') === 'true'", sessionOption),
     false,
   );
   await clickText("Save");
@@ -807,7 +807,7 @@ async function checkCredentialSettings() {
     // app does not silently fall back, then explicitly select its session mode.
     await hasText("Credential store unavailable or locked");
     assert.equal(
-      await script("return arguments[0].checked", sessionOption),
+      await script("return arguments[0].getAttribute('aria-checked') === 'true'", sessionOption),
       false,
     );
     assert.equal(
@@ -901,14 +901,14 @@ async function removeAddon(title, keepData = false) {
   await hasText(`Remove ${title}?`);
   const keep = await until("keep-data choice", () =>
     script(
-      `return [...document.querySelectorAll('[role="dialog"] label')].find(e => e.innerText.includes('Keep data for reinstall from the same source'))?.querySelector('input') ?? null`,
+      `return [...document.querySelectorAll('[role="dialog"] label')].find(e => e.innerText.includes('Keep data for reinstall from the same source'))?.querySelector('[role="checkbox"]') ?? null`,
     ),
   );
-  assert.equal(await script("return arguments[0].checked", keep), false);
+  assert.equal(await script("return arguments[0].getAttribute('aria-checked') === 'true'", keep), false);
   if (keepData) {
     await wd("POST", `/element/${elementId(keep)}/click`, {});
     await until("keep data chosen", () =>
-      script("return arguments[0].checked", keep),
+      script("return arguments[0].getAttribute('aria-checked') === 'true'", keep),
     );
   }
   await clickText("Remove add-on", `document.querySelector('[role="dialog"]')`);
@@ -2840,11 +2840,11 @@ try {
   );
   // After the source replacement above, which starts with fresh settings and
   // private data: these choices must then survive the restart below.
-  const briefChecked = `${briefView} input[type="checkbox"]`;
+  const briefChecked = `${briefView} [role="checkbox"]`;
   const briefPaths = `${briefView} [role="list"]`;
   const showPaths = (checked) =>
     script(
-      `return document.querySelector(arguments[0])?.checked === arguments[1] && !!document.querySelector(arguments[2]) === arguments[1]`,
+      `return document.querySelector(arguments[0])?.getAttribute('aria-checked') === String(arguments[1]) && !!document.querySelector(arguments[2]) === arguments[1]`,
       briefChecked,
       checked,
       briefPaths,
@@ -3046,7 +3046,7 @@ try {
       await hasText("Review Project Brief");
       await hasText("Version 1.0.0 · Local / unverified");
       const option = await script(
-        `return [...document.querySelectorAll('[role="dialog"] label')].find(e => e.innerText.includes('Restore private data retained from version'))?.querySelector('input') ?? null`,
+        `return [...document.querySelectorAll('[role="dialog"] label')].find(e => e.innerText.includes('Restore private data retained from version'))?.querySelector('[role="checkbox"]') ?? null`,
       );
       assert.equal(
         !!option,
@@ -3061,12 +3061,12 @@ try {
         );
         // Restoring is the person's choice, never the default.
         assert.equal(
-          await script("return arguments[0].checked", option),
+          await script("return arguments[0].getAttribute('aria-checked') === 'true'", option),
           false,
         );
         await wd("POST", `/element/${elementId(option)}/click`, {});
         await until("restore chosen", () =>
-          script("return arguments[0].checked", option),
+          script("return arguments[0].getAttribute('aria-checked') === 'true'", option),
         );
       }
       await clickText(

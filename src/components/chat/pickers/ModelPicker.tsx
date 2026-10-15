@@ -19,9 +19,12 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import {
+  CONTEXT_ROW_POPOVER,
+  CONTEXT_ROW_TRIGGER,
   FOOTER_TRIGGER,
   FOOTER_TRIGGER_ICON_ONLY,
   leafModelName,
+  type PickerPlacement,
 } from "./footer-trigger";
 import { refreshProviderCapabilitiesForIntent } from "@/stores/provider-capabilities-store";
 
@@ -78,6 +81,8 @@ interface Props {
   /** Tight composer: only the provider mark; the model name moves to the
    *  tooltip and accessible name. */
   iconOnly?: boolean;
+  /** Footer row (default) or the context row under the composer. */
+  placement?: PickerPlacement;
 }
 
 export function ModelPicker({
@@ -88,8 +93,10 @@ export function ModelPicker({
   openSignal,
   leafLabel = false,
   iconOnly = false,
+  placement = "footer",
 }: Props) {
   const [open, setOpen] = useState(false);
+  const inContextRow = placement === "context-row";
   const list = modelsForProvider(provider);
   const current = value ?? list[0]?.id ?? "";
 
@@ -117,10 +124,14 @@ export function ModelPicker({
         <button
           type="button"
           disabled={disabled}
-          className={cn(
-            FOOTER_TRIGGER,
-            iconOnly ? FOOTER_TRIGGER_ICON_ONLY : "min-w-[60px] shrink",
-          )}
+          className={
+            inContextRow
+              ? cn(CONTEXT_ROW_TRIGGER, "shrink")
+              : cn(
+                  FOOTER_TRIGGER,
+                  iconOnly ? FOOTER_TRIGGER_ICON_ONLY : "min-w-[60px] shrink",
+                )
+          }
           aria-label={
             iconOnly ? `Model: ${modelLabel(provider, current)}` : undefined
           }
@@ -134,14 +145,16 @@ export function ModelPicker({
                   ? leafModelName(modelLabel(provider, current), sessionProviderLabel(provider))
                   : modelLabel(provider, current)}
               </span>
-              <ChevronDown className="size-3 shrink-0 opacity-50" />
+              {!inContextRow && (
+                <ChevronDown className="size-3 shrink-0 opacity-50" />
+              )}
             </>
           )}
         </button>
       </PopoverTrigger>
       <PopoverContent
         className="w-[300px] p-0"
-        align="start"
+        {...(inContextRow ? CONTEXT_ROW_POPOVER : { align: "start" as const })}
         onOpenAutoFocus={focusCmdkOnOpen}
       >
         <Command>

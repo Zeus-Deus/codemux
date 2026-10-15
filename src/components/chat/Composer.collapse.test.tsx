@@ -149,6 +149,39 @@ describe("Composer pill collapse", () => {
     expect(getByTestId("composer-gap")).toHaveTextContent("Enter to queue");
   });
 
+  it("rests with only attach, prompt and Stop while a turn streams", () => {
+    const { queryByRole, getByRole, getByTestId } = renderComposer({
+      streaming: true,
+      permissionModes: [
+        { value: "bypassPermissions", label: "Full access", description: "", is_default: true },
+      ],
+      renderContextRow: (settings) => <div data-testid="context-row">{settings}</div>,
+    });
+    // Queue / steer only appears once there is something to send.
+    expect(queryByRole("button", { name: /Message delivery/ })).toBeNull();
+    expect(getByRole("button", { name: "Stop" })).toBeInTheDocument();
+    // Model and access live in the context row, not the pill.
+    const access = getByRole("button", { name: "Access: Full access" });
+    expect(getByTestId("context-row")).toContainElement(access);
+    expect(getByTestId("composer-controls-row")).not.toContainElement(access);
+  });
+
+  it("offers queue / steer once there is a draft to send mid-turn", () => {
+    const { getByRole } = renderComposer({ draft: "next", streaming: true });
+    expect(getByRole("button", { name: "Message delivery: Queue" })).toBeInTheDocument();
+  });
+
+  it("keeps model and access in the pill when there is no context row", () => {
+    const { getByRole, getByTestId } = renderComposer({
+      permissionModes: [
+        { value: "bypassPermissions", label: "Full access", description: "", is_default: true },
+      ],
+    });
+    expect(getByTestId("composer-controls-row")).toContainElement(
+      getByRole("button", { name: /Full access/ }),
+    );
+  });
+
   it("uses the 94px textarea floor only on drafts", () => {
     const draft = renderComposer({ isDraft: true });
     expect(draft.wrapper()).toHaveAttribute("data-expanded");

@@ -1,3 +1,4 @@
+import { Kbd } from "@/components/ui/kbd";
 import { useEffect, useId, useRef, useState } from "react";
 import {
   DropdownMenu,
@@ -16,7 +17,6 @@ import {
   btnGreenSolid,
   btnGreenTint,
   btnQuiet,
-  kbdChip,
   reviewBodyRequirement,
   spinnerRing,
   tzBody,
@@ -449,7 +449,7 @@ function ReviewerBar({
             tzBody,
           )}
         >
-          Leave a review… <kbd className={kbdChip}>{modEnterLabel()}</kbd>
+          Leave a review… <Kbd>{modEnterLabel()}</Kbd>
         </button>
       )}
       <div className="flex items-center gap-2">

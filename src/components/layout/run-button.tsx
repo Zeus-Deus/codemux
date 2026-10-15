@@ -1,3 +1,4 @@
+import { Kbd } from "@/components/ui/kbd";
 import { useState, useEffect, useRef, type FormEvent } from "react";
 import { Check, ChevronDown, Play, Settings } from "lucide-react";
 import {
@@ -98,9 +99,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
   };
 
   const shortcutBadge = runShortcut ? (
-    <kbd className="ml-1 text-caption leading-none bg-muted px-1 py-0.5 rounded-sm border border-border text-muted-foreground font-sans">
-      {runShortcut}
-    </kbd>
+    <Kbd className="ml-1">{runShortcut}</Kbd>
   ) : null;
 
   const isConfigured = !!runCommand;

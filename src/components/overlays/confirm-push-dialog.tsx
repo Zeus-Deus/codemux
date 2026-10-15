@@ -1,3 +1,4 @@
+import { Checkbox } from "@/components/ui/checkbox";
 import { useState } from "react";
 
 import { ArrowUpRight } from "lucide-react";
@@ -112,11 +113,9 @@ export function ConfirmPushDialog({
           </ul>
 
           <label className="flex items-center gap-2 cursor-pointer select-none">
-            <input
-              type="checkbox"
+            <Checkbox
               checked={dontAskAgain}
-              onChange={(e) => setDontAskAgain(e.target.checked)}
-              className="rounded-sm border-border"
+              onCheckedChange={(checked) => setDontAskAgain(checked === true)}
             />
             <span className="text-body-sm text-muted-foreground">
               Don't ask again for {host.name}

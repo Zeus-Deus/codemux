@@ -1,3 +1,4 @@
+import { CodeBlock, CodeBlockContent, CodeBlockCopyButton, CodeBlockHeader, CodeBlockTitle } from "@/components/ui/code-block";
 import { useEffect, useRef, useState } from "react";
 import { RotateCw } from "lucide-react";
 
@@ -85,10 +86,13 @@ export function HooksManager({ open, onOpenChange, cwd, threadId }: HooksManager
               <h3 className="font-medium">{selected.eventName.replace(/^./, (letter) => letter.toUpperCase())}</h3>
               <p className="mt-1 break-all font-mono text-label text-muted-foreground">{selected.sourcePath}</p>
             </div>
-            <div>
-              <p className="mb-2 text-label text-muted-foreground">{selected.handlerType === "mcpTool" ? "MCP tool" : "Command"}</p>
-              <pre className="whitespace-pre-wrap break-all rounded-md bg-muted p-3 font-mono text-label">{selected.command ?? (selected.server && selected.tool ? `${selected.server}/${selected.tool}` : selected.handlerType)}</pre>
-            </div>
+            <CodeBlock>
+              <CodeBlockHeader>
+                <CodeBlockTitle>{selected.handlerType === "mcpTool" ? "MCP tool" : "Command"}</CodeBlockTitle>
+                <CodeBlockCopyButton value={selected.command ?? (selected.server && selected.tool ? `${selected.server}/${selected.tool}` : selected.handlerType)} />
+              </CodeBlockHeader>
+              <CodeBlockContent className="whitespace-pre-wrap break-all">{selected.command ?? (selected.server && selected.tool ? `${selected.server}/${selected.tool}` : selected.handlerType)}</CodeBlockContent>
+            </CodeBlock>
             <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-label">
               <dt className="text-muted-foreground">Matcher</dt><dd className="break-all">{selected.matcher || "All matching events"}</dd>
               <dt className="text-muted-foreground">Timeout</dt><dd>{selected.timeoutSec}s{selected.async ? " · Asynchronous" : ""}</dd>

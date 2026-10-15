@@ -67,3 +67,27 @@ export function leafModelName(label: string, brand?: string): string {
   const rest = leaf.slice(prefix.length);
   return leaf.toLowerCase().startsWith(prefix) && /^\p{L}/u.test(rest) ? rest : leaf;
 }
+
+/** Where a session-config picker sits: the composer's controls row, or
+ *  the context row tucked under the composer card. */
+export type PickerPlacement = "footer" | "context-row";
+
+/** Context-row trigger: the footer recipe scaled to the 24px row, with
+ *  no chevron. The hover plate carries the affordance. */
+export const CONTEXT_ROW_TRIGGER =
+  "inline-flex h-6 min-w-0 shrink-0 items-center gap-1.5 rounded-md px-1.5 text-label font-medium leading-5 text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:opacity-50 data-[state=open]:bg-surface-2 data-[state=open]:text-foreground";
+
+/** Context-row shrink ladder. `ComposerContextRow` measures the row and
+ *  sets one `data-hide-*` attribute per step on its `group/ctx` root, so
+ *  text goes in a fixed order and only when the row is actually full.
+ *  Nothing wraps; the model name, PR chip and details button never hide. */
+export const CONTEXT_ROW_HIDE_BRANCH = "group-data-[hide-branch]/ctx:hidden";
+export const CONTEXT_ROW_HIDE_SECONDARY = "group-data-[hide-secondary]/ctx:hidden";
+export const CONTEXT_ROW_HIDE_GIT_COUNTS = "group-data-[hide-git-counts]/ctx:hidden";
+export const CONTEXT_ROW_SHOW_GIT_DOT = "hidden group-data-[hide-git-counts]/ctx:block";
+export const CONTEXT_ROW_HIDE_PROJECT = "group-data-[hide-project]/ctx:hidden";
+export const CONTEXT_ROW_HIDE_EFFORT = "group-data-[hide-effort]/ctx:hidden";
+
+/** Context-row pickers open upward from their label and overlap the
+ *  composer, right-aligned because they sit on the row's right side. */
+export const CONTEXT_ROW_POPOVER = { side: "top", align: "end" } as const;

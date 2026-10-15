@@ -25,7 +25,7 @@ import type {
 
 import { ContextUsageMeter } from "./ContextUsageMeter";
 import { useStopTooltip } from "./composer-interrupt";
-import { FOOTER_SEPARATOR } from "./pickers/footer-trigger";
+import { FOOTER_SEPARATOR, type PickerPlacement } from "./pickers/footer-trigger";
 import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
@@ -98,6 +98,9 @@ interface Props {
   configurationDisabled?: boolean;
   /** Toggles the attach popup. When omitted the `+` button is hidden. */
   onAttachClick?: () => void;
+  /** Disables the `+` button. Defaults to `controlsDisabled`; the menu can
+   *  stay reachable for entries that don't need a ready session. */
+  attachDisabled?: boolean;
   /** Whether the attach popup is currently open. */
   attachOpen?: boolean;
   /** Imperative model-picker open request from `/model`. */
@@ -133,13 +136,17 @@ interface Props {
   accessIconOnly?: boolean;
   /** Width ladder: effort + access leave the row for the `+` menu. */
   configInMenu?: boolean;
+  /** Model, effort and access render in the context row under the
+   *  composer instead of this row. */
+  settingsInContextRow?: boolean;
 }
 
 /**
  * The composer's single controls row. Identical geometry in the collapsed
  * pill and the expanded card, so nothing moves horizontally when the
- * textarea opens above it: attach pinned left, model / effort / access and
- * send pinned right, a flexible gap in between.
+ * textarea opens above it: attach pinned left, send pinned right, a
+ * flexible gap in between. Model / effort / access sit beside send only when
+ * the composer has no context row to host them (`settingsInContextRow`).
  */
 export function ComposerFooter({
   hermesThreadId, hermesProjectPath, customAgentsAllowed = true,
@@ -174,6 +181,7 @@ export function ComposerFooter({
   controlsDisabled,
   configurationDisabled = controlsDisabled,
   onAttachClick,
+  attachDisabled = controlsDisabled,
   attachOpen = false,
   modelPickerOpenSignal,
   permissionPickerOpenSignal,
@@ -194,8 +202,8 @@ export function ComposerFooter({
   effortIconOnly = false,
   accessIconOnly = false,
   configInMenu = false,
+  settingsInContextRow = false,
 }: Props) {
-  const modeIsActive = mode !== "default";
   const stopTooltip = useStopTooltip();
 
   return (
@@ -208,7 +216,7 @@ export function ComposerFooter({
         <button
           type="button"
           onClick={onAttachClick}
-          disabled={controlsDisabled}
+          disabled={attachDisabled}
           data-testid="composer-attach-button"
           data-open={attachOpen || undefined}
           className={cn(
@@ -303,62 +311,45 @@ export function ComposerFooter({
                 </>
               )}
             </button>
-            <span className={FOOTER_SEPARATOR} aria-hidden />
+            {!settingsInContextRow && (
+              <span className={FOOTER_SEPARATOR} aria-hidden />
+            )}
           </>
         )}
 
-        {showProviderPicker || provider === "hermes" || provider === "acp" ? (
-          <MultiProviderModelPicker
+        {!settingsInContextRow && (
+          <ComposerSettings
             hermesThreadId={hermesThreadId}
             hermesProjectPath={hermesProjectPath}
             customAgentsAllowed={customAgentsAllowed}
             provider={provider}
             model={model}
+            permissionMode={permissionMode}
+            effort={effort}
+            contextWindow={contextWindow}
+            serviceTier={serviceTier}
+            activeModel={activeModel}
+            effortLabelMap={effortLabelMap}
+            permissionModes={permissionModes}
+            ultrathinkInBodyText={ultrathinkInBodyText}
+            showProviderPicker={showProviderPicker}
+            mode={mode}
             onProviderModelChange={onProviderModelChange}
-            disabled={configurationDisabled}
-            openSignal={modelPickerOpenSignal}
-            leafLabel={modelLeafLabel}
-            iconOnly={modelIconOnly}
+            onModelChange={onModelChange}
+            onPermissionModeChange={onPermissionModeChange}
+            onEffortChange={onEffortChange}
+            onContextWindowChange={onContextWindowChange}
+            onServiceTierChange={onServiceTierChange}
+            configurationDisabled={configurationDisabled}
+            modelPickerOpenSignal={modelPickerOpenSignal}
+            permissionPickerOpenSignal={permissionPickerOpenSignal}
+            placement="footer"
+            modelLeafLabel={modelLeafLabel}
+            modelIconOnly={modelIconOnly}
+            effortIconOnly={effortIconOnly}
+            accessIconOnly={accessIconOnly}
+            configInMenu={configInMenu}
           />
-        ) : (
-          <ModelPicker
-            provider={provider}
-            value={model}
-            onChange={onModelChange}
-            disabled={configurationDisabled}
-            openSignal={modelPickerOpenSignal}
-            leafLabel={modelLeafLabel}
-            iconOnly={modelIconOnly}
-          />
-        )}
-        {!configInMenu && provider !== "acp" && (
-          <>
-            <ReasoningPicker
-              model={activeModel}
-              effortValue={effort}
-              contextWindowValue={contextWindow}
-              labelMap={effortLabelMap}
-              ultrathinkInBodyText={ultrathinkInBodyText}
-              serviceTier={serviceTier}
-              onEffortChange={onEffortChange}
-              onContextWindowChange={onContextWindowChange}
-              onServiceTierChange={onServiceTierChange}
-              disabled={configurationDisabled}
-              withSeparator
-              iconOnly={effortIconOnly}
-            />
-            {/* Stays visible while a mode pill is active (discoverability)
-                but disabled, so it can't fight the pill's setting. */}
-            <PermissionModePicker
-              openSignal={permissionPickerOpenSignal}
-              modes={permissionModes}
-              value={permissionMode}
-              onChange={onPermissionModeChange}
-              disabled={configurationDisabled || modeIsActive}
-              withSeparator
-              iconOnly={accessIconOnly}
-            />
-          </>
         )}
 
         {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} iconOnly={accessIconOnly} />}
@@ -417,6 +408,140 @@ export function ComposerFooter({
       </div>
     </div>
     <ChatGptPlanUsage provider={provider} />
+    </>
+  );
+}
+
+type ComposerSettingsProps = Pick<
+  Props,
+  | "hermesThreadId"
+  | "hermesProjectPath"
+  | "customAgentsAllowed"
+  | "provider"
+  | "model"
+  | "permissionMode"
+  | "effort"
+  | "contextWindow"
+  | "serviceTier"
+  | "activeModel"
+  | "effortLabelMap"
+  | "permissionModes"
+  | "ultrathinkInBodyText"
+  | "showProviderPicker"
+  | "mode"
+  | "onProviderModelChange"
+  | "onModelChange"
+  | "onPermissionModeChange"
+  | "onEffortChange"
+  | "onContextWindowChange"
+  | "onServiceTierChange"
+  | "configurationDisabled"
+  | "modelPickerOpenSignal"
+  | "permissionPickerOpenSignal"
+  | "modelLeafLabel"
+  | "modelIconOnly"
+  | "effortIconOnly"
+  | "accessIconOnly"
+  | "configInMenu"
+> & { placement: PickerPlacement };
+
+/**
+ * Model, effort and access pickers. They sit in the context row under the
+ * composer when there is one, so they stay visible and one click away
+ * without crowding the input; otherwise they sit in the controls row.
+ */
+export function ComposerSettings({
+  hermesThreadId,
+  hermesProjectPath,
+  customAgentsAllowed = true,
+  provider,
+  model,
+  permissionMode,
+  effort,
+  contextWindow,
+  serviceTier = "default",
+  activeModel,
+  effortLabelMap,
+  permissionModes,
+  ultrathinkInBodyText,
+  showProviderPicker,
+  mode,
+  onProviderModelChange,
+  onModelChange,
+  onPermissionModeChange,
+  onEffortChange,
+  onContextWindowChange,
+  onServiceTierChange = () => {},
+  configurationDisabled = false,
+  modelPickerOpenSignal,
+  permissionPickerOpenSignal,
+  placement,
+  modelLeafLabel = false,
+  modelIconOnly = false,
+  effortIconOnly = false,
+  accessIconOnly = false,
+  configInMenu = false,
+}: ComposerSettingsProps) {
+  const inFooter = placement === "footer";
+  return (
+    <>
+      {showProviderPicker || provider === "hermes" || provider === "acp" ? (
+        <MultiProviderModelPicker
+          hermesThreadId={hermesThreadId}
+          hermesProjectPath={hermesProjectPath}
+          customAgentsAllowed={customAgentsAllowed}
+          provider={provider}
+          model={model}
+          onProviderModelChange={onProviderModelChange}
+          disabled={configurationDisabled}
+          openSignal={modelPickerOpenSignal}
+          leafLabel={modelLeafLabel}
+          iconOnly={modelIconOnly}
+          placement={placement}
+        />
+      ) : (
+        <ModelPicker
+          provider={provider}
+          value={model}
+          onChange={onModelChange}
+          disabled={configurationDisabled}
+          openSignal={modelPickerOpenSignal}
+          leafLabel={modelLeafLabel}
+          iconOnly={modelIconOnly}
+          placement={placement}
+        />
+      )}
+      {!configInMenu && provider !== "acp" && (
+        <>
+          <ReasoningPicker
+            model={activeModel}
+            effortValue={effort}
+            contextWindowValue={contextWindow}
+            labelMap={effortLabelMap}
+            ultrathinkInBodyText={ultrathinkInBodyText}
+            serviceTier={serviceTier}
+            onEffortChange={onEffortChange}
+            onContextWindowChange={onContextWindowChange}
+            onServiceTierChange={onServiceTierChange}
+            disabled={configurationDisabled}
+            withSeparator={inFooter}
+            iconOnly={effortIconOnly}
+            placement={placement}
+          />
+          {/* Stays visible while a mode pill is active (discoverability)
+              but disabled, so it can't fight the pill's setting. */}
+          <PermissionModePicker
+            openSignal={permissionPickerOpenSignal}
+            modes={permissionModes}
+            value={permissionMode}
+            onChange={onPermissionModeChange}
+            disabled={configurationDisabled || mode !== "default"}
+            withSeparator={inFooter}
+            iconOnly={accessIconOnly}
+            placement={placement}
+          />
+        </>
+      )}
     </>
   );
 }

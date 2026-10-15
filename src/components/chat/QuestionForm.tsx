@@ -1,8 +1,8 @@
+import { Kbd } from "@/components/ui/kbd";
 import { ChevronLeft, Pencil } from "lucide-react";
 import {
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
-  type ReactNode,
   useCallback,
   useEffect,
   useMemo,
@@ -619,14 +619,6 @@ function OtherRow({
         className="pointer-events-none absolute start-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground/70"
       />
     </div>
-  );
-}
-
-function Kbd({ children }: { children: ReactNode }) {
-  return (
-    <kbd className="rounded-sm bg-muted/60 px-1 py-[1px] font-mono text-caption text-muted-foreground/80">
-      {children}
-    </kbd>
   );
 }
 
