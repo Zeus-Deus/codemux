@@ -25,6 +25,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { sessionProviderLabel } from "@/lib/agent-chat/session-mentions";
 import { fallbackModelLabel } from "@/lib/agent-chat/capability-defaults";
 import { cn } from "@/lib/utils";
 import {
@@ -496,7 +497,7 @@ export function MultiProviderModelPicker({
             <>
               <span className="max-w-[180px] truncate">
                 {leafLabel ? (
-                  leafModelName(triggerLabel)
+                  leafModelName(triggerLabel, sessionProviderLabel(provider))
                 ) : triggerSubtitle ? (
                   <>
                     <span className="opacity-70">{triggerSubtitle}</span>
@@ -519,6 +520,10 @@ export function MultiProviderModelPicker({
         // 384px tall — a scannable column instead of a wide panel.
         className="w-[400px] max-w-[calc(100vw-2rem)] p-0"
         align="start"
+        // The chat column's 1rem gutter: on a phone, where the popup
+        // spans the screen, it lines up with the composer card instead of
+        // sitting flush against the screen edge.
+        collisionPadding={16}
         onOpenAutoFocus={focusCmdkOnOpen}
       >
         {/* `minmax(0,1fr)` (not bare `1fr`): grid items default to
@@ -888,7 +893,8 @@ function ModelRow({
         <kbd
           aria-hidden
           data-testid="model-row-jump-chip"
-          className="pointer-events-none mt-0.5 inline-flex h-4 shrink-0 select-none items-center self-start rounded-sm bg-muted px-1.5 font-sans text-caption font-medium text-muted-foreground"
+          // A keyboard shortcut is noise on a touch screen.
+          className="pointer-events-none mt-0.5 inline-flex h-4 shrink-0 select-none items-center self-start rounded-sm bg-muted px-1.5 font-sans text-caption font-medium text-muted-foreground pointer-coarse:hidden"
         >
           {jumpLabel}
         </kbd>

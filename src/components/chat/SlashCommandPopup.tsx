@@ -1,5 +1,5 @@
 import { Command as CommandPrimitive } from "cmdk";
-import { memo, useCallback, useLayoutEffect, useMemo, useRef, type SyntheticEvent } from "react";
+import { memo, useCallback, useLayoutEffect, useMemo, useRef, type CSSProperties, type SyntheticEvent } from "react";
 
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
@@ -10,6 +10,7 @@ import {
   COMMAND_MENU_ROW,
   COMMAND_MENU_SURFACE,
 } from "./command-menu-styles";
+import { useRoomAbove } from "./command-menu-room";
 import { usePopupHighlight, type PopupHighlightStore } from "./popup-highlight-store";
 import {
   groupSlashItems,
@@ -85,6 +86,10 @@ export function SlashCommandPopup({
   footerNote = null,
 }: Props) {
   const listRef = useRef<HTMLDivElement | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const room = useRoomAbove(rootRef, open);
+  const roomStyle: (CSSProperties & { "--menu-room": string }) | undefined =
+    room === undefined ? undefined : { "--menu-room": `${room - 2}px` };
   const pointerHighlightRef = useRef<string | null>(null);
   const pointerPositionRef = useRef<{ x: number; y: number } | null>(null);
   const selectRef = useRef(onSelect);
@@ -140,12 +145,13 @@ export function SlashCommandPopup({
         <ScrollArea
           type="always"
           className={cn(
-            "max-h-80 w-full",
+            // `--menu-room`: the space above the card (see below).
+            "max-h-[min(20rem,var(--menu-room,20rem))] w-full",
             // Viewport: cap height + force the inner div cmdk renders
             // to sit on a single block (cmdk's <Command> spreads
             // multi-children inside CommandList; the viewport's
             // default flex layout otherwise stretches a single child).
-            "[&>[data-slot=scroll-area-viewport]]:max-h-80",
+            "[&>[data-slot=scroll-area-viewport]]:max-h-[min(20rem,var(--menu-room,20rem))]",
             "[&>[data-slot=scroll-area-viewport]]:overscroll-contain",
             // Radix's viewport wraps children in a `display: table;
             // min-width: 100%` div (inline styles). A table box is
@@ -196,7 +202,11 @@ export function SlashCommandPopup({
 
   return (
     <div
+      ref={rootRef}
       data-testid="slash-command-popup"
+      // Caps the list to the room above the card, less the 2px border, so
+      // a phone's landing page never slides it under the header.
+      style={roomStyle}
       className={cn(
         "absolute bottom-full left-0 right-0 mb-2 z-50 overflow-hidden",
         COMMAND_MENU_SURFACE,

@@ -20,7 +20,9 @@ import {
   Composer,
   composerFooterLadder,
   FOOTER_COMPACT_STEPS,
+  FOOTER_MIN_GAP_EXPANDED_PX,
   FOOTER_MIN_GAP_PX,
+  footerMinGapFor,
   MIN_TEXTAREA_PX,
   nextFooterFit,
   type FooterFit,
@@ -290,11 +292,34 @@ describe("nextFooterFit", () => {
     expect(nextFooterFit(prev, "k", 300, 10)).toBe(prev);
   });
 
+  it("measures against the given minimum gap", () => {
+    // A phone's card leaves only 30px of gap: enough there, not on desktop.
+    const prev = fit(0);
+    expect(nextFooterFit(prev, "k", 358, 30, 12)).toBe(prev);
+    expect(nextFooterFit(prev, "k", 358, 10, 12)).toEqual(fit(1, [360]));
+  });
+
   it("re-fits from step 0 when the content changes", () => {
     expect(nextFooterFit(fit(3, [500, 520, 540]), "k2", 400, 10)).toEqual({
       key: "k2",
       level: 0,
       fitWidths: [],
     });
+  });
+});
+
+describe("footerMinGapFor", () => {
+  it("keeps room for the placeholder while the card can still collapse", () => {
+    expect(footerMinGapFor(400)).toBe(FOOTER_MIN_GAP_PX);
+  });
+
+  it("only asks for a sliver of gap once the card never collapses", () => {
+    expect(footerMinGapFor(358)).toBe(FOOTER_MIN_GAP_EXPANDED_PX);
+  });
+
+  it("stays above the gap's own floor, so an overflowing row still steps", () => {
+    // Desktop reserves 50px for the context ring; a phone only has padding.
+    expect(footerMinGapFor(358, 50)).toBe(54);
+    expect(footerMinGapFor(358, 8)).toBe(12);
   });
 });

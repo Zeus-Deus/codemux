@@ -403,6 +403,22 @@ export function collapseDisabledFor(pillWidth: number): boolean {
  *  least this wide, so the placeholder stays readable. */
 export const FOOTER_MIN_GAP_PX = 96;
 
+/** Below `COLLAPSE_DISABLED_BELOW_PX` the card never folds to the pill, so
+ *  the gap never shows the placeholder — only short, truncating hints. The
+ *  controls keep their labels until the gap is this narrow instead, which
+ *  is what lets a phone show "Opus 5.5" rather than a lone provider mark. */
+export const FOOTER_MIN_GAP_EXPANDED_PX = 8;
+
+/** The gap the controls row must leave before it stops compacting.
+ *  `gapFloorPx` is the narrowest the gap can get (its CSS min-width — room
+ *  for the context ring on desktop — or its padding): an overflowing row
+ *  measures exactly that floor, so the target stays above it or the row
+ *  would overflow without ever stepping down. */
+export function footerMinGapFor(pillWidth: number, gapFloorPx = 0): number {
+  if (!collapseDisabledFor(pillWidth)) return FOOTER_MIN_GAP_PX;
+  return Math.max(FOOTER_MIN_GAP_EXPANDED_PX, gapFloorPx + 4);
+}
+
 /** What the controls row gives up, one step at a time, while its gap is
  *  narrower than `FOOTER_MIN_GAP_PX`. The steps key on the measured gap
  *  rather than fixed pill widths, so a short label ("gpt-5.4") keeps its
@@ -449,13 +465,14 @@ export function nextFooterFit(
   key: string,
   pillWidth: number,
   gapWidth: number,
+  minGap: number = FOOTER_MIN_GAP_PX,
 ): FooterFit {
   if (prev.key !== key) return { key, level: 0, fitWidths: [] };
-  if (gapWidth < FOOTER_MIN_GAP_PX && prev.level < FOOTER_COMPACT_STEPS) {
+  if (gapWidth < minGap && prev.level < FOOTER_COMPACT_STEPS) {
     return {
       key,
       level: prev.level + 1,
-      fitWidths: [...prev.fitWidths, pillWidth + FOOTER_MIN_GAP_PX - gapWidth],
+      fitWidths: [...prev.fitWidths, pillWidth + minGap - gapWidth],
     };
   }
   if (prev.level > 0 && pillWidth >= prev.fitWidths[prev.level - 1]) {
@@ -2725,13 +2742,24 @@ export function Composer({
   // Resize callbacks omit `key` and keep the current content signature.
   const fitFooter = useCallback((key?: string) => {
     const pill = wrapperRef.current?.getBoundingClientRect().width ?? 0;
-    const gap = footerGapRef.current?.getBoundingClientRect().width ?? 0;
+    const gapEl = footerGapRef.current;
+    const gap = gapEl?.getBoundingClientRect().width ?? 0;
     // No layout yet (or jsdom): stay at full width.
     if (pill <= 0) return;
     setCollapseDisabled(collapseDisabledFor(pill));
+    // An overflowing row squeezes the gap to its min-width or, without
+    // one, to its own padding — never to zero.
+    const gapStyle = gapEl ? getComputedStyle(gapEl) : null;
+    const gapFloor = gapStyle
+      ? Math.max(
+          parseFloat(gapStyle.minWidth) || 0,
+          (parseFloat(gapStyle.paddingLeft) || 0) + (parseFloat(gapStyle.paddingRight) || 0),
+        )
+      : 0;
+    const minGap = footerMinGapFor(pill, gapFloor);
     const measured = committedFitRef.current;
     setFooterFit((prev) =>
-      prev === measured ? nextFooterFit(prev, key ?? prev.key, pill, gap) : prev,
+      prev === measured ? nextFooterFit(prev, key ?? prev.key, pill, gap, minGap) : prev,
     );
   }, []);
   useEffect(() => {
