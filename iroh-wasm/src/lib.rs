@@ -21,7 +21,7 @@ use std::str::FromStr;
 
 use futures_util::lock::Mutex;
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, TransportAddr};
 use tokio::io::AsyncWriteExt;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -61,18 +61,24 @@ pub async fn connect(
     node_id: String,
     relay_url: Option<String>,
 ) -> Result<IrohStream, JsValue> {
+    let relays = browser_relay_urls();
     let endpoint = Endpoint::builder(presets::N0)
+        .relay_mode(RelayMode::Custom(RelayMap::from_iter(relays.clone())))
         .alpns(vec![IROH_ALPN.to_vec()])
         .bind()
         .await
         .map_err(js_err)?;
 
     let id = EndpointId::from_str(node_id.trim()).map_err(js_err)?;
-    let mut addr = EndpointAddr::new(id);
+    // Address lookup reports the desktop's home relay with the trailing dot
+    // WebKit can't use, so also offer every default relay without it: a relay
+    // forwards by endpoint id, so whichever one the desktop is homed on works.
+    let mut addr = EndpointAddr::new(id).with_addrs(relays.into_iter().map(TransportAddr::Relay));
     if let Some(url) = relay_url {
         let url = url.trim();
         if !url.is_empty() {
-            addr = addr.with_relay_url(RelayUrl::from_str(url).map_err(js_err)?);
+            let url = RelayUrl::from_str(url).map_err(js_err)?;
+            addr = addr.with_relay_url(without_trailing_dot(&url));
         }
     }
 
@@ -121,6 +127,28 @@ impl IrohStream {
     pub fn close(&self) {
         self.conn.close(0u32.into(), b"client-closed");
     }
+}
+
+/// iroh's default relays, without the trailing dot iroh writes their hostnames
+/// with (`euc1-1.relay.n0.iroh.link.`). WebKit — every iOS browser — fails the
+/// TLS handshake on a trailing-dot host ("Unacceptable TLS certificate"), so
+/// with the stock names the dial hangs forever on Safari.
+fn browser_relay_urls() -> Vec<RelayUrl> {
+    iroh::defaults::prod::default_relay_map()
+        .urls::<Vec<RelayUrl>>()
+        .iter()
+        .map(without_trailing_dot)
+        .collect()
+}
+
+fn without_trailing_dot(url: &RelayUrl) -> RelayUrl {
+    let mut stripped = (**url).clone();
+    if let Some(host) = url.host_str().and_then(|h| h.strip_suffix('.')) {
+        if stripped.set_host(Some(host)).is_err() {
+            return url.clone();
+        }
+    }
+    RelayUrl::from(stripped)
 }
 
 fn js_err<E: std::fmt::Display>(e: E) -> JsValue {

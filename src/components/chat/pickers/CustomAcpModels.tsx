@@ -42,7 +42,7 @@ export function CustomAcpModels({ agentId, threadId, projectPath, active, model,
   };
   return <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-3 text-body-sm" data-testid="custom-acp-models">
     <div className="flex items-center justify-between gap-2"><strong className="truncate">{agent?.name ?? binding?.catalog.agent_name ?? "Custom agent"}</strong><span className="shrink-0 text-label text-muted-foreground">{fixed ? "Fixed for this chat" : "Local ACP"}</span></div>
-    {binding && !agent && <p className="text-label text-muted-foreground">This agent was removed from Settings → Agent.</p>}
+    {binding && !agent && <p className="text-label text-muted-foreground">This agent was removed from Settings → Providers.</p>}
     {warning && <p role="status" className="rounded-md bg-muted/50 p-2 text-label text-muted-foreground">{warning}</p>}
     {(error || actionError) && <p role="alert" className="rounded-md border border-destructive/30 p-2 text-destructive">{actionError ?? error}</p>}
     {agent && <button type="button" className="flex items-center justify-end gap-1.5 text-label text-muted-foreground hover:text-foreground disabled:opacity-40" disabled={loading || busy || probing || !agent.enabled} onClick={() => {

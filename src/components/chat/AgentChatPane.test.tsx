@@ -904,6 +904,26 @@ describe("AgentChatPane remote task launcher", () => {
     await waitFor(() => expect(view.queryByText("Remote task updates paused")).not.toBeInTheDocument());
   });
 
+  it("skips remote tasks in the web remote, which refuses delegation", async () => {
+    const { delegationList } = await import("@/lib/delegation");
+    vi.mocked(delegationList).mockClear();
+    vi.mocked(delegationList).mockRejectedValue(new Error("REMOTE_UNSUPPORTED: delegation requires the desktop app"));
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    try {
+      currentMessages = [{ kind: "assistant_message", id: "parent-answer", seq: 1, text: "Ready", streaming: false, turn_id: "t" }];
+      currentThreadsMap = {};
+      currentSliceOverrides = { "thread-x": { model: "already-seeded" } };
+      const view = render(<AgentChatPane pane={pane} />);
+      await waitFor(() => expect(view.getByRole("textbox")).not.toHaveAttribute("readonly"));
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+      expect(delegationList).not.toHaveBeenCalled();
+      expect(view.queryByText("Remote tasks unavailable")).toBeNull();
+    } finally {
+      delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
+      vi.mocked(delegationList).mockResolvedValue([]);
+    }
+  });
+
   it("opens host consent without sending, rebinding or discarding the parent composer", async () => {
     useRealComposer = true;
     currentMessages = [{ kind: "assistant_message", id: "parent-answer", seq: 1, text: "Ready", streaming: false, turn_id: "t" }];

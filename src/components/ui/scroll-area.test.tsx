@@ -17,6 +17,14 @@ describe("ScrollArea", () => {
     expect(style.firstChild).toBe(text);
   });
 
+  it("clips its own box so positioned descendants cannot grow the page", () => {
+    // Radix's viewport is not positioned, so sr-only labels and other
+    // absolute children resolve against the root. Unclipped, they made the
+    // whole window scroll past the app at the bottom of long Settings pages.
+    const { container } = render(<ScrollArea><p>content</p></ScrollArea>);
+    expect(container.querySelector("[data-slot=scroll-area]")).toHaveClass("relative", "overflow-hidden");
+  });
+
   it("still applies style changes", () => {
     const style = document.createElement("style");
     style.innerHTML = "a{color:red}";

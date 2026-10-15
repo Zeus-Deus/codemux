@@ -33,6 +33,7 @@ import {
 } from "@/stores/provider-health-store";
 import { usePickerFavorites } from "@/stores/picker-favorites-store";
 import { useCustomAcp } from "@/stores/custom-acp-store";
+import { useSettingsStore } from "@/stores/settings-store";
 
 import { MultiProviderModelPicker } from "./MultiProviderModelPicker";
 
@@ -159,6 +160,7 @@ function seedStore(opts: {
 }
 
 beforeEach(() => {
+  useSettingsStore.setState({ settings: {} });
   resetHealthStore();
   seedStore({
     claude: CLAUDE_CAPS,
@@ -177,6 +179,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  useSettingsStore.setState({ settings: {} });
   resetHealthStore();
   localStorage.clear();
   usePickerFavorites.setState({ favorites: [] });
@@ -374,6 +377,27 @@ describe("MultiProviderModelPicker — provider rail", () => {
     expect(screen.getByTestId("multi-provider-rail")).toHaveClass("min-h-0", "overflow-y-auto");
     await user.click(screen.getByTestId("provider-rail-acp-a2"));
     expect(screen.getByTestId("custom-acp-models")).toHaveTextContent("Agent Two");
+  });
+
+  it.each(["claude", "acp"] as const)("preserves the current %s provider while hiding disabled choices", async (provider) => {
+    const user = userEvent.setup();
+    useSettingsStore.setState({ settings: { "providers.disabled": "claude,codex,acp" } });
+    useCustomAcp.setState({
+      agents: [{ id: "a1", name: "Agent One", executable: "agent", args: [], environment: {}, auth_method: null, revision: "1", enabled: true }],
+      selections: { draft: "a1" },
+    });
+    renderPicker({ provider, hermesThreadId: "draft" });
+    await user.click(screen.getByTestId("multi-provider-model-picker-trigger"));
+    await screen.findByTestId("multi-provider-rail");
+
+    expect(screen.queryByTestId("provider-rail-codex")).not.toBeInTheDocument();
+    if (provider === "acp") {
+      expect(screen.getByTestId("provider-rail-acp-a1")).toHaveAccessibleName("Agent One");
+      expect(screen.queryByTestId("provider-rail-claude")).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByTestId("provider-rail-claude")).toBeInTheDocument();
+      expect(screen.queryByTestId("provider-rail-acp-a1")).not.toBeInTheDocument();
+    }
   });
 
   it("marks the active provider as selected", async () => {
