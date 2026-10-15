@@ -1222,6 +1222,26 @@ fn find_owning_workspace<'a>(
     })
 }
 
+fn session_pty_size(snapshot: &crate::state::AppStateSnapshot, session_id: &str) -> PtySize {
+    let session = snapshot
+        .terminal_sessions
+        .iter()
+        .find(|session| session.session_id.0 == session_id);
+    PtySize {
+        cols: session
+            .map(|session| session.cols)
+            .filter(|cols| *cols > 0)
+            .unwrap_or(DEFAULT_COLS)
+            .max(2),
+        rows: session
+            .map(|session| session.rows)
+            .filter(|rows| *rows > 0)
+            .unwrap_or(DEFAULT_ROWS),
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
 fn session_working_dir(app_state: &State<'_, AppStateStore>, session_id: &str) -> String {
     app_state
         .snapshot()
@@ -1720,13 +1740,12 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
         },
     );
 
+    // A restored shell must agree with the pane before its first prompt is
+    // printed. Opening ConPTY at 80×24 and resizing after output attachment
+    // can leave PowerShell's input cursor behind its already-rendered prompt.
+    let snapshot = app_state.snapshot();
     let pty_system = native_pty_system();
-    let pty_pair = match pty_system.openpty(PtySize {
-        rows: DEFAULT_ROWS,
-        cols: DEFAULT_COLS,
-        pixel_width: 0,
-        pixel_height: 0,
-    }) {
+    let pty_pair = match pty_system.openpty(session_pty_size(&snapshot, &session_id)) {
         Ok(pair) => pair,
         Err(error) => {
             emit_terminal_status(
@@ -1770,8 +1789,6 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TERM_PROGRAM", "codemux");
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-
-    let snapshot = app_state.snapshot();
 
     // Find the workspace that owns this session by walking each workspace's
     // pane tree.  Orphaned sessions (no workspace references them) get only
@@ -3368,6 +3385,29 @@ fn daemon_path_viable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_session_pty_starts_at_saved_size() {
+        let app = AppStateStore::default();
+        let id = app.active_terminal_session_id().unwrap().0;
+        assert!(app.update_terminal_session_size(&id, 35, 38));
+        let pair = native_pty_system()
+            .openpty(session_pty_size(&app.snapshot(), &id))
+            .unwrap();
+        let size = pair.master.get_size().unwrap();
+        assert_eq!((size.cols, size.rows), (35, 38));
+    }
+
+    #[test]
+    fn session_pty_size_defaults_missing_or_invalid_geometry() {
+        let app = AppStateStore::default();
+        let id = app.active_terminal_session_id().unwrap().0;
+        app.update_terminal_session_size(&id, 0, 0);
+        for session in [&id[..], "missing"] {
+            let size = session_pty_size(&app.snapshot(), session);
+            assert_eq!((size.cols, size.rows), (80, 24));
+        }
+    }
 
     fn make_sessions() -> Arc<Mutex<HashMap<String, SessionRuntime>>> {
         Arc::new(Mutex::new(HashMap::new()))

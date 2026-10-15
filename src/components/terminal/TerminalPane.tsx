@@ -150,6 +150,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const replayReadyRef = useRef(false);
   const serializeAddonRef = useRef<SerializeAddon | null>(null);
   const webglAddonRef = useRef<WebglAddon | null>(null);
   const attachedSessionRef = useRef<string | null>(null);
@@ -224,7 +225,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   const syncTerminalSize = useCallback(async () => {
     const term = termRef.current;
     const fitAddon = fitAddonRef.current;
-    if (!term || !fitAddon || !visibleRef.current) return;
+    if (!term || !fitAddon || !visibleRef.current || !replayReadyRef.current) return;
 
     if (mobileRef.current && !phoneControlRef.current) {
       const session = useAppStore.getState().appState?.terminal_sessions.find(s => s.session_id === sessionIdRef.current);
@@ -354,8 +355,17 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     const containerEl = containerRef.current;
     if (!containerEl) return;
 
+    replayReadyRef.current = false;
+    // Replay contains cursor positions for the saved PTY geometry. Starting
+    // xterm at its 80×24 default can parse a restored narrow prompt at the
+    // wrong coordinates before the first fit runs.
+    const savedSession = useAppStore.getState().appState?.terminal_sessions.find(
+      (session) => session.session_id === sid,
+    );
     // ── Create terminal ──
     const term = new Terminal({
+      cols: Math.max(2, savedSession?.cols || 80),
+      rows: Math.max(1, savedSession?.rows || 24),
       fontFamily: terminalFamily,
       theme: themeColorsToXtermTheme(syntaxTheme),
       convertEol: false,
@@ -916,12 +926,32 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       },
     });
 
-    // Stages 2 + 3 of the mount, shared with restart: subscribe to the
-    // session's output, then size the PTY to this pane. Resolves false when
-    // the attach failed or the pane went away.
+    // Finish parsing restored output at its recorded geometry before fitting
+    // the pane and subscribing to live output. Shared with shell restart.
     const attachOutput = async (): Promise<boolean> => {
-      // Stage 2: attach the channel. Must come AFTER the scrollback is
-      // enqueued so live bytes drain behind the historical bytes. The
+      // The pump may still have history split across macrotasks; xterm then
+      // parses each write asynchronously. Wait for BOTH queues before fit can
+      // change the coordinates of a saved prompt or absolute cursor sequence.
+      await pump.flush();
+      if (cancelled) return false;
+      await new Promise<void>(resolve => term.write("", resolve));
+      if (cancelled) return false;
+      // Size both ends before subscribing: attach can synchronously replay
+      // output, including ConPTY's absolute cursor positions. A spawning PTY
+      // may not have its master yet; retain the subscription in that case so
+      // its first output can still arrive when startup completes.
+      if (mobileRef.current && !phoneControlRef.current) {
+        const session = useAppStore.getState().appState?.terminal_sessions.find(s => s.session_id === sid);
+        if (session) term.resize(Math.max(2, session.cols), Math.max(1, session.rows));
+      } else if (visibleRef.current) {
+        fitAddon.fit();
+        if (term.cols > 0 && term.rows > 0) {
+          await resizePty(sid, term.cols, term.rows).catch(console.error);
+        }
+      }
+      if (cancelled) return false;
+      replayReadyRef.current = true;
+      // Attach only after scrollback parsing and the initial size sync. The
       // callback advances the kitty stack synchronously (the input handler
       // reads kittyLevel on every keystroke, so it can't wait behind the
       // throttled pump) then enqueues the bytes for the shared drain.
@@ -980,15 +1010,6 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         return false;
       }
 
-      // Stage 3: fit + resize. resizePty is fire-and-forget so doesn't
-      // block the mount finishing.
-      if (mobileRef.current && !phoneControlRef.current) {
-        const session = useAppStore.getState().appState?.terminal_sessions.find(s => s.session_id === sid);
-        if (session) term.resize(Math.max(2, session.cols), Math.max(1, session.rows));
-      } else fitAddon.fit();
-      if ((!mobileRef.current || phoneControlRef.current) && term.cols > 0 && term.rows > 0) {
-        resizePty(sid, term.cols, term.rows).catch(console.error);
-      }
       return true;
     };
 
@@ -997,6 +1018,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       // the backend respawns, so drop the stale generation and protocol state.
       attachedSessionRef.current = null;
       attachedGenerationRef.current = null;
+      replayReadyRef.current = false;
       flowPaused = false;
       kittyStackRef.current = [];
       kittyLevelRef.current = 0;
@@ -1062,6 +1084,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
           restoredCapturesRef.current = meta.adapter_captures;
         }
         if (!meta.alternate_buffer && scrollback.data) {
+          term.resize(Math.max(2, meta.cols || 80), Math.max(1, meta.rows || 24));
           pump.enqueueString(scrollback.data);
           pump.enqueue(
             new TextEncoder().encode(
