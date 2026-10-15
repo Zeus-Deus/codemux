@@ -8083,6 +8083,19 @@ function defaultResult(cmd: string): unknown {
 
 // ── The internals contract ──────────────────────────────────────────
 
+const REMOTE_REFUSED_DELEGATION_COMMANDS = new Set([
+  "delegation_host_info",
+  "delegation_grants",
+  "delegation_authorize",
+  "delegation_revoke",
+  "delegate_task",
+  "delegation_list",
+  "delegation_read",
+  "delegation_cancel",
+  "delegation_respond",
+  "delegation_deliver",
+]);
+
 async function invoke(
   cmd: string,
   args: Args | Uint8Array | ArrayBuffer = {},
@@ -8107,6 +8120,14 @@ async function invoke(
     }
     return defaultResult(cmd);
   }
+
+  // Mirror the web-remote bridge, which refuses delegation before dispatch
+  // (`web_remote/dispatch.rs`). Set `window.__CODEMUX_REMOTE__ = true` to see it.
+  if (
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ &&
+    REMOTE_REFUSED_DELEGATION_COMMANDS.has(cmd)
+  )
+    throw "REMOTE_UNSUPPORTED: delegation requires the desktop app";
 
   const handler = handlers[cmd];
   if (handler) return handler(args);
