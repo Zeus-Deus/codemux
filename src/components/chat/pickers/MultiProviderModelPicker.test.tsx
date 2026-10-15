@@ -370,6 +370,8 @@ describe("MultiProviderModelPicker — provider rail", () => {
     expect(screen.getByTestId("provider-rail-acp-a1")).toHaveAccessibleName("Agent One");
     expect(screen.getByTestId("provider-rail-acp-a2")).toHaveAccessibleName("Agent Two");
     expect(screen.queryByTestId("provider-rail-acp-off")).not.toBeInTheDocument();
+    // Each agent adds an entry, so the rail must scroll inside the fixed-height popup.
+    expect(screen.getByTestId("multi-provider-rail")).toHaveClass("min-h-0", "overflow-y-auto");
     await user.click(screen.getByTestId("provider-rail-acp-a2"));
     expect(screen.getByTestId("custom-acp-models")).toHaveTextContent("Agent Two");
   });

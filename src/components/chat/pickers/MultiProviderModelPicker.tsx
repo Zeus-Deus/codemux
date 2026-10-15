@@ -722,7 +722,9 @@ function ProviderRail({
   return (
     <TooltipProvider delayDuration={200}>
       <div
-        className="flex flex-col gap-1 border-r bg-muted/30 p-1"
+        // Custom agents add one entry each, so the rail scrolls once it
+        // outgrows the fixed-height popup instead of clipping entries.
+        className="flex min-h-0 flex-col gap-1 overflow-y-auto overflow-x-hidden border-r bg-muted/30 p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         data-testid="multi-provider-rail"
       >
         {/* Favorites pseudo-tab — sits above the driver entries with
@@ -732,7 +734,7 @@ function ProviderRail({
             fresh install. */}
         {favoritesCount > 0 ? (
           <>
-            <div className="relative">
+            <div className="relative shrink-0">
               {selected === "favorites" && (
                 <span
                   className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
@@ -786,7 +788,7 @@ function ProviderRail({
           const parsedError = parseProviderError(error);
           const isUnavailable = parsedError !== null;
           return (
-            <div key={p.kind} className="relative">
+            <div key={p.kind} className="relative shrink-0">
               {isSelected && (
                 <span
                   className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
@@ -838,7 +840,7 @@ function ProviderRail({
         {acpEntries.map((agent) => {
           const isSelected = selected === "acp" && selectedAcpAgentId === agent.id;
           return (
-            <div key={`acp:${agent.id}`} className="relative">
+            <div key={`acp:${agent.id}`} className="relative shrink-0">
               {isSelected && (
                 <span
                   className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
