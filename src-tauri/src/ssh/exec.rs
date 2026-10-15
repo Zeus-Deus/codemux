@@ -23,7 +23,7 @@ pub const REMOTE_BIN_DIR: &str = "~/.local/bin";
 /// PATH entries prepended for commands run on a host. Non-interactive SSH
 /// shells usually miss the per-user install locations agent CLIs use
 /// (`claude`'s native installer, npm/bun/cargo globals, Homebrew).
-const REMOTE_PATH_PREFIX: &str = "$HOME/.local/bin:$HOME/.claude/local:$HOME/.npm-global/bin:$HOME/.bun/bin:$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin";
+pub(crate) const REMOTE_PATH_PREFIX: &str = "$HOME/.local/bin:$HOME/.claude/local:$HOME/.npm-global/bin:$HOME/.bun/bin:$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin";
 
 /// Reject SSH targets that `ssh` would parse as an option or that cannot be a
 /// single destination argument. Targets also arrive from account sync, so a

@@ -18,6 +18,16 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "set_preset_pinned"
             | "refresh_workspace_issue"
             | "agent_chat_provider_health"
+            // Settings → Updates from a paired browser or phone. Each command
+            // only picks a provider or a configured device; the executable
+            // and installer are resolved on the machine that owns the CLI.
+            // The chat notice's commands stay desktop-only: they accept a
+            // Hermes executable path.
+            | "provider_updates_local"
+            | "provider_update_local"
+            | "provider_updates_device"
+            | "provider_update_device"
+            | "device_helper_update"
             | "hermes_profiles"
             | "hermes_catalog"
             | "hermes_binding"
@@ -323,6 +333,22 @@ mod tests {
         }
         for cmd in ["hermes_auth", "hermes_get_credentials", "hermes_future_command"] {
             assert!(!allowed(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn update_all_allows_provider_names_but_not_executable_paths() {
+        for cmd in [
+            "provider_updates_local",
+            "provider_update_local",
+            "provider_updates_device",
+            "provider_update_device",
+            "device_helper_update",
+        ] {
+            assert!(allowed(cmd), "{cmd}");
+        }
+        for cmd in ["agent_chat_provider_update", "agent_chat_provider_update_check"] {
+            assert!(!allowed(cmd), "{cmd} accepts an executable path");
         }
     }
 

@@ -1,7 +1,7 @@
 //! Local CLI maintenance for agent chat. Never accepts commands from the renderer.
 //! Detection precedes every update; an unknown owner is deliberately manual-only.
 use crate::agent_provider::{claude, ProviderKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -12,7 +12,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderUpdate {
     pub provider: ProviderKind,
     pub installed_version: Option<String>,
@@ -32,6 +32,8 @@ struct Installation {
     mise_tool: Option<String>,
     mise_request: Option<String>,
 }
+
+const NOT_INSTALLED: &str = "Provider CLI is not installed";
 
 // Serialize package-manager mutations across providers and coalesce checks across panes.
 static MAINTENANCE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -124,14 +126,39 @@ async fn run(program: &Path, args: &[String], seconds: u64, mise: bool) -> Resul
         } else {
             detail
         };
+        let code = output
+            .status
+            .code()
+            .map(|c| format!(" (exit {c})"))
+            .unwrap_or_default();
         return Err(format!(
-            "{} exited with {}: {}",
+            "{} failed{code}: {}",
             program.file_name().unwrap_or_default().to_string_lossy(),
-            output.status,
-            detail.chars().take(1400).collect::<String>().trim()
+            error_summary(&detail)
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+/// The lines of an installer's output that say what went wrong. Progress
+/// output (mise, npm) comes first and would otherwise fill the message.
+fn error_summary(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let mut picked: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| {
+            let lower = l.to_lowercase();
+            (lower.contains("error") || lower.contains("failed") || lower.contains("denied"))
+                && !lower.contains("--verbose")
+                && !lower.starts_with("mise error version:")
+        })
+        .collect();
+    if picked.is_empty() {
+        picked = lines.iter().rev().take(3).rev().copied().collect();
+    }
+    picked.dedup();
+    let text = picked.iter().take(3).copied().collect::<Vec<_>>().join(" · ");
+    text.chars().take(600).collect()
 }
 fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|s| (*s).into()).collect()
@@ -145,9 +172,9 @@ fn mise_owner<'a>(data: &'a Value, binary: &Path) -> Option<(&'a str, &'a Value)
             .iter()
             .find(|v| {
                 v["active"].as_bool() == Some(true)
-                    && v["install_path"]
-                        .as_str()
-                        .is_some_and(|root| binary.starts_with(root))
+                    && v["install_path"].as_str().is_some_and(|root| {
+                        binary.starts_with(root) || binary.starts_with(canonical(Path::new(root)))
+                    })
             })
             .map(|v| (tool.as_str(), v))
     })
@@ -163,7 +190,10 @@ fn is_provider_tool(provider: ProviderKind, tool: &str) -> bool {
                 tool,
                 "github:anomalyco/opencode" | "aqua:anomalyco/opencode"
             ),
-            ProviderKind::Hermes => tool == "github:NousResearch/hermes-agent",
+            // Omarchy installs Hermes through mise's pipx backend.
+            ProviderKind::Hermes => {
+                tool == "github:NousResearch/hermes-agent" || tool.starts_with("pipx:hermes-agent")
+            }
             _ => false,
         }
 }
@@ -178,12 +208,17 @@ fn wrapper_tool(provider: ProviderKind, script: &str) -> Option<String> {
         // Official wrappers quote these fixed identifiers; no shell evaluation.
         let words: Vec<_> = line
             .split_whitespace()
-            .map(|word| word.trim_matches('"'))
+            .map(|word| word.trim_matches(|c| c == '"' || c == '\''))
             .collect();
-        if words.len() < 5 || words[..3] != ["exec", "mise", "x"] || words[4] != "--" {
+        // `exec mise x <tool> -- …`, or the same behind `exec env -u VAR`.
+        if words.first() != Some(&"exec") {
             return None;
         }
-        let tool = &words[3];
+        let at = words.windows(2).position(|w| w == ["mise", "x"])?;
+        if words.get(at + 3) != Some(&"--") {
+            return None;
+        }
+        let tool = words.get(at + 2)?;
         is_provider_tool(provider, tool).then(|| (*tool).to_string())
     })
 }
@@ -206,28 +241,39 @@ async fn detect(
             installation.unwrap_or("hermes"),
         ))?
     } else {
-        which::which(binary_name(provider))
-            .map_err(|_| "Provider CLI is not installed".to_string())?
+        which::which(binary_name(provider)).map_err(|_| NOT_INSTALLED.to_string())?
     };
     let mut resolved = canonical(&binary);
     let wrapper = read_wrapper(provider, &binary);
     if let Ok(mise) = which::which("mise") {
         if let Some(tool) = &wrapper {
-            resolved = PathBuf::from(
-                run(
+            // Omarchy writes a wrapper for every tool it offers; mise installs
+            // the tool on first run. Until then there is nothing to update.
+            // Only a successful answer with nothing installed means "not
+            // installed"; a failed query must still show the agent's row.
+            let raw = run(&mise, &args(&["ls", "--installed", "--json", tool]), 15, true)
+                .await
+                .map_err(|e| format!("Could not ask mise about this installation: {e}"))?;
+            if !raw.contains("install_path") {
+                return Err(NOT_INSTALLED.into());
+            }
+            // mise answers through its `installs/<tool>/latest` alias; the
+            // ownership match below compares against the versioned directory.
+            resolved = canonical(Path::new(
+                &run(
                     &mise,
                     &args(&["which", binary_name(provider), "--tool", tool]),
                     15,
                     true,
                 )
                 .await?,
-            );
+            ));
         }
         // A shim resolves to mise itself; ask mise for its actual selected executable.
         if binary.parent().is_some_and(|p| p.ends_with("shims")) {
-            resolved = PathBuf::from(
-                run(&mise, &args(&["which", binary_name(provider)]), 15, true).await?,
-            );
+            resolved = canonical(Path::new(
+                &run(&mise, &args(&["which", binary_name(provider)]), 15, true).await?,
+            ));
         }
         if let Ok(raw) = run(&mise, &args(&["ls", "--json"]), 15, true).await {
             if let Ok(data) = serde_json::from_str::<Value>(&raw) {
@@ -382,8 +428,11 @@ fn cursor_version(text: &str) -> Option<&str> {
     })
 }
 async fn installed_version(provider: ProviderKind, binary: &Path) -> Result<String, String> {
-    if provider == ProviderKind::Claude {
-        let sidecar = claude::sidecar_path::resolve_sidecar_path().map_err(|e| e.to_string())?;
+    // A device without the Claude runtime still reports its version; the
+    // binary here is already resolved past any mise wrapper.
+    if let (ProviderKind::Claude, Ok(sidecar)) =
+        (provider, claude::sidecar_path::resolve_sidecar_path())
+    {
         return claude::auth::probe_installed(&sidecar, Some(binary))
             .await
             .map_err(|e| e.to_string())?
@@ -487,16 +536,35 @@ fn cursor_newer(current: &str, latest: &str) -> bool {
     matches!((cursor_version(current), cursor_version(latest)), (Some(a), Some(b)) if b[..10] >= a[..10] && b != a)
 }
 
-#[tauri::command]
-pub async fn agent_chat_provider_update_check(
+/// Providers a machine-wide check covers, in display order. Custom ACP
+/// executables are managed by whoever configured them.
+pub const MAINTAINED: [ProviderKind; 6] = [
+    ProviderKind::Claude,
+    ProviderKind::Codex,
+    ProviderKind::Cursor,
+    ProviderKind::Grok,
+    ProviderKind::OpenCode,
+    ProviderKind::Hermes,
+];
+
+/// Whether the provider's CLI resolves on PATH. Presence only: nothing runs.
+pub fn is_installed(provider: ProviderKind) -> bool {
+    provider != ProviderKind::Acp && which::which(binary_name(provider)).is_ok()
+}
+
+/// One provider's update status, from the hourly cache unless `force`.
+pub async fn check_provider(
     provider: ProviderKind,
     installation: Option<String>,
-) -> Result<ProviderUpdate, String> {
+    force: bool,
+) -> ProviderUpdate {
     let key = (provider, installation.clone());
     let _guard = MAINTENANCE.lock().await;
-    if let Some((at, result)) = CACHE.lock().await.get(&key) {
-        if at.elapsed() < CHECK_TTL {
-            return Ok(result.clone());
+    if !force {
+        if let Some((at, result)) = CACHE.lock().await.get(&key) {
+            if at.elapsed() < CHECK_TTL {
+                return result.clone();
+            }
         }
     }
     let result = match detect(provider, installation.as_deref()).await {
@@ -517,11 +585,26 @@ pub async fn agent_chat_provider_update_check(
         .lock()
         .await
         .insert(key, (Instant::now(), result.clone()));
-    Ok(result)
+    result
 }
 
-#[tauri::command]
-pub async fn agent_chat_provider_update(
+/// Every installed provider on this machine. Checks run one at a time
+/// under the maintenance lock, so they never overlap an update.
+pub async fn check_installed(force: bool) -> Vec<ProviderUpdate> {
+    let mut reports = Vec::new();
+    for provider in MAINTAINED.into_iter().filter(|p| is_installed(*p)) {
+        let report = check_provider(provider, None, force).await;
+        // A wrapper on PATH whose tool was never installed is not an agent
+        // this machine has.
+        if report.message.as_deref() != Some(NOT_INSTALLED) {
+            reports.push(report);
+        }
+    }
+    reports
+}
+
+/// Update one provider through the installer that owns it, then verify.
+pub async fn update_provider(
     provider: ProviderKind,
     installation: Option<String>,
 ) -> Result<ProviderUpdate, String> {
@@ -534,6 +617,239 @@ pub async fn agent_chat_provider_update(
         .await
         .insert((provider, installation), (Instant::now(), after.clone()));
     Ok(after)
+}
+
+#[tauri::command]
+pub async fn agent_chat_provider_update_check(
+    provider: ProviderKind,
+    installation: Option<String>,
+) -> Result<ProviderUpdate, String> {
+    Ok(check_provider(provider, installation, false).await)
+}
+
+#[tauri::command]
+pub async fn agent_chat_provider_update(
+    provider: ProviderKind,
+    installation: Option<String>,
+) -> Result<ProviderUpdate, String> {
+    update_provider(provider, installation).await
+}
+
+/// Settings → Updates: every installed provider on this computer.
+#[tauri::command]
+pub async fn provider_updates_local(force: Option<bool>) -> Vec<ProviderUpdate> {
+    check_installed(force.unwrap_or(false)).await
+}
+
+/// Settings → Updates: update one provider on this computer. Unlike the
+/// chat notice's command it takes no executable path, so a paired browser
+/// can only name a provider; the CLI is the one this machine resolves.
+#[tauri::command]
+pub async fn provider_update_local(provider: ProviderKind) -> Result<ProviderUpdate, String> {
+    if !MAINTAINED.contains(&provider) {
+        return Err("Codemux does not update this provider".into());
+    }
+    update_provider(provider, None).await
+}
+
+// ── Devices ─────────────────────────────────────────────────────────
+//
+// A device's providers are checked and updated by its own `codemux-remote
+// providers`, so detection (mise/Omarchy wrappers, npm prefixes, pacman
+// ownership) runs against that machine's real installs. The desktop only
+// picks which provider; it never sends a command line.
+
+/// What one device reported.
+#[derive(Clone, Debug, Serialize)]
+pub struct DeviceProviders {
+    pub host_id: i64,
+    /// The device's `codemux-remote` version, or None when unreachable.
+    pub helper_version: Option<String>,
+    /// This desktop's version: the helper is current when not older.
+    pub app_version: String,
+    /// None when the helper predates `providers` or the device is offline.
+    pub providers: Option<Vec<ProviderUpdate>>,
+    pub error: Option<String>,
+}
+
+/// How a device's helper update went.
+#[derive(Clone, Debug, Serialize)]
+pub struct DeviceHelperUpdate {
+    pub host_id: i64,
+    /// `current`, `upgraded` or `skipped`.
+    pub status: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub message: Option<String>,
+}
+
+#[cfg(unix)]
+fn device_script(subcommand: &str) -> String {
+    use crate::ssh::exec::{codemux_remote_command, sh_quote, REMOTE_PATH_PREFIX};
+    // A login shell, as provider spawns use, so ~/.profile's PATH and mise
+    // shims resolve the same CLIs a thread on the device would run.
+    let inner = format!(
+        "PATH=\"{REMOTE_PATH_PREFIX}:$HOME/.local/share/mise/shims:$PATH\"; export PATH; {}",
+        codemux_remote_command(subcommand)
+    );
+    format!("exec sh -lc {}", sh_quote(&inner))
+}
+
+#[cfg(unix)]
+fn find_host<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    id: i64,
+) -> Result<crate::database::HostRecord, String> {
+    use tauri::Manager;
+    app.try_state::<crate::database::DatabaseStore>()
+        .ok_or("Device list is unavailable")?
+        .list_hosts()
+        .into_iter()
+        .find(|h| h.id == id)
+        .ok_or_else(|| format!("Device not found: {id}"))
+}
+
+#[cfg(unix)]
+fn parse_device_report(host_id: i64, stdout: &str) -> DeviceProviders {
+    let mut report = DeviceProviders {
+        host_id,
+        helper_version: None,
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        providers: None,
+        error: None,
+    };
+    for line in stdout.lines().map(str::trim).filter(|l| l.starts_with('{')) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value["name"] == "codemux-remote" {
+            report.helper_version = value["version"].as_str().map(Into::into);
+        } else if let Some(list) = value.get("providers") {
+            report.providers = serde_json::from_value(list.clone()).ok();
+        }
+    }
+    if report.helper_version.is_none() {
+        report.error = Some("Codemux isn't set up on this device".into());
+    } else if report.providers.is_none() {
+        report.error = Some("Update Codemux on this device to manage its agents".into());
+    }
+    report
+}
+
+/// Settings → Updates: a device's helper version and installed providers.
+#[tauri::command]
+pub async fn provider_updates_device<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    host_id: i64,
+    force: Option<bool>,
+) -> Result<DeviceProviders, String> {
+    #[cfg(unix)]
+    {
+        let host = find_host(&app, host_id)?;
+        let force = if force.unwrap_or(false) { " --force" } else { "" };
+        // An older helper has no `providers`; report its version anyway.
+        let script = device_script(&format!(
+            "version; \"$CMR\" providers check{force} 2>/dev/null || true"
+        ));
+        match crate::ssh::exec::run_remote(&host.ssh_target, &script, Duration::from_secs(180))
+            .await
+        {
+            Ok(stdout) => Ok(parse_device_report(host_id, &stdout)),
+            Err(error) => Ok(DeviceProviders {
+                host_id,
+                helper_version: None,
+                app_version: env!("CARGO_PKG_VERSION").into(),
+                providers: None,
+                error: Some(error),
+            }),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, host_id, force);
+        Err("Devices are not supported on this platform yet".into())
+    }
+}
+
+/// Update one provider on a device. The helper is brought up to this
+/// build first, since older helpers have no `providers update`.
+#[tauri::command]
+pub async fn provider_update_device<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    host_id: i64,
+    provider: ProviderKind,
+) -> Result<ProviderUpdate, String> {
+    #[cfg(unix)]
+    {
+        if !MAINTAINED.contains(&provider) {
+            return Err("Codemux does not update this provider".into());
+        }
+        let host = find_host(&app, host_id)?;
+        crate::hosts_upgrade::upgrade_host(&app, &host).await?;
+        let name = serde_json::to_value(provider)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .ok_or("Unknown provider")?;
+        let script = device_script(&format!("providers update --provider={name}"));
+        let stdout =
+            crate::ssh::exec::run_remote(&host.ssh_target, &script, Duration::from_secs(960))
+                .await?;
+        crate::ssh::exec::parse_last_json_line(&stdout)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, host_id, provider);
+        Err("Devices are not supported on this platform yet".into())
+    }
+}
+
+/// Bring a device's `codemux-remote` up to this build. Same gentle path as
+/// the background upgrader: the `serve` daemon restarts only when idle.
+#[tauri::command]
+pub async fn device_helper_update<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    host_id: i64,
+) -> Result<DeviceHelperUpdate, String> {
+    #[cfg(unix)]
+    {
+        use crate::hosts_upgrade::UpgradeOutcome;
+        let host = find_host(&app, host_id)?;
+        let outcome = crate::hosts_upgrade::upgrade_host(&app, &host).await?;
+        Ok(match outcome {
+            UpgradeOutcome::AlreadyCurrent => DeviceHelperUpdate {
+                host_id,
+                status: "current".into(),
+                from: None,
+                to: None,
+                message: None,
+            },
+            UpgradeOutcome::Upgraded {
+                from,
+                to,
+                deferred_restart,
+            } => DeviceHelperUpdate {
+                host_id,
+                status: "upgraded".into(),
+                from: Some(from),
+                to: Some(to),
+                message: deferred_restart.map(|n| {
+                    format!("{n} running session(s) keep the old version until they finish")
+                }),
+            },
+            UpgradeOutcome::NotAttempted { reason } => DeviceHelperUpdate {
+                host_id,
+                status: "skipped".into(),
+                from: None,
+                to: None,
+                message: Some(reason),
+            },
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, host_id);
+        Err("Devices are not supported on this platform yet".into())
+    }
 }
 
 async fn apply_update(
@@ -556,8 +872,8 @@ async fn apply_update(
     if install.mise_tool.is_some() {
         run(program, &args(&["reshim"]), 30, true).await?;
         // The GUI's inherited PATH may still name the previous mise install.
-        updated.binary = PathBuf::from(
-            run(
+        updated.binary = canonical(Path::new(
+            &run(
                 program,
                 &args(&[
                     "which",
@@ -569,7 +885,7 @@ async fn apply_update(
                 true,
             )
             .await?,
-        );
+        ));
     }
     let after = check(provider, &updated).await?;
     if after.available
@@ -603,6 +919,20 @@ mod tests {
             "npm:@xai-official/grok"
         );
         assert!(mise_owner(&data, Path::new("/usr/bin/grok")).is_none());
+
+        // mise reports `installs/<tool>/latest/...`, a symlink to the active
+        // versioned directory: ownership must follow it.
+        let dir = tempfile::tempdir().unwrap();
+        let versioned = dir.path().join("codex/0.162.1");
+        std::fs::create_dir_all(versioned.join("bin")).unwrap();
+        std::fs::write(versioned.join("bin/codex"), "").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("0.162.1", dir.path().join("codex/latest")).unwrap();
+            let data = serde_json::json!({"codex": [{"active":true,"install_path":versioned,"requested_version":"latest"}]});
+            let via_alias = canonical(&dir.path().join("codex/latest/bin/codex"));
+            assert_eq!(mise_owner(&data, &via_alias).unwrap().0, "codex");
+        }
         assert!(mise_owner(&data, Path::new("/tools/grok/1.0.00/bin/grok")).is_none());
     }
     #[test]
@@ -746,8 +1076,52 @@ mod tests {
             Some("npm:@xai-official/grok")
         );
         assert!(wrapper_tool(ProviderKind::Codex, locked).is_none());
+        // Hermes' wrapper strips a build-time variable before handing over.
+        let hermes = "#!/bin/bash\nmise use -g --quiet --force 'pipx:hermes-agent[extras=all]' || exit 1\nexec env -u UV_PYTHON mise x 'pipx:hermes-agent[extras=all]' -- hermes \"$@\"";
+        assert_eq!(
+            wrapper_tool(ProviderKind::Hermes, hermes).as_deref(),
+            Some("pipx:hermes-agent[extras=all]")
+        );
+        assert!(wrapper_tool(ProviderKind::Codex, "#!/bin/sh\nmise use -g codex\necho exec mise x codex -- codex").is_none());
         assert!(!is_provider_tool(ProviderKind::Codex, "node"));
         assert_eq!(path_recipe(ProviderKind::Codex, Path::new("/home/me/.local/share/mise/installs/node/24/lib/node_modules/@openai/codex/bin/codex.js")).0, "npm");
+    }
+
+    #[test]
+    fn installer_errors_name_the_failure_not_the_progress() {
+        let mise = "mise by @jdx – resolving 2 tools\nmise ✓ opencode  0ms\nmise opencode@2.0.28 sh: line 1: node: command not found\nmise ✗ opencode@2.0.28  468ms · failed: aube install failed: postinstall exited with code Some(127)\nmise ERROR Failed to install aqua:anomalyco/opencode@latest: postinstall exited with code Some(127)\nmise ERROR Version: 2026.10.10 linux-x64\nmise ERROR Run with --verbose or MISE_VERBOSE=1 for more information\n";
+        let summary = error_summary(mise);
+        assert!(summary.starts_with("mise ✗ opencode@2.0.28"), "{summary}");
+        assert!(summary.contains("Failed to install aqua:anomalyco/opencode@latest"));
+        assert!(!summary.contains("resolving") && !summary.contains("--verbose") && !summary.contains("Version:"));
+        assert_eq!(error_summary("one\ntwo\nthree\nfour"), "two · three · four");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_reports_tolerate_banners_and_older_helpers() {
+        let out = "Welcome to the box\n{\"name\":\"codemux-remote\",\"version\":\"0.24.0\",\"protocol_version\":3}\n{\"providers\":[{\"provider\":\"codex\",\"installed_version\":\"0.1.0\",\"latest_version\":\"0.2.0\",\"available\":true,\"manager\":\"Omarchy · mise\",\"can_update\":true,\"message\":null}]}\n";
+        let report = parse_device_report(7, out);
+        assert_eq!(report.helper_version.as_deref(), Some("0.24.0"));
+        let providers = report.providers.unwrap();
+        assert_eq!(providers[0].provider, ProviderKind::Codex);
+        assert!(providers[0].available && report.error.is_none());
+
+        // A helper without `providers` still reports its version, and asks
+        // for an update instead of claiming the device has no agents.
+        let old = parse_device_report(7, "{\"name\":\"codemux-remote\",\"version\":\"0.20.0\"}\n");
+        assert_eq!(old.helper_version.as_deref(), Some("0.20.0"));
+        assert!(old.providers.is_none() && old.error.unwrap().contains("Update Codemux"));
+        assert!(parse_device_report(7, "").error.unwrap().contains("isn't set up"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_scripts_name_only_fixed_subcommands() {
+        let script = device_script("providers update --provider=codex");
+        assert!(script.starts_with("exec sh -lc '"));
+        assert!(script.contains("\"$CMR\" providers update --provider=codex"));
+        assert!(script.contains("mise/shims"));
     }
 
     #[cfg(unix)]

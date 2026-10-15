@@ -194,6 +194,7 @@ import {
 } from "./settings-primitives";
 import { SettingsSyncIndicator } from "./settings-sync-indicator";
 import { AboutSection } from "./about-section";
+import { UpdatesSection } from "./updates-section";
 import { WorkflowsSection } from "./workflows-section";
 import { SettingsNavSearch, revealSettingsAnchor } from "./settings-search";
 import type { SettingsSearchResult } from "@/lib/settings-search";
@@ -2593,6 +2594,9 @@ export function SettingsView() {
 
       case "remote_access":
         return <RemoteAccessSection />;
+
+      case "updates":
+        return <UpdatesSection />;
 
       case "projects": {
         const ENV_VARS: Array<[string, string]> = [
