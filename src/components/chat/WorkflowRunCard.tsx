@@ -1,9 +1,11 @@
+import { CodeBlock, CodeBlockContent, CodeBlockCopyButton, CodeBlockHeader, CodeBlockTitle } from "@/components/ui/code-block";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Ban,
   CheckCircle2,
   ChevronRight,
+  FileCode,
   Workflow as WorkflowIcon,
   XCircle,
 } from "lucide-react";
@@ -254,9 +256,18 @@ function WorkflowApprovalCard({
                 "The script Claude wrote to orchestrate this workflow."}
             </DialogDescription>
           </DialogHeader>
-          <pre className="max-h-[60vh] overflow-auto rounded-md bg-muted/40 p-3 font-mono text-body-sm leading-5 text-foreground whitespace-pre-wrap break-words">
-            {item.script ?? "No script available."}
-          </pre>
+          <CodeBlock>
+            <CodeBlockHeader>
+              <CodeBlockTitle>
+                <FileCode />
+                workflow.js
+              </CodeBlockTitle>
+              {item.script ? <CodeBlockCopyButton value={item.script} /> : null}
+            </CodeBlockHeader>
+            <CodeBlockContent className="max-h-[60vh] whitespace-pre-wrap break-words">
+              {item.script ?? "No script available."}
+            </CodeBlockContent>
+          </CodeBlock>
         </DialogContent>
       </Dialog>
     </div>

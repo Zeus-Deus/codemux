@@ -1,3 +1,4 @@
+import { Kbd } from "@/components/ui/kbd";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CornerDownLeft, X } from "lucide-react";
 
@@ -293,9 +294,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
 
           <div className="flex items-center gap-2 border-t border-hairline-strong bg-surface-1 px-3 py-[11px]">
             <span className="flex min-w-0 flex-1 items-center gap-1.5 font-mono text-caption text-muted-foreground/55">
-              <kbd className="rounded-sm border border-border/70 px-[5px] py-0.5 font-mono">
-                esc
-              </kbd>
+              <Kbd>esc</Kbd>
               <span>cancel</span>
             </span>
             <DialogClose asChild>

@@ -1,3 +1,4 @@
+import { Checkbox } from "@/components/ui/checkbox";
 import { useEffect, useState } from "react";
 import { Download, X } from "lucide-react";
 import {
@@ -159,12 +160,11 @@ export function MobileInstall({ compact = false }: { compact?: boolean }) {
           </p>
           {(Object.keys(categories) as (keyof PushCategories)[]).map((key) => (
             <label key={key} className="flex min-h-11 items-center gap-3">
-              <input
-                type="checkbox"
+              <Checkbox
                 checked={categories[key]}
                 disabled={busy}
-                onChange={async (e) => {
-                  const next = { ...categories, [key]: e.target.checked };
+                onCheckedChange={async (checked) => {
+                  const next = { ...categories, [key]: (checked === true) };
                   setBusy(true);
                   try {
                     if (enabled) await updatePushCategories(next);

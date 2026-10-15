@@ -1,3 +1,5 @@
+import { NativeSelect } from "@/components/ui/native-select";
+import { Checkbox } from "@/components/ui/checkbox";
 import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, RefreshCw, ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -141,10 +143,9 @@ function Credentials({
         );
       })}
       <label className="flex items-center gap-2 text-body">
-        <input
-          type="checkbox"
+        <Checkbox
           checked={session}
-          onChange={(e) => setSession(e.target.checked)}
+          onCheckedChange={(checked) => setSession(checked === true)}
         />
         Store new values for this session only
       </label>
@@ -447,9 +448,8 @@ export function AddonDetail({
                   }
                 />
               ) : field.type === "enum" ? (
-                <select
+                <NativeSelect
                   disabled={configuration !== "ready" || busy}
-                  className="rounded-md border bg-background p-2"
                   value={String(settings[field.id] ?? field.default)}
                   onChange={(e) =>
                     setSettings({ ...settings, [field.id]: e.target.value })
@@ -458,7 +458,7 @@ export function AddonDetail({
                   {field.values.map((value) => (
                     <option key={value}>{value}</option>
                   ))}
-                </select>
+                </NativeSelect>
               ) : (
                 <Input
                   disabled={configuration !== "ready" || busy}

@@ -1,3 +1,4 @@
+import { Kbd } from "@/components/ui/kbd";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -27,7 +28,6 @@ import {
   btnCard,
   btnCardXs,
   btnEmberXs,
-  kbdChip,
   plural,
   tzBody,
   tzEyebrow,
@@ -282,7 +282,7 @@ function ThreadReplyBox({
           {sending ? "Sending" : "Reply"}
         </button>
         <span className="flex-1" />
-        <kbd className={kbdChip}>{modEnterLabel()}</kbd>
+        <Kbd>{modEnterLabel()}</Kbd>
       </div>
       {error && (
         // The drift notice's language, at comment scale: a dot, the

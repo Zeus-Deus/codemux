@@ -1,6 +1,13 @@
-import { BookOpen, Link2 } from "lucide-react";
+import { BookOpen, Braces, Link2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import {
+  CodeBlock,
+  CodeBlockContent,
+  CodeBlockCopyButton,
+  CodeBlockHeader,
+  CodeBlockTitle,
+} from "@/components/ui/code-block";
 import {
   Dialog,
   DialogContent,
@@ -128,17 +135,18 @@ export function SkillViewModal({ skill, onClose }: Props) {
         </div>
 
         {hasFrontmatter && (
-          <details className="text-label">
-            <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
-              Advanced metadata
-            </summary>
-            <pre
-              data-testid="skill-modal-frontmatter"
-              className="mt-2 overflow-x-auto rounded-md bg-muted p-3 font-mono"
-            >
+          <CodeBlock>
+            <CodeBlockHeader>
+              <CodeBlockTitle>
+                <Braces />
+                Advanced metadata
+              </CodeBlockTitle>
+              <CodeBlockCopyButton value={JSON.stringify(frontmatter, null, 2)} />
+            </CodeBlockHeader>
+            <CodeBlockContent data-testid="skill-modal-frontmatter">
               {JSON.stringify(frontmatter, null, 2)}
-            </pre>
-          </details>
+            </CodeBlockContent>
+          </CodeBlock>
         )}
 
         <DialogFooter>

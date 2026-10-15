@@ -1,3 +1,4 @@
+import { Kbd } from "@/components/ui/kbd"
 import * as React from "react"
 import { Tooltip as TooltipPrimitive } from "radix-ui"
 
@@ -35,12 +36,7 @@ function TooltipShortcut({ actionId }: { actionId: string }) {
   const keys = useShortcutLabel(actionId)
   if (!keys) return null
   return (
-    <kbd
-      data-slot="kbd"
-      className="bg-background/15 px-1 py-px font-mono text-micro leading-none font-normal text-background/75"
-    >
-      {keys}
-    </kbd>
+    <Kbd className="bg-background/15 text-background/75">{keys}</Kbd>
   )
 }
 

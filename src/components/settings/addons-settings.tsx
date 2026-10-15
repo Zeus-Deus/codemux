@@ -1,3 +1,4 @@
+import { Checkbox } from "@/components/ui/checkbox";
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { PackagePlus, Pause, Puzzle, RefreshCw, ShieldCheck } from "lucide-react";
@@ -690,10 +691,9 @@ export function AddonsSettings() {
             </DialogDescription>
           </DialogHeader>
           <label className="flex items-center gap-2 text-body">
-            <input
-              type="checkbox"
+            <Checkbox
               checked={keep}
-              onChange={(e) => setKeep(e.target.checked)}
+              onCheckedChange={(checked) => setKeep(checked === true)}
             />
             Keep data for reinstall from the same source
           </label>
