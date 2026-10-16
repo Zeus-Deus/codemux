@@ -4,6 +4,7 @@ import { useChatGptStore } from "@/stores/chatgpt-store";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { AddonsSettings } from "./addons-settings";
+import { PluginsSettings } from "./plugins-settings";
 import { ProvidersSection } from "./providers-section";
 import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from "react";
 import { cn } from "@/lib/utils";
@@ -1764,6 +1765,7 @@ export function SettingsView() {
   const renderSection = () => {
     switch (activeSection) {
       case "addons": return <AddonsSettings />;
+      case "plugins": return <PluginsSettings />;
       case "account":
         return (
           <div>

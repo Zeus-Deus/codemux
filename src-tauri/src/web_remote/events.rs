@@ -41,7 +41,13 @@ impl EventHub {
     /// Subscribe `conn_id` to `event`, registering the backing desktop
     /// listener if this is the first subscriber for that event name.
     pub fn subscribe<R: Runtime>(&self, app: &AppHandle<R>, conn_id: u64, event: &str, out: OutboundTx) {
-        if event.starts_with("addon_") || event.starts_with("addon:") {
+        // Desktop-only surfaces: add-on streams, plugin file changes and the
+        // plugin chat tap never reach a web client.
+        if event.starts_with("addon_")
+            || event.starts_with("addon:")
+            || event.starts_with("plugins_")
+            || event.starts_with("plugin_")
+        {
             return;
         }
         let mut map = self.inner.lock().unwrap();

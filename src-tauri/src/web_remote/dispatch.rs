@@ -249,6 +249,10 @@ pub async fn dispatch_invoke<R: Runtime>(
         let _ = out.send(err_text(id, "REMOTE_UNSUPPORTED: add-ons require the desktop app"));
         return;
     }
+    if cmd.starts_with("plugins_") {
+        let _ = out.send(err_text(id, "REMOTE_UNSUPPORTED: plugins require the desktop app"));
+        return;
+    }
     if cmd.starts_with("web_push_") {
         let shared = app.state::<super::WebRemoteState>().shared();
         let result = match shared.connections.session_for_connection(conn_id) {
@@ -612,6 +616,23 @@ mod addons_boundary_tests {
         let router = Arc::new(ChannelRouter::default());
         let (out, mut frames) = tokio::sync::mpsc::unbounded_channel();
         for command in ["addon_inventory", "addon_subscribe", "addon_execute", "addon_future_command"] {
+            dispatch_invoke(app.handle(), &router, 7, &out, 1, command.into(), json!({"channel":"__CHANNEL__:12"})).await;
+            let Message::Text(frame) = frames.recv().await.unwrap() else { panic!("Expected rejection") };
+            assert!(frame.contains("REMOTE_UNSUPPORTED"));
+            assert!(router.routes.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod plugins_boundary_tests {
+    use super::*;
+    #[tokio::test]
+    async fn plugin_commands_are_denied_before_any_channel_is_allocated() {
+        let app = tauri::test::mock_app();
+        let router = Arc::new(ChannelRouter::default());
+        let (out, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        for command in ["plugins_list", "plugins_read_source", "plugins_set_enabled", "plugins_future_command"] {
             dispatch_invoke(app.handle(), &router, 7, &out, 1, command.into(), json!({"channel":"__CHANNEL__:12"})).await;
             let Message::Text(frame) = frames.recv().await.unwrap() else { panic!("Expected rejection") };
             assert!(frame.contains("REMOTE_UNSUPPORTED"));

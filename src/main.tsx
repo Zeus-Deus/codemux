@@ -56,6 +56,14 @@ function startDevPerformanceSweepAfterMount(): void {
     });
 }
 
+/** Plugins load after the first render and never block it. The loader is
+ *  its own chunk, so a plugin-free start pays one small dynamic import. */
+function startPluginsAfterMount(): void {
+  void import("./contrib/boot")
+    .then(({ startPlugins }) => startPlugins())
+    .catch((error) => console.error("[plugins] failed to start", error));
+}
+
 function mountApp() {
   ReactDOM.createRoot(document.getElementById("root")!).render(
     <React.StrictMode>
@@ -73,6 +81,7 @@ function mountApp() {
   );
   markStartup("react-mounted");
   startDevPerformanceSweepAfterMount();
+  startPluginsAfterMount();
   // Dismiss after React has painted its first frame
   requestAnimationFrame(() => requestAnimationFrame(() => {
     markStartup("first-paint");

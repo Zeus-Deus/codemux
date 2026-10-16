@@ -1,0 +1,178 @@
+import { useMemo, useState } from "react";
+import { FolderOpen, MoreHorizontal, RefreshCw } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { reportFailure } from "@/lib/toast";
+import { pluginsRevealRoot } from "@/contrib/ipc";
+import {
+  pluginActive,
+  setPluginEnabled,
+  usePluginsStore,
+  type PluginRecord,
+  type PluginTier,
+} from "@/contrib/plugins-store";
+import { SectionHeader, SubsectionHeader } from "./settings-primitives";
+
+const TIER_LABEL: Record<PluginTier, string> = {
+  official: "Official",
+  unverified: "Unverified",
+  local: "Local",
+};
+
+function TierBadge({ tier }: { tier: PluginTier }) {
+  return (
+    <Badge variant={tier === "official" ? "secondary" : "outline"} data-plugin-tier={tier}>
+      {TIER_LABEL[tier]}
+    </Badge>
+  );
+}
+
+function statusText(record: PluginRecord): string | null {
+  if (record.status === "loading") return "Loading…";
+  return null;
+}
+
+function PluginRow({ record }: { record: PluginRecord }) {
+  const enabled =
+    !record.inert &&
+    pluginActive(record.id, record.kind === "bundled" ? false : record.tier === "local");
+  const decisions = usePluginsStore((s) => s.decisions);
+  const on = record.id in decisions ? decisions[record.id] : enabled;
+  const paused = usePluginsStore((s) => s.paused) && record.kind !== "bundled";
+  const status = statusText(record);
+  return (
+    <article
+      className="flex items-start gap-3 px-4 py-3"
+      data-plugin-row={record.id}
+      data-plugin-status={record.status}
+    >
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <h3 className="truncate font-medium text-foreground">{record.name}</h3>
+          <TierBadge tier={record.tier} />
+          {record.version && (
+            <span className="text-caption text-muted-foreground">{record.version}</span>
+          )}
+        </div>
+        {record.description && (
+          <p className="mt-0.5 text-body-sm text-muted-foreground">{record.description}</p>
+        )}
+        {status && <p className="mt-0.5 text-body-sm text-muted-foreground">{status}</p>}
+        {record.status === "error" && record.error && (
+          <p className="mt-1 break-words text-body-sm text-destructive" role="alert">
+            {record.error}
+          </p>
+        )}
+      </div>
+      <div className="flex shrink-0 items-center gap-1">
+        {record.file && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button size="icon-sm" variant="ghost" aria-label={`${record.name} actions`}>
+                <MoreHorizontal />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                onSelect={() =>
+                  void revealItemInDir(record.file!).catch(reportFailure("Couldn’t reveal plugin"))
+                }
+              >
+                Reveal folder
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+        {!record.inert && (
+          <Switch
+            checked={on && !paused}
+            disabled={paused}
+            aria-label={`${on ? "Turn off" : "Turn on"} ${record.name}`}
+            onCheckedChange={(next) =>
+              void setPluginEnabled(record.id, next).catch(
+                reportFailure(`Couldn’t ${next ? "turn on" : "turn off"} ${record.name}`),
+              )
+            }
+          />
+        )}
+      </div>
+    </article>
+  );
+}
+
+export function PluginsSettings() {
+  const records = usePluginsStore((s) => s.records);
+  const disabledByEnv = usePluginsStore((s) => s.disabledByEnv);
+  const [reloading, setReloading] = useState(false);
+  const rows = useMemo(
+    () =>
+      Object.values(records).sort(
+        (a, b) =>
+          Number(a.kind !== "bundled") - Number(b.kind !== "bundled") ||
+          a.name.localeCompare(b.name),
+      ),
+    [records],
+  );
+
+  const reload = async () => {
+    setReloading(true);
+    try {
+      const { reloadPlugins } = await import("@/contrib/boot");
+      await reloadPlugins();
+    } catch (error) {
+      reportFailure("Couldn’t reload plugins")(error);
+    } finally {
+      setReloading(false);
+    }
+  };
+
+  return (
+    <div>
+      <SectionHeader
+        title="Plugins"
+        description="Plugins add features to Codemux. They run with full access to Codemux, your projects and your files. Each one can be turned on or off; off means none of its code runs."
+        action={
+          <>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void pluginsRevealRoot().catch(reportFailure("Couldn’t open the plugins folder"))}
+            >
+              <FolderOpen />
+              Open plugins folder
+            </Button>
+            <Button size="sm" variant="outline" disabled={reloading || disabledByEnv} onClick={() => void reload()}>
+              <RefreshCw className={reloading ? "animate-spin" : undefined} />
+              Reload plugins
+            </Button>
+          </>
+        }
+      />
+      {disabledByEnv && (
+        <p className="mb-4 rounded-md border border-hairline bg-surface-1 px-4 py-3 text-body-sm text-muted-foreground" role="status">
+          Plugins disabled by environment (CODEMUX_DISABLE_PLUGINS).
+        </p>
+      )}
+      <SubsectionHeader title="Installed" />
+      {rows.length === 0 ? (
+        <p className="text-body-sm text-muted-foreground">
+          No plugins yet. Drop a folder with a plugin.js into the plugins folder and it appears here as Local.
+        </p>
+      ) : (
+        <div className="divide-y divide-hairline rounded-md border border-hairline">
+          {rows.map((record) => (
+            <PluginRow key={record.id} record={record} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

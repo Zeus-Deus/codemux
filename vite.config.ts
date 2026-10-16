@@ -28,6 +28,7 @@ export default defineConfig({
   },
   resolve: {
     alias: {
+      "@codemux/sdk": path.resolve(__dirname, "./src/sdk/index.ts"),
       "@": path.resolve(__dirname, "./src"),
     },
   },

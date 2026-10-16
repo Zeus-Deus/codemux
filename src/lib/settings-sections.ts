@@ -26,10 +26,12 @@ import {
   CircleArrowUp,
   Workflow,
   Boxes,
+  Blocks,
 } from "lucide-react";
 
 export type Section =
   | "addons"
+  | "plugins"
   | "usage"
   | "interface"
   | "account"
@@ -142,6 +144,7 @@ export function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
     {
       label: "SYSTEM",
       items: [
+        { id: "plugins", label: "Plugins", icon: Blocks },
         { id: "addons", label: "Add-ons", icon: Puzzle },
         // Devices and Remote Access are both about reaching this machine (or
         // its sessions) from somewhere else. Always visible: the daemon is

@@ -52,6 +52,7 @@ pub mod memory;
 pub mod notifications;
 pub mod observability;
 pub mod os_input;
+pub mod plugins;
 pub mod ports;
 pub mod presets;
 pub mod project;
@@ -602,6 +603,7 @@ fn build_core_app<R: tauri::Runtime>(
         // display-coupled behavior on it.
         .manage(mode)
         .manage(commands::addons::AddonState::default())
+        .manage(plugins::commands::PluginsState::default())
         .manage(state::AppStateStore::default())
         // Live per-host reachability for the Devices page. Filled by
         // `hosts_inventory` (Unix only); on Windows every host reads as
@@ -2633,6 +2635,11 @@ fn build_core_app<R: tauri::Runtime>(
             commands::workflows::workflow_script_list,
             commands::workflows::workflow_integrate_artifact,
             commands::workflows::workflow_artifact_preview,
+            plugins::commands::plugins_root,
+            plugins::commands::plugins_list,
+            plugins::commands::plugins_read_source,
+            plugins::commands::plugins_watch,
+            plugins::commands::plugins_reveal_root,
             commands::addons::addon_inventory,
             commands::addons::addon_import_review,
             commands::addons::addon_accept_review,
