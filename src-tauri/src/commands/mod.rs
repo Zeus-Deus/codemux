@@ -1,4 +1,3 @@
-pub mod addons;
 pub mod agent_chat;
 pub mod ai;
 pub mod async_questions;

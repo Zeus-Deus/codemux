@@ -14,6 +14,7 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { reportFailure } from "@/lib/toast";
 import { pluginsRemove, pluginsRevealRoot, type InstallSource } from "@/contrib/ipc";
 import { useConfirm } from "@/components/ui/confirm-dialog";
+import { useUIStore } from "@/stores/ui-store";
 import { PluginCatalog, usePluginInstaller } from "./plugin-install";
 import {
   setPluginEnabled,
@@ -199,6 +200,8 @@ export function PluginsSettings({ onOpenSettings }: { onOpenSettings?: (pluginId
     if (!ok) return;
     try {
       await pluginsRemove(folderIdOf(record));
+      const prefix = `plugin:${folderIdOf(record)}:`;
+      useUIStore.getState().forgetRightPanelPanes((pane) => pane.startsWith(prefix));
       const { reloadPlugins } = await import("@/contrib/boot");
       await reloadPlugins();
     } catch (error) {

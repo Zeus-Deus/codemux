@@ -3,8 +3,6 @@ import { useWorkflowSettings } from "@/lib/workflows/workflow-settings";
 import { usePopupArrowNavigation } from "./use-popup-arrow-navigation";
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import { MESSAGE_DELIVERY_OPTIONS, parseMessageDelivery, STEERING_UNAVAILABLE, withMessageDelivery } from "@/lib/agent-chat/message-delivery";
-import { useAddonComposerAdapter } from "@/lib/addons/use-addon-composer-adapter";
-import { ComposerAddonAccessory, useAddonComposerActions } from "@/components/addons/composer-addons";
 import { usePluginComposerActions, usePluginComposerBinding } from "@/contrib/react/composer-plugins";
 import { Slot } from "@/contrib/react/slot";
 import { COMPOSER_ACCESSORY_AREA, COMPOSER_FOOTER_AREA } from "@/sdk/areas";
@@ -577,8 +575,6 @@ export function Composer({
   // and the + menu always work.
   const workflowButton = useWorkflowSettings().composerButton;
   const workflowsOpen = useUIStore((state) => workspaceId ? state.rightPanelTabs[workspaceId] === "workflows" : false);
-  const addonComposer = useAddonComposerAdapter(workspaceId, threadId, draft, onDraftChange);
-  const addonActions = useAddonComposerActions(addonComposer);
   const customAgentsAllowed = useAppStore(s => {
     const workspace = s.appState?.workspaces.find(w => w.workspace_id === workspaceId);
     return !workspace?.attach_only && workspace?.host_id == null;
@@ -2062,7 +2058,6 @@ export function Composer({
           disabled: readOnly || !sessionReady || remoteDisconnected,
           onSelect: () => {},
         }] : []),
-        ...addonActions,
         ...pluginActions,
       ];
       // Without a ready chat session nothing here can act on the chat,
@@ -2147,7 +2142,6 @@ export function Composer({
     }));
   }, [
     attachSubmode,
-    addonActions,
     pluginActions,
     attachFileMatches,
     attachFolderMatches,
@@ -2253,7 +2247,7 @@ export function Composer({
   const handleAttachPopupSelect = useCallback(
     (item: SlashCommandItem) => {
       if (item.disabled) return;
-      if (item.id.startsWith("addon:") || item.id.startsWith("plugin:") || item.id === "workflows:panel") { item.onSelect(); closeAttachPopup(); return; }
+      if (item.id.startsWith("plugin:") || item.id === "workflows:panel") { item.onSelect(); closeAttachPopup(); return; }
       if (item.id === "delegate:host") {
         if (readOnly || !sessionReady || remoteDisconnected) return;
         closeAttachPopup();
@@ -3784,7 +3778,6 @@ export function Composer({
               Drop images to attach
             </div>
           ) : null}
-          <ComposerAddonAccessory composerId={addonComposer.id} onClose={() => textareaRef.current?.focus()} />
           <Slot area={COMPOSER_ACCESSORY_AREA} props={{ workspaceId, threadId }} variant="block" />
           <ComposerFooter
             hermesThreadId={threadId}

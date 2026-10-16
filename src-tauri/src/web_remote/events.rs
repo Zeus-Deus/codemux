@@ -41,13 +41,9 @@ impl EventHub {
     /// Subscribe `conn_id` to `event`, registering the backing desktop
     /// listener if this is the first subscriber for that event name.
     pub fn subscribe<R: Runtime>(&self, app: &AppHandle<R>, conn_id: u64, event: &str, out: OutboundTx) {
-        // Desktop-only surfaces: add-on streams, plugin file changes and the
-        // plugin chat tap never reach a web client.
-        if event.starts_with("addon_")
-            || event.starts_with("addon:")
-            || event.starts_with("plugins_")
-            || event.starts_with("plugin_")
-        {
+        // Desktop-only surfaces: plugin file changes and the plugin chat tap
+        // never reach a web client.
+        if event.starts_with("plugins_") || event.starts_with("plugin_") {
             return;
         }
         let mut map = self.inner.lock().unwrap();
@@ -171,14 +167,14 @@ mod tests {
 }
 
 #[cfg(test)]
-mod addons_boundary_tests {
+mod plugins_boundary_tests {
     use super::*;
     #[test]
-    fn addon_streams_never_register_remote_subscribers() {
+    fn plugin_streams_never_register_remote_subscribers() {
         let app = tauri::test::mock_app();
         let hub = EventHub::default();
         let (out, _) = tokio::sync::mpsc::unbounded_channel();
-        for name in ["addon_ui", "addon:ui", "addon_future"] {
+        for name in ["plugins_changed", "plugin_agent_event", "plugin_future"] {
             hub.subscribe(app.handle(), 1, name, out.clone());
             assert_eq!(hub.subscriber_count(name), 0);
         }

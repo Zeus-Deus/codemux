@@ -1,4 +1,3 @@
-import { useAddonPlatform } from "@/lib/addons/platform";
 import { Slot } from "@/contrib/react/slot";
 import { APP_OVERLAY_AREA } from "@/sdk/areas";
 import { useChatGptStore } from "@/stores/chatgpt-store";
@@ -72,7 +71,6 @@ const CloseGuardDialog = lazy(() =>
 );
 
 function App() {
-  useAddonPlatform();
   useChatGptStatus();
   const localMode = useChatGptStore((s) => s.localMode);
   const localReady = useChatGptStore((s) => s.ready);

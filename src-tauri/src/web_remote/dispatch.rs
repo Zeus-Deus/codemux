@@ -245,10 +245,6 @@ pub async fn dispatch_invoke<R: Runtime>(
     mut args: Value,
 ) {
     // Deny before channel rewriting or native invocation.
-    if cmd.starts_with("addon_") {
-        let _ = out.send(err_text(id, "REMOTE_UNSUPPORTED: add-ons require the desktop app"));
-        return;
-    }
     if cmd.starts_with("plugins_") {
         let _ = out.send(err_text(id, "REMOTE_UNSUPPORTED: plugins require the desktop app"));
         return;
@@ -604,23 +600,6 @@ mod delegation_boundary_tests {
         }
         // Desktop's scoped dispatcher remains enabled.
         assert_eq!(crate::delegation::app::invoke(app.handle(), "delegation_grants", json!({"paneId":pane.0})).await.unwrap(), json!([]));
-    }
-}
-
-#[cfg(test)]
-mod addons_boundary_tests {
-    use super::*;
-    #[tokio::test]
-    async fn addon_commands_are_denied_before_any_channel_is_allocated() {
-        let app = tauri::test::mock_app();
-        let router = Arc::new(ChannelRouter::default());
-        let (out, mut frames) = tokio::sync::mpsc::unbounded_channel();
-        for command in ["addon_inventory", "addon_subscribe", "addon_execute", "addon_future_command"] {
-            dispatch_invoke(app.handle(), &router, 7, &out, 1, command.into(), json!({"channel":"__CHANNEL__:12"})).await;
-            let Message::Text(frame) = frames.recv().await.unwrap() else { panic!("Expected rejection") };
-            assert!(frame.contains("REMOTE_UNSUPPORTED"));
-            assert!(router.routes.lock().unwrap().is_empty());
-        }
     }
 }
 

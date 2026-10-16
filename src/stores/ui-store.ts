@@ -49,7 +49,7 @@ export type ThemeStudioRequest =
  *  opened per file, so the id carries its own payload — that keeps the
  *  open-pane list a plain, persistable string array. */
 export type RightPanelTab =
-  RightPanelCorePane | `doc:${string}` | `addon:${string}:${string}` | `plugin:${string}:${string}` | typeof RIGHT_PANEL_EMPTY;
+  RightPanelCorePane | `doc:${string}` | `plugin:${string}:${string}` | typeof RIGHT_PANEL_EMPTY;
 
 /** The deck a workspace starts with. Matches the three panes that were
  *  always-present tabs before the deck existed, so an upgrade is a no-op
@@ -248,8 +248,8 @@ interface UIStore {
   closeRightPanelPane: (workspaceId: string, pane: RightPanelTab) => void;
   /** Forget panes in every workspace, as if they had never been opened:
    *  no dismissal is recorded and an active one hands focus to its
-   *  neighbour. Used when an add-on is disabled or removed, which is the
-   *  only time its saved pane preferences go away. */
+   *  neighbour. Used when a plugin is removed, which is the only time its
+   *  saved pane preferences go away (turning it off only hides them). */
   forgetRightPanelPanes: (forget: (pane: RightPanelTab) => boolean) => void;
   /** Drag-to-reorder from the deck's tab strip. `order` is the strip's new
    *  order — which may be only the *visible* subset of the open panes,

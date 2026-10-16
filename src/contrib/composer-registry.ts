@@ -1,7 +1,7 @@
 /**
  * Mounted composers, for `host.composer`. Each Composer registers a small
  * handle while mounted; the "focused" one is whichever had focus last (or the
- * only one mounted). Adapted from the add-on composer registry.
+ * only one mounted).
  */
 export interface ComposerHandle {
   workspaceId: string | null;
@@ -39,7 +39,7 @@ export function composerFor(workspaceId: string | null, threadId: string | null)
   return null;
 }
 
-/** Same rule the add-on registry used: a new line unless the draft is empty
+/** A new line unless the draft is empty
  *  or already ends with one. */
 export function appendText(draft: string, text: string): string {
   return !text ? draft : draft + (draft && !draft.endsWith("\n") ? "\n" : "") + text;

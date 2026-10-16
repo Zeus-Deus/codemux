@@ -44,7 +44,6 @@ import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 import { createAgentConnectorMock } from "./agent-connector-mock";
 import { workflowMockHandlers } from "./workflow-mock";
 import { createCustomAcpMock } from "./custom-acp-mock";
-import { addonMockHandlers } from "./addon-mock";
 import { pluginMockHandlers } from "./plugin-mock";
 import {
   delegationScenarioFromSearch,
@@ -4407,9 +4406,7 @@ const handlers: Record<string, Handler> = {
   }),
   get_home_dir: () => MOCK_HOME_DIR,
   get_feature_flags: () => FEATURE_FLAGS,
-  // Empty by default: plugins never alter a clean core-only UI. Synthetic
-  // manager states are opt-in with `?addons=…` (see ./addon-mock).
-  ...addonMockHandlers(),
+  // Empty by default: plugins never alter a clean core-only UI.
   ...pluginMockHandlers(),
   ...workflowMockHandlers((event) => emitEvent("workflow-changed", event)),
   get_package_format: () =>
@@ -8203,14 +8200,6 @@ async function invoke(
 
   const viaPlugin = routePlugin(cmd, args);
   if (viaPlugin !== MISS) return viaPlugin;
-
-  // An add-on command resolving `null` would look like success to the
-  // manager UI. Reject the way the host rejects an unavailable operation.
-  if (cmd.startsWith("addon_"))
-    throw {
-      message: `${cmd} is unavailable in the browser preview`,
-      data: { code: "REMOTE_UNSUPPORTED" },
-    };
 
   return defaultResult(cmd);
 }

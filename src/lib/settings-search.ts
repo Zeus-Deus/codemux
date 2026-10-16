@@ -48,7 +48,7 @@ const SECTION_KEYWORDS: Partial<Record<Section, string>> = {
   browser: "web preview viewport cookies",
   git: "branch commit merge",
   source_control: "github gitlab forgejo gh glab pull request hosting",
-  addons: "extensions plugins add-ons",
+  plugins: "extensions add-ons addons install catalog github",
   hosts: "devices machines hosts ssh cloud remote",
   remote_access: "phone mobile pairing qr web browser access",
   updates: "update all upgrade version providers agents cli claude codex mise omarchy npm devices",

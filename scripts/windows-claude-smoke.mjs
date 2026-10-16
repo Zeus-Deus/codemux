@@ -137,7 +137,7 @@ try {
   // copy so GUI checks prove the installed resource actually works.
   await rename(stagedSidecar, `${stagedSidecar}.smoke-backup`);
   hiddenSidecar = `${stagedSidecar}.smoke-backup`;
-  await run('powershell.exe', ['-NoProfile', '-File', 'scripts/addons/windows-webview-debug.ps1', '-Mode', 'enable']);
+  await run('powershell.exe', ['-NoProfile', '-File', 'scripts/windows-webview-debug.ps1', '-Mode', 'enable']);
   debugPolicy = true;
   const guiCases = [['stale', staleEnv, !expectPathFailure], ['repaired', repairedEnv, true]];
   if (!expectPathFailure) guiCases.push(['installed-after-startup', staleEnv, false]);
@@ -214,6 +214,6 @@ try {
   for (const child of owned) await stop(child);
   if (hiddenCli) await rename(hiddenCli, install.cli);
   if (hiddenSidecar) await rename(hiddenSidecar, stagedSidecar);
-  if (debugPolicy) await run('powershell.exe', ['-NoProfile', '-File', 'scripts/addons/windows-webview-debug.ps1', '-Mode', 'disable']);
+  if (debugPolicy) await run('powershell.exe', ['-NoProfile', '-File', 'scripts/windows-webview-debug.ps1', '-Mode', 'disable']);
   await writeFile(join(evidenceDir, 'smoke.json'), JSON.stringify(evidence, null, 2));
 }

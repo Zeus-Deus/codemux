@@ -1,7 +1,4 @@
 import { Kbd } from "@/components/ui/kbd";
-import { useAddonsStore } from "@/stores/addons-store";
-import { addonEnabled } from "@/lib/addons/types";
-import { executeAddon } from "@/lib/addons/platform";
 import { useContributions } from "@/contrib/react/use-contributions";
 import { PALETTE_AREA } from "@/sdk/areas";
 import type { PaletteCommandData } from "@/sdk/host";
@@ -218,7 +215,6 @@ interface PaletteCommand {
   workspaceScoped?: boolean;
   /** Hidden where recent chats can't be imported (see `useCanImportLocalSessions`). */
   requiresChatImport?: boolean;
-  addon?: boolean;
   /** Contributed by a plugin; listed under "Plugins". */
   plugin?: boolean;
 }
@@ -733,39 +729,6 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
 
   // ── Command rows ───────────────────────────────────────────────────────
   const canImportChats = useCanImportLocalSessions();
-  const addonInstalled = useAddonsStore(s => s.installed);
-  const addonsPaused = useAddonsStore(s => s.paused);
-  // Add-on commands are attributed ("title · add-on") and never get a
-  // keybinding. They are absent in a browser client and while the active
-  // workspace is remote, where add-ons cannot act on it.
-  const addonCommands = useMemo<PaletteCommand[]>(
-    () =>
-      addonsPaused ||
-      isRemoteClient() ||
-      activeWorkspace?.host_id ||
-      activeWorkspace?.remote_cwd ||
-      activeWorkspace?.attach_only
-        ? []
-        : addonInstalled.filter(addonEnabled).flatMap(({ manifest }) =>
-            manifest.contributes.commands.map((command) => ({
-              id: `addon:${manifest.id}:${command.id}`,
-              label: `${command.title} · ${manifest.name}`,
-              icon: Puzzle,
-              requiresWorkspace: command.requiresWorkspace,
-              addon: true,
-              run: () => {
-                void executeAddon(manifest.id, command.id, "commands");
-              },
-            })),
-          ),
-    [
-      addonInstalled,
-      addonsPaused,
-      activeWorkspace?.host_id,
-      activeWorkspace?.remote_cwd,
-      activeWorkspace?.attach_only,
-    ],
-  );
   // Plugin commands: an empty area (no plugin enabled) is the frozen empty
   // array, so this memo yields [] and the palette is unchanged.
   const pluginContributions = useContributions(PALETTE_AREA);
@@ -817,7 +780,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   );
   const commandRows = useMemo<CommandRow[]>(
     () =>
-      [...PALETTE_COMMANDS, ...addonCommands, ...pluginCommands]
+      [...PALETTE_COMMANDS, ...pluginCommands]
         .filter((c) => !c.requiresWorkspace || activeWorkspace !== null)
         .filter((c) => !c.requiresChatImport || canImportChats)
         .filter((c) => !c.available || c.available(commandContext))
@@ -827,7 +790,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           command,
           keys: command.actionId ? getKeysForAction(command.actionId) : "",
         })),
-    [activeWorkspace, getKeysForAction, addonCommands, pluginCommands, commandContext, canImportChats],
+    [activeWorkspace, getKeysForAction, pluginCommands, commandContext, canImportChats],
   );
 
   // Per-viewer convenience: what this person ran lately, offered first in the
@@ -1058,8 +1021,8 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     openedForThemesRef.current &&
     rawQuery === "theme" &&
     matchedThemes.length + matchedThemeStudio.length > 0;
-  // Workspace and add-on commands rank with the core ones but render in their
-  // own "This workspace" and "Add-ons" groups, so each header counts only its
+  // Workspace and plugin commands rank with the core ones but render in their
+  // own "This workspace" and "Plugins" groups, so each header counts only its
   // own rows.
   const matchedWorkspaceCommands = useMemo(
     () => matchedCommands.filter((row) => row.command.workspaceScoped),
@@ -1068,12 +1031,8 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   const matchedCoreCommands = useMemo(
     () =>
       matchedCommands.filter(
-        (row) => !row.command.addon && !row.command.plugin && !row.command.workspaceScoped,
+        (row) => !row.command.plugin && !row.command.workspaceScoped,
       ),
-    [matchedCommands],
-  );
-  const matchedAddonCommands = useMemo(
-    () => matchedCommands.filter((row) => row.command.addon),
     [matchedCommands],
   );
   const matchedPluginCommands = useMemo(
@@ -1470,21 +1429,6 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           {settingsRows.map((row) => (
             <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
           ))}
-          {matchedAddonCommands.length > 0 && (
-            <GroupHeader
-              label="Add-ons"
-              count={`${matchedAddonCommands.length}`}
-              first={
-                nothingBeforeCommands &&
-                matchedWorkspaceCommands.length === 0 &&
-                matchedCoreCommands.length === 0 &&
-                settingsRows.length === 0
-              }
-            />
-          )}
-          {matchedAddonCommands.map((row) => (
-            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
-          ))}
           {matchedPluginCommands.length > 0 && (
             <GroupHeader
               label="Plugins"
@@ -1493,8 +1437,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
                 nothingBeforeCommands &&
                 matchedWorkspaceCommands.length === 0 &&
                 matchedCoreCommands.length === 0 &&
-                settingsRows.length === 0 &&
-                matchedAddonCommands.length === 0
+                settingsRows.length === 0
               }
             />
           )}

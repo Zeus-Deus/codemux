@@ -6,7 +6,7 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
 # GitHub's elevated runner ignores WEBVIEW2_* environment overrides. Use the
 # documented machine override for this executable only; never change a value
 # already present on the runner. No product setting or binary is modified.
-# The acceptance run opens an add-on link, which starts the runner's own
+# The acceptance run can open a link, which starts the runner's own
 # browser in front of the app. Chromium's switch for tests keeps a covered
 # window visible to its page, so frames and screenshots still come from the
 # app. It is a plain switch: it cannot replace the app's --disable-features.

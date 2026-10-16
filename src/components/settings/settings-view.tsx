@@ -3,7 +3,6 @@ import { MobileInstall } from "@/components/mobile/mobile-install";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
-import { AddonsSettings } from "./addons-settings";
 import { PluginSettingsPageView, PluginsSettings, usePluginSettingsPages } from "./plugins-settings";
 import { Slot } from "@/contrib/react/slot";
 import { APPEARANCE_EXTRA_AREA } from "@/sdk/areas";
@@ -1788,7 +1787,6 @@ export function SettingsView() {
   const renderSection = () => {
     if (pluginSettingsId) return <PluginSettingsPageView pluginId={pluginSettingsId} />;
     switch (activeSection) {
-      case "addons": return <AddonsSettings />;
       case "plugins": return <PluginsSettings onOpenSettings={(id) => setActiveSection(`plugin:${id}`)} />;
       case "account":
         return (

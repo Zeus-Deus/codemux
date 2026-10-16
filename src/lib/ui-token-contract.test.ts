@@ -194,10 +194,8 @@ const CATEGORIES: Category[] = [
     scan: (contents) => [contents],
     // SectionHeader itself is the one place that styles the title.
     path: /^src\/components\/settings\/(?!settings-primitives\.tsx)/,
-    budget: 2,
-    why:
-      "the Usage page (usage-section.tsx, owned by an open PR) and an " +
-      "add-on's own detail page title (addon-detail.tsx)",
+    budget: 1,
+    why: "the Usage page (usage-section.tsx, owned by an open PR)",
   },
   {
     label: "per-icon strokeWidth (one base-layer rule owns icon weight)",

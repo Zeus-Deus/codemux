@@ -86,16 +86,16 @@ import type { RightPanelTab } from "@/stores/ui-store";
 import { TabDropIndicator } from "../tab-drop-indicator";
 import { middleClickCloseProps } from "../tab-strip-actions";
 import { PaneActionButton } from "./pane-actions";
-import { isAddonPane, isPluginPane, PANE_REGISTRY, type PaneMeta } from "./pane-registry";
+import { isPluginPane, PANE_REGISTRY, type PaneMeta } from "./pane-registry";
 import type { SurfaceAction } from "./surface-actions";
 import { PanelHeader } from "@/components/ui/panel-header";
 
 export interface DeckTab {
   id: RightPanelTab;
   label: string;
-  /** Who contributed the pane, for panes that are not CodeMux's own (an
-   *  add-on's name). Named in the tooltip and the accessible name, so an
-   *  add-on titled "Changes" never passes for the core pane. */
+  /** Who contributed the pane, for panes that are not CodeMux's own (a
+   *  plugin's name). Named in the tooltip and the accessible name, so a
+   *  plugin pane titled "Changes" never passes for the core pane. */
   attribution?: string;
   icon: LucideIcon;
   /** Small mono badge — a count today ("12", "3/4"). */
@@ -306,10 +306,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
 }: PaneTabStripProps) {
   const remoteClient = isRemoteClient();
   const reserve = inTitlebar ? topRightReserve(remoteClient, true) : 0;
-  const coreSurfaces = surfaces.filter(
-    (surface) => !isAddonPane(surface.id) && !isPluginPane(surface.id),
-  );
-  const addonSurfaces = surfaces.filter((surface) => isAddonPane(surface.id));
+  const coreSurfaces = surfaces.filter((surface) => !isPluginPane(surface.id));
   const pluginSurfaces = surfaces.filter((surface) => isPluginPane(surface.id));
 
   const tabIds = tabs.map((tab) => tab.id);
@@ -430,31 +427,8 @@ export const PaneTabStrip = memo(function PaneTabStrip({
               {surface.label}
             </DropdownMenuItem>
           ))}
-          {/* Add-on panels get their own section, each attributed to its
-              add-on, so none can pass for a core pane. Absent without any. */}
-          {addonSurfaces.length > 0 && (
-            <>
-              <DropdownMenuSeparator className="mx-1 my-[5px]" />
-              <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
-                ADD-ONS
-              </DropdownMenuLabel>
-              {addonSurfaces.map((surface) => (
-                <DropdownMenuItem
-                  key={surface.id}
-                  aria-label={`${surface.label} — ${surface.description}`}
-                  className="h-[30px] rounded-md px-[9px] text-body font-medium"
-                  onClick={surface.onOpen}
-                >
-                  <surface.icon className="size-[14px]" />
-                  <span className="min-w-0 truncate">{surface.label}</span>
-                  <span className="ml-auto min-w-0 truncate pl-2 text-label font-normal text-muted-foreground">
-                    {surface.description}
-                  </span>
-                </DropdownMenuItem>
-              ))}
-            </>
-          )}
-          {/* Plugin panes, attributed like add-on panels. Absent without any. */}
+          {/* Plugin panes get their own section, each attributed to its plugin,
+              so none can pass for a core pane. Absent without any. */}
           {pluginSurfaces.length > 0 && (
             <>
               <DropdownMenuSeparator className="mx-1 my-[5px]" />
