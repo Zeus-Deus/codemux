@@ -26,7 +26,7 @@ import {
   type InstallPreview,
   type InstallSource,
 } from "@/contrib/ipc";
-import { takeDecisionOverride, usePluginsStore, type PluginTier } from "@/contrib/plugins-store";
+import { beginInstallationChange, usePluginsStore, type PluginTier } from "@/contrib/plugins-store";
 import { SubsectionHeader } from "./settings-primitives";
 
 export const FULL_ACCESS_WARNING =
@@ -68,15 +68,16 @@ export function usePluginInstaller() {
     async (source: InstallSource, preview: InstallPreview, enable: boolean) => {
       setStage({ kind: "installing", source, preview, enable });
       try {
-        // A fresh install is a new installation: a failed toggle from a
-        // removed copy with this id must not decide whether it runs.
-        const restore = preview.replaces ? () => {} : takeDecisionOverride(preview.id);
+        // A fresh install is a new installation: nothing a removed copy with
+        // this id chose (or was still saving) may decide whether it runs.
+        const change = preview.replaces ? null : await beginInstallationChange(preview.id);
         try {
           await pluginsInstall(source, preview.sha, enable);
         } catch (error) {
-          restore();
+          change?.rollback();
           throw error;
         }
+        change?.commit();
         const { reloadPlugins } = await import("@/contrib/boot");
         await reloadPlugins();
         setStage({ kind: "closed" });

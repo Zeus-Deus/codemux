@@ -18,7 +18,7 @@ import { useUIStore } from "@/stores/ui-store";
 import { PluginCatalog, usePluginInstaller } from "./plugin-install";
 import {
   setPluginEnabled,
-  takeDecisionOverride,
+  beginInstallationChange,
   usePluginsStore,
   type PluginRecord,
   type PluginTier,
@@ -106,6 +106,7 @@ function PluginRow({ record, actions }: { record: PluginRecord; actions: RowActi
     (usePluginsStore((s) => s.paused) && record.kind !== "bundled");
   const status = statusText(record);
   const saveError = usePluginsStore((s) => s.unsavedDecisions[record.id] ?? null);
+  const changing = usePluginsStore((s) => !!s.changing[record.id]);
   return (
     <article
       className="flex items-start gap-3 px-4 py-3"
@@ -174,8 +175,8 @@ function PluginRow({ record, actions }: { record: PluginRecord; actions: RowActi
         )}
         {!record.inert && (
           <Switch
-            checked={on && !paused}
-            disabled={paused}
+            checked={on && !paused && !changing}
+            disabled={paused || changing}
             aria-label={`${on ? "Turn off" : "Turn on"} ${record.name}`}
             onCheckedChange={(next) =>
               void setPluginEnabled(record.id, next).catch(
@@ -206,13 +207,17 @@ export function PluginsSettings({ onOpenSettings }: { onOpenSettings?: (pluginId
     });
     if (!ok) return;
     try {
-      const restore = takeDecisionOverride(folderIdOf(record));
+      const change = await beginInstallationChange(folderIdOf(record));
       try {
         await pluginsRemove(folderIdOf(record));
       } catch (error) {
-        restore();
+        change.rollback();
+        // The folder stays: bring the live state back in line with its switch.
+        const { reloadPlugins } = await import("@/contrib/boot");
+        void reloadPlugins();
         throw error;
       }
+      change.commit();
       const prefix = `plugin:${folderIdOf(record)}:`;
       useUIStore.getState().forgetRightPanelPanes((pane) => pane.startsWith(prefix));
       const { reloadPlugins } = await import("@/contrib/boot");

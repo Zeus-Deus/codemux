@@ -48,6 +48,8 @@ interface PluginsState {
   rootPath: string | null;
   /** Toggles not yet saved natively: null while saving, else the save error. */
   unsavedDecisions: Record<string, string | null>;
+  /** Plugins whose installation is being removed or replaced right now. */
+  changing: Record<string, true>;
 }
 
 export const usePluginsStore = create<PluginsState>()(() => ({
@@ -59,13 +61,16 @@ export const usePluginsStore = create<PluginsState>()(() => ({
   pausedReason: null,
   rootPath: null,
   unsavedDecisions: {},
+  changing: {},
 }));
 
 const handles = new Map<string, PluginHandle>();
 
 /** The user's choice if any, else the plugin's own default. */
 export function pluginActive(id: string, defaultEnabled: boolean): boolean {
-  const { decisions } = usePluginsStore.getState();
+  const { decisions, changing } = usePluginsStore.getState();
+  // Mid remove/fresh install: nothing of it may run until that settles.
+  if (changing[id]) return false;
   return id in decisions ? decisions[id] : defaultEnabled;
 }
 
@@ -102,28 +107,50 @@ let attempts = 0;
 const writes = new Map<string, Promise<void>>();
 
 /**
- * Drop the session override for `id` before an install or remove replaces
- * its installation: a failed choice belongs to the installation it was made
- * for, never to a reinstall sharing its id. Returns `restore`, for when the
- * native operation fails and the old installation stays.
+ * Remove, or a fresh install, replaces the installation behind `id`. While
+ * that native operation runs:
+ * - the plugin can't be activated (a rescan in the window, e.g. a file save
+ *   or Reload plugins, sees it as off), and its switch can't be toggled;
+ * - every save already queued for it has landed BEFORE this resolves, so no
+ *   save of the old installation can land after the native step.
+ * The old installation's choices (including a failed "off") stay
+ * authoritative until `commit()`, which drops them atomically once the
+ * native step succeeded. `rollback()` keeps them; rescan afterwards so the
+ * live state matches the switch again.
  */
-export function takeDecisionOverride(id: string): () => void {
-  const had = unsaved.has(id);
-  const value = unsaved.get(id);
-  const error = usePluginsStore.getState().unsavedDecisions[id];
-  unsaved.delete(id);
-  latestAttempt.set(id, ++attempts); // in-flight saves no longer own it
-  usePluginsStore.setState((s) => {
-    const { [id]: _gone, ...rest } = s.unsavedDecisions;
-    return { unsavedDecisions: rest };
-  });
-  return () => {
-    if (!had || unsaved.has(id)) return;
-    unsaved.set(id, value!);
-    usePluginsStore.setState((s) => ({
-      decisions: { ...s.decisions, [id]: value! },
-      unsavedDecisions: { ...s.unsavedDecisions, [id]: error ?? null },
-    }));
+export async function beginInstallationChange(
+  id: string,
+): Promise<{ commit: () => void; rollback: () => void }> {
+  usePluginsStore.setState((s) => ({ changing: { ...s.changing, [id]: true } }));
+  // Drain: wait until no save for this plugin is queued or in flight.
+  for (let chain = writes.get(id); chain; chain = writes.get(id)) {
+    await chain.catch(() => undefined);
+    if (writes.get(id) === chain) writes.delete(id);
+  }
+  const end = () =>
+    usePluginsStore.setState((s) => {
+      const { [id]: _done, ...rest } = s.changing;
+      return { changing: rest };
+    });
+  let settled = false;
+  return {
+    commit: () => {
+      if (settled) return;
+      settled = true;
+      unsaved.delete(id);
+      latestAttempt.delete(id);
+      usePluginsStore.setState((s) => {
+        const { [id]: _gone, ...rest } = s.unsavedDecisions;
+        const { [id]: _old, ...decisions } = s.decisions;
+        return { unsavedDecisions: rest, decisions };
+      });
+      end();
+    },
+    rollback: () => {
+      if (settled) return;
+      settled = true;
+      end();
+    },
   };
 }
 
@@ -153,6 +180,8 @@ export function setDecisionPersistence(fn: (id: string, enabled: boolean) => Pro
  * the SDK exposes no verb for it, so one plugin can't switch another.
  */
 export async function setPluginEnabled(id: string, enabled: boolean): Promise<void> {
+  // Its installation is being replaced or removed; the switch is disabled.
+  if (usePluginsStore.getState().changing[id]) return;
   usePluginsStore.setState((s) => ({
     decisions: { ...s.decisions, [id]: enabled },
     unsavedDecisions: { ...s.unsavedDecisions, [id]: null },
@@ -223,5 +252,6 @@ export function resetPluginsStoreForTests(): void {
     pausedReason: null,
     rootPath: null,
     unsavedDecisions: {},
+    changing: {},
   });
 }

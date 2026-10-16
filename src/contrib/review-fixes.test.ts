@@ -322,18 +322,63 @@ describe("decisions after install and remove", () => {
     expect(invoke).not.toHaveBeenCalledWith("plugins_read_source", expect.anything());
   });
 
+  it("queued saves of a removed copy land before the reinstall, never after", async () => {
+    // Native registry fake: a write is an upsert, remove forgets the row.
+    const native: Record<string, boolean> = { hello: true };
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    let first = true;
+    const { setDecisionPersistence, beginInstallationChange } = await import("./plugins-store");
+    setDecisionPersistence(async (id, on) => {
+      if (first) {
+        first = false;
+        await new Promise<void>((r) => (releaseFirst = r));
+      }
+      native[id] = on;
+      order.push(`save:${on}`);
+    });
+    usePluginsStore.setState({ decisionsLoaded: true, decisions: { hello: true } });
+    await setPluginEnabled("hello", false); // pending
+    await setPluginEnabled("hello", true); // queued behind it
+    // Remove + plain Install: the change waits for the queue to drain first.
+    const begun = beginInstallationChange("hello");
+    let ready = false;
+    void begun.then(() => (ready = true));
+    await tick();
+    expect(ready).toBe(false);
+    releaseFirst();
+    const change = await begun;
+    expect(order).toEqual(["save:false", "save:true"]);
+    // Native remove + fresh install (off) happen only now.
+    delete native.hello;
+    native.hello = false;
+    order.push("install:false");
+    change.commit();
+    await tick();
+    expect(order).toEqual(["save:false", "save:true", "install:false"]);
+    expect(native.hello).toBe(false);
+    invoke.mockImplementation(async (cmd: unknown) => {
+      if (cmd === "plugins_get_decisions") return { ...native };
+      if (cmd === "plugins_list") return [entry];
+      if (cmd === "plugins_read_source") throw new Error("must not read the reinstall");
+      return undefined;
+    });
+    await scanDiskPlugins(true);
+    expect(pluginActive("hello", false)).toBe(false);
+    expect(invoke).not.toHaveBeenCalledWith("plugins_read_source", expect.anything());
+  });
+
   it("a failed enable does not turn on a reinstall left off", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const { setDecisionPersistence, takeDecisionOverride } = await import("./plugins-store");
+    const { setDecisionPersistence, beginInstallationChange } = await import("./plugins-store");
     setDecisionPersistence(async () => {
       throw new Error("disk full");
     });
     usePluginsStore.setState({ decisionsLoaded: true, decisions: { hello: false } });
     await setPluginEnabled("hello", true);
     await vi.waitFor(() => expect(usePluginsStore.getState().unsavedDecisions.hello).toBe("disk full"));
-    // Remove, then a plain Install: the dialog and the row drop the override
-    // before the native operation; natively the decision is now off.
-    takeDecisionOverride("hello");
+    const change = await beginInstallationChange("hello");
+    change.commit(); // remove + plain Install succeeded; natively it's off
     invoke.mockImplementation(async (cmd: unknown) => {
       if (cmd === "plugins_get_decisions") return { hello: false };
       if (cmd === "plugins_list") return [entry];
@@ -346,25 +391,48 @@ describe("decisions after install and remove", () => {
     expect(usePluginsStore.getState().unsavedDecisions.hello).toBeUndefined();
   });
 
-  it("a failed remove keeps the existing installation's failed choice", async () => {
+  it("a failed 'off' holds through a pending remove, a rescan in the window and a rejected remove", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const { setDecisionPersistence, takeDecisionOverride } = await import("./plugins-store");
+    const { setDecisionPersistence, beginInstallationChange } = await import("./plugins-store");
     setDecisionPersistence(async () => {
       throw new Error("disk full");
     });
     usePluginsStore.setState({ decisionsLoaded: true, decisions: { hello: true } });
     await setPluginEnabled("hello", false);
     await vi.waitFor(() => expect(usePluginsStore.getState().unsavedDecisions.hello).toBe("disk full"));
-    const restore = takeDecisionOverride("hello");
-    restore();
     invoke.mockImplementation(async (cmd: unknown) => {
-      if (cmd === "plugins_get_decisions") return { hello: true };
-      if (cmd === "plugins_list") return [entry];
+      if (cmd === "plugins_get_decisions") return { hello: true }; // native still on
+      if (cmd === "plugins_list") return [entry]; // the folder is still there
       if (cmd === "plugins_read_source") throw new Error("must stay off");
       return undefined;
     });
+    const change = await beginInstallationChange("hello");
+    // A save event or Reload plugins while the remove is pending:
     await scanDiskPlugins(true);
     expect(pluginActive("hello", false)).toBe(false);
+    // The remove is rejected; the folder stays, and so does the failed "off".
+    change.rollback();
+    await scanDiskPlugins(true);
+    expect(pluginActive("hello", false)).toBe(false);
+    expect(usePluginsStore.getState().unsavedDecisions.hello).toBe("disk full");
+    expect(invoke).not.toHaveBeenCalledWith("plugins_read_source", expect.anything());
+  });
+
+  it("a plugin being removed can't be switched on, and a rescan meanwhile keeps it off", async () => {
+    const { beginInstallationChange } = await import("./plugins-store");
+    usePluginsStore.setState({ decisionsLoaded: true, decisions: { hello: false } });
+    const change = await beginInstallationChange("hello");
+    await setPluginEnabled("hello", true);
+    expect(usePluginsStore.getState().decisions.hello).toBe(false);
+    invoke.mockImplementation(async (cmd: unknown) => {
+      if (cmd === "plugins_get_decisions") return { hello: true };
+      if (cmd === "plugins_list") return [entry];
+      if (cmd === "plugins_read_source") throw new Error("must not run mid-remove");
+      return undefined;
+    });
+    await scanDiskPlugins(true);
+    expect(invoke).not.toHaveBeenCalledWith("plugins_read_source", expect.anything());
+    change.rollback();
   });
 
   it("a toggle still being saved wins over the native copy", async () => {
