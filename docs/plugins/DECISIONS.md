@@ -23,3 +23,4 @@ One line each: decision — why — how to revert.
 - Plugin themes are namespaced `plugin:<pluginId>:<id>` and validated with the custom-theme parser — they can never shadow a built-in or user theme — drop the prefix in `contrib/themes.ts`.
 - `host.openRightPane` selects the pane for the active workspace and is a no-op on a chat draft (no right panel there) — switching views behind the user's back is worse than nothing — open the workspace view first in `sdk/host.ts`.
 - The title-bar slot sits after the whole action island so it renders in both GUI and legacy chrome — the first placement only existed in GUI chrome — move it back inside `titlebar-utility-actions`.
+- The milestone 4 backdrop test plugin is a disk plugin kept at `docs/plugins/examples/backdrop-test/plugin.js`, not a bundled one — it proves the third-party path (plain ESM, blob import, live install) that the ASCII backdrop plugin will use — move it under `src/plugins/` with a `meta.ts` to bundle it.
