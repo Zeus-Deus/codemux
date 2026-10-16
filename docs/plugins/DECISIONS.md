@@ -11,3 +11,4 @@ One line each: decision — why — how to revert.
 - `minCodemux` is compared as three numeric dotted parts; pre-release tags are ignored — enough for a gate, no semver dependency — swap `satisfiesMinVersion` for a semver library.
 - Plugin errors toast once per failed load/registration and stay on the plugin's row until the next good load — attribution without toast spam on every save — n/a.
 - Windows (WebView2) was not tested for blob-module imports in milestone 1: no Windows runner or VM was available — record only; test on Windows before release.
+- One pull request, updated per milestone, kept as a draft until milestone 7 — milestones build on each other and this repo's CI only runs for PRs that target main, so stacked PRs would show no checks — split by cherry-picking each milestone's commits onto its own branch.
