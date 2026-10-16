@@ -1,4 +1,6 @@
 import { Sidebar, SidebarContent, SidebarFooter, SidebarRail } from "@/components/ui/sidebar";
+import { Slot } from "@/contrib/react/slot";
+import { SIDEBAR_SECTION_AREA } from "@/sdk/areas";
 import { SidebarActionRow } from "./sidebar-action-row";
 import { SidebarWorkspaceList } from "./sidebar-workspace-list";
 import { SidebarSetupBanner } from "./sidebar-setup-banner";
@@ -24,6 +26,7 @@ export function AppSidebar() {
           rail can still scroll vertically when there are many projects. */}
       <SidebarContent className="group-data-[collapsible=icon]:overflow-auto">
         <SidebarWorkspaceList />
+        <Slot area={SIDEBAR_SECTION_AREA} variant="block" />
       </SidebarContent>
       <SidebarSetupBanner />
       <SidebarFooter className="gap-0 p-0">

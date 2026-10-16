@@ -1,4 +1,6 @@
 import { useAddonPlatform } from "@/lib/addons/platform";
+import { Slot } from "@/contrib/react/slot";
+import { APP_OVERLAY_AREA } from "@/sdk/areas";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { useChatGptStatus } from "@/hooks/use-chatgpt-status";
 import { ChatGptWelcome } from "@/components/auth/chatgpt-welcome";
@@ -261,6 +263,8 @@ function App() {
       {/* App-level so the size shortcuts answer on Settings and the other
           full-screen pages too, which replace the shell. */}
       <InterfaceSizeHud />
+      {/* Plugin floating UI and headless components. Nothing without one. */}
+      <Slot area={APP_OVERLAY_AREA} variant="silent" />
       <Toaster />
     </>
   );

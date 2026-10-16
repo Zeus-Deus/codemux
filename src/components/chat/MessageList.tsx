@@ -1,4 +1,8 @@
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
+import { useContributions } from "@/contrib/react/use-contributions";
+import { TOOL_RENDERER_AREA } from "@/sdk/areas";
+import { ContribBoundary, ContribRender } from "@/contrib/react/boundary";
+import { findPluginToolRenderer } from "@/contrib/tool-renderers";
 import { useMobileHistory } from "@/components/mobile/mobile-history";
 import {
   ArrowDown,
@@ -1286,6 +1290,8 @@ export const MessageList = memo(function MessageList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cancelFollowForUserNavigation, messageJumpRequest]);
 
+  // The same frozen [] while no plugin renders tools, so rows don't re-render.
+  const pluginToolRenderers = useContributions(TOOL_RENDERER_AREA);
   const renderItem = useCallback(
     ({ item: slot }: { item: TranscriptSlot }) => (
       <div className={CHAT_COLUMN}>
@@ -1316,6 +1322,7 @@ export const MessageList = memo(function MessageList({
           revertingTurnIndex={revertingTurnIndex}
           onToggleTurnFold={toggleTurnFold}
           onKeepWorkLogOpen={keepWorkLogOpen}
+          pluginToolRenderers={pluginToolRenderers}
         />
       </div>
     ),
@@ -1337,6 +1344,7 @@ export const MessageList = memo(function MessageList({
       turnCheckpointByNonce,
       workspaceId,
       cwd,
+      pluginToolRenderers,
     ],
   );
 
@@ -1985,7 +1993,15 @@ function renderAssistantBody(
       );
     case "reasoning":
       return <ReasoningBlock item={item} />;
-    case "tool_call":
+    case "tool_call": {
+      const pluginRenderer = findPluginToolRenderer(item.tool_name);
+      if (pluginRenderer) {
+        return (
+          <ContribBoundary id={pluginRenderer.id} variant="block">
+            <ContribRender render={pluginRenderer.render} props={{ call: item }} />
+          </ContribBoundary>
+        );
+      }
       return isTaskSummaryTool(item) ? (
         <TaskSummaryCard item={item} workspaceId={handlers.workspaceId} />
       ) : isInlineHtmlRender(item) ? (
@@ -1998,6 +2014,7 @@ function renderAssistantBody(
           onDecide={handlers.handleDecide}
         />
       );
+    }
     case "permission_request":
       switch (item.request_kind) {
         case "plan":
@@ -2213,7 +2230,11 @@ function SlotRow({
   revertingTurnIndex,
   onToggleTurnFold,
   onKeepWorkLogOpen,
+  pluginToolRenderers: _pluginToolRenderers,
 }: {
+  /** Snapshot of `transcript.toolRenderer`; a new value re-renders rows so
+   *  turning a renderer plugin on or off updates mounted tool cards. */
+  pluginToolRenderers?: readonly unknown[];
   slot: TranscriptSlot;
   approval: PermissionRequestItem | null;
   subagentName: string | null;

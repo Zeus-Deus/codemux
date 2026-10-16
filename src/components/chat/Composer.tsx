@@ -5,6 +5,9 @@ import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import { MESSAGE_DELIVERY_OPTIONS, parseMessageDelivery, STEERING_UNAVAILABLE, withMessageDelivery } from "@/lib/agent-chat/message-delivery";
 import { useAddonComposerAdapter } from "@/lib/addons/use-addon-composer-adapter";
 import { ComposerAddonAccessory, useAddonComposerActions } from "@/components/addons/composer-addons";
+import { usePluginComposerActions, usePluginComposerBinding } from "@/contrib/react/composer-plugins";
+import { Slot } from "@/contrib/react/slot";
+import { COMPOSER_ACCESSORY_AREA, COMPOSER_FOOTER_AREA } from "@/sdk/areas";
 import {
   BookOpen,
   Bug,
@@ -592,6 +595,8 @@ export function Composer({
   // backend (claude/codex/…) — a different axis entirely.
   const scProvider = resolveProvider(providerKind);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const pluginComposer = usePluginComposerBinding(workspaceId, threadId, draft, onDraftChange, textareaRef);
+  const pluginActions = usePluginComposerActions(pluginComposer);
   // Mirror layer that paints the colored highlights behind the
   // transparent textarea. The textarea owns scroll position; the
   // mirror's `scrollTop` is slaved to it on every textarea scroll so
@@ -2058,6 +2063,7 @@ export function Composer({
           onSelect: () => {},
         }] : []),
         ...addonActions,
+        ...pluginActions,
       ];
       // Without a ready chat session nothing here can act on the chat,
       // but the workflows panel is workspace navigation and still works.
@@ -2142,6 +2148,7 @@ export function Composer({
   }, [
     attachSubmode,
     addonActions,
+    pluginActions,
     attachFileMatches,
     attachFolderMatches,
     attachSessionMatches,
@@ -2246,7 +2253,7 @@ export function Composer({
   const handleAttachPopupSelect = useCallback(
     (item: SlashCommandItem) => {
       if (item.disabled) return;
-      if (item.id.startsWith("addon:") || item.id === "workflows:panel") { item.onSelect(); closeAttachPopup(); return; }
+      if (item.id.startsWith("addon:") || item.id.startsWith("plugin:") || item.id === "workflows:panel") { item.onSelect(); closeAttachPopup(); return; }
       if (item.id === "delegate:host") {
         if (readOnly || !sessionReady || remoteDisconnected) return;
         closeAttachPopup();
@@ -2813,10 +2820,12 @@ export function Composer({
   const footerLadder = composerFooterLadder(footerFit.level);
 
   const [focusWithin, setFocusWithin] = useState(false);
+  const markPluginComposerFocused = pluginComposer.markFocused;
   const handleWrapperFocus = useCallback(() => {
     setFocusWithin(true);
     setRestingFocus(false);
-  }, []);
+    markPluginComposerFocused();
+  }, [markPluginComposerFocused]);
   const handleWrapperBlur = useCallback(
     (e: React.FocusEvent<HTMLDivElement>) => {
       const next = e.relatedTarget as Node | null;
@@ -3776,6 +3785,7 @@ export function Composer({
             </div>
           ) : null}
           <ComposerAddonAccessory composerId={addonComposer.id} onClose={() => textareaRef.current?.focus()} />
+          <Slot area={COMPOSER_ACCESSORY_AREA} props={{ workspaceId, threadId }} variant="block" />
           <ComposerFooter
             hermesThreadId={threadId}
             hermesProjectPath={cwd}
@@ -3894,6 +3904,7 @@ export function Composer({
               />,
             )
           : (belowComposerSlot ?? null)}
+        <Slot area={COMPOSER_FOOTER_AREA} props={{ workspaceId, threadId }} variant="block" />
       </div>
       {provider === "codex" && <HooksManager open={hooksOpen} onOpenChange={setHooksOpen} cwd={cwd ?? null} threadId={threadId ?? null} />}
       <ProviderCommandsDialog open={helpOpen} onOpenChange={setHelpOpen} providerLabel={sessionProviderLabel(provider)} items={allSlashItems} loading={skillsLoading || providerCommandsEntry.loading} error={providerCommandsEntry.error ?? skillsError ?? skillAdapterError ?? null} onSelect={(item) => {

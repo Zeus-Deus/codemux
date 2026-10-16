@@ -86,7 +86,7 @@ import type { RightPanelTab } from "@/stores/ui-store";
 import { TabDropIndicator } from "../tab-drop-indicator";
 import { middleClickCloseProps } from "../tab-strip-actions";
 import { PaneActionButton } from "./pane-actions";
-import { isAddonPane, PANE_REGISTRY, type PaneMeta } from "./pane-registry";
+import { isAddonPane, isPluginPane, PANE_REGISTRY, type PaneMeta } from "./pane-registry";
 import type { SurfaceAction } from "./surface-actions";
 import { PanelHeader } from "@/components/ui/panel-header";
 
@@ -306,8 +306,11 @@ export const PaneTabStrip = memo(function PaneTabStrip({
 }: PaneTabStripProps) {
   const remoteClient = isRemoteClient();
   const reserve = inTitlebar ? topRightReserve(remoteClient, true) : 0;
-  const coreSurfaces = surfaces.filter((surface) => !isAddonPane(surface.id));
+  const coreSurfaces = surfaces.filter(
+    (surface) => !isAddonPane(surface.id) && !isPluginPane(surface.id),
+  );
   const addonSurfaces = surfaces.filter((surface) => isAddonPane(surface.id));
+  const pluginSurfaces = surfaces.filter((surface) => isPluginPane(surface.id));
 
   const tabIds = tabs.map((tab) => tab.id);
   const { containerRef, dragTabId, dropIndicatorLeft, getPillProps } =
@@ -436,6 +439,29 @@ export const PaneTabStrip = memo(function PaneTabStrip({
                 ADD-ONS
               </DropdownMenuLabel>
               {addonSurfaces.map((surface) => (
+                <DropdownMenuItem
+                  key={surface.id}
+                  aria-label={`${surface.label} — ${surface.description}`}
+                  className="h-[30px] rounded-md px-[9px] text-body font-medium"
+                  onClick={surface.onOpen}
+                >
+                  <surface.icon className="size-[14px]" />
+                  <span className="min-w-0 truncate">{surface.label}</span>
+                  <span className="ml-auto min-w-0 truncate pl-2 text-label font-normal text-muted-foreground">
+                    {surface.description}
+                  </span>
+                </DropdownMenuItem>
+              ))}
+            </>
+          )}
+          {/* Plugin panes, attributed like add-on panels. Absent without any. */}
+          {pluginSurfaces.length > 0 && (
+            <>
+              <DropdownMenuSeparator className="mx-1 my-[5px]" />
+              <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
+                PLUGINS
+              </DropdownMenuLabel>
+              {pluginSurfaces.map((surface) => (
                 <DropdownMenuItem
                   key={surface.id}
                   aria-label={`${surface.label} — ${surface.description}`}

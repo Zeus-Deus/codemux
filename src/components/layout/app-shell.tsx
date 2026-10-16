@@ -31,6 +31,7 @@ import { useWorktreeIncludeToast } from "@/hooks/use-worktree-include-toast";
 import { useMountedOnceOpen } from "@/hooks/use-mounted-once-open";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
 import { UtilityPageStandaloneContext } from "./utility-page";
+import { PluginPage } from "@/contrib/react/plugin-page";
 import { markStartup } from "@/lib/perf/interaction-trace";
 import { scheduleSequentialIdlePrefetch } from "@/lib/idle-prefetch";
 
@@ -308,7 +309,7 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   if (utilityPage && (mobile || !shellAvailable)) {
     return (
       <UtilityPageStandaloneContext.Provider value={true}>
-        <LazyBoundary label={UTILITY_PAGE_LABEL[utilityPage]} className="h-screen">
+        <LazyBoundary label={utilityPageLabel(utilityPage)} className="h-screen">
           <UtilityPageContent page={utilityPage} />
         </LazyBoundary>
       </UtilityPageStandaloneContext.Provider>
@@ -377,7 +378,7 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
           </div>
           {utilityPage && (
             <div className="absolute inset-0 z-20 flex flex-col bg-background">
-              <LazyBoundary label={UTILITY_PAGE_LABEL[utilityPage]} className="h-full">
+              <LazyBoundary label={utilityPageLabel(utilityPage)} className="h-full">
                 <UtilityPageContent page={utilityPage} />
               </LazyBoundary>
             </div>
@@ -433,14 +434,19 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   );
 }
 
-const UTILITY_PAGE_LABEL: Record<UtilityPage, string> = {
+const UTILITY_PAGE_LABELS: Record<string, string> = {
   automations: "Automations",
   devices: "Devices",
   "pull-requests": "Pull requests",
   usage: "Usage",
 };
 
+function utilityPageLabel(page: UtilityPage): string {
+  return UTILITY_PAGE_LABELS[page] ?? "plugin page";
+}
+
 function UtilityPageContent({ page }: { page: UtilityPage }) {
+  if (page.startsWith("plugin:")) return <PluginPage id={page.slice("plugin:".length)} />;
   if (page === "automations") return <AutomationsView />;
   if (page === "devices") return <DevicesView />;
   if (page === "usage") return <UsageView />;

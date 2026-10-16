@@ -3,9 +3,11 @@ import { useAddonsStore } from "@/stores/addons-store";
 import { addonEnabled } from "@/lib/addons/types";
 import { executeAddon } from "@/lib/addons/platform";
 import { useContributions } from "@/contrib/react/use-contributions";
-import { PALETTE_AREA, type PaletteCommandData } from "@/sdk";
+import { PALETTE_AREA } from "@/sdk/areas";
+import type { PaletteCommandData } from "@/sdk/host";
 import { pluginLabel, pluginIdOf } from "@/contrib/attribution";
 import { reportPluginError } from "@/contrib/activation";
+import { usePluginThemes, withPluginThemes } from "@/contrib/themes";
 import { Puzzle } from "lucide-react";
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Command as CommandPrimitive } from "cmdk";
@@ -840,9 +842,10 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   }, [commandRows, recentCommandIds]);
 
   // ── Theme rows ─────────────────────────────────────────────────────────
+  const pluginThemes = usePluginThemes();
   const customThemes = useMemo(
-    () => parseCustomThemes(customThemePayloads),
-    [customThemePayloads],
+    () => withPluginThemes(parseCustomThemes(customThemePayloads), pluginThemes),
+    [customThemePayloads, pluginThemes],
   );
   const allThemes = useMemo(
     () => [...(omarchy ? [omarchy] : []), ...BUILT_IN_THEMES, ...customThemes],

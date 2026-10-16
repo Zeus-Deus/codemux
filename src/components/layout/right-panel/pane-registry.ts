@@ -139,6 +139,11 @@ export function isAddonPane(id: string): id is `addon:${string}:${string}` {
   return /^addon:[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$/.test(id);
 }
 
+/** A plugin pane: `plugin:<pluginId>:<localId>`. */
+export function isPluginPane(id: string): id is `plugin:${string}:${string}` {
+  return /^plugin:[a-z0-9-]{1,64}:[^:]+$/.test(id);
+}
+
 export function isCorePane(id: RightPanelTab): id is RightPanelCorePane {
   return BY_ID.has(id as RightPanelCorePane);
 }

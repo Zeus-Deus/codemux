@@ -19,6 +19,9 @@ import {
   type PluginTier,
 } from "@/contrib/plugins-store";
 import { SectionHeader, SubsectionHeader } from "./settings-primitives";
+import { useContributions } from "@/contrib/react/use-contributions";
+import { ContribBoundary, ContribRender } from "@/contrib/react/boundary";
+import { SETTINGS_PAGES_AREA } from "@/sdk/areas";
 
 const TIER_LABEL: Record<PluginTier, string> = {
   official: "Official",
@@ -37,6 +40,43 @@ function TierBadge({ tier }: { tier: PluginTier }) {
 function statusText(record: PluginRecord): string | null {
   if (record.status === "loading") return "Loading…";
   return null;
+}
+
+/** Settings pages a plugin registered, keyed by plugin id. */
+export function usePluginSettingsPages() {
+  const pages = useContributions(SETTINGS_PAGES_AREA);
+  return useMemo(() => {
+    const byPlugin = new Map<string, typeof pages>();
+    for (const page of pages) {
+      const pluginId = (page.data as { pluginId?: string } | undefined)?.pluginId;
+      if (!pluginId) continue;
+      byPlugin.set(pluginId, [...(byPlugin.get(pluginId) ?? []), page]);
+    }
+    return byPlugin;
+  }, [pages]);
+}
+
+/** Settings → <plugin>: every settings page the plugin registered. */
+export function PluginSettingsPageView({ pluginId }: { pluginId: string }) {
+  const record = usePluginsStore((s) => s.records[pluginId]);
+  const pages = usePluginSettingsPages().get(pluginId) ?? [];
+  return (
+    <div data-plugin-settings={pluginId}>
+      <SectionHeader title={record?.name ?? pluginId} description={record?.description} />
+      <div className="space-y-8">
+        {pages.map((page) => (
+          <section key={page.id}>
+            {pages.length > 1 && page.title && <SubsectionHeader title={page.title} />}
+            {page.render && (
+              <ContribBoundary id={page.id} variant="block">
+                <ContribRender render={page.render} />
+              </ContribBoundary>
+            )}
+          </section>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function PluginRow({ record }: { record: PluginRecord }) {

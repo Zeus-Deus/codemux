@@ -5,6 +5,7 @@ import { useOmarchyStore } from "@/stores/omarchy-store";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { initialThemeSource, THEME_SOURCE_KEY, type ThemeSource } from "@/lib/omarchy-theme";
 import { parseCustomThemes, resolveTheme, THEME_BOOT_STORAGE_KEY } from "@/lib/themes";
+import { usePluginThemes, withPluginThemes } from "@/contrib/themes";
 
 const EMPTY: unknown[] = [];
 // Capture before the first application writes its boot cache. A returning
@@ -26,7 +27,11 @@ export function useAppTheme() {
   const legacyPalette = useSettingsStore((s) => s.settings["appearance.palette"]);
   const omarchy = useOmarchyStore((s) => s.theme);
   const discovered = useOmarchyStore((s) => s.loaded);
-  const customThemes = useMemo(() => parseCustomThemes(payloads), [payloads]);
+  const pluginThemes = usePluginThemes();
+  const customThemes = useMemo(
+    () => withPluginThemes(parseCustomThemes(payloads), pluginThemes),
+    [payloads, pluginThemes],
+  );
   const effectiveId = legacyPalette === "warm" && ["default", "system", "dark"].includes(manualId) ? "warm" : manualId;
   const manual = useMemo(() => resolveTheme(effectiveId, customThemes), [effectiveId, customThemes]);
   const source = isRemoteClient() ? "manual" : initialThemeSource({

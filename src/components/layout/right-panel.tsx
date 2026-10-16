@@ -1,9 +1,15 @@
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
+import { Puzzle } from "lucide-react";
 import { useAddonsStore } from "@/stores/addons-store";
 import { addonEnabled } from "@/lib/addons/types";
 import { AddonView } from "@/components/addons/addon-view";
 import { addonIcon } from "@/components/addons/addon-renderer";
-import { isAddonPane } from "./right-panel/pane-registry";
+import { isAddonPane, isPluginPane } from "./right-panel/pane-registry";
+import { useContributions } from "@/contrib/react/use-contributions";
+import { ContribBoundary, ContribRender } from "@/contrib/react/boundary";
+import { pluginLabel, pluginIdOf } from "@/contrib/attribution";
+import { RIGHT_PANEL_AREA } from "@/sdk/areas";
+import type { RightPaneData } from "@/sdk/host";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 /**
  * The right panel — a **pane deck**.
@@ -345,9 +351,26 @@ export const RightPanel = memo(function RightPanel({
       workspace.attach_only,
     ],
   );
+  // Plugin panes: absent (and their saved ids just hidden) while the plugin
+  // is off, the same rule add-on panels follow.
+  const pluginPaneContributions = useContributions(RIGHT_PANEL_AREA);
+  const pluginPanes = useMemo(
+    () =>
+      isRemoteClient()
+        ? []
+        : pluginPaneContributions.map((c) => ({
+            pane: `plugin:${c.id}` as `plugin:${string}:${string}`,
+            contribution: c,
+            title: c.title ?? c.id,
+            pluginName: pluginLabel(pluginIdOf(c.id)),
+            icon: (c.data as RightPaneData | undefined)?.icon ?? Puzzle,
+          })),
+    [pluginPaneContributions],
+  );
   const isAvailable = useCallback(
     (id: RightPanelTab): boolean => {
       if (isAddonPane(id)) return addonPanels.some(panel => panel.pane === id);
+      if (isPluginPane(id)) return pluginPanes.some(panel => panel.pane === id);
       if (!isCorePane(id)) return id.startsWith("doc:");
       switch (id) {
         case "workflows":
@@ -362,7 +385,7 @@ export const RightPanel = memo(function RightPanel({
           return true;
       }
     },
-    [tasksSnapshot, workflowRun, subagentSummary.groups, addonPanels, enableAgentChat, workspace.host_id, workspace.attach_only],
+    [tasksSnapshot, workflowRun, subagentSummary.groups, addonPanels, pluginPanes, enableAgentChat, workspace.host_id, workspace.attach_only],
   );
 
   // Availability-gated panes join the strip on their own when their data
@@ -669,6 +692,16 @@ export const RightPanel = memo(function RightPanel({
           : FileText;
       return { id, label: baseName(path), icon, testId: "doc-tab" };
     }
+    if (isPluginPane(id)) {
+      const panel = pluginPanes.find((panel) => panel.pane === id)!;
+      return {
+        id,
+        label: panel.title,
+        attribution: panel.pluginName,
+        icon: panel.icon as DeckTab["icon"],
+        testId: "plugin-tab",
+      };
+    }
     if (isAddonPane(id)) {
       const panel = addonPanels.find((panel) => panel.pane === id)!;
       return {
@@ -756,6 +789,15 @@ export const RightPanel = memo(function RightPanel({
         label: panel.title,
         description: panel.pluginName,
         icon: addonIcon(panel.icon),
+        onOpen: () => setRightPanelTab(workspaceId, panel.pane),
+      })),
+    ...pluginPanes
+      .filter((panel) => !visiblePanes.includes(panel.pane))
+      .map((panel) => ({
+        id: panel.pane,
+        label: panel.title,
+        description: panel.pluginName,
+        icon: panel.icon as SurfaceAction["icon"],
         onOpen: () => setRightPanelTab(workspaceId, panel.pane),
       })),
   ];
@@ -1001,6 +1043,17 @@ export const RightPanel = memo(function RightPanel({
             onRequestRawView={showActiveDocSource}
             treeRefreshKey={treeRefreshKey}
           />
+        ) : activePane && isPluginPane(activePane) ? (
+          (() => {
+            const panel = pluginPanes.find((p) => p.pane === activePane);
+            return panel?.contribution.render ? (
+              <div className="h-full min-h-0 overflow-auto" data-plugin-pane={panel.contribution.id}>
+                <ContribBoundary id={panel.contribution.id} variant="block">
+                  <ContribRender render={panel.contribution.render} props={{ workspaceId }} />
+                </ContribBoundary>
+              </div>
+            ) : null;
+          })()
         ) : activePane && isAddonPane(activePane) ? (
           <AddonView
             key={`${workspaceId}/${activePane}`}
