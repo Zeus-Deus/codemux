@@ -245,27 +245,26 @@ export function PluginsSettings({ onOpenSettings }: { onOpenSettings?: (pluginId
       <SectionHeader
         title="Plugins"
         description="Plugins add features to Codemux. They run with full access to Codemux, your projects and your files. Each one can be turned on or off; off means none of its code runs."
-        action={
-          <>
-            <Button size="sm" variant="outline" disabled={disabledByEnv} onClick={installer.promptUrl}>
-              <Github />
-              Install from GitHub URL…
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => void pluginsRevealRoot().catch(reportFailure("Couldn’t open the plugins folder"))}
-            >
-              <FolderOpen />
-              Open plugins folder
-            </Button>
-            <Button size="sm" variant="outline" disabled={reloading || disabledByEnv} onClick={() => void reload()}>
-              {reloading ? <Spinner /> : <RefreshCw />}
-              Reload plugins
-            </Button>
-          </>
-        }
+        className="mb-4"
       />
+      <div className="mb-7 flex flex-wrap items-center gap-2" data-plugins-actions>
+        <Button size="sm" variant="outline" disabled={disabledByEnv} onClick={installer.promptUrl}>
+          <Github />
+          Install from GitHub URL…
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => void pluginsRevealRoot().catch(reportFailure("Couldn’t open the plugins folder"))}
+        >
+          <FolderOpen />
+          Open plugins folder
+        </Button>
+        <Button size="sm" variant="outline" disabled={reloading || disabledByEnv} onClick={() => void reload()}>
+          {reloading ? <Spinner /> : <RefreshCw />}
+          Reload plugins
+        </Button>
+      </div>
       {disabledByEnv && (
         <p className="mb-4 rounded-md border border-hairline bg-surface-1 px-4 py-3 text-body-sm text-muted-foreground" role="status">
           Plugins disabled by environment (CODEMUX_DISABLE_PLUGINS).
