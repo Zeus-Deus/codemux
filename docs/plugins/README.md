@@ -69,6 +69,7 @@ export default {
 | `ctx.onDispose(fn)` | Runs when the plugin turns off, reloads or is removed. |
 | `ctx.setTimeout`, `ctx.setInterval`, `ctx.addEventListener` | Like the globals, but cleaned up for you on unload. |
 | `ctx.storage.get(key, fallback)` / `.set(key, value)` / `.remove(key)` | JSON in the device-local settings DB under `plugin.<id>.<key>`. Never synced. |
+| `ctx.host` | The host API bound to this plugin. Use it for subscriptions made after an `await` or in your own async callbacks; they are removed when the plugin turns off. |
 | `ctx.id`, `ctx.source` (`plugin:<id>`), `ctx.tier` | Who you are. |
 
 A contribution is `{ id, area, title?, order?, when?, enabled?, render?, data? }`.
@@ -107,8 +108,11 @@ Settings pages use `ctx.registerSettingsPage`, not an area.
 
 ## Host API
 
-`import { host } from "@codemux/sdk"`. Every subscription returns an
-unsubscribe and is also cleaned up when the plugin turns off.
+`import { host } from "@codemux/sdk"`, or `ctx.host`. Every subscription returns an unsubscribe.
+
+**Cleanup when the plugin turns off:** subscriptions made through `ctx.host` are always removed. A bare `host.*` subscription is removed only if it was made synchronously inside `register()` or inside a callback the host invoked for you. After an `await`, the host can't tell which plugin is calling, so use `ctx.host` there.
+
+**Errors in callbacks:** a subscription callback that throws is logged against your plugin. It never breaks the app or other listeners.
 
 | Member | |
 |---|---|
@@ -165,6 +169,7 @@ A plugin's source is capped at 16 MiB.
 
 - **JSX in a disk plugin won't parse.** Use `React.createElement`/`jsx()` or bundle with esbuild.
 - **Track everything you start.** A bare `window.setInterval`, `addEventListener` or appended `<style>` survives turning the plugin off and stacks up on every hot reload, because ES modules can't be unloaded. Use `ctx.setTimeout`/`ctx.setInterval`/`ctx.addEventListener` and put anything else in `ctx.onDispose`. Module-scope state is yours to reset.
+- **Subscribe through `ctx.host` after an `await`.** A bare `host.chat.onEvent(...)` made after an `await` has no known owner, so it keeps running after the plugin turns off.
 - **Module evaluation has a 10 s deadline.** Don't top-level `await` anything that might not settle; do the waiting inside `register()`.
 - **Keep `render` identities stable.** Define components once at module scope, not inline in `register`, or React remounts them on every registry change.
 - **Use theme variables, not colours.** `var(--background)`, `var(--foreground)`, `var(--muted-foreground)`, or `host.theme.cssVar(role)`. Redraw canvases on `host.theme.subscribe`.

@@ -5,7 +5,7 @@
  * disposer runs, each disposer isolated).
  */
 import { toast } from "@/lib/toast";
-import { Owner, runAs, trackAsyncRegistration } from "./lifetime";
+import { Owner, runAs } from "./lifetime";
 import { createPluginContext, type CodemuxPlugin } from "./plugin";
 import {
   patchPlugin,
@@ -17,6 +17,11 @@ import {
 
 /** Live plugins: id → owner of the current incarnation. */
 const loaded = new Map<string, Owner>();
+
+/** Live disposers of a plugin's current incarnation (tests, diagnostics). */
+export function liveDisposers(id: string): number {
+  return loaded.get(id)?.size ?? 0;
+}
 
 export function isLoaded(id: string): boolean {
   return loaded.has(id);
@@ -67,10 +72,7 @@ export function activatePlugin(plugin: CodemuxPlugin, record: Omit<PluginRecord,
   }
   publishPlugin({ ...record, status: "loaded", error: undefined });
   if (result && typeof (result as PromiseLike<unknown>).then === "function") {
-    const settled = Promise.resolve(result);
-    // Host subscriptions made after an `await` belong to this registration.
-    trackAsyncRegistration(owner, settled);
-    void settled.catch((error: unknown) => {
+    void Promise.resolve(result).catch((error: unknown) => {
       if (loaded.get(plugin.id) === owner) fail(error);
     });
   }

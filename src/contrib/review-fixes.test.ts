@@ -34,7 +34,7 @@ vi.mock("@/lib/themes", () => ({
   THEME_ROLE_VARIABLES: {},
 }));
 
-import { activatePlugin, resetActivationForTests, unloadPlugin } from "./activation";
+import { activatePlugin, liveDisposers, resetActivationForTests, unloadPlugin } from "./activation";
 import { chatListenerCount } from "./chat-events";
 import { resetLifetimeForTests } from "./lifetime";
 import { pluginActive, resetPluginsStoreForTests, setPluginEnabled, usePluginsStore } from "./plugins-store";
@@ -57,14 +57,14 @@ afterEach(() => {
 });
 
 describe("plugin ownership", () => {
-  it("owns host subscriptions made after an await in async register()", async () => {
+  it("ctx.host owns subscriptions made after an await in async register()", async () => {
     let resume!: () => void;
     const gate = new Promise<void>((r) => (resume = r));
     const plugin: CodemuxPlugin = {
       id: "demo",
-      async register() {
+      async register(ctx) {
         await gate;
-        host.chat.onEvent(() => {});
+        ctx.host.chat.onEvent(() => {});
       },
     };
     activatePlugin(plugin, record);
@@ -73,6 +73,83 @@ describe("plugin ownership", () => {
     expect(chatListenerCount()).toBe(1);
     unloadPlugin("demo");
     expect(chatListenerCount()).toBe(0);
+  });
+
+  it("overlapping async registrations each own their own subscriptions", async () => {
+    const gates: Record<string, () => void> = {};
+    const seen: string[] = [];
+    const plugin = (id: string): CodemuxPlugin => ({
+      id,
+      async register(ctx) {
+        await new Promise<void>((r) => (gates[id] = r));
+        ctx.host.chat.onEvent(() => seen.push(id));
+      },
+    });
+    activatePlugin(plugin("a"), { ...record, id: "a" });
+    activatePlugin(plugin("b"), { ...record, id: "b" });
+    // A resumes while B is still waiting; then B.
+    gates.a();
+    await tick();
+    gates.b();
+    await tick();
+    expect(chatListenerCount()).toBe(2);
+    unloadPlugin("a");
+    expect(chatListenerCount()).toBe(1);
+    unloadPlugin("b");
+    expect(chatListenerCount()).toBe(0);
+  });
+
+  it("an async ctx callback subscribing after an await is owned through ctx.host", async () => {
+    vi.useFakeTimers();
+    const plugin: CodemuxPlugin = {
+      id: "demo",
+      register(ctx) {
+        ctx.setTimeout(async () => {
+          await Promise.resolve();
+          ctx.host.chat.onEvent(() => {});
+        }, 5);
+      },
+    };
+    activatePlugin(plugin, record);
+    await vi.advanceTimersByTimeAsync(5);
+    expect(chatListenerCount()).toBe(1);
+    unloadPlugin("demo");
+    expect(chatListenerCount()).toBe(0);
+  });
+
+  it("a bare host subscription with no certain owner is not given to another plugin", async () => {
+    let resume!: () => void;
+    const pending = new Promise<void>((r) => (resume = r));
+    activatePlugin(
+      { id: "waiting", async register() { await pending; } },
+      { ...record, id: "waiting" },
+    );
+    const off = host.chat.onEvent(() => {});
+    unloadPlugin("waiting");
+    expect(chatListenerCount()).toBe(1);
+    off();
+    expect(chatListenerCount()).toBe(0);
+    resume();
+  });
+
+  it("finished and cancelled ctx resources are released, not kept until unload", () => {
+    vi.useFakeTimers();
+    let ownerSize = () => -1;
+    const target = new EventTarget();
+    const plugin: CodemuxPlugin = {
+      id: "demo",
+      register(ctx) {
+        const tick = () => ctx.setTimeout(tick, 1);
+        tick();
+        for (let i = 0; i < 20; i += 1) ctx.addEventListener(target, "x", () => {})();
+      },
+    };
+    activatePlugin(plugin, record);
+    // Probe the owner through the module's live set size.
+    ownerSize = () => liveDisposers("demo");
+    vi.advanceTimersByTime(200);
+    // One registration-free timer is live at any moment.
+    expect(ownerSize()).toBe(1);
   });
 
   it("owns subscriptions made inside ctx timer callbacks", () => {
@@ -169,6 +246,50 @@ describe("decisions after install and remove", () => {
     await scanDiskPlugins(true);
     expect(pluginActive("hello", false)).toBe(true);
     expect(invoke).toHaveBeenCalledWith("plugins_read_source", { id: "hello" });
+  });
+
+  it("a disable whose save failed stays off across later rescans", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    invoke.mockImplementation(async (cmd: unknown) => {
+      if (cmd === "plugins_get_decisions") return { hello: true };
+      if (cmd === "plugins_list") return [entry];
+      if (cmd === "plugins_read_source") throw new Error("must not read a plugin the user turned off");
+      return undefined;
+    });
+    const { setDecisionPersistence } = await import("./plugins-store");
+    setDecisionPersistence(async () => {
+      throw new Error("disk full");
+    });
+    usePluginsStore.setState({ decisionsLoaded: true, decisions: { hello: true } });
+    await setPluginEnabled("hello", false);
+    await tick();
+    expect(usePluginsStore.getState().unsavedDecisions.hello).toBe("disk full");
+    await scanDiskPlugins(true);
+    expect(pluginActive("hello", false)).toBe(false);
+    expect(invoke).not.toHaveBeenCalledWith("plugins_read_source", expect.anything());
+  });
+
+  it("a block that lands during a scan is applied once that scan ends", async () => {
+    let finishRead!: (source: string) => void;
+    let blocked = false;
+    invoke.mockImplementation(async (cmd: unknown) => {
+      if (cmd === "plugins_get_decisions") return { hello: true };
+      if (cmd === "plugins_list") return [blocked ? { ...entry, error: "Blocked by the Codemux catalog: test" } : entry];
+      if (cmd === "plugins_read_source") return new Promise<string>((r) => (finishRead = r));
+      return undefined;
+    });
+    usePluginsStore.setState({ decisionsLoaded: true, decisions: { hello: true } });
+    const first = scanDiskPlugins();
+    await vi.waitFor(() => expect(finishRead).toBeTypeOf("function"));
+    // The catalog now blocks it; the native side emits { id: null }.
+    blocked = true;
+    const second = scanDiskPlugins();
+    finishRead("export default { id: 'hello', register() {} }");
+    await first;
+    await second;
+    const row = usePluginsStore.getState().records.hello;
+    expect(row.status).toBe("error");
+    expect(row.error).toContain("Blocked");
   });
 
   it("a toggle still being saved wins over the native copy", async () => {

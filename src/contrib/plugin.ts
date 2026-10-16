@@ -9,7 +9,8 @@ import { registry } from "./registry";
 import type { Contribution } from "./types";
 import { pluginStorage } from "./storage";
 import type { PluginTier } from "./plugins-store";
-import { bindOwner, type Owner } from "./lifetime";
+import { bindOwner, ownedDisposer, type Owner } from "./lifetime";
+import { createHost, type Host } from "@/sdk/host";
 
 export const SETTINGS_PAGES_AREA = "settings.pages";
 
@@ -63,39 +64,35 @@ export interface PluginContext {
   ) => () => void;
   /** JSON in the device-local settings DB under `plugin.<id>.<key>`. Never synced. */
   storage: PluginStorage;
+  /**
+   * The host API bound to this plugin: every subscription made through it is
+   * removed when the plugin turns off, including ones made after an `await`
+   * (where a bare `host.*` call can't tell which plugin is calling).
+   */
+  host: Host;
 }
 
-/** Timers and DOM listeners. Each is a disposer of the owner, so a timer or
- *  listener started after the plugin was turned off is cancelled at once.
- *  Callbacks run as the owner, so host subscriptions made inside them are
- *  owned too. A fired timeout's disposer becomes a no-op. */
+/** Timers and DOM listeners, owned by the incarnation: cancelled when the
+ *  plugin turns off, cancelled at once if started after that, and released
+ *  from the owner when they finish or are cancelled early (so a plugin that
+ *  keeps scheduling timeouts never accumulates them). Callbacks run as the
+ *  owner, so host subscriptions made inside them are owned too. */
 function createLifetime(owner: Owner) {
-  const scoped = (cleanup: () => void) => {
-    let live = true;
-    const dispose = () => {
-      if (!live) return;
-      live = false;
-      cleanup();
-    };
-    owner.track(dispose);
-    return dispose;
-  };
   return {
     setTimeout: (fn: () => void, ms: number) => {
       if (owner.ended) return () => {};
       const run = bindOwner(owner, fn);
-      let dispose = () => {};
       const id = globalThis.setTimeout(() => {
         dispose();
         run();
       }, ms);
-      dispose = scoped(() => globalThis.clearTimeout(id));
+      const dispose = ownedDisposer(owner, () => globalThis.clearTimeout(id));
       return dispose;
     },
     setInterval: (fn: () => void, ms: number) => {
       if (owner.ended) return () => {};
       const id = globalThis.setInterval(bindOwner(owner, fn), ms);
-      return scoped(() => globalThis.clearInterval(id));
+      return ownedDisposer(owner, () => globalThis.clearInterval(id));
     },
     addEventListener: (
       target: EventTarget,
@@ -109,7 +106,7 @@ function createLifetime(owner: Owner) {
           ? bindOwner(owner, listener)
           : { handleEvent: bindOwner(owner, (e: Event) => listener.handleEvent(e)) };
       target.addEventListener(type, bound, options);
-      return scoped(() => target.removeEventListener(type, bound, options));
+      return ownedDisposer(owner, () => target.removeEventListener(type, bound, options));
     },
   };
 }
@@ -121,10 +118,8 @@ export function createPluginContext(pluginId: string, tier: PluginTier, owner: O
     id: `${pluginId}:${c.id}`,
     source,
   });
-  const track = (dispose: () => void) => {
-    owner.track(dispose);
-    return dispose;
-  };
+  // Unregistering early releases the disposer from the owner too.
+  const track = (dispose: () => void) => ownedDisposer(owner, dispose);
   return {
     id: pluginId,
     source,
@@ -143,8 +138,9 @@ export function createPluginContext(pluginId: string, tier: PluginTier, owner: O
           }),
         ),
       ),
-    onDispose: (fn) => void track(fn),
+    onDispose: (fn) => void owner.track(fn),
     ...createLifetime(owner),
     storage: pluginStorage(pluginId),
+    host: createHost(owner),
   };
 }

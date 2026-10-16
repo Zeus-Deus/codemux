@@ -104,6 +104,7 @@ function PluginRow({ record, actions }: { record: PluginRecord; actions: RowActi
     usePluginsStore((s) => s.disabledByEnv) ||
     (usePluginsStore((s) => s.paused) && record.kind !== "bundled");
   const status = statusText(record);
+  const saveError = usePluginsStore((s) => s.unsavedDecisions[record.id] ?? null);
   return (
     <article
       className="flex items-start gap-3 px-4 py-3"
@@ -125,6 +126,11 @@ function PluginRow({ record, actions }: { record: PluginRecord; actions: RowActi
         {record.status === "error" && record.error && (
           <p className="mt-1 break-words text-body-sm text-destructive" role="alert">
             {record.error}
+          </p>
+        )}
+        {saveError && (
+          <p className="mt-1 break-words text-body-sm text-destructive" role="alert" data-plugin-save-error>
+            Couldn’t save this choice: {saveError}. It applies until Codemux restarts.
           </p>
         )}
       </div>

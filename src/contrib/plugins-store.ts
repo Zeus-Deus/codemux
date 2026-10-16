@@ -46,6 +46,8 @@ interface PluginsState {
   paused: boolean;
   pausedReason: string | null;
   rootPath: string | null;
+  /** Toggles not yet saved natively: null while saving, else the save error. */
+  unsavedDecisions: Record<string, string | null>;
 }
 
 export const usePluginsStore = create<PluginsState>()(() => ({
@@ -56,6 +58,7 @@ export const usePluginsStore = create<PluginsState>()(() => ({
   paused: false,
   pausedReason: null,
   rootPath: null,
+  unsavedDecisions: {},
 }));
 
 const handles = new Map<string, PluginHandle>();
@@ -83,7 +86,12 @@ export function dropPlugin(id: string): void {
   handles.delete(id);
 }
 
-/** Decisions the user just made whose native write hasn't finished. */
+/**
+ * Decisions the user made that the native registry doesn't have yet: still
+ * being written, or the write failed. They override the native copy until a
+ * write succeeds or the user changes them, so a failed "off" is never undone
+ * by the next rescan.
+ */
 const unsaved = new Map<string, boolean>();
 
 /**
@@ -112,13 +120,30 @@ export function setDecisionPersistence(fn: (id: string, enabled: boolean) => Pro
  * the SDK exposes no verb for it, so one plugin can't switch another.
  */
 export async function setPluginEnabled(id: string, enabled: boolean): Promise<void> {
-  usePluginsStore.setState((s) => ({ decisions: { ...s.decisions, [id]: enabled } }));
+  usePluginsStore.setState((s) => ({
+    decisions: { ...s.decisions, [id]: enabled },
+    unsavedDecisions: { ...s.unsavedDecisions, [id]: null },
+  }));
   unsaved.set(id, enabled);
-  void persistDecision(id, enabled)
-    .catch((error) => console.error(`[plugins] could not save the decision for ${id}`, error))
-    .finally(() => {
-      if (unsaved.get(id) === enabled) unsaved.delete(id);
-    });
+  const attempt = enabled;
+  void persistDecision(id, enabled).then(
+    () => {
+      if (unsaved.get(id) !== attempt) return;
+      unsaved.delete(id);
+      usePluginsStore.setState((s) => {
+        const { [id]: _done, ...rest } = s.unsavedDecisions;
+        return { unsavedDecisions: rest };
+      });
+    },
+    (error) => {
+      console.error(`[plugins] could not save the decision for ${id}`, error);
+      if (unsaved.get(id) !== attempt) return;
+      // Kept in `unsaved`: this choice still governs this session.
+      usePluginsStore.setState((s) => ({
+        unsavedDecisions: { ...s.unsavedDecisions, [id]: error instanceof Error ? error.message : String(error) },
+      }));
+    },
+  );
   const handle = handles.get(id);
   if (!handle) return;
   const { disabledByEnv, paused, records } = usePluginsStore.getState();
@@ -155,5 +180,6 @@ export function resetPluginsStoreForTests(): void {
     paused: false,
     pausedReason: null,
     rootPath: null,
+    unsavedDecisions: {},
   });
 }

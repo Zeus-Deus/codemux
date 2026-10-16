@@ -189,6 +189,9 @@ function retire(id: string): void {
 }
 
 let scanning: Promise<void> | null = null;
+/** The one follow-up pass queued behind the scan in flight. */
+let rescan: Promise<void> | null = null;
+let rescanReload = false;
 
 /** Native decisions are the truth after an install or remove; read them
  *  before acting on a folder change. A failed read keeps what we have. */
@@ -210,7 +213,19 @@ export function scanDiskPlugins(
   reloadKnown = false,
   { decisionsFresh = false }: { decisionsFresh?: boolean } = {},
 ): Promise<void> {
-  if (scanning) return scanning.then(() => (reloadKnown ? scanDiskPlugins(true) : undefined));
+  // A request during a scan is a NEW invalidation (a file changed, a block
+  // landed): the scan in flight may have read the old inventory, so run a
+  // fresh pass after it. Requests arriving meanwhile share that one pass.
+  if (scanning) {
+    rescanReload ||= reloadKnown;
+    rescan ??= scanning.then(() => {
+      const reload = rescanReload;
+      rescan = null;
+      rescanReload = false;
+      return scanDiskPlugins(reload);
+    });
+    return rescan;
+  }
   scanning = (async () => {
     if (!decisionsFresh) await syncDecisions();
     let entries: DiskPluginEntry[];
@@ -267,5 +282,7 @@ export function resetRuntimeLoaderForTests(): void {
   known.clear();
   queues.clear();
   scanning = null;
+  rescan = null;
+  rescanReload = false;
   appVersion = null;
 }

@@ -1,21 +1,21 @@
 /**
  * Plugin ownership of disposers and host subscriptions.
  *
- * Every plugin incarnation has one `Owner`. Its disposers run, last first,
- * when the plugin is turned off, reloaded or removed; a disposer attached
- * after that (a late async registration) runs immediately instead of leaking.
+ * Every plugin incarnation has one `Owner`. Its live disposers run, last
+ * first, when the plugin is turned off, reloaded or removed. A resource that
+ * finishes or is cancelled earlier releases itself, so a long-lived plugin
+ * never accumulates them. A disposer attached after the owner ended runs at
+ * once instead of leaking.
  *
- * Host subscriptions (`host.chat.onEvent`, `host.theme.subscribe`, …) attach
- * to the owner that is current when they are made:
- * - while `register()` runs synchronously;
- * - inside every plugin callback the host invokes (ctx timers and listeners,
- *   host subscription callbacks), which re-enter their owner;
- * - after an `await` in an async `register()`: the registration still in
- *   flight owns them (JS has no async context, so with two plugins awaiting
- *   at the same moment the most recent registration is chosen).
+ * Which plugin is calling a bare `host.*` subscription is known for certain
+ * only while `register()` runs synchronously and inside callbacks the host
+ * invokes for a plugin (ctx timers and listeners, host subscription
+ * callbacks). JS has no async context, so after an `await` the caller is
+ * unknown and nothing here guesses: `ctx.host` is bound to its incarnation
+ * and is the way to subscribe there.
  */
 export class Owner {
-  private disposers: (() => void)[] = [];
+  private live = new Set<() => void>();
   private done = false;
 
   constructor(readonly pluginId: string) {}
@@ -24,20 +24,32 @@ export class Owner {
     return this.done;
   }
 
-  track(dispose: () => void): void {
-    if (this.done) {
-      safely(this.pluginId, dispose, "late disposer failed");
-      return;
-    }
-    this.disposers.push(dispose);
+  /** Live disposers (diagnostics and tests). */
+  get size(): number {
+    return this.live.size;
   }
 
-  /** Run every disposer, last first, each isolated. Idempotent. */
+  /**
+   * Attach a cleanup. Returns `release`, which forgets it without running
+   * it. After the owner ended, the cleanup runs immediately.
+   */
+  track(dispose: () => void): () => void {
+    if (this.done) {
+      safely(this.pluginId, dispose, "late disposer failed");
+      return () => {};
+    }
+    // Wrapped, so the same function tracked twice is two entries.
+    const entry = () => dispose();
+    this.live.add(entry);
+    return () => void this.live.delete(entry);
+  }
+
+  /** Run every live disposer, last first, each isolated. Idempotent. */
   end(): void {
     if (this.done) return;
     this.done = true;
-    const disposers = this.disposers.reverse();
-    this.disposers = [];
+    const disposers = [...this.live].reverse();
+    this.live.clear();
     for (const dispose of disposers) safely(this.pluginId, dispose, "disposer failed during unload");
   }
 }
@@ -50,9 +62,27 @@ function safely(pluginId: string, fn: () => void, what: string) {
   }
 }
 
+/**
+ * A cleanup owned by `owner` that may also be called early. Calling it runs
+ * the cleanup once and releases it from the owner; unloading runs it if it
+ * is still live; for an ended owner it runs at once.
+ */
+export function ownedDisposer(owner: Owner | null, cleanup: () => void): () => void {
+  let live = true;
+  const run = () => {
+    if (!live) return;
+    live = false;
+    cleanup();
+  };
+  if (!owner) return run;
+  const release = owner.track(run);
+  return () => {
+    release();
+    run();
+  };
+}
+
 let current: Owner | null = null;
-/** Async registrations still in flight, in start order. */
-const pending: Owner[] = [];
 
 export function runAs<T>(owner: Owner | null, fn: () => T): T {
   const previous = current;
@@ -64,9 +94,9 @@ export function runAs<T>(owner: Owner | null, fn: () => T): T {
   }
 }
 
-/** The plugin making this call, if the host can tell. */
+/** The plugin making this call, when that is certain; else null. */
 export function currentOwner(): Owner | null {
-  return current ?? pending[pending.length - 1] ?? null;
+  return current;
 }
 
 /** Wrap a plugin callback so host calls made inside it belong to `owner`. */
@@ -75,24 +105,7 @@ export function bindOwner<A extends unknown[], R>(owner: Owner | null, fn: (...a
   return (...args: A) => runAs(owner, () => fn(...args));
 }
 
-/** Mark an async `register()` as in flight until `settled`. */
-export function trackAsyncRegistration(owner: Owner, settled: Promise<unknown>): void {
-  pending.push(owner);
-  const done = () => {
-    const i = pending.indexOf(owner);
-    if (i >= 0) pending.splice(i, 1);
-  };
-  void settled.then(done, done);
-}
-
-/** Attach `dispose` to the plugin making this call, if any. */
-export function trackAmbient(dispose: () => void): () => void {
-  currentOwner()?.track(dispose);
-  return dispose;
-}
-
 /** Test-only. */
 export function resetLifetimeForTests(): void {
   current = null;
-  pending.length = 0;
 }
