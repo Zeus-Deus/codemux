@@ -45,5 +45,6 @@ export function pluginMockHandlers(): Record<string, Handler> {
     plugins_safe_mode_status: () => ({ paused: false, reason: null, disabledByEnv: false }),
     plugins_startup_checkpoint: () => null,
     plugins_resume: () => null,
+    plugins_set_event_tap: () => null,
   };
 }

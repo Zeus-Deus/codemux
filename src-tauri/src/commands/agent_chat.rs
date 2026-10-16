@@ -6812,6 +6812,7 @@ fn bridge_grok_usage_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRunti
             reasoning_tokens,
             cost_usd,
             cost_source,
+            ..
         } => {
             if *provider == ProviderKind::Grok {
                 if let Some(bridge) = app.try_state::<GrokUsageLedgerBridge>() {
@@ -6905,6 +6906,9 @@ fn saturating_usage_i64(value: u64) -> i64 {
 /// UUID carried by `ResumeCursorUpdated` so the history dropdown can
 /// resume this session after a restart.
 pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeEvent) {
+    // Plugin chat tap: every event, before anything below can swallow it
+    // (usage and plan-quota events return early). One atomic load when off.
+    crate::plugins::tap::emit(app, &event);
     // Row id of whatever this event wrote to `agent_chat_messages`, if
     // anything. Persistence happens BEFORE fan-out (below), so the live
     // payload can carry the durable position of its own row — that is

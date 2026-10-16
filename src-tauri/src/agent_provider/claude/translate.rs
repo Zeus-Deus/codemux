@@ -26,7 +26,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::agent_provider::{
-    classify_task_kind, pricing, CompletedItem, ContentDelta, ContextUsageTracker, CostSource,
+    classify_task_kind, pricing, CacheWriteTtl, CompletedItem, ContentDelta, ContextUsageTracker, CostSource,
     PlanAuthMode,
     PlanUsageWindow, PlanWindowKind, ProviderKind, ProviderRuntimeEvent, ProviderSessionId,
     RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, SubagentTaskKind, TaskSnapshotItem,
@@ -153,6 +153,18 @@ impl UsageSplit {
             cache_read: self.cache_read.saturating_sub(previous.cache_read),
             cache_write: self.cache_write.saturating_sub(previous.cache_write),
             cache_write_1h: self.cache_write_1h.saturating_sub(previous.cache_write_1h),
+        }
+    }
+
+    /// `1h` if any cache write in this split was at the 1-hour tier,
+    /// else `5m` if there were cache writes at all.
+    fn cache_write_ttl(&self) -> Option<CacheWriteTtl> {
+        if self.cache_write_1h > 0 {
+            Some(CacheWriteTtl::OneHour)
+        } else if self.cache_write > 0 {
+            Some(CacheWriteTtl::FiveMinutes)
+        } else {
+            None
         }
     }
 
@@ -1104,6 +1116,7 @@ fn record_usage(
         cost_usd,
         // Claude has no rate catalogue; every priced row is table-priced.
         cost_source: cost_usd.map(|_| CostSource::Table),
+        cache_write_ttl: delta.cache_write_ttl(),
     }]
 }
 
@@ -4738,6 +4751,59 @@ mod usage_ledger_tests {
         assert_eq!(r[0].2, 3_000, "cache_read_input_tokens");
         assert_eq!(r[0].3, 500, "cache_creation_input_tokens");
         assert_eq!(r[0].5.as_deref(), Some("claude-opus-4-5"));
+    }
+
+    /// `cache_write_ttl` names the tier of this increment's cache writes:
+    /// 1h wins when any 1-hour write happened, 5m for plain writes, none
+    /// without writes. It is carried for plugins (`host.chat.onEvent`) and
+    /// never changes the four token fields.
+    #[test]
+    fn usage_recorded_carries_the_cache_write_ttl() {
+        let ttl = |usage: serde_json::Value| {
+            let mut demux = SubagentDemux::default();
+            let events = translate_sdk_message_with(
+                &tid(),
+                &assistant("msg_ttl", "claude-opus-4-5", usage, None),
+                &mut demux,
+            );
+            events
+                .iter()
+                .find_map(|e| match e {
+                    ProviderRuntimeEvent::UsageRecorded { cache_write_ttl, .. } => Some(*cache_write_ttl),
+                    _ => None,
+                })
+                .expect("a usage row")
+        };
+        let mut one_hour = usage(10, 1, 0, 0);
+        one_hour["cache_creation"] =
+            json!({ "ephemeral_1h_input_tokens": 300, "ephemeral_5m_input_tokens": 0 });
+        assert_eq!(ttl(one_hour), Some(CacheWriteTtl::OneHour));
+        let mut five_min = usage(10, 1, 0, 0);
+        five_min["cache_creation"] =
+            json!({ "ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 200 });
+        assert_eq!(ttl(five_min), Some(CacheWriteTtl::FiveMinutes));
+        assert_eq!(ttl(usage(10, 1, 0, 50)), Some(CacheWriteTtl::FiveMinutes));
+        assert_eq!(ttl(usage(10, 1, 400, 0)), None);
+
+        // Wire form plugins see.
+        let event = ProviderRuntimeEvent::UsageRecorded {
+            thread_id: tid(),
+            provider: crate::agent_provider::ProviderKind::Claude,
+            model: None,
+            subagent: true,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 1,
+            reasoning_tokens: 0,
+            cost_usd: None,
+            cost_source: None,
+            cache_write_ttl: Some(CacheWriteTtl::OneHour),
+        };
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["type"], "usage_recorded");
+        assert_eq!(v["cache_write_ttl"], "1h");
+        assert_eq!(v["subagent"], true);
     }
 
     /// THE dedup invariant this design rests on.

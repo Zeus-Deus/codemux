@@ -400,6 +400,7 @@ impl AgentProvider for ScriptedProvider {
                 reasoning_tokens: 0,
                 cost_usd: Some(0.0),
                 cost_source: None,
+                cache_write_ttl: None,
             })
             .unwrap();
         self.events

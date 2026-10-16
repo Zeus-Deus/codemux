@@ -618,6 +618,7 @@ impl ManagedBridgeSession {
                             reasoning_tokens: tokens.reasoning_tokens,
                             cost_usd: None,
                             cost_source: None,
+                            cache_write_ttl: None,
                         });
                     }
                     Some(TurnUsage {

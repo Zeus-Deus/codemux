@@ -199,3 +199,48 @@ fn safe_mode_follows_the_loading_marker() {
     let broken = registry::SafeMode::detect(tmp.path(), Some("file is not a database"));
     assert!(broken.status().reason.unwrap().contains("registry"));
 }
+
+/// The chat tap is off by default and builds no payload while off; the
+/// global flag is shared, so this one test drives the whole on/off cycle.
+#[test]
+fn chat_event_tap_emits_nothing_while_off() {
+    use crate::agent_provider::{ProviderKind, ProviderRuntimeEvent, ThreadId};
+    use crate::plugins::tap;
+    let thread = ThreadId("t-1".into());
+    let event = ProviderRuntimeEvent::UsageRecorded {
+        thread_id: thread.clone(),
+        provider: ProviderKind::Claude,
+        model: None,
+        subagent: false,
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        reasoning_tokens: 0,
+        cost_usd: None,
+        cost_source: None,
+        cache_write_ttl: None,
+    };
+    assert!(!tap::enabled(), "the tap starts off");
+    assert!(tap::payload(Some(&thread), &event).is_none());
+
+    tap::set_enabled(true);
+    let payload = tap::payload(Some(&thread), &event).expect("payload while on");
+    let v = serde_json::to_value(&payload).unwrap();
+    assert_eq!(v["thread_id"], "t-1");
+    assert_eq!(v["event"]["type"], "usage_recorded");
+
+    tap::set_enabled(false);
+    assert!(tap::payload(Some(&thread), &event).is_none());
+
+    // Emitting through a real (mock) app while off reaches no listener.
+    let app = tauri::test::mock_app();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    use tauri::Listener;
+    app.listen_any(tap::PLUGIN_AGENT_EVENT, move |_| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    tap::emit(app.handle(), &event);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}

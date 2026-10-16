@@ -773,6 +773,8 @@ fn build_core_app<R: tauri::Runtime>(
                 // page's output subscribers are dead weight from here on.
                 if mode == AppMode::Gui && webview.label() == "main" {
                     webview_recovery::release_page_subscribers(webview.app_handle());
+                    // The old page's plugin chat listeners are gone too.
+                    plugins::tap::set_enabled(false);
                 }
                 return;
             }
@@ -2645,6 +2647,7 @@ fn build_core_app<R: tauri::Runtime>(
             plugins::commands::plugins_safe_mode_status,
             plugins::commands::plugins_startup_checkpoint,
             plugins::commands::plugins_resume,
+            plugins::commands::plugins_set_event_tap,
             commands::addons::addon_inventory,
             commands::addons::addon_import_review,
             commands::addons::addon_accept_review,

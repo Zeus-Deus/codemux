@@ -703,6 +703,7 @@ fn event_bridge_persists_exact_grok_usage_once_per_turn() {
         reasoning_tokens: 3,
         cost_usd: Some(0.25),
         cost_source: Some(CostSource::Provider),
+        cache_write_ttl: None,
     };
     let completed = || ProviderRuntimeEvent::TurnCompleted {
         thread_id: ThreadId("thread-grok-usage".into()),

@@ -413,6 +413,15 @@ pub enum CostSource {
     Table,
 }
 
+/// Prompt-cache write tier (Anthropic `cache_creation.ephemeral_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheWriteTtl {
+    #[serde(rename = "1h")]
+    OneHour,
+    #[serde(rename = "5m")]
+    FiveMinutes,
+}
+
 impl CostSource {
     /// The matching provider-history cache value.
     pub fn as_str(&self) -> &'static str {
@@ -802,6 +811,11 @@ pub enum ProviderRuntimeEvent {
         /// bill is measured versus estimated. `None` iff `cost_usd` is.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_source: Option<CostSource>,
+        /// Cache TTL tier of this increment's cache writes: `1h` when any
+        /// were written at the 1-hour tier, else `5m` when any were written,
+        /// else `None`. Only Claude reports it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_ttl: Option<CacheWriteTtl>,
     },
     /// The provider's plan-quota occupancy changed.
     ///

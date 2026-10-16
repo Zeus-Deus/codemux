@@ -1126,6 +1126,7 @@ fn record_usage(
         // Codex has no rate catalogue — every priced Codex row comes
         // from the static table.
         cost_source: cost_usd.map(|_| CostSource::Table),
+        cache_write_ttl: None,
     }]
 }
 

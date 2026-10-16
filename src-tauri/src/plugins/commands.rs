@@ -171,3 +171,12 @@ pub fn plugins_resume<R: Runtime>(app: AppHandle<R>, state: State<'_, PluginsSta
     state.safe_mode().resume();
     Ok(())
 }
+
+/// Turn the chat event tap on (first `host.chat.onEvent` subscriber) or off
+/// (last one gone). See `plugins/tap.rs`.
+#[tauri::command]
+pub fn plugins_set_event_tap<R: Runtime>(app: AppHandle<R>, on: bool) -> Result<(), String> {
+    gui(&app)?;
+    super::tap::set_enabled(on);
+    Ok(())
+}

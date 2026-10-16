@@ -11,6 +11,10 @@ import type { ProviderRuntimeEvent } from "@/tauri/events";
 export interface PluginChatEvent {
   threadId: string;
   event: ProviderRuntimeEvent;
+  /** For `usage_recorded`: the cache tier of this increment's writes. */
+  cacheWriteTtl?: "1h" | "5m";
+  /** For `usage_recorded`: whether a subagent did the work. */
+  subagent?: boolean;
 }
 
 type Listener = (event: PluginChatEvent) => void;
@@ -19,7 +23,11 @@ const listeners = new Set<Listener>();
 let unlisten: Promise<UnlistenFn> | null = null;
 
 function dispatch(payload: { thread_id: string; event: ProviderRuntimeEvent }) {
-  const event = { threadId: payload.thread_id, event: payload.event };
+  const event: PluginChatEvent = { threadId: payload.thread_id, event: payload.event };
+  if (payload.event.type === "usage_recorded") {
+    event.cacheWriteTtl = payload.event.cache_write_ttl;
+    event.subagent = payload.event.subagent;
+  }
   for (const listener of [...listeners]) {
     try {
       listener(event);
