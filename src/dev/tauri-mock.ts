@@ -45,6 +45,7 @@ import { createAgentConnectorMock } from "./agent-connector-mock";
 import { workflowMockHandlers } from "./workflow-mock";
 import { createCustomAcpMock } from "./custom-acp-mock";
 import { addonMockHandlers } from "./addon-mock";
+import { pluginMockHandlers } from "./plugin-mock";
 import {
   delegationScenarioFromSearch,
   mockDelegatedChild,
@@ -4409,6 +4410,7 @@ const handlers: Record<string, Handler> = {
   // Empty by default: plugins never alter a clean core-only UI. Synthetic
   // manager states are opt-in with `?addons=…` (see ./addon-mock).
   ...addonMockHandlers(),
+  ...pluginMockHandlers(),
   ...workflowMockHandlers((event) => emitEvent("workflow-changed", event)),
   get_package_format: () =>
     updateMockScenario === "pacman" || updateMockScenario === "other"

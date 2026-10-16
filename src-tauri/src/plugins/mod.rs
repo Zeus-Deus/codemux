@@ -13,6 +13,7 @@
 
 pub mod commands;
 pub mod paths;
+pub mod registry;
 pub mod watch;
 
 use serde::{Deserialize, Serialize};

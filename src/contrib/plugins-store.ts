@@ -25,6 +25,8 @@ export interface PluginRecord {
   origin?: { source: string; repo: string; sha: string; catalogId?: string };
   /** A row that is informational only (shadowed copy, duplicate id). */
   inert?: boolean;
+  /** What the switch shows when the user hasn't chosen. */
+  defaultEnabled?: boolean;
 }
 
 export interface PluginHandle {
@@ -103,6 +105,10 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<vo
   );
   const handle = handles.get(id);
   if (!handle) return;
+  const { disabledByEnv, paused, records } = usePluginsStore.getState();
+  // Kill switch and safe mode hold code back even when a switch is flipped;
+  // the decision is saved and applies on the next normal start.
+  if (enabled && (disabledByEnv || (paused && records[id]?.kind !== "bundled"))) return;
   if (enabled) {
     await handle.activate();
   } else {

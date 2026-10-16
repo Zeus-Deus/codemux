@@ -17,7 +17,6 @@ import {
   satisfiesMinVersion,
   unloadPlugin,
 } from "./activation";
-import { evaluatePluginSource } from "./evaluate";
 import {
   pluginsList,
   pluginsReadSource,
@@ -67,6 +66,7 @@ function baseRecord(entry: DiskPluginEntry): Omit<PluginRecord, "status"> {
     description: entry.marker?.description,
     kind: "disk",
     tier: tierOf(entry),
+    defaultEnabled: defaultEnabledOf(entry),
     file: entry.file,
     origin: entry.marker
       ? {
@@ -91,6 +91,9 @@ async function activateDisk(entry: DiskPluginEntry): Promise<void> {
   markLoading(entry.id);
   try {
     const source = await pluginsReadSource(entry.id);
+    // The evaluator (and the SDK runtime shims it installs) is its own chunk:
+    // nothing of it loads until an enabled disk plugin needs it.
+    const { evaluatePluginSource } = await import("./evaluate");
     const plugin = await evaluatePluginSource(source, entry.id);
     if (plugin.id !== entry.id) {
       throw new Error(`plugin id "${plugin.id}" must equal its folder name "${entry.id}"`);

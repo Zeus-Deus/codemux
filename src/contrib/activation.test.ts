@@ -120,3 +120,14 @@ describe("plugin activation", () => {
     expect(satisfiesMinVersion("0.25.0", undefined)).toBe(true);
   });
 });
+
+describe("kill switch", () => {
+  it("saves a decision but loads nothing while plugins are disabled by environment", async () => {
+    const plugin: CodemuxPlugin = { id: "demo", register: (ctx) => void ctx.register({ id: "x", area: "test.kill" }) };
+    adoptPlugin(plugin, record, false);
+    usePluginsStore.setState({ disabledByEnv: true });
+    await setPluginEnabled("demo", true);
+    expect(registry.getArea("test.kill")).toEqual([]);
+    expect(usePluginsStore.getState().decisions.demo).toBe(true);
+  });
+});

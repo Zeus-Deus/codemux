@@ -157,3 +157,45 @@ fn watcher_reports_a_saved_plugin_file() {
     let changes = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
     assert!(changes.iter().any(|c| c.id.as_deref() == Some("hello")), "{changes:?}");
 }
+
+#[test]
+fn registry_round_trips_decisions_and_rejects_bad_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reg = registry::Registry::open(&tmp.path().join("plugins.sqlite")).unwrap();
+    reg.set_enabled("hello", true).unwrap();
+    reg.set_enabled("other", false).unwrap();
+    reg.set_enabled("hello", false).unwrap();
+    let d = reg.decisions().unwrap();
+    assert_eq!(d.get("hello"), Some(&false));
+    assert_eq!(d.get("other"), Some(&false));
+    assert!(reg.set_enabled("../x", true).is_err());
+    reg.forget("other").unwrap();
+    assert!(!reg.decisions().unwrap().contains_key("other"));
+}
+
+#[test]
+fn corrupt_registry_fails_to_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("plugins.sqlite");
+    fs::write(&path, b"this is not a sqlite database at all, just junk bytes....").unwrap();
+    assert!(registry::Registry::open(&path).is_err());
+}
+
+#[test]
+fn safe_mode_follows_the_loading_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let clean = registry::SafeMode::detect(tmp.path(), None);
+    assert!(!clean.status().paused);
+    clean.begin_loading().unwrap();
+    // Next launch finds the marker: paused.
+    let crashed = registry::SafeMode::detect(tmp.path(), None);
+    assert!(crashed.status().paused);
+    assert!(crashed.status().reason.unwrap().contains("didn't finish starting"));
+    crashed.resume();
+    assert!(!crashed.status().paused);
+    crashed.startup_ok().unwrap();
+    assert!(!registry::SafeMode::detect(tmp.path(), None).status().paused);
+    // A registry error pauses too.
+    let broken = registry::SafeMode::detect(tmp.path(), Some("file is not a database"));
+    assert!(broken.status().reason.unwrap().contains("registry"));
+}

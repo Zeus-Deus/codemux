@@ -13,7 +13,6 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { reportFailure } from "@/lib/toast";
 import { pluginsRevealRoot } from "@/contrib/ipc";
 import {
-  pluginActive,
   setPluginEnabled,
   usePluginsStore,
   type PluginRecord,
@@ -41,12 +40,11 @@ function statusText(record: PluginRecord): string | null {
 }
 
 function PluginRow({ record }: { record: PluginRecord }) {
-  const enabled =
-    !record.inert &&
-    pluginActive(record.id, record.kind === "bundled" ? false : record.tier === "local");
   const decisions = usePluginsStore((s) => s.decisions);
-  const on = record.id in decisions ? decisions[record.id] : enabled;
-  const paused = usePluginsStore((s) => s.paused) && record.kind !== "bundled";
+  const on = record.id in decisions ? decisions[record.id] : (record.defaultEnabled ?? false);
+  const paused =
+    usePluginsStore((s) => s.disabledByEnv) ||
+    (usePluginsStore((s) => s.paused) && record.kind !== "bundled");
   const status = statusText(record);
   return (
     <article
@@ -111,6 +109,8 @@ function PluginRow({ record }: { record: PluginRecord }) {
 export function PluginsSettings() {
   const records = usePluginsStore((s) => s.records);
   const disabledByEnv = usePluginsStore((s) => s.disabledByEnv);
+  const paused = usePluginsStore((s) => s.paused);
+  const pausedReason = usePluginsStore((s) => s.pausedReason);
   const [reloading, setReloading] = useState(false);
   const rows = useMemo(
     () =>
@@ -160,6 +160,28 @@ export function PluginsSettings() {
         <p className="mb-4 rounded-md border border-hairline bg-surface-1 px-4 py-3 text-body-sm text-muted-foreground" role="status">
           Plugins disabled by environment (CODEMUX_DISABLE_PLUGINS).
         </p>
+      )}
+      {paused && !disabledByEnv && (
+        <div
+          className="mb-4 flex items-center justify-between gap-4 rounded-md border border-hairline bg-surface-1 px-4 py-3"
+          role="status"
+          data-plugins-safe-mode
+        >
+          <p className="text-body-sm text-muted-foreground">
+            {pausedReason ?? "Plugins you installed are paused."}
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() =>
+              void import("@/contrib/boot")
+                .then(({ resumePlugins }) => resumePlugins())
+                .catch(reportFailure("Couldn’t resume plugins"))
+            }
+          >
+            Resume plugins
+          </Button>
+        </div>
       )}
       <SubsectionHeader title="Installed" />
       {rows.length === 0 ? (

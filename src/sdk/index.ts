@@ -13,6 +13,7 @@ export type {
   PluginStorage,
 } from "@/contrib/plugin";
 export type { Contribution } from "@/contrib/types";
+export type { BundledPluginMeta } from "@/contrib/bundled";
 export type { PaletteCommandData } from "./host";
 
 /** Identity helper for typed plugin definitions. */

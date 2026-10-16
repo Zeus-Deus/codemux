@@ -35,3 +35,17 @@ export const pluginsRevealRoot = () => invoke<void>("plugins_reveal_root");
 
 export const onPluginsChanged = (cb: (id: string | null) => void): Promise<UnlistenFn> =>
   listen<{ id: string | null }>("plugins_changed", (e) => cb(e.payload?.id ?? null));
+
+export interface SafeModeStatus {
+  paused: boolean;
+  reason: string | null;
+  disabledByEnv: boolean;
+}
+
+export const pluginsGetDecisions = () => invoke<Record<string, boolean>>("plugins_get_decisions");
+export const pluginsSetEnabled = (id: string, on: boolean) =>
+  invoke<void>("plugins_set_enabled", { id, on });
+export const pluginsSafeModeStatus = () => invoke<SafeModeStatus>("plugins_safe_mode_status");
+export const pluginsStartupCheckpoint = (phase: "loading" | "ok") =>
+  invoke<void>("plugins_startup_checkpoint", { phase });
+export const pluginsResume = () => invoke<void>("plugins_resume");
