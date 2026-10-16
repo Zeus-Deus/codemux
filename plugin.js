@@ -3,7 +3,7 @@
 import * as React from "react";
 import { Button, host, icons, PALETTE_AREA, RIGHT_PANEL_AREA } from "@codemux/sdk";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const h = React.createElement;
 
 function HelloPane({ workspaceId }) {
