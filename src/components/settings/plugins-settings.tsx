@@ -19,6 +19,7 @@ import {
   type PluginTier,
 } from "@/contrib/plugins-store";
 import { SectionHeader, SubsectionHeader } from "./settings-primitives";
+import { Spinner } from "@/components/ui/spinner";
 import { useContributions } from "@/contrib/react/use-contributions";
 import { ContribBoundary, ContribRender } from "@/contrib/react/boundary";
 import { SETTINGS_PAGES_AREA } from "@/sdk/areas";
@@ -190,7 +191,7 @@ export function PluginsSettings() {
               Open plugins folder
             </Button>
             <Button size="sm" variant="outline" disabled={reloading || disabledByEnv} onClick={() => void reload()}>
-              <RefreshCw className={reloading ? "animate-spin" : undefined} />
+              {reloading ? <Spinner /> : <RefreshCw />}
               Reload plugins
             </Button>
           </>

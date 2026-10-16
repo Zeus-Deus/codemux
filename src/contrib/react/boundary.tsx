@@ -61,7 +61,7 @@ export class ContribBoundary extends Component<BoundaryProps, BoundaryState> {
         className={
           this.props.variant === "block"
             ? "flex items-center gap-2 px-3 py-2 text-caption text-destructive"
-            : "inline-flex items-center gap-1 rounded px-1.5 text-caption text-destructive"
+            : "inline-flex items-center gap-1 rounded-md px-1.5 text-caption text-destructive"
         }
       >
         <AlertTriangle className="size-3 shrink-0" aria-hidden />
@@ -69,7 +69,7 @@ export class ContribBoundary extends Component<BoundaryProps, BoundaryState> {
         <button
           type="button"
           onClick={this.reset}
-          className="inline-flex items-center gap-0.5 rounded px-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+          className="inline-flex items-center gap-0.5 rounded-md px-1 text-muted-foreground hover:bg-accent hover:text-foreground"
         >
           <RotateCw className="size-3" aria-hidden />
           Retry
