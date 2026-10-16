@@ -11,7 +11,9 @@
 //! plugins.loading                     unclean-start marker (safe mode)
 //! ```
 
+pub mod catalog;
 pub mod commands;
+pub mod install;
 pub mod paths;
 pub mod registry;
 pub mod tap;
@@ -62,6 +64,9 @@ pub struct InstallMarker {
     pub installed_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subdir: Option<String>,
+    /// Branch or tag a Git install follows for updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,3 +167,5 @@ pub fn read_source(root: &Path, id: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod install_tests;

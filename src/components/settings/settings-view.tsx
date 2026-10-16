@@ -1789,7 +1789,7 @@ export function SettingsView() {
     if (pluginSettingsId) return <PluginSettingsPageView pluginId={pluginSettingsId} />;
     switch (activeSection) {
       case "addons": return <AddonsSettings />;
-      case "plugins": return <PluginsSettings />;
+      case "plugins": return <PluginsSettings onOpenSettings={(id) => setActiveSection(`plugin:${id}`)} />;
       case "account":
         return (
           <div>

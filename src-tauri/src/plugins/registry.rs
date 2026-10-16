@@ -67,6 +67,28 @@ impl Registry {
             .map_err(|e| e.to_string())
     }
 
+    pub fn meta(&self, key: &str) -> Result<Option<String>, String> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+                params![key, value],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     pub fn forget(&self, id: &str) -> Result<(), String> {
         self.conn
             .lock()

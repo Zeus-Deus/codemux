@@ -46,5 +46,21 @@ export function pluginMockHandlers(): Record<string, Handler> {
     plugins_startup_checkpoint: () => null,
     plugins_resume: () => null,
     plugins_set_event_tap: () => null,
+    plugins_catalog: () => ({
+      catalog: { schemaVersion: 1, revision: 1, plugins: [], blocked: [] },
+      fetchedAt: null,
+      error: null,
+    }),
+    plugins_preview_install: () => {
+      throw new Error("Installing plugins needs the desktop app");
+    },
+    plugins_install: () => {
+      throw new Error("Installing plugins needs the desktop app");
+    },
+    plugins_remove: (a) => {
+      delete disk[String(a.id)];
+      delete decisions[String(a.id)];
+      return null;
+    },
   };
 }

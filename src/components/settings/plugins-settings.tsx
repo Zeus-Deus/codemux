@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { FolderOpen, MoreHorizontal, RefreshCw } from "lucide-react";
+import { FolderOpen, Github, MoreHorizontal, RefreshCw } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -7,11 +7,14 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { reportFailure } from "@/lib/toast";
-import { pluginsRevealRoot } from "@/contrib/ipc";
+import { pluginsRemove, pluginsRevealRoot, type InstallSource } from "@/contrib/ipc";
+import { useConfirm } from "@/components/ui/confirm-dialog";
+import { PluginCatalog, usePluginInstaller } from "./plugin-install";
 import {
   setPluginEnabled,
   usePluginsStore,
@@ -80,7 +83,20 @@ export function PluginSettingsPageView({ pluginId }: { pluginId: string }) {
   );
 }
 
-function PluginRow({ record }: { record: PluginRecord }) {
+/** The plugins-folder name behind a row. A shadowed disk copy's row id
+ *  carries a suffix; error rows (blocked, bad name) keep the folder name. */
+function folderIdOf(record: PluginRecord): string {
+  return record.id.replace(/:disk-shadowed$/, "");
+}
+
+interface RowActions {
+  openSettings: (id: string) => void;
+  update: (source: InstallSource) => void;
+  remove: (record: PluginRecord) => void;
+  hasSettings: boolean;
+}
+
+function PluginRow({ record, actions }: { record: PluginRecord; actions: RowActions }) {
   const decisions = usePluginsStore((s) => s.decisions);
   const on = record.id in decisions ? decisions[record.id] : (record.defaultEnabled ?? false);
   const paused =
@@ -112,7 +128,7 @@ function PluginRow({ record }: { record: PluginRecord }) {
         )}
       </div>
       <div className="flex shrink-0 items-center gap-1">
-        {record.file && (
+        {(record.file || actions.hasSettings) && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button size="icon-sm" variant="ghost" aria-label={`${record.name} actions`}>
@@ -120,13 +136,31 @@ function PluginRow({ record }: { record: PluginRecord }) {
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuItem
-                onSelect={() =>
-                  void revealItemInDir(record.file!).catch(reportFailure("Couldn’t reveal plugin"))
-                }
-              >
-                Reveal folder
-              </DropdownMenuItem>
+              {actions.hasSettings && !record.inert && (
+                <DropdownMenuItem onSelect={() => actions.openSettings(record.id)}>Settings</DropdownMenuItem>
+              )}
+              {record.file && (
+                <DropdownMenuItem
+                  onSelect={() =>
+                    void revealItemInDir(record.file!).catch(reportFailure("Couldn’t reveal plugin"))
+                  }
+                >
+                  Reveal folder
+                </DropdownMenuItem>
+              )}
+              {record.origin && folderIdOf(record) === record.id && (
+                <DropdownMenuItem onSelect={() => actions.update({ kind: "update", id: record.id })}>
+                  Update…
+                </DropdownMenuItem>
+              )}
+              {record.kind !== "bundled" && record.file && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem variant="destructive" onSelect={() => actions.remove(record)}>
+                    Remove…
+                  </DropdownMenuItem>
+                </>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         )}
@@ -147,8 +181,36 @@ function PluginRow({ record }: { record: PluginRecord }) {
   );
 }
 
-export function PluginsSettings() {
+export function PluginsSettings({ onOpenSettings }: { onOpenSettings?: (pluginId: string) => void } = {}) {
   const records = usePluginsStore((s) => s.records);
+  const installer = usePluginInstaller();
+  const { confirm, dialog: confirmDialog } = useConfirm();
+  const settingsPages = usePluginSettingsPages();
+  const remove = async (record: PluginRecord) => {
+    const ok = await confirm({
+      title: `Remove ${record.name}?`,
+      description:
+        record.tier === "local"
+          ? "This deletes the plugin’s folder from the plugins folder. A linked folder is only unlinked."
+          : "This deletes the installed copy. You can install it again later.",
+      confirmLabel: "Remove plugin",
+      destructive: true,
+    });
+    if (!ok) return;
+    try {
+      await pluginsRemove(folderIdOf(record));
+      const { reloadPlugins } = await import("@/contrib/boot");
+      await reloadPlugins();
+    } catch (error) {
+      reportFailure(`Couldn’t remove ${record.name}`)(error);
+    }
+  };
+  const rowActions = (record: PluginRecord): RowActions => ({
+    openSettings: (id) => onOpenSettings?.(id),
+    update: installer.installFrom,
+    remove: (r) => void remove(r),
+    hasSettings: settingsPages.has(record.id) && !!onOpenSettings,
+  });
   const disabledByEnv = usePluginsStore((s) => s.disabledByEnv);
   const paused = usePluginsStore((s) => s.paused);
   const pausedReason = usePluginsStore((s) => s.pausedReason);
@@ -182,6 +244,10 @@ export function PluginsSettings() {
         description="Plugins add features to Codemux. They run with full access to Codemux, your projects and your files. Each one can be turned on or off; off means none of its code runs."
         action={
           <>
+            <Button size="sm" variant="outline" disabled={disabledByEnv} onClick={installer.promptUrl}>
+              <Github />
+              Install from GitHub URL…
+            </Button>
             <Button
               size="sm"
               variant="outline"
@@ -232,10 +298,13 @@ export function PluginsSettings() {
       ) : (
         <div className="divide-y divide-hairline rounded-md border border-hairline">
           {rows.map((record) => (
-            <PluginRow key={record.id} record={record} />
+            <PluginRow key={record.id} record={record} actions={rowActions(record)} />
           ))}
         </div>
       )}
+      {!disabledByEnv && <PluginCatalog onInstall={installer.installFrom} />}
+      {installer.dialog}
+      {confirmDialog}
     </div>
   );
 }

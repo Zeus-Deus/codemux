@@ -2,8 +2,10 @@
 //! `plugins_*` command before dispatch (web_remote/dispatch.rs).
 
 use super::{
+    catalog::{CatalogCache, CatalogView},
+    install::{self, Existing},
     registry::{Registry, SafeMode, SafeModeStatus, REGISTRY_FILE},
-    watch, DiskPluginEntry,
+    watch, DiskPluginEntry, InstallMarker,
 };
 use serde::Serialize;
 use std::{
@@ -11,7 +13,7 @@ use std::{
     path::PathBuf,
     sync::{Mutex, OnceLock},
 };
-use tauri::{AppHandle, Emitter, Runtime, State};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 #[derive(Default)]
 pub struct PluginsState {
@@ -20,6 +22,9 @@ pub struct PluginsState {
     /// safe mode instead of failing every call.
     registry: OnceLock<Result<Registry, String>>,
     safe_mode: OnceLock<SafeMode>,
+    catalog: CatalogCache,
+    /// One install/update/remove at a time.
+    installing: tokio::sync::Mutex<()>,
 }
 
 impl PluginsState {
@@ -30,6 +35,31 @@ impl PluginsState {
         })
     }
 
+    /// The catalog without the network: the persisted copy from the last
+    /// fetch, else the bundled one.
+    fn catalog_now(&self) -> super::catalog::Catalog {
+        if let Ok(registry) = self.registry() {
+            if let Ok(Some(json)) = registry.meta(CATALOG_META_KEY) {
+                if let Ok(saved) = serde_json::from_str::<SavedCatalog>(&json) {
+                    self.catalog.seed(saved.catalog, saved.fetched_at);
+                }
+            }
+        }
+        self.catalog.current().catalog
+    }
+
+    /// The catalog, re-fetched when due; a successful fetch is persisted.
+    async fn catalog_fresh(&self, force: bool) -> CatalogView {
+        let _ = self.catalog_now();
+        let view = self.catalog.get(force).await;
+        if let (Some((catalog, fetched_at)), Ok(registry)) = (self.catalog.fetched(), self.registry()) {
+            if let Ok(json) = serde_json::to_string(&SavedCatalog { catalog, fetched_at }) {
+                let _ = registry.set_meta(CATALOG_META_KEY, &json);
+            }
+        }
+        view
+    }
+
     fn safe_mode(&self) -> &SafeMode {
         self.safe_mode.get_or_init(|| {
             let error = self.registry().as_ref().err().cloned();
@@ -37,6 +67,14 @@ impl PluginsState {
             SafeMode::detect(&dir, error.as_deref())
         })
     }
+}
+
+const CATALOG_META_KEY: &str = "catalog";
+
+#[derive(Serialize, serde::Deserialize)]
+struct SavedCatalog {
+    catalog: super::catalog::Catalog,
+    fetched_at: u64,
 }
 
 fn gui<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
@@ -67,12 +105,27 @@ pub fn plugins_root<R: Runtime>(app: AppHandle<R>) -> Result<PluginsRoot, String
 }
 
 #[tauri::command]
-pub async fn plugins_list<R: Runtime>(app: AppHandle<R>) -> Result<Vec<DiskPluginEntry>, String> {
+pub async fn plugins_list<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, PluginsState>,
+) -> Result<Vec<DiskPluginEntry>, String> {
     gui(&app)?;
     let root = root()?;
-    tauri::async_runtime::spawn_blocking(move || super::list(&root).map_err(|e| e.to_string()))
-        .await
-        .map_err(|e| e.to_string())?
+    let catalog = state.catalog_now();
+    tauri::async_runtime::spawn_blocking(move || {
+        install::recover(&root);
+        let mut entries = super::list(&root).map_err(|e| e.to_string())?;
+        // Blocked ids or commits are disabled at load, with the reason shown.
+        for entry in &mut entries {
+            let sha = entry.marker.as_ref().map(|m| m.sha.as_str());
+            if let Some(reason) = catalog.blocked_reason(&entry.id, sha) {
+                entry.error.get_or_insert(format!("Blocked by the Codemux catalog: {reason}"));
+            }
+        }
+        Ok(entries)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -101,6 +154,18 @@ pub fn plugins_watch<R: Runtime>(app: AppHandle<R>, state: State<'_, PluginsStat
     })
     .map_err(|e| format!("Cannot watch the plugins folder: {e}"))?;
     *slot = Some(watcher);
+    // Re-check the catalog's blocklist in the background, never during
+    // startup. A new block makes the renderer rescan, which disables it.
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let state = handle.state::<PluginsState>();
+        let before = state.catalog_now().blocked;
+        let after = state.catalog_fresh(false).await.catalog.blocked;
+        if before != after {
+            let _ = handle.emit_to("main", watch::CHANGED_EVENT, watch::Changed { id: None });
+        }
+    });
     Ok(())
 }
 
@@ -178,5 +243,250 @@ pub fn plugins_resume<R: Runtime>(app: AppHandle<R>, state: State<'_, PluginsSta
 pub fn plugins_set_event_tap<R: Runtime>(app: AppHandle<R>, on: bool) -> Result<(), String> {
     gui(&app)?;
     super::tap::set_enabled(on);
+    Ok(())
+}
+
+// ── catalog, install, update, remove ──────────────────────────────────
+
+/// The catalog (bundled copy until the first fetch; re-fetched every 24 h).
+#[tauri::command]
+pub async fn plugins_catalog<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, PluginsState>,
+    refresh: Option<bool>,
+) -> Result<CatalogView, String> {
+    gui(&app)?;
+    Ok(state.catalog_fresh(refresh.unwrap_or(false)).await)
+}
+
+/// What the install dialog shows before anything is written.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallPreview {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub version: Option<String>,
+    pub source: String,
+    pub repo: String,
+    pub sha: String,
+    pub subdir: Option<String>,
+    pub tier: String,
+    /// Set when this replaces an existing install (the installed commit).
+    pub replaces: Option<String>,
+}
+
+struct Plan {
+    preview: InstallPreview,
+    marker: InstallMarker,
+    files: Vec<(String, Vec<u8>)>,
+}
+
+fn blocked_check(catalog: &super::catalog::Catalog, id: &str, sha: &str) -> Result<(), String> {
+    match catalog.blocked_reason(id, Some(sha)) {
+        Some(reason) => Err(format!("Blocked by the Codemux catalog: {reason}")),
+        None => Ok(()),
+    }
+}
+
+fn plan_git(root: &std::path::Path, catalog: &super::catalog::Catalog, url: &str, git_ref: Option<&str>) -> Result<Plan, String> {
+    let repo = install::parse_repo(url)?;
+    let git = install::Git::new()?;
+    let tree = if git_ref.is_some() { None } else { repo.tree.as_deref() };
+    let fetched = install::fetch_plugin(&git, &format!("{}.git", repo.repo), tree, git_ref, None)?;
+    let id = install::folder_id(&fetched.meta, &repo.name)?;
+    blocked_check(catalog, &id, &fetched.sha)?;
+    finish_plan(root, id, "git", repo.repo, "unverified".into(), None, fetched)
+}
+
+fn plan_catalog(root: &std::path::Path, catalog: &super::catalog::Catalog, id: &str) -> Result<Plan, String> {
+    let entry = catalog.entry(id).ok_or_else(|| format!("\"{id}\" is not in the plugin catalog"))?;
+    blocked_check(catalog, &entry.id, &entry.sha)?;
+    let git = install::Git::new()?;
+    let fetched = install::fetch_plugin(&git, &format!("{}.git", entry.repo), None, Some(&entry.sha), entry.subdir.as_deref())?;
+    if fetched.meta.id.as_deref().is_some_and(|found| found != entry.id) {
+        return Err(format!(
+            "The plugin at that commit says its id is \"{}\", not \"{}\"",
+            fetched.meta.id.as_deref().unwrap_or(""),
+            entry.id
+        ));
+    }
+    let mut fetched = fetched;
+    fetched.meta.name.get_or_insert_with(|| entry.name.clone());
+    if !entry.description.is_empty() {
+        fetched.meta.description.get_or_insert_with(|| entry.description.clone());
+    }
+    finish_plan(root, entry.id.clone(), "catalog", entry.repo.clone(), entry.tier.clone(), Some(entry.id.clone()), fetched)
+}
+
+fn finish_plan(
+    root: &std::path::Path,
+    id: String,
+    source: &str,
+    repo: String,
+    tier: String,
+    catalog_id: Option<String>,
+    fetched: install::Fetched,
+) -> Result<Plan, String> {
+    let replaces = match install::existing(root, &id)? {
+        Existing::Installed(marker) => Some(marker.sha),
+        Existing::Local => {
+            return Err(format!("A Local plugin folder named \"{id}\" already exists. Remove it first."))
+        }
+        Existing::Link => return Err(format!("\"{id}\" is a linked folder. Remove the link first.")),
+        Existing::None => None,
+    };
+    let name = fetched.meta.name.clone().unwrap_or_else(|| id.clone());
+    let marker = InstallMarker {
+        source: source.into(),
+        repo: repo.clone(),
+        sha: fetched.sha.clone(),
+        catalog_id,
+        tier: tier.clone(),
+        installed_at: install::now_rfc3339(),
+        subdir: fetched.subdir.clone(),
+        git_ref: fetched.git_ref.clone(),
+        name: Some(name.clone()),
+        description: fetched.meta.description.clone(),
+    };
+    Ok(Plan {
+        preview: InstallPreview {
+            id,
+            name,
+            description: fetched.meta.description.clone(),
+            version: fetched.meta.version.clone(),
+            source: source.into(),
+            repo,
+            sha: fetched.sha,
+            subdir: fetched.subdir,
+            tier,
+            replaces,
+        },
+        marker,
+        files: fetched.files,
+    })
+}
+
+/// Where to install from: a GitHub URL (optionally a ref) or a catalog id.
+#[derive(serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum InstallSource {
+    Git { url: String, git_ref: Option<String> },
+    Catalog { id: String },
+    /// The update of an installed plugin: same source, newest commit
+    /// (catalog: the catalog's pinned commit).
+    Update { id: String },
+}
+
+fn plan_for(root: &std::path::Path, catalog: &super::catalog::Catalog, source: &InstallSource) -> Result<Plan, String> {
+    match source {
+        InstallSource::Git { url, git_ref } => plan_git(root, catalog, url, git_ref.as_deref()),
+        InstallSource::Catalog { id } => plan_catalog(root, catalog, id),
+        InstallSource::Update { id } => {
+            let marker = match install::existing(root, id)? {
+                Existing::Installed(marker) => marker,
+                _ => return Err(format!("\"{id}\" was not installed from the catalog or GitHub")),
+            };
+            match (marker.source.as_str(), marker.catalog_id.as_deref()) {
+                ("catalog", Some(catalog_id)) => plan_catalog(root, catalog, catalog_id),
+                _ => {
+                    let repo = install::parse_repo(&marker.repo)?;
+                    let git = install::Git::new()?;
+                    let fetched = install::fetch_plugin(
+                        &git,
+                        &format!("{}.git", repo.repo),
+                        None,
+                        Some(marker.git_ref.as_deref().unwrap_or("HEAD")),
+                        marker.subdir.as_deref(),
+                    )?;
+                    blocked_check(catalog, id, &fetched.sha)?;
+                    let mut plan = finish_plan(root, id.clone(), "git", repo.repo, marker.tier.clone(), None, fetched)?;
+                    plan.marker.git_ref = marker.git_ref.clone();
+                    Ok(plan)
+                }
+            }
+        }
+    }
+}
+
+/// Resolve the source to one commit and describe it, without writing.
+#[tauri::command]
+pub async fn plugins_preview_install<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, PluginsState>,
+    source: InstallSource,
+) -> Result<InstallPreview, String> {
+    gui(&app)?;
+    let root = root()?;
+    let catalog = state.catalog_fresh(false).await.catalog;
+    tauri::async_runtime::spawn_blocking(move || plan_for(&root, &catalog, &source).map(|p| p.preview))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Install exactly the previewed commit. The plugin starts off unless
+/// `enable` (the dialog's "Install and turn on"). A different commit than the
+/// preview showed (the branch moved) is refused, so the dialog never lies.
+#[tauri::command]
+pub async fn plugins_install<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, PluginsState>,
+    source: InstallSource,
+    expected_sha: String,
+    enable: bool,
+) -> Result<InstallPreview, String> {
+    gui(&app)?;
+    let _one = state.installing.lock().await;
+    let root = root()?;
+    let catalog = state.catalog_fresh(false).await.catalog;
+    let plan = {
+        let (root, catalog, source) = (root.clone(), catalog.clone(), source.clone());
+        tauri::async_runtime::spawn_blocking(move || plan_for(&root, &catalog, &source))
+            .await
+            .map_err(|e| e.to_string())??
+    };
+    if plan.preview.sha != expected_sha {
+        return Err("The plugin changed since the preview; review the new commit and try again".into());
+    }
+    let id = plan.preview.id.clone();
+    let is_update = plan.preview.replaces.is_some();
+    {
+        let (root, id, files, marker) = (root.clone(), id.clone(), plan.files, plan.marker);
+        tauri::async_runtime::spawn_blocking(move || install::write_install(&root, &id, &files, &marker))
+            .await
+            .map_err(|e| e.to_string())??;
+    }
+    // A new install starts off (or on, from "Install and turn on"); an update
+    // keeps the user's decision.
+    if let Ok(registry) = state.registry() {
+        if !is_update || enable {
+            registry.set_enabled(&id, enable)?;
+        }
+    }
+    let _ = app.emit_to("main", watch::CHANGED_EVENT, watch::Changed { id: Some(id) });
+    Ok(plan.preview)
+}
+
+/// Remove an installed or Local disk plugin. A linked folder is unlinked,
+/// never its target. Bundled plugins have no folder and can't be removed.
+#[tauri::command]
+pub async fn plugins_remove<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, PluginsState>,
+    id: String,
+) -> Result<(), String> {
+    gui(&app)?;
+    let _one = state.installing.lock().await;
+    let root = root()?;
+    {
+        let (root, id) = (root.clone(), id.clone());
+        tauri::async_runtime::spawn_blocking(move || super::paths::remove_plugin_dir(&root, &id))
+            .await
+            .map_err(|e| e.to_string())??;
+    }
+    if let Ok(registry) = state.registry() {
+        registry.forget(&id)?;
+    }
+    let _ = app.emit_to("main", watch::CHANGED_EVENT, watch::Changed { id: Some(id) });
     Ok(())
 }
