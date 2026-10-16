@@ -93,6 +93,39 @@ export function dropPlugin(id: string): void {
  * by the next rescan.
  */
 const unsaved = new Map<string, boolean>();
+/** Per plugin: the number of the latest toggle. Only that toggle's save may
+ *  clear the override or report an error. */
+const latestAttempt = new Map<string, number>();
+let attempts = 0;
+/** Per plugin: the save chain, so writes land in the order they were made
+ *  and an older write can never be the last one persisted. */
+const writes = new Map<string, Promise<void>>();
+
+/**
+ * Drop the session override for `id` before an install or remove replaces
+ * its installation: a failed choice belongs to the installation it was made
+ * for, never to a reinstall sharing its id. Returns `restore`, for when the
+ * native operation fails and the old installation stays.
+ */
+export function takeDecisionOverride(id: string): () => void {
+  const had = unsaved.has(id);
+  const value = unsaved.get(id);
+  const error = usePluginsStore.getState().unsavedDecisions[id];
+  unsaved.delete(id);
+  latestAttempt.set(id, ++attempts); // in-flight saves no longer own it
+  usePluginsStore.setState((s) => {
+    const { [id]: _gone, ...rest } = s.unsavedDecisions;
+    return { unsavedDecisions: rest };
+  });
+  return () => {
+    if (!had || unsaved.has(id)) return;
+    unsaved.set(id, value!);
+    usePluginsStore.setState((s) => ({
+      decisions: { ...s.decisions, [id]: value! },
+      unsavedDecisions: { ...s.unsavedDecisions, [id]: error ?? null },
+    }));
+  };
+}
 
 /**
  * Adopt the native registry's decisions. Every rescan does this first:
@@ -125,10 +158,13 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<vo
     unsavedDecisions: { ...s.unsavedDecisions, [id]: null },
   }));
   unsaved.set(id, enabled);
-  const attempt = enabled;
-  void persistDecision(id, enabled).then(
+  const attempt = ++attempts;
+  latestAttempt.set(id, attempt);
+  const isLatest = () => latestAttempt.get(id) === attempt;
+  const write = (writes.get(id) ?? Promise.resolve()).then(() => persistDecision(id, enabled));
+  const tail = write.then(
     () => {
-      if (unsaved.get(id) !== attempt) return;
+      if (!isLatest()) return;
       unsaved.delete(id);
       usePluginsStore.setState((s) => {
         const { [id]: _done, ...rest } = s.unsavedDecisions;
@@ -137,13 +173,17 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<vo
     },
     (error) => {
       console.error(`[plugins] could not save the decision for ${id}`, error);
-      if (unsaved.get(id) !== attempt) return;
+      if (!isLatest()) return;
       // Kept in `unsaved`: this choice still governs this session.
       usePluginsStore.setState((s) => ({
         unsavedDecisions: { ...s.unsavedDecisions, [id]: error instanceof Error ? error.message : String(error) },
       }));
     },
   );
+  writes.set(id, tail);
+  void tail.finally(() => {
+    if (writes.get(id) === tail) writes.delete(id);
+  });
   const handle = handles.get(id);
   if (!handle) return;
   const { disabledByEnv, paused, records } = usePluginsStore.getState();
@@ -171,6 +211,8 @@ export function deactivateAll(filter: (r: PluginRecord) => boolean = () => true)
 export function resetPluginsStoreForTests(): void {
   handles.clear();
   unsaved.clear();
+  latestAttempt.clear();
+  writes.clear();
   persistDecision = async () => {};
   usePluginsStore.setState({
     records: {},

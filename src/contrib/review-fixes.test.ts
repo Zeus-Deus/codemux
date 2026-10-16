@@ -292,6 +292,81 @@ describe("decisions after install and remove", () => {
     expect(row.error).toContain("Blocked");
   });
 
+  it("off → on → off with only the last save failing keeps the last 'off'", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const saves: { resolve: () => void; reject: (e: Error) => void }[] = [];
+    const { setDecisionPersistence } = await import("./plugins-store");
+    setDecisionPersistence(
+      () => new Promise<void>((resolve, reject) => saves.push({ resolve, reject })),
+    );
+    invoke.mockImplementation(async (cmd: unknown) => {
+      if (cmd === "plugins_get_decisions") return { hello: true };
+      if (cmd === "plugins_list") return [entry];
+      if (cmd === "plugins_read_source") throw new Error("must not read a plugin the user turned off");
+      return undefined;
+    });
+    usePluginsStore.setState({ decisionsLoaded: true, decisions: { hello: true } });
+    await setPluginEnabled("hello", false);
+    await setPluginEnabled("hello", true);
+    await setPluginEnabled("hello", false);
+    // Writes are serialized: complete them one at a time, in order.
+    await vi.waitFor(() => expect(saves.length).toBe(1));
+    saves[0].resolve();
+    await vi.waitFor(() => expect(saves.length).toBe(2));
+    saves[1].resolve();
+    await vi.waitFor(() => expect(saves.length).toBe(3));
+    saves[2].reject(new Error("disk full"));
+    await vi.waitFor(() => expect(usePluginsStore.getState().unsavedDecisions.hello).toBe("disk full"));
+    await scanDiskPlugins(true);
+    expect(pluginActive("hello", false)).toBe(false);
+    expect(invoke).not.toHaveBeenCalledWith("plugins_read_source", expect.anything());
+  });
+
+  it("a failed enable does not turn on a reinstall left off", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { setDecisionPersistence, takeDecisionOverride } = await import("./plugins-store");
+    setDecisionPersistence(async () => {
+      throw new Error("disk full");
+    });
+    usePluginsStore.setState({ decisionsLoaded: true, decisions: { hello: false } });
+    await setPluginEnabled("hello", true);
+    await vi.waitFor(() => expect(usePluginsStore.getState().unsavedDecisions.hello).toBe("disk full"));
+    // Remove, then a plain Install: the dialog and the row drop the override
+    // before the native operation; natively the decision is now off.
+    takeDecisionOverride("hello");
+    invoke.mockImplementation(async (cmd: unknown) => {
+      if (cmd === "plugins_get_decisions") return { hello: false };
+      if (cmd === "plugins_list") return [entry];
+      if (cmd === "plugins_read_source") throw new Error("must not read the reinstall");
+      return undefined;
+    });
+    await scanDiskPlugins(true);
+    expect(pluginActive("hello", false)).toBe(false);
+    expect(invoke).not.toHaveBeenCalledWith("plugins_read_source", expect.anything());
+    expect(usePluginsStore.getState().unsavedDecisions.hello).toBeUndefined();
+  });
+
+  it("a failed remove keeps the existing installation's failed choice", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { setDecisionPersistence, takeDecisionOverride } = await import("./plugins-store");
+    setDecisionPersistence(async () => {
+      throw new Error("disk full");
+    });
+    usePluginsStore.setState({ decisionsLoaded: true, decisions: { hello: true } });
+    await setPluginEnabled("hello", false);
+    await vi.waitFor(() => expect(usePluginsStore.getState().unsavedDecisions.hello).toBe("disk full"));
+    const restore = takeDecisionOverride("hello");
+    restore();
+    invoke.mockImplementation(async (cmd: unknown) => {
+      if (cmd === "plugins_get_decisions") return { hello: true };
+      if (cmd === "plugins_list") return [entry];
+      if (cmd === "plugins_read_source") throw new Error("must stay off");
+      return undefined;
+    });
+    await scanDiskPlugins(true);
+    expect(pluginActive("hello", false)).toBe(false);
+  });
+
   it("a toggle still being saved wins over the native copy", async () => {
     let finish!: () => void;
     invoke.mockImplementation(async (cmd: unknown) => {

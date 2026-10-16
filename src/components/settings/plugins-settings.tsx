@@ -18,6 +18,7 @@ import { useUIStore } from "@/stores/ui-store";
 import { PluginCatalog, usePluginInstaller } from "./plugin-install";
 import {
   setPluginEnabled,
+  takeDecisionOverride,
   usePluginsStore,
   type PluginRecord,
   type PluginTier,
@@ -205,7 +206,13 @@ export function PluginsSettings({ onOpenSettings }: { onOpenSettings?: (pluginId
     });
     if (!ok) return;
     try {
-      await pluginsRemove(folderIdOf(record));
+      const restore = takeDecisionOverride(folderIdOf(record));
+      try {
+        await pluginsRemove(folderIdOf(record));
+      } catch (error) {
+        restore();
+        throw error;
+      }
       const prefix = `plugin:${folderIdOf(record)}:`;
       useUIStore.getState().forgetRightPanelPanes((pane) => pane.startsWith(prefix));
       const { reloadPlugins } = await import("@/contrib/boot");
