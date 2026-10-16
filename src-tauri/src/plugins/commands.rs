@@ -48,14 +48,21 @@ impl PluginsState {
         self.catalog.current().catalog
     }
 
-    /// The catalog, re-fetched when due; a successful fetch is persisted.
-    async fn catalog_fresh(&self, force: bool) -> CatalogView {
-        let _ = self.catalog_now();
+    /// The catalog, re-fetched when due. Every caller goes through here, so
+    /// a successful fetch is always persisted, and a changed blocklist always
+    /// makes the renderer rescan, which disables a newly blocked plugin at
+    /// once (whoever triggered the fetch: Settings, install, the startup
+    /// check).
+    async fn catalog_fresh<R: Runtime>(&self, app: &AppHandle<R>, force: bool) -> CatalogView {
+        let before = self.catalog_now().blocked;
         let view = self.catalog.get(force).await;
         if let (Some((catalog, fetched_at)), Ok(registry)) = (self.catalog.fetched(), self.registry()) {
             if let Ok(json) = serde_json::to_string(&SavedCatalog { catalog, fetched_at }) {
                 let _ = registry.set_meta(CATALOG_META_KEY, &json);
             }
+        }
+        if view.catalog.blocked != before {
+            let _ = app.emit_to("main", watch::CHANGED_EVENT, watch::Changed { id: None });
         }
         view
     }
@@ -112,8 +119,16 @@ pub async fn plugins_list<R: Runtime>(
     gui(&app)?;
     let root = root()?;
     let catalog = state.catalog_now();
+    // Tidy what an interrupted install left behind, but never while an
+    // install, update or remove is running: its staging folder and backup
+    // are live then. Skipped now, it runs on a later listing.
+    if let Ok(_quiet) = state.installing.try_lock() {
+        let root = root.clone();
+        tauri::async_runtime::spawn_blocking(move || install::recover(&root))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     tauri::async_runtime::spawn_blocking(move || {
-        install::recover(&root);
         let mut entries = super::list(&root).map_err(|e| e.to_string())?;
         // Blocked ids or commits are disabled at load, with the reason shown.
         for entry in &mut entries {
@@ -160,11 +175,7 @@ pub fn plugins_watch<R: Runtime>(app: AppHandle<R>, state: State<'_, PluginsStat
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         let state = handle.state::<PluginsState>();
-        let before = state.catalog_now().blocked;
-        let after = state.catalog_fresh(false).await.catalog.blocked;
-        if before != after {
-            let _ = handle.emit_to("main", watch::CHANGED_EVENT, watch::Changed { id: None });
-        }
+        let _ = state.catalog_fresh(&handle, false).await;
     });
     Ok(())
 }
@@ -256,7 +267,7 @@ pub async fn plugins_catalog<R: Runtime>(
     refresh: Option<bool>,
 ) -> Result<CatalogView, String> {
     gui(&app)?;
-    Ok(state.catalog_fresh(refresh.unwrap_or(false)).await)
+    Ok(state.catalog_fresh(&app, refresh.unwrap_or(false)).await)
 }
 
 /// What the install dialog shows before anything is written.
@@ -418,7 +429,7 @@ pub async fn plugins_preview_install<R: Runtime>(
 ) -> Result<InstallPreview, String> {
     gui(&app)?;
     let root = root()?;
-    let catalog = state.catalog_fresh(false).await.catalog;
+    let catalog = state.catalog_fresh(&app, false).await.catalog;
     tauri::async_runtime::spawn_blocking(move || plan_for(&root, &catalog, &source).map(|p| p.preview))
         .await
         .map_err(|e| e.to_string())?
@@ -438,7 +449,7 @@ pub async fn plugins_install<R: Runtime>(
     gui(&app)?;
     let _one = state.installing.lock().await;
     let root = root()?;
-    let catalog = state.catalog_fresh(false).await.catalog;
+    let catalog = state.catalog_fresh(&app, false).await.catalog;
     let plan = {
         let (root, catalog, source) = (root.clone(), catalog.clone(), source.clone());
         tauri::async_runtime::spawn_blocking(move || plan_for(&root, &catalog, &source))

@@ -132,6 +132,10 @@ pub struct CatalogView {
 #[derive(Default)]
 pub struct CatalogCache {
     state: Mutex<Option<(Catalog, Option<u64>, Option<String>)>>,
+    /// One fetch at a time: overlapping refreshes (Settings, install
+    /// preview, the startup check) wait for the one in flight and reuse its
+    /// result, so an older response can never overwrite a newer one.
+    fetching: tokio::sync::Mutex<()>,
     #[cfg(test)]
     pub fetcher: Mutex<Option<Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>>>,
 }
@@ -225,22 +229,49 @@ impl CatalogCache {
     /// (or `force`). A failed fetch keeps the previous catalog and reports
     /// the error beside it.
     pub async fn get(&self, force: bool) -> CatalogView {
-        if force || self.due() {
-            let previous = self.current();
-            let result = match self.fetch().await {
-                Ok(bytes) => Catalog::parse(&bytes),
-                Err(e) => Err(e),
-            };
-            let next = match result {
-                // Never roll back to an older revision than we already have.
-                Ok(catalog) if catalog.revision >= previous.catalog.revision => {
-                    (catalog, Some(now()), None)
-                }
-                Ok(_) => (previous.catalog, Some(now()), None),
-                Err(error) => (previous.catalog, previous.fetched_at, Some(error)),
-            };
-            *self.state.lock().unwrap() = Some(next);
+        if !(force || self.due()) {
+            return self.current();
         }
+        let started = self.generation();
+        let _one = self.fetching.lock().await;
+        // Someone else fetched while we waited: use their result.
+        if self.generation() != started && !self.due_ignoring_dev_override() {
+            return self.current();
+        }
+        let result = match self.fetch().await {
+            Ok(bytes) => Catalog::parse(&bytes),
+            Err(e) => Err(e),
+        };
+        self.accept(result);
         self.current()
+    }
+
+    /// Merge a fetch result into the cache under its lock, against what is
+    /// there NOW: never roll back to an older revision, and a failure keeps
+    /// the current catalog and only records the error.
+    pub(super) fn accept(&self, result: Result<Catalog, String>) {
+        let mut guard = self.state.lock().unwrap();
+        let (current, fetched_at) = match guard.take() {
+            Some((catalog, at, _)) => (catalog, at),
+            None => (bundled(), None),
+        };
+        *guard = Some(match result {
+            Ok(catalog) if catalog.revision >= current.revision => (catalog, Some(now()), None),
+            Ok(_) => (current, Some(now()), None),
+            Err(error) => (current, fetched_at, Some(error)),
+        });
+    }
+
+    /// Changes whenever a fetch lands (its time or catalog).
+    fn generation(&self) -> (Option<u64>, u64) {
+        let view = self.current();
+        (view.fetched_at, view.catalog.revision)
+    }
+
+    fn due_ignoring_dev_override(&self) -> bool {
+        match self.state.lock().unwrap().as_ref() {
+            Some((_, Some(at), _)) => now().saturating_sub(*at) >= RECHECK_SECONDS,
+            _ => true,
+        }
     }
 }

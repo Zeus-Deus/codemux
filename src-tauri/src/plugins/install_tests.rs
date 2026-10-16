@@ -262,3 +262,25 @@ async fn a_failed_catalog_fetch_keeps_the_previous_catalog() {
     *cache.fetcher.lock().unwrap() = Some(Box::new(move || Ok(older.clone())));
     assert_eq!(cache.get(true).await.catalog.revision, 5, "never rolls back");
 }
+
+#[test]
+fn a_late_catalog_result_never_undoes_a_newer_one() {
+    // Two refreshes started from revision 1. The newer response (revision 3,
+    // which adds a block) lands first; the older one (revision 2) and a
+    // failing one land after it. Both are merged against what is cached NOW.
+    let cache = super::catalog::CatalogCache::default();
+    let parse = |json: &str| Catalog::parse(json.as_bytes());
+    cache.accept(parse(r#"{"schemaVersion":1,"revision":1,"plugins":[]}"#));
+    cache.accept(parse(
+        r#"{"schemaVersion":1,"revision":3,"plugins":[],"blocked":[{"id":"evil","reason":"malware"}]}"#,
+    ));
+    cache.accept(parse(r#"{"schemaVersion":1,"revision":2,"plugins":[]}"#));
+    let view = cache.current();
+    assert_eq!(view.catalog.revision, 3);
+    assert_eq!(view.catalog.blocked_reason("evil", None).as_deref(), Some("malware"));
+    cache.accept(Err("offline".into()));
+    let view = cache.current();
+    assert_eq!(view.catalog.revision, 3, "a failure keeps the newest catalog");
+    assert_eq!(view.catalog.blocked_reason("evil", None).as_deref(), Some("malware"));
+    assert_eq!(view.error.as_deref(), Some("offline"));
+}
