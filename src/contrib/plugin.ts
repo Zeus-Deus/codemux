@@ -9,6 +9,7 @@ import { registry } from "./registry";
 import type { Contribution } from "./types";
 import { pluginStorage } from "./storage";
 import type { PluginTier } from "./plugins-store";
+import { bindOwner, type Owner } from "./lifetime";
 
 export const SETTINGS_PAGES_AREA = "settings.pages";
 
@@ -64,36 +65,36 @@ export interface PluginContext {
   storage: PluginStorage;
 }
 
-/** Timers and DOM listeners, retired as ONE tracked disposer. A fired
- *  timeout drops out of the set so long-lived plugins don't accumulate. */
-function createLifetime(track: (dispose: () => void) => void) {
-  const cleanups = new Set<() => void>();
-  let tracked = false;
+/** Timers and DOM listeners. Each is a disposer of the owner, so a timer or
+ *  listener started after the plugin was turned off is cancelled at once.
+ *  Callbacks run as the owner, so host subscriptions made inside them are
+ *  owned too. A fired timeout's disposer becomes a no-op. */
+function createLifetime(owner: Owner) {
   const scoped = (cleanup: () => void) => {
-    if (!tracked) {
-      tracked = true;
-      track(() => {
-        cleanups.forEach((pending) => pending());
-        cleanups.clear();
-      });
-    }
-    cleanups.add(cleanup);
-    return () => {
-      if (!cleanups.delete(cleanup)) return;
+    let live = true;
+    const dispose = () => {
+      if (!live) return;
+      live = false;
       cleanup();
     };
+    owner.track(dispose);
+    return dispose;
   };
   return {
     setTimeout: (fn: () => void, ms: number) => {
-      const clear = () => globalThis.clearTimeout(id);
+      if (owner.ended) return () => {};
+      const run = bindOwner(owner, fn);
+      let dispose = () => {};
       const id = globalThis.setTimeout(() => {
-        cleanups.delete(clear);
-        fn();
+        dispose();
+        run();
       }, ms);
-      return scoped(clear);
+      dispose = scoped(() => globalThis.clearTimeout(id));
+      return dispose;
     },
     setInterval: (fn: () => void, ms: number) => {
-      const id = globalThis.setInterval(fn, ms);
+      if (owner.ended) return () => {};
+      const id = globalThis.setInterval(bindOwner(owner, fn), ms);
       return scoped(() => globalThis.clearInterval(id));
     },
     addEventListener: (
@@ -102,17 +103,18 @@ function createLifetime(track: (dispose: () => void) => void) {
       listener: EventListenerOrEventListenerObject,
       options?: AddEventListenerOptions | boolean,
     ) => {
-      target.addEventListener(type, listener, options);
-      return scoped(() => target.removeEventListener(type, listener, options));
+      if (owner.ended) return () => {};
+      const bound: EventListenerOrEventListenerObject =
+        typeof listener === "function"
+          ? bindOwner(owner, listener)
+          : { handleEvent: bindOwner(owner, (e: Event) => listener.handleEvent(e)) };
+      target.addEventListener(type, bound, options);
+      return scoped(() => target.removeEventListener(type, bound, options));
     },
   };
 }
 
-export function createPluginContext(
-  pluginId: string,
-  tier: PluginTier,
-  onDispose: (dispose: () => void) => void,
-): PluginContext {
+export function createPluginContext(pluginId: string, tier: PluginTier, owner: Owner): PluginContext {
   const source = `plugin:${pluginId}`;
   const scope = (c: PluginContribution): Contribution => ({
     ...c,
@@ -120,7 +122,7 @@ export function createPluginContext(
     source,
   });
   const track = (dispose: () => void) => {
-    onDispose(dispose);
+    owner.track(dispose);
     return dispose;
   };
   return {
@@ -142,7 +144,7 @@ export function createPluginContext(
         ),
       ),
     onDispose: (fn) => void track(fn),
-    ...createLifetime(track),
+    ...createLifetime(owner),
     storage: pluginStorage(pluginId),
   };
 }

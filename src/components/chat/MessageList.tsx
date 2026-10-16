@@ -1843,7 +1843,12 @@ function ItemRow({
   cwd,
   referenceCwd,
   referencePaths,
+  pluginToolRenderers: _pluginToolRenderers,
 }: {
+  /** Snapshot of `transcript.toolRenderer`: not read here (the lookup is
+   *  imperative), but a new value breaks this leaf's memo so a mounted tool
+   *  card switches to or from a plugin renderer when one is toggled. */
+  pluginToolRenderers?: readonly unknown[];
   item: ChatViewItem;
   commentary?: boolean;
   /** The item's turn is still running; gates a tool card's live timer. */
@@ -1994,7 +1999,11 @@ function renderAssistantBody(
     case "reasoning":
       return <ReasoningBlock item={item} />;
     case "tool_call": {
-      const pluginRenderer = findPluginToolRenderer(item.tool_name);
+      // Approvals stay core-owned: a call waiting on Allow/Deny (or whose
+      // decision is in flight or failed) always gets the core card, whose
+      // footer is the only approval UI for it.
+      const approvalOpen = !!handlers.approval && handlers.approval.resolution?.state !== "resolved";
+      const pluginRenderer = approvalOpen ? undefined : findPluginToolRenderer(item.tool_name);
       if (pluginRenderer) {
         return (
           <ContribBoundary id={pluginRenderer.id} variant="block">
@@ -2230,7 +2239,7 @@ function SlotRow({
   revertingTurnIndex,
   onToggleTurnFold,
   onKeepWorkLogOpen,
-  pluginToolRenderers: _pluginToolRenderers,
+  pluginToolRenderers,
 }: {
   /** Snapshot of `transcript.toolRenderer`; a new value re-renders rows so
    *  turning a renderer plugin on or off updates mounted tool cards. */
@@ -2314,6 +2323,7 @@ function SlotRow({
           cwd={cwd}
           referenceCwd={referenceCwd}
           referencePaths={referencePaths}
+          pluginToolRenderers={pluginToolRenderers}
         />
       )}
     </div>

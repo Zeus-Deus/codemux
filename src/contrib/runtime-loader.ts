@@ -18,6 +18,7 @@ import {
   unloadPlugin,
 } from "./activation";
 import {
+  pluginsGetDecisions,
   pluginsList,
   pluginsReadSource,
   type DiskPluginEntry,
@@ -26,6 +27,7 @@ import {
   dropPlugin,
   pluginActive,
   publishPlugin,
+  replaceDecisions,
   usePluginsStore,
   type PluginRecord,
   type PluginTier,
@@ -188,14 +190,29 @@ function retire(id: string): void {
 
 let scanning: Promise<void> | null = null;
 
+/** Native decisions are the truth after an install or remove; read them
+ *  before acting on a folder change. A failed read keeps what we have. */
+async function syncDecisions(): Promise<void> {
+  if (!usePluginsStore.getState().decisionsLoaded) return;
+  try {
+    replaceDecisions(await pluginsGetDecisions());
+  } catch (error) {
+    console.warn("[plugins] could not re-read plugin decisions", error);
+  }
+}
+
 /**
  * Reconcile the root with the inventory. `reloadKnown` (Reload plugins)
  * re-reads every enabled plugin too: an installer's atomic folder swap can
  * leave a watcher on the old inode.
  */
-export function scanDiskPlugins(reloadKnown = false): Promise<void> {
+export function scanDiskPlugins(
+  reloadKnown = false,
+  { decisionsFresh = false }: { decisionsFresh?: boolean } = {},
+): Promise<void> {
   if (scanning) return scanning.then(() => (reloadKnown ? scanDiskPlugins(true) : undefined));
   scanning = (async () => {
+    if (!decisionsFresh) await syncDecisions();
     let entries: DiskPluginEntry[];
     try {
       entries = await pluginsList();
@@ -224,6 +241,7 @@ export async function onDiskChange(id: string | null): Promise<void> {
     await scanDiskPlugins();
     return;
   }
+  await syncDecisions();
   let entries: DiskPluginEntry[];
   try {
     entries = await pluginsList();

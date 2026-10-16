@@ -75,12 +75,29 @@ export async function startPlugins(): Promise<void> {
   }
 
   // Safe mode: a crash during this launch leaves the marker for the next one.
-  await pluginsStartupCheckpoint("loading").catch(() => undefined);
-  window.setTimeout(() => void pluginsStartupCheckpoint("ok").catch(() => undefined), STARTUP_OK_MS);
+  await armCrashCheckpoint().catch(() => undefined);
 
   await adoptBundledPlugins();
   await watchDisk();
-  await scanDiskPlugins();
+  // Decisions were read just above; later scans re-read them.
+  await scanDiskPlugins(false, { decisionsFresh: true });
+}
+
+let checkpointTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Write the "loading plugins" marker, then clear it once the app has stayed
+ * up for STARTUP_OK_MS. Every activation attempt that may crash re-arms it:
+ * startup and Resume plugins.
+ */
+async function armCrashCheckpoint(): Promise<void> {
+  if (checkpointTimer) clearTimeout(checkpointTimer);
+  checkpointTimer = null;
+  await pluginsStartupCheckpoint("loading");
+  checkpointTimer = setTimeout(() => {
+    checkpointTimer = null;
+    void pluginsStartupCheckpoint("ok").catch(() => undefined);
+  }, STARTUP_OK_MS);
 }
 
 /** Settings → Plugins → Reload: rescan and re-read every enabled plugin. */
@@ -88,9 +105,23 @@ export function reloadPlugins(): Promise<void> {
   return scanDiskPlugins(true);
 }
 
-/** Safe-mode banner → Resume plugins: lift the pause and load disk plugins. */
+
+/**
+ * Safe-mode banner → Resume plugins. The crash marker is written BEFORE the
+ * pause lifts, so a plugin that crashes the app while loading pauses again
+ * on the next launch. A failed marker write keeps the pause.
+ */
 export async function resumePlugins(): Promise<void> {
+  await armCrashCheckpoint();
   await pluginsResume();
   usePluginsStore.setState({ paused: false, pausedReason: null });
   await scanDiskPlugins(true);
+}
+
+/** Test-only. */
+export function resetBootForTests(): void {
+  if (checkpointTimer) clearTimeout(checkpointTimer);
+  checkpointTimer = null;
+  started = false;
+  watching = false;
 }

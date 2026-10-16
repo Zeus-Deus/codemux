@@ -762,3 +762,22 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay", () => {
     expect(useUIStore.getState().showSettings).toBe(true);
   });
 });
+
+describe("use-keyboard-shortcuts dispatch — plugin shortcuts", () => {
+  it("runs a plugin shortcut with no app state or active workspace", async () => {
+    const { registry } = await import("@/contrib/registry");
+    const run = vi.fn();
+    const off = registry.register({
+      id: "demo:global",
+      area: "keybinds",
+      data: { label: "Demo", defaultKeys: "Ctrl+Alt+G", run },
+    });
+    useAppStore.setState({ appState: null });
+    try {
+      expect(dispatch("plugin:demo:global")).toBe(true);
+      expect(run).toHaveBeenCalledOnce();
+    } finally {
+      off();
+    }
+  });
+});

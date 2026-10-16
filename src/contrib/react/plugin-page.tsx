@@ -11,7 +11,7 @@ export function PluginPage({ id }: { id: string }) {
   return (
     <UtilityPage title={page?.title ?? "Plugin"} backLabel="Close page" onBack={close}>
       {page?.render ? (
-        <ContribBoundary id={page.id} variant="block">
+        <ContribBoundary key={page.id} id={page.id} variant="block">
           <ContribRender render={page.render} />
         </ContribBoundary>
       ) : (

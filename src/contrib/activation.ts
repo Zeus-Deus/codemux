@@ -5,7 +5,7 @@
  * disposer runs, each disposer isolated).
  */
 import { toast } from "@/lib/toast";
-import { withAmbientTracker } from "./lifetime";
+import { Owner, runAs, trackAsyncRegistration } from "./lifetime";
 import { createPluginContext, type CodemuxPlugin } from "./plugin";
 import {
   patchPlugin,
@@ -15,29 +15,20 @@ import {
   type PluginRecord,
 } from "./plugins-store";
 
-/** Live plugins: id → disposers of the current incarnation. */
-const loaded = new Map<string, (() => void)[]>();
+/** Live plugins: id → owner of the current incarnation. */
+const loaded = new Map<string, Owner>();
 
 export function isLoaded(id: string): boolean {
   return loaded.has(id);
 }
 
 export function unloadPlugin(id: string): void {
-  const disposers = loaded.get(id);
+  const owner = loaded.get(id);
   // Released BEFORE disposers run, each in its own try/catch: a throwing
-  // disposer must not wedge every later reload (Hermes #126338).
+  // disposer must not wedge every later reload (Hermes #126338). Last
+  // registered, first disposed: mirrors setup order.
   loaded.delete(id);
-  // Last registered, first disposed: mirrors setup order.
-  disposers
-    ?.slice()
-    .reverse()
-    .forEach((dispose) => {
-      try {
-        dispose();
-      } catch (error) {
-        console.error(`[plugins] ${id}: disposer failed during unload`, error);
-      }
-    });
+  owner?.end();
 }
 
 function message(error: unknown): string {
@@ -55,22 +46,11 @@ export function reportPluginError(name: string, title: string, error: unknown): 
  */
 export function activatePlugin(plugin: CodemuxPlugin, record: Omit<PluginRecord, "status">): boolean {
   unloadPlugin(plugin.id);
-  const disposers: (() => void)[] = [];
-  // Set BEFORE register() so a throw midway is disposable.
-  loaded.set(plugin.id, disposers);
-  const track = (dispose: () => void) => {
-    // A disposer added after this incarnation was unloaded (a late async
-    // registration) runs immediately instead of leaking.
-    if (loaded.get(plugin.id) !== disposers) {
-      try {
-        dispose();
-      } catch (error) {
-        console.error(`[plugins] ${plugin.id}: late disposer failed`, error);
-      }
-      return;
-    }
-    disposers.push(dispose);
-  };
+  // Set BEFORE register() so a throw midway is disposable. A disposer added
+  // after this incarnation ended (a late async registration, a timer started
+  // after unload) runs immediately instead of leaking.
+  const owner = new Owner(plugin.id);
+  loaded.set(plugin.id, owner);
 
   const fail = (error: unknown) => {
     unloadPlugin(plugin.id);
@@ -80,17 +60,18 @@ export function activatePlugin(plugin: CodemuxPlugin, record: Omit<PluginRecord,
 
   let result: unknown;
   try {
-    result = withAmbientTracker(track, () =>
-      plugin.register(createPluginContext(plugin.id, record.tier, track)),
-    );
+    result = runAs(owner, () => plugin.register(createPluginContext(plugin.id, record.tier, owner)));
   } catch (error) {
     fail(error);
     return false;
   }
   publishPlugin({ ...record, status: "loaded", error: undefined });
   if (result && typeof (result as PromiseLike<unknown>).then === "function") {
-    void Promise.resolve(result).catch((error: unknown) => {
-      if (loaded.get(plugin.id) === disposers) fail(error);
+    const settled = Promise.resolve(result);
+    // Host subscriptions made after an `await` belong to this registration.
+    trackAsyncRegistration(owner, settled);
+    void settled.catch((error: unknown) => {
+      if (loaded.get(plugin.id) === owner) fail(error);
     });
   }
   return true;

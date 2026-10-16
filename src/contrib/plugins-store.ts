@@ -83,6 +83,19 @@ export function dropPlugin(id: string): void {
   handles.delete(id);
 }
 
+/** Decisions the user just made whose native write hasn't finished. */
+const unsaved = new Map<string, boolean>();
+
+/**
+ * Adopt the native registry's decisions. Every rescan does this first:
+ * install and remove write decisions natively, so a stale renderer copy
+ * would otherwise decide (a removed plugin's old "on" would turn on a
+ * reinstall the user chose to leave off). Toggles still being saved win.
+ */
+export function replaceDecisions(decisions: Record<string, boolean>): void {
+  usePluginsStore.setState({ decisions: { ...decisions, ...Object.fromEntries(unsaved) } });
+}
+
 export function hasHandle(id: string): boolean {
   return handles.has(id);
 }
@@ -100,9 +113,12 @@ export function setDecisionPersistence(fn: (id: string, enabled: boolean) => Pro
  */
 export async function setPluginEnabled(id: string, enabled: boolean): Promise<void> {
   usePluginsStore.setState((s) => ({ decisions: { ...s.decisions, [id]: enabled } }));
-  void persistDecision(id, enabled).catch((error) =>
-    console.error(`[plugins] could not save the decision for ${id}`, error),
-  );
+  unsaved.set(id, enabled);
+  void persistDecision(id, enabled)
+    .catch((error) => console.error(`[plugins] could not save the decision for ${id}`, error))
+    .finally(() => {
+      if (unsaved.get(id) === enabled) unsaved.delete(id);
+    });
   const handle = handles.get(id);
   if (!handle) return;
   const { disabledByEnv, paused, records } = usePluginsStore.getState();
@@ -129,6 +145,7 @@ export function deactivateAll(filter: (r: PluginRecord) => boolean = () => true)
 /** Test-only reset. */
 export function resetPluginsStoreForTests(): void {
   handles.clear();
+  unsaved.clear();
   persistDecision = async () => {};
   usePluginsStore.setState({
     records: {},

@@ -46,6 +46,12 @@ export class ContribBoundary extends Component<BoundaryProps, BoundaryState> {
     console.error(`[plugins] ${this.props.id} failed to render`, error, info.componentStack);
   }
 
+  // A boundary reused for a different contribution (switching panes or
+  // pages) starts clean: one plugin's crash never sticks to another.
+  componentDidUpdate(prev: BoundaryProps) {
+    if (prev.id !== this.props.id && this.state.error) this.setState({ error: null });
+  }
+
   private reset = () => this.setState({ error: null });
 
   render() {

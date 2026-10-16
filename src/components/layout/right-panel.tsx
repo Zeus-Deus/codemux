@@ -991,7 +991,7 @@ export const RightPanel = memo(function RightPanel({
             const panel = pluginPanes.find((p) => p.pane === activePane);
             return panel?.contribution.render ? (
               <div className="h-full min-h-0 overflow-auto" data-plugin-pane={panel.contribution.id}>
-                <ContribBoundary id={panel.contribution.id} variant="block">
+                <ContribBoundary key={panel.contribution.id} id={panel.contribution.id} variant="block">
                   <ContribRender render={panel.contribution.render} props={{ workspaceId }} />
                 </ContribBoundary>
               </div>

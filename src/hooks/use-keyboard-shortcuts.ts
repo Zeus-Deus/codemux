@@ -280,6 +280,10 @@ export function dispatch(actionId: string, event?: KeyboardEvent): boolean {
     return jumpToNextNeedsYou();
   }
 
+  // Plugin keybinds (`plugin:<pluginId>:<localId>`) are global: they run
+  // with or without an open workspace (a plugin checks host.workspace itself).
+  if (actionId.startsWith("plugin:")) return runPluginKeybind(actionId, event);
+
   if (!appState) return false;
   const ws = appState.workspaces.find(
     (w) => w.workspace_id === selectActiveWorkspaceId(useAppStore.getState()),
@@ -432,6 +436,5 @@ export function dispatch(actionId: string, event?: KeyboardEvent): boolean {
     return true;
   }
 
-  // Plugin keybinds (`plugin:<pluginId>:<localId>`) fall through here.
-  return runPluginKeybind(actionId, event);
+  return false;
 }

@@ -24,7 +24,7 @@ import {
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
 import type { WorkspaceSnapshot } from "@/tauri/types";
-import { trackAmbient } from "@/contrib/lifetime";
+import { bindOwner, currentOwner, trackAmbient } from "@/contrib/lifetime";
 import { focusedComposer } from "@/contrib/composer-registry";
 import { subscribeChatEvents, type PluginChatEvent } from "@/contrib/chat-events";
 
@@ -115,6 +115,24 @@ function cssVar(role: ThemeRole): string {
   return THEME_ROLE_VARIABLES[role];
 }
 
+/**
+ * A plugin's subscription callback, isolated and owned: a throw is reported
+ * against the plugin and never unwinds the core code that notified it (the
+ * theme's layout effect, a store update, the other listeners), and host
+ * calls made inside run as that plugin.
+ */
+function guarded<A extends unknown[]>(fn: (...args: A) => void): (...args: A) => void {
+  const owner = currentOwner();
+  const run = bindOwner(owner, fn);
+  return (...args: A) => {
+    try {
+      run(...args);
+    } catch (error) {
+      console.error(`[plugins] ${owner?.pluginId ?? "plugin"}: subscription callback threw`, error);
+    }
+  };
+}
+
 /** Subscribe helper that also detaches when the calling plugin is turned off. */
 function tracked(unsubscribe: () => void): () => void {
   let done = false;
@@ -143,8 +161,10 @@ export interface ThreadSnapshot {
 export const host = {
   theme: {
     get: (): ThemeDefinition => getActiveTheme(),
-    subscribe: (fn: (theme: ThemeDefinition) => void) =>
-      tracked(subscribeActiveTheme(() => fn(getActiveTheme()))),
+    subscribe: (fn: (theme: ThemeDefinition) => void) => {
+      const run = guarded(fn);
+      return tracked(subscribeActiveTheme(() => run(getActiveTheme())));
+    },
     /** CSS variable name for a theme role, e.g. `--cm-theme-background`. */
     cssVar,
   },
@@ -173,13 +193,14 @@ export const host = {
   workspace: {
     current: currentWorkspace,
     subscribe: (fn: (ws: WorkspaceSnapshot | null) => void) => {
+      const run = guarded(fn);
       let last = currentWorkspace();
       return tracked(
         useAppStore.subscribe(() => {
           const next = currentWorkspace();
           if (next !== last) {
             last = next;
-            fn(next);
+            run(next);
           }
         }),
       );
@@ -190,13 +211,14 @@ export const host = {
     get: (key: string): string =>
       useSettingsStore.getState().settings[key] ?? SETTINGS_DEFAULTS[key] ?? "",
     subscribe: (key: string, fn: (value: string) => void) => {
+      const run = guarded(fn);
       let last = host.settings.get(key);
       return tracked(
         useSettingsStore.subscribe(() => {
           const next = host.settings.get(key);
           if (next !== last) {
             last = next;
-            fn(next);
+            run(next);
           }
         }),
       );
@@ -212,7 +234,7 @@ export const host = {
      * `plan_usage_updated`. The first subscriber turns the native tap on;
      * the last one leaving turns it off.
      */
-    onEvent: (fn: (event: PluginChatEvent) => void) => tracked(subscribeChatEvents(fn)),
+    onEvent: (fn: (event: PluginChatEvent) => void) => tracked(subscribeChatEvents(guarded(fn))),
     async getThread(threadId: string): Promise<ThreadSnapshot> {
       const live = useAgentChatStore.getState().threads[threadId] ?? null;
       let session: AgentChatSessionRecord | null = null;
@@ -241,9 +263,10 @@ export const host = {
   invoke: <T = unknown>(cmd: string, args?: Record<string, unknown>) => tauriInvoke<T>(cmd, args),
   /** UNSTABLE raw app event subscription. Removed when the plugin turns off. */
   listen<T = unknown>(event: string, fn: (payload: T) => void): () => void {
+    const run = guarded(fn);
     let unlisten: (() => void) | null = null;
     let cancelled = false;
-    void tauriListen<T>(event, (e) => fn(e.payload)).then((u) => {
+    void tauriListen<T>(event, (e) => run(e.payload)).then((u) => {
       if (cancelled) u();
       else unlisten = u;
     });
