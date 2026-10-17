@@ -1402,10 +1402,25 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
     }
 
-    crate::commands::agent_chat::shutdown_agent_chat_threads(
-        &app,
-        close_result.removed_agent_chat_threads,
-    );
+    let deleting_files = remove_worktree && worktree_path.is_some();
+    if deleting_files {
+        // Agents run inside the worktree; deleting it while one is still
+        // stopping would pull files out from under a live process. A stop
+        // that was not acknowledged keeps the files.
+        crate::commands::agent_chat::shutdown_agent_chat_threads_and_wait(
+            &app,
+            close_result.removed_agent_chat_threads,
+        )
+        .await
+        .map_err(|error| {
+            format!("Agent session did not stop ({error}); worktree files retained.")
+        })?;
+    } else {
+        crate::commands::agent_chat::shutdown_agent_chat_threads(
+            &app,
+            close_result.removed_agent_chat_threads,
+        );
+    }
 
     if remove_worktree {
         if let Some(wt_path) = worktree_path {

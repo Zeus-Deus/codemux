@@ -5582,10 +5582,33 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
     app: &AppHandle<R>,
     threads: Vec<(ProviderKind, String)>,
 ) {
+    let threads = begin_agent_chat_thread_shutdown(app, threads);
     if threads.is_empty() {
         return;
     }
-    // Synchronous and before the spawn: the pane is already gone, so the
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = stop_agent_chat_threads(&app_handle, threads).await;
+    });
+}
+
+/// [`shutdown_agent_chat_threads`], but resolves only once every session has
+/// stopped. Worktree deletion awaits this so no agent is still running in
+/// the directory when its files are removed. Errs when a provider did not
+/// acknowledge the stop; a session that was not running counts as stopped.
+pub async fn shutdown_agent_chat_threads_and_wait<R: Runtime>(
+    app: &AppHandle<R>,
+    threads: Vec<(ProviderKind, String)>,
+) -> Result<(), String> {
+    let threads = begin_agent_chat_thread_shutdown(app, threads);
+    stop_agent_chat_threads(app, threads).await
+}
+
+fn begin_agent_chat_thread_shutdown<R: Runtime>(
+    app: &AppHandle<R>,
+    threads: Vec<(ProviderKind, String)>,
+) -> Vec<(ProviderKind, String, Arc<ThreadGate>)> {
+    // Synchronous and before any await: the pane is already gone, so the
     // tracking is dead the moment we are called, and this must not depend
     // on the async cleanup task being scheduled.
     let tracker: State<'_, SubagentTracker> = app.state();
@@ -5594,39 +5617,52 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
         super::usage_resume::cancel_for_stopped_thread(app, thread_id);
         super::delegation::on_thread_stopped(app, thread_id, super::delegation::StopKind::Close);
     }
-    let threads: Vec<_> = threads
+    threads
         .into_iter()
         .map(|(kind, thread_id)| {
             let gate = native_thread_gate(app, &thread_id);
             gate.cancel();
             (kind, thread_id, gate)
         })
-        .collect();
-    let app_handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let registry: State<'_, ProviderRegistry> = app_handle.state();
-        for (kind, thread_id, gate) in threads {
-            let _activity_guard = super::usage_resume::activity_lock(&thread_id)
-                .lock_owned()
-                .await;
-            super::usage_resume::cancel_for_stopped_thread(&app_handle, &thread_id);
-            let _native_guard = gate.dispatch.clone().lock_owned().await;
-            let Some(impl_) = registry.get(kind).await else {
-                continue;
-            };
-            if let Err(error) = impl_.stop_session(ThreadId(thread_id.clone())).await {
+        .collect()
+}
+
+async fn stop_agent_chat_threads<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    threads: Vec<(ProviderKind, String, Arc<ThreadGate>)>,
+) -> Result<(), String> {
+    let registry: State<'_, ProviderRegistry> = app_handle.state();
+    let mut first_error = None;
+    for (kind, thread_id, gate) in threads {
+        let _activity_guard = super::usage_resume::activity_lock(&thread_id)
+            .lock_owned()
+            .await;
+        super::usage_resume::cancel_for_stopped_thread(app_handle, &thread_id);
+        let _native_guard = gate.dispatch.clone().lock_owned().await;
+        let Some(impl_) = registry.get(kind).await else {
+            continue;
+        };
+        match impl_.stop_session(ThreadId(thread_id.clone())).await {
+            Ok(()) => {
+                if let Some(state) = app_handle.try_state::<NativeControlState>() {
+                    state.clear_worker(&thread_id);
+                    state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id: ThreadId(thread_id.clone()),
+                        status: SessionStatus::Closed,
+                    });
+                }
+            }
+            // Nothing was running, so nothing can still be using the files.
+            Err(ProviderError::SessionNotFound { .. } | ProviderError::SessionClosed { .. }) => {}
+            Err(error) => {
                 eprintln!(
                     "[agent_chat] cleanup stop_session failed for {kind:?} {thread_id}: {error:?}"
                 );
-            } else if let Some(state) = app_handle.try_state::<NativeControlState>() {
-                state.clear_worker(&thread_id);
-                state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {
-                    thread_id: ThreadId(thread_id.clone()),
-                    status: SessionStatus::Closed,
-                });
+                first_error.get_or_insert_with(|| format!("{kind:?} {thread_id}: {error}"));
             }
         }
-    });
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 // ── Session history (for the pane-header dropdown) ──────────────────
@@ -8920,6 +8956,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::PathBuf;
 
     #[tokio::test]
     async fn hermes_stop_during_lazy_resume_prevents_later_dispatch() {
@@ -10379,6 +10416,9 @@ mod tests {
         live: Mutex<std::collections::HashSet<String>>,
         stopped: Mutex<Vec<String>>,
         started_on: Mutex<Vec<Option<i64>>>,
+        stop_started: tokio::sync::Notify,
+        stop_release: Option<Arc<tokio::sync::Notify>>,
+        fail_stop: bool,
     }
 
     #[async_trait::async_trait]
@@ -10442,6 +10482,16 @@ mod tests {
             unimplemented!()
         }
         async fn stop_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+            self.stop_started.notify_one();
+            if let Some(release) = &self.stop_release {
+                release.notified().await;
+            }
+            if self.fail_stop {
+                return Err(ProviderError::ProcessError {
+                    message: "test shutdown was not acknowledged".into(),
+                    source: None,
+                });
+            }
             self.stopped.lock().unwrap().push(thread_id.0.clone());
             self.live.lock().unwrap().remove(&thread_id.0);
             Ok(())
@@ -10558,6 +10608,113 @@ mod tests {
             .unwrap()
             .contains("other-workspace-thread"));
         assert!(!session_hosts().lock().unwrap().contains_key(thread));
+    }
+
+    // Workspace close emits state and schedules layout persistence. Isolate
+    // that write in a subprocess so these fixtures never touch the user's layout.
+    fn worktree_close_fixture_child(test: &str) -> bool {
+        if std::env::var_os("CODEMUX_TEST_LAYOUT_PATH").is_some() {
+            return false;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("commands::agent_chat::tests::{test}"), "--nocapture"])
+            .env("CODEMUX_TEST_LAYOUT_PATH", root.path().join("layout.json"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "workspace close fixture: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
+
+    async fn worktree_close_app(
+        thread: &str,
+        provider: Arc<PlacementProvider>,
+    ) -> (tempfile::TempDir, tauri::App<tauri::test::MockRuntime>, String, PathBuf) {
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "initial"],
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        }
+        let worktree = crate::git::git_create_worktree(repo.path(), "close-agent", true, None, None).unwrap();
+        provider.live.lock().unwrap().insert(thread.to_string());
+        let (app, workspace) = placement_app(thread, None, provider).await;
+        app.manage(crate::terminal::PtyState::default());
+        app.manage(SubagentTracker::default());
+        let state = app.state::<AppStateStore>();
+        let mut snapshot = state.snapshot();
+        let ws = snapshot.workspaces.iter_mut().find(|ws| ws.workspace_id.0 == workspace).unwrap();
+        ws.cwd = worktree.clone();
+        ws.worktree_path = Some(worktree.clone());
+        ws.git_branch = Some("close-agent".into());
+        ws.workspace_kind = Some("worktree".into());
+        ws.protected = false;
+        state.replace_snapshot(snapshot);
+        (repo, app, workspace, PathBuf::from(worktree))
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_waits_for_agent_shutdown() {
+        if worktree_close_fixture_child("worktree_deletion_waits_for_agent_shutdown") {
+            return;
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(PlacementProvider {
+            stop_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let (_repo, app, workspace, worktree) = worktree_close_app("close-wait", provider.clone()).await;
+        let handle = app.handle().clone();
+        let mut close = tokio::spawn(async move {
+            super::super::workspace::close_workspace_with_worktree_impl(
+                handle.clone(), &handle.state::<AppStateStore>(), &handle.state::<DatabaseStore>(),
+                workspace, true, Some(false), Some(true),
+            ).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), provider.stop_started.notified()).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(100), &mut close).await;
+        let waited = result.is_err();
+        let retained_while_stopping = worktree.exists();
+        release.notify_one();
+        match result {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => close.await.unwrap().unwrap(),
+        }
+        assert!(waited, "workspace deletion completed before its agent stopped");
+        assert!(retained_while_stopping, "worktree must exist while the agent is stopping");
+        assert!(!worktree.exists(), "worktree should be removed after shutdown");
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_retains_files_when_agent_shutdown_fails() {
+        if worktree_close_fixture_child("worktree_deletion_retains_files_when_agent_shutdown_fails") {
+            return;
+        }
+        let provider = Arc::new(PlacementProvider { fail_stop: true, ..Default::default() });
+        let (_repo, app, workspace, worktree) = worktree_close_app("close-failed-stop", provider).await;
+        let handle = app.handle();
+        let result = super::super::workspace::close_workspace_with_worktree_impl(
+            handle.clone(), &handle.state::<AppStateStore>(), &handle.state::<DatabaseStore>(),
+            workspace, true, Some(false), Some(true),
+        ).await;
+        let retained = worktree.exists();
+        if retained {
+            crate::git::git_remove_worktree(&worktree, None, true).unwrap();
+        }
+        let error = result.expect_err("unacknowledged shutdown must refuse file deletion");
+        assert!(error.contains("test shutdown was not acknowledged"), "unexpected error: {error}");
+        assert!(retained, "failed agent shutdown must retain the worktree");
     }
 
     /// Give `workspace` an absolute folder on its device, so a session can
