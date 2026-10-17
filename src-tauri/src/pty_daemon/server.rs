@@ -85,7 +85,9 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 512;
 /// Sent ahead of the snapshot when a lagged client is resynced. CAN aborts
 /// any escape sequence the dropped bytes cut short, and RIS resets the
 /// terminal so the snapshot redraws onto a clean screen instead of on top of
-/// whatever the partial stream left behind.
+/// whatever the partial stream left behind. RIS also clears terminal modes
+/// (alt screen, mouse, bracketed paste), so a full-screen app may need to
+/// redraw if the replay buffer no longer holds the sequences that set them.
 const RESYNC_PREFIX: &[u8] = b"\x18\x1bc";
 
 /// Maximum size of the "cold-start replay" buffer per session. Captures
