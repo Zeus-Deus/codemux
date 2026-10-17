@@ -2510,6 +2510,7 @@ function mockFollowUpMergeAll(a: Record<string, unknown>): unknown {
         reason: "Still running.",
       })),
     conflict: null,
+    stopped: null,
   };
 }
 

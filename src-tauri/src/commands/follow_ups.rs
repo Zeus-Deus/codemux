@@ -391,20 +391,72 @@ pub struct MergeConflict {
 }
 
 /// What Merge all did. Merging stops at the first conflict, which is
-/// aborted, so `merged` lists only branches that are in.
+/// aborted, so `merged` lists only branches that are in. `stopped` says why
+/// it stopped early for another reason (someone else's merge appeared);
+/// whatever merged before that is still listed, so its state is kept.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct MergeAllResult {
     pub target_branch: Option<String>,
     pub merged: Vec<MergedBranch>,
     pub skipped: Vec<SkippedBranch>,
     pub conflict: Option<MergeConflict>,
+    pub stopped: Option<String>,
+}
+
+const MERGE_IN_PROGRESS: &str =
+    "A merge is already in progress in this workspace. Finish or abort it first.";
+const MERGE_APPEARED: &str =
+    "Stopped: another merge started in this workspace. It was left as it is; finish or abort it, then merge the rest.";
+
+/// Checkouts Merge all is merging into right now, by git directory, so two
+/// app-initiated runs never interleave in one checkout.
+static MERGING: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
+struct MergeLock(PathBuf);
+
+impl MergeLock {
+    fn acquire(target: &Path) -> Result<Self, String> {
+        let key = git(target, &["rev-parse", "--absolute-git-dir"])
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| target.to_path_buf());
+        let key = key.canonicalize().unwrap_or(key);
+        let mut held = MERGING.lock().unwrap_or_else(|p| p.into_inner());
+        if !held.insert(key.clone()) {
+            return Err("Merge all is already running in this workspace.".into());
+        }
+        Ok(Self(key))
+    }
+}
+
+impl Drop for MergeLock {
+    fn drop(&mut self) {
+        MERGING
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// The commit `MERGE_HEAD` names in the checkout at `dir`, if a merge is in
+/// progress.
+fn merge_head(dir: &Path) -> Option<String> {
+    git(dir, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).ok()
+}
+
+/// Whether a failed `git merge <theirs>` left a merge that this run owns:
+/// git did not refuse to start over an existing merge, and the merge in
+/// progress is of exactly the commit this run asked for. Anything else is
+/// someone else's operation and is never aborted.
+fn owns_failed_merge(dir: &Path, error: &str, theirs: &str) -> bool {
+    !error.contains("not concluded your merge") && merge_head(dir).as_deref() == Some(theirs)
 }
 
 /// Whether the checkout containing `dir` has a merge in progress. Asked
 /// through git so it holds in a linked worktree (where `.git` is a file)
 /// and from a subdirectory of the checkout.
 fn merge_in_progress(dir: &Path) -> bool {
-    git(dir, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok()
+    merge_head(dir).is_some()
 }
 
 /// Merge `candidates` into the checkout at `target` with `--no-ff`, in
@@ -412,15 +464,25 @@ fn merge_in_progress(dir: &Path) -> bool {
 /// A child with uncommitted work in its worktree is reported as not
 /// mergeable, never merged half-done. On a conflict the merge this run
 /// started is aborted and nothing after it is attempted; a merge it did not
-/// start is never aborted.
+/// start is never aborted. A merge someone else starts mid-run ends the run
+/// with `stopped`, keeping what already merged.
 pub(crate) fn merge_branches(
     target: &Path,
     candidates: &[MergeCandidate],
 ) -> Result<MergeAllResult, String> {
+    merge_branches_with(target, candidates, |_| {})
+}
+
+/// [`merge_branches`] with a hook run just before each candidate's merge,
+/// so tests can interleave another process's git operation.
+fn merge_branches_with(
+    target: &Path,
+    candidates: &[MergeCandidate],
+    mut before_merge: impl FnMut(&MergeCandidate),
+) -> Result<MergeAllResult, String> {
+    let _lock = MergeLock::acquire(target)?;
     if merge_in_progress(target) {
-        return Err(
-            "A merge is already in progress in this workspace. Finish or abort it first.".into(),
-        );
+        return Err(MERGE_IN_PROGRESS.into());
     }
     let dirty = dirty_files(target, false)?;
     if !dirty.is_empty() {
@@ -486,14 +548,20 @@ pub(crate) fn merge_branches(
             continue;
         }
         let message = format!("Merge {}: {}", candidate.branch, candidate.title);
-        // Someone may have started a merge since the check above; never
-        // run (and later abort) on top of it.
+        before_merge(candidate);
+        // Someone may have started a merge since the check above. Stop
+        // without touching it, and keep what already merged.
         if merge_in_progress(target) {
-            return Err(
-                "A merge is already in progress in this workspace. Finish or abort it first."
-                    .into(),
-            );
+            result.stopped = Some(MERGE_APPEARED.into());
+            break;
         }
+        // The commit this merge asks for: a merge in progress afterwards is
+        // ours only if it names exactly this commit.
+        let theirs = git(
+            target,
+            &["rev-parse", "--verify", &format!("refs/heads/{}^{{commit}}", candidate.branch)],
+        )
+        .unwrap_or_default();
         match git(
             target,
             &[
@@ -516,8 +584,13 @@ pub(crate) fn merge_branches(
                     .lines()
                     .map(str::to_string)
                     .collect();
-                // Leave the workspace exactly as it was before this merge:
-                // MERGE_HEAD was absent before it, so a present one is ours.
+                if merge_in_progress(target) && !owns_failed_merge(target, &error, &theirs) {
+                    // Someone else's merge got in between our check and
+                    // ours. Never abort it.
+                    result.stopped = Some(MERGE_APPEARED.into());
+                    break;
+                }
+                // Leave the workspace exactly as it was before this merge.
                 if merge_in_progress(target) {
                     let _ = git(target, &["merge", "--abort"]);
                 }
@@ -1256,6 +1329,59 @@ mod tests {
             before,
             "left stays merged"
         );
+    }
+
+    #[test]
+    fn a_merge_started_between_candidates_stops_the_run_and_keeps_earlier_merges() {
+        let (_dir, repo) = repo();
+        commit_on(&repo, "one", "b.txt", "b\n");
+        commit_on(&repo, "two", "c.txt", "c\n");
+        commit_on(&repo, "theirs", "e.txt", "e\n");
+        let result = merge_branches_with(&repo, &[candidate("one"), candidate("two")], |next| {
+            if next.branch == "two" {
+                // Another process starts its own merge right before ours.
+                git(&repo, &["merge", "--no-ff", "--no-commit", "theirs"]).unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(result.merged.len(), 1, "the first merge is kept: {result:?}");
+        assert_eq!(result.merged[0].branch, "one");
+        assert!(result.conflict.is_none());
+        assert!(result.stopped.as_deref().unwrap().contains("another merge"));
+        let theirs = git(&repo, &["rev-parse", "theirs"]).unwrap();
+        assert_eq!(merge_head(&repo).as_deref(), Some(theirs.as_str()), "their merge is untouched");
+        assert!(repo.join("e.txt").exists() && !repo.join("c.txt").exists());
+    }
+
+    #[test]
+    fn a_failed_merge_over_someone_elses_merge_is_never_theirs_to_abort() {
+        let (_dir, repo) = repo();
+        commit_on(&repo, "kid", "b.txt", "b\n");
+        commit_on(&repo, "theirs", "e.txt", "e\n");
+        git(&repo, &["merge", "--no-ff", "--no-commit", "theirs"]).unwrap();
+        let kid = git(&repo, &["rev-parse", "kid"]).unwrap();
+        // What git says when our merge would start over theirs.
+        let refused = git(&repo, &["merge", "--no-ff", "--no-edit", "kid"]).unwrap_err();
+        assert!(!owns_failed_merge(&repo, &refused, &kid), "{refused}");
+        assert!(merge_in_progress(&repo), "still in progress");
+        // A conflict this run produced is its own.
+        git(&repo, &["merge", "--abort"]).unwrap();
+        commit_on(&repo, "left", "a.txt", "one\nLEFT\nthree\n");
+        commit_on(&repo, "right", "a.txt", "one\nRIGHT\nthree\n");
+        git(&repo, &["merge", "--no-ff", "--no-edit", "left"]).unwrap();
+        let right = git(&repo, &["rev-parse", "right"]).unwrap();
+        let conflict = git(&repo, &["merge", "--no-ff", "--no-edit", "right"]).unwrap_err();
+        assert!(owns_failed_merge(&repo, &conflict, &right), "{conflict}");
+    }
+
+    #[test]
+    fn two_merge_all_runs_never_share_a_checkout() {
+        let (_dir, repo) = repo();
+        let held = MergeLock::acquire(&repo).unwrap();
+        let refused = merge_branches(&repo, &[candidate("x")]).unwrap_err();
+        assert!(refused.contains("already running"), "{refused}");
+        drop(held);
+        assert!(MergeLock::acquire(&repo).is_ok());
     }
 
     #[test]

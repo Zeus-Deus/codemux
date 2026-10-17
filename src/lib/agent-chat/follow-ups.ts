@@ -291,10 +291,14 @@ export function mergeSummary(result: {
   merged: Array<{ title: string }>;
   skipped: Array<{ title: string; reason: string }>;
   conflict: { title: string; branch: string; files: string[]; message: string | null } | null;
+  stopped?: string | null;
 }): { text: string; failed: boolean } {
   const into = result.target_branch ? ` into ${result.target_branch}` : "";
   const n = result.merged.length;
   const merged = n > 0 ? `Merged ${n} branch${n === 1 ? "" : "es"}${into}.` : "";
+  if (result.stopped) {
+    return { text: [merged, result.stopped].filter(Boolean).join(" "), failed: true };
+  }
   if (result.conflict) {
     const { title, branch, files, message } = result.conflict;
     const what = files.length > 0 ? `conflicts in ${files.join(", ")}` : (message ?? "git refused");

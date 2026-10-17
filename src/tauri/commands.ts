@@ -3694,6 +3694,9 @@ export interface FollowUpMergeResult {
     files: string[];
     message: string | null;
   } | null;
+  /** Why the run stopped early without a conflict (another merge appeared);
+   *  branches merged before that are still listed. */
+  stopped?: string | null;
 }
 
 /** Claude and Codex, plus the other installed delegation candidates. */

@@ -158,6 +158,18 @@ describe("suggested tasks", () => {
     expect(conflict.text).toContain("Merged 1 branch into main.");
     expect(conflict.text).toContain("conflicts in src/a.ts");
     expect(conflict.text).toContain("aborted");
+    // Stopped by someone else's merge: what merged before stays reported.
+    const stopped = mergeSummary({
+      target_branch: "main",
+      merged: [{ title: "A" }],
+      skipped: [],
+      conflict: null,
+      stopped: "Stopped: another merge started in this workspace.",
+    });
+    expect(stopped).toEqual({
+      text: "Merged 1 branch into main. Stopped: another merge started in this workspace.",
+      failed: true,
+    });
   });
 
   it("sends the full brief but shows a short line for Do it here", () => {
