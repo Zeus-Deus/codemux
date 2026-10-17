@@ -7,6 +7,7 @@ import {
   deriveActivityDurationMs,
   deriveActivitySummary,
   deriveWorkingCounter,
+  editCounts,
   formatActivityDuration,
   stepDurationMs,
   stepElapsedLabel,
@@ -124,6 +125,15 @@ describe("stepMeta / toStepView", () => {
       input: { file_path: "/a", old_string: "one\ntwo", new_string: "one\ntwo\nthree" },
     });
     expect(stepMeta(edit)).toBe("+1 −0");
+  });
+  it("computes an edit's counts once per tool call object", () => {
+    const edit = tool("Edit", {
+      input: { file_path: "/a", old_string: "one", new_string: "two" },
+    });
+    const counts = editCounts(edit);
+    expect(counts).toEqual({ added: 1, removed: 1 });
+    expect(editCounts(edit)).toBe(counts);
+    expect(editCounts({ ...edit })).not.toBe(counts);
   });
   it("labels a running step and an errored step", () => {
     expect(stepMeta(tool("Bash", { status: "running" }))).toBe("running");

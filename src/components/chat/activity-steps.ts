@@ -412,9 +412,21 @@ export interface EditCounts {
   removed: number;
 }
 
+// Step rows re-read their meta on every streamed render, and the counts come
+// from an LCS diff. The reducer keeps a settled call's object stable, so
+// caching by identity computes each call's counts once.
+const editCountsCache = new WeakMap<ToolCallItem, EditCounts | null>();
+
 /** Added / removed line counts for an Edit-family tool, reusing the same
  *  LCS diff the inline DiffView renders. `null` when no diff-able input. */
 export function editCounts(item: ToolCallItem): EditCounts | null {
+  if (editCountsCache.has(item)) return editCountsCache.get(item) ?? null;
+  const counts = computeEditCounts(item);
+  editCountsCache.set(item, counts);
+  return counts;
+}
+
+function computeEditCounts(item: ToolCallItem): EditCounts | null {
   const input = isRecord(item.input) ? item.input : null;
   if (!input) return null;
   let oldText: string;

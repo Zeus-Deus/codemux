@@ -4,10 +4,20 @@ import { Profiler, type ComponentType } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { CHAT_MARKDOWN_COMPONENTS, ChatCodeRendererProvider } from "./ChatCodeBlock";
+import {
+  CHAT_MARKDOWN_COMPONENTS,
+  ChatCodeRendererProvider,
+  MAX_HIGHLIGHT_CHARS,
+  STREAMING_HIGHLIGHT_INTERVAL_MS,
+} from "./ChatCodeBlock";
 
-vi.mock("streamdown", () => ({ useIsCodeFenceIncomplete: () => false }));
-afterEach(cleanup);
+const fence = vi.hoisted(() => ({ incomplete: false }));
+vi.mock("streamdown", () => ({ useIsCodeFenceIncomplete: () => fence.incomplete }));
+afterEach(() => {
+  cleanup();
+  fence.incomplete = false;
+  vi.useRealTimers();
+});
 
 const Fence = CHAT_MARKDOWN_COMPONENTS.code as ComponentType<{
   className: string;
@@ -222,5 +232,42 @@ describe("code fence remounts", () => {
     vi.mocked(highlighter.highlight).mockClear();
     mount(`0${code}`, highlighter);
     expect(highlighter.highlight).toHaveBeenCalledOnce();
+  });
+});
+
+describe("code fence highlight cost", () => {
+  it("renders fences over the size limit plain without asking the highlighter", () => {
+    const highlighter = plugin();
+    const code = `const big = "${"x".repeat(MAX_HIGHLIGHT_CHARS)}";`;
+    const a = mount(code, highlighter);
+    expect(highlighter.highlight).not.toHaveBeenCalled();
+    expect(a.container.querySelector("code")?.textContent).toBe(code);
+    expect(lastColor(a.container)).not.toContain("#ff0000");
+  });
+
+  it("re-highlights an open fence at most once per interval, then at once on close", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    fence.incomplete = true;
+    const highlighter = plugin();
+    const a = mount("const a = 1;", highlighter);
+    expect(highlighter.highlight).toHaveBeenCalledOnce();
+
+    a.rerender(tree("const a = 1;\nconst b", highlighter));
+    a.rerender(tree("const a = 1;\nconst b = 2;", highlighter));
+    // Text shows immediately; the tail stays uncolored until the next pass.
+    expect(a.container.querySelector("code")?.textContent).toContain("const b = 2;");
+    expect(highlighter.highlight).toHaveBeenCalledOnce();
+
+    act(() => vi.advanceTimersByTime(STREAMING_HIGHLIGHT_INTERVAL_MS));
+    expect(highlighter.highlight).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(highlighter.highlight).mock.lastCall?.[0].code).toBe(
+      "const a = 1;\nconst b = 2;",
+    );
+
+    a.rerender(tree("const a = 1;\nconst b = 2;\nconst c = 3;", highlighter));
+    expect(highlighter.highlight).toHaveBeenCalledTimes(2);
+    fence.incomplete = false;
+    a.rerender(tree("const a = 1;\nconst b = 2;\nconst c = 3;", highlighter));
+    expect(highlighter.highlight).toHaveBeenCalledTimes(3);
   });
 });

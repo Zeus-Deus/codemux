@@ -231,6 +231,11 @@ function rememberHighlight(entry: HighlightedEntry) {
   }
 }
 
+// Shiki tokenizes on the main thread at roughly 8ms per 1,000 characters, so
+// one pass over a fence this size already blocks for most of a second.
+export const MAX_HIGHLIGHT_CHARS = 100_000;
+export const STREAMING_HIGHLIGHT_INTERVAL_MS = 250;
+
 /**
  * Highlighted tokens for one fence, stale-while-revalidating.
  *
@@ -246,12 +251,16 @@ function rememberHighlight(entry: HighlightedEntry) {
  * language being unchanged, and on the old code still being a prefix of the
  * new one — a fence that switches language or is rewritten falls back to raw
  * rather than painting one language's colors onto another's source.
+ *
+ * Fences over `MAX_HIGHLIGHT_CHARS` are never sent to Shiki and render plain.
  */
 function useHighlightedCode(
   code: string,
   language: string,
   highlighter: CodeHighlighterPlugin,
+  streaming: boolean,
 ): HighlightResult {
+  const highlightable = code.length <= MAX_HIGHLIGHT_CHARS;
   const cacheKey = `${language}\u0000${code}`;
   const [lightTheme, darkTheme] = highlighter.getThemes();
   const cache = remountHighlights.get(highlighter);
@@ -261,14 +270,20 @@ function useHighlightedCode(
   const [highlighted, setHighlighted] = useState<HighlightedEntry | null>(
     () => cached ?? null,
   );
+  // When this block's last highlight pass finished and how long it took.
+  const lastPass = useRef({ endedAt: -Infinity, ms: 0 });
 
   useEffect(() => {
     if (cached) {
       setHighlighted((previous) => previous === cached ? previous : cached);
       return;
     }
+    if (!highlightable) return;
     let active = true;
+    let startedAt = 0;
     const accept = (result: HighlightResult) => {
+      const endedAt = performance.now();
+      lastPass.current = { endedAt, ms: endedAt - startedAt };
       if (!active) return;
       const entry: HighlightedEntry = {
         cacheKey,
@@ -281,22 +296,46 @@ function useHighlightedCode(
       rememberHighlight(entry);
       setHighlighted(entry);
     };
-    const result = highlighter.highlight(
-      {
-        code,
-        language: language as BundledLanguage,
-        themes: [lightTheme, darkTheme],
-      },
-      accept,
-    );
-    if (result) accept(result);
+    const request = () => {
+      startedAt = performance.now();
+      const result = highlighter.highlight(
+        {
+          code,
+          language: language as BundledLanguage,
+          themes: [lightTheme, darkTheme],
+        },
+        accept,
+      );
+      if (result) accept(result);
+    };
+    // Every pass re-tokenizes the whole fence synchronously, so an open fence
+    // is re-highlighted at most once per interval (or per the last pass's own
+    // cost, if longer); the tail in between shows uncolored.
+    const { endedAt, ms } = lastPass.current;
+    const wait = streaming
+      ? endedAt + Math.max(STREAMING_HIGHLIGHT_INTERVAL_MS, ms) - performance.now()
+      : 0;
+    const timer = wait > 0 ? window.setTimeout(request, wait) : null;
+    if (timer === null) request();
     return () => {
       active = false;
+      if (timer !== null) window.clearTimeout(timer);
     };
-  }, [cached, cacheKey, code, highlighter, language, lightTheme, darkTheme]);
+  }, [
+    cached,
+    cacheKey,
+    code,
+    highlightable,
+    highlighter,
+    language,
+    lightTheme,
+    darkTheme,
+    streaming,
+  ]);
 
   return useMemo(() => {
     if (cached) return cached.result;
+    if (!highlightable) return rawHighlightResult(code);
     const compatible = highlighted?.highlighter === highlighter
       && sameThemes(highlighted.themes, [lightTheme, darkTheme]);
     if (compatible && highlighted.cacheKey === cacheKey) return highlighted.result;
@@ -307,7 +346,17 @@ function useHighlightedCode(
       );
     }
     return rawHighlightResult(code);
-  }, [cached, cacheKey, code, highlighted, language, highlighter, lightTheme, darkTheme]);
+  }, [
+    cached,
+    cacheKey,
+    code,
+    highlightable,
+    highlighted,
+    language,
+    highlighter,
+    lightTheme,
+    darkTheme,
+  ]);
 }
 
 type TokenStyle = CSSProperties & Record<`--${string}`, string | number>;
@@ -323,12 +372,14 @@ function HighlightedCode({
   code,
   language,
   highlighter,
+  streaming,
 }: {
   code: string;
   language: string;
   highlighter: CodeHighlighterPlugin;
+  streaming: boolean;
 }) {
-  const result = useHighlightedCode(code, language, highlighter);
+  const result = useHighlightedCode(code, language, highlighter, streaming);
   const lines = useMemo(
     () =>
       result.tokens.map((tokens, lineIndex) => ({
@@ -513,6 +564,7 @@ function ChatFencedCode({
           code={code}
           language={language}
           highlighter={highlighter}
+          streaming={isIncomplete}
         />
       </div>
     </div>
