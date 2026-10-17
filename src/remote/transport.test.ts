@@ -270,7 +270,6 @@ describe("liveness", () => {
     vi.useFakeTimers();
     const { transport, rec } = newTransport();
     const ws = await connect(transport);
-    const inflight = expect(transport.invoke("hangs")).rejects.toThrow(/connection lost/);
 
     await vi.advanceTimersByTimeAsync(24_000);
     expect(probes(ws)).toHaveLength(0);
@@ -279,7 +278,6 @@ describe("liveness", () => {
 
     // Half-open: the socket never fires onclose on its own.
     await vi.advanceTimersByTimeAsync(10_000);
-    await inflight;
     expect(rec.statuses).toEqual(["connected", "reconnecting"]);
     expect(ws.onmessage).toBeNull();
 
@@ -299,6 +297,36 @@ describe("liveness", () => {
     await vi.advanceTimersByTimeAsync(12_000);
     expect(rec.statuses).toEqual(["connected"]);
     expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  it("waits longer while a real invoke's reply may still be downloading", async () => {
+    vi.useFakeTimers();
+    const { transport, rec } = newTransport();
+    const ws = await connect(transport);
+    const big = expect(transport.invoke("get_terminal_scrollback")).rejects.toThrow(/connection lost/);
+
+    await vi.advanceTimersByTimeAsync(26_000);
+    expect(probes(ws)).toHaveLength(1);
+    // Past the idle probe timeout, but the big reply could still be arriving.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(rec.statuses).toEqual(["connected"]);
+
+    await vi.advanceTimersByTimeAsync(92_000);
+    await big;
+    expect(rec.statuses).toEqual(["connected", "reconnecting"]);
+  });
+
+  it("counts partial-frame activity as proof of life", async () => {
+    vi.useFakeTimers();
+    const { transport, rec } = newTransport();
+    const ws = await connect(transport) as FakeWebSocket & { onactivity?: (() => void) | null };
+
+    await vi.advanceTimersByTimeAsync(26_000);
+    expect(probes(ws)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(8_000);
+    ws.onactivity?.();
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(rec.statuses).toEqual(["connected"]);
   });
 
   it("accepts an older server's err reply to the probe", async () => {

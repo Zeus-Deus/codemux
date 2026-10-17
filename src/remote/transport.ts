@@ -28,8 +28,10 @@ import { remoteClientId } from "./client-view";
  *     socket alive; after `IDLE_PROBE_MS` of silence, or when the page
  *     becomes visible or the browser comes back online, the transport sends
  *     a probe, and if nothing at all arrives within `PROBE_TIMEOUT_MS` it
- *     replaces the socket. Waking while a reconnect is backing off retries
- *     at once.
+ *     replaces the socket. While a real invoke is outstanding its response
+ *     may be one large frame still downloading, which looks like silence,
+ *     so the probe waits `BUSY_PROBE_TIMEOUT_MS` instead. Waking while a
+ *     reconnect is backing off retries at once.
  *
  * This protocol contract MUST match the Rust server exactly.
  */
@@ -61,6 +63,13 @@ export interface WebSocketLike {
   onclose: ((ev: { code?: number; reason?: string }) => void) | null;
   onerror: ((ev: unknown) => void) | null;
   onmessage: ((ev: { data: unknown }) => void) | null;
+  /**
+   * Optional: bytes arrived, even if no whole message has yet. The iroh
+   * adapter fires it per chunk; a browser `WebSocket` has no such signal.
+   * Counts as liveness, so a large frame still downloading isn't mistaken
+   * for a dead socket.
+   */
+  onactivity?: (() => void) | null;
 }
 
 /** Injectable seams (defaults use the browser globals). */
@@ -101,9 +110,16 @@ const LIVENESS_PROBE_CMD = "__codemux_ping";
 /** Silence after which the transport probes the socket. */
 const IDLE_PROBE_MS = 25_000;
 /** How long a probe may go without any inbound frame before the socket is
- *  declared dead. Generous, because one large frame on a slow link arrives
- *  as silence until it completes. */
+ *  declared dead, when nothing else is awaiting a reply. */
 const PROBE_TIMEOUT_MS = 10_000;
+/**
+ * The same, while a real invoke is outstanding. Its reply can be one large
+ * frame (a saved scrollback, a page of chat history) that a browser socket
+ * only delivers once complete, and the probe's reply queues behind it, so a
+ * slow link would otherwise be dropped mid-transfer, and the reconnect would
+ * re-request the same payload.
+ */
+const BUSY_PROBE_TIMEOUT_MS = 120_000;
 /** Cadence of the idle/deadline check while a socket is open. */
 const LIVENESS_TICK_MS = 2_000;
 
@@ -263,6 +279,8 @@ export class FrameInflater {
 interface PendingInvoke {
   resolve(value: unknown): void;
   reject(reason: unknown): void;
+  /** A liveness probe rather than a real command. */
+  probe?: boolean;
 }
 
 export class RemoteTransport {
@@ -335,7 +353,7 @@ export class RemoteTransport {
     const ws = this.ws;
     this.ws = null;
     if (ws) {
-      ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+      ws.onopen = ws.onclose = ws.onerror = ws.onmessage = ws.onactivity = null;
       try {
         ws.close();
       } catch {
@@ -420,6 +438,7 @@ export class RemoteTransport {
     ws.binaryType = "arraybuffer";
     ws.onopen = () => this.handleOpen();
     ws.onmessage = (ev) => this.handleMessage(ev.data);
+    ws.onactivity = () => this.noteActivity();
     ws.onclose = () => this.handleClose();
     ws.onerror = () => {
       /* an `onclose` always follows — reconnect is driven from there */
@@ -534,9 +553,11 @@ export class RemoteTransport {
    *  (see `handleMessage`), so the reply itself is discarded. */
   private sendProbe(): void {
     if (!this.socketOpen || !this.ws || this.probeDeadline !== null) return;
-    this.probeDeadline = Date.now() + PROBE_TIMEOUT_MS;
+    let busy = false;
+    for (const p of this.pending.values()) if (!p.probe) busy = true;
+    this.probeDeadline = Date.now() + (busy ? BUSY_PROBE_TIMEOUT_MS : PROBE_TIMEOUT_MS);
     const id = this.nextInvokeId++;
-    this.pending.set(id, { resolve: () => {}, reject: () => {} });
+    this.pending.set(id, { resolve: () => {}, reject: () => {}, probe: true });
     try {
       this.ws.send(JSON.stringify({ t: "invoke", id, cmd: LIVENESS_PROBE_CMD, args: {} }));
     } catch {
@@ -553,7 +574,7 @@ export class RemoteTransport {
     const ws = this.ws;
     if (!ws) return;
     console.warn("[web-remote] connection stopped responding; reconnecting");
-    ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+    ws.onopen = ws.onclose = ws.onerror = ws.onmessage = ws.onactivity = null;
     try {
       ws.close();
     } catch {
@@ -602,11 +623,15 @@ export class RemoteTransport {
   }
 
   /** Both transports (WS and iroh) surface strings and `ArrayBuffer`s here. */
-  private handleMessage(data: unknown): void {
-    // Any frame at all proves the socket alive, even one queued ahead of a
-    // probe's reply behind a large transfer.
+  /** Any frame (or, on iroh, any bytes) proves the socket alive, even when
+   *  it's traffic queued ahead of a probe's reply. */
+  private noteActivity(): void {
     this.lastFrameAt = Date.now();
     this.probeDeadline = null;
+  }
+
+  private handleMessage(data: unknown): void {
+    this.noteActivity();
     if (data instanceof ArrayBuffer) {
       this.handleBinaryMessage(data);
       return;
