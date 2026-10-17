@@ -96,9 +96,38 @@ fn account_request_allowed(method: &str, path: &str) -> bool {
         "POST" => path
             .strip_prefix("/api/devices/")
             .and_then(|rest| rest.strip_suffix("/connect"))
-            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())),
+            .is_some_and(account_device_id_allowed),
         _ => false,
     }
+}
+
+fn account_device_id_allowed(id: &str) -> bool {
+    // DeviceRegistry uses encodeURIComponent for opaque row IDs. Keep that
+    // encoding intact, but reject separators and dot segments even when encoded.
+    let Ok(decoded) = urlencoding::decode(id) else {
+        return false;
+    };
+    if decoded.is_empty()
+        || matches!(decoded.as_ref(), "." | "..")
+        || decoded
+            .bytes()
+            .any(|b| b.is_ascii_control() || matches!(b, b'/' | b'\\'))
+    {
+        return false;
+    }
+    let mut bytes = id.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            if !bytes.next().is_some_and(|b| b.is_ascii_hexdigit())
+                || !bytes.next().is_some_and(|b| b.is_ascii_hexdigit())
+            {
+                return false;
+            }
+        } else if !byte.is_ascii_alphanumeric() && !b"-_.!~*'()".contains(&byte) {
+            return false;
+        }
+    }
+    true
 }
 
 #[tauri::command]
@@ -291,10 +320,92 @@ mod tests {
         assert!(!account_request_allowed("DELETE", "/api/devices/42"));
         assert!(!account_request_allowed("GET", "/api/devices/42/connect"));
         assert!(!account_request_allowed("POST", "/api/devices//connect"));
-        assert!(!account_request_allowed("POST", "/api/devices/4a/connect"));
-        assert!(!account_request_allowed("POST", "/api/devices/1/../../user/connect"));
+        assert!(!account_request_allowed(
+            "POST",
+            "/api/devices/1/../../user/connect"
+        ));
         assert!(!account_request_allowed("GET", "/api/workspaces"));
         assert!(!account_request_allowed("GET", "/api/devices?x=1"));
+    }
+
+    #[test]
+    fn account_connect_preserves_opaque_registry_ids() {
+        for id in [
+            "row-1",
+            "d1",
+            "4a",
+            "device_1.2~!()*'",
+            "row%20one",
+            "%C3%A9",
+            "id%3F%23%25",
+        ] {
+            let path = format!("/api/devices/{id}/connect");
+            assert!(account_request_allowed("POST", &path), "{id}");
+            let request = reqwest::Client::new()
+                .post(format!("https://api.example.test{path}"))
+                .build()
+                .unwrap();
+            assert_eq!(
+                request.url().origin().ascii_serialization(),
+                "https://api.example.test"
+            );
+            assert_eq!(
+                request.url().path(),
+                path,
+                "the encoded ID must be preserved"
+            );
+            assert_eq!(request.url().query(), None);
+            assert_eq!(request.url().fragment(), None);
+        }
+    }
+
+    #[test]
+    fn account_connect_rejects_unsafe_path_segments() {
+        for id in [
+            "",
+            ".",
+            "..",
+            "%2e",
+            ".%2E",
+            "%2E.",
+            "%2e%2E",
+            "row/other",
+            "row\\other",
+            "..%2fuser",
+            "..%5Cuser",
+            "row%2Fother",
+            "//evil.example",
+            "https://evil.example",
+            "row?admin=1",
+            "row#fragment",
+            "row one",
+            "row\n",
+            "row%0A",
+            "row%00",
+            "%",
+            "%2",
+            "%GG",
+            "%FF",
+        ] {
+            let path = format!("/api/devices/{id}/connect");
+            assert!(!account_request_allowed("POST", &path), "{id:?}");
+        }
+        assert!(!account_request_allowed(
+            "POST",
+            "https://evil.example/api/devices/d1/connect"
+        ));
+        assert!(!account_request_allowed(
+            "POST",
+            "//evil.example/api/devices/d1/connect"
+        ));
+        assert!(!account_request_allowed(
+            "POST",
+            "/api/devices/d1/connect?admin=1"
+        ));
+        assert!(!account_request_allowed(
+            "POST",
+            "/api/devices/d1/connect#fragment"
+        ));
     }
 
     #[test]
