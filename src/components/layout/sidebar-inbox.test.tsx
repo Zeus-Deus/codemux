@@ -3613,3 +3613,51 @@ describe("SidebarInbox — new workspace arrival", () => {
     expect(container.querySelector("[data-creating-card]")).toBeNull();
   });
 });
+
+describe("SidebarInbox — follow-up children", () => {
+  it("links a child card back to its parent, and the link activates the parent", async () => {
+    const parent = makeWorkspace({ title: "sidebar-view-toggle" });
+    const child = makeWorkspace({
+      title: "Nest delegated chats",
+      parent_workspace_id: parent.workspace_id,
+    });
+    workspaces = [parent, child];
+    const { container } = await flushRender();
+
+    // The child stays an ordinary card of its own.
+    const childCard = container.querySelector(
+      `[data-inbox-card="${child.workspace_id}"]`,
+    ) as HTMLElement;
+    expect(childCard).not.toBeNull();
+    const link = within(childCard).getByRole("button", {
+      name: "Open parent workspace sidebar-view-toggle",
+    });
+    expect(childCard).toHaveTextContent("from");
+
+    fireEvent.click(link);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(activateWorkspace).toHaveBeenCalledWith(parent.workspace_id);
+    expect(activateWorkspace).not.toHaveBeenCalledWith(child.workspace_id);
+
+    // The parent itself carries no link.
+    const parentCard = container.querySelector(
+      `[data-inbox-card="${parent.workspace_id}"]`,
+    ) as HTMLElement;
+    expect(parentCard.querySelector("[data-parent-link]")).toBeNull();
+  });
+
+  it("omits the link when the parent workspace is gone", async () => {
+    const child = makeWorkspace({
+      title: "Orphan follow-up",
+      parent_workspace_id: "ws-missing",
+    });
+    workspaces = [child];
+    const { container } = await flushRender();
+    expect(container.querySelector("[data-parent-link]")).toBeNull();
+    expect(
+      container.querySelector(`[data-inbox-card="${child.workspace_id}"]`),
+    ).not.toBeNull();
+  });
+});

@@ -70,6 +70,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Spinner } from "@/components/ui/spinner";
 import { WorkflowPanel } from "@/components/workflows/workflow-panel";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { OrchestrationPanel } from "@/components/workflow/orchestration-panel";
@@ -84,6 +85,13 @@ import { useActiveChatTasks } from "@/hooks/use-active-chat-tasks";
 import { useTitlebarOverlay } from "@/hooks/use-gui-chrome";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { isMarkdownFile } from "@/components/editor/EditorPane";
+import {
+  closeSideChat,
+  lastSideChatTurn,
+  selectWorkspaceSideChat,
+  useSideChatStore,
+} from "@/lib/agent-chat/side-chat";
+import { sessionProviderLabel } from "@/lib/agent-chat/session-mentions";
 import { subagentDeckSummary } from "@/lib/agent-chat/subagents";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { isImageExtension, isVideoExtension } from "@/lib/editor-languages";
@@ -141,6 +149,7 @@ import {
   paneMeta,
 } from "./right-panel/pane-registry";
 import { PaneTabStrip, type DeckTab } from "./right-panel/pane-tab-strip";
+import { SideChatPane } from "./right-panel/side-chat-pane";
 import { SubagentsPane } from "./right-panel/subagents-pane";
 import type { SurfaceAction } from "./right-panel/surface-actions";
 
@@ -310,6 +319,11 @@ export const RightPanel = memo(function RightPanel({
     [messages, dismissedSubagentAttention],
   );
 
+  // The `/btw` side chat for this workspace's deck, if one is open.
+  const sideChat = useSideChatStore(
+    useMemo(() => selectWorkspaceSideChat(workspaceId), [workspaceId]),
+  );
+
   // ── Deck membership ──
   const openPanes = storedPanes ?? DEFAULT_RIGHT_PANEL_PANES;
   const dismissed = storedDismissed;
@@ -343,11 +357,13 @@ export const RightPanel = memo(function RightPanel({
           return workflowRun != null;
         case "subagents":
           return subagentSummary.groups > 0;
+        case "side-chat":
+          return sideChat != null;
         default:
           return true;
       }
     },
-    [tasksSnapshot, workflowRun, subagentSummary.groups, pluginPanes, enableAgentChat, workspace.host_id, workspace.attach_only],
+    [tasksSnapshot, workflowRun, subagentSummary.groups, sideChat, pluginPanes, enableAgentChat, workspace.host_id, workspace.attach_only],
   );
 
   // Availability-gated panes join the strip on their own when their data
@@ -544,6 +560,11 @@ export const RightPanel = memo(function RightPanel({
   const dropPane = useCallback(
     (id: RightPanelTab) => {
       closeRightPanelPane(workspaceId, id);
+      if (id === "side-chat") {
+        // Closing the pane is the end of the side chat: reap its fork.
+        const open = useSideChatStore.getState().activeByWorkspace[workspaceId];
+        if (open) void closeSideChat(open);
+      }
       if (id === "browser") {
         // Explicit user close: tell the backend the browser has no surface
         // again, and that this was deliberate so the agent's next command
@@ -708,6 +729,12 @@ export const RightPanel = memo(function RightPanel({
         break;
       case "orchestration":
         tab.testId = "orchestration-tab";
+        break;
+      case "side-chat":
+        tab.testId = "side-chat-tab";
+        if (lastSideChatTurn(sideChat)?.status === "streaming") {
+          tab.badge = <Spinner label="Answering" className="size-3 text-status-working" />;
+        }
         break;
     }
     return tab;
@@ -944,6 +971,9 @@ export const RightPanel = memo(function RightPanel({
       running: subagentSummary.running,
       finished: subagentSummary.finished,
     },
+    sideChat: sideChat
+      ? { providerLabel: sessionProviderLabel(sideChat.provider), ended: sideChat.ended }
+      : null,
   });
 
   return (
@@ -1042,6 +1072,13 @@ export const RightPanel = memo(function RightPanel({
           />
         ) : activePane === "subagents" ? (
           <SubagentsPane threadId={threadId} messages={messages} />
+        ) : activePane === "side-chat" ? (
+          <SideChatPane
+            key={sideChat?.sideId ?? "none"}
+            chat={sideChat}
+            workspaceId={workspaceId}
+            cwd={workspace.cwd}
+          />
         ) : (
           <PanePicker surfaces={surfaces} />
         )}

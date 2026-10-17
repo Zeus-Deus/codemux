@@ -5,6 +5,7 @@ import {
   Cpu,
   ListTodo,
   MessageCircleQuestion,
+  MessageCircleReply,
   RotateCcw,
   SquareSlash,
   Workflow,
@@ -575,6 +576,37 @@ export function buildWorkflowCommand({
     icon: Workflow,
     group: "WORKFLOWS",
     disabled: !available,
+    onSelect: () => {},
+  };
+}
+
+interface BuildSideChatCommandArgs {
+  /** Whether this chat's provider can fork a side chat (Claude, Codex). */
+  supported: boolean;
+  /** Provider label for the unavailable reason. */
+  providerLabel: string;
+}
+
+/**
+ * Build the `/btw` row shared by the typed `/` popup and the `+` menu.
+ * Selecting it inserts `/btw `; sending `/btw <question>` asks a read-only
+ * fork of this chat in the Side chat pane instead of a provider turn.
+ */
+export function buildSideChatCommand({
+  supported,
+  providerLabel,
+}: BuildSideChatCommandArgs): SlashCommandItem {
+  return {
+    id: "btw",
+    label: "Side question",
+    description: supported
+      ? "Ask about this chat without adding to it"
+      : `Not available for ${providerLabel} yet`,
+    searchDescription: "btw side chat question aside by the way",
+    command: "/btw",
+    icon: MessageCircleReply,
+    group: "CHAT",
+    disabled: !supported,
     onSelect: () => {},
   };
 }

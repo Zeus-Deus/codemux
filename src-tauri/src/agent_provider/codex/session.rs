@@ -298,7 +298,7 @@ pub(crate) struct CodexSession {
     host_caller: crate::mcp::registry::HostCaller,
     /// Codemux instructions for the tools listed at `thread/start`, added to
     /// every turn's developer instructions.
-    guidance: Option<&'static str>,
+    guidance: Option<String>,
 }
 
 impl CodexSession {
@@ -1382,7 +1382,7 @@ impl CodexSession {
         let model = model_override.or(model_default);
         let effort = effort_override.or(effort_default);
         let collaboration_mode =
-            runtime_collaboration_mode(model.as_deref(), effort.as_deref(), self.guidance);
+            runtime_collaboration_mode(model.as_deref(), effort.as_deref(), self.guidance.as_deref());
         let params = TurnStartParams {
             thread_id: codex_thread_id,
             input: input_items,
@@ -2479,13 +2479,14 @@ async fn dynamic_tool_specs(
 }
 
 /// Codemux's instructions for the dynamic tools a thread starts with, so the
-/// agent knows to show a page inline rather than only write it to a file.
-fn developer_guidance(tools: &[DynamicToolSpec]) -> Option<&'static str> {
-    let html_render = codex_dynamic_tool_name(crate::mcp_server::HTML_RENDER_REGISTRY_NAME);
-    tools
+/// agent knows when to reach for them (show a page inline rather than only
+/// write it to a file; suggest follow-up tasks rather than list them).
+fn developer_guidance(tools: &[DynamicToolSpec]) -> Option<String> {
+    let names: Vec<String> = tools
         .iter()
-        .any(|DynamicToolSpec::Function { name, .. }| *name == html_render)
-        .then_some(crate::mcp_server::HTML_RENDER_GUIDANCE)
+        .map(|DynamicToolSpec::Function { name, .. }| registry_tool_name(name))
+        .collect();
+    crate::mcp_server::tool_guidance(names.iter().map(String::as_str))
 }
 
 /// Execute a Codex dynamic-tool request through the process-wide registry and
@@ -2863,14 +2864,40 @@ mod tests {
             tool("mcp__codemux__browser_click"),
             tool("mcp__codemux__html_render"),
         ]);
-        assert_eq!(guidance, Some(crate::mcp_server::HTML_RENDER_GUIDANCE));
+        assert_eq!(guidance.as_deref(), Some(crate::mcp_server::HTML_RENDER_GUIDANCE));
         assert!(developer_guidance(&[]).is_none());
         assert!(developer_guidance(&[tool("mcp__other__html_render")]).is_none());
 
-        let mode = runtime_collaboration_mode(Some("gpt-5.6-sol"), None, guidance).unwrap();
+        let mode =
+            runtime_collaboration_mode(Some("gpt-5.6-sol"), None, guidance.as_deref()).unwrap();
         let instructions = mode.settings.developer_instructions;
         assert!(instructions.contains(crate::mcp_server::HTML_RENDER_GUIDANCE));
         assert!(instructions.ends_with("</runtime_info>"), "runtime identity stays last");
+    }
+
+    #[test]
+    fn developer_instructions_guide_suggestions_only_when_suggest_tasks_is_listed() {
+        let tool = |registry_name: &str| DynamicToolSpec::Function {
+            name: codex_dynamic_tool_name(registry_name),
+            description: String::new(),
+            input_schema: json!({}),
+            defer_loading: None,
+        };
+        let suggest = crate::commands::follow_ups::SUGGEST_TASKS_GUIDANCE;
+        assert_eq!(
+            developer_guidance(&[tool("mcp__codemux__suggest_tasks")]).as_deref(),
+            Some(suggest)
+        );
+        let both = developer_guidance(&[
+            tool("mcp__codemux__html_render"),
+            tool("mcp__codemux__suggest_tasks"),
+        ])
+        .unwrap();
+        assert!(both.starts_with(crate::mcp_server::HTML_RENDER_GUIDANCE));
+        assert!(both.ends_with(suggest));
+        assert!(developer_guidance(&[tool("mcp__other__suggest_tasks")]).is_none());
+        let mode = runtime_collaboration_mode(Some("gpt-5.6-sol"), None, Some(&both)).unwrap();
+        assert!(mode.settings.developer_instructions.contains(suggest));
     }
 
     #[test]

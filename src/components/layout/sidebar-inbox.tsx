@@ -1,14 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  AlarmClock,
-  ChevronDown,
-  ChevronRight,
-  Folder,
-  FolderOpen,
-  FolderPlus,
-  Layers,
-  Undo2,
-} from "lucide-react";
+import { AlarmClock, ChevronRight, Layers, Undo2 } from "lucide-react";
 import { openExternalUrl } from "@/lib/open-url";
 import { cn } from "@/lib/utils";
 import {
@@ -21,7 +12,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
-import { MenuKeycap } from "@/components/ui/menu-chrome";
 import {
   selectActiveWorkspaceId,
   useAppStore,
@@ -46,7 +36,6 @@ import {
 import { formatElapsed } from "@/stores/sidebar-density-store";
 import { getWorkspaceProviders, getWorkspaceStatus } from "@/lib/pane-status";
 import { useCoarseClock } from "@/lib/use-coarse-clock";
-import { useProjectActions } from "@/hooks/use-project-actions";
 import { useProjectAppearance } from "./use-project-appearance";
 import {
   SidebarInboxCard,
@@ -102,6 +91,10 @@ import {
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { SidebarEmptyState } from "./sidebar-empty-state";
 import { SidebarHeaderActions } from "./sidebar-action-row";
+import {
+  SidebarProjectFilter,
+  computeProjectCounts,
+} from "./sidebar-project-filter";
 
 /** How long the settle collapse runs before the card actually moves below
  *  the divider. Matches the card wrapper's `duration-250`. */
@@ -345,60 +338,6 @@ function selectModeFor(e: {
  *  matches the card path — a stale draft would follow the user across. */
 function activateFromSidebar(workspaceId: string): void {
   activateWorkspaceInteraction(workspaceId).catch(console.error);
-}
-
-/** A project's mini square avatar, resolving its customised appearance. Kept
- *  as a per-item component so the appearance hook always runs unconditionally
- *  (each avatar owns its own hook rather than looping hooks in the parent). */
-function ProjectMiniAvatar({ name, path }: { name: string; path: string }) {
-  const appearance = useProjectAppearance(path);
-  return (
-    <ProjectAvatar
-      name={name}
-      color={appearance.customColor}
-      imageUrl={appearance.imageUrl}
-      cacheBust={appearance.imageVersion}
-      size="sm"
-      shape="square"
-      className="font-bold"
-    />
-  );
-}
-
-interface ProjectFilterItemProps {
-  name: string;
-  path: string;
-  /** Number of visible cards in this project, including pinned parked work. */
-  count: number;
-  active: boolean;
-  onSelect: () => void;
-}
-
-/** One project row in the filter dropdown: mini avatar, name, and its active
- *  workspace count. */
-function ProjectFilterItem({
-  name,
-  path,
-  count,
-  active,
-  onSelect,
-}: ProjectFilterItemProps) {
-  return (
-    <DropdownMenuItem
-      onClick={onSelect}
-      aria-label={name}
-      className={cn(
-        "h-8 gap-2 rounded-md px-2 text-label font-semibold",
-        active && "bg-surface-3 text-foreground",
-      )}
-    >
-      <ProjectMiniAvatar name={name} path={path} />
-      <span className="min-w-0 flex-1 truncate">{name}</span>
-      <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
-        {count}
-      </span>
-    </DropdownMenuItem>
-  );
 }
 
 /** Header for the Wrapping up / Snoozed / Settled sections. Collapsing is a plain disclosure
@@ -938,8 +877,6 @@ export function SidebarInbox() {
     [projectGroups, homeDir],
   );
   const pendingWorkspaces = useUIStore((s) => s.pendingWorkspaces);
-  const setShowNewProjectScreen = useUIStore((s) => s.setShowNewProjectScreen);
-  const { openProject } = useProjectActions();
 
   const showGitStats = useSettingsStore(selectSidebarShowGitStats);
   const autoSettleDays = useSettingsStore(selectSidebarAutoSettleDays);
@@ -1881,34 +1818,16 @@ export function SidebarInbox() {
   // Show the badges only while the jump modifier is physically held.
   const jumpHintsVisible = useJumpHintsVisible();
 
-  // Whether the project filter dropdown is open — drives the trigger chevron
-  // rotation.
-  const [filterMenuOpen, setFilterMenuOpen] = useState(false);
-
   // Active (unsettled) workspace count per project, plus the grand total for
   // the "All projects" row. Derived from the same grouping + settled data the
   // lists use, so the badges always match what the filter would show. Parking
   // is the only thing that decrements a count — a wrapping-up card is still an
   // active workspace, and dropping it from the total would report work as gone
   // the moment its PR opened.
-  const projectCounts = useMemo(() => {
-    const map = new Map<string, number>();
-    let total = 0;
-    for (const group of projectGroups) {
-      let count = 0;
-      for (const ws of group.workspaces) {
-        if (
-          ws.pinned_at != null ||
-          (!settledIds.has(ws.workspace_id) && !snoozedIds.has(ws.workspace_id))
-        ) {
-          count += 1;
-        }
-      }
-      map.set(group.projectPath, count);
-      total += count;
-    }
-    return { map, total };
-  }, [projectGroups, settledIds, snoozedIds]);
+  const projectCounts = useMemo(
+    () => computeProjectCounts(projectGroups, settledIds, snoozedIds),
+    [projectGroups, settledIds, snoozedIds],
+  );
 
   const filterName = filter
     ? projectGroups.find((g) => g.projectPath === filter)?.projectName ?? null
@@ -1962,6 +1881,11 @@ export function SidebarInbox() {
         selected={selectedIds.has(id)}
         onSelect={handleSelect}
         onMarkUnread={handleMarkUnread}
+        parentTitle={
+          ws.parent_workspace_id
+            ? workspaceById.get(ws.parent_workspace_id)?.title ?? null
+            : null
+        }
       />
     );
   };
@@ -1975,99 +1899,13 @@ export function SidebarInbox() {
           is what lets the list below keep its static, status-blind order. */}
       <div className="sticky top-0 z-10 bg-sidebar">
         <div className="flex items-center gap-1 px-2.5 pb-2.5 min-w-0">
-          <DropdownMenu open={filterMenuOpen} onOpenChange={setFilterMenuOpen}>
-            <DropdownMenuTrigger asChild>
-              <button
-                type="button"
-                aria-label="Filter by project"
-                data-project-filter
-                className={cn(
-                  "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2.5",
-                  "border border-transparent bg-transparent text-label font-semibold text-foreground/80",
-                  "transition-colors duration-150 hover:border-border/60 hover:bg-surface-2",
-                )}
-              >
-                {filter === null ? (
-                  <Folder className="size-3.5 shrink-0 text-muted-foreground" />
-                ) : (
-                  <ProjectMiniAvatar name={filterName ?? ""} path={filter} />
-                )}
-                <span className="min-w-0 flex-1 truncate text-left">
-                  {filter === null ? "All projects" : filterName}
-                </span>
-                <ChevronDown
-                  className={cn(
-                    "size-3 shrink-0 text-muted-foreground transition-transform duration-150",
-                    filterMenuOpen && "rotate-180",
-                  )}
-                />
-              </button>
-            </DropdownMenuTrigger>
-            {/* Capped at a menu-sized panel rather than growing with the
-                project count: past a dozen or so projects an uncapped menu
-                stretches to the window edge and reads as clipped. The cap is
-                whichever is smaller — a comfortable ~9 rows, or whatever room
-                Radix actually has — so the same panel behaves in a short
-                window. */}
-            <DropdownMenuContent
-              side="bottom"
-              align="start"
-              className="flex max-h-[min(21rem,var(--radix-dropdown-menu-content-available-height))] w-[248px] flex-col overflow-y-hidden p-0"
-            >
-              {/* "All projects" is the reset, so it stays pinned above the
-                  scroll area — scrolling to the top to clear a filter is the
-                  kind of small tax that makes a long list feel like work. */}
-              <div className="shrink-0 border-b border-border/60 p-1.5">
-                <DropdownMenuItem
-                  onClick={() => setFilter(null)}
-                  aria-label="All projects"
-                  className={cn(
-                    "h-8 gap-2 rounded-md px-2 text-label font-semibold",
-                    filter === null && "bg-surface-3 text-foreground",
-                  )}
-                >
-                  <Folder className="size-3.5 shrink-0 text-muted-foreground" />
-                  <span className="min-w-0 flex-1 truncate">All projects</span>
-                  <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
-                    {projectCounts.total}
-                  </span>
-                </DropdownMenuItem>
-              </div>
-              <div className="thin-scrollbar [scrollbar-gutter:stable] min-h-0 flex-1 overflow-y-auto p-1.5">
-                {projectGroups.map((group) => (
-                  <ProjectFilterItem
-                    key={group.projectPath}
-                    name={group.projectName}
-                    path={group.projectPath}
-                    count={projectCounts.map.get(group.projectPath) ?? 0}
-                    active={filter === group.projectPath}
-                    onSelect={() => setFilter(group.projectPath)}
-                  />
-                ))}
-              </div>
-              {/* Project creation is pinned under the list, mirroring the
-                  pinned reset above it. Single-line rows sized like the
-                  project rows; the labels themselves carry the difference
-                  (adopt what's on disk vs start or clone a new repo). */}
-              <div className="shrink-0 border-t border-border/60 p-1.5">
-                <DropdownMenuItem
-                  onClick={() => openProject()}
-                  className="h-8 gap-2 rounded-md px-2 text-label"
-                >
-                  <FolderOpen className="size-3.5 shrink-0 text-muted-foreground" />
-                  <span className="min-w-0 flex-1 truncate">Open existing project</span>
-                  <MenuKeycap actionId="openProject" />
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={() => setShowNewProjectScreen(true)}
-                  className="h-8 gap-2 rounded-md px-2 text-label"
-                >
-                  <FolderPlus className="size-3.5 shrink-0 text-muted-foreground" />
-                  <span className="min-w-0 flex-1 truncate">Create or clone project</span>
-                </DropdownMenuItem>
-              </div>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <SidebarProjectFilter
+            projectGroups={projectGroups}
+            counts={projectCounts}
+            filter={filter}
+            filterName={filterName}
+            setFilter={setFilter}
+          />
           <SidebarHeaderActions />
         </div>
 

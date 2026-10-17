@@ -1,4 +1,5 @@
 import type { MessageDelivery } from "@/lib/agent-chat/message-delivery";
+import { COMPOSER_ROUND_CONTROL, COMPOSER_SEND } from "./composer-surface";
 import { ChatGptPlanUsage } from "./chatgpt-plan-usage";
 import { MessageDeliveryPicker } from "./MessageDeliveryPicker";
 import {
@@ -43,10 +44,7 @@ const DELIVERY_SEND_TITLE: Record<MessageDelivery, string> = {
   interrupt: "Stop current work and send",
 };
 
-/** 34px circle shared by attach / send / stop so the row's two ends sit on
- *  one optical baseline, concentric with the 44px pill (5px inset). */
-const ROUND_CONTROL =
-  "inline-flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-full";
+const ROUND_CONTROL = COMPOSER_ROUND_CONTROL;
 
 interface Props {
   hermesThreadId?: string | null;
@@ -364,9 +362,7 @@ export function ComposerFooter({
             title={DELIVERY_SEND_TITLE[delivery]}
             className={cn(
               ROUND_CONTROL,
-              "bg-primary/90 text-primary-foreground shadow-xs shadow-primary/25",
-              "transition-[transform,background-color,color] duration-150 hover:scale-105 hover:bg-primary active:scale-100",
-              "disabled:opacity-30 disabled:shadow-none disabled:cursor-not-allowed disabled:hover:scale-100",
+              COMPOSER_SEND,
             )}
           >
             {delivery === "queue" ? <ListEnd className="size-4" /> : delivery === "steer" ? <CornerDownRight className="size-4" /> : <ArrowUp className="size-4" />}
@@ -395,9 +391,7 @@ export function ComposerFooter({
             disabled={!canSubmit || streaming}
             className={cn(
               ROUND_CONTROL,
-              "bg-primary/90 text-primary-foreground shadow-xs shadow-primary/25",
-              "transition-[transform,background-color,color] duration-150 hover:scale-105 hover:bg-primary active:scale-100",
-              "disabled:opacity-30 disabled:shadow-none disabled:cursor-not-allowed disabled:hover:scale-100",
+              COMPOSER_SEND,
             )}
             aria-label="Send"
             title={onBackgroundSubmit ? "Send (Ctrl+Enter or Ctrl-click to send in background)" : "Send"}
