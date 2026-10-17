@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSettingsStore } from "@/stores/settings-store";
 import {
+  STREAMING_HIGHLIGHT_INTERVAL_MS,
   extractFenceTitle,
   syntheticFilenameForLanguage,
 } from "./ChatCodeBlock";
@@ -84,10 +85,10 @@ function fenced(language: string, code: string, meta = ""): string {
   );
 }
 
-function markdownTree(markdown: string) {
+function markdownTree(markdown: string, streaming = false) {
   return (
     <TooltipProvider>
-      <ChatMarkdown>{markdown}</ChatMarkdown>
+      <ChatMarkdown streaming={streaming}>{markdown}</ChatMarkdown>
     </TooltipProvider>
   );
 }
@@ -130,6 +131,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe("ChatMarkdown code blocks", () => {
@@ -248,6 +250,46 @@ describe("streaming code blocks", () => {
 
     act(() => codePluginMocks.flush());
     expect(tokenColors(container)).toEqual(["rgb(1, 2, 3)", "rgb(1, 2, 3)"]);
+  });
+
+  it("throttles a streaming message's open fence and highlights it once settled", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    codePluginMocks.setDeferred(true);
+    const requested = () =>
+      codePluginMocks.highlight.mock.calls.map(([options]) => options.code);
+    const { container, rerender } = render(
+      markdownTree("```tsx\nconst w = 1;", true),
+    );
+    // Streamdown commits a render's blocks on a zero-delay timer.
+    const settle = () => act(() => vi.advanceTimersByTime(0));
+    settle();
+    expect(requested()).toEqual(["const w = 1;"]);
+
+    // Appends while the first pass is still in flight queue nothing more.
+    rerender(markdownTree("```tsx\nconst w = 1;\nconst x = 2;", true));
+    settle();
+    rerender(markdownTree("```tsx\nconst w = 1;\nconst x = 2;\nconst y = 3;", true));
+    settle();
+    act(() => vi.advanceTimersByTime(STREAMING_HIGHLIGHT_INTERVAL_MS * 4));
+    expect(requested()).toEqual(["const w = 1;"]);
+    expect(container.textContent).toContain("const y = 3;");
+
+    // Once it lands, only the latest code is requested, after waiting out
+    // the last pass's cost (which here includes the held load).
+    act(() => codePluginMocks.flush());
+    expect(requested()).toHaveLength(1);
+    act(() => vi.advanceTimersByTime(STREAMING_HIGHLIGHT_INTERVAL_MS * 4));
+    expect(requested()).toEqual([
+      "const w = 1;",
+      "const w = 1;\nconst x = 2;\nconst y = 3;",
+    ]);
+
+    act(() => codePluginMocks.flush());
+    const final = "const w = 1;\nconst x = 2;\nconst y = 3;\nconst z = 4;";
+    rerender(markdownTree(`\`\`\`tsx\n${final}\n\`\`\``, false));
+    settle();
+    expect(requested()).toHaveLength(3);
+    expect(requested()[2]).toBe(final);
   });
 
   it("drops to raw rather than reusing another language's highlight", () => {

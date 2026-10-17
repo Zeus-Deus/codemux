@@ -38,6 +38,7 @@ import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
 import { toast } from "@/lib/toast";
 
 import { useChatFileLinkContext } from "./chat-file-link-context";
+import { useChatMarkdownStreaming } from "./chat-markdown-streaming";
 import { MarkdownFileLink } from "./MarkdownFileLink";
 
 interface ChatCodeRendererContextValue {
@@ -271,7 +272,7 @@ function useHighlightedCode(
     () => cached ?? null,
   );
   // This block's last finished highlight pass, whether one is still in
-  // flight, and the latest open-fence request deferred until it lands.
+  // flight, and the latest streaming request deferred until it lands.
   const pass = useRef<{
     endedAt: number;
     ms: number;
@@ -324,9 +325,9 @@ function useHighlightedCode(
     };
     // Every pass re-tokenizes the whole fence synchronously, and a pass the
     // plugin has queued (say, behind a cold highlighter load) cannot be
-    // cancelled. So an open fence waits for any pass in flight, then is
-    // re-highlighted at most once per interval (or per the last pass's own
-    // cost, if longer); the tail in between shows uncolored.
+    // cancelled. So while its message streams, a fence waits for any pass in
+    // flight, then is re-highlighted at most once per interval (or per the
+    // last pass's own cost, if longer); the tail in between shows uncolored.
     const schedule = () => {
       const { endedAt, ms } = pass.current;
       const wait = streaming
@@ -496,6 +497,9 @@ function ChatFencedCode({
 }: ComponentProps<"code"> & ExtraProps) {
   const { defaultWrap, highlighter } = useChatCodeRenderer();
   const isIncomplete = useIsCodeFenceIncomplete();
+  // The message's own streaming flag: Streamdown only reports an open fence
+  // when it is told the text is animating, which `ChatMarkdown` does not do.
+  const streaming = useChatMarkdownStreaming();
   const language = extractFenceLanguage(className);
   const meta = node?.properties?.metastring;
   const fenceTitle = extractFenceTitle(
@@ -585,7 +589,7 @@ function ChatFencedCode({
           code={code}
           language={language}
           highlighter={highlighter}
-          streaming={isIncomplete}
+          streaming={streaming}
         />
       </div>
     </div>

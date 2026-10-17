@@ -11,11 +11,13 @@ import {
   STREAMING_HIGHLIGHT_INTERVAL_MS,
 } from "./ChatCodeBlock";
 
-const fence = vi.hoisted(() => ({ incomplete: false }));
-vi.mock("streamdown", () => ({ useIsCodeFenceIncomplete: () => fence.incomplete }));
+import { ChatMarkdownStreamingContext } from "./chat-markdown-streaming";
+
+vi.mock("streamdown", () => ({ useIsCodeFenceIncomplete: () => false }));
+const message = { streaming: false };
 afterEach(() => {
   cleanup();
-  fence.incomplete = false;
+  message.streaming = false;
   vi.useRealTimers();
 });
 
@@ -50,7 +52,9 @@ function tree(code: string, highlighter: CodeHighlighterPlugin, commits: string[
         <Profiler id="fence" onRender={() => {
           commits.push(document.querySelector("[data-chat-code-body] span span")?.getAttribute("style") ?? "");
         }}>
-          <Fence className="language-typescript">{code}</Fence>
+          <ChatMarkdownStreamingContext.Provider value={message.streaming}>
+            <Fence className="language-typescript">{code}</Fence>
+          </ChatMarkdownStreamingContext.Provider>
         </Profiler>
       </ChatCodeRendererProvider>
     </TooltipProvider>
@@ -245,9 +249,9 @@ describe("code fence highlight cost", () => {
     expect(lastColor(a.container)).not.toContain("#ff0000");
   });
 
-  it("re-highlights an open fence at most once per interval, then at once on close", () => {
+  it("re-highlights a streaming fence at most once per interval, then at once when settled", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
-    fence.incomplete = true;
+    message.streaming = true;
     const highlighter = plugin();
     const a = mount("const a = 1;", highlighter);
     expect(highlighter.highlight).toHaveBeenCalledOnce();
@@ -266,14 +270,14 @@ describe("code fence highlight cost", () => {
 
     a.rerender(tree("const a = 1;\nconst b = 2;\nconst c = 3;", highlighter));
     expect(highlighter.highlight).toHaveBeenCalledTimes(2);
-    fence.incomplete = false;
+    message.streaming = false;
     a.rerender(tree("const a = 1;\nconst b = 2;\nconst c = 3;", highlighter));
     expect(highlighter.highlight).toHaveBeenCalledTimes(3);
   });
 
-  it("holds open-fence requests while a pass is still in flight", () => {
+  it("holds streaming requests while a pass is still in flight", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
-    fence.incomplete = true;
+    message.streaming = true;
     const pending: Array<(result: HighlightResult) => void> = [];
     const highlighter = plugin();
     vi.mocked(highlighter.highlight).mockImplementation((_options, callback) => {
@@ -296,8 +300,8 @@ describe("code fence highlight cost", () => {
       "const a = 1;\nconst b = 2;\nconst c = 3;",
     );
 
-    // Closing the fence highlights at once, even with a pass in flight.
-    fence.incomplete = false;
+    // A settled message highlights at once, even with a pass in flight.
+    message.streaming = false;
     a.rerender(tree("const a = 1;\nconst b = 2;\nconst c = 3;", highlighter));
     expect(highlighter.highlight).toHaveBeenCalledTimes(3);
   });
