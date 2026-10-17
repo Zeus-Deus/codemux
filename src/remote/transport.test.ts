@@ -62,9 +62,10 @@ function newTransport(overrides: {
 }
 
 async function connect(transport: RemoteTransport): Promise<FakeWebSocket> {
+  const socketIndex = FakeWebSocket.instances.length;
   const p = transport.connect();
-  await flushMicrotasks();
-  const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+  await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(socketIndex + 1));
+  const ws = FakeWebSocket.instances[socketIndex];
   ws.open();
   await p;
   return ws;
@@ -213,7 +214,7 @@ describe("disconnect handling", () => {
     const reopened = transport.connect();
     tickets[0](new Response(JSON.stringify({ ticket: "stale" })));
     tickets[1](new Response(JSON.stringify({ ticket: "current" })));
-    await flushMicrotasks();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
 
     expect(FakeWebSocket.instances).toHaveLength(1);
     expect(FakeWebSocket.instances[0].url).toContain("ticket=current");
@@ -290,7 +291,7 @@ describe("reconnect", () => {
     await expect(transport.connect()).rejects.toThrow(/unauthorized/);
     const reconnect = transport.connect();
     void reconnect.catch(() => {});
-    await flushMicrotasks();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     const ws = FakeWebSocket.instances[0];
     ws.open();
@@ -309,7 +310,7 @@ describe("reconnect", () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(rec.unauthorized).toBe(1);
     const reconnect = transport.connect();
-    await flushMicrotasks();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
     expect(fetchImpl).toHaveBeenCalledTimes(3);
     expect(FakeWebSocket.instances).toHaveLength(2);
     FakeWebSocket.instances[1].open();

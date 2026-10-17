@@ -167,12 +167,14 @@ describe("shim get_app_state seeding", () => {
       fetchSnapshot: () => Promise.resolve(seedState),
     });
     handles.push(handle);
-    void handle.transport.connect();
+    const cancelled = expect(handle.transport.connect()).rejects.toThrow(/connection closed/);
     await flushMicrotasks();
 
     // Socket is not open — a raw transport invoke would reject with "not
     // connected", but the seed answers get_app_state anyway.
     await expect(internals().invoke("get_app_state", {})).resolves.toEqual(seedState);
+    handle.transport.close();
+    await cancelled;
   });
 
   it("only seeds the FIRST get_app_state; later calls take the WS path", async () => {
