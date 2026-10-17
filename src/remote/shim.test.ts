@@ -125,6 +125,23 @@ describe("terminal attach serialization", () => {
     await expect(b).resolves.toBe(2);
   });
 
+  it("releases queued attaches when the socket drops mid-replay", async () => {
+    const { ws } = await setup();
+    const a = internals().invoke("attach_pty_output", { sessionId: "a" });
+    const b = internals().invoke("attach_pty_output", { sessionId: "b" });
+    const rejected = expect(a).rejects.toThrow(/connection lost/);
+    await flushMicrotasks();
+    expect(attaches(ws)).toHaveLength(1);
+
+    ws.drop();
+    await rejected;
+    // The queued attach is not wedged: it runs next, and fails fast while
+    // the socket is down instead of waiting on the dead one.
+    await expect(b).rejects.toThrow(/not connected/);
+    const c = internals().invoke("attach_pty_output", { sessionId: "c" });
+    await expect(c).rejects.toThrow(/not connected/);
+  });
+
   it("keeps the queue moving after a failed attach", async () => {
     const { ws } = await setup();
     const a = internals().invoke("attach_pty_output", { sessionId: "a" });

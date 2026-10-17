@@ -115,7 +115,10 @@ export function installShim(options: InstallShimOptions): ShimHandle {
   // page load) attaches every mounted terminal at once. The reply only
   // arrives once its replay has been written, so waiting for it caps the
   // replay in flight at one. `null` while no attach is outstanding, so an
-  // idle attach goes out synchronously like any other invoke.
+  // idle attach goes out synchronously like any other invoke. A drop rejects
+  // the outstanding attach and releases the queue. There is deliberately no
+  // timeout: a full replay over a slow link legitimately takes minutes, and
+  // the command itself is synchronous on the host.
   let ptyAttachTail: Promise<unknown> | null = null;
 
   // Track the prefetch's settled value WITHOUT ever awaiting it on the hot
