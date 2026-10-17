@@ -92,10 +92,8 @@ pub(crate) struct ClaudeSessionState {
     /// concurrent drains (notifications task + inline interrupt fallback)
     /// each popping and dispatching an item in the same idle window.
     pub dispatching: bool,
-    /// Set by a user Stop so the queue stays put instead of dispatching the
-    /// next item the moment the stopped turn settles. Cleared by an explicit
-    /// send or "send now", or once the queue is empty.
-    pub queue_held: bool,
+    /// Holds the queue after a user Stop until an explicit send.
+    pub(crate) queue_hold: crate::agent_provider::queue_hold::QueueHold,
 }
 
 impl ClaudeSessionState {
@@ -531,7 +529,7 @@ impl ClaudeSession {
             sdk_session_id: None,
             queued_turns: VecDeque::new(),
             dispatching: false,
-            queue_held: false,
+            queue_hold: Default::default(),
         });
         let session = Arc::new(Self {
             thread_id: thread_id.clone(),
@@ -654,9 +652,10 @@ impl ClaudeSession {
                     input,
                 };
                 // Sent by hand while a Stop settles: it goes first and
-                // releases the held queue behind it.
-                if std::mem::take(&mut state.queue_held) {
+                // releases the held queue behind it once it starts.
+                if state.queue_hold.is_held() {
                     state.queued_turns.push_front(queued);
+                    state.queue_hold.release_with(&queued_id);
                 } else {
                     state.queued_turns.push_back(queued);
                 }
@@ -672,7 +671,7 @@ impl ClaudeSession {
             // A message sent by hand goes first; the held queue follows it.
             // Reserve dispatch so a drain cannot start a queued turn before
             // this one becomes active.
-            let was_held = std::mem::take(&mut state.queue_held);
+            let was_held = state.queue_hold.take();
             if was_held {
                 state.dispatching = true;
             }
@@ -695,7 +694,7 @@ impl ClaudeSession {
             let mut state = self.state.lock().await;
             state.dispatching = false;
             if sent.is_err() {
-                state.queue_held = true;
+                state.queue_hold.restore(true);
             }
         }
         let outcome = match sent {
@@ -742,10 +741,8 @@ impl ClaudeSession {
                 if !idle {
                     return;
                 }
-                if state.queue_held {
-                    if state.queued_turns.is_empty() {
-                        state.queue_held = false;
-                    }
+                let front = state.queued_turns.front().map(|q| q.queued_id.clone());
+                if !state.queue_hold.admits(front.as_deref()) {
                     return;
                 }
                 match state.queued_turns.pop_front() {
@@ -783,6 +780,7 @@ impl ClaudeSession {
                     {
                         let mut state = self.state.lock().await;
                         state.dispatching = false;
+                        state.queue_hold.settle(&queued.queued_id, true);
                     }
                     let _ = self
                         .event_tx
@@ -802,6 +800,7 @@ impl ClaudeSession {
                     {
                         let mut state = self.state.lock().await;
                         state.dispatching = false;
+                        state.queue_hold.settle(&queued.queued_id, false);
                     }
                     // Don't wedge the queue: surface the failure, cancel
                     // this item, and try the next one.
@@ -889,14 +888,17 @@ impl ClaudeSession {
     /// longer waits on a zombie approval — the following drain dispatches
     /// it as soon as the turn ends.
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
-        let (has_active_turn, original_index, was_held) = {
+        let (has_active_turn, original_index) = {
             let mut state = self.state.lock().await;
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
                 // `turn_busy`, not `active_turn`: an SDK-initiated turn
                 // parked on a question has no `active_turn`, and draining
                 // would just leave the item stuck behind the callback.
                 // Interrupting aborts the callback sidecar-side.
-                Some(idx) => (state.turn_busy(), idx, std::mem::take(&mut state.queue_held)),
+                Some(idx) => {
+                    state.queue_hold.release_with(queued_id);
+                    (state.turn_busy(), idx)
+                }
                 // Unknown / already-dispatched / cancelled — no-op.
                 None => return Ok(()),
             }
@@ -913,7 +915,7 @@ impl ClaudeSession {
                     {
                         let mut state = self.state.lock().await;
                         restore_queued_position(&mut state.queued_turns, queued_id, original_index);
-                        state.queue_held |= was_held;
+                        state.queue_hold.settle(queued_id, false);
                     }
                     Err(err)
                 }
@@ -927,9 +929,9 @@ impl ClaudeSession {
     }
 
     /// Keep queued turns queued after a user Stop; see
-    /// [`ClaudeSessionState::queue_held`].
+    /// [`ClaudeSessionState::queue_hold`].
     pub async fn hold_queue(&self) {
-        self.state.lock().await.queue_held = true;
+        self.state.lock().await.queue_hold.hold();
     }
 
     /// Cancel every queued turn, emitting a

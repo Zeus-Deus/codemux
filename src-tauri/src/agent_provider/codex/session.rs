@@ -180,10 +180,8 @@ pub(crate) struct CodexSessionState {
     /// dispatch order. Drained one-at-a-time as the session returns to
     /// idle (see [`CodexSession::drain_queue`]).
     pub queued_turns: VecDeque<QueuedTurn>,
-    /// Set by a user Stop so the queue stays put instead of dispatching the
-    /// next item the moment the stopped turn settles. Cleared by an explicit
-    /// send, steer or "send now", or once the queue is empty.
-    pub queue_held: bool,
+    /// Holds the queue after a user Stop until an explicit send.
+    pub(crate) queue_hold: crate::agent_provider::queue_hold::QueueHold,
 }
 
 #[derive(Default)]
@@ -193,13 +191,15 @@ struct PendingTurnStart {
 }
 
 /// Steering that started a new turn is a message sent by hand, which releases
-/// a queue held by Stop. Guidance inside a turn, or a failure, keeps the hold.
-async fn release_hold_if_started(
+/// a queue held by Stop. Guidance inside a turn, or a failure, restores the
+/// hold taken before delivery (a Stop during delivery holds it regardless).
+async fn restore_hold_unless_started(
     state: &Mutex<CodexSessionState>,
+    was_held: bool,
     result: &Result<crate::agent_provider::TurnStartResult, ProviderError>,
 ) {
-    if matches!(result, Ok(started) if !started.steered) {
-        state.lock().await.queue_held = false;
+    if !matches!(result, Ok(started) if !started.steered) {
+        state.lock().await.queue_hold.restore(was_held);
     }
 }
 
@@ -748,7 +748,7 @@ impl CodexSession {
             service_tier,
             tier_models,
             queued_turns: VecDeque::new(),
-            queue_held: false,
+            queue_hold: Default::default(),
         });
         let session = Arc::new(Self {
             thread_id: thread_id.clone(),
@@ -844,7 +844,7 @@ impl CodexSession {
         self: &Arc<Self>,
         input: SendTurnInput,
     ) -> Result<SendOutcome, ProviderError> {
-        let _outbound = self.outbound.lock().await;
+        let outbound = self.outbound.lock().await;
         self.ensure_open().await?;
         let was_held = {
             let mut state = self.state.lock().await;
@@ -865,9 +865,10 @@ impl CodexSession {
                     input,
                 };
                 // Sent by hand while a Stop settles: it goes first and
-                // releases the held queue behind it.
-                if std::mem::take(&mut state.queue_held) {
+                // releases the held queue behind it once it starts.
+                if state.queue_hold.is_held() {
                     state.queued_turns.push_front(queued);
+                    state.queue_hold.release_with(&queued_id);
                 } else {
                     state.queued_turns.push_back(queued);
                 }
@@ -881,7 +882,7 @@ impl CodexSession {
                 return Ok(SendOutcome::Queued(queued_id));
             }
             // A message sent by hand goes first; the held queue follows it.
-            std::mem::take(&mut state.queue_held)
+            state.queue_hold.take()
         };
         let checkpoint = input.turn_checkpoint.clone();
         if let Some(checkpoint) = checkpoint.as_ref() {
@@ -898,7 +899,7 @@ impl CodexSession {
                 checkpoint.clone(),
             )
             .await;
-        match sent {
+        let outcome = match sent {
             Ok(turn_id) => {
                 if let Some(checkpoint) = checkpoint.as_ref() {
                     checkpoint.commit().await;
@@ -909,12 +910,17 @@ impl CodexSession {
                 if let Some(checkpoint) = checkpoint.as_ref() {
                     checkpoint.abort().await;
                 }
-                if was_held {
-                    self.state.lock().await.queue_held = true;
-                }
+                self.state.lock().await.queue_hold.restore(was_held);
                 Err(error)
             }
+        };
+        drop(outbound);
+        if was_held && outcome.is_ok() {
+            // The turn may have settled before its start response while
+            // notification drains were locked out; resume the queue now.
+            self.drain_queue().await;
         }
+        outcome
     }
 
     /// Serialize guidance with sends and queue drains. The provider owns the
@@ -925,8 +931,9 @@ impl CodexSession {
     ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
         let result = {
             let _outbound = self.outbound.lock().await;
+            let was_held = self.state.lock().await.queue_hold.take();
             let result = self.deliver_steer(input).await;
-            release_hold_if_started(&self.state, &result).await;
+            restore_hold_unless_started(&self.state, was_held, &result).await;
             result
         };
         self.drain_queue().await;
@@ -1073,8 +1080,9 @@ impl CodexSession {
                 .display_text
                 .clone()
                 .unwrap_or_else(|| input.text.clone());
+            let was_held = self.state.lock().await.queue_hold.take();
             let result = self.deliver_steer(input).await;
-            release_hold_if_started(&self.state, &result).await;
+            restore_hold_unless_started(&self.state, was_held, &result).await;
             let result = result?;
             self.state
                 .lock()
@@ -1116,10 +1124,8 @@ impl CodexSession {
                 if !idle {
                     return;
                 }
-                if state.queue_held {
-                    if state.queued_turns.is_empty() {
-                        state.queue_held = false;
-                    }
+                let front = state.queued_turns.front().map(|q| q.queued_id.clone());
+                if !state.queue_hold.admits(front.as_deref()) {
                     return;
                 }
                 state.queued_turns.pop_front()
@@ -1150,6 +1156,7 @@ impl CodexSession {
                     if let Some(checkpoint) = checkpoint.as_ref() {
                         checkpoint.commit().await;
                     }
+                    self.state.lock().await.queue_hold.settle(&queued.queued_id, true);
                     let _ = self
                         .event_tx()
                         .send(ProviderRuntimeEvent::QueuedTurnDispatched {
@@ -1167,6 +1174,7 @@ impl CodexSession {
                     if let Some(checkpoint) = checkpoint.as_ref() {
                         checkpoint.abort().await;
                     }
+                    self.state.lock().await.queue_hold.settle(&queued.queued_id, false);
                     let _ = self.event_tx().send(ProviderRuntimeEvent::RuntimeWarning {
                         thread_id: Some(self.thread_id.clone()),
                         message: format!(
@@ -1240,14 +1248,13 @@ impl CodexSession {
     /// the promoted message stays queued until then.
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
         let outbound = self.outbound.lock().await;
-        let (has_active_turn, original_index, was_held) = {
+        let (has_active_turn, original_index) = {
             let mut state = self.state.lock().await;
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
-                Some(idx) => (
-                    state.active_turn.is_some(),
-                    idx,
-                    std::mem::take(&mut state.queue_held),
-                ),
+                Some(idx) => {
+                    state.queue_hold.release_with(queued_id);
+                    (state.active_turn.is_some(), idx)
+                }
                 // Unknown / already-dispatched / cancelled — no-op.
                 None => return Ok(()),
             }
@@ -1258,7 +1265,7 @@ impl CodexSession {
                 Err(err) => {
                     let mut state = self.state.lock().await;
                     restore_queued_position(&mut state.queued_turns, queued_id, original_index);
-                    state.queue_held |= was_held;
+                    state.queue_hold.settle(queued_id, false);
                     Err(err)
                 }
             }
@@ -1271,9 +1278,9 @@ impl CodexSession {
     }
 
     /// Keep queued turns queued after a user Stop; see
-    /// [`CodexSessionState::queue_held`].
+    /// [`CodexSessionState::queue_hold`].
     pub async fn hold_queue(&self) {
-        self.state.lock().await.queue_held = true;
+        self.state.lock().await.queue_hold.hold();
     }
 
     /// Cancel every queued turn, emitting a cancellation for each. Used

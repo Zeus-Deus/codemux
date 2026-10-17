@@ -139,10 +139,8 @@ struct State {
     interrupted: bool,
     pending: HashMap<RequestId, Pending>,
     queued: VecDeque<Queued>,
-    /// Set by a user Stop so the queue stays put instead of dispatching the
-    /// next item the moment the stopped turn settles. Cleared by an explicit
-    /// send or "send now", or once the queue is empty.
-    queue_held: bool,
+    /// Holds the queue after a user Stop until an explicit send.
+    queue_hold: crate::agent_provider::queue_hold::QueueHold,
     prose: String,
     thoughts: String,
     output_bytes: [usize; 2],
@@ -150,14 +148,15 @@ struct State {
 }
 impl State {
     /// The next queued turn to dispatch, unless a user Stop holds the queue.
+    /// A popped item dispatches as a turn at once, so a release settles here.
     fn next_queued(&mut self) -> Option<Queued> {
-        if self.queue_held {
-            if self.queued.is_empty() {
-                self.queue_held = false;
-            }
+        let front = self.queued.front().map(|queued| queued.id.as_str());
+        if !self.queue_hold.admits(front) {
             return None;
         }
-        self.queued.pop_front()
+        let queued = self.queued.pop_front()?;
+        self.queue_hold.settle(&queued.id, true);
+        Some(queued)
     }
 }
 struct Session {
@@ -514,7 +513,7 @@ impl Session {
                 interrupted: false,
                 pending: HashMap::new(),
                 queued: VecDeque::new(),
-                queue_held: false,
+                queue_hold: Default::default(),
                 prose: String::new(),
                 thoughts: String::new(),
                 output_bytes: [0; 2],
@@ -1625,9 +1624,10 @@ impl Session {
                 input,
             };
             // Sent by hand while a Stop settles: it goes first and releases
-            // the held queue behind it.
-            if std::mem::take(&mut s.queue_held) {
+            // the held queue behind it once it starts.
+            if s.queue_hold.is_held() {
                 s.queued.push_front(queued);
+                s.queue_hold.release_with(&id);
             } else {
                 s.queued.push_back(queued);
             }
@@ -1641,7 +1641,7 @@ impl Session {
         s.active = Some(turn.clone());
         s.interrupted = false;
         // A message sent by hand goes first; the held queue follows it.
-        s.queue_held = false;
+        s.queue_hold.take();
         drop(s);
         let session = self.clone();
         let worker_turn = turn.clone();
@@ -1994,7 +1994,7 @@ impl AgentProvider for GenericAcpProvider {
         // A blanket Stop is the user's Stop button: hold the queue rather
         // than dispatch the next message the moment this turn settles.
         if turn.is_none() {
-            session.state.lock().await.queue_held = true;
+            session.state.lock().await.queue_hold.hold();
         }
         session.interrupt(turn).await
     }
@@ -2083,17 +2083,20 @@ impl AgentProvider for GenericAcpProvider {
             return Ok(());
         };
         let queued = s.queued.remove(index).unwrap();
-        let was_held = std::mem::take(&mut s.queue_held);
         if s.active.is_some() {
+            // The promoted item goes through a held queue; the hold lifts
+            // once it dispatches.
+            s.queue_hold.release_with(&id);
             s.queued.push_front(queued);
             let turn = s.active.clone();
             drop(s);
             let result = session.interrupt(turn).await;
-            if was_held && result.is_err() {
-                session.state.lock().await.queue_held = true;
+            if result.is_err() {
+                session.state.lock().await.queue_hold.settle(&id, false);
             }
             return result;
         }
+        s.queue_hold.take();
         // Idle with a queue only happens while a Stop holds it, so nothing
         // will drain this item: dispatch it as the worker would.
         let turn = TurnId(format!("acp-turn-{}", Uuid::new_v4()));
