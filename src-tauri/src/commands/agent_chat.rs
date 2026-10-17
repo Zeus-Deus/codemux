@@ -5586,22 +5586,91 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
     if threads.is_empty() {
         return;
     }
+    // Registered before the spawn so a worktree deletion that starts right
+    // after this call still finds the stop and waits for it.
+    let thread_ids: Vec<String> = threads.iter().map(|(_, id, _)| id.clone()).collect();
+    let db = app.try_state::<DatabaseStore>();
+    let workspaces: Vec<Option<String>> = thread_ids
+        .iter()
+        .map(|id| db.as_ref()?.get_agent_chat_session(id).map(|s| s.workspace_id))
+        .collect();
+    let (done, result) = tokio::sync::watch::channel(None);
+    {
+        let mut pending = pending_stops().lock().unwrap();
+        for (thread_id, workspace_id) in thread_ids.iter().zip(workspaces) {
+            pending.insert(
+                thread_id.clone(),
+                PendingStop { workspace_id, result: result.clone() },
+            );
+        }
+    }
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = stop_agent_chat_threads(&app_handle, threads).await;
+        let outcome = stop_agent_chat_threads(&app_handle, threads).await;
+        done.send_replace(Some(outcome));
+        let mut pending = pending_stops().lock().unwrap();
+        for thread_id in thread_ids {
+            if pending
+                .get(&thread_id)
+                .is_some_and(|stop| stop.result.same_channel(&result))
+            {
+                pending.remove(&thread_id);
+            }
+        }
     });
 }
 
+/// A fire-and-forget stop still in flight, with the workspace its session
+/// was recorded under (`None` when no session row exists).
+struct PendingStop {
+    workspace_id: Option<String>,
+    result: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+}
+
+/// In-flight stops by thread id. A chat closed just before its workspace is
+/// deleted is no longer in the workspace, so deletion finds its stop here.
+fn pending_stops() -> &'static Mutex<HashMap<String, PendingStop>> {
+    static PENDING: OnceLock<Mutex<HashMap<String, PendingStop>>> = OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+
+/// Wait for in-flight stops of sessions in `workspace_id`, or whose workspace
+/// is unknown. Errs when any of them failed.
+async fn wait_for_pending_stops(workspace_id: &str) -> Result<(), String> {
+    let stops: Vec<_> = pending_stops()
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|stop| stop.workspace_id.as_deref().is_none_or(|id| id == workspace_id))
+        .map(|stop| stop.result.clone())
+        .collect();
+    let mut first_error = None;
+    for mut result in stops {
+        let outcome = match result.wait_for(Option::is_some).await {
+            Ok(outcome) => outcome.clone().unwrap_or(Ok(())),
+            Err(_) => Err("agent shutdown ended without reporting".to_string()),
+        };
+        if let Err(error) = outcome {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 /// [`shutdown_agent_chat_threads`], but resolves only once every session has
-/// stopped. Worktree deletion awaits this so no agent is still running in
-/// the directory when its files are removed. Errs when a provider did not
-/// acknowledge the stop; a session that was not running counts as stopped.
+/// stopped, including stops already in flight for chats closed earlier in
+/// `workspace_id`. Worktree deletion awaits this so no agent is still running
+/// in the directory when its files are removed. Errs when a provider did not
+/// acknowledge a stop; a session that was not running counts as stopped.
 pub async fn shutdown_agent_chat_threads_and_wait<R: Runtime>(
     app: &AppHandle<R>,
+    workspace_id: &str,
     threads: Vec<(ProviderKind, String)>,
 ) -> Result<(), String> {
     let threads = begin_agent_chat_thread_shutdown(app, threads);
-    stop_agent_chat_threads(app, threads).await
+    let stopped = stop_agent_chat_threads(app, threads).await;
+    let earlier = wait_for_pending_stops(workspace_id).await;
+    stopped.and(earlier)
 }
 
 fn begin_agent_chat_thread_shutdown<R: Runtime>(
@@ -10692,6 +10761,48 @@ mod tests {
             Err(_) => close.await.unwrap().unwrap(),
         }
         assert!(waited, "workspace deletion completed before its agent stopped");
+        assert!(retained_while_stopping, "worktree must exist while the agent is stopping");
+        assert!(!worktree.exists(), "worktree should be removed after shutdown");
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_waits_for_stop_of_chat_closed_earlier() {
+        if worktree_close_fixture_child("worktree_deletion_waits_for_stop_of_chat_closed_earlier") {
+            return;
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(PlacementProvider {
+            stop_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let thread = "close-pane-first";
+        let (_repo, app, workspace, worktree) = worktree_close_app(thread, provider.clone()).await;
+        let handle = app.handle().clone();
+        // What `agent_chat_close_pane` does: the pane leaves the workspace and
+        // its stop runs in the background.
+        {
+            let state = handle.state::<AppStateStore>();
+            let pane = state.agent_chat_pane_id_for_thread(thread).unwrap();
+            state.close_pane_with_selection(&pane, true).unwrap();
+        }
+        shutdown_agent_chat_threads(&handle, vec![(ProviderKind::Codex, thread.to_string())]);
+        tokio::time::timeout(Duration::from_secs(5), provider.stop_started.notified()).await.unwrap();
+
+        let mut close = tokio::spawn(async move {
+            super::super::workspace::close_workspace_with_worktree_impl(
+                handle.clone(), &handle.state::<AppStateStore>(), &handle.state::<DatabaseStore>(),
+                workspace, true, Some(false), Some(true),
+            ).await
+        });
+        let result = tokio::time::timeout(Duration::from_millis(100), &mut close).await;
+        let waited = result.is_err();
+        let retained_while_stopping = worktree.exists();
+        release.notify_one();
+        match result {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => close.await.unwrap().unwrap(),
+        }
+        assert!(waited, "workspace deletion completed before the closed chat's agent stopped");
         assert!(retained_while_stopping, "worktree must exist while the agent is stopping");
         assert!(!worktree.exists(), "worktree should be removed after shutdown");
     }

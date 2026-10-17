@@ -1409,6 +1409,7 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         // that was not acknowledged keeps the files.
         crate::commands::agent_chat::shutdown_agent_chat_threads_and_wait(
             &app,
+            &workspace_id,
             close_result.removed_agent_chat_threads,
         )
         .await
