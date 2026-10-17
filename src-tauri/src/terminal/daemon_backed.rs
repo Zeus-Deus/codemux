@@ -1057,24 +1057,42 @@ async fn spawn_prepared_session<R: Runtime>(
     Ok(())
 }
 
-/// Acknowledgement for one queued input write. Both input paths await it
-/// after releasing the shared sessions lock.
+/// Acknowledgement for one queued input write. Internal callers await it after
+/// releasing the shared sessions lock; terminal typing drops it (see
+/// `admit_pty_input`), which routes a failure to the session's next input.
 pub(crate) type WriteAck = tokio::sync::oneshot::Receiver<std::io::Result<()>>;
 
 type QueuedWrite = (Vec<u8>, tokio::sync::oneshot::Sender<std::io::Result<()>>);
+
+/// Upper bound on input merged into one daemon write by the drain task.
+const MAX_COALESCED_INPUT: usize = 64 * 1024;
 
 /// One ordered input queue per session, shared by IPC and synchronous input.
 /// Each caller receives its own daemon acknowledgement or error.
 #[derive(Clone)]
 pub(crate) struct DaemonWriter {
     queue: tokio::sync::mpsc::UnboundedSender<QueuedWrite>,
+    /// Failure of a write whose acknowledgement nobody awaited.
+    unawaited_failure: Arc<std::sync::Mutex<Option<std::io::Error>>>,
 }
 
 impl DaemonWriter {
     pub(super) fn new(client: Arc<PtyDaemonClient>, session_id: String) -> Self {
         let (queue, mut pending) = tokio::sync::mpsc::unbounded_channel::<QueuedWrite>();
+        let unawaited_failure = Arc::new(std::sync::Mutex::new(None));
+        let drain_failure = Arc::clone(&unawaited_failure);
         tauri::async_runtime::spawn(async move {
-            while let Some((data, reply)) = pending.recv().await {
+            while let Some((mut data, reply)) = pending.recv().await {
+                // Merge input queued while the previous write was in flight,
+                // so a typing burst costs one daemon round trip, not one each.
+                let mut replies = vec![reply];
+                while data.len() < MAX_COALESCED_INPUT {
+                    let Ok((more, reply)) = pending.try_recv() else {
+                        break;
+                    };
+                    data.extend_from_slice(&more);
+                    replies.push(reply);
+                }
                 let result = client
                     .write(session_id.clone(), &data)
                     .await
@@ -1088,10 +1106,31 @@ impl DaemonWriter {
                         }
                         error => std::io::Error::other(error),
                     });
-                let _ = reply.send(result);
+                for reply in replies {
+                    let result = match &result {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+                    };
+                    if let Err(Err(error)) = reply.send(result) {
+                        drain_failure
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_insert(error);
+                    }
+                }
             }
         });
-        Self { queue }
+        Self {
+            queue,
+            unawaited_failure,
+        }
+    }
+
+    pub(super) fn take_unawaited_failure(&self) -> Option<std::io::Error> {
+        self.unawaited_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     pub(super) fn enqueue(&self, data: &[u8]) -> std::io::Result<WriteAck> {
@@ -1204,9 +1243,11 @@ mod tests {
         let mut reader = BufReader::new(server_read);
         let writer = super::DaemonWriter::new(client, "session".into());
         let first_ack = writer.enqueue(b"command").unwrap();
-        let second_ack = writer.enqueue(b"\r").unwrap();
         let (first_id, first) = read_test_write(&mut reader).await;
         assert_eq!(first, b"command");
+        // Input queued while a write is in flight goes out next, merged in order.
+        let second_ack = writer.enqueue(b"\r").unwrap();
+        let third_ack = writer.enqueue(b"ls").unwrap();
         let mut line = String::new();
         assert!(
             tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut line))
@@ -1222,7 +1263,7 @@ mod tests {
         )
         .await;
         let (second_id, second) = read_test_write(&mut reader).await;
-        assert_eq!(second, b"\r");
+        assert_eq!(second, b"\rls");
         send_test_response(
             &mut server_write,
             ServerResponse::Written {
@@ -1232,14 +1273,15 @@ mod tests {
         .await;
         first_ack.await.unwrap().unwrap();
         second_ack.await.unwrap().unwrap();
+        third_ack.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn daemon_writer_input_waits_without_holding_sessions_lock() {
-        use super::super::{write_pty_input, write_pty_input_sync, SessionRuntime};
+        use super::super::{write_pty_input_sync, SessionRuntime};
         use std::sync::{Arc, Mutex};
 
-        for synchronous in [false, true] {
+        {
             let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
             let client = PtyDaemonClient::from_test_stream(client_stream, Duration::from_secs(1));
             let (server_read, mut server_write) = server_stream.into_split();
@@ -1253,15 +1295,9 @@ mod tests {
                 runtime,
             )])));
             let input_sessions = sessions.clone();
-            let input = if synchronous {
-                tokio::task::spawn_blocking(move || {
-                    write_pty_input_sync(&input_sessions, "session", b"input")
-                })
-            } else {
-                tokio::spawn(
-                    async move { write_pty_input(&input_sessions, "session", b"input").await },
-                )
-            };
+            let input = tokio::task::spawn_blocking(move || {
+                write_pty_input_sync(&input_sessions, "session", b"input")
+            });
             let (request_id, _) = read_test_write(&mut reader).await;
             assert!(
                 !input.is_finished(),
@@ -1285,6 +1321,56 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown session"));
         }
+    }
+
+    #[tokio::test]
+    async fn typing_is_admitted_without_waiting_for_the_daemon() {
+        use super::super::{admit_pty_input, SessionRuntime};
+        use std::sync::{Arc, Mutex};
+
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let client = PtyDaemonClient::from_test_stream(client_stream, Duration::from_secs(1));
+        let (server_read, mut server_write) = server_stream.into_split();
+        let mut reader = BufReader::new(server_read);
+        let mut runtimes = std::collections::HashMap::new();
+        for id in ["slow", "other"] {
+            let writer = super::DaemonWriter::new(client.clone(), id.into());
+            let mut runtime = SessionRuntime::new(id);
+            runtime.daemon_writer = Some(writer.clone());
+            runtime.writer = Some(Box::new(writer));
+            runtimes.insert(id.to_string(), runtime);
+        }
+        let sessions = Arc::new(Mutex::new(runtimes));
+
+        // An unacknowledged write to one session doesn't hold up another.
+        admit_pty_input(&sessions, "slow", b"a").unwrap();
+        let (slow_id, slow) = read_test_write(&mut reader).await;
+        assert_eq!(slow, b"a");
+        admit_pty_input(&sessions, "other", b"b").unwrap();
+        let (other_id, other) = read_test_write(&mut reader).await;
+        assert_eq!(other, b"b");
+        send_test_response(&mut server_write, ServerResponse::Written { request_id: other_id }).await;
+        send_test_response(
+            &mut server_write,
+            ServerResponse::Error {
+                request_id: slow_id,
+                message: "unknown session".into(),
+            },
+        )
+        .await;
+
+        // The unawaited failure is reported by the session's next input,
+        // which is still queued.
+        let slow_writer = sessions.lock().unwrap()["slow"].daemon_writer.clone().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while slow_writer.unawaited_failure.lock().unwrap().is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "failure was never recorded");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let error = admit_pty_input(&sessions, "slow", b"c").unwrap_err();
+        assert!(error.contains("unknown session"), "{error}");
+        let (_, next) = read_test_write(&mut reader).await;
+        assert_eq!(next, b"c");
     }
 
     #[tokio::test]

@@ -185,7 +185,7 @@ pub struct OutputSubscriber {
 
 pub struct SessionRuntime {
     pub writer: Option<Box<dyn Write + Send>>,
-    /// Shares the sync adapter's input queue so IPC can await the daemon
+    /// Shares the sync adapter's input queue so callers can await the daemon
     /// acknowledgement without holding the shared sessions lock.
     #[cfg(unix)]
     pub(crate) daemon_writer: Option<daemon_backed::DaemonWriter>,
@@ -3057,13 +3057,14 @@ pub async fn write_to_pty(
         })
         .ok_or_else(|| "No active terminal session found".to_string())?;
 
-    write_pty_input(&terminal_state.sessions, &session_id, data.as_bytes()).await
+    admit_pty_input(&terminal_state.sessions, &session_id, data.as_bytes())
 }
 
 type PtyWriteAck = tokio::sync::oneshot::Receiver<std::io::Result<()>>;
 
 /// Enqueue daemon input under the session lock so every caller shares the
-/// same order. Local PTY writes finish here; daemon replies are awaited later.
+/// same order. Local PTY writes finish here; callers that need the daemon's
+/// reply await it after releasing the lock.
 fn queue_pty_input(
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
@@ -3098,15 +3099,29 @@ fn queue_pty_input(
     })
 }
 
-async fn write_pty_input(
+/// Terminal typing waits only for ordered admission into the session's input
+/// queue, not for the daemon round trip. A remote connection drains every
+/// `write_to_pty` through one ordered lane shared by all of its terminals, so
+/// awaiting each acknowledgement there would hold every terminal's input
+/// behind one slow (e.g. SSH-tunneled) daemon. A failure of an unawaited write
+/// is reported by the session's next call.
+pub(crate) fn admit_pty_input(
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
     data: &[u8],
 ) -> Result<(), String> {
-    if let Some(ack) = queue_pty_input(sessions, session_id, data)? {
-        ack.await
-            .map_err(|_| "PTY daemon writer stopped before acknowledgement".to_string())?
-            .map_err(|error| format!("Failed to write to PTY: {error}"))?;
+    #[cfg(unix)]
+    let earlier_failure = with_existing_session_runtime(sessions, session_id, |runtime| {
+        runtime
+            .daemon_writer
+            .as_ref()
+            .and_then(daemon_backed::DaemonWriter::take_unawaited_failure)
+    })
+    .flatten();
+    queue_pty_input(sessions, session_id, data)?;
+    #[cfg(unix)]
+    if let Some(error) = earlier_failure {
+        return Err(format!("Failed to write earlier PTY input: {error}"));
     }
     Ok(())
 }
