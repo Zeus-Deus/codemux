@@ -22,6 +22,14 @@ import { remoteClientId } from "./client-view";
  *   - Reconnect with exponential backoff (1s → 16s cap): re-issue a
  *     ticket, reopen, re-subscribe. In-flight invokes reject on the drop;
  *     the UI's own `get_app_state`-on-mount + snapshot events self-heal.
+ *   - Liveness: a half-open socket (a phone waking from sleep, a dropped
+ *     NAT mapping) never fires `onclose`, so the status would read
+ *     "connected" while every call hangs. Any inbound frame proves the
+ *     socket alive; after `IDLE_PROBE_MS` of silence, or when the page
+ *     becomes visible or the browser comes back online, the transport sends
+ *     a probe, and if nothing at all arrives within `PROBE_TIMEOUT_MS` it
+ *     replaces the socket. Waking while a reconnect is backing off retries
+ *     at once.
  *
  * This protocol contract MUST match the Rust server exactly.
  */
@@ -81,6 +89,23 @@ class UnauthorizedError extends Error {
 
 const BASE_RECONNECT_MS = 1000;
 const MAX_RECONNECT_MS = 16000;
+
+/**
+ * Invoke command used as the liveness probe. The server answers it inline
+ * (`LIVENESS_PROBE_CMD` in `web_remote/server.rs`); an older server rejects
+ * it as a disallowed command, and that `err` frame proves liveness just as
+ * well. Browsers never expose the server's WS ping frames to page JS, and the
+ * iroh path doesn't carry them, so a probe has to be an ordinary frame.
+ */
+const LIVENESS_PROBE_CMD = "__codemux_ping";
+/** Silence after which the transport probes the socket. */
+const IDLE_PROBE_MS = 25_000;
+/** How long a probe may go without any inbound frame before the socket is
+ *  declared dead. Generous, because one large frame on a slow link arrives
+ *  as silence until it completes. */
+const PROBE_TIMEOUT_MS = 10_000;
+/** Cadence of the idle/deadline check while a socket is open. */
+const LIVENESS_TICK_MS = 2_000;
 
 /** Minimum length of a binary channel frame: tag(1) + cb(4) + idx(8). */
 const BINARY_HEADER_LEN = 13;
@@ -262,6 +287,13 @@ export class RemoteTransport {
   private reconnectDelay = BASE_RECONNECT_MS;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** When the open socket last delivered a frame (any frame). */
+  private lastFrameAt = 0;
+  /** Deadline of the outstanding liveness probe, if one is in flight. */
+  private probeDeadline: number | null = null;
+  private livenessTimer: ReturnType<typeof setInterval> | null = null;
+  private wakeListening = false;
+
   private firstConnectResolve: (() => void) | null = null;
   private firstConnectReject: ((reason: unknown) => void) | null = null;
 
@@ -282,6 +314,7 @@ export class RemoteTransport {
    */
   connect(): Promise<void> {
     this.closed = false;
+    this.listenForWake(true);
     return new Promise<void>((resolve, reject) => {
       this.firstConnectResolve = resolve;
       this.firstConnectReject = reject;
@@ -292,6 +325,8 @@ export class RemoteTransport {
   /** Tear down intentionally (no reconnect). */
   close(): void {
     this.closed = true;
+    this.listenForWake(false);
+    this.stopLiveness();
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -424,6 +459,7 @@ export class RemoteTransport {
   private handleOpen(): void {
     this.socketOpen = true;
     this.reconnectDelay = BASE_RECONNECT_MS;
+    this.startLiveness();
     // Re-send every active subscription so the server re-registers its
     // `listen_any` hooks for this fresh socket.
     for (const event of this.subscriptions) {
@@ -440,6 +476,7 @@ export class RemoteTransport {
     const wasOpen = this.socketOpen;
     this.socketOpen = false;
     this.ws = null;
+    this.stopLiveness();
     // Reject in-flight invokes — their responses will never arrive.
     if (this.pending.size > 0) {
       const err = new Error("web-remote: connection lost");
@@ -467,6 +504,93 @@ export class RemoteTransport {
     }
   }
 
+  // ── Liveness ──────────────────────────────────────────────────────
+
+  private startLiveness(): void {
+    this.stopLiveness();
+    this.lastFrameAt = Date.now();
+    this.livenessTimer = setInterval(() => this.checkLiveness(), LIVENESS_TICK_MS);
+  }
+
+  private stopLiveness(): void {
+    if (this.livenessTimer !== null) {
+      clearInterval(this.livenessTimer);
+      this.livenessTimer = null;
+    }
+    this.probeDeadline = null;
+  }
+
+  private checkLiveness(): void {
+    if (!this.socketOpen) return;
+    const now = Date.now();
+    if (this.probeDeadline !== null) {
+      if (now >= this.probeDeadline) this.replaceDeadSocket();
+      return;
+    }
+    if (now - this.lastFrameAt >= IDLE_PROBE_MS) this.sendProbe();
+  }
+
+  /** Ask the server for a reply. Only the arrival of *some* frame matters
+   *  (see `handleMessage`), so the reply itself is discarded. */
+  private sendProbe(): void {
+    if (!this.socketOpen || !this.ws || this.probeDeadline !== null) return;
+    this.probeDeadline = Date.now() + PROBE_TIMEOUT_MS;
+    const id = this.nextInvokeId++;
+    this.pending.set(id, { resolve: () => {}, reject: () => {} });
+    try {
+      this.ws.send(JSON.stringify({ t: "invoke", id, cmd: LIVENESS_PROBE_CMD, args: {} }));
+    } catch {
+      /* the deadline check replaces the socket */
+    }
+  }
+
+  /**
+   * The socket stopped delivering anything. A half-open socket's `close()`
+   * may not fire `onclose` for minutes, so detach from it and run the drop
+   * path directly: reject in-flight invokes, report `reconnecting`, reconnect.
+   */
+  private replaceDeadSocket(): void {
+    const ws = this.ws;
+    if (!ws) return;
+    console.warn("[web-remote] connection stopped responding; reconnecting");
+    ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+    try {
+      ws.close();
+    } catch {
+      /* already gone */
+    }
+    this.handleClose();
+  }
+
+  /** Page shown again or network back: check the socket now, or skip the
+   *  rest of a reconnect backoff. */
+  private readonly handleWake = (): void => {
+    if (this.closed) return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    if (this.socketOpen) {
+      this.sendProbe();
+      return;
+    }
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.reconnectDelay = BASE_RECONNECT_MS;
+      void this.attemptConnect();
+    }
+  };
+
+  private listenForWake(on: boolean): void {
+    if (on === this.wakeListening || typeof window === "undefined") return;
+    this.wakeListening = on;
+    if (on) {
+      document.addEventListener("visibilitychange", this.handleWake);
+      window.addEventListener("online", this.handleWake);
+    } else {
+      document.removeEventListener("visibilitychange", this.handleWake);
+      window.removeEventListener("online", this.handleWake);
+    }
+  }
+
   private scheduleReconnect(): void {
     if (this.closed || this.reconnectTimer !== null) return;
     const delay = this.reconnectDelay;
@@ -479,6 +603,10 @@ export class RemoteTransport {
 
   /** Both transports (WS and iroh) surface strings and `ArrayBuffer`s here. */
   private handleMessage(data: unknown): void {
+    // Any frame at all proves the socket alive, even one queued ahead of a
+    // probe's reply behind a large transfer.
+    this.lastFrameAt = Date.now();
+    this.probeDeadline = null;
     if (data instanceof ArrayBuffer) {
       this.handleBinaryMessage(data);
       return;

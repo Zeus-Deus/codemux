@@ -71,6 +71,7 @@ import { createWritePump } from "./terminal-write-pump";
 import { createIdleScrollbackSerializer } from "./scrollback-idle-serializer";
 import { parkTeardown, flushTeardown } from "./deferred-teardown";
 import { useAppStore, getSessionWorkspaceId } from "@/stores/app-store";
+import { useRemoteReconnectEpoch } from "@/remote/remote-connection-store";
 import {
   useTerminalCwdStore,
   parseOsc7,
@@ -131,6 +132,7 @@ function isAltScreen(t: Terminal): boolean {
 export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
   const mobile = useMobileLayout();
   const mobileRef = useRef(mobile);
+  const reconnectEpoch = useRemoteReconnectEpoch();
   mobileRef.current = mobile;
   const [phoneControl, setPhoneControl] = useState(false);
   const phoneControlRef = useRef(phoneControl);
@@ -1296,9 +1298,12 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       kittyLevelRef.current = 0;
       termRef.current = null;
     };
-    // Intentionally depend only on sessionId — theme updates are handled separately
+    // Intentionally depend only on sessionId — theme updates are handled
+    // separately. A web-remote reconnect also remounts: the host dropped this
+    // pane's output channel with the old socket, and a fresh mount re-attaches
+    // and replays the backend's output ring, so bytes from the gap aren't lost.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId]);
+  }, [sessionId, reconnectEpoch]);
 
   // One palette drives xterm, Shiki, and CodeMirror. App-theme changes and
   // desktop-theme events both flow through useSyntaxThemeColors.

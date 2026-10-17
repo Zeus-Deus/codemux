@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -56,10 +56,124 @@ use super::{Shared, WebRemoteState};
 pub const SESSION_COOKIE: &str = "cmux_web_session";
 /// Keepalive ping cadence.
 const PING_INTERVAL_SECS: u64 = 30;
+/// Invoke command the client sends as a liveness probe (see `LIVENESS_PROBE_CMD`
+/// in `src/remote/transport.ts`). Answered in [`handle_text_frame`], never
+/// dispatched.
+const LIVENESS_PROBE_CMD: &str = "__codemux_ping";
+
+/// Most outbound bytes one connection may have queued but not yet written.
+///
+/// Producers (PTY channels above all) never wait on the socket, so a client on
+/// a slow or stalled link would otherwise grow host memory without limit. Past
+/// this budget the connection is dropped; the client reconnects and resyncs.
+/// It must stay well above the largest legitimate burst, or the resync would
+/// itself trip the budget and loop: each terminal attach replays its whole
+/// `pending_output` ring (up to 256 MiB, see `OUTPUT_BUFFER_BYTE_LIMIT` in
+/// `terminal/mod.rs`) at once, and a reconnect re-attaches every mounted
+/// terminal together. This leaves room for two full rings.
+const MAX_OUTBOUND_QUEUED_BYTES: usize = 512 * 1024 * 1024;
 
 /// Writer handle for a connection: every frame producer (invoke
 /// responses, channel router, event hub) pushes onto this.
-pub type OutboundTx = mpsc::UnboundedSender<Message>;
+///
+/// Sends never block. They are charged against a per-connection byte budget
+/// ([`MAX_OUTBOUND_QUEUED_BYTES`]) that the writer releases as it drains. A
+/// send that would exceed it is refused, every later send is refused too, and
+/// the connection's close signal is tripped so the reader loop tears it down.
+#[derive(Clone)]
+pub struct OutboundTx {
+    tx: mpsc::UnboundedSender<Message>,
+    budget: Arc<OutboundBudget>,
+}
+
+struct OutboundBudget {
+    queued: AtomicUsize,
+    limit: usize,
+    overflowed: AtomicBool,
+    close: watch::Sender<bool>,
+}
+
+/// The writer's end of an [`OutboundTx`]. Receiving a frame releases its bytes.
+pub struct OutboundRx {
+    rx: mpsc::UnboundedReceiver<Message>,
+    budget: Arc<OutboundBudget>,
+}
+
+/// Bytes a queued frame holds in memory.
+fn queued_size(msg: &Message) -> usize {
+    match msg {
+        Message::Text(s) => s.len(),
+        Message::Binary(b) | Message::Ping(b) | Message::Pong(b) => b.len(),
+        Message::Close(_) => 0,
+    }
+}
+
+/// Open a connection's outbound queue. Overflowing it trips `close`.
+pub(super) fn outbound_channel(close: watch::Sender<bool>) -> (OutboundTx, OutboundRx) {
+    outbound_channel_with_limit(close, MAX_OUTBOUND_QUEUED_BYTES)
+}
+
+fn outbound_channel_with_limit(close: watch::Sender<bool>, limit: usize) -> (OutboundTx, OutboundRx) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let budget = Arc::new(OutboundBudget {
+        queued: AtomicUsize::new(0),
+        limit,
+        overflowed: AtomicBool::new(false),
+        close,
+    });
+    (
+        OutboundTx { tx, budget: budget.clone() },
+        OutboundRx { rx, budget },
+    )
+}
+
+impl OutboundTx {
+    /// Queue a frame for the writer. Fails once the receiver is gone or the
+    /// connection has overflowed its budget.
+    pub fn send(&self, msg: Message) -> Result<(), mpsc::error::SendError<Message>> {
+        let budget = &self.budget;
+        if budget.overflowed.load(Ordering::Relaxed) {
+            return Err(mpsc::error::SendError(msg));
+        }
+        let size = queued_size(&msg);
+        let queued = budget.queued.fetch_add(size, Ordering::SeqCst) + size;
+        if queued > budget.limit {
+            budget.queued.fetch_sub(size, Ordering::SeqCst);
+            if !budget.overflowed.swap(true, Ordering::SeqCst) {
+                eprintln!(
+                    "[codemux::web_remote] client fell {} MiB behind; dropping the connection so it resyncs",
+                    queued / (1024 * 1024)
+                );
+                let _ = budget.close.send(true);
+            }
+            return Err(mpsc::error::SendError(msg));
+        }
+        self.tx.send(msg).inspect_err(|_| {
+            budget.queued.fetch_sub(size, Ordering::SeqCst);
+        })
+    }
+}
+
+impl OutboundRx {
+    pub async fn recv(&mut self) -> Option<Message> {
+        let msg = self.rx.recv().await?;
+        self.budget.queued.fetch_sub(queued_size(&msg), Ordering::SeqCst);
+        Some(msg)
+    }
+
+    #[cfg(test)]
+    pub fn try_recv(&mut self) -> Result<Message, mpsc::error::TryRecvError> {
+        let msg = self.rx.try_recv()?;
+        self.budget.queued.fetch_sub(queued_size(&msg), Ordering::SeqCst);
+        Ok(msg)
+    }
+}
+
+/// An outbound queue for unit tests that don't care about the close signal.
+#[cfg(test)]
+pub(super) fn test_outbound() -> (OutboundTx, OutboundRx) {
+    outbound_channel(watch::channel(false).0)
+}
 
 /// Ordered dispatch lane for invokes whose *arrival order* is load-bearing.
 /// Carries `(id, cmd, args)` and is drained by a single per-connection task,
@@ -95,7 +209,8 @@ struct ConnInfo {
     session_id: String,
     transport: Transport,
     out: OutboundTx,
-    /// Set `true` to force this socket closed (revocation / keepalive death).
+    /// Set `true` to force this socket closed (revocation / keepalive death /
+    /// outbound overflow).
     close: watch::Sender<bool>,
 }
 
@@ -658,8 +773,8 @@ async fn handle_socket<R: Runtime>(
         .web_remote_touch_session(&session_id);
 
     let (mut sink, mut stream) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     let (close_tx, mut close_rx) = watch::channel(false);
+    let (out_tx, mut out_rx) = outbound_channel(close_tx.clone());
     let conn_id = shared
         .connections
         .register(&session_id, Transport::Lan, out_tx.clone(), close_tx.clone());
@@ -812,6 +927,15 @@ pub(super) fn handle_text_frame<R: Runtime>(
                 ));
                 return;
             }
+            // The client's liveness probe. Browsers never surface WS ping
+            // frames to page JS (and the iroh path drops them), so the client
+            // probes with an invoke instead. Answer it here, without a dispatch
+            // task. Older servers reject it as a disallowed command, and the
+            // client counts that `err` as proof of life too.
+            if cmd == LIVENESS_PROBE_CMD {
+                let _ = out.send(Message::Text(json!({ "t": "ok", "id": id, "data": null }).to_string()));
+                return;
+            }
             // Ordered commands (terminal input) go through the per-connection
             // serial lane so their client-send order is preserved; the send
             // is synchronous here, inside the in-order reader loop, so frames
@@ -940,7 +1064,7 @@ mod tests {
     #[test]
     fn connection_registry_close_session_signals_and_frames() {
         let reg = ConnectionRegistry::default();
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = test_outbound();
         let (close_tx, close_rx) = watch::channel(false);
         let id = reg.register("sess-1", Transport::Lan, out_tx, close_tx);
 
@@ -960,11 +1084,33 @@ mod tests {
     }
 
     #[test]
+    fn outbound_queue_overflow_drops_the_connection() {
+        let (close_tx, close_rx) = watch::channel(false);
+        let (out, mut rx) = outbound_channel_with_limit(close_tx, 10);
+
+        // Within budget; draining a frame releases its bytes.
+        out.send(Message::Binary(vec![0; 6])).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Message::Binary(_))));
+        out.send(Message::Binary(vec![0; 6])).unwrap();
+        out.send(Message::Text("abcd".into())).unwrap();
+        assert!(!*close_rx.borrow());
+
+        // One byte over: refused, and the connection is told to close.
+        assert!(out.send(Message::Text("x".into())).is_err());
+        assert!(*close_rx.borrow(), "overflow trips the close signal");
+
+        // Draining doesn't revive it: the client must reconnect and resync.
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+        assert!(out.send(Message::Text("x".into())).is_err());
+    }
+
+    #[test]
     fn close_session_only_targets_matching_session() {
         let reg = ConnectionRegistry::default();
-        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_a, mut rx_a) = test_outbound();
         let (ctx_a, _cra) = watch::channel(false);
-        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = test_outbound();
         let (ctx_b, crb) = watch::channel(false);
         reg.register("A", Transport::Lan, tx_a, ctx_a);
         reg.register("B", Transport::Relay, tx_b, ctx_b);
@@ -983,9 +1129,9 @@ mod tests {
         // control until it is closed, so graceful listener shutdown is not
         // enough on its own.
         let reg = ConnectionRegistry::default();
-        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_a, mut rx_a) = test_outbound();
         let (ctx_a, cra) = watch::channel(false);
-        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = test_outbound();
         let (ctx_b, crb) = watch::channel(false);
         reg.register("A", Transport::Lan, tx_a, ctx_a);
         reg.register("B", Transport::Relay, tx_b, ctx_b);
@@ -1003,9 +1149,9 @@ mod tests {
         // Turning the LAN listener off (or rebinding it) must not kick a phone
         // that is connected over the relay, and vice versa.
         let reg = ConnectionRegistry::default();
-        let (tx_lan, mut rx_lan) = mpsc::unbounded_channel();
+        let (tx_lan, mut rx_lan) = test_outbound();
         let (ctx_lan, cr_lan) = watch::channel(false);
-        let (tx_relay, mut rx_relay) = mpsc::unbounded_channel();
+        let (tx_relay, mut rx_relay) = test_outbound();
         let (ctx_relay, cr_relay) = watch::channel(false);
         reg.register("A", Transport::Lan, tx_lan, ctx_lan);
         reg.register("B", Transport::Relay, tx_relay, ctx_relay);
