@@ -541,10 +541,17 @@ mod tests {
             assert_eq!(update.preview.replaces.as_deref(), Some(fresh.marker.sha.as_str()));
 
             let error = plan(root.path(), other, repo).err().expect("another source must not be an update");
-            assert!(error.contains("different repository or source") && error.contains("Remove it first"), "{error}");
+            assert!(error.contains("this install is from") && error.contains("Remove it first"), "{error}");
 
-            let error = plan(root.path(), source, "https://github.com/fork/hello").err().unwrap();
-            assert!(error.contains("different repository or source"), "{error}");
+            // Git: another repository declaring the id is refused. Catalog: the
+            // entry is the same plugin even after its repository moves.
+            let moved = plan(root.path(), source, "https://github.com/fork/hello");
+            if source == "git" {
+                let error = moved.err().unwrap();
+                assert!(error.contains("this install is from GitHub (https://github.com/fork/hello)"), "{error}");
+            } else {
+                assert_eq!(moved.unwrap().preview.replaces.as_deref(), Some(fresh.marker.sha.as_str()));
+            }
         }
     }
 }

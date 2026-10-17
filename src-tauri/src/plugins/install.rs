@@ -355,8 +355,11 @@ fn file_name_ok(name: &str) -> bool {
     let mut components = Path::new(name).components();
     // Separators are forbidden on every platform; Windows drive prefixes
     // must also be rejected before joining a name to the staging folder.
+    // Windows trims trailing dots and spaces, so `...` or `.. ` could act as
+    // `..`: refuse every name starting with `..`.
     !name.contains('/')
         && !name.contains('\\')
+        && !name.starts_with("..")
         && matches!(
             (components.next(), components.next()),
             (Some(Component::Normal(_)), None)
@@ -487,25 +490,31 @@ pub fn existing(root: &Path, id: &str) -> Result<Existing, String> {
     }
 }
 
-/// An install replaces `installed` only as its update: the same source and
-/// repository (and catalog entry). The id comes from the fetched
+/// An install replaces `installed` only as its update: the same catalog entry,
+/// or a Git install of the same repository. The id comes from the fetched
 /// plugin, so another repository declaring it must not take over the folder,
 /// and with it the user's on/off decision.
 pub fn check_replacement(id: &str, installed: &InstallMarker, marker: &InstallMarker) -> Result<(), String> {
-    let same_source = match (installed.source.as_str(), marker.source.as_str()) {
+    let same = match (installed.source.as_str(), marker.source.as_str()) {
+        // The catalog vouches for its entry even if the entry's repository moves.
         ("catalog", "catalog") => installed.catalog_id.is_some() && installed.catalog_id == marker.catalog_id,
-        ("git", "git") => true,
+        // GitHub owner and repository names are case-insensitive.
+        ("git", "git") => installed.repo.eq_ignore_ascii_case(&marker.repo),
         _ => false,
     };
-    // GitHub owner and repository names are case-insensitive.
-    if same_source && installed.repo.eq_ignore_ascii_case(&marker.repo) {
-        Ok(())
-    } else {
-        Err(format!(
-            "\"{id}\" is already installed from a different repository or source ({}). Remove it first.",
-            installed.repo
-        ))
+    if same {
+        return Ok(());
     }
+    let from = |m: &InstallMarker| match m.source.as_str() {
+        "catalog" => format!("the catalog ({})", m.repo),
+        "git" => format!("GitHub ({})", m.repo),
+        other => format!("{other} ({})", m.repo),
+    };
+    Err(format!(
+        "\"{id}\" is already installed from {}; this install is from {}. Remove it first.",
+        from(installed),
+        from(marker)
+    ))
 }
 
 /// Write `files` + marker into a staging folder and swap it over
@@ -535,7 +544,7 @@ pub fn write_install(
     std::fs::create_dir(&staging).map_err(|e| format!("Cannot create the install folder: {e}"))?;
     let write = || -> Result<(), String> {
         for (name, bytes) in files {
-            if !file_name_ok(name) || name == MARKER_FILE || name.starts_with("..") {
+            if !file_name_ok(name) || name == MARKER_FILE {
                 continue;
             }
             std::fs::write(staging.join(name), bytes).map_err(|e| format!("Cannot write {name}: {e}"))?;
@@ -628,7 +637,7 @@ mod tests {
             assert!(file_name_ok(name), "{name}");
         }
         for name in [
-            "", ".", "..", "../evil.js", "a/../evil.js", "a/b.js", "a\\b.js", "/evil.js", "file.js/",
+            "", ".", "..", "...", ".. ", "..evil.js", "../evil.js", "a/../evil.js", "a/b.js", "a\\b.js", "/evil.js", "file.js/",
         ] {
             assert!(!file_name_ok(name), "{name}");
         }

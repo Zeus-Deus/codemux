@@ -157,18 +157,17 @@ fn plugin_install_identity_is_checked_before_writing() {
         let root = tempfile::tempdir().unwrap();
         let files = vec![(ENTRY_FILE.into(), b"original".to_vec())];
         install::write_install(root.path(), "hello", &files, &original).unwrap();
-        let mut replacements = vec![
-            InstallMarker { repo: "https://github.com/fork/hello".into(), ..original.clone() },
-            InstallMarker {
-                source: if original.source == "git" { "catalog" } else { "git" }.into(),
-                catalog_id: Some("hello".into()),
-                ..original.clone()
-            },
-        ];
-        if original.source == "catalog" {
-            replacements.push(InstallMarker { catalog_id: Some("other".into()), ..original.clone() });
-        }
-        for replacement in replacements {
+        let moved = InstallMarker { repo: "https://github.com/fork/hello".into(), ..original.clone() };
+        let other_source = InstallMarker {
+            source: if original.source == "git" { "catalog" } else { "git" }.into(),
+            catalog_id: Some("hello".into()),
+            ..original.clone()
+        };
+        let other_plugin = match original.source.as_str() {
+            "catalog" => InstallMarker { catalog_id: Some("other".into()), ..original.clone() },
+            _ => moved.clone(),
+        };
+        for replacement in [other_source, other_plugin] {
             let error = install::write_install(
                 root.path(),
                 "hello",
@@ -177,12 +176,17 @@ fn plugin_install_identity_is_checked_before_writing() {
             )
             .expect_err("an unrelated install must not replace the installed plugin");
             assert!(
-                error.contains("different repository or source") && error.contains("Remove it first"),
+                error.contains("this install is from") && error.contains("Remove it first"),
                 "{error}"
             );
             assert_eq!(std::fs::read(root.path().join("hello").join(ENTRY_FILE)).unwrap(), b"original");
             assert_eq!(super::read_marker(&root.path().join("hello")).unwrap(), Some(original.clone()));
             assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1, "no staging or backup folders");
+        }
+        // A catalog entry whose repository moved is still an update.
+        if original.source == "catalog" {
+            install::write_install(root.path(), "hello", &files, &moved).unwrap();
+            assert_eq!(super::read_marker(&root.path().join("hello")).unwrap(), Some(moved));
         }
     }
 }
