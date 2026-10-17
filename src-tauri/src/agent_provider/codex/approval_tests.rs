@@ -146,26 +146,20 @@ async fn approvals_resolve_on_answer_and_settle_when_their_turn_ends() {
         .respond_to_request(request.clone(), allow.clone())
         .await
         .unwrap();
-    // The fixture completes the turn as soon as it reads the reply, so the
-    // completion may be published before the resolution.
-    let (mut decision, mut completed) = (None, false);
-    while decision.is_none() || !completed {
-        match next_matching(&mut rx, |event| match event {
-            ProviderRuntimeEvent::RequestResolved {
-                request_id,
-                decision,
-                ..
-            } if request_id == request => Some(Some(decision)),
-            ProviderRuntimeEvent::TurnCompleted { .. } => Some(None),
-            _ => None,
-        })
-        .await
-        {
-            Some(found) => decision = Some(serde_json::to_value(found).unwrap()),
-            None => completed = true,
-        }
-    }
-    assert_eq!(decision, Some(serde_json::to_value(allow).unwrap()));
+    // The fixture completes the turn as soon as it reads the reply; the
+    // resolution must still be published first.
+    let first = next_matching(&mut rx, |event| match event {
+        ProviderRuntimeEvent::RequestResolved {
+            request_id,
+            decision,
+            ..
+        } if request_id == request => Some(Some(serde_json::to_value(decision).unwrap())),
+        ProviderRuntimeEvent::TurnCompleted { .. } => Some(None),
+        _ => None,
+    })
+    .await;
+    assert_eq!(first, Some(serde_json::to_value(allow).unwrap()));
+    turn_completed(&mut rx).await;
 
     // Stop during an approval settles it and unblocks the next send.
     session.enqueue_or_send(turn("second")).await.unwrap();

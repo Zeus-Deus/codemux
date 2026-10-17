@@ -1841,11 +1841,26 @@ impl CodexSession {
             })?
         };
         let payload = serde_json::to_value(ApprovalResponse::from(decision.clone())).unwrap();
-        self.child().await
+        let child = self.child().await;
+        // Hold the notification demux until the resolution is published, so
+        // a turn completion Codex emits in reaction to this reply is always
+        // broadcast after it (late resolutions re-arm mid-turn tracking).
+        let _demux = self.notification_demux.lock().await;
+        child
             .respond(pending.rpc_id, Ok(payload))
             .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("respond failed: {e}"),
+            .map_err(|e| match e {
+                // A dead child cannot receive this answer: report the
+                // request as orphaned instead of a retryable failure.
+                crate::json_rpc_child::RpcChildError::ChildExited { .. }
+                | crate::json_rpc_child::RpcChildError::AlreadyShutdown => {
+                    ProviderError::SessionClosed {
+                        thread_id: self.thread_id.clone(),
+                    }
+                }
+                e => ProviderError::RpcError {
+                    message: format!("respond failed: {e}"),
+                },
             })?;
         // Codex sends no confirmation of its own; without this the card
         // stays "responding" and hydration later reports it expired.
@@ -2580,14 +2595,24 @@ fn spawn_incoming_requests_task(
                         let turn_ended = pending.turn_id.as_ref().is_some_and(|turn| {
                             state.settled_turns.iter().any(|(t, u)| t == thread && u == turn)
                         });
-                        if !turn_ended {
+                        // The crash watchdog marks the session dead before it
+                        // drains this map under the same lock, so a request
+                        // admitted after that drain is expired here instead.
+                        let dead = session.dead.load(Ordering::Relaxed);
+                        if !turn_ended && !dead {
                             state.pending_approvals.insert(request_id.clone(), pending);
                         }
                         // Publish while still holding the lock: a settlement
                         // on another worker must not broadcast this
                         // request's resolution ahead of its opening.
                         let _ = event_tx.send(event);
-                        turn_ended
+                        if dead {
+                            let _ = event_tx.send(crate::agent_provider::expired_request_event(
+                                session.thread_id.clone(),
+                                request_id.clone(),
+                            ));
+                        }
+                        turn_ended && !dead
                     };
                     if turn_ended {
                         let _ = event_tx.send(ProviderRuntimeEvent::RequestResolved {
