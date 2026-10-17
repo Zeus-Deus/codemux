@@ -651,7 +651,9 @@ fn write_command_to_pty(
     command: &str,
 ) {
     let payload = build_pty_command_payload(command);
-    let _ = terminal::write_pty_input_sync(sessions, session_id, &payload);
+    if let Err(error) = terminal::write_pty_input_sync(sessions, session_id, &payload) {
+        eprintln!("[codemux::presets] cannot write command to {session_id}: {error}");
+    }
 }
 
 /// Concatenate `command` + the PTY command terminator into a single
