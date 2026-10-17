@@ -889,6 +889,32 @@ describe("SidebarInboxCard — device label", () => {
   });
 });
 
+describe("SidebarInboxCard — another machine's workspace", () => {
+  const machine = { name: "ai-node", live: true };
+
+  it("marks the card with the machine glyph and names it in the tooltip", () => {
+    const { container } = renderCard({ machine });
+    const marker = within(metaLine(container)).getByRole("img", { name: "Runs on ai-node" });
+    expect(marker).toHaveAttribute("title", "Runs on ai-node");
+    expect(marker).not.toHaveTextContent("ai-node");
+  });
+
+  it("says when the machine is offline", () => {
+    renderCard({ machine: { name: "studio", live: false } });
+    expect(screen.getByRole("img", { name: "Runs on studio (offline)" })).toBeInTheDocument();
+  });
+
+  it("offers no local lifecycle actions and does not open locally", async () => {
+    const { props, card } = renderCard({ machine, status: "review" });
+    expect(screen.queryByRole("button", { name: /^Settle/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Pin/ })).toBeNull();
+    expect(within(card).getByText("Done · review")).toBeInTheDocument();
+    await userEvent.click(card);
+    expect(props.onSelect).not.toHaveBeenCalled();
+    expect(activateWorkspace).not.toHaveBeenCalled();
+  });
+});
+
 describe("metaClusterWidth", () => {
   it("never reserves less than the widest single indicator", () => {
     expect(metaClusterWidth(0, false)).toBe(META_CLUSTER_MIN_WIDTH);

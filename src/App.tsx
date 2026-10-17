@@ -17,6 +17,7 @@ import { useTerminalCwdPoll } from "@/hooks/use-terminal-cwd-poll";
 import { useAutomationFireToast } from "@/hooks/use-automation-fire-toast";
 import { useWebNotifications } from "@/hooks/use-web-notifications";
 import { useNotificationActivate } from "@/hooks/use-notification-activate";
+import { useEnvironmentRuntime } from "@/environments/use-environment-runtime";
 import { useSmoothScrollingInit } from "@/hooks/use-smooth-scrolling";
 import { useRendererModeInit } from "@/hooks/use-renderer-mode";
 import { AppShell } from "@/components/layout/app-shell";
@@ -189,6 +190,8 @@ function App() {
   useWebNotifications();
   // Desktop only: clicking a native agent notification opens that agent.
   useNotificationActivate();
+  // Desktop only: live connections to the account's other machines.
+  useEnvironmentRuntime(isAuthenticated);
 
   if (isLoading || (!isAuthenticated && (!localReady || !localMode || cloudLogin))) {
     return <><LoginScreen /><ChatGptWelcome enterWorkbench /></>;

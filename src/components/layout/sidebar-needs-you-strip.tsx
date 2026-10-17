@@ -15,11 +15,15 @@ import { useUIStore } from "@/stores/ui-store";
 import { dbGetUiState } from "@/tauri/commands";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import type { WorkspaceSnapshot } from "@/tauri/types";
+import { useRemoteWorkspaces } from "@/environments/remote-workspaces";
 
 interface StripEntry {
   workspace: WorkspaceSnapshot;
   projectName: string;
   projectPath: string;
+  /** Lives on another machine: the jump scrolls to its card but cannot open
+   *  it yet. */
+  remote?: boolean;
 }
 
 interface Props {
@@ -50,13 +54,13 @@ const MAX_VISIBLE_ENTRIES = 4;
  *  draft, exactly like a card click) and smooth-scroll its card into view.
  *  The card never moves — the strip only points at it, which is what lets the
  *  list keep a stable, status-blind order. */
-function jumpToWorkspace(workspaceId: string, projectPath: string) {
+function jumpToWorkspace(workspaceId: string, projectPath: string, remote = false) {
   // Ask the target's project to expand. A no-op in the flat inbox (it has no
   // collapsible groups), but harmless and still correct for any grouped list:
   // a row inside a collapsed group isn't rendered, so the scroll below would
   // silently do nothing.
   useUIStore.getState().requestExpandProject(projectPath);
-  activateWorkspaceInteraction(workspaceId).catch(console.error);
+  if (!remote) activateWorkspaceInteraction(workspaceId).catch(console.error);
   // The row may not exist yet — the group was just asked to expand and React
   // needs a commit to mount it. Retry across a few frames until the row is in
   // the DOM, then scroll; give up after a small cap so we never spin.
@@ -100,6 +104,7 @@ export function SidebarNeedsYouStrip({
 }: Props) {
   const paneStatuses = useAppStore((s) => s.appState?.pane_statuses);
   const statusSince = useSidebarDensityStore((s) => s.statusSince);
+  const remoteWorkspaces = useRemoteWorkspaces();
   const observeStatus = useSidebarDensityStore((s) => s.observeStatus);
 
   // Collect every workspace whose aggregate status is `permission` (walking
@@ -117,9 +122,25 @@ export function SidebarNeedsYouStrip({
   // orders by status at all; the list below stays deliberately status-blind,
   // and the strip exists precisely so it can.
   const entries = useMemo<StripEntry[]>(() => {
-    if (!paneStatuses) return [];
     const out: StripEntry[] = [];
+    // Another machine's paths differ from this one's, so the filter matches
+    // its workspaces by project name.
+    const filterName =
+      filterPath == null
+        ? null
+        : (projectGroups.find((g) => g.projectPath === filterPath)?.projectName ?? null);
+    for (const r of remoteWorkspaces) {
+      if (r.status !== "permission") continue;
+      if (filterPath != null && r.repo.name !== filterName) continue;
+      out.push({
+        workspace: r.workspace,
+        projectName: r.repo.name,
+        projectPath: r.repo.path,
+        remote: true,
+      });
+    }
     for (const group of projectGroups) {
+      if (!paneStatuses) break;
       if (filterPath !== null && group.projectPath !== filterPath) continue;
       for (const workspace of group.workspaces) {
         if (getWorkspaceStatus(workspace.surfaces, paneStatuses) === "permission") {
@@ -132,7 +153,7 @@ export function SidebarNeedsYouStrip({
       }
     }
     return sortOldestBlockedFirst(out, (e) => e.workspace.workspace_id, statusSince);
-  }, [projectGroups, paneStatuses, filterPath, statusSince]);
+  }, [projectGroups, paneStatuses, filterPath, statusSince, remoteWorkspaces]);
 
   // Per-project colors, sourced from the same UI-state key the sidebar group
   // header uses (`project.color:<path>`). Fetched lazily for the projects
@@ -205,14 +226,14 @@ export function SidebarNeedsYouStrip({
       <div className="flex flex-col">
         {entries
           .slice(0, MAX_VISIBLE_ENTRIES)
-          .map(({ workspace, projectName, projectPath }) => {
+          .map(({ workspace, projectName, projectPath, remote }) => {
             const mark = statusSince[workspace.workspace_id];
             const age = formatElapsed(mark != null ? now - mark.at : 0);
             return (
               <button
                 key={workspace.workspace_id}
                 type="button"
-                onClick={() => jumpToWorkspace(workspace.workspace_id, projectPath)}
+                onClick={() => jumpToWorkspace(workspace.workspace_id, projectPath, remote)}
                 className="group/needs flex items-center gap-2 rounded-sm px-1 py-[3px] text-left hover:bg-surface-2 transition-colors duration-150"
                 aria-label={`Jump to ${workspace.title} — waiting for your input`}
               >
