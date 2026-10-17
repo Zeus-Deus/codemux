@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::Arc;
 
 use tauri::State;
@@ -326,7 +325,7 @@ pub fn set_preset_bar_visible<R: tauri::Runtime>(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn apply_preset<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
@@ -652,45 +651,14 @@ fn write_command_to_pty(
     command: &str,
 ) {
     let payload = build_pty_command_payload(command);
-    let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(runtime) = guard.get_mut(session_id) {
-        if let Some(writer) = runtime.writer.as_mut() {
-            let _ = writer.write_all(&payload);
-            let _ = writer.flush();
-        }
-    }
+    let _ = terminal::write_pty_input_sync(sessions, session_id, &payload);
 }
 
 /// Concatenate `command` + the PTY command terminator into a single
 /// byte buffer suitable for one `write_all` call.
 ///
-/// Why this exists as a discrete helper: the daemon-backed `Writer`
-/// implementation (`DaemonWriter` in `terminal/daemon_backed.rs`) is
-/// fire-and-forget. Each call to `Write::write` spawns its own Tokio
-/// task that round-trips a separate `Write` RPC to the PTY daemon —
-/// there is no FIFO between successive writes on the same handle.
-///
-/// The previous code wrote command bytes and the terminator in two
-/// separate `write_all` calls. On the daemon path, those became two
-/// independent async tasks that could land at the daemon's master fd
-/// in either order:
-///
-///   1. Command first, CR second → shell echoes `claude ...`, then
-///      receives CR → readline submits → preset launches. Correct.
-///   2. CR first, command second → shell receives CR on an empty
-///      line → submits nothing, redraws prompt → THEN the command
-///      bytes arrive and sit at the new prompt with no terminator.
-///      User sees the command text typed in the input but never
-///      executed; pressing Enter manually launches the preset. This
-///      was the "sometimes does nothing" bug after the writer-poll
-///      fix (the writer-poll fix uncovered it by removing the
-///      synthesis path's duplicate write that happened to fire later
-///      in lock-step order).
-///
-/// Combining into one buffer means a single `write_all` → single
-/// `Write::write` call → single spawn → single daemon RPC. The
-/// command and its terminator are atomic from the daemon's
-/// perspective; nothing can race them apart.
+/// Keep the command and Enter atomic at the PTY. Combining them also avoids
+/// a second daemon round trip because writes wait for acknowledgement.
 fn build_pty_command_payload(command: &str) -> Vec<u8> {
     let mut payload = Vec::with_capacity(command.len() + PTY_COMMAND_TERMINATOR.len());
     payload.extend_from_slice(command.as_bytes());
@@ -871,36 +839,19 @@ fn wait_and_write_command(
     // Write the plain command text followed by the PTY command
     // terminator in a SINGLE `write_all` call. See
     // `build_pty_command_payload` for why this MUST be one call (and
-    // not two): on the daemon-backed Linux path, separate `write_all`s
-    // race each other and can land the terminator before the command
-    // bytes, leaving the shell with the command typed at a fresh
-    // prompt waiting for a manual Enter. See `PTY_COMMAND_TERMINATOR`
-    // for why CR is the right terminator byte on both Linux and
-    // Windows.
+    // not two), so the command and Enter reach the PTY together in one
+    // daemon round trip. See `PTY_COMMAND_TERMINATOR` for why CR is the
+    // right terminator byte on both Linux and Windows.
     let payload = build_pty_command_payload(&command_to_write);
-    let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(runtime) = guard.get_mut(session_id) {
-        if let Some(writer) = runtime.writer.as_mut() {
-            let write_result = writer.write_all(&payload);
-            let flush_result = writer.flush();
-            eprintln!(
-                "[codemux::presets] wrote preset/resume command to {session_id} \
-                 (write_ok={}, flush_ok={}, payload_len={}, cmd={command_to_write:?})",
-                write_result.is_ok(),
-                flush_result.is_ok(),
-                payload.len(),
-            );
-        } else {
-            eprintln!(
-                "[codemux::presets] cannot write command to {session_id}: \
-                 runtime.writer is None"
-            );
+    match terminal::write_pty_input_sync(sessions, session_id, &payload) {
+        Ok(()) => eprintln!(
+            "[codemux::presets] wrote preset/resume command to {session_id} \
+             (payload_len={}, cmd={command_to_write:?})",
+            payload.len(),
+        ),
+        Err(error) => {
+            eprintln!("[codemux::presets] cannot write command to {session_id}: {error}")
         }
-    } else {
-        eprintln!(
-            "[codemux::presets] cannot write command to {session_id}: \
-             runtime missing from sessions map"
-        );
     }
 }
 
@@ -998,6 +949,7 @@ mod tests {
     use super::*;
     use crate::terminal::SessionRuntime;
     use std::collections::HashMap;
+    use std::io::Write;
 
     fn make_sessions() -> Arc<std::sync::Mutex<HashMap<String, SessionRuntime>>> {
         Arc::new(std::sync::Mutex::new(HashMap::new()))

@@ -185,6 +185,10 @@ pub struct OutputSubscriber {
 
 pub struct SessionRuntime {
     pub writer: Option<Box<dyn Write + Send>>,
+    /// Shares the sync adapter's input queue so IPC can await the daemon
+    /// acknowledgement without holding the shared sessions lock.
+    #[cfg(unix)]
+    pub(crate) daemon_writer: Option<daemon_backed::DaemonWriter>,
     pub master: Option<Box<dyn MasterPty + Send>>,
     /// Live consumers of this session's PTY output. Empty when nothing is
     /// attached (output then accumulates in `pending_output` for replay on
@@ -292,6 +296,8 @@ impl SessionRuntime {
     pub(crate) fn new(session_id: &str) -> Self {
         Self {
             writer: None,
+            #[cfg(unix)]
+            daemon_writer: None,
             master: None,
             output_subscribers: Vec::new(),
             next_output_generation: 0,
@@ -1672,6 +1678,7 @@ async fn handle_daemon_spawn_failure<R: Runtime>(
             || SessionRuntime::new(&session_id),
             |runtime| {
                 runtime.writer = None;
+                runtime.daemon_writer = None;
                 runtime.master = None;
                 runtime.child_pid = None;
                 runtime.persistent = false;
@@ -2001,6 +2008,10 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
         || SessionRuntime::new(&session_id),
         |runtime| {
             runtime.writer = Some(writer);
+            #[cfg(unix)]
+            {
+                runtime.daemon_writer = None;
+            }
             runtime.master = Some(pty_pair.master);
             runtime.child_pid = Some(child_pid);
             runtime.skip_preset_launch = auto_resume_command.is_some();
@@ -2127,6 +2138,10 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
             || SessionRuntime::new(&wait_session_id),
             |runtime| {
                 runtime.writer = None;
+                #[cfg(unix)]
+                {
+                    runtime.daemon_writer = None;
+                }
                 runtime.master = None;
             },
         );
@@ -2516,6 +2531,7 @@ pub(crate) fn terminate_pty_session_keep_channel(
         let daemon_client = rt.daemon_client.take();
         rt.child_pid = None;
         rt.writer = None;
+        rt.daemon_writer = None;
         rt.master = None;
         // `persistent` flips to false so try_reserve_session_spawn
         // sees an idle slot and reserves it. The next spawn flips it
@@ -3027,7 +3043,7 @@ fn forward_flow_control_to_daemon(
 }
 
 #[tauri::command]
-pub fn write_to_pty(
+pub async fn write_to_pty(
     terminal_state: State<'_, PtyState>,
     app_state: State<'_, AppStateStore>,
     data: String,
@@ -3041,24 +3057,80 @@ pub fn write_to_pty(
         })
         .ok_or_else(|| "No active terminal session found".to_string())?;
 
-    with_session_runtime(
-        &terminal_state.sessions,
-        &session_id,
-        || SessionRuntime::new(&session_id),
-        |runtime| {
-            let writer = runtime
-                .writer
-                .as_mut()
-                .ok_or_else(|| format!("Terminal shell {session_id} is not currently writable"))?;
+    write_pty_input(&terminal_state.sessions, &session_id, data.as_bytes()).await
+}
 
-            writer
-                .write_all(data.as_bytes())
-                .map_err(|error| format!("Failed to write to PTY: {error}"))?;
-            writer
-                .flush()
-                .map_err(|error| format!("Failed to flush PTY writer: {error}"))
-        },
-    )
+type PtyWriteAck = tokio::sync::oneshot::Receiver<std::io::Result<()>>;
+
+/// Enqueue daemon input under the session lock so every caller shares the
+/// same order. Local PTY writes finish here; daemon replies are awaited later.
+fn queue_pty_input(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    data: &[u8],
+) -> Result<Option<PtyWriteAck>, String> {
+    with_existing_session_runtime(sessions, session_id, |runtime| {
+        let writer = runtime
+            .writer
+            .as_mut()
+            .ok_or_else(|| format!("Terminal shell {session_id} is not currently writable"))?;
+
+        #[cfg(unix)]
+        if let Some(daemon_writer) = &runtime.daemon_writer {
+            return daemon_writer
+                .enqueue(data)
+                .map(Some)
+                .map_err(|error| format!("Failed to write to PTY: {error}"));
+        }
+
+        writer
+            .write_all(data)
+            .map_err(|error| format!("Failed to write to PTY: {error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("Failed to flush PTY writer: {error}"))?;
+        Ok(None)
+    })
+    .unwrap_or_else(|| {
+        Err(format!(
+            "Terminal shell {session_id} is not currently writable"
+        ))
+    })
+}
+
+async fn write_pty_input(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    data: &[u8],
+) -> Result<(), String> {
+    if let Some(ack) = queue_pty_input(sessions, session_id, data)? {
+        ack.await
+            .map_err(|_| "PTY daemon writer stopped before acknowledgement".to_string())?
+            .map_err(|error| format!("Failed to write to PTY: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Synchronous callers also release the sessions lock before the RPC wait.
+pub(crate) fn write_pty_input_sync(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    data: &[u8],
+) -> Result<(), String> {
+    if let Some(ack) = queue_pty_input(sessions, session_id, data)? {
+        let wait = || ack.blocking_recv();
+        let result = if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            tokio::task::block_in_place(wait)
+        } else {
+            wait()
+        };
+        result
+            .map_err(|_| "PTY daemon writer stopped before acknowledgement".to_string())?
+            .map_err(|error| format!("Failed to write to PTY: {error}"))?;
+    }
+    Ok(())
 }
 
 /// Write data to a PTY by session ID (non-Tauri helper for internal use).
@@ -3067,23 +3139,7 @@ pub fn write_to_pty_by_session(
     session_id: &str,
     data: &str,
 ) -> Result<(), String> {
-    with_session_runtime(
-        &pty_state.sessions,
-        session_id,
-        || SessionRuntime::new(session_id),
-        |runtime| {
-            let writer = runtime
-                .writer
-                .as_mut()
-                .ok_or_else(|| format!("Terminal shell {session_id} is not currently writable"))?;
-            writer
-                .write_all(data.as_bytes())
-                .map_err(|e| format!("Failed to write to PTY: {e}"))?;
-            writer
-                .flush()
-                .map_err(|e| format!("Failed to flush PTY writer: {e}"))
-        },
-    )
+    write_pty_input_sync(&pty_state.sessions, session_id, data.as_bytes())
 }
 
 /// Write data to a PTY by session ID using a PtyState directly (for spawned threads).
@@ -3092,23 +3148,7 @@ pub fn write_to_pty_by_session_direct(
     session_id: &str,
     data: &str,
 ) -> Result<(), String> {
-    with_session_runtime(
-        &pty_state.sessions,
-        session_id,
-        || SessionRuntime::new(session_id),
-        |runtime| {
-            let writer = runtime
-                .writer
-                .as_mut()
-                .ok_or_else(|| format!("Terminal shell {session_id} is not currently writable"))?;
-            writer
-                .write_all(data.as_bytes())
-                .map_err(|e| format!("Failed to write to PTY: {e}"))?;
-            writer
-                .flush()
-                .map_err(|e| format!("Failed to flush PTY writer: {e}"))
-        },
-    )
+    write_pty_input_sync(&pty_state.sessions, session_id, data.as_bytes())
 }
 
 /// Hard cap on `lines` that `read_terminal_output` will return. Guards against
