@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codemux reliability and efficiency audit</title>
+  <style>
+    html, body { margin: 0; background: transparent; color: var(--foreground); font-family: var(--font-sans, system-ui); }
+    * { box-sizing: border-box; }
+    #codemux-audit { width: 100%; }
+    p { margin: 0 0 16px; }
+    h2, h3 { font-weight: 500; }
+    h2 { margin: 24px 0 12px; }
+    h3 { margin: 0 0 8px; }
+    .muted, figcaption, .caption { color: var(--muted-foreground); }
+    .caption { margin-bottom: 8px; }
+    .number { font-variant-numeric: tabular-nums; }
+    figure { margin: 20px 0 24px; }
+    #buffer-chart { width: 100%; height: 196px; display: block; overflow: visible; }
+    #buffer-chart text { fill: var(--foreground); font-size: 12px; font-family: var(--font-sans, system-ui); }
+    .plot-frame, .grid-line { fill: none; stroke: var(--border); stroke-width: 1; }
+    .grid-line { opacity: .5; }
+    .bar-before { fill: var(--muted-foreground); opacity: .45; }
+    .bar-after { fill: var(--chart-1); }
+    .benchmark-result { margin: 2px 0 6px; font-weight: 500; }
+    .findings { margin: 0; }
+    .finding { display: grid; grid-template-columns: 136px minmax(0, 1fr); gap: 16px; padding: 13px 0; border-bottom: 1px solid var(--border); }
+    .finding dt { font-weight: 500; }
+    .finding dd { margin: 0; }
+    .finding small { display: block; color: var(--muted-foreground); margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
+    th, td { padding: 10px 12px 10px 0; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: anywhere; }
+    th { font-weight: 500; color: var(--muted-foreground); }
+    td:last-child { padding-right: 0; }
+    .check { white-space: nowrap; font-variant-numeric: tabular-nums; }
+    details { margin-top: 18px; }
+    summary { font-weight: 500; padding: 4px 0; }
+    details p, details ul { margin: 10px 0 0; }
+    li { margin: 6px 0; }
+    code { font-family: var(--font-mono, monospace); overflow-wrap: anywhere; }
+    .evidence-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 12px; }
+    .evidence-grid figure { margin: 0; }
+    .evidence-grid img { display: block; width: 100%; height: auto; border-radius: var(--radius); }
+    .evidence-grid figcaption { margin-top: 8px; }
+    @media (max-width: 480px) {
+      .finding { grid-template-columns: 1fr; gap: 4px; }
+      .evidence-grid { grid-template-columns: 1fr; }
+      th, td { padding-right: 8px; }
+    }
+  </style>
+</head>
+<body>
+<main id="codemux-audit">
+  <p class="caption">Codemux · local code audit · 17 October 2026</p>
+  <p>Fixed file-preservation bugs and async races, reduced copying, and removed proven unused code.</p>
+
+  <figure aria-labelledby="buffer-title">
+    <h3 id="buffer-title">Remote terminal buffer append time</h3>
+    <p class="muted">128 MiB appended to a full 1 MiB buffer. Median of five runs; lower is faster.</p>
+    <svg id="buffer-chart" role="img" aria-labelledby="chart-title chart-description">
+      <title id="chart-title">Buffer append time before and after optimization</title>
+      <desc id="chart-description">Before: 180.221 milliseconds. After: 1.433 milliseconds. The deque avoids shifting the retained buffer on every append.</desc>
+    </svg>
+    <p class="benchmark-result number">180.221 ms → 1.433 ms · about 126× faster for this operation</p>
+    <figcaption>Buffer append only; not whole-app, I/O, or network speed. Snapshot/tail equivalence passed 50,000 varied appends.</figcaption>
+  </figure>
+
+  <h2>What changed</h2>
+  <dl class="findings">
+    <div class="finding">
+      <dt>Editing</dt>
+      <dd>File switches, saves, and remounts preserve the current buffer and its newer unsaved edits.</dd>
+    </div>
+    <div class="finding">
+      <dt>Search and state</dt>
+      <dd>Obsolete searches and listeners cannot overwrite newer state. MCP and preset hydration keep live updates.</dd>
+    </div>
+    <div class="finding">
+      <dt>Files and Git</dt>
+      <dd>NUL-delimited filename records preserve unusual valid-UTF-8 names in Git; worktree copying also preserves raw Unix path bytes. Generated workspace paths reject navigation components.</dd>
+    </div>
+    <div class="finding">
+      <dt>Terminal lifetime</dt>
+      <dd>Owned children are terminated and reaped. Replay and serializer ownership prevent duplicate output and missed history saves.</dd>
+    </div>
+    <div class="finding">
+      <dt>Remote streams</dt>
+      <dd>Shutdown settles requests; reconnects remain retryable. Mixed SSE newline records and strict HTTP framing preserve message boundaries, including valid bodyless HTTP responses.</dd>
+    </div>
+    <div class="finding">
+      <dt>Efficiency</dt>
+      <dd>Shared snapshots avoid full index/file-list copies. Concurrent folder lookups share one scan. Filesystem work leaves the async executor; unchanged state avoids replacement containers.</dd>
+    </div>
+    <div class="finding">
+      <dt>Dead code</dt>
+      <dd>Removed seven unused modules (848 lines), one runtime dependency, obsolete helpers, redundant folder lookups, and unused capability state.</dd>
+    </div>
+  </dl>
+
+  <h2>Verification</h2>
+  <table aria-label="Observed audit verification results">
+    <thead><tr><th scope="col">Check</th><th scope="col">Observed result</th></tr></thead>
+    <tbody>
+      <tr><td>Frontend regression and consumer tests</td><td data-result="frontend">415 passed · 27 files</td></tr>
+      <tr><td>Native Rust tests</td><td data-result="rust">203 passed · 1 existing ignored test</td></tr>
+      <tr><td>Claude and managed workflow sidecars</td><td class="check">139 passed</td></tr>
+      <tr><td>Hermes adapter</td><td class="check">13 passed</td></tr>
+      <tr><td>Independent review</td><td>Claude Opus 5.5 · high · two rounds; no remaining in-scope blockers</td></tr>
+      <tr><td>Type checks and production build</td><td data-result="build">TypeScript, Rust, and both sidecars passed; production build passed</td></tr>
+      <tr><td>Browser flows with mock data</td><td data-result="browser">Issue/PR search and selection; editor edit → save → reopen passed</td></tr>
+    </tbody>
+  </table>
+  <p class="muted" style="margin-top: 12px">Regressions were reproduced before fixes; existing neighboring behavior was tested too. Repository-wide validation remains with CI, following project instructions.</p>
+
+  <details>
+    <summary>Inspect browser evidence</summary>
+    <div class="evidence-grid">
+      <figure><img src="issue-search.png" alt="Mock issue picker showing a search result for issue 146"><figcaption>Issue search</figcaption></figure>
+      <figure><img src="pr-selected.png" alt="Mock chat composer after selecting pull request 172"><figcaption>PR selected into the draft</figcaption></figure>
+      <figure><img src="editor-unsaved.png" alt="Mock editor showing an unsaved audit marker"><figcaption>Editor with unsaved edits</figcaption></figure>
+      <figure><img src="editor-reopened.png" alt="Mock editor after reopening with the saved audit marker still present"><figcaption>Saved content survives reopening</figcaption></figure>
+    </div>
+  </details>
+
+  <details>
+    <summary>Review scope and limits</summary>
+    <p>Reviewed startup and event lifecycles, editor/disk operations, Git/worktree paths, terminal replay and process ownership, indexing and file selection, HTTP/SSE/WebSocket lifecycles, and provider sidecars.</p>
+    <ul>
+      <li>Validation ran locally on Linux. Windows/macOS, live paid providers, SSH, relay transports, and release packaging were not exercised.</li>
+      <li>Browser checks used seeded mock data. Missing mock responses for delegation, issue lookup, and editor tabs were corrected so those flows could be exercised.</li>
+      <li>Slow-client queue growth and inactive rate-limit entry retention remain unmeasured hardening candidates. No claim is made that every possible defect has been eliminated.</li>
+    </ul>
+  </details>
+</main>
+<script>
+(() => {
+  const root = document.getElementById('codemux-audit');
+  const svg = root.querySelector('#buffer-chart');
+  const ns = 'http://www.w3.org/2000/svg';
+  const values = [{ label: 'Before', ms: 180.221, css: 'bar-before' }, { label: 'After', ms: 1.433, css: 'bar-after' }];
+  function add(name, attributes, text) {
+    const element = document.createElementNS(ns, name);
+    for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value));
+    if (text !== undefined) element.textContent = text;
+    svg.appendChild(element);
+  }
+  function draw() {
+    svg.querySelectorAll(':scope > :not(title):not(desc)').forEach(element => element.remove());
+    const width = Math.max(240, svg.getBoundingClientRect().width);
+    const left = 78, right = width - 76, top = 28, bottom = 130;
+    const maximum = Math.ceil(Math.max(...values.map(value => value.ms)) / 50) * 50;
+    const x = value => left + value / maximum * (right - left);
+    svg.setAttribute('viewBox', `0 0 ${width} 196`);
+    add('rect', { x: left, y: top, width: right - left, height: bottom - top, class: 'plot-frame', 'data-chart-frame': '' });
+    for (const value of [0, maximum / 2, maximum]) {
+      add('line', { x1: x(value), x2: x(value), y1: top, y2: bottom, class: 'grid-line' });
+      add('text', { x: x(value), y: 151, 'text-anchor': 'middle' }, value);
+    }
+    values.forEach((value, index) => {
+      const y = 46 + index * 50;
+      add('text', { x: 0, y: y + 14 }, value.label);
+      add('rect', { x: left, y, width: x(value.ms) - left, height: 20, class: value.css });
+      add('text', { x: x(value.ms) + 8, y: y + 14 }, `${value.ms.toFixed(2)} ms`);
+    });
+    add('text', { x: 0, y: 15, class: 'axis-title', 'data-axis': 'y' }, 'Version');
+    add('text', { x: (left + right) / 2, y: 183, 'text-anchor': 'middle', class: 'axis-title', 'data-axis': 'x' }, 'Append time (ms)');
+    console.log('audit-chart', JSON.stringify({ width, horizontalOverflow: root.scrollWidth > root.clientWidth, bars: values.length }));
+  }
+  new ResizeObserver(draw).observe(svg);
+  draw();
+})();
+</script>
+</body>
+</html>

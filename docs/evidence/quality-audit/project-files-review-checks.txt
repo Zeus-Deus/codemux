@@ -1,0 +1,85 @@
+Project file cache review verification
+Recorded: 2026-10-17T20:12:12+00:00
+Scope: src-tauri/src/commands/project_files.rs only.
+
+Finding and fix
+Concurrent requests for a cold or expired folder could each perform a complete
+filesystem walk after the first audit refactor released the global cache lock.
+The review fix uses one OnceLock<Arc<CacheEntry>> per folder generation. Folder
+selection and expired-generation replacement happen under the global map mutex;
+initialization waits and filesystem walking happen after releasing that mutex.
+Inactive expired slots are pruned; active initializations and old Arc readers
+remain valid. No independent lock map is retained.
+
+Test method
+A temporary rustc test harness imports the actual repository module with #[path].
+It uses the real Cargo-built tauri, serde, tempfile, tokio, regex, ignore, and
+nucleo_matcher dependencies. No production module is copied or stubbed.
+The scanner injection calls the actual walk_project function while counting
+calls. A channel pauses the first scanner, a second caller requests the same
+folder, and an unrelated cold folder must finish before the paused walk is
+released. Assertions require exactly one counted walk, one shared result Arc,
+fresh contents, and a subsequent shared cache hit. A separate lifecycle test
+checks expired-slot eviction and preservation of existing snapshot readers.
+Both red and green harness builds exited 0.
+
+INTERMEDIATE AUDIT RED (intentional, before the review fix)
+This red captures a regression in the audit's first cache optimization. It is
+historical failure evidence, not an unresolved failure in the final code.
+The recorded initial test revision checked early completion before the final
+walk-count assertion; the committed test checks the count first. Both checks
+remain present, and the recorded failure output is preserved unchanged.
+Test command:
+<temporary>/project-files-singleflight-tests concurrent_ --test-threads=2
+Observed libtest exit: 101
+
+running 2 tests
+test project_files::tests::concurrent_cold_cache_requests_share_one_walk_without_blocking_other_projects ... FAILED
+test project_files::tests::concurrent_expired_cache_requests_share_one_walk_without_blocking_other_projects ... FAILED
+
+failures:
+
+---- project_files::tests::concurrent_cold_cache_requests_share_one_walk_without_blocking_other_projects stdout ----
+
+thread 'project_files::tests::concurrent_cold_cache_requests_share_one_walk_without_blocking_other_projects' (1385044) panicked at <workspace>/src-tauri/src/commands/project_files.rs:1007:9:
+a concurrent caller started another walk
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- project_files::tests::concurrent_expired_cache_requests_share_one_walk_without_blocking_other_projects stdout ----
+
+thread 'project_files::tests::concurrent_expired_cache_requests_share_one_walk_without_blocking_other_projects' (1385045) panicked at <workspace>/src-tauri/src/commands/project_files.rs:1007:9:
+a concurrent caller started another walk
+
+
+failures:
+    project_files::tests::concurrent_cold_cache_requests_share_one_walk_without_blocking_other_projects
+    project_files::tests::concurrent_expired_cache_requests_share_one_walk_without_blocking_other_projects
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.01s
+
+
+FOCUSED GREEN (after the per-folder generation fix)
+Test command:
+<temporary>/project-files-singleflight-tests concurrent_ cached_paths_are_shared_and_refresh_preserves_existing_readers --test-threads=2
+Observed libtest exit: 0
+
+running 3 tests
+test project_files::tests::cached_paths_are_shared_and_refresh_preserves_existing_readers ... ok
+test project_files::tests::concurrent_cold_cache_requests_share_one_walk_without_blocking_other_projects ... ok
+test project_files::tests::concurrent_expired_cache_requests_share_one_walk_without_blocking_other_projects ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 38 filtered out; finished in 0.11s
+
+
+NATIVE CARGO INTEGRATION CHECK STATUS
+Queued command:
+cargo test -j 2 --manifest-path src-tauri/Cargo.toml --lib commands::project_files::tests:: -- --test-threads=2
+Observed output before cancellation:
+    Blocking waiting for file lock on build directory
+The queued command was stopped with SIGINT while still waiting for the build
+lock (exit 130), at the parent agent's direction. It did not execute tests.
+Native verification subsequently passed in the parent's combined filtered Cargo
+run: 203 passed, 0 failed, 1 pre-existing ignored. See native-tests-final.txt and
+verification.json for the actual final command and observed results.
+
+Whitespace verification: git diff --check -- src-tauri/src/commands/project_files.rs passed.

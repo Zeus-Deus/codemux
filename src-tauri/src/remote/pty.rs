@@ -15,7 +15,7 @@
 //! output; there is no streaming push path in v1 (it's not needed
 //! for stdio MCP tools and would just complicate the surface area).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -24,13 +24,32 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use uuid::Uuid;
 
+/// Keep the child owned through partial spawn failures and terminal teardown.
+/// `portable_pty::Child` itself does not terminate or reap on drop.
+struct PtyChild(Box<dyn portable_pty::Child + Send + Sync>);
+
+impl PtyChild {
+    fn terminate(&mut self) -> std::io::Result<()> {
+        if self.0.try_wait()?.is_none() {
+            self.0.kill()?;
+            self.0.wait()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PtyChild {
+    fn drop(&mut self) {
+        if let Err(error) = self.terminate() {
+            log::warn!("Failed to terminate remote PTY child: {error}");
+        }
+    }
+}
+
 /// One spawned PTY shell.
 struct PtySlot {
-    /// Master fd, kept alive so writes succeed and child doesn't
-    /// get SIGHUP'd when we drop our handle. Unused after being
-    /// stored but the Drop side-effect (closing the master fd) is
-    /// what triggers PTY teardown when the slot is removed, so the
-    /// field is load-bearing despite being read-flagged dead.
+    /// Keep the master handle for the terminal lifetime. The reader also
+    /// holds a cloned descriptor, so dropping this alone cannot stop a child.
     #[allow(dead_code)]
     master: Box<dyn MasterPty + Send>,
     /// Writer half, separated because portable-pty's reader and
@@ -43,9 +62,7 @@ struct PtySlot {
     cwd: String,
     /// Command line used to spawn (for diagnostics).
     command: String,
-    /// Child process handle. We hold it so the OS doesn't reap the
-    /// process behind our back; dropping it kills the shell.
-    _child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: PtyChild,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -75,20 +92,20 @@ impl std::error::Error for PtyError {}
 const BUFFER_CAP: usize = 1 * 1024 * 1024; // 1 MiB per terminal — plenty for control plane
 
 struct RingBuffer {
-    bytes: Vec<u8>,
+    bytes: VecDeque<u8>,
     cap: usize,
 }
 
 impl RingBuffer {
     fn new(cap: usize) -> Self {
-        Self { bytes: Vec::new(), cap }
+        Self { bytes: VecDeque::new(), cap }
     }
     fn push(&mut self, chunk: &[u8]) {
         if chunk.len() >= self.cap {
             // Single chunk bigger than the cap — keep only the tail.
             let start = chunk.len() - self.cap;
             self.bytes.clear();
-            self.bytes.extend_from_slice(&chunk[start..]);
+            self.bytes.extend(&chunk[start..]);
             return;
         }
         let total = self.bytes.len() + chunk.len();
@@ -96,17 +113,17 @@ impl RingBuffer {
             let drop_count = total - self.cap;
             self.bytes.drain(0..drop_count);
         }
-        self.bytes.extend_from_slice(chunk);
+        self.bytes.extend(chunk);
     }
     fn snapshot(&self) -> Vec<u8> {
-        self.bytes.clone()
+        self.bytes.iter().copied().collect()
     }
     fn snapshot_tail(&self, max: usize) -> Vec<u8> {
         if self.bytes.len() <= max {
-            return self.bytes.clone();
+            return self.snapshot();
         }
         let start = self.bytes.len() - max;
-        self.bytes[start..].to_vec()
+        self.bytes.range(start..).copied().collect()
     }
 }
 
@@ -163,10 +180,11 @@ impl PtyManager {
         // outside an AppImage.
         crate::execution::sanitize_appimage_env_pty(&mut builder);
 
-        let child = pair
-            .slave
-            .spawn_command(builder)
-            .map_err(|e| PtyError::Io(format!("spawn: {e}")))?;
+        let child = PtyChild(
+            pair.slave
+                .spawn_command(builder)
+                .map_err(|e| PtyError::Io(format!("spawn: {e}")))?,
+        );
         // Slave fd is no longer needed in this process now that the
         // child holds it. Dropping it explicitly avoids fd leaks.
         drop(pair.slave);
@@ -212,7 +230,7 @@ impl PtyManager {
             buffer,
             cwd: info.cwd.clone(),
             command: info.command.clone(),
-            _child: child,
+            child,
         };
         self.slots.lock().unwrap().insert(id, slot);
         Ok(info)
@@ -262,15 +280,15 @@ impl PtyManager {
             .collect()
     }
 
-    /// Kill the terminal (drops the child + master fd, which sends
-    /// SIGHUP to the shell).
+    /// Terminate and reap the terminal's child, then release its PTY handles.
     pub fn close(&self, terminal_id: &str) -> Result<(), PtyError> {
-        let mut slots = self.slots.lock().unwrap();
-        let slot = slots
+        // Release the manager lock before process termination can block.
+        let mut slot = self.slots.lock().unwrap()
             .remove(terminal_id)
             .ok_or_else(|| PtyError::NotFound(terminal_id.to_string()))?;
-        drop(slot);
-        Ok(())
+        slot.child
+            .terminate()
+            .map_err(|e| PtyError::Io(format!("close: {e}")))
     }
 }
 
@@ -330,6 +348,55 @@ mod tests {
         mgr.close(&info.id).unwrap();
     }
 
+    #[cfg(unix)]
+    fn assert_owned_child_reaped(close_terminal: bool) {
+        // On failure, clean up exactly the process this fixture spawned.
+        struct Cleanup(u32);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    // Do not signal a PID that close already reaped.
+                    if libc::waitpid(self.0 as i32, std::ptr::null_mut(), libc::WNOHANG) == 0 {
+                        libc::kill(self.0 as i32, libc::SIGKILL);
+                        libc::waitpid(self.0 as i32, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+        }
+
+        let mgr = PtyManager::new();
+        let info = mgr
+            .spawn(std::env::temp_dir(), Some("exec sleep 300".into()))
+            .unwrap();
+        let pid = mgr.slots.lock().unwrap()[&info.id]
+            .child.0.process_id().unwrap();
+        let _cleanup = Cleanup(pid);
+        if close_terminal {
+            mgr.close(&info.id).unwrap();
+        } else {
+            drop(mgr);
+        }
+
+        let result = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(result, -1, "terminal teardown left child {pid} alive or unreaped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_terminal_terminates_and_reaps_its_owned_child() {
+        assert_owned_child_reaped(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_terminal_manager_terminates_and_reaps_its_owned_child() {
+        assert_owned_child_reaped(false);
+    }
+
     #[test]
     fn ring_buffer_caps_at_one_mib() {
         let mut rb = RingBuffer::new(8);
@@ -344,5 +411,25 @@ mod tests {
         let mut rb = RingBuffer::new(4);
         rb.push(b"abcdefghij");
         assert_eq!(&rb.snapshot(), b"ghij");
+    }
+
+    #[test]
+    fn ring_buffer_wraparound_preserves_snapshot_and_tail() {
+        let mut rb = RingBuffer::new(8);
+        for chunk in [b"12345".as_slice(), b"6789", b"ab"] {
+            rb.push(chunk);
+        }
+        assert_eq!(rb.snapshot(), b"456789ab");
+        assert_eq!(rb.snapshot_tail(3), b"9ab");
+        assert_eq!(rb.snapshot_tail(20), b"456789ab");
+        assert!(rb.snapshot_tail(0).is_empty());
+    }
+
+    #[test]
+    fn ring_buffer_with_zero_capacity_retains_no_output() {
+        let mut rb = RingBuffer::new(0);
+        rb.push(b"ignored");
+        rb.push(b"");
+        assert!(rb.snapshot().is_empty());
     }
 }

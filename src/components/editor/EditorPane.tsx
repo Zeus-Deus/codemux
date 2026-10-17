@@ -270,9 +270,10 @@ export function EditorPane({
       // Refuse to silently overwrite a version written since this buffer
       // last synced with disk (an agent edit, typically).
       const signature = await fileSignature(path).catch(() => null);
+      if (viewRef.current !== view || useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
       if (signature !== null && signature !== diskSignatureRef.current) {
         const disk = await readFile(path);
-        if (useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
+        if (viewRef.current !== view || useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
         diskSignatureRef.current = signature;
         const baseline = useEditorStore.getState().getTab(tabId)?.baselineContent;
         if (disk !== baseline && disk !== c) {
@@ -285,14 +286,18 @@ export function EditorPane({
       // Again after the write: a check that started while it was in flight
       // may have read the old (or half-written) file.
       diskEpochRef.current++;
-      // The tab moved to another file while the write was in flight; that
-      // file's load owns the baseline now.
-      if (useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
+      // The tab may have moved files or remounted while the write awaited
+      // disk. Its current pane owns the baseline and unsaved edits now.
+      if (viewRef.current !== view || useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
       // Unknown until the next check re-reads it, which also confirms the
       // write landed as this buffer.
       diskSignatureRef.current = null;
       setBaselineContent(tabId, c);
-      setContent(c);
+      // The write saves the captured buffer; edits made while it awaited
+      // disk still belong to the current buffer and must remain unsaved.
+      const current = view.state.doc.toString();
+      setDirty(tabId, current !== c);
+      setContent(current);
       setDiskConflict(null);
       flashNotice("saved");
     } catch (err) {
@@ -300,7 +305,7 @@ export function EditorPane({
         description: String(err),
       });
     }
-  }, [tabId, setBaselineContent, setDiskConflict, flashNotice]);
+  }, [tabId, setBaselineContent, setDirty, setDiskConflict, flashNotice]);
 
   const reloadFromDisk = useCallback(() => {
     if (diskConflict == null) return;
@@ -422,6 +427,7 @@ export function EditorPane({
     setDiskConflict(null);
     diskSignatureRef.current = null;
     diskEpochRef.current++;
+    let cancelled = false;
 
     // Fire the file read IPC and the language-module dynamic import
     // concurrently. They are independent \u2014 `readFile` does Tauri IPC
@@ -436,6 +442,7 @@ export function EditorPane({
 
     readPromise
       .then((c) => {
+        if (cancelled) return;
         // Out of the undo history: Ctrl+Z must not empty a freshly opened file.
         view.dispatch({
           changes: { from: 0, to: view.state.doc.length, insert: c },
@@ -446,10 +453,10 @@ export function EditorPane({
         setLoadedFilePath(filePath);
       })
       .catch((err) => {
-        setErrorMsg(String(err));
+        if (!cancelled) setErrorMsg(String(err));
       })
       .finally(() => {
-        isLoadingRef.current = false;
+        if (!cancelled) isLoadingRef.current = false;
       });
 
     // Apply the language as soon as it's ready, independently of the
@@ -459,12 +466,18 @@ export function EditorPane({
     // the file is generally not yet visible (the rendered-markdown
     // path is the dominant view for .md files anyway).
     langPromise.then((lang) => {
-      if (lang && viewRef.current) {
-        viewRef.current.dispatch({
+      if (!cancelled && lang) {
+        view.dispatch({
           effects: languageCompartment.current.reconfigure(lang),
         });
       }
     });
+
+    return () => {
+      cancelled = true;
+      isLoadingRef.current = false;
+      diskEpochRef.current++;
+    };
   }, [filePath, tabId, setBaselineContent, setDiskConflict]);
 
   // Watch the open text file for edits made outside the editor. Polling a

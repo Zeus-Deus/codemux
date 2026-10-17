@@ -219,6 +219,31 @@ describe("shareStructural — arrays", () => {
 });
 
 describe("shareStructural — Record<string, ...> key changes", () => {
+  it("preserves an own __proto__ key from an IPC record", () => {
+    const prev: Record<string, unknown> = JSON.parse('{"__proto__":{"value":1},"stable":{"value":3}}');
+    const next: Record<string, unknown> = JSON.parse('{"__proto__":{"value":2},"stable":{"value":3}}');
+    const result = shareStructural(prev, next);
+    expect(Object.prototype.hasOwnProperty.call(result, "__proto__")).toBe(true);
+    expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+    expect(result).toEqual(next);
+    expect(result.stable).toBe(prev.stable);
+  });
+
+  it("preserves null-prototype records when their values change", () => {
+    const prev: Record<string, unknown> = Object.assign(Object.create(null), { value: 1 });
+    const next: Record<string, unknown> = Object.assign(Object.create(null), { value: 2 });
+    const result = shareStructural(prev, next);
+    expect(Object.getPrototypeOf(result)).toBeNull();
+    expect(result.value).toBe(2);
+  });
+
+  it("distinguishes an own property from an inherited property of the same name", () => {
+    const prev: Record<string, unknown> = { removed: undefined };
+    const next: Record<string, unknown> = { toString: Object.prototype.toString };
+    const result = shareStructural(prev, next);
+    expect(Object.keys(result)).toEqual(["toString"]);
+  });
+
   it("returns new object when a key is added", () => {
     const prev = deepFreeze({ pane_statuses: { p1: "idle" } });
     const next = deepFreeze({ pane_statuses: { p1: "idle", p2: "working" } });

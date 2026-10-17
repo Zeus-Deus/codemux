@@ -135,6 +135,7 @@ import type {
   CheckInfo,
   ChatModelInfo,
   FeatureFlags,
+  GitHubIssue,
   PaneStatus,
   PaneNodeSnapshot,
   PresetStoreSnapshot,
@@ -221,6 +222,38 @@ const PROVIDER_RUNTIME_COMMANDS = new Set([
 
 function findWorkspace(id: unknown): WorkspaceSnapshot | undefined {
   return appState.workspaces.find((w) => w.workspace_id === id);
+}
+
+function mockGithubIssue(linked: NonNullable<WorkspaceSnapshot["linked_issue"]>): GitHubIssue {
+  return {
+    ...linked,
+    assignees: ["mock-dev"],
+    url: `https://github.com/mock/repo/issues/${linked.number}`,
+    body:
+      "Seeded by the dev mock runtime so the issue-detail popover is " +
+      "fully exercisable in a plain browser.\n\nIn the real app this " +
+      "body comes from `gh issue view`.",
+    comments: [],
+    totalComments: 0,
+    updatedAt: null,
+  };
+}
+
+function mockGithubIssuesByPath(path: string, search: unknown): GitHubIssue[] {
+  const workspace = appState.workspaces.find((candidate) =>
+    candidate.cwd === path || candidate.worktree_path === path || candidate.project_root === path,
+  );
+  if (!workspace) return [];
+  const root = workspace.project_root ?? workspace.cwd;
+  const issues = new Map<number, GitHubIssue>();
+  for (const candidate of appState.workspaces) {
+    if ((candidate.project_root ?? candidate.cwd) !== root || !candidate.linked_issue) continue;
+    issues.set(candidate.linked_issue.number, mockGithubIssue(candidate.linked_issue));
+  }
+  const query = String(search ?? "").trim().replace(/^#/, "").toLowerCase();
+  return [...issues.values()].filter((issue) =>
+    !query || String(issue.number).includes(query) || issue.title.toLowerCase().includes(query),
+  );
 }
 
 function firstLeafPaneId(node: PaneNodeSnapshot): string | null {
@@ -4357,6 +4390,10 @@ const handlers: Record<string, Handler> = {
   follow_up_merge_all: (a) => mockFollowUpMergeAll(a),
   ...customAcpMock.handlers,
   ...agentConnectorMock.handlers,
+  // Remote delegations start empty. These reads run for every chat pane;
+  // falling back to null would display an error in an otherwise healthy chat.
+  delegation_list: () => [],
+  delegation_grants: () => [],
   get_chatgpt_status: mockChatGptRead,
   get_local_workbench: () => mockLocalWorkbench,
   set_local_workbench: (a) => { mockLocalWorkbench = a.enabled === true; },
@@ -6106,21 +6143,18 @@ const handlers: Record<string, Handler> = {
   get_github_issue: (a) => {
     const linked = findWorkspace(a.workspaceId)?.linked_issue;
     if (!linked || linked.number !== (a.issueNumber as number)) return null;
-    return {
-      number: linked.number,
-      title: linked.title,
-      state: linked.state,
-      labels: linked.labels,
-      assignees: ["mock-dev"],
-      url: `https://github.com/mock/repo/issues/${linked.number}`,
-      body:
-        "Seeded by the dev mock runtime so the issue-detail popover is " +
-        "fully exercisable in a plain browser.\n\nIn the real app this " +
-        "body comes from `gh issue view`.",
-      comments: [],
-      totalComments: 0,
-      updatedAt: null,
-    };
+    return mockGithubIssue(linked);
+  },
+  list_github_issues: (a) => {
+    const workspace = findWorkspace(a.workspaceId);
+    return workspace ? mockGithubIssuesByPath(workspace.cwd, a.search) : [];
+  },
+  list_github_issues_by_path: (a) => mockGithubIssuesByPath(String(a.path ?? ""), a.search),
+  get_github_issue_by_path: (a) => {
+    const issue = mockGithubIssuesByPath(String(a.path ?? ""), undefined)
+      .find((candidate) => candidate.number === Number(a.issueNumber));
+    if (!issue) throw new Error("Issue not found in this mock repository");
+    return issue;
   },
   list_incoming_prs: () => [],
 
@@ -7582,6 +7616,15 @@ const handlers: Record<string, Handler> = {
    */
   create_tab: (a) => {
     const ws = findWorkspace(a.workspaceId);
+    if (ws && a.kind === "editor") {
+      const tabId = `tab-mock-editor-${++mockTabSeq}`;
+      replaceWorkspace(ws.workspace_id, () => ({
+        tabs: [...ws.tabs, { tab_id: tabId, kind: "editor", title: "Editor", surface_id: null, browser_id: null, icon: null }],
+        active_tab_id: tabId,
+      }));
+      emitAppState();
+      return tabId;
+    }
     if (!ws || a.kind !== "terminal") return `tab-mock-${Date.now()}`;
     const n = ++mockTabSeq;
     const paneId = `pane-mock-tab-${n}`;

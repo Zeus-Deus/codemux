@@ -1,0 +1,600 @@
+Observed failing-run excerpts, recorded during this audit.
+Compilation chatter omitted from the native run. Absolute workspace/harness paths
+are replaced with <workspace>/<isolated-harness>; trailing formatting whitespace
+is removed. Assertions and results are unchanged.
+These are test-first diagnostic failures, not failures in the final validated code.
+
+
+Baseline native regression run (production baseline plus new regression tests)
+==============================================================================
+running 7 tests
+test commands::project_files::tests::folder_listing_yields_instead_of_blocking_the_async_executor ... FAILED
+test commands::project_files::tests::file_listing_yields_instead_of_blocking_the_async_executor ... FAILED
+test indexing::tests::index_reads_share_storage_and_keep_replaced_snapshots_alive ... FAILED
+test pty_daemon::server::tests::attaching_a_client_replays_only_to_that_client ... FAILED
+test scripts::tests::test_worktree_includes_preserves_unusual_file_names ... FAILED
+test workspace_paths::tests::dot_segments_cannot_escape_the_workspace_directory ... FAILED
+test git::tests::source_control_preserves_unusual_file_names_end_to_end ... FAILED
+
+failures:
+
+---- commands::project_files::tests::folder_listing_yields_instead_of_blocking_the_async_executor stdout ----
+
+thread 'commands::project_files::tests::folder_listing_yields_instead_of_blocking_the_async_executor' (526777) panicked at src/commands/project_files.rs:865:9:
+project filesystem work blocked the async executor
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- commands::project_files::tests::file_listing_yields_instead_of_blocking_the_async_executor stdout ----
+
+thread 'commands::project_files::tests::file_listing_yields_instead_of_blocking_the_async_executor' (526776) panicked at src/commands/project_files.rs:865:9:
+project filesystem work blocked the async executor
+
+---- indexing::tests::index_reads_share_storage_and_keep_replaced_snapshots_alive stdout ----
+
+thread 'indexing::tests::index_reads_share_storage_and_keep_replaced_snapshots_alive' (527399) panicked at src/indexing.rs:657:9:
+assertion `left == right` failed
+  left: 0x7fce98010e80
+ right: 0x7fce9801bc20
+
+---- pty_daemon::server::tests::attaching_a_client_replays_only_to_that_client stdout ----
+
+thread 'pty_daemon::server::tests::attaching_a_client_replays_only_to_that_client' (527400) panicked at src/pty_daemon/server.rs:1016:9:
+another client's attach must not duplicate the first client's scrollback
+
+---- scripts::tests::test_worktree_includes_preserves_unusual_file_names stdout ----
+[codemux::scripts] worktree includes source=Defaults for /tmp/.tmpGQF5WE
+
+thread 'scripts::tests::test_worktree_includes_preserves_unusual_file_names' (527401) panicked at src/scripts.rs:968:9:
+assertion `left == right` failed
+  left: 0
+ right: 3
+
+---- workspace_paths::tests::dot_segments_cannot_escape_the_workspace_directory stdout ----
+
+thread 'workspace_paths::tests::dot_segments_cannot_escape_the_workspace_directory' (527406) panicked at src/workspace_paths.rs:185:13:
+assertion `left == right` failed
+  left: "~/.codemux/worktrees/./."
+ right: "~/.codemux/worktrees/workspace/main"
+
+---- git::tests::source_control_preserves_unusual_file_names_end_to_end stdout ----
+
+thread 'git::tests::source_control_preserves_unusual_file_names_end_to_end' (527397) panicked at src/git.rs:3505:13:
+missing path "über.txt": [GitFileStatus { path: "\"\\\"quoted\\\".txt\"", status: Untracked, is_staged: false, is_unstaged: true, additions: 0, deletions: 0, conflict_type: None }, GitFileStatus { path: "\"line\\nbreak.txt\"", status: Untracked, is_staged: false, is_unstaged: true, additions: 0, deletions: 0, conflict_type: None }, GitFileStatus { path: "arrow.txt\"", status: Untracked, is_staged: false, is_unstaged: true, additions: 0, deletions: 0, conflict_type: None }, GitFileStatus { path: "\"literal => arrow.txt\"", status: Untracked, is_staged: false, is_unstaged: true, additions: 0, deletions: 0, conflict_type: None }, GitFileStatus { path: "\"tab\\tname.txt\"", status: Untracked, is_staged: false, is_unstaged: true, additions: 0, deletions: 0, conflict_type: None }, GitFileStatus { path: "\"trailing-space.txt \"", status: Untracked, is_staged: false, is_unstaged: true, additions: 0, deletions: 0, conflict_type: None }, GitFileStatus { path: "\"\\303\\274ber.txt\"", status: Untracked, is_staged: false, is_unstaged: true, additions: 0, deletions: 0, conflict_type: None }]
+
+
+failures:
+    commands::project_files::tests::file_listing_yields_instead_of_blocking_the_async_executor
+    commands::project_files::tests::folder_listing_yields_instead_of_blocking_the_async_executor
+    git::tests::source_control_preserves_unusual_file_names_end_to_end
+    indexing::tests::index_reads_share_storage_and_keep_replaced_snapshots_alive
+    pty_daemon::server::tests::attaching_a_client_replays_only_to_that_client
+    scripts::tests::test_worktree_includes_preserves_unusual_file_names
+    workspace_paths::tests::dot_segments_cannot_escape_the_workspace_directory
+
+test result: FAILED. 0 passed; 7 failed; 0 ignored; 0 measured; 4426 filtered out; finished in 2.02s
+
+error: test failed, to rerun pass `--lib`
+
+
+Baseline structural sharing regressions
+=======================================
+
+> codemux@0.24.0 test
+> vitest run src/lib/structural-share.test.ts
+
+(node:368547) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+ RUN  v3.2.6 <workspace>
+
+(node:368644) ExperimentalWarning: localStorage is not available because --localstorage-file was not provided.
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ❯ src/lib/structural-share.test.ts (21 tests | 3 failed) 12ms
+   ✓ shareStructural — identity fast paths > returns prev when Object.is(prev, next) (same ref / dev-mock case) 1ms
+   ✓ shareStructural — identity fast paths > returns prev for a fully deep-equal next with all fresh refs 1ms
+   ✓ shareStructural — primitives & type mismatch > returns next for differing primitives 0ms
+   ✓ shareStructural — primitives & type mismatch > returns next on primitive type change 0ms
+   ✓ shareStructural — primitives & type mismatch > returns next for null-vs-object in either direction 0ms
+   ✓ shareStructural — primitives & type mismatch > returns next on array-vs-object type mismatch 0ms
+   ✓ shareStructural — primitives & type mismatch > compares non-plain objects (class instances) by identity, taking next 0ms
+   ✓ shareStructural — nested subtree sharing > shares all unchanged workspaces/surfaces when one nested field changes 0ms
+   ✓ shareStructural — nested subtree sharing > shares unchanged branches of a recursive pane split tree 0ms
+   ✓ shareStructural — arrays > returns a new array (not prev) when length grows, sharing unchanged elements 0ms
+   ✓ shareStructural — arrays > returns a new array when length shrinks (workspace removed) 0ms
+   ✓ shareStructural — arrays > reconciles element-wise on reorder (index-based, no keying) 0ms
+   × shareStructural — Record<string, ...> key changes > preserves an own __proto__ key from an IPC record 4ms
+     → expected false to be true // Object.is equality
+   × shareStructural — Record<string, ...> key changes > preserves null-prototype records when their values change 1ms
+     → expected { …(12) } to be null
+   × shareStructural — Record<string, ...> key changes > distinguishes an own property from an inherited property of the same name 1ms
+     → expected [ 'removed' ] to deeply equal [ 'toString' ]
+   ✓ shareStructural — Record<string, ...> key changes > returns new object when a key is added 0ms
+   ✓ shareStructural — Record<string, ...> key changes > returns new object when a key is removed 0ms
+   ✓ shareStructural — Record<string, ...> key changes > returns new object when a value changes, sharing sibling object values 0ms
+   ✓ shareStructural — Record<string, ...> key changes > returns new object when a same-size key set differs (swap) 0ms
+   ✓ shareStructural — optional-field presence > does not share when an optional key is present in one and absent in the other 0ms
+   ✓ shareStructural — no input mutation > never mutates prev or next 0ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/lib/structural-share.test.ts > shareStructural — Record<string, ...> key changes > preserves an own __proto__ key from an IPC record
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ src/lib/structural-share.test.ts:226:71
+    224|     const next: Record<string, unknown> = JSON.parse('{"__proto__":{"v…
+    225|     const result = shareStructural(prev, next);
+    226|     expect(Object.prototype.hasOwnProperty.call(result, "__proto__")).…
+       |                                                                       ^
+    227|     expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+    228|     expect(result).toEqual(next);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+
+ FAIL  src/lib/structural-share.test.ts > shareStructural — Record<string, ...> key changes > preserves null-prototype records when their values change
+AssertionError: expected { …(12) } to be null
+
+- Expected:
+null
+
++ Received:
+{}
+
+ ❯ src/lib/structural-share.test.ts:236:43
+    234|     const next: Record<string, unknown> = Object.assign(Object.create(…
+    235|     const result = shareStructural(prev, next);
+    236|     expect(Object.getPrototypeOf(result)).toBeNull();
+       |                                           ^
+    237|     expect(result.value).toBe(2);
+    238|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+
+ FAIL  src/lib/structural-share.test.ts > shareStructural — Record<string, ...> key changes > distinguishes an own property from an inherited property of the same name
+AssertionError: expected [ 'removed' ] to deeply equal [ 'toString' ]
+
+- Expected
++ Received
+
+  [
+-   "toString",
++   "removed",
+  ]
+
+ ❯ src/lib/structural-share.test.ts:244:33
+    242|     const next: Record<string, unknown> = { toString: Object.prototype…
+    243|     const result = shareStructural(prev, next);
+    244|     expect(Object.keys(result)).toEqual(["toString"]);
+       |                                 ^
+    245|   });
+    246|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  3 failed | 18 passed (21)
+   Start at  20:04:33
+   Duration  675ms (transform 98ms, setup 88ms, collect 30ms, tests 12ms, environment 275ms, prepare 65ms)
+
+
+
+Baseline AI commit ownership regressions
+========================================
+
+> codemux@0.24.0 test
+> vitest run src/stores/ai-commit-store.test.ts
+
+(node:336957) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+ RUN  v3.2.6 <workspace>
+
+(node:337029) ExperimentalWarning: localStorage is not available because --localstorage-file was not provided.
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ❯ src/stores/ai-commit-store.test.ts (5 tests | 4 failed) 9ms
+   × commit message request ownership > keeps the newest message when requests finish out of order 5ms
+     → expected 'Outdated changes' to be 'Current changes' // Object.is equality
+   × commit message request ownership > ignores errors from a superseded request 1ms
+     → expected 'error' to be 'generating' // Object.is equality
+   × commit message request ownership > does not recreate a cleared generation after resolve 1ms
+     → expected { status: 'done', …(1) } to be undefined
+   × commit message request ownership > does not recreate a cleared generation after reject 0ms
+     → expected { status: 'error', …(1) } to be undefined
+   ✓ commit message request ownership > keeps concurrent workspaces independent 0ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/stores/ai-commit-store.test.ts > commit message request ownership > keeps the newest message when requests finish out of order
+AssertionError: expected 'Outdated changes' to be 'Current changes' // Object.is equality
+
+Expected: "Current changes"
+Received: "Outdated changes"
+
+ ❯ src/stores/ai-commit-store.test.ts:37:47
+     35|     await flush();
+     36|
+     37|     expect(store.consumeMessage("workspace")).toBe("Current changes");
+       |                                               ^
+     38|     expect(store.getGeneration("workspace")).toBeUndefined();
+     39|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/4]⎯
+
+ FAIL  src/stores/ai-commit-store.test.ts > commit message request ownership > ignores errors from a superseded request
+AssertionError: expected 'error' to be 'generating' // Object.is equality
+
+Expected: "generating"
+Received: "error"
+
+ ❯ src/stores/ai-commit-store.test.ts:49:54
+     47|     old.reject(new Error("Old failure"));
+     48|     await flush();
+     49|     expect(store.getGeneration("workspace")?.status).toBe("generating"…
+       |                                                      ^
+     50|     current.resolve("Current message");
+     51|     await flush();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/4]⎯
+
+ FAIL  src/stores/ai-commit-store.test.ts > commit message request ownership > does not recreate a cleared generation after resolve
+AssertionError: expected { status: 'done', …(1) } to be undefined
+
+- Expected:
+undefined
+
++ Received:
+{
+  "message": "Dismissed message",
+  "status": "done",
+}
+
+ ❯ src/stores/ai-commit-store.test.ts:63:46
+     61|     else request.reject(new Error("Dismissed error"));
+     62|     await flush();
+     63|     expect(store.getGeneration("workspace")).toBeUndefined();
+       |                                              ^
+     64|   });
+     65|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/4]⎯
+
+ FAIL  src/stores/ai-commit-store.test.ts > commit message request ownership > does not recreate a cleared generation after reject
+AssertionError: expected { status: 'error', …(1) } to be undefined
+
+- Expected:
+undefined
+
++ Received:
+{
+  "error": "Error: Dismissed error",
+  "status": "error",
+}
+
+ ❯ src/stores/ai-commit-store.test.ts:63:46
+     61|     else request.reject(new Error("Dismissed error"));
+     62|     await flush();
+     63|     expect(store.getGeneration("workspace")).toBeUndefined();
+       |                                              ^
+     64|   });
+     65|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/4]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  4 failed | 1 passed (5)
+   Start at  20:02:02
+   Duration  616ms (transform 90ms, setup 75ms, collect 29ms, tests 9ms, environment 223ms, prepare 94ms)
+
+
+
+Baseline transport lifecycle regressions
+========================================
+
+> codemux@0.24.0 test
+> vitest run src/remote/transport.test.ts
+
+(node:310502) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+ RUN  v3.2.6 <workspace>
+
+(node:310572) ExperimentalWarning: localStorage is not available because --localstorage-file was not provided.
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ❯ src/remote/transport.test.ts (32 tests | 3 failed) 308ms
+   ✓ parseBinaryChannelFrame > decodes a well-formed frame 1ms
+   ✓ parseBinaryChannelFrame > preserves large u64 indices past 2^32 0ms
+   ✓ parseBinaryChannelFrame > rejects short buffers and a wrong frame tag 0ms
+   ✓ invoke roundtrip > resolves on the id-matched ok frame 2ms
+   ✓ invoke roundtrip > rejects on the id-matched err frame 0ms
+   ✓ invoke roundtrip > matches out-of-order responses by id 0ms
+   ✓ invoke roundtrip > rejects invoke when the socket is not connected 0ms
+   ✓ channel + event frame routing > routes JSON chan frames to onChannelMessage 0ms
+   ✓ channel + event frame routing > routes binary frames to onChannelMessage as a Uint8Array 1ms
+   ✓ channel + event frame routing > routes event frames to onEvent 0ms
+   × disconnect handling > rejects pending invokes when explicitly closed without reconnecting 5ms
+     → expected "spy" to be called with arguments: [ ObjectContaining{…} ]
+
+Number of calls: 0
+
+   × disconnect handling > settles an initial connection cancelled while its ticket is in flight 0ms
+     → expected "spy" to be called with arguments: [ ObjectContaining{…} ]
+
+Number of calls: 0
+
+   × disconnect handling > shares concurrent connect calls and ignores tickets from a closed connection 1ms
+     → expected "spy" to be called 1 times, but got 2 times
+   ✓ disconnect handling > rejects in-flight invokes and reports reconnecting on drop 1ms
+   ✓ reconnect > re-issues a ticket and re-sends all subscriptions 1ms
+   ✓ reconnect > gives up and reports unauthorized on a 401 ticket 0ms
+   ✓ reconnect > ignores a 401 ticket that lands after close() 1ms
+   ✓ compression negotiation > offers compress=deflate alongside the encoded ticket 0ms
+   ✓ compressed frames > resolves a pending invoke from a 0x02 text envelope 2ms
+   ✓ compressed frames > delivers a 0x03 envelope like the uncompressed binary frame 1ms
+   ✓ compressed frames > keeps the inflate stream across frames (context takeover) 1ms
+   ✓ compressed frames > cannot decode a later frame without the earlier dictionary 1ms
+   ✓ compressed frames > interleaves compressed, plain text and plain binary frames in order 1ms
+   ✓ compressed frames > decodes a fresh server stream after a reconnect 1ms
+   ✓ golden frames from the real server compressor > inflates a recorded connection stream to exact bytes 281ms
+   ✓ golden frames from the real server compressor > cannot read a golden frame out of order 0ms
+   ✓ malformed compressed frames > closes the socket and reconnects onto a fresh stream on a failed inflate 2ms
+   ✓ malformed compressed frames > rejects in-flight invokes when the stream is poisoned 0ms
+   ✓ malformed compressed frames > escalates a truncated envelope header 1ms
+   ✓ malformed compressed frames > escalates an envelope whose uncompressed_len disagrees 1ms
+   ✓ malformed compressed frames > rejects an absurd declared length without allocating for it 1ms
+   ✓ malformed compressed frames > drops compressed frames still arriving on the dying socket 1ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/remote/transport.test.ts > disconnect handling > rejects pending invokes when explicitly closed without reconnecting
+AssertionError: expected "spy" to be called with arguments: [ ObjectContaining{…} ]
+
+Number of calls: 0
+
+ ❯ src/remote/transport.test.ts:185:22
+    183|     await flushMicrotasks();
+    184|
+    185|     expect(rejected).toHaveBeenCalledWith(expect.objectContaining({ me…
+       |                      ^
+    186|     await vi.advanceTimersByTimeAsync(60_000);
+    187|     expect(FakeWebSocket.instances).toHaveLength(1);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+
+ FAIL  src/remote/transport.test.ts > disconnect handling > settles an initial connection cancelled while its ticket is in flight
+AssertionError: expected "spy" to be called with arguments: [ ObjectContaining{…} ]
+
+Number of calls: 0
+
+ ❯ src/remote/transport.test.ts:200:22
+    198|     await flushMicrotasks();
+    199|
+    200|     expect(rejected).toHaveBeenCalledWith(expect.objectContaining({ me…
+       |                      ^
+    201|   });
+    202|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+
+ FAIL  src/remote/transport.test.ts > disconnect handling > shares concurrent connect calls and ignores tickets from a closed connection
+AssertionError: expected "spy" to be called 1 times, but got 2 times
+ ❯ src/remote/transport.test.ts:209:23
+    207|     void transport.connect().catch(() => {});
+    208|     const sameConnection = transport.connect().catch(() => {});
+    209|     expect(fetchImpl).toHaveBeenCalledTimes(1);
+       |                       ^
+    210|     transport.close();
+    211|     await sameConnection;
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  3 failed | 29 passed (32)
+   Start at  20:00:21
+   Duration  867ms (transform 61ms, setup 41ms, collect 46ms, tests 308ms, environment 211ms, prepare 81ms)
+
+
+
+Baseline PTY cleanup, isolated real-dependency harness
+======================================================
+
+running 9 tests
+test pty::tests::dropping_terminal_manager_terminates_and_reaps_its_owned_child ... FAILED
+test pty::tests::closing_terminal_terminates_and_reaps_its_owned_child ... FAILED
+test pty::tests::read_unknown_returns_not_found ... ok
+test pty::tests::ring_buffer_caps_at_one_mib ... ok
+test pty::tests::ring_buffer_oversized_single_chunk_keeps_tail ... ok
+test pty::tests::ring_buffer_with_zero_capacity_retains_no_output ... ok
+test pty::tests::ring_buffer_wraparound_preserves_snapshot_and_tail ... ok
+test pty::tests::list_shows_spawned_terminals ... ok
+test pty::tests::spawn_write_read_roundtrip ... ok
+
+failures:
+
+---- pty::tests::dropping_terminal_manager_terminates_and_reaps_its_owned_child stdout ----
+
+thread 'pty::tests::dropping_terminal_manager_terminates_and_reaps_its_owned_child' (476156) panicked at <isolated-harness>/pty-baseline.rs:360:9:
+assertion `left == right` failed: terminal teardown left child 476158 alive or unreaped
+  left: 0
+ right: -1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- pty::tests::closing_terminal_terminates_and_reaps_its_owned_child stdout ----
+
+thread 'pty::tests::closing_terminal_terminates_and_reaps_its_owned_child' (476155) panicked at <isolated-harness>/pty-baseline.rs:360:9:
+assertion `left == right` failed: terminal teardown left child 476157 alive or unreaped
+  left: 0
+ right: -1
+
+
+failures:
+    pty::tests::closing_terminal_terminates_and_reaps_its_owned_child
+    pty::tests::dropping_terminal_manager_terminates_and_reaps_its_owned_child
+
+test result: FAILED. 7 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+
+Baseline HTTP reader, isolated exact-source harness
+===================================================
+
+running 5 tests
+test read_response_rejects_invalid_content_length ... FAILED
+test read_response_rejects_overflowing_content_length ... FAILED
+test read_response_rejects_conflicting_content_lengths ... FAILED
+test read_response_rejects_truncated_content_length_body ... FAILED
+test read_response_rejects_unframed_body_beyond_existing_safety_cap ... FAILED
+
+failures:
+
+---- read_response_rejects_invalid_content_length stdout ----
+
+thread 'read_response_rejects_invalid_content_length' (427783) panicked at <isolated-harness>/proxy_regressions.rs:89:9:
+assertion failed: read_via_pipe(raw).await.is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- read_response_rejects_overflowing_content_length stdout ----
+
+thread 'read_response_rejects_overflowing_content_length' (427784) panicked at <isolated-harness>/proxy_regressions.rs:36:31:
+attempt to add with overflow
+
+---- read_response_rejects_conflicting_content_lengths stdout ----
+
+thread 'read_response_rejects_conflicting_content_lengths' (427782) panicked at <isolated-harness>/proxy_regressions.rs:95:9:
+assertion failed: read_via_pipe(raw).await.is_err()
+
+---- read_response_rejects_truncated_content_length_body stdout ----
+
+thread 'read_response_rejects_truncated_content_length_body' (427785) panicked at <isolated-harness>/proxy_regressions.rs:77:9:
+assertion failed: read_via_pipe(raw).await.is_err()
+
+---- read_response_rejects_unframed_body_beyond_existing_safety_cap stdout ----
+
+thread 'read_response_rejects_unframed_body_beyond_existing_safety_cap' (427786) panicked at <isolated-harness>/proxy_regressions.rs:108:9:
+assertion failed: result.is_err()
+
+
+failures:
+    read_response_rejects_conflicting_content_lengths
+    read_response_rejects_invalid_content_length
+    read_response_rejects_overflowing_content_length
+    read_response_rejects_truncated_content_length_body
+    read_response_rejects_unframed_body_beyond_existing_safety_cap
+
+test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+
+Baseline SSE record splitter, isolated exact-source harness
+===========================================================
+
+running 1 test
+test find_record_end_keeps_mixed_newline_records_separate ... FAILED
+
+failures:
+
+---- find_record_end_keeps_mixed_newline_records_separate stdout ----
+
+thread 'find_record_end_keeps_mixed_newline_records_separate' (433133) panicked at <isolated-harness>/sse_regressions.rs:45:9:
+assertion `left == right` failed
+  left: Some("first\nsecond")
+ right: Some("first")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    find_record_end_keeps_mixed_newline_records_separate
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+
+Intermediate audit revision: cached unauthorized retry regression, fixed before final validation
+================================================================================================
+
+> codemux@0.24.0 test
+> vitest run src/remote/transport.test.ts
+
+(node:468932) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+ RUN  v3.2.6 <workspace>
+
+(node:468984) ExperimentalWarning: localStorage is not available because --localstorage-file was not provided.
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ❯ src/remote/transport.test.ts (34 tests | 2 failed) 1083ms
+   ✓ parseBinaryChannelFrame > decodes a well-formed frame 3ms
+   ✓ parseBinaryChannelFrame > preserves large u64 indices past 2^32 0ms
+   ✓ parseBinaryChannelFrame > rejects short buffers and a wrong frame tag 0ms
+   ✓ invoke roundtrip > resolves on the id-matched ok frame 3ms
+   ✓ invoke roundtrip > rejects on the id-matched err frame 1ms
+   ✓ invoke roundtrip > matches out-of-order responses by id 0ms
+   ✓ invoke roundtrip > rejects invoke when the socket is not connected 1ms
+   ✓ channel + event frame routing > routes JSON chan frames to onChannelMessage 0ms
+   ✓ channel + event frame routing > routes binary frames to onChannelMessage as a Uint8Array 2ms
+   ✓ channel + event frame routing > routes event frames to onEvent 0ms
+   ✓ disconnect handling > rejects pending invokes when explicitly closed without reconnecting 5ms
+   ✓ disconnect handling > settles an initial connection cancelled while its ticket is in flight 1ms
+   ✓ disconnect handling > shares concurrent connect calls and ignores tickets from a closed connection 8ms
+   ✓ disconnect handling > rejects in-flight invokes and reports reconnecting on drop 2ms
+   ✓ reconnect > re-issues a ticket and re-sends all subscriptions 1ms
+   ✓ reconnect > gives up and reports unauthorized on a 401 ticket 0ms
+   × reconnect > allows a fresh connection after the initial ticket is unauthorized 8ms
+     → expected "spy" to be called 2 times, but got 1 times
+   × reconnect > opens a fresh socket after a later reconnect ticket is unauthorized 5ms
+     → expected "spy" to be called 3 times, but got 2 times
+   ✓ reconnect > ignores a 401 ticket that lands after close() 0ms
+   ✓ compression negotiation > offers compress=deflate alongside the encoded ticket 0ms
+   ✓ compressed frames > resolves a pending invoke from a 0x02 text envelope 8ms
+   ✓ compressed frames > delivers a 0x03 envelope like the uncompressed binary frame 3ms
+   ✓ compressed frames > keeps the inflate stream across frames (context takeover) 2ms
+   ✓ compressed frames > cannot decode a later frame without the earlier dictionary 2ms
+   ✓ compressed frames > interleaves compressed, plain text and plain binary frames in order 2ms
+   ✓ compressed frames > decodes a fresh server stream after a reconnect 3ms
+   ✓ golden frames from the real server compressor > inflates a recorded connection stream to exact bytes  960ms
+   ✓ golden frames from the real server compressor > cannot read a golden frame out of order 3ms
+   ✓ malformed compressed frames > closes the socket and reconnects onto a fresh stream on a failed inflate 12ms
+   ✓ malformed compressed frames > rejects in-flight invokes when the stream is poisoned 1ms
+   ✓ malformed compressed frames > escalates a truncated envelope header 4ms
+   ✓ malformed compressed frames > escalates an envelope whose uncompressed_len disagrees 14ms
+   ✓ malformed compressed frames > rejects an absurd declared length without allocating for it 5ms
+   ✓ malformed compressed frames > drops compressed frames still arriving on the dying socket 4ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/remote/transport.test.ts > reconnect > allows a fresh connection after the initial ticket is unauthorized
+AssertionError: expected "spy" to be called 2 times, but got 1 times
+ ❯ src/remote/transport.test.ts:294:23
+    292|     void reconnect.catch(() => {});
+    293|     await flushMicrotasks();
+    294|     expect(fetchImpl).toHaveBeenCalledTimes(2);
+       |                       ^
+    295|     const ws = FakeWebSocket.instances[0];
+    296|     ws.open();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  src/remote/transport.test.ts > reconnect > opens a fresh socket after a later reconnect ticket is unauthorized
+AssertionError: expected "spy" to be called 3 times, but got 2 times
+ ❯ src/remote/transport.test.ts:313:23
+    311|     const reconnect = transport.connect();
+    312|     await flushMicrotasks();
+    313|     expect(fetchImpl).toHaveBeenCalledTimes(3);
+       |                       ^
+    314|     expect(FakeWebSocket.instances).toHaveLength(2);
+    315|     FakeWebSocket.instances[1].open();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 32 passed (34)
+   Start at  20:11:19
+   Duration  2.44s (transform 235ms, setup 149ms, collect 197ms, tests 1.08s, environment 427ms, prepare 116ms)

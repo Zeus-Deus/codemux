@@ -172,6 +172,55 @@ describe("channel + event frame routing", () => {
 });
 
 describe("disconnect handling", () => {
+  it("rejects pending invokes when explicitly closed without reconnecting", async () => {
+    vi.useFakeTimers();
+    const { transport, rec } = newTransport();
+    await connect(transport);
+    const rejected = vi.fn();
+    void transport.invoke("slow").catch(rejected);
+
+    transport.close();
+    await flushMicrotasks();
+
+    expect(rejected).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringMatching(/closed/) }));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(rec.statuses).not.toContain("reconnecting");
+  });
+
+  it("settles an initial connection cancelled while its ticket is in flight", async () => {
+    const { transport } = newTransport({
+      fetchImpl: (() => new Promise<Response>(() => {})) as typeof fetch,
+    });
+    const rejected = vi.fn();
+    void transport.connect().catch(rejected);
+    transport.close();
+    await flushMicrotasks();
+
+    expect(rejected).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringMatching(/closed/) }));
+  });
+
+  it("shares concurrent connect calls and ignores tickets from a closed connection", async () => {
+    const tickets: Array<(response: Response) => void> = [];
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => tickets.push(resolve)));
+    const { transport } = newTransport({ fetchImpl: fetchImpl as typeof fetch });
+    void transport.connect().catch(() => {});
+    const sameConnection = transport.connect().catch(() => {});
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    transport.close();
+    await sameConnection;
+
+    const reopened = transport.connect();
+    tickets[0](new Response(JSON.stringify({ ticket: "stale" })));
+    tickets[1](new Response(JSON.stringify({ ticket: "current" })));
+    await flushMicrotasks();
+
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(FakeWebSocket.instances[0].url).toContain("ticket=current");
+    FakeWebSocket.instances[0].open();
+    await reopened;
+  });
+
   it("rejects in-flight invokes and reports reconnecting on drop", async () => {
     vi.useFakeTimers();
     const { transport, rec } = newTransport();
@@ -231,6 +280,40 @@ describe("reconnect", () => {
     const { transport, rec } = newTransport({ fetchImpl: fetch.fetchImpl });
     await expect(transport.connect()).rejects.toBeTruthy();
     expect(rec.unauthorized).toBe(1);
+  });
+
+  it("allows a fresh connection after the initial ticket is unauthorized", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ticket: "refreshed" })));
+    const { transport } = newTransport({ fetchImpl: fetchImpl as typeof fetch });
+    await expect(transport.connect()).rejects.toThrow(/unauthorized/);
+    const reconnect = transport.connect();
+    void reconnect.catch(() => {});
+    await flushMicrotasks();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    const ws = FakeWebSocket.instances[0];
+    ws.open();
+    await reconnect;
+  });
+
+  it("opens a fresh socket after a later reconnect ticket is unauthorized", async () => {
+    vi.useFakeTimers();
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ticket: "initial" })))
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ticket: "refreshed" })));
+    const { transport, rec } = newTransport({ fetchImpl: fetchImpl as typeof fetch });
+    const firstSocket = await connect(transport);
+    firstSocket.drop();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(rec.unauthorized).toBe(1);
+    const reconnect = transport.connect();
+    await flushMicrotasks();
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    FakeWebSocket.instances[1].open();
+    await reconnect;
   });
 
   it("ignores a 401 ticket that lands after close()", async () => {

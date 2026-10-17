@@ -83,6 +83,79 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("EditorPane disk sync", () => {
+  it("ignores an earlier file read after another file has loaded", async () => {
+    let finishOldRead!: (value: string) => void;
+    vi.mocked(readFile).mockImplementationOnce(() => new Promise((done) => { finishOldRead = done; }));
+    const { container } = render(<EditorPane tabId={TAB} />);
+    vi.mocked(readFile).mockResolvedValueOnce("const newer = 2;\n");
+    act(() => { useEditorStore.getState().setFilePath(TAB, "/repo/src/newer.ts"); });
+    const view = EditorView.findFromDOM(container.querySelector(".cm-editor") as HTMLElement)!;
+    await waitFor(() => expect(view.state.doc.toString()).toBe("const newer = 2;\n"));
+    await act(async () => { finishOldRead("const older = 1;\n"); });
+    expect(view.state.doc.toString()).toBe("const newer = 2;\n");
+    expect(useEditorStore.getState().tabs[TAB].baselineContent).toBe("const newer = 2;\n");
+  });
+
+  it("ignores an earlier file error after another file has loaded", async () => {
+    let failOldRead!: (reason: Error) => void;
+    vi.mocked(readFile).mockImplementationOnce(() => new Promise((_done, fail) => { failOldRead = fail; }));
+    const { container } = render(<EditorPane tabId={TAB} />);
+    vi.mocked(readFile).mockResolvedValueOnce("const newer = 2;\n");
+    act(() => { useEditorStore.getState().setFilePath(TAB, "/repo/src/newer.ts"); });
+    const view = EditorView.findFromDOM(container.querySelector(".cm-editor") as HTMLElement)!;
+    await waitFor(() => expect(view.state.doc.toString()).toBe("const newer = 2;\n"));
+    await act(async () => { failOldRead(new Error("old file unavailable")); });
+    expect(screen.queryByText(/old file unavailable/)).not.toBeInTheDocument();
+  });
+
+  it("does not recreate a removed tab when its file read resolves", async () => {
+    let finishRead!: (value: string) => void;
+    vi.mocked(readFile).mockImplementationOnce(() => new Promise((done) => { finishRead = done; }));
+    const { unmount } = render(<EditorPane tabId={TAB} />);
+    unmount();
+    useEditorStore.getState().removeTab(TAB);
+    await act(async () => { finishRead("late content"); });
+    expect(useEditorStore.getState().getTab(TAB)).toBeUndefined();
+  });
+
+  it("keeps edits typed during a save marked dirty", async () => {
+    const view = await openEditor();
+    type(view, "// saved edit\n");
+    const saved = view.state.doc.toString();
+    let finishWrite!: () => void;
+    writeFile.mockImplementationOnce((_path, content) => new Promise<void>((done) => {
+      finishWrite = () => { disk.content = content; disk.version++; done(); };
+    }));
+    save(view);
+    await waitFor(() => expect(writeFile).toHaveBeenCalledWith(PATH, saved));
+    type(view, "// unsaved edit\n");
+    await act(async () => { finishWrite(); });
+    expect(view.state.doc.toString()).toBe(`${saved}// unsaved edit\n`);
+    expect(useEditorStore.getState().tabs[TAB].baselineContent).toBe(saved);
+    expect(useEditorStore.getState().tabs[TAB].isDirty).toBe(true);
+  });
+
+  it("does not reset a remounted pane when the previous pane's write finishes", async () => {
+    const original = await openEditor();
+    type(original, "// previous pane edit\n");
+    const saving = original.state.doc.toString();
+    let finishWrite!: () => void;
+    writeFile.mockImplementationOnce((_path, content) => new Promise<void>((done) => {
+      finishWrite = () => { disk.content = content; disk.version++; done(); };
+    }));
+    save(original);
+    await waitFor(() => expect(writeFile).toHaveBeenCalledWith(PATH, saving));
+    cleanup();
+    const current = await openEditor();
+    const baseline = current.state.doc.toString();
+    type(current, "// new pane edit\n");
+    await act(async () => { finishWrite(); });
+    expect(disk.content).toBe(saving);
+    expect(current.state.doc.toString()).toBe(`${baseline}// new pane edit\n`);
+    expect(useEditorStore.getState().tabs[TAB].baselineContent).toBe(baseline);
+    expect(useEditorStore.getState().tabs[TAB].isDirty).toBe(true);
+  });
+
   it("reloads a clean buffer in place when the file changes on disk", async () => {
     const view = await openEditor();
     act(() => view.dispatch({ selection: { anchor: 3 } }));
