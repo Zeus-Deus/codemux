@@ -51,16 +51,107 @@ struct SideChat {
     pump: JoinHandle<()>,
 }
 
+/// One side chat id's lifecycle: claimed while its provider starts, then
+/// running. Close removes either; a starter whose claim is gone (or was
+/// re-claimed) must reap what it started instead of publishing it.
+enum Slot<T> {
+    Starting(u64),
+    Running(T),
+}
+
+/// Side chat slots keyed by renderer-minted id. Generic so the start/close
+/// race can be tested without spawning provider processes.
+struct SideChatSlots<T> {
+    slots: HashMap<String, Slot<T>>,
+    next_token: u64,
+}
+
+impl<T> Default for SideChatSlots<T> {
+    fn default() -> Self {
+        Self {
+            slots: HashMap::new(),
+            next_token: 0,
+        }
+    }
+}
+
+impl<T> SideChatSlots<T> {
+    /// Claim `id` before starting its provider. Returns the claim token the
+    /// starter hands back to [`Self::finish`] or [`Self::abandon`].
+    fn begin(&mut self, id: &str) -> Result<u64, String> {
+        if self.slots.contains_key(id) {
+            return Err("This side chat is already running.".into());
+        }
+        self.next_token += 1;
+        let token = self.next_token;
+        self.slots.insert(id.to_string(), Slot::Starting(token));
+        Ok(token)
+    }
+
+    /// Publish a started chat. If the claim was cancelled meanwhile, hands
+    /// the chat back so the caller reaps it.
+    fn finish(&mut self, id: &str, token: u64, chat: T) -> Result<(), T> {
+        match self.slots.get(id) {
+            Some(Slot::Starting(claim)) if *claim == token => {
+                self.slots.insert(id.to_string(), Slot::Running(chat));
+                Ok(())
+            }
+            _ => Err(chat),
+        }
+    }
+
+    /// Drop a claim whose start failed, unless something else owns `id` now.
+    fn abandon(&mut self, id: &str, token: u64) {
+        if matches!(self.slots.get(id), Some(Slot::Starting(claim)) if *claim == token) {
+            self.slots.remove(id);
+        }
+    }
+
+    /// Close `id`: cancels a pending start, or returns the running chat.
+    fn close(&mut self, id: &str) -> Option<T> {
+        match self.slots.remove(id)? {
+            Slot::Starting(_) => None,
+            Slot::Running(chat) => Some(chat),
+        }
+    }
+
+    fn running(&self, id: &str) -> Option<&T> {
+        match self.slots.get(id)? {
+            Slot::Running(chat) => Some(chat),
+            Slot::Starting(_) => None,
+        }
+    }
+
+    /// Remove `id` only if it is running and matches `is_same`.
+    fn remove_running_if(&mut self, id: &str, is_same: impl FnOnce(&T) -> bool) {
+        if self.running(id).is_some_and(is_same) {
+            self.slots.remove(id);
+        }
+    }
+
+    /// Cancel every pending start and return every running chat.
+    fn drain(&mut self) -> Vec<T> {
+        self.slots
+            .drain()
+            .filter_map(|(_, slot)| match slot {
+                Slot::Running(chat) => Some(chat),
+                Slot::Starting(_) => None,
+            })
+            .collect()
+    }
+}
+
 /// Live side chats keyed by renderer-minted id. Managed Tauri state.
 #[derive(Default)]
 pub struct SideChatStore {
-    chats: Mutex<HashMap<String, SideChat>>,
+    chats: Mutex<SideChatSlots<SideChat>>,
 }
 
 impl SideChatStore {
-    /// Reap every side chat (app exit).
+    /// Reap every side chat (app exit). Starts still in flight are
+    /// cancelled and reap themselves when they finish.
     pub async fn shutdown_all(&self) {
-        let chats: Vec<SideChat> = self.chats.lock().await.drain().map(|(_, c)| c).collect();
+        let chats = self.chats.lock().await.drain();
         for chat in chats {
             dispose(chat).await;
         }
@@ -184,24 +275,34 @@ pub async fn agent_chat_side_chat_start<R: Runtime>(
         let registry: State<'_, ProviderRegistry> = app.state();
         lookup_provider(&registry, main.provider).await?;
     }
-    let store: State<'_, SideChatStore> = app.state();
-    if store.chats.lock().await.contains_key(&side_id) {
-        return Err("This side chat is already running.".into());
+    if !matches!(main.provider, ProviderKind::Claude | ProviderKind::Codex) {
+        ensure_side_chat_supported(main.provider)?;
+        return Err("Side chat isn't available for this agent yet.".into());
     }
-    let (chat, started) = match main.provider {
-        ProviderKind::Claude => start_claude(&app, &side_id, &main, &question).await?,
-        ProviderKind::Codex => start_codex(&app, &side_id, &main, &question).await?,
-        other => {
-            ensure_side_chat_supported(other)?;
-            return Err("Side chat isn't available for this agent yet.".into());
+    let store: State<'_, SideChatStore> = app.state();
+    // Claim the id before spawning, so a close that lands while the
+    // provider starts cancels this start instead of finding nothing.
+    let token = store.chats.lock().await.begin(&side_id)?;
+    let result = match main.provider {
+        ProviderKind::Claude => start_claude(&app, &side_id, &main, &question).await,
+        _ => start_codex(&app, &side_id, &main, &question).await,
+    };
+    let (chat, started) = match result {
+        Ok(started) => started,
+        Err(error) => {
+            store.chats.lock().await.abandon(&side_id, token);
+            return Err(error);
         }
     };
-    let previous = store.chats.lock().await.insert(side_id, chat);
-    if let Some(previous) = previous {
-        dispose(previous).await;
+    let finished = store.chats.lock().await.finish(&side_id, token, chat);
+    if let Err(chat) = finished {
+        dispose(chat).await;
+        return Err(SIDE_CHAT_CANCELLED.into());
     }
     Ok(started)
 }
+
+const SIDE_CHAT_CANCELLED: &str = "The side chat was closed before it started.";
 
 /// Ask a follow-up in an open side chat. It continues the same fork.
 #[tauri::command]
@@ -215,7 +316,7 @@ pub async fn agent_chat_side_chat_send<R: Runtime>(
     let (child, request) = {
         let chats = store.chats.lock().await;
         let chat = chats
-            .get(&side_id)
+            .running(&side_id)
             .ok_or("This side chat has ended. Start a new one with /btw.")?;
         let request = match &chat.backend {
             SideBackend::Claude => ("side-chat-send", json!({ "text": question })),
@@ -242,14 +343,15 @@ pub async fn agent_chat_side_chat_send<R: Runtime>(
         .map_err(|error| format!("Couldn't send to the side chat: {error}"))
 }
 
-/// Close a side chat and reap its process. Idempotent.
+/// Close a side chat and reap its process, or cancel its pending start.
+/// Idempotent.
 #[tauri::command]
 pub async fn agent_chat_side_chat_close<R: Runtime>(
     app: AppHandle<R>,
     side_id: String,
 ) -> Result<(), String> {
     let store: State<'_, SideChatStore> = app.state();
-    let chat = store.chats.lock().await.remove(&side_id);
+    let chat = store.chats.lock().await.close(&side_id);
     if let Some(chat) = chat {
         dispose(chat).await;
     }
@@ -472,13 +574,79 @@ fn spawn_pump<R: Runtime>(
         emit(&app, &side_id, SideChatUpdate::Closed);
         // Drop the dead entry so a later send reports the ended chat.
         if let Some(store) = app.try_state::<SideChatStore>() {
-            let mut chats = store.chats.lock().await;
-            if chats
-                .get(&side_id)
-                .is_some_and(|chat| Arc::ptr_eq(&chat.child, &child))
-            {
-                chats.remove(&side_id);
-            }
+            store
+                .chats
+                .lock()
+                .await
+                .remove_running_if(&side_id, |chat| Arc::ptr_eq(&chat.child, &child));
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SideChatSlots;
+
+    #[test]
+    fn start_then_finish_publishes_the_chat() {
+        let mut slots = SideChatSlots::default();
+        let token = slots.begin("a").unwrap();
+        assert!(slots.running("a").is_none(), "a pending start is not sendable");
+        assert!(slots.finish("a", token, 1).is_ok());
+        assert_eq!(slots.running("a"), Some(&1));
+        assert_eq!(slots.close("a"), Some(1));
+        assert!(slots.running("a").is_none());
+    }
+
+    #[test]
+    fn close_during_start_hands_the_chat_back_for_reaping() {
+        let mut slots = SideChatSlots::default();
+        let token = slots.begin("a").unwrap();
+        assert_eq!(slots.close("a"), None, "nothing running to reap yet");
+        assert_eq!(slots.finish("a", token, 7), Err(7));
+        assert!(slots.running("a").is_none(), "a cancelled start is never published");
+    }
+
+    #[test]
+    fn a_stale_starter_cannot_take_over_a_reclaimed_id() {
+        let mut slots = SideChatSlots::default();
+        let stale = slots.begin("a").unwrap();
+        slots.close("a");
+        let fresh = slots.begin("a").unwrap();
+        assert_eq!(slots.finish("a", stale, 1), Err(1));
+        slots.abandon("a", stale);
+        assert!(slots.finish("a", fresh, 2).is_ok());
+        assert_eq!(slots.running("a"), Some(&2));
+    }
+
+    #[test]
+    fn duplicate_starts_are_refused_and_failed_starts_release_the_id() {
+        let mut slots: SideChatSlots<u8> = SideChatSlots::default();
+        let token = slots.begin("a").unwrap();
+        assert!(slots.begin("a").is_err());
+        slots.abandon("a", token);
+        assert!(slots.begin("a").is_ok());
+    }
+
+    #[test]
+    fn shutdown_cancels_pending_starts_and_returns_running_chats() {
+        let mut slots = SideChatSlots::default();
+        let running = slots.begin("a").unwrap();
+        slots.finish("a", running, 1).unwrap();
+        let pending = slots.begin("b").unwrap();
+        assert_eq!(slots.drain(), vec![1]);
+        assert_eq!(slots.finish("b", pending, 2), Err(2));
+    }
+
+    #[test]
+    fn pump_exit_only_removes_its_own_running_chat() {
+        let mut slots = SideChatSlots::default();
+        let token = slots.begin("a").unwrap();
+        slots.remove_running_if("a", |_: &u8| true);
+        assert!(slots.finish("a", token, 1).is_ok(), "a pending claim survives");
+        slots.remove_running_if("a", |chat| *chat == 2);
+        assert_eq!(slots.running("a"), Some(&1));
+        slots.remove_running_if("a", |chat| *chat == 1);
+        assert!(slots.running("a").is_none());
+    }
 }

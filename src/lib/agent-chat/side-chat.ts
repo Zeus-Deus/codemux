@@ -244,14 +244,23 @@ export async function startSideChat(args: {
     turns: [{ question: args.question, answer: "", status: "streaming" }],
     ended: false,
   });
+  // Closing or replacing the pane drops the chat from the store; a start
+  // still in flight then must not spawn, or must reap what it spawned.
+  const isOpen = () => sideId in useSideChatStore.getState().chats;
   try {
     // Subscribe before the fork starts so no early delta is missed.
     await ensureSideChatListener();
+    if (!isOpen()) return sideId;
     const started = await invoke<SideChatStarted | null | undefined>("agent_chat_side_chat_start", {
       sideId,
       threadId: args.threadId,
       text: args.question,
     });
+    if (!isOpen()) {
+      // The close raced ahead of the backend's claim and found nothing.
+      await invoke("agent_chat_side_chat_close", { sideId }).catch(() => {});
+      return sideId;
+    }
     if (started && typeof started === "object") {
       useSideChatStore.getState().started(sideId, {
         model: started.model ?? null,
@@ -259,6 +268,7 @@ export async function startSideChat(args: {
       });
     }
   } catch (error) {
+    if (!isOpen()) return sideId;
     useSideChatStore.getState().fail(sideId, errorText(error));
     useSideChatStore.getState().apply({ side_id: sideId, kind: "closed" });
   }

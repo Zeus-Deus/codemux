@@ -1642,6 +1642,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // `/btw <question>` asks a read-only fork of this chat's session in
       // the Side chat pane. Nothing reaches the main thread: no bubble, no
       // turn, and the running turn keeps going.
+      // Side chats take text only; refuse attachments rather than drop them.
+      if (
+        !isContinue
+        && parseBtwCommand(rawText)
+        && (useAgentChatStore.getState().threads[threadId]?.stagedAttachments.length ?? 0) > 0
+      ) {
+        toast.error("Side chats can't take attachments yet", {
+          description: "Remove the attachments or send this as a normal message.",
+        });
+        return;
+      }
       const side = isContinue
         ? null
         : askSideQuestion({ text: rawText, threadId, provider, workspaceId: paneWorkspaceId });

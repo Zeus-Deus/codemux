@@ -4710,6 +4710,26 @@ describe("AgentChatPane /btw", () => {
     expect(setInputDraftMock).toHaveBeenCalledWith("thread-x", "");
   });
 
+  it("refuses staged attachments instead of dropping them, keeping the draft", async () => {
+    const error = vi.spyOn(toast, "error");
+    currentMessages = [{ kind: "user_message", id: "m1", seq: 1, source_event_id: 7 }];
+    currentSliceOverrides = { "thread-x": {
+      inputDraft: "/btw what is in this screenshot?",
+      stagedAttachments: [{ id: "img", kind: "image", ref: "shot.png", metadata: { label: "shot.png" } }],
+    } };
+    const view = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+    fireEvent.click(view.container.querySelector('[data-testid="composer-submit"]')!);
+    await act(async () => {});
+    expect(sideChatMocks.start).not.toHaveBeenCalled();
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    expect(setInputDraftMock).not.toHaveBeenCalledWith("thread-x", "");
+    expect(error).toHaveBeenCalledWith("Side chats can't take attachments yet", expect.objectContaining({
+      description: "Remove the attachments or send this as a normal message.",
+    }));
+    error.mockRestore();
+  });
+
   it("refuses unsupported providers and keeps the draft", async () => {
     await submit("/btw anything", { provider: "cursor" as never });
     expect(sideChatMocks.start).not.toHaveBeenCalled();

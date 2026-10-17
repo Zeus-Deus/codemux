@@ -14,6 +14,7 @@ import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useUIStore } from "@/stores/ui-store";
 
 import {
+  closeSideChat,
   parseBtwCommand,
   sendSideChat,
   sideChatSupported,
@@ -159,6 +160,62 @@ describe("side chat store", () => {
     const chat = useSideChatStore.getState().chats[sideId]!;
     expect(chat.ended).toBe(true);
     expect(chat.turns[0]).toMatchObject({ status: "error", error: "This chat has no provider session yet." });
+  });
+
+  it("a start that resolves after the chat was closed reaps the fork and stays closed", async () => {
+    let release!: (value: unknown) => void;
+    invoke.mockImplementationOnce(() => new Promise((resolve) => (release = resolve)));
+    const pending = startSideChat({ threadId: "t-1", workspaceId: "ws-1", provider: "claude", question: "a" });
+    await flush();
+    const sideId = useSideChatStore.getState().activeByWorkspace["ws-1"]!;
+    await closeSideChat(sideId);
+    invoke.mockClear();
+    release({ model: "m", effort: null });
+    await pending;
+    expect(invoke).toHaveBeenCalledWith("agent_chat_side_chat_close", { sideId });
+    const state = useSideChatStore.getState();
+    expect(state.chats[sideId]).toBeUndefined();
+    expect(state.activeByWorkspace["ws-1"]).toBeUndefined();
+  });
+
+  it("a start replaced before it resolves reaps its fork and leaves the new chat alone", async () => {
+    let release!: (value: unknown) => void;
+    invoke.mockImplementationOnce(() => new Promise((resolve) => (release = resolve)));
+    const pendingFirst = startSideChat({ threadId: "t-1", workspaceId: "ws-1", provider: "claude", question: "a" });
+    await flush();
+    const first = useSideChatStore.getState().activeByWorkspace["ws-1"]!;
+    const second = await startSideChat({ threadId: "t-1", workspaceId: "ws-1", provider: "claude", question: "b" });
+    invoke.mockClear();
+    release({ model: null, effort: null });
+    await pendingFirst;
+    expect(invoke).toHaveBeenCalledWith("agent_chat_side_chat_close", { sideId: first });
+    expect(invoke).not.toHaveBeenCalledWith("agent_chat_side_chat_close", { sideId: second });
+    const state = useSideChatStore.getState();
+    expect(state.chats[first]).toBeUndefined();
+    expect(state.activeByWorkspace["ws-1"]).toBe(second);
+  });
+
+  it("a chat closed while the listener registers never starts a fork", async () => {
+    // startSideChat yields at the listener await; the close lands there.
+    const pending = startSideChat({ threadId: "t-1", workspaceId: "ws-1", provider: "claude", question: "a" });
+    const sideId = useSideChatStore.getState().activeByWorkspace["ws-1"]!;
+    const closing = closeSideChat(sideId);
+    await pending;
+    await closing;
+    expect(invoke.mock.calls.some(([cmd]) => cmd === "agent_chat_side_chat_start")).toBe(false);
+    expect(useSideChatStore.getState().chats[sideId]).toBeUndefined();
+  });
+
+  it("a start cancelled by close does not resurrect the chat as an error", async () => {
+    let reject!: (error: unknown) => void;
+    invoke.mockImplementationOnce(() => new Promise((_, rej) => (reject = rej)));
+    const pending = startSideChat({ threadId: "t-1", workspaceId: "ws-1", provider: "codex", question: "a" });
+    await flush();
+    const sideId = useSideChatStore.getState().activeByWorkspace["ws-1"]!;
+    await closeSideChat(sideId);
+    reject("The side chat was closed before it started.");
+    await pending;
+    expect(useSideChatStore.getState().chats[sideId]).toBeUndefined();
   });
 
   it("a fork that exits mid-answer is reported, and sends stop", async () => {

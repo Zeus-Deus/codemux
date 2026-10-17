@@ -1860,6 +1860,8 @@ pub fn drain_journal<R: Runtime>(app: &AppHandle<R>) {
         );
         usage_resume::cancel_for_stopped_thread(app, &row.child_thread_id);
     }
+    // Started suggested tasks interrupted before they were journaled.
+    super::follow_ups::reconcile_on_launch(app);
 }
 
 #[cfg(test)]

@@ -400,14 +400,28 @@ pub struct MergeAllResult {
     pub conflict: Option<MergeConflict>,
 }
 
+/// Whether the checkout containing `dir` has a merge in progress. Asked
+/// through git so it holds in a linked worktree (where `.git` is a file)
+/// and from a subdirectory of the checkout.
+fn merge_in_progress(dir: &Path) -> bool {
+    git(dir, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok()
+}
+
 /// Merge `candidates` into the checkout at `target` with `--no-ff`, in
-/// order. Refuses a dirty target. A child with uncommitted work in its
-/// worktree is reported as not mergeable, never merged half-done. On a
-/// conflict the merge is aborted and nothing after it is attempted.
+/// order. Refuses a target with a merge in progress or uncommitted changes.
+/// A child with uncommitted work in its worktree is reported as not
+/// mergeable, never merged half-done. On a conflict the merge this run
+/// started is aborted and nothing after it is attempted; a merge it did not
+/// start is never aborted.
 pub(crate) fn merge_branches(
     target: &Path,
     candidates: &[MergeCandidate],
 ) -> Result<MergeAllResult, String> {
+    if merge_in_progress(target) {
+        return Err(
+            "A merge is already in progress in this workspace. Finish or abort it first.".into(),
+        );
+    }
     let dirty = dirty_files(target, false)?;
     if !dirty.is_empty() {
         return Err(format!(
@@ -416,11 +430,6 @@ pub(crate) fn merge_branches(
             if dirty.len() == 1 { "" } else { "s" },
             if dirty.len() == 1 { "it" } else { "them" },
         ));
-    }
-    if target.join(".git").is_dir() && target.join(".git/MERGE_HEAD").exists() {
-        return Err(
-            "A merge is already in progress in this workspace. Finish or abort it first.".into(),
-        );
     }
     let mut result = MergeAllResult {
         target_branch: crate::git::current_branch(target),
@@ -477,6 +486,14 @@ pub(crate) fn merge_branches(
             continue;
         }
         let message = format!("Merge {}: {}", candidate.branch, candidate.title);
+        // Someone may have started a merge since the check above; never
+        // run (and later abort) on top of it.
+        if merge_in_progress(target) {
+            return Err(
+                "A merge is already in progress in this workspace. Finish or abort it first."
+                    .into(),
+            );
+        }
         match git(
             target,
             &[
@@ -499,8 +516,11 @@ pub(crate) fn merge_branches(
                     .lines()
                     .map(str::to_string)
                     .collect();
-                // Leave the workspace exactly as it was before this merge.
-                let _ = git(target, &["merge", "--abort"]);
+                // Leave the workspace exactly as it was before this merge:
+                // MERGE_HEAD was absent before it, so a present one is ours.
+                if merge_in_progress(target) {
+                    let _ = git(target, &["merge", "--abort"]);
+                }
                 result.conflict = Some(MergeConflict {
                     child_thread_id: candidate.child_thread_id.clone(),
                     title: candidate.title.clone(),
@@ -572,6 +592,84 @@ pub(crate) fn on_task_finished<R: Runtime>(app: &AppHandle<R>, child: &str, outc
         }
         emit_changed(&app, &row.parent_thread_id);
     });
+}
+
+/// Children whose `follow_up_start` is still between claiming the
+/// suggestion and handing the task to the delegation tracker, in this
+/// process. Startup reconciliation must not touch them.
+static STARTING: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn starting() -> std::sync::MutexGuard<'static, HashSet<String>> {
+    STARTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Marks a child as starting for as long as it lives.
+struct StartingGuard(String);
+
+impl StartingGuard {
+    fn new(child: &str) -> Self {
+        starting().insert(child.to_string());
+        Self(child.to_string())
+    }
+}
+
+impl Drop for StartingGuard {
+    fn drop(&mut self) {
+        starting().remove(&self.0);
+    }
+}
+
+/// Settle rows a previous run left `running` without ever handing them to
+/// the delegation tracker (quit or crash during `follow_up_start`, before
+/// its restart journal entry was written). Rows the tracker knows (`is_live`)
+/// or that this process is starting right now are left alone. A start that
+/// never got its workspace gives the suggestion back so it can be started
+/// again; one that did is Stopped, like any task the app closed on.
+/// Returns the parents whose rows changed.
+pub(crate) fn reconcile_interrupted_starts(
+    db: &DatabaseStore,
+    is_live: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut parents = Vec::new();
+    for row in db.running_follow_up_tasks() {
+        let child = row.child_thread_id.as_str();
+        if is_live(child) || starting().contains(child) {
+            continue;
+        }
+        let settled = if row.workspace_id.is_empty() {
+            db.delete_follow_up_task(child)
+        } else {
+            db.set_follow_up_outcome(child, "stopped")
+        };
+        match settled {
+            Ok(()) if !parents.contains(&row.parent_thread_id) => {
+                parents.push(row.parent_thread_id)
+            }
+            Ok(()) => {}
+            Err(error) => eprintln!("[codemux::follow_ups] {error}"),
+        }
+    }
+    parents
+}
+
+/// [`reconcile_interrupted_starts`] at launch, after the delegation journal
+/// was drained (journaled children are already Stopped by then).
+pub(crate) fn reconcile_on_launch<R: Runtime>(app: &AppHandle<R>) {
+    let Some(db) = app.try_state::<DatabaseStore>() else {
+        return;
+    };
+    let state = app.try_state::<DelegationState>();
+    let parents = reconcile_interrupted_starts(&db, |child| {
+        state
+            .as_ref()
+            .is_some_and(|state| state.is_running_child(child))
+    });
+    for parent in parents {
+        emit_changed(app, &parent);
+    }
 }
 
 /// An agent that can run a started task, for the card's picker.
@@ -718,8 +816,11 @@ pub async fn follow_up_start<R: Runtime>(
     };
     let branch = branch_name_for(&suggestion.title, &existing);
     let child = uuid::Uuid::new_v4().to_string();
+    let _starting = StartingGuard::new(&child);
 
     // Claims the suggestion before the slow part, so a second click fails.
+    // If the app quits before the journal entry below, the next launch
+    // settles the row (`reconcile_on_launch`).
     let mut row = FollowUpTaskRow {
         child_thread_id: child.clone(),
         parent_thread_id: parent.to_string(),
@@ -1154,6 +1255,168 @@ mod tests {
             git(&repo, &["rev-parse", "HEAD"]).unwrap(),
             before,
             "left stays merged"
+        );
+    }
+
+    #[test]
+    fn a_users_merge_in_a_linked_worktree_is_refused_and_left_alone() {
+        let (dir, repo) = repo();
+        commit_on(&repo, "theirs", "e.txt", "e\n");
+        commit_on(&repo, "kid", "b.txt", "b\n");
+        let parent = dir.path().join("parent-wt");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "parent",
+                parent.to_str().unwrap(),
+                "main",
+            ],
+        )
+        .unwrap();
+        assert!(parent.join(".git").is_file(), "a linked worktree");
+        // The user's own merge, staged but not committed.
+        git(&parent, &["merge", "--no-ff", "--no-commit", "theirs"]).unwrap();
+        assert!(merge_in_progress(&parent));
+        std::fs::create_dir(parent.join("src")).unwrap();
+        let sub = parent.join("src");
+        assert!(merge_in_progress(&sub), "seen from a subdirectory");
+
+        for target in [&parent, &sub] {
+            let refused = merge_branches(target, &[candidate("kid")]).unwrap_err();
+            assert!(refused.contains("already in progress"), "{refused}");
+        }
+        assert!(merge_in_progress(&parent), "the user's merge is untouched");
+        assert!(parent.join("e.txt").exists(), "its staged changes too");
+        assert!(!parent.join("b.txt").exists(), "nothing was merged");
+    }
+
+    #[test]
+    fn a_conflict_from_a_subdirectory_of_a_linked_worktree_is_aborted() {
+        let (dir, repo) = repo();
+        commit_on(&repo, "left", "a.txt", "one\nLEFT\nthree\n");
+        let parent = dir.path().join("parent-wt");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "parent",
+                parent.to_str().unwrap(),
+                "main",
+            ],
+        )
+        .unwrap();
+        std::fs::write(parent.join("a.txt"), "one\nPARENT\nthree\n").unwrap();
+        std::fs::create_dir(parent.join("src")).unwrap();
+        std::fs::write(parent.join("src/keep.txt"), "k\n").unwrap();
+        git(&parent, &["add", "."]).unwrap();
+        git(&parent, &["commit", "-q", "-m", "parent edit"]).unwrap();
+        let before = git(&parent, &["rev-parse", "HEAD"]).unwrap();
+
+        let result = merge_branches(&parent.join("src"), &[candidate("left")]).unwrap();
+        let conflict = result.conflict.expect("left conflicts with the parent");
+        assert_eq!(conflict.files, vec!["a.txt".to_string()]);
+        assert!(!merge_in_progress(&parent), "our own merge was aborted");
+        assert_eq!(git(&parent, &["rev-parse", "HEAD"]).unwrap(), before);
+        assert!(dirty_files(&parent, true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_interrupted_start_is_settled_on_the_next_launch() {
+        let db = DatabaseStore::new_in_memory();
+        let row = |child: &str, index: u32, workspace: &str, outcome: &str| FollowUpTaskRow {
+            child_thread_id: child.into(),
+            parent_thread_id: format!("parent-{child}"),
+            tool_call_id: "call".into(),
+            index,
+            workspace_id: workspace.into(),
+            parent_workspace_id: "ws-parent".into(),
+            repo_path: "/repo".into(),
+            worktree_path: String::new(),
+            branch: format!("branch-{child}"),
+            base_sha: "a".repeat(40),
+            provider: "codex".into(),
+            title: format!("Task {child}"),
+            outcome: outcome.into(),
+            additions: None,
+            deletions: None,
+            commits: None,
+            uncommitted: None,
+            merged: false,
+            created_at_ms: index as i64,
+        };
+        // Quit while its worktree was being created: no workspace yet.
+        db.insert_follow_up_task(&row("no-ws", 0, "", "running"))
+            .unwrap();
+        // Quit after the workspace existed but before the journal entry.
+        db.insert_follow_up_task(&row("has-ws", 1, "ws-child", "running"))
+            .unwrap();
+        // Tracked by the delegation state, and being started right now.
+        db.insert_follow_up_task(&row("live", 2, "ws-live", "running"))
+            .unwrap();
+        db.insert_follow_up_task(&row("starting", 3, "", "running"))
+            .unwrap();
+        db.insert_follow_up_task(&row("done", 4, "ws-done", "completed"))
+            .unwrap();
+        let _guard = StartingGuard::new("starting");
+
+        let mut parents = reconcile_interrupted_starts(&db, |child| child == "live");
+        parents.sort();
+        assert_eq!(parents, vec!["parent-has-ws", "parent-no-ws"]);
+        assert!(
+            db.get_follow_up_task("no-ws").is_none(),
+            "the suggestion can be started again"
+        );
+        db.insert_follow_up_task(&row("retry", 0, "", "running"))
+            .expect("its reservation was released");
+        assert_eq!(db.get_follow_up_task("has-ws").unwrap().outcome, "stopped");
+        assert_eq!(db.get_follow_up_task("live").unwrap().outcome, "running");
+        assert_eq!(
+            db.get_follow_up_task("starting").unwrap().outcome,
+            "running"
+        );
+        assert_eq!(db.get_follow_up_task("done").unwrap().outcome, "completed");
+    }
+
+    #[test]
+    fn launch_reconciles_after_draining_the_journal() {
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(DelegationState::default());
+        let db = app.state::<DatabaseStore>();
+        let row = FollowUpTaskRow {
+            child_thread_id: "orphan".into(),
+            parent_thread_id: "parent".into(),
+            tool_call_id: "call".into(),
+            index: 0,
+            workspace_id: String::new(),
+            parent_workspace_id: "ws-parent".into(),
+            repo_path: "/repo".into(),
+            worktree_path: String::new(),
+            branch: "orphan".into(),
+            base_sha: "a".repeat(40),
+            provider: "codex".into(),
+            title: "Orphan".into(),
+            outcome: "running".into(),
+            additions: None,
+            deletions: None,
+            commits: None,
+            uncommitted: None,
+            merged: false,
+            created_at_ms: 1,
+        };
+        db.insert_follow_up_task(&row).unwrap();
+        // The journal is empty: the start never reached it.
+        super::super::delegation::drain_journal(app.handle());
+        assert!(
+            db.get_follow_up_task("orphan").is_none(),
+            "the interrupted reservation was released at launch"
         );
     }
 

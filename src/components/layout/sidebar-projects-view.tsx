@@ -388,20 +388,19 @@ export function SidebarProjectsView() {
     return map;
   }, [allWorkspaces, paneStatuses]);
 
-  // The inbox's safety nets, applied as presentation only (the Activity view
-  // owns the lifecycle writes): a parked workspace whose agent is working or
-  // blocked, or whose snooze is due, shows as live here.
+  // The lifecycle writes (resurface, wake, the wake timer) are made by
+  // `useInboxLifecycle`, which runs whichever view is mounted. This override
+  // only covers the frame between a status landing and that effect's store
+  // write: a parked workspace whose agent is working or blocked shows as live
+  // at once instead of flashing hidden first.
   const liveOverride = useMemo(() => {
     const out = new Set<string>();
     for (const id of parkedIds) {
       const status = statusById.get(id) ?? null;
       if (status === "working" || status === "permission") out.add(id);
     }
-    for (const entry of snoozed) {
-      if (entry.until <= now) out.add(entry.id);
-    }
     return out;
-  }, [parkedIds, statusById, snoozed, now]);
+  }, [parkedIds, statusById]);
 
   const storedIndex = useMemo(() => {
     const map = new Map<string, number>();

@@ -9,12 +9,31 @@ import {
   within,
 } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { SidebarProvider } from "@/components/ui/sidebar";
 import type {
   AppStateSnapshot,
   PaneStatus,
   SurfaceSnapshot,
   WorkspaceSnapshot,
 } from "@/tauri/types";
+
+// shadcn SidebarProvider uses useIsMobile → window.matchMedia, which jsdom
+// doesn't implement. Stub a minimal shape so the provider can mount.
+if (typeof window !== "undefined" && !window.matchMedia) {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: (query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }),
+  });
+}
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn().mockResolvedValue(undefined),
@@ -99,6 +118,7 @@ vi.mock("@/stores/app-store", () => {
 
 import { SidebarProjectsView } from "./sidebar-projects-view";
 import { SidebarViewSwitch } from "./sidebar-action-row";
+import { SidebarWorkspaceList } from "./sidebar-workspace-list";
 import {
   __resetSidebarInboxStoreForTests,
   useSidebarInboxStore,
@@ -164,6 +184,38 @@ async function renderView() {
     });
   }
   return utils;
+}
+
+/** Render the real sidebar mount point (view switch + lifecycle host) with the
+ *  Projects view selected, so the inbox view is never mounted. */
+function sidebarTree() {
+  return (
+    <SidebarProvider>
+      <TooltipProvider>
+        <SidebarWorkspaceList />
+      </TooltipProvider>
+    </SidebarProvider>
+  );
+}
+
+async function flush() {
+  for (let i = 0; i < 3; i += 1) {
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+}
+
+async function renderSidebar() {
+  const utils = render(sidebarTree());
+  await flush();
+  return utils;
+}
+
+/** Re-render in place: the app-store mock is read fresh on every render. */
+async function rerenderSidebar(rerender: (ui: React.ReactElement) => void) {
+  rerender(sidebarTree());
+  await flush();
 }
 
 beforeEach(() => {
@@ -399,5 +451,98 @@ describe("SidebarViewSwitch", () => {
     expect(
       within(group).getByRole("radio", { name: "Projects view" }),
     ).toHaveAttribute("data-state", "off");
+  });
+});
+
+describe("SidebarProjectsView — inbox lifecycle while Projects is shown", () => {
+  it("resurfaces a settled workspace whose agent starts working, and keeps it out after it finishes", async () => {
+    workspaces = [makeWorkspace({ title: "parked", surfaces: withPane("p1") })];
+    persistedSettled = JSON.stringify({
+      settled: [{ id: "ws-1", at: 1 }],
+      snoozed: [],
+      keepActive: ["ws-1"],
+      activity: {},
+    });
+    const { container, rerender } = await renderSidebar();
+    expect(container.querySelector("[data-inbox-card]")).toBeNull();
+    expect(screen.getByRole("button", { name: "Show 1 settled" })).toBeInTheDocument();
+
+    paneStatuses = { p1: "working" };
+    await rerenderSidebar(rerender);
+    // The durable write landed, not just a presentation override.
+    expect(useSidebarInboxStore.getState().settled).toEqual([]);
+    // Resurfacing is activity, not a user decision: it clears the pin.
+    expect(useSidebarInboxStore.getState().keepActive["ws-1"]).toBeUndefined();
+
+    paneStatuses = { p1: "review" };
+    await rerenderSidebar(rerender);
+    expect(useSidebarInboxStore.getState().settled).toEqual([]);
+    expect(container.querySelector('[data-projects-row="ws-1"]')).not.toBeNull();
+    expect(screen.queryByRole("button", { name: /settled$/ })).toBeNull();
+  });
+
+  it("wakes a snoozed workspace whose agent raises a hand, and keeps it awake after", async () => {
+    const base = Date.now();
+    workspaces = [makeWorkspace({ title: "deferred", surfaces: withPane("p1") })];
+    persistedSettled = JSON.stringify({
+      settled: [],
+      snoozed: [{ id: "ws-1", at: base, until: base + 7 * 86_400_000 }],
+      keepActive: [],
+      activity: {},
+    });
+    const { container, rerender } = await renderSidebar();
+    expect(useSidebarInboxStore.getState().snoozed).toHaveLength(1);
+    expect(container.querySelector('[data-projects-row="ws-1"]')).toBeNull();
+
+    paneStatuses = { p1: "permission" };
+    await rerenderSidebar(rerender);
+    expect(useSidebarInboxStore.getState().snoozed).toEqual([]);
+
+    paneStatuses = {};
+    await rerenderSidebar(rerender);
+    expect(useSidebarInboxStore.getState().snoozed).toEqual([]);
+    expect(container.querySelector('[data-projects-row="ws-1"]')).not.toBeNull();
+  });
+
+  it("wakes a snoozed workspace on time via the boundary timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const base = Date.now();
+      workspaces = [makeWorkspace({ title: "five seconds out" })];
+      persistedSettled = JSON.stringify({
+        settled: [],
+        snoozed: [{ id: "ws-1", at: base, until: base + 5_000 }],
+        keepActive: [],
+        activity: {},
+      });
+      const { container } = await renderSidebar();
+      expect(container.querySelector('[data-projects-row="ws-1"]')).toBeNull();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6_000);
+      });
+      expect(useSidebarInboxStore.getState().snoozed).toEqual([]);
+      expect(container.querySelector('[data-projects-row="ws-1"]')).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps running after switching to Activity", async () => {
+    workspaces = [makeWorkspace({ title: "parked", surfaces: withPane("p1") })];
+    persistedSettled = JSON.stringify({
+      settled: [{ id: "ws-1", at: 1 }],
+      snoozed: [],
+      keepActive: [],
+      activity: {},
+    });
+    const { rerender } = await renderSidebar();
+    act(() => {
+      useSidebarViewStore.setState({ view: "activity" });
+    });
+    await flush();
+    paneStatuses = { p1: "working" };
+    await rerenderSidebar(rerender);
+    expect(useSidebarInboxStore.getState().settled).toEqual([]);
   });
 });

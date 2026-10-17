@@ -233,6 +233,21 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Every row still marked `running`, oldest first.
+    pub fn running_follow_up_tasks(&self) -> Vec<FollowUpTaskRow> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM agent_follow_up_tasks
+             WHERE outcome = 'running'
+             ORDER BY created_at_ms ASC, child_thread_id ASC"
+        )) else {
+            return Vec::new();
+        };
+        stmt.query_map([], row)
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
     pub fn set_follow_up_merged(&self, child_thread_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

@@ -7,7 +7,8 @@ import {
 import { SidebarRailWorkspaces } from "./sidebar-rail-workspaces";
 import { SidebarInbox } from "./sidebar-inbox";
 import { SidebarProjectsView } from "./sidebar-projects-view";
-import { useSidebarViewStore } from "./sidebar-view-store";
+import { useSidebarViewStore, type SidebarView } from "./sidebar-view-store";
+import { InboxLifecycle } from "./use-inbox-lifecycle";
 
 /** The sidebar's workspace area.
  *
@@ -22,6 +23,11 @@ import { useSidebarViewStore } from "./sidebar-view-store";
  *  - Collapsed: the icon rail — one avatar button per active workspace with a
  *    per-workspace status dot (`SidebarRailWorkspaces`), mirroring the inbox
  *    order.
+ *
+ *  The inbox lifecycle (`InboxLifecycle`: settle / snooze safety nets, wake
+ *  timers, activity stamps, auto-settle) is mounted here in every state, not
+ *  inside a view, so a transition is never missed just because the user is
+ *  looking at Projects or the collapsed rail.
  */
 export function SidebarWorkspaceList() {
   const { state } = useSidebar();
@@ -33,16 +39,30 @@ export function SidebarWorkspaceList() {
     void loadView();
   }, [loadView]);
 
-  if (state === "collapsed") {
-    return <SidebarRailWorkspaces />;
-  }
+  return (
+    <>
+      {state === "collapsed" ? (
+        <SidebarRailWorkspaces />
+      ) : (
+        <SidebarWorkspaceViews view={viewLoaded ? view : null} />
+      )}
+      {/* One stable slot in every state, so collapsing the sidebar or
+          switching views never remounts it (that would drop its status-edge
+          memory and re-arm the wake timer). After the views on purpose:
+          effects run in tree order, so the inbox has subscribed to lifecycle
+          events before the first sweep reports one. */}
+      <InboxLifecycle />
+    </>
+  );
+}
 
+function SidebarWorkspaceViews({ view }: { view: SidebarView | null }) {
   return (
     <SidebarGroup className="flex-1 p-0">
       <SidebarGroupContent className="flex flex-1 flex-col">
         {/* Wait for the stored choice so a sidebar left on Projects never
             mounts the inbox for a frame first. The read is one local IPC. */}
-        {!viewLoaded ? null : view === "projects" ? (
+        {view === null ? null : view === "projects" ? (
           <SidebarProjectsView />
         ) : (
           <SidebarInbox />

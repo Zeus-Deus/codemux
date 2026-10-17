@@ -18,23 +18,51 @@ import { onFollowUpChanged } from "@/tauri/events";
 interface FollowUpStore {
   rows: Record<string, FollowUpTaskRow[]>;
   providers: FollowUpProvider[] | null;
+  /** Re-read the thread's rows. A call while a read is in flight queues one
+   *  trailing read, so a change the in-flight read may have missed still
+   *  lands; the promise settles once the thread's rows are current. */
   refresh: (parentThreadId: string) => Promise<void>;
   loadProviders: () => Promise<void>;
 }
 
+/** Threads someone has asked for: change events keep these fresh, even
+ *  before their first read has returned. */
+const watched = new Set<string>();
+/** The thread's current read loop, while one runs. */
 const inFlight = new Map<string, Promise<void>>();
+/** Threads that changed after their in-flight read started. */
+const dirty = new Set<string>();
 let providersInFlight: Promise<void> | null = null;
 
 export const useFollowUpStore = create<FollowUpStore>((set) => ({
   rows: {},
   providers: null,
   refresh: (parentThreadId) => {
+    watched.add(parentThreadId);
     const running = inFlight.get(parentThreadId);
-    if (running) return running;
-    const next = followUpList(parentThreadId)
-      .then((rows) => set((state) => ({ rows: { ...state.rows, [parentThreadId]: rows } })))
-      .catch((error) => console.warn("[follow-ups] list failed", error))
-      .finally(() => inFlight.delete(parentThreadId));
+    if (running) {
+      dirty.add(parentThreadId);
+      return running;
+    }
+    const loop = async () => {
+      try {
+        do {
+          dirty.delete(parentThreadId);
+          try {
+            const rows = await followUpList(parentThreadId);
+            // Shown at once; a queued read below overwrites them.
+            set((state) => ({
+              rows: { ...state.rows, [parentThreadId]: rows },
+            }));
+          } catch (error) {
+            console.warn("[follow-ups] list failed", error);
+          }
+        } while (dirty.has(parentThreadId));
+      } finally {
+        inFlight.delete(parentThreadId);
+      }
+    };
+    const next = loop();
     inFlight.set(parentThreadId, next);
     return next;
   },
@@ -53,7 +81,7 @@ let listening: Promise<unknown> | null = null;
 function listenOnce() {
   listening ??= onFollowUpChanged(({ parent_thread_id }) => {
     // Only threads someone has looked at are kept fresh.
-    if (parent_thread_id in useFollowUpStore.getState().rows) {
+    if (watched.has(parent_thread_id)) {
       void useFollowUpStore.getState().refresh(parent_thread_id);
     }
   }).catch((error) => {
@@ -65,7 +93,9 @@ function listenOnce() {
 const EMPTY: FollowUpTaskRow[] = [];
 
 /** The thread's started suggestions, loaded on first use. */
-export function useFollowUpRows(parentThreadId: string | null): FollowUpTaskRow[] {
+export function useFollowUpRows(
+  parentThreadId: string | null,
+): FollowUpTaskRow[] {
   const rows = useFollowUpStore((state) =>
     parentThreadId ? (state.rows[parentThreadId] ?? EMPTY) : EMPTY,
   );
@@ -83,4 +113,14 @@ export function useFollowUpProviders(): FollowUpProvider[] | null {
     void useFollowUpStore.getState().loadProviders();
   }, []);
   return providers;
+}
+
+/** Test seam: forget module-level state between tests. */
+export function resetFollowUpStoreForTests() {
+  watched.clear();
+  inFlight.clear();
+  dirty.clear();
+  providersInFlight = null;
+  listening = null;
+  useFollowUpStore.setState({ rows: {}, providers: null });
 }

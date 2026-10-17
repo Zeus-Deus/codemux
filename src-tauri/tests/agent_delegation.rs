@@ -1768,8 +1768,14 @@ mod delegation {
         assert!(h.db().drain_delegated_open_tasks().unwrap().is_empty());
 
         // With the setting off, the tool is neither listed nor served.
+        // (`suggest_tasks` shares this host but starts nothing, so it is not
+        // gated on the delegation setting.)
         h.db().set_setting(DELEGATION_SETTING_KEY, "false").unwrap();
-        assert!(h.host.tools_for(&h.caller(FULL)).is_empty());
+        assert!(h
+            .host
+            .tools_for(&h.caller(FULL))
+            .iter()
+            .all(|tool| tool.prefixed_name != DELEGATE_TOOL));
         assert_eq!(
             h.call(FULL, args("codex", "Add slugify helper"))
                 .unwrap_err(),
@@ -1784,10 +1790,10 @@ mod delegation {
             h.host
                 .tools_for(caller)
                 .into_iter()
-                .map(|tool| {
-                    assert_eq!(tool.prefixed_name, DELEGATE_TOOL);
-                    tool.input_schema["properties"]["provider"]["enum"].clone()
-                })
+                // The host also serves `suggest_tasks`; this test is about
+                // the delegate tool alone.
+                .filter(|tool| tool.prefixed_name == DELEGATE_TOOL)
+                .map(|tool| tool.input_schema["properties"]["provider"]["enum"].clone())
                 .collect::<Vec<_>>()
         };
         // Claude lists by the setting alone; its live mode is checked per call.
