@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { DeviceRegistry } from "@/remote/device-registry";
+import { useAuthStore } from "@/stores/auth-store";
 
 import { NativeIrohDialer, nativeAccountFetch } from "./native";
 import { startEnvironmentRuntime, type EnvironmentRuntime } from "./runtime";
@@ -17,8 +18,9 @@ const ACCOUNT_PROXY_BASE = "https://account.codemux.invalid";
  * account token of their own, so they skip this.
  */
 export function useEnvironmentRuntime(signedIn: boolean): void {
+  const userId = useAuthStore((state) => state.user?.id);
   useEffect(() => {
-    if (!signedIn || isRemoteClient() || !("__TAURI_INTERNALS__" in window)) return;
+    if (!userId || !signedIn || isRemoteClient() || !("__TAURI_INTERNALS__" in window)) return;
     let runtime: EnvironmentRuntime | null = null;
     let cancelled = false;
     void invoke<EnvironmentDescriptor | null>("environment_info")
@@ -37,7 +39,8 @@ export function useEnvironmentRuntime(signedIn: boolean): void {
       .catch(() => {});
     return () => {
       cancelled = true;
-      runtime?.stop();
+      if (runtime) runtime.stop();
+      else useEnvironmentsStore.getState().reset();
     };
-  }, [signedIn]);
+  }, [signedIn, userId]);
 }
