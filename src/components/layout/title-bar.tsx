@@ -1,4 +1,3 @@
-import { useState, useEffect, useCallback } from "react";
 import { Slot } from "@/contrib/react/slot";
 import { TITLEBAR_ACTIONS_AREA } from "@/sdk/areas";
 import {
@@ -16,27 +15,27 @@ import { RemoteConnectionChip } from "@/components/remote/remote-connection-indi
 import { ResourceMonitor } from "./resource-monitor";
 import { TitleBarTabs } from "./title-bar-tabs";
 import { AgentLauncher, DraftAgentLauncher } from "./agent-launcher";
-import { RunButton } from "./run-button";
+import {
+  WorkspaceDetailsHost,
+  WorkspaceDetailsToggle,
+} from "./workspace-details/workspace-details-panel";
+import { EditorMenuItems } from "./editor-menu-items";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuGroup,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { groupEditors } from "@/lib/editor-groups";
 import { resolveRightPanelWidth } from "@/lib/right-panel-width";
 import {
+  PANEL_CLUSTER_GAP,
   RIGHT_PANEL_RESIZER_REACH,
+  WINDOW_CONTROLS_INSET,
   panelClusterRight,
   topRightReserve,
 } from "@/lib/titlebar-geometry";
 import { PaneActionButton } from "./right-panel/pane-actions";
 import {
   BAND_ACTIVE_FILL,
-  BAND_CONTROL_HOVER,
   BAND_CONTROL_RADIUS,
 } from "./titlebar-control-style";
 import {
@@ -47,10 +46,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import {
-  selectActiveWorkspaceId,
   useActiveWorkspace,
   useActiveWorkspaceId,
-  useAppStore,
 } from "@/stores/app-store";
 import { useDraftGuiChrome, useGuiChrome } from "@/hooks/use-gui-chrome";
 import {
@@ -62,104 +59,43 @@ import { useSidebarGapWidth } from "@/hooks/use-sidebar-gap-width";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { selectUtilityPage } from "@/lib/utility-pages";
-import { toast, reportFailure } from "@/lib/toast";
-import { applyPreset, openInEditor } from "@/tauri/commands";
+import { toast } from "@/lib/toast";
+import { applyPreset } from "@/tauri/commands";
 import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
 import { cn } from "@/lib/utils";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { PresetIcon } from "@/components/icons/preset-icon";
-import { useSyncedSettingsStore, selectDefaultEditor } from "@/stores/synced-settings-store";
 import type { TerminalPreset, WorkspaceSnapshot } from "@/tauri/types";
-import { useDetectedEditors } from "@/stores/editor-discovery-store";
-import { eyebrowVariants } from "@/components/ui/eyebrow";
+import { useEditorLauncher } from "@/hooks/use-editor-launcher";
+import { useRootFontPx } from "@/hooks/use-root-font-px";
+import {
+  selectShowResourceMonitor,
+  useSyncedSettingsStore,
+} from "@/stores/synced-settings-store";
 
-// ── IDE Launcher ──
+// ── IDE Launcher (legacy bar) ──
+//
+// The GUI chrome moved this into the Workspace details card's
+// "Open in <editor>" row; the legacy h-9 bar keeps its labelled chip.
 
-interface IdeLauncherProps {
-  /** GUI chrome renders the compressed [icon square][caret] shape — no
-   *  editor-name label — to save horizontal room in the h-10 bar. The
-   *  legacy h-9 bar keeps the default (labelled) shape unchanged, so this
-   *  defaults to `false` and every existing call site stays byte-identical. */
-  compact?: boolean;
-}
+function IdeLauncher() {
+  const { editors, defaultEditor, defaultEditorId, isLoading, open, unavailable } =
+    useEditorLauncher();
 
-function IdeLauncher({ compact = false }: IdeLauncherProps) {
-  const editors = useDetectedEditors();
-  const [isLoading, setIsLoading] = useState(false);
-  const persistedEditor = useSyncedSettingsStore(selectDefaultEditor);
-  const activeWorkspace = useAppStore(
-    (s) =>
-      s.appState?.workspaces.find(
-        (w) => w.workspace_id === selectActiveWorkspaceId(s),
-      ),
-  );
-
-  useEffect(() => {
-    if (
-      editors.length > 0 &&
-      !persistedEditor &&
-      !useSyncedSettingsStore.getState().isLoading
-    ) {
-      void useSyncedSettingsStore
-        .getState()
-        .updateSetting("editor", "default_ide", editors[0].id);
-    }
-  }, [editors, persistedEditor]);
-
-  const workspacePath = activeWorkspace?.cwd;
-  const defaultEditorId = persistedEditor || (editors.length > 0 ? editors[0].id : null);
-
-  const handleOpen = useCallback(
-    (editorId: string) => {
-      if (!workspacePath || isLoading) return;
-      setIsLoading(true);
-      useSyncedSettingsStore.getState().updateSetting("editor", "default_ide", editorId);
-      const editorName = editors.find((e) => e.id === editorId)?.name ?? "the editor";
-      openInEditor(editorId, workspacePath)
-        .catch(reportFailure(`Couldn't open in ${editorName}`))
-        .finally(() => setIsLoading(false));
-    },
-    [workspacePath, isLoading, editors],
-  );
-
-  const defaultEditor = editors.find((e) => e.id === defaultEditorId);
-  const groupedEditors = groupEditors(editors);
-  const showGroupLabels = groupedEditors.length > 1;
-
-  if (editors.length === 0 || !workspacePath) return null;
-
-  const mainTooltip = compact
-    ? defaultEditor
-      ? `Open in editor: ${defaultEditor.name} — click to change`
-      : "Open in editor"
-    : defaultEditor
-      ? `Open in ${defaultEditor.name}`
-      : "Open in editor";
+  if (unavailable) return null;
 
   return (
-    // Compact keeps the band's 2px rhythm between the icon and its caret;
-    // the legacy shape's two halves are one joined chip, so no gap there.
-    <div className={cn("flex items-center", compact && "gap-[2px]")}>
+    <div className="flex items-center">
       <Tooltip>
         <TooltipTrigger asChild>
           <button
             type="button"
-            onClick={() => defaultEditor && handleOpen(defaultEditor.id)}
+            onClick={() => defaultEditor && open(defaultEditor.id)}
             disabled={isLoading || !defaultEditor}
             className={cn(
-              "flex items-center gap-1",
-              // `compact` (GUI-chrome only) joins the band's one control
-              // family: 28px tall on the shared radius token, with no
-              // border and no resting fill — a hover fill is the whole
-              // treatment, same as the panel toggle. Non-compact (legacy
-              // bar) keeps its bordered chip and stays byte-identical.
-              !compact && "border border-r-0 bg-secondary/50",
-              "text-label font-medium",
-              compact
-                ? cn("size-7 justify-center px-0", BAND_CONTROL_RADIUS)
-                : "h-6 rounded-l-md border-border/60 px-2",
-              compact ? BAND_CONTROL_HOVER : "transition-colors duration-150",
-              !compact && "hover:bg-secondary hover:border-border",
+              "flex h-6 items-center gap-1 rounded-l-md border border-r-0 border-border/60 bg-secondary/50 px-2",
+              "text-label font-medium transition-colors duration-150",
+              "hover:bg-secondary hover:border-border",
               isLoading && "opacity-50 pointer-events-none",
             )}
           >
@@ -168,15 +104,13 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
             ) : (
               <ExternalLink className="size-3 shrink-0" />
             )}
-            {!compact && (
-              <span className="hidden sm:inline">
-                {defaultEditor?.name ?? "Open"}
-              </span>
-            )}
+            <span className="hidden sm:inline">
+              {defaultEditor?.name ?? "Open"}
+            </span>
           </button>
         </TooltipTrigger>
         <TooltipContent side="bottom" sideOffset={4}>
-          {mainTooltip}
+          {defaultEditor ? `Open in ${defaultEditor.name}` : "Open in editor"}
         </TooltipContent>
       </Tooltip>
       <DropdownMenu>
@@ -186,14 +120,9 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
             disabled={isLoading}
             aria-label="Choose editor"
             className={cn(
-              "flex items-center justify-center",
-              !compact && "border bg-secondary/50",
-              "text-muted-foreground",
-              compact
-                ? cn("h-7 w-5", BAND_CONTROL_RADIUS)
-                : "h-6 w-5 rounded-r-md border-border/60",
-              compact ? BAND_CONTROL_HOVER : "transition-colors duration-150",
-              !compact && "hover:bg-secondary hover:border-border hover:text-foreground",
+              "flex h-6 w-5 items-center justify-center rounded-r-md border border-border/60 bg-secondary/50",
+              "text-muted-foreground transition-colors duration-150",
+              "hover:bg-secondary hover:border-border hover:text-foreground",
               isLoading && "opacity-50 pointer-events-none",
             )}
           >
@@ -201,35 +130,11 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="w-48">
-          {groupedEditors.map((group, groupIdx) => (
-            // Render each family as a labelled section using
-            // DropdownMenuGroup for proper radix aria semantics. We only
-            // show a header + separator when more than one group is
-            // present — a user with only VS Code installed shouldn't
-            // see a lonely "VS Code family" header above a single item.
-            <DropdownMenuGroup key={group.id}>
-              {groupIdx > 0 && <DropdownMenuSeparator />}
-              {showGroupLabels && (
-                <DropdownMenuLabel className={eyebrowVariants({ tone: "muted" })}>
-                  {group.label}
-                </DropdownMenuLabel>
-              )}
-              {group.editors.map((editor) => (
-                <DropdownMenuItem
-                  key={editor.id}
-                  onClick={() => handleOpen(editor.id)}
-                >
-                  <EditorIcon id={editor.id} className="size-4" />
-                  <span>{editor.name}</span>
-                  {editor.id === defaultEditorId && (
-                    <span className="ml-auto text-caption text-muted-foreground">
-                      default
-                    </span>
-                  )}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuGroup>
-          ))}
+          <EditorMenuItems
+            editors={editors}
+            defaultEditorId={defaultEditorId}
+            onOpen={open}
+          />
         </DropdownMenuContent>
       </DropdownMenu>
     </div>
@@ -268,8 +173,9 @@ function SidebarToggleButton({
 
 // ── Fixed panel-control cluster ──
 //
-// Full-expand + the right-panel toggle, pinned to the window's top-right
-// corner just inside the native window buttons. This cluster does not move:
+// The resource monitor, Workspace details, full-expand and the right-panel
+// toggle, pinned to the window's top-right corner just inside the native
+// window buttons, on one evenly spaced rhythm. This cluster does not move:
 // panel open or closed, narrow or wide, it is in the same place. That is the
 // whole point of it existing separately from the action island — the island
 // stops at the panel's left edge (it belongs to the workspace column), and
@@ -277,7 +183,13 @@ function SidebarToggleButton({
 // button hundreds of pixels left and left a dead 40px strip above the
 // panel's own tab row. See `src/lib/titlebar-geometry.ts`.
 
-function RightPanelChromeCluster({ workspaceId }: { workspaceId: string }) {
+function RightPanelChromeCluster({
+  workspaceId,
+  remPx,
+}: {
+  workspaceId: string;
+  remPx: number;
+}) {
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
   const collapseRightPanel = useUIStore((s) => s.collapseRightPanel);
   const toggleMaximized = useUIStore((s) => s.toggleRightPanelMaximized);
@@ -300,10 +212,15 @@ function RightPanelChromeCluster({ workspaceId }: { workspaceId: string }) {
   return (
     <div
       data-testid="titlebar-panel-cluster"
-      className="pointer-events-auto absolute top-1 z-10 flex h-8 items-center gap-[2px]"
-      style={{ right: `${panelClusterRight(isRemoteClient())}px` }}
+      className="pointer-events-auto absolute top-1 z-10 flex h-8 items-center gap-1"
+      style={{ right: `${panelClusterRight(isRemoteClient(), remPx)}px` }}
       onPointerDown={(e) => e.stopPropagation()}
     >
+      {/* Leads the run so it keeps its place when the panel opens, rather
+          than riding the workspace band to the panel's edge. */}
+      <ResourceMonitor variant="ghost" />
+      {/* Full-expand leaves no workspace column for the card to sit in. */}
+      <WorkspaceDetailsToggle disabled={open && maximized} />
       {open && (
         <PaneActionButton
           label={maximized ? "Restore panel width" : "Expand panel"}
@@ -568,6 +485,9 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   const rightPanelOpen = guiChrome && activeWorkspacePanelOpen;
   const panelMaximized = rightPanelOpen && rightPanelMaximized;
   const remoteClient = isRemoteClient();
+  // The corner's controls are rem-sized; its geometry scales with them.
+  const remPx = useRootFontPx();
+  const resourceMonitorShown = useSyncedSettingsStore(selectShowResourceMonitor);
   // How much of the band the panel owns, measured from the window's right
   // edge. Everything the *workspace* puts in the band has to stop here.
   const panelBandWidth = panelMaximized
@@ -577,20 +497,20 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
     : rightPanelWidth;
   // The band's right inset, measured from the window's right edge.
   //
-  // Panel closed, the workspace branch has to stop before the fixed panel
-  // cluster: `topRightReserve` clears that cluster with 6px of breath, and
-  // the extra 8px turns it into the single 14px gap the mock puts between
-  // the action run and the corner cluster. That is the one deliberate
-  // break in the band — everything inside a run is on a 2px rhythm, and
-  // the 14px is what tells the eye the corner cluster is a separate,
-  // fixed thing rather than the tail of the workspace's own controls.
-  // (Panel open, the band tracks the panel's edge; that offset is left
-  // exactly as it was.) A draft has no panel cluster to clear, only the
-  // native window buttons.
+  // Panel closed, the workspace band stops one rhythm gap short of the
+  // fixed panel cluster (`topRightReserve`), so its last control — the
+  // resource monitor — continues the corner's evenly spaced run instead of
+  // floating apart from it (see `TITLEBAR_RHYTHM_GAP`). Panel open, the
+  // band tracks the panel's edge. A draft has no panel cluster to clear,
+  // only the native window buttons.
   const bandRightInset = rightPanelOpen
     ? panelBandWidth + 8
     : guiChrome
-      ? topRightReserve(remoteClient, false) + 8
+      ? topRightReserve(remoteClient, {
+          panelOpen: false,
+          monitor: resourceMonitorShown,
+          remPx,
+        })
       : remoteClient
         ? 6
         : 104;
@@ -741,39 +661,17 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
 
         <div
           data-testid="titlebar-action-island"
-          className="pointer-events-auto flex h-8 shrink-0 items-center gap-[2px]"
+          className={cn(
+            "pointer-events-auto flex h-8 shrink-0 items-center",
+            // GUI chrome: the same rhythm as the corner cluster it leads into.
+            guiChrome ? "gap-1" : "gap-[2px]",
+          )}
           onPointerDown={(e) => e.stopPropagation()}
         >
-          {guiChrome ? (
-            <>
-              <div
-                data-testid="titlebar-primary-actions"
-                className="flex items-center gap-[2px]"
-              >
-                {activeWorkspaceId && (
-                  <RunButton workspaceId={activeWorkspaceId} variant="split" />
-                )}
-                <IdeLauncher compact />
-              </div>
-              {/* The right-panel toggle used to sit here. It now lives in
-                  the fixed top-right cluster below, because this island
-                  tracks the panel's left edge and the toggle must not. */}
-              <div
-                data-testid="titlebar-utility-actions"
-                // Same 2px as the primary run and no leading margin: the
-                // mock has one uninterrupted action run, with the only
-                // real gap being the 14px before the fixed corner cluster.
-                className="flex items-center gap-[2px]"
-              >
-                {/* Ghost, not the bordered toolbar chip: the band is one
-                    frameless family, and this glyph sits mid-run between
-                    the equally frameless IDE launcher and panel toggle. */}
-                <ResourceMonitor variant="ghost" />
-              </div>
-            </>
-          ) : (
-            <ResourceMonitor />
-          )}
+          {/* GUI chrome: Run and "Open in editor" moved into the Workspace
+              details card, and the resource monitor into the fixed corner
+              cluster, so only plugin actions are left here. */}
+          {!guiChrome && <ResourceMonitor />}
           {/* Plugin actions, in both layouts. Nothing without a plugin. */}
           <Slot area={TITLEBAR_ACTIONS_AREA} />
           {remoteClient && <RemoteConnectionChip compact />}
@@ -785,7 +683,34 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           never depends on the panel. Workspace-only: a draft renders no
           right panel, so there is nothing for it to control. */}
       {guiChrome && activeWorkspaceId && !pageOpen && (
-        <RightPanelChromeCluster workspaceId={activeWorkspaceId} />
+        <RightPanelChromeCluster workspaceId={activeWorkspaceId} remPx={remPx} />
+      )}
+
+      {/* The Workspace details card, pinned to the workspace column's
+          top-right corner (or, when the column is too narrow for it and a
+          readable chat lane, a popover in that same corner). Hidden with
+          the workspace column: under a utility page or a fully expanded
+          panel there is nothing for it to sit beside. */}
+      {guiChrome && activeWorkspaceId && !pageOpen && !panelMaximized && (
+        <WorkspaceDetailsHost
+          workspaceId={activeWorkspaceId}
+          rightInset={rightPanelOpen ? panelBandWidth : 0}
+          // Its right edge continues the line of the controls above it:
+          // the window buttons' edge, the web client's cluster inset, or
+          // the band's own 8px stop before an open panel.
+          edgeGap={
+            ((rightPanelOpen ? 8 : remoteClient ? PANEL_CLUSTER_GAP : WINDOW_CONTROLS_INSET) *
+              remPx) /
+            16
+          }
+          remPx={remPx}
+          columnWidth={
+            (rightPanelRowWidth > 0
+              ? rightPanelRowWidth
+              : (typeof window === "undefined" ? 0 : window.innerWidth) - sidebarGapWidth) -
+            (rightPanelOpen ? panelBandWidth : 0)
+          }
+        />
       )}
 
       {/* Native window controls stay attached to the physical window edge,

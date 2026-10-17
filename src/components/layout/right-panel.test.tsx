@@ -251,8 +251,9 @@ describe("RightPanel titlebar band", () => {
     expect(header).not.toHaveClass("mt-10");
     expect(header).toHaveClass("h-10");
     expect(header).toHaveAttribute("data-in-titlebar", "true");
-    // Clears the fixed panel cluster (64 + 6) and the window buttons (104).
-    expect(header.style.paddingRight).toBe("174px");
+    // Clears the fixed cluster (monitor, details, expand, panel: 124 + 4)
+    // and the window buttons (100 + 2).
+    expect(header.style.paddingRight).toBe("230px");
   });
 
   // The titlebar is frameless: no cluster paints a surface of its own, and
@@ -300,7 +301,7 @@ describe("RightPanel titlebar band", () => {
     renderDeck();
     expect(
       screen.getByTestId("right-panel-tabs-header").style.paddingRight,
-    ).toBe("76px");
+    ).toBe("134px");
   });
 
   // With the GUI flag off the in-flow legacy `h-9` bar already occupies the

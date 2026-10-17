@@ -43,6 +43,7 @@ import {
   SplitSquareHorizontal,
   SplitSquareVertical,
   Square,
+  SquareMenu,
   Terminal,
   UserRound,
   X,
@@ -434,6 +435,7 @@ export const PALETTE_COMMANDS: PaletteCommand[] = [
   // View
   { id: "toggle-sidebar", label: "Toggle sidebar", icon: PanelLeft, actionId: "toggleSidebar" },
   { id: "toggle-right-panel", label: "Toggle right panel", icon: Columns2, actionId: "toggleRightPanel", requiresWorkspace: true },
+  { id: "toggle-workspace-details", label: "Toggle workspace details", icon: SquareMenu, keywords: "run editor commit branch changes agents", actionId: "toggleWorkspaceDetails", requiresWorkspace: true },
   {
     id: "toggle-preset-bar",
     label: "Toggle preset bar",

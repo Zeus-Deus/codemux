@@ -125,6 +125,19 @@ interface UIStore {
    * so the app can never boot into a maximized panel over a hidden chat.
    */
   rightPanelMaximized: boolean;
+  /** Whether the pinned Workspace details card (run, editor, git, agents)
+   *  is shown. On by default; persisted, so closing it sticks. */
+  workspaceDetailsOpen: boolean;
+  /** How the card fits right now: pinned beside the chat lane, or — when
+   *  the workspace column is too narrow for both — a popover. Published by
+   *  the title bar from its geometry. Transient. */
+  workspaceDetailsMode: "pinned" | "popover";
+  /** The popover form's open state. Transient: a narrow window never boots
+   *  with a card over the transcript. */
+  workspaceDetailsPopoverOpen: boolean;
+  /** The card's host is mounted, i.e. the card can be shown at all. The
+   *  toggle shortcut is a no-op otherwise. Transient. */
+  workspaceDetailsHosted: boolean;
   /** Where the file-search dialog should open its pick: a main-area editor
    *  tab (the historic behavior) or a right-panel doc pane. */
   fileSearchTarget: "editor" | "right-panel";
@@ -267,6 +280,12 @@ interface UIStore {
   setRightPanelRowWidth: (width: number) => void;
   /** Toggle full-expand. No-op while the panel is collapsed. */
   toggleRightPanelMaximized: (workspaceId: string) => void;
+  setWorkspaceDetailsOpen: (open: boolean) => void;
+  setWorkspaceDetailsMode: (mode: "pinned" | "popover") => void;
+  setWorkspaceDetailsPopoverOpen: (open: boolean) => void;
+  setWorkspaceDetailsHosted: (hosted: boolean) => void;
+  /** Show/hide the card in whichever form it currently takes. */
+  toggleWorkspaceDetails: () => void;
   setShowNewWorkspaceDialog: (
     show: boolean,
     projectDir?: string | null,
@@ -354,6 +373,10 @@ export const useUIStore = create<UIStore>()(
       rightPanelWidth: null,
       rightPanelRowWidth: 0,
       rightPanelMaximized: false,
+      workspaceDetailsOpen: true,
+      workspaceDetailsMode: "pinned",
+      workspaceDetailsPopoverOpen: false,
+      workspaceDetailsHosted: false,
       fileSearchTarget: "editor",
       showNewWorkspaceDialog: false,
       newWorkspaceProjectDir: null,
@@ -622,6 +645,24 @@ export const useUIStore = create<UIStore>()(
           return { rightPanelMaximized: !state.rightPanelMaximized };
         }),
 
+      setWorkspaceDetailsOpen: (open) => set({ workspaceDetailsOpen: open }),
+      setWorkspaceDetailsMode: (mode) =>
+        set((state) =>
+          state.workspaceDetailsMode === mode
+            ? state
+            : { workspaceDetailsMode: mode, workspaceDetailsPopoverOpen: false },
+        ),
+      setWorkspaceDetailsPopoverOpen: (open) =>
+        set({ workspaceDetailsPopoverOpen: open }),
+      setWorkspaceDetailsHosted: (hosted) =>
+        set({ workspaceDetailsHosted: hosted }),
+      toggleWorkspaceDetails: () =>
+        set((state) =>
+          state.workspaceDetailsMode === "pinned"
+            ? { workspaceDetailsOpen: !state.workspaceDetailsOpen }
+            : { workspaceDetailsPopoverOpen: !state.workspaceDetailsPopoverOpen },
+        ),
+
       setShowNewWorkspaceDialog: (show, projectDir = null) =>
         set({
           showNewWorkspaceDialog: show,
@@ -813,6 +854,7 @@ export const useUIStore = create<UIStore>()(
         lastModelSelections: state.lastModelSelections,
         hasSeenOnboarding: state.hasSeenOnboarding,
         dismissedSubagentAttention: state.dismissedSubagentAttention,
+        workspaceDetailsOpen: state.workspaceDetailsOpen,
       }),
       // v0 → v1: the right-panel tab id `"pr"` was renamed to `"review"`
       // when the panel itself was renamed (Phase 3). Rewrite any persisted
