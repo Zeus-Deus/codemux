@@ -11,8 +11,8 @@
 //!     Tauri channel → xterm.
 //!
 //! Input flow:
-//!     xterm onData → write_to_pty (sync) → `DaemonWriter::write` (fire
-//!     and forget tokio task) → client.write → socket → daemon → master fd.
+//!     xterm onData → write_to_pty (sync) → `DaemonWriter::write` (ordered
+//!     queue, one drain task) → client.write → socket → daemon → master fd.
 
 use super::{
     emit_terminal_status, hydration_workspace_pty_env, queue_or_send_output, with_session_runtime,
@@ -1058,46 +1058,70 @@ async fn spawn_prepared_session<R: Runtime>(
 
 /// Adapter from sync `std::io::Write` to async `PtyDaemonClient::write`.
 ///
-/// Writes are **fire-and-forget**: each `write` call clones the bytes,
-/// spawns a tokio task that sends them to the daemon, and returns the
-/// reported byte count immediately. Failures are logged but don't bubble
-/// up to the caller. This matches the existing in-process behavior, where
-/// `portable_pty::Writer::write` is also effectively non-blocking once
-/// the OS buffer has room.
+/// Writes are queued, not awaited: `write` hands the bytes to one drain task
+/// per writer, which sends them to the daemon strictly in order, each after
+/// the previous one is acknowledged. Callers hold the shared sessions lock
+/// (often on the main thread), so blocking on a daemon round trip here would
+/// stall every terminal. A failed send is therefore reported by the next
+/// `write` or `flush`, and a closed daemon connection fails immediately.
 pub(crate) struct DaemonWriter {
     client: Arc<PtyDaemonClient>,
-    session_id: String,
+    queue: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    failure: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl DaemonWriter {
     fn new(client: Arc<PtyDaemonClient>, session_id: String) -> Self {
-        Self { client, session_id }
+        let (queue, mut pending) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let failure = Arc::new(std::sync::Mutex::new(None));
+        let drain_client = client.clone();
+        let drain_failure = failure.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some(data) = pending.recv().await {
+                if let Err(error) = drain_client.write(session_id.clone(), &data).await {
+                    eprintln!(
+                        "[codemux::terminal::daemon_backed] DaemonWriter dispatch failed for \
+                         {session_id}: {error}"
+                    );
+                    *drain_failure.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(error.to_string());
+                }
+            }
+        });
+        Self {
+            client,
+            queue,
+            failure,
+        }
+    }
+
+    fn take_failure(&self) -> std::io::Result<()> {
+        if let Some(message) = self.failure.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            return Err(std::io::Error::other(message));
+        }
+        if self.client.is_closed() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pty daemon connection closed",
+            ));
+        }
+        Ok(())
     }
 }
 
 impl std::io::Write for DaemonWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let client = self.client.clone();
-        let session_id = self.session_id.clone();
-        let data = buf.to_vec();
-        // Only log on failure — the happy path fires for every
-        // keystroke, which would flood stderr.
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = client.write(session_id.clone(), &data).await {
-                eprintln!(
-                    "[codemux::terminal::daemon_backed] DaemonWriter dispatch failed for \
-                     {session_id}: {error}"
-                );
-            }
-        });
+        self.take_failure()?;
+        self.queue.send(buf.to_vec()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty daemon writer stopped")
+        })?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        // No-op: writes are already dispatched, and the daemon flushes the
-        // master fd after every write. A blocking flush here would require
-        // round-tripping the daemon, which is wrong for the sync interface.
-        Ok(())
+        // Does not wait for the queue: the daemon flushes the master fd after
+        // every write. It only surfaces a failure the drain task has seen.
+        self.take_failure()
     }
 }
 
@@ -1113,6 +1137,82 @@ mod tests {
     use crate::pty_daemon::{DaemonSessionInfo, PtyDaemonClient, PtyDaemonError};
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// Read one `Write` request off the fake daemon socket.
+    async fn read_test_write(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> (u64, Vec<u8>) {
+        use base64::Engine;
+
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let ClientRequest::Write { request_id, data_b64, .. } = serde_json::from_str(&line).unwrap() else {
+            panic!("expected Write");
+        };
+        (request_id, base64::engine::general_purpose::STANDARD.decode(data_b64).unwrap())
+    }
+
+    async fn send_test_response(write: &mut tokio::net::unix::OwnedWriteHalf, response: ServerResponse) {
+        let mut bytes = serde_json::to_vec(&Frame::Response(response)).unwrap();
+        bytes.push(b'\n');
+        write.write_all(&bytes).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_writer_reports_write_rejection() {
+        use std::io::Write;
+
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let client = PtyDaemonClient::from_test_stream(client_stream, Duration::from_secs(1));
+        let (server_read, mut server_write) = server_stream.into_split();
+        let mut reader = BufReader::new(server_read);
+        let mut writer = super::DaemonWriter::new(client, "missing".into());
+        writer.write_all(b"input").unwrap();
+        let (request_id, _) = read_test_write(&mut reader).await;
+        send_test_response(
+            &mut server_write,
+            ServerResponse::Error { request_id, message: "unknown session".into() },
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let error = loop {
+            match writer.flush() {
+                Err(error) => break error,
+                Ok(()) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Ok(()) => panic!("daemon rejection was never reported to the writer"),
+            }
+        };
+        assert!(error.to_string().contains("unknown session"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_writer_sends_each_write_after_the_previous_is_acknowledged() {
+        use std::io::Write;
+
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let client = PtyDaemonClient::from_test_stream(client_stream, Duration::from_secs(1));
+        let (server_read, mut server_write) = server_stream.into_split();
+        let mut reader = BufReader::new(server_read);
+        let mut writer = super::DaemonWriter::new(client, "session".into());
+        writer.write_all(b"command").unwrap();
+        writer.write_all(b"\r").unwrap();
+        writer.flush().unwrap();
+
+        let (first_id, first) = read_test_write(&mut reader).await;
+        assert_eq!(first, b"command");
+        let mut line = String::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut line)).await.is_err(),
+            "the second write was sent before the first was acknowledged"
+        );
+        send_test_response(&mut server_write, ServerResponse::Written { request_id: first_id }).await;
+        let (second_id, second) = read_test_write(&mut reader).await;
+        assert_eq!(second, b"\r");
+        send_test_response(&mut server_write, ServerResponse::Written { request_id: second_id }).await;
+    }
 
     #[test]
     fn only_confirmed_spawn_rejections_allow_local_fallback() {
