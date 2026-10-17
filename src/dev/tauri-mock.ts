@@ -5781,7 +5781,11 @@ const handlers: Record<string, Handler> = {
   },
 
   // ── Editors / tooling ──
-  detect_editors: () => [],
+  detect_editors: () => [
+    { id: "cursor", name: "Cursor", command: "cursor" },
+    { id: "code", name: "VS Code", command: "code" },
+  ],
+  open_in_editor: () => undefined,
   // No mock project configures a run command, so answer the way the backend
   // does then (Ctrl+Shift+G shows the failure toast).
   run_project_dev_command: () => {

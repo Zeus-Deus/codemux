@@ -52,7 +52,7 @@ export const RIGHT_PANEL_WIDTH_UI_KEY = "right_panel_width_v2";
  * It used to be 240, back when the panel's tab row had the panel's full
  * width to itself. That row is now the window's titlebar band, so its right
  * end is spoken for by the fixed panel cluster and the native window buttons
- * drawn above it — `topRightReserve()` in `@/lib/titlebar-geometry`, 174px on
+ * drawn above it — `topRightReserve()` in `@/lib/titlebar-geometry`, 198px on
  * desktop. At 240 that left about 60px for the tabs *and* the active pane's
  * actions. 360 leaves room for about one tab, with the rest scrolled.
  *
