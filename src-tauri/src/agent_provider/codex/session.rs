@@ -2566,6 +2566,7 @@ fn spawn_incoming_requests_task(
                         continue;
                     }
                     let request_id = mint_request_id();
+                    let event = translate_server_request(&session.thread_id, &request_id, &msg);
                     let turn_ended = {
                         let payload = msg.payload();
                         let field = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_owned);
@@ -2582,10 +2583,12 @@ fn spawn_incoming_requests_task(
                         if !turn_ended {
                             state.pending_approvals.insert(request_id.clone(), pending);
                         }
+                        // Publish while still holding the lock: a settlement
+                        // on another worker must not broadcast this
+                        // request's resolution ahead of its opening.
+                        let _ = event_tx.send(event);
                         turn_ended
                     };
-                    let event = translate_server_request(&session.thread_id, &request_id, &msg);
-                    let _ = event_tx.send(event);
                     if turn_ended {
                         let _ = event_tx.send(ProviderRuntimeEvent::RequestResolved {
                             thread_id: session.thread_id.clone(),
@@ -2797,14 +2800,25 @@ fn spawn_child_exit_watchdog(
                             // Recover the in-flight turn id before clearing it so
                             // the watchdog can settle it with a synthetic terminal
                             // `TurnCompleted` ahead of the Error state.
-                            let active_turn = {
+                            let (active_turn, orphaned) = {
                                 let mut state = session.state.lock().await;
                                 let active_turn = state.active_turn.take();
                                 state.status = SessionStatus::Error {
                                     message: msg.clone(),
                                 };
-                                active_turn
+                                // A sub-agent can still be waiting on an
+                                // approval after the parent turn ended, so
+                                // expire every callback, not just the turn's.
+                                let orphaned: Vec<RequestId> =
+                                    state.pending_approvals.drain().map(|(id, _)| id).collect();
+                                (active_turn, orphaned)
                             };
+                            for request_id in orphaned {
+                                let _ = event_tx.send(crate::agent_provider::expired_request_event(
+                                    session.thread_id.clone(),
+                                    request_id,
+                                ));
+                            }
                             // TurnCompleted(child_exited) first, then the Error
                             // state — see `child_exit_events` for the ordering
                             // contract.

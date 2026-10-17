@@ -6962,12 +6962,7 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
                     for (thread_id, request_id) in open_requests.observe(&event) {
                         forward_event(
                             &app,
-                            ProviderRuntimeEvent::RequestResponseFailed {
-                                thread_id,
-                                request_id,
-                                reason: RequestResponseFailureReason::StaleProviderCallback,
-                                message: ENDED_SESSION_REQUEST_MESSAGE.to_string(),
-                            },
+                            crate::agent_provider::expired_request_event(thread_id, request_id),
                         );
                     }
                 }
@@ -6979,9 +6974,6 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
         });
     }
 }
-
-const ENDED_SESSION_REQUEST_MESSAGE: &str =
-    "This request expired when the provider session ended. Continue to have the agent repeat it.";
 
 /// Requests each thread still has open on one provider's event stream.
 ///

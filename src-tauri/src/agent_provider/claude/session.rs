@@ -1928,14 +1928,24 @@ fn spawn_child_exit_watchdog(
                             // both Running and WaitingApproval) BEFORE clearing
                             // it, so the watchdog can settle it with a synthetic
                             // terminal `TurnCompleted`.
-                            let active_turn = {
+                            let (active_turn, orphaned) = {
                                 let mut state = session.state.lock().await;
                                 let active_turn = state.active_turn.take();
                                 state.status = SessionStatus::Error {
                                     message: msg.clone(),
                                 };
-                                active_turn
+                                // Background subagents can hold approvals
+                                // after the parent turn ended; expire them all.
+                                let orphaned: Vec<RequestId> =
+                                    state.pending_approvals.drain().map(|(id, _)| id).collect();
+                                (active_turn, orphaned)
                             };
+                            for request_id in orphaned {
+                                let _ = event_tx.send(crate::agent_provider::expired_request_event(
+                                    session.thread_id.clone(),
+                                    request_id,
+                                ));
+                            }
                             // TurnCompleted(child_exited) first, then the Error
                             // state — see `child_exit_events` for why the order
                             // matters.
