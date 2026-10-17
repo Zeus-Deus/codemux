@@ -23,7 +23,7 @@ use crate::pty_daemon::protocol::{
 };
 use base64::Engine;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,6 +110,21 @@ const FLOW_PARK_POLL: Duration = Duration::from_millis(10);
 enum SessionFrame {
     Output(Vec<u8>),
     Exited(i32),
+}
+
+struct Attachment {
+    replay: VecDeque<SessionFrame>,
+    receiver: broadcast::Receiver<SessionFrame>,
+}
+
+impl Attachment {
+    fn try_recv(&mut self) -> Result<SessionFrame, broadcast::error::TryRecvError> {
+        if let Some(frame) = self.replay.pop_front() {
+            Ok(frame)
+        } else {
+            self.receiver.try_recv()
+        }
+    }
 }
 
 struct DaemonSession {
@@ -303,7 +318,7 @@ async fn handle_connection(
     // Each client connection holds receivers for whatever sessions it's
     // attached to. When the receiver yields a frame, we forward to the
     // socket. Detach removes the entry.
-    let mut attached: HashMap<String, broadcast::Receiver<SessionFrame>> = HashMap::new();
+    let mut attached: HashMap<String, Attachment> = HashMap::new();
 
     // Persistent accumulation buffer for the request line currently being
     // read. It MUST survive across loop iterations: the read below times out
@@ -445,7 +460,7 @@ async fn write_frame(
 async fn handle_request(
     req: ClientRequest,
     state: SharedState,
-    attached: &mut HashMap<String, broadcast::Receiver<SessionFrame>>,
+    attached: &mut HashMap<String, Attachment>,
 ) -> ServerResponse {
     match req {
         ClientRequest::Hello { request_id } => ServerResponse::Hello {
@@ -498,21 +513,25 @@ async fn handle_request(
             // stuck pause self-heals on the next attach (e.g. app restart,
             // reopening the pane).
             session.flow_paused.store(false, Ordering::Relaxed);
-            // Subscribe to live output (after replay so we don't drop
-            // anything in the gap).
-            let rx = session.frame_tx.subscribe();
-            attached.insert(session_id.clone(), rx);
-            // Flush replay buffer first so the freshly-attached xterm
-            // has something to render.
-            let replay = { session.replay.lock().await.clone() };
+            // Capturing replay and subscribing must be atomic with the
+            // reader's append+broadcast and the waiter's exit+broadcast.
+            // Otherwise output can arrive both in replay and the live queue.
+            let replay = session.replay.lock().await;
+            let exit_code = session.exit_code.lock().await;
+            let receiver = session.frame_tx.subscribe();
+            let mut initial = VecDeque::new();
             if !replay.is_empty() {
-                let _ = session.frame_tx.send(SessionFrame::Output(replay));
+                initial.push_back(SessionFrame::Output(replay.clone()));
             }
-            // Late-attachers to an exited session: emit Exited
-            // immediately so they don't sit waiting on a dead channel.
-            if let Some(code) = *session.exit_code.lock().await {
-                let _ = session.frame_tx.send(SessionFrame::Exited(code));
+            if let Some(code) = *exit_code {
+                initial.push_back(SessionFrame::Exited(code));
             }
+            // Replay belongs only to this attachment. Broadcasting it would
+            // duplicate scrollback (or exit events) in every existing client.
+            attached.insert(
+                session_id.clone(),
+                Attachment { replay: initial, receiver },
+            );
             ServerResponse::Attached {
                 request_id,
                 session_id,
@@ -876,8 +895,8 @@ async fn spawn_pty(
                             let excess = rb.len() - REPLAY_BUFFER_BYTES;
                             rb.drain(0..excess);
                         }
+                        let _ = read_tx.send(SessionFrame::Output(chunk));
                     }
-                    let _ = read_tx.send(SessionFrame::Output(chunk));
                 }
                 Err(error) => {
                     eprintln!(
@@ -917,12 +936,13 @@ async fn spawn_pty(
                 -1
             }
         };
-        // Record the exit code so late-attachers see it.
+        // Publish while holding the same lock attach uses to decide whether
+        // this exit belongs in replay or will arrive through the live queue.
         rt_handle.block_on(async {
-            *wait_exit_code.lock().await = Some(code);
+            let mut exit_code = wait_exit_code.lock().await;
+            *exit_code = Some(code);
+            let _ = wait_tx.send(SessionFrame::Exited(code));
         });
-        // Emit Exited to any currently-attached client.
-        let _ = wait_tx.send(SessionFrame::Exited(code));
         // Evict from the daemon's session map so subsequent
         // Write/Resize/Attach for this id error with "unknown session".
         rt_handle.block_on(async {
@@ -960,6 +980,89 @@ fn kill_session_pid(_pid: u32) {
 mod tests {
     use super::pid_file_for;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn attaching_a_client_replays_only_to_that_client() {
+        use super::*;
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let (frame_tx, _) = broadcast::channel(OUTPUT_CHANNEL_CAPACITY);
+        let session = Arc::new(DaemonSession {
+            session_id: "test-session".into(),
+            workspace_id: "test-workspace".into(),
+            pid: 0,
+            argv: vec![],
+            cwd: String::new(),
+            rows: 24,
+            cols: 80,
+            created_at: 0,
+            master: Arc::new(Mutex::new(pair.master)),
+            writer: Arc::new(Mutex::new(writer)),
+            frame_tx,
+            replay: Arc::new(Mutex::new(b"history".to_vec())),
+            exit_code: Arc::new(Mutex::new(None)),
+            flow_paused: Arc::new(AtomicBool::new(false)),
+        });
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        state.lock().await.sessions.insert("test-session".into(), session.clone());
+        let mut first = HashMap::new();
+        let mut second = HashMap::new();
+
+        for (request_id, attached) in [(1, &mut first), (2, &mut second)] {
+            let response = handle_request(
+                ClientRequest::Attach {
+                    request_id,
+                    session_id: "test-session".into(),
+                },
+                state.clone(),
+                attached,
+            )
+            .await;
+            assert!(matches!(response, ServerResponse::Attached { .. }));
+            assert!(matches!(
+                attached.get_mut("test-session").unwrap().try_recv().unwrap(),
+                SessionFrame::Output(data) if data == b"history",
+            ));
+        }
+
+        assert!(matches!(
+            first.get_mut("test-session").unwrap().try_recv(),
+            Err(broadcast::error::TryRecvError::Empty),
+        ), "another client's attach must not duplicate the first client's scrollback");
+
+        session.frame_tx.send(SessionFrame::Output(b"live".to_vec())).unwrap();
+        for attached in [&mut first, &mut second] {
+            assert!(matches!(
+                attached.get_mut("test-session").unwrap().try_recv().unwrap(),
+                SessionFrame::Output(data) if data == b"live",
+            ));
+        }
+
+        *session.exit_code.lock().await = Some(17);
+        let mut late = HashMap::new();
+        handle_request(
+            ClientRequest::Attach { request_id: 3, session_id: "test-session".into() },
+            state,
+            &mut late,
+        ).await;
+        let late = late.get_mut("test-session").unwrap();
+        assert!(matches!(late.try_recv().unwrap(), SessionFrame::Output(data) if data == b"history"));
+        assert!(matches!(late.try_recv().unwrap(), SessionFrame::Exited(17)));
+        for attached in [&mut first, &mut second] {
+            assert!(matches!(
+                attached.get_mut("test-session").unwrap().try_recv(),
+                Err(broadcast::error::TryRecvError::Empty),
+            ));
+        }
+    }
 
     #[test]
     fn pid_file_is_socket_path_plus_pid_suffix() {

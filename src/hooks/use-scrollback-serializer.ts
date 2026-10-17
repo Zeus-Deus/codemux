@@ -38,7 +38,9 @@ export function registerTerminalForSerialize(
 ): () => void {
   serializeRegistry.set(sessionId, callback);
   return () => {
-    serializeRegistry.delete(sessionId);
+    if (serializeRegistry.get(sessionId) === callback) {
+      serializeRegistry.delete(sessionId);
+    }
   };
 }
 
@@ -56,8 +58,10 @@ export function useScrollbackSerializer() {
     if (isRemoteClient()) return;
 
     let unlisten: (() => void) | null = null;
+    let cancelled = false;
 
     onSerializeTerminalBuffers(async () => {
+      if (cancelled) return;
       // Step 1: serialize all currently mounted (live) panes
       const promises: Promise<void | unknown>[] = [];
 
@@ -83,11 +87,17 @@ export function useScrollbackSerializer() {
 
       // Step 3: signal the backend that serialization is done
       await emitScrollbackSerializationComplete();
-    }).then((fn) => {
-      unlisten = fn;
-    });
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => {
+        console.error("[scrollback] Failed to register close listener:", err);
+      });
 
     return () => {
+      cancelled = true;
       unlisten?.();
     };
   }, []);

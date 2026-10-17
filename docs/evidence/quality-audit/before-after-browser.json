@@ -1,0 +1,23 @@
+{
+  "date": "2026-10-17",
+  "runtime": "development Tauri mock, seeded agent-chat workspace, 1280x800 Chromium viewport",
+  "baseline_commit": "464e3840408365112a06728469e10ab7870f4345",
+  "steps": [
+    "Open default seeded Agent Chat",
+    "Attach > GitHub Issue\u2026",
+    "Enter 146 in Search issues...",
+    "Wait for search to settle and capture"
+  ],
+  "before": {
+    "screenshot": "before-issue-search.png",
+    "result": "No issues found; unrelated seeded mock delegation-list error banner also present"
+  },
+  "after": {
+    "screenshot": "after-issue-search.png",
+    "result": "Issue146 appears; seeded delegation-list error absent"
+  },
+  "interpretation": "Demonstrates corrected development mock coverage. Production async race fixes are proven by focused regression tests, not this static screenshot.",
+  "automation": "Native collaborative browser; exact selectors corrected after initial locator failures",
+  "environment_note": "The temporary baseline checkout initially shared the dependency optimization cache. Stopped that server and forced dependency optimization in the current checkout before capturing after; the final page loaded and issue search was inspected successfully.",
+  "owned_servers_and_preview": "stopped/closed after capture"
+}

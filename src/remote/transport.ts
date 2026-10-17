@@ -264,6 +264,8 @@ export class RemoteTransport {
 
   private firstConnectResolve: (() => void) | null = null;
   private firstConnectReject: ((reason: unknown) => void) | null = null;
+  private connectPromise: Promise<void> | null = null;
+  private generation = 0;
 
   constructor(opts: TransportOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
@@ -277,21 +279,30 @@ export class RemoteTransport {
 
   /**
    * Open the socket. Resolves once the first connection is live; rejects
-   * only if the session is unauthorized on that first attempt. Transient
-   * failures keep retrying (the caller shows a connecting/waiting state).
+   * if the session is unauthorized or the transport is explicitly closed.
+   * Transient failures keep retrying (the caller shows a connecting/waiting state).
    */
   connect(): Promise<void> {
+    if (this.connectPromise) return this.connectPromise;
     this.closed = false;
-    return new Promise<void>((resolve, reject) => {
+    this.connectPromise = new Promise<void>((resolve, reject) => {
       this.firstConnectResolve = resolve;
       this.firstConnectReject = reject;
-      void this.attemptConnect();
     });
+    void this.attemptConnect();
+    return this.connectPromise;
   }
 
   /** Tear down intentionally (no reconnect). */
   close(): void {
     this.closed = true;
+    this.generation += 1;
+    const error = new Error("web-remote: connection closed");
+    this.firstConnectReject?.(error);
+    this.firstConnectReject = this.firstConnectResolve = null;
+    this.connectPromise = null;
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -353,6 +364,7 @@ export class RemoteTransport {
 
   private async attemptConnect(): Promise<void> {
     if (this.closed) return;
+    const generation = this.generation;
     let ticket: string;
     try {
       ticket = await this.fetchTicket();
@@ -360,18 +372,19 @@ export class RemoteTransport {
       // Closed while the ticket was in flight: a late 401 belongs to a torn
       // down attempt (e.g. a withdrawn pairing), not to whatever session the
       // caller holds now, so it must not trigger the unauthorized hook.
-      if (this.closed) return;
+      if (this.closed || generation !== this.generation) return;
       if (err instanceof UnauthorizedError) {
         this.closed = true;
-        this.hooks.onUnauthorized();
         this.firstConnectReject?.(err);
         this.firstConnectReject = this.firstConnectResolve = null;
+        this.connectPromise = null;
+        this.hooks.onUnauthorized();
         return;
       }
       this.scheduleReconnect();
       return;
     }
-    if (this.closed) return;
+    if (this.closed || generation !== this.generation) return;
 
     let ws: WebSocketLike;
     try {

@@ -125,7 +125,6 @@ export function PrPickerPanel({
   const [directHit, setDirectHit] = useState<PullRequestInfo | null>(null);
   const [directSearching, setDirectSearching] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   useEffect(() => {
     if (!open || !projectPath) return;
@@ -157,11 +156,14 @@ export function PrPickerPanel({
         setLoading(false);
       });
 
-    requestAnimationFrame(() => {
+    const focusFrame = requestAnimationFrame(() => {
       inputRef.current?.focus();
     });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(focusFrame);
+    };
   }, [open, projectPath]);
 
   const filteredPrs = useMemo(() => {
@@ -186,33 +188,31 @@ export function PrPickerPanel({
     setFocusIndex(0);
   }, [displayPrs.length]);
 
-  const triggerDirectFetch = useCallback(
-    (query: string) => {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-      const stripped = query.replace(/^[#!]/, "").trim();
-      if (!/^\d+$/.test(stripped)) {
-        setDirectHit(null);
-        setDirectSearching(false);
-        return;
-      }
-      const num = Number.parseInt(stripped, 10);
-      debounceRef.current = setTimeout(() => {
-        setDirectSearching(true);
-        getGithubPrByPath(projectPath, num)
-          .then((pr) => {
-            setDirectHit(pr);
-            setDirectSearching(false);
-          })
-          .catch(() => setDirectSearching(false));
-      }, 300);
-    },
-    [projectPath],
-  );
+  useEffect(() => {
+    setDirectHit(null);
+    setDirectSearching(false);
+    const stripped = search.replace(/^[#!]/, "").trim();
+    if (!open || !projectPath || !/^\d+$/.test(stripped)) return;
 
-  const handleSearchChange = (value: string) => {
-    setSearch(value);
-    triggerDirectFetch(value);
-  };
+    // A late lookup must never put a different PR back under a newer query.
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      setDirectSearching(true);
+      getGithubPrByPath(projectPath, Number.parseInt(stripped, 10))
+        .then((pr) => {
+          if (!cancelled) setDirectHit(pr);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled) setDirectSearching(false);
+        });
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [open, projectPath, search]);
 
   const handleSelectPr = useCallback(
     (pr: PullRequestInfo) => {
@@ -257,7 +257,7 @@ export function PrPickerPanel({
           <input
             ref={inputRef}
             value={search}
-            onChange={(e) => handleSearchChange(e.target.value)}
+            onChange={(e) => setSearch(e.target.value)}
             placeholder={`Search ${provider.shortNoun}s… (or type a number)`}
             className="flex-1 bg-transparent text-label text-foreground placeholder:text-muted-foreground/50 outline-none min-w-0"
           />

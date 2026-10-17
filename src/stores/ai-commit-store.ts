@@ -26,29 +26,31 @@ export const useAiCommitStore = create<AiCommitStore>()((set, get) => ({
   getGeneration: (workspaceId) => get().generations[workspaceId],
 
   requestGeneration: (workspaceId, cwd, cli, model) => {
+    // The entry owns this request; clearing or replacing it invalidates late replies.
+    const request: GenerationEntry = { status: "generating" };
     set((s) => ({
       generations: {
         ...s.generations,
-        [workspaceId]: { status: "generating" },
+        [workspaceId]: request,
       },
     }));
 
     generateAiCommitMessage(cwd, cli, model)
       .then((message) => {
-        set((s) => ({
-          generations: {
-            ...s.generations,
-            [workspaceId]: { status: "done", message },
-          },
-        }));
+        set((s) => {
+          if (s.generations[workspaceId] !== request) return s;
+          return {
+            generations: { ...s.generations, [workspaceId]: { status: "done", message } },
+          };
+        });
       })
       .catch((err) => {
-        set((s) => ({
-          generations: {
-            ...s.generations,
-            [workspaceId]: { status: "error", error: String(err) },
-          },
-        }));
+        set((s) => {
+          if (s.generations[workspaceId] !== request) return s;
+          return {
+            generations: { ...s.generations, [workspaceId]: { status: "error", error: String(err) } },
+          };
+        });
       });
   },
 

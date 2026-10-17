@@ -8,6 +8,7 @@ import {
   type RenderResult,
 } from "@testing-library/react";
 import { useState, type ComponentProps } from "react";
+import userEvent from "@testing-library/user-event";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { FolderMatch, FileMatch } from "@/tauri/types";
@@ -530,6 +531,15 @@ describe("Composer command menu — search + structure (redesign)", () => {
 });
 
 describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
+  it.each(["issue", "pr"] as const)("keeps the %s picker open after a real pointer click", async (kind) => {
+    const user = userEvent.setup();
+    const { getByTestId } = renderControlled({ repoSupported: true, providerCliInstalled: true, providerAuthenticated: true });
+    await user.click(getByTestId("composer-attach-button"));
+    await waitFor(() => expect(getByTestId("composer-command-search")).toHaveFocus());
+    await user.click(getByTestId(`slash-item-attach:${kind}`));
+    expect(getByTestId(`composer-${kind}-picker`)).toBeInTheDocument();
+  });
+
   it("disables the GitHub Issue row when repoSupported is false", () => {
     const { getByTestId } = renderControlled({ repoSupported: false });
     fireEvent.click(getByTestId("composer-attach-button"));

@@ -1,0 +1,55 @@
+{
+  "date": "2026-10-17",
+  "reviewer": "Claude Opus 5.5",
+  "effort": "high",
+  "baseline_commit": "464e3840408365112a06728469e10ab7870f4345",
+  "rounds": [
+    {
+      "round": 1,
+      "status": "completed",
+      "findings": [
+        {
+          "priority": "medium",
+          "finding": "Concurrent cold or expired project-file lookups duplicated directory scans after the initial executor offload.",
+          "response": "Reproduced with counted real walks; added per-folder OnceLock cache generations and expiry/isolation coverage."
+        },
+        {
+          "priority": "low",
+          "finding": "Strict HTTP body length checks could reject valid HEAD or304 responses with representation metadata.",
+          "response": "Reproduced; reader/parser now use request method and bodyless status semantics; strict ordinary-body validation retained."
+        }
+      ],
+      "independently_observed": {
+        "frontend_tests_passed": 129,
+        "rust_tests_passed": 107,
+        "rust_tests_ignored": 1,
+        "ring_buffer_speedup_reproduced": true,
+        "varied_append_equivalence_cases": 50000
+      },
+      "limits": [
+        "The full audit validation counts are recorded separately; independent review checks overlap them.",
+        "Live SSH, relay, other operating systems and release packaging were not exercised."
+      ]
+    },
+    {
+      "round": 2,
+      "status": "completed",
+      "verdict": "No in-scope blockers; the duplicate scan finding is fixed and the bodyless HTTP follow-up introduces no new regression.",
+      "inspected": [
+        "Per-folder cache generation selection, expiry, pruning, panic recovery, cross-folder independence and tests",
+        "HEAD/204/304 bodyless response handling and strict ordinary HTTP framing"
+      ],
+      "independently_exercised": "Standalone OnceLock panic/retry model confirmed another waiting caller can initialize after a panic without poisoning the global lock.",
+      "limits": [
+        "Final native Cargo integration coverage remained with the parent run, not the reviewer.",
+        "Optional test-name/evidence editorial nits were not correctness blockers."
+      ]
+    }
+  ],
+  "accepted_behavior": [
+    "Skipping app-state initialization also stops its event subscriptions; resuming fetches a fresh snapshot.",
+    "Closing a remote PTY now explicitly terminates and reaps its owned child outside the manager mutex.",
+    "connect() shares the first connection promise; current call sites connect once per transport."
+  ],
+  "scope_preserved": "Unused merge-store removal retains backend commands and public frontend wrappers."
+}
