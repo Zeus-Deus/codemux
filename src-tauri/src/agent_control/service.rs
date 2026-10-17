@@ -103,6 +103,37 @@ pub(crate) async fn launch<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
     }
     if let Some(title) = input.title.as_deref() { identifier(title, "title", 100)?; }
     if input.worktree.is_some() { return Err(ControlError::new("unsupported_operation", "Worktree launch is not available yet")); }
+    validate_worker(app, caller, &input).await?;
+    authorize(app, caller)?;
+    let epoch = app.state::<NativeControlState>().epoch.clone();
+    let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&args).map_err(|e|ControlError::new("invalid_arguments",e.to_string()))?));
+    let thread = uuid::Uuid::new_v4().to_string();
+    let admitted = app.state::<DatabaseStore>().admit_control_operation(
+        &caller.principal, &input.client_request_id, "thread_launch", &fingerprint, &epoch,
+        Some(&workspace.workspace_id.0), Some(&thread),
+    ).map_err(|e| ControlError::new(if e.starts_with("request_key_conflict") { "request_key_conflict" } else { "operation_admission_failed" }, e))?;
+    let receipt = serde_json::to_value(&admitted.receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
+    if !admitted.newly_admitted { return Ok(receipt); }
+    let app = app.clone();
+    let caller = caller.clone();
+    let operation = admitted.receipt.operation_id;
+    tauri::async_runtime::spawn(async move {
+        let db = app.state::<DatabaseStore>();
+        if db.update_control_operation(&caller.principal, &operation, &epoch, "running", None, None, None, None).is_err() { return; }
+        let outcome = materialize(&app, &caller, input, &thread).await;
+        let (state, result, error) = match outcome {
+            Ok(result) => ("succeeded", Some(result), None),
+            Err(error) => ("failed", None, serde_json::to_value(error).ok()),
+        };
+        if let Err(error) = db.update_control_operation(&caller.principal, &operation, &epoch, state, None, None, result.as_ref(), error.as_ref()) {
+            eprintln!("[codemux::agent_control] could not save operation outcome: {error}");
+        }
+    });
+    Ok(receipt)
+}
+
+async fn validate_worker<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, input: &Launch) -> Result<(), ControlError> {
+    permission_ceiling(caller, input.provider, input.permission_mode.as_deref())?;
     agent_chat::feature_flag_on(&app.state::<crate::observability::ObservabilityStore>())?;
     if app.state::<ProviderRegistry>().get(input.provider).await.is_none() {
         return Err(ControlError::new("provider_not_configured", "The selected provider is not configured in CodeMux"));
@@ -130,32 +161,35 @@ pub(crate) async fn launch<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
     if input.fast_mode && !model.is_some_and(|model| model.supports_fast_mode) {
         return Err(ControlError::new("unsupported_fast_mode", "The selected model does not advertise fast mode"));
     }
-    authorize(app, caller)?;
-    let epoch = app.state::<NativeControlState>().epoch.clone();
-    let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&args).map_err(|e|ControlError::new("invalid_arguments",e.to_string()))?));
-    let thread = uuid::Uuid::new_v4().to_string();
-    let admitted = app.state::<DatabaseStore>().admit_control_operation(
-        &caller.principal, &input.client_request_id, "thread_launch", &fingerprint, &epoch,
-        Some(&workspace.workspace_id.0), Some(&thread),
-    ).map_err(|e| ControlError::new(if e.starts_with("request_key_conflict") { "request_key_conflict" } else { "operation_admission_failed" }, e))?;
-    let receipt = serde_json::to_value(&admitted.receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
-    if !admitted.newly_admitted { return Ok(receipt); }
-    let app = app.clone();
-    let caller = caller.clone();
-    let operation = admitted.receipt.operation_id;
-    tauri::async_runtime::spawn(async move {
-        let db = app.state::<DatabaseStore>();
-        if db.update_control_operation(&caller.principal, &operation, &epoch, "running", None, None, None, None).is_err() { return; }
-        let outcome = materialize(&app, &caller, input, &thread).await;
-        let (state, result, error) = match outcome {
-            Ok(result) => ("succeeded", Some(result), None),
-            Err(error) => ("failed", None, serde_json::to_value(error).ok()),
+    Ok(())
+}
+
+/// An in-app launch validates the same worker options before creating a
+/// worktree, then uses the native owner to publish and start its chat.
+pub(crate) struct PreparedWorkspaceChat(Launch);
+
+impl PreparedWorkspaceChat {
+    pub(crate) async fn prepare<R: Runtime>(
+        app: &AppHandle<R>, caller: &ControlCaller, provider: ProviderKind,
+        title: String, message: String, model: Option<String>, effort: Option<String>,
+    ) -> Result<Self, ControlError> {
+        let input = Launch {
+            workspace_id: String::new(), client_request_id: uuid::Uuid::new_v4().to_string(),
+            provider, permission_mode: crate::commands::agent_chat::fallback_permission_mode(provider).map(str::to_string),
+            title: Some(title), message: Some(message), model, effort,
+            context_window: None, fast_mode: false, select: false, worktree: None,
         };
-        if let Err(error) = db.update_control_operation(&caller.principal, &operation, &epoch, state, None, None, result.as_ref(), error.as_ref()) {
-            eprintln!("[codemux::agent_control] could not save operation outcome: {error}");
-        }
-    });
-    Ok(receipt)
+        validate_worker(app, caller, &input).await?;
+        authorize(app, caller)?;
+        Ok(Self(input))
+    }
+
+    pub(crate) async fn materialize<R: Runtime>(
+        mut self, app: &AppHandle<R>, caller: &ControlCaller, workspace_id: String,
+    ) -> Result<Value, ControlError> {
+        self.0.workspace_id = workspace_id;
+        materialize(app, caller, self.0, &uuid::Uuid::new_v4().to_string()).await
+    }
 }
 
 async fn materialize<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, input: Launch, thread: &str) -> Result<Value, ControlError> {

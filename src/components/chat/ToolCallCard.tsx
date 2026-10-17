@@ -1,3 +1,4 @@
+import { isWorkspaceLaunchCall } from "@/lib/agent-chat/workspace-launch";
 import { Kbd } from "@/components/ui/kbd";
 import { HermesPermissionOptions, isHermesPermission, hermesPermissionAllowed } from "./HermesPermissionOptions";
 import { memo, useEffect, useId, useMemo, useRef, useState, type ComponentType } from "react";
@@ -124,7 +125,8 @@ export const ToolCallCard = memo(function ToolCallCard({
     }
   }, [hasImages]);
 
-  const Icon = toolIcon(item.tool_name);
+  const visualName = isWorkspaceLaunchCall(item) ? "workspace_launch" : item.tool_name;
+  const Icon = toolIcon(visualName);
   const glyph = glyphForState({
     isPendingApproval,
     isResponding,
@@ -159,7 +161,7 @@ export const ToolCallCard = memo(function ToolCallCard({
       <span
         className={cn(
           "flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-md",
-          categoryTint(toolCategory(item.tool_name)),
+          categoryTint(toolCategory(visualName)),
           isDenied && "opacity-50",
         )}
       >

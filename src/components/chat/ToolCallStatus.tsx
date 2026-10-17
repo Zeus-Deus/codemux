@@ -1,3 +1,4 @@
+import { workspaceLaunchBranch, workspaceLaunchInput } from "@/lib/agent-chat/workspace-launch";
 import { hermesLearningLabel } from "@/lib/agent-chat/hermes-learning";
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 
@@ -53,6 +54,15 @@ const VERB_MAP: Record<string, string> = {
 };
 
 export function describeToolCall(item: ToolCallItem): ToolDescription {
+  const launch = workspaceLaunchInput(item.tool_name, item.input);
+  if (launch) {
+    return {
+      verb: item.status === "error" ? "Workspace launch failed" : item.status === "running" ? "Starting workspace" : "Started workspace",
+      target: typeof launch.title === "string" ? launch.title : null,
+      targetMono: false,
+      argument: workspaceLaunchBranch(item),
+    };
+  }
   const learning = hermesLearningLabel(item);
   if (learning) return { verb: learning, target: null, targetMono: false, argument: null };
   const verb = VERB_MAP[item.tool_name] ?? `Called ${item.tool_name}`;

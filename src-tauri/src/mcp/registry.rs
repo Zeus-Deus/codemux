@@ -143,6 +143,19 @@ pub trait HostTools: Send + Sync {
     ) -> Option<serde_json::Value>;
 }
 
+/// One registry slot serves each independent in-process host tool owner.
+pub struct CompositeHostTools(pub Vec<Arc<dyn HostTools>>);
+
+impl HostTools for CompositeHostTools {
+    fn tools_for(&self, caller: &HostCaller) -> Vec<McpTool> {
+        self.0.iter().flat_map(|host| host.tools_for(caller)).collect()
+    }
+
+    fn call(&self, caller: &HostCaller, name: &str, arguments: &serde_json::Value) -> Option<serde_json::Value> {
+        self.0.iter().find_map(|host| host.call(caller, name, arguments))
+    }
+}
+
 impl std::fmt::Debug for McpRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The inner Mutex is async; logging the handle count would

@@ -2684,7 +2684,7 @@ impl HermesSendGate {
 /// duplicated here as a cheap `&'static str` rather than building the full
 /// capabilities bundle (which allocates the model list) just to read one
 /// field. OpenCode has no permission modes, so it stays `None`.
-pub(super) fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
+pub(crate) fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
     match provider {
         ProviderKind::Claude => Some("bypassPermissions"),
         ProviderKind::Codex => Some("danger-full-access"),
@@ -5204,6 +5204,12 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
     {
         Ok(()) => {
             record_native_worker_mode(&app, &thread_id.0, provider, Some(mode));
+            if provider == ProviderKind::Claude {
+                // Full-access host tools follow Claude's live permission mode.
+                if let Some(mcp) = app.try_state::<crate::mcp::registry::McpRegistry>() {
+                    mcp.notify_host_tools_changed();
+                }
+            }
             Ok(())
         }
         Err(ProviderError::SessionNotFound { .. }) => {

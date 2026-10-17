@@ -103,7 +103,7 @@ const CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: another coding agent handed y
 /// The footer for a started suggested task, which runs on its own branch.
 pub(crate) const WORKTREE_CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: the user started this task from another chat's suggestions; that chat will read your final message. You are in your own git worktree on a new branch made from that chat's latest commit (its uncommitted edits are not here). Work on your own: do not ask questions or wait for input; if something is unclear, pick the safest reasonable option and say so. When done, COMMIT all of your work on this branch (do not push, do not switch branches) so it can be merged back; leave nothing uncommitted. End with a short report: what you changed (files), the commit(s), how you checked it, and anything left undone.";
 
-const TOOL_DESCRIPTION: &str = "Hand one task to another coding agent installed in Codemux, such as Codex or Claude. It runs as its own chat in a background tab of this workspace, in the same folder, with full access, and its final report is posted back here automatically. Use it when the user asks for another agent, or wants an implementation or independent review by a different vendor. For helpers on your own provider, use your built-in subagent tool; worktree_create and preset_apply start terminal agents whose results never come back here. Call it only from the main conversation, never from a subagent.
+const TOOL_DESCRIPTION: &str = "Hand one task to another coding agent installed in Codemux, such as Codex or Claude. It runs as its own chat in a background tab of this workspace, in the same folder, with full access, and its final report is posted back here automatically. Use it when the user asks for another agent, or wants an implementation or independent review by a different vendor. For helpers on your own provider, use your built-in subagent tool; use workspace_launch for separate top-level workspaces whose results do not come back here. Call it only from the main conversation, never from a subagent.
 
 The agent sees ONLY `task`, nothing from this conversation. Write a self-contained brief: the goal, the relevant files, every decision it must follow (names, interfaces, constraints) and how to check the result. For parallel work, call this several times in one turn and give each task its own files; agents share the checkout, so do not edit files a running task owns. Pass model and effort only when the user asked for them; otherwise omit for the agent's defaults.
 
@@ -577,7 +577,7 @@ pub(super) fn parse_provider(id: &str) -> Option<ProviderKind> {
 /// Whether a parent may delegate: only Claude and Codex chats, and only in
 /// Full access. `mode` is Claude's LIVE mode (the Plan/Ask pills switch it)
 /// or the mode a Codex session started with.
-fn parent_is_full(provider: ProviderKind, mode: Option<&str>) -> bool {
+pub(crate) fn parent_is_full(provider: ProviderKind, mode: Option<&str>) -> bool {
     matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
         && resolve_start_permission_mode(provider, mode.map(str::to_string)).as_deref()
             == fallback_permission_mode(provider)
@@ -600,7 +600,7 @@ fn mode_label(mode: Option<&str>) -> String {
 /// Agents to offer `caller` (with the setting on), or none when the tool
 /// must not be listed. Codex decides once at session start, from the mode
 /// it started in.
-fn offered_agents(
+pub(crate) fn offered_agents(
     caller: &HostCaller,
     caller_is_child: bool,
     is_installed: impl Fn(ProviderKind) -> bool,

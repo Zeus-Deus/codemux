@@ -35,6 +35,7 @@ pub mod usage_import;
 pub mod usage_quota;
 pub mod usage_resume;
 pub mod workspace;
+pub mod workspace_launch;
 pub mod workspaces_sync;
 pub mod workflows;
 pub mod pr_watch;
