@@ -180,6 +180,10 @@ pub(crate) struct CodexSessionState {
     /// dispatch order. Drained one-at-a-time as the session returns to
     /// idle (see [`CodexSession::drain_queue`]).
     pub queued_turns: VecDeque<QueuedTurn>,
+    /// Set by a user Stop so the queue stays put instead of dispatching the
+    /// next item the moment the stopped turn settles. Cleared by an explicit
+    /// send, steer or "send now", or once the queue is empty.
+    pub queue_held: bool,
 }
 
 #[derive(Default)]
@@ -733,6 +737,7 @@ impl CodexSession {
             service_tier,
             tier_models,
             queued_turns: VecDeque::new(),
+            queue_held: false,
         });
         let session = Arc::new(Self {
             thread_id: thread_id.clone(),
@@ -830,7 +835,7 @@ impl CodexSession {
     ) -> Result<SendOutcome, ProviderError> {
         let _outbound = self.outbound.lock().await;
         self.ensure_open().await?;
-        {
+        let was_held = {
             let mut state = self.state.lock().await;
             if state.active_turn.is_some() {
                 if input.dispatch_guard.is_some() {
@@ -857,7 +862,9 @@ impl CodexSession {
                 });
                 return Ok(SendOutcome::Queued(queued_id));
             }
-        }
+            // A message sent by hand goes first; the held queue follows it.
+            std::mem::take(&mut state.queue_held)
+        };
         let checkpoint = input.turn_checkpoint.clone();
         if let Some(checkpoint) = checkpoint.as_ref() {
             checkpoint.prepare().await;
@@ -884,6 +891,9 @@ impl CodexSession {
                 if let Some(checkpoint) = checkpoint.as_ref() {
                     checkpoint.abort().await;
                 }
+                if was_held {
+                    self.state.lock().await.queue_held = true;
+                }
                 Err(error)
             }
         }
@@ -897,6 +907,7 @@ impl CodexSession {
     ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
         let result = {
             let _outbound = self.outbound.lock().await;
+            self.state.lock().await.queue_held = false;
             self.deliver_steer(input).await
         };
         self.drain_queue().await;
@@ -1030,14 +1041,18 @@ impl CodexSession {
     pub async fn steer_queued(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
         let outbound = self.outbound.lock().await;
         let result = async {
-            let input = self
-                .state
-                .lock()
-                .await
-                .queued_turns
-                .iter()
-                .find(|q| q.queued_id == queued_id)
-                .map(|q| q.input.clone());
+            let input = {
+                let mut state = self.state.lock().await;
+                let input = state
+                    .queued_turns
+                    .iter()
+                    .find(|q| q.queued_id == queued_id)
+                    .map(|q| q.input.clone());
+                if input.is_some() {
+                    state.queue_held = false;
+                }
+                input
+            };
             let Some(input) = input else { return Ok(()) };
             let text = input
                 .display_text
@@ -1082,6 +1097,12 @@ impl CodexSession {
                     && matches!(state.status, SessionStatus::Ready)
                     && state.pending_approvals.is_empty();
                 if !idle {
+                    return;
+                }
+                if state.queue_held {
+                    if state.queued_turns.is_empty() {
+                        state.queue_held = false;
+                    }
                     return;
                 }
                 state.queued_turns.pop_front()
@@ -1205,7 +1226,10 @@ impl CodexSession {
         let (has_active_turn, original_index) = {
             let mut state = self.state.lock().await;
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
-                Some(idx) => (state.active_turn.is_some(), idx),
+                Some(idx) => {
+                    state.queue_held = false;
+                    (state.active_turn.is_some(), idx)
+                }
                 // Unknown / already-dispatched / cancelled — no-op.
                 None => return Ok(()),
             }
@@ -1225,6 +1249,12 @@ impl CodexSession {
         drop(outbound);
         self.drain_queue().await;
         result
+    }
+
+    /// Keep queued turns queued after a user Stop; see
+    /// [`CodexSessionState::queue_held`].
+    pub async fn hold_queue(&self) {
+        self.state.lock().await.queue_held = true;
     }
 
     /// Cancel every queued turn, emitting a cancellation for each. Used

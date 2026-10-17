@@ -139,10 +139,26 @@ struct State {
     interrupted: bool,
     pending: HashMap<RequestId, Pending>,
     queued: VecDeque<Queued>,
+    /// Set by a user Stop so the queue stays put instead of dispatching the
+    /// next item the moment the stopped turn settles. Cleared by an explicit
+    /// send or "send now", or once the queue is empty.
+    queue_held: bool,
     prose: String,
     thoughts: String,
     output_bytes: [usize; 2],
     tools: HashSet<String>,
+}
+impl State {
+    /// The next queued turn to dispatch, unless a user Stop holds the queue.
+    fn next_queued(&mut self) -> Option<Queued> {
+        if self.queue_held {
+            if self.queued.is_empty() {
+                self.queue_held = false;
+            }
+            return None;
+        }
+        self.queued.pop_front()
+    }
 }
 struct Session {
     thread: ThreadId,
@@ -498,6 +514,7 @@ impl Session {
                 interrupted: false,
                 pending: HashMap::new(),
                 queued: VecDeque::new(),
+                queue_held: false,
                 prose: String::new(),
                 thoughts: String::new(),
                 output_bytes: [0; 2],
@@ -1616,6 +1633,8 @@ impl Session {
         let turn = TurnId(format!("acp-turn-{}", Uuid::new_v4()));
         s.active = Some(turn.clone());
         s.interrupted = false;
+        // A message sent by hand goes first; the held queue follows it.
+        s.queue_held = false;
         drop(s);
         let session = self.clone();
         let worker_turn = turn.clone();
@@ -1829,7 +1848,7 @@ impl Session {
                 thread_id: self.thread.clone(),
                 status: SessionStatus::Ready,
             });
-            let next = state.queued.pop_front();
+            let next = state.next_queued();
             if let Some(queued) = next {
                 turn = TurnId(format!("acp-turn-{}", Uuid::new_v4()));
                 state.active = Some(turn.clone());
@@ -1964,7 +1983,13 @@ impl AgentProvider for GenericAcpProvider {
         thread: ThreadId,
         turn: Option<TurnId>,
     ) -> Result<(), ProviderError> {
-        self.session(&thread).await?.interrupt(turn).await
+        let session = self.session(&thread).await?;
+        // A blanket Stop is the user's Stop button: hold the queue rather
+        // than dispatch the next message the moment this turn settles.
+        if turn.is_none() {
+            session.state.lock().await.queue_held = true;
+        }
+        session.interrupt(turn).await
     }
     async fn respond_to_request(
         &self,
@@ -2046,17 +2071,37 @@ impl AgentProvider for GenericAcpProvider {
         id: String,
     ) -> Result<(), ProviderError> {
         let session = self.session(&thread).await?;
-        let turn = {
-            let mut s = session.state.lock().await;
-            if let Some(index) = s.queued.iter().position(|q| q.id == id) {
-                let queued = s.queued.remove(index).unwrap();
-                s.queued.push_front(queued);
-                s.active.clone()
-            } else {
-                return Ok(());
-            }
+        let mut s = session.state.lock().await;
+        let Some(index) = s.queued.iter().position(|q| q.id == id) else {
+            return Ok(());
         };
-        session.interrupt(turn).await
+        let queued = s.queued.remove(index).unwrap();
+        s.queue_held = false;
+        if s.active.is_some() {
+            s.queued.push_front(queued);
+            let turn = s.active.clone();
+            drop(s);
+            return session.interrupt(turn).await;
+        }
+        // Idle with a queue only happens while a Stop holds it, so nothing
+        // will drain this item: dispatch it as the worker would.
+        let turn = TurnId(format!("acp-turn-{}", Uuid::new_v4()));
+        s.active = Some(turn.clone());
+        s.interrupted = false;
+        session.emit(ProviderRuntimeEvent::QueuedTurnDispatched {
+            steered: false,
+            thread_id: thread,
+            queued_id: queued.id,
+            turn_id: turn.clone(),
+            text: queued
+                .input
+                .display_text
+                .clone()
+                .unwrap_or_else(|| queued.input.text.clone()),
+        });
+        drop(s);
+        tokio::spawn(session.clone().worker(turn, queued.input));
+        Ok(())
     }
     fn event_stream(&self) -> ProviderEventStream {
         crate::agent_provider::provider::broadcast_event_stream(&self.inner.events, self.kind())

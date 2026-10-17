@@ -360,6 +360,11 @@ impl AgentProvider for OpenCodeAgentProvider {
             return session.interrupt().await;
         }
         let session = self.lookup(&thread_id).await?;
+        // A blanket Stop is the user's Stop button: hold the queue rather
+        // than dispatch the next message the moment this turn settles.
+        if turn_id.is_none() {
+            session.hold_queue();
+        }
         session.interrupt_selected(turn_id).await
     }
 

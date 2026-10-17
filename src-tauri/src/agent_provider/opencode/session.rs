@@ -202,6 +202,10 @@ pub struct OpenCodeSession {
     ready: tokio::sync::watch::Receiver<bool>,
     outbound: Mutex<()>,
     queued: Mutex<VecDeque<(String, crate::agent_provider::SendTurnInput)>>,
+    /// Set by a user Stop so the queue stays put instead of dispatching the
+    /// next item the moment the stopped turn settles. Cleared by an explicit
+    /// send, steer or "send now", or once the queue is empty.
+    queue_held: AtomicBool,
     queue_worker: Mutex<Option<JoinHandle<()>>>,
     native_requests: Mutex<Vec<JoinHandle<()>>>,
     native_admissions: Mutex<Vec<NativeAdmission>>,
@@ -510,6 +514,7 @@ impl OpenCodeSession {
             ready,
             outbound: Mutex::new(()),
             queued: Mutex::new(VecDeque::new()),
+            queue_held: AtomicBool::new(false),
             queue_worker: Mutex::new(None),
             native_requests: Mutex::new(Vec::new()),
             native_admissions: Mutex::new(Vec::new()),
@@ -606,10 +611,23 @@ impl OpenCodeSession {
                 thread_id: self.thread_id.clone(),
             });
         }
-        if self.turn_active().await || !self.queued.lock().await.is_empty() {
+        let turn_active = self.turn_active().await;
+        // A message sent by hand after a Stop goes first; the held queue
+        // follows it.
+        let was_held = !turn_active && self.queue_held.swap(false, Ordering::SeqCst);
+        if !was_held && (turn_active || !self.queued.lock().await.is_empty()) {
             return Ok(self.queue_input(input, None).await);
         }
-        self.dispatch_input(input, false, None).await
+        let result = self.dispatch_input(input, false, None).await;
+        if was_held && result.is_err() {
+            self.queue_held.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    /// Keep queued turns queued after a user Stop; see `queue_held`.
+    pub fn hold_queue(&self) {
+        self.queue_held.store(true, Ordering::SeqCst);
     }
 
     async fn queue_input(
@@ -649,6 +667,7 @@ impl OpenCodeSession {
         input: crate::agent_provider::SendTurnInput,
     ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
         let _outbound = self.outbound.lock().await;
+        self.queue_held.store(false, Ordering::SeqCst);
         self.dispatch_input(input, true, None).await
     }
 
@@ -713,9 +732,17 @@ impl OpenCodeSession {
             return;
         }
         while !self.turn_active().await {
-            let Some((id, input)) = self.queued.lock().await.pop_front() else {
+            let mut queue = self.queued.lock().await;
+            if self.queue_held.load(Ordering::SeqCst) {
+                if queue.is_empty() {
+                    self.queue_held.store(false, Ordering::SeqCst);
+                }
+                return;
+            }
+            let Some((id, input)) = queue.pop_front() else {
                 return;
             };
+            drop(queue);
             let text = input
                 .display_text
                 .clone()
@@ -788,6 +815,7 @@ impl OpenCodeSession {
             .find(|(key, _)| key == id)
             .map(|(_, input)| input.clone());
         let Some(input) = input else { return Ok(()) };
+        self.queue_held.store(false, Ordering::SeqCst);
         if steer {
             let text = input
                 .display_text
@@ -2394,6 +2422,49 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_stop_holds_queue_until_manual_send() {
+        let mut server = Server::new_async().await;
+        let prompt = |text: &str| {
+            mockito::Matcher::PartialJson(serde_json::json!({"parts":[{"type":"text","text":text}]}))
+        };
+        let queued_post = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .match_body(prompt("Queued"))
+            .with_status(204)
+            .expect(0)
+            .create_async()
+            .await;
+        let manual_post = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .match_body(prompt("Manual"))
+            .with_status(204)
+            .expect(1)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        session.event_ctx.lock().await.turn_active = true;
+        let queued = session
+            .enqueue_or_send(delivery_input("Queued"))
+            .await
+            .unwrap();
+        assert!(queued.queued_id.is_some());
+        // The user presses Stop and the stopped turn settles.
+        session.hold_queue();
+        session.event_ctx.lock().await.turn_active = false;
+        session.drain_queue().await;
+        assert_eq!(session.queued.lock().await.len(), 1);
+        // A message sent by hand goes first, ahead of the held queue.
+        let manual = session
+            .enqueue_or_send(delivery_input("Manual"))
+            .await
+            .unwrap();
+        assert!(manual.queued_id.is_none());
+        assert_eq!(session.queued.lock().await.len(), 1);
+        queued_post.assert_async().await;
+        manual_post.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn attaches_shared_gateway_through_opencode_runtime_api() {
         let mut server = Server::new_async().await;
         let attach = server
@@ -2613,6 +2684,7 @@ pub(crate) mod tests {
             ready,
             outbound: Mutex::new(()),
             queued: Mutex::new(VecDeque::new()),
+            queue_held: AtomicBool::new(false),
             queue_worker: Mutex::new(None),
             native_requests: Mutex::new(Vec::new()),
             native_admissions: Mutex::new(Vec::new()),

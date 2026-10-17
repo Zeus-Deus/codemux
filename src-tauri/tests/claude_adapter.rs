@@ -1264,6 +1264,66 @@ async fn queued_turns_dispatch_fifo_on_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_holds_queued_turns_until_sent_now() {
+    // Pressing Stop must not immediately send the next queued message: the
+    // user may have stopped because the run was going wrong. The queue stays
+    // put until the user sends it explicitly.
+    let provider = provider_with_fake().await;
+    let thread = ThreadId("t-stop-queue".into());
+    provider.start_session(start_input(&thread.0)).await.unwrap();
+    let mut stream = provider.event_stream();
+    let input = |text: &str| SendTurnInput {
+        thread_id: thread.clone(),
+        text: text.into(),
+        images: vec![],
+        model_override: None,
+        effort_override: None,
+        permission_mode_override: None,
+        client_nonce: None,
+        display_text: None,
+        skill_invocations: vec![],
+        turn_checkpoint: None,
+        dispatch_guard: None,
+    };
+    provider.send_turn(input("first")).await.unwrap();
+    let queued = provider
+        .send_turn(input("second"))
+        .await
+        .unwrap()
+        .queued_id
+        .expect("second send queued");
+
+    provider.interrupt_turn(thread.clone(), None).await.unwrap();
+    async fn next_dispatch(
+        stream: &mut (impl futures_util::Stream<Item = ProviderRuntimeEvent> + Unpin),
+    ) -> Option<String> {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::QueuedTurnDispatched { queued_id, .. } = ev {
+                return Some(queued_id);
+            }
+        }
+        None
+    }
+    assert!(
+        timeout(Duration::from_millis(500), next_dispatch(&mut stream))
+            .await
+            .is_err(),
+        "Stop must leave the queued message queued"
+    );
+
+    provider
+        .send_queued_turn_now(thread.clone(), queued.clone())
+        .await
+        .unwrap();
+    let dispatched = timeout(Duration::from_secs(3), next_dispatch(&mut stream))
+        .await
+        .ok()
+        .flatten();
+    assert_eq!(dispatched.as_deref(), Some(queued.as_str()));
+    provider.stop_session(thread).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_queued_turn_removes_it() {
     let provider = provider_with_fake().await;
     provider

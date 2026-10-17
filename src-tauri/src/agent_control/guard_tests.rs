@@ -969,13 +969,14 @@ async fn review_s2_actual_acp_queue_drain_revalidates_native_worker_ceiling() {
     agent_chat::agent_chat_start_session(app.handle().clone(), pane, ProviderKind::Cursor, input, Some("guarded-queue".into())).await.unwrap();
     let mut events = provider.event_stream();
     let mut first = send("guarded-queue"); first.text = "await-cancel".into();
-    agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
+    let first = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
     let mut control = guard(&workspace, "guarded-queue"); control.provider=ProviderKind::Cursor; control.caller.access=ControlAccess::Supervised;
     let queued = agent_chat::send_turn_with_control(app.handle().clone(), ProviderKind::Cursor, send("guarded-queue"), Some(control)).await.unwrap();
     let queued_id = queued.queued_id.unwrap();
     app.state::<crate::database::DatabaseStore>().update_agent_chat_session_config("guarded-queue",
         &crate::database::AgentChatSessionConfig {permission_mode:Some(Some("agent".into())),..Default::default()}).unwrap();
-    provider.interrupt_turn(ThreadId("guarded-queue".into()), None).await.unwrap();
+    // Interrupt the selected turn: a blanket Stop holds the queue instead.
+    provider.interrupt_turn(ThreadId("guarded-queue".into()), Some(first.turn_id)).await.unwrap();
     let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while let Some(event) = events.next().await {
             match &event {
@@ -1683,6 +1684,9 @@ async fn review_fr1_rejection_case(mode: &str) {
         // on rejection rather than inherited by independent native Q2.
         provider.interrupt_turn(ThreadId(thread.into()), None).await.unwrap();
         assert!(provider.has_session(&ThreadId(thread.into())).await);
+        // The Stop holds Q2 in the queue; release it explicitly so Q2 runs
+        // under a fresh claim.
+        provider.send_queued_turn_now(ThreadId(thread.into()), q2.clone()).await.unwrap();
     } else {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while provider.has_session(&ThreadId(thread.into())).await { tokio::task::yield_now().await; }

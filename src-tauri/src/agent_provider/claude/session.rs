@@ -92,6 +92,10 @@ pub(crate) struct ClaudeSessionState {
     /// concurrent drains (notifications task + inline interrupt fallback)
     /// each popping and dispatching an item in the same idle window.
     pub dispatching: bool,
+    /// Set by a user Stop so the queue stays put instead of dispatching the
+    /// next item the moment the stopped turn settles. Cleared by an explicit
+    /// send or "send now", or once the queue is empty.
+    pub queue_held: bool,
 }
 
 impl ClaudeSessionState {
@@ -527,6 +531,7 @@ impl ClaudeSession {
             sdk_session_id: None,
             queued_turns: VecDeque::new(),
             dispatching: false,
+            queue_held: false,
         });
         let session = Arc::new(Self {
             thread_id: thread_id.clone(),
@@ -630,7 +635,7 @@ impl ClaudeSession {
         // approval/question raised by an SDK-initiated turn, where
         // `active_turn` is `None` but the SDK cannot read new input until
         // the callback is answered.
-        {
+        let was_held = {
             let mut state = self.state.lock().await;
             if state.turn_busy() {
                 if input.dispatch_guard.is_some() {
@@ -657,7 +662,9 @@ impl ClaudeSession {
                 });
                 return Ok(SendOutcome::Queued(queued_id));
             }
-        }
+            // A message sent by hand goes first; the held queue follows it.
+            std::mem::take(&mut state.queue_held)
+        };
         let checkpoint = input.turn_checkpoint.clone();
         if let Some(checkpoint) = checkpoint.as_ref() {
             checkpoint.prepare().await;
@@ -681,6 +688,9 @@ impl ClaudeSession {
             Err(error) => {
                 if let Some(checkpoint) = checkpoint.as_ref() {
                     checkpoint.abort().await;
+                }
+                if was_held {
+                    self.state.lock().await.queue_held = true;
                 }
                 Err(error)
             }
@@ -707,6 +717,12 @@ impl ClaudeSession {
                     && state.pending_approvals.is_empty()
                     && !state.dispatching;
                 if !idle {
+                    return;
+                }
+                if state.queue_held {
+                    if state.queued_turns.is_empty() {
+                        state.queue_held = false;
+                    }
                     return;
                 }
                 match state.queued_turns.pop_front() {
@@ -857,7 +873,10 @@ impl ClaudeSession {
                 // parked on a question has no `active_turn`, and draining
                 // would just leave the item stuck behind the callback.
                 // Interrupting aborts the callback sidecar-side.
-                Some(idx) => (state.turn_busy(), idx),
+                Some(idx) => {
+                    state.queue_held = false;
+                    (state.turn_busy(), idx)
+                }
                 // Unknown / already-dispatched / cancelled — no-op.
                 None => return Ok(()),
             }
@@ -884,6 +903,12 @@ impl ClaudeSession {
             self.drain_queue().await;
             Ok(())
         }
+    }
+
+    /// Keep queued turns queued after a user Stop; see
+    /// [`ClaudeSessionState::queue_held`].
+    pub async fn hold_queue(&self) {
+        self.state.lock().await.queue_held = true;
     }
 
     /// Cancel every queued turn, emitting a
@@ -1085,7 +1110,8 @@ impl ClaudeSession {
             }
         }
         // Fallback drain: if the notification hasn't run yet, this
-        // dispatches the next (queued) turn now that the session is idle.
+        // dispatches the next (queued) turn now that the session is idle —
+        // the promoted item of a "send now"; a user Stop holds the queue.
         // The `dispatching` guard makes a concurrent drain (from the
         // notifications task) safe.
         self.drain_queue().await;

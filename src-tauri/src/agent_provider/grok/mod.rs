@@ -201,7 +201,13 @@ impl AgentProvider for GrokAgentProvider {
         thread_id: ThreadId,
         turn_id: Option<TurnId>,
     ) -> Result<(), ProviderError> {
-        self.session(&thread_id).await?.interrupt(turn_id).await
+        let session = self.session(&thread_id).await?;
+        // A blanket Stop is the user's Stop button: hold the queue rather
+        // than dispatch the next message the moment this turn settles.
+        if turn_id.is_none() {
+            session.hold_queue().await;
+        }
+        session.interrupt(turn_id).await
     }
 
     async fn cancel_queued_turn(

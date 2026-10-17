@@ -242,6 +242,10 @@ pub(crate) struct AcpSessionState {
     config_options: Vec<Value>,
     pending: HashMap<RequestId, PendingRequest>,
     queued: VecDeque<QueuedTurn>,
+    /// Set by a user Stop so the queue stays put instead of dispatching the
+    /// next item the moment the stopped turn settles. Cleared by an explicit
+    /// send or "send now", or once the queue is empty.
+    queue_held: bool,
     selected_queued: Option<Arc<QueuedDispatch>>,
     assistant_text: String,
     thinking_text: String,
@@ -315,6 +319,17 @@ impl AcpSessionState {
             return true;
         }
         false
+    }
+
+    /// The next queued turn to dispatch, unless a user Stop holds the queue.
+    fn next_queued(&mut self) -> Option<QueuedTurn> {
+        if self.queue_held {
+            if self.queued.is_empty() {
+                self.queue_held = false;
+            }
+            return None;
+        }
+        self.queued.pop_front()
     }
 
     /// Release the prompt slot. Drops any Stop still aimed at the
@@ -649,6 +664,7 @@ impl AcpSession {
                 config_options: config_options(&setup),
                 pending: HashMap::new(),
                 queued: VecDeque::new(),
+                queue_held: false,
                 selected_queued: None,
                 assistant_text: String::new(),
                 thinking_text: String::new(),
@@ -862,11 +878,16 @@ impl AcpSession {
         // idle session and start concurrent `session/prompt` requests.
         state.active_turn = Some(self.dispatching_turn_id());
         let generation = state.claim_turn();
+        // A message sent by hand goes first; the held queue follows it.
+        let was_held = std::mem::take(&mut state.queue_held);
         drop(state);
         match self.dispatch_turn(input, None, generation).await {
             Ok(turn_id) => Ok(SendOutcome::Started(turn_id)),
             Err(error) => {
                 self.release_dispatch_reservation().await;
+                if was_held {
+                    self.state.lock().await.queue_held = true;
+                }
                 Err(error)
             }
         }
@@ -1140,7 +1161,7 @@ impl AcpSession {
                         next = None;
                         state.queued.drain(..).map(|queued| queued.id).collect::<Vec<_>>()
                     } else {
-                        next = state.queued.pop_front().map(|queued| {
+                        next = state.next_queued().map(|queued| {
                             self.claim_queued_turn(&mut state, queued)
                         });
                         Vec::new()
@@ -1495,7 +1516,7 @@ impl AcpSession {
             // generation for any queued turn — is what stops it becoming
             // an instant cancellation of somebody else's turn.
             state.interrupt_generation = None;
-            match state.queued.pop_front() {
+            match state.next_queued() {
                 Some(queued) => {
                     // Reserve the dispatch slot before releasing the lock.
                     // Without this marker a concurrent send could observe
@@ -1517,6 +1538,11 @@ impl AcpSession {
                 status: SessionStatus::Ready,
             });
         next
+    }
+
+    /// Keep queued turns queued after a user Stop; see `queue_held`.
+    pub async fn hold_queue(&self) {
+        self.state.lock().await.queue_held = true;
     }
 
     /// Record a Stop against the turn that is claimed right now.
@@ -1569,6 +1595,9 @@ impl AcpSession {
                 .iter()
                 .position(|queued| queued.id == queued_id)
                 .and_then(|index| state.queued.remove(index));
+            if queued.is_some() {
+                state.queue_held = false;
+            }
             match queued {
                 Some(queued) if state.active_turn.is_some() => {
                     state.queued.push_front(queued);
@@ -4594,6 +4623,7 @@ mod tests {
             config_options: vec![],
             pending: HashMap::new(),
             queued: VecDeque::new(),
+            queue_held: false,
             selected_queued: None,
             assistant_text: String::new(),
             thinking_text: String::new(),
