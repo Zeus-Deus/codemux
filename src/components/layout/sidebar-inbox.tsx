@@ -89,7 +89,7 @@ import {
   useVisibleSidebarDraftCount,
 } from "./sidebar-draft-block";
 import { Eyebrow } from "@/components/ui/eyebrow";
-import { SidebarOtherMachines } from "./sidebar-other-machines";
+import { useRemoteWorkspaces } from "@/environments/remote-workspaces";
 import { SidebarEmptyState } from "./sidebar-empty-state";
 import { SidebarHeaderActions } from "./sidebar-action-row";
 import {
@@ -873,6 +873,7 @@ export function SidebarInbox() {
   const homeDir = useHomeDir();
   const hosts = useHosts();
   const projectGroups = useProjectGroupedWorkspaces(allWorkspaces, homeDir, hosts);
+  const remoteWorkspaces = useRemoteWorkspaces();
   const sidebarDraftCatalog = useMemo(
     () => buildSidebarDraftCatalog(projectGroups, homeDir),
     [projectGroups, homeDir],
@@ -1333,8 +1334,19 @@ export function SidebarInbox() {
   // Does anything render *after* the pinned block? Every section the list can
   // draw below the pinned cards, in render order. Only this decides whether the
   // pinned hairline has a second side to separate.
+  // Workspaces on the account's other machines join the active list as
+  // ordinary cards. Paths differ between machines, so the project filter
+  // matches them by project name.
+  const filterName = filter
+    ? projectGroups.find((g) => g.projectPath === filter)?.projectName ?? null
+    : null;
+  const visibleRemote = remoteWorkspaces.filter(
+    (r) => !filter || r.repo.name === filterName,
+  );
+
   const hasContentBelowPinned =
     topTier.length > 0 ||
+    visibleRemote.length > 0 ||
     visibleCreating.length > 0 ||
     filteredPending.length > 0 ||
     wrappingUpTier.length > 0 ||
@@ -1614,10 +1626,6 @@ export function SidebarInbox() {
     [projectGroups, settledIds, snoozedIds],
   );
 
-  const filterName = filter
-    ? projectGroups.find((g) => g.projectPath === filter)?.projectName ?? null
-    : null;
-
   // The filtered project can disappear underneath us (its last workspace was
   // archived / deleted). Without this the trigger would render a blank label
   // and the list an unexplained empty state, so fall back to "All projects".
@@ -1717,6 +1725,7 @@ export function SidebarInbox() {
 
         {visibleDraftCount === 0 &&
           orderedActiveCards.length === 0 &&
+          visibleRemote.length === 0 &&
           visibleCreating.length === 0 &&
           filteredPending.length === 0 && (
             <SidebarEmptyState filterName={filterName ?? null} />
@@ -1749,6 +1758,29 @@ export function SidebarInbox() {
         ))}
 
         {topTier.map((ws, index) => renderCard(ws, pinnedCards.length + index))}
+
+        {visibleRemote.map((r) => (
+          <SidebarInboxCard
+            key={r.workspace.workspace_id}
+            workspace={r.workspace}
+            repo={r.repo}
+            isActive={false}
+            status={r.status}
+            showGitStats={showGitStats}
+            now={now}
+            leaving={false}
+            justUnsettled={false}
+            metaClusterMinWidth={metaClusterMinWidth}
+            unread={false}
+            woke={false}
+            selected={false}
+            onSettle={handleSettle}
+            onSnooze={handleSnooze}
+            onSelect={handleSelect}
+            onMarkUnread={handleMarkUnread}
+            machine={r.machine}
+          />
+        ))}
 
         {filteredPending.map((pw) => (
           <PendingWorkspaceRow key={pw.id} pending={pw} className="gap-2 px-2 py-2" />
@@ -1866,7 +1898,6 @@ export function SidebarInbox() {
             )}
           </div>
         )}
-        <SidebarOtherMachines />
       </div>
 
       {/* Bulk right-click menu. Anchored to a zero-size element parked at the
