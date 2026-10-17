@@ -6952,16 +6952,99 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
     for (kind, provider) in providers {
         let app = app.clone();
         let mut stream = provider.event_stream();
+        let requests_survive = provider.pending_requests_survive_session_restart();
         tauri::async_runtime::spawn(async move {
             use futures_util::StreamExt;
             eprintln!("[codemux::agent_chat] event bridge started for {kind:?}");
+            let mut open_requests = OpenRequests::default();
             while let Some(event) = stream.next().await {
+                if !requests_survive {
+                    for (thread_id, request_id) in open_requests.observe(&event) {
+                        forward_event(
+                            &app,
+                            ProviderRuntimeEvent::RequestResponseFailed {
+                                thread_id,
+                                request_id,
+                                reason: RequestResponseFailureReason::StaleProviderCallback,
+                                message: ENDED_SESSION_REQUEST_MESSAGE.to_string(),
+                            },
+                        );
+                    }
+                }
                 forward_event(&app, event);
             }
             eprintln!(
                 "[codemux::agent_chat] event bridge for {kind:?} ended (provider stream closed)"
             );
         });
+    }
+}
+
+const ENDED_SESSION_REQUEST_MESSAGE: &str =
+    "This request expired when the provider session ended. Continue to have the agent repeat it.";
+
+/// Requests each thread still has open on one provider's event stream.
+///
+/// A crashed or closed session takes its process-local callbacks with it,
+/// yet nothing else settles the requests it raised, so their cards stay
+/// answerable until a submit fails. The bridge expires them at the death
+/// boundary instead (only for providers whose requests do not survive a
+/// session restart).
+#[derive(Default)]
+struct OpenRequests(HashMap<ThreadId, Vec<RequestId>>);
+
+impl OpenRequests {
+    /// Track `event` and return the requests it leaves without a live
+    /// callback: everything open on a thread whose session closed, or
+    /// whose process exited mid-turn.
+    fn observe(&mut self, event: &ProviderRuntimeEvent) -> Vec<(ThreadId, RequestId)> {
+        let ended = match event {
+            ProviderRuntimeEvent::RequestOpened {
+                thread_id,
+                request_id,
+                ..
+            } => {
+                let open = self.0.entry(thread_id.clone()).or_default();
+                if !open.contains(request_id) {
+                    open.push(request_id.clone());
+                }
+                return Vec::new();
+            }
+            ProviderRuntimeEvent::RequestResolved {
+                thread_id,
+                request_id,
+                ..
+            }
+            | ProviderRuntimeEvent::RequestResponseFailed {
+                thread_id,
+                request_id,
+                ..
+            } => {
+                if let Some(open) = self.0.get_mut(thread_id) {
+                    open.retain(|id| id != request_id);
+                    if open.is_empty() {
+                        self.0.remove(thread_id);
+                    }
+                }
+                return Vec::new();
+            }
+            ProviderRuntimeEvent::SessionStateChanged {
+                thread_id,
+                status: SessionStatus::Closed,
+            } => thread_id,
+            ProviderRuntimeEvent::TurnCompleted {
+                thread_id,
+                status: crate::agent_provider::TurnStatus::Error { subtype, .. },
+                ..
+            } if subtype == crate::agent_provider::CHILD_EXITED_SUBTYPE => thread_id,
+            _ => return Vec::new(),
+        };
+        self.0
+            .remove(ended)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|request_id| (ended.clone(), request_id))
+            .collect()
     }
 }
 
@@ -9097,6 +9180,58 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[test]
+    fn open_requests_expire_when_their_session_closes_or_crashes() {
+        let thread = ThreadId("t".into());
+        let opened = |id: &str| ProviderRuntimeEvent::RequestOpened {
+            thread_id: thread.clone(),
+            turn_id: TurnId("turn".into()),
+            request_id: RequestId(id.into()),
+            request_kind: "user-input".into(),
+            payload: json!({}),
+            tool_use_id: None,
+            subagent_id: None,
+        };
+        let crashed = ProviderRuntimeEvent::TurnCompleted {
+            thread_id: thread.clone(),
+            turn_id: TurnId("turn".into()),
+            status: crate::agent_provider::TurnStatus::Error {
+                subtype: crate::agent_provider::CHILD_EXITED_SUBTYPE.into(),
+                message: "dead".into(),
+            },
+            usage: None,
+        };
+        let mut open = OpenRequests::default();
+        assert!(open.observe(&opened("answered")).is_empty());
+        assert!(open.observe(&opened("orphan")).is_empty());
+        open.observe(&ProviderRuntimeEvent::RequestResolved {
+            thread_id: thread.clone(),
+            request_id: RequestId("answered".into()),
+            decision: ApprovalDecision::Cancel,
+        });
+        // A recoverable error keeps the callback alive.
+        assert!(open
+            .observe(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: thread.clone(),
+                status: SessionStatus::Error { message: "turn failed".into() },
+            })
+            .is_empty());
+        assert_eq!(
+            open.observe(&crashed),
+            vec![(thread.clone(), RequestId("orphan".into()))]
+        );
+        assert!(open.observe(&crashed).is_empty());
+
+        open.observe(&opened("closing"));
+        assert_eq!(
+            open.observe(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: thread.clone(),
+                status: SessionStatus::Closed,
+            }),
+            vec![(thread, RequestId("closing".into()))]
+        );
+    }
 
     #[tokio::test]
     async fn hermes_stop_during_lazy_resume_prevents_later_dispatch() {
