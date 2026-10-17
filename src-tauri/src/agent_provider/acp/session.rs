@@ -859,11 +859,18 @@ impl AcpSession {
         }
         if state.active_turn.is_some() {
             let queued_id = self.opaque_id("queued");
-            state.queued.push_back(QueuedTurn {
+            let queued = QueuedTurn {
                 id: queued_id.clone(),
                 input: input.clone(),
                 dispatch: None,
-            });
+            };
+            // Sent by hand while a Stop settles: it goes first and releases
+            // the held queue behind it.
+            if std::mem::take(&mut state.queue_held) {
+                state.queued.push_front(queued);
+            } else {
+                state.queued.push_back(queued);
+            }
             drop(state);
             let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
                 thread_id: self.thread_id.clone(),
@@ -1588,17 +1595,15 @@ impl AcpSession {
     }
 
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
-        let (ready_to_dispatch, should_interrupt) = {
+        let (ready_to_dispatch, should_interrupt, was_held) = {
             let mut state = self.state.lock().await;
             let queued = state
                 .queued
                 .iter()
                 .position(|queued| queued.id == queued_id)
                 .and_then(|index| state.queued.remove(index));
-            if queued.is_some() {
-                state.queue_held = false;
-            }
-            match queued {
+            let was_held = queued.is_some() && std::mem::take(&mut state.queue_held);
+            let (ready, interrupt) = match queued {
                 Some(queued) if state.active_turn.is_some() => {
                     state.queued.push_front(queued);
                     (None, true)
@@ -1607,24 +1612,33 @@ impl AcpSession {
                     (Some(self.claim_queued_turn(&mut state, queued)), false)
                 }
                 None => (None, false),
-            }
+            };
+            (ready, interrupt, was_held)
         };
-        if let Some((queued, generation)) = ready_to_dispatch {
+        let result = if let Some((queued, generation)) = ready_to_dispatch {
             let queued_id = queued.id.clone();
-            if let Err(error) = self
+            match self
                 .dispatch_turn(queued.input, queued.dispatch.clone(), generation)
                 .await
             {
-                self.release_dispatch_reservation().await;
-                self.cancel_selected_queued(&queued_id).await;
-                return Err(error);
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    self.release_dispatch_reservation().await;
+                    self.cancel_selected_queued(&queued_id).await;
+                    Err(error)
+                }
             }
         } else if should_interrupt {
             // The promoted item is already first in line before cancellation,
             // so prompt completion cannot race past it.
-            self.interrupt(None).await?;
+            self.interrupt(None).await
+        } else {
+            Ok(())
+        };
+        if was_held && result.is_err() {
+            self.state.lock().await.queue_held = true;
         }
-        Ok(())
+        result
     }
 
     async fn release_dispatch_reservation(&self) {

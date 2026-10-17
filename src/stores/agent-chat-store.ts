@@ -561,29 +561,16 @@ function isSliceBusy(slice: ChatThreadSlice): boolean {
   );
 }
 
-/** Queued turns whose cancellation this client requested. The Cancel button
- *  restores their text itself, so the event must not restore it again. */
-const localQueuedCancels = new Set<string>();
-
-export function beginLocalQueuedCancel(queuedId: string): void {
-  localQueuedCancels.add(queuedId);
-}
-
-export function endLocalQueuedCancel(queuedId: string): void {
-  localQueuedCancels.delete(queuedId);
-}
-
 /**
- * The composer draft after the backend cancels a queued turn on its own
- * (session error or close, failed dispatch). The text goes back into the
- * draft so the user does not lose it; appended so several cancellations keep
- * their queue order.
+ * The composer draft after a queued turn is cancelled — by the user's Cancel
+ * button, a session error or close, or a failed dispatch. The text goes back
+ * into the draft so the user does not lose it; appended so several
+ * cancellations keep their queue order.
  */
 function draftAfterQueuedCancel(
   slice: ChatThreadSlice,
   queuedId: string,
 ): string {
-  if (localQueuedCancels.delete(queuedId)) return slice.inputDraft;
   const queued = slice.messages.find(
     (m) => m.kind === "user_message" && m.queued?.queuedId === queuedId,
   );

@@ -649,10 +649,17 @@ impl ClaudeSession {
                     .clone()
                     .unwrap_or_else(|| input.text.clone());
                 let client_nonce = input.client_nonce.clone();
-                state.queued_turns.push_back(QueuedTurn {
+                let queued = QueuedTurn {
                     queued_id: queued_id.clone(),
                     input,
-                });
+                };
+                // Sent by hand while a Stop settles: it goes first and
+                // releases the held queue behind it.
+                if std::mem::take(&mut state.queue_held) {
+                    state.queued_turns.push_front(queued);
+                } else {
+                    state.queued_turns.push_back(queued);
+                }
                 drop(state);
                 let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
                     thread_id: self.thread_id.clone(),
@@ -663,7 +670,13 @@ impl ClaudeSession {
                 return Ok(SendOutcome::Queued(queued_id));
             }
             // A message sent by hand goes first; the held queue follows it.
-            std::mem::take(&mut state.queue_held)
+            // Reserve dispatch so a drain cannot start a queued turn before
+            // this one becomes active.
+            let was_held = std::mem::take(&mut state.queue_held);
+            if was_held {
+                state.dispatching = true;
+            }
+            was_held
         };
         let checkpoint = input.turn_checkpoint.clone();
         if let Some(checkpoint) = checkpoint.as_ref() {
@@ -678,7 +691,14 @@ impl ClaudeSession {
                 checkpoint.clone(),
             )
             .await;
-        match sent {
+        if was_held {
+            let mut state = self.state.lock().await;
+            state.dispatching = false;
+            if sent.is_err() {
+                state.queue_held = true;
+            }
+        }
+        let outcome = match sent {
             Ok(turn_id) => {
                 if let Some(checkpoint) = checkpoint.as_ref() {
                     checkpoint.commit().await;
@@ -689,12 +709,15 @@ impl ClaudeSession {
                 if let Some(checkpoint) = checkpoint.as_ref() {
                     checkpoint.abort().await;
                 }
-                if was_held {
-                    self.state.lock().await.queue_held = true;
-                }
                 Err(error)
             }
+        };
+        if was_held && outcome.is_ok() {
+            // A drain skipped while dispatch was reserved; the turn may
+            // already have settled.
+            self.drain_queue().await;
         }
+        outcome
     }
 
     /// Pop the next queued turn (if the session is idle) and dispatch it.
@@ -866,17 +889,14 @@ impl ClaudeSession {
     /// longer waits on a zombie approval — the following drain dispatches
     /// it as soon as the turn ends.
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
-        let (has_active_turn, original_index) = {
+        let (has_active_turn, original_index, was_held) = {
             let mut state = self.state.lock().await;
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
                 // `turn_busy`, not `active_turn`: an SDK-initiated turn
                 // parked on a question has no `active_turn`, and draining
                 // would just leave the item stuck behind the callback.
                 // Interrupting aborts the callback sidecar-side.
-                Some(idx) => {
-                    state.queue_held = false;
-                    (state.turn_busy(), idx)
-                }
+                Some(idx) => (state.turn_busy(), idx, std::mem::take(&mut state.queue_held)),
                 // Unknown / already-dispatched / cancelled — no-op.
                 None => return Ok(()),
             }
@@ -893,6 +913,7 @@ impl ClaudeSession {
                     {
                         let mut state = self.state.lock().await;
                         restore_queued_position(&mut state.queued_turns, queued_id, original_index);
+                        state.queue_held |= was_held;
                     }
                     Err(err)
                 }

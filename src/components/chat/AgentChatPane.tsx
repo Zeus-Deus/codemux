@@ -80,8 +80,6 @@ import {
 import {
   DEFAULT_THREAD_PERMISSION_MODE,
   registerMountedThread,
-  beginLocalQueuedCancel,
-  endLocalQueuedCancel,
   useAgentChatStore,
   type Attachment,
   type ChatMode,
@@ -2626,43 +2624,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // Follow-up queueing: cancel a queued (not-yet-dispatched) turn. The
   // backend emits `queued_turn_cancelled`, which the reducer uses to
   // remove the greyed bubble — so we don't optimistically remove here.
-  // When the provider confirms it actually removed an item, restore the
-  // cancelled text into the composer draft so the user can edit and resend
-  // (prepended if the composer already has content, to avoid clobbering an
-  // in-progress draft). The store restores text for cancellations the user
-  // did not ask for; marking this one keeps it from restoring it twice.
+  // The store puts the cancelled text back into the composer draft when
+  // that event arrives (whatever caused it), so nothing is restored here:
+  // an id that already dispatched emits no event and is not resurrected.
   const handleCancelQueued = useCallback(
-    (queuedId: string, text: string) => {
+    (queuedId: string) => {
       if (!threadId) return;
-      const tid = threadId;
-      beginLocalQueuedCancel(queuedId);
-      void (async () => {
-        try {
-          const cancelled = await agentChatCancelQueuedTurn(
-            provider,
-            tid,
-            queuedId,
-          );
-          // The provider returns false when this id already dispatched.
-          // Do not resurrect an already-sent prompt in the composer just
-          // because the UI briefly held a stale queue marker.
-          if (!cancelled) {
-            endLocalQueuedCancel(queuedId);
-            return;
-          }
-          const current =
-            useAgentChatStore.getState().threads[tid]?.inputDraft ?? "";
-          setInputDraft(
-            tid,
-            current.trim().length > 0 ? `${text}\n${current}` : text,
-          );
-        } catch (err) {
-          endLocalQueuedCancel(queuedId);
-          toast.error(`Failed to cancel queued message: ${err}`);
-        }
-      })();
+      agentChatCancelQueuedTurn(provider, threadId, queuedId).catch((err) => {
+        toast.error(`Failed to cancel queued message: ${err}`);
+      });
     },
-    [threadId, provider, setInputDraft],
+    [threadId, provider],
   );
 
   // Promote a queued message using the chosen delivery mode. Provider

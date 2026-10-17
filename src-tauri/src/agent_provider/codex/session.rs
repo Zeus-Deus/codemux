@@ -192,6 +192,17 @@ struct PendingTurnStart {
     failed: bool,
 }
 
+/// Steering that started a new turn is a message sent by hand, which releases
+/// a queue held by Stop. Guidance inside a turn, or a failure, keeps the hold.
+async fn release_hold_if_started(
+    state: &Mutex<CodexSessionState>,
+    result: &Result<crate::agent_provider::TurnStartResult, ProviderError>,
+) {
+    if matches!(result, Ok(started) if !started.steered) {
+        state.lock().await.queue_held = false;
+    }
+}
+
 /// A user turn parked in the follow-up queue behind the active turn.
 #[derive(Debug, Clone)]
 pub(crate) struct QueuedTurn {
@@ -849,10 +860,17 @@ impl CodexSession {
                     .clone()
                     .unwrap_or_else(|| input.text.clone());
                 let client_nonce = input.client_nonce.clone();
-                state.queued_turns.push_back(QueuedTurn {
+                let queued = QueuedTurn {
                     queued_id: queued_id.clone(),
                     input,
-                });
+                };
+                // Sent by hand while a Stop settles: it goes first and
+                // releases the held queue behind it.
+                if std::mem::take(&mut state.queue_held) {
+                    state.queued_turns.push_front(queued);
+                } else {
+                    state.queued_turns.push_back(queued);
+                }
                 drop(state);
                 let _ = self.event_tx().send(ProviderRuntimeEvent::TurnQueued {
                     thread_id: self.thread_id.clone(),
@@ -907,8 +925,9 @@ impl CodexSession {
     ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
         let result = {
             let _outbound = self.outbound.lock().await;
-            self.state.lock().await.queue_held = false;
-            self.deliver_steer(input).await
+            let result = self.deliver_steer(input).await;
+            release_hold_if_started(&self.state, &result).await;
+            result
         };
         self.drain_queue().await;
         result
@@ -1041,24 +1060,22 @@ impl CodexSession {
     pub async fn steer_queued(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
         let outbound = self.outbound.lock().await;
         let result = async {
-            let input = {
-                let mut state = self.state.lock().await;
-                let input = state
-                    .queued_turns
-                    .iter()
-                    .find(|q| q.queued_id == queued_id)
-                    .map(|q| q.input.clone());
-                if input.is_some() {
-                    state.queue_held = false;
-                }
-                input
-            };
+            let input = self
+                .state
+                .lock()
+                .await
+                .queued_turns
+                .iter()
+                .find(|q| q.queued_id == queued_id)
+                .map(|q| q.input.clone());
             let Some(input) = input else { return Ok(()) };
             let text = input
                 .display_text
                 .clone()
                 .unwrap_or_else(|| input.text.clone());
-            let result = self.deliver_steer(input).await?;
+            let result = self.deliver_steer(input).await;
+            release_hold_if_started(&self.state, &result).await;
+            let result = result?;
             self.state
                 .lock()
                 .await
@@ -1223,13 +1240,14 @@ impl CodexSession {
     /// the promoted message stays queued until then.
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
         let outbound = self.outbound.lock().await;
-        let (has_active_turn, original_index) = {
+        let (has_active_turn, original_index, was_held) = {
             let mut state = self.state.lock().await;
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
-                Some(idx) => {
-                    state.queue_held = false;
-                    (state.active_turn.is_some(), idx)
-                }
+                Some(idx) => (
+                    state.active_turn.is_some(),
+                    idx,
+                    std::mem::take(&mut state.queue_held),
+                ),
                 // Unknown / already-dispatched / cancelled — no-op.
                 None => return Ok(()),
             }
@@ -1240,6 +1258,7 @@ impl CodexSession {
                 Err(err) => {
                     let mut state = self.state.lock().await;
                     restore_queued_position(&mut state.queued_turns, queued_id, original_index);
+                    state.queue_held |= was_held;
                     Err(err)
                 }
             }

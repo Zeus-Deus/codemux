@@ -2,7 +2,6 @@ import { describe, it, expect, beforeEach } from "vitest";
 
 import {
   DEFAULT_THREAD_PERMISSION_MODE,
-  beginLocalQueuedCancel,
   useAgentChatStore,
   type Attachment,
 } from "./agent-chat-store";
@@ -100,18 +99,15 @@ describe("agent-chat-store", () => {
       ).toBe(false);
     });
 
-    it("leaves a user-requested cancel to the Cancel button", () => {
+    it("leaves the draft alone for an unknown or already-dispatched id", () => {
       resetStore();
       const store = useAgentChatStore.getState();
       store.ensureThread("t");
-      queue("t", "q1", "mine");
-      beginLocalQueuedCancel("q1");
-      cancel("t", "q1");
-      expect(useAgentChatStore.getState().threads.t.inputDraft).toBe("");
-      // The mark is consumed, so a later backend cancel restores again.
-      queue("t", "q2", "later");
-      cancel("t", "q2");
-      expect(useAgentChatStore.getState().threads.t.inputDraft).toBe("later");
+      store.setInputDraft("t", "typed now");
+      cancel("t", "never-queued");
+      expect(useAgentChatStore.getState().threads.t.inputDraft).toBe(
+        "typed now",
+      );
     });
   });
 

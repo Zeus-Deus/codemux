@@ -1620,10 +1620,17 @@ impl Session {
                     .clone()
                     .unwrap_or_else(|| input.text.clone()),
             });
-            s.queued.push_back(Queued {
+            let queued = Queued {
                 id: id.clone(),
                 input,
-            });
+            };
+            // Sent by hand while a Stop settles: it goes first and releases
+            // the held queue behind it.
+            if std::mem::take(&mut s.queue_held) {
+                s.queued.push_front(queued);
+            } else {
+                s.queued.push_back(queued);
+            }
             return Ok(TurnStartResult {
                 steered: false,
                 turn_id: TurnId(String::new()),
@@ -2076,12 +2083,16 @@ impl AgentProvider for GenericAcpProvider {
             return Ok(());
         };
         let queued = s.queued.remove(index).unwrap();
-        s.queue_held = false;
+        let was_held = std::mem::take(&mut s.queue_held);
         if s.active.is_some() {
             s.queued.push_front(queued);
             let turn = s.active.clone();
             drop(s);
-            return session.interrupt(turn).await;
+            let result = session.interrupt(turn).await;
+            if was_held && result.is_err() {
+                session.state.lock().await.queue_held = true;
+            }
+            return result;
         }
         // Idle with a queue only happens while a Stop holds it, so nothing
         // will drain this item: dispatch it as the worker would.

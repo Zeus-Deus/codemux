@@ -787,8 +787,6 @@ vi.mock("@/stores/agent-chat-store", () => {
     // The pane registers its thread so warm-slice eviction can't drop a
     // transcript that is on screen. Returns the unregister.
     registerMountedThread: () => registerMountedThreadMock(),
-    beginLocalQueuedCancel: vi.fn(),
-    endLocalQueuedCancel: vi.fn(),
   };
 });
 
@@ -1843,7 +1841,9 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
     await waitFor(() => expect(anchorClientNonce(container)).toBe(""));
   });
 
-  it("restores a queued message only when the backend actually cancels it", async () => {
+  it("leaves restoring a cancelled queued message to its cancellation event", async () => {
+    // The store restores the text when `queued_turn_cancelled` arrives, so a
+    // cancel racing a session failure cannot lose it or restore it twice.
     currentSliceOverrides = {
       "thread-x": { inputDraft: "draft already in progress" },
     };
@@ -1859,10 +1859,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
         "q-1",
       );
     });
-    expect(setInputDraftMock).toHaveBeenCalledWith(
-      "thread-x",
-      "queued follow-up\ndraft already in progress",
-    );
+    expect(setInputDraftMock).not.toHaveBeenCalled();
   });
 
   it("does not resurrect an already-dispatched queued message in the composer", async () => {
