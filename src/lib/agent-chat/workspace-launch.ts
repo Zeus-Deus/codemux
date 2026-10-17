@@ -25,6 +25,13 @@ export function isWorkspaceLaunchCall(item: ToolCallItem): boolean {
   return workspaceLaunchInput(item.tool_name, item.input) !== null;
 }
 
+/** Codex reports host refusals inside a completed dynamic-tool envelope. */
+export function workspaceLaunchFailed(item: ToolCallItem): boolean {
+  const content = parse(item.result_content);
+  return item.status === "error" ||
+    (record(content) && (content.success === false || content.isError === true));
+}
+
 function startingBranch(content: unknown): string | null {
   const value = parse(content);
   if (Array.isArray(value)) {

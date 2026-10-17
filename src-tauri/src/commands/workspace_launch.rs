@@ -95,7 +95,12 @@ fn caller_workspace<R: Runtime>(
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = std::process::Command::new("git");
-    command.current_dir(repo).args(args);
+    command
+        .current_dir(repo)
+        .args(args)
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
     crate::execution::sanitize_gui_env_std(&mut command);
     let output = command
         .output()
@@ -302,6 +307,13 @@ async fn start<R: Runtime>(
         )
         .await
         .map_err(|error| error.to_string())?;
+        // Provider preparation may yield while another launch creates the checkout.
+        if crate::git::conventional_worktree_path(&repo, &branch).is_some_and(|path| path.exists())
+        {
+            return Err(format!(
+                "A worktree path already exists for '{branch}'. Choose a new branch."
+            ));
+        }
         let created = super::workspace::create_worktree_workspace_impl_with_selection(
             app.clone(),
             &app.state::<AppStateStore>(),

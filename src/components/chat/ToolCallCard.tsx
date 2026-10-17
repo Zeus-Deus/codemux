@@ -1,4 +1,4 @@
-import { isWorkspaceLaunchCall } from "@/lib/agent-chat/workspace-launch";
+import { isWorkspaceLaunchCall, workspaceLaunchFailed } from "@/lib/agent-chat/workspace-launch";
 import { Kbd } from "@/components/ui/kbd";
 import { HermesPermissionOptions, isHermesPermission, hermesPermissionAllowed } from "./HermesPermissionOptions";
 import { memo, useEffect, useId, useMemo, useRef, useState, type ComponentType } from "react";
@@ -88,14 +88,17 @@ export const ToolCallCard = memo(function ToolCallCard({
   const isRequestFailed = resolution?.state === "failed";
   const isDenied =
     resolution?.state === "resolved" && resolution.decision.decision !== "allow" && resolution.decision.decision !== "allow_for_session" && !(resolution.decision.decision === "provider_option" && hermesPermissionAllowed(approval?.payload, resolution.decision.option_id));
+  const isWorkspaceLaunch = isWorkspaceLaunchCall(item);
+  const launchFailed = isWorkspaceLaunch && workspaceLaunchFailed(item);
+  const isError = item.status === "error" || launchFailed;
   const isExecuting =
     !isPendingApproval &&
     !isResponding &&
     !isRequestFailed &&
     !isDenied &&
+    !isError &&
     item.status === "running";
-  const isSuccess = item.status === "done";
-  const isError = item.status === "error";
+  const isSuccess = !isError && item.status === "done";
 
   // Default collapsed behavior:
   //  - pending_approval: expanded so user can see what they're approving.
@@ -125,7 +128,12 @@ export const ToolCallCard = memo(function ToolCallCard({
     }
   }, [hasImages]);
 
-  const visualName = isWorkspaceLaunchCall(item) ? "workspace_launch" : item.tool_name;
+  // A streamed Codex refusal arrives after the collapsed card has mounted.
+  useEffect(() => {
+    if (launchFailed) setExpanded(true);
+  }, [launchFailed]);
+
+  const visualName = isWorkspaceLaunch ? "workspace_launch" : item.tool_name;
   const Icon = toolIcon(visualName);
   const glyph = glyphForState({
     isPendingApproval,

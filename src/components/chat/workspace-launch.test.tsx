@@ -53,6 +53,25 @@ describe("workspace launch visuals", () => {
     expect(isWorkspaceLaunchCall(launch({ tool_name: "Bash" }))).toBe(false);
   });
 
+  it.each([false, true])("shows a Codex refusal as an expanded error (streamed: %s)", (streamed) => {
+    const item = launch({
+      tool_name: "dynamicToolCall",
+      input: { tool: "codemux_mcp__codemux__workspace_launch", arguments: JSON.stringify({ title: "Fix terminal resize", message: "Brief", branch: "fix-resize" }) },
+      status: "done",
+      result_content: { success: false, contentItems: [{ type: "inputText", text: "Branch 'fix-resize' already exists or is starting. Choose a new branch." }] },
+    });
+    const { container, rerender } = render(<ToolCallCard item={streamed ? { ...item, status: "running", result_content: null } : item} approval={null} onDecide={() => {}} />);
+    if (streamed) {
+      expect(screen.getByRole("button", { name: /Starting workspace/ })).toHaveAttribute("aria-expanded", "false");
+      rerender(<ToolCallCard item={item} approval={null} onDecide={() => {}} />);
+    }
+    expect(screen.getByRole("button", { name: /Workspace launch failed Fix terminal resize fix-resize/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByText("Started workspace")).not.toBeInTheDocument();
+    expect(container.querySelector(".lucide-x")).toBeInTheDocument();
+    expect(container.querySelector(".lucide-check")).not.toBeInTheDocument();
+    expect(screen.getByText(/Branch 'fix-resize' already exists or is starting/)).toBeVisible();
+  });
+
   it("keeps launches visible beside the reply after the turn settles", () => {
     const item = launch();
     const messages: ChatViewItem[] = [

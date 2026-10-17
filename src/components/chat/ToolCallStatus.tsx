@@ -1,4 +1,4 @@
-import { workspaceLaunchBranch, workspaceLaunchInput } from "@/lib/agent-chat/workspace-launch";
+import { workspaceLaunchBranch, workspaceLaunchFailed, workspaceLaunchInput } from "@/lib/agent-chat/workspace-launch";
 import { hermesLearningLabel } from "@/lib/agent-chat/hermes-learning";
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 
@@ -57,7 +57,7 @@ export function describeToolCall(item: ToolCallItem): ToolDescription {
   const launch = workspaceLaunchInput(item.tool_name, item.input);
   if (launch) {
     return {
-      verb: item.status === "error" ? "Workspace launch failed" : item.status === "running" ? "Starting workspace" : "Started workspace",
+      verb: workspaceLaunchFailed(item) ? "Workspace launch failed" : item.status === "running" ? "Starting workspace" : "Started workspace",
       target: typeof launch.title === "string" ? launch.title : null,
       targetMono: false,
       argument: workspaceLaunchBranch(item),
