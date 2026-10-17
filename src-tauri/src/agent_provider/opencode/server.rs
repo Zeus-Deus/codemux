@@ -266,10 +266,21 @@ impl ServerProcess {
             signal_group(pid, libc::SIGKILL);
         }
         #[cfg(windows)]
-        if let Some(pid) = self.0.id() {
-            // taskkill blocks; the still-open child handle keeps the PID
-            // from being reused while it walks the tree.
-            let _ = tokio::task::spawn_blocking(move || crate::agent_browser::kill_pid(pid)).await;
+        if let (Some(pid), Some(Ok(handle))) = (
+            self.0.id(),
+            self.0.raw_handle().map(|raw| {
+                unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(raw) }
+                    .try_clone_to_owned()
+            }),
+        ) {
+            // taskkill finds the tree by PID. The job owns a duplicate of the
+            // process handle, so the PID cannot be reused even if this future
+            // is cancelled (SHUTDOWN_TIMEOUT) and the child dropped first.
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::agent_browser::kill_pid(pid);
+                drop(handle);
+            })
+            .await;
         }
         self.0.kill().await
     }
