@@ -201,7 +201,7 @@ export function UsageTokenTypes({
         "grid items-center gap-x-3",
         compact
           ? "grid-cols-[auto_minmax(1.5rem,1fr)_minmax(7rem,9rem)_minmax(1.5rem,1fr)_auto]"
-          : "grid-cols-[auto_minmax(2rem,1fr)_minmax(8rem,11rem)_minmax(2rem,1fr)_auto]",
+          : "grid-cols-[auto_minmax(1.5rem,1fr)_minmax(7rem,11rem)_minmax(1.5rem,1fr)_auto]",
         className,
       )}
     >

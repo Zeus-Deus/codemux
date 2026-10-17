@@ -1466,11 +1466,13 @@ function ToolGroup({
 
   return (
     <div
-      className={cn("transition-opacity duration-150", dimmed && "opacity-50")}
+      className={cn("@container transition-opacity duration-150", dimmed && "opacity-50")}
       onPointerEnter={() => onHoverProvider(provider.provider)}
       onPointerLeave={() => onHoverProvider(null)}
     >
-      <div className="grid grid-cols-[minmax(10rem,13rem)_minmax(0,1fr)_auto] items-center gap-x-6 gap-y-3 px-4 py-3.5 lg:grid-cols-[minmax(10rem,13rem)_11.5rem_minmax(0,1fr)_auto]">
+      {/* Sized by the card, not the window: the sparkline and meters drop out
+          as it narrows so the tool name and its figures always fit. */}
+      <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-6 gap-y-3 px-4 py-3.5 @xl:grid-cols-[minmax(10rem,13rem)_minmax(0,1fr)_auto] @2xl:grid-cols-[minmax(10rem,13rem)_11.5rem_minmax(0,1fr)_auto]">
         <span className="flex min-w-0 items-center gap-2.5">
           {isKnownProvider(provider.provider) ? (
             <ProviderLogo provider={provider.provider} className="h-[18px] w-[18px] shrink-0" />
@@ -1499,7 +1501,7 @@ function ToolGroup({
             aria-label={`${seriesLabel(provider.provider)} plan limits: ${bars
               .map((w) => `${WINDOW_LABEL[w.kind]} ${remainingPct(w)}% left`)
               .join(", ")}. Open Limits.`}
-            className="hidden flex-col gap-1.5 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 lg:flex"
+            className="hidden flex-col gap-1.5 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 @2xl:flex"
           >
             {bars.map((w) => (
               <Tooltip key={w.kind}>
@@ -1533,7 +1535,7 @@ function ToolGroup({
             ))}
           </button>
         ) : (
-          <span className="hidden text-label text-muted-foreground lg:block">
+          <span className="hidden text-label text-muted-foreground @2xl:block">
             No plan limits reported
           </span>
         )}
@@ -1544,6 +1546,7 @@ function ToolGroup({
           hovered={hovered}
           onHover={onHover}
           ariaLabel={`${seriesLabel(provider.provider)} per ${unit}`}
+          className="hidden @xl:block"
           describe={(index) => {
             const slice = buckets[index]?.providers[provider.provider];
             const label = buckets[index]?.sub_label ?? "";
@@ -1588,7 +1591,7 @@ function ToolGroup({
                   onFocus={() => onHoverModel(m)}
                   onBlur={() => onHoverModel(null)}
                   aria-label={`Open ${m.model} details`}
-                  className="group grid w-full grid-cols-[minmax(0,1fr)_6rem_4.5rem_6.5rem_1rem] items-center gap-x-4 py-1.5 pl-[3.25rem] pr-4 text-left transition-colors duration-150 hover:bg-accent/20 focus-visible:bg-accent/20 focus-visible:outline-none"
+                  className="group grid w-full grid-cols-[minmax(0,1fr)_auto_1rem] items-center gap-x-3 py-1.5 pl-8 pr-4 text-left @xl:grid-cols-[minmax(0,1fr)_6rem_4.5rem_6.5rem_1rem] @xl:gap-x-4 @xl:pl-[3.25rem] transition-colors duration-150 hover:bg-accent/20 focus-visible:bg-accent/20 focus-visible:outline-none"
                 >
                   <span className="flex min-w-0 items-center gap-2">
                     <span className="truncate font-mono text-body-sm text-foreground/90">{m.model}</span>
@@ -1596,7 +1599,7 @@ function ToolGroup({
                     {!m.priced && <Pill>no price</Pill>}
                     {subagents && <Pill>subagents</Pill>}
                   </span>
-                  <span className="h-1.5 overflow-hidden rounded-full bg-muted/50" aria-hidden>
+                  <span className="hidden h-1.5 overflow-hidden rounded-full bg-muted/50 @xl:block" aria-hidden>
                     <span
                       className={cn("block h-full rounded-full", seriesFill(m.provider))}
                       style={{
@@ -1607,7 +1610,7 @@ function ToolGroup({
                       }}
                     />
                   </span>
-                  <span className="text-right font-mono text-body-sm tabular-nums text-foreground/75">
+                  <span className="hidden text-right font-mono text-body-sm tabular-nums text-foreground/75 @xl:block">
                     {/* An unpriced model has no cost share, so under Cost it
                         shows its share of the page's tokens, marked "tok". */}
                     {metric === "cost" && !m.priced
@@ -1634,7 +1637,7 @@ function ToolGroup({
             );
           })}
           {models.length > MODELS_SHOWN && (
-            <li className="pl-[3.25rem] pt-1">
+            <li className="pl-8 pt-1 @xl:pl-[3.25rem]">
               <button
                 type="button"
                 onClick={() => setShowAll((v) => !v)}
