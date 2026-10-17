@@ -1,0 +1,45 @@
+Codemux local audit — 2026-10-17
+Baseline commit: 464e3840408365112a06728469e10ab7870f4345
+
+Terminal buffer benchmark
+-------------------------
+The benchmark contains the baseline Vec and patched VecDeque implementations.
+It appends 16,384 chunks of 8 KiB to an already-full 1 MiB buffer (128 MiB total).
+Each run verifies the final snapshot and tail. Five samples per implementation.
+This measures only append elapsed time: snapshots, PTY I/O and app work are excluded.
+The measured ratio is not a claim about whole-app responsiveness.
+
+Run from the repository root:
+  rustc --edition=2021 -O docs/evidence/quality-audit/ring-buffer-benchmark.rs -o /tmp/codemux-ring-benchmark
+  /tmp/codemux-ring-benchmark baseline
+  /tmp/codemux-ring-benchmark optimized
+  rustc --edition=2021 -O --test docs/evidence/quality-audit/ring-buffer-benchmark.rs -o /tmp/codemux-ring-equivalence
+  /tmp/codemux-ring-equivalence
+
+The equivalence check covers 50,000 varied appends across five capacities,
+comparing complete snapshots and several tail lengths against a flat reference.
+Raw samples, source hashes and compiler version are in ring-buffer-results.json.
+
+Snapshot reconciliation benchmark
+---------------------------------
+Synthetic 270-workspace snapshot, 371,902 serialized bytes, three surfaces and
+three tabs per workspace. Compared baseline and patched shareStructural using
+300 reconciliations per sample, seven alternating samples per implementation.
+Both an unchanged snapshot and one changed leaf are measured. GC ran before
+each sample. Node v26.11.1. Rust compilation ran concurrently; timings are
+diagnostic local measurements, not a release performance guarantee.
+Raw samples are in snapshot-sharing-results.json.
+
+Reproduce from the repository root:
+  git show 464e3840408365112a06728469e10ab7870f4345:src/lib/structural-share.ts > /tmp/codemux-share-baseline.ts
+  node --expose-gc docs/evidence/quality-audit/snapshot-sharing-benchmark.mjs /tmp/codemux-share-baseline.ts
+
+Browser evidence
+----------------
+Screenshots use the development mock with seeded data. Initial after-flow checks
+ran on localhost:1422. The later before/after pair uses a baseline archive on 1423
+and the current checkout on 1422; see before-after-browser.json for exact steps.
+Port 1420 was occupied; the existing process was preserved. The Codemux CLI
+control endpoint was unavailable. Preview navigation/snapshots worked, but
+repeated interaction timeouts required the installed agent-browser fallback
+with an isolated Chromium session. No live provider credentials were needed.

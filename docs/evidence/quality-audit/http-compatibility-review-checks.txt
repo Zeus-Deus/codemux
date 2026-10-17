@@ -1,0 +1,66 @@
+Intermediate audit HTTP compatibility regression checks.
+The three red cases were run using exact extracted production reader/parser/functions
+and the compiled real tokio/axum dependencies. The green run includes all 19 reader/parser
+tests, including bodyless metadata, persistent 204, truncated 200, chunk framing and caps.
+The initial monolithic native red compilation was stopped before tests ran; it is
+not counted as a red test result. Native final verification subsequently passed: 203 tests, 0 failures, 1 pre-existing
+ignored; see native-tests-final.txt and verification.json.
+
+Before bodyless-response follow-up fix
+
+running 3 tests
+test read_response_preserves_head_content_length_metadata ... FAILED
+test read_response_preserves_bodyless_transfer_encoding_metadata ... FAILED
+test read_response_preserves_not_modified_content_length_metadata ... FAILED
+
+failures:
+
+---- read_response_preserves_head_content_length_metadata stdout ----
+
+thread 'read_response_preserves_head_content_length_metadata' (1408686) panicked at <exact-source-harness>:227:76:
+called `Result::unwrap()` on an `Err` value: ()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- read_response_preserves_bodyless_transfer_encoding_metadata stdout ----
+
+thread 'read_response_preserves_bodyless_transfer_encoding_metadata' (1408685) panicked at <exact-source-harness>:247:61:
+called `Option::unwrap()` on a `None` value
+
+---- read_response_preserves_not_modified_content_length_metadata stdout ----
+
+thread 'read_response_preserves_not_modified_content_length_metadata' (1408687) panicked at <exact-source-harness>:235:49:
+called `Result::unwrap()` on an `Err` value: ()
+
+
+failures:
+    read_response_preserves_bodyless_transfer_encoding_metadata
+    read_response_preserves_head_content_length_metadata
+    read_response_preserves_not_modified_content_length_metadata
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.00s
+
+
+After bodyless-response follow-up fix
+
+running 19 tests
+test parse_response_decodes_chunk_extensions_and_trailers ... ok
+test parse_response_decodes_chunked_body ... ok
+test parse_response_extracts_status_type_and_body ... ok
+test parse_response_preserves_error_status ... ok
+test parse_response_rejects_garbage ... ok
+test parse_response_rejects_incomplete_or_malformed_chunks ... ok
+test read_response_accepts_repeated_identical_content_lengths ... ok
+test read_response_errors_on_truncated_headers ... ok
+test read_response_falls_back_to_eof_when_unframed ... ok
+test read_response_finishes_no_content_without_waiting_for_close ... ok
+test read_response_preserves_bodyless_transfer_encoding_metadata ... ok
+test read_response_preserves_not_modified_content_length_metadata ... ok
+test read_response_preserves_head_content_length_metadata ... ok
+test read_response_rejects_invalid_content_length ... ok
+test read_response_rejects_overflowing_content_length ... ok
+test read_response_rejects_truncated_content_length_body ... ok
+test read_response_rejects_conflicting_content_lengths ... ok
+test read_response_uses_content_length_and_stops ... ok
+test read_response_rejects_unframed_body_beyond_existing_safety_cap ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s

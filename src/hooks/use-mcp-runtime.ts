@@ -28,17 +28,27 @@ export function useMcpRuntime() {
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
+    let hydrating = true;
+    const liveDuringHydration = new Map<string, McpServerRuntime>();
 
     void getMcpRuntimeStatus()
       .then((rows) => {
         if (cancelled) return;
-        setRuntimes(new Map(rows.map((r) => [r.id, r])));
+        const snapshot = new Map(rows.map((r) => [r.id, r]));
+        // Events received after the read began are newer for their server;
+        // hydrate untouched rows without rolling those live updates back.
+        for (const [id, row] of liveDuringHydration) snapshot.set(id, row);
+        setRuntimes(snapshot);
         setLoaded(true);
       })
       .catch((err) => {
         if (cancelled) return;
         console.warn("[mcp] getMcpRuntimeStatus failed:", err);
         setLoaded(true);
+      })
+      .finally(() => {
+        hydrating = false;
+        liveDuringHydration.clear();
       });
 
     // `listen()` throws synchronously when `window.__TAURI_INTERNALS__`
@@ -49,6 +59,7 @@ export function useMcpRuntime() {
       void listen<McpServerRuntime>(MCP_STATUS_CHANGED_EVENT, (event) => {
         if (cancelled) return;
         const row = event.payload;
+        if (hydrating) liveDuringHydration.set(row.id, row);
         setRuntimes((prev) => {
           const next = new Map(prev);
           next.set(row.id, row);

@@ -230,7 +230,6 @@ pub(crate) struct Negotiation {
     pub load: bool,
     pub close: bool,
     pub images: bool,
-    pub additional_directories: bool,
     pub auth_methods: Vec<AcpAuthMethod>,
 }
 impl Negotiation {
@@ -274,12 +273,14 @@ impl Negotiation {
                 });
             }
         }
+        // Additional directories are rejected by host policy even when
+        // advertised; preserve validation without retaining unused state.
+        object("/sessionCapabilities/additionalDirectories")?;
         Ok(Self {
             resume: object("/sessionCapabilities/resume")?,
             load: boolean("/loadSession")?,
             close: object("/sessionCapabilities/close")?,
             images: boolean("/promptCapabilities/image")?,
-            additional_directories: object("/sessionCapabilities/additionalDirectories")?,
             auth_methods,
         })
     }

@@ -53,6 +53,12 @@ export function useAppStateInit(skip = false) {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingCommitRef = useRef<(() => void) | null>(null);
 
+  useEffect(() => () => {
+    if (debounceRef.current !== null) clearTimeout(debounceRef.current);
+    debounceRef.current = null;
+    pendingCommitRef.current = null;
+  }, [skip]);
+
   // Run a snapshot that is still sitting in the coalescing window, now.
   //
   // It was delivered BEFORE whatever prompted the flush and carries a lower
@@ -72,12 +78,17 @@ export function useAppStateInit(skip = false) {
   // Fetch initial state on mount (skip if not authenticated yet)
   useEffect(() => {
     if (skip) return;
+    let cancelled = false;
     getAppState()
       .then((snapshot) => {
+        if (cancelled) return;
         setAppState(snapshot);
         markStartup("initial-snapshot-ready", tracedPayloadMeta(snapshot));
       })
       .catch((err) => console.error("Failed to fetch app state:", err));
+    return () => {
+      cancelled = true;
+    };
   }, [setAppState, skip]);
 
   // Subscribe to state changes with a 16ms debounce. The backend already
@@ -230,15 +241,28 @@ export function useAppStateInit(skip = false) {
   // delta path permanently shut.
   useEffect(() => {
     if (skip || resyncRequestId === 0) return;
+    let cancelled = false;
+    const endOwnedResync = () => {
+      const state = useAppStore.getState();
+      if (state.resyncRequestId === resyncRequestId) state.endResync();
+    };
     getAppState()
-      .then(setAppState)
+      .then((snapshot) => {
+        if (!cancelled) setAppState(snapshot);
+      })
       .catch((err) => console.error("Failed to resync app state:", err))
       .finally(() => {
-        useAppStore.getState().endResync();
+        if (!cancelled) endOwnedResync();
       });
+    return () => {
+      cancelled = true;
+      // A retired fetch no longer owns the baseline. Release its window so
+      // a resumed listener can retry, without closing a newer request's window.
+      endOwnedResync();
+    };
   }, [resyncRequestId, setAppState, skip]);
 
-  useTauriEvent(onAppStateChanged, handleStateChanged, [handleStateChanged]);
-  useTauriEvent(onAppStateDelta, handleDelta, [handleDelta]);
-  useTauriEvent(onAppStateRevision, handleRevision, [handleRevision]);
+  useTauriEvent(onAppStateChanged, handleStateChanged, [handleStateChanged], !skip);
+  useTauriEvent(onAppStateDelta, handleDelta, [handleDelta], !skip);
+  useTauriEvent(onAppStateRevision, handleRevision, [handleRevision], !skip);
 }

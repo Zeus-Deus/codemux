@@ -1,0 +1,40 @@
+{
+  "compiler": "rustc 1.99.0 (b940084d7 2026-09-28) (Arch Linux rust 1:1.99.0-1)",
+  "workload": {
+    "buffer_capacity_bytes": 1048576,
+    "push_count": 16384,
+    "push_bytes": 8192,
+    "total_append_bytes": 134217728,
+    "initial_state": "full"
+  },
+  "measurement": "isolated ring-buffer append elapsed wall time; excludes snapshots, PTY I/O and app work",
+  "units": "microseconds",
+  "source_sha256": {
+    "baseline": "f4bb85f2ac9ae57149efa57057851146bab57d6b8be6a5165d4b91f7f6417bd6",
+    "optimized": "8fc0ffb9fce0452f1f1ce75a346536e43ce90a9b94862c55cbff01a8e1d8a2b9"
+  },
+  "runs": {
+    "baseline": {
+      "samples": [
+        180221,
+        179934,
+        180118,
+        188510,
+        198474
+      ],
+      "median": 180221
+    },
+    "optimized": {
+      "samples": [
+        1748,
+        1770,
+        1433,
+        1376,
+        1304
+      ],
+      "median": 1433
+    }
+  },
+  "median_ratio": 125.76482903000698,
+  "source_hash_method": "SHA-256 of UTF-8 source from struct RingBuffer { through the byte before newline /// Top-level manager.; both excerpts also appear verbatim in ring-buffer-benchmark.rs. Baseline from baseline_commit in verification.json; optimized from src-tauri/src/remote/pty.rs."
+}

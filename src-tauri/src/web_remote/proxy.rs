@@ -255,12 +255,12 @@ async fn forward(
     stream.write_all(&wire).await.map_err(|_| ())?;
     let _ = stream.flush().await;
 
-    let raw = tokio::time::timeout(Duration::from_secs(30), read_response(&mut stream))
+    let raw = tokio::time::timeout(Duration::from_secs(30), read_response(&mut stream, method))
         .await
         .map_err(|_| ())?
         .map_err(|_| ())?;
 
-    let parsed = parse_http_response(&raw).ok_or(())?;
+    let parsed = parse_http_response(&raw, method).ok_or(())?;
     let mut builder = axum::response::Response::builder().status(parsed.status);
     if let Some(ct) = parsed.content_type {
         builder = builder.header(header::CONTENT_TYPE, ct);
@@ -275,10 +275,10 @@ async fn forward(
 /// Headers are read first; then, if the response carries a `Content-Length`,
 /// exactly that many body bytes are read and reading STOPS (so a daemon that
 /// ignores our `Connection: close` and keeps the socket open can't wedge us).
-/// Without a `Content-Length` — chunked or close-delimited — it reads to EOF,
-/// which the outer `Connection: close` guarantees terminates. A 30s timeout in
-/// the caller backstops any pathological server.
-async fn read_response<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Vec<u8>, ()> {
+/// Without a `Content-Length` — chunked or close-delimited — it reads to EOF.
+/// The caller requests `Connection: close`; its 30s timeout bounds a server
+/// that ignores that request. Incomplete bodies are rejected, not forwarded.
+async fn read_response<R: AsyncRead + Unpin>(stream: &mut R, method: &Method) -> Result<Vec<u8>, ()> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
 
@@ -297,29 +297,48 @@ async fn read_response<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Vec<u8>, 
         }
     };
     let body_start = header_end + 4;
+    let head = String::from_utf8_lossy(&buf[..header_end]);
+    let code = head.split_whitespace().nth(1).ok_or(())?
+        .parse::<u16>().map_err(|_| ())?;
+    let status = StatusCode::from_u16(code).map_err(|_| ())?;
+    // HEAD and 304 can carry representation length/encoding metadata without
+    // sending that representation. Bodyless responses end at their headers.
+    if !response_has_body(method, status) {
+        buf.truncate(body_start);
+        return Ok(buf);
+    }
 
     // 2. Prefer an explicit Content-Length; fall back to close-delimited.
     let content_length = {
         let head = String::from_utf8_lossy(&buf[..header_end]);
-        head.split("\r\n").skip(1).find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
-        })
+        let mut length = None;
+        for line in head.split("\r\n").skip(1) {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                for value in value.split(',') {
+                    let parsed = value.trim().parse::<usize>().map_err(|_| ())?;
+                    if length.is_some_and(|previous| previous != parsed) {
+                        return Err(());
+                    }
+                    length = Some(parsed);
+                }
+            }
+        }
+        length
     };
 
     match content_length {
         Some(len) => {
-            while buf.len() < body_start + len {
+            let end = body_start.checked_add(len).ok_or(())?;
+            while buf.len() < end {
                 let n = stream.read(&mut chunk).await.map_err(|_| ())?;
                 if n == 0 {
-                    break; // short read; return what we have
+                    return Err(());
                 }
                 buf.extend_from_slice(&chunk[..n]);
             }
-            let end = (body_start + len).min(buf.len());
             buf.truncate(end);
         }
         None => loop {
@@ -329,11 +348,18 @@ async fn read_response<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Vec<u8>, 
             }
             buf.extend_from_slice(&chunk[..n]);
             if buf.len() > (16 << 20) {
-                break; // 16 MiB safety cap for an unframed body
+                return Err(()); // never return a silently truncated response
             }
         },
     }
     Ok(buf)
+}
+
+fn response_has_body(method: &Method, status: StatusCode) -> bool {
+    method != Method::HEAD
+        && !status.is_informational()
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
 }
 
 struct ParsedResponse {
@@ -345,7 +371,7 @@ struct ParsedResponse {
 /// Parse a raw HTTP/1.1 response into status + content-type + decoded body.
 /// Handles the `Transfer-Encoding: chunked` case; otherwise the body is taken
 /// verbatim (Content-Length or connection-close delimited).
-fn parse_http_response(raw: &[u8]) -> Option<ParsedResponse> {
+fn parse_http_response(raw: &[u8], method: &Method) -> Option<ParsedResponse> {
     let sep = find_subsequence(raw, b"\r\n\r\n")?;
     let head = &raw[..sep];
     let body_raw = &raw[sep + 4..];
@@ -372,8 +398,10 @@ fn parse_http_response(raw: &[u8]) -> Option<ParsedResponse> {
         }
     }
 
-    let body = if chunked {
-        dechunk(body_raw)
+    let body = if !response_has_body(method, status) {
+        Vec::new()
+    } else if chunked {
+        dechunk(body_raw)?
     } else {
         body_raw.to_vec()
     };
@@ -393,34 +421,29 @@ fn find_subsequence(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Decode an HTTP/1.1 chunked-transfer body.
-fn dechunk(mut data: &[u8]) -> Vec<u8> {
+fn dechunk(mut data: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     loop {
-        let Some(nl) = find_subsequence(data, b"\r\n") else {
-            break;
-        };
+        let nl = find_subsequence(data, b"\r\n")?;
         // The size line may carry a `;ext` suffix; only the hex prefix counts.
-        let size_line = std::str::from_utf8(&data[..nl]).unwrap_or("");
-        let size_hex = size_line.split(';').next().unwrap_or("").trim();
-        let Ok(size) = usize::from_str_radix(size_hex, 16) else {
-            break;
-        };
+        let size_line = std::str::from_utf8(&data[..nl]).ok()?;
+        let size_hex = size_line.split(';').next()?.trim();
+        let size = usize::from_str_radix(size_hex, 16).ok()?;
         data = &data[nl + 2..];
         if size == 0 {
-            break; // final chunk
+            // The final chunk is followed by an empty line or a complete
+            // trailer section. A missing terminator means a truncated body.
+            return (data.starts_with(b"\r\n")
+                || find_subsequence(data, b"\r\n\r\n").is_some())
+                .then_some(out);
         }
-        if data.len() < size {
-            out.extend_from_slice(data);
-            break;
+        let next = size.checked_add(2)?;
+        if data.len() < next || &data[size..next] != b"\r\n" {
+            return None;
         }
         out.extend_from_slice(&data[..size]);
-        data = &data[size..];
-        // Skip the CRLF that terminates each chunk's data.
-        if data.starts_with(b"\r\n") {
-            data = &data[2..];
-        }
+        data = &data[next..];
     }
-    out
 }
 
 #[cfg(test)]
@@ -464,7 +487,7 @@ mod tests {
     #[test]
     fn parse_response_extracts_status_type_and_body() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
-        let parsed = parse_http_response(raw).expect("parses");
+        let parsed = parse_http_response(raw, &Method::GET).expect("parses");
         assert_eq!(parsed.status, StatusCode::OK);
         assert_eq!(parsed.content_type.as_deref(), Some("application/json"));
         assert_eq!(parsed.body, b"{\"ok\":true}");
@@ -473,7 +496,7 @@ mod tests {
     #[test]
     fn parse_response_preserves_error_status() {
         let raw = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nnope";
-        let parsed = parse_http_response(raw).expect("parses");
+        let parsed = parse_http_response(raw, &Method::GET).expect("parses");
         assert_eq!(parsed.status, StatusCode::NOT_FOUND);
         assert_eq!(parsed.body, b"nope");
     }
@@ -481,25 +504,53 @@ mod tests {
     #[test]
     fn parse_response_decodes_chunked_body() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-        let parsed = parse_http_response(raw).expect("parses");
+        let parsed = parse_http_response(raw, &Method::GET).expect("parses");
         assert_eq!(parsed.status, StatusCode::OK);
         assert_eq!(parsed.body, b"hello world");
     }
 
     #[test]
+    fn parse_response_decodes_chunk_extensions_and_trailers() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;source=test\r\nhello\r\n0\r\nX-Trace: complete\r\n\r\n";
+        assert_eq!(parse_http_response(raw, &Method::GET).unwrap().body, b"hello");
+    }
+
+    #[test]
+    fn parse_response_rejects_incomplete_or_malformed_chunks() {
+        for body in [
+            b"5\r\nhel".as_slice(),
+            b"5\r\nhello\r\n",
+            b"5\r\nhelloXX0\r\n\r\n",
+            b"not-hex\r\nhello\r\n0\r\n\r\n",
+            b"0\r\n",
+        ] {
+            let mut raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            raw.extend_from_slice(body);
+            assert!(
+                parse_http_response(&raw, &Method::GET).is_none(),
+                "accepted malformed chunk body {body:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_response_rejects_garbage() {
-        assert!(parse_http_response(b"not http at all").is_none());
+        assert!(parse_http_response(b"not http at all", &Method::GET).is_none());
     }
 
     // Feed `raw` through a duplex pipe (writer drops → EOF) and read it back.
     async fn read_via_pipe(raw: &'static [u8]) -> Result<Vec<u8>, ()> {
+        read_via_pipe_with_method(raw, &Method::GET).await
+    }
+
+    async fn read_via_pipe_with_method(raw: &'static [u8], method: &Method) -> Result<Vec<u8>, ()> {
         use tokio::io::AsyncWriteExt;
         let (mut w, mut r) = tokio::io::duplex(32);
         tokio::spawn(async move {
             let _ = w.write_all(raw).await;
             // drop `w` → EOF on `r`
         });
-        read_response(&mut r).await
+        read_response(&mut r, method).await
     }
 
     #[tokio::test]
@@ -508,7 +559,7 @@ mod tests {
         // read must not block waiting for a close that may never come).
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA";
         let out = read_via_pipe(raw).await.expect("reads");
-        let parsed = parse_http_response(&out).expect("parses");
+        let parsed = parse_http_response(&out, &Method::GET).expect("parses");
         assert_eq!(parsed.body, b"hello");
     }
 
@@ -516,7 +567,7 @@ mod tests {
     async fn read_response_falls_back_to_eof_when_unframed() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nno length here";
         let out = read_via_pipe(raw).await.expect("reads");
-        let parsed = parse_http_response(&out).expect("parses");
+        let parsed = parse_http_response(&out, &Method::GET).expect("parses");
         assert_eq!(parsed.body, b"no length here");
     }
 
@@ -524,6 +575,101 @@ mod tests {
     async fn read_response_errors_on_truncated_headers() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/pla"; // no header terminator
         assert!(read_via_pipe(raw).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_response_preserves_head_content_length_metadata() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 123\r\n\r\n";
+        let response = read_via_pipe_with_method(raw, &Method::HEAD).await.unwrap();
+        let parsed = parse_http_response(&response, &Method::HEAD).unwrap();
+        assert_eq!(parsed.status, StatusCode::OK);
+        assert!(parsed.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_response_preserves_not_modified_content_length_metadata() {
+        let raw = b"HTTP/1.1 304 Not Modified\r\nContent-Length: 123\r\n\r\n";
+        let response = read_via_pipe(raw).await.unwrap();
+        let parsed = parse_http_response(&response, &Method::GET).unwrap();
+        assert_eq!(parsed.status, StatusCode::NOT_MODIFIED);
+        assert!(parsed.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_response_preserves_bodyless_transfer_encoding_metadata() {
+        for (raw, method) in [
+            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(), Method::HEAD),
+            (b"HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: chunked\r\n\r\n", Method::GET),
+        ] {
+            let response = read_via_pipe_with_method(raw, &method).await.unwrap();
+            assert!(parse_http_response(&response, &method).unwrap().body.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn read_response_finishes_no_content_without_waiting_for_close() {
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        writer.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_response(&mut reader, &Method::GET),
+        ).await.expect("204 ends at its headers, even on a persistent connection").unwrap();
+        let parsed = parse_http_response(&response, &Method::GET).unwrap();
+        assert_eq!(parsed.status, StatusCode::NO_CONTENT);
+        assert!(parsed.body.is_empty());
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn read_response_rejects_truncated_content_length_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort";
+        assert!(read_via_pipe(raw).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_response_rejects_overflowing_content_length() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\n";
+        assert!(read_via_pipe(raw).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_response_rejects_invalid_content_length() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: invalid\r\n\r\nhello";
+        assert!(read_via_pipe(raw).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_response_rejects_conflicting_content_lengths() {
+        for raw in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 10\r\n\r\nhello".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5, 10\r\n\r\nhello",
+        ] {
+            assert!(read_via_pipe(raw).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn read_response_accepts_repeated_identical_content_lengths() {
+        for raw in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5, 5\r\n\r\nhello",
+        ] {
+            let response = read_via_pipe(raw).await.unwrap();
+            assert_eq!(parse_http_response(&response, &Method::GET).unwrap().body, b"hello");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_response_rejects_unframed_body_beyond_existing_safety_cap() {
+        let (mut writer, mut reader) = tokio::io::duplex(8192);
+        let producer = tokio::spawn(async move {
+            let _ = writer.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+            let _ = writer.write_all(&vec![b'x'; (16 << 20) + 1]).await;
+        });
+        let result = read_response(&mut reader, &Method::GET).await;
+        drop(reader);
+        producer.await.unwrap();
+        assert!(result.is_err());
     }
 
     #[test]

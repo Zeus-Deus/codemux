@@ -324,12 +324,12 @@ fn resolve_upstream_ref(repo_path: &Path) -> Option<String> {
 }
 
 pub fn git_status(repo_path: &Path) -> Result<Vec<GitFileStatus>, String> {
-    let output = run_git(repo_path, &["status", "--porcelain=v1"])?;
+    let output = run_git(repo_path, &["status", "--porcelain=v1", "-z"])?;
     let mut files = parse_porcelain_status(&output);
 
     // Merge per-file diff stats
-    let unstaged_stats = run_git_permissive(repo_path, &["diff", "--numstat"]);
-    let staged_stats = run_git_permissive(repo_path, &["diff", "--cached", "--numstat"]);
+    let unstaged_stats = run_git_permissive(repo_path, &["diff", "--numstat", "-z"]);
+    let staged_stats = run_git_permissive(repo_path, &["diff", "--cached", "--numstat", "-z"]);
     let per_file = parse_numstat_per_file(&unstaged_stats, &staged_stats);
     for file in &mut files {
         if let Some(&(a, d)) = per_file.get(&file.path) {
@@ -968,40 +968,22 @@ pub fn git_log(repo_path: &Path, count: usize) -> Result<Vec<GitLogEntry>, Strin
 pub fn get_commit_files(repo_path: &Path, hash: &str) -> Result<Vec<CommitFileEntry>, String> {
     let output = run_git(
         repo_path,
-        &["diff-tree", "--no-commit-id", "--name-status", "-r", hash],
+        &["diff-tree", "--no-commit-id", "--name-status", "-z", "-r", hash],
     )?;
-    let mut files = Vec::new();
-    for line in output.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        // Format: "M\tpath" or "A\tpath" or "D\tpath" or "R100\told\tnew"
-        let parts: Vec<&str> = line.splitn(2, '\t').collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let status_code = parts[0].chars().next().unwrap_or('M');
-        let status = match status_code {
-            'A' => "added",
-            'M' => "modified",
-            'D' => "deleted",
-            'R' => "renamed",
-            'C' => "copied",
-            _ => "modified",
-        };
-        // For renames/copies, parts[1] is "old\tnew" — use the new path
-        let path = if status_code == 'R' || status_code == 'C' {
-            parts[1].split('\t').last().unwrap_or(parts[1])
-        } else {
-            parts[1]
-        };
-        files.push(CommitFileEntry {
-            path: path.to_string(),
-            status: status.to_string(),
-        });
-    }
-    Ok(files)
+    Ok(parse_name_status(&output)
+        .into_iter()
+        .map(|file| CommitFileEntry {
+            path: file.path,
+            status: match file.status {
+                FileStatus::Added => "added",
+                FileStatus::Deleted => "deleted",
+                FileStatus::Renamed => "renamed",
+                FileStatus::Copied => "copied",
+                _ => "modified",
+            }
+            .to_string(),
+        })
+        .collect())
 }
 
 pub fn git_branch_info(repo_path: &Path) -> Result<GitBranchInfo, String> {
@@ -1038,20 +1020,19 @@ pub fn git_branch_info(repo_path: &Path) -> Result<GitBranchInfo, String> {
 
 fn parse_porcelain_status(output: &str) -> Vec<GitFileStatus> {
     let mut results = Vec::new();
-    for line in output.lines() {
-        if line.len() < 4 {
+    let mut records = output.split_terminator('\0');
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
             continue;
         }
-        let index_status = line.as_bytes()[0];
-        let worktree_status = line.as_bytes()[1];
-        let path_part = &line[3..];
-
-        // For renames/copies, path is "old -> new"; use the new path
-        let path = if let Some(arrow_pos) = path_part.find(" -> ") {
-            path_part[arrow_pos + 4..].to_string()
-        } else {
-            path_part.to_string()
-        };
+        let index_status = record.as_bytes()[0];
+        let worktree_status = record.as_bytes()[1];
+        let path = record[3..].to_string();
+        // In porcelain -z the destination is first, followed by a separate
+        // source record for a rename/copy. Literal arrows are ordinary names.
+        if matches!(index_status, b'R' | b'C') || matches!(worktree_status, b'R' | b'C') {
+            records.next();
+        }
 
         let (status, conflict_type) = match (index_status, worktree_status) {
             // Conflict codes — must be checked before single-letter matches
@@ -1063,8 +1044,8 @@ fn parse_porcelain_status(output: &str) -> Vec<GitFileStatus> {
             // Normal status codes
             (b'?', b'?') => (FileStatus::Untracked, None),
             (b'A', _) => (FileStatus::Added, None),
-            (b'R', _) => (FileStatus::Renamed, None),
-            (b'C', _) => (FileStatus::Copied, None),
+            (b'R', _) | (_, b'R') => (FileStatus::Renamed, None),
+            (b'C', _) | (_, b'C') => (FileStatus::Copied, None),
             (b'D', _) | (_, b'D') => (FileStatus::Deleted, None),
             (b'M', _) | (_, b'M') => (FileStatus::Modified, None),
             _ => (FileStatus::Modified, None),
@@ -1086,42 +1067,31 @@ fn parse_porcelain_status(output: &str) -> Vec<GitFileStatus> {
     results
 }
 
-/// Extract the destination path from a `git diff --numstat` path field,
-/// handling git's compact rename forms so the key matches what
-/// `git diff --name-status` reports (and stats attach correctly):
-///   "old => new"        -> "new"
-///   "dir/{old => new}"  -> "dir/new"
-///   "{old => new}/file" -> "new/file"
-///   "a/{old => new}/b"  -> "a/new/b"
-/// Non-rename paths are returned unchanged.
-fn numstat_new_path(raw: &str) -> String {
-    if !raw.contains(" => ") {
-        return raw.to_string();
-    }
-    if let (Some(open), Some(close)) = (raw.find('{'), raw.find('}')) {
-        if open < close {
-            let prefix = &raw[..open];
-            let inside = &raw[open + 1..close];
-            let suffix = &raw[close + 1..];
-            let new_part = inside.split(" => ").nth(1).unwrap_or(inside);
-            return format!("{prefix}{new_part}{suffix}");
-        }
-    }
-    // No braces: the whole field is "old => new".
-    raw.split(" => ").nth(1).unwrap_or(raw).to_string()
-}
-
+/// Parse `git diff --numstat -z`, whose rename/copy records contain an
+/// empty path field followed by separate old and new path records.
 fn parse_numstat_per_file(unstaged: &str, staged: &str) -> std::collections::HashMap<String, (u32, u32)> {
     let mut map = std::collections::HashMap::new();
-    for line in unstaged.lines().chain(staged.lines()) {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 3 {
-            let adds = parts[0].parse::<u32>().unwrap_or(0);
-            let dels = parts[1].parse::<u32>().unwrap_or(0);
-            let path = numstat_new_path(parts[2]);
-            let entry = map.entry(path).or_insert((0, 0));
-            entry.0 += adds;
-            entry.1 += dels;
+    for output in [unstaged, staged] {
+        let mut records = output.split_terminator('\0');
+        while let Some(record) = records.next() {
+            let mut fields = record.splitn(3, '\t');
+            let (Some(additions), Some(deletions), Some(path)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let path = if path.is_empty() {
+                let (Some(_old), Some(new)) = (records.next(), records.next()) else {
+                    break;
+                };
+                new
+            } else {
+                path
+            };
+            let entry = map.entry(path.to_string()).or_insert((0u32, 0u32));
+            // Binary files report "-" for both counts.
+            entry.0 += additions.parse::<u32>().unwrap_or(0);
+            entry.1 += deletions.parse::<u32>().unwrap_or(0);
         }
     }
     map
@@ -1141,35 +1111,30 @@ fn parse_numstat(output: &str) -> (u32, u32) {
     (total_add, total_del)
 }
 
+/// Parse `git diff --name-status -z` (also used by `diff-tree`).
 fn parse_name_status(output: &str) -> Vec<GitFileStatus> {
     let mut files = Vec::new();
-    for line in output.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.splitn(2, '\t').collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let status_code = parts[0].chars().next().unwrap_or('M');
-        let path_part = parts[1];
-        // Renames show as "R100\told\tnew"
-        let path = if let Some(tab_pos) = path_part.find('\t') {
-            path_part[tab_pos + 1..].to_string()
-        } else {
-            path_part.to_string()
+    let mut records = output.split_terminator('\0');
+    while let Some(status_code) = records.next() {
+        let Some(mut path) = records.next() else {
+            break;
         };
+        let status_code = status_code.as_bytes().first().copied().unwrap_or(b'M');
+        if matches!(status_code, b'R' | b'C') {
+            let Some(destination) = records.next() else {
+                break;
+            };
+            path = destination;
+        }
         let status = match status_code {
-            'A' => FileStatus::Added,
-            'M' => FileStatus::Modified,
-            'D' => FileStatus::Deleted,
-            'R' => FileStatus::Renamed,
-            'C' => FileStatus::Copied,
+            b'A' => FileStatus::Added,
+            b'D' => FileStatus::Deleted,
+            b'R' => FileStatus::Renamed,
+            b'C' => FileStatus::Copied,
             _ => FileStatus::Modified,
         };
         files.push(GitFileStatus {
-            path,
+            path: path.to_string(),
             status,
             is_staged: false,
             is_unstaged: false,
@@ -1179,24 +1144,6 @@ fn parse_name_status(output: &str) -> Vec<GitFileStatus> {
         });
     }
     files
-}
-
-fn parse_single_numstat(output: &str) -> std::collections::HashMap<String, (u32, u32)> {
-    let mut map = std::collections::HashMap::new();
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 3 {
-            let adds = parts[0].parse::<u32>().unwrap_or(0);
-            let dels = parts[1].parse::<u32>().unwrap_or(0);
-            // Handle renames: numstat shows compact forms like
-            // "src/lib/{old => new}" — reconstruct the full destination path.
-            let path = numstat_new_path(parts[2]);
-            let entry = map.entry(path).or_insert((0, 0));
-            entry.0 += adds;
-            entry.1 += dels;
-        }
-    }
-    map
 }
 
 /// Resolve a base branch ref, trying origin/<branch> first, then local.
@@ -1221,11 +1168,11 @@ pub fn git_diff_base_branch(repo_path: &Path, base_branch: &str) -> Result<BaseB
     }
 
     let range = format!("{}..HEAD", merge_base);
-    let name_status = run_git_permissive(repo_path, &["diff", "--name-status", &range]);
+    let name_status = run_git_permissive(repo_path, &["diff", "--name-status", "-z", &range]);
     let mut files = parse_name_status(&name_status);
 
-    let numstat = run_git_permissive(repo_path, &["diff", "--numstat", &range]);
-    let stats = parse_single_numstat(&numstat);
+    let numstat = run_git_permissive(repo_path, &["diff", "--numstat", "-z", &range]);
+    let stats = parse_numstat_per_file(&numstat, "");
     for file in &mut files {
         if let Some(&(a, d)) = stats.get(&file.path) {
             file.additions = a;
@@ -3316,16 +3263,7 @@ mod tests {
 
     #[test]
     fn parse_porcelain_status_handles_common_statuses() {
-        let input = "\
-?? untracked.txt
-A  staged-new.txt
-M  modified-staged.txt
- M modified-unstaged.txt
-MM modified-both.txt
-D  deleted.txt
- D deleted-unstaged.txt
-R  old-name.txt -> new-name.txt
-C  source.txt -> copy.txt";
+        let input = "?? untracked.txt\0A  staged-new.txt\0M  modified-staged.txt\0 M modified-unstaged.txt\0MM modified-both.txt\0D  deleted.txt\0 D deleted-unstaged.txt\0R  new-name.txt\0old-name.txt\0C  copy.txt\0source.txt\0";
 
         let results = parse_porcelain_status(input);
         assert_eq!(results.len(), 9);
@@ -3412,43 +3350,27 @@ C  source.txt -> copy.txt";
     }
 
     #[test]
-    fn numstat_new_path_handles_rename_forms() {
-        // Non-rename path is unchanged.
-        assert_eq!(numstat_new_path("src/a.txt"), "src/a.txt");
-        // Whole-path rename (no shared component).
-        assert_eq!(numstat_new_path("old.txt => new.txt"), "new.txt");
-        assert_eq!(
-            numstat_new_path("src/a.txt => dest/b.txt"),
-            "dest/b.txt"
-        );
-        // Shared prefix / suffix / both, in git's brace form.
-        assert_eq!(
-            numstat_new_path("src/lib/{old.txt => new.txt}"),
-            "src/lib/new.txt"
-        );
-        assert_eq!(
-            numstat_new_path("{src => dest}/file.txt"),
-            "dest/file.txt"
-        );
-        assert_eq!(
-            numstat_new_path("src/{a => b}/file.txt"),
-            "src/b/file.txt"
-        );
-    }
-
-    #[test]
-    fn parse_single_numstat_attaches_stats_to_renamed_path() {
-        // The key must be the full destination path so it matches
-        // `git diff --name-status` (`src/lib/new.txt`) and stats attach.
-        let map = parse_single_numstat("5\t3\tsrc/lib/{old.txt => new.txt}\n");
+    fn parse_numstat_per_file_attaches_stats_to_renamed_path() {
+        let map = parse_numstat_per_file("5\t3\t\0src/lib/old.txt\0src/lib/new.txt\0", "4\t1\t\0src/file.txt\0dest/file.txt\0");
         assert_eq!(map.get("src/lib/new.txt"), Some(&(5, 3)));
+        assert_eq!(map.get("dest/file.txt"), Some(&(4, 1)));
         assert_eq!(map.get("new.txt"), None);
     }
 
     #[test]
-    fn parse_numstat_per_file_attaches_stats_to_renamed_path() {
-        let map = parse_numstat_per_file("4\t1\t{src => dest}/file.txt\n", "");
-        assert_eq!(map.get("dest/file.txt"), Some(&(4, 1)));
+    fn parse_numstat_per_file_preserves_literal_delimiters_and_sums_both_sides() {
+        let map = parse_numstat_per_file("2\t1\tliteral => arrow\tname\n.txt\0", "3\t4\tliteral => arrow\tname\n.txt\0");
+        assert_eq!(map.get("literal => arrow\tname\n.txt"), Some(&(5, 5)));
+    }
+
+    #[test]
+    fn parse_name_status_preserves_paths_and_rename_destinations() {
+        let files = parse_name_status("M\0file\twith\nwhitespace \0R100\0old => name\0new -> name\0A\0über.txt\0");
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].path, "file\twith\nwhitespace ");
+        assert_eq!(files[1].path, "new -> name");
+        assert_eq!(files[1].status, FileStatus::Renamed);
+        assert_eq!(files[2].path, "über.txt");
     }
 
     #[test]
@@ -3466,7 +3388,7 @@ C  source.txt -> copy.txt";
 
     #[test]
     fn parse_porcelain_status_handles_paths_with_spaces() {
-        let input = "M  path with spaces/file name.txt\n?? another file.txt";
+        let input = "M  path with spaces/file name.txt\0?? another file.txt\0";
         let results = parse_porcelain_status(input);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].path, "path with spaces/file name.txt");
@@ -3483,6 +3405,52 @@ C  source.txt -> copy.txt";
         run_git(&path, &["init"]).expect("git init");
         run_git(&path, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "initial"]).expect("initial commit");
         (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_control_preserves_unusual_file_names_end_to_end() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        let base = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let names = [
+            "über.txt", "line\nbreak.txt", "tab\tname.txt", "\"quoted\".txt",
+            "literal -> arrow.txt", "literal => arrow.txt", "trailing-space.txt ",
+        ];
+        for name in names {
+            std::fs::write(repo.join(name), "original\n").unwrap();
+        }
+
+        let files = git_status(&repo).unwrap();
+        assert_eq!(files.len(), names.len());
+        for name in names {
+            assert!(files.iter().any(|file| file.path == name), "missing path {name:?}: {files:?}");
+        }
+        git_stage(&repo, &files.into_iter().map(|file| file.path).collect::<Vec<_>>()).unwrap();
+        git_commit(&repo, "add unusual files").unwrap();
+
+        let committed = get_commit_files(&repo, "HEAD").unwrap();
+        assert_eq!(committed.len(), names.len());
+        for name in names {
+            assert!(committed.iter().any(|file| file.path == name));
+            std::fs::write(repo.join(name), "updated\nextra\n").unwrap();
+        }
+        let modified = git_status(&repo).unwrap();
+        assert_eq!(modified.len(), names.len());
+        for name in names {
+            let file = modified.iter().find(|file| file.path == name).unwrap();
+            assert_eq!((file.additions, file.deletions), (2, 1), "stats for {name:?}");
+        }
+        git_stage(&repo, &modified.into_iter().map(|file| file.path).collect::<Vec<_>>()).unwrap();
+        git_commit(&repo, "update unusual files").unwrap();
+
+        let diff = git_diff_base_branch(&repo, &base).unwrap();
+        assert_eq!(diff.files.len(), names.len());
+        for name in names {
+            let file = diff.files.iter().find(|file| file.path == name).unwrap();
+            assert_eq!((file.additions, file.deletions), (2, 0));
+        }
+        assert!(git_status(&repo).unwrap().is_empty());
     }
 
     #[test]
@@ -4166,7 +4134,7 @@ C  source.txt -> copy.txt";
 
     #[test]
     fn staged_vs_unstaged_parsing() {
-        let input = " M unstaged-only.rs\nM  staged-only.rs\nMM both-staged-and-unstaged.rs\n?? untracked-file.txt\nA  staged-added.rs";
+        let input = " M unstaged-only.rs\0M  staged-only.rs\0MM both-staged-and-unstaged.rs\0?? untracked-file.txt\0A  staged-added.rs\0";
 
         let results = parse_porcelain_status(input);
         assert_eq!(results.len(), 5);

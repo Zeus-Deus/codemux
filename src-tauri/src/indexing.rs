@@ -1,7 +1,7 @@
 use crate::git::ensure_git_exclude;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
@@ -111,7 +111,7 @@ pub struct IndexSearchResult {
 }
 
 pub struct ProjectIndexStore {
-    inner: Arc<Mutex<ProjectIndexSnapshot>>,
+    inner: Arc<Mutex<Arc<ProjectIndexSnapshot>>>,
 }
 
 impl Default for ProjectIndexStore {
@@ -120,7 +120,7 @@ impl Default for ProjectIndexStore {
         // setup() once the active workspace is known, avoiding the old bug
         // where env::current_dir() (often $HOME) was scanned.
         Self {
-            inner: Arc::new(Mutex::new(default_index(PathBuf::new()))),
+            inner: Arc::new(Mutex::new(Arc::new(default_index(PathBuf::new())))),
         }
     }
 }
@@ -130,26 +130,28 @@ impl ProjectIndexStore {
     pub fn initialize_for_project(&self, project_root: PathBuf) {
         let snapshot = load_or_default_index(Some(project_root.display().to_string()))
             .unwrap_or_else(|_| default_index(project_root));
-        *self.inner.lock().unwrap() = snapshot;
+        self.replace_snapshot(snapshot);
     }
 
-    pub fn snapshot(&self) -> ProjectIndexSnapshot {
+    /// Readers retain an immutable generation without cloning its file contents
+    /// or holding the store lock while searching.
+    pub fn snapshot(&self) -> Arc<ProjectIndexSnapshot> {
         self.inner.lock().unwrap().clone()
     }
 
     pub fn replace_snapshot(&self, snapshot: ProjectIndexSnapshot) {
-        *self.inner.lock().unwrap() = snapshot;
+        *self.inner.lock().unwrap() = Arc::new(snapshot);
     }
 
     pub fn status(&self) -> ProjectIndexStatus {
         let snapshot = self.snapshot();
         ProjectIndexStatus {
-            project_root: snapshot.project_root,
+            project_root: snapshot.project_root.clone(),
             file_count: snapshot.file_count,
             chunk_count: snapshot.chunk_count,
             indexed_at_ms: snapshot.indexed_at_ms,
             watch_enabled: snapshot.watch_enabled,
-            semantic_status: snapshot.semantic_status,
+            semantic_status: snapshot.semantic_status.clone(),
         }
     }
 }
@@ -171,7 +173,7 @@ pub fn search_index(
 }
 
 pub fn spawn_index_watcher(store: tauri::State<'_, ProjectIndexStore>) {
-    let project_root = PathBuf::from(store.snapshot().project_root);
+    let project_root = PathBuf::from(&store.snapshot().project_root);
     if project_root.as_os_str().is_empty() || !project_root.is_dir() {
         eprintln!("[codemux::index] No valid project root — skipping index watcher");
         return;
@@ -255,7 +257,7 @@ pub fn spawn_index_watcher(store: tauri::State<'_, ProjectIndexStore>) {
             match build_index_for_root(&current_root) {
                 Ok(snapshot) => {
                     let _ = save_index(&snapshot);
-                    *store.lock().unwrap() = snapshot;
+                    *store.lock().unwrap() = Arc::new(snapshot);
                 }
                 Err(error) => {
                     eprintln!("[codemux::index] Failed to refresh index: {error}");
@@ -481,8 +483,15 @@ fn search_snapshot(
         .map(|term| term.to_lowercase())
         .filter(|term| !term.is_empty())
         .collect::<Vec<_>>();
-    if terms.is_empty() {
+    if terms.is_empty() || limit == 0 {
         return vec![];
+    }
+
+    // A file can contribute many matching chunks. Find its symbols through
+    // one lookup instead of linearly scanning every indexed file each time.
+    let mut files_by_path = HashMap::with_capacity(snapshot.files.len());
+    for file in &snapshot.files {
+        files_by_path.entry(file.file_path.as_str()).or_insert(file);
     }
 
     let mut results = snapshot
@@ -498,10 +507,8 @@ fn search_snapshot(
                 return None;
             }
 
-            let matched_symbols = snapshot
-                .files
-                .iter()
-                .find(|file| file.file_path == chunk.file_path)
+            let matched_symbols = files_by_path
+                .get(chunk.file_path.as_str())
                 .map(|file| {
                     file.symbol_names
                         .iter()
@@ -636,5 +643,32 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].score, 2);
         assert_eq!(results[0].matched_symbols, vec!["build_index"]);
+    }
+
+    #[test]
+    fn index_reads_share_storage_and_keep_replaced_snapshots_alive() {
+        let store = ProjectIndexStore::default();
+        let mut initial = default_index(PathBuf::from("/first"));
+        initial.chunk_count = 1;
+        initial.chunks.push(IndexedChunk {
+            chunk_id: "first.rs:1-1".into(),
+            file_path: "first.rs".into(),
+            line_start: 1,
+            line_end: 1,
+            text: "original needle".into(),
+        });
+        store.replace_snapshot(initial);
+
+        let first = store.snapshot();
+        let second = store.snapshot();
+        assert_eq!(first.chunks.as_ptr(), second.chunks.as_ptr());
+        assert_eq!(store.status().chunk_count, 1);
+        assert_eq!(search_index(&store, "needle", None)[0].file_path, "first.rs");
+
+        store.replace_snapshot(default_index(PathBuf::from("/second")));
+        assert_eq!(first.project_root, "/first");
+        assert_eq!(first.chunks[0].text, "original needle");
+        assert_eq!(store.status().project_root, "/second");
+        assert!(search_index(&store, "needle", None).is_empty());
     }
 }
