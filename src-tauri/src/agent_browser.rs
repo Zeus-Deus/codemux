@@ -492,7 +492,7 @@ fn clear_session_pid(session_name: &str) {
 /// (any children agent-browser spawned: chromium, helper procs), `/F`
 /// forces termination since we already gave the daemon a graceful close
 /// via the `agent-browser close` command before reaching this fallback.
-fn kill_pid(pid: u32) {
+pub(crate) fn kill_pid(pid: u32) {
     if pid == 0 {
         return;
     }
