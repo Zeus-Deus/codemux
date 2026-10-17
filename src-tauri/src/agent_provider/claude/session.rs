@@ -1219,13 +1219,20 @@ impl ClaudeSession {
                 Err(ProviderError::RequestNotPending { request_id })
             }
             // A dead sidecar cannot receive this answer: report the request
-            // as orphaned instead of a retryable failure.
+            // as orphaned instead of a retryable failure. A reply still
+            // outstanding when the child exits fails as a plain RPC error,
+            // after the child is already marked not alive.
             Err(
                 crate::json_rpc_child::RpcChildError::ChildExited { .. }
                 | crate::json_rpc_child::RpcChildError::AlreadyShutdown,
             ) => Err(ProviderError::SessionClosed {
                 thread_id: self.thread_id.clone(),
             }),
+            Err(crate::json_rpc_child::RpcChildError::RpcError(_)) if !self.sidecar.is_alive() => {
+                Err(ProviderError::SessionClosed {
+                    thread_id: self.thread_id.clone(),
+                })
+            }
             Err(e) => Err(ProviderError::RpcError {
                 message: format!("respond-to-request RPC failed: {e}"),
             }),
