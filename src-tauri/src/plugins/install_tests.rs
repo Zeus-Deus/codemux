@@ -148,6 +148,46 @@ fn a_local_or_linked_folder_is_never_replaced() {
 }
 
 #[test]
+fn plugin_install_identity_is_checked_before_writing() {
+    let git = marker(&"a".repeat(40));
+    for original in [
+        git.clone(),
+        InstallMarker { source: "catalog".into(), catalog_id: Some("hello".into()), ..git },
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let files = vec![(ENTRY_FILE.into(), b"original".to_vec())];
+        install::write_install(root.path(), "hello", &files, &original).unwrap();
+        let mut replacements = vec![
+            InstallMarker { repo: "https://github.com/fork/hello".into(), ..original.clone() },
+            InstallMarker {
+                source: if original.source == "git" { "catalog" } else { "git" }.into(),
+                catalog_id: Some("hello".into()),
+                ..original.clone()
+            },
+        ];
+        if original.source == "catalog" {
+            replacements.push(InstallMarker { catalog_id: Some("other".into()), ..original.clone() });
+        }
+        for replacement in replacements {
+            let error = install::write_install(
+                root.path(),
+                "hello",
+                &[(ENTRY_FILE.into(), b"replacement".to_vec())],
+                &replacement,
+            )
+            .expect_err("an unrelated install must not replace the installed plugin");
+            assert!(
+                error.contains("different repository or source") && error.contains("Remove it first"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(root.path().join("hello").join(ENTRY_FILE)).unwrap(), b"original");
+            assert_eq!(super::read_marker(&root.path().join("hello")).unwrap(), Some(original.clone()));
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1, "no staging or backup folders");
+        }
+    }
+}
+
+#[test]
 fn ids_and_paths_refuse_traversal_and_symlinks() {
     let f = fixture();
     for bad in ["../evil", "a/b", "..", ".hidden", "Evil", "a\\b", ""] {

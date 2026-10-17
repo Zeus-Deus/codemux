@@ -11,7 +11,7 @@
 use super::{InstallMarker, ENTRY_FILE, MARKER_FILE, MAX_SOURCE_BYTES};
 use std::{
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -351,6 +351,18 @@ pub struct Fetched {
     pub meta: ScannedMeta,
 }
 
+fn file_name_ok(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    // Separators are forbidden on every platform; Windows drive prefixes
+    // must also be rejected before joining a name to the staging folder.
+    !name.contains('/')
+        && !name.contains('\\')
+        && matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(_)), None)
+        )
+}
+
 /// Resolve `url` (+ optional ref/folder) to one commit and read the plugin
 /// folder's regular files. Symlinks, submodules, sub-folders and any
 /// `.codemux-plugin.json` in the repository are skipped.
@@ -416,7 +428,7 @@ pub fn fetch_plugin(
     let files: Vec<(String, String)> = entries
         .into_iter()
         .filter(|(mode, _, name)| (mode == "100644" || mode == "100755") && name != MARKER_FILE)
-        .filter(|(_, _, name)| !name.contains('/') && !name.contains('\\') && name != "." && name != "..")
+        .filter(|(_, _, name)| file_name_ok(name))
         .map(|(_, oid, name)| (name, oid))
         .collect();
     if files.len() > MAX_FILES {
@@ -475,9 +487,30 @@ pub fn existing(root: &Path, id: &str) -> Result<Existing, String> {
     }
 }
 
+/// An install replaces `installed` only as its update: the same source and
+/// repository (and catalog entry). The id comes from the fetched
+/// plugin, so another repository declaring it must not take over the folder,
+/// and with it the user's on/off decision.
+pub fn check_replacement(id: &str, installed: &InstallMarker, marker: &InstallMarker) -> Result<(), String> {
+    let same_source = match (installed.source.as_str(), marker.source.as_str()) {
+        ("catalog", "catalog") => installed.catalog_id.is_some() && installed.catalog_id == marker.catalog_id,
+        ("git", "git") => true,
+        _ => false,
+    };
+    // GitHub owner and repository names are case-insensitive.
+    if same_source && installed.repo.eq_ignore_ascii_case(&marker.repo) {
+        Ok(())
+    } else {
+        Err(format!(
+            "\"{id}\" is already installed from a different repository or source ({}). Remove it first.",
+            installed.repo
+        ))
+    }
+}
+
 /// Write `files` + marker into a staging folder and swap it over
-/// `<root>/<id>`. Refuses to replace a Local folder or a linked folder:
-/// those are the user's own code.
+/// `<root>/<id>`. Refuses to replace a Local folder, a linked folder (the
+/// user's own code) or an install from another source.
 pub fn write_install(
     root: &Path,
     id: &str,
@@ -493,7 +526,8 @@ pub fn write_install(
         Existing::Link => {
             return Err(format!("\"{id}\" is a linked folder. Remove the link first."))
         }
-        Existing::None | Existing::Installed(_) => {}
+        Existing::Installed(installed) => check_replacement(id, &installed, marker)?,
+        Existing::None => {}
     }
     let dest = super::paths::plugin_dir(root, id).map_err(|e| e.to_string())?;
     let suffix = unique_suffix();
@@ -501,7 +535,7 @@ pub fn write_install(
     std::fs::create_dir(&staging).map_err(|e| format!("Cannot create the install folder: {e}"))?;
     let write = || -> Result<(), String> {
         for (name, bytes) in files {
-            if name.contains('/') || name.contains('\\') || name == MARKER_FILE || name.starts_with("..") {
+            if !file_name_ok(name) || name == MARKER_FILE || name.starts_with("..") {
                 continue;
             }
             std::fs::write(staging.join(name), bytes).map_err(|e| format!("Cannot write {name}: {e}"))?;
@@ -582,4 +616,37 @@ pub fn folder_id(meta: &ScannedMeta, repo_name: &str) -> Result<String, String> 
 
 pub fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_file_names_are_single_normal_components() {
+        for name in [ENTRY_FILE, "README.md", ".hidden", "some file.js"] {
+            assert!(file_name_ok(name), "{name}");
+        }
+        for name in [
+            "", ".", "..", "../evil.js", "a/../evil.js", "a/b.js", "a\\b.js", "/evil.js", "file.js/",
+        ] {
+            assert!(!file_name_ok(name), "{name}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plugin_file_names_reject_windows_prefixes() {
+        // A drive-relative name replaces the staging path even without a slash.
+        assert_eq!(
+            Path::new(r"C:\plugins\.staging-hello").join("d:evil.js"),
+            Path::new("d:evil.js")
+        );
+        for name in [
+            "d:evil.js", "D:evil.js", "d:", r"D:\evil.js", r"\evil.js",
+            r"\\server\share\evil.js", r"\\?\D:\evil.js",
+        ] {
+            assert!(!file_name_ok(name), "{name}");
+        }
+    }
 }
