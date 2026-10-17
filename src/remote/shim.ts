@@ -35,6 +35,9 @@ type Args = Record<string, unknown>;
 
 /** The backend command whose first response the HTTP snapshot seeds. */
 const APP_STATE_COMMAND = "get_app_state";
+/** Terminal attach. Its reply follows a replay of the session's whole output
+ *  ring (up to 256 MiB), queued ahead of it on this connection. */
+const PTY_ATTACH_COMMAND = "attach_pty_output";
 /** The event carrying a full `AppStateSnapshot` over the WS. A snapshot
  *  delivered on this event supersedes the HTTP seed (the no-stale guard). */
 const APP_STATE_EVENT = "app-state-changed";
@@ -107,6 +110,13 @@ export function installShim(options: InstallShimOptions): ShimHandle {
   // newer has arrived over the socket.
   let wsAppStateSeq = 0;
   let connectedCount = 0;
+  // Terminal attaches run one at a time. The host's per-connection outbound
+  // budget fits one full replay ring but not several, and a reconnect (or a
+  // page load) attaches every mounted terminal at once. The reply only
+  // arrives once its replay has been written, so waiting for it caps the
+  // replay in flight at one. `null` while no attach is outstanding, so an
+  // idle attach goes out synchronously like any other invoke.
+  let ptyAttachTail: Promise<unknown> | null = null;
 
   // Track the prefetch's settled value WITHOUT ever awaiting it on the hot
   // path: `get_app_state` consults `seedSettled` synchronously, so a slow or
@@ -326,6 +336,17 @@ export function installShim(options: InstallShimOptions): ShimHandle {
       if (seedSettled && seedValue != null && wsAppStateSeq === 0) {
         return seedValue;
       }
+    }
+    if (cmd === PTY_ATTACH_COMMAND) {
+      const attach = ptyAttachTail
+        ? ptyAttachTail.then(() => transport.invoke(cmd, args))
+        : transport.invoke(cmd, args);
+      const tail = attach.catch(() => undefined);
+      ptyAttachTail = tail;
+      void tail.then(() => {
+        if (ptyAttachTail === tail) ptyAttachTail = null;
+      });
+      return attach;
     }
     // Real backend command → over the wire.
     return transport.invoke(cmd, args);

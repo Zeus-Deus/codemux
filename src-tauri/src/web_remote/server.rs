@@ -69,8 +69,10 @@ const LIVENESS_PROBE_CMD: &str = "__codemux_ping";
 /// It must stay well above the largest legitimate burst, or the resync would
 /// itself trip the budget and loop: each terminal attach replays its whole
 /// `pending_output` ring (up to 256 MiB, see `OUTPUT_BUFFER_BYTE_LIMIT` in
-/// `terminal/mod.rs`) at once, and a reconnect re-attaches every mounted
-/// terminal together. This leaves room for two full rings.
+/// `terminal/mod.rs`) at once, ahead of its reply. The web shim sends terminal
+/// attaches one at a time, each after the previous reply (`PTY_ATTACH_COMMAND`
+/// in `src/remote/shim.ts`), so at most one ring is in flight; the rest of the
+/// budget is headroom for live traffic.
 const MAX_OUTBOUND_QUEUED_BYTES: usize = 512 * 1024 * 1024;
 
 /// Writer handle for a connection: every frame producer (invoke

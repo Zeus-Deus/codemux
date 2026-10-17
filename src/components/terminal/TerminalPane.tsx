@@ -1332,14 +1332,15 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   // across that swap (the active pane of both surfaces is focused), so an
   // effect keyed only on `focused` would never re-run — leaving the freshly
   // mounted terminal unfocused until the user clicks it. Keying on
-  // `sessionId` re-focuses whenever the underlying terminal changes. The
+  // `sessionId` re-focuses whenever the underlying terminal changes, as does
+  // `reconnectEpoch` (a web-remote reconnect rebuilds the xterm). The
   // main mount effect is declared earlier, so it has already pointed
   // `termRef.current` at the new terminal by the time this runs.
   useEffect(() => {
     if (focused && termRef.current && !mobileRef.current) {
       termRef.current.focus();
     }
-  }, [focused, sessionId]);
+  }, [focused, sessionId, reconnectEpoch]);
 
   useEffect(() => { void syncTerminalSize(); }, [phoneControl, mirrorSize?.cols, mirrorSize?.rows, syncTerminalSize]);
 
