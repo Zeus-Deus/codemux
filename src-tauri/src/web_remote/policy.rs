@@ -167,6 +167,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "detect_run_candidates"
             | "discover_source_control"
             | "dock_browser_in_right_panel"
+            | "environment_info"
             | "flush_scrollback_cache"
             | "generate_branch_name"
             | "generate_random_branch_name"
@@ -307,6 +308,18 @@ mod tests {
             "get_local_workbench", "set_local_workbench",
         ] {
             assert!(!allowed(cmd), "{cmd} exposes local-only ChatGPT account/preferences authority");
+        }
+    }
+    #[test]
+    fn web_remote_reads_environment_identity_but_never_dials_out() {
+        // A paired client learns which machine it drives; it must not use the
+        // desktop's account token or iroh client to reach other machines.
+        assert!(allowed("environment_info"));
+        for cmd in [
+            "environment_account_request", "environment_dial",
+            "environment_stream_write", "environment_stream_close",
+        ] {
+            assert!(!allowed(cmd), "{cmd} lends desktop account or network authority");
         }
     }
     #[test]
