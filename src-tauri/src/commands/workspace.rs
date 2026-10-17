@@ -1857,6 +1857,10 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
     if entry.pinned_at.is_some() {
         state.restore_workspace_pinned_at(&restored_id, entry.pinned_at)?;
     }
+    // A started suggested task keeps its link to the workspace it came from.
+    if entry.parent_workspace_id.is_some() {
+        state.set_workspace_parent(&restored_id, entry.parent_workspace_id.clone());
+    }
 
     db.restore_hermes_chat_history(&entry.workspace_id, &restored_id,
         entry.worktree_path.as_deref().unwrap_or(&entry.cwd))?;

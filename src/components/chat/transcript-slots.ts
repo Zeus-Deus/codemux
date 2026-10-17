@@ -14,6 +14,17 @@ import type {
   WorkflowRunItem,
 } from "@/lib/agent-chat/types";
 import { isAppReceipt } from "@/lib/agent-chat/types";
+import {
+  isSuggestToolCall as isSuggestToolCallGuard,
+  linkSuggestedTasks,
+  viewsForCall,
+} from "@/lib/agent-chat/follow-ups";
+
+/** Not a type guard: a refused `suggest_tasks` call is still a tool call,
+ *  so the negative branch must not narrow `tool_call` away. */
+function isSuggestToolCall(item: ChatViewItem): boolean {
+  return isSuggestToolCallGuard(item);
+}
 import { isInlineHtmlRender } from "@/lib/agent-chat/html-render";
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 
@@ -77,6 +88,14 @@ export type SlotBody =
   /** Contiguous delegations, one card. Never folded into the work log or
    *  a settled turn: the hand-off is the turn's visible outcome. */
   | { kind: "delegation"; entries: DelegationEntry[] }
+  /** A `suggest_tasks` call: the suggested follow-up tasks, with the live
+   *  row of each one the user started (by index, null when not started).
+   *  Never folded: the user acts on it after the turn. */
+  | {
+      kind: "suggested_tasks";
+      call: ToolCallItem;
+      views: ReadonlyArray<SubagentView | null>;
+    }
   | TurnFoldBody;
 
 export interface TranscriptSlot {
@@ -128,6 +147,7 @@ function isQuietObservationalTool(step: ActivityStep): boolean {
  *    checklist.
  *  - `html_render` pages — the page is part of the reply, not process.
  *  - `delegate_task` calls — they render as the delegation card.
+ *  - `suggest_tasks` calls — they render as the suggested-tasks card.
  * (`subagent_run` items are not tool calls; the slot builder joins them into
  * the same work-log line separately.)
  */
@@ -137,7 +157,8 @@ function isGroupableTool(item: ChatViewItem): item is ToolCallItem {
     item.approval_request_id == null &&
     !isTaskSummaryTool(item) &&
     !isInlineHtmlRender(item) &&
-    !isDelegateToolCall(item)
+    !isDelegateToolCall(item) &&
+    !isSuggestToolCall(item)
   );
 }
 
@@ -222,8 +243,9 @@ function isFoldableSettledItem(
   terminalId: string | null,
   pendingRequestIds: ReadonlySet<string>,
 ): boolean {
-  // A delegation outlives its turn and stays where it was handed off.
-  if (isDelegationItem(item)) return false;
+  // A delegation outlives its turn and stays where it was handed off, and
+  // suggested tasks wait for the user after it.
+  if (isDelegationItem(item) || isSuggestToolCall(item)) return false;
   switch (item.kind) {
     case "assistant_message":
       return item.id !== terminalId;
@@ -421,7 +443,8 @@ export function buildTranscriptSlots(
     if (
       item.kind === "tool_call" &&
       item.approval_request_id &&
-      !isDelegationItem(item)
+      !isDelegationItem(item) &&
+      !isSuggestToolCall(item)
     ) {
       mergedRequestIds.add(item.approval_request_id);
     }
@@ -436,6 +459,8 @@ export function buildTranscriptSlots(
     expandedTurnIds,
   );
   const links = linkDelegations(messages);
+  // Started suggestions render on their suggestions card, not as orphans.
+  const suggested = linkSuggestedTasks(messages);
   const bodies: SlotBody[] = [];
   // Contiguous delegations share one card, whatever mix of calls and
   // orphan rows they arrive as.
@@ -523,13 +548,26 @@ export function buildTranscriptSlots(
       } else if (item.kind === "subagent_run") {
         // Rows a call already shows render there; only orphans land here.
         // A card of claimed rows renders nothing and splits nothing.
-        const orphans = item.subagents.filter((view) => !links.claimed.has(view.id));
+        const orphans = item.subagents.filter(
+          (view) => !links.claimed.has(view.id) && !suggested.claimed.has(view.id),
+        );
         if (orphans.length === 0) continue;
         flush();
         for (const view of orphans) {
           delegations.push({ key: view.id, call: null, view });
         }
       }
+      continue;
+    }
+    if (isSuggestToolCall(item)) {
+      flush();
+      flushDelegations();
+      const call = item as ToolCallItem;
+      bodies.push({
+        kind: "suggested_tasks",
+        call,
+        views: viewsForCall(call, suggested.viewByKey),
+      });
       continue;
     }
     // Non-error turn-ended markers were already dropped above, so they do not
@@ -636,6 +674,13 @@ function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
       a.items.every((item, index) => item === b.items[index])
     );
   }
+  if (a.kind === "suggested_tasks" && b.kind === "suggested_tasks") {
+    return (
+      a.call === b.call &&
+      a.views.length === b.views.length &&
+      a.views.every((view, index) => view === b.views[index])
+    );
+  }
   if (a.kind === "delegation" && b.kind === "delegation") {
     return (
       a.entries.length === b.entries.length &&
@@ -663,6 +708,10 @@ function slotIdentity(body: SlotBody): {
   }
   if (body.kind === "turn_fold") {
     const id = `turn-fold:${body.turnId}`;
+    return { key: id, messageId: id, scrollAnchor: false };
+  }
+  if (body.kind === "suggested_tasks") {
+    const id = `suggested:${body.call.id}`;
     return { key: id, messageId: id, scrollAnchor: false };
   }
   if (body.kind === "delegation") {

@@ -171,4 +171,16 @@ describe("deckStatusLine", () => {
       ),
     ).toBe("starting browser…");
   });
+  it("describes the side chat's read-only fork and when it has ended", () => {
+    // The provider and model live in the pane's own top row, not here.
+    expect(deckStatusLine(input({ activePane: "side-chat", sideChat: { ended: false } }))).toBe(
+      "read-only fork · not saved",
+    );
+    expect(
+      deckStatusLine(input({ activePane: "side-chat", sideChat: { providerLabel: "Codex", ended: false } })),
+    ).toBe("read-only fork · not saved");
+    expect(
+      deckStatusLine(input({ activePane: "side-chat", sideChat: { providerLabel: "Claude", ended: true } })),
+    ).toBe("side chat ended · nothing was added to the chat");
+  });
 });

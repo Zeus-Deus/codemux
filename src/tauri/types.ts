@@ -1240,6 +1240,9 @@ export interface WorkspaceSnapshot {
    *  inbox. Pinning overrides settled/snoozed presentation without deleting
    *  that underlying lifecycle state. Optional for older snapshots. */
   pinned_at?: number | null;
+  /** Follow-up child: the workspace whose chat started it. Set by the
+   *  backend; null for ordinary workspaces. */
+  parent_workspace_id?: string | null;
   tabs: TabSnapshot[];
   active_tab_id: string;
   active_surface_id: string;
@@ -1301,6 +1304,8 @@ export interface ArchivedWorkspaceSnapshot {
   archived_at: number;
   /** Preserve the live workspace's pin across archive/restore. */
   pinned_at?: number | null;
+  /** `WorkspaceSnapshot.parent_workspace_id`, restored with the workspace. */
+  parent_workspace_id?: string | null;
 }
 
 export interface PersistenceSchema {

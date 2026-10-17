@@ -536,6 +536,10 @@ pub fn run() {
                 ) {
                     eprintln!("[codemux::opencode] shutdown incomplete: {error}");
                 }
+                // Side chats own their own provider processes; reap them.
+                tauri::async_runtime::block_on(
+                    app.state::<commands::side_chat::SideChatStore>().shutdown_all(),
+                );
                 if let Err(error) = tauri::async_runtime::block_on(
                     app.state::<commands::workflows::WorkflowState>().shutdown(),
                 ) {
@@ -609,6 +613,8 @@ fn build_core_app<R: tauri::Runtime>(
         // Live plan-quota readings for Settings → Usage. In-memory only;
         // see `commands::usage::PlanQuotaStore`.
         .manage(commands::usage::PlanQuotaStore::default())
+        // Ephemeral `/btw` side chats; each owns its provider process.
+        .manage(commands::side_chat::SideChatStore::default())
         .manage(agent_browser::AgentBrowserManager::new_with_cleanup())
         .manage(indexing::ProjectIndexStore::default())
         .manage(observability::load_observability_store())
@@ -2783,6 +2789,9 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_interrupt_turn,
             commands::agent_chat_stop_monitoring,
             commands::agent_chat_turn_active,
+            commands::side_chat::agent_chat_side_chat_start,
+            commands::side_chat::agent_chat_side_chat_send,
+            commands::side_chat::agent_chat_side_chat_close,
             commands::usage_resume::agent_chat_resume_after_usage_limit,
             commands::usage_resume::agent_chat_cancel_usage_resume,
             commands::agent_chat_respond_to_request,
@@ -2832,6 +2841,10 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_get_session_context,
             commands::agent_chat_search,
             commands::agent_chat_open_search_result,
+            commands::follow_ups::follow_up_providers,
+            commands::follow_ups::follow_up_list,
+            commands::follow_ups::follow_up_start,
+            commands::follow_ups::follow_up_merge_all,
             commands::agent_chat_get_session,
             commands::agent_chat_update_session_config,
             commands::agent_chat_rename_session,

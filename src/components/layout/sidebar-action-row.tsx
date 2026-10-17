@@ -4,13 +4,15 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { startNewHomeAgent } from "@/lib/agent-chat/new-home-agent";
 import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
-import { Search as SearchIcon, SquarePen } from "lucide-react";
+import { Inbox, ListTree, Search as SearchIcon, SquarePen } from "lucide-react";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { useTitlebarOverlay } from "@/hooks/use-gui-chrome";
 import { cn } from "@/lib/utils";
+import { useSidebarViewStore, type SidebarView } from "./sidebar-view-store";
 
 /** The "New agent" gesture shared by the sidebar header and its empty state:
  *  a home-directory chat draft when agent chat is on, otherwise (or with
@@ -114,9 +116,73 @@ export function SidebarActionRow() {
   );
 }
 
-/** Search + New agent, sized to sit at the end of the expanded inbox's
- *  project-filter row. Search is icon-only here: the palette shortcut moves
- *  into its tooltip so the project name keeps the row's width. */
+const VIEW_OPTIONS: readonly {
+  view: SidebarView;
+  label: string;
+  Icon: typeof Inbox;
+}[] = [
+  { view: "activity", label: "Activity", Icon: Inbox },
+  { view: "projects", label: "Projects", Icon: ListTree },
+];
+
+/** Two-icon segmented switch between the Activity inbox and the Projects
+ *  view, on the shared `ToggleGroup` (single select). Radix announces it as
+ *  a radio group and moves focus with the arrow keys; the selected view is
+ *  carried by the raised segment plus `aria-checked` / `data-state=on`,
+ *  never by colour alone. Pressing the selected segment again is ignored,
+ *  so one view is always chosen. */
+export function SidebarViewSwitch() {
+  const view = useSidebarViewStore((s) => s.view);
+  const setView = useSidebarViewStore((s) => s.setView);
+  const { getKeysForAction } = useResolvedKeybinds();
+  const toggleKeys = getKeysForAction("toggleSidebarView");
+
+  return (
+    <ToggleGroup
+      type="single"
+      spacing={0.5}
+      value={view}
+      onValueChange={(next) => {
+        // Radix single-select clears the value when the pressed item is
+        // pressed again; a view switch always has exactly one view.
+        if (next === "activity" || next === "projects") setView(next);
+      }}
+      aria-label="Sidebar view"
+      data-sidebar-view-switch
+      className="h-8 shrink-0 rounded-md border border-border/60 bg-surface-1 p-0.5"
+    >
+      {VIEW_OPTIONS.map(({ view: option, label, Icon }) => (
+        <Tooltip key={option}>
+          {/* The item wraps the tooltip trigger, not the other way round:
+              a trigger outside would stamp its own `data-state` (closed /
+              delayed-open) over the item's `data-state=on`. */}
+          <ToggleGroupItem
+            asChild
+            value={option}
+            aria-label={`${label} view`}
+            data-sidebar-view={option}
+            // 26px segments: two of them plus Search and New agent still
+            // leave "All projects" its full label at the default sidebar
+            // width.
+            className="h-full w-[26px] min-w-0 rounded-[calc(var(--radius-md)-2px)] px-0"
+          >
+            <TooltipTrigger>
+              <Icon className="size-[15px]" />
+            </TooltipTrigger>
+          </ToggleGroupItem>
+          <TooltipContent side="bottom" sideOffset={4} className="text-label">
+            {label}
+            {toggleKeys ? ` · ${toggleKeys}` : ""}
+          </TooltipContent>
+        </Tooltip>
+      ))}
+    </ToggleGroup>
+  );
+}
+
+/** View switch + Search + New agent, sized to sit at the end of the expanded
+ *  sidebar's project-filter row. Search is icon-only here: the palette
+ *  shortcut moves into its tooltip so the project name keeps the row's width. */
 export function SidebarHeaderActions() {
   const { getKeysForAction } = useResolvedKeybinds();
   const newAgentKeys = getKeysForAction("newAgent");
@@ -126,6 +192,7 @@ export function SidebarHeaderActions() {
 
   return (
     <>
+      <SidebarViewSwitch />
       <Tooltip>
         <TooltipTrigger asChild>
           <button

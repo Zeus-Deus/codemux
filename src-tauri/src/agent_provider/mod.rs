@@ -27,6 +27,7 @@ pub mod opencode;
 pub mod pricing;
 pub mod provider;
 pub mod types;
+pub mod side_chat;
 pub mod slash_commands;
 pub mod usage_limit;
 

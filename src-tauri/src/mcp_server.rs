@@ -952,6 +952,32 @@ or the user wants to see a page, build a self-contained HTML page and show it wi
 (listed with an MCP prefix) before your final reply, rather than only pointing the user at an HTML file. \
 The reader sees the page above that reply, so don't announce or restate it; add only what it doesn't say.";
 
+/// `suggest_tasks` as host tools are listed to agent chats.
+pub const SUGGEST_TASKS_REGISTRY_NAME: &str = "mcp__codemux__suggest_tasks";
+
+/// Codemux's session instructions per tool, in the order they are appended.
+/// A chat gets a block only when it lists that tool.
+const TOOL_GUIDANCE: [(&str, &str); 2] = [
+    (HTML_RENDER_REGISTRY_NAME, HTML_RENDER_GUIDANCE),
+    (
+        SUGGEST_TASKS_REGISTRY_NAME,
+        crate::commands::follow_ups::SUGGEST_TASKS_GUIDANCE,
+    ),
+];
+
+/// The guidance blocks for the tools a chat lists (registry names, e.g.
+/// `mcp__codemux__html_render`), joined by a blank line, or `None` when
+/// it lists none of them.
+pub fn tool_guidance<'a>(registry_names: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let listed: Vec<&str> = registry_names.into_iter().collect();
+    let blocks: Vec<&str> = TOOL_GUIDANCE
+        .iter()
+        .filter(|(name, _)| listed.contains(name))
+        .map(|(_, guidance)| *guidance)
+        .collect();
+    (!blocks.is_empty()).then(|| blocks.join("\n\n"))
+}
+
 /// Agent-facing contract for `html_render`. The variable names mirror
 /// `htmlRenderThemeVariables` in `src/lib/agent-chat/html-render.ts`, which
 /// injects them into the page; keep the two lists in sync.

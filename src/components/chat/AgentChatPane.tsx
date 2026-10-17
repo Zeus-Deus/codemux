@@ -153,6 +153,8 @@ import { launchChatWorkflow } from "@/components/workflows/launch-chat-workflow"
 import { workflowAttachmentProblem } from "@/lib/workflows/workflow-attachments";
 import { useWorkflowsAvailable } from "@/components/workflows/use-workflows-available";
 import { parseWorkflowCommand } from "@/lib/workflows/workflow-settings";
+import { askSideQuestion } from "@/lib/agent-chat/side-chat-launch";
+import { parseBtwCommand } from "@/lib/agent-chat/side-chat";
 import { useWorkflowUIStore, type ChatWorkflowLink } from "@/stores/workflow-ui-store";
 import type { RemoteTaskScope } from "./remote-task-context";
 import { useDelegationTasks } from "@/stores/delegation-store";
@@ -1637,6 +1639,27 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const delivery = parseMessageDelivery(originalDraft);
       const rawText = delivery.text;
       if (!rawText) return;
+      // `/btw <question>` asks a read-only fork of this chat's session in
+      // the Side chat pane. Nothing reaches the main thread: no bubble, no
+      // turn, and the running turn keeps going.
+      // Side chats take text only; refuse attachments rather than drop them.
+      if (
+        !isContinue
+        && parseBtwCommand(rawText)
+        && (useAgentChatStore.getState().threads[threadId]?.stagedAttachments.length ?? 0) > 0
+      ) {
+        toast.error("Side chats can't take attachments yet", {
+          description: "Remove the attachments or send this as a normal message.",
+        });
+        return;
+      }
+      const side = isContinue
+        ? null
+        : askSideQuestion({ text: rawText, threadId, provider, workspaceId: paneWorkspaceId });
+      if (side) {
+        if (side === "started") setInputDraft(threadId, "");
+        return;
+      }
       // `/workflow <goal>` starts a CodeMux workflow beside the chat instead
       // of a provider turn; it launches below, once attachments resolve.
       const workflowCommand = isContinue ? null : parseWorkflowCommand(rawText);
@@ -3718,7 +3741,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         typeof textOverride === "string" ? textOverride : draft
       ).trim();
       if (!rawText) return;
-      if (paneWorkspaceId && workspaceProjectRoot) {
+      if (paneWorkspaceId && workspaceProjectRoot && !parseBtwCommand(rawText)) {
         autoNameWorkspace(paneWorkspaceId, rawText);
       }
       handleSubmit(textOverride, options);

@@ -34,6 +34,11 @@ export interface DeckStatusInput {
    *  now, and how many have settled in this thread. The pane itself is
    *  live-first and prints no lifetime count, so the foot carries it. */
   subagents: { running: number; finished: number } | null;
+  /** The open `/btw` side chat: whether its read-only fork is still
+   *  running. The pane's own top row names the provider and model (with
+   *  its logo), so the foot doesn't repeat them; `providerLabel` is kept
+   *  for callers that still pass it. */
+  sideChat?: { providerLabel?: string; ended: boolean } | null;
 }
 
 function plural(count: number, word: string): string {
@@ -68,6 +73,12 @@ export function deckStatusLine(input: DeckStatusInput): string {
     }
     const head = "No agents running";
     return finished === 0 ? head : `${head} · ${finished} finished this thread`;
+  }
+
+  if (activePane === "side-chat" && input.sideChat) {
+    return input.sideChat.ended
+      ? "side chat ended · nothing was added to the chat"
+      : "read-only fork · not saved";
   }
 
   if (activePane === "browser" && input.browser) {

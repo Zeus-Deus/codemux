@@ -1,14 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  AlarmClock,
-  ChevronDown,
-  ChevronRight,
-  Folder,
-  FolderOpen,
-  FolderPlus,
-  Layers,
-  Undo2,
-} from "lucide-react";
+import { AlarmClock, ChevronRight, Layers, Undo2 } from "lucide-react";
 import { openExternalUrl } from "@/lib/open-url";
 import { cn } from "@/lib/utils";
 import {
@@ -21,7 +12,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
-import { MenuKeycap } from "@/components/ui/menu-chrome";
 import {
   selectActiveWorkspaceId,
   useAppStore,
@@ -40,13 +30,11 @@ import {
 import {
   useSettingsStore,
   selectSidebarShowGitStats,
-  selectSidebarAutoSettleDays,
   getTimeFormat,
 } from "@/stores/settings-store";
 import { formatElapsed } from "@/stores/sidebar-density-store";
 import { getWorkspaceProviders, getWorkspaceStatus } from "@/lib/pane-status";
 import { useCoarseClock } from "@/lib/use-coarse-clock";
-import { useProjectActions } from "@/hooks/use-project-actions";
 import { useProjectAppearance } from "./use-project-appearance";
 import {
   SidebarInboxCard,
@@ -78,6 +66,7 @@ import {
   selectNewWorkspaceDraftsInFlight,
 } from "./new-workspace-sends";
 import { setJumpTargets, MAX_JUMP_HINTS } from "./sidebar-inbox-jump";
+import { subscribeInboxLifecycle } from "./inbox-lifecycle-events";
 import { useJumpHintsVisible } from "./use-jump-hints-visible";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import {
@@ -102,6 +91,10 @@ import {
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { SidebarEmptyState } from "./sidebar-empty-state";
 import { SidebarHeaderActions } from "./sidebar-action-row";
+import {
+  SidebarProjectFilter,
+  computeProjectCounts,
+} from "./sidebar-project-filter";
 
 /** How long the settle collapse runs before the card actually moves below
  *  the divider. Matches the card wrapper's `duration-250`. */
@@ -345,60 +338,6 @@ function selectModeFor(e: {
  *  matches the card path — a stale draft would follow the user across. */
 function activateFromSidebar(workspaceId: string): void {
   activateWorkspaceInteraction(workspaceId).catch(console.error);
-}
-
-/** A project's mini square avatar, resolving its customised appearance. Kept
- *  as a per-item component so the appearance hook always runs unconditionally
- *  (each avatar owns its own hook rather than looping hooks in the parent). */
-function ProjectMiniAvatar({ name, path }: { name: string; path: string }) {
-  const appearance = useProjectAppearance(path);
-  return (
-    <ProjectAvatar
-      name={name}
-      color={appearance.customColor}
-      imageUrl={appearance.imageUrl}
-      cacheBust={appearance.imageVersion}
-      size="sm"
-      shape="square"
-      className="font-bold"
-    />
-  );
-}
-
-interface ProjectFilterItemProps {
-  name: string;
-  path: string;
-  /** Number of visible cards in this project, including pinned parked work. */
-  count: number;
-  active: boolean;
-  onSelect: () => void;
-}
-
-/** One project row in the filter dropdown: mini avatar, name, and its active
- *  workspace count. */
-function ProjectFilterItem({
-  name,
-  path,
-  count,
-  active,
-  onSelect,
-}: ProjectFilterItemProps) {
-  return (
-    <DropdownMenuItem
-      onClick={onSelect}
-      aria-label={name}
-      className={cn(
-        "h-8 gap-2 rounded-md px-2 text-label font-semibold",
-        active && "bg-surface-3 text-foreground",
-      )}
-    >
-      <ProjectMiniAvatar name={name} path={path} />
-      <span className="min-w-0 flex-1 truncate">{name}</span>
-      <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
-        {count}
-      </span>
-    </DropdownMenuItem>
-  );
 }
 
 /** Header for the Wrapping up / Snoozed / Settled sections. Collapsing is a plain disclosure
@@ -938,21 +877,14 @@ export function SidebarInbox() {
     [projectGroups, homeDir],
   );
   const pendingWorkspaces = useUIStore((s) => s.pendingWorkspaces);
-  const setShowNewProjectScreen = useUIStore((s) => s.setShowNewProjectScreen);
-  const { openProject } = useProjectActions();
 
   const showGitStats = useSettingsStore(selectSidebarShowGitStats);
-  const autoSettleDays = useSettingsStore(selectSidebarAutoSettleDays);
 
   const load = useSidebarInboxStore((s) => s.load);
-  const loaded = useSidebarInboxStore((s) => s.loaded);
   const settled = useSidebarInboxStore((s) => s.settled);
   const snoozed = useSidebarInboxStore((s) => s.snoozed);
-  const keepActive = useSidebarInboxStore((s) => s.keepActive);
-  const activity = useSidebarInboxStore((s) => s.activity);
   const filter = useSidebarInboxStore((s) => s.filter);
   const setFilter = useSidebarInboxStore((s) => s.setFilter);
-  const prune = useSidebarInboxStore((s) => s.prune);
   const frozenActiveDraftRow = useFrozenActiveDraftRow(
     sidebarDraftCatalog,
     filter,
@@ -963,19 +895,13 @@ export function SidebarInbox() {
     frozenActiveDraftRow,
   );
 
-  // One coarse (~30s) clock for every elapsed label in the list, and the tick
-  // the activity + auto-settle + wake effects re-run on.
+  // One coarse (~30s) clock for every elapsed label in the list. The
+  // lifecycle effects keep their own subscription to the same shared tick.
   const now = useCoarseClock(true);
 
   useEffect(() => {
     void load();
   }, [load]);
-
-  // Drop settled entries whose workspace vanished (archived / deleted).
-  useEffect(() => {
-    if (!loaded || !appStateLoaded) return;
-    prune(new Set(allWorkspaces.map((w) => w.workspace_id)));
-  }, [loaded, appStateLoaded, allWorkspaces, prune]);
 
   // Settle motion: collapse the card (~200ms), then flip the persisted flag
   // so it re-renders as a one-line row under the divider (which eases in).
@@ -1030,14 +956,6 @@ export function SidebarInbox() {
       if (!presentIds.has(id)) restorableReviewIdsRef.current.delete(id);
     }
   }, [allWorkspaces, paneStatuses]);
-  // Last status observed by the activity effect. A keep-active pin is cleared
-  // only by a NEW non-idle status edge, matching the server-side
-  // "real activity clears the override" lifecycle. Re-reading an existing
-  // review status after the user clicks Un-settle must not immediately erase
-  // their decision and throw a merged PR back under the divider.
-  const previousStatusRef = useRef(
-    new Map<string, ActivePaneStatus | null>(),
-  );
 
   // Multi-select for bulk parking. Ids only — the rows are re-derived every
   // render, so holding on to snapshots would go stale.
@@ -1250,8 +1168,8 @@ export function SidebarInbox() {
 
   /** Status presented by inbox surfaces. Backend state always wins; the only
    *  synthetic state is the review the user explicitly restores by marking a
-   *  previously completed workspace unread. Lifecycle effects below continue
-   *  to read the backend status directly. */
+   *  previously completed workspace unread. The lifecycle effects
+   *  (`useInboxLifecycle`) read the backend status directly. */
   const statusOf = (ws: WorkspaceSnapshot): ActivePaneStatus | null => {
     const status = paneStatuses
       ? getWorkspaceStatus(ws.surfaces, paneStatuses)
@@ -1528,47 +1446,29 @@ export function SidebarInbox() {
     });
   }, []);
 
-  /** Wake a snoozed workspace back into the active list. `reason` follows the
-   *  store's pin rules — only an explicit "Wake now" is a user decision.
-   *
-   *  A wake still runs while a workspace is pinned: the pin overrides where the
-   *  card is *shown*, not whether its snooze ticket comes due, so the preserved
-   *  shelf entry is cleared on schedule and unpinning later reveals an honest
-   *  active card rather than an expired snooze. */
-  const wake = useCallback(
-    (workspaceId: string, reason: "user" | "activity" | "timer") => {
-      const wasPinned =
-        latest.current.workspaceById.get(workspaceId)?.pinned_at != null;
-      useSidebarInboxStore.getState().unsnooze(workspaceId, reason);
-      markRowIn(setJustUnsettledId, workspaceId);
-      // A manual wake needs no badge — the user is the one who did it. Neither
-      // does a pinned card: the "Woke" pill announces a *return* to a list, and
-      // a pinned card never left it, so the badge would flash news that never
-      // happened.
-      if (reason === "user" || wasPinned) return;
-      setWokeIds((prev) => {
-        if (prev.has(workspaceId)) return prev;
-        const next = new Set(prev);
-        next.add(workspaceId);
-        return next;
-      });
-    },
-    [],
-  );
-
-  /** Stable `onWake` for the snoozed rows: the row only ever wakes by an
-   *  explicit user gesture, so the reason is fixed. */
-  const handleWake = useCallback(
-    (workspaceId: string) => wake(workspaceId, "user"),
-    [wake],
-  );
-
-  // Un-settle a workspace because its live agent resurfaced it (not a user
-  // gesture): clear any keep-active pin via reason "activity", then run the
-  // same rise-in animation the manual path uses.
-  const resurface = (workspaceId: string) => {
-    useSidebarInboxStore.getState().unsettle(workspaceId, "activity");
+  /** Stable `onWake` for the snoozed rows: an explicit "Wake now", which the
+   *  store treats as a keep-active decision. Automatic wakes (activity, timer)
+   *  are made by `useInboxLifecycle`; see `announceWake`. */
+  const handleWake = useCallback((workspaceId: string) => {
+    useSidebarInboxStore.getState().unsnooze(workspaceId, "user");
     markRowIn(setJustUnsettledId, workspaceId);
+  }, []);
+
+  /** Animate a wake made by the lifecycle (its agent raised a hand, or its
+   *  ticket came due) — the store write has already landed. A manual wake
+   *  (`handleWake`) needs no badge — the user is the one who did it. Neither
+   *  does a pinned card: the "Woke" pill announces a *return* to a list, and a
+   *  pinned card never left it, so the badge would flash news that never
+   *  happened. */
+  const announceWake = (workspaceId: string, wasPinned: boolean) => {
+    markRowIn(setJustUnsettledId, workspaceId);
+    if (wasPinned) return;
+    setWokeIds((prev) => {
+      if (prev.has(workspaceId)) return prev;
+      const next = new Set(prev);
+      next.add(workspaceId);
+      return next;
+    });
   };
 
   // ── Selection ──
@@ -1667,206 +1567,27 @@ export function SidebarInbox() {
   };
 
   // ── Lifecycle effects ──
-
-  // Settle safety net: a settled workspace whose agent goes live ("working")
-  // or blocked ("permission") resurfaces into the active list automatically,
-  // so live or blocked work can never stay buried under the divider. Finished
-  // ("review"), monitoring and idle settled rows stay put — only fresh
-  // activity resurfaces them, and a background watch loop is not news: the
-  // user parked the workspace *because* it was going to keep ticking. Unsettle removes the entry from `settled`, so re-runs converge; we
-  // iterate a snapshot and skip ids that aren't currently settled.
-  useEffect(() => {
-    if (!loaded || !paneStatuses) return;
-    for (const entry of settled) {
-      const ws = allWorkspaces.find((w) => w.workspace_id === entry.id);
-      if (!ws) continue;
-      const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
-      if (status === "working" || status === "permission") {
-        resurface(entry.id);
-      }
-    }
-  }, [loaded, paneStatuses, settled, allWorkspaces]);
-
-  // Snooze safety net (the hand-raise): a snoozed workspace whose agent starts
-  // working or blocks on a permission prompt wakes immediately, wake time or
-  // not. A snooze defers *waiting*; it can never be allowed to hide an agent
-  // that is stuck asking the user a question, or the user would sit staring at
-  // an empty inbox while work blocks behind a shelf they collapsed yesterday.
   //
-  // No "is this newer than the snooze?" check is needed. `isSnoozeable`
-  // refuses to snooze a working/blocked workspace in the first place, and
-  // pane statuses are runtime-only (the backend clears them before persisting,
-  // so no stale status survives a restart) — so reaching working/permission
-  // here is always a transition that happened after the snooze was set.
-  useEffect(() => {
-    if (!loaded || !paneStatuses) return;
-    for (const entry of snoozed) {
-      const ws = allWorkspaces.find((w) => w.workspace_id === entry.id);
-      if (!ws) continue;
-      const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
-      if (status === "working" || status === "permission") {
-        wake(entry.id, "activity");
-      }
-    }
-  }, [loaded, paneStatuses, snoozed, allWorkspaces]);
-
-  // A precise timer at the soonest boundary, because the coarse clock alone
-  // would make a wake up to a full tick late — a "In 1 hour" snooze returning
-  // at 1h00m29s reads as a broken promise. Re-armed via the nonce after each
-  // fire so a queue of wakes is walked one boundary at a time.
-  const [wakeNonce, setWakeNonce] = useState(0);
-
-  // Wake sweep: anything whose return ticket has come due goes back to the
-  // active list. It reads the wall clock rather than the coarse one — the
-  // boundary timer below re-runs this effect at the exact moment a ticket
-  // comes due, and the coarse value can be a whole tick behind. The coarse
-  // clock stays in the deps as the periodic backstop.
-  useEffect(() => {
-    if (!loaded) return;
-    const nowMs = Date.now();
-    for (const entry of snoozed) {
-      if (nowMs >= entry.until) wake(entry.id, "timer");
-    }
-  }, [loaded, snoozed, now, wakeNonce, wake]);
-
-  useEffect(() => {
-    if (!loaded || snoozed.length === 0) return;
-    let soonest = Infinity;
-    for (const entry of snoozed) soonest = Math.min(soonest, entry.until);
-    if (!Number.isFinite(soonest)) return;
-    const timer = window.setTimeout(
-      () => setWakeNonce((n) => n + 1),
-      clampTimerDelay(soonest - Date.now()),
-    );
-    return () => window.clearTimeout(timer);
-  }, [loaded, snoozed, wakeNonce]);
-
-  // Activity observation: keep a client-side "last active" stamp per workspace
-  // so the inactivity auto-settle rule has something to measure against. We
-  // stamp when the agent is doing something (non-null status), when it's the
-  // focused workspace, or when we've never recorded it before.
-  //
-  // The first-seen baseline prefers the backend's `last_active_at`: stamping
-  // `Date.now()` there would throw away real idleness and restart every
-  // workspace's clock on every app update, so a machine full of month-old work
-  // would look brand new. Only when the backend has no stamp at all do we fall
-  // back to now — that keeps the anti-mass-settle property (a workspace with no
-  // usable history must never auto-settle the instant it is first seen).
-  //
-  // Only a NEW non-null status edge counts as genuine activity for pin
-  // clearing. A repeated `review` snapshot is completed work, not a new run;
-  // clearing on every non-null observation would make an explicitly
-  // un-settled merged workspace settle again on the next render.
-  useEffect(() => {
-    if (!loaded || !paneStatuses) return;
-    const noteActivity = useSidebarInboxStore.getState().noteActivity;
-    const at = Date.now();
-    const presentIds = new Set<string>();
-    for (const ws of allWorkspaces) {
-      presentIds.add(ws.workspace_id);
-      const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
-      const hadPrevious = previousStatusRef.current.has(ws.workspace_id);
-      const previousStatus = previousStatusRef.current.get(ws.workspace_id);
-      const newAgentActivity =
-        status !== null && hadPrevious && previousStatus !== status;
-      previousStatusRef.current.set(ws.workspace_id, status);
-      const isActiveWs = ws.workspace_id === activeWorkspaceId;
-      const unseen = activity[ws.workspace_id] === undefined;
-      if (status === null && !isActiveWs && !unseen) continue;
-      // A live agent, or a workspace the user is looking at, is active *now*.
-      // Anything else here is a first sighting, which inherits real history.
-      const stamp =
-        status !== null || isActiveWs ? at : ws.last_active_at ?? at;
-      noteActivity(ws.workspace_id, stamp, { clearPin: newAgentActivity });
-    }
-    for (const id of previousStatusRef.current.keys()) {
-      if (!presentIds.has(id)) previousStatusRef.current.delete(id);
-    }
-  }, [loaded, paneStatuses, allWorkspaces, activeWorkspaceId, activity, now]);
-
-  // Auto-settle: server-side completion semantics. A merged/closed PR settles
-  // immediately once the workspace is not running or blocked; otherwise
-  // inactivity past the user's configured window is the fallback. No
-  // leaving animation (this is a
-  // background lifecycle transition, not a gesture) and deliberately no
-  // forward navigation: a sweep must never move the user.
-  //
-  // Anti-fight invariants — the inbox has three base lifecycles (active /
-  // settled / snoozed), plus the durable workspace-pin visibility override
-  // and the local keep-active auto-settle override. These guards make
-  // oscillation impossible:
-  //   • auto-settle refuses working/permission, but completed review is safe;
-  //   • the auto-un-settle safety net ONLY fires at working/permission;
-  //   • the snooze hand-raise ONLY fires at working/permission, and the wake
-  //     sweep only at an elapsed wake time;
-  //   • auto-settle skips snoozed ids entirely (they aren't in `activeCards`),
-  //     so a snoozed workspace can't be settled out from under its own wake
-  //     timer; the store keeps the two shelves mutually exclusive from the
-  //     other side by dropping a snooze when a settle lands;
-  //   • a keep-active pin blocks auto-settle until the agent shows real
-  //     activity (a non-null status un-pins via noteActivity's clearPin);
-  //     selecting the workspace is not activity and leaves the pin standing,
-  //     and a timer wake deliberately touches no pin at all;
-  //   • a durable workspace pin blocks every PARK path (manual, bulk, and this
-  //     sweep) without mutating a preserved settled/snoozed entry, so unpinning
-  //     reveals that base state. Un-park is deliberately not blocked: the
-  //     settle safety net and the snooze wake sweep still clear a preserved
-  //     entry while the card is pinned, because a pin governs where a card is
-  //     shown, not whether its agent went live or its wake time elapsed. Those
-  //     two only ever REMOVE a shelf entry, so they cannot fight the pin — the
-  //     card is already on top either way, and unpinning then reveals the
-  //     up-to-date lifecycle rather than a stale one;
-  //   • the "Wrapping up" tier is not a fifth state and mutates nothing — it is
-  //     a pure partition of the cards this sweep already left alone, so it can
-  //     neither park a row nor be fought over by anything that can. An open PR
-  //     is also outside this sweep's PR rule (which wants merged/closed), so
-  //     the two never claim the same card.
-  // So no two of these effects can act on the same workspace at the same
-  // status, and a user-kept or user-deferred card stays put until its agent
-  // genuinely runs again.
-  useEffect(() => {
-    if (!loaded || !paneStatuses) return;
-    const store = useSidebarInboxStore.getState();
-    const settledSet = new Set(settled.map((e) => e.id));
-    const snoozedSet = new Set(snoozed.map((e) => e.id));
-    for (const ws of allWorkspaces) {
-      const id = ws.workspace_id;
-      if (ws.pinned_at != null) continue;
-      if (settledSet.has(id) || snoozedSet.has(id)) continue;
-      if (keepActive[id]) continue;
-      const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
-      // Aggregate state: the workspace settles when the *set* is finished,
-      // not when its primary happens to merge. Settling a nine-PR stack
-      // because its bottom landed would file the card away with eight
-      // reviews still open.
-      const prs = workspacePrs(ws);
-      const prState = prSetSummary(prs).state;
-      const stamp = effectiveActivityAt(ws.last_active_at, activity[id]);
-      if (
-        shouldAutoSettle(
-          prState,
-          status,
-          stamp,
-          now,
-          autoSettleDays,
-          prsDescribeThisCheckout(prs, ws.git_branch),
-        )
-      ) {
-        store.settle(id, ws.last_active_at ?? undefined);
-        markRowIn(setJustSettledId, id);
-      }
-    }
-  }, [
-    loaded,
-    paneStatuses,
-    allWorkspaces,
-    settled,
-    snoozed,
-    keepActive,
-    activity,
-    autoSettleDays,
-    now,
-  ]);
+  // The durable lifecycle (settle / snooze safety nets, the wake sweep and its
+  // boundary timer, activity stamps, auto-settle, prune) lives in
+  // `useInboxLifecycle`, mounted once beside the view switch so it keeps
+  // running while the Projects view is the one on screen. The inbox only
+  // animates what it reports: the rise-in row and the "woke" badge.
+  useEffect(
+    () =>
+      subscribeInboxLifecycle((event) => {
+        if (event.kind === "auto-settled") {
+          markRowIn(setJustSettledId, event.workspaceId);
+        } else if (event.kind === "resurfaced") {
+          markRowIn(setJustUnsettledId, event.workspaceId);
+        } else {
+          announceWake(event.workspaceId, event.wasPinned);
+        }
+      }),
+    // `markRowIn` / `announceWake` only touch state setters and the timeout
+    // list, all stable for the component's lifetime.
+    [],
+  );
 
   // ── Jump-to-card shortcuts ──
   // Publish the visible active-card ids (view order, filter-scoped) so the
@@ -1881,34 +1602,16 @@ export function SidebarInbox() {
   // Show the badges only while the jump modifier is physically held.
   const jumpHintsVisible = useJumpHintsVisible();
 
-  // Whether the project filter dropdown is open — drives the trigger chevron
-  // rotation.
-  const [filterMenuOpen, setFilterMenuOpen] = useState(false);
-
   // Active (unsettled) workspace count per project, plus the grand total for
   // the "All projects" row. Derived from the same grouping + settled data the
   // lists use, so the badges always match what the filter would show. Parking
   // is the only thing that decrements a count — a wrapping-up card is still an
   // active workspace, and dropping it from the total would report work as gone
   // the moment its PR opened.
-  const projectCounts = useMemo(() => {
-    const map = new Map<string, number>();
-    let total = 0;
-    for (const group of projectGroups) {
-      let count = 0;
-      for (const ws of group.workspaces) {
-        if (
-          ws.pinned_at != null ||
-          (!settledIds.has(ws.workspace_id) && !snoozedIds.has(ws.workspace_id))
-        ) {
-          count += 1;
-        }
-      }
-      map.set(group.projectPath, count);
-      total += count;
-    }
-    return { map, total };
-  }, [projectGroups, settledIds, snoozedIds]);
+  const projectCounts = useMemo(
+    () => computeProjectCounts(projectGroups, settledIds, snoozedIds),
+    [projectGroups, settledIds, snoozedIds],
+  );
 
   const filterName = filter
     ? projectGroups.find((g) => g.projectPath === filter)?.projectName ?? null
@@ -1962,6 +1665,11 @@ export function SidebarInbox() {
         selected={selectedIds.has(id)}
         onSelect={handleSelect}
         onMarkUnread={handleMarkUnread}
+        parentTitle={
+          ws.parent_workspace_id
+            ? workspaceById.get(ws.parent_workspace_id)?.title ?? null
+            : null
+        }
       />
     );
   };
@@ -1975,99 +1683,13 @@ export function SidebarInbox() {
           is what lets the list below keep its static, status-blind order. */}
       <div className="sticky top-0 z-10 bg-sidebar">
         <div className="flex items-center gap-1 px-2.5 pb-2.5 min-w-0">
-          <DropdownMenu open={filterMenuOpen} onOpenChange={setFilterMenuOpen}>
-            <DropdownMenuTrigger asChild>
-              <button
-                type="button"
-                aria-label="Filter by project"
-                data-project-filter
-                className={cn(
-                  "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2.5",
-                  "border border-transparent bg-transparent text-label font-semibold text-foreground/80",
-                  "transition-colors duration-150 hover:border-border/60 hover:bg-surface-2",
-                )}
-              >
-                {filter === null ? (
-                  <Folder className="size-3.5 shrink-0 text-muted-foreground" />
-                ) : (
-                  <ProjectMiniAvatar name={filterName ?? ""} path={filter} />
-                )}
-                <span className="min-w-0 flex-1 truncate text-left">
-                  {filter === null ? "All projects" : filterName}
-                </span>
-                <ChevronDown
-                  className={cn(
-                    "size-3 shrink-0 text-muted-foreground transition-transform duration-150",
-                    filterMenuOpen && "rotate-180",
-                  )}
-                />
-              </button>
-            </DropdownMenuTrigger>
-            {/* Capped at a menu-sized panel rather than growing with the
-                project count: past a dozen or so projects an uncapped menu
-                stretches to the window edge and reads as clipped. The cap is
-                whichever is smaller — a comfortable ~9 rows, or whatever room
-                Radix actually has — so the same panel behaves in a short
-                window. */}
-            <DropdownMenuContent
-              side="bottom"
-              align="start"
-              className="flex max-h-[min(21rem,var(--radix-dropdown-menu-content-available-height))] w-[248px] flex-col overflow-y-hidden p-0"
-            >
-              {/* "All projects" is the reset, so it stays pinned above the
-                  scroll area — scrolling to the top to clear a filter is the
-                  kind of small tax that makes a long list feel like work. */}
-              <div className="shrink-0 border-b border-border/60 p-1.5">
-                <DropdownMenuItem
-                  onClick={() => setFilter(null)}
-                  aria-label="All projects"
-                  className={cn(
-                    "h-8 gap-2 rounded-md px-2 text-label font-semibold",
-                    filter === null && "bg-surface-3 text-foreground",
-                  )}
-                >
-                  <Folder className="size-3.5 shrink-0 text-muted-foreground" />
-                  <span className="min-w-0 flex-1 truncate">All projects</span>
-                  <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
-                    {projectCounts.total}
-                  </span>
-                </DropdownMenuItem>
-              </div>
-              <div className="thin-scrollbar [scrollbar-gutter:stable] min-h-0 flex-1 overflow-y-auto p-1.5">
-                {projectGroups.map((group) => (
-                  <ProjectFilterItem
-                    key={group.projectPath}
-                    name={group.projectName}
-                    path={group.projectPath}
-                    count={projectCounts.map.get(group.projectPath) ?? 0}
-                    active={filter === group.projectPath}
-                    onSelect={() => setFilter(group.projectPath)}
-                  />
-                ))}
-              </div>
-              {/* Project creation is pinned under the list, mirroring the
-                  pinned reset above it. Single-line rows sized like the
-                  project rows; the labels themselves carry the difference
-                  (adopt what's on disk vs start or clone a new repo). */}
-              <div className="shrink-0 border-t border-border/60 p-1.5">
-                <DropdownMenuItem
-                  onClick={() => openProject()}
-                  className="h-8 gap-2 rounded-md px-2 text-label"
-                >
-                  <FolderOpen className="size-3.5 shrink-0 text-muted-foreground" />
-                  <span className="min-w-0 flex-1 truncate">Open existing project</span>
-                  <MenuKeycap actionId="openProject" />
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={() => setShowNewProjectScreen(true)}
-                  className="h-8 gap-2 rounded-md px-2 text-label"
-                >
-                  <FolderPlus className="size-3.5 shrink-0 text-muted-foreground" />
-                  <span className="min-w-0 flex-1 truncate">Create or clone project</span>
-                </DropdownMenuItem>
-              </div>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <SidebarProjectFilter
+            projectGroups={projectGroups}
+            counts={projectCounts}
+            filter={filter}
+            filterName={filterName}
+            setFilter={setFilter}
+          />
           <SidebarHeaderActions />
         </div>
 
