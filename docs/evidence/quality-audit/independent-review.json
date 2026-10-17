@@ -44,6 +44,24 @@
         "Final native Cargo integration coverage remained with the parent run, not the reviewer.",
         "Optional test-name/evidence editorial nits were not correctness blockers."
       ]
+    },
+    {
+      "round": 3,
+      "status": "completed",
+      "scope": "Node 22 CI fixture follow-up; production code unchanged",
+      "verdict": "No blockers; observable waits preserve ownership assertions and explicit seed cancellation strengthens coverage.",
+      "independently_observed": {
+        "node22_version": "22.23.1",
+        "node22_tests_passed": 47,
+        "node22_unhandled_errors": 0,
+        "node26_version": "26.11.1",
+        "node26_tests_passed": 47
+      },
+      "mutation_checks": [
+        "Removing the post-ticket generation guard makes stale-socket detection fail on Node 22 (three of three runs) and Node 26.",
+        "Removing the unauthorized-path connect-promise reset makes both retry tests fail."
+      ],
+      "method": "Reviewer used an isolated temporary source copy for mutation checks; the working production source was not edited."
     }
   ],
   "accepted_behavior": [

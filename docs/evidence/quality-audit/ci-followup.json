@@ -1,0 +1,61 @@
+{
+  "date": "2026-10-17",
+  "parent_commit": "a59f7f1f08c02fe3f087eec21cc6b8ee96dc5223",
+  "ci_job": "https://github.com/Zeus-Deus/codemux/actions/runs/39066733324/job/117495861399",
+  "ci_node_version": "v22.23.3",
+  "local_reproduction_node_version": "v22.23.1",
+  "diagnosis": [
+    "Native Response.json() can finish after the six Promise-only ticks assumed by the new test fixtures; the tests accessed nonexistent sockets.",
+    "An existing snapshot-seed fixture deliberately left connect() pending and discarded its promise; cleanup now correctly rejects that promise."
+  ],
+  "changes": [
+    "Wait for the exact new socket count before opening that socket; preserve current-ticket URL, request counts and ownership assertions.",
+    "Explicitly close and await the expected pending-connect cancellation after confirming seed access before socket opening."
+  ],
+  "production_code_changed": false,
+  "checks": [
+    {
+      "runtime": "Node v22.23.1",
+      "command": "node node_modules/vitest/vitest.mjs run src/remote/transport.test.ts src/remote/snapshot-seed.test.ts",
+      "stage": "before correction",
+      "exit_code": 1,
+      "tests_passed": 44,
+      "tests_failed": 3,
+      "unhandled_errors": 3
+    },
+    {
+      "runtime": "Node v22.23.1",
+      "command": "node node_modules/vitest/vitest.mjs run src/remote/transport.test.ts src/remote/snapshot-seed.test.ts",
+      "stage": "after correction",
+      "exit_code": 0,
+      "tests_passed": 47,
+      "tests_failed": 0,
+      "unhandled_errors": 0
+    },
+    {
+      "runtime": "Node v22.23.1",
+      "command": "node node_modules/vitest/vitest.mjs run src/remote",
+      "exit_code": 0,
+      "files_passed": 20,
+      "tests_passed": 198,
+      "tests_failed": 0,
+      "unhandled_errors": 0
+    },
+    {
+      "runtime": "Node v26.11.1",
+      "command": "npm run test -- src/remote/transport.test.ts src/remote/snapshot-seed.test.ts",
+      "exit_code": 0,
+      "files_passed": 2,
+      "tests_passed": 47,
+      "tests_failed": 0,
+      "unhandled_errors": 0
+    },
+    {
+      "runtime": "Node v26.11.1",
+      "command": "npm run check",
+      "exit_code": 0
+    }
+  ],
+  "counting": "These consumer checks overlap the original 770 targeted cases; do not add the totals.",
+  "review": "Claude Opus 5.5 on high and an independent core reviewer found no blockers. Opus reran 47 tests on Node 22 and 26 and verified stale-ticket/auth-retry mutations are still detected."
+}

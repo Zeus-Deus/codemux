@@ -1,0 +1,189 @@
+CI Node 22 fixture reproduction and correction.
+Absolute workspace paths and trailing formatting whitespace are normalized.
+Local Node version 22.23.1; CI reported 22.23.3. No production code changed.
+
+Before correction: exact CI failures reproduced
+
+ RUN  v3.2.6 <workspace>
+
+ ✓ src/remote/snapshot-seed.test.ts (13 tests) 15ms
+ ❯ src/remote/transport.test.ts (34 tests | 3 failed) 564ms
+   ✓ parseBinaryChannelFrame > decodes a well-formed frame 2ms
+   ✓ parseBinaryChannelFrame > preserves large u64 indices past 2^32 0ms
+   ✓ parseBinaryChannelFrame > rejects short buffers and a wrong frame tag 0ms
+   ✓ invoke roundtrip > resolves on the id-matched ok frame 2ms
+   ✓ invoke roundtrip > rejects on the id-matched err frame 0ms
+   ✓ invoke roundtrip > matches out-of-order responses by id 0ms
+   ✓ invoke roundtrip > rejects invoke when the socket is not connected 1ms
+   ✓ channel + event frame routing > routes JSON chan frames to onChannelMessage 0ms
+   ✓ channel + event frame routing > routes binary frames to onChannelMessage as a Uint8Array 1ms
+   ✓ channel + event frame routing > routes event frames to onEvent 0ms
+   ✓ disconnect handling > rejects pending invokes when explicitly closed without reconnecting 3ms
+   ✓ disconnect handling > settles an initial connection cancelled while its ticket is in flight 0ms
+   × disconnect handling > shares concurrent connect calls and ignores tickets from a closed connection 9ms
+     → expected [] to have a length of 1 but got +0
+   ✓ disconnect handling > rejects in-flight invokes and reports reconnecting on drop 2ms
+   ✓ reconnect > re-issues a ticket and re-sends all subscriptions 2ms
+   ✓ reconnect > gives up and reports unauthorized on a 401 ticket 0ms
+   × reconnect > allows a fresh connection after the initial ticket is unauthorized 1ms
+     → Cannot read properties of undefined (reading 'open')
+   × reconnect > opens a fresh socket after a later reconnect ticket is unauthorized 1ms
+     → Cannot read properties of undefined (reading 'open')
+   ✓ reconnect > ignores a 401 ticket that lands after close() 0ms
+   ✓ compression negotiation > offers compress=deflate alongside the encoded ticket 0ms
+   ✓ compressed frames > resolves a pending invoke from a 0x02 text envelope 10ms
+   ✓ compressed frames > delivers a 0x03 envelope like the uncompressed binary frame 1ms
+   ✓ compressed frames > keeps the inflate stream across frames (context takeover) 1ms
+   ✓ compressed frames > cannot decode a later frame without the earlier dictionary 2ms
+   ✓ compressed frames > interleaves compressed, plain text and plain binary frames in order 1ms
+   ✓ compressed frames > decodes a fresh server stream after a reconnect 2ms
+   ✓ golden frames from the real server compressor > inflates a recorded connection stream to exact bytes  412ms
+   ✓ golden frames from the real server compressor > cannot read a golden frame out of order 1ms
+   ✓ malformed compressed frames > closes the socket and reconnects onto a fresh stream on a failed inflate 92ms
+   ✓ malformed compressed frames > rejects in-flight invokes when the stream is poisoned 2ms
+   ✓ malformed compressed frames > escalates a truncated envelope header 1ms
+   ✓ malformed compressed frames > escalates an envelope whose uncompressed_len disagrees 1ms
+   ✓ malformed compressed frames > rejects an absurd declared length without allocating for it 2ms
+   ✓ malformed compressed frames > drops compressed frames still arriving on the dying socket 4ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/remote/transport.test.ts > disconnect handling > shares concurrent connect calls and ignores tickets from a closed connection
+AssertionError: expected [] to have a length of 1 but got +0
+
+- Expected
++ Received
+
+- 1
++ 0
+
+ ❯ src/remote/transport.test.ts:218:37
+    216|     await flushMicrotasks();
+    217|
+    218|     expect(FakeWebSocket.instances).toHaveLength(1);
+       |                                     ^
+    219|     expect(FakeWebSocket.instances[0].url).toContain("ticket=current");
+    220|     FakeWebSocket.instances[0].open();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+
+ FAIL  src/remote/transport.test.ts > reconnect > allows a fresh connection after the initial ticket is unauthorized
+TypeError: Cannot read properties of undefined (reading 'open')
+ ❯ src/remote/transport.test.ts:296:8
+    294|     expect(fetchImpl).toHaveBeenCalledTimes(2);
+    295|     const ws = FakeWebSocket.instances[0];
+    296|     ws.open();
+       |        ^
+    297|     await reconnect;
+    298|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+
+ FAIL  src/remote/transport.test.ts > reconnect > opens a fresh socket after a later reconnect ticket is unauthorized
+TypeError: Cannot read properties of undefined (reading 'open')
+ ❯ connect src/remote/transport.test.ts:68:6
+     66|   await flushMicrotasks();
+     67|   const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - …
+     68|   ws.open();
+       |      ^
+     69|   await p;
+     70|   return ws;
+ ❯ src/remote/transport.test.ts:307:25
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯
+
+⎯⎯⎯⎯⎯⎯ Unhandled Errors ⎯⎯⎯⎯⎯⎯
+
+Vitest caught 3 unhandled errors during the test run.
+This might cause false positive tests. Resolve unhandled errors to make sure your tests are not affected.
+
+⎯⎯⎯⎯ Unhandled Rejection ⎯⎯⎯⎯⎯
+Error: web-remote: connection closed
+ ❯ RemoteTransport.close src/remote/transport.ts:300:19
+    298|     this.closed = true;
+    299|     this.generation += 1;
+    300|     const error = new Error("web-remote: connection closed");
+       |                   ^
+    301|     this.firstConnectReject?.(error);
+    302|     this.firstConnectReject = this.firstConnectResolve = null;
+ ❯ src/remote/snapshot-seed.test.ts:137:40
+ ❯ node_modules/@vitest/runner/dist/chunk-hooks.js:155:11
+ ❯ node_modules/@vitest/runner/dist/chunk-hooks.js:1897:20
+ ❯ runWithTimeout node_modules/@vitest/runner/dist/chunk-hooks.js:1863:10
+ ❯ runHook node_modules/@vitest/runner/dist/chunk-hooks.js:1436:51
+ ❯ callSuiteHook node_modules/@vitest/runner/dist/chunk-hooks.js:1442:25
+ ❯ callSuiteHook node_modules/@vitest/runner/dist/chunk-hooks.js:1449:27
+ ❯ runTest node_modules/@vitest/runner/dist/chunk-hooks.js:1597:11
+
+This error originated in "src/remote/snapshot-seed.test.ts" test file. It doesn't mean the error was thrown inside the file itself, but while it was running.
+The latest test that might've caused the error is "refetches the snapshot on reconnect and pushes it via app-state-changed". It might mean one of the following:
+- The error was thrown, while Vitest was running this test.
+- If the error occurred after the test had been completed, this was the last documented test before it was thrown.
+
+⎯⎯⎯⎯ Unhandled Rejection ⎯⎯⎯⎯⎯
+Error: web-remote: connection closed
+ ❯ RemoteTransport.close src/remote/transport.ts:300:19
+    298|     this.closed = true;
+    299|     this.generation += 1;
+    300|     const error = new Error("web-remote: connection closed");
+       |                   ^
+    301|     this.firstConnectReject?.(error);
+    302|     this.firstConnectReject = this.firstConnectResolve = null;
+ ❯ src/remote/transport.test.ts:74:27
+ ❯ node_modules/@vitest/runner/dist/chunk-hooks.js:155:11
+ ❯ node_modules/@vitest/runner/dist/chunk-hooks.js:1897:20
+ ❯ runWithTimeout node_modules/@vitest/runner/dist/chunk-hooks.js:1863:10
+ ❯ runHook node_modules/@vitest/runner/dist/chunk-hooks.js:1436:51
+ ❯ callSuiteHook node_modules/@vitest/runner/dist/chunk-hooks.js:1442:25
+ ❯ callSuiteHook node_modules/@vitest/runner/dist/chunk-hooks.js:1449:27
+ ❯ runTest node_modules/@vitest/runner/dist/chunk-hooks.js:1597:11
+
+This error originated in "src/remote/transport.test.ts" test file. It doesn't mean the error was thrown inside the file itself, but while it was running.
+The latest test that might've caused the error is "re-issues a ticket and re-sends all subscriptions". It might mean one of the following:
+- The error was thrown, while Vitest was running this test.
+- If the error occurred after the test had been completed, this was the last documented test before it was thrown.
+
+⎯⎯⎯⎯ Unhandled Rejection ⎯⎯⎯⎯⎯
+Error: web-remote: connection closed
+ ❯ RemoteTransport.close src/remote/transport.ts:300:19
+    298|     this.closed = true;
+    299|     this.generation += 1;
+    300|     const error = new Error("web-remote: connection closed");
+       |                   ^
+    301|     this.firstConnectReject?.(error);
+    302|     this.firstConnectReject = this.firstConnectResolve = null;
+ ❯ src/remote/transport.test.ts:74:27
+ ❯ node_modules/@vitest/runner/dist/chunk-hooks.js:155:11
+ ❯ node_modules/@vitest/runner/dist/chunk-hooks.js:1897:20
+ ❯ runWithTimeout node_modules/@vitest/runner/dist/chunk-hooks.js:1863:10
+ ❯ runHook node_modules/@vitest/runner/dist/chunk-hooks.js:1436:51
+ ❯ callSuiteHook node_modules/@vitest/runner/dist/chunk-hooks.js:1442:25
+ ❯ callSuiteHook node_modules/@vitest/runner/dist/chunk-hooks.js:1449:27
+ ❯ runTest node_modules/@vitest/runner/dist/chunk-hooks.js:1597:11
+
+This error originated in "src/remote/transport.test.ts" test file. It doesn't mean the error was thrown inside the file itself, but while it was running.
+The latest test that might've caused the error is "resolves a pending invoke from a 0x02 text envelope". It might mean one of the following:
+- The error was thrown, while Vitest was running this test.
+- If the error occurred after the test had been completed, this was the last documented test before it was thrown.
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+
+
+ Test Files  1 failed | 1 passed (2)
+      Tests  3 failed | 44 passed (47)
+     Errors  3 errors
+   Start at  22:35:43
+   Duration  2.09s (transform 207ms, setup 389ms, collect 227ms, tests 579ms, environment 1.04s, prepare 333ms)
+
+
+After correction: affected files
+
+ RUN  v3.2.6 <workspace>
+
+ ✓ src/remote/snapshot-seed.test.ts (13 tests) 16ms
+ ✓ src/remote/transport.test.ts (34 tests) 1263ms
+   ✓ golden frames from the real server compressor > inflates a recorded connection stream to exact bytes  315ms
+
+ Test Files  2 passed (2)
+      Tests  47 passed (47)
+   Start at  22:36:25
+   Duration  2.89s (transform 337ms, setup 207ms, collect 352ms, tests 1.28s, environment 1.47s, prepare 381ms)
