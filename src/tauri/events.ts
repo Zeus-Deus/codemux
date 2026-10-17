@@ -486,6 +486,18 @@ export type ProviderRuntimeEvent =
       cache_read_tokens: number;
       cache_write_tokens: number;
       cost_usd: number | null;
+      /** Cache tier of this increment's writes (Claude only). */
+      cache_write_ttl?: "1h" | "5m";
+    }
+  | {
+      /** Provider plan quota. Never reaches panes; plugins see it through
+       *  `host.chat.onEvent`. */
+      type: "plan_usage_updated";
+      thread_id: string;
+      provider: AgentChatProviderKind;
+      windows: unknown[];
+      plan_label?: string;
+      auth_mode?: string;
     }
   | {
       type: "tasks_updated";

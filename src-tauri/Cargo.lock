@@ -1203,7 +1203,6 @@ dependencies = [
  "chrono",
  "clap",
  "codemux",
- "codemux-addon-protocol",
  "dirs",
  "flate2",
  "futures-core",
@@ -1272,18 +1271,6 @@ dependencies = [
  "windows-sys 0.59.0",
  "zbus 5.17.0",
  "zip",
-]
-
-[[package]]
-name = "codemux-addon-protocol"
-version = "1.0.0"
-dependencies = [
- "chrono",
- "schemars 0.8.22",
- "semver",
- "serde",
- "serde_json",
- "url",
 ]
 
 [[package]]

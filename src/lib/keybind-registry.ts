@@ -125,8 +125,30 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
 
 const registryById = new Map(KEYBIND_REGISTRY.map((e) => [e.id, e]));
 
+/**
+ * Extra entries appended after the core list (plugin keybinds). The provider
+ * returns the same array until its entries change, so with no plugin
+ * keybinds `allKeybindEntries()` is `KEYBIND_REGISTRY` itself.
+ */
+let extraEntries: () => readonly KeybindEntry[] = () => [];
+let lastExtra: readonly KeybindEntry[] | null = null;
+let lastAll: readonly KeybindEntry[] = KEYBIND_REGISTRY;
+
+export function setExtraKeybindProvider(provider: () => readonly KeybindEntry[]): void {
+  extraEntries = provider;
+  lastExtra = null;
+}
+
+export function allKeybindEntries(): readonly KeybindEntry[] {
+  const extra = extraEntries();
+  if (extra === lastExtra) return lastAll;
+  lastExtra = extra;
+  lastAll = extra.length === 0 ? KEYBIND_REGISTRY : [...KEYBIND_REGISTRY, ...extra];
+  return lastAll;
+}
+
 export function getRegistryEntry(id: string): KeybindEntry | undefined {
-  return registryById.get(id);
+  return registryById.get(id) ?? extraEntries().find((e) => e.id === id);
 }
 
 /**

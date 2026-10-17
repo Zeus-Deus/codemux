@@ -1,5 +1,6 @@
-import { useMemo } from "react";
-import { KEYBIND_REGISTRY, type KeybindEntry } from "@/lib/keybind-registry";
+import { useMemo, useSyncExternalStore } from "react";
+import { allKeybindEntries, type KeybindEntry } from "@/lib/keybind-registry";
+import { subscribePluginKeybinds } from "@/contrib/keybinds";
 import {
   useSyncedSettingsStore,
   selectKeyboardShortcuts,
@@ -31,7 +32,7 @@ export function resolveKeybinds(
   const keybindMap = new Map<string, ResolvedEntry>();
   const reverseMap = new Map<string, string[]>();
 
-  for (const entry of KEYBIND_REGISTRY) {
+  for (const entry of allKeybindEntries()) {
     // Native shortcuts are handled by the desktop app and can't be rebound,
     // so a stray override (hand-edited settings) must not change what the
     // shortcuts page claims.
@@ -74,5 +75,7 @@ export function resolveKeybinds(
 /** React hook: resolved keybinds that react to settings changes */
 export function useResolvedKeybinds(): ResolvedKeybinds {
   const overrides = useSyncedSettingsStore(selectKeyboardShortcuts);
-  return useMemo(() => resolveKeybinds(overrides), [overrides]);
+  // Plugin keybinds join and leave as plugins turn on and off.
+  const entries = useSyncExternalStore(subscribePluginKeybinds, allKeybindEntries, allKeybindEntries);
+  return useMemo(() => resolveKeybinds(overrides), [overrides, entries]);
 }

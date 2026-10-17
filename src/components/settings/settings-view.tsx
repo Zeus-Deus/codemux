@@ -3,7 +3,9 @@ import { MobileInstall } from "@/components/mobile/mobile-install";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
-import { AddonsSettings } from "./addons-settings";
+import { PluginSettingsPageView, PluginsSettings, usePluginSettingsPages } from "./plugins-settings";
+import { Slot } from "@/contrib/react/slot";
+import { APPEARANCE_EXTRA_AREA } from "@/sdk/areas";
 import { ProvidersSection } from "./providers-section";
 import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from "react";
 import { cn } from "@/lib/utils";
@@ -158,7 +160,8 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { GripVertical, Star } from "lucide-react";
+import { Blocks, GripVertical, Star } from "lucide-react";
+import { usePluginsStore } from "@/contrib/plugins-store";
 
 import { buildNavGroups, isSettingsSectionAvailable, type Section } from "@/lib/settings-sections";
 import { SettingsFooterPin } from "./settings-footer-pin";
@@ -1445,14 +1448,34 @@ export function SettingsView() {
   const { confirm, dialog: confirmDialog } = useConfirm();
 
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
-  const navGroups = buildNavGroups(enableAgentChat);
+  // Plugin settings pages get their own nav group, absent without any.
+  const pluginSettingsPages = usePluginSettingsPages();
+  const pluginRecords = usePluginsStore((s) => s.records);
+  const navGroups = useMemo(() => {
+    const groups = buildNavGroups(enableAgentChat);
+    if (pluginSettingsPages.size === 0) return groups;
+    return [
+      ...groups,
+      {
+        label: "PLUGIN SETTINGS",
+        items: [...pluginSettingsPages.keys()].map((pluginId) => ({
+          id: `plugin:${pluginId}` as Section,
+          label: pluginRecords[pluginId]?.name ?? pluginId,
+          icon: Blocks,
+        })),
+      },
+    ];
+  }, [enableAgentChat, pluginSettingsPages, pluginRecords]);
   const settingsNavigationVersion = useUIStore((s) => s.settingsNavigationVersion);
   const [activeSection, setActiveSection] = useState<string>(settingsSection ?? "account");
   // Honor repeated requests too, even after local navigation within Settings.
   useEffect(() => {
     if (settingsSection !== null) setActiveSection(settingsSection);
   }, [settingsSection, settingsNavigationVersion]);
-  const sectionAvailable = isSettingsSectionAvailable(activeSection, enableAgentChat);
+  const pluginSettingsId = activeSection.startsWith("plugin:") ? activeSection.slice("plugin:".length) : null;
+  const sectionAvailable = pluginSettingsId
+    ? pluginSettingsPages.has(pluginSettingsId)
+    : isSettingsSectionAvailable(activeSection, enableAgentChat);
   const contentScrollRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     // Repeated Settings requests should scroll to the top while preserving
@@ -1762,8 +1785,9 @@ export function SettingsView() {
   }, [defaultEditor, editors, updateSyncedSetting]);
 
   const renderSection = () => {
+    if (pluginSettingsId) return <PluginSettingsPageView pluginId={pluginSettingsId} />;
     switch (activeSection) {
-      case "addons": return <AddonsSettings />;
+      case "plugins": return <PluginsSettings onOpenSettings={(id) => setActiveSection(`plugin:${id}`)} />;
       case "account":
         return (
           <div>
@@ -2010,6 +2034,8 @@ export function SettingsView() {
                 </div>
               </div>
             </SectionGroup>
+            {/* Plugin appearance options. Nothing renders without one. */}
+            <Slot area={APPEARANCE_EXTRA_AREA} variant="block" />
           </div>
         );
 
@@ -2922,7 +2948,7 @@ export function SettingsView() {
         <div className="ml-2">
           <SettingsSyncIndicator />
         </div>
-        {sectionAvailable && !mobile && <SettingsFooterPin section={activeSection} />}
+        {sectionAvailable && !pluginSettingsId && !mobile && <SettingsFooterPin section={activeSection as Section} />}
       </div>
 
       {/* Body */}

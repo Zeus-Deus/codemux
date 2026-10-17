@@ -7,7 +7,7 @@ import {
   docPaneId,
   docPanePath,
   isCorePane,
-  isAddonPane,
+  isPluginPane,
   paneMeta,
 } from "./pane-registry";
 
@@ -71,12 +71,11 @@ describe("breadcrumb paths", () => {
   });
 });
 
-describe("add-on pane IDs", () => {
-  it("does not classify add-ons, empty sentinels or unknown IDs as core", () => {
-    expect(isAddonPane("addon:codemux.project-brief:brief")).toBe(true);
-    expect(isCorePane("addon:codemux.project-brief:brief")).toBe(false);
+describe("plugin pane IDs", () => {
+  it("does not classify plugin panes, empty sentinels or unknown IDs as core", () => {
+    expect(isPluginPane("plugin:project-brief:brief")).toBe(true);
+    expect(isCorePane("plugin:project-brief:brief")).toBe(false);
     expect(isCorePane("unknown" as never)).toBe(false);
-    expect(isAddonPane("addon:../escape:brief")).toBe(false);
-    expect(isAddonPane("addon:codemux.project-brief:brief:extra")).toBe(false);
+    expect(isPluginPane("plugin:../escape:brief")).toBe(false);
   });
 });

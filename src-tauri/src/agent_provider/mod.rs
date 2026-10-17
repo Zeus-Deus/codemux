@@ -33,7 +33,7 @@ pub mod usage_limit;
 pub use context_usage::ContextUsageTracker;
 pub use errors::{ProviderError, SerializableProviderError};
 pub use events::{
-    child_exit_events, classify_task_kind, CompletedItem, ContentDelta, ContextUsageSnapshot, CostSource,
+    CacheWriteTtl, child_exit_events, classify_task_kind, CompletedItem, ContentDelta, ContextUsageSnapshot, CostSource,
     PlanAuthMode, PlanUsageWindow, PlanWindowKind, ProviderRuntimeEvent, RequestResponseFailureReason, SubagentSnapshot, SubagentStatus,
     SubagentTaskKind, TaskSnapshotItem, TaskStatus, TasksSnapshot, TurnStatus, TurnUsage,
     UserMessageImage, WorkflowPhaseSnapshot, WorkflowSnapshot, CHILD_EXITED_SUBTYPE,

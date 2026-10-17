@@ -8,7 +8,7 @@
 
 import { resolveKeybinds } from "@/hooks/use-resolved-keybinds";
 import { parseKeyCombo, normalizeKeyName } from "@/lib/keybind-utils";
-import { KEYBIND_REGISTRY } from "@/lib/keybind-registry";
+import { allKeybindEntries } from "@/lib/keybind-registry";
 import { isAppShortcutApplicable } from "@/lib/app-shortcut-applicability";
 
 export interface AppShortcut {
@@ -23,9 +23,13 @@ let _cached: AppShortcut[] = [];
 let _lastOverrides: Record<string, string> | null = null;
 
 /** Rebuild the app shortcut list from current overrides. Called by use-keyboard-shortcuts. */
+let _lastEntries: readonly unknown[] | null = null;
+
 export function updateAppShortcuts(overrides: Record<string, string>) {
-  if (overrides === _lastOverrides) return;
+  const entries = allKeybindEntries();
+  if (overrides === _lastOverrides && entries === _lastEntries) return;
   _lastOverrides = overrides;
+  _lastEntries = entries;
 
   const resolved = resolveKeybinds(overrides);
   const shortcuts: AppShortcut[] = [];
@@ -36,7 +40,7 @@ export function updateAppShortcuts(overrides: Record<string, string>) {
     // combos the terminal has to give up. `composer` ones only exist inside a
     // focused chat composer, so a terminal never needs to yield them.
     // `native` ones are consumed by the desktop app before the page sees them.
-    const reg = KEYBIND_REGISTRY.find((e) => e.id === id);
+    const reg = allKeybindEntries().find((e) => e.id === id);
     if (reg?.when === "terminal" || reg?.when === "non-terminal" || reg?.when === "composer") continue;
     if (reg?.native) continue;
     if (!entry.activeKeys) continue;

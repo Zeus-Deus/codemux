@@ -4,7 +4,6 @@ import { useAuthStore } from "@/stores/auth-store";
 import { useChatGptStore } from "@/stores/chatgpt-store";
 import App from "./App";
 import { getHomeDir, repairInactiveMcpConfigs } from "@/tauri/commands";
-vi.mock("@/lib/addons/platform", () => ({ useAddonPlatform: vi.fn() }));
 vi.mock("@/hooks/use-app-state", () => ({ useAppStateInit: vi.fn() }));
 vi.mock("@/hooks/use-chatgpt-status", () => ({ useChatGptStatus: vi.fn() }));
 vi.mock("@/hooks/use-keyboard-shortcuts", () => ({ useKeyboardShortcuts: vi.fn() }));

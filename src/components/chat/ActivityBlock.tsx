@@ -1,4 +1,6 @@
 import { ArrowRight, Bot, HelpCircle, Lightbulb, ListTree } from "lucide-react";
+import { ContribBoundary, ContribRender } from "@/contrib/react/boundary";
+import { usePluginToolRenderer } from "@/contrib/tool-renderers";
 import { memo, useState } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
@@ -353,11 +355,25 @@ function StepLine({
             {step.text}
           </p>
         ) : (
-          <ToolCallBody item={step} />
+          <StepBody step={step} />
         )}
       </TraceCollapsibleContent>
     </TraceCollapsible>
   );
+}
+
+/** A tool step's opened body: a plugin renderer for this tool when one is
+ *  enabled (`transcript.toolRenderer`), otherwise the core body. */
+function StepBody({ step }: { step: Extract<ActivityStep, { kind: "tool_call" }> }) {
+  const plugin = usePluginToolRenderer(step.tool_name);
+  if (plugin) {
+    return (
+      <ContribBoundary id={plugin.id} variant="block">
+        <ContribRender render={plugin.render} props={{ call: step }} />
+      </ContribBoundary>
+    );
+  }
+  return <ToolCallBody item={step} />;
 }
 
 /** A subagent run inside the work log. Its detail lives in the Subagents

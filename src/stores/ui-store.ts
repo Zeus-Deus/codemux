@@ -49,7 +49,7 @@ export type ThemeStudioRequest =
  *  opened per file, so the id carries its own payload — that keeps the
  *  open-pane list a plain, persistable string array. */
 export type RightPanelTab =
-  RightPanelCorePane | `doc:${string}` | `addon:${string}:${string}` | typeof RIGHT_PANEL_EMPTY;
+  RightPanelCorePane | `doc:${string}` | `plugin:${string}:${string}` | typeof RIGHT_PANEL_EMPTY;
 
 /** The deck a workspace starts with. Matches the three panes that were
  *  always-present tabs before the deck existed, so an upgrade is a no-op
@@ -143,6 +143,8 @@ interface UIStore {
   showDevices: boolean;
   showPullRequests: boolean;
   showUsage: boolean;
+  /** A plugin page (`<pluginId>:<localId>`), opened by host.openPage. */
+  showPluginPage: string | null;
   /** A pull request the page should select as it opens — set by the
    *  palette or a link, consumed and cleared by the page. `url` is where
    *  a link came from, so the page can hand it to the browser if the
@@ -246,8 +248,8 @@ interface UIStore {
   closeRightPanelPane: (workspaceId: string, pane: RightPanelTab) => void;
   /** Forget panes in every workspace, as if they had never been opened:
    *  no dismissal is recorded and an active one hands focus to its
-   *  neighbour. Used when an add-on is disabled or removed, which is the
-   *  only time its saved pane preferences go away. */
+   *  neighbour. Used when a plugin is removed, which is the only time its
+   *  saved pane preferences go away (turning it off only hides them). */
   forgetRightPanelPanes: (forget: (pane: RightPanelTab) => boolean) => void;
   /** Drag-to-reorder from the deck's tab strip. `order` is the strip's new
    *  order — which may be only the *visible* subset of the open panes,
@@ -280,6 +282,7 @@ interface UIStore {
   /** Leave whichever utility page is open (Automations, Devices, Pull
    *  requests, Usage) and return to the workspace underneath it. */
   closeUtilityPages: () => void;
+  setShowPluginPage: (id: string | null) => void;
   /** Open the Pull Requests page, optionally on a given pull request. */
   setShowPullRequests: (
     show: boolean,
@@ -331,6 +334,7 @@ const NO_UTILITY_PAGE = {
   showDevices: false,
   showPullRequests: false,
   showUsage: false,
+  showPluginPage: null,
   pendingPrSelection: null,
 } as const;
 
@@ -362,6 +366,7 @@ export const useUIStore = create<UIStore>()(
       showDevices: false,
       showPullRequests: false,
       showUsage: false,
+      showPluginPage: null,
       pendingPrSelection: null,
       prBadgeSeen: [],
       renameWorkspaceId: null,
@@ -651,6 +656,8 @@ export const useUIStore = create<UIStore>()(
           showPullRequests: show,
           pendingPrSelection: show ? select : null,
         }),
+      setShowPluginPage: (id) =>
+        set(id ? { ...NO_UTILITY_PAGE, showPluginPage: id } : { showPluginPage: null }),
       closeUtilityPages: () =>
         set((state) =>
           selectUtilityPage(state) === null ? state : NO_UTILITY_PAGE,

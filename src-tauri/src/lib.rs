@@ -11,7 +11,6 @@ pub const APP_DIR_NAME: &str = "codemux-dev";
 #[cfg(not(debug_assertions))]
 pub const APP_DIR_NAME: &str = "codemux";
 
-pub mod addons;
 pub mod agent_capability;
 pub mod active_workspace_persistence;
 pub mod agent_context;
@@ -52,6 +51,7 @@ pub mod memory;
 pub mod notifications;
 pub mod observability;
 pub mod os_input;
+pub mod plugins;
 pub mod ports;
 pub mod presets;
 pub mod project;
@@ -541,9 +541,6 @@ pub fn run() {
                 ) {
                     eprintln!("[codemux::workflows] shutdown incomplete: {error}");
                 }
-                if let Some(manager) = app.state::<commands::addons::AddonState>().existing() {
-                    tauri::async_runtime::block_on(manager.shutdown());
-                }
                 if let Err(error) = active_workspace_persistence::flush_latest(app) {
                     eprintln!("[codemux::selection] shutdown flush failed: {error}");
                 }
@@ -601,7 +598,7 @@ fn build_core_app<R: tauri::Runtime>(
         // Mode is managed state so commands and the setup closure can gate
         // display-coupled behavior on it.
         .manage(mode)
-        .manage(commands::addons::AddonState::default())
+        .manage(plugins::commands::PluginsState::default())
         .manage(state::AppStateStore::default())
         // Live per-host reachability for the Devices page. Filled by
         // `hosts_inventory` (Unix only); on Windows every host reads as
@@ -771,6 +768,8 @@ fn build_core_app<R: tauri::Runtime>(
                 // page's output subscribers are dead weight from here on.
                 if mode == AppMode::Gui && webview.label() == "main" {
                     webview_recovery::release_page_subscribers(webview.app_handle());
+                    // The old page's plugin chat listeners are gone too.
+                    plugins::tap::set_enabled(false);
                 }
                 return;
             }
@@ -2633,41 +2632,21 @@ fn build_core_app<R: tauri::Runtime>(
             commands::workflows::workflow_script_list,
             commands::workflows::workflow_integrate_artifact,
             commands::workflows::workflow_artifact_preview,
-            commands::addons::addon_inventory,
-            commands::addons::addon_import_review,
-            commands::addons::addon_accept_review,
-            commands::addons::addon_cancel_review,
-            commands::addons::addon_remove,
-            commands::addons::addon_rollback,
-            commands::addons::addon_enable,
-            commands::addons::addon_resume,
-            commands::addons::addon_registry_reset,
-            commands::addons::addon_catalog,
-            commands::addons::addon_catalog_review,
-            commands::addons::addon_check_update,
-            commands::addons::addon_retry_cleanup,
-            commands::addons::addon_developer_mode,
-            commands::addons::addon_development_review,
-            commands::addons::addon_development_reload,
-            commands::addons::addon_settings_get,
-            commands::addons::addon_diagnostics,
-            commands::addons::addon_subscribe,
-            commands::addons::addon_pause_all,
-            commands::addons::addon_disable,
-            commands::addons::addon_context_changed,
-            commands::addons::addon_composer_closed,
-            commands::addons::addon_composer_register,
-            commands::addons::addon_execute,
-            commands::addons::addon_mount,
-            commands::addons::addon_unmount,
-            commands::addons::addon_ui_event,
-            commands::addons::addon_ui_link,
-            commands::addons::addon_ui_ack,
-            commands::addons::addon_effect_result,
-            commands::addons::addon_effect_claim,
-            commands::addons::addon_settings_set,
-            commands::addons::addon_credential_set,
-            commands::addons::addon_credential_clear,
+            plugins::commands::plugins_root,
+            plugins::commands::plugins_list,
+            plugins::commands::plugins_read_source,
+            plugins::commands::plugins_watch,
+            plugins::commands::plugins_reveal_root,
+            plugins::commands::plugins_get_decisions,
+            plugins::commands::plugins_set_enabled,
+            plugins::commands::plugins_safe_mode_status,
+            plugins::commands::plugins_startup_checkpoint,
+            plugins::commands::plugins_resume,
+            plugins::commands::plugins_set_event_tap,
+            plugins::commands::plugins_catalog,
+            plugins::commands::plugins_preview_install,
+            plugins::commands::plugins_install,
+            plugins::commands::plugins_remove,
             diagnostics::get_performance_diagnostics,
             commands::get_current_theme,
             commands::get_omarchy_theme,

@@ -1598,6 +1598,7 @@ function DraftChatSurfaceInner({
               />
             )}
             onStartWithoutProject={handleStartWithoutProject}
+            workspaceId={sessionWorkspaceId}
           />
         )}
       </div>

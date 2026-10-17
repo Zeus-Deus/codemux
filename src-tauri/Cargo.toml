@@ -28,7 +28,6 @@ crate-type = ["rlib"]
 tauri-build = { version = "2", features = ["codegen"] }
 
 [dependencies]
-codemux-addon-protocol = { path = "addon-protocol" }
 semver = "1"
 tar = "0.4"
 # The `test` feature exposes `tauri::test::MockRuntime` in normal (non-dev)

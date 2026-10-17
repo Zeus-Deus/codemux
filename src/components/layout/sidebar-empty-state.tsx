@@ -1,4 +1,7 @@
 import { useEffect, useState } from "react";
+import { useContributions } from "@/contrib/react/use-contributions";
+import { ContribBoundary, ContribRender } from "@/contrib/react/boundary";
+import { SIDEBAR_EMPTY_STATE_AREA } from "@/sdk/areas";
 import "@fontsource/instrument-serif/latin-400-italic.css";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { formatKeyCombo } from "@/components/ui/menu-chrome";
@@ -184,13 +187,21 @@ export function SidebarEmptyState({ filterName }: { filterName: string | null })
   }, [index]);
 
   const plate = PLATES[index];
+  // A plugin may replace the plate illustration; the first one wins.
+  const pluginPlate = useContributions(SIDEBAR_EMPTY_STATE_AREA)[0];
 
   return (
     <div
       data-sidebar-empty
       className="flex min-h-[360px] min-w-0 flex-1 flex-col items-center justify-center gap-4 px-3 py-8 text-center wrap-anywhere"
     >
-      <Plate src={plate.src} />
+      {pluginPlate?.render ? (
+        <ContribBoundary id={pluginPlate.id} variant="block">
+          <ContribRender render={pluginPlate.render} />
+        </ContribBoundary>
+      ) : (
+        <Plate src={plate.src} />
+      )}
       <span className="font-mono text-micro uppercase tracking-[0.14em] text-muted-foreground/80">
         <b className="font-medium text-status-working">{plate.fig}</b> — {plate.caption}
       </span>

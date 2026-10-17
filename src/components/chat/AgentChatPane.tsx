@@ -4271,7 +4271,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       )}
       {conversationWritable && <ProviderUpdateNotice provider={provider} threadId={threadId} remote={providerUpdatesRemote} />}
       {transcriptMessages.length === 0 && !hydrating ? (
-        <ChatHomeLanding composer={composerEl} />
+        <ChatHomeLanding composer={composerEl} workspaceId={paneWorkspaceId} />
       ) : (
         <>
           {enteredSubagent ? (

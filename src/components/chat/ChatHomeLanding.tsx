@@ -1,4 +1,7 @@
 import { useRef, type ReactElement, type ReactNode } from "react";
+import { LandingBackdropHost } from "@/contrib/react/landing-backdrop";
+import { Slot } from "@/contrib/react/slot";
+import { LANDING_BELOW_COMPOSER_AREA } from "@/sdk/areas";
 import { ChevronDown, FolderOpen, GitBranch } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { MenuKeycap } from "@/components/ui/menu-chrome";
@@ -39,6 +42,8 @@ interface Props {
   projectPicker?: (trigger: ReactElement) => ReactNode;
   /** Shown under a project headline; switches the thread to no project. */
   onStartWithoutProject?: () => void;
+  /** The workspace this landing will run in, for plugin areas. */
+  workspaceId?: string | null;
 }
 
 /**
@@ -62,6 +67,7 @@ export function ChatHomeLanding({
   projectName,
   projectPicker,
   onStartWithoutProject,
+  workspaceId = null,
 }: Props) {
   const noWorkspaces = useAppStore(
     (s) => s.appState !== null && (s.appState.workspaces?.length ?? 0) === 0,
@@ -154,9 +160,10 @@ export function ChatHomeLanding({
     // `my-auto` on the column centres it while it fits and lets it scroll
     // from the top in a short pane, where flex centring would clip the
     // headline off the top.
+    <LandingBackdropHost>
     <div className="@container flex h-full w-full flex-col items-center overflow-x-hidden overflow-y-auto">
       <div className="my-auto flex w-full flex-col items-center gap-8 pt-6 pb-12">
-        <div className="flex flex-col items-center gap-2 px-4">
+        <div className="flex flex-col items-center gap-2 px-4" data-backdrop-calm>
           <h1 className="text-3xl font-medium tracking-tight text-foreground text-center">
             {headline}
           </h1>
@@ -183,6 +190,7 @@ export function ChatHomeLanding({
           {noWorkspaces && (
             <FirstProjectActions onProjectOpened={onProjectOpened} />
           )}
+          <Slot area={LANDING_BELOW_COMPOSER_AREA} props={{ workspaceId }} variant="block" />
         </div>
         {agents && noWorkspaces && !isRemoteClient() && (
           <AgentAvailabilityStrip selected={agents.selected} onSelect={agents.onSelect} />
@@ -190,6 +198,7 @@ export function ChatHomeLanding({
         <LocalSessionImportEntry firstRun />
       </div>
     </div>
+    </LandingBackdropHost>
   );
 }
 

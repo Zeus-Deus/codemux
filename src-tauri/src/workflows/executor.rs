@@ -1351,6 +1351,7 @@ mod tests {
                     reasoning_tokens: 0,
                     cost_usd: None,
                     cost_source: None,
+                    cache_write_ttl: None,
                 })
                 .unwrap();
             if matches!(self.behavior, Behavior::Approval) {
@@ -1385,6 +1386,7 @@ mod tests {
                             reasoning_tokens: 0,
                             cost_usd: None,
                             cost_source: None,
+                            cache_write_ttl: None,
                         })
                         .unwrap();
                     events
@@ -1458,6 +1460,7 @@ mod tests {
                         reasoning_tokens: 0,
                         cost_usd: None,
                         cost_source: None,
+                        cache_write_ttl: None,
                     })
                     .unwrap();
                 self.events

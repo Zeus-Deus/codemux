@@ -9,7 +9,7 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import {
-  KEYBIND_REGISTRY,
+  allKeybindEntries,
   KEYBIND_CATEGORIES,
   CATEGORY_LABELS,
   getNativeEntryForCombo,
@@ -149,7 +149,7 @@ export function KeybindEditor() {
   const lowerSearch = search.toLowerCase();
   const remote = isRemoteClient();
   const filteredEntries = (category: KeybindCategory) =>
-    KEYBIND_REGISTRY.filter(
+    allKeybindEntries().filter(
       (e) =>
         e.category === category &&
         !(remote && e.native) &&

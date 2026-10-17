@@ -1,4 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
+import { Slot } from "@/contrib/react/slot";
+import { TITLEBAR_ACTIONS_AREA } from "@/sdk/areas";
 import {
   PanelLeft,
   PanelRight,
@@ -772,6 +774,8 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           ) : (
             <ResourceMonitor />
           )}
+          {/* Plugin actions, in both layouts. Nothing without a plugin. */}
+          <Slot area={TITLEBAR_ACTIONS_AREA} />
           {remoteClient && <RemoteConnectionChip compact />}
         </div>
       </div>

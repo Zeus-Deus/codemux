@@ -575,9 +575,9 @@ it("distinguishes repeated requests for the same mounted Settings page", () => {
   expect(persisted.state).not.toHaveProperty("settingsNavigationVersion");
 });
 
-describe("ui-store — forgetting add-on panes", () => {
-  const brief = "addon:test.plugin:brief" as const;
-  const other = "addon:other.plugin:view" as const;
+describe("ui-store — forgetting plugin panes", () => {
+  const brief = "plugin:test-plugin:brief" as const;
+  const other = "plugin:other-plugin:view" as const;
   const isBrief = (pane: string) => pane === brief;
 
   it("drops the pane everywhere without recording a dismissal", () => {

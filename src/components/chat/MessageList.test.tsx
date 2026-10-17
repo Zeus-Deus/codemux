@@ -2817,3 +2817,64 @@ it("shows summarization instead of the live activity line", () => {
   expect(screen.getByRole("status", { name: "Agent is summarizing context" })).toBeInTheDocument();
   expect(screen.queryByRole("status", { name: "Agent is working" })).toBeNull();
 });
+
+describe("MessageList plugin tool renderers", () => {
+  const bash = (approval_request_id: string | null): ToolCallItem => ({
+    ...readCall(1, "/b"),
+    tool_name: "Bash",
+    input: { command: "npm test" },
+    status: approval_request_id ? "running" : "done",
+    approval_request_id,
+  });
+  const renderer = () => <div data-testid="plugin-bash">plugin card</div>;
+
+  it("keeps the core card, with Allow/Deny, for a call waiting on approval", async () => {
+    const { registry } = await import("@/contrib/registry");
+    const off = registry.register({
+      id: "demo:bash",
+      area: "transcript.toolRenderer",
+      data: { tool: "Bash", render: renderer },
+    });
+    try {
+      render(
+        <MessageList
+          messages={[
+            bash("req-b"),
+            planReq({ request_id: "req-b", request_kind: "command", tool_use_id: "tu-1" }),
+          ]}
+          {...noopHandlers}
+        />,
+      );
+      expect(await screen.findByRole("button", { name: "Allow" })).toBeInTheDocument();
+      expect(screen.queryByTestId("plugin-bash")).toBeNull();
+    } finally {
+      off();
+    }
+  });
+
+  it("switches a mounted card to and from a plugin renderer live", async () => {
+    const { registry } = await import("@/contrib/registry");
+    // An approved call stays a standalone card (approval-gated calls never
+    // fold into the work log), and once approved a renderer may draw it.
+    const approved = planReq({
+      request_id: "req-ok",
+      request_kind: "command",
+      tool_use_id: "tu-1",
+      resolution: { state: "resolved", decision: { decision: "allow" } } as PermissionRequestItem["resolution"],
+    });
+    render(<MessageList messages={[bash("req-ok"), approved]} {...noopHandlers} />);
+    expect(await screen.findByText("npm test")).toBeInTheDocument();
+    expect(screen.queryByTestId("plugin-bash")).toBeNull();
+    let off = () => {};
+    act(() => {
+      off = registry.register({
+        id: "demo:bash",
+        area: "transcript.toolRenderer",
+        data: { tool: "Bash", render: renderer },
+      });
+    });
+    expect(await screen.findByTestId("plugin-bash")).toBeInTheDocument();
+    act(() => off());
+    await waitFor(() => expect(screen.queryByTestId("plugin-bash")).toBeNull());
+  });
+});

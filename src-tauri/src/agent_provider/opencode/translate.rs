@@ -1254,6 +1254,7 @@ fn record_usage(
         reasoning_tokens: delta.reasoning,
         cost_usd,
         cost_source,
+        cache_write_ttl: None,
     }]
 }
 

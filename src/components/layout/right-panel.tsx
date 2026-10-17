@@ -1,9 +1,11 @@
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
-import { useAddonsStore } from "@/stores/addons-store";
-import { addonEnabled } from "@/lib/addons/types";
-import { AddonView } from "@/components/addons/addon-view";
-import { addonIcon } from "@/components/addons/addon-renderer";
-import { isAddonPane } from "./right-panel/pane-registry";
+import { Puzzle } from "lucide-react";
+import { isPluginPane } from "./right-panel/pane-registry";
+import { useContributions } from "@/contrib/react/use-contributions";
+import { ContribBoundary, ContribRender } from "@/contrib/react/boundary";
+import { pluginLabel, pluginIdOf } from "@/contrib/attribution";
+import { RIGHT_PANEL_AREA } from "@/sdk/areas";
+import type { RightPaneData } from "@/sdk/host";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 /**
  * The right panel — a **pane deck**.
@@ -312,42 +314,25 @@ export const RightPanel = memo(function RightPanel({
   const openPanes = storedPanes ?? DEFAULT_RIGHT_PANEL_PANES;
   const dismissed = storedDismissed;
 
-  const addonInstalled = useAddonsStore(s => s.installed);
-  const addonsPaused = useAddonsStore(s => s.paused);
-  // Add-on panes are hidden, never forgotten, while add-ons are paused or the
-  // workspace is remote: their saved IDs come back on resume. Only disabling
-  // or removing the add-on strips them (see `refreshAddons`).
-  const addonPanels = useMemo(
+  // Plugin panes: absent (and their saved ids just hidden) while the plugin
+  // is off; a pane comes back when its plugin turns on again.
+  const pluginPaneContributions = useContributions(RIGHT_PANEL_AREA);
+  const pluginPanes = useMemo(
     () =>
-      addonsPaused ||
-      isRemoteClient() ||
-      workspace.host_id ||
-      workspace.remote_cwd ||
-      workspace.attach_only
+      isRemoteClient()
         ? []
-        : addonInstalled
-            .filter((i) => addonEnabled(i) || i.status === "failed-disabled")
-            .flatMap(({ manifest, status }) =>
-              manifest.contributes.panels.map((panel) => ({
-                ...panel,
-                failed: status === "failed-disabled",
-                pane: `addon:${manifest.id}:${panel.id}` as const,
-                pluginId: manifest.id,
-                pluginName: manifest.name,
-                label: `${panel.title} — ${manifest.name}`,
-              })),
-            ),
-    [
-      addonInstalled,
-      addonsPaused,
-      workspace.host_id,
-      workspace.remote_cwd,
-      workspace.attach_only,
-    ],
+        : pluginPaneContributions.map((c) => ({
+            pane: `plugin:${c.id}` as `plugin:${string}:${string}`,
+            contribution: c,
+            title: c.title ?? c.id,
+            pluginName: pluginLabel(pluginIdOf(c.id)),
+            icon: (c.data as RightPaneData | undefined)?.icon ?? Puzzle,
+          })),
+    [pluginPaneContributions],
   );
   const isAvailable = useCallback(
     (id: RightPanelTab): boolean => {
-      if (isAddonPane(id)) return addonPanels.some(panel => panel.pane === id);
+      if (isPluginPane(id)) return pluginPanes.some(panel => panel.pane === id);
       if (!isCorePane(id)) return id.startsWith("doc:");
       switch (id) {
         case "workflows":
@@ -362,7 +347,7 @@ export const RightPanel = memo(function RightPanel({
           return true;
       }
     },
-    [tasksSnapshot, workflowRun, subagentSummary.groups, addonPanels, enableAgentChat, workspace.host_id, workspace.attach_only],
+    [tasksSnapshot, workflowRun, subagentSummary.groups, pluginPanes, enableAgentChat, workspace.host_id, workspace.attach_only],
   );
 
   // Availability-gated panes join the strip on their own when their data
@@ -669,14 +654,14 @@ export const RightPanel = memo(function RightPanel({
           : FileText;
       return { id, label: baseName(path), icon, testId: "doc-tab" };
     }
-    if (isAddonPane(id)) {
-      const panel = addonPanels.find((panel) => panel.pane === id)!;
+    if (isPluginPane(id)) {
+      const panel = pluginPanes.find((panel) => panel.pane === id)!;
       return {
         id,
         label: panel.title,
         attribution: panel.pluginName,
-        icon: addonIcon(panel.icon),
-        testId: "addon-tab",
+        icon: panel.icon as DeckTab["icon"],
+        testId: "plugin-tab",
       };
     }
     const meta = paneMeta(id as RightPanelCorePane)!;
@@ -749,13 +734,13 @@ export const RightPanel = memo(function RightPanel({
       icon: meta.icon,
       onOpen: () => setRightPanelTab(workspaceId, meta.id),
     })),
-    ...addonPanels
-      .filter((panel) => !panel.failed && !visiblePanes.includes(panel.pane))
+    ...pluginPanes
+      .filter((panel) => !visiblePanes.includes(panel.pane))
       .map((panel) => ({
         id: panel.pane,
         label: panel.title,
         description: panel.pluginName,
-        icon: addonIcon(panel.icon),
+        icon: panel.icon as SurfaceAction["icon"],
         onOpen: () => setRightPanelTab(workspaceId, panel.pane),
       })),
   ];
@@ -1001,14 +986,17 @@ export const RightPanel = memo(function RightPanel({
             onRequestRawView={showActiveDocSource}
             treeRefreshKey={treeRefreshKey}
           />
-        ) : activePane && isAddonPane(activePane) ? (
-          <AddonView
-            key={`${workspaceId}/${activePane}`}
-            id={activePane.split(":")[1]}
-            view={activePane.split(":")[2]}
-            workspaceId={workspaceId}
-            label={addonPanels.find((panel) => panel.pane === activePane)?.label}
-          />
+        ) : activePane && isPluginPane(activePane) ? (
+          (() => {
+            const panel = pluginPanes.find((p) => p.pane === activePane);
+            return panel?.contribution.render ? (
+              <div className="h-full min-h-0 overflow-auto" data-plugin-pane={panel.contribution.id}>
+                <ContribBoundary key={panel.contribution.id} id={panel.contribution.id} variant="block">
+                  <ContribRender render={panel.contribution.render} props={{ workspaceId }} />
+                </ContribBoundary>
+              </div>
+            ) : null;
+          })()
         ) : activePane === "files" ? (
           <FileTreePanel
             workspace={workspace}

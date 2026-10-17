@@ -2434,6 +2434,7 @@ impl AcpSession {
                 // No rate catalogue — a priced Cursor row is always the
                 // static table's estimate.
                 cost_source: cost_usd.map(|_| CostSource::Table),
+                cache_write_ttl: None,
             });
         }
     }
@@ -2483,6 +2484,7 @@ impl AcpSession {
             reasoning_tokens: usage.reasoning,
             cost_usd,
             cost_source,
+            cache_write_ttl: None,
         });
     }
 

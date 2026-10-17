@@ -26,6 +26,7 @@ import { escapeClaimedElsewhere } from "@/lib/escape-guard";
 import { stepInterfaceSize } from "@/lib/typography";
 import { announceInterfaceSize } from "@/components/overlays/interface-size-hud";
 import { getRegistryEntry } from "@/lib/keybind-registry";
+import { runPluginKeybind } from "@/contrib/keybinds";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import { isAppShortcutApplicable } from "@/lib/app-shortcut-applicability";
 import { getJumpTarget } from "@/components/layout/sidebar-inbox-jump";
@@ -58,10 +59,11 @@ export function useKeyboardShortcuts() {
   const reverseMapRef = useRef(reverseMap);
   reverseMapRef.current = reverseMap;
 
-  // Keep app-shortcuts in sync with resolved keybinds
+  // Keep app-shortcuts in sync with resolved keybinds (plugin keybinds
+  // change `reverseMap` when a plugin turns on or off).
   useEffect(() => {
     updateAppShortcuts(overrides);
-  }, [overrides]);
+  }, [overrides, reverseMap]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -277,6 +279,10 @@ export function dispatch(actionId: string, event?: KeyboardEvent): boolean {
   if (actionId === "jumpToNeedsYou") {
     return jumpToNextNeedsYou();
   }
+
+  // Plugin keybinds (`plugin:<pluginId>:<localId>`) are global: they run
+  // with or without an open workspace (a plugin checks host.workspace itself).
+  if (actionId.startsWith("plugin:")) return runPluginKeybind(actionId, event);
 
   if (!appState) return false;
   const ws = appState.workspaces.find(
