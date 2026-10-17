@@ -2629,6 +2629,23 @@ export interface PriceOverride {
   cache_write: number;
 }
 
+/** Cost by the source that priced it, USD. */
+export interface CostSources {
+  provider_usd: number;
+  table_usd: number;
+  override_usd: number;
+}
+
+/** Inputs of the cache-savings estimate; all zero for a model the static
+ *  price table does not know. */
+export interface CacheSavings {
+  savings_usd: number;
+  /** What the table-priced work would have cost with no cache. */
+  uncached_usd: number;
+  /** What that same work actually cost. */
+  cached_usd: number;
+}
+
 /** One row of the flat, cross-provider model breakdown. */
 export interface FlatModelUsage {
   provider: string;
@@ -2649,6 +2666,10 @@ export interface FlatModelUsage {
   category_cost: CategoryCost;
   /** The rates the model is priced at (override, else the static table). */
   rates: PriceOverride | null;
+  /** Cost by the source that priced it; sums to the period's confidence. */
+  cost_sources: CostSources;
+  /** This model's part of the period's cache savings. */
+  cache_savings: CacheSavings;
   /** This model's slice of every bucket, aligned with `UsageSummary.buckets`. */
   buckets: UsageBucketSlice[];
 }

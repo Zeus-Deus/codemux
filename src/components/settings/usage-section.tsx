@@ -1,17 +1,32 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
   ChevronDown,
-  ChevronUp,
+  ChevronRight,
+  Download,
+  ListFilter,
   Loader2,
   RefreshCw,
   SlidersHorizontal,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { escapeClaimedElsewhere } from "@/lib/escape-guard";
 import { ProviderLogo } from "@/components/chat/provider-logo";
 import { SegmentedControl } from "./settings-primitives";
-import { UsageAreaChart, UsageSparkline } from "./usage-area-chart";
+import { UsageSparkline, UsageTrendChart, busiestIndex } from "./usage-trend-chart";
+import { UsageTokenTypes, tokenTypeRows } from "./usage-token-types";
+import { TermHint } from "./term-hint";
 import {
   usageExportCsv,
   usagePriceOverrides,
@@ -25,7 +40,6 @@ import type {
   PlanUsageWindow,
   PriceOverride,
   QuotaProbeStatus,
-  UsageComposition,
   PlanWindowKind,
   ProviderQuota,
   UsageBucket,
@@ -36,7 +50,9 @@ import type {
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { filterQuota, filterUsageSummary } from "./usage-filter";
 import {
+  formatCount,
   formatMoney,
   formatPercent,
   formatTokens,
@@ -46,7 +62,7 @@ import {
   seriesFill,
   seriesLabel,
 } from "./usage-format";
-import { UsageLimitsView, formatCheckedAgo } from "./usage-limits";
+import { UsageLimitsView, formatCheckedAgo, formatResetsIn } from "./usage-limits";
 import {
   ModelPricesDialog,
   PriceEditorDialog,
@@ -55,12 +71,10 @@ import {
 import {
   readUsagePreferences,
   saveUsagePreferences,
-  type UsageBreakdown,
   type UsageMetric,
   type UsagePreferences,
-  type UsageView,
+  type UsageTimeView,
 } from "./usage-preferences";
-import { UsageShareBar, costTypeSegments, tokenTypeSegments } from "./usage-share-bar";
 
 export { formatMoney, formatTokens } from "./usage-format";
 
@@ -77,23 +91,22 @@ const QUOTA_REFRESH_AFTER_MS = 60_000;
  *  shows, so a faster tick would repaint for nothing. */
 const LIMITS_TICK_MS = 30_000;
 
-const VIEW_OPTIONS: { value: UsageView; label: string }[] = [
-  { value: "activity", label: "Usage" },
-  { value: "limits", label: "Limits" },
-];
-
-const PERIOD_OPTIONS: { value: UsagePeriod; label: string }[] = [
-  { value: "today", label: "Today" },
-  { value: "7d", label: "7 days" },
-  { value: "30d", label: "30 days" },
-  { value: "90d", label: "90 days" },
-];
-
 type Metric = UsageMetric;
 
-const METRIC_OPTIONS: { value: Metric; label: string }[] = [
-  { value: "cost", label: "Est. cost" },
-  { value: "tokens", label: "Tokens" },
+/** One switch for what the page shows: spend, tokens, or plan limits. */
+type UsageMode = Metric | "limits";
+
+const MODE_OPTIONS: { value: UsageMode; label: string; key: string }[] = [
+  { value: "cost", label: "Cost", key: "c" },
+  { value: "tokens", label: "Tokens", key: "t" },
+  { value: "limits", label: "Limits", key: "l" },
+];
+
+const PERIOD_OPTIONS: { value: UsagePeriod; label: string; key: string }[] = [
+  { value: "today", label: "Past 24h", key: "1" },
+  { value: "7d", label: "7 days", key: "2" },
+  { value: "30d", label: "30 days", key: "3" },
+  { value: "90d", label: "90 days", key: "4" },
 ];
 
 /** Per provider, whichever reading is newer: the summary's snapshot of
@@ -184,18 +197,22 @@ export function meterNote(quota: ProviderQuota): string {
 
 /**
  * "Usage" settings section — token and cost accounting per provider,
- * model, and session, read from the local `agent_usage_ledger`.
+ * model, and session, read from each provider's local history.
  *
  * Cost is always an API/list-price equivalent. Subscription quota is shown
  * separately when a provider reports it; the page never guesses what was
  * actually billed.
  *
  * Also the body of the Usage page, which already titles itself — there
- * `showTitle` is off and only the range line and controls remain.
+ * `showTitle` is off and only the range line and controls remain. Only the
+ * page takes the single-key `shortcuts`; Settings has its own keys.
  */
-export function UsageSection({ showTitle = true }: { showTitle?: boolean } = {}) {
+export function UsageSection({
+  showTitle = true,
+  shortcuts = false,
+}: { showTitle?: boolean; shortcuts?: boolean } = {}) {
   const [preferences, setPreferences] = useState<UsagePreferences>(readUsagePreferences);
-  const { view, period, metric, breakdown } = preferences;
+  const { view, period, metric, timeView } = preferences;
   const updatePreferences = useCallback((patch: Partial<UsagePreferences>) => {
     setPreferences((current) => {
       const next = { ...current, ...patch };
@@ -203,14 +220,31 @@ export function UsageSection({ showTitle = true }: { showTitle?: boolean } = {})
       return next;
     });
   }, []);
-  const setPeriod = (value: UsagePeriod) => updatePreferences({ period: value });
-  const setMetric = (value: Metric) => updatePreferences({ metric: value });
-  const setBreakdown = (value: UsageBreakdown) => updatePreferences({ breakdown: value });
+  const setPeriod = useCallback(
+    (value: UsagePeriod) => updatePreferences({ period: value }),
+    [updatePreferences],
+  );
+  const setMode = useCallback(
+    (mode: UsageMode) =>
+      updatePreferences(
+        mode === "limits" ? { view: "limits" } : { view: "activity", metric: mode },
+      ),
+    [updatePreferences],
+  );
+  const setTimeView = (value: UsageTimeView) => updatePreferences({ timeView: value });
+  const hiddenProviders = useMemo(
+    () => new Set(preferences.hiddenProviders),
+    [preferences.hiddenProviders],
+  );
+  const mode: UsageMode = view === "limits" ? "limits" : metric;
 
-  const [summary, setSummary] = useState<UsageSummary | null>(null);
+  const [rawSummary, setRawSummary] = useState<UsageSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // One pointer for the whole page: a day, provider or model pointed at
+  // anywhere lights up in every chart and table that shows it.
   const [hovered, setHovered] = useState<number | null>(null);
-  const [expanded, setExpanded] = useState<string | null>(null);
+  const [hoveredProvider, setHoveredProvider] = useState<string | null>(null);
+  const [hoveredModel, setHoveredModel] = useState<FlatModelUsage | null>(null);
   const [exporting, setExporting] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -238,9 +272,9 @@ export function UsageSection({ showTitle = true }: { showTitle?: boolean } = {})
     setError(null);
     setRefreshing(true);
     return usageSummary(period)
-      .then((next) => setSummary(next))
+      .then((next) => setRawSummary(next))
       .catch((err) => {
-        setSummary(null);
+        setRawSummary(null);
         setError(String(err));
       })
       .finally(() => setRefreshing(false));
@@ -332,10 +366,64 @@ export function UsageSection({ showTitle = true }: { showTitle?: boolean } = {})
     setHovered(null);
   }, [period]);
 
-  const quota = useMemo(
-    () => newestQuota(summary?.quota, directQuota),
-    [summary?.quota, directQuota],
+  // C / T / L pick the view and 1–4 the period, as on t3code — only while
+  // nothing else (a field, menu, or dialog) owns the key.
+  useEffect(() => {
+    if (!shortcuts) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey || event.repeat) return;
+      if (escapeClaimedElsewhere(event)) return;
+      const key = event.key.toLowerCase();
+      const nextMode = MODE_OPTIONS.find((option) => option.key === key)?.value;
+      const nextPeriod = PERIOD_OPTIONS.find((option) => option.key === key)?.value;
+      if (nextMode) setMode(nextMode);
+      else if (nextPeriod) setPeriod(nextPeriod);
+      else return;
+      event.preventDefault();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [shortcuts, setMode, setPeriod]);
+
+  const summary = useMemo(
+    () => (rawSummary ? filterUsageSummary(rawSummary, hiddenProviders) : null),
+    [rawSummary, hiddenProviders],
   );
+  const overlay = useMemo(
+    () =>
+      hoveredModel
+        ? {
+            model: hoveredModel.model,
+            values: hoveredModel.buckets.map((slice) => metricOf(slice, metric)),
+          }
+        : null,
+    [hoveredModel, metric],
+  );
+  const quota = useMemo(
+    () => filterQuota(newestQuota(rawSummary?.quota, directQuota), hiddenProviders),
+    [rawSummary?.quota, directQuota, hiddenProviders],
+  );
+  const shownStatuses = useMemo(
+    () => quotaStatuses.filter((status) => !hiddenProviders.has(status.provider)),
+    [quotaStatuses, hiddenProviders],
+  );
+  // Every provider the page knows of, hidden ones included, so a hidden
+  // provider can always be brought back from the filter.
+  const knownProviders = useMemo(() => {
+    const ids = new Set<string>([
+      ...(rawSummary?.providers.map((p) => p.provider) ?? []),
+      ...Object.keys(directQuota ?? {}),
+      ...preferences.hiddenProviders,
+    ]);
+    return [...ids];
+  }, [rawSummary, directQuota, preferences.hiddenProviders]);
+  const toggleProvider = (provider: string, visible: boolean) => {
+    const next = new Set(hiddenProviders);
+    if (visible) next.delete(provider);
+    else next.add(provider);
+    updatePreferences({ hiddenProviders: [...next] });
+  };
+
   const selectedModel =
     selectedModelKey === null
       ? undefined
@@ -374,6 +462,9 @@ export function UsageSection({ showTitle = true }: { showTitle?: boolean } = {})
   };
 
   const busy = view === "limits" ? quotaLoading : refreshing || scanning;
+  // The figures on screen belong to another period until the new one
+  // lands; they stay up, dimmed, rather than blanking the page.
+  const stale = summary !== null && summary.period !== period;
   const newestReading = Math.max(
     0,
     ...Object.values(quota)
@@ -383,28 +474,40 @@ export function UsageSection({ showTitle = true }: { showTitle?: boolean } = {})
 
   return (
     <div>
-      <div className="mb-6 flex items-end justify-between gap-4">
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
         <div className="min-w-0">
           {showTitle && (
             <h2 className="text-body-lg font-semibold tracking-tight">Usage</h2>
           )}
-          <p className={cn("text-body-sm text-muted-foreground", showTitle && "mt-1")}>
+          <p
+            className={cn(
+              "flex items-center gap-1.5 text-body-sm text-muted-foreground",
+              showTitle && "mt-1",
+            )}
+          >
             {view === "limits"
               ? quotaLoading
                 ? "Plan limits · reading…"
                 : newestReading > 0
                   ? `Plan limits · checked ${formatCheckedAgo(newestReading, now)}`
                   : "Plan limits"
-              : `${summary ? rangeLabel(summary) : "Loading…"} · ${
-                  refreshing ? "refreshing…" : "live"
+              : `${summary ? rangeLabel(summary) : "Loading…"} · this machine · ${
+                  scanning ? "reading provider history" : refreshing ? "refreshing" : "live"
                 }`}
+            {busy && <Loader2 className="size-3 animate-spin" aria-hidden />}
           </p>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+          <ProviderFilter
+            providers={knownProviders}
+            hidden={hiddenProviders}
+            onToggle={toggleProvider}
+            onShowAll={() => updatePreferences({ hiddenProviders: [] })}
+          />
           <SegmentedControl
-            value={view}
-            onChange={(value) => updatePreferences({ view: value })}
-            options={VIEW_OPTIONS}
+            value={mode}
+            onChange={setMode}
+            options={MODE_OPTIONS.map(withShortcutTitle(shortcuts))}
             ariaLabel="Usage view"
           />
           {/* The period does not apply to Limits; it stays in place but
@@ -412,7 +515,7 @@ export function UsageSection({ showTitle = true }: { showTitle?: boolean } = {})
           <SegmentedControl
             value={period}
             onChange={setPeriod}
-            options={PERIOD_OPTIONS}
+            options={PERIOD_OPTIONS.map(withShortcutTitle(shortcuts))}
             ariaLabel="Usage period"
             disabled={view === "limits"}
           />
@@ -433,8 +536,12 @@ export function UsageSection({ showTitle = true }: { showTitle?: boolean } = {})
             size="sm"
             onClick={handleExport}
             disabled={exporting || !summary || view === "limits"}
+            aria-label="Export CSV"
+            title="Export CSV"
           >
-            Export CSV
+            <Download className="size-3.5" aria-hidden />
+            {/* Icon-only until the header has room for the words. */}
+            <span className="hidden xl:inline">Export CSV</span>
           </Button>
         </div>
       </div>
@@ -442,7 +549,7 @@ export function UsageSection({ showTitle = true }: { showTitle?: boolean } = {})
       {view === "limits" ? (
         <UsageLimitsView
           quota={quota}
-          statuses={quotaStatuses}
+          statuses={shownStatuses}
           error={quotaError}
           now={now}
           loading={quotaLoading}
@@ -456,45 +563,57 @@ export function UsageSection({ showTitle = true }: { showTitle?: boolean } = {})
           )}
 
           {summary === null ? (
-            !error && (
-              <div className="flex items-center gap-2 py-6 text-body text-muted-foreground">
-                <Loader2 className="size-4 animate-spin" aria-hidden />
-                Loading usage…
-              </div>
-            )
-          ) : summary.totals.total_tokens === 0 ? (
+            !error && <UsageSkeleton />
+          ) : summary.totals.total_tokens === 0 && hiddenProviders.size === 0 ? (
             <div className="rounded-lg border border-border/60 bg-muted/30 px-4 py-10 text-center text-body text-muted-foreground">
               No agent activity in this period.
             </div>
           ) : (
-            <div className="space-y-4">
-              <OverviewCard
+            <div
+              aria-busy={stale || undefined}
+              className={cn(
+                "flex flex-col gap-10 transition-opacity duration-250",
+                stale && "opacity-45 delay-150",
+              )}
+            >
+              <HeadlineSection
                 summary={summary}
                 metric={metric}
-                onMetricChange={setMetric}
-                hovered={hovered}
-                onHover={setHovered}
-              />
-              <CompositionRow composition={summary.composition} />
-              <TypeSplitCard summary={summary} />
-              <LanesCard
-                summary={summary}
-                quota={quota}
-                expanded={expanded}
-                onToggle={(provider) =>
-                  setExpanded((current) => (current === provider ? null : provider))
-                }
-              />
-              <BreakdownCard
-                summary={summary}
-                view={breakdown}
-                onViewChange={setBreakdown}
-                onSelectModel={(model) =>
-                  setSelectedModelKey(`${model.provider}:${model.model}`)
-                }
                 onOpenPrices={() => setPricesOpen(true)}
               />
-              <ProviderHistoryFooter busy={scanning} sessionCount={summary.totals.session_count} />
+              <OverTimeSection
+                summary={summary}
+                metric={metric}
+                view={timeView}
+                onViewChange={setTimeView}
+                hovered={hovered}
+                onHover={setHovered}
+                hoveredProvider={hoveredProvider}
+                onHoverProvider={setHoveredProvider}
+                overlay={overlay}
+              />
+              {summary.providers.length > 0 && (
+                <ToolsSection
+                  summary={summary}
+                  quota={quota}
+                  metric={metric}
+                  hovered={hovered}
+                  onHover={setHovered}
+                  hoveredProvider={hoveredProvider}
+                  onHoverProvider={setHoveredProvider}
+                  onHoverModel={setHoveredModel}
+                  onSelectModel={(model) =>
+                    setSelectedModelKey(`${model.provider}:${model.model}`)
+                  }
+                  onOpenPrices={() => setPricesOpen(true)}
+                  onOpenLimits={() => setMode("limits")}
+                />
+              )}
+              <TokenTypesSection summary={summary} metric={metric} />
+              <ProviderHistoryFooter
+                sessionCount={summary.totals.session_count}
+                providers={summary.providers.map((p) => p.provider)}
+              />
             </div>
           )}
         </>
@@ -538,6 +657,7 @@ export function UsageSection({ showTitle = true }: { showTitle?: boolean } = {})
           hasOverride={
             priceEditor.model !== null && own(overrides, priceEditor.model) !== undefined
           }
+          knownModels={rawSummary?.models.map((m) => m.model) ?? []}
           onClose={() => setPriceEditor(null)}
           onSaved={onPricesChanged}
         />
@@ -546,7 +666,118 @@ export function UsageSection({ showTitle = true }: { showTitle?: boolean } = {})
   );
 }
 
-/** First bucket to last, in the backend's own words. "Today" is a
+/** Adds "(key)" to each option's hover title when shortcuts are live. */
+function withShortcutTitle(enabled: boolean) {
+  return <T extends string>(option: { value: T; label: string; key: string }) => ({
+    value: option.value,
+    label: option.label,
+    title: enabled ? `${option.label} (${option.key.toUpperCase()})` : undefined,
+  });
+}
+
+/** Which providers the page counts. Hiding one removes it from every
+ *  figure, chart, and table, and from Limits. The last visible provider
+ *  cannot be hidden, so the page is never filtered down to nothing. */
+function ProviderFilter({
+  providers,
+  hidden,
+  onToggle,
+  onShowAll,
+}: {
+  providers: string[];
+  hidden: ReadonlySet<string>;
+  onToggle: (provider: string, visible: boolean) => void;
+  onShowAll: () => void;
+}) {
+  if (providers.length < 2) return null;
+  const visibleCount = providers.filter((p) => !hidden.has(p)).length;
+  const label =
+    visibleCount === providers.length
+      ? "All providers"
+      : visibleCount === 1
+        ? seriesLabel(providers.find((p) => !hidden.has(p)) ?? "")
+        : `${visibleCount} of ${providers.length} providers`;
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-label={`Filter providers: ${label}`}
+          className={cn(visibleCount < providers.length && "text-foreground")}
+        >
+          <ListFilter className="size-3.5" aria-hidden />
+          {/* Narrow headers keep just the icon, plus a count when filtered. */}
+          <span className="hidden xl:inline">{label}</span>
+          {visibleCount < providers.length && (
+            <span className="font-mono text-caption tabular-nums xl:hidden">
+              {visibleCount}/{providers.length}
+            </span>
+          )}
+          <ChevronDown className="size-3 text-muted-foreground" aria-hidden />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-52">
+        {providers.map((provider) => {
+          const visible = !hidden.has(provider);
+          return (
+            <DropdownMenuCheckboxItem
+              key={provider}
+              checked={visible}
+              disabled={visible && visibleCount === 1}
+              onSelect={(event) => event.preventDefault()}
+              onCheckedChange={(checked) => onToggle(provider, checked === true)}
+            >
+              <span
+                className={cn("size-2 shrink-0 rounded-full", seriesFill(provider))}
+                aria-hidden
+              />
+              {isKnownProvider(provider) ? (
+                <ProviderLogo provider={provider} className="size-3.5" />
+              ) : null}
+              {seriesLabel(provider)}
+            </DropdownMenuCheckboxItem>
+          );
+        })}
+        {visibleCount < providers.length && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={onShowAll}>Show all providers</DropdownMenuItem>
+          </>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/** The page's own shape while the first summary loads, so nothing jumps
+ *  when it lands. */
+function UsageSkeleton() {
+  return (
+    <div className="flex flex-col gap-10" aria-busy aria-label="Loading usage">
+      <div className="flex flex-wrap justify-between gap-6">
+        <div className="flex flex-col gap-2">
+          <Skeleton className="h-3 w-28" />
+          <Skeleton className="h-10 w-64" />
+          <Skeleton className="h-4 w-80" />
+        </div>
+        <div className="flex w-[17rem] flex-col gap-2">
+          <Skeleton className="h-3 w-24" />
+          <Skeleton className="h-2 w-full" />
+          <Skeleton className="h-12 w-full" />
+        </div>
+      </div>
+      <div className="flex flex-col gap-3">
+        <Skeleton className="h-3 w-20" />
+        <Skeleton className="h-5 w-72" />
+        <Skeleton className="h-[232px] w-full" />
+      </div>
+      <Skeleton className="h-56 w-full rounded-lg" />
+    </div>
+  );
+}
+
+/** First bucket to last, in the backend's own words. "Past 24h" is a
  *  trailing 24-hour window rather than a calendar day, so it reads
  *  "Yesterday 13:00 – Today 12:00" — naming it "Today, 00:00 – now" would
  *  claim a range the chart does not show. */
@@ -557,9 +788,16 @@ function rangeLabel(summary: UsageSummary): string {
   return `${first.sub_label} – ${last.sub_label}`;
 }
 
+const PERIOD_WORDS: Record<UsagePeriod, string> = {
+  today: "past 24 hours",
+  "7d": "last 7 days",
+  "30d": "last 30 days",
+  "90d": "last 90 days",
+};
+
 /** The value one bucket contributes for one provider, under the active
- *  metric. Shared by the chart and its tooltip so a hovered point and its
- *  numbers can never disagree. */
+ *  metric. Shared by the chart and its readout so a hovered point and
+ *  its numbers can never disagree. */
 function bucketValue(
   bucket: UsageBucket,
   provider: string,
@@ -574,37 +812,240 @@ function formatMetric(value: number, metric: Metric): string {
   return metric === "cost" ? formatMoney(value) : formatTokens(value);
 }
 
-// ── overview ──
+/** Y-axis figures: whole dollars wherever cents add nothing ($0, $20,
+ *  $1,500), so the axis gutter stays narrow. The readout keeps the cents. */
+function formatAxisValue(value: number, metric: Metric): string {
+  if (metric === "tokens") return formatTokens(value);
+  return value >= 100 || Number.isInteger(value)
+    ? `$${Math.round(value).toLocaleString("en-US")}`
+    : formatMoney(value);
+}
 
-/** Design canvas value. The chart flexes horizontally on its own; only
- *  the height needs stating. */
-const CHART_HEIGHT_PX = 200;
+function metricOf(item: { cost_usd: number; tokens: number }, metric: Metric): number {
+  return metric === "cost" ? item.cost_usd : item.tokens;
+}
 
-function OverviewCard({
+/** What one section's answer line and title look like: a quiet label,
+ *  then the finding in plain words, so the chart below is the evidence
+ *  rather than the puzzle. */
+function SectionHeading({
+  title,
+  answer,
+  hint,
+  children,
+}: {
+  title: string;
+  answer?: ReactNode;
+  /** How to read or use the section, under the answer. */
+  hint?: ReactNode;
+  children?: ReactNode;
+}) {
+  return (
+    <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-2">
+      <div className="flex min-w-0 flex-col gap-1">
+        <Eyebrow>{title}</Eyebrow>
+        {answer && <p className="text-body text-foreground">{answer}</p>}
+        {hint && <p className="text-body-sm text-muted-foreground">{hint}</p>}
+      </div>
+      {children && <div className="flex flex-wrap items-center gap-2">{children}</div>}
+    </div>
+  );
+}
+
+// ── headline ──
+
+/** The one number the page is about, what it is (and is not), and how
+ *  much of it rests on known prices. */
+function HeadlineSection({
   summary,
   metric,
-  onMetricChange,
-  hovered,
-  onHover,
+  onOpenPrices,
 }: {
   summary: UsageSummary;
   metric: Metric;
-  onMetricChange: (metric: Metric) => void;
+  onOpenPrices: () => void;
+}) {
+  const { totals } = summary;
+  const total = metric === "cost" ? totals.estimated_cost_usd : totals.total_tokens;
+  return (
+    <section className="flex flex-wrap items-start justify-between gap-x-10 gap-y-6">
+      <div className="flex min-w-0 flex-col gap-2">
+        <Eyebrow>{metric === "cost" ? "Estimated API value" : "Tokens processed"}</Eyebrow>
+        <p className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <span className="select-text font-mono text-[2.25rem] font-semibold leading-none tabular-nums tracking-tight text-foreground">
+            {formatMetric(total, metric)}
+          </span>
+          <span className="text-body text-muted-foreground">
+            across {formatCount(totals.session_count)}{" "}
+            {totals.session_count === 1 ? "session" : "sessions"} ·{" "}
+            {PERIOD_WORDS[summary.period as UsagePeriod] ?? rangeLabel(summary)}
+          </span>
+        </p>
+        <p className="max-w-xl text-body-sm text-foreground/80">
+          {metric === "cost" ? (
+            <>
+              Not your bill: what this work would cost at each provider&apos;s{" "}
+              <TermHint hint="Subscriptions such as Claude Max or ChatGPT Pro are billed differently. Switch to Limits to see how much of your plan is left.">
+                public API prices
+              </TermHint>
+              .
+            </>
+          ) : (
+            <>Every token the models read or wrote: new input, reused context, cache writes and output.</>
+          )}
+        </p>
+        {metric === "cost" && summary.confidence.unpriced_token_share > 0 && (
+          <p className="text-body-sm text-status-working">
+            Excludes {formatPercent(summary.confidence.unpriced_token_share)} of tokens from
+            models with no known price.{" "}
+            <button
+              type="button"
+              onClick={onOpenPrices}
+              className="rounded-sm font-medium text-foreground underline underline-offset-[3px] hover:text-accent-ember focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+            >
+              Set prices
+            </button>
+          </p>
+        )}
+      </div>
+      {metric === "cost" ? (
+        <PricingCoverage confidence={summary.confidence} />
+      ) : (
+        <div className="flex w-[15rem] flex-col gap-1.5">
+          <Eyebrow>Reused from cache</Eyebrow>
+          <span className="font-mono text-body-lg font-semibold tabular-nums">
+            {formatPercent(totals.cache_read_share)}
+          </span>
+          <span className="text-body-sm text-muted-foreground">
+            of all tokens were earlier context the model{" "}
+            <TermHint hint="A cache read re-uses conversation the provider already holds, at about a tenth of the input price.">
+              re-read cheaply
+            </TermHint>
+            .
+          </span>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** Where the estimate's prices came from — so a reader can tell how much
+ *  of the headline is the provider's own figure, Codemux's price list, or
+ *  their own rates, and what was left out. */
+function PricingCoverage({ confidence }: { confidence: CostConfidence }) {
+  const sources = [
+    {
+      key: "provider",
+      label: "Reported by the provider",
+      share: confidence.provider_reported_share,
+      tone: "bg-foreground/85",
+      hint: "Cost the provider reported itself.",
+    },
+    {
+      key: "table",
+      label: "Codemux price list",
+      share: confidence.table_priced_share,
+      tone: "bg-foreground/50",
+      hint: "Priced from the public list prices Codemux knows.",
+    },
+    {
+      key: "override",
+      label: "Your prices",
+      share: confidence.override_priced_share ?? 0,
+      tone: "bg-accent-ember",
+      hint: "Priced from rates you set under Model prices.",
+    },
+  ];
+  const lead = [...sources].sort((a, b) => b.share - a.share)[0]!;
+  return (
+    <div className="flex w-[17rem] flex-col gap-2">
+      <Eyebrow>How it&apos;s priced</Eyebrow>
+      <div className="flex h-2 gap-0.5 overflow-hidden rounded-full bg-muted/50" role="img" aria-label={sources.map((s) => `${s.label} ${formatPercent(s.share)}`).join(", ")}>
+        {sources
+          .filter((s) => s.share > 0)
+          .map((s) => (
+            <Tooltip key={s.key}>
+              <TooltipTrigger asChild>
+                <span
+                  className={cn("h-full first:rounded-l-full last:rounded-r-full", s.tone)}
+                  style={{ width: `${s.share * 100}%` }}
+                />
+              </TooltipTrigger>
+              <TooltipContent side="top">
+                {s.label}: {formatPercent(s.share)} of cost. {s.hint}
+              </TooltipContent>
+            </Tooltip>
+          ))}
+      </div>
+      <ul className="flex flex-col gap-1 text-body-sm">
+        {sources.map((s) => (
+          <li key={s.key} className="flex items-center justify-between gap-3">
+            <span className="flex items-center gap-2 text-muted-foreground">
+              <span className={cn("size-2 shrink-0 rounded-full", s.tone)} aria-hidden />
+              {s.label}
+            </span>
+            <span
+              className={cn(
+                "font-mono tabular-nums",
+                s.key === lead.key ? "text-foreground" : "text-muted-foreground",
+              )}
+            >
+              {formatPercent(s.share)}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// ── over time ──
+
+/** The chart flexes horizontally on its own; only the height needs
+ *  stating. */
+const CHART_HEIGHT_PX = 232;
+
+const TIME_VIEW_OPTIONS: { value: UsageTimeView; label: string }[] = [
+  { value: "chart", label: "Chart" },
+  { value: "table", label: "Table" },
+];
+
+function OverTimeSection({
+  summary,
+  metric,
+  view,
+  onViewChange,
+  hovered,
+  onHover,
+  hoveredProvider,
+  onHoverProvider,
+  overlay,
+}: {
+  summary: UsageSummary;
+  metric: Metric;
+  view: UsageTimeView;
+  onViewChange: (view: UsageTimeView) => void;
   hovered: number | null;
   onHover: (index: number | null) => void;
+  hoveredProvider: string | null;
+  onHoverProvider: (provider: string | null) => void;
+  /** One model's part of each bucket, while that model is pointed at. */
+  overlay: { model: string; values: number[] } | null;
 }) {
-  const { totals, providers, buckets } = summary;
-  // Lane order drives series order everywhere — legend, stack, and
-  // readout — so the eye can track one provider across all three.
-  const order = useMemo(() => providers.map((p) => p.provider), [providers]);
-
+  const { providers, buckets, models } = summary;
+  const hourly = summary.period === "today";
+  // Largest provider first, in the legend, the readout and the table.
+  const order = useMemo(
+    () => [...providers].sort((a, b) => metricOf(b, metric) - metricOf(a, metric)),
+    [providers, metric],
+  );
   const series = useMemo(
     () =>
       order.map((p) => ({
-        key: p,
-        label: seriesLabel(p),
-        ...seriesColor(p),
-        values: buckets.map((bucket) => bucketValue(bucket, p, metric)),
+        key: p.provider,
+        label: seriesLabel(p.provider),
+        ...seriesColor(p.provider),
+        values: buckets.map((bucket) => bucketValue(bucket, p.provider, metric)),
       })),
     [buckets, order, metric],
   );
@@ -612,350 +1053,166 @@ function OverviewCard({
     () => buckets.map((b) => ({ label: b.label, subLabel: b.sub_label })),
     [buckets],
   );
+  const busiest = busiestIndex(series, buckets.length);
+  const periodTotal = metric === "cost" ? summary.totals.estimated_cost_usd : summary.totals.total_tokens;
+  const busiestTotal =
+    busiest === null ? 0 : series.reduce((sum, s) => sum + (s.values[busiest] ?? 0), 0);
+  const unit = hourly ? "hour" : "day";
+  // The chart memoises its geometry on these, so they must stay stable
+  // across hover re-renders.
+  const formatValue = useCallback((v: number) => formatMetric(v, metric), [metric]);
+  const formatAxis = useCallback((v: number) => formatAxisValue(v, metric), [metric]);
+  const secondaryValue = useCallback(
+    (provider: string, index: number) => {
+      const slice = buckets[index]?.providers[provider];
+      if (!slice) return null;
+      return metric === "cost" ? `${formatTokens(slice.tokens)} tok` : formatMoney(slice.cost_usd);
+    },
+    [buckets, metric],
+  );
 
-  return (
-    <div className="rounded-lg border border-border/60 bg-muted/30 p-4">
-      <div className="flex items-end justify-between gap-4">
-        {/* Gaps and stat size step up to the design's values (44px / 27px)
-            only at the viewport where the settings column actually goes
-            wide; below that they stay at the compact figures the reading
-            column needs. */}
-        <div className="flex flex-wrap items-end gap-x-8 gap-y-4 xl:gap-x-11">
-          <HeroStat
-            label="Estimated cost"
-            value={formatMoney(totals.estimated_cost_usd)}
-            note="API/list-price equivalent"
-          />
-          <HeroStat
-            label="Tokens"
-            value={formatTokens(totals.total_tokens)}
-            note={`${formatPercent(totals.cache_read_share)} served from cache`}
-          />
-          <HeroStat
-            label="Sessions"
-            value={totals.session_count.toLocaleString()}
-            note="provider history on this machine"
-          />
-        </div>
-        <div className="shrink-0">
-          <SegmentedControl
-            value={metric}
-            onChange={onMetricChange}
-            options={METRIC_OPTIONS}
-            ariaLabel="Chart metric"
-            size="sm"
-          />
-        </div>
-      </div>
-
-      <UsageAreaChart
-        className="mt-5"
-        series={series}
-        points={points}
-        height={CHART_HEIGHT_PX}
-        hovered={hovered}
-        onHover={onHover}
-        formatValue={(v) => formatMetric(v, metric)}
-        ariaLabel={
-          metric === "cost"
-            ? "Estimated cost per bucket by provider"
-            : "Tokens per bucket by provider"
-        }
-      />
-
-      <div className="mt-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 xl:gap-x-6">
-          {providers.map((provider) => (
-            <span
-              key={provider.provider}
-              className="inline-flex items-center gap-2 text-label"
-            >
-              <span
-                className={cn(
-                  "size-2 shrink-0 rounded-sm",
-                  seriesFill(provider.provider),
-                )}
-                aria-hidden
-              />
-              <span className="font-medium text-foreground">
-                {seriesLabel(provider.provider)}
-              </span>
-              <span className="select-text font-mono tabular-nums text-muted-foreground">
-                {metric === "cost"
-                  ? formatMoney(provider.cost_usd)
-                  : formatTokens(provider.tokens)}
-              </span>
-            </span>
-          ))}
-        </div>
-        <span className="font-mono text-caption text-muted-foreground/80">
-          {metric === "cost"
-            ? "API/list-price equivalent · not an invoice"
-            : "input + output + cache read + cache write"}
+  const topModel = (index: number) => {
+    let best: FlatModelUsage | null = null;
+    let bestValue = 0;
+    for (const m of models) {
+      const value = metricOf(m.buckets[index] ?? { cost_usd: 0, tokens: 0 }, metric);
+      if (value > bestValue) {
+        best = m;
+        bestValue = value;
+      }
+    }
+    if (!best) return null;
+    return (
+      <p className="mt-1.5 flex items-center justify-between gap-4 border-t border-border/50 pt-1.5 text-label text-muted-foreground">
+        <span>Top model</span>
+        <span className="truncate font-mono text-foreground">
+          {best.model} · {formatMetric(bestValue, metric)}
         </span>
-      </div>
-    </div>
-  );
-}
-
-function HeroStat({
-  label,
-  value,
-  note,
-}: {
-  label: string;
-  value: string;
-  note: string;
-}) {
-  return (
-    <div className="flex flex-col gap-1.5">
-      <Eyebrow>
-        {label}
-      </Eyebrow>
-      <span
-        className={cn(
-          "select-text font-mono text-[1.375rem] font-semibold leading-none tabular-nums tracking-tight xl:text-[1.6875rem]",
-          "text-foreground",
-        )}
-      >
-        {value}
-      </span>
-      <span className="text-label text-muted-foreground">{note}</span>
-    </div>
-  );
-}
-
-// ── token composition ──
-
-/** A quiet, boxless strip of five figures, hairline-separated. It is a
- *  breakdown of the same period the cards above describe, so giving it a
- *  card of its own would imply a third independent subject. */
-function CompositionRow({ composition }: { composition: UsageComposition }) {
-  const c = composition;
-  const cells: { label: string; value: string; note: string }[] = [
-    {
-      label: "Processed",
-      value: formatTokens(c.processed_tokens),
-      note: "tokens this period",
-    },
-    {
-      label: "Cached input",
-      value: formatTokens(c.cache_read_tokens),
-      note: `${formatPercent(c.cache_read_share_of_input)} of input`,
-    },
-    {
-      label: "Uncached input",
-      value: formatTokens(c.input_tokens),
-      note: `${formatTokens(c.cache_write_tokens)} cache writes`,
-    },
-    {
-      label: "Output",
-      value: formatTokens(c.output_tokens),
-      // Only Codex and OpenCode split reasoning out; a Claude-only
-      // period has nothing to say here and says nothing.
-      note:
-        c.reasoning_tokens > 0
-          ? `includes ${formatTokens(c.reasoning_tokens)} reasoning`
-          : "",
-    },
-    {
-      label: "Cache savings",
-      value: formatMoney(c.cache_savings_usd),
-      note:
-        c.cache_savings_multiplier != null
-          ? `${c.cache_savings_multiplier.toFixed(1)}× vs uncached list price`
-          : "vs uncached list price",
-    },
-  ];
-  return (
-    <div className="flex flex-wrap px-1">
-      {cells.map((cell, i) => (
-        <div
-          key={cell.label}
-          className={cn(
-            "flex min-w-[150px] flex-1 flex-col gap-1 py-1 pr-5",
-            i > 0 && "border-l border-border/60 pl-5",
-          )}
-        >
-          <Eyebrow>
-            {cell.label}
-          </Eyebrow>
-          <span className="select-text font-mono text-body-lg tabular-nums">
-            {cell.value}
-          </span>
-          <span className="text-caption text-muted-foreground">{cell.note}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// ── cost and tokens by type ──
-
-/** Where the money went (input, output, cache reads and writes) beside
- *  where the tokens went. They differ sharply: cache reads dominate the
- *  tokens and barely register in the cost. */
-function TypeSplitCard({ summary }: { summary: UsageSummary }) {
-  const tokens = {
-    input_tokens: summary.composition.input_tokens,
-    cache_read_tokens: summary.composition.cache_read_tokens,
-    cache_write_tokens: summary.composition.cache_write_tokens,
-    output_tokens: summary.composition.output_tokens,
+      </p>
+    );
   };
+
   return (
-    <div className="grid gap-x-10 gap-y-5 rounded-lg border border-border/60 bg-muted/30 p-4 lg:grid-cols-2">
-      <UsageShareBar
-        label="Cost by type"
-        segments={costTypeSegments(summary.category_cost)}
-        format={formatMoney}
-      />
-      <UsageShareBar
-        label="Tokens by type"
-        segments={tokenTypeSegments(tokens)}
-        format={formatTokens}
-      />
-    </div>
+    <section className="flex flex-col gap-4">
+      <SectionHeading
+        title="Over time"
+        answer={
+          busiest === null ? (
+            <span className="text-muted-foreground">Nothing ran in this period.</span>
+          ) : (
+            <>
+              Busiest {unit}:{" "}
+              <span className="font-medium">{buckets[busiest]?.sub_label}</span> ·{" "}
+              <span className="font-mono">{formatMetric(busiestTotal, metric)}</span>
+              <span className="text-muted-foreground">
+                , {formatPercent(periodTotal > 0 ? busiestTotal / periodTotal : 0)} of the period
+              </span>
+            </>
+          )
+        }
+      >
+        <ul className="flex flex-wrap items-center gap-1" aria-label="Providers in the chart">
+          {order.map((p) => (
+            <li key={p.provider}>
+              <button
+                type="button"
+                onPointerEnter={() => onHoverProvider(p.provider)}
+                onPointerLeave={() => onHoverProvider(null)}
+                onFocus={() => onHoverProvider(p.provider)}
+                onBlur={() => onHoverProvider(null)}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-label transition-colors duration-150 hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+                  hoveredProvider && hoveredProvider !== p.provider
+                    ? "text-muted-foreground/60"
+                    : "text-foreground",
+                )}
+              >
+                <span
+                  className={cn("size-2 shrink-0 rounded-full", seriesFill(p.provider))}
+                  aria-hidden
+                />
+                {seriesLabel(p.provider)}
+              </button>
+            </li>
+          ))}
+        </ul>
+        <SegmentedControl
+          value={view}
+          onChange={onViewChange}
+          options={TIME_VIEW_OPTIONS}
+          ariaLabel="Over time view"
+          size="sm"
+        />
+      </SectionHeading>
+
+      {view === "chart" && (
+        <p className="-mt-2 h-5 text-body-sm text-muted-foreground" aria-live="polite">
+          {overlay ? (
+            <>
+              Dashed line: <span className="font-mono text-foreground">{overlay.model}</span>{" "}
+              on its own
+            </>
+          ) : (
+            <>Point at a {unit} for its breakdown, or at a tool or model below to trace it here.</>
+          )}
+        </p>
+      )}
+      {view === "chart" ? (
+        <UsageTrendChart
+          series={series}
+          points={points}
+          height={CHART_HEIGHT_PX}
+          hovered={hovered}
+          onHover={onHover}
+          highlightedSeries={hoveredProvider}
+          formatValue={formatValue}
+          formatAxis={formatAxis}
+          secondaryValue={secondaryValue}
+          readoutExtra={topModel}
+          overlay={overlay?.values ?? null}
+          ariaLabel={
+            metric === "cost"
+              ? `Estimated API value per ${unit} by provider`
+              : `Tokens per ${unit} by provider`
+          }
+        />
+      ) : (
+        <DayRows
+          summary={summary}
+          order={order.map((p) => p.provider)}
+          metric={metric}
+          hovered={hovered}
+          onHover={onHover}
+        />
+      )}
+    </section>
   );
 }
 
-// ── flat model / day breakdown ──
-
-type BreakdownView = UsageBreakdown;
-
-const BREAKDOWN_OPTIONS: { value: BreakdownView; label: string }[] = [
-  { value: "model", label: "Model" },
-  { value: "day", label: "Day" },
-];
-
-/** "Where is my money going" — deliberately flat and cross-provider,
- *  next to the lanes card's "how is each provider behaving". */
-function BreakdownCard({
+function DayRows({
   summary,
-  view,
-  onViewChange,
-  onSelectModel,
-  onOpenPrices,
+  order,
+  metric,
+  hovered,
+  onHover,
 }: {
   summary: UsageSummary;
-  view: BreakdownView;
-  onViewChange: (view: BreakdownView) => void;
-  onSelectModel: (model: FlatModelUsage) => void;
-  onOpenPrices: () => void;
+  /** Provider columns, largest first, like the chart legend. */
+  order: string[];
+  metric: Metric;
+  hovered: number | null;
+  onHover: (index: number | null) => void;
 }) {
-  const totalCost = summary.models.reduce((sum, m) => sum + m.cost_usd, 0);
-  const totalTokens = summary.models.reduce((sum, m) => sum + m.tokens, 0);
-
-  return (
-    <div className="rounded-lg border border-border/60 bg-muted/30 p-4">
-      <div className="mb-3 flex items-center justify-between gap-4">
-        <Eyebrow>
-          Breakdown
-        </Eyebrow>
-        <div className="flex items-center gap-2">
-          <Button variant="ghost" size="sm" onClick={onOpenPrices}>
-            <SlidersHorizontal className="size-3.5" aria-hidden />
-            Model prices
-          </Button>
-          <SegmentedControl
-            value={view}
-            onChange={onViewChange}
-            options={BREAKDOWN_OPTIONS}
-            ariaLabel="Breakdown grouping"
-            size="sm"
-          />
-        </div>
-      </div>
-
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
-        <div className="min-w-0 flex-1">
-          {view === "model" ? (
-            <ModelRows
-              models={summary.models}
-              totalCost={totalCost}
-              totalTokens={totalTokens}
-              onSelect={onSelectModel}
-            />
-          ) : (
-            <DayRows summary={summary} />
-          )}
-        </div>
-        <CostConfidenceBlock confidence={summary.confidence} />
-      </div>
-    </div>
-  );
-}
-
-function ModelRows({
-  models,
-  totalCost,
-  totalTokens,
-  onSelect,
-}: {
-  models: FlatModelUsage[];
-  totalCost: number;
-  totalTokens: number;
-  onSelect: (model: FlatModelUsage) => void;
-}) {
-  if (models.length === 0) {
-    return (
-      <p className="py-4 text-body-sm text-muted-foreground">No models yet.</p>
-    );
-  }
-  return (
-    <div className="flex flex-col">
-      {models.map((m, i) => (
-        <button
-          type="button"
-          key={`${m.provider}-${m.model}`}
-          onClick={() => onSelect(m)}
-          aria-label={`Open ${m.model} details`}
-          className={cn(
-            "-mx-2 flex items-center gap-3 rounded-md px-2 py-1.5 text-left transition-colors duration-150 hover:bg-accent/30 focus-visible:bg-accent/30 focus-visible:outline-none",
-            i > 0 && "border-t border-border/30",
-          )}
-        >
-          {isKnownProvider(m.provider) ? (
-            <ProviderLogo provider={m.provider} className="size-3.5" />
-          ) : (
-            <span className="size-3.5" aria-hidden />
-          )}
-          <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
-            {m.model}
-            {m.price_overridden && (
-              <span className="ml-2 font-sans text-caption text-muted-foreground/80">
-                your price
-              </span>
-            )}
-          </span>
-          <span className="w-[78px] shrink-0 select-text text-right font-mono text-body-sm tabular-nums">
-            {/* An unpriced model has no cost to show — an em-dash is
-                honest where "$0.00" would read as free. */}
-            {m.priced ? formatMoney(m.cost_usd) : "—"}
-          </span>
-          <span className="w-[64px] shrink-0 text-right font-mono text-caption tabular-nums text-muted-foreground">
-            {m.priced
-              ? formatPercent(totalCost > 0 ? m.cost_usd / totalCost : 0)
-              : `${formatPercent(totalTokens > 0 ? m.tokens / totalTokens : 0)} tok`}
-          </span>
-          <span className="w-[64px] shrink-0 select-text text-right font-mono text-label tabular-nums text-muted-foreground">
-            {formatTokens(m.tokens)}
-          </span>
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function DayRows({ summary }: { summary: UsageSummary }) {
   // Derived from the buckets the chart already uses, so the two can
   // never disagree. Newest first — the opposite of the chart's axis,
-  // because a table is read from the top. One cost column per provider,
-  // in lane order, so a spike can be traced to whoever caused it.
-  const order = summary.providers.map((p) => p.provider);
+  // because a table is read from the top. One column per provider under
+  // the active metric, so a spike can be traced to whoever caused it;
+  // the last column carries the other metric.
   const rows = summary.buckets
-    .map((bucket) => {
+    .map((bucket, index) => {
       const providers = Object.values(bucket.providers);
       return {
+        index,
         key: bucket.start_ms,
         label: bucket.sub_label,
         byProvider: bucket.providers,
@@ -968,16 +1225,20 @@ function DayRows({ summary }: { summary: UsageSummary }) {
 
   if (rows.length === 0) {
     return (
-      <p className="py-4 text-body-sm text-muted-foreground">
-        No activity yet.
+      <p className="border-t border-border/60 py-6 text-center text-body-sm text-muted-foreground">
+        No activity in this period.
       </p>
     );
   }
-  const columns = `minmax(5.5rem,1fr) repeat(${order.length}, minmax(4.5rem,5.5rem)) 5.5rem 4.5rem`;
+  const columns = `minmax(5.5rem,1fr) repeat(${order.length}, minmax(4.5rem,5.5rem)) 6rem 5rem`;
   return (
-    <div className="flex flex-col overflow-x-auto">
+    <div className="flex flex-col overflow-x-auto" onPointerLeave={() => onHover(null)}>
+      <p className="pb-1 text-body-sm text-muted-foreground">
+        Each tool&apos;s {metric === "cost" ? "estimated API value" : "tokens"} per{" "}
+        {summary.period === "today" ? "hour" : "day"}, newest first.
+      </p>
       <div
-        className="grid items-center gap-x-3 pb-1.5 text-caption text-muted-foreground"
+        className="grid items-center gap-x-3 border-b border-border/60 py-2 text-label text-muted-foreground"
         style={{ gridTemplateColumns: columns }}
       >
         <span>{summary.period === "today" ? "Hour" : "Day"}</span>
@@ -990,16 +1251,20 @@ function DayRows({ summary }: { summary: UsageSummary }) {
             {seriesLabel(provider)}
           </span>
         ))}
-        <span className="text-right">Total</span>
-        <span className="text-right">Tokens</span>
+        <span className="text-right">{metric === "cost" ? "Total value" : "Total tokens"}</span>
+        <span className="text-right">{metric === "cost" ? "Tokens" : "Est. value"}</span>
       </div>
       {rows.map((r) => (
         <div
           key={r.key}
-          className="grid items-center gap-x-3 border-t border-border/30 py-1.5"
+          onPointerEnter={() => onHover(r.index)}
+          className={cn(
+            "grid items-center gap-x-3 border-b border-border/40 py-2 transition-colors duration-150 hover:bg-accent/20",
+            hovered === r.index && "bg-accent/20",
+          )}
           style={{ gridTemplateColumns: columns }}
         >
-          <span className="min-w-0 truncate text-label text-muted-foreground">
+          <span className="min-w-0 truncate text-body-sm text-muted-foreground">
             {r.label}
           </span>
           {order.map((provider) => (
@@ -1007,14 +1272,16 @@ function DayRows({ summary }: { summary: UsageSummary }) {
               key={provider}
               className="select-text text-right font-mono text-label tabular-nums text-muted-foreground"
             >
-              {r.byProvider[provider] ? formatMoney(r.byProvider[provider].cost_usd) : "—"}
+              {r.byProvider[provider]
+                ? formatMetric(metricOf(r.byProvider[provider], metric), metric)
+                : "—"}
             </span>
           ))}
           <span className="select-text text-right font-mono text-body-sm tabular-nums">
-            {formatMoney(r.cost)}
+            {metric === "cost" ? formatMoney(r.cost) : formatTokens(r.tokens)}
           </span>
           <span className="select-text text-right font-mono text-label tabular-nums text-muted-foreground">
-            {formatTokens(r.tokens)}
+            {metric === "cost" ? formatTokens(r.tokens) : formatMoney(r.cost)}
           </span>
         </div>
       ))}
@@ -1022,245 +1289,472 @@ function DayRows({ summary }: { summary: UsageSummary }) {
   );
 }
 
-/** Makes the estimated nature of most cost figures visible rather than
- *  implicit. Rows render even at 0% so the block keeps a stable shape. */
-function CostConfidenceBlock({ confidence }: { confidence: CostConfidence }) {
-  const rows: { label: string; value: string }[] = [
-    {
-      label: "Provider reported",
-      value: formatPercent(confidence.provider_reported_share),
-    },
-    { label: "Model priced", value: formatPercent(confidence.table_priced_share) },
-    {
-      label: "Your prices",
-      value: formatPercent(confidence.override_priced_share ?? 0),
-    },
-    { label: "Unpriced", value: `${formatPercent(confidence.unpriced_token_share)} tok` },
-    { label: "Cache savings", value: formatMoney(confidence.cache_savings_usd) },
-  ];
+// ── by tool and model ──
+
+/** Models ranked by the active metric. Unpriced models have no cost, so
+ *  under Cost they sort after every priced one, by tokens. */
+export function sortModels(models: FlatModelUsage[], metric: Metric): FlatModelUsage[] {
+  return [...models].sort((a, b) => {
+    if (metric === "tokens") return b.tokens - a.tokens || a.model.localeCompare(b.model);
+    if (a.priced !== b.priced) return a.priced ? -1 : 1;
+    return b.cost_usd - a.cost_usd || b.tokens - a.tokens || a.model.localeCompare(b.model);
+  });
+}
+
+/** Models listed under each tool before "Show more". */
+const MODELS_SHOWN = 3;
+const STRIP_HEIGHT_PX = 26;
+
+/** Each tool, with its plan headroom and day-by-day rhythm, and the models
+ *  that did its work nested underneath — one place per figure. */
+function ToolsSection({
+  summary,
+  quota,
+  metric,
+  hovered,
+  onHover,
+  hoveredProvider,
+  onHoverProvider,
+  onHoverModel,
+  onSelectModel,
+  onOpenPrices,
+  onOpenLimits,
+}: {
+  summary: UsageSummary;
+  quota: Record<string, ProviderQuota>;
+  metric: Metric;
+  hovered: number | null;
+  onHover: (index: number | null) => void;
+  hoveredProvider: string | null;
+  onHoverProvider: (provider: string | null) => void;
+  onHoverModel: (model: FlatModelUsage | null) => void;
+  onSelectModel: (model: FlatModelUsage) => void;
+  onOpenPrices: () => void;
+  onOpenLimits: () => void;
+}) {
+  const total = metric === "cost" ? summary.totals.estimated_cost_usd : summary.totals.total_tokens;
+  const lanes = useMemo(
+    () => [...summary.providers].sort((a, b) => metricOf(b, metric) - metricOf(a, metric)),
+    [summary.providers, metric],
+  );
+  const topModel = sortModels(summary.models, metric)[0];
+  // One scale for every model bar on the page, so bars compare across tools.
+  const modelPeak = Math.max(0, ...summary.models.map((m) => metricOf(m, metric)));
+  const lead = lanes[0];
+  const share = (value: number) => (total > 0 ? value / total : 0);
+
   return (
-    <div className="shrink-0 lg:w-[200px] lg:border-l lg:border-border/60 lg:pl-4">
-      <Eyebrow className="mb-2">
-        Cost confidence
-      </Eyebrow>
-      <div className="flex flex-col gap-1">
-        {rows.map((r) => (
-          <div key={r.label} className="flex items-baseline justify-between gap-3">
-            <span className="text-label text-muted-foreground">{r.label}</span>
-            <span className="select-text font-mono text-label tabular-nums">
-              {r.value}
-            </span>
-          </div>
+    <section className="flex flex-col gap-4">
+      <SectionHeading
+        title="By tool and model"
+        answer={
+          lead && (
+            <>
+              {lanes.length === 1 ? (
+                <>All of it came from {seriesLabel(lead.provider)}</>
+              ) : (
+                <>
+                  {seriesLabel(lead.provider)} did{" "}
+                  <span className="font-mono">{formatPercent(share(metricOf(lead, metric)))}</span> of it
+                </>
+              )}
+              {topModel && (topModel.priced || metric === "tokens") && (
+                <span className="text-muted-foreground">
+                  ; <span className="font-mono text-foreground">{topModel.model}</span> was the
+                  largest model at{" "}
+                  <span className="font-mono text-foreground">
+                    {formatMetric(metricOf(topModel, metric), metric)}
+                  </span>
+                </span>
+              )}
+              .
+            </>
+          )
+        }
+        hint={
+          <>
+            The small line beside each tool shows its activity per{" "}
+            {summary.period === "today" ? "hour" : "day"} on its own scale; model bars share one
+            scale. Select a model for its trend and prices.
+          </>
+        }
+      >
+        <Button variant="ghost" size="sm" onClick={onOpenPrices}>
+          <SlidersHorizontal className="size-3.5" aria-hidden />
+          Model prices
+        </Button>
+      </SectionHeading>
+
+      <div className="divide-y divide-border/50 rounded-lg border border-border/60">
+        {lanes.map((provider) => (
+          <ToolGroup
+            key={provider.provider}
+            provider={provider}
+            models={sortModels(
+              summary.models.filter((m) => m.provider === provider.provider),
+              metric,
+            )}
+            quota={quota[provider.provider]}
+            buckets={summary.buckets}
+            metric={metric}
+            pageTotal={total}
+            pageTokens={summary.totals.total_tokens}
+            modelPeak={modelPeak}
+            unit={summary.period === "today" ? "hour" : "day"}
+            hovered={hovered}
+            onHover={onHover}
+            dimmed={hoveredProvider !== null && hoveredProvider !== provider.provider}
+            onHoverProvider={onHoverProvider}
+            onHoverModel={onHoverModel}
+            onSelectModel={onSelectModel}
+            onOpenLimits={onOpenLimits}
+          />
         ))}
       </div>
+    </section>
+  );
+}
+
+function ToolGroup({
+  provider,
+  models,
+  quota,
+  buckets,
+  metric,
+  pageTotal,
+  pageTokens,
+  modelPeak,
+  unit,
+  hovered,
+  onHover,
+  dimmed,
+  onHoverProvider,
+  onHoverModel,
+  onSelectModel,
+  onOpenLimits,
+}: {
+  provider: UsageProvider;
+  models: FlatModelUsage[];
+  /** Live plan quota, when the provider reports any. */
+  quota?: ProviderQuota;
+  buckets: UsageBucket[];
+  metric: Metric;
+  pageTotal: number;
+  pageTokens: number;
+  /** The largest model on the page, which every model bar is scaled to. */
+  modelPeak: number;
+  unit: "hour" | "day";
+  hovered: number | null;
+  onHover: (index: number | null) => void;
+  dimmed: boolean;
+  onHoverProvider: (provider: string | null) => void;
+  onHoverModel: (model: FlatModelUsage | null) => void;
+  onSelectModel: (model: FlatModelUsage) => void;
+  onOpenLimits: () => void;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const bars = quota ? meterWindows(quota.windows) : [];
+  const now = Date.now();
+  const values = useMemo(
+    () => buckets.map((b) => bucketValue(b, provider.provider, metric)),
+    [buckets, provider.provider, metric],
+  );
+  const value = metricOf(provider, metric);
+  const share = pageTotal > 0 ? value / pageTotal : 0;
+  const subagentTokens = new Map(provider.models.map((m) => [m.model, m.subagent_tokens]));
+  const shown = showAll ? models : models.slice(0, MODELS_SHOWN);
+
+  return (
+    <div
+      className={cn("transition-opacity duration-150", dimmed && "opacity-50")}
+      onPointerEnter={() => onHoverProvider(provider.provider)}
+      onPointerLeave={() => onHoverProvider(null)}
+    >
+      <div className="grid grid-cols-[minmax(10rem,13rem)_minmax(0,1fr)_auto] items-center gap-x-6 gap-y-3 px-4 py-3.5 lg:grid-cols-[minmax(10rem,13rem)_11.5rem_minmax(0,1fr)_auto]">
+        <span className="flex min-w-0 items-center gap-2.5">
+          {isKnownProvider(provider.provider) ? (
+            <ProviderLogo provider={provider.provider} className="h-[18px] w-[18px] shrink-0" />
+          ) : (
+            <span
+              className={cn("size-2.5 shrink-0 rounded-full", seriesFill(provider.provider))}
+              aria-hidden
+            />
+          )}
+          <span className="flex min-w-0 flex-col gap-0.5">
+            <span className="truncate text-body font-medium">{seriesLabel(provider.provider)}</span>
+            <span className="truncate text-label text-muted-foreground">
+              {quota?.plan_label ? `${quota.plan_label} · ` : ""}
+              {formatCount(provider.session_count)}{" "}
+              {provider.session_count === 1 ? "session" : "sessions"}
+            </span>
+          </span>
+        </span>
+
+        {/* Plan headroom in the same words as Limits: the bar is what is
+            LEFT, so a short bar always means "close to the cap". */}
+        {bars.length > 0 ? (
+          <button
+            type="button"
+            onClick={onOpenLimits}
+            aria-label={`${seriesLabel(provider.provider)} plan limits: ${bars
+              .map((w) => `${WINDOW_LABEL[w.kind]} ${remainingPct(w)}% left`)
+              .join(", ")}. Open Limits.`}
+            className="hidden flex-col gap-1.5 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 lg:flex"
+          >
+            {bars.map((w) => (
+              <Tooltip key={w.kind}>
+                <TooltipTrigger asChild>
+                  <span className="flex items-center gap-2">
+                    <span className="w-9 shrink-0 text-label text-muted-foreground">
+                      {WINDOW_LABEL[w.kind]}
+                    </span>
+                    <span className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted-foreground/20">
+                      <span
+                        className={cn("block h-full rounded-full", meterTone(w.used_pct))}
+                        style={{ width: `${remainingPct(w)}%` }}
+                      />
+                    </span>
+                    <span className="w-14 shrink-0 text-right font-mono text-label tabular-nums text-muted-foreground">
+                      {remainingPct(w)}% left
+                    </span>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top">
+                  {WINDOW_LONG_LABEL[w.kind]}: {Math.round(w.used_pct)}% used, {remainingPct(w)}%
+                  left{formatResetAt(w.resets_at_ms) ? ` · ${formatResetAt(w.resets_at_ms)}` : ""}.
+                  Click for all limits.
+                </TooltipContent>
+              </Tooltip>
+            ))}
+            {resetNotes(bars, now).map((note) => (
+              <span key={note} className="pl-11 text-label text-foreground/75">
+                {note}
+              </span>
+            ))}
+          </button>
+        ) : (
+          <span className="hidden text-label text-muted-foreground lg:block">
+            No plan limits reported
+          </span>
+        )}
+
+        <UsageSparkline
+          values={values}
+          height={STRIP_HEIGHT_PX}
+          hovered={hovered}
+          onHover={onHover}
+          ariaLabel={`${seriesLabel(provider.provider)} per ${unit}`}
+          describe={(index) => {
+            const slice = buckets[index]?.providers[provider.provider];
+            const label = buckets[index]?.sub_label ?? "";
+            if (!slice) return `${label} · nothing`;
+            return `${label} · ${formatMoney(slice.cost_usd)} · ${formatTokens(slice.tokens)} tokens`;
+          }}
+          {...seriesColor(provider.provider)}
+        />
+
+        <span className="flex items-baseline gap-4 justify-self-end">
+          <span className="flex flex-col items-end gap-0.5">
+            <span className="font-mono text-body tabular-nums">{formatPercent(share)}</span>
+            <span className="text-label text-foreground/70">
+              of {metric === "cost" ? "value" : "tokens"}
+            </span>
+          </span>
+          <span className="flex w-[6.5rem] flex-col items-end gap-0.5">
+            <span className="select-text font-mono text-body-lg font-semibold tabular-nums tracking-tight">
+              {formatMetric(value, metric)}
+            </span>
+            <span className="text-label text-muted-foreground">
+              {metric === "cost"
+                ? `${formatTokens(provider.tokens)} tokens`
+                : formatMoney(provider.cost_usd)}
+            </span>
+          </span>
+        </span>
+      </div>
+
+      {models.length > 0 && (
+        <ul className="pb-2" aria-label={`${seriesLabel(provider.provider)} models`}>
+          {shown.map((m) => {
+            const modelValue = metricOf(m, metric);
+            const subagents = (subagentTokens.get(m.model) ?? 0) > 0;
+            return (
+              <li key={m.model}>
+                <button
+                  type="button"
+                  onClick={() => onSelectModel(m)}
+                  onPointerEnter={() => onHoverModel(m)}
+                  onPointerLeave={() => onHoverModel(null)}
+                  onFocus={() => onHoverModel(m)}
+                  onBlur={() => onHoverModel(null)}
+                  aria-label={`Open ${m.model} details`}
+                  className="group grid w-full grid-cols-[minmax(0,1fr)_6rem_4.5rem_6.5rem_1rem] items-center gap-x-4 py-1.5 pl-[3.25rem] pr-4 text-left transition-colors duration-150 hover:bg-accent/20 focus-visible:bg-accent/20 focus-visible:outline-none"
+                >
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span className="truncate font-mono text-body-sm text-foreground/90">{m.model}</span>
+                    {m.price_overridden && <Pill>your price</Pill>}
+                    {!m.priced && <Pill>no price</Pill>}
+                    {subagents && <Pill>subagents</Pill>}
+                  </span>
+                  <span className="h-1.5 overflow-hidden rounded-full bg-muted/50" aria-hidden>
+                    <span
+                      className={cn("block h-full rounded-full", seriesFill(m.provider))}
+                      style={{
+                        width:
+                          modelValue > 0 && modelPeak > 0
+                            ? `max(4%, ${(modelValue / modelPeak) * 100}%)`
+                            : 0,
+                      }}
+                    />
+                  </span>
+                  <span className="text-right font-mono text-body-sm tabular-nums text-foreground/75">
+                    {/* An unpriced model has no cost share, so under Cost it
+                        shows its share of the page's tokens, marked "tok". */}
+                    {metric === "cost" && !m.priced
+                      ? `${formatPercent(pageTokens > 0 ? m.tokens / pageTokens : 0)} tok`
+                      : formatPercent(pageTotal > 0 ? modelValue / pageTotal : 0)}
+                  </span>
+                  <span className="select-text text-right font-mono text-body-sm tabular-nums">
+                    {metric === "cost" ? (
+                      m.priced ? (
+                        formatMoney(m.cost_usd)
+                      ) : (
+                        <span className="font-sans text-label text-muted-foreground">No price</span>
+                      )
+                    ) : (
+                      formatTokens(m.tokens)
+                    )}
+                  </span>
+                  <ChevronRight
+                    className="size-3.5 text-muted-foreground/60 transition-colors duration-150 group-hover:text-foreground group-focus-visible:text-foreground"
+                    aria-hidden
+                  />
+                </button>
+              </li>
+            );
+          })}
+          {models.length > MODELS_SHOWN && (
+            <li className="pl-[3.25rem] pt-1">
+              <button
+                type="button"
+                onClick={() => setShowAll((v) => !v)}
+                className="rounded-sm text-label text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+              >
+                {showAll ? "Show fewer" : `Show ${models.length - MODELS_SHOWN} more`}
+              </button>
+            </li>
+          )}
+        </ul>
+      )}
     </div>
+  );
+}
+
+function Pill({ children }: { children: ReactNode }) {
+  return (
+    <span className="shrink-0 rounded-sm bg-muted/60 px-1.5 py-px text-caption text-muted-foreground">
+      {children}
+    </span>
+  );
+}
+
+/** When each shown window frees up again, in words: "5h resets in 2h 13m",
+ *  so the meters read without a trip to Limits. */
+function resetNotes(windows: PlanUsageWindow[], now: number): string[] {
+  return windows.flatMap((window) => {
+    const resetsIn = formatResetsIn(window, now);
+    return resetsIn ? [`${WINDOW_LABEL[window.kind]} ${resetsIn}`] : [];
+  });
+}
+
+function remainingPct(window: PlanUsageWindow): number {
+  return Math.max(0, Math.min(100, Math.round(100 - window.used_pct)));
+}
+
+const WINDOW_LONG_LABEL: Record<PlanWindowKind, string> = {
+  five_hour: "5-hour window",
+  seven_day: "Weekly window",
+  seven_day_opus: "Weekly Opus window",
+  seven_day_sonnet: "Weekly Sonnet window",
+  overage: "Extra usage",
+  other: "Limit",
+};
+
+// ── by token type ──
+
+function TokenTypesSection({ summary, metric }: { summary: UsageSummary; metric: Metric }) {
+  const rows = tokenTypeRows(summary.composition, summary.category_cost);
+  const c = summary.composition;
+  const output = rows.find((r) => r.key === "output");
+  const totalCost = rows.reduce((sum, r) => sum + r.cost, 0);
+  const tokenShare = output && c.processed_tokens > 0 ? (output.tokens ?? 0) / c.processed_tokens : 0;
+  const costShare = output && totalCost > 0 ? output.cost / totalCost : 0;
+  return (
+    <section className="flex flex-col gap-4">
+      <SectionHeading
+        title="By token type"
+        answer={
+          output && totalCost > 0 ? (
+            <>
+              Output was <span className="font-mono">{formatPercent(tokenShare)}</span> of tokens
+              but <span className="font-mono">{formatPercent(costShare)}</span> of the value
+              <span className="text-muted-foreground">: writing costs far more than reading.</span>
+            </>
+          ) : undefined
+        }
+      />
+      <UsageTokenTypes rows={rows} emphasis={metric} />
+      {c.cache_savings_usd > 0 && (
+        <p className="flex flex-wrap items-baseline gap-x-1.5 rounded-lg bg-status-open/10 px-4 py-3 text-body-sm text-foreground">
+          <span>
+            Caching saved about{" "}
+            <span className="font-mono font-semibold">{formatMoney(c.cache_savings_usd)}</span>
+            {c.cache_savings_multiplier != null && (
+              <>
+                {" "}
+                — the same work would have cost{" "}
+                <span className="font-mono">{c.cache_savings_multiplier.toFixed(1)}×</span> as much
+                without it
+              </>
+            )}
+            .
+          </span>
+          <TermHint hint="Compares what reused context actually cost with paying the full input price for it. Only models in Codemux's price list are counted, so tools priced by the provider (such as OpenCode) add nothing here.">
+            How is this worked out?
+          </TermHint>
+        </p>
+      )}
+    </section>
   );
 }
 
 // ── provider-history footer ──
 
 function ProviderHistoryFooter({
-  busy,
   sessionCount,
+  providers,
 }: {
-  busy: boolean;
   sessionCount: number;
+  providers: string[];
 }) {
+  const names = providers.map(seriesLabel);
+  const list =
+    names.length <= 1
+      ? (names[0] ?? "")
+      : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
   return (
-    <div className="flex items-baseline gap-4 px-1 pt-1">
-      <p className="min-w-0 flex-1 text-label leading-relaxed text-muted-foreground">
+    <div className="border-t border-border/60 pt-4">
+      <p className="text-body-sm leading-relaxed text-muted-foreground">
         <span className="font-medium text-foreground">
-          Includes {sessionCount.toLocaleString()} provider session
+          Includes {sessionCount.toLocaleString()} session
           {sessionCount === 1 ? "" : "s"}
-        </span>{" "}
-        from this machine&apos;s Claude Code, Codex, and OpenCode histories,
-        regardless of which app launched them. Sources include{" "}
+          {list ? ` from ${list}` : ""} on this machine
+        </span>
+        , whichever app launched them. History sources include{" "}
         <span className="font-mono text-caption">~/.claude/projects</span>,{" "}
         <span className="font-mono text-caption">~/.codex/sessions</span>, and
-        OpenCode&apos;s local data directory. This machine only.
+        OpenCode&apos;s local data directory.
       </p>
-      {busy && (
-        <span className="shrink-0 font-mono text-caption text-muted-foreground">
-          scanning…
-        </span>
-      )}
-    </div>
-  );
-}
-
-// ── provider lanes ──
-
-const SPARK_HEIGHT_PX = 30;
-
-function LanesCard({
-  summary,
-  quota,
-  expanded,
-  onToggle,
-}: {
-  summary: UsageSummary;
-  quota: Record<string, ProviderQuota>;
-  expanded: string | null;
-  onToggle: (provider: string) => void;
-}) {
-  return (
-    <div className="rounded-lg border border-border/60 bg-muted/30 px-4">
-      {summary.providers.map((provider, index) => (
-        <ProviderLane
-          key={provider.provider}
-          provider={provider}
-          quota={quota[provider.provider]}
-          buckets={summary.buckets}
-          open={expanded === provider.provider}
-          onToggle={() => onToggle(provider.provider)}
-          divided={index > 0}
-        />
-      ))}
-    </div>
-  );
-}
-
-function ProviderLane({
-  provider,
-  quota,
-  buckets,
-  open,
-  onToggle,
-  divided,
-}: {
-  provider: UsageProvider;
-  /** Live plan quota, when the provider reports any. Absent → the lane
-   *  renders exactly as it did before meters existed. */
-  quota?: ProviderQuota;
-  buckets: UsageBucket[];
-  open: boolean;
-  onToggle: () => void;
-  divided: boolean;
-}) {
-  const bars = quota ? meterWindows(quota.windows) : [];
-  const note = quota ? meterNote(quota) : "";
-  const laneValues = useMemo(
-    () => buckets.map((b) => b.providers[provider.provider]?.tokens ?? 0),
-    [buckets, provider.provider],
-  );
-
-  return (
-    <div className={cn(divided && "border-t border-border/40")}>
-      <button
-        type="button"
-        onClick={onToggle}
-        aria-expanded={open}
-        className="flex w-full items-center gap-4 py-3.5 text-left transition-colors duration-150 hover:bg-accent/20"
-      >
-        {/* Widens with the column so provider plan labels do not truncate;
-            the model rows below indent to match. */}
-        <span className="flex w-[150px] shrink-0 items-center gap-2.5 xl:w-[200px]">
-          {isKnownProvider(provider.provider) ? (
-            <ProviderLogo provider={provider.provider} className="h-[18px] w-[18px]" />
-          ) : (
-            <span className="h-[18px] w-[18px]" aria-hidden />
-          )}
-          <span className="flex min-w-0 flex-col gap-0.5">
-            <span className="truncate text-body font-medium">
-              {seriesLabel(provider.provider)}
-            </span>
-            <span className="truncate text-caption text-muted-foreground">
-              {quota?.plan_label ?? "Provider history"}
-            </span>
-          </span>
-        </span>
-
-        {/* Quota meters when the provider reports a plan, sparkline
-            otherwise. A provider with no quota data (OpenCode, or one
-            that has not run this session) renders exactly as before —
-            an empty meter would imply a limit that does not exist. */}
-        {bars.length > 0 ? (
-          <span className="flex w-[168px] shrink-0 flex-col gap-1.5">
-            {bars.map((w) => (
-              <span key={w.kind} className="flex items-center gap-2">
-                <span className="w-9 shrink-0 text-caption text-muted-foreground">
-                  {WINDOW_LABEL[w.kind]}
-                </span>
-                <span className="h-1 flex-1 overflow-hidden rounded-full bg-muted-foreground/20">
-                  <span
-                    className={cn("block h-full rounded-full", meterTone(w.used_pct))}
-                    style={{ width: `${Math.min(100, Math.max(0, w.used_pct))}%` }}
-                  />
-                </span>
-                <span className="w-8 shrink-0 select-text text-right font-mono text-caption tabular-nums text-muted-foreground">
-                  {Math.round(w.used_pct)}%
-                </span>
-              </span>
-            ))}
-            {note && (
-              <span className="truncate text-caption text-muted-foreground/80">
-                {note}
-              </span>
-            )}
-          </span>
-        ) : null}
-        <span className="min-w-0 flex-1 self-center">
-          <UsageSparkline
-            values={laneValues}
-            height={SPARK_HEIGHT_PX}
-            {...seriesColor(provider.provider)}
-          />
-        </span>
-
-        <span className="flex w-[76px] shrink-0 flex-col gap-0.5 text-right">
-          <span className="select-text font-mono text-body tabular-nums">
-            {formatTokens(provider.tokens)}
-          </span>
-          <span className="text-caption text-muted-foreground">tokens</span>
-        </span>
-
-        <span className="flex w-[96px] shrink-0 flex-col gap-0.5 text-right">
-          <span
-            className="select-text font-mono text-body-lg font-semibold tabular-nums tracking-tight"
-          >
-            {formatMoney(provider.cost_usd)}
-          </span>
-          <span className="text-caption text-muted-foreground">API equivalent</span>
-        </span>
-
-        <span className="shrink-0 text-muted-foreground" aria-hidden>
-          {open ? (
-            <ChevronUp className="size-3.5" />
-          ) : (
-            <ChevronDown className="size-3.5" />
-          )}
-        </span>
-      </button>
-
-      {open && (
-        <div className="pb-3 pl-[150px] xl:pl-[200px]">
-          {provider.models.map((model) => {
-            const share =
-              provider.tokens > 0 ? model.tokens / provider.tokens : 0;
-            return (
-              <div
-                key={model.model}
-                className="flex items-center gap-4 border-t border-border/30 py-1.5"
-              >
-                <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
-                  {model.model}
-                </span>
-                <span className="w-[110px] shrink-0 text-caption text-muted-foreground">
-                  {formatPercent(share)} of tokens
-                  {model.subagent_tokens > 0 && " · subagents"}
-                </span>
-                <span className="w-[76px] shrink-0 select-text text-right font-mono text-label tabular-nums text-muted-foreground">
-                  {formatTokens(model.tokens)}
-                </span>
-                <span className="w-[96px] shrink-0 select-text text-right font-mono text-label tabular-nums text-muted-foreground">
-                  {formatMoney(model.cost_usd)}
-                </span>
-                <span className="w-3.5 shrink-0" aria-hidden />
-              </div>
-            );
-          })}
-        </div>
-      )}
     </div>
   );
 }

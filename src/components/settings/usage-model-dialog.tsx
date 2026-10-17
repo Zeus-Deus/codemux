@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { Pencil, Trash2 } from "lucide-react";
 
@@ -22,7 +22,7 @@ import {
   type PriceOverride,
   type UsageBucket,
 } from "@/tauri/commands";
-import { UsageAreaChart } from "./usage-area-chart";
+import { UsageTrendChart } from "./usage-trend-chart";
 import {
   formatMoney,
   formatPercent,
@@ -32,7 +32,7 @@ import {
   seriesLabel,
 } from "./usage-format";
 import type { UsageMetric } from "./usage-preferences";
-import { UsageShareBar, costTypeSegments, tokenTypeSegments } from "./usage-share-bar";
+import { UsageTokenTypes, modelTokenTypeRows } from "./usage-token-types";
 
 /** Share of a model's input served from cache, or null without input.
  *  Cache writes count as misses: that input was processed in full. */
@@ -92,8 +92,10 @@ export function UsageModelDialog({
   const stats = [
     { label: "Cost", value: model.priced ? formatMoney(model.cost_usd) : "Unpriced" },
     { label: "Tokens", value: formatTokens(model.tokens) },
-    perMillion === null ? null : { label: "Per 1M tokens", value: formatMoney(perMillion) },
-    hitRate === null ? null : { label: "Cache hit", value: formatPercent(hitRate) },
+    // Blends input, output and cache rates, so it is an average, never
+    // the model's list price (that sits in the footer).
+    perMillion === null ? null : { label: "Avg per 1M tokens", value: formatMoney(perMillion) },
+    hitRate === null ? null : { label: "Input from cache", value: formatPercent(hitRate) },
     { label: "Sessions", value: model.session_count.toLocaleString() },
   ].filter((stat) => stat !== null);
 
@@ -114,11 +116,23 @@ export function UsageModelDialog({
     () => buckets.map((b) => ({ label: b.label, subLabel: b.sub_label })),
     [buckets],
   );
-  const format = (v: number) => (chartMetric === "cost" ? formatMoney(v) : formatTokens(v));
+  // Stable, so the chart's memoised geometry survives hover re-renders.
+  const format = useCallback(
+    (v: number) => (chartMetric === "cost" ? formatMoney(v) : formatTokens(v)),
+    [chartMetric],
+  );
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="gap-6 sm:max-w-3xl">
+      <DialogContent
+        className="gap-6 sm:max-w-3xl"
+        // The first tabbable element is a term hint; focusing it on open
+        // would pop its tooltip unasked. The dialog takes focus as a whole.
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          if (event.currentTarget instanceof HTMLElement) event.currentTarget.focus();
+        }}
+      >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             {isKnownProvider(model.provider) && (
@@ -148,7 +162,7 @@ export function UsageModelDialog({
           ))}
         </div>
 
-        <UsageAreaChart
+        <UsageTrendChart
           series={series}
           points={points}
           height={CHART_HEIGHT_PX}
@@ -158,23 +172,12 @@ export function UsageModelDialog({
           ariaLabel={`${model.model} ${chartMetric === "cost" ? "cost" : "tokens"} per bucket`}
         />
 
-        <div className="grid gap-x-10 gap-y-6 sm:grid-cols-2">
-          {model.priced && (
-            <UsageShareBar
-              label="Cost by type"
-              segments={costTypeSegments(model.category_cost)}
-              format={formatMoney}
-            />
-          )}
-          <UsageShareBar
-            label="Tokens by type"
-            segments={tokenTypeSegments(model)}
-            format={formatTokens}
-          />
-        </div>
+        {/* An unpriced model's cost is unknown, not zero: its cost side
+            shows a dash and the tokens side carries the emphasis. */}
+        <UsageTokenTypes rows={modelTokenTypeRows(model)} emphasis={chartMetric} compact />
 
         <DialogFooter className="items-center sm:justify-between">
-          <span className="text-label text-muted-foreground">
+          <span className="text-body-sm text-foreground/75">
             {model.unpriced_tokens > 0
               ? `${formatTokens(model.unpriced_tokens)} tokens have no known price`
               : model.rates
@@ -235,6 +238,7 @@ export function PriceEditorDialog({
   model,
   initialRates,
   hasOverride,
+  knownModels = [],
   onClose,
   onSaved,
 }: {
@@ -242,6 +246,8 @@ export function PriceEditorDialog({
   model: string | null;
   initialRates: PriceOverride | null;
   hasOverride: boolean;
+  /** Model ids seen in usage, offered as suggestions when typing one. */
+  knownModels?: string[];
   onClose: () => void;
   onSaved: (overrides: Record<string, PriceOverride>) => void;
 }) {
@@ -309,7 +315,16 @@ export function PriceEditorDialog({
               placeholder="provider/model-id"
               aria-invalid={invalid === "model"}
               className="font-mono"
+              list={model === null ? "usage-price-known-models" : undefined}
+              autoComplete="off"
             />
+            {model === null && (
+              <datalist id="usage-price-known-models">
+                {[...new Set(knownModels)].sort().map((id) => (
+                  <option key={id} value={id} />
+                ))}
+              </datalist>
+            )}
           </div>
           <div className="grid grid-cols-2 gap-3">
             {RATE_FIELDS.map((field) => (

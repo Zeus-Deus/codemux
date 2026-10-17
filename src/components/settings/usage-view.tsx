@@ -28,7 +28,7 @@ export function UsageView() {
     <UtilityPage title="Usage" backLabel="Close usage" onBack={() => setShowUsage(false)}>
       <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
         <div className="mx-auto w-full max-w-6xl px-5 pb-12 pt-3 sm:px-6">
-          <UsageSection showTitle={false} />
+          <UsageSection showTitle={false} shortcuts />
         </div>
       </div>
     </UtilityPage>

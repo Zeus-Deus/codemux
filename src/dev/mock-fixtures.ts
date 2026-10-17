@@ -2766,15 +2766,8 @@ export function mockUsageSummary(period: string): unknown {
       .filter((p) => p.provider !== "claude")
       .reduce((n, p) => n + p.output_tokens, 0) * 0.38,
   );
-  const providerPricedCost = providers
-    .filter((p) => p.provider === "opencode")
-    .reduce((n, p) => n + p.cost_usd, 0);
-  const allCost = providers.reduce((n, p) => n + p.cost_usd, 0);
-  const savings = allCost * 2.2;
-
   const zeroCost = () => ({ input: 0, output: 0, cache_read: 0, cache_write: 0, unsplit: 0 });
   const categoryCost = zeroCost();
-  let overrideCost = 0;
   const models = providers
     .flatMap((p) =>
       p.models.map((m) => {
@@ -2808,7 +2801,13 @@ export function mockUsageSummary(period: string): unknown {
           : priced
             ? m.cost_usd
             : 0;
-        if (override) overrideCost += cost;
+        const providerReported = p.provider === "opencode" && !override;
+        const tablePriced = priced && !override && !providerReported;
+        // What the table-priced work would have cost with no cache. The
+        // mock's costs come from flat per-provider rates rather than the
+        // model table, so the no-cache figure is a fixed multiple of them
+        // instead of a recomputation that would not match.
+        const uncached = tablePriced && table ? cost * 3.2 : 0;
         const weightSum = weights ? weights.reduce((a, b) => a + b, 0) : 0;
         const category = zeroCost();
         if (cost > 0 && weights && weightSum > 0) {
@@ -2830,7 +2829,7 @@ export function mockUsageSummary(period: string): unknown {
           tokens: m.tokens,
           cost_usd: cost,
           priced,
-          provider_reported: p.provider === "opencode" && !override,
+          provider_reported: providerReported,
           price_overridden: override != null,
           ...split,
           reasoning_tokens:
@@ -2839,6 +2838,16 @@ export function mockUsageSummary(period: string): unknown {
           session_count: Math.max(1, Math.round(p.session_count * weight)),
           category_cost: category,
           rates,
+          cost_sources: {
+            provider_usd: providerReported ? cost : 0,
+            table_usd: tablePriced ? cost : 0,
+            override_usd: override ? cost : 0,
+          },
+          cache_savings: {
+            savings_usd: Math.max(0, uncached - (tablePriced && table ? cost : 0)),
+            uncached_usd: uncached,
+            cached_usd: tablePriced && table ? cost : 0,
+          },
           // The model's slice of each bucket, in proportion to its share
           // of the provider — the same series the lanes chart.
           buckets: buckets.map((bucket) => {
@@ -2855,7 +2864,28 @@ export function mockUsageSummary(period: string): unknown {
     .sort((a, b) =>
       a.priced === b.priced ? b.cost_usd - a.cost_usd : Number(b.priced) - Number(a.priced),
     );
-  const pricedCost = models.reduce((n, m) => n + m.cost_usd, 0);
+  // Each provider's cost is the sum of its models' as the backend computes
+  // it, so an unpriced model (cost 0) leaves the lane, the hero and the
+  // cost-by-type total agreeing.
+  for (const provider of providers) {
+    const own = models.filter((m) => m.provider === provider.provider);
+    provider.cost_usd = own.reduce((n, m) => n + m.cost_usd, 0);
+    for (const entry of provider.models) {
+      entry.cost_usd = own.find((m) => m.model === entry.model)?.cost_usd ?? 0;
+    }
+  }
+  for (const bucket of buckets) {
+    for (const [provider, slice] of Object.entries(bucket.providers)) {
+      const lane = providers.find((p) => p.provider === provider);
+      slice.cost_usd = lane && lane.tokens > 0 ? (lane.cost_usd * slice.tokens) / lane.tokens : 0;
+    }
+  }
+  const allCost = models.reduce((n, m) => n + m.cost_usd, 0);
+  const sumOf = (f: (m: (typeof models)[number]) => number) =>
+    models.reduce((n, m) => n + f(m), 0);
+  const savings = sumOf((m) => m.cache_savings.savings_usd);
+  const savingsBasis = sumOf((m) => m.cache_savings.cached_usd);
+  const share = (part: number) => (allCost > 0 ? part / allCost : 0);
 
   return {
     period,
@@ -2872,15 +2902,15 @@ export function mockUsageSummary(period: string): unknown {
       output_tokens: outputTokens,
       reasoning_tokens: reasoningTokens,
       cache_savings_usd: savings,
-      cache_savings_multiplier: 3.2,
+      cache_savings_multiplier:
+        savingsBasis > 0.005 ? sumOf((m) => m.cache_savings.uncached_usd) / savingsBasis : null,
     },
     category_cost: categoryCost,
     confidence: {
-      provider_reported_share: allCost > 0 ? providerPricedCost / allCost : 0,
-      table_priced_share:
-        pricedCost > 0 ? 1 - providerPricedCost / allCost - overrideCost / pricedCost : 0,
-      override_priced_share: pricedCost > 0 ? overrideCost / pricedCost : 0,
-      unpriced_token_share: mockPriceOverrides["openrouter/kimi-k2"] ? 0 : 0.041,
+      provider_reported_share: share(sumOf((m) => m.cost_sources.provider_usd)),
+      table_priced_share: share(sumOf((m) => m.cost_sources.table_usd)),
+      override_priced_share: share(sumOf((m) => m.cost_sources.override_usd)),
+      unpriced_token_share: totalTokens > 0 ? sumOf((m) => m.unpriced_tokens) / totalTokens : 0,
       cache_savings_usd: savings,
     },
     models,
