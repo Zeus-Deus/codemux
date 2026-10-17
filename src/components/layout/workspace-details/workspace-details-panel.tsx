@@ -177,11 +177,17 @@ export function resolveDetailsCardPlacement({
   return { top, width, maxHeight };
 }
 
-/** Whether a workspace's active surface is exactly one agent-chat pane. */
+/**
+ * Whether the selected tab shows exactly one agent-chat pane. Resolved from
+ * the active *tab*, like `workspace-main.tsx`: editor and diff tabs have no
+ * surface, and selecting one leaves `active_surface_id` on the last pane
+ * surface, so reading that directly would pin the card over an editor.
+ */
 export function isSoleChatSurface(workspace: WorkspaceSnapshot | null): boolean {
-  const surface = workspace?.surfaces.find(
-    (candidate) => candidate.surface_id === workspace.active_surface_id,
-  );
+  if (!workspace) return false;
+  const tab = workspace.tabs.find((t) => t.tab_id === workspace.active_tab_id);
+  if (!tab?.surface_id) return false;
+  const surface = workspace.surfaces.find((s) => s.surface_id === tab.surface_id);
   return surface?.root.kind === "agent_chat";
 }
 
@@ -635,7 +641,13 @@ function VersionControlSection({
     <Section testId="workspace-details-git">
       <BranchRow workspace={workspace} branch={branch} />
       <PullRequestRow workspace={workspace} onOpened={onClose} />
-      <GitActionRow workspace={workspace} openPane={openPane} />
+      {/* Push / pull / fetch / publish and the upstream probe run git in a
+          local path. A workspace on another device (or attached in place
+          there) has no local checkout to run them in, so — like the right
+          panel's host-local panes — the row is left out for it. */}
+      {!isHostBacked(workspace) && (
+        <GitActionRow workspace={workspace} openPane={openPane} />
+      )}
       <button
         type="button"
         onClick={() => openPane("changes")}
@@ -651,6 +663,11 @@ function VersionControlSection({
       </button>
     </Section>
   );
+}
+
+/** The workspace lives on another device rather than in a local checkout. */
+function isHostBacked(workspace: WorkspaceSnapshot): boolean {
+  return workspace.host_id != null || !!workspace.attach_only;
 }
 
 function BranchRow({

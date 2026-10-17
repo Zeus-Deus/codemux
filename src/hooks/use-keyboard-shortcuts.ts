@@ -295,13 +295,11 @@ export function dispatch(actionId: string, event?: KeyboardEvent): boolean {
   );
   const activePaneId = surface?.active_pane_id;
 
-  // Only while the card can actually be shown: its host is mounted by the
-  // title bar exactly then (GUI chrome, no Settings / new-project screen /
-  // utility page / draft over the workspace, panel not fully expanded).
-  // Otherwise the shortcut would silently flip the saved preference for a
-  // card nobody can see.
+  // Gated in `isAppShortcutApplicable` (above): the card's host is mounted
+  // only while it can show (GUI chrome, no Settings / new-project screen /
+  // utility page / draft, panel not fully expanded), so an unavailable
+  // binding neither flips the saved preference nor eats terminal input.
   if (actionId === "toggleWorkspaceDetails") {
-    if (!ui.workspaceDetailsHosted) return false;
     ui.toggleWorkspaceDetails();
     return true;
   }

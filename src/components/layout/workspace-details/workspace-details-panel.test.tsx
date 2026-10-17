@@ -81,6 +81,25 @@ const CHAT_SURFACE: WorkspaceSnapshot["surfaces"][number] = {
   },
 };
 
+const CHAT_TAB: WorkspaceSnapshot["tabs"][number] = {
+  tab_id: "tab-1",
+  kind: "terminal",
+  title: "Agent Chat",
+  surface_id: "surface-1",
+  browser_id: null,
+  icon: null,
+};
+
+/** Editor and diff tabs have no surface of their own. */
+const EDITOR_TAB: WorkspaceSnapshot["tabs"][number] = {
+  tab_id: "tab-editor",
+  kind: "editor",
+  title: "main.rs",
+  surface_id: null,
+  browser_id: null,
+  icon: null,
+};
+
 const TERMINAL_SURFACE: WorkspaceSnapshot["surfaces"][number] = {
   surface_id: "surface-1",
   title: "Terminal",
@@ -109,7 +128,7 @@ function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSna
     pr_url: "https://github.com/example/repo/pull/172",
     linked_issue: null,
     notifications_muted: false,
-    tabs: [],
+    tabs: [CHAT_TAB, EDITOR_TAB],
     active_tab_id: "tab-1",
     active_surface_id: "surface-1",
     surfaces: [CHAT_SURFACE],
@@ -495,5 +514,34 @@ describe("WorkspaceDetailsToggle — round-2 regressions", () => {
     await flush();
     expect(screen.getByText("Publish branch")).toBeInTheDocument();
     expect(screen.queryByText("Fetch")).toBeNull();
+  });
+});
+
+describe("WorkspaceDetailsToggle — Mario review regressions", () => {
+  it("does not pin over an editor tab selected after a chat tab", async () => {
+    // Selecting an editor/diff tab leaves `active_surface_id` on the chat.
+    mocks.workspace = makeWorkspace({ active_tab_id: "tab-editor" });
+    renderToggle();
+    await flush();
+    expect(useUIStore.getState().workspaceDetailsMode).toBe("popover");
+    expect(screen.queryByTestId("workspace-details-card")).toBeNull();
+  });
+
+  it("offers no local git actions for a workspace that lives on another device", async () => {
+    mocks.workspace = makeWorkspace({ host_id: 7 } as Partial<WorkspaceSnapshot>);
+    renderToggle();
+    await flush();
+    expect(screen.queryByRole("button", { name: "Git actions" })).toBeNull();
+    expect(screen.queryByText("Commit")).toBeNull();
+    // Branch and Changes still describe it.
+    expect(screen.getByText("feat/x")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Changes/ })).toBeInTheDocument();
+  });
+
+  it("offers no local git actions for an attach-in-place workspace", async () => {
+    mocks.workspace = makeWorkspace({ attach_only: true } as Partial<WorkspaceSnapshot>);
+    renderToggle();
+    await flush();
+    expect(screen.queryByRole("button", { name: "Git actions" })).toBeNull();
   });
 });
