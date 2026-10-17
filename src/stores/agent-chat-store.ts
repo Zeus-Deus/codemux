@@ -561,6 +561,39 @@ function isSliceBusy(slice: ChatThreadSlice): boolean {
   );
 }
 
+/** Queued turns whose cancellation this client requested. The Cancel button
+ *  restores their text itself, so the event must not restore it again. */
+const localQueuedCancels = new Set<string>();
+
+export function beginLocalQueuedCancel(queuedId: string): void {
+  localQueuedCancels.add(queuedId);
+}
+
+export function endLocalQueuedCancel(queuedId: string): void {
+  localQueuedCancels.delete(queuedId);
+}
+
+/**
+ * The composer draft after the backend cancels a queued turn on its own
+ * (session error or close, failed dispatch). The text goes back into the
+ * draft so the user does not lose it; appended so several cancellations keep
+ * their queue order.
+ */
+function draftAfterQueuedCancel(
+  slice: ChatThreadSlice,
+  queuedId: string,
+): string {
+  if (localQueuedCancels.delete(queuedId)) return slice.inputDraft;
+  const queued = slice.messages.find(
+    (m) => m.kind === "user_message" && m.queued?.queuedId === queuedId,
+  );
+  const text = queued?.kind === "user_message" ? queued.text : "";
+  if (!text.trim()) return slice.inputDraft;
+  return slice.inputDraft.trim().length > 0
+    ? `${slice.inputDraft}\n${text}`
+    : text;
+}
+
 /**
  * One provider event folded into one slice. Returns the SAME slice object
  * when nothing changed, which is what keeps `updateSlice` from cloning the
@@ -575,7 +608,10 @@ function reduceThreadEvent(
   // to interrupt_turn if the provider wants a specific turn.
   let activeTurnId = slice.activeTurnId;
   let resumeCursor = slice.resumeCursor;
-  if (event.type === "session_state_changed") {
+  let inputDraft = slice.inputDraft;
+  if (event.type === "queued_turn_cancelled") {
+    inputDraft = draftAfterQueuedCancel(slice, event.queued_id);
+  } else if (event.type === "session_state_changed") {
     if (event.status.status === "running") {
       activeTurnId = event.status.active_turn;
     } else if (
@@ -595,11 +631,12 @@ function reduceThreadEvent(
   if (
     applied === (slice as ChatThreadState) &&
     activeTurnId === slice.activeTurnId &&
-    resumeCursor === slice.resumeCursor
+    resumeCursor === slice.resumeCursor &&
+    inputDraft === slice.inputDraft
   ) {
     return slice;
   }
-  return { ...slice, ...applied, activeTurnId, resumeCursor };
+  return { ...slice, ...applied, activeTurnId, resumeCursor, inputDraft };
 }
 
 export const useAgentChatStore = create<AgentChatStore>((set) => ({

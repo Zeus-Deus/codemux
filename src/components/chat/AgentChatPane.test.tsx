@@ -787,6 +787,8 @@ vi.mock("@/stores/agent-chat-store", () => {
     // The pane registers its thread so warm-slice eviction can't drop a
     // transcript that is on screen. Returns the unregister.
     registerMountedThread: () => registerMountedThreadMock(),
+    beginLocalQueuedCancel: vi.fn(),
+    endLocalQueuedCancel: vi.fn(),
   };
 });
 
@@ -1762,6 +1764,24 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
 
     fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
     await waitFor(() => expect(anchorNonce(container)).toBe("2"));
+  });
+
+  it("keeps text typed while a failed send was in flight", async () => {
+    const { agentChatSendTurn } = await import("@/tauri/commands");
+    vi.mocked(agentChatSendTurn).mockImplementationOnce(async () => {
+      // The composer stays editable while the send is in flight.
+      currentSliceOverrides = { "thread-x": { inputDraft: "typed meanwhile" } };
+      throw new Error("boom");
+    });
+    const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+    fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
+    await waitFor(() => {
+      expect(setInputDraftMock).toHaveBeenCalledWith(
+        "thread-x",
+        "hello there\ntyped meanwhile",
+      );
+    });
   });
 
   it("anchors a queued follow-up dispatched with 'send now'", async () => {

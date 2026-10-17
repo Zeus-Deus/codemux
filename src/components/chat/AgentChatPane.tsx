@@ -80,6 +80,8 @@ import {
 import {
   DEFAULT_THREAD_PERMISSION_MODE,
   registerMountedThread,
+  beginLocalQueuedCancel,
+  endLocalQueuedCancel,
   useAgentChatStore,
   type Attachment,
   type ChatMode,
@@ -242,6 +244,12 @@ const CONTEXT_USAGE_PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
  *  hitting Enter. Lines up with the gh detail cache TTL on the Rust
  *  side so a re-fetch is cheap when the cached value is still warm. */
 const STALE_ATTACHMENT_THRESHOLD_MS = 60_000;
+
+/** The composer draft after a failed send: the sent text goes back ahead of
+ *  anything typed while the send was in flight, never twice. */
+function draftAfterFailedSend(sent: string, current: string): string {
+  return current.trim() === sent ? current : mergeRevertedDraft(sent, current);
+}
 
 /** Synthetic user prompt fired when the user invokes Debug-mode
  *  cleanup. The grep pattern carries no comment-prefix so the model
@@ -1940,7 +1948,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // The anchored row is gone, so its reserved response space must go
         // with it — otherwise a failed image send leaves phantom end space.
         clearSendAnchor(clientNonce);
-        setInputDraft(threadId, originalDraft);
+        // Merge: the composer stays editable during the send, so anything
+        // typed meanwhile must survive the restore.
+        setInputDraft(
+          threadId,
+          draftAfterFailedSend(
+            originalDraft,
+            useAgentChatStore.getState().threads[threadId]?.inputDraft ?? "",
+          ),
+        );
         toast.error(
           "An attached image failed to upload — remove it and try again.",
         );
@@ -1998,11 +2014,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // Same rollback discipline as the failed-image path above: the
         // anchor dies with the bubble it pointed at.
         clearSendAnchor(clientNonce);
-        // Restore the composer text so the user doesn't lose it. A Continue
+        // Restore the composer text so the user doesn't lose it, merged
+        // with anything typed while the send was in flight. A Continue
         // send never owned the draft (it preserved the user's own in-progress
         // text above), so leave that intact rather than stamping "Continue".
         if (!isContinue) {
-          setInputDraft(threadId, originalDraft);
+          setInputDraft(
+            threadId,
+            draftAfterFailedSend(
+              originalDraft,
+              useAgentChatStore.getState().threads[threadId]?.inputDraft ?? "",
+            ),
+          );
         }
         toast.error(`Failed to send turn: ${formatProviderError(err)}`);
         // A failed send may mean the provider runtime itself is broken —
@@ -2606,11 +2629,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // When the provider confirms it actually removed an item, restore the
   // cancelled text into the composer draft so the user can edit and resend
   // (prepended if the composer already has content, to avoid clobbering an
-  // in-progress draft).
+  // in-progress draft). The store restores text for cancellations the user
+  // did not ask for; marking this one keeps it from restoring it twice.
   const handleCancelQueued = useCallback(
     (queuedId: string, text: string) => {
       if (!threadId) return;
       const tid = threadId;
+      beginLocalQueuedCancel(queuedId);
       void (async () => {
         try {
           const cancelled = await agentChatCancelQueuedTurn(
@@ -2621,7 +2646,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           // The provider returns false when this id already dispatched.
           // Do not resurrect an already-sent prompt in the composer just
           // because the UI briefly held a stale queue marker.
-          if (!cancelled) return;
+          if (!cancelled) {
+            endLocalQueuedCancel(queuedId);
+            return;
+          }
           const current =
             useAgentChatStore.getState().threads[tid]?.inputDraft ?? "";
           setInputDraft(
@@ -2629,6 +2657,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             current.trim().length > 0 ? `${text}\n${current}` : text,
           );
         } catch (err) {
+          endLocalQueuedCancel(queuedId);
           toast.error(`Failed to cancel queued message: ${err}`);
         }
       })();
