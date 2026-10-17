@@ -270,4 +270,35 @@ describe("code fence highlight cost", () => {
     a.rerender(tree("const a = 1;\nconst b = 2;\nconst c = 3;", highlighter));
     expect(highlighter.highlight).toHaveBeenCalledTimes(3);
   });
+
+  it("holds open-fence requests while a pass is still in flight", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    fence.incomplete = true;
+    const pending: Array<(result: HighlightResult) => void> = [];
+    const highlighter = plugin();
+    vi.mocked(highlighter.highlight).mockImplementation((_options, callback) => {
+      if (callback) pending.push(callback);
+      return null;
+    });
+    // A cold highlighter load: appends arrive before the first pass lands.
+    const a = mount("const a = 1;", highlighter);
+    a.rerender(tree("const a = 1;\nconst b = 2;", highlighter));
+    a.rerender(tree("const a = 1;\nconst b = 2;\nconst c = 3;", highlighter));
+    act(() => vi.advanceTimersByTime(STREAMING_HIGHLIGHT_INTERVAL_MS * 4));
+    expect(highlighter.highlight).toHaveBeenCalledOnce();
+
+    act(() => pending[0](tokens("const a = 1;")));
+    expect(highlighter.highlight).toHaveBeenCalledOnce();
+    // The next pass waits out the last one's cost, which here includes the load.
+    act(() => vi.advanceTimersByTime(STREAMING_HIGHLIGHT_INTERVAL_MS * 4));
+    expect(highlighter.highlight).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(highlighter.highlight).mock.lastCall?.[0].code).toBe(
+      "const a = 1;\nconst b = 2;\nconst c = 3;",
+    );
+
+    // Closing the fence highlights at once, even with a pass in flight.
+    fence.incomplete = false;
+    a.rerender(tree("const a = 1;\nconst b = 2;\nconst c = 3;", highlighter));
+    expect(highlighter.highlight).toHaveBeenCalledTimes(3);
+  });
 });

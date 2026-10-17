@@ -270,8 +270,14 @@ function useHighlightedCode(
   const [highlighted, setHighlighted] = useState<HighlightedEntry | null>(
     () => cached ?? null,
   );
-  // When this block's last highlight pass finished and how long it took.
-  const lastPass = useRef({ endedAt: -Infinity, ms: 0 });
+  // This block's last finished highlight pass, whether one is still in
+  // flight, and the latest open-fence request deferred until it lands.
+  const pass = useRef<{
+    endedAt: number;
+    ms: number;
+    pending: boolean;
+    onIdle: (() => void) | null;
+  }>({ endedAt: -Infinity, ms: 0, pending: false, onIdle: null });
 
   useEffect(() => {
     if (cached) {
@@ -281,9 +287,15 @@ function useHighlightedCode(
     if (!highlightable) return;
     let active = true;
     let startedAt = 0;
+    let timer: number | null = null;
     const accept = (result: HighlightResult) => {
-      const endedAt = performance.now();
-      lastPass.current = { endedAt, ms: endedAt - startedAt };
+      const state = pass.current;
+      state.endedAt = performance.now();
+      state.ms = state.endedAt - startedAt;
+      state.pending = false;
+      const idle = state.onIdle;
+      state.onIdle = null;
+      idle?.();
       if (!active) return;
       const entry: HighlightedEntry = {
         cacheKey,
@@ -297,7 +309,9 @@ function useHighlightedCode(
       setHighlighted(entry);
     };
     const request = () => {
+      timer = null;
       startedAt = performance.now();
+      pass.current.pending = true;
       const result = highlighter.highlight(
         {
           code,
@@ -308,18 +322,25 @@ function useHighlightedCode(
       );
       if (result) accept(result);
     };
-    // Every pass re-tokenizes the whole fence synchronously, so an open fence
-    // is re-highlighted at most once per interval (or per the last pass's own
+    // Every pass re-tokenizes the whole fence synchronously, and a pass the
+    // plugin has queued (say, behind a cold highlighter load) cannot be
+    // cancelled. So an open fence waits for any pass in flight, then is
+    // re-highlighted at most once per interval (or per the last pass's own
     // cost, if longer); the tail in between shows uncolored.
-    const { endedAt, ms } = lastPass.current;
-    const wait = streaming
-      ? endedAt + Math.max(STREAMING_HIGHLIGHT_INTERVAL_MS, ms) - performance.now()
-      : 0;
-    const timer = wait > 0 ? window.setTimeout(request, wait) : null;
-    if (timer === null) request();
+    const schedule = () => {
+      const { endedAt, ms } = pass.current;
+      const wait = streaming
+        ? endedAt + Math.max(STREAMING_HIGHLIGHT_INTERVAL_MS, ms) - performance.now()
+        : 0;
+      if (wait > 0) timer = window.setTimeout(request, wait);
+      else request();
+    };
+    if (streaming && pass.current.pending) pass.current.onIdle = schedule;
+    else schedule();
     return () => {
       active = false;
       if (timer !== null) window.clearTimeout(timer);
+      if (pass.current.onIdle === schedule) pass.current.onIdle = null;
     };
   }, [
     cached,
