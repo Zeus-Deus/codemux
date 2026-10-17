@@ -5,11 +5,9 @@ pub mod managed;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_core::Stream;
 use tokio::sync::{broadcast, RwLock};
 
 use crate::agent_provider::{
@@ -418,17 +416,7 @@ impl AgentProvider for CursorAgentProvider {
     }
 
     fn event_stream(&self) -> ProviderEventStream {
-        let receiver = self.event_tx.subscribe();
-        let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
-            loop {
-                match receiver.recv().await {
-                    Ok(event) => return Some((event, receiver)),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                }
-            }
-        });
-        Box::pin(stream) as Pin<Box<dyn Stream<Item = ProviderRuntimeEvent> + Send + 'static>>
+        super::provider::broadcast_event_stream(&self.event_tx, self.kind())
     }
 
     fn managed_event_stream(&self, thread_id: &ThreadId) -> ProviderEventStream {

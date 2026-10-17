@@ -661,6 +661,12 @@ export interface AgentChatEventPayload {
   persisted_id?: number | null;
 }
 
+/** Low-frequency thread-less warnings; transcript traffic uses Channels. */
+export const onAgentChatGlobalEvent = (
+  cb: EventCallback<AgentChatEventPayload>,
+): Promise<UnlistenFn> =>
+  listen<AgentChatEventPayload>("agent_chat_event", (e) => cb(e.payload));
+
 export interface AgentChatTurnCheckpointPayload {
   thread_id: string;
   checkpoint: import("./commands").AgentChatTurnCheckpointRecord;

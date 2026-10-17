@@ -5567,9 +5567,9 @@ pub async fn agent_chat_stop_session_guarded<R: Runtime>(
 /// Also drops each thread's [`SubagentTracker`] entry, mirroring
 /// `agent_chat_close_pane`. Relying on the session's `Closed` event to do
 /// it is not enough on this path: `stop_session` can answer
-/// `SessionNotFound` (nothing to emit), and the broadcast bridge swallows
-/// `Lagged`, so the terminal event can simply never arrive. A surviving
-/// entry with `turn_settled` still set would keep answering
+/// `SessionNotFound` (nothing to emit), and the broadcast bridge drops
+/// events on `Lagged`, so the terminal event can simply never arrive. A
+/// surviving entry with `turn_settled` still set would keep answering
 /// [`SubagentTracker::delegated_work_holding_turn`] — which
 /// `agent_chat_turn_active` reads — so a reopened thread would hydrate as
 /// a phantom live run until the stall watchdog tombstoned it.
@@ -6765,9 +6765,11 @@ fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> String {
 /// thread-scoped events go to the thread's attached `Channel` (see
 /// [`AgentChatChannelRegistry`]), thread-less ones to the
 /// [`AGENT_CHAT_EVENT`] event bus. When a provider's stream ends (on
-/// shutdown) the task exits cleanly; the `event_stream()` helper on
-/// each provider already swallows `broadcast::error::RecvError::Lagged`
-/// and continues, so slow subscribers never crash this loop.
+/// shutdown) the task exits cleanly. If this loop falls behind a
+/// provider's bounded broadcast channel, `event_stream()` yields a
+/// thread-less `provider_event_lag` `RuntimeWarning` in place of the
+/// dropped events and continues. The global warning tells the user that
+/// conversation history may be incomplete.
 ///
 /// Intended to be called once after the registry has been fully
 /// populated at startup. Idempotency is not required — call sites
@@ -7169,7 +7171,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     // notices, and runtime warnings are skipped:
     //   - content_delta: replaced by the trailing item_completed
     //   - session_state_changed / session_configured: lifecycle only
-    //   - runtime_warning: console-only by design
+    //   - runtime_warning: transient diagnostics (except the Hermes restriction)
     //   - resume_cursor_updated: already persisted above
     if should_persist_event(&event) {
         if let Some(thread_id) = thread_id_for_event(&event) {
@@ -7179,7 +7181,28 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                     match db.append_agent_chat_message(&thread_id.0, &payload) {
                         Ok(row_id) => persisted_id = row_id,
                         Err(error) => {
-                            eprintln!("[codemux::agent_chat] failed to persist message: {error}")
+                            eprintln!("[codemux::agent_chat] failed to persist message: {error}");
+                            // The live pane still renders this event, so the
+                            // user must learn it will be gone after a restart.
+                            // Report directly on the transient warning bus;
+                            // reporting a failed write must not require
+                            // another transcript write.
+                            let warning = AgentChatEventPayload {
+                                thread_id: ThreadId(String::new()),
+                                event: ProviderRuntimeEvent::RuntimeWarning {
+                                    thread_id: None,
+                                    message: format!(
+                                        "Conversation history could not be saved and may be incomplete after a restart: {error}"
+                                    ),
+                                    original_payload: Some(serde_json::json!({
+                                        "code": "transcript_write_failed",
+                                        "thread_id": thread_id.0,
+                                        "error": error,
+                                    })),
+                                },
+                                persisted_id: None,
+                            };
+                            let _ = app.emit(AGENT_CHAT_EVENT, warning);
                         }
                     }
                 }
@@ -11951,8 +11974,8 @@ mod tests {
 
     // Pane/tab/workspace teardown must drop the hold, not leave it to the
     // session's `Closed` event: `stop_session` can answer `SessionNotFound`
-    // (nothing to emit) and the broadcast bridge swallows `Lagged`, so that
-    // event can simply never arrive. `shutdown_agent_chat_threads` and
+    // (nothing to emit) and the broadcast bridge drops events on `Lagged`,
+    // so that event can simply never arrive. `shutdown_agent_chat_threads` and
     // `agent_chat_close_pane` both route here.
     #[test]
     fn clearing_a_thread_releases_the_delegated_work_hold() {
