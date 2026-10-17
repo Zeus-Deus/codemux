@@ -2686,6 +2686,13 @@ pub fn close_tab<R: tauri::Runtime>(
 ) -> Result<(), String> {
     let result = state.close_tab(&workspace_id, &tab_id)?;
 
+    // Straight after the removal: a worktree deletion that no longer sees
+    // these chats in the workspace finds their stops in flight instead.
+    crate::commands::agent_chat::shutdown_agent_chat_threads(
+        &app,
+        result.removed_agent_chat_threads,
+    );
+
     // Kill the PTY child + process group for every terminal session that
     // was attached to this tab. `state.close_tab` already removed them from
     // the store, so we go straight to the PTY helper.
@@ -2698,11 +2705,6 @@ pub fn close_tab<R: tauri::Runtime>(
         // Tab close is cleanup, not explicit dismissal — agent can reopen the pane.
         state.detach_agent_browser_from_pane(&browser_id.0, false);
     }
-
-    crate::commands::agent_chat::shutdown_agent_chat_threads(
-        &app,
-        result.removed_agent_chat_threads,
-    );
 
     crate::state::emit_app_state(&app);
     Ok(())

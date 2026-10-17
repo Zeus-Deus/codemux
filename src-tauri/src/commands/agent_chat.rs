@@ -5634,16 +5634,25 @@ fn pending_stops() -> &'static Mutex<HashMap<String, PendingStop>> {
     PENDING.get_or_init(Default::default)
 }
 
-/// Wait for in-flight stops of sessions in `workspace_id`, or whose workspace
-/// is unknown. Errs when any of them failed.
-async fn wait_for_pending_stops(workspace_id: &str) -> Result<(), String> {
-    let stops: Vec<_> = pending_stops()
+/// In-flight stops of sessions in `workspace_id`, or whose workspace is
+/// unknown. Taken before any await: a stop that finishes later leaves the
+/// registry, and its result must still reach the caller.
+fn pending_stops_for(
+    workspace_id: &str,
+) -> Vec<tokio::sync::watch::Receiver<Option<Result<(), String>>>> {
+    pending_stops()
         .lock()
         .unwrap()
         .values()
         .filter(|stop| stop.workspace_id.as_deref().is_none_or(|id| id == workspace_id))
         .map(|stop| stop.result.clone())
-        .collect();
+        .collect()
+}
+
+/// Wait for `stops` to finish. Errs when any of them failed.
+async fn wait_for_stops(
+    stops: Vec<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
+) -> Result<(), String> {
     let mut first_error = None;
     for mut result in stops {
         let outcome = match result.wait_for(Option::is_some).await {
@@ -5667,10 +5676,10 @@ pub async fn shutdown_agent_chat_threads_and_wait<R: Runtime>(
     workspace_id: &str,
     threads: Vec<(ProviderKind, String)>,
 ) -> Result<(), String> {
+    let earlier = pending_stops_for(workspace_id);
     let threads = begin_agent_chat_thread_shutdown(app, threads);
     let stopped = stop_agent_chat_threads(app, threads).await;
-    let earlier = wait_for_pending_stops(workspace_id).await;
-    stopped.and(earlier)
+    stopped.and(wait_for_stops(earlier).await)
 }
 
 fn begin_agent_chat_thread_shutdown<R: Runtime>(
@@ -10805,6 +10814,40 @@ mod tests {
         assert!(waited, "workspace deletion completed before the closed chat's agent stopped");
         assert!(retained_while_stopping, "worktree must exist while the agent is stopping");
         assert!(!worktree.exists(), "worktree should be removed after shutdown");
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_keeps_failures_of_stops_finishing_while_waiting() {
+        if worktree_close_fixture_child("worktree_deletion_keeps_failures_of_stops_finishing_while_waiting") {
+            return;
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(PlacementProvider {
+            stop_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let (app, workspace) = placement_app("live-chat", None, provider.clone()).await;
+        app.manage(SubagentTracker::default());
+        // A chat closed earlier whose background stop is still running.
+        let (done, result) = tokio::sync::watch::channel(None);
+        pending_stops().lock().unwrap().insert(
+            "closed-chat".into(),
+            PendingStop { workspace_id: Some(workspace.clone()), result },
+        );
+        let handle = app.handle().clone();
+        let wait = tokio::spawn(async move {
+            shutdown_agent_chat_threads_and_wait(
+                &handle, &workspace, vec![(ProviderKind::Codex, "live-chat".into())],
+            ).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), provider.stop_started.notified()).await.unwrap();
+        // The earlier stop fails and leaves the registry while the live chat
+        // is still stopping.
+        done.send_replace(Some(Err("closed chat did not stop".into())));
+        pending_stops().lock().unwrap().remove("closed-chat");
+        release.notify_one();
+        let error = wait.await.unwrap().expect_err("an earlier failed stop must block deletion");
+        assert!(error.contains("closed chat did not stop"), "unexpected error: {error}");
     }
 
     #[tokio::test]
