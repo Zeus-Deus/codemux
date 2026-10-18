@@ -465,11 +465,34 @@ pub struct AcceptedDelivery {
     pub missing: Vec<String>,
 }
 
+/// A pattern matching `token` with each character written literally (any
+/// case), percent-encoded (also repeatedly, `%2561`), or as a JSON `\u00XX`
+/// escape, so no common encoding of the token survives redaction.
+fn token_pattern(token: &str) -> Regex {
+    let mut pattern = String::from("(?i)");
+    for ch in token.chars() {
+        let mut alternatives = vec![regex::escape(&ch.to_string())];
+        if ch.is_ascii() {
+            let mut codes = vec![format!("{:02x}", ch as u8)];
+            if ch.is_ascii_alphabetic() {
+                codes.push(format!("{:02x}", ch.to_ascii_uppercase() as u8));
+                codes.push(format!("{:02x}", ch.to_ascii_lowercase() as u8));
+            }
+            codes.dedup();
+            let codes = codes.join("|");
+            alternatives.push(format!("%(?:25)*(?:{codes})"));
+            alternatives.push(format!(r"\\u00(?:{codes})"));
+        }
+        pattern.push_str(&format!("(?:{})", alternatives.join("|")));
+    }
+    Regex::new(&pattern).expect("token pattern compiles")
+}
+
 /// Validate one webhook request and record its run.
 ///
 /// Checks, in order: body size, the URL token, that the automation is
 /// enabled, and the signature (when configured). Then it renders the
-/// prompt, with the URL token redacted from the path and query, and records a `scheduled` run, or a `skipped_busy` one when a
+/// prompt, with every copy of the URL token redacted, and records a `scheduled` run, or a `skipped_busy` one when a
 /// run is already in flight. The caller executes the returned run.
 pub fn accept_delivery(
     db: &DatabaseStore,
@@ -506,29 +529,13 @@ pub fn accept_delivery(
         _ => return Err(DeliveryRejection::SignatureUnavailable),
     }
 
-    // The URL token must never reach the agent. It can arrive in the path,
-    // the query, a proxy header such as `x-original-uri`, or the body (a
-    // GitHub `ping` carries the hook URL), literally or percent-encoded.
-    let token_pattern = Regex::new(&format!("(?i){}", regex::escape(expected)))
-        .map_err(|e| DeliveryRejection::Storage(e.to_string()))?;
-    let scrub = |text: &str| -> String {
-        let replaced = token_pattern.replace_all(text, REDACTED).into_owned();
-        let decoded = urlencoding::decode(&replaced).map(|d| d.into_owned());
-        match decoded {
-            Ok(decoded) if token_pattern.is_match(&decoded) => REDACTED.to_string(),
-            _ => replaced,
-        }
-    };
-    let mut visible = request.clone();
-    visible.path = scrub(&visible.path);
-    visible.query = scrub(&visible.query);
-    for value in visible.headers.values_mut() {
-        *value = scrub(value);
-    }
-    let mut rendered = render_prompt(&automation.prompt, &visible, MAX_RENDERED_PROMPT_BYTES)
+    // The URL token must never reach the agent. It can arrive anywhere the
+    // prompt reads from: the path, the query, a proxy header such as
+    // `x-original-uri`, or the body (a GitHub `ping` carries the hook URL).
+    // Scrubbing the finished prompt covers every source at once.
+    let mut rendered = render_prompt(&automation.prompt, request, MAX_RENDERED_PROMPT_BYTES)
         .ok_or(DeliveryRejection::PromptTooLarge)?;
-    // Catches decoded query and form values and literal copies in the body.
-    rendered.prompt = token_pattern
+    rendered.prompt = token_pattern(expected)
         .replace_all(&rendered.prompt, REDACTED)
         .into_owned();
     if rendered.prompt.trim().is_empty() {
@@ -977,6 +984,32 @@ mod tests {
         assert!(!prompt.to_lowercase().contains(&token), "{prompt}");
         assert!(!prompt.contains(&encoded), "{prompt}");
         assert!(prompt.starts_with(&format!("POST /hooks/automations/{id}/[redacted]?")));
+    }
+
+    #[test]
+    fn encoded_tokens_in_the_body_and_odd_bytes_are_redacted_too() {
+        let db = crate::database::init_test_database();
+        let a = webhook_automation(&db, "{{request}}|{{body.u}}|{{body.j}}");
+        let (id, token) = (a.webhook_id.clone().unwrap(), a.webhook_token.clone().unwrap());
+        let percent: String = token.bytes().map(|b| format!("%{b:02x}")).collect();
+        let double: String = token.bytes().map(|b| format!("%25{b:02X}")).collect();
+        let json_escaped: String = token.bytes().map(|b| format!("\\u00{b:02x}")).collect();
+        let body = format!(r#"{{"u":"{percent}","j":"{json_escaped}","d":"{double}"}}"#);
+        // `%FF` is not valid UTF-8 once decoded; redaction must not give up.
+        let query = format!("x=%FF&url={percent}");
+        let req = WebhookRequest::new(
+            "POST",
+            "/",
+            &query,
+            [("Content-Type", "application/json")],
+            body.into_bytes(),
+        );
+
+        let prompt = accept_delivery(&db, &id, &token, &req, at(0)).unwrap().automation.prompt;
+        for leaked in [&token, &percent, &double, &json_escaped] {
+            assert!(!prompt.contains(leaked.as_str()), "{leaked} in {prompt}");
+        }
+        assert!(prompt.contains("x=%FF&url=[redacted]"), "{prompt}");
     }
 
     #[test]
