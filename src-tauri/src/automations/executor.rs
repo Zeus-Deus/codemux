@@ -9,6 +9,9 @@
 //! 3. records the terminal `succeeded` / `failed` status (and the
 //!    workspace path) back on the run row.
 //!
+//! A webhook delivery takes the same path through `dispatch_webhook`,
+//! with the prompt already rendered from the request.
+//!
 //! The pure pieces — `agent_command`, `automation_branch` — are unit
 //! tested; `prepare_worktree` is covered against a real temp repo.
 
@@ -360,6 +363,33 @@ pub async fn execute_run<RT: tauri::Runtime>(
     with_db(&handle, |db| apply_outcome(db, run.id, &outcome));
 }
 
+/// Webhook entry point for the HTTP route: validate the request with
+/// `webhook::accept_delivery`, then announce and execute the run in the
+/// background, like a scheduled fire. Returns once the run is recorded, so
+/// the route can answer the sender without waiting for the agent.
+pub fn dispatch_webhook<RT: tauri::Runtime>(
+    handle: &AppHandle<RT>,
+    webhook_id: &str,
+    token: &str,
+    request: &super::webhook::WebhookRequest,
+) -> Result<AutomationRunRecord, super::webhook::DeliveryRejection> {
+    use tauri::Emitter;
+
+    let accepted = with_db(handle, |db| {
+        super::webhook::accept_delivery(db, webhook_id, token, request, Utc::now())
+    })?;
+    if let Err(error) = handle.emit("automations://fire", &accepted.run) {
+        eprintln!("[codemux::automations] failed to emit fire event: {error}");
+    }
+    let run = accepted.run.clone();
+    tauri::async_runtime::spawn(execute_run(
+        handle.clone(),
+        accepted.automation,
+        accepted.run,
+    ));
+    Ok(run)
+}
+
 /// Fallible body of `execute_run`. On success returns the worktree path
 /// and any PR URL detected; on failure returns the worktree path (when
 /// one was created) alongside the error, so the run row can still point
@@ -555,6 +585,11 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
             dirty: false,
+            trigger_type: Default::default(),
+            webhook_id: None,
+            webhook_token: None,
+            webhook_signature: None,
+            webhook_secret_ref: None,
         }
     }
 

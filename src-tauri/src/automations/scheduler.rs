@@ -8,6 +8,7 @@
 //! logic pure makes it unit-testable without a host or a clock.
 
 use crate::automations::recurrence;
+use crate::database::automation_triggers::AutomationTrigger;
 use crate::database::{AutomationRecord, AutomationRunRecord, DatabaseStore};
 use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 
@@ -28,11 +29,13 @@ pub fn fire_key(at: DateTime<Utc>) -> String {
         .to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-/// Whether an automation is due to fire at `now`: it must be enabled and
-/// carry a `next_run_at` that has arrived. A paused automation, or one
-/// whose recurrence is exhausted (no `next_run_at`), is never due.
+/// Whether an automation is due to fire at `now`: it must be a scheduled,
+/// enabled automation carrying a `next_run_at` that has arrived. A paused
+/// automation, one whose recurrence is exhausted (no `next_run_at`), or a
+/// webhook automation (fired by `webhook::accept_delivery` instead) is
+/// never due.
 pub fn is_due(automation: &AutomationRecord, now: DateTime<Utc>) -> bool {
-    if !automation.enabled {
+    if !automation.enabled || automation.trigger_type != AutomationTrigger::Schedule {
         return false;
     }
     match automation.next_run_at.as_deref().and_then(parse_utc) {
@@ -185,6 +188,11 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
             dirty: false,
+            trigger_type: Default::default(),
+            webhook_id: None,
+            webhook_token: None,
+            webhook_signature: None,
+            webhook_secret_ref: None,
         }
     }
 
@@ -233,6 +241,16 @@ mod tests {
     }
 
     #[test]
+    fn webhook_automation_is_never_due() {
+        // Even with a stale `next_run_at` left over, the scheduler must not
+        // fire an automation that only webhooks start.
+        let now = Utc.with_ymd_and_hms(2026, 1, 2, 9, 0, 0).unwrap();
+        let mut a = automation(true, Some("2026-01-02T09:00:00+00:00"));
+        a.trigger_type = AutomationTrigger::Webhook;
+        assert!(!is_due(&a, now));
+    }
+
+    #[test]
     fn not_due_when_next_run_is_malformed() {
         // A garbage timestamp must not panic the loop — it is simply
         // never due until the value is corrected.
@@ -257,6 +275,7 @@ mod tests {
                 project_path: None,
                 project_remote: None,
                 retention_limit: 10,
+                trigger_type: None,
             })
             .unwrap();
         db.set_automation_next_run(a.id, next_run).unwrap();
@@ -325,6 +344,7 @@ mod tests {
                 project_path: None,
                 project_remote: None,
                 retention_limit: 10,
+                trigger_type: None,
             })
             .unwrap();
         db.set_automation_next_run(a.id, Some("2026-01-02T09:00:00+00:00"))
@@ -386,6 +406,7 @@ mod tests {
                 project_path: None,
                 project_remote: None,
                 retention_limit: 10,
+                trigger_type: None,
             })
             .unwrap();
         db.set_automation_next_run(a.id, Some("2026-01-02T09:00:00+00:00"))

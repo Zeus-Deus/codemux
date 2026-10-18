@@ -1,4 +1,5 @@
 pub mod async_questions;
+pub mod automation_triggers;
 pub mod agent_control;
 pub mod mcp_connector;
 pub mod delegated_tasks;
@@ -1167,6 +1168,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     delegated_tasks::create_schema(conn)?;
     follow_ups::create_schema(conn)?;
     pr_watch::create_schema(conn)?;
+    automation_triggers::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new
@@ -2494,6 +2496,17 @@ pub struct AutomationRecord {
     pub updated_at: String,
     pub deleted_at: Option<String>,
     pub dirty: bool,
+    pub trigger_type: automation_triggers::AutomationTrigger,
+    /// Public id in a webhook automation's URL. `None` for scheduled ones.
+    pub webhook_id: Option<String>,
+    /// Secret token in a webhook automation's URL. Never serialized, so a
+    /// record that reaches a log or the wire cannot leak it.
+    #[serde(skip_serializing, default)]
+    pub webhook_token: Option<String>,
+    /// Optional HMAC check on incoming requests.
+    pub webhook_signature: Option<automation_triggers::WebhookSignature>,
+    /// `secrets.id` of the signing secret, set whenever a signature is.
+    pub webhook_secret_ref: Option<String>,
 }
 
 /// One fire of an automation (or a skipped fire).
@@ -2515,6 +2528,8 @@ pub struct AutomationRunRecord {
     pub pr_url: Option<String>,
     pub error: Option<String>,
     pub created_at: String,
+    /// What started the run: `schedule` or `webhook`.
+    pub trigger_type: automation_triggers::AutomationTrigger,
 }
 
 /// Editable fields of an automation, shared by create and update.
@@ -2532,25 +2547,39 @@ pub struct AutomationInput {
     #[serde(default)]
     pub project_remote: Option<String>,
     pub retention_limit: i64,
+    /// Fixed at creation. `None` on create means a scheduled automation;
+    /// on update it keeps the existing trigger.
+    #[serde(default)]
+    pub trigger_type: Option<automation_triggers::AutomationTrigger>,
 }
 
 const AUTOMATION_COLUMNS: &str = "id, server_id, name, prompt, agent, schedule, \
      timezone, host_id, project_path, project_remote, enabled, retention_limit, \
-     last_run_at, next_run_at, created_at, updated_at, deleted_at, dirty";
+     last_run_at, next_run_at, created_at, updated_at, deleted_at, dirty, \
+     trigger_type, webhook_id, webhook_token, webhook_signature, webhook_secret_ref";
 
 const AUTOMATION_RUN_COLUMNS: &str = "id, automation_id, status, scheduled_for, \
      started_at, finished_at, host_id, workspace_id, branch, pr_url, error, \
-     created_at";
+     created_at, trigger_type";
 
 impl DatabaseStore {
     /// Insert a new automation. Marked `dirty` so a future sync pushes it.
     pub fn insert_automation(&self, input: &AutomationInput) -> Result<AutomationRecord, String> {
+        let trigger = input.trigger_type.unwrap_or_default();
+        let (webhook_id, webhook_token) = match trigger {
+            automation_triggers::AutomationTrigger::Webhook => {
+                let (id, token) = automation_triggers::new_webhook_credentials();
+                (Some(id), Some(token))
+            }
+            automation_triggers::AutomationTrigger::Schedule => (None, None),
+        };
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO automations
                 (user_id, name, prompt, agent, schedule, timezone,
-                 host_id, project_path, project_remote, retention_limit, dirty)
-             VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+                 host_id, project_path, project_remote, retention_limit, dirty,
+                 trigger_type, webhook_id, webhook_token)
+             VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12)",
             params![
                 input.name,
                 input.prompt,
@@ -2561,6 +2590,9 @@ impl DatabaseStore {
                 input.project_path,
                 input.project_remote,
                 input.retention_limit,
+                trigger.as_str(),
+                webhook_id,
+                webhook_token,
             ],
         )
         .map_err(|e| format!("Failed to insert automation: {e}"))?;
@@ -3029,6 +3061,11 @@ fn row_to_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationReco
         updated_at: row.get(15)?,
         deleted_at: row.get(16)?,
         dirty: dirty_int != 0,
+        trigger_type: automation_triggers::AutomationTrigger::from_db(&row.get::<_, String>(18)?),
+        webhook_id: row.get(19)?,
+        webhook_token: row.get(20)?,
+        webhook_signature: automation_triggers::signature_from_db(row.get(21)?),
+        webhook_secret_ref: row.get(22)?,
     })
 }
 
@@ -3046,6 +3083,7 @@ fn row_to_automation_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Automation
         pr_url: row.get(9)?,
         error: row.get(10)?,
         created_at: row.get(11)?,
+        trigger_type: automation_triggers::AutomationTrigger::from_db(&row.get::<_, String>(12)?),
     })
 }
 
@@ -9460,6 +9498,7 @@ mod tests {
             project_path: Some("/home/user/repo".to_string()),
             project_remote: None,
             retention_limit: 10,
+            trigger_type: None,
         }
     }
 

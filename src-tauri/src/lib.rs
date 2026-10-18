@@ -74,6 +74,7 @@ pub mod ssh;
 pub mod resource_metrics;
 pub mod scripts;
 pub mod scrollback;
+pub mod secrets;
 pub mod skills;
 pub mod skills_sync;
 pub mod session_adapters;
@@ -3127,6 +3128,13 @@ fn build_core_app<R: tauri::Runtime>(
             commands::pr_watch::pr_watch_start,
             commands::pr_watch::pr_watch_stop,
             commands::pr_watch::pr_watch_status,
+            // Webhook-triggered automations and the private secret store.
+            commands::automations_webhook_credentials,
+            commands::automations_rotate_webhook_token,
+            commands::automations_set_webhook_signature,
+            commands::secrets_store,
+            commands::secrets_list,
+            commands::secrets_delete,
         ])
 }
 
