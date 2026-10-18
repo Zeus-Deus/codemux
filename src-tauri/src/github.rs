@@ -2976,6 +2976,18 @@ pub fn get_check_log_excerpt(
     Ok(tail_check_log(&log, check_name))
 }
 
+/// Tail of one GitHub Actions job's failed-step log, addressed by job id.
+///
+/// A check's name is its job's name, not its workflow's, so resolving the run
+/// from the name (as [`get_check_log_excerpt`] does) misses ordinary
+/// `CI` / `test` pairs. Callers that have the job id from a check's details
+/// URL use this instead.
+pub fn get_job_log_excerpt(repo_path: &Path, job_id: u64) -> Result<String, String> {
+    let job = job_id.to_string();
+    let log = run_gh(repo_path, &["run", "view", "--job", &job, "--log-failed"])?;
+    Ok(tail_check_log(&log, ""))
+}
+
 /// Pick the failing run whose workflow name goes with `check_name`.
 ///
 /// Rows arrive newest first as `databaseId\tname`. The names are related

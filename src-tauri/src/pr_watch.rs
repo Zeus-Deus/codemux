@@ -12,10 +12,10 @@
 //! without `gh`. Events are marked told in the same transaction that spends
 //! the attempt, before the turn is sent: a crash can lose one wake but never
 //! repeat one.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -25,9 +25,8 @@ use crate::agent_provider::{ProviderKind, ThreadId};
 use crate::commands::agent_chat::{send_turn_with_origin, SendTurnCommandInput, TurnOrigin};
 use crate::database::pr_watch::{PrWatchRecord, PR_WATCH_ENDED, PR_WATCH_EXHAUSTED};
 use crate::database::DatabaseStore;
-use crate::github::CheckInfo;
 
-/// Checks take minutes, and each pass costs two GitHub reads per watch.
+/// Checks take minutes, and each pass costs one GitHub read per watch.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(120);
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 pub const MAX_ATTEMPTS_LIMIT: u32 = 10;
@@ -43,6 +42,7 @@ const MAX_LISTED: usize = 10;
 const MAX_EXCERPT_CHARS: usize = 4_000;
 const MAX_REMARK_CHARS: usize = 2_000;
 const GH_TIMEOUT: Duration = Duration::from_secs(20);
+const VIEWER_TTL: Duration = Duration::from_secs(30 * 60);
 pub const PR_WATCH_CHANGED_EVENT: &str = "pr-watch-changed";
 
 static KICK: OnceLock<tokio::sync::Notify> = OnceLock::new();
@@ -95,6 +95,55 @@ pub(crate) enum RemarkKind {
     Inline { path: String, line: Option<u32> },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckState {
+    Pending,
+    Success,
+    Failure,
+    Cancelled,
+    /// Neutral, skipped or stale: finished, and asks nothing of anyone.
+    Neutral,
+}
+
+/// One check on the head commit, from `statusCheckRollup`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrCheck {
+    pub name: String,
+    pub workflow: String,
+    pub state: CheckState,
+    pub url: Option<String>,
+    pub started_at: String,
+}
+
+impl PrCheck {
+    fn label(&self) -> String {
+        if self.workflow.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{} / {}", self.workflow, self.name)
+        }
+    }
+
+    /// One check *run*. The start time separates two runs of an integration
+    /// that reuses its details URL; Actions reruns also get a new job URL.
+    fn key(&self, head_sha: &str) -> String {
+        format!(
+            "check:{head_sha}:{}:{}:{}",
+            self.label(),
+            self.url.as_deref().unwrap_or(""),
+            self.started_at
+        )
+    }
+
+    /// The Actions job behind this check, when it is one.
+    fn actions_job_id(&self) -> Option<u64> {
+        let url = self.url.as_deref()?;
+        let (_, rest) = url.split_once("/actions/runs/")?;
+        let (_, job) = rest.split_once("/job/")?;
+        job.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PrView {
     pub state: String,
@@ -107,23 +156,53 @@ pub(crate) struct PrView {
     /// container inline comments arrive in, so an unseen key is the cue to
     /// read them; a review without a body is not a remark on its own.
     pub review_keys: Vec<String>,
+    /// Read in the same query as `head_sha`, so they always belong to it.
+    pub checks: Vec<PrCheck>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct PrSnapshot {
-    pub view: PrView,
-    /// `None` when the checks could not be read this pass.
-    pub checks: Option<Vec<CheckInfo>>,
+fn is_own(author: &str, viewer: &str) -> bool {
+    author.eq_ignore_ascii_case(viewer)
 }
 
-fn is_own(author: &str, viewer: Option<&str>) -> bool {
-    viewer.is_some_and(|viewer| author.eq_ignore_ascii_case(viewer))
+fn parse_check(value: &serde_json::Value) -> Option<PrCheck> {
+    let text = |key: &str| value[key].as_str().unwrap_or("").to_string();
+    let (name, url, started_at, state) = if value["__typename"] == "StatusContext" {
+        let state = match value["state"].as_str()? {
+            "SUCCESS" => CheckState::Success,
+            "FAILURE" | "ERROR" => CheckState::Failure,
+            _ => CheckState::Pending,
+        };
+        let started = value["startedAt"].as_str().or(value["createdAt"].as_str()).unwrap_or("");
+        (text("context"), value["targetUrl"].as_str(), started.to_string(), state)
+    } else {
+        let state = if value["status"].as_str() != Some("COMPLETED") {
+            CheckState::Pending
+        } else {
+            match value["conclusion"].as_str().unwrap_or("") {
+                "SUCCESS" => CheckState::Success,
+                "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED" => CheckState::Failure,
+                "CANCELLED" => CheckState::Cancelled,
+                _ => CheckState::Neutral,
+            }
+        };
+        (text("name"), value["detailsUrl"].as_str(), text("startedAt"), state)
+    };
+    if name.is_empty() {
+        return None;
+    }
+    Some(PrCheck {
+        name,
+        workflow: text("workflowName"),
+        state,
+        url: url.filter(|u| !u.is_empty()).map(str::to_string),
+        started_at,
+    })
 }
 
-/// Parse `gh pr view --json state,url,headRefOid,baseRefName,mergeable,comments,reviews`.
-/// Anything the viewer wrote is dropped here: the user's own account is the
+/// Parse `gh pr view --json state,url,headRefOid,baseRefName,mergeable,comments,reviews,statusCheckRollup`.
+/// Anything `viewer` wrote is dropped here: the user's own account is the
 /// one their agent comments as, and its replies must never wake it.
-pub(crate) fn parse_pr_view(json: &str, viewer: Option<&str>) -> Result<PrView, String> {
+pub(crate) fn parse_pr_view(json: &str, viewer: &str) -> Result<PrView, String> {
     let v: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("Failed to parse pull request JSON: {e}"))?;
     let text = |value: &serde_json::Value| value.as_str().unwrap_or("").to_string();
@@ -164,6 +243,7 @@ pub(crate) fn parse_pr_view(json: &str, viewer: Option<&str>) -> Result<PrView, 
         }
         remarks.push(Remark { key, author, body, url: None, kind: RemarkKind::Review { state } });
     }
+    let checks = v["statusCheckRollup"].as_array().into_iter().flatten().filter_map(parse_check).collect();
     Ok(PrView {
         state: text(&v["state"]),
         url: text(&v["url"]),
@@ -172,12 +252,13 @@ pub(crate) fn parse_pr_view(json: &str, viewer: Option<&str>) -> Result<PrView, 
         mergeable: text(&v["mergeable"]),
         remarks,
         review_keys,
+        checks,
     })
 }
 
 pub(crate) fn inline_remarks(
     comments: Vec<crate::github::InlineReviewComment>,
-    viewer: Option<&str>,
+    viewer: &str,
 ) -> Vec<Remark> {
     comments
         .into_iter()
@@ -192,28 +273,6 @@ pub(crate) fn inline_remarks(
         .collect()
 }
 
-fn check_failed(check: &CheckInfo) -> bool {
-    check.conclusion.as_deref() == Some("fail")
-}
-
-fn check_pending(check: &CheckInfo) -> bool {
-    match check.conclusion.as_deref() {
-        Some("pending") => true,
-        Some(_) => false,
-        None => !check.status.eq_ignore_ascii_case("completed"),
-    }
-}
-
-/// One check *run*: a rerun of the same check gets a new job URL, so it is a
-/// new event, while the same failure seen on the next pass is not.
-fn check_key(head_sha: &str, check: &CheckInfo) -> String {
-    format!(
-        "check:{head_sha}:{}:{}",
-        check.name,
-        check.detail_url.as_deref().unwrap_or("")
-    )
-}
-
 fn conflict_key(head_sha: &str) -> String {
     format!("conflict:{head_sha}")
 }
@@ -222,7 +281,7 @@ fn conflict_key(head_sha: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WakeReport {
-    pub failed: Vec<CheckInfo>,
+    pub failed: Vec<PrCheck>,
     pub remarks: Vec<Remark>,
     pub conflict: bool,
 }
@@ -255,11 +314,10 @@ pub(crate) struct Evaluation {
 
 pub(crate) fn evaluate(
     watch: &PrWatchRecord,
-    snapshot: &PrSnapshot,
+    view: &PrView,
     seen: &HashSet<String>,
     now_ms: i64,
 ) -> Evaluation {
-    let view = &snapshot.view;
     let mut next = watch.clone();
     next.last_checked_at_ms = Some(now_ms);
     next.last_error = None;
@@ -280,29 +338,41 @@ pub(crate) fn evaluate(
         next.failure_pending_since_ms = None;
     }
 
-    // Always safe to record: these carry no news by themselves.
-    let mut quiet_seen: Vec<String> =
-        view.review_keys.iter().filter(|key| !seen.contains(*key)).cloned().collect();
+    // The conversation before the watch began is history, not news.
+    let mut baseline = Vec::new();
     let mut fresh_remarks = Vec::new();
     if watch.baselined {
         fresh_remarks = view.remarks.iter().filter(|r| !seen.contains(&r.key)).cloned().collect();
     } else {
-        // The conversation before the watch began is history, not news.
-        quiet_seen.extend(view.remarks.iter().map(|r| r.key.clone()));
+        baseline.extend(view.remarks.iter().map(|r| r.key.clone()));
+        baseline.extend(view.review_keys.iter().cloned());
         next.baselined = true;
     }
+    // Reviews are recorded only once their news is delivered (or there was
+    // none): an unseen review key is what makes the next pass read its
+    // inline comments again.
+    let reviews: Vec<String> = view
+        .review_keys
+        .iter()
+        .filter(|key| !seen.contains(*key) && !baseline.contains(key))
+        .cloned()
+        .collect();
 
     let mut failed = Vec::new();
-    if let Some(checks) = snapshot.checks.as_ref().filter(|checks| !checks.is_empty()) {
-        let pending = checks.iter().any(check_pending);
-        let failing: Vec<&CheckInfo> = checks.iter().filter(|c| check_failed(c)).collect();
-        if !pending && failing.is_empty() {
-            // Green on this head: the fix worked, so the budget refills.
+    if !view.checks.is_empty() {
+        let pending = view.checks.iter().any(|c| c.state == CheckState::Pending);
+        let green = !pending
+            && view.checks.iter().all(|c| matches!(c.state, CheckState::Success | CheckState::Neutral))
+            && view.checks.iter().any(|c| c.state == CheckState::Success);
+        if green {
+            // The fix worked, so the budget refills. Cancelled runs prove
+            // nothing and leave it alone.
             next.attempts = 0;
         }
-        let untold: Vec<CheckInfo> = failing
-            .into_iter()
-            .filter(|c| !seen.contains(&check_key(head, c)))
+        let untold: Vec<PrCheck> = view
+            .checks
+            .iter()
+            .filter(|c| c.state == CheckState::Failure && !seen.contains(&c.key(head)))
             .cloned()
             .collect();
         if untold.is_empty() {
@@ -321,7 +391,9 @@ pub(crate) fn evaluate(
 
     let report = WakeReport { failed, remarks: fresh_remarks, conflict };
     if report.failed.is_empty() && report.remarks.is_empty() && !report.conflict {
-        return Evaluation { decision: Decision::Quiet, next, mark_seen: quiet_seen };
+        // Nothing new was found inside the unseen reviews either.
+        baseline.extend(reviews);
+        return Evaluation { decision: Decision::Quiet, next, mark_seen: baseline };
     }
     let exhausted = if report.is_fix() {
         next.attempts >= next.max_attempts
@@ -340,15 +412,16 @@ pub(crate) fn evaluate(
         } else {
             format!("Stopped after {COMMENT_WAKE_LIMIT} comment-only updates in a row")
         });
-        return Evaluation { decision: Decision::Exhausted, next, mark_seen: quiet_seen };
+        return Evaluation { decision: Decision::Exhausted, next, mark_seen: baseline };
     }
     if report.is_fix() {
         next.attempts += 1;
     } else {
         next.comment_streak += 1;
     }
-    let mut mark_seen = quiet_seen;
-    mark_seen.extend(report.failed.iter().map(|c| check_key(head, c)));
+    let mut mark_seen = baseline;
+    mark_seen.extend(reviews);
+    mark_seen.extend(report.failed.iter().map(|c| c.key(head)));
     mark_seen.extend(report.remarks.iter().map(|r| r.key.clone()));
     if report.conflict {
         mark_seen.push(conflict_key(head));
@@ -370,7 +443,7 @@ fn summary(report: &WakeReport) -> String {
         parts.push(format!("{} failed", plural(report.failed.len(), "check", "checks")));
     }
     if !report.remarks.is_empty() {
-        parts.push(format!("{}", plural(report.remarks.len(), "new comment", "new comments")));
+        parts.push(plural(report.remarks.len(), "new comment", "new comments"));
     }
     if report.conflict {
         parts.push("merge conflict".to_string());
@@ -387,11 +460,12 @@ fn clip(text: &str, max: usize) -> String {
 }
 
 /// The agent-facing turn and the short line the transcript shows for it.
+/// `excerpts` is keyed by [`PrCheck::key`].
 pub(crate) fn render_wake(
     watch: &PrWatchRecord,
     view: &PrView,
     report: &WakeReport,
-    excerpts: &[(String, String)],
+    excerpts: &HashMap<String, String>,
 ) -> (String, String) {
     let short_head: String = view.head_sha.chars().take(7).collect();
     let mut lines = vec![format!(
@@ -406,9 +480,9 @@ pub(crate) fn render_wake(
             plural(report.failed.len(), "check", "checks")
         ));
         for check in report.failed.iter().take(MAX_LISTED) {
-            let url = check.detail_url.as_deref().map(|u| format!(" {u}")).unwrap_or_default();
-            lines.push(format!("- {}{url}", check.name));
-            if let Some((_, excerpt)) = excerpts.iter().find(|(name, _)| name == &check.name) {
+            let url = check.url.as_deref().map(|u| format!(" {u}")).unwrap_or_default();
+            lines.push(format!("- {}{url}", check.label()));
+            if let Some(excerpt) = excerpts.get(&check.key(&view.head_sha)) {
                 lines.push("  Log excerpt:".into());
                 lines.push("  ```".into());
                 lines.extend(clip(excerpt, MAX_EXCERPT_CHARS).lines().map(|l| format!("  {l}")));
@@ -480,40 +554,74 @@ fn wake_nonce(watch: &PrWatchRecord, mark_seen: &[String]) -> String {
 
 // ── Fetch ──────────────────────────────────────────────────────────────
 
-fn fetch_snapshot(repo: &Path, watch: &PrWatchRecord, seen: &HashSet<String>, viewer: Option<&str>) -> Result<PrSnapshot, String> {
+/// The account `gh` actually reads as. `GH_TOKEN` can differ from the
+/// configured login, so ask the API rather than local config.
+fn viewer_login(repo: &Path) -> Result<String, String> {
+    static VIEWERS: OnceLock<Mutex<HashMap<PathBuf, (String, Instant)>>> = OnceLock::new();
+    let cache = VIEWERS.get_or_init(Default::default);
+    if let Some((login, at)) = cache.lock().unwrap().get(repo) {
+        if at.elapsed() < VIEWER_TTL {
+            return Ok(login.clone());
+        }
+    }
+    let login = crate::github_budget::run(repo, &["api", "user", "--jq", ".login"], GH_TIMEOUT)
+        .map_err(|e| format!("Could not identify the GitHub account: {e}"))?
+        .trim()
+        .to_string();
+    if login.is_empty() {
+        return Err("Could not identify the GitHub account".into());
+    }
+    cache.lock().unwrap().insert(repo.to_path_buf(), (login.clone(), Instant::now()));
+    Ok(login)
+}
+
+fn fetch_view(repo: &Path, watch: &PrWatchRecord, seen: &HashSet<String>) -> Result<PrView, String> {
+    let viewer = viewer_login(repo)?;
     let number = watch.pr_number.to_string();
     let json = crate::github_budget::run(
         repo,
         &[
             "pr", "view", &number, "--json",
-            "state,url,headRefOid,baseRefName,mergeable,comments,reviews",
+            "state,url,headRefOid,baseRefName,mergeable,comments,reviews,statusCheckRollup",
         ],
         GH_TIMEOUT,
     )?;
-    let mut view = parse_pr_view(&json, viewer)?;
+    let mut view = parse_pr_view(&json, &viewer)?;
     // Inline comments are only ever new inside a new review.
     if view.review_keys.iter().any(|key| !seen.contains(key)) {
         let inline = crate::github::get_pr_inline_comments(repo, watch.pr_number)?;
-        view.remarks.extend(inline_remarks(inline, viewer));
+        view.remarks.extend(inline_remarks(inline, &viewer));
     }
-    let checks = match crate::github::get_pr_checks(repo, Some(watch.pr_number)) {
-        Ok(checks) => Some(checks),
-        Err(error) => {
-            // `gh pr checks` also fails when a PR has no checks at all.
-            eprintln!("[codemux::pr-watch] checks unavailable for #{}: {error}", watch.pr_number);
-            None
-        }
-    };
-    Ok(PrSnapshot { view, checks })
+    Ok(view)
 }
 
-fn fetch_excerpts(repo: &Path, pr_number: u32, failed: &[CheckInfo]) -> Vec<(String, String)> {
+/// Drop the colour codes Actions logs carry (`ESC [ ... letter`).
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn fetch_excerpts(repo: &Path, head_sha: &str, failed: &[PrCheck]) -> HashMap<String, String> {
     failed
         .iter()
+        .filter_map(|check| Some((check, check.actions_job_id()?)))
         .take(MAX_LOG_EXCERPTS)
-        .filter_map(|check| {
-            let excerpt = crate::github::get_check_log_excerpt(repo, pr_number, &check.name).ok()?;
-            (!excerpt.trim().is_empty()).then(|| (check.name.clone(), excerpt))
+        .filter_map(|(check, job)| {
+            let excerpt = strip_ansi(&crate::github::get_job_log_excerpt(repo, job).ok()?);
+            (!excerpt.trim().is_empty()).then(|| (check.key(head_sha), excerpt))
         })
         .collect()
 }
@@ -608,27 +716,21 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
     let fetch_watch = watch.clone();
     let fetch_seen = seen.clone();
     let fetch_repo = repo.clone();
-    let snapshot = tokio::task::spawn_blocking(move || {
-        let viewer = match crate::github::check_gh_status_for_path(&fetch_repo) {
-            crate::github::GhStatus::Authenticated { username } => username,
-            _ => return Err("GitHub CLI is not signed in".to_string()),
-        };
-        fetch_snapshot(&fetch_repo, &fetch_watch, &fetch_seen, Some(&viewer))
-    })
-    .await
-    .map_err(|e| format!("PR watch fetch failed: {e}"))??;
+    let view = tokio::task::spawn_blocking(move || fetch_view(&fetch_repo, &fetch_watch, &fetch_seen))
+        .await
+        .map_err(|e| format!("PR watch fetch failed: {e}"))??;
 
     let now = now_ms();
-    let evaluation = evaluate(watch, &snapshot, &seen, now);
+    let evaluation = evaluate(watch, &view, &seen, now);
     let excerpts = match &evaluation.decision {
         Decision::Wake(report) if !report.failed.is_empty() => {
             let failed = report.failed.clone();
-            let number = watch.pr_number;
-            tokio::task::spawn_blocking(move || fetch_excerpts(&repo, number, &failed))
+            let head = view.head_sha.clone();
+            tokio::task::spawn_blocking(move || fetch_excerpts(&repo, &head, &failed))
                 .await
                 .unwrap_or_default()
         }
-        _ => Vec::new(),
+        _ => HashMap::new(),
     };
     // The write is the commit point: if the watch was re-armed or removed
     // while we fetched, nothing is recorded and nobody is woken.
@@ -638,7 +740,7 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
     let mut next = evaluation.next.clone();
     match &evaluation.decision {
         Decision::Wake(report) => {
-            let (text, display_text) = render_wake(&next, &snapshot.view, report, &excerpts);
+            let (text, display_text) = render_wake(&next, &view, report, &excerpts);
             let input = SendTurnCommandInput {
                 thread_id: ThreadId(next.thread_id.clone()),
                 text,
@@ -666,7 +768,7 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
                 }
             }
         }
-        Decision::Exhausted => notify_stopped(app, &next.thread_id),
+        Decision::Exhausted => notify_stopped(app, &next),
         Decision::Quiet | Decision::Ended => {}
     }
     // Every committed pass moves `last_checked_at_ms`, which the UI shows.
@@ -674,14 +776,28 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
     Ok(())
 }
 
-fn notify_stopped<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
-    match app.state::<crate::state::AppStateStore>().notification_target_for_thread(thread_id) {
+fn notify_stopped<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) {
+    let state = app.state::<crate::state::AppStateStore>();
+    // A chat whose pane is closed still deserves the notice; clicking it
+    // then opens the workspace.
+    let target = state.notification_target_for_thread(&watch.thread_id).or_else(|| {
+        let workspace = state.find_workspace(&watch.workspace_id)?;
+        let active = state.snapshot().active_workspace_id == workspace.workspace_id;
+        Some(crate::state::NotificationTarget {
+            workspace_id: workspace.workspace_id.0.clone(),
+            workspace_title: workspace.title.clone(),
+            pane_id: String::new(),
+            muted: workspace.notifications_muted,
+            in_active_workspace: active,
+        })
+    });
+    match target {
         Some(target) => crate::notifications::notify_agent(
             app,
             crate::notifications::AgentNotice::PrWatchStopped,
             &target,
         ),
-        None => eprintln!("[codemux::pr-watch] {thread_id} stopped watching; its pane is not open to notify"),
+        None => eprintln!("[codemux::pr-watch] {} stopped watching; no workspace to notify", watch.thread_id),
     }
 }
 
@@ -714,19 +830,17 @@ mod tests {
         }
     }
 
-    fn check(name: &str, bucket: &str, job: u32) -> CheckInfo {
-        CheckInfo {
+    fn check(name: &str, state: CheckState, job: u32) -> PrCheck {
+        PrCheck {
             name: name.into(),
-            status: if bucket == "pending" { "IN_PROGRESS" } else { "COMPLETED" }.into(),
-            conclusion: Some(bucket.into()),
-            elapsed_time: None,
-            detail_url: Some(format!("https://github.com/o/r/actions/runs/1/job/{job}")),
-            started_at: None,
-            completed_at: None,
+            workflow: "CI".into(),
+            state,
+            url: Some(format!("https://github.com/o/r/actions/runs/1/job/{job}")),
+            started_at: format!("2026-10-18T00:00:{job:02}Z"),
         }
     }
 
-    fn view(head: &str, remarks: Vec<Remark>) -> PrView {
+    fn view(head: &str, remarks: Vec<Remark>, checks: Vec<PrCheck>) -> PrView {
         PrView {
             state: "OPEN".into(),
             url: "https://github.com/o/r/pull/42".into(),
@@ -735,6 +849,7 @@ mod tests {
             mergeable: "MERGEABLE".into(),
             remarks,
             review_keys: vec![],
+            checks,
         }
     }
 
@@ -746,10 +861,6 @@ mod tests {
             url: None,
             kind: RemarkKind::Comment,
         }
-    }
-
-    fn snap(view: PrView, checks: Vec<CheckInfo>) -> PrSnapshot {
-        PrSnapshot { view, checks: Some(checks) }
     }
 
     /// Apply an evaluation the way the sweep commits it.
@@ -773,13 +884,27 @@ mod tests {
                 {"id":"PRR_3","author":{"login":"carol"},"body":"","state":"APPROVED"},
                 {"id":"PRR_4","author":{"login":"Zeus-Deus"},"body":"self review","state":"COMMENTED"},
                 {"id":"PRR_5","author":{"login":"dave"},"body":"draft","state":"PENDING"}
+            ],
+            "statusCheckRollup":[
+                {"__typename":"CheckRun","name":"rust (ubuntu)","workflowName":"CI","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":"https://github.com/o/r/actions/runs/5/job/77","startedAt":"t1"},
+                {"__typename":"CheckRun","name":"lint","workflowName":"CI","status":"IN_PROGRESS","conclusion":"","detailsUrl":"d","startedAt":"t2"},
+                {"__typename":"CheckRun","name":"old","workflowName":"CI","status":"COMPLETED","conclusion":"CANCELLED","detailsUrl":"d2","startedAt":"t3"},
+                {"__typename":"StatusContext","context":"ci/external","state":"ERROR","targetUrl":"https://ci.example/1","startedAt":"t4"}
             ]
         }"#;
-        let view = parse_pr_view(json, Some("Zeus-Deus")).unwrap();
+        let view = parse_pr_view(json, "Zeus-Deus").unwrap();
         let keys: Vec<_> = view.remarks.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(keys, ["comment:IC_3", "review:PRR_2"]);
         assert_eq!(view.review_keys, ["review:PRR_1", "review:PRR_2", "review:PRR_3"]);
         assert_eq!(view.head_sha, "abc");
+        let states: Vec<_> = view.checks.iter().map(|c| c.state).collect();
+        assert_eq!(
+            states,
+            [CheckState::Failure, CheckState::Pending, CheckState::Cancelled, CheckState::Failure]
+        );
+        assert_eq!(view.checks[0].label(), "CI / rust (ubuntu)");
+        assert_eq!(view.checks[0].actions_job_id(), Some(77));
+        assert_eq!(view.checks[3].actions_job_id(), None);
     }
 
     #[test]
@@ -795,7 +920,7 @@ mod tests {
             in_reply_to_id: None,
             pull_request_review_id: Some(9),
         };
-        let remarks = inline_remarks(vec![inline(1, "alice"), inline(2, "ME")], Some("me"));
+        let remarks = inline_remarks(vec![inline(1, "alice"), inline(2, "ME")], "me");
         assert_eq!(remarks.len(), 1);
         assert_eq!(remarks[0].key, "inline:1");
     }
@@ -805,12 +930,8 @@ mod tests {
         let mut w = watch();
         w.baselined = false;
         let mut seen = HashSet::new();
-        let eval = evaluate(
-            &w,
-            &snap(view("h1", vec![comment("old", "earlier")]), vec![check("ci", "fail", 1)]),
-            &seen,
-            1_000,
-        );
+        let v = view("h1", vec![comment("old", "earlier")], vec![check("ci", CheckState::Failure, 1)]);
+        let eval = evaluate(&w, &v, &seen, 1_000);
         let Decision::Wake(report) = &eval.decision else { panic!("{:?}", eval.decision) };
         assert!(report.remarks.is_empty(), "history never wakes");
         assert_eq!(report.failed.len(), 1);
@@ -820,57 +941,92 @@ mod tests {
         assert!(seen.contains("comment:old"));
 
         // Same check run on the next pass: told already.
-        let again = evaluate(&next, &snap(view("h1", vec![comment("old", "earlier")]), vec![check("ci", "fail", 1)]), &seen, 2_000);
+        let again = evaluate(&next, &v, &seen, 2_000);
         assert!(matches!(again.decision, Decision::Quiet));
     }
 
     #[test]
     fn rerun_of_a_check_is_a_new_event() {
         let mut seen = HashSet::new();
-        let first = evaluate(&watch(), &snap(view("h1", vec![]), vec![check("ci", "fail", 1)]), &seen, 0);
+        let first = evaluate(&watch(), &view("h1", vec![], vec![check("ci", CheckState::Failure, 1)]), &seen, 0);
         let next = commit(&first, &mut seen);
-        let rerun = evaluate(&next, &snap(view("h1", vec![]), vec![check("ci", "fail", 2)]), &seen, 1);
-        assert!(matches!(rerun.decision, Decision::Wake(_)));
+        let mut rerun = check("ci", CheckState::Failure, 1);
+        rerun.started_at = "later".into();
+        let again = evaluate(&next, &view("h1", vec![], vec![rerun]), &seen, 1);
+        assert!(matches!(again.decision, Decision::Wake(_)), "same URL, new start time");
     }
 
     #[test]
     fn failures_wait_for_pending_checks_up_to_the_window() {
         let seen = HashSet::new();
-        let checks = vec![check("lint", "fail", 1), check("test", "pending", 2)];
-        let held = evaluate(&watch(), &snap(view("h1", vec![]), checks.clone()), &seen, 1_000);
+        let checks = vec![check("lint", CheckState::Failure, 1), check("test", CheckState::Pending, 2)];
+        let held = evaluate(&watch(), &view("h1", vec![], checks.clone()), &seen, 1_000);
         assert!(matches!(held.decision, Decision::Quiet));
         assert_eq!(held.next.failure_pending_since_ms, Some(1_000));
         assert!(held.mark_seen.is_empty());
 
-        let still = evaluate(&held.next, &snap(view("h1", vec![]), checks.clone()), &seen, 2_000);
+        let still = evaluate(&held.next, &view("h1", vec![], checks.clone()), &seen, 2_000);
         assert!(matches!(still.decision, Decision::Quiet));
         assert_eq!(still.next.failure_pending_since_ms, Some(1_000));
 
-        let late = evaluate(&still.next, &snap(view("h1", vec![]), checks), &seen, 1_000 + FAILURE_BATCH_WINDOW_MS);
+        let late = evaluate(&still.next, &view("h1", vec![], checks), &seen, 1_000 + FAILURE_BATCH_WINDOW_MS);
         let Decision::Wake(report) = late.decision else { panic!() };
         assert_eq!(report.failed.len(), 1);
         assert_eq!(late.next.failure_pending_since_ms, None);
     }
 
     #[test]
-    fn fix_attempts_cap_then_exhaust_and_green_refills() {
+    fn fix_attempts_cap_then_exhaust_and_only_success_refills() {
         let mut seen = HashSet::new();
         let mut w = watch();
         for job in 1..=3 {
-            let eval = evaluate(&w, &snap(view("h1", vec![]), vec![check("ci", "fail", job)]), &seen, job as i64);
+            let eval = evaluate(&w, &view("h1", vec![], vec![check("ci", CheckState::Failure, job)]), &seen, job as i64);
             assert!(matches!(eval.decision, Decision::Wake(_)));
             w = commit(&eval, &mut seen);
         }
         assert_eq!(w.attempts, 3);
-        let fourth = evaluate(&w, &snap(view("h1", vec![]), vec![check("ci", "fail", 4)]), &seen, 10);
+        let fourth = evaluate(&w, &view("h1", vec![], vec![check("ci", CheckState::Failure, 4)]), &seen, 10);
         assert!(matches!(fourth.decision, Decision::Exhausted));
         assert_eq!(fourth.next.status, PR_WATCH_EXHAUSTED);
         assert!(fourth.mark_seen.is_empty(), "untold so re-arming delivers it");
 
-        // Instead: green on a new head refills the budget.
-        let green = evaluate(&w, &snap(view("h2", vec![]), vec![check("ci", "pass", 5)]), &seen, 11);
+        // Cancelled runs prove nothing.
+        let cancelled = evaluate(&w, &view("h2", vec![], vec![check("ci", CheckState::Cancelled, 5)]), &seen, 11);
+        assert_eq!(cancelled.next.attempts, 3);
+        // Green on a new head refills the budget.
+        let green = evaluate(
+            &w,
+            &view("h2", vec![], vec![check("ci", CheckState::Success, 5), check("docs", CheckState::Neutral, 6)]),
+            &seen,
+            11,
+        );
         assert!(matches!(green.decision, Decision::Quiet));
         assert_eq!(green.next.attempts, 0);
+    }
+
+    #[test]
+    fn exhausted_pass_leaves_reviews_untold() {
+        let mut w = watch();
+        w.attempts = 3;
+        let mut v = view("h1", vec![], vec![check("ci", CheckState::Failure, 1)]);
+        v.review_keys = vec!["review:R1".into()];
+        v.remarks = vec![Remark {
+            key: "review:R1".into(),
+            author: "bob".into(),
+            body: "please rename".into(),
+            url: None,
+            kind: RemarkKind::Review { state: "CHANGES_REQUESTED".into() },
+        }];
+        let eval = evaluate(&w, &v, &HashSet::new(), 0);
+        assert!(matches!(eval.decision, Decision::Exhausted));
+        assert!(eval.mark_seen.is_empty());
+
+        // A review with nothing new inside is recorded on a quiet pass.
+        let mut quiet = view("h1", vec![], vec![]);
+        quiet.review_keys = vec!["review:R2".into()];
+        let eval = evaluate(&watch(), &quiet, &HashSet::new(), 0);
+        assert!(matches!(eval.decision, Decision::Quiet));
+        assert_eq!(eval.mark_seen, ["review:R2"]);
     }
 
     #[test]
@@ -878,16 +1034,16 @@ mod tests {
         let mut seen = HashSet::new();
         let mut w = watch();
         for i in 0..COMMENT_WAKE_LIMIT {
-            let eval = evaluate(&w, &snap(view("h1", vec![comment(&i.to_string(), "hi")]), vec![]), &seen, i as i64);
+            let eval = evaluate(&w, &view("h1", vec![comment(&i.to_string(), "hi")], vec![]), &seen, i as i64);
             assert!(matches!(eval.decision, Decision::Wake(_)), "wake {i}");
             w = commit(&eval, &mut seen);
         }
         assert_eq!(w.attempts, 0, "comments are not fix attempts");
-        let capped = evaluate(&w, &snap(view("h1", vec![comment("x", "hi")]), vec![]), &seen, 100);
+        let capped = evaluate(&w, &view("h1", vec![comment("x", "hi")], vec![]), &seen, 100);
         assert!(matches!(capped.decision, Decision::Exhausted));
 
         // A moved head resets the streak.
-        let moved = evaluate(&w, &snap(view("h2", vec![comment("x", "hi")]), vec![]), &seen, 100);
+        let moved = evaluate(&w, &view("h2", vec![comment("x", "hi")], vec![]), &seen, 100);
         assert!(matches!(moved.decision, Decision::Wake(_)));
         assert_eq!(moved.next.comment_streak, 1);
     }
@@ -895,17 +1051,17 @@ mod tests {
     #[test]
     fn conflict_wakes_once_per_head_and_merge_ends() {
         let mut seen = HashSet::new();
-        let mut v = view("h1", vec![]);
+        let mut v = view("h1", vec![], vec![]);
         v.mergeable = "CONFLICTING".into();
-        let first = evaluate(&watch(), &PrSnapshot { view: v.clone(), checks: None }, &seen, 0);
+        let first = evaluate(&watch(), &v, &seen, 0);
         let Decision::Wake(report) = &first.decision else { panic!() };
         assert!(report.conflict);
         let next = commit(&first, &mut seen);
-        let again = evaluate(&next, &PrSnapshot { view: v.clone(), checks: None }, &seen, 1);
+        let again = evaluate(&next, &v, &seen, 1);
         assert!(matches!(again.decision, Decision::Quiet));
 
         v.state = "MERGED".into();
-        let ended = evaluate(&next, &PrSnapshot { view: v, checks: None }, &seen, 2);
+        let ended = evaluate(&next, &v, &seen, 2);
         assert!(matches!(ended.decision, Decision::Ended));
         assert_eq!(ended.next.status, PR_WATCH_ENDED);
     }
@@ -914,8 +1070,10 @@ mod tests {
     fn rendered_wake_carries_checks_logs_and_comments() {
         let mut w = watch();
         w.attempts = 1;
+        let failed = check("rust (ubuntu)", CheckState::Failure, 7);
+        let v = view("abcdef123", vec![], vec![]);
         let report = WakeReport {
-            failed: vec![check("rust (ubuntu)", "fail", 7)],
+            failed: vec![failed.clone()],
             remarks: vec![Remark {
                 key: "inline:5".into(),
                 author: "alice".into(),
@@ -925,15 +1083,21 @@ mod tests {
             }],
             conflict: false,
         };
-        let excerpts = vec![("rust (ubuntu)".to_string(), "error[E0308]: mismatched types".to_string())];
-        let (text, display) = render_wake(&w, &view("abcdef123", vec![]), &report, &excerpts);
+        let excerpts = HashMap::from([(failed.key(&v.head_sha), "error[E0308]: mismatched types".to_string())]);
+        let (text, display) = render_wake(&w, &v, &report, &excerpts);
         assert!(text.contains("pull request #42"));
         assert!(text.contains("1 check failed on abcdef1"));
+        assert!(text.contains("- CI / rust (ubuntu) https://github.com/o/r/actions/runs/1/job/7"));
         assert!(text.contains("error[E0308]: mismatched types"));
         assert!(text.contains("alice on src/lib.rs:12"));
         assert!(text.contains("  > this unwrap panics"));
         assert!(text.contains("automatic fix attempt 1 of 3"));
         assert_eq!(display, "PR #42 — 1 check failed, 1 new comment");
+    }
+
+    #[test]
+    fn strip_ansi_keeps_the_text() {
+        assert_eq!(strip_ansi("\u{1b}[1m\u{1b}[91merror\u{1b}[0m: test failed"), "error: test failed");
     }
 
     #[test]

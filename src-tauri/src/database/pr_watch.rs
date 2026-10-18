@@ -55,9 +55,9 @@ pub struct PrWatchRecord {
     pub pr_number: u32,
     pub pr_url: Option<String>,
     pub status: String,
-    /// Bumped on every (re-)arm. A sweep only writes back, and only wakes,
-    /// when the generation it read is still current, so an unwatch or
-    /// re-arm racing a sweep always wins.
+    /// Fresh random token on every (re-)arm. A sweep only writes back, and
+    /// only wakes, when the generation it read is still current, so an
+    /// unwatch or re-arm racing a sweep always wins.
     #[serde(skip)]
     pub generation: i64,
     /// Automatic fix attempts (failing checks or a conflict) allowed before
@@ -145,7 +145,15 @@ impl DatabaseStore {
             tx.execute("DELETE FROM pr_watch_seen WHERE thread_id = ?1", params![thread_id])
                 .map_err(|e| format!("Failed to reset PR watch history: {e}"))?;
         }
-        let generation = existing.as_ref().map_or(1, |w| w.generation + 1);
+        // Random, not a counter: unwatch deletes the row, and a counter
+        // restarting at 1 would let a sweep that read the old watch pass
+        // the generation check against the new one.
+        let generation = loop {
+            let token = uuid::Uuid::new_v4().as_u64_pair().0 as i64;
+            if existing.as_ref().map_or(true, |w| w.generation != token) {
+                break token;
+            }
+        };
         let created_at_ms = existing.as_ref().map_or(now_ms, |w| w.created_at_ms);
         // A different pull request starts from nothing; the same one keeps
         // its baseline and head so re-arming does not replay history.
@@ -294,7 +302,6 @@ mod tests {
         let db = DatabaseStore::new_in_memory();
         let first = db.arm_pr_watch("t1", "ws", 7, Some("u"), 3, 10).unwrap();
         assert_eq!(first.status, PR_WATCH_ACTIVE);
-        assert_eq!(first.generation, 1);
 
         let mut progress = first.clone();
         progress.attempts = 2;
@@ -307,7 +314,7 @@ mod tests {
 
         // Re-arming the same PR resets counters but keeps history.
         let rearmed = db.arm_pr_watch("t1", "ws", 7, None, 5, 30).unwrap();
-        assert_eq!(rearmed.generation, 2);
+        assert_ne!(rearmed.generation, first.generation);
         assert_eq!(rearmed.attempts, 0);
         assert_eq!(rearmed.max_attempts, 5);
         assert_eq!(rearmed.status, PR_WATCH_ACTIVE);
@@ -337,5 +344,12 @@ mod tests {
         assert!(!db.delete_pr_watch("t1").unwrap());
         assert!(db.get_pr_watch("t1").unwrap().is_none());
         assert!(!db.save_pr_watch_progress(&stale, &[], 40).unwrap());
+
+        // Stop, then start again: a sweep that read the first watch still
+        // cannot write to the replacement.
+        let replacement = db.arm_pr_watch("t1", "ws", 8, None, 3, 50).unwrap();
+        assert_ne!(replacement.generation, stale.generation);
+        assert!(!db.save_pr_watch_progress(&stale, &["check:x".into()], 60).unwrap());
+        assert_eq!(db.get_pr_watch("t1").unwrap().unwrap().pr_number, 8);
     }
 }
