@@ -1314,12 +1314,19 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         }
     }
 
+    let closing = state.find_workspace(&workspace_id);
     let close_result = state
         .close_workspace(&workspace_id)
         .map_err(|e| format!("Failed to close workspace: {e}"))?;
     // Before any await below: a chat closed just before this may still be
     // stopping, and its result must not be lost if it finishes meanwhile.
     let earlier_stops = crate::commands::agent_chat::snapshot_pending_stops(&workspace_id);
+    // A worktree left on disk becomes a cleanup candidate once it goes stale.
+    if !remove_worktree {
+        if let Some(ref ws) = closing {
+            crate::worktree_cleanup::remember_closed(db, ws);
+        }
+    }
 
     // Reconcile only after the state mutation succeeds. A duplicate workspace
     // at the same checkout still owns the shared path-level config; deleting
@@ -2277,7 +2284,11 @@ pub async fn close_workspace<R: tauri::Runtime>(
         }
     }
 
+    let closing = state.find_workspace(&workspace_id);
     let result = state.close_workspace(&workspace_id)?;
+    if let Some(ref ws) = closing {
+        crate::worktree_cleanup::remember_closed(&db, ws);
+    }
 
     // `.mcp.json` belongs to the checkout, not to one workspace row. Preserve
     // (and, if necessary, repair) it while another live workspace shares the
