@@ -2661,3 +2661,184 @@ async fn a_failed_requested_compaction_stays_out_of_the_transcript() {
     assert!(!status.busy && !status.compacting, "{status:?}");
     provider.stop_session(id).await.ok();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_compaction_is_stopped_before_queued_sends_run() {
+    let thread = "t-compact-timeout";
+    let home = compaction_home(&[]);
+    // The compaction never ends on its own. When the app interrupts it, a
+    // late compaction `result` arrives before the confirmed interrupt; both
+    // must stay hidden and must not end the follow-up turn.
+    let script = write_script(json!([
+        compaction_sdk(thread, 5, "send-turn",
+            json!({"type": "result", "subtype": "success", "num_turns": 1})),
+        compaction_sdk(thread, 5, "compact-idle",
+            json!({"type": "system", "subtype": "status", "status": "compacting"})),
+        compaction_sdk(thread, 5, "interrupt",
+            json!({"type": "assistant", "parent_tool_use_id": null, "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "Late compaction output"}]}})),
+        compaction_sdk(thread, 5, "interrupt",
+            json!({"type": "result", "subtype": "error_during_execution", "num_turns": 0})),
+        json!({"after": "interrupt", "delay_ms": 5, "emit": "notification",
+            "method": "turn-interrupted", "params": {"threadId": thread}}),
+    ]));
+    let capture_dir = tempfile::tempdir().unwrap();
+    let capture = capture_dir.path().join("rpc.jsonl");
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy()),
+        ("FAKE_CLAUDE_SIDECAR_CAPTURE", &capture.to_string_lossy()),
+    ]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    let id = ThreadId(thread.into());
+    provider.start_session(compaction_start(thread, &home)).await.unwrap();
+    assert!(provider.set_compaction_timeout_for_tests(&id, Duration::from_millis(300)).await);
+    let mut stream = provider.event_stream();
+    provider.send_turn(compaction_send(thread, "big task")).await.unwrap();
+    wait_turn_completed(&mut stream).await;
+    provider.request_compaction(&id).await.expect("compaction starts");
+    let sent = provider.send_turn(compaction_send(thread, "follow-up")).await.unwrap();
+    assert!(sent.queued_id.is_some());
+
+    let mut before = Vec::new();
+    timeout(Duration::from_secs(10), async {
+        while let Some(event) = stream.next().await {
+            // The follow-up's own start (`Running`, then the dispatch
+            // event) ends what the compaction could have produced.
+            if matches!(
+                event,
+                ProviderRuntimeEvent::QueuedTurnDispatched { .. }
+                    | ProviderRuntimeEvent::SessionStateChanged {
+                        status: SessionStatus::Running { .. },
+                        ..
+                    }
+            ) {
+                return;
+            }
+            before.push(event);
+        }
+        panic!("stream ended");
+    })
+    .await
+    .expect("queued follow-up dispatched after the stop");
+    for event in &before {
+        assert!(
+            is_compaction_fact(event) || matches!(event, ProviderRuntimeEvent::TurnQueued { .. }),
+            "a stopped compaction leaked {event:?}"
+        );
+    }
+    assert!(matches!(
+        before.iter().rev().find(|e| matches!(e, ProviderRuntimeEvent::ContextCompactionChanged { .. })),
+        Some(ProviderRuntimeEvent::ContextCompactionChanged { active: false, .. })
+    ));
+    let rpcs = std::fs::read_to_string(&capture).unwrap();
+    assert_eq!(rpcs.matches("\"interrupt\"").count(), 1);
+    // The follow-up runs as a normal turn and ends with its own result.
+    wait_turn_completed(&mut stream).await;
+    let status = provider.runtime_status(&id).await.unwrap();
+    assert!(!status.busy && !status.compacting, "{status:?}");
+    provider.stop_session(id).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compaction_that_ends_before_its_ack_leaves_no_compacting_marker() {
+    let thread = "t-compact-fast";
+    let home = compaction_home(&[]);
+    let script = compaction_script(thread, 5);
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy()),
+        ("FAKE_CLAUDE_COMPACT_ACK_DELAY_MS", "300"),
+    ]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    let id = ThreadId(thread.into());
+    provider.start_session(compaction_start(thread, &home)).await.unwrap();
+    let mut stream = provider.event_stream();
+    provider.send_turn(compaction_send(thread, "big task")).await.unwrap();
+    wait_turn_completed(&mut stream).await;
+    provider.request_compaction(&id).await.expect("compaction starts");
+
+    let mut markers = Vec::new();
+    let mut notices = 0;
+    let _ = timeout(Duration::from_millis(800), async {
+        while let Some(event) = stream.next().await {
+            match event {
+                ProviderRuntimeEvent::ContextCompactionChanged { active, .. } => markers.push(active),
+                ProviderRuntimeEvent::RuntimeWarning { message, .. }
+                    if message.starts_with("idle-compaction: ") => notices += 1,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert_eq!(markers.first(), Some(&true), "{markers:?}");
+    assert_eq!(markers.last(), Some(&false), "{markers:?}");
+    assert_eq!(notices, 1);
+    assert!(!provider.runtime_status(&id).await.unwrap().compacting);
+    provider.stop_session(id).await.ok();
+}
+
+/// A compaction claimed while the user's `result` is being processed must
+/// not take that result as its own. Races a request against every result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compaction_claimed_during_a_user_result_never_swallows_it() {
+    const ROUNDS: usize = 20;
+    let thread = "t-compact-race";
+    let home = compaction_home(&[]);
+    let script = compaction_script(thread, 1);
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
+    let provider = Arc::new(provider_with_custom_sidecar(wrapper.path.clone()).await);
+    let id = ThreadId(thread.into());
+    provider.start_session(compaction_start(thread, &home)).await.unwrap();
+    let mut stream = provider.event_stream();
+    for round in 0..ROUNDS {
+        provider.send_turn(compaction_send(thread, "task")).await.unwrap();
+        // Ask as fast as possible, so the claim lands right as the
+        // session turns idle.
+        let racer = {
+            let provider = Arc::clone(&provider);
+            let id = id.clone();
+            tokio::spawn(async move {
+                loop {
+                    match provider.request_compaction(&id).await {
+                        Ok(()) => return,
+                        Err("busy") => tokio::task::yield_now().await,
+                        Err(other) => panic!("unexpected refusal {other}"),
+                    }
+                }
+            })
+        };
+        let mut completed = 0;
+        timeout(Duration::from_secs(10), async {
+            while let Some(event) = stream.next().await {
+                let text = format!("{event:?}");
+                assert!(
+                    !text.contains("Conversation compacted"),
+                    "round {round}: compaction output leaked: {text}"
+                );
+                match event {
+                    ProviderRuntimeEvent::TurnCompleted { .. } => completed += 1,
+                    ProviderRuntimeEvent::RuntimeWarning { message, .. }
+                        if message.starts_with("idle-compaction: ") =>
+                    {
+                        return
+                    }
+                    _ => {}
+                }
+            }
+            panic!("stream ended");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: compaction notice"));
+        racer.await.unwrap();
+        assert_eq!(completed, 1, "round {round}: the user's turn must end exactly once");
+        // Let the notification task release the claim before the next send.
+        timeout(Duration::from_secs(5), async {
+            while provider.runtime_status(&id).await.unwrap().compacting {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    provider.stop_session(id).await.ok();
+}

@@ -188,6 +188,16 @@ struct PendingTurnStart {
     failed: bool,
 }
 
+/// Clears the session's dispatch flag when a send settles, including when
+/// its future is dropped.
+struct DispatchFlag<'a>(&'a AtomicBool);
+
+impl Drop for DispatchFlag<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// A user turn parked in the follow-up queue behind the active turn.
 #[derive(Debug, Clone)]
 pub(crate) struct QueuedTurn {
@@ -264,6 +274,9 @@ pub(crate) struct CodexSession {
     /// Mutable session state.
     pub state: Mutex<CodexSessionState>,
     outbound: Mutex<()>,
+    /// A send is being prepared or started (checkpoint, `turn/start` in
+    /// flight) before `active_turn` is bound. Read by `runtime_status`.
+    dispatching: AtomicBool,
     /// Broadcast sender used to emit runtime events from methods that
     /// mutate the follow-up queue (enqueue / dispatch / cancel). The
     /// background tasks receive their own clone via spawn args.
@@ -744,6 +757,7 @@ impl CodexSession {
             notification_demux: Mutex::new(demux),
             state,
             outbound: Mutex::new(()),
+            dispatching: AtomicBool::new(false),
             event_tx: event_tx.clone(),
             shutdown_tx: shutdown_tx.clone(),
             tasks: Mutex::new(Vec::new()),
@@ -857,7 +871,9 @@ impl CodexSession {
                 });
                 return Ok(SendOutcome::Queued(queued_id));
             }
+            self.dispatching.store(true, Ordering::SeqCst);
         }
+        let _dispatching = DispatchFlag(&self.dispatching);
         let checkpoint = input.turn_checkpoint.clone();
         if let Some(checkpoint) = checkpoint.as_ref() {
             checkpoint.prepare().await;
@@ -1084,9 +1100,14 @@ impl CodexSession {
                 if !idle {
                     return;
                 }
-                state.queued_turns.pop_front()
+                let next = state.queued_turns.pop_front();
+                if next.is_some() {
+                    self.dispatching.store(true, Ordering::SeqCst);
+                }
+                next
             };
             let Some(queued) = next else { return };
+            let _dispatching = DispatchFlag(&self.dispatching);
             let text = queued
                 .input
                 .display_text
@@ -1464,6 +1485,13 @@ impl CodexSession {
     /// treated as absent by the provider so the next send auto-resumes.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
+    }
+
+    /// Whether a send is between leaving the queue (or the send button)
+    /// and Codex binding its turn. Read under the state lock for a
+    /// consistent view with `queued_turns`.
+    pub(crate) fn dispatch_in_flight(&self) -> bool {
+        self.dispatching.load(Ordering::SeqCst)
     }
 
     /// A managed replacement temporarily marks its retired child dead while

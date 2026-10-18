@@ -109,6 +109,23 @@ impl ClaudeAgentProvider {
         }
     }
 
+    /// Tests only: shorten how long a requested compaction may run before
+    /// the app stops it. Returns whether the thread has a session.
+    #[doc(hidden)]
+    pub async fn set_compaction_timeout_for_tests(
+        &self,
+        thread_id: &ThreadId,
+        timeout: std::time::Duration,
+    ) -> bool {
+        match self.sessions.read().await.get(thread_id) {
+            Some(session) => {
+                session.set_compaction_timeout(timeout);
+                true
+            }
+            None => false,
+        }
+    }
+
     async fn collect_sessions(&self) -> Vec<Arc<ClaudeSession>> {
         let sessions = self.sessions.read().await;
         sessions.values().cloned().collect()

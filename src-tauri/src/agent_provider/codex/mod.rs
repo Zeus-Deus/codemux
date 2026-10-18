@@ -548,7 +548,9 @@ impl AgentProvider for CodexAgentProvider {
         }
         let state = session.state.lock().await;
         Some(crate::agent_provider::ThreadRuntimeStatus {
-            busy: state.active_turn.is_some() || !state.pending_approvals.is_empty(),
+            busy: state.active_turn.is_some()
+                || !state.pending_approvals.is_empty()
+                || session.dispatch_in_flight(),
             queued: Some(state.queued_turns.len()),
             compacting: false,
             status: crate::agent_provider::ThreadRuntimeStatus::status_name(&state.status).into(),

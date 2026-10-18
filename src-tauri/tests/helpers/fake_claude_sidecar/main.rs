@@ -263,6 +263,23 @@ fn main() {
             }
             "compact-idle" => {
                 capture_params(method, &msg.params);
+                // Regression fixture: the whole compaction can finish before
+                // its acknowledgement reaches the host.
+                if let Some(delay) = std::env::var("FAKE_CLAUDE_COMPACT_ACK_DELAY_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    fire_script_entries_for(method, &script);
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    if let Some(id) = id {
+                        write_line(&json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "started": true },
+                        }));
+                    }
+                    continue;
+                }
                 if let Some(id) = id {
                     write_line(&json!({
                         "jsonrpc": "2.0",
