@@ -5,12 +5,10 @@ import { SIDEBAR_EMPTY_STATE_AREA } from "@/sdk/areas";
 import "@fontsource/instrument-serif/latin-400-italic.css";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { formatKeyCombo } from "@/components/ui/menu-chrome";
-import bustUrl from "@/assets/plates/briareus-bust.webp";
-import titanUrl from "@/assets/plates/briareus-titan.webp";
-import orreryUrl from "@/assets/plates/orrery.webp";
-import baudotUrl from "@/assets/plates/baudot.webp";
-import peacockUrl from "@/assets/plates/peacock.webp";
+import { LAST_PLATE_KEY, PLATES, readLastPlate } from "@/lib/plates";
 import { useNewAgentAction } from "./sidebar-action-row";
+
+export { PLATES, type PlateEntry } from "@/lib/plates";
 
 /**
  * The sidebar's "nothing running" state.
@@ -23,91 +21,6 @@ import { useNewAgentAction } from "./sidebar-action-row";
  * twice in a row.
  */
 
-export interface PlateEntry {
-  src: string;
-  fig: string;
-  caption: string;
-  quote: string;
-  source: string;
-}
-
-// Attributions are deliberately careful: "After" marks a paraphrased
-// translation, "per" marks a saying that survives only through a later writer.
-export const PLATES: PlateEntry[] = [
-  {
-    src: titanUrl,
-    fig: "Fig. 01",
-    caption: "The hundred-handed",
-    quote: "Many hands make light work.",
-    source: "Heywood’s Proverbs, 1546",
-  },
-  {
-    src: bustUrl,
-    fig: "Fig. 02",
-    caption: "Briareus, at rest",
-    quote: "Rest is not idleness.",
-    source: "John Lubbock, 1894",
-  },
-  {
-    src: orreryUrl,
-    fig: "Fig. 03",
-    caption: "The orrery, stilled",
-    quote: "Order is Heaven’s first law.",
-    source: "Alexander Pope, 1734",
-  },
-  {
-    src: baudotUrl,
-    fig: "Fig. 04",
-    caption: "The telegraph exchange",
-    quote: "What hath God wrought?",
-    source: "Samuel Morse, 1844",
-  },
-  {
-    src: peacockUrl,
-    fig: "Fig. 05",
-    caption: "The eyes of Argus",
-    quote: "Two at a time would sleep; the rest kept watch.",
-    source: "After Ovid, Metamorphoses I",
-  },
-  {
-    src: orreryUrl,
-    fig: "Fig. 03",
-    caption: "The orrery, stilled",
-    quote: "Give me a place to stand, and I will move the earth.",
-    source: "Archimedes, per Pappus",
-  },
-  {
-    src: bustUrl,
-    fig: "Fig. 02",
-    caption: "Briareus, at rest",
-    quote: "Make haste slowly.",
-    source: "Augustus, per Suetonius",
-  },
-  {
-    src: titanUrl,
-    fig: "Fig. 01",
-    caption: "The hundred-handed",
-    quote: "Well begun is half done.",
-    source: "After Horace, Epistles I.2",
-  },
-  {
-    src: peacockUrl,
-    fig: "Fig. 05",
-    caption: "The eyes of Argus",
-    quote: "They also serve who only stand and wait.",
-    source: "John Milton, 1673",
-  },
-  {
-    src: baudotUrl,
-    fig: "Fig. 04",
-    caption: "The telegraph exchange",
-    quote: "Little strokes fell great oaks.",
-    source: "Poor Richard’s Almanack, 1750",
-  },
-];
-
-const LAST_PLATE_KEY = "codemux.sidebar.emptyPlate";
-
 /** A uniformly random index in `[0, count)` other than `last`. `rand` is a
  *  number in `[0, 1)`; injected so the no-repeat rule is testable. */
 export function pickPlateIndex(last: number, count: number, rand: number): number {
@@ -115,15 +28,6 @@ export function pickPlateIndex(last: number, count: number, rand: number): numbe
   const hasLast = Number.isInteger(last) && last >= 0 && last < count;
   const pick = Math.floor(rand * (hasLast ? count - 1 : count));
   return hasLast && pick >= last ? pick + 1 : pick;
-}
-
-function readLastPlate(): number {
-  try {
-    const raw = localStorage.getItem(LAST_PLATE_KEY);
-    return raw === null ? -1 : Number(raw);
-  } catch {
-    return -1;
-  }
 }
 
 /**

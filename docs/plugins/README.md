@@ -98,7 +98,7 @@ Import the constants from `@codemux/sdk`.
 | `TITLEBAR_ACTIONS_AREA` | The title bar's action island | `render()` (stop `pointerdown` on controls so the window doesn't drag) |
 | `SIDEBAR_SECTION_AREA` | Between the workspace list and the sidebar footer | `render()` |
 | `SIDEBAR_EMPTY_STATE_AREA` | Replaces the empty-sidebar plate (first one wins) | `render()` |
-| `LANDING_BACKDROP_AREA` | Behind the new-thread landing, `pointer-events: none` | `render({ onPulse, calmRect })` |
+| `LANDING_BACKDROP_AREA` | Behind the new-thread landing, `pointer-events: none` | `render({ onPulse, calmRect, onCalmChange })` |
 | `LANDING_BELOW_COMPOSER_AREA` | Under the composer on the new-thread landing | `render({ workspaceId })` |
 | `TOOL_RENDERER_AREA` | Replaces the core card for a tool call (first match wins) | `data: { tool: "Bash", render({ call }) }` |
 | `THEMES_AREA` | Listed in the theme picker; never auto-selected | `data: ThemeDefinition` |
@@ -185,9 +185,9 @@ The app itself ships plugins in `src/plugins/<id>/`:
 
 - `meta.ts` is loaded eagerly: id, name, description and `defaultEnabled`.
 - `plugin.ts(x)` is a lazy chunk that is fetched only when the plugin is on.
-- Bundled code may import only `@codemux/sdk` and `react`. This is enforced by `src/plugins/import-fence.test.ts`.
+- Bundled code may import only `@codemux/sdk`, `react`, and sibling files in its own folder (`./field`). Assets and anything outside the folder go through the SDK. This is enforced by `src/plugins/import-fence.test.ts`.
 
-`src/plugins/example` uses every area and is off by default.
+`src/plugins/example` uses every area and is off by default. `src/plugins/thread-backdrop` (Official, on by default) is a complete real plugin: an engraving typed out in faint monospace behind a new thread, built on `LANDING_BACKDROP_AREA`, `ctx.host.theme`, `PLATES` and `onCalmChange`.
 
 ## Decisions
 
