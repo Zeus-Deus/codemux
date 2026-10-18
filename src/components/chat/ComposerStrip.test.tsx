@@ -35,6 +35,7 @@ import {
   useMonitoringOccupant,
   useSubagentOccupant,
   useUsageLimitOccupant,
+  remoteTasksOccupant,
 } from "./use-composer-strip-occupants";
 
 vi.mock("@/lib/toast", () => ({ toast: { error: vi.fn() } }));
@@ -1047,5 +1048,89 @@ describe("ComposerStrip — pending approval", () => {
     );
     expect(rows()[0]).toHaveAttribute("data-kind", "approval");
     expect(screen.queryByTestId("composer-strip-goal-more")).toBeNull();
+  });
+});
+
+describe("ComposerStrip — remote tasks", () => {
+  const idle = {
+    error: null,
+    subscriptionError: null,
+    loading: false,
+    subscriptionHealth: "connected" as const,
+  };
+
+  it("is absent while the remote task list is healthy", () => {
+    expect(remoteTasksOccupant(idle, vi.fn())).toBeNull();
+  });
+
+  it("shows a failed read as an announced error row with a Retry chip", () => {
+    const onRetry = vi.fn();
+    const message = "Cannot reach build-box over SSH: connection refused after 3 attempts";
+    render(
+      <ComposerStrip
+        occupants={[remoteTasksOccupant({ ...idle, error: message }, onRetry)]}
+      />,
+    );
+    const row = rows()[0];
+    expect(row).toHaveAttribute("data-kind", "error");
+    const status = within(row).getByRole("status");
+    expect(within(status).getByText("Remote tasks unavailable")).toBeInTheDocument();
+    const detail = within(status).getByText(message);
+    expect(detail.className).toContain("truncate");
+    expect(detail).toHaveAttribute("title", message);
+    const retry = within(row).getByRole("button", { name: "Retry remote task updates" });
+    expect(retry).toHaveTextContent("Retry");
+    fireEvent.click(retry);
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it("names a paused subscription first and disables Retry while it reconnects", () => {
+    const occupant = remoteTasksOccupant(
+      {
+        ...idle,
+        error: "list failed",
+        subscriptionError: "Task listener offline",
+        subscriptionHealth: "connecting",
+      },
+      vi.fn(),
+    );
+    render(<ComposerStrip occupants={[occupant]} />);
+    expect(screen.getByText("Remote task updates paused")).toBeInTheDocument();
+    expect(screen.getByText("Task listener offline")).toBeInTheDocument();
+    expect(screen.queryByText("list failed")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Retry remote task updates" }),
+    ).toBeDisabled();
+  });
+
+  it("disables Retry while the list is loading", () => {
+    render(
+      <ComposerStrip
+        occupants={[remoteTasksOccupant({ ...idle, error: "x", loading: true }, vi.fn())]}
+      />,
+    );
+    expect(
+      screen.getByRole("button", { name: "Retry remote task updates" }),
+    ).toBeDisabled();
+  });
+
+  it("names itself, not a session error, in a goal's drill-in", () => {
+    render(
+      <ComposerStrip
+        goal={{
+          goal: { text: "Ship it", setAt: Date.now(), sourceMessageId: "user-1", status: "standing" },
+          resumePhrase: "/goal resume",
+          onResume: vi.fn(),
+          onEditResume: vi.fn(),
+          onClear: vi.fn(),
+          onCopy: vi.fn(),
+        }}
+        occupants={[remoteTasksOccupant({ ...idle, error: "offline" }, vi.fn())]}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("composer-strip-goal-more"));
+    expect(screen.getByTestId("composer-strip-goal-others")).toHaveTextContent(
+      "remote tasks unavailable",
+    );
   });
 });

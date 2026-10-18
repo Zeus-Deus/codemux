@@ -68,6 +68,8 @@ export interface StripAction {
    *  a text-only secondary. Default: the standard filled chip. */
   tone?: "solid" | "quiet";
   testId?: string;
+  /** Accessible name when the visible label alone is ambiguous ("Retry"). */
+  ariaLabel?: string;
 }
 
 /** One row. Slots are fixed so every occupant lines up on the same grid:
@@ -96,6 +98,8 @@ export interface StripRow {
   /** False for a row that only heads the items below it (delegation's
    *  "Stop all"), so the `+n` counts never include it. */
   countsAsItem?: boolean;
+  /** Announce the row to assistive tech when it appears (`role="status"`). */
+  announce?: boolean;
 }
 
 export interface StripOccupant {
@@ -415,7 +419,7 @@ function occupantSummary(present: StripOccupant[]): string | null {
       case "monitoring":
         return "monitoring";
       case "error":
-        return "session error";
+        return o.summary.label.toLowerCase();
       case "usage":
         return "usage limit";
       case "approval":
@@ -442,6 +446,7 @@ function StripRowView({
       className="shrink-0"
     >
       <div
+        role={row.announce ? "status" : undefined}
         className={cn(
           "flex shrink-0 items-center gap-2.5 px-2",
           STRIP_ROW_HEIGHT,
@@ -504,6 +509,7 @@ function StripActionButton({ action }: { action: StripAction }) {
       data-testid={action.testId ?? "composer-strip-action"}
       disabled={action.disabled}
       title={action.title}
+      aria-label={action.ariaLabel}
       onClick={action.onClick}
       className={cn(
         action.tone === "solid"
