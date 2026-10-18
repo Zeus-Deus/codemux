@@ -147,7 +147,7 @@ export function useQueuedTurnEditor({
         finish(false);
       } catch (error) {
         edit.saving = undefined;
-        toast.error(`Couldn't edit the queued message: ${error}`);
+        toast.failure("Couldn't edit the queued message", error);
       }
     },
     [provider, finish],
@@ -292,7 +292,7 @@ export function QueuedTurnsList({
   const move = useCallback(
     (queuedId: string, before: string | null) => {
       agentChatMoveQueuedTurn(provider, threadId, queuedId, before).catch((error) => {
-        toast.error(`Couldn't move the queued message: ${error}`);
+        toast.failure("Couldn't move the queued message", error);
       });
     },
     [provider, threadId],
@@ -304,7 +304,7 @@ export function QueuedTurnsList({
       if (nonce) requestSendAnchor(nonce);
       agentChatSendSavedQueuedTurn(provider, threadId, item.queued!.queuedId, "queue").catch((error) => {
         if (nonce) clearSendAnchor(nonce);
-        toast.error(`Couldn't send the saved message: ${error}`);
+        toast.failure("Couldn't send the saved message", error);
       });
     },
     [provider, threadId, requestSendAnchor, clearSendAnchor],
@@ -315,7 +315,7 @@ export function QueuedTurnsList({
       const queuedId = item.queued!.queuedId;
       if (!item.queued?.saved) return onRemove(queuedId);
       agentChatCancelSavedQueuedTurn(threadId, queuedId).catch((error) => {
-        toast.error(`Couldn't remove the saved message: ${error}`);
+        toast.failure("Couldn't remove the saved message", error);
       });
     },
     [threadId, onRemove],
@@ -353,7 +353,7 @@ export function QueuedTurnsList({
         aria-label={expanded ? "Collapse queued messages" : "Expand queued messages"}
         onClick={() => setExpanded((open) => !open)}
         className={cn(
-          "flex w-full items-center gap-2.5 rounded-t-[13px] px-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
+          "flex w-full items-center gap-2.5 rounded-t-lg px-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
           STRIP_ROW_HEIGHT,
         )}
       >
@@ -363,7 +363,7 @@ export function QueuedTurnsList({
         <span className="text-body-sm font-semibold text-foreground/80">Queued</span>
         <span className="ml-auto font-mono text-label tabular-nums text-muted-foreground">{count}</span>
         <span className="flex size-[26px] items-center justify-center text-muted-foreground" aria-hidden>
-          <ChevronDown className={cn("size-3.5 transition-transform", !expanded && "rotate-180")} />
+          <ChevronDown className={cn("size-3.5 transition-transform duration-150", !expanded && "rotate-180")} />
         </span>
       </button>
       <ol
@@ -422,10 +422,10 @@ export function QueuedTurnsList({
               )}
             >
               {drag && drag.insertIndex === index && drag.queuedId !== queuedId ? (
-                <span aria-hidden className="pointer-events-none absolute inset-x-1 top-0 h-0.5 rounded bg-accent-ember/70" />
+                <span aria-hidden className="pointer-events-none absolute inset-x-1 top-0 h-0.5 rounded-sm bg-accent-ember/70" />
               ) : null}
               {drag && index === ids.length - 1 && drag.insertIndex === ids.length ? (
-                <span aria-hidden className="pointer-events-none absolute inset-x-1 bottom-0 h-0.5 rounded bg-accent-ember/70" />
+                <span aria-hidden className="pointer-events-none absolute inset-x-1 bottom-0 h-0.5 rounded-sm bg-accent-ember/70" />
               ) : null}
               <button
                 type="button"
