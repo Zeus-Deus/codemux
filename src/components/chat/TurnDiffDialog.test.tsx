@@ -166,6 +166,28 @@ describe("TurnDiffDialog", () => {
     expect(pure).toHaveTextContent("Renamed");
   });
 
+  it("says when an empty file was added or deleted", async () => {
+    const empty = (path: string, change: "added" | "deleted") => ({
+      path,
+      old_path: null,
+      change,
+      additions: 0,
+      deletions: 0,
+      binary: false,
+      patch: `diff --git a/${path} b/${path}\n${change === "added" ? "new" : "deleted"} file mode 100644\nindex 0000000..e69de29\n`,
+      patch_omitted: null,
+    });
+    getTurnDiff.mockResolvedValue({
+      ...ready,
+      files: [empty("pkg/__init__.py", "added"), empty("old/__init__.py", "deleted")],
+      files_changed: 2,
+    });
+    open();
+    const [added, deleted] = await screen.findAllByTestId("turn-diff-omitted");
+    expect(added).toHaveTextContent("Empty file added");
+    expect(deleted).toHaveTextContent("Empty file deleted");
+  });
+
   it("returns focus to the element that opened it", async () => {
     getTurnDiff.mockResolvedValue(null);
     const opener = document.createElement("button");

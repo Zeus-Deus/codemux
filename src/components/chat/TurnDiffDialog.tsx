@@ -31,9 +31,14 @@ const OMITTED_REASON: Record<NonNullable<TurnDiffFile["patch_omitted"]>, string>
 /** How often an open dialog asks again while the turn's end is captured. */
 const IN_PROGRESS_POLL_MS = 2000;
 
-/** What a patch with no hunks records: a rename, copy or mode change. */
+/** What a patch with no hunks records: an empty file added or deleted, a
+ *  rename, a copy, or a mode or type change. */
 function metadataOnlyReason(file: TurnDiffFile): string {
   switch (file.change) {
+    case "added":
+      return "Empty file added";
+    case "deleted":
+      return "Empty file deleted";
     case "renamed":
       return "Renamed";
     case "copied":
@@ -216,8 +221,9 @@ export function TurnDiffDialog({
         className="flex max-h-[calc(100dvh-4rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl"
         data-testid="turn-diff-dialog"
         onCloseAutoFocus={(event) => {
+          // The opener may have been recycled out of the transcript since.
           const target = returnFocusRef?.current;
-          if (target) {
+          if (target?.isConnected) {
             event.preventDefault();
             target.focus();
           }

@@ -1,5 +1,5 @@
 import { FileDiff } from "lucide-react";
-import { useRef, useState } from "react";
+import { useState } from "react";
 
 import { Eyebrow } from "@/components/ui/eyebrow";
 import {
@@ -10,7 +10,6 @@ import {
 import { useUIStore } from "@/stores/ui-store";
 
 import type { TurnChangeSummary } from "./turn-changes";
-import { TurnDiffDialog } from "./TurnDiffDialog";
 
 /** Show a path relative to the workspace when it lives inside it. */
 function displayPath(path: string, cwd?: string | null): string {
@@ -34,49 +33,44 @@ function Counts({ added, removed }: { added: number; removed: number }) {
 /**
  * Closes a settled turn with the answer to "what did it touch?": a file count
  * and summed line counts, and a hover list per file. A click opens the turn's
- * real git diff when the turn is known, else the workspace's Changes pane.
+ * real git diff through `onShowDiff` when the turn's diff can be fetched,
+ * else the workspace's Changes pane.
  */
 export function TurnChangesChip({
   changes,
   workspaceId,
   cwd,
-  threadId,
-  turnId,
+  onShowDiff,
 }: {
   changes: TurnChangeSummary;
   workspaceId?: string | null;
   cwd?: string | null;
-  threadId?: string | null;
-  turnId?: string | null;
+  /** Opens the turn's diff; the chip passes itself to get focus back. */
+  onShowDiff?: (trigger: HTMLElement) => void;
 }) {
-  const [diffOpen, setDiffOpen] = useState(false);
   const [listOpen, setListOpen] = useState(false);
-  const chipRef = useRef<HTMLButtonElement>(null);
   const count = changes.files.length;
   const label = `${count} ${count === 1 ? "file" : "files"} changed`;
-  const showsDiff = Boolean(threadId && turnId);
   return (
-    <>
     <HoverCard
       openDelay={300}
       closeDelay={100}
-      // Never left floating above the diff dialog the chip just opened.
-      open={listOpen && !diffOpen}
+      open={listOpen}
       onOpenChange={setListOpen}
     >
       <HoverCardTrigger asChild>
         <button
-          ref={chipRef}
           type="button"
-          onClick={() => {
-            if (showsDiff) {
+          onClick={(event) => {
+            if (onShowDiff) {
+              // Never left floating above the diff dialog this opens.
               setListOpen(false);
-              setDiffOpen(true);
+              onShowDiff(event.currentTarget);
             } else if (workspaceId) {
               useUIStore.getState().setRightPanelTab(workspaceId, "changes");
             }
           }}
-          aria-label={`${label}, ${changes.added} lines added, ${changes.removed} removed. ${showsDiff ? "Show this turn's diff" : "Open changes"}`}
+          aria-label={`${label}, ${changes.added} lines added, ${changes.removed} removed. ${onShowDiff ? "Show this turn's diff" : "Open changes"}`}
           className="inline-flex min-w-0 items-center gap-1.5 rounded-sm px-1 text-label text-muted-foreground transition-colors duration-100 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
           data-testid="turn-changes-chip"
         >
@@ -114,16 +108,5 @@ export function TurnChangesChip({
         </ul>
       </HoverCardContent>
     </HoverCard>
-    {showsDiff && threadId && turnId ? (
-      <TurnDiffDialog
-        open={diffOpen}
-        onOpenChange={setDiffOpen}
-        threadId={threadId}
-        turnId={turnId}
-        workspaceId={workspaceId}
-        returnFocusRef={chipRef}
-      />
-    ) : null}
-    </>
   );
 }

@@ -4,11 +4,6 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { useUIStore } from "@/stores/ui-store";
 
-const getTurnDiff = vi.fn();
-vi.mock("@/tauri/commands", () => ({
-  agentChatGetTurnDiff: (...args: unknown[]) => getTurnDiff(...args),
-}));
-
 import { TurnChangesChip } from "./TurnChangesChip";
 
 const changes = {
@@ -49,22 +44,15 @@ describe("TurnChangesChip", () => {
     );
   });
 
-  it("opens the turn's git diff when it knows the turn", async () => {
-    getTurnDiff.mockResolvedValue(null);
+  it("hands itself to onShowDiff instead of opening the Changes pane", () => {
+    const onShowDiff = vi.fn();
     render(
-      <TurnChangesChip
-        changes={changes}
-        workspaceId="ws-1"
-        cwd="/repo"
-        threadId="t1"
-        turnId="turn-1"
-      />,
+      <TurnChangesChip changes={changes} workspaceId="ws-1" cwd="/repo" onShowDiff={onShowDiff} />,
     );
     const chip = screen.getByTestId("turn-changes-chip");
     expect(chip).toHaveAccessibleName(/Show this turn's diff/);
     fireEvent.click(chip);
-    expect(await screen.findByTestId("turn-diff-dialog")).toBeInTheDocument();
-    expect(getTurnDiff).toHaveBeenCalledWith("t1", "turn-1");
+    expect(onShowDiff).toHaveBeenCalledWith(chip);
     expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBeUndefined();
   });
 });

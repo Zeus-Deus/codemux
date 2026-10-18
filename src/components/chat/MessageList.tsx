@@ -62,6 +62,7 @@ import { SignInNotice } from "./SignInNotice";
 import { HtmlRenderFrame } from "./HtmlRenderFrame";
 import { ToolCallCard } from "./ToolCallCard";
 import { TurnChangesChip } from "./TurnChangesChip";
+import { TurnDiffDialog } from "./TurnDiffDialog";
 import { AsyncQuestionRecord } from "./AsyncQuestionPanel";
 import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
@@ -288,6 +289,17 @@ export const MessageList = memo(function MessageList({
   const [expandedTurnIds, setExpandedTurnIds] = useState<Set<string>>(
     () => new Set(),
   );
+  // The turn diff dialog lives here too: a row that owned it would take it
+  // down when following the live edge recycles that row.
+  const [turnDiff, setTurnDiff] = useState<{ turnId: string; open: boolean } | null>(null);
+  const turnDiffTriggerRef = useRef<HTMLElement | null>(null);
+  const showTurnDiff = useCallback((turnId: string, trigger: HTMLElement) => {
+    turnDiffTriggerRef.current = trigger;
+    setTurnDiff({ turnId, open: true });
+  }, []);
+  useEffect(() => {
+    setTurnDiff(null);
+  }, [threadKey]);
   const toggleTurnFold = useCallback((turnId: string, pinnedBy: readonly string[]) => {
     setExpandedTurnIds((current) => {
       const next = new Set(current);
@@ -1310,7 +1322,7 @@ export const MessageList = memo(function MessageList({
           }
           workspaceId={workspaceId}
           cwd={cwd}
-          threadId={threadKey}
+          onShowTurnDiff={threadKey ? showTurnDiff : undefined}
           referenceCwd={referenceCwdByMessageId.get(slot.messageId)}
           referencePaths={referencePathsByMessageId.get(slot.messageId)}
           onRespondToRequest={onRespondToRequest}
@@ -1347,6 +1359,7 @@ export const MessageList = memo(function MessageList({
       workspaceId,
       cwd,
       threadKey,
+      showTurnDiff,
       pluginToolRenderers,
     ],
   );
@@ -1501,6 +1514,16 @@ export const MessageList = memo(function MessageList({
         </Button>
       )}
       </div>
+      {threadKey && turnDiff ? (
+        <TurnDiffDialog
+          open={turnDiff.open}
+          onOpenChange={(open) => setTurnDiff((current) => current && { ...current, open })}
+          threadId={threadKey}
+          turnId={turnDiff.turnId}
+          workspaceId={workspaceId}
+          returnFocusRef={turnDiffTriggerRef}
+        />
+      ) : null}
     </ChatFileLinkContext.Provider>
   );
 });
@@ -2170,7 +2193,7 @@ function TurnFoldRow({
   changes,
   workspaceId,
   cwd,
-  threadId,
+  onShowTurnDiff,
   onToggleTurnFold,
 }: {
   turnId: string;
@@ -2181,7 +2204,7 @@ function TurnFoldRow({
   changes?: TurnChangeSummary;
   workspaceId?: string | null;
   cwd?: string | null;
-  threadId?: string | null;
+  onShowTurnDiff?: (turnId: string, trigger: HTMLElement) => void;
   onToggleTurnFold: (turnId: string, pinnedBy: readonly string[]) => void;
 }) {
   const Icon = expanded ? ChevronDown : ChevronRight;
@@ -2206,8 +2229,9 @@ function TurnFoldRow({
           changes={changes}
           workspaceId={workspaceId}
           cwd={cwd}
-          threadId={threadId}
-          turnId={turnId}
+          onShowDiff={
+            onShowTurnDiff ? (trigger) => onShowTurnDiff(turnId, trigger) : undefined
+          }
         />
       ) : null}
     </div>
@@ -2240,7 +2264,7 @@ function SlotRow({
   subagentName,
   workspaceId,
   cwd,
-  threadId,
+  onShowTurnDiff,
   referenceCwd,
   referencePaths,
   onRespondToRequest,
@@ -2264,8 +2288,8 @@ function SlotRow({
   subagentName: string | null;
   workspaceId?: string | null;
   cwd?: string | null;
-  /** The thread whose turns these are; lets a turn's chip fetch its diff. */
-  threadId?: string | null;
+  /** Opens a turn's git diff; absent when there is no thread to ask. */
+  onShowTurnDiff?: (turnId: string, trigger: HTMLElement) => void;
   referenceCwd?: string | null;
   referencePaths?: readonly string[];
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
@@ -2315,7 +2339,7 @@ function SlotRow({
           changes={slot.body.changes}
           workspaceId={workspaceId}
           cwd={cwd}
-          threadId={threadId}
+          onShowTurnDiff={onShowTurnDiff}
           onToggleTurnFold={onToggleTurnFold}
         />
       ) : slot.body.kind === "delegation" ? (
