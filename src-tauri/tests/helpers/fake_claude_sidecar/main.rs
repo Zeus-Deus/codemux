@@ -261,6 +261,17 @@ fn main() {
                     fire_script_entries_for(method, &script);
                 }
             }
+            "compact-idle" => {
+                capture_params(method, &msg.params);
+                if let Some(id) = id {
+                    write_line(&json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "started": true },
+                    }));
+                }
+                fire_script_entries_for(method, &script);
+            }
             "interrupt" | "set-model" | "set-permission-mode" => {
                 if method == "interrupt" {
                     capture_params(method, &msg.params);

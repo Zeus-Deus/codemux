@@ -92,6 +92,20 @@ pub(crate) struct ClaudeSessionState {
     /// concurrent drains (notifications task + inline interrupt fallback)
     /// each popping and dispatching an item in the same idle window.
     pub dispatching: bool,
+    /// Set while a compaction requested by a plugin (see
+    /// [`super::idle_compaction`]) runs on the live query. User turns queue
+    /// behind it, exactly as they would behind a turn, and its `result` is
+    /// not a user turn ending.
+    pub idle_compaction: Option<IdleRun>,
+}
+
+/// One idle compaction in flight.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IdleRun {
+    id: u64,
+    /// The SDK reported the compaction boundary, so the history really
+    /// was replaced by a summary.
+    compacted: bool,
 }
 
 impl ClaudeSessionState {
@@ -107,6 +121,13 @@ impl ClaudeSessionState {
     /// and hydrate must keep the request answerable instead of expiring it.
     pub(crate) fn turn_busy(&self) -> bool {
         self.active_turn.is_some() || !self.pending_approvals.is_empty()
+    }
+
+    /// Whether the SDK cannot take a new prompt right now. Unlike
+    /// [`turn_busy`](Self::turn_busy) this includes an idle compaction,
+    /// which is not a run the UI should show as live.
+    pub(crate) fn sdk_busy(&self) -> bool {
+        self.turn_busy() || self.idle_compaction.is_some()
     }
 }
 
@@ -170,7 +191,6 @@ fn restore_queued_position(
 pub(crate) struct ClaudeSession {
     pub thread_id: ThreadId,
     pub provider_session_id: ProviderSessionId,
-    #[allow(dead_code)]
     pub cwd: PathBuf,
     pub sidecar: Arc<JsonRpcChild>,
     pub state: Mutex<ClaudeSessionState>,
@@ -210,6 +230,21 @@ pub(crate) struct ClaudeSession {
     native_authority: Arc<crate::delegation::authority::NativeAuthority>,
     managed: Option<Arc<crate::agent_provider::managed::ManagedSession>>,
     managed_diagnostics: bool,
+    /// What a plugin-requested compaction needs to honour the CLI's own
+    /// opt-outs.
+    compaction: CompactionSupport,
+}
+
+struct CompactionSupport {
+    /// Local, unmanaged chats only: a device's CLI reads that device's
+    /// settings, which this computer cannot see, so its opt-outs couldn't
+    /// be honoured; managed workflow attempts own their whole run.
+    eligible: bool,
+    /// `--settings` object the CLI was launched with.
+    flag_settings: Option<Value>,
+    /// Env overlay the sidecar (and so the CLI) was launched with.
+    env: HashMap<String, String>,
+    next_id: std::sync::atomic::AtomicU64,
 }
 
 /// Spawn the bundled sidecar on this computer in `cwd`.
@@ -299,6 +334,7 @@ impl ClaudeSession {
         }
         let sidecar_binary = spawn.sidecar_binary;
         let env = input.env.clone().unwrap_or_default();
+        let compaction_env = env.clone();
         let sidecar = match input.remote.as_ref() {
             // On a device the runtime installed there runs over `ssh -T`;
             // `input.cwd` is already a path on that device.
@@ -527,7 +563,14 @@ impl ClaudeSession {
             sdk_session_id: None,
             queued_turns: VecDeque::new(),
             dispatching: false,
+            idle_compaction: None,
         });
+        let compaction = CompactionSupport {
+            eligible: managed.is_none() && input.remote.is_none(),
+            flag_settings: input.extra.get("settings").cloned(),
+            env: compaction_env,
+            next_id: Default::default(),
+        };
         let session = Arc::new(Self {
             thread_id: thread_id.clone(),
             provider_session_id: provider_session_id.clone(),
@@ -552,6 +595,7 @@ impl ClaudeSession {
                 .and_then(Value::as_bool)
                 == Some(true),
             managed,
+            compaction,
         });
 
         // Announce the session up front.
@@ -606,6 +650,216 @@ impl ClaudeSession {
         Ok(session)
     }
 
+    /// Run Claude Code's `/compact` on this idle session, on behalf of a
+    /// plugin. Every gate is re-checked here: the CLI's own opt-outs, then,
+    /// under the lifecycle lock, that nothing runs or waits. The claim made
+    /// under that lock makes a user send arriving from then on queue behind
+    /// the compaction instead of racing it.
+    pub async fn request_compaction(
+        self: &Arc<Self>,
+    ) -> Result<(), super::idle_compaction::Refusal> {
+        use super::idle_compaction::{self as idle, Refusal};
+        if !self.compaction.eligible {
+            return Err(Refusal::Unsupported);
+        }
+        if self.is_dead() {
+            return Err(Refusal::Closed);
+        }
+        let env = |key: &str| {
+            self.compaction
+                .env
+                .get(key)
+                .cloned()
+                .or_else(|| idle::process_env(key))
+        };
+        let settings =
+            idle::ClaudeSettings::load(&self.cwd, self.compaction.flag_settings.as_ref(), &env);
+        if let Some(refusal) = settings.opt_out(&env) {
+            return Err(refusal);
+        }
+        let id = self
+            .compaction
+            .next_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        {
+            let mut state = self.state.lock().await;
+            match state.status {
+                SessionStatus::Closed => return Err(Refusal::Closed),
+                SessionStatus::Starting | SessionStatus::Error { .. } => {
+                    return Err(Refusal::NotReady)
+                }
+                SessionStatus::Ready
+                | SessionStatus::Running { .. }
+                | SessionStatus::WaitingApproval { .. } => {}
+            }
+            if state.sdk_busy()
+                || state.dispatching
+                || !matches!(state.status, SessionStatus::Ready)
+            {
+                return Err(Refusal::Busy);
+            }
+            if !state.queued_turns.is_empty() {
+                return Err(Refusal::Queued);
+            }
+            state.idle_compaction = Some(IdleRun {
+                id,
+                compacted: false,
+            });
+        }
+        let ack = self
+            .sidecar
+            .request(
+                super::protocol::METHOD_COMPACT_IDLE,
+                json!({ "threadId": self.thread_id.0 }),
+            )
+            .await;
+        let refused = match &ack {
+            Ok(ack) if ack.get("started").and_then(Value::as_bool) == Some(true) => None,
+            Ok(ack) => Some(match ack.get("reason").and_then(Value::as_str) {
+                Some("closed") => Refusal::Closed,
+                Some("query_dead") => Refusal::NotReady,
+                _ => Refusal::Failed,
+            }),
+            Err(_) => Some(Refusal::Failed),
+        };
+        if let Some(refusal) = refused {
+            self.finish_idle_compaction(id).await;
+            return Err(refusal);
+        }
+        // The SDK reports its own `compacting` status too; this makes the
+        // marker independent of that.
+        let _ = self
+            .event_tx
+            .send(ProviderRuntimeEvent::ContextCompactionChanged {
+                thread_id: self.thread_id.clone(),
+                active: true,
+            });
+        eprintln!(
+            "[codemux::claude] idle compaction started for {}",
+            self.thread_id.0
+        );
+        // Never leave follow-ups stuck behind a compaction that never settles.
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(idle::IN_FLIGHT_TIMEOUT).await;
+            if let Some(session) = weak.upgrade() {
+                if session.finish_idle_compaction(id).await {
+                    eprintln!(
+                        "[codemux::claude] idle compaction abandoned after timeout for {}",
+                        session.thread_id.0
+                    );
+                    let _ = session
+                        .event_tx
+                        .send(ProviderRuntimeEvent::ContextCompactionChanged {
+                            thread_id: session.thread_id.clone(),
+                            active: false,
+                        });
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Release the claim of compaction `id` (if it still holds it) and let
+    /// queued follow-ups through. Returns whether it still held the claim.
+    async fn finish_idle_compaction(self: &Arc<Self>, id: u64) -> bool {
+        let released = {
+            let mut state = self.state.lock().await;
+            let held = state.idle_compaction.is_some_and(|run| run.id == id);
+            if held {
+                state.idle_compaction = None;
+            }
+            held
+        };
+        if released {
+            self.drain_queue().await;
+        }
+        released
+    }
+
+    /// Route the events of one notification while an idle compaction may
+    /// be in flight. The compaction is not a user turn: only its own facts
+    /// (the compacting marker, context size, resume cursor, usage) pass
+    /// through. Turn starts/ends and transcript items are dropped, so there
+    /// is no "Working" state, no "finished" ping and no reply bubble, and a
+    /// failed compaction stays silent as in Claude Code (the CLI's error
+    /// text would otherwise render as an assistant reply). Its `result`
+    /// ends the run and adds the notice when it compacted.
+    async fn settle_idle_events(
+        self: &Arc<Self>,
+        message: Option<&Value>,
+        mut events: Vec<ProviderRuntimeEvent>,
+    ) -> Vec<ProviderRuntimeEvent> {
+        let Some(message) = message else {
+            return events;
+        };
+        let kind = message.get("type").and_then(Value::as_str);
+        let main_thread = super::translate::parent_tool_use_id(message).is_none();
+        let boundary = main_thread
+            && kind == Some("system")
+            && message.get("subtype").and_then(Value::as_str) == Some("compact_boundary");
+        let ended = {
+            let mut state = self.state.lock().await;
+            let Some(run) = state.idle_compaction.as_mut() else {
+                return events;
+            };
+            if boundary {
+                run.compacted = true;
+            }
+            events.retain(|event| {
+                matches!(
+                    event,
+                    ProviderRuntimeEvent::ContextCompactionChanged { .. }
+                        | ProviderRuntimeEvent::ContextUsageUpdated { .. }
+                        | ProviderRuntimeEvent::ResumeCursorUpdated { .. }
+                        | ProviderRuntimeEvent::UsageRecorded { .. }
+                        | ProviderRuntimeEvent::PlanUsageUpdated { .. }
+                )
+            });
+            if !(main_thread && kind == Some("result")) {
+                return events;
+            }
+            state.idle_compaction.take()
+        };
+        let Some(run) = ended else { return events };
+        // The marker must not outlive a compaction that never reported its
+        // own end (e.g. one that failed before compacting).
+        events.push(ProviderRuntimeEvent::ContextCompactionChanged {
+            thread_id: self.thread_id.clone(),
+            active: false,
+        });
+        if run.compacted {
+            eprintln!(
+                "[codemux::claude] idle compaction finished for {}",
+                self.thread_id.0
+            );
+            events.push(ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(self.thread_id.clone()),
+                message: super::idle_compaction::notice_message(),
+                original_payload: None,
+            });
+        } else {
+            eprintln!(
+                "[codemux::claude] idle compaction ended without compacting for {}",
+                self.thread_id.0
+            );
+        }
+        events
+    }
+
+    /// The live state a plugin's `host.chat.getStatus` reads.
+    pub async fn runtime_status(&self) -> crate::agent_provider::ThreadRuntimeStatus {
+        let state = self.state.lock().await;
+        crate::agent_provider::ThreadRuntimeStatus {
+            busy: state.sdk_busy() || state.dispatching,
+            queued: Some(state.queued_turns.len()),
+            compacting: state.idle_compaction.is_some(),
+            status: crate::agent_provider::ThreadRuntimeStatus::status_name(&state.status)
+                .into(),
+        }
+    }
+
     pub(crate) fn managed_startup_guard(&self) -> Option<crate::json_rpc_child::ManagedStartupGuard> {
         let mut guard = self.sidecar.managed_startup_guard()?;
         guard.set_task_shutdown(self.shutdown_tx.clone());
@@ -632,7 +886,7 @@ impl ClaudeSession {
         // the callback is answered.
         {
             let mut state = self.state.lock().await;
-            if state.turn_busy() {
+            if state.sdk_busy() {
                 if input.dispatch_guard.is_some() {
                     return Err(ProviderError::ValidationError {
                         message: "Guarded result cannot queue behind a busy parent".into(),
@@ -705,6 +959,7 @@ impl ClaudeSession {
                 let idle = state.active_turn.is_none()
                     && matches!(state.status, SessionStatus::Ready)
                     && state.pending_approvals.is_empty()
+                    && state.idle_compaction.is_none()
                     && !state.dispatching;
                 if !idle {
                     return;
@@ -1267,6 +1522,7 @@ impl ClaudeSession {
             let mut state = self.state.lock().await;
             state.status = SessionStatus::Closed;
             state.active_turn = None;
+            state.idle_compaction = None;
             // Pending approvals never get a response — drop them so
             // a later `respond_to_request` sees an empty map.
             state.pending_approvals.clear();
@@ -1456,6 +1712,10 @@ fn spawn_notifications_task(
                             // Result/interruption handling clears the active
                             // turn. Preserve its identity before that mutation.
                             let active_turn=session.state.lock().await.active_turn.clone();
+                            let sdk_message = match &structured {
+                                SidecarNotification::SdkMessage { message, .. } => Some(message.clone()),
+                                _ => None,
+                            };
                             mutate_state_from_notification(&session, &structured).await;
                             // Catch any panic in the pure translator so
                             // a bug can't kill this task.
@@ -1475,6 +1735,7 @@ fn spawn_notifications_task(
                                     original_payload: Some(note.params),
                                 }]
                             });
+                            let events = session.settle_idle_events(sdk_message.as_ref(), events).await;
                             // Claude SDK messages carry session_id
                             // but no per-turn id, so the translator
                             // emits events with `turn_id = ""`. Stamp
@@ -1984,6 +2245,7 @@ async fn mutate_state_from_notification(
                 session.native_authority.revoke();
             }
             state.active_turn = None;
+            state.idle_compaction = None;
             state.status = if reason == "iteration-complete" {
                 SessionStatus::Ready
             } else {
@@ -1997,6 +2259,7 @@ async fn mutate_state_from_notification(
             // since gone Closed / Error.
             let mut state = session.state.lock().await;
             state.active_turn = None;
+            state.idle_compaction = None;
             if matches!(state.status, SessionStatus::Running { .. }) {
                 state.status = SessionStatus::Ready;
             }
@@ -2020,6 +2283,7 @@ async fn mutate_state_from_notification(
                 message: error.message.clone(),
             };
             state.active_turn = None;
+            state.idle_compaction = None;
         }
         _ => {}
     }

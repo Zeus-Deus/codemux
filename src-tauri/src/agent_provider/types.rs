@@ -582,6 +582,37 @@ pub enum SessionStatus {
     Closed,
 }
 
+/// What a thread's live session is doing right now, for plugins
+/// (`host.chat.getStatus`). Read from in-memory session state only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadRuntimeStatus {
+    /// The session cannot take a new prompt now: a turn, a pending
+    /// approval, a queue dispatch or a compaction is in flight.
+    pub busy: bool,
+    /// Follow-up turns waiting behind the active one, when the provider
+    /// keeps its own queue; `None` when it can't tell.
+    pub queued: Option<usize>,
+    /// A plugin-requested compaction is running.
+    pub compacting: bool,
+    /// The session's lifecycle phase: `starting`, `ready`, `running`,
+    /// `waiting_approval`, `error` or `closed`.
+    pub status: String,
+}
+
+impl ThreadRuntimeStatus {
+    pub fn status_name(status: &SessionStatus) -> &'static str {
+        match status {
+            SessionStatus::Starting => "starting",
+            SessionStatus::Ready => "ready",
+            SessionStatus::Running { .. } => "running",
+            SessionStatus::WaitingApproval { .. } => "waiting_approval",
+            SessionStatus::Error { .. } => "error",
+            SessionStatus::Closed => "closed",
+        }
+    }
+}
+
 /// Snapshot of a live provider session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSession {

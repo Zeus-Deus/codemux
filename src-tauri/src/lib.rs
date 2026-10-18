@@ -2643,6 +2643,8 @@ fn build_core_app<R: tauri::Runtime>(
             plugins::commands::plugins_startup_checkpoint,
             plugins::commands::plugins_resume,
             plugins::commands::plugins_set_event_tap,
+            plugins::commands::plugins_chat_status,
+            plugins::commands::plugins_chat_request_compaction,
             plugins::commands::plugins_catalog,
             plugins::commands::plugins_preview_install,
             plugins::commands::plugins_install,

@@ -13,6 +13,7 @@
 
 pub mod auth;
 pub mod capabilities;
+pub mod idle_compaction;
 pub mod protocol;
 pub mod slash_commands;
 pub(crate) mod session;
@@ -395,6 +396,28 @@ impl AgentProvider for ClaudeAgentProvider {
         }
         let state = session.state.lock().await;
         state.turn_busy()
+    }
+
+    async fn runtime_status(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Option<crate::agent_provider::ThreadRuntimeStatus> {
+        let session = self.sessions.read().await.get(thread_id).cloned()?;
+        if session.is_dead() {
+            return None;
+        }
+        Some(session.runtime_status().await)
+    }
+
+    async fn request_compaction(&self, thread_id: &ThreadId) -> Result<(), &'static str> {
+        let session = self.sessions.read().await.get(thread_id).cloned();
+        let Some(session) = session.filter(|session| !session.is_dead()) else {
+            return Err(idle_compaction::Refusal::NoSession.as_str());
+        };
+        session
+            .request_compaction()
+            .await
+            .map_err(idle_compaction::Refusal::as_str)
     }
 
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {

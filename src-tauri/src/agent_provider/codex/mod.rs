@@ -538,6 +538,23 @@ impl AgentProvider for CodexAgentProvider {
         state.active_turn.is_some()
     }
 
+    async fn runtime_status(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Option<crate::agent_provider::ThreadRuntimeStatus> {
+        let session = self.sessions.read().await.get(thread_id).cloned()?;
+        if session.is_dead() {
+            return None;
+        }
+        let state = session.state.lock().await;
+        Some(crate::agent_provider::ThreadRuntimeStatus {
+            busy: state.active_turn.is_some() || !state.pending_approvals.is_empty(),
+            queued: Some(state.queued_turns.len()),
+            compacting: false,
+            status: crate::agent_provider::ThreadRuntimeStatus::status_name(&state.status).into(),
+        })
+    }
+
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {
         let sessions = self.collect_sessions().await;
         let mut out = Vec::with_capacity(sessions.len());

@@ -35,6 +35,15 @@ const RESUME_FALLBACK_PREFIX = "resume-fallback: ";
 /** Codex could not apply a saved premium tier and selected Standard. */
 export const SERVICE_TIER_FALLBACK_PREFIX = "service-tier-fallback: ";
 
+/** Claude adapter: an idle chat was compacted on a plugin's request.
+ *  Informational, not a warning. */
+export const IDLE_COMPACTION_PREFIX = "idle-compaction: ";
+
+/** Whether a notice row reports an idle compaction (rendered muted). */
+export function isIdleCompactionWarning(message: string): boolean {
+  return message.startsWith(IDLE_COMPACTION_PREFIX);
+}
+
 /** Explicit restriction emitted by the pinned Hermes adapter on session start. */
 const HERMES_USAGE_LIMIT_RECOVERY_PREFIX = "hermes-usage-limit-recovery: ";
 
@@ -69,6 +78,8 @@ function readRateLimitStatus(originalPayload: unknown): string | null {
  *   could not be applied; the session uses Standard).
  * - `"hermes-usage-limit-recovery: <text>"` → `<text>` (the adapter's
  *   explicit compatibility restriction, persisted for reopened chats).
+ * - `"idle-compaction: <text>"` → `<text>` (an idle Claude chat was
+ *   summarized on a plugin's request; rendered as info).
  * - anything else → null (SDK debug noise).
  */
 export function runtimeNoticeFromWarning(
@@ -94,6 +105,9 @@ export function runtimeNoticeFromWarning(
   }
   if (message.startsWith(HERMES_USAGE_LIMIT_RECOVERY_PREFIX)) {
     return message.slice(HERMES_USAGE_LIMIT_RECOVERY_PREFIX.length);
+  }
+  if (isIdleCompactionWarning(message)) {
+    return message.slice(IDLE_COMPACTION_PREFIX.length);
   }
   return null;
 }

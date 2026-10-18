@@ -611,7 +611,7 @@ mod plugins_boundary_tests {
         let app = tauri::test::mock_app();
         let router = Arc::new(ChannelRouter::default());
         let (out, mut frames) = tokio::sync::mpsc::unbounded_channel();
-        for command in ["plugins_list", "plugins_read_source", "plugins_set_enabled", "plugins_future_command"] {
+        for command in ["plugins_list", "plugins_read_source", "plugins_set_enabled", "plugins_chat_status", "plugins_chat_request_compaction", "plugins_future_command"] {
             dispatch_invoke(app.handle(), &router, 7, &out, 1, command.into(), json!({"channel":"__CHANNEL__:12"})).await;
             let Message::Text(frame) = frames.recv().await.unwrap() else { panic!("Expected rejection") };
             assert!(frame.contains("REMOTE_UNSUPPORTED"));

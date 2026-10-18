@@ -46,7 +46,8 @@ pub use types::{
     ApprovalDecision, ChatModelInfo, ContextWindowOption, EffortGranularity, ImageInput,
     PermissionModeOption, ProviderCapabilities, ProviderChatCapabilities, ProviderKind,
     ProviderSession, ProviderSessionId, RequestId, SendOutcome, SendTurnInput, SessionStatus,
-    StartSessionInput, ThreadId, TurnDispatchCheckpoint, TurnId, TurnStartResult, UsageBaseline,
+    StartSessionInput, ThreadId, ThreadRuntimeStatus, TurnDispatchCheckpoint, TurnId,
+    TurnStartResult, UsageBaseline,
 };
 
 /// The MCP registry a session publishes tools from and runs tool calls

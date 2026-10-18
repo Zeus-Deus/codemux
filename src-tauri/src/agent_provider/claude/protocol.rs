@@ -30,6 +30,8 @@ pub const METHOD_RESPOND_TO_REQUEST: &str = "respond-to-request";
 pub const METHOD_RESPOND_TO_USER_INPUT: &str = "respond-to-user-input";
 pub const METHOD_INITIALIZATION_RESULT: &str = "initialization-result";
 pub const METHOD_STOP_SESSION: &str = "stop-session";
+/// Run `/compact` on an idle session's live query (see `idle_compaction`).
+pub const METHOD_COMPACT_IDLE: &str = "compact-idle";
 pub const METHOD_PROBE_INSTALLED: &str = "probe-installed";
 pub const METHOD_PROBE_AUTHENTICATED: &str = "probe-authenticated";
 

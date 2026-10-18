@@ -699,6 +699,27 @@ export class ClaudeSession {
     this.promptQueue.push(msg);
   }
 
+  /** Idle compaction: run Claude Code's `/compact` on the live query
+   *  while its prompt cache is still warm. A plugin decides when; the
+   *  host owns every safety gate (busy state, opt-outs); this only
+   *  refuses when the query cannot run it as-is. A query killed by an interrupt
+   *  is refused rather than rebuilt: a rebuilt CLI boot is not the warm
+   *  cache this compaction exists to read.
+   *
+   *  The compaction is not a user turn, so it must never be replayed by
+   *  the stale-resume self-heal. */
+  compactIdle(): { started: boolean; reason?: string } {
+    if (this.closed) return { started: false, reason: "closed" };
+    if (this.queryDead) return { started: false, reason: "query_dead" };
+    this.lastUserMessage = null;
+    this.promptQueue.push({
+      type: "user",
+      message: { role: "user", content: "/compact" },
+      parent_tool_use_id: null,
+    });
+    return { started: true };
+  }
+
   /** Halt the current turn. `query.interrupt()` makes the SDK query's
    *  iterator exit, so the query is marked dead and the next
    *  `sendTurn` rebuilds a resumed query. A `turn-interrupted`

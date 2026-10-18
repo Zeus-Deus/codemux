@@ -11,6 +11,7 @@ import type {
 import { isDelegatedId, isDelegatedRow } from "./delegation";
 import {
   runtimeNoticeFromWarning,
+  isIdleCompactionWarning,
   signedOutProviderFromWarning,
 } from "./runtime-notice";
 import {
@@ -2133,6 +2134,7 @@ function applyEventInner(
         seq,
         message: notice,
         ...(signIn ? { signIn } : {}),
+        ...(isIdleCompactionWarning(event.message) ? { severity: "info" as const } : {}),
       };
       return { ...next, messages: appendItem(next.messages, item) };
     }
