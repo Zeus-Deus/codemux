@@ -23,8 +23,11 @@ use std::process::{Command, Stdio};
 pub const TURN_DIFF_REF_PREFIX: &str = "refs/codemux/turn-diffs";
 
 /// Blobs above this size are diffed as binary (stats `-`, no patch), so
-/// git never line-diffs a huge generated file.
+/// git never line-diffs a huge generated file. A `diff` attribute can
+/// override that, so [`MAX_PATCH_BLOB_BYTES`] is also checked directly.
 const BIG_FILE_THRESHOLD: &str = "core.bigFileThreshold=4m";
+/// No patch is rendered for a file whose old or new blob is larger.
+const MAX_PATCH_BLOB_BYTES: u64 = 4 * 1024 * 1024;
 /// Files listed per turn. Totals still count every file.
 const MAX_FILES: usize = 1000;
 /// A file with more changed lines than this gets stats but no patch.
@@ -188,6 +191,25 @@ fn seed_snapshot_index(repo: &Path, index: &Path) -> Result<(), String> {
     if !copied {
         // Without a trustworthy stat cache, hash everything once instead.
         let _ = std::fs::remove_file(index);
+        return Ok(());
+    }
+    // The user's assume-unchanged marks would make `add -A` skip those
+    // files for good in this private index; capture them like any other.
+    let listed = git_with(repo, &["ls-files", "-z", "-v"], Some(index), None)?;
+    let assumed: Vec<&[u8]> = listed
+        .split(|b| *b == 0)
+        .filter(|entry| entry.len() > 2 && entry[0].is_ascii_lowercase() && entry[1] == b' ')
+        .map(|entry| &entry[2..])
+        .collect();
+    if !assumed.is_empty() {
+        let mut paths = assumed.join(&0u8);
+        paths.push(0);
+        git_with(
+            repo,
+            &["update-index", "-z", "--no-assume-unchanged", "--stdin"],
+            Some(index),
+            Some(&paths),
+        )?;
     }
     Ok(())
 }
@@ -230,7 +252,14 @@ fn sync_ignored(repo: &Path, index: &Path) -> Result<(), String> {
         std::fs::symlink_metadata(repo.join(String::from_utf8_lossy(path).as_ref())).is_ok()
     }));
     if !missing.is_empty() {
-        let args = ["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"];
+        let args = [
+            "-c",
+            "core.ignoreStat=false",
+            "add",
+            "-f",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ];
         git_with(repo, &args, Some(index), Some(&missing))?;
     }
     Ok(())
@@ -255,7 +284,9 @@ pub fn snapshot(
     if !index.exists() {
         seed_snapshot_index(&repo, &index)?;
     }
-    let staged = git_with(&repo, &["add", "-A"], Some(&index), None)
+    // `core.ignoreStat` would mark what `add` stages as assume-unchanged.
+    let add = ["-c", "core.ignoreStat=false", "add", "-A"];
+    let staged = git_with(&repo, &add, Some(&index), None)
         .and_then(|_| sync_ignored(&repo, &index))
         .and_then(|_| git_with(&repo, &["write-tree"], Some(&index), None));
     let tree = match staged {
@@ -351,6 +382,8 @@ struct RawEntry {
     change: TurnDiffChange,
     old_path: Option<String>,
     path: String,
+    /// Old and new blob ids; gitlinks and absent sides are left out.
+    blobs: Vec<String>,
 }
 
 fn split_nul(out: &[u8]) -> Vec<String> {
@@ -371,11 +404,18 @@ fn parse_raw(out: &[u8]) -> Result<Vec<RawEntry>, String> {
             index += 1;
             continue;
         }
-        let status = header
-            .rsplit(' ')
-            .next()
+        // `:<old mode> <new mode> <old id> <new id> <status>`
+        let parts: Vec<&str> = header.trim_start_matches(':').split(' ').collect();
+        let status = parts
+            .get(4)
             .and_then(|s| s.chars().next())
             .ok_or_else(|| format!("Unexpected git diff record: {header}"))?;
+        let blobs = [(0, 2), (1, 3)]
+            .iter()
+            .filter_map(|&(mode, id)| Some((*parts.get(mode)?, *parts.get(id)?)))
+            .filter(|(mode, id)| *mode != "160000" && id.bytes().any(|b| b != b'0'))
+            .map(|(_, id)| id.to_string())
+            .collect();
         let two_paths = matches!(status, 'R' | 'C');
         let first = fields
             .get(index + 1)
@@ -402,6 +442,7 @@ fn parse_raw(out: &[u8]) -> Result<Vec<RawEntry>, String> {
             change,
             old_path,
             path,
+            blobs,
         });
         index += if two_paths { 3 } else { 2 };
     }
@@ -455,6 +496,13 @@ enum PatchChunk {
     Budget,
 }
 
+/// One file's section of a patch run, with the `diff --git` line that
+/// opened it so it can be matched to the file it belongs to.
+struct PatchSection {
+    header: Vec<u8>,
+    chunk: PatchChunk,
+}
+
 /// Turn one file's collected bytes into its chunk, charging the turn budget.
 /// Once a patch does not fit, the budget is spent: later files get none.
 fn finish_chunk(bytes: Option<Vec<u8>>, budget: &mut usize) -> PatchChunk {
@@ -471,20 +519,49 @@ fn finish_chunk(bytes: Option<Vec<u8>>, budget: &mut usize) -> PatchChunk {
     }
 }
 
+/// Read one line, keeping at most `keep` bytes of it. Returns the line's
+/// full length; 0 at the end of output.
+fn read_line_capped(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    keep: usize,
+) -> std::io::Result<usize> {
+    line.clear();
+    let mut total = 0;
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(total);
+        }
+        let (take, done) = match buf.iter().position(|b| *b == b'\n') {
+            Some(end) => (end + 1, true),
+            None => (buf.len(), false),
+        };
+        let room = keep.saturating_sub(line.len());
+        line.extend_from_slice(&buf[..take.min(room)]);
+        reader.consume(take);
+        total += take;
+        if done {
+            return Ok(total);
+        }
+    }
+}
+
 /// Run one patch call for `specs` and split it per file while reading, at
 /// the `diff --git` headers (every other patch line starts with a space,
-/// `+`, `-`, `@`, `\` or a header keyword). A file's bytes are dropped as
-/// soon as they pass the per-file cap, and git is stopped once the turn
-/// budget is spent, so memory stays bounded whatever the files hold. A line
-/// is at most one text blob line, which `core.bigFileThreshold` bounds.
-/// The second value is whether reading stopped early.
+/// `+`, `-`, `@`, `\` or a header keyword). Lines are read in bounded
+/// pieces, a file's bytes are dropped as soon as they pass the per-file
+/// cap, and git is stopped once the turn budget is spent, so memory stays
+/// bounded whatever the files hold. A type change (say, a symlink replaced
+/// by a file) prints two sections under the same header; they are kept as
+/// one. The second value is whether reading stopped early.
 fn stream_patches(
     repo: &Path,
     from: &str,
     to: &str,
     specs: &[String],
     budget: &mut usize,
-) -> Result<(Vec<PatchChunk>, bool), String> {
+) -> Result<(Vec<PatchSection>, bool), String> {
     let mut args = diff_args(&["--src-prefix=a/", "--dst-prefix=b/"], from, to);
     args.push("--");
     args.extend(specs.iter().map(String::as_str));
@@ -498,39 +575,43 @@ fn stream_patches(
         .map_err(|e| format!("Failed to run git: {e}"))?;
     let stdout = child.stdout.take().ok_or("git diff has no output pipe")?;
     let mut reader = BufReader::new(stdout);
-    let mut chunks = Vec::new();
-    // `None` once the file being read is over the per-file cap.
-    let mut current: Option<Option<Vec<u8>>> = None;
+    let mut sections = Vec::new();
+    // The open section's header and bytes; `None` bytes once over the cap.
+    let mut current: Option<(Vec<u8>, Option<Vec<u8>>)> = None;
     let mut line = Vec::new();
     let mut stopped = false;
     loop {
-        line.clear();
-        let read = reader
-            .read_until(b'\n', &mut line)
+        let read = read_line_capped(&mut reader, &mut line, MAX_FILE_PATCH_BYTES + 1)
             .map_err(|e| format!("Failed to read git diff: {e}"))?;
         if read == 0 {
             break;
         }
-        if line.starts_with(b"diff --git ") || current.is_none() {
-            if let Some(done) = current.take() {
-                chunks.push(finish_chunk(done, budget));
+        let opens = line.starts_with(b"diff --git ")
+            && current.as_ref().is_none_or(|(header, _)| *header != line);
+        if opens || current.is_none() {
+            if let Some((header, bytes)) = current.take() {
+                let chunk = finish_chunk(bytes, budget);
+                sections.push(PatchSection { header, chunk });
             }
             if *budget == 0 {
                 stopped = true;
                 break;
             }
-            current = Some(Some(Vec::new()));
+            current = Some((line.clone(), Some(Vec::new())));
         }
-        if let Some(slot) = current.as_mut() {
+        if let Some((_, slot)) = current.as_mut() {
             match slot {
-                Some(bytes) if bytes.len() + line.len() > MAX_FILE_PATCH_BYTES => *slot = None,
+                Some(bytes) if read > line.len() || bytes.len() + read > MAX_FILE_PATCH_BYTES => {
+                    *slot = None
+                }
                 Some(bytes) => bytes.extend_from_slice(&line),
                 None => {}
             }
         }
     }
-    if let Some(done) = current.take() {
-        chunks.push(finish_chunk(done, budget));
+    if let Some((header, bytes)) = current.take() {
+        let chunk = finish_chunk(bytes, budget);
+        sections.push(PatchSection { header, chunk });
     }
     if stopped {
         let _ = child.kill();
@@ -541,13 +622,26 @@ fn stream_patches(
     if !stopped && !status.success() {
         return Err(format!("git diff failed: {status}"));
     }
-    Ok((chunks, stopped))
+    Ok((sections, stopped))
 }
 
-/// Patches for `files`, in order. One git call per batch; if a complete run
-/// does not split into exactly one chunk per file, fetch that batch's files
-/// one by one instead of guessing which chunk is whose. Files after the
-/// budget runs out get [`PatchChunk::Budget`] without asking git.
+/// Whether `header` can be `file`'s `diff --git` line. Paths git would
+/// quote are not checked.
+fn header_matches(header: &[u8], file: &TurnDiffFile) -> bool {
+    let needs_quoting = |path: &str| path.bytes().any(|b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\');
+    let old = file.old_path.as_deref().unwrap_or(&file.path);
+    if needs_quoting(old) || needs_quoting(&file.path) {
+        return true;
+    }
+    let expected = format!("diff --git a/{old} b/{}", file.path);
+    header.strip_suffix(b"\n").unwrap_or(header) == expected.as_bytes()
+}
+
+/// Patches for `files`, in order. One git call per batch; the sections must
+/// match the files one to one (all of them, or a prefix when the budget
+/// stopped the run). Otherwise that batch is fetched file by file instead of
+/// guessing which section is whose. Files after the budget runs out get
+/// [`PatchChunk::Budget`] without asking git.
 fn fetch_patches(
     repo: &Path,
     from: &str,
@@ -562,17 +656,25 @@ fn fetch_patches(
             continue;
         }
         let specs: Vec<String> = batch.iter().flat_map(|file| pathspecs(file)).collect();
-        let (mut chunks, stopped) = stream_patches(repo, from, to, &specs, &mut budget)?;
-        if stopped || chunks.len() == batch.len() {
-            chunks.truncate(batch.len());
-            chunks.resize_with(batch.len(), || PatchChunk::Budget);
-            patches.extend(chunks);
+        let (sections, stopped) = stream_patches(repo, from, to, &specs, &mut budget)?;
+        let matched = if stopped {
+            sections.len() <= batch.len()
+        } else {
+            sections.len() == batch.len()
+        } && sections
+            .iter()
+            .zip(batch)
+            .all(|(section, file)| header_matches(&section.header, file));
+        if matched {
+            let read = sections.len();
+            patches.extend(sections.into_iter().map(|section| section.chunk));
+            patches.extend((read..batch.len()).map(|_| PatchChunk::Budget));
             continue;
         }
         // Undo the mismatched run's charges before fetching file by file.
-        budget += chunks
+        budget += sections
             .iter()
-            .map(|chunk| match chunk {
+            .map(|section| match &section.chunk {
                 PatchChunk::Patch(text) => text.len(),
                 _ => 0,
             })
@@ -582,21 +684,49 @@ fn fetch_patches(
                 patches.push(PatchChunk::Budget);
                 continue;
             }
-            let (chunks, _) = stream_patches(repo, from, to, &pathspecs(file), &mut budget)?;
-            patches.push(
-                chunks
-                    .into_iter()
-                    .next()
-                    .unwrap_or(PatchChunk::Patch(String::new())),
-            );
+            let (sections, _) = stream_patches(repo, from, to, &pathspecs(file), &mut budget)?;
+            let mut chunks = sections.into_iter().map(|section| section.chunk);
+            let first = chunks.next().unwrap_or(PatchChunk::Patch(String::new()));
+            // More than one section for one file: keep them together.
+            patches.push(chunks.fold(first, |joined, next| match (joined, next) {
+                (PatchChunk::Patch(mut a), PatchChunk::Patch(b)) => {
+                    a.push_str(&b);
+                    PatchChunk::Patch(a)
+                }
+                (PatchChunk::Patch(_), other) | (other, _) => other,
+            }));
         }
     }
     Ok(patches)
 }
 
+/// Size in bytes of each blob, by id. Missing objects are left out.
+fn blob_sizes<'a>(
+    repo: &Path,
+    ids: impl Iterator<Item = &'a str>,
+) -> Result<std::collections::HashMap<String, u64>, String> {
+    let input: String = ids.map(|id| format!("{id}\n")).collect();
+    if input.is_empty() {
+        return Ok(Default::default());
+    }
+    let out = git_with(
+        repo,
+        &["cat-file", "--batch-check=%(objectname) %(objectsize)"],
+        None,
+        Some(input.as_bytes()),
+    )?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| {
+            let (id, size) = line.split_once(' ')?;
+            Some((id.to_string(), size.parse().ok()?))
+        })
+        .collect())
+}
+
 /// Diff two snapshot commits taken in `repo`.
 pub fn diff_snapshots(repo: &Path, from: &str, to: &str) -> Result<TurnDiff, String> {
-    let raw = parse_raw(&git(repo, &diff_args(&["--raw", "-z"], from, to))?)?;
+    let raw = parse_raw(&git(repo, &diff_args(&["--raw", "-z", "--no-abbrev"], from, to))?)?;
     let numstat = parse_numstat(&git(repo, &diff_args(&["--numstat", "-z"], from, to))?)?;
     if raw.len() != numstat.len() {
         return Err(format!(
@@ -610,11 +740,13 @@ pub fn diff_snapshots(repo: &Path, from: &str, to: &str) -> Result<TurnDiff, Str
         files_changed: raw.len(),
         ..TurnDiff::default()
     };
+    let mut blobs = Vec::new();
     for (entry, stats) in raw.into_iter().zip(numstat) {
         let (additions, deletions) = stats.unwrap_or((0, 0));
         diff.additions += additions;
         diff.deletions += deletions;
         if diff.files.len() < MAX_FILES {
+            blobs.push(entry.blobs);
             diff.files.push(TurnDiffFile {
                 path: entry.path,
                 old_path: entry.old_path,
@@ -631,14 +763,25 @@ pub fn diff_snapshots(repo: &Path, from: &str, to: &str) -> Result<TurnDiff, Str
 
     // Choose which files get a patch from their line counts, before asking
     // git to render anything.
+    let sizes = blob_sizes(
+        repo,
+        diff.files
+            .iter()
+            .zip(&blobs)
+            .filter(|(file, _)| !file.binary)
+            .flat_map(|(_, ids)| ids.iter().map(String::as_str)),
+    )?;
     let mut lines_budget = MAX_TOTAL_PATCH_LINES;
     let mut wanted = Vec::new();
-    for (index, file) in diff.files.iter_mut().enumerate() {
+    for (index, (file, ids)) in diff.files.iter_mut().zip(&blobs).enumerate() {
         if file.binary {
             continue;
         }
         let lines = file.additions + file.deletions;
-        if lines > MAX_FILE_PATCH_LINES {
+        let oversized = ids
+            .iter()
+            .any(|id| sizes.get(id).is_some_and(|size| *size > MAX_PATCH_BLOB_BYTES));
+        if oversized || lines > MAX_FILE_PATCH_LINES {
             file.patch_omitted = Some(TurnDiffPatchOmitted::TooLarge);
         } else if lines > lines_budget {
             file.patch_omitted = Some(TurnDiffPatchOmitted::Budget);
@@ -822,6 +965,49 @@ mod tests {
         assert!(diff.files[first_spent..].iter().all(|f| f.patch.is_none()));
         assert!(diff.truncated);
         assert_eq!(diff.files_changed, 51);
+    }
+
+    #[test]
+    fn turn_diff_keeps_both_halves_of_a_type_change() {
+        let (_dir, repo) = init_repo();
+        std::os::unix::fs::symlink("keep.txt", repo.join("link")).unwrap();
+        let before = snap(&repo, "before");
+        fs::remove_file(repo.join("link")).unwrap();
+        fs::write(repo.join("link"), "now a file\n").unwrap();
+        fs::write(repo.join("zz-after.txt"), "later\n").unwrap();
+        let after = snap(&repo, "after");
+        let diff = diff_snapshots(&repo, &before, &after).unwrap();
+        let link = file(&diff, "link");
+        assert_eq!(link.change, TurnDiffChange::TypeChanged);
+        let patch = link.patch.as_deref().unwrap();
+        assert!(patch.contains("-keep.txt") && patch.contains("+now a file"), "{patch}");
+        let later = file(&diff, "zz-after.txt").patch.as_deref().unwrap();
+        assert!(later.contains("+later"), "{later}");
+    }
+
+    #[test]
+    fn turn_diff_withholds_huge_blobs_even_when_attributes_force_text() {
+        let (_dir, repo) = init_repo();
+        fs::write(repo.join(".gitattributes"), "*.json diff\n").unwrap();
+        let before = snap(&repo, "before");
+        let line = "x".repeat((MAX_PATCH_BLOB_BYTES + 1) as usize);
+        fs::write(repo.join("data.json"), format!("{line}\n")).unwrap();
+        let after = snap(&repo, "after");
+        let diff = diff_snapshots(&repo, &before, &after).unwrap();
+        let data = file(&diff, "data.json");
+        assert!(!data.binary, "the attribute forces a text diff");
+        assert_eq!(data.patch_omitted, Some(TurnDiffPatchOmitted::TooLarge));
+    }
+
+    #[test]
+    fn snapshot_ignores_assume_unchanged_marks() {
+        let (_dir, repo) = init_repo();
+        run(&repo, &["update-index", "--assume-unchanged", "keep.txt"]);
+        let before = snap(&repo, "before");
+        fs::write(repo.join("keep.txt"), "edited by the agent\n").unwrap();
+        let after = snap(&repo, "after");
+        let diff = diff_snapshots(&repo, &before, &after).unwrap();
+        assert_eq!(file(&diff, "keep.txt").change, TurnDiffChange::Modified);
     }
 
     #[test]
