@@ -22,6 +22,9 @@ pub enum AgentNotice {
     Finished,
     /// The agent is blocked on an approval or a question.
     NeedsInput,
+    /// A watched pull request still needs work after the chat used every
+    /// automatic attempt, so Codemux stopped waking it.
+    PrWatchStopped,
 }
 
 /// Payload for the global [`NOTIFICATION_EVENT`]. Serialized snake_case so web
@@ -113,6 +116,10 @@ fn agent_payload(notice: AgentNotice, target: &NotificationTarget) -> Notificati
         AgentNotice::NeedsInput => (
             "Agent needs your input",
             "Approve or answer to let it continue.",
+        ),
+        AgentNotice::PrWatchStopped => (
+            "Pull request needs you",
+            "Codemux stopped watching after its automatic fix attempts.",
         ),
     };
     NotificationPayload {

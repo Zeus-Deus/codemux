@@ -158,6 +158,7 @@ import type {
   WebRemoteSessionView,
   WebRemoteStatus,
   WorkspaceSnapshot,
+  PrWatchStatus,
 } from "@/tauri/types";
 
 console.log(
@@ -4346,6 +4347,10 @@ function streamMockSideAnswer(sideId: string, question: string, first: boolean):
   }, at + 60));
 }
 
+// Pull-request watches by thread. In-memory only: the mock has no sweep,
+// so a watch stays `active` until stopped.
+const prWatches = new Map<string, PrWatchStatus>();
+
 const handlers: Record<string, Handler> = {
   follow_up_providers: () => [
     { id: "claude", label: "Claude", installed: true },
@@ -8001,6 +8006,45 @@ const handlers: Record<string, Handler> = {
     emitAppState();
     return undefined;
   },
+  pr_watch_start: (a) => {
+    const threadId = a.threadId as string;
+    const workspace =
+      (threadId === MOCK_CHAT_THREAD_ID ? findWorkspace("ws-codemux-chat") : undefined) ??
+      findWorkspace(appState.active_workspace_id);
+    if (!workspace) return Promise.reject("The chat's workspace is not open");
+    const prNumber = (a.prNumber as number | null) ?? workspace.pr_number;
+    if (prNumber == null) return Promise.reject("This workspace has no linked pull request");
+    const now = Date.now();
+    const previous = prWatches.get(threadId);
+    const watch: PrWatchStatus = {
+      thread_id: threadId,
+      workspace_id: workspace.workspace_id,
+      pr_number: prNumber,
+      pr_url: workspace.pr_number === prNumber ? (workspace.pr_url ?? null) : null,
+      status: "active",
+      max_attempts: (a.maxAttempts as number | null) ?? 3,
+      attempts: 0,
+      comment_streak: 0,
+      head_sha: null,
+      last_checked_at_ms: null,
+      last_wake_at_ms: null,
+      last_wake_summary: null,
+      last_error: null,
+      stop_reason: null,
+      created_at_ms: previous?.created_at_ms ?? now,
+      updated_at_ms: now,
+    };
+    prWatches.set(threadId, watch);
+    emitEvent("pr-watch-changed", { thread_id: threadId, watch });
+    return watch;
+  },
+  pr_watch_stop: (a) => {
+    const threadId = a.threadId as string;
+    const removed = prWatches.delete(threadId);
+    if (removed) emitEvent("pr-watch-changed", { thread_id: threadId, watch: null });
+    return removed;
+  },
+  pr_watch_status: (a) => prWatches.get(a.threadId as string) ?? null,
 };
 
 // Archive entries whose (simulated) worktree is dirty: deleting them

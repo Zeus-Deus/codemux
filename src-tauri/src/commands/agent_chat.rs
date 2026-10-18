@@ -3257,6 +3257,10 @@ pub enum TurnOrigin {
     Delegation,
     /// App-owned, correlated remote result; idle-only and non-interrupting.
     RemoteDelegation,
+    /// A watched pull request changed (`crate::pr_watch`). Not user
+    /// activity: it must not start a delegation round or forget a pending
+    /// usage resume, and it always queues behind a busy turn.
+    PrWatch,
 }
 
 /// The one send path behind [`agent_chat_send_turn`] and the usage-limit

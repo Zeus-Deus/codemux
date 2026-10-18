@@ -730,3 +730,15 @@ export const onFollowUpChanged = (
   cb: EventCallback<{ parent_thread_id: string }>,
 ): Promise<UnlistenFn> =>
   listen<{ parent_thread_id: string }>("follow-up-changed", (e) => cb(e.payload));
+
+export interface PrWatchChangedPayload {
+  thread_id: string;
+  /** `null` once the chat stopped watching. */
+  watch: import("./types").PrWatchStatus | null;
+}
+
+/** A chat's pull-request watch changed: armed, swept, woke, stopped. */
+export const onPrWatchChanged = (
+  cb: EventCallback<PrWatchChangedPayload>,
+): Promise<UnlistenFn> =>
+  listen<PrWatchChangedPayload>("pr-watch-changed", (e) => cb(e.payload));
