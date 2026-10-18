@@ -253,6 +253,10 @@ struct AgentChatChannelEntry {
 pub struct AgentChatChannelRegistry {
     channels: Mutex<HashMap<String, Vec<AgentChatChannelEntry>>>,
     next_generation: AtomicU64,
+    /// Held while one payload goes to every channel of a thread, so two
+    /// producers (the event bridge and the send path) cannot interleave and
+    /// hand mirrored clients the same events in different orders.
+    fanout: Mutex<()>,
 }
 
 /// One authoritative Grok bill waiting for the immediately-following
@@ -7454,6 +7458,7 @@ pub(super) fn fan_out_to_thread_channels<R: Runtime>(
     payload: &AgentChatEventPayload,
 ) {
     let channels: State<'_, AgentChatChannelRegistry> = app.state();
+    let _in_order = channels.fanout.lock().expect("channel fan-out poisoned");
     for channel in channels.channels_for(&thread_id.0) {
         if let Err(error) = channel.send(payload.clone()) {
             eprintln!(
