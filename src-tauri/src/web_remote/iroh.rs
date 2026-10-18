@@ -73,6 +73,7 @@ use tauri::{AppHandle, Manager, Runtime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
+use super::server::OutboundRx;
 use super::Shared;
 use crate::database::DatabaseStore;
 use crate::web_remote::auth::{self, AuthedSession};
@@ -241,7 +242,7 @@ fn message_to_frame(msg: &Message) -> MessageFrame<'_> {
 /// re-encoding each through the codec. The single owner of `send` — every
 /// producer (invoke responses, channel router, event hub, the registry's Close)
 /// feeds `out_rx`, exactly as the WS writer task works.
-async fn writer_loop(mut send: SendStream, mut out_rx: mpsc::UnboundedReceiver<Message>) {
+async fn writer_loop(mut send: SendStream, mut out_rx: OutboundRx) {
     while let Some(msg) = out_rx.recv().await {
         match message_to_frame(&msg) {
             MessageFrame::Wire(kind, payload) => {
@@ -893,8 +894,8 @@ async fn handle_bi_stream<R: Runtime>(
 
     // 2. Register in the SHARED registry the WS transport + revocation use, so
     //    close_session / close_all sever this iroh session too.
-    let (out_tx, out_rx) = mpsc::unbounded_channel::<Message>();
     let (close_tx, mut close_rx) = watch::channel(false);
+    let (out_tx, out_rx) = super::server::outbound_channel(close_tx.clone());
     let conn_id = shared
         .connections
         .register(&session_id, crate::web_remote::server::Transport::Relay, out_tx.clone(), close_tx.clone());
@@ -1600,8 +1601,8 @@ mod tests {
             }
         };
 
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<Message>();
         let (close_tx, mut close_rx) = watch::channel(false);
+        let (out_tx, out_rx) = crate::web_remote::server::outbound_channel(close_tx.clone());
         let conn_id = shared
             .connections
             .register(&session_id, crate::web_remote::server::Transport::Relay, out_tx.clone(), close_tx.clone());

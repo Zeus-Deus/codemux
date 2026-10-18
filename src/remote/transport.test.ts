@@ -249,6 +249,136 @@ describe("reconnect", () => {
   });
 });
 
+describe("liveness", () => {
+  const probes = (ws: FakeWebSocket) =>
+    ws.parsedSent().filter((m) => m.t === "invoke" && m.cmd === "__codemux_ping");
+
+  function setVisibility(state: DocumentVisibilityState): void {
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => state,
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }
+
+  afterEach(() => {
+    // Drop the per-test override so jsdom's own getter shows through again.
+    delete (document as { visibilityState?: unknown }).visibilityState;
+  });
+
+  it("replaces a silent socket after an unanswered probe", async () => {
+    vi.useFakeTimers();
+    const { transport, rec } = newTransport();
+    const ws = await connect(transport);
+
+    await vi.advanceTimersByTimeAsync(24_000);
+    expect(probes(ws)).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(probes(ws)).toHaveLength(1);
+
+    // Half-open: the socket never fires onclose on its own.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(rec.statuses).toEqual(["connected", "reconnecting"]);
+    expect(ws.onmessage).toBeNull();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
+  it("counts any inbound frame as proof of life", async () => {
+    vi.useFakeTimers();
+    const { transport, rec } = newTransport();
+    const ws = await connect(transport);
+
+    await vi.advanceTimersByTimeAsync(26_000);
+    expect(probes(ws)).toHaveLength(1);
+    // Not the probe's reply, just traffic queued ahead of it.
+    ws.recvText({ t: "event", event: "x", payload: null });
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(rec.statuses).toEqual(["connected"]);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  it("waits longer while a real invoke's reply may still be downloading", async () => {
+    vi.useFakeTimers();
+    const { transport, rec } = newTransport();
+    const ws = await connect(transport);
+    const big = expect(transport.invoke("get_terminal_scrollback")).rejects.toThrow(/connection lost/);
+
+    await vi.advanceTimersByTimeAsync(26_000);
+    expect(probes(ws)).toHaveLength(1);
+    // Past the idle probe timeout, but the big reply could still be arriving.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(rec.statuses).toEqual(["connected"]);
+
+    await vi.advanceTimersByTimeAsync(92_000);
+    await big;
+    expect(rec.statuses).toEqual(["connected", "reconnecting"]);
+  });
+
+  it("counts partial-frame activity as proof of life", async () => {
+    vi.useFakeTimers();
+    const { transport, rec } = newTransport();
+    const ws = await connect(transport) as FakeWebSocket & { onactivity?: (() => void) | null };
+
+    await vi.advanceTimersByTimeAsync(26_000);
+    expect(probes(ws)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(8_000);
+    ws.onactivity?.();
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(rec.statuses).toEqual(["connected"]);
+  });
+
+  it("accepts an older server's err reply to the probe", async () => {
+    vi.useFakeTimers();
+    const { transport, rec } = newTransport();
+    const ws = await connect(transport);
+    setVisibility("visible");
+    const [probe] = probes(ws);
+    ws.recvText({ t: "err", id: probe.id, error: "web-remote: command is not allowed" });
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(rec.statuses).toEqual(["connected"]);
+  });
+
+  it("probes as soon as the page becomes visible", async () => {
+    vi.useFakeTimers();
+    const { transport, rec } = newTransport();
+    const ws = await connect(transport);
+
+    setVisibility("hidden");
+    expect(probes(ws)).toHaveLength(0);
+    setVisibility("visible");
+    expect(probes(ws)).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(rec.statuses).toEqual(["connected", "reconnecting"]);
+  });
+
+  it("skips the reconnect backoff when the network comes back", async () => {
+    vi.useFakeTimers();
+    const { transport } = newTransport();
+    const ws1 = await connect(transport);
+    // Back the delay off to 4s: drop, fail one reconnect, drop again.
+    ws1.drop();
+    await vi.advanceTimersByTimeAsync(1_000);
+    FakeWebSocket.instances[1].drop();
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    window.dispatchEvent(new Event("online"));
+    await flushMicrotasks();
+    expect(FakeWebSocket.instances).toHaveLength(3);
+  });
+
+  it("stops listening for wake events after close", async () => {
+    vi.useFakeTimers();
+    const { transport } = newTransport();
+    const ws = await connect(transport);
+    transport.close();
+    setVisibility("visible");
+    expect(probes(ws)).toHaveLength(0);
+  });
+});
+
 describe("compression negotiation", () => {
   it("offers compress=deflate alongside the encoded ticket", async () => {
     const { transport } = newTransport();

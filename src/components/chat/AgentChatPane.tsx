@@ -6,6 +6,7 @@ import { AsyncQuestionPanel } from "./AsyncQuestionPanel";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
+import { useRemoteReconnectEpoch } from "@/remote/remote-connection-store";
 import { useAgentChatTurnCheckpoints } from "@/hooks/use-agent-chat-turn-checkpoints";
 import { useAttachSessionHandoff } from "@/hooks/use-attach-session-handoff";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
@@ -1257,6 +1258,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     );
   }, []);
   useAgentChatEvents(threadId, handleEvent);
+  const reconnectEpoch = useRemoteReconnectEpoch();
   // Detaching from a thread (switch / unmount) has no next frame to flush
   // on, so drain whatever this thread queued before the listener goes.
   useEffect(() => {
@@ -1355,7 +1357,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         hydrateAttemptedRef.current = null;
       }
     };
-  }, [threadId, paneWorkspaceId]);
+    // A web-remote reconnect re-attaches the channel (useAgentChatEvents, on
+    // the same epoch and declared earlier, so its attach is registered
+    // first) and re-runs this warm hydrate to fetch the rows the gap missed.
+  }, [threadId, paneWorkspaceId, reconnectEpoch]);
 
   // Start a session only after the user interacts with this provider's chat
   // pane. Restoring an empty persisted pane during application startup must

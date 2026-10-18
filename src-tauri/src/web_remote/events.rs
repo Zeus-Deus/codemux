@@ -120,15 +120,14 @@ fn fan_out(inner: &Arc<Mutex<HashMap<String, EventEntry>>>, event: &str, payload
 mod tests {
     use super::*;
     use serde_json::json;
-    use tokio::sync::mpsc;
 
     // fan_out is exercised directly here; the full listen_any registration
     // path needs a live AppHandle and is covered by the Stage-4 e2e drive.
     #[test]
     fn fan_out_delivers_event_frame_to_all_subscribers() {
         let inner: Arc<Mutex<HashMap<String, EventEntry>>> = Arc::new(Mutex::new(HashMap::new()));
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = crate::web_remote::server::test_outbound();
+        let (tx2, mut rx2) = crate::web_remote::server::test_outbound();
         {
             let mut map = inner.lock().unwrap();
             let mut subs = HashMap::new();
@@ -173,7 +172,7 @@ mod plugins_boundary_tests {
     fn plugin_streams_never_register_remote_subscribers() {
         let app = tauri::test::mock_app();
         let hub = EventHub::default();
-        let (out, _) = tokio::sync::mpsc::unbounded_channel();
+        let (out, _) = crate::web_remote::server::test_outbound();
         for name in ["plugins_changed", "plugin_agent_event", "plugin_future"] {
             hub.subscribe(app.handle(), 1, name, out.clone());
             assert_eq!(hub.subscriber_count(name), 0);

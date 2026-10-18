@@ -3,7 +3,7 @@ import { connectOverIroh } from "./hosted-bootstrap";
 import { DeviceRegistry, type RegisteredDevice } from "./device-registry";
 import { loadIrohDialer } from "./iroh-wasm-loader";
 import type { IrohByteStream } from "./iroh-transport";
-import { encodeFrame, KIND_TEXT } from "./iroh-codec";
+import { encodeFrame, FrameDecoder, KIND_TEXT, type IrohFrame } from "./iroh-codec";
 
 vi.mock("./iroh-wasm-loader", async (importOriginal) => ({
   ...await importOriginal<typeof import("./iroh-wasm-loader")>(),
@@ -187,9 +187,28 @@ describe("hosted connection startup", () => {
     const dial = vi.fn(async () => {
       let firstRead = true;
       let finishRead: ((value: Uint8Array | null) => void) | null = null;
+      // Replies waiting for the next read. A live desktop answers every
+      // invoke, including the transport's idle liveness probe.
+      const replies: Uint8Array[] = [];
+      const reply = (frame: Uint8Array) => {
+        const waiting = finishRead;
+        finishRead = null;
+        if (waiting) waiting(frame);
+        else replies.push(frame);
+      };
+      const decoder = new FrameDecoder();
       const close = vi.fn(() => { finishRead?.(null); });
       const stream: IrohByteStream = {
-        write: async () => {},
+        write: async (data) => {
+          decoder.push(data);
+          let frame: IrohFrame | null;
+          while ((frame = decoder.next()) !== null) {
+            const msg = JSON.parse(new TextDecoder().decode(frame.payload)) as { t?: string; id?: number };
+            if (msg.t === "invoke") {
+              reply(encodeFrame(KIND_TEXT, new TextEncoder().encode(JSON.stringify({ t: "ok", id: msg.id, data: null }))));
+            }
+          }
+        },
         read: () => {
           if (firstRead) {
             firstRead = false;
@@ -197,6 +216,8 @@ describe("hosted connection startup", () => {
               approved ? { t: "welcome" } : { t: "unauthorized", reason: "pending_approval" },
             ))));
           }
+          const queued = replies.shift();
+          if (queued) return Promise.resolve(queued);
           return new Promise((resolve) => { finishRead = resolve; drop = () => resolve(null); });
         },
         close,
