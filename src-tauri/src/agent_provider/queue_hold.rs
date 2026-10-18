@@ -12,12 +12,16 @@ pub(crate) struct QueueHold {
     /// The queued item an explicit send promoted; it may dispatch through a
     /// held queue, and the hold lifts once it starts.
     release: Option<String>,
+    /// A manual send has temporarily lifted the hold via [`take`](Self::take).
+    /// Releases recorded meanwhile survive its [`restore`](Self::restore).
+    taken: bool,
 }
 
 impl QueueHold {
     /// A user Stop: hold the queue, dropping any pending release.
     pub fn hold(&mut self) {
         self.held = true;
+        self.taken = false;
         self.release = None;
     }
 
@@ -44,7 +48,7 @@ impl QueueHold {
     /// An explicit send of queued item `id`: let it through a held queue.
     /// Returns the release it replaced, for [`revert_release`](Self::revert_release).
     pub fn release_with(&mut self, id: &str) -> Option<String> {
-        if self.held {
+        if self.held || self.taken {
             self.release.replace(id.to_owned())
         } else {
             None
@@ -74,13 +78,18 @@ impl QueueHold {
     /// release survives for that restore; only a newer [`hold`](Self::hold)
     /// drops it, and it is ignored while the queue is not held.
     pub fn take(&mut self) -> bool {
-        std::mem::take(&mut self.held)
+        let was_held = std::mem::take(&mut self.held);
+        if was_held {
+            self.taken = true;
+        }
+        was_held
     }
 
     /// Undo [`take`](Self::take) after a send that did not start a turn.
     pub fn restore(&mut self, was_held: bool) {
         if was_held {
             self.held = true;
+            self.taken = false;
         }
     }
 }
@@ -169,6 +178,26 @@ mod tests {
         hold.hold();
         hold.revert_release("q", previous);
         assert!(!hold.admits(Some("m")));
+    }
+
+    #[test]
+    fn send_now_during_a_taken_hold_survives_its_restore() {
+        // A manual send lifted the hold; "send now" on Q interrupts it before
+        // its prompt, and the manual send then restores the hold.
+        let mut hold = QueueHold::default();
+        hold.hold();
+        let was_held = hold.take();
+        hold.release_with("q");
+        hold.restore(was_held);
+        assert!(hold.admits(Some("q")));
+        // A Stop in between still wins.
+        let mut hold = QueueHold::default();
+        hold.hold();
+        let was_held = hold.take();
+        hold.release_with("q");
+        hold.hold();
+        hold.restore(was_held);
+        assert!(!hold.admits(Some("q")));
     }
 
     #[test]
