@@ -90,6 +90,15 @@ describe("reconcileQueuedTurns", () => {
     expect(reconcileQueuedTurns(state, "t", rows)).toBe(state);
   });
 
+  it("gives a bubble built from another client's event its images", () => {
+    const fromEvent = applyEvent(createEmptyThreadState(), {
+      type: "turn_queued", thread_id: "t", queued_id: "s1", client_nonce: "nonce-s1", text: "saved s1",
+    });
+    expect(queuedMessages(fromEvent.messages)[0].images).toBeUndefined();
+    const next = reconcileQueuedTurns(fromEvent, "t", [row("s1", false)]);
+    expect(queuedMessages(next.messages)[0].images).toEqual([{ src: "/tmp/a.png", mediaType: "image/png" }]);
+  });
+
   it("repairs a live edit, move and removal missed while detached", () => {
     let state = createEmptyThreadState();
     for (const id of ["a", "b", "c"]) {

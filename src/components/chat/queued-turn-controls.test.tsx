@@ -193,6 +193,16 @@ describe("useQueuedTurnEditor", () => {
     expect(draft()).toBe("half-typed");
   });
 
+  it("lets an edit of a turn with images clear its words", () => {
+    const withImage = { ...item("a"), images: [{ src: "/tmp/a.png", mediaType: "image/png" }] };
+    seed("", [withImage]);
+    const { result } = renderHook(() => useQueuedTurnEditor({ threadId: thread, provider: "claude" }));
+    act(() => result.current.begin(item("a")));
+    expect(result.current.editingHasImages).toBe(false);
+    act(() => result.current.begin(withImage));
+    expect(result.current.editingHasImages).toBe(true);
+  });
+
   it("puts the displaced draft back when the pane goes away mid-edit", () => {
     seed("half-typed", [item("a")]);
     const { result, unmount } = renderHook(() => useQueuedTurnEditor({ threadId: thread, provider: "claude" }));
@@ -263,7 +273,8 @@ describe("useQueuedTurnEditor", () => {
     act(() => {
       saving = result.current.save("rewritten");
     });
-    seed("rewritten", []);
+    // Dispatch promotes the bubble: it stays, no longer queued.
+    seed("rewritten", [{ ...item("a"), queued: undefined }]);
     expect(result.current.editingId).toBe("a");
     await act(async () => {
       resolve(true);
@@ -282,6 +293,34 @@ describe("useQueuedTurnEditor", () => {
     seed("my edit", [{ ...item("a"), queued: undefined }]);
     expect(result.current.editingId).toBeNull();
     expect(draft()).toBe("half-typed\nmy edit");
+  });
+
+  it("returns an edit once when its turn is cancelled during the save, either way the save ends", async () => {
+    for (const accepted of [false, true]) {
+      seed("D", [item("a")]);
+      let resolve: (value: boolean) => void = () => {};
+      commands.agentChatEditQueuedTurn.mockImplementation(() => new Promise((r) => { resolve = r; }));
+      const hook = renderHook(() => useQueuedTurnEditor({ threadId: thread, provider: "claude" }));
+      act(() => hook.result.current.begin(item("a")));
+      act(() => useAgentChatStore.getState().setInputDraft(thread, "E"));
+      let saving: Promise<void> = Promise.resolve();
+      act(() => {
+        saving = hook.result.current.save("E");
+      });
+      act(() => {
+        const store = useAgentChatStore.getState();
+        // An accepted edit reached the bubble before the cancellation did.
+        if (accepted) store.applyEvent(thread, { type: "queued_turn_edited", thread_id: thread, queued_id: "a", text: "E" });
+        store.applyEvent(thread, { type: "queued_turn_cancelled", thread_id: thread, queued_id: "a" });
+      });
+      await act(async () => {
+        resolve(accepted);
+        await saving;
+      });
+      expect(hook.result.current.editingId).toBeNull();
+      expect(draft()).toBe("D\nE");
+      hook.unmount();
+    }
   });
 
   it("returns the edited turn's words once when it is cancelled mid-edit", () => {

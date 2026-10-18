@@ -119,6 +119,8 @@ export function useQueuedTurnEditor({
     draft: string;
     original: string;
     saving?: string;
+    /** The turn was cancelled; its returned copy is already stripped. */
+    cancelled?: boolean;
   } | null>(null);
 
   /** End the edit. `restore` puts the displaced draft back; `keep` leaves
@@ -169,6 +171,8 @@ export function useQueuedTurnEditor({
       try {
         const still = await agentChatEditQueuedTurn(provider, edit.threadId, edit.queuedId, text);
         if (editRef.current !== edit) return;
+        // Cancelled while saving, whichever won: its words come back once.
+        if (edit.cancelled) return finish("keep");
         if (still) {
           // Anything typed while the save was in flight is not the saved
           // text, so it stays in the composer.
@@ -209,17 +213,28 @@ export function useQueuedTurnEditor({
       setInputDraft(edit.threadId, rest);
       edit.draft = joinDrafts(edit.draft, text);
     }
-    // The edited turn left the queue. A save in flight settles the edit
-    // itself.
-    if (now.has(edit.queuedId) || edit.saving !== undefined) return;
+    // The edited turn left the queue.
+    if (now.has(edit.queuedId)) return;
     const cancelled = !messages.some((m) => m.id === edit.itemId);
-    if (cancelled) {
+    if (cancelled && !edit.cancelled) {
       // Its text came back to the composer too. Drop that copy: the words
       // in the composer (the original or the user's edit) are what return.
-      const rest = withoutReturned(draftOf(edit.threadId), before.get(edit.queuedId) ?? edit.original);
-      if (rest !== null) setInputDraft(edit.threadId, rest);
-      return finish("keep");
+      edit.cancelled = true;
+      // The copy is its text when cancelled: as last shown, or as a save in
+      // flight just changed it.
+      const current = draftOf(edit.threadId);
+      const returned = [before.get(edit.queuedId) ?? edit.original, edit.saving]
+        .filter((text): text is string => text !== undefined);
+      for (const text of returned) {
+        const rest = withoutReturned(current, text);
+        if (rest === null) continue;
+        setInputDraft(edit.threadId, rest);
+        break;
+      }
     }
+    // A save in flight settles the edit itself.
+    if (edit.saving !== undefined) return;
+    if (cancelled) return finish("keep");
     // It dispatched: keep a changed draft, otherwise put the earlier one back.
     finish(draftOf(edit.threadId).trim() === edit.original.trim() ? "restore" : "keep");
   }, [messages, finish, setInputDraft]);
@@ -618,6 +633,10 @@ function queuedSignature(messages: ChatThreadState["messages"]): string {
 }
 
 
+function imagesOf(row: QueuedTurnView) {
+  return row.images.map((image) => ({ src: image.path, mediaType: image.media_type }));
+}
+
 /** Match the thread's queued bubbles to the backend's queue: add the
  *  missing ones (a client attaching mid-queue), update text and the saved
  *  flag, drop ones no longer queued, and take its order. Events missed
@@ -646,14 +665,20 @@ export function reconcileQueuedTurns(
         queued_id: row.queued_id,
         text: row.text,
       });
-      // A bubble kept from before the backend restarted is saved now.
+      // A bubble kept from before the backend restarted is saved now, and a
+      // bubble built from another client's event has no images yet. An
+      // optimistic preview of the same images stays.
       const item = next.messages[index];
-      if (item.kind === "user_message" && !!item.queued?.saved !== row.saved) {
+      if (item.kind !== "user_message") continue;
+      const savedChanged = !!item.queued?.saved !== row.saved;
+      const imagesMissing = row.images.length > 0 && (item.images?.length ?? 0) !== row.images.length;
+      if (savedChanged || imagesMissing) {
         next = {
           ...next,
           messages: replaceTranscriptItem(next.messages, index, {
             ...item,
             queued: { queuedId: row.queued_id, ...(row.saved ? { saved: true } : {}) },
+            ...(imagesMissing ? { images: imagesOf(row) } : {}),
           }),
         };
       }
@@ -679,9 +704,7 @@ export function reconcileQueuedTurns(
       messages: replaceTranscriptItem(next.messages, added, {
         ...item,
         queued: { queuedId: row.queued_id, ...(row.saved ? { saved: true } : {}) },
-        ...(row.images.length > 0
-          ? { images: row.images.map((image) => ({ src: image.path, mediaType: image.media_type })) }
-          : {}),
+        ...(row.images.length > 0 ? { images: imagesOf(row) } : {}),
       }),
     };
   }
