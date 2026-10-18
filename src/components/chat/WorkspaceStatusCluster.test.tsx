@@ -57,6 +57,14 @@ vi.mock("@/lib/toast", () => ({
   },
 }));
 
+// The chip's own behaviour is covered in pr-watch-row.test.tsx; here only
+// whether the cluster mounts it matters.
+vi.mock("./PrWatchChip", () => ({
+  PrWatchChip: ({ threadId }: { threadId: string }) => (
+    <span data-testid="pr-watch-chip-mount" data-thread={threadId} />
+  ),
+}));
+
 import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
 import { toast } from "@/lib/toast";
 import { useBrowserPeekStore } from "@/stores/browser-peek-store";
@@ -126,6 +134,20 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("WorkspaceStatusCluster", () => {
+  it("keeps the pane's watch chip without a PR badge", () => {
+    // A watch is pinned to its PR; after the workspace loses the association
+    // (e.g. back on the default branch) its stop control must remain.
+    mocks.workspace = makeWorkspace({ git_branch: "main", pr_number: null, pr_state: null });
+    render(<WorkspaceStatusCluster threadId="thread-1" />);
+    expect(screen.getByTestId("pr-watch-chip-mount")).toHaveAttribute("data-thread", "thread-1");
+  });
+
+  it("renders no watch chip without a chat", () => {
+    mocks.workspace = makeWorkspace({ pr_number: 7, pr_state: "OPEN", pr_url: "u" });
+    render(<WorkspaceStatusCluster />);
+    expect(screen.queryByTestId("pr-watch-chip-mount")).toBeNull();
+  });
+
   it("renders nothing when there is no active workspace", () => {
     const { container } = render(<WorkspaceStatusCluster />);
     expect(container).toBeEmptyDOMElement();

@@ -224,6 +224,16 @@ describe("PrWatchRow", () => {
     expect(mocks.start).not.toHaveBeenCalled();
   });
 
+  it("keeps an active watch stoppable after the workspace loses its PR", async () => {
+    mocks.status = watch({ attempts: 1 });
+    render(<PrWatchRow workspace={workspace({ pr_number: null, pr_state: null })} />);
+    const row = await screen.findByTestId("workspace-details-pr-watch");
+    await waitFor(() => expect(row).toHaveTextContent("On · 1/3"));
+    fireEvent.click(row);
+    await waitFor(() => expect(mocks.stop).toHaveBeenCalledWith("thread-1"));
+    await waitFor(() => expect(row).not.toBeInTheDocument());
+  });
+
   it("is absent without an open pull request on GitHub", () => {
     const { container, rerender } = render(<PrWatchRow workspace={workspace({ pr_state: "MERGED" })} />);
     expect(container).toBeEmptyDOMElement();

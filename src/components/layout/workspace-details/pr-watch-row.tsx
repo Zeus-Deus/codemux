@@ -18,12 +18,16 @@ import { DETAILS_ICON, DETAILS_LABEL, DETAILS_ROW, DETAILS_TRAILING } from "./st
  * "Watch CI & reviews" under the pull request row: the workspace's chat is
  * woken when a check fails, someone else comments or reviews, or the branch
  * conflicts. Acts for the focused chat, else the workspace's first chat.
+ *
+ * Starting a watch needs an open pull request on the workspace; an active
+ * watch keeps the row (to stop it) even after that association goes away,
+ * because the watch is pinned to its PR and keeps running.
  */
 export function PrWatchRow({ workspace }: { workspace: WorkspaceSnapshot }) {
   const { threadId: focused } = useActiveChatTasks(workspace);
-  const threadId = canWatchPr(workspace) ? watchTargetThreadId(workspace, focused) : null;
+  const threadId = watchTargetThreadId(workspace, focused);
   const { watch, load, busy, toggle } = usePrWatch(threadId);
-  if (!canWatchPr(workspace)) return null;
+  if (!canWatchPr(workspace) && watch?.status !== "active") return null;
 
   const view = describePrWatch(watch);
   const loaded = load === "loaded";

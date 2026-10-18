@@ -264,7 +264,10 @@ export function WorkspaceStatusCluster({
             </button>
           )}
 
-          {prState && threadId && <PrWatchChip threadId={threadId} />}
+          {/* Not gated on the PR badge: a watch is pinned to its PR and keeps
+              running after the workspace's association changes, so its stop
+              control must stay. The chip renders nothing without a watch. */}
+          {threadId && <PrWatchChip threadId={threadId} />}
 
           {/* Never folds: the details popover can't open the issue. */}
           {issueChip}
