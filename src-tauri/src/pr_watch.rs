@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use crate::agent_provider::{ProviderKind, ThreadId};
-use crate::commands::agent_chat::{send_turn_with_origin, SendTurnCommandInput, TurnOrigin};
+use crate::commands::agent_chat::{send_turn_reporting_dispatch, SendTurnCommandInput, TurnOrigin};
 use crate::database::pr_watch::{PrWatchRecord, PR_WATCH_ENDED, PR_WATCH_EXHAUSTED};
 use crate::database::DatabaseStore;
 
@@ -38,7 +38,10 @@ const COMMENT_WAKE_LIMIT: u32 = 10;
 /// never longer than this: a check that never finishes cannot hold it back.
 const FAILURE_BATCH_WINDOW_MS: i64 = 10 * 60 * 1000;
 const MAX_LOG_EXCERPTS: usize = 3;
+/// One wake carries at most this many comments and failed checks. Only
+/// what a wake carries is recorded as told; the rest follows next time.
 const MAX_LISTED: usize = 10;
+const MAX_FAILED_LISTED: usize = 20;
 const MAX_EXCERPT_CHARS: usize = 4_000;
 const MAX_REMARK_CHARS: usize = 2_000;
 const GH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -284,6 +287,9 @@ pub(crate) struct WakeReport {
     pub failed: Vec<PrCheck>,
     pub remarks: Vec<Remark>,
     pub conflict: bool,
+    /// Untold items left for the next wake because this one was full.
+    pub more_failed: usize,
+    pub more_remarks: usize,
 }
 
 impl WakeReport {
@@ -310,6 +316,9 @@ pub(crate) struct Evaluation {
     pub decision: Decision,
     pub next: PrWatchRecord,
     pub mark_seen: Vec<String>,
+    /// The part of `mark_seen` a wake delivers: what to unmark if the turn
+    /// definitely never reached the chat.
+    pub delivered: Vec<String>,
 }
 
 pub(crate) fn evaluate(
@@ -324,7 +333,7 @@ pub(crate) fn evaluate(
     if matches!(view.state.as_str(), "MERGED" | "CLOSED") {
         next.status = PR_WATCH_ENDED.into();
         next.stop_reason = Some(format!("Pull request was {}", view.state.to_ascii_lowercase()));
-        return Evaluation { decision: Decision::Ended, next, mark_seen: Vec::new() };
+        return Evaluation { decision: Decision::Ended, next, mark_seen: Vec::new(), delivered: Vec::new() };
     }
 
     let head = view.head_sha.as_str();
@@ -356,6 +365,7 @@ pub(crate) fn evaluate(
         .collect();
 
     let mut failed = Vec::new();
+    let mut more_failed = 0;
     if !view.checks.is_empty() {
         let pending = view.checks.iter().any(|c| c.state == CheckState::Pending);
         let green = !pending
@@ -378,6 +388,8 @@ pub(crate) fn evaluate(
             let since = next.failure_pending_since_ms.unwrap_or(now_ms);
             if !pending || now_ms - since >= FAILURE_BATCH_WINDOW_MS {
                 failed = untold;
+                more_failed = failed.len().saturating_sub(MAX_FAILED_LISTED);
+                failed.truncate(MAX_FAILED_LISTED);
                 next.failure_pending_since_ms = None;
             } else {
                 next.failure_pending_since_ms = Some(since);
@@ -386,11 +398,13 @@ pub(crate) fn evaluate(
     }
     let conflict = view.mergeable == "CONFLICTING" && !seen.contains(&conflict_key(head));
 
-    let report = WakeReport { failed, remarks: fresh_remarks, conflict };
+    let more_remarks = fresh_remarks.len().saturating_sub(MAX_LISTED);
+    fresh_remarks.truncate(MAX_LISTED);
+    let report = WakeReport { failed, remarks: fresh_remarks, conflict, more_failed, more_remarks };
     if report.failed.is_empty() && report.remarks.is_empty() && !report.conflict {
         // Nothing new was found inside the unseen reviews either.
         baseline.extend(reviews);
-        return Evaluation { decision: Decision::Quiet, next, mark_seen: baseline };
+        return Evaluation { decision: Decision::Quiet, next, mark_seen: baseline, delivered: Vec::new() };
     }
     let exhausted = if report.is_fix() {
         next.attempts >= next.max_attempts
@@ -409,23 +423,29 @@ pub(crate) fn evaluate(
         } else {
             format!("Stopped after {COMMENT_WAKE_LIMIT} comment-only updates in a row")
         });
-        return Evaluation { decision: Decision::Exhausted, next, mark_seen: baseline };
+        return Evaluation { decision: Decision::Exhausted, next, mark_seen: baseline, delivered: Vec::new() };
     }
     if report.is_fix() {
         next.attempts += 1;
     } else {
         next.comment_streak += 1;
     }
-    let mut mark_seen = baseline;
-    mark_seen.extend(reviews);
-    mark_seen.extend(report.failed.iter().map(|c| c.key(head)));
-    mark_seen.extend(report.remarks.iter().map(|r| r.key.clone()));
-    if report.conflict {
-        mark_seen.push(conflict_key(head));
+    let mut delivered = Vec::new();
+    // A review is retired only once all of its news went out; until then its
+    // unseen key keeps the inline comments being read.
+    if report.more_remarks == 0 {
+        delivered.extend(reviews);
     }
+    delivered.extend(report.failed.iter().map(|c| c.key(head)));
+    delivered.extend(report.remarks.iter().map(|r| r.key.clone()));
+    if report.conflict {
+        delivered.push(conflict_key(head));
+    }
+    let mut mark_seen = baseline;
+    mark_seen.extend(delivered.iter().cloned());
     next.last_wake_at_ms = Some(now_ms);
     next.last_wake_summary = Some(summary(&report));
-    Evaluation { decision: Decision::Wake(report), next, mark_seen }
+    Evaluation { decision: Decision::Wake(report), next, mark_seen, delivered }
 }
 
 // ── Message ────────────────────────────────────────────────────────────
@@ -476,7 +496,7 @@ pub(crate) fn render_wake(
             "{} failed on {short_head}:",
             plural(report.failed.len(), "check", "checks")
         ));
-        for check in report.failed.iter().take(MAX_LISTED) {
+        for check in &report.failed {
             let url = check.url.as_deref().map(|u| format!(" {u}")).unwrap_or_default();
             lines.push(format!("- {}{url}", check.label()));
             if let Some(excerpt) = excerpts.get(&check.key(&view.head_sha)) {
@@ -491,14 +511,14 @@ pub(crate) fn render_wake(
                 ));
             }
         }
-        if report.failed.len() > MAX_LISTED {
-            lines.push(format!("- and {} more", report.failed.len() - MAX_LISTED));
+        if report.more_failed > 0 {
+            lines.push(format!("- and {} more, in the next update", report.more_failed));
         }
     }
     if !report.remarks.is_empty() {
         lines.push(String::new());
         lines.push(format!("{}:", plural(report.remarks.len(), "new comment", "new comments")));
-        for remark in report.remarks.iter().take(MAX_LISTED) {
+        for remark in &report.remarks {
             let what = match &remark.kind {
                 RemarkKind::Comment => String::new(),
                 RemarkKind::Review { state } => format!(" (review: {})", state.to_ascii_lowercase().replace('_', " ")),
@@ -516,8 +536,8 @@ pub(crate) fn render_wake(
                 lines.extend(body.lines().map(|l| format!("  > {l}")));
             }
         }
-        if report.remarks.len() > MAX_LISTED {
-            lines.push(format!("- and {} more", report.remarks.len() - MAX_LISTED));
+        if report.more_remarks > 0 {
+            lines.push(format!("- and {} more, in the next update", report.more_remarks));
         }
     }
     if report.conflict {
@@ -797,16 +817,28 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
                 model_override: None,
                 effort_override: None,
                 permission_mode_override: None,
-                client_nonce: Some(wake_nonce(&next, &evaluation.mark_seen)),
+                client_nonce: Some(wake_nonce(&next, &evaluation.delivered)),
                 delivery: crate::agent_provider::types::MessageDelivery::Queue,
             };
-            if let Err(error) = send_turn_with_origin(app.clone(), provider, input, TurnOrigin::PrWatch).await {
-                // Not retried: the turn may have reached the provider, and a
-                // duplicate wake is worse than a missed one the UI reports.
+            if let Err((error, reached)) =
+                send_turn_reporting_dispatch(app.clone(), provider, input, TurnOrigin::PrWatch).await
+            {
                 next.last_error = Some(format!("Could not wake the chat: {error}"));
+                // A send rejected before the provider was asked (no session,
+                // provider unavailable) delivered nothing: hand back the
+                // attempt and the events, so the next pass retries with the
+                // same nonce. Once dispatch was attempted the turn may have
+                // landed, and a duplicate wake is worse than a missed one
+                // the UI reports, so that is not retried.
+                let unmark: &[String] = if reached {
+                    &[]
+                } else {
+                    refund_wake(&mut next, watch, report);
+                    &evaluation.delivered
+                };
                 // Past the commit point nothing may return `Err`: the
                 // caller's error path would write back the pre-pass record.
-                match db.save_pr_watch_progress(&next, &[], now_ms()) {
+                match db.save_pr_watch_progress_unmarking(&next, unmark, now_ms()) {
                     Ok(true) => {}
                     Ok(false) => return Ok(()),
                     Err(error) => eprintln!("[codemux::pr-watch] {error}"),
@@ -819,6 +851,17 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
     // Every committed pass moves `last_checked_at_ms`, which the UI shows.
     emit_changed(app, &watch.thread_id, Some(next));
     Ok(())
+}
+
+/// Undo what [`evaluate`] spent on a wake that never reached the chat.
+fn refund_wake(next: &mut PrWatchRecord, before: &PrWatchRecord, report: &WakeReport) {
+    if report.is_fix() {
+        next.attempts = next.attempts.saturating_sub(1);
+    } else {
+        next.comment_streak = next.comment_streak.saturating_sub(1);
+    }
+    next.last_wake_at_ms = before.last_wake_at_ms;
+    next.last_wake_summary = before.last_wake_summary.clone();
 }
 
 fn notify_stopped<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) {
@@ -1127,6 +1170,8 @@ mod tests {
                 kind: RemarkKind::Inline { path: "src/lib.rs".into(), line: Some(12) },
             }],
             conflict: false,
+            more_failed: 0,
+            more_remarks: 0,
         };
         let excerpts = HashMap::from([(failed.key(&v.head_sha), "error[E0308]: mismatched types".to_string())]);
         let (text, display) = render_wake(&w, &v, &report, &excerpts);
@@ -1156,6 +1201,46 @@ mod tests {
         );
         assert_eq!(parse_pr_url("https://github.com/o/r/pull/8", 7), None, "number must match");
         assert_eq!(parse_pr_url("https://github.com/o/r/issues/7", 7), None);
+    }
+
+    #[test]
+    fn a_full_wake_tells_only_what_it_carries() {
+        let mut seen = HashSet::new();
+        let remarks: Vec<Remark> = (0..13).map(|i| comment(&i.to_string(), "fix")).collect();
+        let checks: Vec<PrCheck> = (0..23).map(|i| check(&format!("c{i}"), CheckState::Failure, i)).collect();
+        let mut v = view("h1", remarks, checks);
+        v.review_keys = vec!["review:R".into()];
+        let first = evaluate(&watch(), &v, &seen, 0);
+        let Decision::Wake(report) = &first.decision else { panic!() };
+        assert_eq!((report.remarks.len(), report.more_remarks), (MAX_LISTED, 3));
+        assert_eq!((report.failed.len(), report.more_failed), (MAX_FAILED_LISTED, 3));
+        assert!(!first.mark_seen.contains(&"review:R".to_string()), "review stays open");
+        let (text, _) = render_wake(&first.next, &v, report, &HashMap::new());
+        assert!(text.contains("- and 3 more, in the next update"));
+
+        // The remainder goes out next time, and only then is the review retired.
+        let next = commit(&first, &mut seen);
+        let second = evaluate(&next, &v, &seen, 1);
+        let Decision::Wake(report) = &second.decision else { panic!() };
+        assert_eq!((report.remarks.len(), report.more_remarks), (3, 0));
+        assert_eq!((report.failed.len(), report.more_failed), (3, 0));
+        assert!(second.delivered.contains(&"review:R".to_string()));
+    }
+
+    #[test]
+    fn a_refunded_wake_returns_its_attempt() {
+        let before = watch();
+        let eval = evaluate(&before, &view("h1", vec![], vec![check("ci", CheckState::Failure, 1)]), &HashSet::new(), 5);
+        let Decision::Wake(report) = &eval.decision else { panic!() };
+        let mut next = eval.next.clone();
+        assert_eq!(next.attempts, 1);
+        refund_wake(&mut next, &before, report);
+        assert_eq!(next.attempts, 0);
+        assert_eq!(next.last_wake_at_ms, None);
+        assert!(!eval.delivered.is_empty());
+        // The retry carries the same events, so the same nonce.
+        let again = evaluate(&next, &view("h1", vec![], vec![check("ci", CheckState::Failure, 1)]), &HashSet::new(), 6);
+        assert_eq!(wake_nonce(&next, &again.delivered), wake_nonce(&eval.next, &eval.delivered));
     }
 
     #[test]

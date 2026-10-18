@@ -247,6 +247,27 @@ impl DatabaseStore {
         seen: &[String],
         now_ms: i64,
     ) -> Result<bool, String> {
+        self.write_pr_watch(record, seen, &[], now_ms)
+    }
+
+    /// Like [`Self::save_pr_watch_progress`], but forgets `untold` events
+    /// instead: a wake that never reached the chat hands them back.
+    pub fn save_pr_watch_progress_unmarking(
+        &self,
+        record: &PrWatchRecord,
+        untold: &[String],
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        self.write_pr_watch(record, &[], untold, now_ms)
+    }
+
+    fn write_pr_watch(
+        &self,
+        record: &PrWatchRecord,
+        seen: &[String],
+        untold: &[String],
+        now_ms: i64,
+    ) -> Result<bool, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
@@ -288,6 +309,13 @@ impl DatabaseStore {
                 params![record.thread_id, key, now_ms],
             )
             .map_err(|e| format!("Failed to record PR watch event: {e}"))?;
+        }
+        for key in untold {
+            tx.execute(
+                "DELETE FROM pr_watch_seen WHERE thread_id = ?1 AND event_key = ?2",
+                params![record.thread_id, key],
+            )
+            .map_err(|e| format!("Failed to hand back PR watch event: {e}"))?;
         }
         tx.commit()
             .map_err(|e| format!("Failed to commit PR watch progress: {e}"))?;
@@ -341,6 +369,19 @@ mod tests {
             .save_pr_watch_progress(&stale, &["check:x".into()], 30)
             .unwrap());
         assert!(db.pr_watch_seen_keys("t1").unwrap().is_empty());
+
+        // A wake that never reached the chat hands its events back.
+        let current = db.get_pr_watch("t1").unwrap().unwrap();
+        assert!(db
+            .save_pr_watch_progress(&current, &["check:a".into(), "comment:b".into()], 31)
+            .unwrap());
+        assert!(db
+            .save_pr_watch_progress_unmarking(&current, &["check:a".into()], 32)
+            .unwrap());
+        assert_eq!(
+            db.pr_watch_seen_keys("t1").unwrap(),
+            HashSet::from(["comment:b".to_string()])
+        );
 
         assert!(db.delete_pr_watch("t1").unwrap());
         assert!(!db.delete_pr_watch("t1").unwrap());
