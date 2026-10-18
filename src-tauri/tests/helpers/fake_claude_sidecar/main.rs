@@ -289,6 +289,19 @@ fn main() {
                 }
                 fire_script_entries_for(method, &script);
             }
+            "interrupt" if std::env::var("FAKE_CLAUDE_INTERRUPT_ERROR").is_ok() => {
+                // Regression fixture: the interrupt's outcome is unknown to
+                // the host, while the sidecar may still act on it.
+                capture_params(method, &msg.params);
+                if let Some(id) = id {
+                    write_line(&json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32000, "message": "interrupt outcome unknown" },
+                    }));
+                }
+                fire_script_entries_for(method, &script);
+            }
             "interrupt" | "set-model" | "set-permission-mode" => {
                 if method == "interrupt" {
                     capture_params(method, &msg.params);

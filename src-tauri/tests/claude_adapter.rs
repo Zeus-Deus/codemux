@@ -2842,3 +2842,123 @@ async fn a_compaction_claimed_during_a_user_result_never_swallows_it() {
     }
     provider.stop_session(id).await.ok();
 }
+
+/// Drives a compaction into its timeout with `script_after_interrupt`
+/// answering the app's interrupt, sends a follow-up meanwhile, and returns
+/// every event seen until the session is torn down.
+async fn unconfirmed_stop_events(
+    thread: &str,
+    extra_env: &[(&str, &str)],
+    script_after_interrupt: Vec<serde_json::Value>,
+) -> (Vec<ProviderRuntimeEvent>, ClaudeAgentProvider, Option<String>) {
+    let home = compaction_home(&[]);
+    let mut script = vec![
+        compaction_sdk(thread, 5, "send-turn",
+            json!({"type": "result", "subtype": "success", "num_turns": 1})),
+        compaction_sdk(thread, 5, "compact-idle",
+            json!({"type": "system", "subtype": "status", "status": "compacting"})),
+    ];
+    script.extend(script_after_interrupt);
+    let script = write_script(json!(script));
+    let mut env = vec![("FAKE_CLAUDE_SIDECAR_SCRIPT".to_string(), script.path.to_string_lossy().to_string())];
+    env.extend(extra_env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let wrapper = wrapper_with_env(&env_refs);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    let id = ThreadId(thread.into());
+    provider.start_session(compaction_start(thread, &home)).await.unwrap();
+    assert!(provider.set_compaction_timeout_for_tests(&id, Duration::from_millis(200)).await);
+    let mut stream = provider.event_stream();
+    provider.send_turn(compaction_send(thread, "big task")).await.unwrap();
+    wait_turn_completed(&mut stream).await;
+    provider.request_compaction(&id).await.expect("compaction starts");
+    let sent = provider.send_turn(compaction_send(thread, "follow-up")).await.unwrap();
+    let mut events = Vec::new();
+    let _ = timeout(Duration::from_secs(8), async {
+        while let Some(event) = stream.next().await {
+            let gone = matches!(
+                event,
+                ProviderRuntimeEvent::SessionStateChanged { status: SessionStatus::Error { .. }, .. }
+            );
+            events.push(event);
+            if gone {
+                // Let anything still draining arrive.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                while let Some(Some(event)) =
+                    tokio::time::timeout(Duration::from_millis(50), stream.next()).await.ok()
+                {
+                    events.push(event);
+                }
+                return;
+            }
+        }
+    })
+    .await;
+    // Keep the script alive until the run is over.
+    drop(script);
+    (events, provider, sent.queued_id)
+}
+
+fn assert_no_turn_ran_after_compaction(events: &[ProviderRuntimeEvent]) {
+    for event in events {
+        let text = format!("{event:?}");
+        assert!(!text.contains("Late compaction output"), "compaction output leaked: {text}");
+        assert!(
+            !matches!(
+                event,
+                ProviderRuntimeEvent::QueuedTurnDispatched { .. }
+                    | ProviderRuntimeEvent::SessionStateChanged { status: SessionStatus::Running { .. }, .. }
+            ),
+            "a follow-up ran on a query that never confirmed its stop: {event:?}"
+        );
+    }
+    assert!(events.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnCancelled { .. })));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        ProviderRuntimeEvent::SessionStateChanged { status: SessionStatus::Error { .. }, .. }
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compaction_result_does_not_release_an_interrupt_with_an_unknown_outcome() {
+    let thread = "t-compact-unknown-stop";
+    // The interrupt RPC fails, the compaction's own result arrives, and the
+    // sidecar's late `turn-interrupted` follows.
+    let (events, provider, queued) = unconfirmed_stop_events(
+        thread,
+        &[("FAKE_CLAUDE_INTERRUPT_ERROR", "1")],
+        vec![
+            compaction_sdk(thread, 5, "interrupt",
+                json!({"type": "result", "subtype": "error_during_execution", "num_turns": 0})),
+            json!({"after": "interrupt", "delay_ms": 400, "emit": "notification",
+                "method": "turn-interrupted", "params": {"threadId": thread}}),
+        ],
+    )
+    .await;
+    assert!(queued.is_some());
+    assert_no_turn_ran_after_compaction(&events);
+    // The session is gone; the app's next send rebuilds it.
+    assert!(!provider.has_session(&ThreadId(thread.into())).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compaction_torn_down_keeps_its_output_hidden_and_its_queue_closed() {
+    let thread = "t-compact-teardown";
+    // The interrupt is acknowledged but never confirmed, and the run keeps
+    // talking while the app tears its sidecar down.
+    let (events, provider, queued) = unconfirmed_stop_events(
+        thread,
+        &[],
+        vec![
+            compaction_sdk(thread, 2100, "interrupt",
+                json!({"type": "assistant", "parent_tool_use_id": null, "message": {"role": "assistant",
+                "content": [{"type": "text", "text": "Late compaction output"}]}})),
+        ],
+    )
+    .await;
+    assert!(queued.is_some());
+    assert_no_turn_ran_after_compaction(&events);
+    let id = ThreadId(thread.into());
+    assert!(!provider.has_session(&id).await);
+    assert_eq!(provider.request_compaction(&id).await, Err("no_session"));
+}

@@ -861,11 +861,12 @@ impl ClaudeSession {
 
     /// Stop compaction `id`, which outlived its timeout (or whose start
     /// RPC had an unknown outcome), before letting queued sends through.
-    /// The claim, and with it the output filter, stays until the SDK is
-    /// known to be done: an interrupt it confirmed (`turn-interrupted`) or
-    /// the run's own `result`. If neither arrives the query can't be
-    /// trusted with a user turn, so the session is torn down; the next send
-    /// rebuilds it from the resume cursor.
+    /// Only a stop the sidecar confirmed (`turn-interrupted`) releases the
+    /// claim: the run's own `result` does not, since an interrupt already
+    /// sent can still land afterwards. Without that confirmation the query
+    /// can't be trusted with a user turn, so the session is torn down while
+    /// it keeps the claim, and with it the output filter and the queue, for
+    /// good; the next send rebuilds it from the resume cursor.
     pub(crate) async fn abandon_idle_compaction(self: &Arc<Self>, id: u64) {
         {
             let mut state = self.state.lock().await;
@@ -888,10 +889,7 @@ impl ClaudeSession {
             .is_ok();
         if interrupted {
             let deadline = tokio::time::Instant::now() + IDLE_STOP_GRACE;
-            while tokio::time::Instant::now() < deadline {
-                // Wait for the interrupt itself even when the run's own
-                // `result` already landed: its `turn-interrupted` must not
-                // reach a user turn dispatched after the claim is gone.
+            loop {
                 let stopped = {
                     let state = self.state.lock().await;
                     match state.idle_compaction {
@@ -900,28 +898,43 @@ impl ClaudeSession {
                     }
                 };
                 if stopped {
+                    let run = self.take_idle_claim(id).await;
+                    if run.is_some_and(|run| !run.settled) {
+                        self.emit_compaction_ended();
+                    }
+                    self.drain_queue().await;
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
-        let Some(run) = self.take_idle_claim(id).await else {
-            return;
-        };
-        if !run.settled {
-            self.emit_compaction_ended();
-        }
-        if run.stopped || run.settled {
-            self.drain_queue().await;
-            return;
-        }
         eprintln!(
-            "[codemux::claude] idle compaction did not stop for {}; restarting its session",
+            "[codemux::claude] idle compaction did not confirm its stop for {}; restarting its session",
             self.thread_id.0
         );
-        // The watchdog reports the exit, cancels queued sends and marks the
-        // session dead, exactly as for a sidecar that died on its own.
+        let settled = {
+            let mut state = self.state.lock().await;
+            let Some(run) = state.idle_compaction.as_mut().filter(|run| run.id == id) else {
+                return;
+            };
+            // Under the lifecycle lock: from here the provider treats the
+            // session as gone, and the app's next send rebuilds it.
+            self.dead.store(true, Ordering::Relaxed);
+            let settled = run.settled;
+            run.settled = true;
+            settled
+        };
+        if !settled {
+            self.emit_compaction_ended();
+        }
+        // The claim is never released: sends still queue behind it and the
+        // filter stays on while the child drains; the watchdog cancels the
+        // queue when it exits, as for any dead sidecar.
         let _ = self.sidecar.shutdown().await;
+        self.cancel_all_queued().await;
     }
 
     /// Route the events of one notification that arrived while compaction
@@ -951,7 +964,7 @@ impl ClaudeSession {
         let Some(run) = state.idle_compaction.as_mut().filter(|run| run.id == owner) else {
             return events;
         };
-        if signal == IdleSignal::Gone {
+        if signal == IdleSignal::Gone && !run.abandoning {
             // The session itself ended or failed; that is the user's to see.
             let settled = run.settled;
             state.idle_compaction = None;
