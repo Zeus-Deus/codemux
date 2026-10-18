@@ -38,6 +38,8 @@ use super::protocol::{
 };
 use super::translate::{translate_notification_with, SubagentDemux};
 use crate::agent_provider::ImageInput;
+
+mod steer;
 use base64::Engine;
 
 /// Default per-RPC timeout for the sidecar. Matches the value
@@ -94,6 +96,8 @@ pub(crate) struct ClaudeSessionState {
     pub dispatching: bool,
     /// Holds the queue after a user Stop until an explicit send.
     pub(crate) queue_hold: crate::agent_provider::queue_hold::QueueHold,
+    /// Guidance delivered into the running turn; see [`steer`].
+    pub(crate) steer: steer::SteerState,
 }
 
 impl ClaudeSessionState {
@@ -530,6 +534,7 @@ impl ClaudeSession {
             queued_turns: VecDeque::new(),
             dispatching: false,
             queue_hold: Default::default(),
+            steer: Default::default(),
         });
         let session = Arc::new(Self {
             thread_id: thread_id.clone(),
@@ -1067,7 +1072,7 @@ impl ClaudeSession {
             self.native_authority.invalidate();
         }
         let active = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             if let Some(requested) = turn_id.as_ref() {
                 let active = state.active_turn.as_ref().ok_or_else(|| {
                     ProviderError::ValidationError {
@@ -1085,17 +1090,24 @@ impl ClaudeSession {
                 // Keep selection and revocation atomic with turn transitions.
                 self.native_authority.invalidate();
             }
-            state.active_turn.clone()
+            // A newer Stop wins over guidance sent into this turn.
+            let active = state.active_turn.clone();
+            state.steer.stop(active.clone());
+            active
         };
         let params = InterruptParams {
             thread_id: self.thread_id.0.clone(),
         };
-        self.sidecar
+        if let Err(e) = self
+            .sidecar
             .request(METHOD_INTERRUPT, serde_json::to_value(&params).unwrap())
             .await
-            .map_err(|e| ProviderError::RpcError {
+        {
+            self.state.lock().await.steer.stop_failed(&active);
+            return Err(ProviderError::RpcError {
                 message: format!("interrupt RPC failed: {e}"),
-            })?;
+            });
+        }
         // By the time the RPC returns, the sidecar's `turn-interrupted`
         // notification may ALREADY have been processed by the
         // notifications task, which may already have flipped the session
@@ -1580,6 +1592,7 @@ fn spawn_notifications_task(
                                     ));
                                 }
                             }
+                            session.announce_steer_continuation().await;
                             // Follow-up queue: a notification may have
                             // just returned the session to idle (SDK
                             // `result` → Ready) or torn it down
@@ -2040,6 +2053,7 @@ async fn mutate_state_from_notification(
             // flight and stays `Running` until its real `result` lands.
             let mut state = session.state.lock().await;
             state.sdk_session_id = None;
+            state.steer.drop_pending();
         }
         SidecarNotification::SdkMessage { message, .. } => {
             // The SDK's `result` message marks the end of a single
@@ -2070,6 +2084,7 @@ async fn mutate_state_from_notification(
                 if matches!(state.status, SessionStatus::Running { .. }) {
                     state.status = SessionStatus::Ready;
                 }
+                session.continue_unconsumed_steers(&mut state, message);
             }
         }
         SidecarNotification::SessionEnded { reason, .. } => {
@@ -2080,6 +2095,7 @@ async fn mutate_state_from_notification(
             if reason != "iteration-complete" {
                 session.native_authority.revoke();
             }
+            state.steer.drop_pending();
             state.active_turn = None;
             state.status = if reason == "iteration-complete" {
                 SessionStatus::Ready
@@ -2093,6 +2109,7 @@ async fn mutate_state_from_notification(
             // only from Running, so we never resurrect a session that has
             // since gone Closed / Error.
             let mut state = session.state.lock().await;
+            state.steer.drop_pending();
             state.active_turn = None;
             if matches!(state.status, SessionStatus::Running { .. }) {
                 state.status = SessionStatus::Ready;
@@ -2113,6 +2130,7 @@ async fn mutate_state_from_notification(
         SidecarNotification::SessionError { error, .. } => {
             session.native_authority.finish_current();
             let mut state = session.state.lock().await;
+            state.steer.drop_pending();
             state.status = SessionStatus::Error {
                 message: error.message.clone(),
             };

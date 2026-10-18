@@ -16,6 +16,7 @@ import type { EventEmitter } from "../session.ts";
 import {
   ClaudeSession,
   type SendTurnInput,
+  type SteerTurnInput,
   type SessionStartInput,
 } from "../session.ts";
 import type { ApprovalDecision } from "../permissions.ts";
@@ -230,18 +231,35 @@ const sendTurn: MethodHandler = async (params) => {
   // JSON-RPC frame stays text-only; we don't decode them here, the
   // SDK accepts the same shape verbatim as part of its multimodal
   // user message content array.
-  const rawImages = optArray(p["images"], "images");
-  if (rawImages && rawImages.length > 0) {
-    input.images = rawImages.map((raw, idx) => {
-      const obj = asObject(raw, `images[${idx}]`);
-      return {
-        mediaType: asString(obj["mediaType"], `images[${idx}].mediaType`),
-        dataBase64: asString(obj["dataBase64"], `images[${idx}].dataBase64`),
-      };
-    });
-  }
+  const images = parseImages(p["images"]);
+  if (images) input.images = images;
   await session.sendTurn(input);
   return { turnStarted: true };
+};
+
+function parseImages(raw: unknown): SendTurnInput["images"] {
+  const rawImages = optArray(raw, "images");
+  if (!rawImages || rawImages.length === 0) return undefined;
+  return rawImages.map((item, idx) => {
+    const obj = asObject(item, `images[${idx}]`);
+    return {
+      mediaType: asString(obj["mediaType"], `images[${idx}].mediaType`),
+      dataBase64: asString(obj["dataBase64"], `images[${idx}].dataBase64`),
+    };
+  });
+}
+
+const steerTurn: MethodHandler = async (params) => {
+  const p = asObject(params, "steer-turn");
+  const session = getSession(asString(p["threadId"], "threadId"));
+  const input: SteerTurnInput = {
+    text: asString(p["text"], "text"),
+    uuid: asString(p["uuid"], "uuid"),
+  };
+  const images = parseImages(p["images"]);
+  if (images) input.images = images;
+  await session.steerTurn(input);
+  return { steered: true };
 };
 
 const interrupt: MethodHandler = async (params) => {
@@ -473,6 +491,7 @@ export function buildMethods(emit: EventEmitter): Record<string, MethodHandler> 
     ping: (params) => ping((params ?? {}) as Record<string, unknown>),
     "start-session": makeStartSession(emit),
     "send-turn": sendTurn,
+    "steer-turn": steerTurn,
     interrupt,
     "set-model": setModel,
     "set-permission-mode": setPermissionMode,

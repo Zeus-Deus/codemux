@@ -266,6 +266,33 @@ impl AgentProvider for ClaudeAgentProvider {
         })
     }
 
+    async fn steer_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&input.thread_id).cloned()
+        };
+        let session = session.ok_or_else(|| ProviderError::SessionNotFound {
+            thread_id: input.thread_id.clone(),
+        })?;
+        session.steer_turn(input).await
+    }
+
+    async fn steer_queued_turn(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+    ) -> Result<(), ProviderError> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&thread_id).cloned()
+        };
+        // A missing session means nothing is queued — treat as a no-op.
+        let Some(session) = session else {
+            return Ok(());
+        };
+        session.steer_queued(&queued_id).await
+    }
+
     async fn interrupt_turn(
         &self,
         thread_id: ThreadId,

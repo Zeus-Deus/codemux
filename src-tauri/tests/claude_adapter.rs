@@ -2406,3 +2406,273 @@ async fn claude_real_session() {
         .await
         .ok();
 }
+
+// ===========================================================================
+// Steering
+// ===========================================================================
+
+fn turn_input(thread: &str, text: &str) -> SendTurnInput {
+    SendTurnInput {
+        thread_id: ThreadId(thread.into()),
+        text: text.into(),
+        images: vec![],
+        model_override: None,
+        effort_override: None,
+        permission_mode_override: None,
+        client_nonce: None,
+        display_text: None,
+        skill_invocations: vec![],
+        turn_checkpoint: None,
+        dispatch_guard: None,
+    }
+}
+
+/// A scripted top-level `result` echoing `uuids` as the consumed prompts.
+fn result_after(after: &str, delay_ms: u64, thread: &str, uuids: serde_json::Value) -> serde_json::Value {
+    json!({ "after": after, "delay_ms": delay_ms, "emit": "notification",
+        "method": "sdk-message",
+        "params": { "threadId": thread, "message": {
+            "type": "result", "subtype": "success", "duration_ms": 1, "num_turns": 1,
+            "user_message_uuids": uuids } } })
+}
+
+/// Lifecycle events in arrival order until `done` matches or `ms` elapse.
+async fn lifecycle_until(
+    stream: &mut (impl futures_util::Stream<Item = ProviderRuntimeEvent> + Unpin),
+    ms: u64,
+    done: impl Fn(&ProviderRuntimeEvent) -> bool,
+) -> Vec<ProviderRuntimeEvent> {
+    let mut seen = Vec::new();
+    let _ = timeout(Duration::from_millis(ms), async {
+        while let Some(ev) = stream.next().await {
+            let keep = matches!(
+                ev,
+                ProviderRuntimeEvent::TurnCompleted { .. }
+                    | ProviderRuntimeEvent::SessionStateChanged { .. }
+                    | ProviderRuntimeEvent::QueuedTurnDispatched { .. }
+            );
+            let finished = done(&ev);
+            if keep {
+                seen.push(ev);
+            }
+            if finished {
+                break;
+            }
+        }
+    })
+    .await;
+    seen
+}
+
+fn running_turns(events: &[ProviderRuntimeEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|ev| match ev {
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Running { active_turn },
+                ..
+            } => Some(active_turn.0.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_lands_as_guidance_in_the_running_turn() {
+    let thread = "t-steer-guidance";
+    let script = write_script(json!([result_after("steer-turn", 20, thread, json!("$steered"))]));
+    let capture = tempfile::NamedTempFile::new().unwrap();
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy()),
+        ("FAKE_CLAUDE_SIDECAR_CAPTURE", &capture.path().to_string_lossy()),
+    ]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    provider.start_session(start_input(thread)).await.unwrap();
+    let first = provider.send_turn(turn_input(thread, "first")).await.unwrap();
+    let mut stream = provider.event_stream();
+
+    let steered = provider.steer_turn(turn_input(thread, "also this")).await.unwrap();
+    assert!(steered.steered);
+    assert_eq!(steered.turn_id, first.turn_id);
+    assert!(steered.queued_id.is_none());
+
+    // The one result consumed both prompts: the turn completes and nothing
+    // else starts.
+    let events = lifecycle_until(&mut stream, 600, |_| false).await;
+    assert!(events.iter().any(|ev| matches!(ev,
+        ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if *turn_id == first.turn_id)));
+    assert!(running_turns(&events).is_empty(), "{events:?}");
+    assert!(!provider.turn_active(&ThreadId(thread.into())).await);
+
+    let captured = std::fs::read_to_string(capture.path()).unwrap();
+    let steer = captured
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|record| record["method"] == "steer-turn")
+        .expect("steer-turn RPC");
+    assert_eq!(steer["params"]["text"], "also this");
+    assert!(!steer["params"]["uuid"].as_str().unwrap().is_empty());
+    provider.stop_session(ThreadId(thread.into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guidance_the_turn_missed_runs_as_a_continuation_before_the_queue() {
+    // The turn ends before the CLI reads the guidance, so the CLI runs it as
+    // a turn of its own. That turn must be tracked, and queued messages wait
+    // for it.
+    let thread = "t-steer-missed";
+    let script = write_script(json!([
+        result_after("steer-turn", 150, thread, json!(["first-prompt"])),
+        result_after("steer-turn", 300, thread, json!("$steered")),
+    ]));
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    provider.start_session(start_input(thread)).await.unwrap();
+    let first = provider.send_turn(turn_input(thread, "first")).await.unwrap();
+    let mut stream = provider.event_stream();
+    assert!(provider.steer_turn(turn_input(thread, "guidance")).await.unwrap().steered);
+    let queued = provider.send_turn(turn_input(thread, "follow-up")).await.unwrap();
+    assert!(queued.queued_id.is_some());
+
+    let events = lifecycle_until(&mut stream, 3000, |ev| {
+        matches!(ev, ProviderRuntimeEvent::QueuedTurnDispatched { .. })
+    })
+    .await;
+    let order: Vec<String> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            ProviderRuntimeEvent::TurnCompleted { turn_id, .. } => Some(format!("done:{}", turn_id.0)),
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Running { active_turn }, ..
+            } => Some(format!("run:{}", active_turn.0)),
+            ProviderRuntimeEvent::QueuedTurnDispatched { .. } => Some("dispatch".into()),
+            _ => None,
+        })
+        .collect();
+    let continuation = running_turns(&events)
+        .into_iter()
+        .next()
+        .expect("continuation turn announced");
+    assert_ne!(continuation, first.turn_id.0);
+    // The queued follow-up starts (its own `run:` then `dispatch`) only
+    // after the continuation completes.
+    assert_eq!(
+        order[..3],
+        [
+            format!("done:{}", first.turn_id.0),
+            format!("run:{continuation}"),
+            format!("done:{continuation}"),
+        ],
+        "{order:?}"
+    );
+    assert_eq!(order.last().map(String::as_str), Some("dispatch"), "{order:?}");
+    provider.stop_session(ThreadId(thread.into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_wins_over_pending_guidance() {
+    // An aborting turn can still report a result. Guidance it never consumed
+    // died with the Stop and must not start a phantom continuation.
+    let thread = "t-steer-stop";
+    let script = write_script(json!([result_after("interrupt", 20, thread, json!(["first-prompt"]))]));
+    let wrapper =
+        wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_SCRIPT", &script.path.to_string_lossy())]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    let thread_id = ThreadId(thread.into());
+    provider.start_session(start_input(thread)).await.unwrap();
+    provider.send_turn(turn_input(thread, "first")).await.unwrap();
+    assert!(provider.steer_turn(turn_input(thread, "guidance")).await.unwrap().steered);
+    let mut stream = provider.event_stream();
+    provider.interrupt_turn(thread_id.clone(), None).await.unwrap();
+
+    let events = lifecycle_until(&mut stream, 500, |_| false).await;
+    assert!(running_turns(&events).is_empty(), "{events:?}");
+    assert!(!provider.turn_active(&thread_id).await);
+    provider.stop_session(thread_id).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_steer_strands_nothing() {
+    let thread = "t-steer-fail";
+    let wrapper = wrapper_with_env(&[("FAKE_CLAUDE_STEER_ERROR", "-32603:boom")]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    let thread_id = ThreadId(thread.into());
+    provider.start_session(start_input(thread)).await.unwrap();
+    provider.send_turn(turn_input(thread, "first")).await.unwrap();
+    let queued = provider
+        .send_turn(turn_input(thread, "second"))
+        .await
+        .unwrap()
+        .queued_id
+        .unwrap();
+
+    assert!(provider.steer_turn(turn_input(thread, "guidance")).await.is_err());
+    assert!(provider
+        .steer_queued_turn(thread_id.clone(), queued.clone())
+        .await
+        .is_err());
+    // The turn keeps running and the queued message is still queued.
+    assert!(provider.turn_active(&thread_id).await);
+    assert!(provider.cancel_queued_turn(thread_id.clone(), queued).await.unwrap());
+    provider.stop_session(thread_id).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steering_a_queued_message_delivers_it_into_the_running_turn() {
+    let thread = "t-steer-queued";
+    let provider = provider_with_fake().await;
+    let thread_id = ThreadId(thread.into());
+    provider.start_session(start_input(thread)).await.unwrap();
+    let first = provider.send_turn(turn_input(thread, "first")).await.unwrap();
+    let queued = provider
+        .send_turn(turn_input(thread, "second"))
+        .await
+        .unwrap()
+        .queued_id
+        .unwrap();
+    let mut stream = provider.event_stream();
+    provider
+        .steer_queued_turn(thread_id.clone(), queued.clone())
+        .await
+        .unwrap();
+    let events = lifecycle_until(&mut stream, 1000, |ev| {
+        matches!(ev, ProviderRuntimeEvent::QueuedTurnDispatched { .. })
+    })
+    .await;
+    assert!(events.iter().any(|ev| matches!(ev,
+        ProviderRuntimeEvent::QueuedTurnDispatched { queued_id, turn_id, steered: true, .. }
+            if *queued_id == queued && *turn_id == first.turn_id)), "{events:?}");
+    assert!(!provider.cancel_queued_turn(thread_id.clone(), queued).await.unwrap());
+    provider.stop_session(thread_id).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_without_a_running_turn_sends_normally() {
+    let thread = "t-steer-idle";
+    let provider = provider_with_fake().await;
+    provider.start_session(start_input(thread)).await.unwrap();
+    let started = provider.steer_turn(turn_input(thread, "hello")).await.unwrap();
+    assert!(!started.steered);
+    assert!(started.queued_id.is_none());
+    assert!(!started.turn_id.0.is_empty());
+    assert!(provider.turn_active(&ThreadId(thread.into())).await);
+    provider.stop_session(ThreadId(thread.into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_refuses_slash_commands_and_old_sidecars() {
+    let thread = "t-steer-refuse";
+    let wrapper = wrapper_with_env(&[("FAKE_CLAUDE_STEER_ERROR", "-32601:unknown method: steer-turn")]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    provider.start_session(start_input(thread)).await.unwrap();
+    provider.send_turn(turn_input(thread, "first")).await.unwrap();
+    let slash = provider.steer_turn(turn_input(thread, "/compact")).await;
+    assert!(matches!(slash, Err(ProviderError::ValidationError { .. })), "{slash:?}");
+    let old = provider.steer_turn(turn_input(thread, "guidance")).await;
+    assert!(
+        matches!(&old, Err(ProviderError::ValidationError { message }) if message.contains("can't steer")),
+        "{old:?}"
+    );
+    provider.stop_session(ThreadId(thread.into())).await.ok();
+}

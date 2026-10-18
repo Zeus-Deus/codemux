@@ -1,0 +1,386 @@
+//! Steering: guidance pushed into a running Claude turn.
+//!
+//! The sidecar pushes the message into the live SDK prompt stream with
+//! `priority: "next"`, so the CLI reads it when it builds its next API
+//! request (usually once the current tool returns) without cancelling
+//! anything. If the turn ends first, the CLI runs the message as a turn of
+//! its own. Every `result` echoes the prompt uuids its turn consumed
+//! (`user_message_uuids`), which tells the two cases apart: guidance still
+//! pending after a result gets a continuation turn, so its output is
+//! attributed and the follow-up queue cannot dispatch into the gap.
+//!
+//! A newer Stop always wins: `interrupt` drops pending guidance and refuses
+//! new guidance into the turn it is ending.
+
+use std::sync::Arc;
+
+use base64::Engine as _;
+use serde_json::Value;
+
+use super::{ClaudeSession, ClaudeSessionState};
+use crate::agent_provider::claude::protocol::{SendTurnImage, SteerTurnParams, METHOD_STEER_TURN};
+use crate::agent_provider::{
+    ImageInput, ProviderError, ProviderRuntimeEvent, SendOutcome, SendTurnInput, SessionStatus,
+    TurnId, TurnStartResult,
+};
+use crate::json_rpc_child::RpcChildError;
+
+const AWAITING_USER: &str =
+    "Claude is waiting on a question or approval. Answer it, or choose Queue or Interrupt and send.";
+const SLASH_COMMAND: &str =
+    "Slash commands can't steer a running turn. Choose Queue or Interrupt and send.";
+
+/// Per-session steering state, kept under the session's state lock.
+#[derive(Debug, Default)]
+pub(crate) struct SteerState {
+    /// Prompt uuids pushed into the running turn and not yet seen consumed.
+    pending: Vec<String>,
+    /// The turn an `interrupt` is ending.
+    stopping: Option<TurnId>,
+    /// The turn started for guidance its predecessor's result did not consume.
+    continuation: Option<TurnId>,
+    /// A continuation whose `Running` state has not been announced yet.
+    unannounced: Option<TurnId>,
+}
+
+impl SteerState {
+    /// An interrupt is ending `turn`: guidance pending in it dies with it.
+    pub fn stop(&mut self, turn: Option<TurnId>) {
+        self.drop_pending();
+        self.stopping = turn;
+    }
+
+    /// The interrupt RPC failed, so `turn` keeps running.
+    pub fn stop_failed(&mut self, turn: &Option<TurnId>) {
+        if &self.stopping == turn {
+            self.stopping = None;
+        }
+    }
+
+    /// The SDK query ended or was rebuilt, losing any guidance it held.
+    pub fn drop_pending(&mut self) {
+        self.pending.clear();
+        self.continuation = None;
+        self.unannounced = None;
+    }
+
+    /// A top-level `result`. Returns whether guidance is still pending, which
+    /// the CLI runs next as a turn of its own.
+    fn settle_result(&mut self, result: &Value) -> bool {
+        match result.get("user_message_uuids").and_then(Value::as_array) {
+            Some(consumed) => self
+                .pending
+                .retain(|uuid| !consumed.iter().any(|c| c.as_str() == Some(uuid))),
+            // A CLI that does not echo cannot say. Assume consumed, which is
+            // how such a CLI behaved before steering existed.
+            None => self.pending.clear(),
+        }
+        self.continuation = None;
+        self.unannounced = None;
+        !self.pending.is_empty()
+    }
+
+    /// Guidance that never reached the CLI. Returns the continuation turn
+    /// that was waiting only on it.
+    fn forget(&mut self, uuid: &str) -> Option<TurnId> {
+        self.pending.retain(|pending| pending != uuid);
+        if self.pending.is_empty() {
+            self.unannounced = None;
+            self.continuation.take()
+        } else {
+            None
+        }
+    }
+}
+
+enum Plan {
+    /// Deliver into `turn` as guidance tagged `uuid`.
+    Steer { turn: TurnId, uuid: String },
+    /// No turn to steer, or one a Stop is ending: send through the normal
+    /// path, which starts it, or queues it ahead of a held queue.
+    Send,
+}
+
+/// Decide under the state lock, recording the guidance as pending before
+/// any result can race its delivery.
+fn plan(state: &mut ClaudeSessionState, input: &SendTurnInput) -> Result<Plan, ProviderError> {
+    let Some(turn) = state.active_turn.clone() else {
+        if state.turn_busy() {
+            return Err(ProviderError::ValidationError {
+                message: AWAITING_USER.into(),
+            });
+        }
+        return Ok(Plan::Send);
+    };
+    if state.queue_hold.is_held()
+        || state.steer.stopping.as_ref() == Some(&turn)
+        || input.dispatch_guard.is_some()
+    {
+        return Ok(Plan::Send);
+    }
+    if crate::agent_provider::slash_commands::leading_command(&input.text).is_some() {
+        return Err(ProviderError::ValidationError {
+            message: SLASH_COMMAND.into(),
+        });
+    }
+    if let Some(checkpoint) = &input.turn_checkpoint {
+        checkpoint.authorize_dispatch()?;
+    }
+    let uuid = uuid::Uuid::new_v4().to_string();
+    state.steer.pending.push(uuid.clone());
+    Ok(Plan::Steer { turn, uuid })
+}
+
+fn encode_images(images: &[ImageInput]) -> Vec<SendTurnImage> {
+    images
+        .iter()
+        .map(|img| SendTurnImage {
+            media_type: img.media_type.clone(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&img.data),
+        })
+        .collect()
+}
+
+impl ClaudeSession {
+    /// Non-interrupting guidance for the running turn. Idle sessions, and
+    /// turns a Stop is ending, take the normal send path instead.
+    pub async fn steer_turn(
+        self: &Arc<Self>,
+        input: SendTurnInput,
+    ) -> Result<TurnStartResult, ProviderError> {
+        let plan = plan(&mut *self.state.lock().await, &input)?;
+        match plan {
+            Plan::Steer { turn, uuid } => {
+                self.deliver_steer(&uuid, &input).await?;
+                Ok(TurnStartResult {
+                    steered: true,
+                    turn_id: turn,
+                    queued_id: None,
+                })
+            }
+            Plan::Send => Ok(match self.enqueue_or_send(input).await? {
+                SendOutcome::Started(turn_id) => TurnStartResult {
+                    steered: false,
+                    turn_id,
+                    queued_id: None,
+                },
+                SendOutcome::Queued(queued_id) => TurnStartResult {
+                    steered: false,
+                    turn_id: TurnId(String::new()),
+                    queued_id: Some(queued_id),
+                },
+            }),
+        }
+    }
+
+    /// Steer with a queued message. It leaves the queue only once delivered;
+    /// a failed delivery puts it back where it was. When it cannot steer, it
+    /// is sent next instead, through a held queue too, without interrupting.
+    pub async fn steer_queued(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
+        let (turn, uuid, queued, index) = {
+            let mut state = self.state.lock().await;
+            let Some(index) = state
+                .queued_turns
+                .iter()
+                .position(|q| q.queued_id == queued_id)
+            else {
+                return Ok(());
+            };
+            let queued = state.queued_turns.remove(index).expect("index in range");
+            match plan(&mut state, &queued.input) {
+                Ok(Plan::Steer { turn, uuid }) => (turn, uuid, queued, index),
+                Ok(Plan::Send) => {
+                    state.queued_turns.push_front(queued);
+                    state.queue_hold.release_with(queued_id);
+                    drop(state);
+                    self.drain_queue().await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    state.queued_turns.insert(index, queued);
+                    return Err(error);
+                }
+            }
+        };
+        if let Err(error) = self.deliver_steer(&uuid, &queued.input).await {
+            let mut state = self.state.lock().await;
+            if matches!(state.status, SessionStatus::Closed | SessionStatus::Error { .. }) {
+                // The session cancelled its queue while this was out of it.
+                drop(state);
+                let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                    thread_id: self.thread_id.clone(),
+                    queued_id: queued.queued_id,
+                });
+            } else {
+                let index = index.min(state.queued_turns.len());
+                state.queued_turns.insert(index, queued);
+            }
+            return Err(error);
+        }
+        let text = queued.input.display_text.unwrap_or(queued.input.text);
+        let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnDispatched {
+            steered: true,
+            thread_id: self.thread_id.clone(),
+            queued_id: queued.queued_id,
+            turn_id: turn,
+            text,
+        });
+        Ok(())
+    }
+
+    async fn deliver_steer(
+        self: &Arc<Self>,
+        uuid: &str,
+        input: &SendTurnInput,
+    ) -> Result<(), ProviderError> {
+        let params = SteerTurnParams {
+            thread_id: self.thread_id.0.clone(),
+            text: input.text.clone(),
+            uuid: uuid.to_owned(),
+            images: encode_images(&input.images),
+        };
+        let Err(error) = self
+            .sidecar
+            .request(METHOD_STEER_TURN, serde_json::to_value(&params).unwrap())
+            .await
+        else {
+            return Ok(());
+        };
+        let orphan = self.state.lock().await.steer.forget(uuid);
+        if let Some(turn) = orphan {
+            self.settle_orphaned_continuation(&turn).await;
+        }
+        Err(match error {
+            RpcChildError::RpcError(error) if error.code == -32601 => {
+                ProviderError::ValidationError {
+                    message: "This Claude sidecar can't steer. Choose Queue or Interrupt and send."
+                        .into(),
+                }
+            }
+            RpcChildError::RpcError(error) if error.message.contains("no running turn") => {
+                ProviderError::ValidationError {
+                    message: "The turn stopped before your guidance arrived, so it was not sent."
+                        .into(),
+                }
+            }
+            other => ProviderError::RpcError {
+                message: format!("Guidance was not delivered: {other}"),
+            },
+        })
+    }
+
+    /// A continuation started for guidance that then failed to deliver will
+    /// never see a result. Return the session to idle.
+    async fn settle_orphaned_continuation(self: &Arc<Self>, turn: &TurnId) {
+        {
+            let mut state = self.state.lock().await;
+            if state.active_turn.as_ref() != Some(turn) {
+                return;
+            }
+            self.native_authority.finish(&turn.0);
+            state.active_turn = None;
+            if matches!(state.status, SessionStatus::Running { .. }) {
+                state.status = SessionStatus::Ready;
+                let _ = self
+                    .event_tx
+                    .send(ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id: self.thread_id.clone(),
+                        status: SessionStatus::Ready,
+                    });
+            }
+        }
+        self.drain_queue().await;
+    }
+
+    /// Called with the turn's `result`, after it cleared the active turn.
+    /// Guidance the turn did not consume runs next as the CLI's own turn;
+    /// mark it running now so nothing dispatches into the gap.
+    pub(super) fn continue_unconsumed_steers(&self, state: &mut ClaudeSessionState, result: &Value) {
+        if !state.steer.settle_result(result) || !matches!(state.status, SessionStatus::Ready) {
+            return;
+        }
+        let turn = TurnId(format!("claude-turn-{}", uuid::Uuid::new_v4()));
+        let generation = self.native_authority.begin();
+        self.native_authority.bind(generation, &turn.0);
+        state.active_turn = Some(turn.clone());
+        state.status = SessionStatus::Running {
+            active_turn: turn.clone(),
+        };
+        state.steer.continuation = Some(turn.clone());
+        state.steer.unannounced = Some(turn);
+    }
+
+    /// Announce a continuation once the finished turn's events are out, so
+    /// subscribers see the completion before the next turn starts.
+    pub(super) async fn announce_steer_continuation(&self) {
+        let mut state = self.state.lock().await;
+        let Some(turn) = state.steer.unannounced.take() else {
+            return;
+        };
+        if state.active_turn.as_ref() != Some(&turn) {
+            return;
+        }
+        let _ = self
+            .event_tx
+            .send(ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: self.thread_id.clone(),
+                status: SessionStatus::Running { active_turn: turn },
+            });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn steer_with(pending: &[&str]) -> SteerState {
+        SteerState {
+            pending: pending.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn result_that_consumed_the_guidance_settles_it() {
+        let mut steer = steer_with(&["s1"]);
+        assert!(!steer.settle_result(&json!({"type": "result", "user_message_uuids": ["p", "s1"]})));
+        assert!(steer.pending.is_empty());
+    }
+
+    #[test]
+    fn guidance_missing_from_the_result_stays_pending() {
+        let mut steer = steer_with(&["s1", "s2"]);
+        assert!(steer.settle_result(&json!({"type": "result", "user_message_uuids": ["p", "s1"]})));
+        assert_eq!(steer.pending, ["s2"]);
+    }
+
+    #[test]
+    fn result_without_an_echo_assumes_consumed() {
+        let mut steer = steer_with(&["s1"]);
+        assert!(!steer.settle_result(&json!({"type": "result"})));
+        assert!(steer.pending.is_empty());
+    }
+
+    #[test]
+    fn stop_drops_pending_guidance() {
+        let mut steer = steer_with(&["s1"]);
+        steer.continuation = Some(TurnId("c".into()));
+        steer.stop(Some(TurnId("t".into())));
+        assert!(steer.pending.is_empty());
+        assert!(steer.continuation.is_none());
+        assert_eq!(steer.stopping, Some(TurnId("t".into())));
+        assert!(!steer.settle_result(&json!({"user_message_uuids": ["p"]})));
+        steer.stop_failed(&Some(TurnId("t".into())));
+        assert!(steer.stopping.is_none());
+    }
+
+    #[test]
+    fn forgetting_the_last_guidance_orphans_its_continuation() {
+        let mut steer = steer_with(&["s1", "s2"]);
+        steer.continuation = Some(TurnId("c".into()));
+        assert_eq!(steer.forget("s1"), None);
+        assert_eq!(steer.forget("s2"), Some(TurnId("c".into())));
+        assert!(steer.continuation.is_none());
+    }
+}

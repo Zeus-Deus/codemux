@@ -109,6 +109,15 @@ export interface SendTurnInput {
   images?: Array<{ mediaType: string; dataBase64: string }>;
 }
 
+/** Parameters for `steer-turn`: guidance for the running turn. */
+export interface SteerTurnInput {
+  text: string;
+  /** Host-chosen prompt uuid. The CLI echoes it in `user_message_uuids` on
+   *  the `result` of whichever turn consumed the message. */
+  uuid: string;
+  images?: Array<{ mediaType: string; dataBase64: string }>;
+}
+
 // ---------------------------------------------------------------------------
 // Dependency-injection seam for tests. Real RPCs use the SDK's `query`;
 // tests swap in a `FakeQuery` factory.
@@ -680,13 +689,43 @@ export class ClaudeSession {
         });
       }
     }
-    const preparedText = applyClaudePromptEffortPrefix(input.text, this.effort);
-    // Stage 6 — when images are attached we build a multi-block
-    // content array per Anthropic's vision spec: image blocks come
-    // BEFORE the text block ("describe these images" pattern). The
-    // text-only fast path keeps the string-content shape so existing
-    // unit tests that match on `content === text` stay green.
-    const images = input.images ?? [];
+    const msg = this.buildUserMessage(input.text, input.images);
+    // Retain the turn and grant it one stale-resume recovery attempt
+    // before it's dispatched, so a self-heal can replay it verbatim.
+    this.lastUserMessage = msg;
+    this.resumeFallbackAttempted = false;
+    this.promptQueue.push(msg);
+  }
+
+  /** Steer the running turn: push guidance into the live prompt stream
+   *  without interrupting. With `priority: "next"` the CLI reads it when it
+   *  builds its next API request, usually after the current tool returns. If
+   *  the turn ends first, the CLI runs it as a turn of its own. The host
+   *  tells the two apart by `uuid`. Rejected while an interrupt is ending
+   *  the query, which would silently drop the message. */
+  async steerTurn(input: SteerTurnInput): Promise<void> {
+    if (this.closed) {
+      throw new Error("session is closed");
+    }
+    if (this.interrupting || this.queryDead) {
+      throw new Error("no running turn to steer");
+    }
+    const msg = this.buildUserMessage(input.text, input.images);
+    msg.priority = "next";
+    msg.uuid = input.uuid as NonNullable<SDKUserMessage["uuid"]>;
+    this.promptQueue.push(msg);
+  }
+
+  /** Stage 6 — when images are attached we build a multi-block content
+   *  array per Anthropic's vision spec: image blocks come BEFORE the text
+   *  block ("describe these images" pattern). The text-only fast path keeps
+   *  the string-content shape so existing unit tests that match on
+   *  `content === text` stay green. */
+  private buildUserMessage(
+    text: string,
+    images: SendTurnInput["images"] = [],
+  ): SDKUserMessage {
+    const preparedText = applyClaudePromptEffortPrefix(text, this.effort);
     const content =
       images.length === 0
         ? preparedText
@@ -701,7 +740,7 @@ export class ClaudeSession {
             })),
             { type: "text" as const, text: preparedText },
           ];
-    const msg: SDKUserMessage = {
+    return {
       type: "user",
       message: {
         role: "user",
@@ -709,11 +748,6 @@ export class ClaudeSession {
       },
       parent_tool_use_id: null,
     };
-    // Retain the turn and grant it one stale-resume recovery attempt
-    // before it's dispatched, so a self-heal can replay it verbatim.
-    this.lastUserMessage = msg;
-    this.resumeFallbackAttempted = false;
-    this.promptQueue.push(msg);
   }
 
   /** Halt the current turn. `query.interrupt()` makes the SDK query's
