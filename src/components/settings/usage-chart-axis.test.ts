@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { monotonePath, tickIndices } from "./usage-area-chart";
+import { monotonePath, niceAxisMax, tickIndices } from "./usage-chart-axis";
 
 describe("monotonePath", () => {
   it("handles the degenerate sizes", () => {
@@ -24,6 +24,14 @@ describe("monotonePath", () => {
     expect(Math.min(...ys)).toBeGreaterThanOrEqual(0);
     expect(d.startsWith("M0,100 C")).toBe(true);
     expect(d.endsWith("40,100")).toBe(true);
+  });
+});
+
+describe("niceAxisMax", () => {
+  it("rounds the top up to a 1/2/2.5/5 step", () => {
+    expect(niceAxisMax(18.67)).toBe(20);
+    expect(niceAxisMax(2_530_000)).toBe(4_000_000);
+    expect(niceAxisMax(0)).toBe(1);
   });
 });
 

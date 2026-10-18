@@ -151,6 +151,27 @@ test("start-session RPC appends Codemux instructions to Claude Code's prompt", a
   }
 });
 
+test("suggest_tasks runs without an approval prompt; other host tools still ask", async () => {
+  const { emit } = recordingEmitter();
+  const tool = (prefixedName: string) => ({
+    name: prefixedName.split("__").pop()!,
+    prefixedName,
+    description: null,
+    inputSchema: { type: "object" },
+    serverId: "codemux-host",
+  });
+  const session = new ClaudeSession(minimalInput({
+    permissionMode: "default",
+    mcpTools: [tool("mcp__codemux__suggest_tasks"), tool("mcp__codemux__delegate_task")],
+  }), emit);
+  expect(fake.capturedOptions?.allowedTools).toEqual(["mcp__codemux__mcp__codemux__suggest_tasks"]);
+  await session.close();
+
+  const plain = new ClaudeSession(minimalInput({ mcpTools: [tool("mcp__codemux__delegate_task")] }), emit);
+  expect(fake.capturedOptions?.allowedTools).toBeUndefined();
+  await plain.close();
+});
+
 test("managed workflows expose only virtual tools and ignore native settings", async () => {
   const { emit } = recordingEmitter();
   const session = new ClaudeSession(minimalInput({

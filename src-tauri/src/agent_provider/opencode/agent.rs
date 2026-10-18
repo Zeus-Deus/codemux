@@ -14,11 +14,9 @@
 //! itself; the provider just routes calls.
 
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_core::Stream;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::agent_provider::events::ProviderRuntimeEvent;
@@ -526,17 +524,7 @@ impl AgentProvider for OpenCodeAgentProvider {
     }
 
     fn event_stream(&self) -> ProviderEventStream {
-        let rx = self.event_tx.subscribe();
-        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-            loop {
-                match rx.recv().await {
-                    Ok(item) => return Some((item, rx)),
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
-            }
-        });
-        Box::pin(stream) as Pin<Box<dyn Stream<Item = ProviderRuntimeEvent> + Send + 'static>>
+        crate::agent_provider::provider::broadcast_event_stream(&self.event_tx, self.kind())
     }
 
     fn managed_event_stream(&self, thread_id: &ThreadId) -> ProviderEventStream {

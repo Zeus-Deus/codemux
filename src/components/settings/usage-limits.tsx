@@ -126,32 +126,37 @@ function remainingTone(remaining: number): string {
   return "bg-status-open";
 }
 
-const PACE: Record<LimitPace, { label: string; icon: typeof Gauge }> = {
+const PACE: Record<LimitPace, { word: string; label: string; icon: typeof Gauge }> = {
   ahead: {
-    label: "Ahead of pace: spending faster than the window elapses",
+    word: "May run out early",
+    label: "Using it faster than the window passes; at this rate it runs out before it resets.",
     icon: TrendingUp,
   },
-  on: { label: "On pace with the window", icon: Gauge },
+  on: { word: "On pace", label: "Using it about as fast as the window passes.", icon: Gauge },
   under: {
-    label: "Under pace: headroom left for the rest of the window",
+    word: "Plenty left",
+    label: "Using it slower than the window passes; there is headroom for the rest of it.",
     icon: TrendingDown,
   },
 };
 
-function PaceIcon({ pace }: { pace: LimitPace }) {
+/** Pace in words, with the reasoning on hover, so the row reads without
+ *  decoding an arrow. */
+function PaceLabel({ pace }: { pace: LimitPace }) {
   const Icon = PACE[pace].icon;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <span
-          role="img"
-          aria-label={PACE[pace].label}
+          tabIndex={0}
+          aria-label={`${PACE[pace].word}: ${PACE[pace].label}`}
           className={cn(
-            "inline-flex",
+            "inline-flex items-center gap-1.5 rounded-sm text-label outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
             pace === "ahead" ? "text-status-attention" : "text-muted-foreground",
           )}
         >
-          <Icon className="size-3.5" aria-hidden />
+          <Icon className="size-3.5 shrink-0" aria-hidden />
+          {PACE[pace].word}
         </span>
       </TooltipTrigger>
       <TooltipContent side="top">{PACE[pace].label}</TooltipContent>
@@ -276,7 +281,7 @@ function ProviderLimits({
       </div>
 
       {windows.length > 0 && (
-        <div className="grid grid-cols-[minmax(0,9.5rem)_4.75rem_minmax(0,1fr)_1rem_7.5rem] items-center gap-x-4 gap-y-1.5 rounded-lg border border-border/60 bg-muted/30 px-4 py-3">
+        <div className="grid grid-cols-[minmax(0,9.5rem)_4.75rem_minmax(0,1fr)_8.5rem_7.5rem] items-center gap-x-4 gap-y-1.5 rounded-lg border border-border/60 bg-muted/30 px-4 py-3">
           {windows.map((window, index) => {
             const pace = paceOf(window, now);
             const resetsIn = formatResetsIn(window, now);
@@ -292,9 +297,7 @@ function ProviderLimits({
                   <span className="font-sans text-caption text-muted-foreground">left</span>
                 </span>
                 <WindowBar window={window} now={now} />
-                <span className="flex justify-center">
-                  {pace && <PaceIcon pace={pace} />}
-                </span>
+                <span className="flex">{pace && <PaceLabel pace={pace} />}</span>
                 <span
                   className="truncate text-right text-caption tabular-nums text-muted-foreground"
                   title={
@@ -401,11 +404,20 @@ export function UsageLimitsView({
           now={now}
         />
       ))}
-      <p className="px-1 text-label leading-relaxed text-muted-foreground">
-        Read directly from each provider&apos;s CLI on this machine. Bars show
-        quota left; the vertical line marks how much of the window&apos;s time
-        is left, where even spending would put the bar.
-      </p>
+      <div className="flex flex-col gap-1.5 px-1 text-label leading-relaxed text-muted-foreground">
+        <p className="flex flex-wrap items-center gap-x-5 gap-y-1">
+          <span className="inline-flex items-center gap-2">
+            <span className="h-1.5 w-6 rounded-full bg-status-open" aria-hidden />
+            Bar: how much of the limit is left
+          </span>
+          <span className="inline-flex items-center gap-2">
+            <span className="h-3 w-px bg-foreground/70" aria-hidden />
+            Line: how much of the window&apos;s time is left. A bar ending left of
+            its line is running out early.
+          </span>
+        </p>
+        <p>Read directly from each provider&apos;s CLI on this machine.</p>
+      </div>
     </div>
   );
 }

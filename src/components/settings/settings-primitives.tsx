@@ -248,7 +248,8 @@ export function SegmentedControl<T extends string>({
 }: {
   value: T;
   onChange: (value: T) => void;
-  options: { value: T; label: string }[];
+  /** `title` is the option's hover text, e.g. its keyboard shortcut. */
+  options: { value: T; label: string; title?: string }[];
   ariaLabel?: string;
   /** Keeps the control in place but inert, for a choice that does not
    *  apply to the current view. */
@@ -311,6 +312,7 @@ export function SegmentedControl<T extends string>({
             type="button"
             role="radio"
             aria-checked={active}
+            title={opt.title}
             disabled={disabled}
             onClick={() => onChange(opt.value)}
             className={cn(

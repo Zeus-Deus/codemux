@@ -1016,6 +1016,7 @@ mod tests {
             imported_snapshot_only: Some(false),
             last_active_at: None,
             last_visited_at: None,
+            parent_workspace_id: None,
         }
     }
 

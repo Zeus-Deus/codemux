@@ -661,6 +661,12 @@ export interface AgentChatEventPayload {
   persisted_id?: number | null;
 }
 
+/** Low-frequency thread-less warnings; transcript traffic uses Channels. */
+export const onAgentChatGlobalEvent = (
+  cb: EventCallback<AgentChatEventPayload>,
+): Promise<UnlistenFn> =>
+  listen<AgentChatEventPayload>("agent_chat_event", (e) => cb(e.payload));
+
 export interface AgentChatTurnCheckpointPayload {
   thread_id: string;
   checkpoint: import("./commands").AgentChatTurnCheckpointRecord;
@@ -718,3 +724,9 @@ export const onTunnelStatusChanged = (
   cb: EventCallback<TunnelStatusPayload>,
 ): Promise<UnlistenFn> =>
   listen<TunnelStatusPayload>("tunnel-status-changed", (e) => cb(e.payload));
+
+/** A started suggestion changed (started, finished, measured or merged). */
+export const onFollowUpChanged = (
+  cb: EventCallback<{ parent_thread_id: string }>,
+): Promise<UnlistenFn> =>
+  listen<{ parent_thread_id: string }>("follow-up-changed", (e) => cb(e.payload));

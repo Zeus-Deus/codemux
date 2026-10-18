@@ -378,9 +378,8 @@ fn err_text(id: u64, message: &str) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
 
-    fn drain_text(rx: &mut mpsc::UnboundedReceiver<Message>) -> Value {
+    fn drain_text(rx: &mut crate::web_remote::server::OutboundRx) -> Value {
         match rx.try_recv().expect("a frame was sent") {
             Message::Text(s) => serde_json::from_str(&s).unwrap(),
             other => panic!("expected text frame, got {other:?}"),
@@ -409,7 +408,7 @@ mod tests {
     #[test]
     fn rewrite_allocates_and_registers_top_level_channel() {
         let router = Arc::new(ChannelRouter::default());
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = crate::web_remote::server::test_outbound();
         let mut args = json!({ "channel": "__CHANNEL__:7", "sessionId": "s1" });
         rewrite_channel_markers(&mut args, &router, 1, &tx, false);
 
@@ -425,7 +424,7 @@ mod tests {
     #[test]
     fn rewrite_handles_nested_channels() {
         let router = Arc::new(ChannelRouter::default());
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = crate::web_remote::server::test_outbound();
         let mut args = json!({ "opts": { "cb": "__CHANNEL__:3" }, "list": ["__CHANNEL__:4"] });
         rewrite_channel_markers(&mut args, &router, 9, &tx, false);
         assert_eq!(router.routes.lock().unwrap().len(), 2);
@@ -434,7 +433,7 @@ mod tests {
     #[test]
     fn route_json_body_emits_chan_frame_with_client_id_and_idx() {
         let router = Arc::new(ChannelRouter::default());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::web_remote::server::test_outbound();
         let server_cb = register_route(&router, &tx, 42, false);
 
         // Simulate a channel send (as the interceptor would).
@@ -451,7 +450,7 @@ mod tests {
     #[test]
     fn route_raw_body_emits_binary_frame() {
         let router = Arc::new(ChannelRouter::default());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::web_remote::server::test_outbound();
         let server_cb = register_route(&router, &tx, 1, false);
 
         let body = InvokeResponseBody::Raw(vec![0xde, 0xad]);
@@ -485,7 +484,7 @@ mod tests {
         // array before the interceptor saw them, so the router decodes it back
         // and emits the same compact frame the raw path does.
         let router = Arc::new(ChannelRouter::default());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::web_remote::server::test_outbound();
         let server_cb = register_route(&router, &tx, 42, true);
 
         let body = InvokeResponseBody::Json("[27,91,65]".to_string());
@@ -508,7 +507,7 @@ mod tests {
         // Byte-identical behaviour for every command that isn't a raw byte
         // stream — the tag is the only thing that changes the encoding.
         let router = Arc::new(ChannelRouter::default());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::web_remote::server::test_outbound();
         let server_cb = register_route(&router, &tx, 42, false);
 
         let body = InvokeResponseBody::Json("[27,91,65]".to_string());
@@ -524,7 +523,7 @@ mod tests {
         // Defensive: if a tagged command's channel body shape ever changes (an
         // object, or numbers outside 0..=255), the JSON frame still goes out.
         let router = Arc::new(ChannelRouter::default());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::web_remote::server::test_outbound();
         let server_cb = register_route(&router, &tx, 9, true);
 
         for body in [
@@ -550,8 +549,8 @@ mod tests {
     #[test]
     fn remove_conn_drops_only_that_connections_routes() {
         let router = Arc::new(ChannelRouter::default());
-        let (tx_a, _ra) = mpsc::unbounded_channel();
-        let (tx_b, _rb) = mpsc::unbounded_channel();
+        let (tx_a, _ra) = crate::web_remote::server::test_outbound();
+        let (tx_b, _rb) = crate::web_remote::server::test_outbound();
         router.alloc(1, 100, tx_a, false);
         router.alloc(2, 200, tx_b, false);
         assert_eq!(router.routes.lock().unwrap().len(), 2);
@@ -564,8 +563,8 @@ mod tests {
     #[test]
     fn routed_ids_lists_only_live_routes() {
         let router = Arc::new(ChannelRouter::default());
-        let (tx_a, _ra) = mpsc::unbounded_channel();
-        let (tx_b, _rb) = mpsc::unbounded_channel();
+        let (tx_a, _ra) = crate::web_remote::server::test_outbound();
+        let (tx_b, _rb) = crate::web_remote::server::test_outbound();
         let a = router.alloc(1, 100, tx_a, false);
         let b = router.alloc(2, 200, tx_b, false);
         assert_eq!(router.routed_ids(), [a, b].into_iter().collect());
@@ -591,7 +590,7 @@ mod delegation_boundary_tests {
         app.manage(state); app.manage(db);
         app.manage(Arc::new(crate::delegation::journal::Journal::open(dir.path()).unwrap()));
         let router = Arc::new(ChannelRouter::default());
-        let (out, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        let (out, mut frames) = crate::web_remote::server::test_outbound();
         for command in ["delegation_grants", "delegation_authorize", "delegate_task", "delegation_host_info", "delegation_revoke", "delegation_list", "delegation_read", "delegation_cancel", "delegation_respond", "delegation_deliver"] {
             dispatch_invoke(app.handle(), &router, 7, &out, 1, command.into(), json!({"paneId":pane.0,"channel":"__CHANNEL__:12"})).await;
             let Message::Text(frame) = frames.recv().await.unwrap() else { panic!("Expected rejection") };
@@ -610,7 +609,7 @@ mod plugins_boundary_tests {
     async fn plugin_commands_are_denied_before_any_channel_is_allocated() {
         let app = tauri::test::mock_app();
         let router = Arc::new(ChannelRouter::default());
-        let (out, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        let (out, mut frames) = crate::web_remote::server::test_outbound();
         for command in ["plugins_list", "plugins_read_source", "plugins_set_enabled", "plugins_chat_status", "plugins_chat_request_compaction", "plugins_future_command"] {
             dispatch_invoke(app.handle(), &router, 7, &out, 1, command.into(), json!({"channel":"__CHANNEL__:12"})).await;
             let Message::Text(frame) = frames.recv().await.unwrap() else { panic!("Expected rejection") };

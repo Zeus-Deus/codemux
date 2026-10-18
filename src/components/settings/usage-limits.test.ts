@@ -10,7 +10,6 @@ import {
 } from "./usage-limits";
 import { isKnownProvider, seriesFill, seriesLabel } from "./usage-format";
 import { parseRateDraft } from "./usage-model-dialog";
-import { costTypeSegments } from "./usage-share-bar";
 
 const MIN = 60_000;
 const NOW = 1_800_000_000_000;
@@ -81,20 +80,6 @@ describe("price editor parsing", () => {
     expect(
       parseRateDraft({ input: "1", output: "2", cache_read: "abc", cache_write: "" }),
     ).toEqual({ ok: false, field: "cache_read" });
-  });
-});
-
-describe("cost by type", () => {
-  it("drops sub-cent unsplit cost as rounding", () => {
-    const segments = costTypeSegments({
-      input: 1,
-      output: 2,
-      cache_read: 0.5,
-      cache_write: 0.25,
-      unsplit: 0.004,
-    });
-    expect(segments.find((s) => s.label === "Unsplit")?.value).toBe(0);
-    expect(segments.find((s) => s.label === "Output")?.value).toBe(2);
   });
 });
 

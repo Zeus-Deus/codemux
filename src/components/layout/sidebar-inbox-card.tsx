@@ -4,6 +4,7 @@ import {
   AlarmClock,
   Check,
   CircleDotDashed,
+  CornerDownRight,
   Layers,
   Pin,
   PinOff,
@@ -162,6 +163,49 @@ interface Props {
   selected: boolean;
   onSelect: (workspaceId: string, mode: "single" | "toggle" | "range") => void;
   onMarkUnread: (workspaceId: string) => void;
+  /** Title of the workspace whose chat started this one (a follow-up child),
+   *  or null for an ordinary workspace or one whose parent is gone. Renders a
+   *  one-line "from <parent>" link that activates the parent. A string rather
+   *  than the parent snapshot so the parent's own ticks never re-render this
+   *  card. */
+  parentTitle?: string | null;
+}
+
+/** "from <parent>" line on a follow-up child's card. The card itself stays an
+ *  ordinary card; this is only the way back to the chat that started it. */
+function ParentLink({
+  parentWorkspaceId,
+  parentTitle,
+}: {
+  parentWorkspaceId: string;
+  parentTitle: string;
+}) {
+  const open = (e: React.SyntheticEvent) => {
+    // The card root activates the child on click/Enter; the link means the
+    // parent, so neither the click nor the key may reach it.
+    e.stopPropagation();
+    activateWorkspaceInteraction(parentWorkspaceId).catch(console.error);
+  };
+  return (
+    <div
+      data-parent-link={parentWorkspaceId}
+      className="mt-0.5 flex min-w-0 items-center gap-1 text-label text-muted-foreground/70"
+    >
+      <CornerDownRight aria-hidden className="size-3 shrink-0" />
+      <span className="shrink-0">from</span>
+      <button
+        type="button"
+        onClick={open}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+        }}
+        aria-label={`Open parent workspace ${parentTitle}`}
+        className="min-w-0 truncate rounded-sm font-medium text-muted-foreground underline decoration-border underline-offset-2 transition-colors duration-150 hover:text-foreground hover:decoration-muted-foreground"
+      >
+        {parentTitle}
+      </button>
+    </div>
+  );
 }
 
 /** One active-workspace card in the flat sidebar inbox: repo eyebrow, work
@@ -203,6 +247,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   selected,
   onSelect,
   onMarkUnread,
+  parentTitle = null,
 }: Props) {
   const appearance = useProjectAppearance(repo.path);
   const hosts = useHosts();
@@ -852,6 +897,13 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 <div className="mt-0.5 truncate text-label text-status-attention">
                   {permissionBlockerText(workspace)}
                 </div>
+              )}
+
+              {parentTitle && workspace.parent_workspace_id && (
+                <ParentLink
+                  parentWorkspaceId={workspace.parent_workspace_id}
+                  parentTitle={parentTitle}
+                />
               )}
 
               {/* Mono meta line, two columns: the git-local facts (branch ·

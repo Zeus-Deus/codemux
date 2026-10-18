@@ -40,6 +40,7 @@ import { useRemotePathPickerStore } from "@/components/remote/remote-path-picker
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
 import { useCloseGuardStore } from "@/lib/close-guard";
 import { useActiveWorkspacePersistenceErrors } from "@/hooks/use-active-workspace-persistence-errors";
+import { useAgentChatWarnings } from "@/hooks/use-agent-chat-warnings";
 import { markStartup } from "@/lib/perf/interaction-trace";
 import { usePostPaintPendingSessionRefresh } from "@/hooks/use-post-paint-session-refresh";
 
@@ -175,6 +176,7 @@ function App() {
   useTerminalCwdPoll();
   useAutomationFireToast();
   useActiveWorkspacePersistenceErrors();
+  useAgentChatWarnings();
   // Default short Linux wheel glides; native WebKit animation stays off.
   useSmoothScrollingInit();
   // Ask the backend which renderer it ended up on, so composited-only UI

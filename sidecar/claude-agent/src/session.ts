@@ -127,6 +127,12 @@ export function setQueryFactoryForTests(factory: QueryFactory): void {
   queryFactory = factory;
 }
 
+/** The active query factory (the SDK's, or a test double). Side chats
+ *  share this seam so the same fake drives their tests. */
+export function currentQueryFactory(): QueryFactory {
+  return queryFactory;
+}
+
 /** Restore the default factory. Call from test teardown. */
 export function resetQueryFactoryForTests(): void {
   queryFactory = defaultQuery;
@@ -185,6 +191,10 @@ function isAbortLikeError(err: unknown): boolean {
     m.includes("aborted")
   );
 }
+
+/** Registry names of Codemux host tools that need no approval. Mirrored in
+ *  `src-tauri/src/commands/follow_ups.rs` (`suggest_tasks` starts nothing). */
+const AUTO_ALLOWED_HOST_TOOLS = new Set(["mcp__codemux__suggest_tasks"]);
 
 /** Build the full SDK `Options` object from our public `SessionStartInput`.
  *  Every field is set conditionally except the hardcoded infrastructure
@@ -278,6 +288,13 @@ function buildQueryOptions(
     opts.mcpServers = {
       codemux: buildCodemuxMcpServer(mcpTools),
     };
+    // Host tools that only show something to the user and change nothing
+    // run without an approval prompt in every mode (Supervised, Plan):
+    // asking "may I suggest tasks?" defeats the point of suggesting them.
+    const autoAllowed = mcpTools
+      .filter((tool) => AUTO_ALLOWED_HOST_TOOLS.has(tool.prefixedName))
+      .map((tool) => `mcp__codemux__${tool.prefixedName}`);
+    if (autoAllowed.length > 0) opts.allowedTools = autoAllowed;
   }
 
   if (input.managed) {

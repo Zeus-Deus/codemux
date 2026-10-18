@@ -8,6 +8,7 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use futures_core::Stream;
+use tokio::sync::broadcast;
 
 use super::errors::ProviderError;
 use super::events::ProviderRuntimeEvent;
@@ -20,6 +21,37 @@ use super::types::{
 /// provider. Aliased so adapter signatures stay legible.
 pub type ProviderEventStream =
     Pin<Box<dyn Stream<Item = ProviderRuntimeEvent> + Send + 'static>>;
+
+/// Broadcast retention is bounded, but transcript consumers must learn about
+/// every gap. A lag count cannot identify which threads lost events, so report
+/// it as a provider-wide warning rather than guessing a thread to attach it to.
+pub(super) fn broadcast_event_stream(
+    sender: &broadcast::Sender<ProviderRuntimeEvent>,
+    provider: ProviderKind,
+) -> ProviderEventStream {
+    let receiver = sender.subscribe();
+    Box::pin(futures_util::stream::unfold(
+        receiver,
+        move |mut receiver| async move {
+            let event = match receiver.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Closed) => return None,
+                Err(broadcast::error::RecvError::Lagged(count)) => ProviderRuntimeEvent::RuntimeWarning {
+                    thread_id: None,
+                    message: format!(
+                        "{provider:?} event stream lost {count} events. Conversation history may be incomplete."
+                    ),
+                    original_payload: Some(serde_json::json!({
+                        "code": "provider_event_lag",
+                        "provider": provider,
+                        "dropped_events": count,
+                    })),
+                },
+            };
+            Some((event, receiver))
+        },
+    ))
+}
 
 /// Contract every CLI-backed agent integration must satisfy.
 ///
@@ -322,11 +354,59 @@ pub trait AgentProvider: Send + Sync {
     ///
     /// Each call typically returns a fresh subscription; implementations are
     /// free to multiplex a single underlying broadcaster to many consumers.
+    /// Bounded streams must report gaps with a `RuntimeWarning` so consumers
+    /// do not mistake a partial transcript for a complete one.
     fn event_stream(&self) -> ProviderEventStream;
 
     /// Managed subscribers must surface event loss instead of silently
     /// treating a truncated stream as a successful execution.
     fn managed_event_stream(&self, _thread_id: &ThreadId) -> ProviderEventStream {
         self.event_stream()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn provider_event_delivery_shared_stream_reports_repeated_lag_and_closes() {
+        let (sender, _) = tokio::sync::broadcast::channel(2);
+        let mut stream = broadcast_event_stream(&sender, ProviderKind::Grok);
+        let send = |i: usize| {
+            sender
+                .send(ProviderRuntimeEvent::RuntimeWarning {
+                    thread_id: None,
+                    message: i.to_string(),
+                    original_payload: None,
+                })
+                .unwrap();
+        };
+        for i in 0..4 {
+            send(i);
+        }
+        let warning = stream.next().await.unwrap();
+        assert!(matches!(warning, ProviderRuntimeEvent::RuntimeWarning {
+            original_payload: Some(details), ..
+        } if details["provider"] == "grok" && details["dropped_events"] == 2));
+        assert!(
+            matches!(stream.next().await, Some(ProviderRuntimeEvent::RuntimeWarning { message, .. }) if message == "2")
+        );
+
+        for i in 4..7 {
+            send(i);
+        }
+        let warning = stream.next().await.unwrap();
+        assert!(matches!(warning, ProviderRuntimeEvent::RuntimeWarning {
+            original_payload: Some(details), ..
+        } if details["code"] == "provider_event_lag" && details["dropped_events"] == 2));
+        drop(sender);
+        for i in 5..7 {
+            assert!(
+                matches!(stream.next().await, Some(ProviderRuntimeEvent::RuntimeWarning { message, .. }) if message == i.to_string())
+            );
+        }
+        assert!(stream.next().await.is_none());
     }
 }

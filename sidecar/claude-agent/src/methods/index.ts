@@ -19,6 +19,8 @@ import {
   type SessionStartInput,
 } from "../session.ts";
 import type { ApprovalDecision } from "../permissions.ts";
+import { currentQueryFactory } from "../session.ts";
+import { SideChat, type SideChatStartInput } from "../side-chat.ts";
 import { getUsage } from "./get-usage.ts";
 import { listCommands } from "./list-commands.ts";
 import { listModels } from "./list-models.ts";
@@ -26,6 +28,9 @@ import { ping } from "./ping.ts";
 
 /** The live sessions this process is managing, keyed by `threadId`. */
 const sessions = new Map<string, ClaudeSession>();
+
+/** A sidecar launched for a `/btw` side chat hosts exactly one fork. */
+let sideChat: SideChat | null = null;
 
 /** Signature every method handler must satisfy. */
 export type MethodHandler = (params: unknown) => Promise<unknown>;
@@ -415,6 +420,53 @@ const getUsageMethod: MethodHandler = async (params) => {
   });
 };
 
+function makeStartSideChat(emit: EventEmitter): MethodHandler {
+  return async (params) => {
+    const p = asObject(params, "start-side-chat");
+    if (sideChat) throw new InvalidParamsError("a side chat is already running in this sidecar");
+    const sideId = asString(p["sideId"], "sideId");
+    const resume = asString(p["resume"], "resume");
+    const text = asString(p["text"], "text");
+    if (!resume.trim()) throw new InvalidParamsError("resume must name the main session");
+    if (!text.trim()) throw new InvalidParamsError("text must not be empty");
+    const input: SideChatStartInput = {
+      sideId,
+      cwd: asString(p["cwd"], "cwd"),
+      resume,
+      pathToClaudeCodeExecutable: asString(
+        p["pathToClaudeCodeExecutable"],
+        "pathToClaudeCodeExecutable",
+      ),
+      text,
+    };
+    const model = optString(p["model"], "model");
+    if (model !== undefined) input.model = model;
+    const effort = optString(p["effort"], "effort");
+    if (effort !== undefined && effort.trim()) input.effort = effort.trim();
+    const appendSystemPrompt = optString(p["appendSystemPrompt"], "appendSystemPrompt");
+    if (appendSystemPrompt !== undefined) input.appendSystemPrompt = appendSystemPrompt;
+    sideChat = new SideChat(input, emit, currentQueryFactory());
+    return { sideId };
+  };
+}
+
+const sideChatSend: MethodHandler = async (params) => {
+  const p = asObject(params, "side-chat-send");
+  const text = asString(p["text"], "text");
+  if (!sideChat) throw new InvalidParamsError("no side chat is running");
+  if (!text.trim()) throw new InvalidParamsError("text must not be empty");
+  sideChat.send(text);
+  return { turnStarted: true };
+};
+
+const stopSideChat: MethodHandler = async () => {
+  const chat = sideChat;
+  sideChat = null;
+  if (!chat) return { alreadyClosed: true };
+  await chat.close();
+  return {};
+};
+
 // ---------------------------------------------------------------------------
 // Public: build the registry
 // ---------------------------------------------------------------------------
@@ -441,6 +493,9 @@ export function buildMethods(emit: EventEmitter): Record<string, MethodHandler> 
     "list-models": listModelsMethod,
     "list-commands": listCommandsMethod,
     "get-usage": getUsageMethod,
+    "start-side-chat": makeStartSideChat(emit),
+    "side-chat-send": sideChatSend,
+    "stop-side-chat": stopSideChat,
   };
 }
 
@@ -448,6 +503,7 @@ export function buildMethods(emit: EventEmitter): Record<string, MethodHandler> 
  *  layer. Used between test cases to avoid state leaking. */
 export function _resetSessionsForTests(): void {
   sessions.clear();
+  sideChat = null;
 }
 
 /** Test-only: inspect the internal map. */

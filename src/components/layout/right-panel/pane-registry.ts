@@ -12,8 +12,8 @@
  *   - doc panes  — `doc:<absolute path>`, one per opened file
  *
  * Availability is separate from openness. `files`/`changes`/`review`/`diff`/
- * `browser` are always available; `tasks`, `orchestration` and `subagents`
- * only exist while the focused thread has the data behind them, and
+ * `browser` are always available; `tasks`, `orchestration`, `subagents` and
+ * `side-chat` only exist while the focused thread has the data behind them, and
  * auto-open when it appears (unless the user closed them — see
  * `rightPanelDismissedPanes`).
  *
@@ -30,6 +30,7 @@ import {
   GitPullRequest,
   Globe,
   ListChecks,
+  MessageCircleReply,
   Waypoints,
   Workflow,
   type LucideIcon,
@@ -98,6 +99,13 @@ export const PANE_REGISTRY: readonly PaneMeta[] = [
     label: "Subagents",
     icon: Bot,
     description: "Watch delegated agents as they run.",
+    conditional: true,
+  },
+  {
+    id: "side-chat",
+    label: "Side chat",
+    icon: MessageCircleReply,
+    description: "Ask a side question without adding to the chat.",
     conditional: true,
   },
   {

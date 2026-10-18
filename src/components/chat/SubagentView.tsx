@@ -19,6 +19,7 @@ import { cn } from "@/lib/utils";
 
 import { ActivityBlock } from "./ActivityBlock";
 import { DelegationCard } from "./DelegationCard";
+import { SuggestedTasksCard } from "./SuggestedTasksCard";
 import { AssistantMessage } from "./AssistantMessage";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
@@ -107,6 +108,8 @@ export function SubagentView({
               </div>
             ) : slot.body.kind === "delegation" ? (
               <DelegationCard entries={slot.body.entries} />
+            ) : slot.body.kind === "suggested_tasks" ? (
+              <SuggestedTasksCard call={slot.body.call} views={slot.body.views} />
             ) : (
               <SubItem
                 item={slot.body.item}

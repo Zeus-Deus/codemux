@@ -27,6 +27,13 @@ interface RemoteConnectionState {
   host: string;
   /** Prominent copy for the `offline` state (revoked / session gone). */
   offlineMessage: string | null;
+  /**
+   * Bumped each time a dropped connection comes back. The host drops a
+   * socket's channel routes with it, so anything streaming over a `Channel`
+   * (terminal output, agent chat) keys an effect on this to attach again and
+   * catch up. Stays 0 on desktop and across the first connect.
+   */
+  reconnectEpoch: number;
   /** Steady connected state → quiet title-bar chip. */
   setConnected: (host: string) => void;
   /** Backoff/reconnect → loud amber banner. */
@@ -39,8 +46,14 @@ export const useRemoteConnectionStore = create<RemoteConnectionState>((set) => (
   status: null,
   host: "",
   offlineMessage: null,
+  reconnectEpoch: 0,
   setConnected: (host) =>
-    set({ status: "connected", host, offlineMessage: null }),
+    set((s) => ({
+      status: "connected",
+      host,
+      offlineMessage: null,
+      reconnectEpoch: s.reconnectEpoch + (s.status === "reconnecting" ? 1 : 0),
+    })),
   setReconnecting: (host) =>
     set((s) => ({ status: "reconnecting", host: host || s.host })),
   setOffline: (message) =>
@@ -49,3 +62,7 @@ export const useRemoteConnectionStore = create<RemoteConnectionState>((set) => (
       offlineMessage: message ?? "Remote access revoked",
     }),
 }));
+
+/** The current {@link RemoteConnectionState.reconnectEpoch}, for effect deps. */
+export const useRemoteReconnectEpoch = (): number =>
+  useRemoteConnectionStore((s) => s.reconnectEpoch);

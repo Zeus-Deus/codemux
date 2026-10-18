@@ -6,18 +6,38 @@ export function own<T>(table: Record<string, T>, key: string): T | undefined {
   return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
 }
 
-/** 8.0B / 1.4M / 82K / 640 — the design's `toks`.
+const TOKEN_TIERS = [
+  { scale: 1e12, suffix: "T" },
+  { scale: 1e9, suffix: "B" },
+  { scale: 1e6, suffix: "M" },
+  { scale: 1e3, suffix: "K" },
+] as const;
+
+/** Three significant figures, trailing zeros dropped: 12.5M / 1.25M /
+ *  804K / 8B / 640.
  *
- *  The B tier is not hypothetical: provider history on a busy machine
- *  puts the 30-day figure in the billions, and without it the hero read
- *  "7961.5M" — technically correct, unreadable, and visibly wider than
- *  the stat next to it. */
+ *  The B and T tiers are not hypothetical: provider history on a busy
+ *  machine puts the 30-day figure in the billions. */
 export function formatTokens(n: number): string {
   if (!Number.isFinite(n)) return "0";
-  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
-  if (n >= 1e3) return `${Math.round(n / 1e3)}K`;
-  return String(Math.round(n));
+  const abs = Math.abs(n);
+  for (const [index, tier] of TOKEN_TIERS.entries()) {
+    if (abs < tier.scale) continue;
+    const scaled = n / tier.scale;
+    const digits = Math.abs(scaled) >= 100 ? 0 : Math.abs(scaled) >= 10 ? 1 : 2;
+    const text = scaled.toFixed(digits);
+    // 999.6K rounds to "1000K"; the next tier up reads it as "1M".
+    if (Math.abs(Number(text)) >= 1000 && index > 0) {
+      return `${trimZeros((n / TOKEN_TIERS[index - 1].scale).toFixed(2))}${TOKEN_TIERS[index - 1].suffix}`;
+    }
+    return `${trimZeros(text)}${tier.suffix}`;
+  }
+  const rounded = Math.round(n);
+  return Math.abs(rounded) >= 1000 ? "1K" : String(rounded);
+}
+
+function trimZeros(text: string): string {
+  return text.includes(".") ? text.replace(/\.?0+$/, "") : text;
 }
 
 /** Thousands separators keep large API-equivalent estimates readable. */
@@ -30,19 +50,30 @@ export function formatMoney(n: number): string {
   return `$${MONEY.format(Number.isFinite(n) ? n : 0)}`;
 }
 
+/** Whole percents from 10% up, one decimal below that, and "<0.1%" for
+ *  a share too small to show, so a real but tiny share never reads "0%". */
 export function formatPercent(fraction: number): string {
-  return `${Math.round((Number.isFinite(fraction) ? fraction : 0) * 100)}%`;
+  const percent = (Number.isFinite(fraction) ? fraction : 0) * 100;
+  if (percent > 0 && percent < 0.1) return "<0.1%";
+  if (percent >= 9.95 || percent === 0) return `${Math.round(percent)}%`;
+  return `${trimZeros(percent.toFixed(1))}%`;
+}
+
+/** 1,234 sessions. */
+export function formatCount(n: number): string {
+  return Math.round(Number.isFinite(n) ? n : 0).toLocaleString("en-US");
 }
 
 /** Series colors, per the design-system token rules — no raw palette
  *  classes. Claude takes the brand accent, OpenCode the green status
- *  tone, and Codex a neutral foreground tint (Codemux has no third
- *  brand hue, and inventing one would imply a status meaning). */
+ *  tone, Cursor violet, Grok sky and Codex a neutral foreground tint.
+ *  Two neutrals side by side in a stacked column read as one block, so
+ *  only one provider gets a grey. */
 const SERIES_FILL: Record<string, string> = {
   claude: "bg-accent-ember",
   codex: "bg-foreground/45",
   cursor: "bg-accent-violet",
-  grok: "bg-foreground/70",
+  grok: "bg-status-remote",
   opencode: "bg-status-open",
 };
 
@@ -53,7 +84,7 @@ const SERIES_COLOR: Record<string, { color: string; opacity: number }> = {
   claude: { color: "var(--accent-ember)", opacity: 1 },
   codex: { color: "var(--foreground)", opacity: 0.55 },
   cursor: { color: "var(--accent-violet)", opacity: 1 },
-  grok: { color: "var(--foreground)", opacity: 0.8 },
+  grok: { color: "var(--status-remote)", opacity: 1 },
   opencode: { color: "var(--status-open)", opacity: 1 },
 };
 

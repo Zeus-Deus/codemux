@@ -30,6 +30,7 @@ import { runPluginKeybind } from "@/contrib/keybinds";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import { isAppShortcutApplicable } from "@/lib/app-shortcut-applicability";
 import { getJumpTarget } from "@/components/layout/sidebar-inbox-jump";
+import { useSidebarViewStore } from "@/components/layout/sidebar-view-store";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { selectWorkspaceNavigationTarget } from "@/lib/workspace-navigation";
 import { jumpToNextNeedsYou } from "@/lib/needs-you";
@@ -176,6 +177,12 @@ export function dispatch(actionId: string, event?: KeyboardEvent): boolean {
     return true;
   }
 
+  // ── Sidebar view (Activity ⇄ Projects) ──
+  if (actionId === "toggleSidebarView") {
+    useSidebarViewStore.getState().toggleView();
+    return true;
+  }
+
   // ── Interface size (zoom) ──
   // Steps the synced interface size rather than the webview zoom: every UI
   // size is rem-based, so this scales the app while native child surfaces
@@ -294,6 +301,15 @@ export function dispatch(actionId: string, event?: KeyboardEvent): boolean {
     (s) => s.surface_id === ws.active_surface_id,
   );
   const activePaneId = surface?.active_pane_id;
+
+  // Gated in `isAppShortcutApplicable` (above): the card's host is mounted
+  // only while it can show (GUI chrome, no Settings / new-project screen /
+  // utility page / draft, panel not fully expanded), so an unavailable
+  // binding neither flips the saved preference nor eats terminal input.
+  if (actionId === "toggleWorkspaceDetails") {
+    ui.toggleWorkspaceDetails();
+    return true;
+  }
 
   if (actionId === "runDevCommand") {
     runProjectDevCommand(ws.workspace_id).catch(reportFailure("Couldn't run the dev command"));

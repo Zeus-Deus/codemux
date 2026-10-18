@@ -89,6 +89,11 @@ import { PaneActionButton } from "./pane-actions";
 import { isPluginPane, PANE_REGISTRY, type PaneMeta } from "./pane-registry";
 import type { SurfaceAction } from "./surface-actions";
 import { PanelHeader } from "@/components/ui/panel-header";
+import { useRootFontPx } from "@/hooks/use-root-font-px";
+import {
+  selectShowResourceMonitor,
+  useSyncedSettingsStore,
+} from "@/stores/synced-settings-store";
 
 export interface DeckTab {
   id: RightPanelTab;
@@ -305,7 +310,11 @@ export const PaneTabStrip = memo(function PaneTabStrip({
   className,
 }: PaneTabStripProps) {
   const remoteClient = isRemoteClient();
-  const reserve = inTitlebar ? topRightReserve(remoteClient, true) : 0;
+  const remPx = useRootFontPx();
+  const monitor = useSyncedSettingsStore(selectShowResourceMonitor);
+  const reserve = inTitlebar
+    ? topRightReserve(remoteClient, { panelOpen: true, monitor, remPx })
+    : 0;
   const coreSurfaces = surfaces.filter((surface) => !isPluginPane(surface.id));
   const pluginSurfaces = surfaces.filter((surface) => isPluginPane(surface.id));
 

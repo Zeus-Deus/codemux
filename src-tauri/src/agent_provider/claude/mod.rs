@@ -22,11 +22,9 @@ pub mod translate;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_core::Stream;
 use tokio::sync::{broadcast, RwLock};
 
 use crate::agent_provider::{
@@ -458,17 +456,7 @@ impl AgentProvider for ClaudeAgentProvider {
     }
 
     fn event_stream(&self) -> ProviderEventStream {
-        let rx = self.event_tx.subscribe();
-        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-            loop {
-                match rx.recv().await {
-                    Ok(item) => return Some((item, rx)),
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
-            }
-        });
-        Box::pin(stream) as Pin<Box<dyn Stream<Item = ProviderRuntimeEvent> + Send + 'static>>
+        super::provider::broadcast_event_stream(&self.event_tx, self.kind())
     }
 
     fn managed_event_stream(&self, thread_id: &ThreadId) -> ProviderEventStream {

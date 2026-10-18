@@ -50,6 +50,7 @@ import type { AgentChatTurnCheckpointRecord } from "@/tauri/commands";
 import { ActivityBlock } from "./ActivityBlock";
 import { AssistantMessage } from "./AssistantMessage";
 import { DelegationCard } from "./DelegationCard";
+import { SuggestedTasksCard } from "./SuggestedTasksCard";
 import { DelegationResultsDivider } from "./DelegationResultsDivider";
 import { MessageTrail } from "./MessageTrail";
 import { PermissionRequestBlock } from "./PermissionRequestBlock";
@@ -1654,6 +1655,8 @@ function slotBodyContains(body: SlotBody, id: string): boolean {
       return body.entries.some(
         (entry) => entry.call?.id === id || entry.view?.id === id,
       );
+    case "suggested_tasks":
+      return body.call.id === id || body.views.some((view) => view?.id === id);
     case "turn_fold":
       return false;
   }
@@ -1817,6 +1820,7 @@ function transcriptSlotType(slot: TranscriptSlot): string {
   if (slot.body.kind === "activity") return "activity";
   if (slot.body.kind === "turn_fold") return "turn_fold";
   if (slot.body.kind === "delegation") return "delegation";
+  if (slot.body.kind === "suggested_tasks") return "suggested_tasks";
   return slot.body.item.kind;
 }
 
@@ -2276,7 +2280,7 @@ function SlotRow({
       ? "mt-2"
       : slot.body.kind === "turn_fold"
         ? "mt-4"
-        : slot.body.kind === "delegation"
+        : slot.body.kind === "delegation" || slot.body.kind === "suggested_tasks"
           ? "mt-3"
           : slot.body.item.kind === "user_message"
             ? "mt-5"
@@ -2311,6 +2315,8 @@ function SlotRow({
       ) : slot.body.kind === "delegation" ? (
         // Memoized itself; `entries` keeps identity across untouched rebuilds.
         <DelegationCard entries={slot.body.entries} />
+      ) : slot.body.kind === "suggested_tasks" ? (
+        <SuggestedTasksCard call={slot.body.call} views={slot.body.views} />
       ) : (
         <ItemRowMemo
           item={slot.body.item}

@@ -2,6 +2,7 @@ pub mod async_questions;
 pub mod agent_control;
 pub mod mcp_connector;
 pub mod delegated_tasks;
+pub mod follow_ups;
 pub mod hermes;
 pub mod custom_acp;
 pub(crate) mod local_sessions;
@@ -1163,6 +1164,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 
     async_questions::create_schema(conn)?;
     delegated_tasks::create_schema(conn)?;
+    follow_ups::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new
@@ -8833,15 +8835,115 @@ mod tests {
 
     #[test]
     fn agent_chat_messages_append_surfaces_unrelated_errors() {
-        // Closed-on-purpose: only FK_CONSTRAINT is swallowed. Other
-        // SQL errors must propagate so we don't silently accumulate
-        // data corruption. Without an easy way to force a non-FK
-        // failure in-memory, this test acts as documentation: if this
-        // assert ever changes shape, revisit `append_agent_chat_message`.
+        // Only FK_CONSTRAINT is swallowed. Ordinary appends still succeed;
+        // the read-only bridge test below exercises a non-FK write failure.
         let db = init_test_database();
         seed_session(&db, "t");
         // Sanity: the happy path still returns Ok on a real row.
         assert!(db.append_agent_chat_message("t", r#"{"ok":true}"#).is_ok());
+    }
+
+    // Lives here rather than in agent_chat.rs because forcing a non-FK
+    // write failure needs the private connection (`PRAGMA query_only`).
+    #[tokio::test]
+    async fn provider_event_delivery_surfaces_transcript_write_failure_and_recovers() {
+        use crate::agent_provider::{CompletedItem, ProviderRuntimeEvent, ThreadId, TurnId};
+        use crate::commands::agent_chat::{
+            forward_event, AgentChatChannelRegistry, AgentChatEventPayload, GrokUsageLedgerBridge,
+            RunActivityTracker, SubagentTracker, AGENT_CHAT_EVENT,
+        };
+        use tauri::{Listener, Manager};
+
+        let db = init_test_database();
+        seed_session(&db, "t");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only=ON")
+            .unwrap();
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        app.manage(AgentChatChannelRegistry::default());
+        app.manage(GrokUsageLedgerBridge::default());
+        app.manage(SubagentTracker::default());
+        app.manage(RunActivityTracker::default());
+        app.manage(crate::state::AppStateStore::default());
+        let handle = app.handle();
+        let warnings = std::sync::Arc::new(Mutex::new(Vec::<AgentChatEventPayload>::new()));
+        let captured_warnings = warnings.clone();
+        handle.listen(AGENT_CHAT_EVENT, move |event| {
+            captured_warnings
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(event.payload()).unwrap());
+        });
+        let received = std::sync::Arc::new(Mutex::new(Vec::<AgentChatEventPayload>::new()));
+        let captured = received.clone();
+        handle.state::<AgentChatChannelRegistry>().attach(
+            "t",
+            tauri::ipc::Channel::new(move |body| {
+                captured.lock().unwrap().push(body.deserialize().unwrap());
+                Ok(())
+            }),
+        );
+        let event = ProviderRuntimeEvent::ItemCompleted {
+            thread_id: ThreadId("t".into()),
+            turn_id: TurnId("turn-1".into()),
+            subagent_id: None,
+            item: CompletedItem::AssistantText {
+                text: "visible but not saved".into(),
+            },
+        };
+        forward_event(handle, event.clone());
+
+        let db = handle.state::<DatabaseStore>();
+        assert!(db.list_agent_chat_messages("t").is_empty());
+        assert_eq!(
+            received.lock().unwrap().len(),
+            1,
+            "live delivery survives a failed write"
+        );
+        assert!(received.lock().unwrap()[0].persisted_id.is_none());
+        {
+            let warnings = warnings.lock().unwrap();
+            assert_eq!(
+                warnings.len(),
+                1,
+                "a failed write must warn the user without recursively persisting the warning"
+            );
+            assert_eq!(warnings[0].thread_id.0, "");
+            assert!(
+                matches!(&warnings[0].event, ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: None, original_payload: Some(details), ..
+            } if details["code"] == "transcript_write_failed" && details["thread_id"] == "t"
+                && details["error"].as_str().unwrap().contains("readonly"))
+            );
+        }
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only=OFF")
+            .unwrap();
+        forward_event(handle, event);
+        assert_eq!(db.list_agent_chat_messages("t").len(), 1);
+        assert!(received.lock().unwrap()[1].persisted_id.is_some());
+        assert_eq!(warnings.lock().unwrap().len(), 1);
+
+        // A late event after explicit deletion remains an intentional no-op.
+        db.delete_agent_chat_session("t").unwrap();
+        forward_event(
+            handle,
+            ProviderRuntimeEvent::ItemCompleted {
+                thread_id: ThreadId("t".into()),
+                turn_id: TurnId("turn-1".into()),
+                subagent_id: None,
+                item: CompletedItem::AssistantText {
+                    text: "late event".into(),
+                },
+            },
+        );
+        assert_eq!(warnings.lock().unwrap().len(), 1);
     }
 
     #[test]
