@@ -137,9 +137,9 @@ static KICK: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::
 /// from its final check through the delete, so a workspace can't adopt a
 /// checkout that is being deleted (see [`opening_guard`]).
 static OPENING: LazyLock<tokio::sync::RwLock<()>> = LazyLock::new(|| tokio::sync::RwLock::new(()));
-/// Worktrees whose closed chats haven't confirmed they stopped, with a
-/// count per close. A failed stop is never released (until restart, which
-/// ends every session Codemux started).
+/// Checkouts whose workspace's chats haven't confirmed they stopped, with a
+/// count per close (see [`RetireHold`]). A failed stop is never released
+/// (until restart, which ends every session Codemux started).
 static STOPPING: LazyLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
     LazyLock::new(Default::default);
 
@@ -193,36 +193,31 @@ fn is_disposable(ws: &WorkspaceSnapshot) -> bool {
         && crate::commands::workspace::archive_refusal_reason(ws).is_none()
 }
 
-/// A workspace was closed (or archived) with its worktree left on disk.
-/// Holds the worktree out of cleanup until every chat stop issued for the
-/// workspace (`earlier` plus any still registered) is acknowledged; then,
-/// for a plain close, records it so a later sweep can offer it once stale.
-/// A stop that fails keeps the hold. Call after the chats were told to stop.
-pub(crate) fn retire_workspace<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    ws: &WorkspaceSnapshot,
-    earlier: crate::commands::agent_chat::EarlierStops,
-    record_close: bool,
-) {
-    if !is_disposable(ws) {
-        return;
+/// Workspaces with a chat stop that failed: their checkouts stay out of
+/// cleanup until restart.
+static FAILED_STOPS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+/// Called when stopping chats of `workspace_ids` failed.
+pub(crate) fn note_failed_stop(workspace_ids: &[String]) {
+    FAILED_STOPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(workspace_ids.iter().cloned());
+}
+
+/// Keeps one checkout out of cleanup while its workspace's sessions stop.
+/// Dropping it releases the hold; [`RetireHold::keep`] makes it permanent.
+pub(crate) struct RetireHold(Option<PathBuf>);
+
+impl RetireHold {
+    pub(crate) fn keep(mut self) {
+        self.0 = None;
     }
-    let Some(path) = ws.worktree_path.clone() else { return };
-    let key = path_key(Path::new(&path));
-    *STOPPING.lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_default() += 1;
-    let pending = crate::commands::agent_chat::snapshot_pending_stops(&ws.workspace_id.0);
-    let app = app.clone();
-    let ws = ws.clone();
-    tauri::async_runtime::spawn(async move {
-        let stopped = crate::commands::agent_chat::wait_for_stops(earlier)
-            .await
-            .and(crate::commands::agent_chat::wait_for_stops(pending).await);
-        if let Err(error) = stopped {
-            eprintln!(
-                "[worktree-cleanup] keeping {path} out of cleanup: a chat did not stop ({error})"
-            );
-            return;
-        }
+}
+
+impl Drop for RetireHold {
+    fn drop(&mut self) {
+        let Some(key) = self.0.take() else { return };
         let mut stopping = STOPPING.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(count) = stopping.get_mut(&key) {
             *count -= 1;
@@ -230,10 +225,61 @@ pub(crate) fn retire_workspace<R: tauri::Runtime>(
                 stopping.remove(&key);
             }
         }
-        drop(stopping);
-        if record_close {
+    }
+}
+
+/// Take before a workspace leaves app state: from then on nothing else
+/// marks its checkout as in use. Covers a worktree workspace and a plain
+/// one opened inside Codemux's worktree directory. Synchronous.
+pub(crate) fn hold_checkout(ws: &WorkspaceSnapshot) -> RetireHold {
+    let path = ws.worktree_path.as_deref().unwrap_or(&ws.cwd);
+    let key = path_key(Path::new(path));
+    if !managed_root().is_some_and(|root| key.starts_with(root)) {
+        return RetireHold(None);
+    }
+    *STOPPING.lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_default() += 1;
+    RetireHold(Some(key))
+}
+
+/// The workspace left app state with its checkout on disk and its chats
+/// told to stop (`issued`, plus `earlier` stops of chats closed before).
+/// Once every stop is acknowledged, a plain close is recorded so a later
+/// sweep can offer the worktree when stale, and then the hold is released.
+/// Any failed stop, now or earlier in the workspace, keeps the hold.
+pub(crate) fn retire_workspace<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    hold: RetireHold,
+    ws: &WorkspaceSnapshot,
+    earlier: crate::commands::agent_chat::EarlierStops,
+    issued: crate::commands::agent_chat::EarlierStops,
+    record_close: bool,
+) {
+    let pending = crate::commands::agent_chat::snapshot_pending_stops(&ws.workspace_id.0);
+    let app = app.clone();
+    let ws = ws.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut stopped = Ok(());
+        for stops in [earlier, issued, pending] {
+            stopped = stopped.and(crate::commands::agent_chat::wait_for_stops(stops).await);
+        }
+        let failed_before = FAILED_STOPS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&ws.workspace_id.0);
+        if stopped.is_err() || failed_before {
+            eprintln!(
+                "[worktree-cleanup] keeping {} out of cleanup: a chat did not stop",
+                ws.worktree_path.as_deref().unwrap_or(&ws.cwd),
+            );
+            hold.keep();
+            return;
+        }
+        if record_close && is_disposable(&ws) {
             remember_closed(&app.state::<crate::database::DatabaseStore>(), &ws);
         }
+        // Released only after the close is recorded, so a sweep never sees
+        // the checkout without either the hold or its fresh close time.
+        drop(hold);
     });
 }
 
@@ -511,17 +557,25 @@ struct MergedPr {
     includes_head: bool,
 }
 
-fn merged_pr(path: &Path) -> Option<MergedPr> {
+/// GitHub's answer for a branch: the merged PR's number and head commit.
+/// Cached between a removal's two passes; inclusion is decided per pass.
+type PrLookup = Option<(u32, Option<String>)>;
+
+fn lookup_merged_pr(path: &Path) -> PrLookup {
     let pr = crate::github::get_branch_pr(path).ok()??;
-    if pr.state != "MERGED" {
-        return None;
-    }
-    // An ancestor check needs the PR head locally; without it the answer
-    // is "not included", which only ever keeps a worktree.
-    let includes_head = pr.head_ref_oid.as_deref().is_some_and(|oid| {
-        git(path, &["merge-base", "--is-ancestor", "HEAD", oid]).is_ok()
-    });
-    Some(MergedPr { number: pr.number, includes_head })
+    (pr.state == "MERGED").then_some((pr.number, pr.head_ref_oid))
+}
+
+/// Whether the inspected `head` is in the PR. An ancestor check needs the
+/// PR head locally; without it the answer is "not included", which only
+/// ever keeps a worktree.
+fn merged_pr(path: &Path, head: Option<&str>, lookup: &PrLookup) -> Option<MergedPr> {
+    let (number, oid) = lookup.as_ref()?;
+    let includes_head = match (head, oid) {
+        (Some(head), Some(oid)) => git(path, &["merge-base", "--is-ancestor", head, oid]).is_ok(),
+        _ => false,
+    };
+    Some(MergedPr { number: *number, includes_head })
 }
 
 /// Pure verdict for one candidate. `pr` is consulted lazily because it
@@ -673,14 +727,18 @@ fn evaluate_one(
     db: &crate::database::DatabaseStore,
     candidate: &Candidate,
     cwds: &[PathBuf],
-    pr: &mut Option<Option<MergedPr>>,
+    pr: &mut Option<PrLookup>,
 ) -> Option<StaleWorktree> {
     let inspection = inspect(&candidate.path);
+    let head = inspection.head.clone();
     judge(
         candidate,
         &inspection,
         now_secs(),
-        &mut || pr.get_or_insert_with(|| merged_pr(&candidate.path)).clone(),
+        &mut || {
+            let lookup = pr.get_or_insert_with(|| lookup_merged_pr(&candidate.path));
+            merged_pr(&candidate.path, head.as_deref(), lookup)
+        },
         activity(&candidate.path, cwds),
         hermes_pending(db, &candidate.path),
     )
@@ -779,6 +837,14 @@ async fn remove_locked<R: tauri::Runtime>(
         // from claiming the directory.
         let _opening = OPENING.write().await;
         let _hermes = crate::agent_provider::hermes::WORKTREE_LIFECYCLE.lock().await;
+        // Gathered again: a reopen and close since the first pass leaves a
+        // newer retirement time that must restart the settle period.
+        let Some(candidate) = current_candidates(app)
+            .into_iter()
+            .find(|c| path_key(&c.path) == path_key(&candidate.path))
+        else {
+            continue;
+        };
         let app_for_task = app.clone();
         let result = tokio::task::spawn_blocking(move || {
             let db = app_for_task.state::<crate::database::DatabaseStore>();
@@ -1248,6 +1314,22 @@ mod tests {
         STOPPING.lock().unwrap().remove(&key);
         assert!(held.is_some_and(|reason| reason.contains("chat")));
         assert_eq!(activity(dir.path(), &[]), None);
+    }
+
+    #[test]
+    fn a_retire_hold_releases_on_drop_unless_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (released, kept) = (path_key(dir.path()).join("a"), path_key(dir.path()).join("b"));
+        for key in [&released, &kept] {
+            *STOPPING.lock().unwrap().entry(key.clone()).or_default() += 1;
+        }
+        drop(RetireHold(Some(released.clone())));
+        RetireHold(Some(kept.clone())).keep();
+        let stopping = STOPPING.lock().unwrap();
+        assert!(!stopping.contains_key(&released));
+        assert!(stopping.contains_key(&kept));
+        drop(stopping);
+        STOPPING.lock().unwrap().remove(&kept);
     }
 
     #[test]

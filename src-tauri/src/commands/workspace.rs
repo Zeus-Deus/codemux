@@ -377,6 +377,8 @@ async fn create_empty_workspace_impl<R: tauri::Runtime>(
     select: bool,
     initial_chat: Option<crate::state::InitialChatPane>,
 ) -> Result<WorkspaceCreated, String> {
+    // Cleanup must not delete a checkout while it is being opened.
+    let _opening = crate::worktree_cleanup::opening_guard().await;
     // Defense-in-depth: a workspace cwd must always be an absolute path so
     // every terminal it spawns can `chdir` into it. A literal `~` here would
     // be stored verbatim and leave terminals stranded in `$HOME`.
@@ -463,6 +465,8 @@ pub async fn create_workspace_with_preset<R: tauri::Runtime>(
     layout: String,
     select: Option<bool>,
 ) -> Result<String, String> {
+    // Cleanup must not delete a checkout while it is being opened.
+    let _opening = crate::worktree_cleanup::opening_guard().await;
     let layout = match layout.as_str() {
         "single" => WorkspacePresetLayout::Single,
         "pair" => WorkspacePresetLayout::Pair,
@@ -1322,6 +1326,9 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
     }
 
     let closing = state.find_workspace(&workspace_id);
+    // Before the workspace leaves state, so cleanup never sees its checkout
+    // unclaimed while sessions still run in it.
+    let mut cleanup_hold = closing.as_ref().map(crate::worktree_cleanup::hold_checkout);
     let close_result = state
         .close_workspace(&workspace_id)
         .map_err(|e| format!("Failed to close workspace: {e}"))?;
@@ -1426,17 +1433,28 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         )
         .await
         .map_err(|error| {
+            // The files stay, with a session that may still run in them.
+            if let Some(hold) = cleanup_hold.take() {
+                hold.keep();
+            }
             format!("Agent session did not stop ({error}); worktree files retained.")
         })?;
     } else {
-        crate::commands::agent_chat::shutdown_agent_chat_threads(
+        let issued = crate::commands::agent_chat::shutdown_agent_chat_threads(
             &app,
             close_result.removed_agent_chat_threads,
         );
         // Files stay on disk: cleanup may offer them once these stops are
         // acknowledged (and the worktree goes stale).
-        if let Some(ref ws) = closing {
-            crate::worktree_cleanup::retire_workspace(&app, ws, earlier_stops, !remove_worktree);
+        if let (Some(ws), Some(hold)) = (closing.as_ref(), cleanup_hold.take()) {
+            crate::worktree_cleanup::retire_workspace(
+                &app,
+                hold,
+                ws,
+                earlier_stops,
+                issued,
+                !remove_worktree,
+            );
         }
     }
 
@@ -2291,6 +2309,8 @@ pub async fn close_workspace<R: tauri::Runtime>(
     }
 
     let closing = state.find_workspace(&workspace_id);
+    // See the same hold in `close_workspace_with_worktree_impl`.
+    let cleanup_hold = closing.as_ref().map(crate::worktree_cleanup::hold_checkout);
     let result = state.close_workspace(&workspace_id)?;
     let earlier_stops = crate::commands::agent_chat::snapshot_pending_stops(&workspace_id);
 
@@ -2372,14 +2392,14 @@ pub async fn close_workspace<R: tauri::Runtime>(
         crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
     }
 
-    crate::commands::agent_chat::shutdown_agent_chat_threads(
+    let issued = crate::commands::agent_chat::shutdown_agent_chat_threads(
         &app,
         result.removed_agent_chat_threads,
     );
 
     // See the same step in `close_workspace_with_worktree_impl`.
-    if let Some(ref ws) = closing {
-        crate::worktree_cleanup::retire_workspace(&app, ws, earlier_stops, true);
+    if let (Some(ws), Some(hold)) = (closing.as_ref(), cleanup_hold) {
+        crate::worktree_cleanup::retire_workspace(&app, hold, ws, earlier_stops, issued, true);
     }
 
     crate::state::emit_app_state(&app);
