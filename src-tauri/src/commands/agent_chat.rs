@@ -5691,6 +5691,9 @@ fn begin_agent_chat_thread_shutdown<R: Runtime>(
     app: &AppHandle<R>,
     threads: Vec<(ProviderKind, String)>,
 ) -> Vec<(ProviderKind, String, Arc<ThreadGate>)> {
+    if threads.is_empty() {
+        return Vec::new();
+    }
     // Synchronous and before any await: the pane is already gone, so the
     // tracking is dead the moment we are called, and this must not depend
     // on the async cleanup task being scheduled.
@@ -5714,6 +5717,9 @@ async fn stop_agent_chat_threads<R: Runtime>(
     app_handle: &AppHandle<R>,
     threads: Vec<(ProviderKind, String, Arc<ThreadGate>)>,
 ) -> Result<(), String> {
+    if threads.is_empty() {
+        return Ok(());
+    }
     let registry: State<'_, ProviderRegistry> = app_handle.state();
     let mut first_error = None;
     for (kind, thread_id, gate) in threads {
