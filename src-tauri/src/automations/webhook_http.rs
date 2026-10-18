@@ -15,9 +15,15 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
+use tokio::sync::Semaphore;
 
 use super::webhook::{DeliveryRejection, WebhookRequest, MAX_WEBHOOK_BODY_BYTES};
+
+/// Deliveries validated at once. Acceptance locks the database and may read
+/// the secrets key file, so it runs on the blocking pool, and this cap keeps
+/// a burst of requests from taking that pool over.
+static ACCEPT_PERMITS: Semaphore = Semaphore::const_new(4);
 
 /// Path prefix of webhook URLs; the full path is
 /// `{WEBHOOK_PATH_PREFIX}/<webhook_id>/<token>`.
@@ -41,6 +47,17 @@ async fn receive<R: Runtime>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Graceful shutdown lets a request that was still uploading complete
+    // after Remote access is switched off; it must not start a run then.
+    let listening = app
+        .try_state::<crate::web_remote::WebRemoteState>()
+        .is_some_and(|state| state.lan_listening());
+    if !listening {
+        return respond(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": "Remote access is off" }),
+        );
+    }
     let request = WebhookRequest::new(
         method.as_str(),
         uri.path(),
@@ -50,7 +67,20 @@ async fn receive<R: Runtime>(
             .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?))),
         body.to_vec(),
     );
-    match super::executor::dispatch_webhook(&app, &webhook_id, &token, &request) {
+    let Ok(_permit) = ACCEPT_PERMITS.acquire().await else {
+        return respond(StatusCode::SERVICE_UNAVAILABLE, json!({ "error": "Shutting down" }));
+    };
+    let dispatched = tauri::async_runtime::spawn_blocking(move || {
+        super::executor::dispatch_webhook(&app, &webhook_id, &token, &request)
+    })
+    .await;
+    let Ok(dispatched) = dispatched else {
+        return respond(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": "Could not record the run" }),
+        );
+    };
+    match dispatched {
         Ok(accepted) => respond(
             StatusCode::ACCEPTED,
             json!({ "run_id": accepted.run_id, "missing": accepted.missing }),
@@ -123,6 +153,9 @@ mod tests {
         // No project, so an accepted run fails fast at repo resolution and
         // never launches an agent.
         app.manage(db);
+        let remote = crate::web_remote::WebRemoteState::default();
+        remote.set_lan_listening_for_test(true);
+        app.manage(remote);
         (
             app,
             automation.webhook_id.unwrap(),
@@ -188,6 +221,17 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "This automation is paused");
         assert!(db.list_automation_runs(automation_id, 10).is_empty());
+    }
+
+    #[tokio::test]
+    async fn nothing_runs_once_remote_access_is_off() {
+        let (app, id, token, automation_id) = app_with_webhook();
+        app.state::<crate::web_remote::WebRemoteState>()
+            .set_lan_listening_for_test(false);
+        let (status, _) =
+            post_to(&app, &format!("{WEBHOOK_PATH_PREFIX}/{id}/{token}"), b"{}".to_vec()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(app.state::<DatabaseStore>().list_automation_runs(automation_id, 10).is_empty());
     }
 
     #[tokio::test]

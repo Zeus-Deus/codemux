@@ -70,6 +70,22 @@ function endpointLabel(endpoint: WebRemoteEndpoint): string {
   return `${ENDPOINT_GROUPS[endpoint.group] ?? "Other"} · ${endpoint.host}`;
 }
 
+/** Endpoints a webhook sender can reach: plain HTTP(S) addresses the
+ *  listener actually serves under its bind scope. */
+export function webhookEndpoints(
+  endpoints: WebRemoteEndpoint[],
+  bindScope: string | undefined,
+): WebRemoteEndpoint[] {
+  return endpoints.filter((endpoint) => {
+    if (!/^https?:\/\//.test(endpoint.url)) return false;
+    if (bindScope === "loopback") return endpoint.group === "this_device";
+    if (bindScope === "tailscale") {
+      return endpoint.group === "this_device" || endpoint.group === "tailscale";
+    }
+    return true;
+  });
+}
+
 function preferredEndpoint(endpoints: WebRemoteEndpoint[]): WebRemoteEndpoint | null {
   return (
     endpoints.find((e) => e.recommended) ??
@@ -110,9 +126,10 @@ export function WebhookPanel({
     Promise.all([webRemoteStatus(), webRemoteListEndpoints()])
       .then(([status, list]) => {
         if (cancelled) return;
+        const usable = webhookEndpoints(list, status.bind_scope);
         setListening(status.enabled && status.running);
-        setEndpoints(list);
-        setEndpointUrl((current) => current ?? preferredEndpoint(list)?.url ?? null);
+        setEndpoints(usable);
+        setEndpointUrl(preferredEndpoint(usable)?.url ?? null);
       })
       .catch(() => !cancelled && setListening(false));
     return () => {

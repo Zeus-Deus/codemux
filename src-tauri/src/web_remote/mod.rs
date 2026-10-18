@@ -299,6 +299,28 @@ impl WebRemoteState {
     pub fn active_connection_count(&self) -> usize {
         self.inner.connections.active_count()
     }
+
+    /// Whether the LAN listener is wanted and bound right now. Webhook intake
+    /// checks this after reading a body, because graceful shutdown lets a
+    /// request that was still uploading finish after Remote access is off.
+    pub fn lan_listening(&self) -> bool {
+        lan_wanted(&self.inner.config.lock().unwrap()) && self.inner.runtime.lock().unwrap().is_some()
+    }
+
+    /// Tests: pretend the LAN listener is enabled and bound.
+    #[cfg(test)]
+    pub(crate) fn set_lan_listening_for_test(&self, listening: bool) {
+        {
+            let mut cfg = self.inner.config.lock().unwrap();
+            cfg.enabled = listening;
+            cfg.lan_enabled = listening;
+        }
+        *self.inner.runtime.lock().unwrap() = listening.then(|| RunningServer {
+            port: DEFAULT_PORT,
+            scope: BIND_SCOPE_ALL.to_string(),
+            shutdown: tokio::sync::watch::channel(false).0,
+        });
+    }
 }
 
 // ── Status snapshot (command return + event payload) ────────────────

@@ -667,7 +667,9 @@ function AutomationDetail({
       />
 
       {webhook ? (
-        <WebhookPanel automation={automation} onChanged={onChanged} />
+        // Keyed so a slow load or rotation for one automation can never land
+        // in another's panel.
+        <WebhookPanel key={automation.id} automation={automation} onChanged={onChanged} />
       ) : (
         <div className="grid grid-cols-2 gap-3">
           <FactCard label="Next run" value={formatStamp(automation.next_run_at)} />

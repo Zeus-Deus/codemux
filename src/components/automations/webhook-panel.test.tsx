@@ -4,7 +4,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import type { AutomationView } from "@/tauri/commands";
-import { WebhookPanel } from "./webhook-panel";
+import { WebhookPanel, webhookEndpoints } from "./webhook-panel";
 
 const commands = vi.hoisted(() => ({
   automationsWebhookCredentials: vi.fn(),
@@ -157,5 +157,34 @@ describe("WebhookPanel", () => {
     await user.click(screen.getByRole("button", { name: "Save check" }));
 
     await waitFor(() => expect(commands.secretsDelete).toHaveBeenCalledWith("secret_old"));
+  });
+
+  it("only offers addresses the listener serves under its bind scope", () => {
+    const endpoint = (group: string, url: string) => ({
+      kind: "lan",
+      group,
+      host: url,
+      port: 4377,
+      url,
+      secure: false,
+      recommended: false,
+      label: "",
+    });
+    const all = [
+      endpoint("this_device", "http://127.0.0.1:4377"),
+      endpoint("local_network", "http://192.168.1.20:4377"),
+      endpoint("tailscale", "https://box.tail.ts.net"),
+      endpoint("other", "iroh://node"),
+    ];
+    const urls = (scope?: "all" | "tailscale" | "loopback") =>
+      webhookEndpoints(all, scope).map((e) => e.url);
+    expect(urls("all")).toEqual([
+      "http://127.0.0.1:4377",
+      "http://192.168.1.20:4377",
+      "https://box.tail.ts.net",
+    ]);
+    expect(urls(undefined)).toEqual(urls("all"));
+    expect(urls("tailscale")).toEqual(["http://127.0.0.1:4377", "https://box.tail.ts.net"]);
+    expect(urls("loopback")).toEqual(["http://127.0.0.1:4377"]);
   });
 });
