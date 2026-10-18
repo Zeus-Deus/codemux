@@ -3147,14 +3147,18 @@ pub struct ProviderUsageCacheRow {
     pub reasoning_tokens: i64,
     pub cost_usd: Option<f64>,
     pub cost_source: Option<String>,
+    /// The provider account whose history produced the row (`None` for the
+    /// CLI's own sign-in). Set on insert only, so the first history to
+    /// produce a row keeps it.
+    pub account_id: Option<String>,
 }
 
 const UPSERT_PROVIDER_USAGE_SQL: &str =
     "INSERT INTO agent_usage_ledger (
          created_at, thread_id, workspace_id, provider, model, subagent,
          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-         reasoning_tokens, cost_usd, cost_source, source, import_key
-     ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'provider_history', ?13)
+         reasoning_tokens, cost_usd, cost_source, source, import_key, account_id
+     ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'provider_history', ?13, ?14)
      ON CONFLICT(import_key) WHERE import_key IS NOT NULL DO UPDATE SET
          created_at = excluded.created_at,
          thread_id = excluded.thread_id,
@@ -3495,6 +3499,7 @@ impl DatabaseStore {
                         row.cost_usd,
                         row.cost_source,
                         row.import_key,
+                        row.account_id,
                     ])
                     .map_err(|e| format!("Failed to upsert provider usage row: {e}"))?;
             }
@@ -3574,13 +3579,19 @@ impl DatabaseStore {
     /// rows have no second history source and must survive that rebuild. Other
     /// legacy live rows are removed because their providers *do* have history
     /// importers and retaining them would double-count Codemux-launched work.
+    /// Rows of a removed provider account survive for the same reason as
+    /// Grok's: their history was deleted with the account.
     pub fn reset_usage_history(&self) -> Result<usize, String> {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let removed = tx
             .execute(
+                // A removed provider account's history is gone with its
+                // folder, so its rows cannot be rebuilt and are kept.
                 "DELETE FROM agent_usage_ledger
-                 WHERE provider != 'grok' OR source != 'live'",
+                 WHERE (provider != 'grok' OR source != 'live')
+                   AND (account_id IS NULL
+                        OR account_id IN (SELECT id FROM provider_accounts))",
                 [],
             )
             .map_err(|e| format!("Failed to clear usage cache: {e}"))?;
@@ -6367,6 +6378,7 @@ mod tests {
             reasoning_tokens: 0,
             cost_usd: Some(0.25),
             cost_source: Some("provider".into()),
+            account_id: None,
         };
         let rows = [make("opencode:a", 2), make("opencode:b", 3)];
         assert_eq!(db.upsert_provider_usage_rows(&rows).unwrap(), 2);

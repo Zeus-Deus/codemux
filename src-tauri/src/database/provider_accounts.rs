@@ -251,40 +251,6 @@ impl DatabaseStore {
         .map_err(|e| e.to_string())?;
         Ok(())
     }
-
-    /// Import keys among `keys` already in the ledger. Their account was
-    /// settled by whichever history first produced them.
-    pub fn existing_usage_import_keys(&self, keys: &[&str]) -> Result<HashSet<String>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let mut found = HashSet::new();
-        let mut stmt = conn
-            .prepare("SELECT 1 FROM agent_usage_ledger WHERE import_key = ?1")
-            .map_err(|e| e.to_string())?;
-        for key in keys {
-            if stmt.exists([key]).map_err(|e| e.to_string())? {
-                found.insert((*key).to_string());
-            }
-        }
-        Ok(found)
-    }
-
-    /// Attribute imported rows to an extra account.
-    pub fn tag_usage_rows_with_account(&self, rows: &[(String, String)]) -> Result<(), String> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        {
-            let mut stmt = tx
-                .prepare("UPDATE agent_usage_ledger SET account_id = ?1 WHERE import_key = ?2")
-                .map_err(|e| e.to_string())?;
-            for (account, key) in rows {
-                stmt.execute(params![account, key]).map_err(|e| e.to_string())?;
-            }
-        }
-        tx.commit().map_err(|e| e.to_string())
-    }
 }
 
 #[cfg(test)]
@@ -357,5 +323,63 @@ mod tests {
         assert_eq!(db.provider_account_defaults("").unwrap()["codex"], "b");
         db.set_provider_account_default("", "codex", None).unwrap();
         assert!(db.provider_account_defaults("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_usage_row_keeps_the_account_that_first_produced_it() {
+        let db = store();
+        let row = |account: Option<&str>, output: i64| crate::database::ProviderUsageCacheRow {
+            import_key: "claude:msg-1".into(),
+            created_at: 1_800_000_000_000,
+            thread_id: "claude:s1".into(),
+            provider: "claude".into(),
+            model: None,
+            subagent: false,
+            input_tokens: 1,
+            output_tokens: output,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            cost_usd: None,
+            cost_source: None,
+            account_id: account.map(str::to_string),
+        };
+        db.upsert_provider_usage_rows(&[row(Some("work"), 1)]).unwrap();
+        // A later scan sees the copy in another home: totals update, the
+        // owner does not.
+        db.upsert_provider_usage_rows(&[row(None, 2)]).unwrap();
+        let rows = db.usage_rows_since(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].output_tokens, 2);
+        assert_eq!(rows[0].account_id.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn a_removed_accounts_usage_survives_a_cache_rebuild() {
+        let db = store();
+        db.insert_provider_account(&account("work", "claude", 1)).unwrap();
+        db.insert_provider_account(&account("gone", "claude", 2)).unwrap();
+        let row = |key: &str, account: Option<&str>| crate::database::ProviderUsageCacheRow {
+            import_key: key.into(),
+            created_at: 1_800_000_000_000,
+            thread_id: "claude:s1".into(),
+            provider: "claude".into(),
+            model: None,
+            subagent: false,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            cost_usd: None,
+            cost_source: None,
+            account_id: account.map(str::to_string),
+        };
+        db.upsert_provider_usage_rows(&[row("a", None), row("b", Some("work")), row("c", Some("gone"))])
+            .unwrap();
+        db.delete_provider_account("gone").unwrap();
+        db.reset_usage_history().unwrap();
+        let kept = db.usage_rows_since(0).unwrap();
+        assert_eq!(kept.iter().map(|r| r.account_id.as_deref()).collect::<Vec<_>>(), vec![Some("gone")]);
     }
 }

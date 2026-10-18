@@ -856,6 +856,7 @@ fn source_changed(db: &DatabaseStore, key: &str, signature: (i64, i64)) -> bool 
 fn materialize_rows(
     db: &DatabaseStore,
     rows: Vec<ImportedRow>,
+    owners: &HashMap<String, String>,
     report: &mut UsageImportReport,
     sessions: &mut HashSet<String>,
 ) -> Result<(), String> {
@@ -878,6 +879,7 @@ fn materialize_rows(
             }
         };
         cache_rows.push(ProviderUsageCacheRow {
+            account_id: owners.get(&row.import_key).cloned(),
             import_key: row.import_key,
             created_at: row.created_at_ms,
             thread_id: format!("{}:{}", row.provider, row.session_id),
@@ -1058,16 +1060,16 @@ pub async fn usage_scan_provider_history(
 
     // A row is attributed once, to the history that first produced it: a
     // chat switched to another account carries a copy of its earlier turns,
-    // and those stay with the account that ran them.
-    let settled = db.existing_usage_import_keys(
-        &account_keys.iter().map(|(_, key)| key.as_str()).collect::<Vec<_>>(),
-    )?;
-    let mut claimed = HashSet::new();
-    account_keys.retain(|(_, key)| {
-        !settled.contains(key) && !default_keys.contains(key) && claimed.insert(key.clone())
-    });
-    materialize_rows(&db, pending_rows, &mut report, &mut sessions)?;
-    db.tag_usage_rows_with_account(&account_keys)?;
+    // and those stay with the account that ran them. The account is written
+    // with the row and never updated, so an earlier scan's owner stands; in
+    // one scan the CLI's own history wins.
+    let mut owners: HashMap<String, String> = HashMap::new();
+    for (account, key) in account_keys {
+        if !default_keys.contains(&key) {
+            owners.entry(key).or_insert(account);
+        }
+    }
+    materialize_rows(&db, pending_rows, &owners, &mut report, &mut sessions)?;
     report.sessions_found = sessions.len() as i64;
     db.set_usage_import_states(&completed_states, now_ms())?;
     // Record the version only after a complete pass so an interrupted rebuild
@@ -1542,7 +1544,7 @@ mod tests {
             .unwrap(),
         );
         let mut report = UsageImportReport::default();
-        materialize_rows(&db, rows, &mut report, &mut HashSet::new()).unwrap();
+        materialize_rows(&db, rows, &HashMap::new(), &mut report, &mut HashSet::new()).unwrap();
         assert_eq!(report.rows_updated, 3);
         let rows = db.usage_rows_since(0).unwrap();
         let claude = rows

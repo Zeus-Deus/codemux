@@ -86,7 +86,10 @@ pub fn codex_identity_cached(home: &Path) -> AccountIdentity {
     let auth = auth_file(home);
     match cached {
         Some((at, identity)) if at == auth => identity,
-        _ => AccountIdentity { signed_in: Some(auth), ..Default::default() },
+        // `auth.json` proves a sign-in; its absence does not prove a
+        // sign-out (keyring storage never writes it), so that waits for a
+        // probe.
+        _ => AccountIdentity { signed_in: auth.then_some(true), ..Default::default() },
     }
 }
 
@@ -230,5 +233,9 @@ mod tests {
         // Signing out with file storage removes `auth.json`; signing in adds it.
         std::fs::write(home.join("auth.json"), "{}").unwrap();
         assert_eq!(codex_identity_cached(&home).email, None);
+        // Before any probe, a home without `auth.json` is unknown, not signed out.
+        let cold = tmp.path().join("cold");
+        std::fs::create_dir_all(&cold).unwrap();
+        assert_eq!(codex_identity_cached(&cold).signed_in, None);
     }
 }
