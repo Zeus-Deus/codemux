@@ -630,7 +630,7 @@ impl OpenCodeSession {
         }
         let was_held = self.queue_hold().take();
         let result = self.dispatch_input(input, false, None).await;
-        self.restore_hold_unless_started(was_held, &result);
+        self.restore_hold_unless_started(was_held, &result).await;
         result
     }
 
@@ -682,20 +682,37 @@ impl OpenCodeSession {
         let _outbound = self.outbound.lock().await;
         let was_held = self.queue_hold().take();
         let result = self.dispatch_input(input, true, None).await;
-        self.restore_hold_unless_started(was_held, &result);
+        self.restore_hold_unless_started(was_held, &result).await;
         result
     }
 
     /// A send that started a new turn is a message sent by hand, which
-    /// releases a queue held by Stop. Guidance, re-queueing or a failure
-    /// restores the hold taken before it (a Stop meanwhile holds it anyway).
-    fn restore_hold_unless_started(
+    /// releases a queue held by Stop. Guidance or a failure restores the hold
+    /// taken before it (a Stop meanwhile holds it anyway). A send deferred
+    /// into the queue is still sent by hand: it goes first through the
+    /// restored hold, unless a Stop arrived meanwhile.
+    async fn restore_hold_unless_started(
         &self,
         was_held: bool,
         result: &Result<crate::agent_provider::TurnStartResult, ProviderError>,
     ) {
-        if !matches!(result, Ok(started) if !started.steered && started.queued_id.is_none()) {
-            self.queue_hold().restore(was_held);
+        match result {
+            Ok(started) if !started.steered && started.queued_id.is_none() => {}
+            Ok(deferred) if was_held && deferred.queued_id.is_some() => {
+                let id = deferred.queued_id.as_deref().unwrap_or_default();
+                let mut queue = self.queued.lock().await;
+                let mut hold = self.queue_hold();
+                if hold.is_held() {
+                    return;
+                }
+                if let Some(index) = queue.iter().position(|(key, _)| key == id) {
+                    let item = queue.remove(index).unwrap();
+                    queue.push_front(item);
+                }
+                hold.restore(true);
+                hold.release_with(id);
+            }
+            _ => self.queue_hold().restore(was_held),
         }
     }
 
@@ -850,7 +867,7 @@ impl OpenCodeSession {
                 .unwrap_or_else(|| input.text.clone());
             let was_held = self.queue_hold().take();
             let result = self.dispatch_input(input, true, Some(id.into())).await;
-            self.restore_hold_unless_started(was_held, &result);
+            self.restore_hold_unless_started(was_held, &result).await;
             let result = result?;
             if result.queued_id.is_some() {
                 return Ok(());
@@ -2613,6 +2630,47 @@ pub(crate) mod tests {
         assert_eq!(session.queued.lock().await.len(), 1);
         abort.assert_async().await;
         queued_post.assert_async().await;
+    }
+
+    fn deferred(id: &str) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
+        Ok(crate::agent_provider::TurnStartResult {
+            turn_id: TurnId(String::new()),
+            queued_id: Some(id.into()),
+            steered: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn delivery_deferred_send_goes_first_through_held_queue() {
+        let server = Server::new_async().await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        session.queued.lock().await.extend([
+            ("a".to_string(), delivery_input("A")),
+            ("b".to_string(), delivery_input("B")),
+        ]);
+        session.hold_queue();
+        session.queue_hold().release_with("a");
+        // Steering B is deferred into the queue by the native runtime.
+        let was_held = session.queue_hold().take();
+        session.restore_hold_unless_started(was_held, &deferred("b")).await;
+        assert_eq!(session.queued.lock().await[0].0, "b");
+        assert!(session.queue_hold().admits(Some("b")));
+    }
+
+    #[tokio::test]
+    async fn delivery_stop_during_deferred_send_keeps_queue_held() {
+        let server = Server::new_async().await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        session.queued.lock().await.extend([
+            ("a".to_string(), delivery_input("A")),
+            ("b".to_string(), delivery_input("B")),
+        ]);
+        session.hold_queue();
+        let was_held = session.queue_hold().take();
+        session.hold_queue();
+        session.restore_hold_unless_started(was_held, &deferred("b")).await;
+        assert_eq!(session.queued.lock().await[0].0, "a");
+        assert!(!session.queue_hold().admits(Some("a")));
     }
 
     #[tokio::test]
