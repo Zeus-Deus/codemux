@@ -170,6 +170,8 @@ pub(crate) async fn create_workspace_impl_with_selection<R: tauri::Runtime>(
     cwd: Option<String>,
     select: bool,
 ) -> Result<String, String> {
+    // Cleanup must not delete a checkout while it is being opened.
+    let _opening = crate::worktree_cleanup::opening_guard().await;
     // A workspace cwd must be absolute so its terminals can `chdir` into it;
     // a hand-typed `~` path would otherwise be stored verbatim.
     let cwd = cwd.map(|path| crate::project::expand_tilde(&path));
@@ -731,6 +733,9 @@ pub(crate) async fn create_worktree_workspace_impl_with_selection<R: tauri::Runt
         _ => return Err(format!("Unsupported layout: {layout}")),
     };
 
+    // Cleanup must not delete a checkout while it is being opened.
+    let _opening = crate::worktree_cleanup::opening_guard().await;
+
     // Validate repo_path is a git repository before creating anything
     if crate::config::workspace_config::find_git_root(Path::new(&repo_path)).is_none() {
         return Err(format!("Not a git repository: {repo_path}"));
@@ -1014,6 +1019,8 @@ pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
     layout: String,
     select: bool,
 ) -> Result<String, String> {
+    // Cleanup must not delete a checkout while it is being opened.
+    let _opening = crate::worktree_cleanup::opening_guard().await;
     let layout = match layout.as_str() {
         "single" => WorkspacePresetLayout::Single,
         "pair" => WorkspacePresetLayout::Pair,
@@ -1426,6 +1433,11 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
             &app,
             close_result.removed_agent_chat_threads,
         );
+        // Files stay on disk: cleanup may offer them once these stops are
+        // acknowledged (and the worktree goes stale).
+        if let Some(ref ws) = closing {
+            crate::worktree_cleanup::retire_workspace(&app, ws, earlier_stops, !remove_worktree);
+        }
     }
 
     if remove_worktree {
@@ -1471,14 +1483,6 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
             })
             .await
             .map_err(|e| format!("git_remove_worktree task join failed: {e}"))??;
-        }
-    }
-
-    // Once its sessions are told to stop, a worktree left on disk becomes
-    // a cleanup candidate (after worktree_cleanup's settle period).
-    if !remove_worktree {
-        if let Some(ref ws) = closing {
-            crate::worktree_cleanup::remember_closed(db, ws);
         }
     }
 
@@ -2288,6 +2292,7 @@ pub async fn close_workspace<R: tauri::Runtime>(
 
     let closing = state.find_workspace(&workspace_id);
     let result = state.close_workspace(&workspace_id)?;
+    let earlier_stops = crate::commands::agent_chat::snapshot_pending_stops(&workspace_id);
 
     // `.mcp.json` belongs to the checkout, not to one workspace row. Preserve
     // (and, if necessary, repair) it while another live workspace shares the
@@ -2374,7 +2379,7 @@ pub async fn close_workspace<R: tauri::Runtime>(
 
     // See the same step in `close_workspace_with_worktree_impl`.
     if let Some(ref ws) = closing {
-        crate::worktree_cleanup::remember_closed(&db, ws);
+        crate::worktree_cleanup::retire_workspace(&app, ws, earlier_stops, true);
     }
 
     crate::state::emit_app_state(&app);

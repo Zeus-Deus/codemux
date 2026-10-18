@@ -133,6 +133,22 @@ static RUN_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync
 static NOTIFIED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 /// Wakes the sweep early, e.g. right after automatic cleanup is enabled.
 static KICK: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::new);
+/// Opening a workspace takes this shared; a removal takes it exclusively
+/// from its final check through the delete, so a workspace can't adopt a
+/// checkout that is being deleted (see [`opening_guard`]).
+static OPENING: LazyLock<tokio::sync::RwLock<()>> = LazyLock::new(|| tokio::sync::RwLock::new(()));
+/// Worktrees whose closed chats haven't confirmed they stopped, with a
+/// count per close. A failed stop is never released (until restart, which
+/// ends every session Codemux started).
+static STOPPING: LazyLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
+    LazyLock::new(Default::default);
+
+/// Held by every path that opens a workspace on an existing checkout, from
+/// before it looks at the directory until the workspace is in app state.
+/// Never acquire it twice in one task: a queued removal would deadlock.
+pub(crate) async fn opening_guard() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    OPENING.read().await
+}
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -172,15 +188,57 @@ fn store_closed(db: &crate::database::DatabaseStore, closed: &[ClosedWorktree]) 
 /// Serializes read-modify-write of the closed list.
 static CLOSED_LOCK: Mutex<()> = Mutex::new(());
 
-/// Remember that `ws` was closed with its worktree left on disk, so a later
-/// sweep can offer it once it goes stale. Only disposable local worktrees
-/// are recorded; everything else is never a cleanup candidate.
-pub(crate) fn remember_closed(db: &crate::database::DatabaseStore, ws: &WorkspaceSnapshot) {
-    if crate::commands::workspace::refuse_worktree_removal(ws).is_some()
-        || crate::commands::workspace::archive_refusal_reason(ws).is_some()
-    {
+fn is_disposable(ws: &WorkspaceSnapshot) -> bool {
+    crate::commands::workspace::refuse_worktree_removal(ws).is_none()
+        && crate::commands::workspace::archive_refusal_reason(ws).is_none()
+}
+
+/// A workspace was closed (or archived) with its worktree left on disk.
+/// Holds the worktree out of cleanup until every chat stop issued for the
+/// workspace (`earlier` plus any still registered) is acknowledged; then,
+/// for a plain close, records it so a later sweep can offer it once stale.
+/// A stop that fails keeps the hold. Call after the chats were told to stop.
+pub(crate) fn retire_workspace<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    ws: &WorkspaceSnapshot,
+    earlier: crate::commands::agent_chat::EarlierStops,
+    record_close: bool,
+) {
+    if !is_disposable(ws) {
         return;
     }
+    let Some(path) = ws.worktree_path.clone() else { return };
+    let key = path_key(Path::new(&path));
+    *STOPPING.lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_default() += 1;
+    let pending = crate::commands::agent_chat::snapshot_pending_stops(&ws.workspace_id.0);
+    let app = app.clone();
+    let ws = ws.clone();
+    tauri::async_runtime::spawn(async move {
+        let stopped = crate::commands::agent_chat::wait_for_stops(earlier)
+            .await
+            .and(crate::commands::agent_chat::wait_for_stops(pending).await);
+        if let Err(error) = stopped {
+            eprintln!(
+                "[worktree-cleanup] keeping {path} out of cleanup: a chat did not stop ({error})"
+            );
+            return;
+        }
+        let mut stopping = STOPPING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = stopping.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                stopping.remove(&key);
+            }
+        }
+        drop(stopping);
+        if record_close {
+            remember_closed(&app.state::<crate::database::DatabaseStore>(), &ws);
+        }
+    });
+}
+
+/// Remember that `ws` was closed with its worktree left on disk.
+fn remember_closed(db: &crate::database::DatabaseStore, ws: &WorkspaceSnapshot) {
     let Some(path) = ws.worktree_path.clone() else { return };
     let _guard = CLOSED_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut closed = load_closed(db);
@@ -211,25 +269,29 @@ fn is_open(live: &HashSet<PathBuf>, key: &Path) -> bool {
 }
 
 /// Archived and closed worktrees under `root` that still exist and that no
-/// live workspace has open. An archived entry wins over a closed record for
-/// the same path (archiving goes through the close path too).
+/// live workspace has open, one per path.
 fn gather_candidates(
     snapshot: &AppStateSnapshot,
     closed: &[ClosedWorktree],
     root: &Path,
 ) -> Vec<Candidate> {
     let live = live_paths(snapshot);
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
+    let mut index: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
+    let mut out: Vec<Candidate> = Vec::new();
     let mut push = |candidate: Candidate| {
         let key = path_key(&candidate.path);
-        if key != root
-            && key.starts_with(root)
-            && candidate.path.is_dir()
-            && !is_open(&live, &key)
-            && seen.insert(key)
-        {
-            out.push(candidate);
+        if key == root || !key.starts_with(root) || !candidate.path.is_dir() || is_open(&live, &key) {
+            return;
+        }
+        // An archive entry can outlive a later reopen and close of the same
+        // checkout; the most recent retirement is the one that counts.
+        match index.get(&key) {
+            Some(&i) if out[i].retired_at >= candidate.retired_at => {}
+            Some(&i) => out[i] = candidate,
+            None => {
+                index.insert(key, out.len());
+                out.push(candidate);
+            }
         }
     };
     for entry in &snapshot.archived_workspaces {
@@ -411,9 +473,32 @@ fn is_disposable_ignored(path: &Path, repo_root: &Path, rel: &str) -> bool {
     if LITTER_FILES.contains(&name) {
         return true;
     }
-    match (std::fs::read(path.join(trimmed)), std::fs::read(repo_root.join(trimmed))) {
-        (Ok(here), Ok(main)) => here == main,
-        _ => false,
+    files_identical(&path.join(trimmed), &repo_root.join(trimmed))
+}
+
+/// Byte-for-byte equality, streamed. Files over [`MAX_COMPARED_BYTES`]
+/// count as different (and so keep the worktree) rather than being read.
+fn files_identical(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+    const MAX_COMPARED_BYTES: u64 = 16 * 1024 * 1024;
+    let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    if !meta_a.is_file() || meta_a.len() != meta_b.len() || meta_a.len() > MAX_COMPARED_BYTES {
+        return false;
+    }
+    let (Ok(mut file_a), Ok(mut file_b)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    let (mut buf_a, mut buf_b) = ([0u8; 8192], [0u8; 8192]);
+    loop {
+        let Ok(n) = file_a.read(&mut buf_a) else { return false };
+        if n == 0 {
+            return file_b.read(&mut buf_b).is_ok_and(|m| m == 0);
+        }
+        if file_b.read_exact(&mut buf_b[..n]).is_err() || buf_a[..n] != buf_b[..n] {
+            return false;
+        }
     }
 }
 
@@ -440,14 +525,15 @@ fn merged_pr(path: &Path) -> Option<MergedPr> {
 }
 
 /// Pure verdict for one candidate. `pr` is consulted lazily because it
-/// costs a GitHub request; `busy` is the process check. Returns `None` when
-/// the worktree is not stale (or is not one Codemux may manage at all).
+/// costs a GitHub request; `activity` says what still runs in it, if
+/// anything. Returns `None` when the worktree is not stale (or is not one
+/// Codemux may manage at all).
 fn judge(
     candidate: &Candidate,
     inspection: &Inspection,
     now: u64,
     pr: &mut dyn FnMut() -> Option<MergedPr>,
-    busy: bool,
+    activity: Option<&str>,
     hermes_pending: bool,
 ) -> Option<StaleWorktree> {
     if inspection.unmanaged {
@@ -481,8 +567,8 @@ fn judge(
         return None;
     };
 
-    let kept_because = if busy {
-        Some("A process is running inside it".to_string())
+    let kept_because = if let Some(activity) = activity {
+        Some(activity.to_string())
     } else if hermes_pending {
         Some("Hermes cleanup is still pending".to_string())
     } else if inspection.branch.is_none() {
@@ -561,28 +647,51 @@ fn is_busy(path: &Path, cwds: &[PathBuf]) -> bool {
     cwds.iter().any(|cwd| cwd.starts_with(&key))
 }
 
+/// What still runs in `path`, if anything Codemux can see.
+fn activity(path: &Path, cwds: &[PathBuf]) -> Option<&'static str> {
+    let stopping = STOPPING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&path_key(path));
+    if stopping {
+        Some("A chat that ran in it hasn't confirmed it stopped")
+    } else if is_busy(path, cwds) {
+        Some("A process is running inside it")
+    } else {
+        None
+    }
+}
+
 fn hermes_pending(db: &crate::database::DatabaseStore, path: &Path) -> bool {
     // An unreadable hold counts as a hold.
     db.hermes_cleanup_pending_path(&path.to_string_lossy()).unwrap_or(true)
 }
 
-/// Evaluate every candidate. Blocking: shells out to git and GitHub.
+/// Evaluate one candidate. Blocking: shells out to git, and to GitHub
+/// unless `pr` already holds the answer (it is filled in for next time).
+fn evaluate_one(
+    db: &crate::database::DatabaseStore,
+    candidate: &Candidate,
+    cwds: &[PathBuf],
+    pr: &mut Option<Option<MergedPr>>,
+) -> Option<StaleWorktree> {
+    let inspection = inspect(&candidate.path);
+    judge(
+        candidate,
+        &inspection,
+        now_secs(),
+        &mut || pr.get_or_insert_with(|| merged_pr(&candidate.path)).clone(),
+        activity(&candidate.path, cwds),
+        hermes_pending(db, &candidate.path),
+    )
+}
+
+/// Evaluate every candidate.
 fn evaluate(db: &crate::database::DatabaseStore, candidates: &[Candidate]) -> Vec<StaleWorktree> {
-    let now = now_secs();
     let cwds = process_cwds();
     candidates
         .iter()
-        .filter_map(|candidate| {
-            let inspection = inspect(&candidate.path);
-            judge(
-                candidate,
-                &inspection,
-                now,
-                &mut || merged_pr(&candidate.path),
-                is_busy(&candidate.path, &cwds),
-                hermes_pending(db, &candidate.path),
-            )
-        })
+        .filter_map(|candidate| evaluate_one(db, candidate, &cwds, &mut None))
         .collect()
 }
 
@@ -626,8 +735,10 @@ fn remove_worktree(path: &Path) -> Result<(), String> {
 }
 
 /// Remove the requested worktrees that are still stale and safe. Each one
-/// is re-evaluated from fresh state right before its removal, so anything
-/// reopened, edited or committed to since the review is kept.
+/// is evaluated from fresh state, then checked again (git state, live
+/// workspaces, processes, holds) with workspace opening blocked from that
+/// final check through the delete, so anything reopened, edited or
+/// committed to since the review is kept.
 async fn remove_locked<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     paths: &[String],
@@ -641,33 +752,50 @@ async fn remove_locked<R: tauri::Runtime>(
         else {
             continue;
         };
-        // Same lock the close path holds around its delete, so a Hermes
-        // start can't claim this directory between check and removal.
+        // First pass without blocking anyone: it may wait on GitHub.
+        let app_for_task = app.clone();
+        let first = tokio::task::spawn_blocking(move || {
+            let db = app_for_task.state::<crate::database::DatabaseStore>();
+            let mut pr = None;
+            let verdict = evaluate_one(&db, &candidate, &process_cwds(), &mut pr);
+            (candidate, pr, verdict)
+        })
+        .await;
+        let (candidate, pr) = match first {
+            Ok((candidate, pr, Some(verdict))) if verdict.kept_because.is_none() => (candidate, pr),
+            Ok((_, _, Some(kept))) => {
+                outcome.kept.push(kept);
+                continue;
+            }
+            // No longer stale: nothing to report.
+            Ok((_, _, None)) => continue,
+            Err(error) => {
+                eprintln!("[worktree-cleanup] removal check failed: {error}");
+                continue;
+            }
+        };
+        // Final check and delete: no workspace may open a checkout from
+        // here on, and the close path's Hermes lock keeps a Hermes start
+        // from claiming the directory.
+        let _opening = OPENING.write().await;
         let _hermes = crate::agent_provider::hermes::WORKTREE_LIFECYCLE.lock().await;
         let app_for_task = app.clone();
         let result = tokio::task::spawn_blocking(move || {
             let db = app_for_task.state::<crate::database::DatabaseStore>();
-            let verdict = evaluate(&db, std::slice::from_ref(&candidate)).pop()?;
+            let mut pr = pr;
+            let verdict = evaluate_one(&db, &candidate, &process_cwds(), &mut pr)?;
+            let snapshot = app_for_task.state::<AppStateStore>().snapshot();
             if verdict.kept_because.is_some() {
                 return Some(verdict);
             }
-            // Evaluation can take seconds (git, GitHub). Look again right
-            // before deleting: a workspace may have reopened it meanwhile,
-            // or a terminal started in it.
-            let key = path_key(&candidate.path);
-            let snapshot = app_for_task.state::<AppStateStore>().snapshot();
-            let late_reason = if is_open(&live_paths(&snapshot), &key) {
-                Some("A workspace opened it again")
-            } else if is_busy(&candidate.path, &process_cwds()) {
-                Some("A process is running inside it")
-            } else {
-                None
-            };
-            if let Some(reason) = late_reason {
-                return Some(StaleWorktree { kept_because: Some(reason.to_string()), ..verdict });
+            if is_open(&live_paths(&snapshot), &path_key(&candidate.path)) {
+                return Some(StaleWorktree {
+                    kept_because: Some("A workspace opened it again".to_string()),
+                    ..verdict
+                });
             }
             Some(match remove_worktree(&candidate.path) {
-                Ok(_) => verdict,
+                Ok(()) => verdict,
                 Err(error) => StaleWorktree {
                     kept_because: Some(format!("git refused to remove it: {error}")),
                     ..verdict
@@ -809,7 +937,7 @@ mod tests {
     const INCLUDED: MergedPr = MergedPr { number: 7, includes_head: true };
 
     fn verdict(inspection: &Inspection, retired_at: u64, pr: Option<MergedPr>) -> Option<StaleWorktree> {
-        judge(&candidate(retired_at), inspection, NOW, &mut || pr.clone(), false, false)
+        judge(&candidate(retired_at), inspection, NOW, &mut || pr.clone(), None, false)
     }
 
     #[test]
@@ -897,9 +1025,9 @@ mod tests {
     #[test]
     fn running_process_or_hermes_hold_keeps_it() {
         let merged = Inspection { merged_into: Some("main".into()), ..clean() };
-        let busy = judge(&candidate(SETTLED), &merged, NOW, &mut || None, true, false).unwrap();
-        assert!(busy.kept_because.unwrap().contains("process"));
-        let held = judge(&candidate(SETTLED), &merged, NOW, &mut || None, false, true).unwrap();
+        let busy = judge(&candidate(SETTLED), &merged, NOW, &mut || None, Some("busy"), false).unwrap();
+        assert_eq!(busy.kept_because.as_deref(), Some("busy"));
+        let held = judge(&candidate(SETTLED), &merged, NOW, &mut || None, None, true).unwrap();
         assert!(held.kept_because.unwrap().contains("Hermes"));
     }
 
@@ -907,7 +1035,7 @@ mod tests {
     fn pr_is_not_requested_when_a_local_reason_suffices() {
         let merged = Inspection { merged_into: Some("main".into()), ..clean() };
         let mut asked = false;
-        judge(&candidate(SETTLED), &merged, NOW, &mut || { asked = true; None }, false, false);
+        judge(&candidate(SETTLED), &merged, NOW, &mut || { asked = true; None }, None, false);
         assert!(!asked);
     }
 
@@ -1057,6 +1185,69 @@ mod tests {
         let live_paths = HashSet::from([path_key(&open.join("sub"))]);
         assert!(is_open(&live_paths, &path_key(&open)));
         assert!(!is_open(&live_paths, &path_key(&closed)));
+    }
+
+    #[test]
+    fn the_latest_retirement_wins_for_one_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = path_key(dir.path());
+        let wt = root.join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let mut snapshot = AppStateStore::default().snapshot();
+        snapshot.workspaces.clear();
+        snapshot.archived_workspaces = vec![crate::state::ArchivedWorkspaceSnapshot {
+            archive_id: "a".into(),
+            workspace_id: "w".into(),
+            title: "archived".into(),
+            cwd: wt.to_string_lossy().into_owned(),
+            worktree_path: Some(wt.to_string_lossy().into_owned()),
+            project_root: None,
+            project_uid: None,
+            workspace_kind: Some("worktree".into()),
+            git_branch: None,
+            protected: false,
+            is_git: true,
+            pinned_at: None,
+            parent_workspace_id: None,
+            archived_at: 10,
+        }];
+        let reopened = ClosedWorktree {
+            path: wt.to_string_lossy().into_owned(),
+            title: "closed".into(),
+            branch: None,
+            closed_at: 500,
+        };
+        let candidates = gather_candidates(&snapshot, &[reopened], &root);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!((candidates[0].retired_at, candidates[0].source), (500, WorktreeSource::Closed));
+    }
+
+    #[test]
+    fn files_identical_streams_and_rejects_differences() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, body: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+        let big = vec![7u8; 20_000];
+        let mut big_changed = big.clone();
+        big_changed[19_999] = 8;
+        assert!(files_identical(&file("a", &big), &file("b", &big)));
+        assert!(!files_identical(&file("c", &big), &file("d", &big_changed)));
+        assert!(!files_identical(&file("e", b"x"), &dir.path().join("missing")));
+        assert!(!files_identical(dir.path(), dir.path()), "directories are never copies");
+    }
+
+    #[test]
+    fn an_unconfirmed_chat_stop_holds_the_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = path_key(dir.path());
+        STOPPING.lock().unwrap().insert(key.clone(), 1);
+        let held = activity(dir.path(), &[]);
+        STOPPING.lock().unwrap().remove(&key);
+        assert!(held.is_some_and(|reason| reason.contains("chat")));
+        assert_eq!(activity(dir.path(), &[]), None);
     }
 
     #[test]

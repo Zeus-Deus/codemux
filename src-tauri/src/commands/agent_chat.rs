@@ -5718,7 +5718,7 @@ pub fn snapshot_pending_stops(workspace_id: &str) -> EarlierStops {
 }
 
 /// Wait for `stops` to finish. Errs when any of them failed.
-async fn wait_for_stops(stops: EarlierStops) -> Result<(), String> {
+pub(crate) async fn wait_for_stops(stops: EarlierStops) -> Result<(), String> {
     let mut first_error = None;
     for mut result in stops.0 {
         let outcome = match result.wait_for(Option::is_some).await {
