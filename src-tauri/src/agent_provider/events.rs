@@ -914,6 +914,18 @@ pub const RATE_LIMIT_SUBTYPE: &str = "rate_limit";
 /// `src/lib/agent-chat/reducer.ts`.
 pub const CHILD_EXITED_SUBTYPE: &str = "child_exited";
 
+/// Terminal event for a request whose provider process ended (crash or
+/// close) before it was answered. Persisted, so hydration shows it expired
+/// rather than offering a control whose callback is gone.
+pub fn expired_request_event(thread_id: ThreadId, request_id: RequestId) -> ProviderRuntimeEvent {
+    ProviderRuntimeEvent::RequestResponseFailed {
+        thread_id,
+        request_id,
+        reason: RequestResponseFailureReason::StaleProviderCallback,
+        message: "This request expired when the provider session ended. Continue to have the agent repeat it.".into(),
+    }
+}
+
 /// Build the terminal runtime events a provider watchdog should emit when
 /// its child process (sidecar / app-server / shared server) dies
 /// unexpectedly mid-run.

@@ -1218,6 +1218,28 @@ impl ClaudeSession {
             {
                 Err(ProviderError::RequestNotPending { request_id })
             }
+            // A dead sidecar cannot receive this answer: report the request
+            // as orphaned instead of a retryable failure. A reply still
+            // outstanding when the child exits fails as a plain RPC error,
+            // after the child is already marked not alive.
+            Err(
+                crate::json_rpc_child::RpcChildError::ChildExited { .. }
+                | crate::json_rpc_child::RpcChildError::AlreadyShutdown,
+            ) => Err(ProviderError::SessionClosed {
+                thread_id: self.thread_id.clone(),
+            }),
+            Err(crate::json_rpc_child::RpcChildError::IoError(e))
+                if e.kind() == std::io::ErrorKind::BrokenPipe =>
+            {
+                Err(ProviderError::SessionClosed {
+                    thread_id: self.thread_id.clone(),
+                })
+            }
+            Err(crate::json_rpc_child::RpcChildError::RpcError(_)) if !self.sidecar.is_alive() => {
+                Err(ProviderError::SessionClosed {
+                    thread_id: self.thread_id.clone(),
+                })
+            }
             Err(e) => Err(ProviderError::RpcError {
                 message: format!("respond-to-request RPC failed: {e}"),
             }),
@@ -1504,6 +1526,12 @@ fn spawn_notifications_task(
                             // turn. Preserve its identity before that mutation.
                             let active_turn=session.state.lock().await.active_turn.clone();
                             mutate_state_from_notification(&session, &structured).await;
+                            let opened_request = match &structured {
+                                SidecarNotification::RequestOpened { request_id, .. } => {
+                                    Some(RequestId(request_id.clone()))
+                                }
+                                _ => None,
+                            };
                             // Catch any panic in the pure translator so
                             // a bug can't kill this task.
                             let events = std::panic::catch_unwind(
@@ -1536,6 +1564,21 @@ fn spawn_notifications_task(
                             for mut e in events {
                                 stamp_turn_id(&mut e, active_turn.as_ref());
                                 let _ = event_tx.send(e);
+                            }
+                            // The crash watchdog may have drained (and
+                            // expired) pending requests before this one was
+                            // published. It marks the session dead before
+                            // taking the state lock, so checking under that
+                            // lock catches every request it missed.
+                            if let Some(request_id) = opened_request {
+                                let mut state = session.state.lock().await;
+                                if session.dead.load(Ordering::Relaxed) {
+                                    state.pending_approvals.remove(&request_id);
+                                    let _ = event_tx.send(crate::agent_provider::expired_request_event(
+                                        session.thread_id.clone(),
+                                        request_id,
+                                    ));
+                                }
                             }
                             // Follow-up queue: a notification may have
                             // just returned the session to idle (SDK
@@ -1928,14 +1971,24 @@ fn spawn_child_exit_watchdog(
                             // both Running and WaitingApproval) BEFORE clearing
                             // it, so the watchdog can settle it with a synthetic
                             // terminal `TurnCompleted`.
-                            let active_turn = {
+                            let (active_turn, orphaned) = {
                                 let mut state = session.state.lock().await;
                                 let active_turn = state.active_turn.take();
                                 state.status = SessionStatus::Error {
                                     message: msg.clone(),
                                 };
-                                active_turn
+                                // Background subagents can hold approvals
+                                // after the parent turn ended; expire them all.
+                                let orphaned: Vec<RequestId> =
+                                    state.pending_approvals.drain().map(|(id, _)| id).collect();
+                                (active_turn, orphaned)
                             };
+                            for request_id in orphaned {
+                                let _ = event_tx.send(crate::agent_provider::expired_request_event(
+                                    session.thread_id.clone(),
+                                    request_id,
+                                ));
+                            }
                             // TurnCompleted(child_exited) first, then the Error
                             // state — see `child_exit_events` for why the order
                             // matters.
