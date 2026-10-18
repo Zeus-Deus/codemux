@@ -2944,18 +2944,30 @@ async fn a_compaction_result_does_not_release_an_interrupt_with_an_unknown_outco
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_compaction_torn_down_keeps_its_output_hidden_and_its_queue_closed() {
     let thread = "t-compact-teardown";
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("emitted");
+    let marker_env = marker.to_string_lossy().to_string();
     // The interrupt is acknowledged but never confirmed, and the run keeps
-    // talking while the app tears its sidecar down.
+    // talking after the app has started tearing its sidecar down (the
+    // fixture stays alive past stdin EOF to write it).
     let (events, provider, queued) = unconfirmed_stop_events(
         thread,
-        &[],
+        &[
+            ("FAKE_CLAUDE_LINGER_AFTER_EOF_MS", "400"),
+            ("FAKE_CLAUDE_EMITTED_MARKER", &marker_env),
+        ],
         vec![
-            compaction_sdk(thread, 2100, "interrupt",
+            compaction_sdk(thread, 2150, "interrupt",
                 json!({"type": "assistant", "parent_tool_use_id": null, "message": {"role": "assistant",
                 "content": [{"type": "text", "text": "Late compaction output"}]}})),
         ],
     )
     .await;
+    let emitted = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert!(
+        emitted.contains("sdk-message"),
+        "the fixture must really write the late output during teardown"
+    );
     assert!(queued.is_some());
     assert_no_turn_ran_after_compaction(&events);
     let id = ThreadId(thread.into());

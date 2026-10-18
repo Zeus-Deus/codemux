@@ -130,6 +130,15 @@ fn fire_script_entries_for(method: &str, script: &[ScriptEntry]) {
                         "method": entry.method,
                         "params": entry.params,
                     }));
+                    // Lets a test prove a late line really was written.
+                    if let Ok(path) = std::env::var("FAKE_CLAUDE_EMITTED_MARKER") {
+                        let mut f = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                            .expect("open emitted marker");
+                        let _ = writeln!(f, "{}", entry.method);
+                    }
                 }
                 "server_request" => {
                     write_line(&json!({
@@ -175,6 +184,14 @@ fn main() {
         line.clear();
         let n = stdin.read_line(&mut line).expect("read_line");
         if n == 0 {
+            // Regression fixture: keep emitting scripted output for a while
+            // after the host closed stdin, like an SDK still mid-run.
+            if let Some(ms) = std::env::var("FAKE_CLAUDE_LINGER_AFTER_EOF_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
             break;
         }
         let trimmed = line.trim();
