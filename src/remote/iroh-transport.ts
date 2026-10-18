@@ -97,6 +97,7 @@ export class IrohWebSocket implements WebSocketLike {
   onclose: ((ev: { code?: number; reason?: string }) => void) | null = null;
   onerror: ((ev: unknown) => void) | null = null;
   onmessage: ((ev: { data: unknown }) => void) | null = null;
+  onactivity: (() => void) | null = null;
 
   private stream: IrohByteStream | null = null;
   private readonly decoder = new FrameDecoder();
@@ -175,6 +176,9 @@ export class IrohWebSocket implements WebSocketLike {
         this.teardown(undefined);
         return;
       }
+      // Bytes are progress even mid-frame: a large frame on a slow relay
+      // takes many reads to complete.
+      if (this.welcomed) this.onactivity?.();
       this.decoder.push(chunk);
       try {
         let frame: IrohFrame | null;

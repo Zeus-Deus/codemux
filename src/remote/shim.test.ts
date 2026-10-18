@@ -102,6 +102,59 @@ describe("invoke routing", () => {
   });
 });
 
+describe("terminal attach serialization", () => {
+  const attaches = (ws: FakeWebSocket) =>
+    ws.parsedSent().filter((m) => m.t === "invoke" && m.cmd === "attach_pty_output");
+
+  it("sends one attach_pty_output at a time, each after the previous reply", async () => {
+    const { ws } = await setup();
+    const a = internals().invoke("attach_pty_output", { sessionId: "a" });
+    const b = internals().invoke("attach_pty_output", { sessionId: "b" });
+    await flushMicrotasks();
+    expect(attaches(ws)).toHaveLength(1);
+    // Other commands are not held behind the replay.
+    void internals().invoke("get_app_state", {});
+    expect(ws.lastSent()).toMatchObject({ cmd: "get_app_state" });
+
+    ws.recvText({ t: "ok", id: attaches(ws)[0].id, data: 1 });
+    await expect(a).resolves.toBe(1);
+    await flushMicrotasks();
+    expect(attaches(ws)).toHaveLength(2);
+    expect(attaches(ws)[1].args).toMatchObject({ sessionId: "b" });
+    ws.recvText({ t: "ok", id: attaches(ws)[1].id, data: 2 });
+    await expect(b).resolves.toBe(2);
+  });
+
+  it("releases queued attaches when the socket drops mid-replay", async () => {
+    const { ws } = await setup();
+    const a = internals().invoke("attach_pty_output", { sessionId: "a" });
+    const b = internals().invoke("attach_pty_output", { sessionId: "b" });
+    const rejected = expect(a).rejects.toThrow(/connection lost/);
+    await flushMicrotasks();
+    expect(attaches(ws)).toHaveLength(1);
+
+    ws.drop();
+    await rejected;
+    // The queued attach is not wedged: it runs next, and fails fast while
+    // the socket is down instead of waiting on the dead one.
+    await expect(b).rejects.toThrow(/not connected/);
+    const c = internals().invoke("attach_pty_output", { sessionId: "c" });
+    await expect(c).rejects.toThrow(/not connected/);
+  });
+
+  it("keeps the queue moving after a failed attach", async () => {
+    const { ws } = await setup();
+    const a = internals().invoke("attach_pty_output", { sessionId: "a" });
+    const b = internals().invoke("attach_pty_output", { sessionId: "b" });
+    await flushMicrotasks();
+    ws.recvText({ t: "err", id: attaches(ws)[0].id, error: "gone" });
+    await expect(a).rejects.toBe("gone");
+    await flushMicrotasks();
+    ws.recvText({ t: "ok", id: attaches(ws)[1].id, data: 2 });
+    await expect(b).resolves.toBe(2);
+  });
+});
+
 describe("event listen/unlisten refcounting", () => {
   it("sends one listen for many subscribers and one unlisten at the last", async () => {
     const { ws } = await setup();

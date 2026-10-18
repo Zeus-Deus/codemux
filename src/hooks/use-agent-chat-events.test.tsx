@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 
 import type { AgentChatEventPayload } from "@/tauri/events";
 
@@ -38,6 +38,7 @@ vi.mock("@/tauri/commands", () => ({
 
 import { useAgentChatEvents } from "./use-agent-chat-events";
 import { useCustomAcp } from "@/stores/custom-acp-store";
+import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 
 function payloadFor(threadId: string, text: string): AgentChatEventPayload {
   return {
@@ -169,6 +170,30 @@ describe("useAgentChatEvents", () => {
     );
 
     act(() => lastChannel().onmessage(payloadFor("thread-2", "tok")));
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-attaches after a web-remote reconnect and detaches the dead channel", async () => {
+    // Earlier tests leave their hooks mounted; they would re-attach too.
+    cleanup();
+    attachAgentChatOutput.mockClear();
+    detachAgentChatOutput.mockClear();
+    const handler = vi.fn();
+    act(() => useRemoteConnectionStore.getState().setConnected("desk"));
+    renderHook(() => useAgentChatEvents("thread-1", handler));
+    const dead = lastChannel();
+
+    // The first connect is not a reconnect; a drop and recovery is.
+    act(() => useRemoteConnectionStore.getState().setReconnecting("desk"));
+    expect(attachAgentChatOutput).toHaveBeenCalledTimes(1);
+    act(() => useRemoteConnectionStore.getState().setConnected("desk"));
+
+    expect(attachAgentChatOutput).toHaveBeenCalledTimes(2);
+    expect(lastChannel()).not.toBe(dead);
+    await waitFor(() =>
+      expect(detachAgentChatOutput).toHaveBeenCalledWith("thread-1", 7),
+    );
+    act(() => lastChannel().onmessage(payloadFor("thread-1", "tok")));
     expect(handler).toHaveBeenCalledTimes(1);
   });
 

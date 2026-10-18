@@ -1640,16 +1640,7 @@ impl AgentProvider for HermesProvider {
         }
     }
     fn event_stream(&self) -> ProviderEventStream {
-        let rx = self.inner.events.subscribe();
-        Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
-            loop {
-                match rx.recv().await {
-                    Ok(e) => return Some((e, rx)),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(_) => return None,
-                }
-            }
-        }))
+        super::provider::broadcast_event_stream(&self.inner.events, self.kind())
     }
     fn managed_event_stream(&self, thread_id: &ThreadId) -> ProviderEventStream {
         super::managed_bridge::event_stream(&self.inner.events, thread_id)

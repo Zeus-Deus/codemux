@@ -781,3 +781,41 @@ describe("use-keyboard-shortcuts dispatch — plugin shortcuts", () => {
     }
   });
 });
+
+// The card's saved visibility must only change when the card can be seen:
+// under Settings, the new-project screen, a utility page, a draft or a fully
+// expanded panel its host is unmounted and the shortcut is a no-op.
+describe("use-keyboard-shortcuts dispatch — toggleWorkspaceDetails", () => {
+  beforeEach(() => {
+    useAppStore.setState({
+      appState: {
+        active_workspace_id: "ws-1",
+        workspaces: [{ workspace_id: "ws-1", surfaces: [] }],
+        agent_browser_sessions: [],
+      } as unknown as NonNullable<ReturnType<typeof useAppStore.getState>["appState"]>,
+    });
+    useUIStore.setState({
+      workspaceDetailsOpen: true,
+      workspaceDetailsMode: "pinned",
+      workspaceDetailsPopoverOpen: false,
+    });
+  });
+
+  it("does nothing while the card's host is not mounted", () => {
+    useUIStore.setState({ workspaceDetailsHosted: false });
+    expect(dispatch("toggleWorkspaceDetails", FAKE_EVENT)).toBe(false);
+    expect(useUIStore.getState().workspaceDetailsOpen).toBe(true);
+  });
+
+  it("toggles the card in its current form while hosted", () => {
+    useUIStore.setState({ workspaceDetailsHosted: true });
+    expect(dispatch("toggleWorkspaceDetails", FAKE_EVENT)).toBe(true);
+    expect(useUIStore.getState().workspaceDetailsOpen).toBe(false);
+
+    useUIStore.setState({ workspaceDetailsMode: "popover" });
+    expect(dispatch("toggleWorkspaceDetails", FAKE_EVENT)).toBe(true);
+    expect(useUIStore.getState().workspaceDetailsPopoverOpen).toBe(true);
+    // The pinned preference is untouched by the popover form.
+    expect(useUIStore.getState().workspaceDetailsOpen).toBe(false);
+  });
+});

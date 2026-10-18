@@ -282,3 +282,25 @@ describe("IrohWebSocket integration with the codec across chunk splits", () => {
     expect((created as unknown as FakeIrohStream).closed).toBe(true);
   });
 });
+
+describe("IrohWebSocket activity", () => {
+  it("reports each chunk after welcome, before a frame is complete", async () => {
+    const h = mount();
+    let activity = 0;
+    h.ws.onactivity = () => (activity += 1);
+    await tick();
+    h.stream.deliver(welcome());
+    await tick();
+    expect(activity).toBe(0);
+
+    const frame = encodeFrame(KIND_TEXT, enc.encode(JSON.stringify({ t: "event", event: "x" })));
+    h.stream.deliver(frame.slice(0, 4));
+    await tick();
+    expect(activity).toBe(1);
+    expect(h.messages).toHaveLength(0);
+    h.stream.deliver(frame.slice(4));
+    await tick();
+    expect(activity).toBe(2);
+    expect(h.messages).toHaveLength(1);
+  });
+});

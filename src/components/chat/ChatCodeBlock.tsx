@@ -38,6 +38,7 @@ import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
 import { toast } from "@/lib/toast";
 
 import { useChatFileLinkContext } from "./chat-file-link-context";
+import { useChatMarkdownStreaming } from "./chat-markdown-streaming";
 import { MarkdownFileLink } from "./MarkdownFileLink";
 
 interface ChatCodeRendererContextValue {
@@ -231,6 +232,11 @@ function rememberHighlight(entry: HighlightedEntry) {
   }
 }
 
+// Shiki tokenizes on the main thread at roughly 8ms per 1,000 characters, so
+// one pass over a fence this size already blocks for most of a second.
+export const MAX_HIGHLIGHT_CHARS = 100_000;
+export const STREAMING_HIGHLIGHT_INTERVAL_MS = 250;
+
 /**
  * Highlighted tokens for one fence, stale-while-revalidating.
  *
@@ -246,12 +252,16 @@ function rememberHighlight(entry: HighlightedEntry) {
  * language being unchanged, and on the old code still being a prefix of the
  * new one — a fence that switches language or is rewritten falls back to raw
  * rather than painting one language's colors onto another's source.
+ *
+ * Fences over `MAX_HIGHLIGHT_CHARS` are never sent to Shiki and render plain.
  */
 function useHighlightedCode(
   code: string,
   language: string,
   highlighter: CodeHighlighterPlugin,
+  streaming: boolean,
 ): HighlightResult {
+  const highlightable = code.length <= MAX_HIGHLIGHT_CHARS;
   const cacheKey = `${language}\u0000${code}`;
   const [lightTheme, darkTheme] = highlighter.getThemes();
   const cache = remountHighlights.get(highlighter);
@@ -261,14 +271,32 @@ function useHighlightedCode(
   const [highlighted, setHighlighted] = useState<HighlightedEntry | null>(
     () => cached ?? null,
   );
+  // This block's last finished highlight pass, whether one is still in
+  // flight, and the latest streaming request deferred until it lands.
+  const pass = useRef<{
+    endedAt: number;
+    ms: number;
+    pending: boolean;
+    onIdle: (() => void) | null;
+  }>({ endedAt: -Infinity, ms: 0, pending: false, onIdle: null });
 
   useEffect(() => {
     if (cached) {
       setHighlighted((previous) => previous === cached ? previous : cached);
       return;
     }
+    if (!highlightable) return;
     let active = true;
+    let startedAt = 0;
+    let timer: number | null = null;
     const accept = (result: HighlightResult) => {
+      const state = pass.current;
+      state.endedAt = performance.now();
+      state.ms = state.endedAt - startedAt;
+      state.pending = false;
+      const idle = state.onIdle;
+      state.onIdle = null;
+      idle?.();
       if (!active) return;
       const entry: HighlightedEntry = {
         cacheKey,
@@ -281,22 +309,55 @@ function useHighlightedCode(
       rememberHighlight(entry);
       setHighlighted(entry);
     };
-    const result = highlighter.highlight(
-      {
-        code,
-        language: language as BundledLanguage,
-        themes: [lightTheme, darkTheme],
-      },
-      accept,
-    );
-    if (result) accept(result);
+    const request = () => {
+      timer = null;
+      startedAt = performance.now();
+      pass.current.pending = true;
+      const result = highlighter.highlight(
+        {
+          code,
+          language: language as BundledLanguage,
+          themes: [lightTheme, darkTheme],
+        },
+        accept,
+      );
+      if (result) accept(result);
+    };
+    // Every pass re-tokenizes the whole fence synchronously, and a pass the
+    // plugin has queued (say, behind a cold highlighter load) cannot be
+    // cancelled. So while its message streams, a fence waits for any pass in
+    // flight, then is re-highlighted at most once per interval (or per the
+    // last pass's own cost, if longer); the tail in between shows uncolored.
+    const schedule = () => {
+      const { endedAt, ms } = pass.current;
+      const wait = streaming
+        ? endedAt + Math.max(STREAMING_HIGHLIGHT_INTERVAL_MS, ms) - performance.now()
+        : 0;
+      if (wait > 0) timer = window.setTimeout(request, wait);
+      else request();
+    };
+    if (streaming && pass.current.pending) pass.current.onIdle = schedule;
+    else schedule();
     return () => {
       active = false;
+      if (timer !== null) window.clearTimeout(timer);
+      if (pass.current.onIdle === schedule) pass.current.onIdle = null;
     };
-  }, [cached, cacheKey, code, highlighter, language, lightTheme, darkTheme]);
+  }, [
+    cached,
+    cacheKey,
+    code,
+    highlightable,
+    highlighter,
+    language,
+    lightTheme,
+    darkTheme,
+    streaming,
+  ]);
 
   return useMemo(() => {
     if (cached) return cached.result;
+    if (!highlightable) return rawHighlightResult(code);
     const compatible = highlighted?.highlighter === highlighter
       && sameThemes(highlighted.themes, [lightTheme, darkTheme]);
     if (compatible && highlighted.cacheKey === cacheKey) return highlighted.result;
@@ -307,7 +368,17 @@ function useHighlightedCode(
       );
     }
     return rawHighlightResult(code);
-  }, [cached, cacheKey, code, highlighted, language, highlighter, lightTheme, darkTheme]);
+  }, [
+    cached,
+    cacheKey,
+    code,
+    highlightable,
+    highlighted,
+    language,
+    highlighter,
+    lightTheme,
+    darkTheme,
+  ]);
 }
 
 type TokenStyle = CSSProperties & Record<`--${string}`, string | number>;
@@ -323,12 +394,14 @@ function HighlightedCode({
   code,
   language,
   highlighter,
+  streaming,
 }: {
   code: string;
   language: string;
   highlighter: CodeHighlighterPlugin;
+  streaming: boolean;
 }) {
-  const result = useHighlightedCode(code, language, highlighter);
+  const result = useHighlightedCode(code, language, highlighter, streaming);
   const lines = useMemo(
     () =>
       result.tokens.map((tokens, lineIndex) => ({
@@ -424,6 +497,9 @@ function ChatFencedCode({
 }: ComponentProps<"code"> & ExtraProps) {
   const { defaultWrap, highlighter } = useChatCodeRenderer();
   const isIncomplete = useIsCodeFenceIncomplete();
+  // The message's own streaming flag: Streamdown only reports an open fence
+  // when it is told the text is animating, which `ChatMarkdown` does not do.
+  const streaming = useChatMarkdownStreaming();
   const language = extractFenceLanguage(className);
   const meta = node?.properties?.metastring;
   const fenceTitle = extractFenceTitle(
@@ -513,6 +589,7 @@ function ChatFencedCode({
           code={code}
           language={language}
           highlighter={highlighter}
+          streaming={streaming}
         />
       </div>
     </div>

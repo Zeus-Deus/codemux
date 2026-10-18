@@ -11,8 +11,8 @@
 //!     Tauri channel → xterm.
 //!
 //! Input flow:
-//!     xterm onData → write_to_pty (sync) → `DaemonWriter::write` (fire
-//!     and forget tokio task) → client.write → socket → daemon → master fd.
+//!     xterm onData → write_to_pty → ordered writer queue → client.write →
+//!     socket → daemon → master fd → acknowledgement.
 
 use super::{
     emit_terminal_status, hydration_workspace_pty_env, queue_or_send_output, with_session_runtime,
@@ -882,6 +882,7 @@ async fn spawn_prepared_session<R: Runtime>(
         &session_id,
         || SessionRuntime::new(&session_id),
         |runtime| {
+            runtime.daemon_writer = Some(writer.clone());
             runtime.writer = Some(Box::new(writer));
             runtime.master = None;
             runtime.child_pid = Some(pid);
@@ -1056,47 +1057,105 @@ async fn spawn_prepared_session<R: Runtime>(
     Ok(())
 }
 
-/// Adapter from sync `std::io::Write` to async `PtyDaemonClient::write`.
-///
-/// Writes are **fire-and-forget**: each `write` call clones the bytes,
-/// spawns a tokio task that sends them to the daemon, and returns the
-/// reported byte count immediately. Failures are logged but don't bubble
-/// up to the caller. This matches the existing in-process behavior, where
-/// `portable_pty::Writer::write` is also effectively non-blocking once
-/// the OS buffer has room.
+/// Acknowledgement for one queued input write. Internal callers await it after
+/// releasing the shared sessions lock; terminal typing drops it (see
+/// `admit_pty_input`), which routes a failure to the session's next input.
+pub(crate) type WriteAck = tokio::sync::oneshot::Receiver<std::io::Result<()>>;
+
+type QueuedWrite = (Vec<u8>, tokio::sync::oneshot::Sender<std::io::Result<()>>);
+
+/// Upper bound on input merged into one daemon write by the drain task.
+const MAX_COALESCED_INPUT: usize = 64 * 1024;
+
+/// One ordered input queue per session, shared by IPC and synchronous input.
+/// Each caller receives its own daemon acknowledgement or error.
+#[derive(Clone)]
 pub(crate) struct DaemonWriter {
-    client: Arc<PtyDaemonClient>,
-    session_id: String,
+    queue: tokio::sync::mpsc::UnboundedSender<QueuedWrite>,
+    /// Failure of a write whose acknowledgement nobody awaited.
+    unawaited_failure: Arc<std::sync::Mutex<Option<std::io::Error>>>,
 }
 
 impl DaemonWriter {
-    fn new(client: Arc<PtyDaemonClient>, session_id: String) -> Self {
-        Self { client, session_id }
+    pub(super) fn new(client: Arc<PtyDaemonClient>, session_id: String) -> Self {
+        let (queue, mut pending) = tokio::sync::mpsc::unbounded_channel::<QueuedWrite>();
+        let unawaited_failure = Arc::new(std::sync::Mutex::new(None));
+        let drain_failure = Arc::clone(&unawaited_failure);
+        tauri::async_runtime::spawn(async move {
+            while let Some((mut data, reply)) = pending.recv().await {
+                // Merge input queued while the previous write was in flight,
+                // so a typing burst costs one daemon round trip, not one each.
+                let mut replies = vec![reply];
+                while data.len() < MAX_COALESCED_INPUT {
+                    let Ok((more, reply)) = pending.try_recv() else {
+                        break;
+                    };
+                    data.extend_from_slice(&more);
+                    replies.push(reply);
+                }
+                let result = client
+                    .write(session_id.clone(), &data)
+                    .await
+                    .map_err(|error| match error {
+                        PtyDaemonError::Io(error) => error,
+                        PtyDaemonError::Closed => {
+                            std::io::Error::from(std::io::ErrorKind::BrokenPipe)
+                        }
+                        PtyDaemonError::Timeout => {
+                            std::io::Error::new(std::io::ErrorKind::TimedOut, error)
+                        }
+                        error => std::io::Error::other(error),
+                    });
+                for reply in replies {
+                    let result = match &result {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+                    };
+                    if let Err(Err(error)) = reply.send(result) {
+                        drain_failure
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_insert(error);
+                    }
+                }
+            }
+        });
+        Self {
+            queue,
+            unawaited_failure,
+        }
+    }
+
+    pub(super) fn take_unawaited_failure(&self) -> Option<std::io::Error> {
+        self.unawaited_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    pub(super) fn enqueue(&self, data: &[u8]) -> std::io::Result<WriteAck> {
+        let (reply, ack) = tokio::sync::oneshot::channel();
+        self.queue.send((data.to_vec(), reply)).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty daemon writer stopped")
+        })?;
+        Ok(ack)
     }
 }
 
+/// Only `queue_pty_input` may write daemon input: it calls `enqueue` and
+/// waits for the acknowledgement after releasing the sessions lock. This impl
+/// exists only so the writer can fill `SessionRuntime::writer`, which marks the
+/// session writable. A direct write fails fast instead of blocking, which
+/// would panic on a tokio runtime thread.
 impl std::io::Write for DaemonWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let client = self.client.clone();
-        let session_id = self.session_id.clone();
-        let data = buf.to_vec();
-        // Only log on failure — the happy path fires for every
-        // keystroke, which would flood stderr.
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = client.write(session_id.clone(), &data).await {
-                eprintln!(
-                    "[codemux::terminal::daemon_backed] DaemonWriter dispatch failed for \
-                     {session_id}: {error}"
-                );
-            }
-        });
-        Ok(buf.len())
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "daemon input must go through queue_pty_input",
+        ))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        // No-op: writes are already dispatched, and the daemon flushes the
-        // master fd after every write. A blocking flush here would require
-        // round-tripping the daemon, which is wrong for the sync interface.
         Ok(())
     }
 }
@@ -1113,6 +1172,248 @@ mod tests {
     use crate::pty_daemon::{DaemonSessionInfo, PtyDaemonClient, PtyDaemonError};
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// Read one `Write` request off the fake daemon socket.
+    async fn read_test_write(
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    ) -> (u64, Vec<u8>) {
+        use base64::Engine;
+
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let ClientRequest::Write {
+            request_id,
+            data_b64,
+            ..
+        } = serde_json::from_str(&line).unwrap()
+        else {
+            panic!("expected Write");
+        };
+        (
+            request_id,
+            base64::engine::general_purpose::STANDARD
+                .decode(data_b64)
+                .unwrap(),
+        )
+    }
+
+    async fn send_test_response(
+        write: &mut tokio::net::unix::OwnedWriteHalf,
+        response: ServerResponse,
+    ) {
+        let mut bytes = serde_json::to_vec(&Frame::Response(response)).unwrap();
+        bytes.push(b'\n');
+        write.write_all(&bytes).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_writer_reports_write_rejection() {
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let client = PtyDaemonClient::from_test_stream(client_stream, Duration::from_secs(1));
+        let (server_read, mut server_write) = server_stream.into_split();
+        let mut reader = BufReader::new(server_read);
+        let ack = super::DaemonWriter::new(client, "missing".into())
+            .enqueue(b"input")
+            .unwrap();
+        let (request_id, _) = read_test_write(&mut reader).await;
+        send_test_response(
+            &mut server_write,
+            ServerResponse::Error {
+                request_id,
+                message: "unknown session".into(),
+            },
+        )
+        .await;
+        let result = ack.await.unwrap();
+        assert!(
+            result.is_err(),
+            "the rejected write was reported as successful"
+        );
+        assert!(result.unwrap_err().to_string().contains("unknown session"));
+    }
+
+    #[tokio::test]
+    async fn daemon_writer_sends_each_write_after_the_previous_is_acknowledged() {
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let client = PtyDaemonClient::from_test_stream(client_stream, Duration::from_secs(1));
+        let (server_read, mut server_write) = server_stream.into_split();
+        let mut reader = BufReader::new(server_read);
+        let writer = super::DaemonWriter::new(client, "session".into());
+        let first_ack = writer.enqueue(b"command").unwrap();
+        let (first_id, first) = read_test_write(&mut reader).await;
+        assert_eq!(first, b"command");
+        // Input queued while a write is in flight goes out next, merged in order.
+        let second_ack = writer.enqueue(b"\r").unwrap();
+        let third_ack = writer.enqueue(b"ls").unwrap();
+        let mut line = String::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut line))
+                .await
+                .is_err(),
+            "the second write was sent before the first was acknowledged"
+        );
+        send_test_response(
+            &mut server_write,
+            ServerResponse::Written {
+                request_id: first_id,
+            },
+        )
+        .await;
+        let (second_id, second) = read_test_write(&mut reader).await;
+        assert_eq!(second, b"\rls");
+        send_test_response(
+            &mut server_write,
+            ServerResponse::Written {
+                request_id: second_id,
+            },
+        )
+        .await;
+        first_ack.await.unwrap().unwrap();
+        second_ack.await.unwrap().unwrap();
+        third_ack.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_writer_input_waits_without_holding_sessions_lock() {
+        use super::super::{write_pty_input_sync, SessionRuntime};
+        use std::sync::{Arc, Mutex};
+
+        {
+            let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+            let client = PtyDaemonClient::from_test_stream(client_stream, Duration::from_secs(1));
+            let (server_read, mut server_write) = server_stream.into_split();
+            let mut reader = BufReader::new(server_read);
+            let writer = super::DaemonWriter::new(client, "session".into());
+            let mut runtime = SessionRuntime::new("session");
+            runtime.daemon_writer = Some(writer.clone());
+            runtime.writer = Some(Box::new(writer));
+            let sessions = Arc::new(Mutex::new(std::collections::HashMap::from([(
+                "session".into(),
+                runtime,
+            )])));
+            let input_sessions = sessions.clone();
+            let input = tokio::task::spawn_blocking(move || {
+                write_pty_input_sync(&input_sessions, "session", b"input")
+            });
+            let (request_id, _) = read_test_write(&mut reader).await;
+            assert!(
+                !input.is_finished(),
+                "input returned before the daemon acknowledged it"
+            );
+            assert!(
+                sessions.try_lock().is_ok(),
+                "input held up other terminals while awaiting the daemon"
+            );
+            send_test_response(
+                &mut server_write,
+                ServerResponse::Error {
+                    request_id,
+                    message: "unknown session".into(),
+                },
+            )
+            .await;
+            assert!(input
+                .await
+                .unwrap()
+                .unwrap_err()
+                .contains("unknown session"));
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_is_admitted_without_waiting_for_the_daemon() {
+        use super::super::{admit_pty_input, SessionRuntime};
+        use std::sync::{Arc, Mutex};
+
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let client = PtyDaemonClient::from_test_stream(client_stream, Duration::from_secs(1));
+        let (server_read, mut server_write) = server_stream.into_split();
+        let mut reader = BufReader::new(server_read);
+        let mut runtimes = std::collections::HashMap::new();
+        for id in ["slow", "other"] {
+            let writer = super::DaemonWriter::new(client.clone(), id.into());
+            let mut runtime = SessionRuntime::new(id);
+            runtime.daemon_writer = Some(writer.clone());
+            runtime.writer = Some(Box::new(writer));
+            runtimes.insert(id.to_string(), runtime);
+        }
+        let sessions = Arc::new(Mutex::new(runtimes));
+
+        // An unacknowledged write to one session doesn't hold up another.
+        admit_pty_input(&sessions, "slow", b"a").unwrap();
+        let (slow_id, slow) = read_test_write(&mut reader).await;
+        assert_eq!(slow, b"a");
+        admit_pty_input(&sessions, "other", b"b").unwrap();
+        let (other_id, other) = read_test_write(&mut reader).await;
+        assert_eq!(other, b"b");
+        send_test_response(&mut server_write, ServerResponse::Written { request_id: other_id }).await;
+        send_test_response(
+            &mut server_write,
+            ServerResponse::Error {
+                request_id: slow_id,
+                message: "unknown session".into(),
+            },
+        )
+        .await;
+
+        // The unawaited failure is reported by the session's next input,
+        // which is still queued.
+        let slow_writer = sessions.lock().unwrap()["slow"].daemon_writer.clone().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while slow_writer.unawaited_failure.lock().unwrap().is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "failure was never recorded");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let error = admit_pty_input(&sessions, "slow", b"c").unwrap_err();
+        assert!(error.contains("unknown session"), "{error}");
+        let (_, next) = read_test_write(&mut reader).await;
+        assert_eq!(next, b"c");
+    }
+
+    #[tokio::test]
+    async fn daemon_writer_direct_write_fails_fast_on_a_runtime_thread() {
+        use std::io::Write;
+
+        let (client_stream, _server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let client = PtyDaemonClient::from_test_stream(client_stream, Duration::from_secs(1));
+        let error = super::DaemonWriter::new(client, "session".into())
+            .write_all(b"input")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn daemon_writer_reports_timeout_and_disconnect() {
+        for disconnected in [false, true] {
+            let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+            let client =
+                PtyDaemonClient::from_test_stream(client_stream, Duration::from_millis(50));
+            let peer = if disconnected {
+                drop(server_stream);
+                None
+            } else {
+                Some(server_stream)
+            };
+            let error = super::DaemonWriter::new(client, "session".into())
+                .enqueue(b"input")
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if disconnected {
+                    std::io::ErrorKind::BrokenPipe
+                } else {
+                    std::io::ErrorKind::TimedOut
+                }
+            );
+            drop(peer);
+        }
+    }
 
     #[test]
     fn only_confirmed_spawn_rejections_allow_local_fallback() {

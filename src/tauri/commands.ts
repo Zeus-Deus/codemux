@@ -2629,6 +2629,23 @@ export interface PriceOverride {
   cache_write: number;
 }
 
+/** Cost by the source that priced it, USD. */
+export interface CostSources {
+  provider_usd: number;
+  table_usd: number;
+  override_usd: number;
+}
+
+/** Inputs of the cache-savings estimate; all zero for a model the static
+ *  price table does not know. */
+export interface CacheSavings {
+  savings_usd: number;
+  /** What the table-priced work would have cost with no cache. */
+  uncached_usd: number;
+  /** What that same work actually cost. */
+  cached_usd: number;
+}
+
 /** One row of the flat, cross-provider model breakdown. */
 export interface FlatModelUsage {
   provider: string;
@@ -2649,6 +2666,10 @@ export interface FlatModelUsage {
   category_cost: CategoryCost;
   /** The rates the model is priced at (override, else the static table). */
   rates: PriceOverride | null;
+  /** Cost by the source that priced it; sums to the period's confidence. */
+  cost_sources: CostSources;
+  /** This model's part of the period's cache savings. */
+  cache_savings: CacheSavings;
   /** This model's slice of every bucket, aligned with `UsageSummary.buckets`. */
   buckets: UsageBucketSlice[];
 }
@@ -3642,3 +3663,87 @@ export const agentChatAnswerQuestion = (
     questionId,
     action,
   });
+
+// ── Suggested follow-up tasks (`suggest_tasks`; src-tauri/src/commands/follow_ups.rs) ──
+
+/** One started suggestion, as `agent_follow_up_tasks` stores it. */
+export interface FollowUpTaskRow {
+  child_thread_id: string;
+  parent_thread_id: string;
+  tool_call_id: string;
+  index: number;
+  /** Empty until the child workspace exists. */
+  workspace_id: string;
+  parent_workspace_id: string;
+  repo_path: string;
+  worktree_path: string;
+  branch: string;
+  /** The parent's HEAD commit the branch was made from. */
+  base_sha: string;
+  provider: string;
+  title: string;
+  outcome: "running" | "completed" | "failed" | "stopped";
+  additions: number | null;
+  deletions: number | null;
+  commits: number | null;
+  /** Files left uncommitted in the child's worktree when it finished. */
+  uncommitted: number | null;
+  merged: boolean;
+  created_at_ms: number;
+}
+
+export interface FollowUpProvider {
+  id: string;
+  label: string;
+  installed: boolean;
+}
+
+export interface FollowUpStarted {
+  child_thread_id: string;
+  workspace_id: string;
+  branch: string;
+}
+
+export interface FollowUpMergeResult {
+  target_branch: string | null;
+  merged: Array<{ child_thread_id: string; title: string; branch: string }>;
+  skipped: Array<{ child_thread_id: string; title: string; branch: string; reason: string }>;
+  conflict: {
+    child_thread_id: string;
+    title: string;
+    branch: string;
+    files: string[];
+    message: string | null;
+  } | null;
+  /** Why the run stopped early without a conflict (another merge appeared);
+   *  branches merged before that are still listed. */
+  stopped?: string | null;
+}
+
+/** Claude and Codex, plus the other installed delegation candidates. */
+export const followUpProviders = () => invoke<FollowUpProvider[]>("follow_up_providers");
+
+export const followUpList = (parentThreadId: string) =>
+  invoke<FollowUpTaskRow[]>("follow_up_list", { parentThreadId });
+
+/** Start suggestion `index` of call `toolCallId` in its own worktree. */
+export const followUpStart = (input: {
+  parentThreadId: string;
+  toolCallId: string;
+  index: number;
+  provider: string;
+  model?: string | null;
+  effort?: string | null;
+}) =>
+  invoke<FollowUpStarted>("follow_up_start", {
+    parentThreadId: input.parentThreadId,
+    toolCallId: input.toolCallId,
+    index: input.index,
+    provider: input.provider,
+    model: input.model ?? null,
+    effort: input.effort ?? null,
+  });
+
+/** Merge every finished child branch into the parent's checkout. */
+export const followUpMergeAll = (parentThreadId: string) =>
+  invoke<FollowUpMergeResult>("follow_up_merge_all", { parentThreadId });

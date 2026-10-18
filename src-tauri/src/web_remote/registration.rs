@@ -160,7 +160,7 @@ impl RegistrationManager {
 /// The stable device id for this install: read from settings, or generated once
 /// and persisted. A persistence failure still returns a usable id (the registry
 /// just can't dedupe across restarts in that degenerate case).
-fn stable_device_id(db: &DatabaseStore) -> String {
+pub(crate) fn stable_device_id(db: &DatabaseStore) -> String {
     if let Some(existing) = db.get_setting(DEVICE_ID_KEY) {
         if !existing.trim().is_empty() {
             return existing;

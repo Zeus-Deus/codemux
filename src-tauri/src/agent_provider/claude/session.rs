@@ -1701,10 +1701,7 @@ async fn push_mcp_refresh(
 /// searches for one, so a tool's description alone does not tell the agent
 /// when to reach for it.
 fn system_prompt_append(tools: &[super::protocol::McpToolEntry]) -> Option<String> {
-    tools
-        .iter()
-        .any(|tool| tool.prefixed_name == crate::mcp_server::HTML_RENDER_REGISTRY_NAME)
-        .then(|| crate::mcp_server::HTML_RENDER_GUIDANCE.to_string())
+    crate::mcp_server::tool_guidance(tools.iter().map(|tool| tool.prefixed_name.as_str()))
 }
 
 /// Snapshot every running MCP tool from the registry into the wire
@@ -2248,5 +2245,32 @@ mod tests {
         // No Codemux tools, or a same-named tool on another server.
         assert!(system_prompt_append(&[]).is_none());
         assert!(system_prompt_append(&[tool("mcp__other__html_render")]).is_none());
+    }
+
+    #[test]
+    fn system_prompt_guides_suggestions_only_when_suggest_tasks_is_listed() {
+        let tool = |prefixed_name: &str| super::super::protocol::McpToolEntry {
+            name: "suggest_tasks".into(),
+            prefixed_name: prefixed_name.into(),
+            description: None,
+            input_schema: json!({}),
+            server_id: "codemux-host".into(),
+        };
+        let suggest = crate::commands::follow_ups::SUGGEST_TASKS_GUIDANCE;
+        assert_eq!(
+            system_prompt_append(&[tool("mcp__codemux__suggest_tasks")]).as_deref(),
+            Some(suggest)
+        );
+        let both = system_prompt_append(&[
+            tool("mcp__codemux__suggest_tasks"),
+            tool("mcp__codemux__html_render"),
+        ])
+        .unwrap();
+        assert_eq!(
+            both,
+            format!("{}\n\n{suggest}", crate::mcp_server::HTML_RENDER_GUIDANCE),
+            "every listed tool's block, in a fixed order"
+        );
+        assert!(system_prompt_append(&[tool("mcp__other__suggest_tasks")]).is_none());
     }
 }

@@ -39,8 +39,22 @@ vi.mock("./agent-launcher", () => ({
   AgentLauncher: () => <div data-testid="agent-launcher" />,
   DraftAgentLauncher: () => <div data-testid="draft-agent-launcher" />,
 }));
-vi.mock("./run-button", () => ({
-  RunButton: () => <div data-testid="run-button" />,
+vi.mock("./workspace-details/workspace-details-panel", () => ({
+  WorkspaceDetailsHost: (props: { columnWidth: number; rightInset: number; edgeGap: number }) => (
+    <div
+      data-testid="workspace-details-host"
+      data-column-width={props.columnWidth}
+      data-right-inset={props.rightInset}
+      data-edge-gap={props.edgeGap}
+    />
+  ),
+  WorkspaceDetailsToggle: () => (
+    <button
+      type="button"
+      aria-label="Workspace details"
+      data-testid="workspace-details-toggle"
+    />
+  ),
 }));
 vi.mock("./resource-monitor", () => ({
   ResourceMonitor: ({ variant }: { variant?: string }) => (
@@ -184,6 +198,7 @@ vi.mock("@/stores/synced-settings-store", () => ({
     { getState: () => ({ isLoading: false, updateSetting: vi.fn() }) },
   ),
   selectDefaultEditor: () => null,
+  selectShowResourceMonitor: () => true,
 }));
 
 vi.mock("@/tauri/commands", () => ({
@@ -287,15 +302,15 @@ describe("TitleBar chrome gating", () => {
     expect(getByTestId("titlebar-tabs")).toBeInTheDocument();
     expect(getByTestId("agent-launcher")).toBeInTheDocument();
     // Rehomed right cluster.
-    const runButton = getByTestId("run-button");
+    const detailsToggle = getByTestId("workspace-details-toggle");
     const resourceMonitor = getByTestId("resource-monitor");
     const panelToggle = getByRole("button", { name: "Open panel" });
     const windowControls = getByTestId("window-controls");
-    expect(runButton).toBeInTheDocument();
+    expect(detailsToggle).toBeInTheDocument();
     expect(resourceMonitor).toBeInTheDocument();
     expect(panelToggle).toBeInTheDocument();
     expect(
-      runButton.compareDocumentPosition(panelToggle) &
+      detailsToggle.compareDocumentPosition(panelToggle) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(
@@ -366,35 +381,26 @@ describe("TitleBar chrome gating", () => {
     expect(panelToggle).not.toHaveClass("bg-card");
   });
 
-  it("groups primary actions separately from utility controls", () => {
+  it("puts the monitor, details, panel and window controls in one fixed run", () => {
     state.enableAgentChat = true;
-    const { getByRole, getByTestId } = renderBar();
-    const primary = getByTestId("titlebar-primary-actions");
-    const utilities = getByTestId("titlebar-utility-actions");
+    const { getByRole, getByTestId, queryByTestId, queryByRole } = renderBar();
+    const cluster = getByTestId("titlebar-panel-cluster");
+    const monitor = getByTestId("resource-monitor");
+    const details = getByRole("button", { name: "Workspace details" });
+    const panel = getByRole("button", { name: "Open panel" });
 
-    expect(primary).toContainElement(getByTestId("run-button"));
-    expect(utilities).toContainElement(getByTestId("resource-monitor"));
-    expect(getByTestId("resource-monitor")).toHaveAttribute(
-      "data-variant",
-      "ghost",
-    );
-    // The panel toggle deliberately does *not* live here any more: this
-    // island tracks the panel's left edge, so the toggle used to jump across
-    // the window whenever the panel opened. It now sits in the fixed cluster.
-    expect(utilities).not.toContainElement(
-      getByRole("button", { name: "Open panel" }),
-    );
-    expect(getByTestId("titlebar-panel-cluster")).toContainElement(
-      getByRole("button", { name: "Open panel" }),
-    );
-    expect(
-      primary.compareDocumentPosition(utilities) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-    // One uninterrupted action run: the utility group carries no leading
-    // margin of its own, just the band's shared 2px rhythm.
-    expect(utilities).toHaveClass("gap-[2px]");
-    expect(utilities).not.toHaveClass("ml-1");
+    // Run and the editor launcher moved into the details card.
+    expect(queryByTestId("titlebar-primary-actions")).toBeNull();
+    expect(queryByRole("button", { name: "Choose editor" })).toBeNull();
+    // The monitor leads the fixed corner cluster rather than riding the
+    // workspace band, so it keeps its place when the panel opens.
+    expect(getByTestId("titlebar-action-island")).not.toContainElement(monitor);
+    for (const el of [monitor, details, panel]) expect(cluster).toContainElement(el);
+    expect(monitor).toHaveAttribute("data-variant", "ghost");
+    expect(monitor.compareDocumentPosition(details) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(details.compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // One 4px rhythm (32px glyph pitch, like the window buttons).
+    expect(cluster).toHaveClass("gap-1");
   });
 
   it("keeps the header frameless: no plates behind the control groups", () => {
@@ -426,7 +432,7 @@ describe("TitleBar chrome gating", () => {
     // draft opened, which is not what's on screen.
     expect(queryByTestId("titlebar-tabs")).toBeNull();
     expect(queryByTestId("agent-launcher")).toBeNull();
-    expect(queryByTestId("run-button")).toBeNull();
+    expect(queryByTestId("workspace-details-toggle")).toBeNull();
     expect(queryByRole("button", { name: "Open panel" })).toBeNull();
     // Shared shell bits still render.
     expect(getByTestId("titlebar-sidebar-cluster")).toBeInTheDocument();
@@ -452,17 +458,13 @@ describe("TitleBar GUI chrome — floating placement", () => {
     // `[data-slot="sidebar-gap"]` node exists in this test tree), so
     // `useSidebarGapWidth` stays on its fallback — which matches
     // `SidebarProvider`'s own default width (256px). The floating band
-    // begins six pixels beyond that edge and stops before the fixed panel
-    // cluster (one 28px button + 6px) plus the window controls (104). The
-    // hidden expand control must not leave an empty slot while the panel is
-    // closed.
-    //
-    // The trailing +8 on the right is the band's one deliberate break in
-    // its 2px rhythm: 6 + 8 = the single 14px gap between the action run
-    // and the fixed corner cluster, so the corner reads as separate
-    // chrome rather than the tail of the workspace's own controls.
+    // begins six pixels beyond that edge and stops one 4px rhythm gap
+    // before the fixed cluster and the window controls (100, plus 2). The
+    // synced-settings mock reads every setting as unset, so the monitor's
+    // slot is not reserved: details + panel toggle = 28 + 4 + 28. The hidden
+    // expand control must not leave an empty slot while the panel is closed.
     expect(band.style.left).toBe("262px");
-    expect(band.style.right).toBe("146px");
+    expect(band.style.right).toBe("166px");
   });
 
   it("moves the workspace actions left of an open right panel", () => {
@@ -526,6 +528,38 @@ describe("TitleBar GUI chrome — floating placement", () => {
 // at the window's top-right; opening the panel moved it hundreds of pixels
 // left, to the *left edge* of a 40px empty strip above the panel's own tabs.
 // Nothing about a panel control should depend on the panel's width.
+describe("TitleBar GUI chrome — workspace details card", () => {
+  it("hands the host the workspace column and lines its edge up with the window buttons", () => {
+    state.enableAgentChat = true;
+    state.rightPanelRowWidth = 1600;
+    const { getByTestId } = renderBar();
+    const host = getByTestId("workspace-details-host");
+    expect(host).toHaveAttribute("data-column-width", "1600");
+    expect(host).toHaveAttribute("data-right-inset", "0");
+    expect(host).toHaveAttribute("data-edge-gap", "4");
+  });
+
+  it("moves the card's corner to the open panel's edge", () => {
+    state.enableAgentChat = true;
+    state.rightPanelTab = "files";
+    state.rightPanelRowWidth = 1600;
+    const { getByTestId } = renderBar();
+    const host = getByTestId("workspace-details-host");
+    // 320px stored, drawn at the 360px minimum.
+    expect(host).toHaveAttribute("data-column-width", "1240");
+    expect(host).toHaveAttribute("data-right-inset", "360");
+    expect(host).toHaveAttribute("data-edge-gap", "8");
+  });
+
+  it("has no card while the panel is fully expanded", () => {
+    state.enableAgentChat = true;
+    state.rightPanelTab = "files";
+    state.rightPanelMaximized = true;
+    const { queryByTestId } = renderBar();
+    expect(queryByTestId("workspace-details-host")).toBeNull();
+  });
+});
+
 describe("TitleBar GUI chrome — fixed panel cluster", () => {
   it("pins the cluster to the same corner whether the panel is open or closed", () => {
     state.enableAgentChat = true;
@@ -538,7 +572,7 @@ describe("TitleBar GUI chrome — fixed panel cluster", () => {
     expect(open.getByTestId("titlebar-panel-cluster").style.right).toBe(
       closedRight,
     );
-    expect(closedRight).toBe("104px");
+    expect(closedRight).toBe("102px");
   });
 
   it("offers full-expand only while the panel is on screen", () => {

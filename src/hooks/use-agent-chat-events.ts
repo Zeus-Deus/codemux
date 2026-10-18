@@ -5,6 +5,7 @@ import {
   clearAgentChatAttach,
   registerAgentChatAttach,
 } from "@/lib/agent-chat/attach-registry";
+import { useRemoteReconnectEpoch } from "@/remote/remote-connection-store";
 import {
   attachAgentChatOutput,
   Channel,
@@ -33,13 +34,17 @@ import type { AgentChatEventPayload } from "@/tauri/events";
  * panes that have not yet started a session.
  *
  * The handler is kept on a ref so a new handler identity does NOT
- * re-attach the backend channel; only a thread id change does.
+ * re-attach the backend channel; only a thread id change does, or a web
+ * remote reconnect (the host drops a socket's channels with it, so the old
+ * one is dead). The pane's hydrate re-runs on the same epoch to read what
+ * the gap missed.
  */
 export function useAgentChatEvents(
   threadId: string | null,
   handler: (payload: AgentChatEventPayload) => void,
 ) {
   const handlerRef = useRef(handler);
+  const reconnectEpoch = useRemoteReconnectEpoch();
   useEffect(() => {
     handlerRef.current = handler;
   }, [handler]);
@@ -80,5 +85,5 @@ export function useAgentChatEvents(
           // Attach failed — nothing to detach.
         });
     };
-  }, [threadId]);
+  }, [threadId, reconnectEpoch]);
 }

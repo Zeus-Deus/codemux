@@ -2,6 +2,7 @@ import { resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { selectProviderCommands, useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { parseMessageDelivery } from "@/lib/agent-chat/message-delivery";
 import { parseWorkflowCommand } from "@/lib/workflows/workflow-settings";
+import { parseBtwCommand } from "@/lib/agent-chat/side-chat";
 import { launchChatWorkflow } from "@/components/workflows/launch-chat-workflow";
 import { workflowAttachmentProblem } from "@/lib/workflows/workflow-attachments";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
@@ -472,6 +473,14 @@ function DraftChatSurfaceInner({
     if (currentDraft.promoting) return;
     const text = parseMessageDelivery(currentDraft.inputDraft).text;
     if (!text) return;
+    // `/btw` forks an existing session; a new chat has none to fork yet.
+    // Say so and keep the draft rather than sending it as a first message.
+    if (parseBtwCommand(text)) {
+      toast.info("Start the chat first", {
+        description: "Side questions fork the chat's session, so send a message before asking one.",
+      });
+      return;
+    }
     // `/workflow <goal>` creates the chat, then starts a CodeMux workflow in
     // it instead of sending a first provider turn.
     const workflowCommand = parseWorkflowCommand(text);

@@ -12,6 +12,12 @@ export function isAppShortcutApplicable(actionId: string): boolean {
       ui.showSettings || ui.showFileSearch || ui.showContentSearch || ui.showCommandPalette);
   }
 
+  // The details card's host is mounted only while the card can show; when
+  // it is not, the key must reach a focused terminal instead of vanishing.
+  if (actionId === "toggleWorkspaceDetails") {
+    return useUIStore.getState().workspaceDetailsHosted;
+  }
+
   const jump = actionId.match(/^workspaceJump([1-9])$/);
   if (jump) return getJumpTarget(Number(jump[1])) != null;
 

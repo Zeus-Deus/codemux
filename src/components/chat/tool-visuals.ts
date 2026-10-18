@@ -5,6 +5,7 @@ import {
   FileText,
   FolderSearch,
   Globe,
+  ListPlus,
   Pencil,
   Search,
   Terminal,
@@ -13,6 +14,7 @@ import {
 } from "lucide-react";
 
 import { isDelegateToolName } from "@/lib/agent-chat/delegation";
+import { isSuggestToolName } from "@/lib/agent-chat/follow-ups";
 
 /**
  * Shared tool → icon / category-tint mapping (design D6). One source of
@@ -51,7 +53,7 @@ export function toolCategory(toolName: string): ToolCategory {
   // `delegate_task` hands work to another agent. It normally renders as the
   // delegation card; anywhere it shows up as a plain tool row (whatever the
   // adapter's prefix), it is an agent hand-off.
-  if (isDelegateToolName(toolName)) return "agent";
+  if (isDelegateToolName(toolName) || isSuggestToolName(toolName)) return "agent";
   return CATEGORY_BY_TOOL[toolName] ?? "other";
 }
 
@@ -73,6 +75,7 @@ const ICON_BY_TOOL: Record<string, LucideIcon> = {
 
 export function toolIcon(toolName: string): LucideIcon {
   if (isDelegateToolName(toolName)) return Bot;
+  if (isSuggestToolName(toolName)) return ListPlus;
   return ICON_BY_TOOL[toolName] ?? Wrench;
 }
 

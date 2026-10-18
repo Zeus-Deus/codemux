@@ -2059,13 +2059,6 @@ impl AgentProvider for GenericAcpProvider {
         session.interrupt(turn).await
     }
     fn event_stream(&self) -> ProviderEventStream {
-        let rx = self.inner.events.subscribe();
-        Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
-            match rx.recv().await {
-            Ok(event)=>Some((event,rx)),
-            Err(broadcast::error::RecvError::Lagged(_))=>Some((ProviderRuntimeEvent::RuntimeWarning {thread_id:None,message:"Custom ACP event subscriber overflowed; refresh the authoritative thread state".into(),original_payload:None},rx)),
-            Err(_)=>None,
-        }
-        }))
+        crate::agent_provider::provider::broadcast_event_stream(&self.inner.events, self.kind())
     }
 }

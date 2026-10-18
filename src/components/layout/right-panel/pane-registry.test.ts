@@ -35,7 +35,7 @@ describe("pane registry", () => {
   });
 
   it("lists exactly the availability-gated panes as conditional", () => {
-    expect([...CONDITIONAL_PANES]).toEqual(["tasks", "subagents", "orchestration"]);
+    expect([...CONDITIONAL_PANES]).toEqual(["tasks", "subagents", "side-chat", "orchestration"]);
   });
 
   it("resolves metadata by id and returns null for an unknown one", () => {

@@ -1077,7 +1077,15 @@ mod tests {
                 )
                 .unwrap();
             let local = reg.host_tools(&caller);
-            assert_eq!(local.len(), usize::from(enabled));
+            // `suggest_tasks` is not behind the delegation setting.
+            assert_eq!(
+                local
+                    .iter()
+                    .filter(|tool| tool.name == "delegate_task")
+                    .count(),
+                usize::from(enabled)
+            );
+            assert!(local.iter().any(|tool| tool.name == "suggest_tasks"));
             let remote = reg
                 .list_all_tools_excluding_source(McpConfigSource::CodexUser)
                 .await;

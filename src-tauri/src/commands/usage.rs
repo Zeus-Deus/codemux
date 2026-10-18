@@ -426,6 +426,25 @@ impl PriceOverride {
     }
 }
 
+/// Cost by the source that priced it, USD.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CostSources {
+    pub provider_usd: f64,
+    pub table_usd: f64,
+    pub override_usd: f64,
+}
+
+/// The inputs of the cache-savings estimate. All zero for a model the
+/// static table does not know.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheSavings {
+    pub savings_usd: f64,
+    /// What the table-priced work would have cost with no cache.
+    pub uncached_usd: f64,
+    /// What that same work actually cost.
+    pub cached_usd: f64,
+}
+
 /// One row of the flat, cross-provider model breakdown.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlatModelUsage {
@@ -454,6 +473,15 @@ pub struct FlatModelUsage {
     /// The rates this model is priced at (override, else static table), so
     /// the UI can show them and prefill the price editor.
     pub rates: Option<PriceOverride>,
+    /// Where this model's cost came from. Summed over any subset of
+    /// models it reproduces [`CostConfidence`] for that subset, which is
+    /// how the page recomputes it when providers are filtered out.
+    #[serde(default)]
+    pub cost_sources: CostSources,
+    /// This model's part of the period's cache savings; sums like
+    /// `cost_sources`.
+    #[serde(default)]
+    pub cache_savings: CacheSavings,
     /// This model's slice of every summary bucket, index-aligned with
     /// [`UsageSummary::buckets`], for the model's own trend chart.
     pub buckets: Vec<BucketSlice>,
@@ -677,12 +705,15 @@ fn summarize_priced(
         }
         if row.cost_source.as_deref() == Some("override") {
             flat.price_overridden = true;
+            flat.cost_sources.override_usd += cost;
         } else if row.cost_source.as_deref() == Some("provider") {
             flat.provider_reported = true;
+            flat.cost_sources.provider_usd += cost;
         } else if row.cost_source.as_deref() == Some("table") {
             flat.table_observed_input += row.observed_input();
             flat.table_output += row.output_tokens;
             flat.table_cost += cost;
+            flat.cost_sources.table_usd += cost;
         }
 
         // Composition strip.
@@ -733,19 +764,24 @@ fn summarize_priced(
     let mut raw_total = 0.0_f64;
     let mut actual_for_savings = 0.0_f64;
     let mut savings = 0.0_f64;
-    for ((_, model), acc) in &flat_acc {
+    for ((_, model), acc) in flat_acc.iter_mut() {
         let Some(rates) = crate::agent_provider::pricing::lookup(model) else {
             continue;
         };
         let raw = (acc.table_observed_input as f64 * rates.input
             + acc.table_output as f64 * rates.output)
             / 1_000_000.0;
-        raw_total += raw;
-        actual_for_savings += acc.table_cost;
         // Clamp per model: a model whose actual cost exceeds the
         // no-cache hypothetical (possible with odd rate tables) must not
         // subtract from another model's genuine saving.
-        savings += (raw - acc.table_cost).max(0.0);
+        acc.cache_savings = CacheSavings {
+            savings_usd: (raw - acc.table_cost).max(0.0),
+            uncached_usd: raw,
+            cached_usd: acc.table_cost,
+        };
+        raw_total += raw;
+        actual_for_savings += acc.table_cost;
+        savings += acc.cache_savings.savings_usd;
     }
     composition.cache_savings_usd = savings;
     composition.cache_savings_multiplier = if actual_for_savings > 0.005 {
@@ -811,6 +847,8 @@ fn summarize_priced(
                 session_count: acc.threads.len() as i64,
                 category_cost: acc.category_cost,
                 rates,
+                cost_sources: acc.cost_sources,
+                cache_savings: acc.cache_savings,
                 buckets: acc.buckets,
             }
         })
@@ -960,6 +998,8 @@ struct FlatAcc {
     table_observed_input: i64,
     table_output: i64,
     table_cost: f64,
+    cost_sources: CostSources,
+    cache_savings: CacheSavings,
     priced: bool,
     provider_reported: bool,
 }
@@ -1932,6 +1972,44 @@ mod tests {
         // Unpriced is a TOKEN share — a cost share would always be 0 and
         // hide the very thing this row exists to show.
         assert!((c.unpriced_token_share - 800.0 / 1000.0).abs() < 1e-9);
+    }
+
+    /// The page rebuilds confidence and savings for a filtered set of
+    /// providers from the model rows, so the rows must add back up to the
+    /// period's own figures.
+    #[test]
+    fn model_cost_sources_and_savings_sum_to_the_period() {
+        let mut provider_row = row(NOW, "opencode", "anthropic/x", [100, 0, 0, 0], 3.0);
+        provider_row.cost_source = Some("provider".into());
+        let table_row = row(
+            NOW,
+            "claude",
+            "claude-sonnet-4-5",
+            [1_000_000, 100_000, 900_000, 0],
+            1.0,
+        );
+        let mut override_row = row(NOW, "codex", "gpt-5-codex", [100, 0, 0, 0], 2.0);
+        override_row.cost_source = Some("override".into());
+
+        let s = summarize(
+            &[provider_row, table_row, override_row],
+            Period::Today,
+            NOW,
+            0,
+            HashMap::new(),
+        );
+        let sum = |f: fn(&FlatModelUsage) -> f64| s.models.iter().map(f).sum::<f64>();
+        let share = |part: f64| part / s.totals.estimated_cost_usd;
+        let c = &s.confidence;
+        assert!((share(sum(|m| m.cost_sources.provider_usd)) - c.provider_reported_share).abs() < 1e-9);
+        assert!((share(sum(|m| m.cost_sources.table_usd)) - c.table_priced_share).abs() < 1e-9);
+        assert!((share(sum(|m| m.cost_sources.override_usd)) - c.override_priced_share).abs() < 1e-9);
+        let savings = sum(|m| m.cache_savings.savings_usd);
+        assert!(savings > 0.0);
+        assert!((savings - s.composition.cache_savings_usd).abs() < 1e-9);
+        let multiplier =
+            sum(|m| m.cache_savings.uncached_usd) / sum(|m| m.cache_savings.cached_usd);
+        assert!((multiplier - s.composition.cache_savings_multiplier.unwrap()).abs() < 1e-9);
     }
 
     #[test]

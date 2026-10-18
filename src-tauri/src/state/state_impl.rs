@@ -689,6 +689,15 @@ pub struct WorkspaceSnapshot {
     /// old persisted state deserializes as `None`.
     #[serde(default)]
     pub last_visited_at: Option<i64>,
+    /// The workspace whose chat started this one: set when the user starts
+    /// one of an agent's suggested follow-up tasks, which runs as its own
+    /// workspace on a git worktree branched from that workspace's commit.
+    /// The sidebar links the child back ("from <parent>") and nests it under
+    /// the parent. May name a workspace that has since closed. Persisted and
+    /// kept across archive/restore; not synced. Additive; old snapshots
+    /// deserialize as `None`.
+    #[serde(default)]
+    pub parent_workspace_id: Option<String>,
 }
 
 impl WorkspaceSnapshot {
@@ -745,6 +754,9 @@ pub struct ArchivedWorkspaceSnapshot {
     /// Preserve the workspace's pin across non-destructive archive/restore.
     #[serde(default)]
     pub pinned_at: Option<i64>,
+    /// `WorkspaceSnapshot::parent_workspace_id`, restored with the workspace.
+    #[serde(default)]
+    pub parent_workspace_id: Option<String>,
     /// Unix seconds at archive time. Lets the frontend sort the archive
     /// list by recency without a separate timestamp store.
     pub archived_at: u64,
@@ -768,6 +780,7 @@ pub fn build_archive_entry(ws: &WorkspaceSnapshot) -> ArchivedWorkspaceSnapshot 
         protected: ws.protected,
         is_git: ws.is_git,
         pinned_at: ws.pinned_at,
+        parent_workspace_id: ws.parent_workspace_id.clone(),
         archived_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1997,6 +2010,7 @@ impl AppStateStore {
             imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
             last_visited_at: Some(current_time_ms_signed()),
+            parent_workspace_id: None,
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -2094,6 +2108,7 @@ impl AppStateStore {
             // dates the pulled checkout from its own git history.
             last_active_at: None,
             last_visited_at: Some(current_time_ms_signed()),
+            parent_workspace_id: None,
         });
 
         // We deliberately do NOT set this as the active workspace.
@@ -2167,6 +2182,7 @@ impl AppStateStore {
             // unknown for the backfill to date rather than faked as `now`.
             last_active_at: None,
             last_visited_at: Some(current_time_ms_signed()),
+            parent_workspace_id: None,
         });
 
         workspace_id
@@ -2357,6 +2373,7 @@ impl AppStateStore {
             imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
             last_visited_at: Some(current_time_ms_signed()),
+            parent_workspace_id: None,
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -2534,6 +2551,7 @@ impl AppStateStore {
             imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
             last_visited_at: Some(current_time_ms_signed()),
+            parent_workspace_id: None,
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -3549,6 +3567,18 @@ impl AppStateStore {
 
     /// Record the branch a worktree workspace was created from. Set once at
     /// create time; callers emit app state themselves.
+    /// Record which workspace started this one (a started suggested task).
+    pub fn set_workspace_parent(&self, workspace_id: &str, parent_workspace_id: Option<String>) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+        {
+            workspace.parent_workspace_id = parent_workspace_id;
+        }
+    }
+
     pub fn set_workspace_base_branch(&self, workspace_id: &str, base_branch: Option<String>) {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(workspace) = snapshot
@@ -6681,6 +6711,7 @@ fn default_app_state() -> AppStateSnapshot {
             imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
             last_visited_at: Some(current_time_ms_signed()),
+            parent_workspace_id: None,
         }],
         terminal_sessions: vec![TerminalSessionSnapshot {
             session_id,
@@ -11849,6 +11880,7 @@ mod archived_workspace_tests {
             protected: false,
             is_git: true,
             pinned_at: None,
+            parent_workspace_id: None,
             archived_at: 1_700_000_000,
         }
     }

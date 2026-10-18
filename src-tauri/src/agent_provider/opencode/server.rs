@@ -21,10 +21,13 @@
 //!   prints `"server is unsecured"` and accepts any caller — even on
 //!   loopback that's a footgun if the user has another tool poking
 //!   at random localhost ports, so we always pin the password.
-//! * **Cleanup**: explicit shutdown terminates and awaits the direct
-//!   child. `kill_on_drop(true)` is a fallback when a handle is dropped;
-//!   it cannot run when the application exits without dropping state.
-//!   This does not guarantee cleanup on an OS crash or of descendants.
+//! * **Cleanup**: on Unix the server leads its own process group, so MCP
+//!   servers and tool subprocesses it starts are stopped with it. Shutdown
+//!   sends TERM to the group, allows a short grace period, sends KILL, then
+//!   reaps the leader; Drop (including cancelled startup) KILLs the group.
+//!   Windows shutdown uses `taskkill /T /F`; Windows Drop still kills only
+//!   the direct child. Nothing runs on an OS crash, and descendants that
+//!   detach into their own group/session escape.
 //! * **GUI sanitation**: env is sanitised through
 //!   `sanitize_gui_env_tokio` so an OpenCode binary
 //!   that inadvertently launches a GUI helper does not pop windows
@@ -68,6 +71,10 @@ pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// indefinitely if the OS fails to complete process termination.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Time the server's process group gets to exit after TERM before KILL.
+#[cfg(unix)]
+const TERMINATE_GRACE: Duration = Duration::from_secs(1);
+
 /// Length of the random server password. 32 alphanumeric characters
 /// = ~190 bits of entropy, vastly more than enough to make a
 /// loopback brute-force pointless. Locked here so tests can pin the
@@ -80,9 +87,9 @@ const SERVER_PASSWORD_LEN: usize = 32;
 /// any session that talks to its HTTP endpoint.
 #[derive(Debug)]
 pub struct OpenCodeServer {
-    /// Owned until explicit termination/reap. `kill_on_drop(true)` is
-    /// only a fallback, not proof that teardown completed.
-    child: Child,
+    /// Owned until explicit termination/reap. Drop is only a fallback,
+    /// not proof that teardown completed.
+    child: ServerProcess,
     /// Stable URL extracted from the ready banner — usable as-is for
     /// `reqwest` requests.
     base_url: String,
@@ -147,12 +154,16 @@ impl OpenCodeServer {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
         sanitize_gui_env_tokio(&mut cmd);
 
         let mut child = cmd
             .spawn()
+            .map(ServerProcess)
             .map_err(|err| format!("spawn_failed: {} ({err})", binary_path.display()))?;
         let stdout = child
+            .0
             .stdout
             .take()
             .ok_or_else(|| "spawn_failed: child stdout pipe missing".to_string())?;
@@ -164,11 +175,11 @@ impl OpenCodeServer {
             Ok(Err(message)) => {
                 // Probe drained stdout before exiting — kill the
                 // child and surface the failure verbatim.
-                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.kill()).await;
+                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.terminate()).await;
                 return Err(message);
             }
             Err(_) => {
-                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.kill()).await;
+                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.terminate()).await;
                 return Err(format!(
                     "ready_timeout_after_{}ms",
                     ready_budget.as_millis()
@@ -205,10 +216,10 @@ impl OpenCodeServer {
     /// Best-effort PID of the running child. `None` after the child
     /// has been reaped.
     pub fn pid(&self) -> Option<u32> {
-        self.child.id()
+        self.child.0.id()
     }
 
-    /// Terminate and reap the owned direct child before returning success.
+    /// Terminate the owned process group/tree and reap its direct child.
     /// Idempotent after a completed wait; Drop remains the error fallback.
     pub async fn shutdown(&mut self) -> Result<(), String> {
         #[cfg(test)]
@@ -216,7 +227,7 @@ impl OpenCodeServer {
             entered.notify_one();
             release.notified().await;
         }
-        tokio::time::timeout(SHUTDOWN_TIMEOUT, self.child.kill())
+        tokio::time::timeout(SHUTDOWN_TIMEOUT, self.child.terminate())
             .await
             .map_err(|_| "opencode_shutdown_timeout".to_string())?
             .map_err(|error| format!("opencode_shutdown_failed: {error}"))
@@ -226,15 +237,96 @@ impl OpenCodeServer {
 impl Drop for OpenCodeServer {
     fn drop(&mut self) {
         // Logged on shutdown so a stuck-server diagnosis can confirm
-        // the right child was killed. `kill_on_drop(true)` does the
-        // actual cleanup — this is just a breadcrumb.
-        if let Some(pid) = self.child.id() {
+        // the right child was killed. `ServerProcess` does the actual
+        // cleanup — this is just a breadcrumb.
+        if let Some(pid) = self.child.0.id() {
             eprintln!(
                 "[codemux::opencode] dropping OpenCodeServer (pid={pid}, url={})",
                 self.base_url
             );
         }
     }
+}
+
+/// The spawned `opencode serve` leader. On Unix it leads its own process
+/// group; every group signal below is sent while the leader is still
+/// unreaped (`Child::id` is `Some`), so its PID — the group ID — cannot have
+/// been recycled for an unrelated group.
+#[derive(Debug)]
+struct ServerProcess(Child);
+
+impl ServerProcess {
+    /// TERM the group, wait up to [`TERMINATE_GRACE`] for the leader, KILL
+    /// the group (descendants may ignore TERM or outlive the leader), reap.
+    async fn terminate(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.id() {
+            signal_group(pid, libc::SIGTERM);
+            let _ = tokio::time::timeout(TERMINATE_GRACE, leader_exited(pid)).await;
+            signal_group(pid, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        if let (Some(pid), Some(Ok(handle))) = (
+            self.0.id(),
+            self.0.raw_handle().map(|raw| {
+                unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(raw) }
+                    .try_clone_to_owned()
+            }),
+        ) {
+            // taskkill finds the tree by PID. The job owns a duplicate of the
+            // process handle, so the PID cannot be reused even if this future
+            // is cancelled (SHUTDOWN_TIMEOUT) and the child dropped first.
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::agent_browser::kill_pid(pid);
+                drop(handle);
+            })
+            .await;
+        }
+        self.0.kill().await
+    }
+}
+
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        // Runs before the inner Child drops, so the leader is still
+        // unreaped; `kill_on_drop` then kills and reaps the leader.
+        #[cfg(unix)]
+        if let Some(pid) = self.0.id() {
+            signal_group(pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: libc::c_int) {
+    // ESRCH just means the whole group is already gone.
+    unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+}
+
+/// Resolve once the leader has exited, without reaping it (`WNOWAIT`).
+#[cfg(target_os = "linux")]
+async fn leader_exited(pid: u32) {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 || unsafe { info.si_pid() } != 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Elsewhere on Unix, always allow the full grace period.
+#[cfg(all(unix, not(target_os = "linux")))]
+async fn leader_exited(_pid: u32) {
+    std::future::pending::<()>().await
 }
 
 /// Read lines from the child's stdout until the ready banner shows
@@ -360,16 +452,121 @@ mod tests {
         assert_eq!(SERVER_PASSWORD_LEN, 32);
     }
 
+    /// Fake `opencode serve` that starts a TERM-ignoring descendant (an MCP
+    /// server or tool subprocess stand-in) and records its PID.
+    #[cfg(target_os = "linux")]
+    fn fake_server_with_descendant(banner: bool) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("opencode");
+        let banner = if banner {
+            "echo 'opencode server listening on http://127.0.0.1:1'"
+        } else {
+            ""
+        };
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n(trap '' TERM; exec sleep 600) &\necho $! > \"$(dirname \"$0\")/pid\"\n{banner}\nwait\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (dir, script)
+    }
+
+    /// Wait for the descendant to stop; on failure kill it (we started it)
+    /// so a failing run does not leak a `sleep 600`.
+    #[cfg(target_os = "linux")]
+    async fn assert_descendant_stopped(dir: &Path) {
+        let pid: i32 = std::fs::read_to_string(dir.join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // A reparented zombie awaiting its new parent's reap has stopped.
+        let running = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| !rest.starts_with('Z')))
+                .unwrap_or(false)
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while running() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let survived = running();
+        if survived {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(!survived, "OpenCode descendant {pid} survived server cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shutdown_stops_server_descendants() {
+        let (dir, script) = fake_server_with_descendant(true);
+        let mut server = OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(5))
+            .await
+            .unwrap();
+        server.shutdown().await.unwrap();
+        assert_eq!(server.pid(), None);
+        assert_descendant_stopped(dir.path()).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_startup_stops_server_descendants() {
+        let (dir, script) = fake_server_with_descendant(false);
+        let error = OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("ready_timeout_after_"), "{error}");
+        assert_descendant_stopped(dir.path()).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn drop_stops_server_descendants() {
+        let (dir, script) = fake_server_with_descendant(true);
+        drop(
+            OpenCodeServer::spawn_with_timeout(&script, Duration::from_secs(5))
+                .await
+                .unwrap(),
+        );
+        assert_descendant_stopped(dir.path()).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelled_startup_stops_server_descendants() {
+        let (dir, script) = fake_server_with_descendant(false);
+        let mut startup = Box::pin(OpenCodeServer::spawn(&script));
+        tokio::select! {
+            result = &mut startup => panic!("startup should still be pending: {result:?}"),
+            started = tokio::time::timeout(Duration::from_secs(5), async {
+                while !std::fs::read_to_string(dir.path().join("pid"))
+                    .is_ok_and(|pid| !pid.trim().is_empty())
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }) => started.expect("fixture did not start"),
+        }
+        drop(startup);
+        assert_descendant_stopped(dir.path()).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_reaps_owned_child_before_return() {
         let child = Command::new("/bin/sleep")
             .arg("600")
             .kill_on_drop(true)
+            .process_group(0)
             .spawn()
             .unwrap();
         let mut server = OpenCodeServer {
-            child,
+            child: ServerProcess(child),
             base_url: "http://127.0.0.1:1".into(),
             api: super::super::api::OpenCodeApi::Legacy,
             server_password: "synthetic".into(),
