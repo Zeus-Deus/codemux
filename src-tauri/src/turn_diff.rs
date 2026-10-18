@@ -198,22 +198,39 @@ fn seed_snapshot_index(repo: &Path, index: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(index);
         return Ok(());
     }
-    // The user's assume-unchanged marks would make `add -A` skip those
-    // files for good in this private index; capture them like any other.
+    // The user's assume-unchanged and skip-worktree marks would make
+    // `add -A` skip those files for good in this private index; capture them
+    // like any other. Skip-worktree stays on files absent from the worktree,
+    // which a sparse checkout leaves out on purpose.
     let listed = git_with(repo, &["ls-files", "-z", "-v"], Some(index), None)?;
-    let assumed: Vec<&[u8]> = listed
-        .split(|b| *b == 0)
-        .filter(|entry| entry.len() > 2 && entry[0].is_ascii_lowercase() && entry[1] == b' ')
-        .map(|entry| &entry[2..])
-        .collect();
-    if !assumed.is_empty() {
-        let mut paths = assumed.join(&0u8);
-        paths.push(0);
+    let mut assumed = Vec::new();
+    let mut skipped = Vec::new();
+    for entry in listed.split(|b| *b == 0) {
+        let (Some(&tag), Some(b' ')) = (entry.first(), entry.get(1)) else {
+            continue;
+        };
+        let path = &entry[2..];
+        if tag.is_ascii_lowercase() {
+            assumed.push(path);
+        }
+        let on_disk = || {
+            std::fs::symlink_metadata(repo.join(String::from_utf8_lossy(path).as_ref())).is_ok()
+        };
+        if tag.eq_ignore_ascii_case(&b'S') && on_disk() {
+            skipped.push(path);
+        }
+    }
+    for (paths, flag) in [(assumed, "--no-assume-unchanged"), (skipped, "--no-skip-worktree")] {
+        if paths.is_empty() {
+            continue;
+        }
+        let mut input = paths.join(&0u8);
+        input.push(0);
         git_with(
             repo,
-            &["update-index", "-z", "--no-assume-unchanged", "--stdin"],
+            &["update-index", "-z", flag, "--stdin"],
             Some(index),
-            Some(&paths),
+            Some(&input),
         )?;
     }
     Ok(())
@@ -1056,6 +1073,17 @@ mod tests {
         assert!(gone.contains("-bye") && !gone.contains("inside"), "{gone}");
         let inner = file(&diff, "gone.txt/inner.txt").patch.as_deref().unwrap();
         assert!(inner.contains("+inside"), "{inner}");
+    }
+
+    #[test]
+    fn snapshot_ignores_skip_worktree_marks_on_present_files() {
+        let (_dir, repo) = init_repo();
+        run(&repo, &["update-index", "--skip-worktree", "keep.txt"]);
+        let before = snap(&repo, "before");
+        fs::write(repo.join("keep.txt"), "edited by the agent\n").unwrap();
+        let after = snap(&repo, "after");
+        let diff = diff_snapshots(&repo, &before, &after).unwrap();
+        assert_eq!(file(&diff, "keep.txt").change, TurnDiffChange::Modified);
     }
 
     #[test]

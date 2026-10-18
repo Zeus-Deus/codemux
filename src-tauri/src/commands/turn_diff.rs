@@ -45,6 +45,24 @@ struct ThreadCapture {
     settled: VecDeque<String>,
     /// `(client_nonce, turn_id)` bindings that arrived before their row.
     bindings: VecDeque<(String, String)>,
+    /// Dispatches snapshotted by `prepare` whose row `commit` has not written
+    /// yet. A turn can finish, and the next one start, before that.
+    prepared: Vec<PreparedTurn>,
+}
+
+/// A prepared dispatch's end, filled in when the next dispatch's snapshot
+/// closes it before the row exists.
+struct PreparedTurn {
+    after_ref: String,
+    repo_path: String,
+    end: Option<String>,
+}
+
+fn take_prepared(thread_id: &str, after_ref: &str) -> Option<PreparedTurn> {
+    let mut captures = captures().lock().unwrap();
+    let prepared = &mut captures.get_mut(thread_id)?.prepared;
+    let index = prepared.iter().position(|turn| turn.after_ref == after_ref)?;
+    Some(prepared.remove(index))
 }
 
 fn captures() -> &'static Mutex<HashMap<String, ThreadCapture>> {
@@ -123,6 +141,13 @@ struct PendingSnapshot {
     after_ref: String,
 }
 
+/// Drop a dispatch that will never get a row: its bookkeeping and both refs.
+fn discard_pending(thread_id: &str, pending: &PendingSnapshot) {
+    take_prepared(thread_id, &pending.after_ref);
+    let repo = Path::new(&pending.repo_path);
+    let _ = crate::turn_diff::delete_refs(repo, [pending.before_ref.as_str(), pending.after_ref.as_str()]);
+}
+
 /// Snapshot `row`'s repository as the turn's end state and close the row.
 fn settle(db: &DatabaseStore, row: &AgentChatTurnDiffRecord) -> Result<(), String> {
     if row.after_commit.is_some() {
@@ -169,11 +194,35 @@ fn snapshot_before_dispatch(
             settle(db, &open)?;
         }
     }
+    // The same goes for a dispatch whose row is not written yet: keep this
+    // end for it, or it would later be snapshotted with this turn's edits.
+    let after_ref = turn_diff_ref_name(thread_id, &token, "after");
+    let mut captures = captures().lock().unwrap();
+    let capture = captures.entry(thread_id.to_string()).or_default();
+    for earlier in capture.prepared.iter_mut().filter(|turn| turn.end.is_none()) {
+        let end = if earlier.repo_path == repo_path {
+            crate::turn_diff::point_ref(Path::new(repo_path), &earlier.after_ref, &before)?;
+            Some(before.clone())
+        } else {
+            crate::turn_diff::snapshot(
+                Path::new(&earlier.repo_path),
+                thread_id,
+                &earlier.after_ref,
+                "codemux turn diff: after turn",
+            )?
+        };
+        earlier.end = end;
+    }
+    capture.prepared.push(PreparedTurn {
+        after_ref: after_ref.clone(),
+        repo_path: repo_path.to_string(),
+        end: None,
+    });
     Ok(Some(PendingSnapshot {
         repo_path: repo_path.to_string(),
         before_ref,
         before_commit: before,
-        after_ref: turn_diff_ref_name(thread_id, &token, "after"),
+        after_ref,
     }))
 }
 
@@ -185,7 +234,8 @@ fn record_accepted(
 ) -> Result<(), String> {
     let lock = thread_lock(thread_id);
     let _guard = lock.lock().unwrap();
-    let (row, pruned) = db.insert_agent_chat_turn_diff(
+    let end = take_prepared(thread_id, &pending.after_ref).and_then(|turn| turn.end);
+    let (mut row, pruned) = db.insert_agent_chat_turn_diff(
         &NewAgentChatTurnDiff {
             thread_id: thread_id.to_string(),
             client_nonce: Some(client_nonce.to_string()),
@@ -199,6 +249,10 @@ fn record_accepted(
     )?;
     for (repo_path, ref_name) in pruned {
         let _ = crate::turn_diff::delete_ref(Path::new(&repo_path), &ref_name);
+    }
+    if let Some(end) = end {
+        db.close_agent_chat_turn_diff(row.id, &end)?;
+        row.after_commit = Some(end);
     }
     if row
         .turn_id
@@ -309,6 +363,11 @@ pub(crate) fn thread_cleanup(db: &DatabaseStore, thread_id: &str) -> ThreadClean
 /// Drop a deleted thread's refs, snapshot indexes and capture state.
 pub(crate) fn forget_thread(cleanup: ThreadCleanup) {
     let thread_id = &cleanup.thread_id;
+    // Wait out a snapshot in flight for this thread, so the sweep below
+    // also takes the ref it is about to write. Work that starts later finds
+    // the thread's rows gone and records nothing.
+    let lock = thread_lock(thread_id);
+    let _guard = lock.lock().unwrap();
     captures().lock().unwrap().remove(thread_id);
     for repo in &cleanup.repos {
         let listed = cleanup
@@ -327,6 +386,8 @@ pub(crate) fn forget_thread(cleanup: ThreadCleanup) {
 /// A thread merged into another on resume: its rows (and the refs they
 /// name) now belong to the survivor, so only per-thread caches go.
 pub(crate) fn forget_merged_thread(thread_id: &str, repos: &[String]) {
+    let lock = thread_lock(thread_id);
+    let _guard = lock.lock().unwrap();
     captures().lock().unwrap().remove(thread_id);
     for repo in repos {
         crate::turn_diff::forget_snapshot_index(Path::new(repo), thread_id);
@@ -386,7 +447,7 @@ pub(crate) fn wrap_dispatch_checkpoint<R: Runtime>(
 impl<R: Runtime> TurnDiffCapture<R> {
     fn discard(&self, pending: Option<PendingSnapshot>) {
         if let Some(pending) = pending {
-            let _ = crate::turn_diff::delete_ref(Path::new(&pending.repo_path), &pending.before_ref);
+            discard_pending(&self.thread_id, &pending);
         }
     }
 }
@@ -440,12 +501,7 @@ impl<R: Runtime> TurnDispatchCheckpoint for TurnDiffCapture<R> {
                 .ok_or_else(|| "database unavailable".to_string())?;
             let fallback = pending.clone();
             record_accepted(&db, &thread_id, &client_nonce, pending)
-                .inspect_err(|_| {
-                    let _ = crate::turn_diff::delete_ref(
-                        Path::new(&fallback.repo_path),
-                        &fallback.before_ref,
-                    );
-                })
+                .inspect_err(|_| discard_pending(&thread_id, &fallback))
         })
         .await;
         match recorded {
@@ -652,6 +708,70 @@ mod tests {
         turn_settled(&db, "t-order", "turn-2").unwrap();
         record_accepted(&db, "t-order", "n2", pending).unwrap();
         assert_eq!(diff(&db, "t-order", "turn-2"), vec![("two.txt".into(), 1, 0)]);
+    }
+
+    #[test]
+    fn a_turn_recorded_after_the_next_dispatch_keeps_its_own_end() {
+        let (_dir, repo, db) = setup("t-unrecorded");
+        let path = Path::new(&repo);
+
+        // Turn 1 is prepared, does its work and completes before its
+        // dispatch is recorded; the queued turn 2 is already preparing.
+        let first = snapshot_before_dispatch(&db, "t-unrecorded", &repo).unwrap().unwrap();
+        fs::write(path.join("one.txt"), "1\n").unwrap();
+        turn_settled(&db, "t-unrecorded", "turn-1").unwrap();
+        let second = snapshot_before_dispatch(&db, "t-unrecorded", &repo).unwrap().unwrap();
+        fs::write(path.join("two.txt"), "2\n").unwrap();
+        record_accepted(&db, "t-unrecorded", "n1", first).unwrap();
+        bind_turn(&db, "t-unrecorded", "n1", "turn-1").unwrap();
+        record_accepted(&db, "t-unrecorded", "n2", second).unwrap();
+        bind_turn(&db, "t-unrecorded", "n2", "turn-2").unwrap();
+        turn_settled(&db, "t-unrecorded", "turn-2").unwrap();
+
+        assert_eq!(diff(&db, "t-unrecorded", "turn-1"), vec![("one.txt".into(), 1, 0)]);
+        assert_eq!(diff(&db, "t-unrecorded", "turn-2"), vec![("two.txt".into(), 1, 0)]);
+    }
+
+    #[test]
+    fn deleting_a_thread_waits_for_a_snapshot_in_flight() {
+        let (_dir, repo, db) = setup("t-delete");
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let late_ref = turn_diff_ref_name("t-delete", "late", "after");
+        let cleanup = thread_cleanup(&db, "t-delete");
+        db.delete_agent_chat_session("t-delete").unwrap();
+
+        // A completion task holds the thread lock and writes its ref late.
+        let lock = thread_lock("t-delete");
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let (repo, late_ref, head) = (repo.clone(), late_ref.clone(), head.clone());
+            std::thread::spawn(move || {
+                let _guard = lock.lock().unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                crate::turn_diff::point_ref(Path::new(&repo), &late_ref, &head).unwrap();
+            })
+        };
+        held_rx.recv().unwrap();
+        forget_thread(cleanup);
+        writer.join().unwrap();
+
+        let left = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &late_ref])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(!left.success(), "the late ref outlived the thread");
     }
 
     #[test]
