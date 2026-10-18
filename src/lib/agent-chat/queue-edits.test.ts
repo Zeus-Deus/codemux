@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { restoreSavedQueue } from "@/components/chat/queued-turn-controls";
+import { reconcileQueuedTurns } from "@/components/chat/queued-turn-controls";
 import { queuedMessages } from "@/components/chat/use-composer-strip-occupants";
 
 import { applyEvent, appendUserMessage, createEmptyThreadState } from "./reducer";
@@ -67,7 +67,7 @@ describe("queued turn edits", () => {
   });
 });
 
-describe("restoreSavedQueue", () => {
+describe("reconcileQueuedTurns", () => {
   const row = (id: string, saved = true) => ({
     queued_id: id,
     text: `saved ${id}`,
@@ -76,21 +76,41 @@ describe("restoreSavedQueue", () => {
     images: id === "s1" ? [{ path: "/tmp/a.png", media_type: "image/png" }] : [],
   });
 
-  it("adds saved turns once, as saved queued bubbles", () => {
+  it("adds missing turns once, saved and live, for a client attaching mid-queue", () => {
     const empty = createEmptyThreadState();
-    const state = restoreSavedQueue(empty, "t", [row("s1"), row("live", false), row("s2")]);
+    const rows = [row("s1"), row("s2"), row("live", false)];
+    const state = reconcileQueuedTurns(empty, "t", rows);
     const restored = queuedMessages(state.messages);
     expect(restored.map((m) => m.queued)).toEqual([
       { queuedId: "s1", saved: true },
       { queuedId: "s2", saved: true },
+      { queuedId: "live" },
     ]);
     expect(restored[0].images).toEqual([{ src: "/tmp/a.png", mediaType: "image/png" }]);
-    expect(restoreSavedQueue(state, "t", [row("s1"), row("s2")])).toBe(state);
+    expect(reconcileQueuedTurns(state, "t", rows)).toBe(state);
+  });
+
+  it("repairs a live edit, move and removal missed while detached", () => {
+    let state = createEmptyThreadState();
+    for (const id of ["a", "b", "c"]) {
+      state = applyEvent(state, {
+        type: "turn_queued", thread_id: "t", queued_id: id, client_nonce: `nonce-${id}`, text: `saved ${id}`,
+      });
+    }
+    // Another client edited c, moved it first and removed b.
+    const next = reconcileQueuedTurns(state, "t", [
+      { ...row("c", false), text: "edited elsewhere" },
+      row("a", false),
+    ]);
+    expect(queuedMessages(next.messages).map((m) => [m.queued, m.text])).toEqual([
+      [{ queuedId: "c" }, "edited elsewhere"],
+      [{ queuedId: "a" }, "saved a"],
+    ]);
   });
 
   it("reconciles text, order and removals with the saved queue", () => {
-    const first = restoreSavedQueue(createEmptyThreadState(), "t", [row("s1"), row("s2"), row("s3")]);
-    const next = restoreSavedQueue(first, "t", [
+    const first = reconcileQueuedTurns(createEmptyThreadState(), "t", [row("s1"), row("s2"), row("s3")]);
+    const next = reconcileQueuedTurns(first, "t", [
       { ...row("s3"), text: "edited elsewhere" },
       row("s1"),
     ]);
@@ -101,7 +121,7 @@ describe("restoreSavedQueue", () => {
   });
 
   it("orders a resent saved turn behind the live turns it joined", () => {
-    let state = restoreSavedQueue(createEmptyThreadState(), "t", [row("s1")]);
+    let state = reconcileQueuedTurns(createEmptyThreadState(), "t", [row("s1")]);
     state = applyEvent(state, {
       type: "turn_queued", thread_id: "t", queued_id: "live-c", client_nonce: "nonce-c", text: "c",
     });
@@ -120,7 +140,7 @@ describe("restoreSavedQueue", () => {
       client_nonce: "nonce-s1",
       text: "saved s1",
     });
-    const restored = restoreSavedQueue(live, "t", [row("s1")]);
+    const restored = reconcileQueuedTurns(live, "t", [row("s1")]);
     expect(queuedMessages(restored.messages).map((m) => m.queued)).toEqual([
       { queuedId: "s1", saved: true },
     ]);
@@ -128,6 +148,6 @@ describe("restoreSavedQueue", () => {
 
   it("leaves a turn that was already sent under its nonce alone", () => {
     const sent = appendUserMessage(createEmptyThreadState(), "saved s1", undefined, "nonce-s1");
-    expect(restoreSavedQueue(sent, "t", [row("s1")])).toBe(sent);
+    expect(reconcileQueuedTurns(sent, "t", [row("s1")])).toBe(sent);
   });
 });

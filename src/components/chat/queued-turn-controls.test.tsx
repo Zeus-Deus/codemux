@@ -38,7 +38,14 @@ function item(queuedId: string, saved = false): UserMessageItem {
 }
 
 function editor(overrides: Partial<QueuedTurnEditor> = {}): QueuedTurnEditor {
-  return { editingId: null, begin: vi.fn(), cancel: vi.fn(), save: vi.fn(async () => {}), ...overrides };
+  return {
+    editingId: null,
+    editingHasImages: false,
+    begin: vi.fn(),
+    cancel: vi.fn(),
+    save: vi.fn(async () => {}),
+    ...overrides,
+  };
 }
 
 function list(overrides: Partial<QueuedTurnsListProps> = {}) {
@@ -213,7 +220,8 @@ describe("useQueuedTurnEditor", () => {
       await saving;
     });
     expect(result.current.editingId).toBeNull();
-    expect(draft()).toBe("next message");
+    // The displaced draft comes back above the newer typing.
+    expect(draft()).toBe("half-typed\nnext message");
   });
 
   it("saves the composer text onto the turn instead of sending", async () => {
@@ -265,13 +273,40 @@ describe("useQueuedTurnEditor", () => {
     expect(draft()).toBe("half-typed");
   });
 
-  it("keeps a changed draft when the turn dispatches mid-edit", () => {
+  it("keeps a changed draft, and the displaced one, when the turn dispatches mid-edit", () => {
     seed("half-typed", [item("a")]);
     const { result } = renderHook(() => useQueuedTurnEditor({ threadId: thread, provider: "claude" }));
     act(() => result.current.begin(item("a")));
     act(() => useAgentChatStore.getState().setInputDraft(thread, "my edit"));
-    seed("my edit", []);
+    // Dispatch promotes the bubble: it stays, no longer queued.
+    seed("my edit", [{ ...item("a"), queued: undefined }]);
     expect(result.current.editingId).toBeNull();
-    expect(draft()).toBe("my edit");
+    expect(draft()).toBe("half-typed\nmy edit");
+  });
+
+  it("returns the edited turn's words once when it is cancelled mid-edit", () => {
+    const cancel = () =>
+      act(() => {
+        useAgentChatStore.getState().applyEvent(thread, {
+          type: "queued_turn_cancelled",
+          thread_id: thread,
+          queued_id: "a",
+        });
+      });
+    // Unchanged: the composer holds the displaced draft and the turn's text.
+    seed("half-typed", [item("a")]);
+    const first = renderHook(() => useQueuedTurnEditor({ threadId: thread, provider: "claude" }));
+    act(() => first.result.current.begin(item("a")));
+    cancel();
+    expect(first.result.current.editingId).toBeNull();
+    expect(draft()).toBe("half-typed\ntext a");
+    first.unmount();
+    // Edited: the edit is what returns, below the displaced draft.
+    seed("half-typed", [item("a")]);
+    const second = renderHook(() => useQueuedTurnEditor({ threadId: thread, provider: "claude" }));
+    act(() => second.result.current.begin(item("a")));
+    act(() => useAgentChatStore.getState().setInputDraft(thread, "my edit"));
+    cancel();
+    expect(draft()).toBe("half-typed\nmy edit");
   });
 });

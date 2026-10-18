@@ -231,13 +231,14 @@ fn saved_row(db: &DatabaseStore, thread_id: &str, queued_id: &str) -> Option<Que
         .filter(|row| row.epoch != epoch())
 }
 
-/// Saved turns being sent right now, which nothing else may change.
+/// Saved turns a send, edit, move or removal is working on. One claim per
+/// row at a time, so a send never reads a row another change is rewriting.
 fn sending() -> &'static Mutex<HashSet<(String, String)>> {
     static SENDING: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
     SENDING.get_or_init(Default::default)
 }
 
-const BEING_SENT: &str = "This message is being sent.";
+const BEING_SENT: &str = "This message is being sent or changed. Try again in a moment.";
 
 fn is_sending(thread_id: &str, queued_id: &str) -> bool {
     sending()
@@ -246,7 +247,24 @@ fn is_sending(thread_id: &str, queued_id: &str) -> bool {
         .contains(&(thread_id.to_owned(), queued_id.to_owned()))
 }
 
-/// Releases a send's claim however the send ends.
+/// Run `op` on saved row `queued_id` while holding its claim, reading the
+/// row only once the claim is held. `Ok(None)` when it is no longer saved.
+fn under_claim<T>(
+    db: &DatabaseStore,
+    thread_id: &str,
+    queued_id: &str,
+    op: impl FnOnce(QueuedTurnRecord) -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    let Some(_claim) = Claim::take(thread_id, queued_id) else {
+        return Err(BEING_SENT.into());
+    };
+    match saved_row(db, thread_id, queued_id) {
+        Some(row) => op(row).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Releases a claim however the work holding it ends.
 struct Claim((String, String));
 
 impl Claim {
@@ -323,35 +341,35 @@ pub async fn agent_chat_edit_queued_turn<R: Runtime>(
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let db: State<'_, DatabaseStore> = app.state();
-    let Some(row) = saved_row(&db, &thread_id.0, &queued_id) else {
+    if saved_row(&db, &thread_id.0, &queued_id).is_none() {
         let registry: State<'_, ProviderRegistry> = app.state();
         return lookup_provider(&registry, provider)
             .await?
             .edit_queued_turn(thread_id, queued_id, text)
             .await
             .map_err(provider_err);
-    };
-    if is_sending(&thread_id.0, &queued_id) {
-        return Err(BEING_SENT.into());
     }
-    let text = text.trim().to_owned();
-    if text.is_empty() && row.images.is_empty() {
-        return Err("A queued message can't be empty. Cancel it instead.".into());
-    }
-    if let Some(prompt) = &row.prompt {
-        if queue_edit::splice_prompt(prompt, &row.text, &text).is_none() {
-            return Err(provider_err(queue_edit::cannot_edit()));
+    let edited = under_claim(&db, &thread_id.0, &queued_id, |row| {
+        let text = text.trim().to_owned();
+        if text.is_empty() && row.images.is_empty() {
+            return Err("A queued message can't be empty. Cancel it instead.".into());
         }
-    }
-    forward_event(
-        &app,
-        ProviderRuntimeEvent::QueuedTurnEdited {
-            thread_id,
-            queued_id,
-            text,
-        },
-    );
-    Ok(true)
+        if let Some(prompt) = &row.prompt {
+            if queue_edit::splice_prompt(prompt, &row.text, &text).is_none() {
+                return Err(provider_err(queue_edit::cannot_edit()));
+            }
+        }
+        forward_event(
+            &app,
+            ProviderRuntimeEvent::QueuedTurnEdited {
+                thread_id: thread_id.clone(),
+                queued_id: queued_id.clone(),
+                text,
+            },
+        );
+        Ok(())
+    })?;
+    Ok(edited.is_some())
 }
 
 /// Move `ids`' item `id` to just before `before`, or to the end.
@@ -390,24 +408,24 @@ pub async fn agent_chat_move_queued_turn<R: Runtime>(
             .await
             .map_err(provider_err);
     }
-    if is_sending(&thread_id.0, &queued_id) {
-        return Err(BEING_SENT.into());
-    }
-    let mut queued_ids: Vec<String> = db
-        .list_queued_turns(&thread_id.0)
-        .into_iter()
-        .filter(|row| row.epoch != epoch())
-        .map(|row| row.queued_id)
-        .collect();
-    move_id(&mut queued_ids, &queued_id, before.as_deref());
-    forward_event(
-        &app,
-        ProviderRuntimeEvent::QueuedTurnsReordered {
-            thread_id,
-            queued_ids,
-        },
-    );
-    Ok(true)
+    let moved = under_claim(&db, &thread_id.0, &queued_id, |_| {
+        let mut queued_ids: Vec<String> = db
+            .list_queued_turns(&thread_id.0)
+            .into_iter()
+            .filter(|row| row.epoch != epoch())
+            .map(|row| row.queued_id)
+            .collect();
+        move_id(&mut queued_ids, &queued_id, before.as_deref());
+        forward_event(
+            &app,
+            ProviderRuntimeEvent::QueuedTurnsReordered {
+                thread_id: thread_id.clone(),
+                queued_ids,
+            },
+        );
+        Ok(())
+    })?;
+    Ok(moved.is_some())
 }
 
 /// Remove a saved turn. Like a live cancel, its text returns to the
@@ -419,20 +437,17 @@ pub async fn agent_chat_cancel_saved_queued_turn<R: Runtime>(
     queued_id: String,
 ) -> Result<bool, String> {
     let db: State<'_, DatabaseStore> = app.state();
-    if saved_row(&db, &thread_id.0, &queued_id).is_none() {
-        return Ok(false);
-    }
-    if is_sending(&thread_id.0, &queued_id) {
-        return Err(BEING_SENT.into());
-    }
-    forward_event(
-        &app,
-        ProviderRuntimeEvent::QueuedTurnCancelled {
-            thread_id,
-            queued_id,
-        },
-    );
-    Ok(true)
+    let cancelled = under_claim(&db, &thread_id.0, &queued_id, |_| {
+        forward_event(
+            &app,
+            ProviderRuntimeEvent::QueuedTurnCancelled {
+                thread_id: thread_id.clone(),
+                queued_id: queued_id.clone(),
+            },
+        );
+        Ok(())
+    })?;
+    Ok(cancelled.is_some())
 }
 
 /// Send a saved turn through the normal send path with `delivery`, as if
@@ -615,8 +630,21 @@ mod tests {
         // One send at a time claims it.
         let claim = Claim::take("t", "old").unwrap();
         assert!(is_sending("t", "old") && Claim::take("t", "old").is_none());
+        // An edit, move or removal waits out a send in flight rather than
+        // changing a row the send has already read.
+        assert_eq!(under_claim(&db, "t", "old", |_| Ok(())), Err(BEING_SENT.to_string()));
         drop(claim);
         assert!(!is_sending("t", "old"));
+        // With the claim free the change runs on the row it re-reads, and
+        // holds the claim while it does.
+        let ran = under_claim(&db, "t", "old", |row| {
+            assert!(is_sending("t", "old"));
+            Ok(row.queued_id)
+        });
+        assert_eq!(ran, Ok(Some("old".to_string())));
+        assert!(!is_sending("t", "old"));
+        db.delete_queued_turn("t", "old").unwrap();
+        assert_eq!(under_claim(&db, "t", "old", |_| Ok(())), Ok(None));
         row.client_nonce = Some("n".into());
         assert_eq!(nonce(&row), "n");
     }

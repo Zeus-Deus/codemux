@@ -59,6 +59,8 @@ import { STRIP_ROW_HEIGHT } from "./ComposerStrip";
 export interface QueuedTurnEditor {
   /** The queued turn whose text is loaded in the composer. */
   editingId: string | null;
+  /** It keeps images, so its words may be cleared. */
+  editingHasImages: boolean;
   begin: (item: UserMessageItem) => void;
   /** Put the draft from before the edit back. */
   cancel: () => void;
@@ -68,6 +70,21 @@ export interface QueuedTurnEditor {
 
 function draftOf(threadId: string): string {
   return useAgentChatStore.getState().threads[threadId]?.inputDraft ?? "";
+}
+
+/** Two drafts in one composer, the way a cancelled turn's text joins one. */
+function joinDrafts(first: string, second: string): string {
+  if (!first.trim()) return second;
+  if (!second.trim()) return first;
+  return `${first}\n${second}`;
+}
+
+/** `current` without `text`, when the store appended it as it does for a
+ *  cancelled turn (on a new line, or alone in an empty composer). */
+function withoutReturned(current: string, text: string): string | null {
+  if (!text.trim()) return null;
+  if (current === text) return "";
+  return current.endsWith(`\n${text}`) ? current.slice(0, -(text.length + 1)) : null;
 }
 
 /** The composer region the queue list belongs to: its nearest ancestor
@@ -92,22 +109,32 @@ export function useQueuedTurnEditor({
   const setInputDraft = useAgentChatStore((s) => s.setInputDraft);
   const messages = useAgentChatStore((s) => (threadId ? s.threads[threadId]?.messages : undefined));
   const [editingId, setEditingId] = useState<string | null>(null);
-  // The draft the edit displaced, the text it loaded, and the text a save
-  // in flight submitted.
+  const [editingHasImages, setEditingHasImages] = useState(false);
+  // The draft the edit displaced, the turn's bubble and the text it loaded,
+  // and the text a save in flight submitted.
   const editRef = useRef<{
     threadId: string;
     queuedId: string;
+    itemId: string;
     draft: string;
     original: string;
     saving?: string;
   } | null>(null);
 
+  /** End the edit. `restore` puts the displaced draft back; `keep` leaves
+   *  the composer's words and adds the displaced draft above them, so
+   *  neither is lost. */
   const finish = useCallback(
-    (restore: boolean) => {
+    (mode: "restore" | "keep") => {
       const edit = editRef.current;
       editRef.current = null;
       setEditingId(null);
-      if (edit && restore) setInputDraft(edit.threadId, edit.draft);
+      setEditingHasImages(false);
+      if (!edit) return;
+      setInputDraft(
+        edit.threadId,
+        mode === "restore" ? edit.draft : joinDrafts(edit.draft, draftOf(edit.threadId)),
+      );
     },
     [setInputDraft],
   );
@@ -117,20 +144,27 @@ export function useQueuedTurnEditor({
       if (!threadId || !item.queued) return;
       const previous = editRef.current;
       const draft = previous?.threadId === threadId ? previous.draft : draftOf(threadId);
-      editRef.current = { threadId, queuedId: item.queued.queuedId, draft, original: item.text };
+      editRef.current = {
+        threadId,
+        queuedId: item.queued.queuedId,
+        itemId: item.id,
+        draft,
+        original: item.text,
+      };
       setEditingId(item.queued.queuedId);
+      setEditingHasImages((item.images?.length ?? 0) > 0);
       setInputDraft(threadId, item.text);
     },
     [threadId, setInputDraft],
   );
 
-  const cancel = useCallback(() => finish(true), [finish]);
+  const cancel = useCallback(() => finish("restore"), [finish]);
 
   const save = useCallback(
     async (text: string) => {
       const edit = editRef.current;
       if (!edit || edit.saving !== undefined) return;
-      if (text.trim() === edit.original.trim()) return finish(true);
+      if (text.trim() === edit.original.trim()) return finish("restore");
       edit.saving = text;
       try {
         const still = await agentChatEditQueuedTurn(provider, edit.threadId, edit.queuedId, text);
@@ -138,13 +172,13 @@ export function useQueuedTurnEditor({
         if (still) {
           // Anything typed while the save was in flight is not the saved
           // text, so it stays in the composer.
-          return finish(draftOf(edit.threadId) === text);
+          return finish(draftOf(edit.threadId) === text ? "restore" : "keep");
         }
         // It dispatched first; the words stay in the composer as a draft.
         toast.error("That message was sent before the edit was saved.", {
           description: "Your edit is still in the composer.",
         });
-        finish(false);
+        finish("keep");
       } catch (error) {
         edit.saving = undefined;
         toast.failure("Couldn't edit the queued message", error);
@@ -169,24 +203,31 @@ export function useQueuedTurnEditor({
     // holds this edit. Move it onto the displaced draft, so it is there
     // whichever way the edit ends.
     for (const [queuedId, text] of before) {
-      if (queuedId === edit.queuedId || now.has(queuedId) || !text.trim()) continue;
-      const current = draftOf(edit.threadId);
-      // The store appends it on a new line, or uses it alone in an empty composer.
-      const tail = current === text ? text : `\n${text}`;
-      if (!current.endsWith(tail)) continue;
-      setInputDraft(edit.threadId, current.slice(0, -tail.length));
-      edit.draft = edit.draft.trim() ? `${edit.draft}\n${text}` : text;
+      if (queuedId === edit.queuedId || now.has(queuedId)) continue;
+      const rest = withoutReturned(draftOf(edit.threadId), text);
+      if (rest === null) continue;
+      setInputDraft(edit.threadId, rest);
+      edit.draft = joinDrafts(edit.draft, text);
     }
     // The edited turn left the queue. A save in flight settles the edit
-    // itself; otherwise keep a changed draft or put the earlier one back.
+    // itself.
     if (now.has(edit.queuedId) || edit.saving !== undefined) return;
-    finish(draftOf(edit.threadId).trim() === edit.original.trim());
+    const cancelled = !messages.some((m) => m.id === edit.itemId);
+    if (cancelled) {
+      // Its text came back to the composer too. Drop that copy: the words
+      // in the composer (the original or the user's edit) are what return.
+      const rest = withoutReturned(draftOf(edit.threadId), before.get(edit.queuedId) ?? edit.original);
+      if (rest !== null) setInputDraft(edit.threadId, rest);
+      return finish("keep");
+    }
+    // It dispatched: keep a changed draft, otherwise put the earlier one back.
+    finish(draftOf(edit.threadId).trim() === edit.original.trim() ? "restore" : "keep");
   }, [messages, finish, setInputDraft]);
 
   // A different thread is a different composer.
   useEffect(() => {
     const edit = editRef.current;
-    if (edit && edit.threadId !== threadId) finish(true);
+    if (edit && edit.threadId !== threadId) finish("restore");
   }, [threadId, finish]);
 
   // Leaving (a closed pane, another tab) ends the edit: the displaced draft
@@ -200,7 +241,10 @@ export function useQueuedTurnEditor({
     [],
   );
 
-  return useMemo(() => ({ editingId, begin, cancel, save }), [editingId, begin, cancel, save]);
+  return useMemo(
+    () => ({ editingId, editingHasImages, begin, cancel, save }),
+    [editingId, editingHasImages, begin, cancel, save],
+  );
 }
 
 // ── The list ───────────────────────────────────────────────────────────
@@ -561,7 +605,7 @@ export function QueuedTurnsList({
   );
 }
 
-// ── Saved queue restore ────────────────────────────────────────────────
+// ── Queue reconcile ────────────────────────────────────────────────
 
 
 /** What the queued bubbles currently say, to tell whether a queue event
@@ -574,29 +618,24 @@ function queuedSignature(messages: ChatThreadState["messages"]): string {
 }
 
 
-/** Match the thread's saved bubbles to the saved queue: add the missing
- *  ones, update text, drop ones no longer saved, and take its order. A
+/** Match the thread's queued bubbles to the backend's queue: add the
+ *  missing ones (a client attaching mid-queue), update text and the saved
+ *  flag, drop ones no longer queued, and take its order. Events missed
+ *  while detached (an edit or move by another client) are repaired here. A
  *  turn already sent under its nonce is left alone. */
-export function restoreSavedQueue(
+export function reconcileQueuedTurns(
   state: ChatThreadState,
   threadId: string,
   rows: QueuedTurnView[],
 ): ChatThreadState {
-  const saved = rows.filter((row) => row.saved);
-  const keep = new Set(saved.map((row) => row.queued_id));
+  const keep = new Set(rows.map((row) => row.queued_id));
   let next = state;
-  const stale = next.messages.some(
-    (m) => m.kind === "user_message" && m.queued?.saved && !keep.has(m.queued.queuedId),
-  );
-  if (stale) {
-    next = {
-      ...next,
-      messages: next.messages.filter(
-        (m) => !(m.kind === "user_message" && m.queued?.saved && !keep.has(m.queued.queuedId)),
-      ),
-    };
+  const gone = (m: ChatThreadState["messages"][number]) =>
+    m.kind === "user_message" && !!m.queued && !keep.has(m.queued.queuedId);
+  if (next.messages.some(gone)) {
+    next = { ...next, messages: next.messages.filter((m) => !gone(m)) };
   }
-  for (const row of saved) {
+  for (const row of rows) {
     const index = next.messages.findIndex(
       (m) => m.kind === "user_message" && m.queued?.queuedId === row.queued_id,
     );
@@ -609,12 +648,12 @@ export function restoreSavedQueue(
       });
       // A bubble kept from before the backend restarted is saved now.
       const item = next.messages[index];
-      if (item.kind === "user_message" && !item.queued?.saved) {
+      if (item.kind === "user_message" && !!item.queued?.saved !== row.saved) {
         next = {
           ...next,
           messages: replaceTranscriptItem(next.messages, index, {
             ...item,
-            queued: { queuedId: row.queued_id, saved: true },
+            queued: { queuedId: row.queued_id, ...(row.saved ? { saved: true } : {}) },
           }),
         };
       }
@@ -639,7 +678,7 @@ export function restoreSavedQueue(
       ...next,
       messages: replaceTranscriptItem(next.messages, added, {
         ...item,
-        queued: { queuedId: row.queued_id, saved: true },
+        queued: { queuedId: row.queued_id, ...(row.saved ? { saved: true } : {}) },
         ...(row.images.length > 0
           ? { images: row.images.map((image) => ({ src: image.path, mediaType: image.media_type })) }
           : {}),
@@ -649,7 +688,7 @@ export function restoreSavedQueue(
   next = reorderQueuedTurns(next, {
     type: "queued_turns_reordered",
     thread_id: threadId,
-    queued_ids: saved.map((row) => row.queued_id),
+    queued_ids: rows.map((row) => row.queued_id),
   });
   // Adding goes through the reducer, which would clear a stall notice.
   return next === state || next.stalled === state.stalled ? next : { ...next, stalled: state.stalled };
@@ -657,8 +696,8 @@ export function restoreSavedQueue(
 
 /** After every transcript replay of the thread (hydration, including a
  *  remote reconnect's, and a revert) and whenever saved rows are rehomed
- *  onto it, match its saved bubbles to the saved queue. Live turns arrive
- *  through events instead. */
+ *  onto it, match its queued bubbles to the backend's queue
+ *  (`reconcileQueuedTurns`). Between those, queue events keep them in step. */
 export function useSavedQueueRestore(
   threadId: string | null,
   hydrated: boolean,
@@ -689,7 +728,7 @@ export function useSavedQueueRestore(
         useAgentChatStore.setState((state) => {
           const slice = state.threads[threadId];
           if (!slice) return {};
-          const next = restoreSavedQueue(slice, threadId, rows);
+          const next = reconcileQueuedTurns(slice, threadId, rows);
           if (next === slice) return {};
           return { threads: { ...state.threads, [threadId]: { ...slice, ...next } } };
         });

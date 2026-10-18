@@ -282,6 +282,9 @@ interface Props {
   /** Replaces the footer's submit hint, e.g. while Enter saves a queued
    *  message's edit instead of sending. */
   submitHint?: string | null;
+  /** Submit an empty draft too: a queued message's edit may drop its
+   *  words while keeping its images. */
+  submitWhenEmpty?: boolean;
   /** Floor for the textarea box, padding included. Defaults to
    *  {@link MIN_TEXTAREA_PX} when `isDraft` (a spacious prompt card) and
    *  to a single line otherwise. */
@@ -545,6 +548,7 @@ export function Composer({
   onSteerNextQueued,
   onEditLastQueued,
   submitHint = null,
+  submitWhenEmpty = false,
   minTextareaPx,
   paneDragActive = false,
   contextUsage = null,
@@ -2953,7 +2957,7 @@ export function Composer({
   }, [fitFooter, footerKey, footerFit]);
   const steeringUnavailable = streaming && delivery.delivery === "steer" && !supportsSteering;
   const discoveringCommands = draftLeadsWithSlash && providerCommandsEntry.loading && !providerCommandsEntry.loaded;
-  const canSubmit = !remoteDisconnected && (provider !== "acp" || (acp.ready && !acp.busy && customAgentsAllowed && !unsupportedAcpImages)) && sessionReady && !sending && !discoveringCommands && delivery.text.length > 0 && !steeringUnavailable;
+  const canSubmit = !remoteDisconnected && (provider !== "acp" || (acp.ready && !acp.busy && customAgentsAllowed && !unsupportedAcpImages)) && sessionReady && !sending && !discoveringCommands && (delivery.text.length > 0 || submitWhenEmpty) && !steeringUnavailable;
   // Subtle affordance so the user knows Enter will queue rather than
   // interrupt, shown only while a turn streams and there's text to send.
   const showQueueHint = streaming && draft.trim().length > 0;

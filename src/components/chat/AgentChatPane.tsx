@@ -4255,6 +4255,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onSteerNextQueued={steerNextQueued}
       onEditLastQueued={editLastQueued}
       submitHint={queueEditor.editingId ? "Enter to save the queued message · Esc to cancel" : null}
+      submitWhenEmpty={queueEditor.editingHasImages}
       stripSlot={conversationWritable ? stripEl : <>{stripEl}{conversationCheckNotice}</>}
       paneDragActive={paneDragDepth > 0}
       tasks={taskSummary}

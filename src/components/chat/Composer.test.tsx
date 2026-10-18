@@ -104,6 +104,21 @@ describe("Composer", () => {
     expect(container.querySelector("textarea")).toHaveValue("Keep this unsent draft");
   });
 
+  it("submits an empty draft only while a queued message with images is being edited", () => {
+    const onSubmit = vi.fn();
+    const { container, rerender } = renderComposer({ draft: "", onSubmit });
+    const send = () => container.querySelector('button[aria-label="Send"]') as HTMLButtonElement;
+    expect(send().disabled).toBe(true);
+    rerender(
+      <TooltipProvider>
+        <Composer {...baseProps()} draft="" onSubmit={onSubmit} submitWhenEmpty />
+      </TooltipProvider>,
+    );
+    expect(send().disabled).toBe(false);
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledOnce();
+  });
+
   it("uses Ctrl+Enter for background send only when the surface supports it", () => {
     const onSubmit = vi.fn();
     const onBackgroundSubmit = vi.fn();
