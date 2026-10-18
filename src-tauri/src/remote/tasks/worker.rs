@@ -479,7 +479,7 @@ child.stdin.close();child.wait()
             store.cancel(&id).unwrap();
             assert!(tokio::time::timeout(Duration::from_secs(5), worker).await.unwrap().unwrap().is_ok());
             let wire = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
-            assert_eq!(wire.lines().filter(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["message"]["result"]["decision"] == "deny").count(), 2, "exact duplicate enqueues must not replay callbacks");
+            assert_eq!(wire.lines().filter(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["message"]["result"]["decision"] == "decline").count(), 2, "exact duplicate enqueues must not replay callbacks");
             assert_eq!(settled[0].status, TaskStatus::AwaitingApproval);
             assert_eq!(settled[0].activity.as_deref(), Some(if progress { "Newer native progress" } else { "Waiting for native approval" }));
             assert_eq!(settled[1].status, TaskStatus::Running);
@@ -570,7 +570,7 @@ child.stdin.close();child.wait()
                 if wire.lines().any(|l| {
                     serde_json::from_str::<serde_json::Value>(l).unwrap()["message"]["result"]
                         ["decision"]
-                        == "deny"
+                        == "decline"
                 }) {
                     return wire;
                 }
@@ -584,7 +584,7 @@ child.stdin.close();child.wait()
                 .filter(
                     |l| serde_json::from_str::<serde_json::Value>(l).unwrap()["message"]["result"]
                         ["decision"]
-                        == "deny"
+                        == "decline"
                 )
                 .count(),
             1
