@@ -27,8 +27,8 @@ pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE automation_runs ADD COLUMN trigger_type TEXT NOT NULL DEFAULT 'schedule'",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_automations_webhook_id \
              ON automations(webhook_id) WHERE webhook_id IS NOT NULL",
-        // Values are sealed with `auth::encrypt_data` (AES-256-GCM, key
-        // derived from the machine id) and are never returned to the UI.
+        // Values are sealed by `crate::secrets` (AES-256-GCM under a random
+        // key kept outside the database) and never returned to the UI.
         "CREATE TABLE IF NOT EXISTS secrets (
             id TEXT PRIMARY KEY,
             label TEXT NOT NULL,
@@ -107,6 +107,11 @@ fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::rngs::OsRng.fill_bytes(&mut buf);
     buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A fresh random id for a stored secret.
+pub fn new_secret_id() -> String {
+    format!("secret_{}", random_hex(16))
 }
 
 /// A fresh `(webhook_id, webhook_token)` pair for a new or rotated URL.
@@ -250,9 +255,13 @@ impl DatabaseStore {
 
     // ── Secrets ──
 
-    /// Store an already-encrypted secret under a new random id.
-    pub fn insert_secret(&self, label: &str, ciphertext: &[u8]) -> Result<SecretMeta, String> {
-        let id = format!("secret_{}", random_hex(16));
+    /// Store an already-encrypted secret under `id` (see `new_secret_id`).
+    pub fn insert_secret(
+        &self,
+        id: &str,
+        label: &str,
+        ciphertext: &[u8],
+    ) -> Result<SecretMeta, String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO secrets (id, label, ciphertext) VALUES (?1, ?2, ?3)",
@@ -363,6 +372,55 @@ mod tests {
         let reread = db.get_automation(existing.id).unwrap();
         assert_eq!(reread.trigger_type, AutomationTrigger::Schedule);
         assert!(reread.webhook_id.is_none());
+    }
+
+    #[test]
+    fn an_undecodable_stored_signature_fails_closed() {
+        use crate::automations::webhook::{accept_delivery, DeliveryRejection, WebhookRequest};
+        let db = init_test_database();
+        let a = db
+            .insert_automation(&AutomationInput {
+                name: "Hook".into(),
+                prompt: "p".into(),
+                agent: "claude".into(),
+                schedule: String::new(),
+                timezone: "UTC".into(),
+                host_id: None,
+                project_path: None,
+                project_remote: None,
+                retention_limit: 10,
+                trigger_type: Some(AutomationTrigger::Webhook),
+            })
+            .unwrap();
+        let secret = crate::secrets::store(&db, "GitHub", "s").unwrap();
+        let signature = WebhookSignature {
+            header: "x-hub-signature-256".into(),
+            encoding: SignatureEncoding::Hex,
+            prefix: "sha256=".into(),
+        };
+        db.set_automation_webhook_signature(a.id, Some((&signature, &secret.id)))
+            .unwrap();
+        // Damage, or an encoding from a newer build this one does not know.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE automations SET webhook_signature = '{\"encoding\":\"sha512\"}' WHERE id = ?1",
+                params![a.id],
+            )
+            .unwrap();
+        let req = WebhookRequest::new("POST", "/", "", [], Vec::new());
+        assert_eq!(
+            accept_delivery(
+                &db,
+                a.webhook_id.as_deref().unwrap(),
+                a.webhook_token.as_deref().unwrap(),
+                &req,
+                chrono::Utc::now(),
+            )
+            .unwrap_err(),
+            DeliveryRejection::SignatureUnavailable
+        );
     }
 
     #[test]

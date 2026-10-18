@@ -212,19 +212,43 @@ fn format_request(request: &WebhookRequest) -> String {
 /// whole set renders (`{{request}}`, `{{headers}}`, `{{query}}`); naming
 /// one (`{{headers.authorization}}`) gives its raw value. Substitution is
 /// a single pass, so placeholders inside the request are left as text.
-pub fn render_prompt(template: &str, request: &WebhookRequest) -> RenderedPrompt {
+///
+/// Returns `None` as soon as the prompt would exceed `max_bytes`, before
+/// building it, so a template that repeats `{{body}}` cannot balloon.
+pub fn render_prompt(
+    template: &str,
+    request: &WebhookRequest,
+    max_bytes: usize,
+) -> Option<RenderedPrompt> {
     let mut missing: Vec<String> = Vec::new();
     let mut parsed: Option<Option<Value>> = None;
+    let mut body_text: Option<String> = None;
+    let mut whole_request: Option<String> = None;
+    let mut prompt = String::new();
+    let push = |prompt: &mut String, text: &str| -> Option<()> {
+        (prompt.len() + text.len() <= max_bytes).then(|| prompt.push_str(text))
+    };
 
-    let prompt = PLACEHOLDER.replace_all(template, |caps: &regex::Captures<'_>| {
+    let mut last = 0;
+    for caps in PLACEHOLDER.captures_iter(template) {
+        let whole = caps.get(0).expect("match has a whole group");
+        push(&mut prompt, &template[last..whole.start()])?;
+        last = whole.end();
+
         let expression = caps[1].trim();
         let mut parts = expression.split('.');
         let root = parts.next().unwrap_or_default();
         let segments: Vec<&str> = parts.collect();
 
         let value: Option<String> = match root {
-            "request" if segments.is_empty() => Some(format_request(request)),
-            "body" if segments.is_empty() => Some(request.body_text()),
+            "request" if segments.is_empty() => Some(
+                whole_request
+                    .get_or_insert_with(|| format_request(request))
+                    .clone(),
+            ),
+            "body" if segments.is_empty() => {
+                Some(body_text.get_or_insert_with(|| request.body_text()).clone())
+            }
             "body" => parsed
                 .get_or_insert_with(|| parse_body(request))
                 .as_ref()
@@ -253,18 +277,18 @@ pub fn render_prompt(template: &str, request: &WebhookRequest) -> RenderedPrompt
             _ => None,
         };
 
-        value.unwrap_or_else(|| {
-            if !missing.iter().any(|seen| seen == expression) {
-                missing.push(expression.to_string());
+        match value {
+            Some(text) => push(&mut prompt, &text)?,
+            None => {
+                if !missing.iter().any(|seen| seen == expression) {
+                    missing.push(expression.to_string());
+                }
             }
-            String::new()
-        })
-    });
-
-    RenderedPrompt {
-        prompt: prompt.into_owned(),
-        missing,
+        }
     }
+    push(&mut prompt, &template[last..])?;
+
+    Some(RenderedPrompt { prompt, missing })
 }
 
 // ── Signature verification ──
@@ -362,9 +386,9 @@ pub enum DeliveryRejection {
     PayloadTooLarge,
     /// A signature is configured and the request's did not match.
     BadSignature,
-    /// A signature is configured but its secret could not be read. Fails
-    /// closed rather than running unverified.
-    SecretUnavailable,
+    /// A signature is configured but it or its secret could not be read.
+    /// Fails closed rather than running unverified.
+    SignatureUnavailable,
     /// The rendered prompt was empty.
     EmptyPrompt,
     PromptTooLarge,
@@ -383,7 +407,7 @@ impl std::fmt::Display for DeliveryRejection {
             Self::Disabled => "This automation is paused",
             Self::PayloadTooLarge => "Request body is too large",
             Self::BadSignature => "Signature check failed",
-            Self::SecretUnavailable => "The signing secret is unavailable",
+            Self::SignatureUnavailable => "The signature check is unavailable",
             Self::EmptyPrompt => "The rendered prompt is empty",
             Self::PromptTooLarge => "The rendered prompt is too large",
             Self::Busy => "A previous run is still in progress",
@@ -408,7 +432,7 @@ pub struct AcceptedDelivery {
 ///
 /// Checks, in order: body size, the URL token, that the automation is
 /// enabled, and the signature (when configured). Then it renders the
-/// prompt and records a `scheduled` run, or a `skipped_busy` one when a
+/// prompt, with the URL token redacted from the path and query, and records a `scheduled` run, or a `skipped_busy` one when a
 /// run is already in flight. The caller executes the returned run.
 pub fn accept_delivery(
     db: &DatabaseStore,
@@ -430,25 +454,30 @@ pub fn accept_delivery(
     if !automation.enabled {
         return Err(DeliveryRejection::Disabled);
     }
-    if let Some(signature) = &automation.webhook_signature {
-        let secret = automation
-            .webhook_secret_ref
-            .as_deref()
-            .ok_or(DeliveryRejection::SecretUnavailable)
-            .and_then(|id| {
-                crate::secrets::reveal(db, id).map_err(|_| DeliveryRejection::SecretUnavailable)
-            })?;
-        if !verify_signature(signature, secret.as_bytes(), &request.headers, &request.body) {
-            return Err(DeliveryRejection::BadSignature);
+    // The signature and its secret are saved together, so a secret without
+    // a readable signature means the stored check could not be decoded.
+    // Refuse rather than run unverified.
+    match (&automation.webhook_signature, automation.webhook_secret_ref.as_deref()) {
+        (None, None) => {}
+        (Some(signature), Some(secret_ref)) => {
+            let secret = crate::secrets::reveal(db, secret_ref)
+                .map_err(|_| DeliveryRejection::SignatureUnavailable)?;
+            if !verify_signature(signature, secret.as_bytes(), &request.headers, &request.body) {
+                return Err(DeliveryRejection::BadSignature);
+            }
         }
+        _ => return Err(DeliveryRejection::SignatureUnavailable),
     }
 
-    let rendered = render_prompt(&automation.prompt, request);
+    // The URL token must never reach the agent, even when the route passes
+    // the full request path and `{{request}}` renders it.
+    let mut visible = request.clone();
+    visible.path = visible.path.replace(expected, REDACTED);
+    visible.query = visible.query.replace(expected, REDACTED);
+    let rendered = render_prompt(&automation.prompt, &visible, MAX_RENDERED_PROMPT_BYTES)
+        .ok_or(DeliveryRejection::PromptTooLarge)?;
     if rendered.prompt.trim().is_empty() {
         return Err(DeliveryRejection::EmptyPrompt);
-    }
-    if rendered.prompt.len() > MAX_RENDERED_PROMPT_BYTES {
-        return Err(DeliveryRejection::PromptTooLarge);
     }
 
     // Microsecond precision keeps each delivery's key distinct under the
@@ -512,13 +541,31 @@ mod tests {
 
     // ── render_prompt ──
 
+    fn render(template: &str, request: &WebhookRequest) -> RenderedPrompt {
+        render_prompt(template, request, usize::MAX).expect("within budget")
+    }
+
+    #[test]
+    fn rendering_stops_at_the_byte_budget() {
+        let req = request("text/plain", &"x".repeat(1000));
+        let template = "{{body}}".repeat(10_000);
+        assert!(render_prompt(&template, &req, 5_000).is_none());
+        assert!(render_prompt("short", &req, 5).is_some());
+        assert!(render_prompt("short!", &req, 5).is_none());
+        // Missing placeholders cost nothing.
+        assert_eq!(
+            render_prompt("{{nope}}ab", &req, 2).unwrap().prompt,
+            "ab"
+        );
+    }
+
     #[test]
     fn renders_json_body_paths_including_array_indices() {
         let req = request(
             "application/json",
             r#"{"issue":{"title":"Crash on start","number":42,"labels":[{"name":"bug"}]},"draft":false}"#,
         );
-        let out = render_prompt(
+        let out = render(
             "Fix #{{body.issue.number}}: {{ body.issue.title }} [{{body.issue.labels.0.name}}] draft={{body.draft}}",
             &req,
         );
@@ -529,7 +576,7 @@ mod tests {
     #[test]
     fn objects_render_as_json_and_missing_paths_render_empty() {
         let req = request("application/json", r#"{"a":{"b":1},"n":null}"#);
-        let out = render_prompt("{{body.a}}|{{body.x.y}}|{{body.n}}|{{body.x.y}}|{{nope}}", &req);
+        let out = render("{{body.a}}|{{body.x.y}}|{{body.n}}|{{body.x.y}}|{{nope}}", &req);
         assert_eq!(out.prompt, "{\n  \"b\": 1\n}||||");
         assert_eq!(out.missing, vec!["body.x.y", "body.n", "nope"]);
     }
@@ -537,14 +584,14 @@ mod tests {
     #[test]
     fn parses_json_even_without_a_json_content_type() {
         let req = request("text/plain", r#"{"ok":"yes"}"#);
-        assert_eq!(render_prompt("{{body.ok}}", &req).prompt, "yes");
+        assert_eq!(render("{{body.ok}}", &req).prompt, "yes");
     }
 
     #[test]
     fn form_encoded_bodies_are_addressable() {
         let req = request("application/x-www-form-urlencoded", "name=Ada+Lovelace&id=7");
         assert_eq!(
-            render_prompt("{{body.name}} #{{body.id}}", &req).prompt,
+            render("{{body.name}} #{{body.id}}", &req).prompt,
             "Ada Lovelace #7"
         );
     }
@@ -552,7 +599,7 @@ mod tests {
     #[test]
     fn raw_body_headers_and_query_lookups() {
         let req = request("text/plain", "hello");
-        let out = render_prompt(
+        let out = render(
             "{{body}} {{headers.x-github-event}} {{headers.X-GITHUB-EVENT}} {{query.ref}}",
             &req,
         );
@@ -562,23 +609,23 @@ mod tests {
     #[test]
     fn whole_sets_redact_credentials_but_named_lookups_do_not() {
         let req = request("text/plain", "body text");
-        let headers = render_prompt("{{headers}}", &req).prompt;
+        let headers = render("{{headers}}", &req).prompt;
         assert!(headers.contains("[redacted]"));
         assert!(!headers.contains("Bearer abc"));
         assert!(headers.contains("issues"));
 
-        let query = render_prompt("{{query}}", &req).prompt;
+        let query = render("{{query}}", &req).prompt;
         assert!(query.contains("main"));
         assert!(!query.contains("hunter2"));
 
-        let whole = render_prompt("{{request}}", &req).prompt;
+        let whole = render("{{request}}", &req).prompt;
         assert!(whole.starts_with("POST /hooks/abc?ref=main&token=[redacted]\n"));
         assert!(!whole.contains("Bearer abc"));
         assert!(whole.ends_with("\n\nbody text"));
 
         // Naming a credential explicitly is the user's choice.
         assert_eq!(
-            render_prompt("{{headers.authorization}}", &req).prompt,
+            render("{{headers.authorization}}", &req).prompt,
             "Bearer abc"
         );
     }
@@ -586,7 +633,7 @@ mod tests {
     #[test]
     fn placeholders_inside_the_request_are_not_expanded() {
         let req = request("application/json", r#"{"title":"{{headers.authorization}}"}"#);
-        let out = render_prompt("{{body.title}}", &req);
+        let out = render("{{body.title}}", &req);
         assert_eq!(out.prompt, "{{headers.authorization}}");
     }
 
@@ -594,7 +641,7 @@ mod tests {
     fn text_without_placeholders_and_stray_braces_pass_through() {
         let req = request("text/plain", "");
         assert_eq!(
-            render_prompt("Plain {{ prompt { }}", &req).prompt,
+            render("Plain {{ prompt { }}", &req).prompt,
             "Plain {{ prompt { }}"
         );
     }
@@ -844,6 +891,40 @@ mod tests {
             accept_delivery(&db, &id, &token, &signed, at(1)).unwrap().automation.prompt,
             "Run 1"
         );
+    }
+
+    #[test]
+    fn the_url_token_never_reaches_the_prompt() {
+        let db = crate::database::init_test_database();
+        let a = webhook_automation(&db, "{{request}}");
+        let (id, token) = (a.webhook_id.clone().unwrap(), a.webhook_token.clone().unwrap());
+        let path = format!("/hooks/automations/{id}/{token}");
+        let query = format!("t={token}");
+        let req = WebhookRequest::new("POST", &path, &query, [], b"hi".to_vec());
+
+        let prompt = accept_delivery(&db, &id, &token, &req, at(0)).unwrap().automation.prompt;
+        assert!(!prompt.contains(&token), "{prompt}");
+        assert!(prompt.starts_with(&format!("POST /hooks/automations/{id}/[redacted]?")));
+    }
+
+    #[test]
+    fn a_signing_secret_with_whitespace_still_verifies() {
+        let db = crate::database::init_test_database();
+        let a = webhook_automation(&db, "go");
+        let secret = crate::secrets::store(&db, "Spaced", " signing-secret ").unwrap();
+        db.set_automation_webhook_signature(a.id, Some((&github_signature(), &secret.id)))
+            .unwrap();
+        let body = b"{}";
+        let header = format!("sha256={}", hmac_hex(" signing-secret ", body));
+        let req = WebhookRequest::new(
+            "POST",
+            "/",
+            "",
+            [("x-hub-signature-256", header.as_str())],
+            body.to_vec(),
+        );
+        let (id, token) = (a.webhook_id.clone().unwrap(), a.webhook_token.clone().unwrap());
+        assert!(accept_delivery(&db, &id, &token, &req, at(0)).is_ok());
     }
 
     #[test]

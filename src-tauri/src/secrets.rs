@@ -1,36 +1,53 @@
 //! Private secrets the user enters once, such as a webhook signing secret.
 //!
-//! Values are sealed with the same machine-guarded AES-256-GCM as the auth
-//! token (`auth::encrypt_data`) and stored in the `secrets` table. Nothing
-//! returns a value to the UI, an agent, or a log: callers get a
+//! Values are sealed with AES-256-GCM under a random 256-bit master key and
+//! stored in the `secrets` table. The key lives in its own owner-only file
+//! (`secrets.key` in the app data directory), apart from the database in
+//! the config directory, so a copy of the database alone reveals nothing.
+//! Losing the key makes stored secrets unreadable; signature checks then
+//! fail closed until the user enters the secret again.
+//!
+//! Nothing returns a value to the UI, an agent, or a log: callers get a
 //! [`SecretMeta`] and refer to the secret by its id. Only backend code that
 //! needs the value, such as webhook signature checks, calls [`reveal`].
+
+use std::path::Path;
+#[cfg(not(test))]
+use std::path::PathBuf;
+
+use aes_gcm::aead::{Aead, KeyInit, OsRng, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
+use rand::RngCore;
 
 use crate::database::automation_triggers::SecretMeta;
 use crate::database::DatabaseStore;
 
 const MAX_LABEL_LEN: usize = 200;
 const MAX_VALUE_LEN: usize = 16 * 1024;
+const KEY_LEN: usize = 32;
+const NONCE_LEN: usize = 12;
+/// First byte of every sealed value, so the format can change later.
+const FORMAT_V1: u8 = 1;
 
-/// Encrypt and store a secret. Surrounding whitespace is dropped, as a
-/// pasted token often carries a trailing newline.
+/// Encrypt and store a secret. The value is kept byte for byte: a signing
+/// secret with surrounding whitespace is still that secret.
 pub fn store(db: &DatabaseStore, label: &str, value: &str) -> Result<SecretMeta, String> {
     let label = label.trim();
-    let value = value.trim();
     if label.is_empty() {
         return Err("A secret needs a name".into());
     }
     if label.len() > MAX_LABEL_LEN {
         return Err(format!("Secret name is too long (max {MAX_LABEL_LEN} chars)"));
     }
-    if value.is_empty() {
+    if value.trim().is_empty() {
         return Err("The secret is empty".into());
     }
     if value.len() > MAX_VALUE_LEN {
         return Err(format!("The secret is too long (max {MAX_VALUE_LEN} bytes)"));
     }
-    let sealed = crate::auth::encrypt_data(value.as_bytes())?;
-    db.insert_secret(label, &sealed)
+    let id = crate::database::automation_triggers::new_secret_id();
+    let sealed = seal(&master_key()?, &id, value.as_bytes())?;
+    db.insert_secret(&id, label, &sealed)
 }
 
 /// Decrypt a stored secret for backend use. The error never contains the
@@ -39,9 +56,100 @@ pub(crate) fn reveal(db: &DatabaseStore, id: &str) -> Result<String, String> {
     let sealed = db
         .load_secret_ciphertext(id)
         .ok_or_else(|| "The secret no longer exists".to_string())?;
-    let plain = crate::auth::decrypt_data(&sealed)
-        .map_err(|_| "The secret could not be decrypted on this machine".to_string())?;
+    let plain = open(&master_key()?, id, &sealed)?;
     String::from_utf8(plain).map_err(|_| "The stored secret is not valid text".to_string())
+}
+
+/// Seal `plain` under `key`. The secret's id is bound in as associated
+/// data, so one row's ciphertext cannot be swapped into another.
+fn seal(key: &[u8; KEY_LEN], id: &str, plain: &[u8]) -> Result<Vec<u8>, String> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| "Secret cipher unavailable")?;
+    let mut nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plain, aad: id.as_bytes() })
+        .map_err(|_| "Could not encrypt the secret")?;
+    let mut out = Vec::with_capacity(1 + NONCE_LEN + ciphertext.len());
+    out.push(FORMAT_V1);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+fn open(key: &[u8; KEY_LEN], id: &str, sealed: &[u8]) -> Result<Vec<u8>, String> {
+    const UNREADABLE: &str = "The secret could not be decrypted on this machine";
+    if sealed.len() <= 1 + NONCE_LEN || sealed[0] != FORMAT_V1 {
+        return Err(UNREADABLE.into());
+    }
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| UNREADABLE)?;
+    let (nonce, ciphertext) = sealed[1..].split_at(NONCE_LEN);
+    cipher
+        .decrypt(Nonce::from_slice(nonce), Payload { msg: ciphertext, aad: id.as_bytes() })
+        .map_err(|_| UNREADABLE.into())
+}
+
+#[cfg(not(test))]
+fn key_path() -> Result<PathBuf, String> {
+    let dir = dirs::data_dir().ok_or("Could not determine the data directory")?;
+    Ok(dir.join(crate::APP_DIR_NAME).join("secrets.key"))
+}
+
+#[cfg(not(test))]
+fn master_key() -> Result<[u8; KEY_LEN], String> {
+    load_or_create_key(&key_path()?)
+}
+
+/// Tests never touch the real key file; each test process gets its own key.
+#[cfg(test)]
+fn master_key() -> Result<[u8; KEY_LEN], String> {
+    static KEY: std::sync::LazyLock<[u8; KEY_LEN]> = std::sync::LazyLock::new(|| {
+        let mut key = [0u8; KEY_LEN];
+        OsRng.fill_bytes(&mut key);
+        key
+    });
+    Ok(*KEY)
+}
+
+/// Read the master key, creating it (owner read/write only) on first use.
+/// `create_new` makes a concurrent first use settle on one key.
+fn load_or_create_key(path: &Path) -> Result<[u8; KEY_LEN], String> {
+    use std::io::{ErrorKind, Write};
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Could not create the secrets directory: {e}"))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            let mut key = [0u8; KEY_LEN];
+            OsRng.fill_bytes(&mut key);
+            file.write_all(&key)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| format!("Could not write the secrets key: {e}"))?;
+            Ok(key)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let bytes =
+                std::fs::read(path).map_err(|e| format!("Could not read the secrets key: {e}"))?;
+            #[cfg(unix)]
+            {
+                // Tighten a key file whose mode was widened since creation.
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+            bytes
+                .try_into()
+                .map_err(|_| "The secrets key file is damaged".to_string())
+        }
+        Err(error) => Err(format!("Could not create the secrets key: {error}")),
+    }
 }
 
 #[cfg(test)]
@@ -49,7 +157,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stores_encrypted_and_reveals_the_trimmed_value() {
+    fn stores_encrypted_and_reveals_the_exact_value() {
         let db = crate::database::init_test_database();
         let meta = store(&db, " GitHub ", "  s3cret-value\n").unwrap();
         assert_eq!(meta.label, "GitHub");
@@ -59,7 +167,34 @@ mod tests {
         assert!(!sealed
             .windows(b"s3cret-value".len())
             .any(|window| window == b"s3cret-value"));
-        assert_eq!(reveal(&db, &meta.id).unwrap(), "s3cret-value");
+        // Whitespace is part of a signing secret; it survives.
+        assert_eq!(reveal(&db, &meta.id).unwrap(), "  s3cret-value\n");
+    }
+
+    #[test]
+    fn ciphertext_is_bound_to_its_key_and_id() {
+        let key = [7u8; KEY_LEN];
+        let sealed = seal(&key, "secret_a", b"value").unwrap();
+        assert_eq!(open(&key, "secret_a", &sealed).unwrap(), b"value");
+        assert!(open(&[8u8; KEY_LEN], "secret_a", &sealed).is_err());
+        assert!(open(&key, "secret_b", &sealed).is_err());
+        assert!(open(&key, "secret_a", &sealed[..5]).is_err());
+    }
+
+    #[test]
+    fn key_file_is_created_once_owner_only_and_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("secrets.key");
+        let first = load_or_create_key(&path).unwrap();
+        assert_eq!(load_or_create_key(&path).unwrap(), first);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::write(&path, b"short").unwrap();
+        assert!(load_or_create_key(&path).is_err());
     }
 
     #[test]

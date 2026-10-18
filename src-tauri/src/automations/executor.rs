@@ -24,15 +24,18 @@ use crate::database::{AutomationRecord, AutomationRunRecord, DatabaseStore};
 
 /// Map an agent name to the headless CLI invocation that runs a single
 /// prompt to completion. Pure.
+///
+/// `--` ends option parsing, so a prompt that starts with `-` (a webhook
+/// body of `--help`, say) is read as the prompt and not as a flag.
 pub fn agent_command(agent: &str, prompt: &str) -> Result<(String, Vec<String>), String> {
     match agent {
         "claude" => Ok((
             "claude".to_string(),
-            vec!["--print".to_string(), prompt.to_string()],
+            vec!["--print".to_string(), "--".to_string(), prompt.to_string()],
         )),
         "codex" => Ok((
             "codex".to_string(),
-            vec!["exec".to_string(), prompt.to_string()],
+            vec!["exec".to_string(), "--".to_string(), prompt.to_string()],
         )),
         other => Err(format!(
             "Automation agent '{other}' is not supported (expected 'claude' or 'codex')"
@@ -447,14 +450,22 @@ mod tests {
     fn agent_command_maps_claude_to_print_mode() {
         let (program, args) = agent_command("claude", "do the thing").unwrap();
         assert_eq!(program, "claude");
-        assert_eq!(args, vec!["--print".to_string(), "do the thing".to_string()]);
+        assert_eq!(args, ["--print", "--", "do the thing"]);
     }
 
     #[test]
     fn agent_command_maps_codex_to_exec_mode() {
         let (program, args) = agent_command("codex", "do the thing").unwrap();
         assert_eq!(program, "codex");
-        assert_eq!(args, vec!["exec".to_string(), "do the thing".to_string()]);
+        assert_eq!(args, ["exec", "--", "do the thing"]);
+    }
+
+    #[test]
+    fn agent_command_keeps_a_dash_prompt_after_the_option_terminator() {
+        for agent in ["claude", "codex"] {
+            let (_, args) = agent_command(agent, "--help").unwrap();
+            assert_eq!(args[args.len() - 2..], ["--", "--help"]);
+        }
     }
 
     #[test]
