@@ -2926,3 +2926,53 @@ async fn service_tier_startup_fallback_reports_catalog_errors_and_downgrades() {
         provider.stop_session(thread).await.unwrap();
     }
 }
+
+/// `runtime_status` (behind `host.chat.getStatus`) counts a send whose
+/// `turn/start` is still in flight as busy, before Codex binds the turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_status_is_busy_while_a_turn_start_is_in_flight() {
+    let gate_dir = tempfile::tempdir().unwrap();
+    let gate = gate_dir.path().join("release-ack");
+    let script = write_script(json!([]));
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_SCRIPT", &script.path.to_string_lossy()),
+        ("FAKE_CODEX_FIRST_ACK_GATE", &gate.to_string_lossy()),
+    ]);
+    let provider = Arc::new(provider_with_fixture_and_binary(wrapper.path.clone()));
+    let id = ThreadId("t-status".into());
+    provider.start_session(start_input("t-status")).await.unwrap();
+    let idle = provider.runtime_status(&id).await.expect("live session");
+    assert!(!idle.busy);
+    assert_eq!(idle.queued, Some(0));
+    assert_eq!(idle.status, "ready");
+
+    let sending = {
+        let provider = Arc::clone(&provider);
+        tokio::spawn(async move {
+            provider
+                .send_turn(SendTurnInput {
+                    thread_id: ThreadId("t-status".into()),
+                    text: "hello".into(),
+                    images: vec![],
+                    model_override: None,
+                    effort_override: None,
+                    permission_mode_override: None,
+                    client_nonce: None,
+                    display_text: None,
+                    skill_invocations: vec![],
+                    turn_checkpoint: None,
+                    dispatch_guard: None,
+                })
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let in_flight = provider.runtime_status(&id).await.unwrap();
+    assert!(in_flight.busy, "a held turn/start must read as busy: {in_flight:?}");
+    assert!(!provider.turn_active(&id).await, "the turn is not bound yet");
+    std::fs::write(&gate, b"go").unwrap();
+    sending.await.unwrap().unwrap();
+    assert!(provider.runtime_status(&id).await.unwrap().busy);
+    assert!(provider.runtime_status(&ThreadId("nope".into())).await.is_none());
+    provider.stop_session(id).await.ok();
+}

@@ -2144,7 +2144,15 @@ function renderAssistantBody(
       // gutter. Amber for advisories the run may recover from (provider
       // rate-limit rejection, enumerated assistant error); red for
       // terminal failures (the session died and this is the cause).
-      // Tokens only (design-system no-hardcoded-color).
+      // Tokens only (design-system no-hardcoded-color). Info is a quiet
+      // routine fact (an idle chat was compacted), not an advisory.
+      if (item.severity === "info") {
+        return (
+          <div className="select-text py-0.5 text-label text-muted-foreground">
+            {item.message}
+          </div>
+        );
+      }
       return item.severity === "error" ? (
         <div className="select-text border-l-2 border-destructive/40 bg-destructive/10 px-3 py-1.5 text-body-sm text-destructive">
           {item.message}

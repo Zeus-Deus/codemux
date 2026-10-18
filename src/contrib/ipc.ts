@@ -100,3 +100,35 @@ export const pluginsPreviewInstall = (source: InstallSource) =>
 export const pluginsInstall = (source: InstallSource, expectedSha: string, enable: boolean) =>
   invoke<InstallPreview>("plugins_install", { source, expectedSha, enable });
 export const pluginsRemove = (id: string) => invoke<void>("plugins_remove", { id });
+
+// ── host.chat: status and compaction ──────────────────────────────────
+
+export interface ThreadStatus {
+  provider: string;
+  /** A turn, pending approval, queue dispatch or compaction is in flight. */
+  busy: boolean;
+  /** Follow-ups waiting behind it; null when the provider can't tell. */
+  queued: number | null;
+  /** A requested compaction is running. */
+  compacting: boolean;
+  status: "starting" | "ready" | "running" | "waiting_approval" | "error" | "closed";
+}
+
+export type CompactionRefusal =
+  | "busy"
+  | "queued"
+  | "not_ready"
+  | "closed"
+  | "no_session"
+  | "not_claude"
+  | "unsupported"
+  | "compaction_off"
+  | "idle_compaction_off"
+  | "failed";
+
+export type CompactionRequestResult = { started: true } | { started: false; reason: CompactionRefusal };
+
+export const pluginsChatStatus = (threadId: string) =>
+  invoke<ThreadStatus | null>("plugins_chat_status", { threadId });
+export const pluginsChatRequestCompaction = (threadId: string) =>
+  invoke<CompactionRequestResult>("plugins_chat_request_compaction", { threadId });

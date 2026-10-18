@@ -1238,3 +1238,74 @@ test("downgrade restore re-arms after ensureLiveQuery rebuilds the query", async
 
   await session.close();
 });
+
+// ---------------------------------------------------------------------------
+// Idle compaction
+// ---------------------------------------------------------------------------
+
+test("compactIdle pushes /compact onto the live query's prompt", async () => {
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  expect(session.compactIdle()).toEqual({ started: true });
+  await new Promise((r) => setTimeout(r, 10));
+  expect(fake.capturedPrompts).toHaveLength(1);
+  expect(
+    (fake.capturedPrompts[0] as { message: { content: unknown } }).message.content,
+  ).toBe("/compact");
+  await session.close();
+});
+
+test("compactIdle refuses a query an interrupt killed instead of rebuilding it", async () => {
+  const fakes: FakeQuery[] = [];
+  setQueryFactoryForTests((args) => {
+    const f = new FakeQuery(args);
+    fakes.push(f);
+    return asQuery(f);
+  });
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  (fakes[0] as FakeQuery).interruptError = abortLikeError();
+  await session.interrupt();
+  expect(session.compactIdle()).toEqual({ started: false, reason: "query_dead" });
+  await new Promise((r) => setTimeout(r, 10));
+  expect(fakes).toHaveLength(1);
+  expect(fakes[0]?.capturedPrompts).toHaveLength(0);
+  await session.close();
+});
+
+test("compactIdle refuses a closed session", async () => {
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  await session.close();
+  expect(session.compactIdle()).toEqual({ started: false, reason: "closed" });
+});
+
+test("a stale-resume self-heal never replays an idle compaction", async () => {
+  const fakes: FakeQuery[] = [];
+  setQueryFactoryForTests((args) => {
+    const f = new FakeQuery(args);
+    fakes.push(f);
+    return asQuery(f);
+  });
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput({ resume: "stale-xyz" }), emit);
+  await session.sendTurn({ text: "hello there" });
+  fakes[0]?.emit(mkSuccessResult());
+  session.compactIdle();
+  await new Promise((r) => setTimeout(r, 10));
+  fakes[0]?.emit(mkStaleResumeResult("stale-xyz"));
+  await new Promise((r) => setTimeout(r, 10));
+  expect(fakes).toHaveLength(2);
+  expect(fakes[1]?.capturedPrompts).toHaveLength(0);
+  await session.close();
+});
+
+test("compact-idle RPC routes to the thread's session", async () => {
+  _resetSessionsForTests();
+  const { emit } = recordingEmitter();
+  const methods = buildMethods(emit);
+  await methods["start-session"]!(minimalInput());
+  expect(await methods["compact-idle"]!({ threadId: "t-1" })).toEqual({ started: true });
+  await methods["stop-session"]!({ threadId: "t-1" });
+  _resetSessionsForTests();
+});

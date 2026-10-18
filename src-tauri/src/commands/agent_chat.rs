@@ -1203,7 +1203,7 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
             .resume_cursor
             .as_ref()
             .and_then(extract_sdk_session_id)
-            .filter(|id| claude_session_file_missing(id))
+            .filter(|id| crate::provider_accounts::claude_start_session_missing(&app, &input, id))
         {
             eprintln!(
                 "[codemux::agent_chat] dropping stale resume cursor at start pane={pane_id} \
@@ -1422,6 +1422,7 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
         input.env = env;
         input.workspace_id = workspace_id;
     }
+    crate::provider_accounts::prepare_start(&app, provider, &mut input, device.is_some());
     let validation = verify_native_control(
         &app,
         provider,
@@ -1502,6 +1503,7 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
     // one ever mints its own so the pane follows the session that exists.
     // `expected_thread` is the id we just claimed, so this always succeeds.
     if session.thread_id.0 != requested_thread_id {
+        crate::provider_accounts::follow_thread(&app, &requested_thread_id, &session.thread_id.0);
         let _ = state.claim_agent_chat_pane(
             &pane_id,
             provider,
@@ -2964,6 +2966,7 @@ async fn ensure_live_session_locked<R: Runtime>(
         }
         None => (None, None),
     };
+    let env = crate::provider_accounts::rebuild_env(app, provider_kind, &thread_id.0, env, device.is_some());
 
     // Build the resume cursor from the persisted id, but for Claude run a
     // preflight: if the CLI's on-disk session JSONL is confirmed gone,
@@ -2975,7 +2978,7 @@ async fn ensure_live_session_locked<R: Runtime>(
         Some(id)
             if provider_kind == ProviderKind::Claude
                 && device.is_none()
-                && claude_session_file_missing(id) =>
+                && crate::provider_accounts::claude_session_missing(env.as_ref(), id) =>
         {
             eprintln!(
                 "[codemux::agent_chat] dropping stale resume cursor for thread={} \
@@ -4882,6 +4885,94 @@ pub async fn agent_chat_turn_active<R: Runtime>(
     Ok(tracker.delegated_work_holding_turn(&thread_id.0))
 }
 
+/// A thread's live state for plugins (`host.chat.getStatus`). `None` when
+/// the thread is unknown or has no live session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginThreadStatus {
+    pub provider: ProviderKind,
+    pub busy: bool,
+    pub queued: Option<usize>,
+    pub compacting: bool,
+    pub status: String,
+}
+
+fn persisted_provider<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Option<ProviderKind> {
+    let db = app.try_state::<DatabaseStore>()?;
+    let record = db.get_agent_chat_session(thread_id)?;
+    serde_json::from_value(serde_json::Value::String(record.provider)).ok()
+}
+
+/// Backs `plugins_chat_status`. Reads in-memory session state only, the
+/// same signals the send path's queue decision uses.
+pub(crate) async fn plugin_thread_status<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+) -> Result<Option<PluginThreadStatus>, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let Some(provider) = persisted_provider(app, thread_id) else {
+        return Ok(None);
+    };
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let Some(impl_) = registry.get(provider).await else {
+        return Ok(None);
+    };
+    let thread = ThreadId(thread_id.to_string());
+    let Some(live) = impl_.runtime_status(&thread).await else {
+        return Ok(None);
+    };
+    // Same second signal as `agent_chat_turn_active`: delegated work can
+    // hold a run open after the provider's own turn ended.
+    let delegated = app
+        .try_state::<SubagentTracker>()
+        .is_some_and(|tracker| tracker.delegated_work_holding_turn(thread_id));
+    Ok(Some(PluginThreadStatus {
+        provider,
+        busy: live.busy || delegated,
+        queued: live.queued,
+        compacting: live.compacting,
+        status: live.status,
+    }))
+}
+
+/// Backs `plugins_chat_request_compaction`. The provider re-checks every
+/// gate under its session lock; this adds the app-level ones. `Err` is a
+/// stable refusal reason for the plugin.
+pub(crate) async fn plugin_request_compaction<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    if feature_flag_on(&observability).is_err() {
+        return Err("unsupported".into());
+    }
+    let Some(provider) = persisted_provider(app, thread_id) else {
+        return Err("no_session".into());
+    };
+    if provider != ProviderKind::Claude {
+        return Err("not_claude".into());
+    }
+    if app
+        .try_state::<SubagentTracker>()
+        .is_some_and(|tracker| tracker.delegated_work_holding_turn(thread_id))
+    {
+        return Err("busy".into());
+    }
+    // Wait out any send that is mid-dispatch; once the session is claimed,
+    // later sends queue behind the compaction.
+    let gate = native_thread_gate(app, thread_id);
+    let _native_guard = gate.dispatch.clone().lock_owned().await;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let Some(impl_) = registry.get(provider).await else {
+        return Err("no_session".into());
+    };
+    impl_
+        .request_compaction(&ThreadId(thread_id.to_string()))
+        .await
+        .map_err(str::to_string)
+}
+
 /// Respond to a pending approval / tool / input request.
 #[tauri::command]
 pub async fn agent_chat_respond_to_request<R: Runtime>(
@@ -5625,6 +5716,41 @@ pub async fn agent_chat_stop_session_guarded<R: Runtime>(
         }
         Err(err) => Err(provider_err(err)),
     }
+}
+
+/// Restart a thread's session in place, running `between` while it is down,
+/// all under the thread's lifecycle locks so no send can rebuild or dispatch
+/// on the old launch in the gap. Used to move a chat to another provider
+/// account (`crate::provider_accounts::switch_thread`).
+pub(crate) async fn restart_session_holding_gate<R: Runtime, T>(
+    app: &AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: &ThreadId,
+    between: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let gate = native_thread_gate(app, &thread_id.0);
+    gate.cancel();
+    let generation = gate.generation();
+    // Same lock order as `agent_chat_stop_session_guarded`.
+    let _activity_guard = super::usage_resume::activity_lock(&thread_id.0).lock_owned().await;
+    super::usage_resume::cancel_for_stopped_thread(app, &thread_id.0);
+    let _native_guard = gate.dispatch.clone().lock_owned().await;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    match impl_.stop_session(thread_id.clone()).await {
+        Ok(()) | Err(ProviderError::SessionNotFound { .. }) => {}
+        Err(err) => return Err(provider_err(err)),
+    }
+    if let Some(state) = app.try_state::<NativeControlState>() {
+        state.clear_worker(&thread_id.0);
+        state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: thread_id.clone(),
+            status: SessionStatus::Closed,
+        });
+    }
+    let value = between.await?;
+    ensure_live_session_locked(app, provider, thread_id, false, None, &gate, generation).await?;
+    Ok(value)
 }
 
 /// Fire-and-forget cleanup for chat sessions whose owning pane/tab/workspace
@@ -7255,6 +7381,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     // `UsageRecorded` it is never persisted and never fanned out — but
     // unlike it, nothing accumulates; each snapshot supersedes the last.
     if let ProviderRuntimeEvent::PlanUsageUpdated {
+        thread_id,
         provider,
         windows,
         plan_label,
@@ -7271,14 +7398,15 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             .ok()
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_else(|| format!("{provider:?}").to_lowercase());
-        if *provider==ProviderKind::Codex {
+        let quota_key = crate::provider_accounts::quota_key_for_thread(app, &provider_id, &thread_id.0);
+        if *provider==ProviderKind::Codex && quota_key == provider_id {
             let managed=crate::agent_provider::codex::chatgpt::owner().managed_selected_now();
             let managed_signal=plan_label.as_deref()==Some("Using ChatGPT plan") && *auth_mode==Some(crate::agent_provider::PlanAuthMode::Subscription);
             if managed {if managed_signal{quota.replace_chatgpt_route(true,now_ms);}return;}
             if managed_signal{return;} // discard a late event from a disconnected managed child
         }
         quota.record(
-            &provider_id,
+            &quota_key,
             windows.clone(),
             plan_label.clone(),
             *auth_mode,
@@ -9028,7 +9156,10 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
     // General runtime warnings remain transient SDK diagnostics.
     if let ProviderRuntimeEvent::RuntimeWarning { thread_id, message, .. } = event {
         return thread_id.is_some()
-            && message == crate::agent_provider::hermes::USAGE_LIMIT_RECOVERY_WARNING;
+            && (message == crate::agent_provider::hermes::USAGE_LIMIT_RECOVERY_WARNING
+                // The idle-compaction notice explains why a reopened chat
+                // now remembers only a summary of its earlier history.
+                || message.starts_with(crate::agent_provider::claude::idle_compaction::NOTICE_PREFIX));
     }
     matches!(
         event,
@@ -9139,7 +9270,7 @@ fn claude_config_dir() -> Option<std::path::PathBuf> {
 ///
 /// Split from the env-reading wrapper so the core logic is unit-testable
 /// with a temp dir and no env mutation.
-fn claude_session_file_missing_in(config_dir: &std::path::Path, session_id: &str) -> bool {
+pub(crate) fn claude_session_file_missing_in(config_dir: &std::path::Path, session_id: &str) -> bool {
     if !is_plausible_session_id(session_id) {
         return false;
     }
@@ -11885,6 +12016,19 @@ mod tests {
         };
         assert!(should_persist_event(&warning(Some(tid()))));
         assert!(!should_persist_event(&warning(None)));
+    }
+
+    #[test]
+    fn should_persist_idle_compaction_notice_but_not_other_claude_warnings() {
+        let warning = |message: String| ProviderRuntimeEvent::RuntimeWarning {
+            thread_id: Some(tid()),
+            message,
+            original_payload: None,
+        };
+        assert!(should_persist_event(&warning(
+            crate::agent_provider::claude::idle_compaction::notice_message()
+        )));
+        assert!(!should_persist_event(&warning("sdk stream_event".into())));
     }
 
     // ── AgentChatChannelRegistry ──

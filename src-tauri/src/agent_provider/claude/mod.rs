@@ -13,6 +13,7 @@
 
 pub mod auth;
 pub mod capabilities;
+pub mod idle_compaction;
 pub mod protocol;
 pub mod slash_commands;
 pub(crate) mod session;
@@ -103,6 +104,23 @@ impl ClaudeAgentProvider {
             sidecar_binary: self.sidecar_binary.clone(),
             claude_binary: self.claude_binary.clone(),
             mcp_registry: self.mcp_registry.clone(),
+        }
+    }
+
+    /// Tests only: shorten how long a requested compaction may run before
+    /// the app stops it. Returns whether the thread has a session.
+    #[doc(hidden)]
+    pub async fn set_compaction_timeout_for_tests(
+        &self,
+        thread_id: &ThreadId,
+        timeout: std::time::Duration,
+    ) -> bool {
+        match self.sessions.read().await.get(thread_id) {
+            Some(session) => {
+                session.set_compaction_timeout(timeout);
+                true
+            }
+            None => false,
         }
     }
 
@@ -425,6 +443,30 @@ impl AgentProvider for ClaudeAgentProvider {
         }
         let state = session.state.lock().await;
         state.turn_busy()
+    }
+
+    async fn runtime_status(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Option<crate::agent_provider::ThreadRuntimeStatus> {
+        let session = self.sessions.read().await.get(thread_id).cloned()?;
+        // A dead session has no status, except while an abandoned
+        // compaction's child drains: it is still compacting until reaped.
+        if session.is_dead() && !session.compaction_draining().await {
+            return None;
+        }
+        Some(session.runtime_status().await)
+    }
+
+    async fn request_compaction(&self, thread_id: &ThreadId) -> Result<(), &'static str> {
+        let session = self.sessions.read().await.get(thread_id).cloned();
+        let Some(session) = session.filter(|session| !session.is_dead()) else {
+            return Err(idle_compaction::Refusal::NoSession.as_str());
+        };
+        session
+            .request_compaction()
+            .await
+            .map_err(idle_compaction::Refusal::as_str)
     }
 
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {

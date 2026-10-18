@@ -295,6 +295,13 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "usage_refresh_quota"
             | "usage_price_overrides"
             | "usage_set_price_override"
+            // Provider accounts: paired clients see the accounts and move a
+            // chat between them. Adding, removing, signing in, and defaults
+            // stay on the desktop with the account folders.
+            | "provider_accounts_list"
+            | "provider_accounts_refresh"
+            | "provider_account_thread"
+            | "provider_account_switch_thread"
             | "validate_resume"
             | "workspaces_adoption_preview"
             | "workspaces_sync_list"
@@ -380,6 +387,22 @@ mod tests {
             "usage_set_price_override",
         ] {
             assert!(allowed(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn provider_accounts_can_be_used_but_not_managed_remotely() {
+        for cmd in ["provider_accounts_list", "provider_accounts_refresh", "provider_account_thread", "provider_account_switch_thread"] {
+            assert!(allowed(cmd), "{cmd}");
+        }
+        for cmd in [
+            "provider_account_add",
+            "provider_account_rename",
+            "provider_account_remove",
+            "provider_account_set_default",
+            "provider_account_open_sign_in",
+        ] {
+            assert!(!allowed(cmd), "{cmd} changes accounts on the desktop");
         }
     }
 

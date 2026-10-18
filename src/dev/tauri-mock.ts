@@ -52,6 +52,7 @@ import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 import { createAgentConnectorMock } from "./agent-connector-mock";
 import { workflowMockHandlers } from "./workflow-mock";
 import { createCustomAcpMock } from "./custom-acp-mock";
+import { createProviderAccountsMock, mockAccountQuota, withAccountUsage } from "./provider-accounts-mock";
 import { pluginMockHandlers } from "./plugin-mock";
 import { seedEnvironmentsFromSearch } from "./environments-mock";
 import {
@@ -4623,7 +4624,7 @@ const handlers: Record<string, Handler> = {
   // ── Usage ──
   // `tzOffsetMinutes` is accepted and ignored: the fixture derives its
   // buckets from the local `Date` already, so it is local by construction.
-  usage_summary: (args: Args) => mockUsageSummary(String(args.period ?? "7d")),
+  usage_summary: (args: Args) => withAccountUsage(mockUsageSummary(String(args.period ?? "7d"))),
   usage_export_csv: (args: Args) =>
     mockUsageExportCsv(String(args.period ?? "7d")),
   // The dev mock has no provider history to read; report a plausible scan. The
@@ -4640,10 +4641,12 @@ const handlers: Record<string, Handler> = {
     await new Promise((resolve) => setTimeout(resolve, 400));
     const now = Date.now();
     return {
-      quota: mockUsageQuota(now),
+      quota: { ...mockUsageQuota(now), ...mockAccountQuota(now) },
       statuses: [
         { provider: "claude", outcome: "ok" },
+        { provider: "claude@claude-work-3f9a1c", outcome: "ok" },
         { provider: "codex", outcome: "ok" },
+        { provider: "codex@codex-side-project-8b2e40", outcome: "failed", message: "Not signed in. Sign in from Settings → Providers." },
       ],
       refreshed_at_ms: now,
     };
@@ -8346,6 +8349,9 @@ const handlers: Record<string, Handler> = {
     return { removed, kept: [] };
   },
   worktree_cleanup_set_auto: () => undefined,
+
+  // ── Provider accounts ──
+  ...createProviderAccountsMock().handlers,
   web_remote_push_devices: () => mockPushDevices(),
 };
 

@@ -92,6 +92,7 @@ import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store"
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
 import { ProviderUpdateNotice } from "./ProviderUpdateNotice";
 import { formatProviderError } from "@/lib/agent-chat/provider-error";
+import { startsOnSignedInAccount } from "@/stores/provider-accounts-store";
 import {
   healthBlocksSend,
   useProviderHealth,
@@ -684,9 +685,19 @@ function DraftChatSurfaceInner({
       // creating a worktree and workspace for it only leaves debris behind.
       // The draft keeps its text and attachments; the banner carries the fix.
       // Local health cannot establish readiness on another device.
-      const blocked = executionHostId === null
+      let blocked = executionHostId === null
         ? await useProviderHealth.getState().ensureReady(finalDraft.provider)
         : null;
+      // Signed out of the CLI's own login is no block for a draft that
+      // starts on a signed-in extra provider account.
+      if (
+        blocked?.installed && blocked.login_command
+        && await startsOnSignedInAccount(
+          finalDraft.provider,
+          finalDraft.threadId,
+          finalDraft.target.kind === "existing_workspace" ? finalDraft.target.workspaceId : null,
+        )
+      ) blocked = null;
       if (blocked) {
         const reason = (blocked.message ?? "The agent isn't available").replace(
           /\.$/,

@@ -271,6 +271,12 @@ const interrupt: MethodHandler = async (params) => {
   return {};
 };
 
+const compactIdle: MethodHandler = async (params) => {
+  const p = asObject(params, "compact-idle");
+  const threadId = asString(p["threadId"], "threadId");
+  return getSession(threadId).compactIdle();
+};
+
 const setModel: MethodHandler = async (params) => {
   const p = asObject(params, "set-model");
   const threadId = asString(p["threadId"], "threadId");
@@ -516,6 +522,7 @@ export function buildMethods(emit: EventEmitter): Record<string, MethodHandler> 
     "send-turn": sendTurn,
     "steer-turn": steerTurn,
     interrupt,
+    "compact-idle": compactIdle,
     "set-model": setModel,
     "set-permission-mode": setPermissionMode,
     "update-mcp-tools": updateMcpTools,
