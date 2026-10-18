@@ -20,7 +20,6 @@ use crate::terminal;
 use crate::workspace_paths::paths_equal;
 use notify_rust::Notification;
 use serde::Serialize;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -3043,7 +3042,7 @@ pub fn run_workspace_setup<R: tauri::Runtime>(
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn run_project_dev_command<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
@@ -3142,17 +3141,11 @@ pub fn run_project_dev_command<R: tauri::Runtime>(
             let sessions = pty_state.sessions.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(300));
-                let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(runtime) = guard.get_mut(&session_id.0) {
-                    if let Some(writer) = runtime.writer.as_mut() {
-                        let data = format!("{}\n", cmd);
-                        if let Err(e) = writer.write_all(data.as_bytes()) {
-                            eprintln!(
-                                "[codemux::scripts] Failed to write run command: {e}"
-                            );
-                        }
-                        let _ = writer.flush();
-                    }
+                let data = format!("{}\n", cmd);
+                if let Err(error) =
+                    terminal::write_pty_input_sync(&sessions, &session_id.0, data.as_bytes())
+                {
+                    eprintln!("[codemux::scripts] Failed to write run command: {error}");
                 }
             });
         }

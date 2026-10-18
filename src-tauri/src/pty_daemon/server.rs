@@ -23,7 +23,7 @@ use crate::pty_daemon::protocol::{
 };
 use base64::Engine;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,10 +78,17 @@ fn remove_pid_file() {
 
 /// Capacity of the per-session output broadcast channel. Tuned for
 /// short-lived disconnects: roughly 30 seconds of typical TUI redraw output
-/// at 64KB chunks. Slow consumers that lag past this will drop frames; the
-/// daemon logs the lag and the Tauri client treats it as a partial-output
-/// signal (worst case: stale xterm cells until the next full redraw).
+/// at 64KB chunks. A consumer that lags past this has lost bytes, so the
+/// daemon resyncs it: `RESYNC_PREFIX` followed by a fresh replay snapshot.
 const OUTPUT_CHANNEL_CAPACITY: usize = 512;
+
+/// Sent ahead of the snapshot when a lagged client is resynced. CAN aborts
+/// any escape sequence the dropped bytes cut short, and RIS resets the
+/// terminal so the snapshot redraws onto a clean screen instead of on top of
+/// whatever the partial stream left behind. RIS also clears terminal modes
+/// (alt screen, mouse, bracketed paste), so a full-screen app may need to
+/// redraw if the replay buffer no longer holds the sequences that set them.
+const RESYNC_PREFIX: &[u8] = b"\x18\x1bc";
 
 /// Maximum size of the "cold-start replay" buffer per session. Captures
 /// recent output so a freshly-attached client sees something on-screen
@@ -144,6 +151,44 @@ struct DaemonSession {
     /// force-cleared on `Attach` and `Close` and by the read loop's
     /// `FLOW_MAX_PARK` backstop. Shared (Arc) with the read thread.
     flow_paused: Arc<AtomicBool>,
+}
+
+/// One connection's view of a session's output.
+struct Subscription {
+    // Retain the snapshot even after the waiter removes an exited session.
+    session: Arc<DaemonSession>,
+    rx: broadcast::Receiver<SessionFrame>,
+    /// Frames owed to this connection alone, delivered before anything on
+    /// `rx`: the replay snapshot, plus `Exited` for an already-ended session.
+    backlog: VecDeque<SessionFrame>,
+}
+
+/// Subscribe to live output and capture the replay snapshot as one step.
+/// The read loop appends and publishes each chunk under the same replay
+/// lock, so every chunk lands in exactly one of the snapshot or `rx`.
+async fn subscribe(session: &Arc<DaemonSession>, prefix: &[u8]) -> Subscription {
+    let replay = session.replay.lock().await;
+    let exit_code = session.exit_code.lock().await;
+    let rx = session.frame_tx.subscribe();
+    let mut snapshot = prefix.to_vec();
+    snapshot.extend_from_slice(&replay);
+    let mut backlog = VecDeque::new();
+    if !snapshot.is_empty() {
+        backlog.push_back(SessionFrame::Output(snapshot));
+    }
+    // Late-attachers to an exited session: emit Exited immediately so they
+    // don't sit waiting on a dead channel. Capture the code and subscribe
+    // under the waiter's publication lock, so Exited is delivered once.
+    if let Some(code) = *exit_code {
+        backlog.push_back(SessionFrame::Exited(code));
+    }
+    drop(exit_code);
+    drop(replay);
+    Subscription {
+        session: session.clone(),
+        rx,
+        backlog,
+    }
 }
 
 #[derive(Default)]
@@ -303,7 +348,7 @@ async fn handle_connection(
     // Each client connection holds receivers for whatever sessions it's
     // attached to. When the receiver yields a frame, we forward to the
     // socket. Detach removes the entry.
-    let mut attached: HashMap<String, broadcast::Receiver<SessionFrame>> = HashMap::new();
+    let mut attached: HashMap<String, Subscription> = HashMap::new();
 
     // Persistent accumulation buffer for the request line currently being
     // read. It MUST survive across loop iterations: the read below times out
@@ -322,10 +367,33 @@ async fn handle_connection(
         //   the drain loop snappy.
         let mut drained_any = false;
         let mut to_detach: Vec<String> = Vec::new();
-        for (sid, rx) in attached.iter_mut() {
+        for (sid, sub) in attached.iter_mut() {
             loop {
-                match rx.try_recv() {
-                    Ok(SessionFrame::Output(data)) => {
+                let frame = match sub.backlog.pop_front() {
+                    Some(frame) => frame,
+                    None => match sub.rx.try_recv() {
+                        Ok(frame) => frame,
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                            // Frames were dropped, so the client's terminal is
+                            // now missing bytes. Resync it from the replay
+                            // buffer rather than carrying on corrupted.
+                            eprintln!(
+                                "[codemux::pty_daemon] client lagged {skipped} frames on \
+                                 session {sid}, resyncing from replay"
+                            );
+                            *sub = subscribe(&sub.session, RESYNC_PREFIX).await;
+                            continue;
+                        }
+                        Err(broadcast::error::TryRecvError::Closed) => {
+                            // Publication ended; detach.
+                            to_detach.push(sid.clone());
+                            break;
+                        }
+                    },
+                };
+                match frame {
+                    SessionFrame::Output(data) => {
                         let frame = Frame::Event(ServerEvent::Output {
                             session_id: sid.clone(),
                             data_b64: base64::engine::general_purpose::STANDARD.encode(&data),
@@ -333,7 +401,7 @@ async fn handle_connection(
                         write_frame(&mut write_half, &frame).await?;
                         drained_any = true;
                     }
-                    Ok(SessionFrame::Exited(code)) => {
+                    SessionFrame::Exited(code) => {
                         let frame = Frame::Event(ServerEvent::Exited {
                             session_id: sid.clone(),
                             exit_code: code,
@@ -342,20 +410,6 @@ async fn handle_connection(
                         drained_any = true;
                         // The session will be removed by the waiter
                         // thread; we just detach our local receiver.
-                        to_detach.push(sid.clone());
-                        break;
-                    }
-                    Err(broadcast::error::TryRecvError::Empty) => break,
-                    Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                        // We dropped frames — keep going, the client's
-                        // xterm will recover on the next full redraw.
-                        eprintln!(
-                            "[codemux::pty_daemon] client lagged on session {sid}, dropping frames"
-                        );
-                    }
-                    Err(broadcast::error::TryRecvError::Closed) => {
-                        // Sender (reader + waiter) dropped. Session is
-                        // definitely gone; detach.
                         to_detach.push(sid.clone());
                         break;
                     }
@@ -445,7 +499,7 @@ async fn write_frame(
 async fn handle_request(
     req: ClientRequest,
     state: SharedState,
-    attached: &mut HashMap<String, broadcast::Receiver<SessionFrame>>,
+    attached: &mut HashMap<String, Subscription>,
 ) -> ServerResponse {
     match req {
         ClientRequest::Hello { request_id } => ServerResponse::Hello {
@@ -498,21 +552,9 @@ async fn handle_request(
             // stuck pause self-heals on the next attach (e.g. app restart,
             // reopening the pane).
             session.flow_paused.store(false, Ordering::Relaxed);
-            // Subscribe to live output (after replay so we don't drop
-            // anything in the gap).
-            let rx = session.frame_tx.subscribe();
-            attached.insert(session_id.clone(), rx);
-            // Flush replay buffer first so the freshly-attached xterm
-            // has something to render.
-            let replay = { session.replay.lock().await.clone() };
-            if !replay.is_empty() {
-                let _ = session.frame_tx.send(SessionFrame::Output(replay));
-            }
-            // Late-attachers to an exited session: emit Exited
-            // immediately so they don't sit waiting on a dead channel.
-            if let Some(code) = *session.exit_code.lock().await {
-                let _ = session.frame_tx.send(SessionFrame::Exited(code));
-            }
+            // The replay goes to this connection only; other viewers of the
+            // session already have that output.
+            attached.insert(session_id.clone(), subscribe(&session, b"").await);
             ServerResponse::Attached {
                 request_id,
                 session_id,
@@ -562,7 +604,12 @@ async fn handle_request(
                     message: format!("pty write: {error}"),
                 };
             }
-            let _ = writer.flush();
+            if let Err(error) = writer.flush() {
+                return ServerResponse::Error {
+                    request_id,
+                    message: format!("pty flush: {error}"),
+                };
+            }
             ServerResponse::Written { request_id }
         }
         ClientRequest::Resize {
@@ -868,14 +915,14 @@ async fn spawn_pty(
                     let chunk = buf[..n].to_vec();
                     // Append to replay buffer; trim oldest bytes if over
                     // capacity. We use blocking_lock here because we're on
-                    // a std::thread (not a tokio worker).
-                    {
-                        let mut rb = read_replay.blocking_lock();
-                        rb.extend_from_slice(&chunk);
-                        if rb.len() > REPLAY_BUFFER_BYTES {
-                            let excess = rb.len() - REPLAY_BUFFER_BYTES;
-                            rb.drain(0..excess);
-                        }
+                    // a std::thread (not a tokio worker). Publish while
+                    // still holding the lock so `subscribe` sees each chunk
+                    // in exactly one of its snapshot or the live stream.
+                    let mut rb = read_replay.blocking_lock();
+                    rb.extend_from_slice(&chunk);
+                    if rb.len() > REPLAY_BUFFER_BYTES {
+                        let excess = rb.len() - REPLAY_BUFFER_BYTES;
+                        rb.drain(0..excess);
                     }
                     let _ = read_tx.send(SessionFrame::Output(chunk));
                 }
@@ -919,10 +966,10 @@ async fn spawn_pty(
         };
         // Record the exit code so late-attachers see it.
         rt_handle.block_on(async {
-            *wait_exit_code.lock().await = Some(code);
+            let mut exit_code = wait_exit_code.lock().await;
+            *exit_code = Some(code);
+            let _ = wait_tx.send(SessionFrame::Exited(code));
         });
-        // Emit Exited to any currently-attached client.
-        let _ = wait_tx.send(SessionFrame::Exited(code));
         // Evict from the daemon's session map so subsequent
         // Write/Resize/Attach for this id error with "unknown session".
         rt_handle.block_on(async {
@@ -960,6 +1007,262 @@ fn kill_session_pid(_pid: u32) {
 mod tests {
     use super::pid_file_for;
     use std::path::Path;
+
+    async fn output_test_session(
+        capacity: usize,
+    ) -> (super::SharedState, std::sync::Arc<super::DaemonSession>) {
+        use super::*;
+
+        // No child or daemon process: only an unused PTY and private socket pairs.
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let (frame_tx, _) = broadcast::channel(capacity);
+        let session = Arc::new(DaemonSession {
+            session_id: "output-test".into(),
+            workspace_id: "test".into(),
+            pid: 0,
+            argv: vec![],
+            cwd: String::new(),
+            rows: 24,
+            cols: 80,
+            created_at: 0,
+            writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
+            master: Arc::new(Mutex::new(pair.master)),
+            frame_tx,
+            replay: Arc::new(Mutex::new(Vec::new())),
+            exit_code: Arc::new(Mutex::new(None)),
+            flow_paused: Arc::new(AtomicBool::new(false)),
+        });
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        state
+            .lock()
+            .await
+            .sessions
+            .insert(session.session_id.clone(), session.clone());
+        (state, session)
+    }
+
+    fn output_test_client(
+        state: super::SharedState,
+    ) -> (
+        std::sync::Arc<crate::pty_daemon::PtyDaemonClient>,
+        tokio::task::JoinHandle<Result<(), String>>,
+    ) {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let task = tokio::spawn(super::handle_connection(server, state));
+        (
+            crate::pty_daemon::PtyDaemonClient::from_test_stream(
+                client,
+                std::time::Duration::from_secs(1),
+            ),
+            task,
+        )
+    }
+
+    async fn publish_test_output(session: &super::DaemonSession, bytes: &[u8]) {
+        let mut replay = session.replay.lock().await;
+        replay.extend_from_slice(bytes);
+        let _ = session
+            .frame_tx
+            .send(super::SessionFrame::Output(bytes.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn attaching_replays_only_to_the_new_subscriber() {
+        let (state, session) = output_test_session(8).await;
+        publish_test_output(&session, b"history").await;
+        let (first, first_task) = output_test_client(state.clone());
+        let mut first_output = first.attach(session.session_id.clone()).await.unwrap();
+        assert_eq!(first_output.recv().await.unwrap(), b"history");
+
+        let (second, second_task) = output_test_client(state);
+        let mut second_output = second.attach(session.session_id.clone()).await.unwrap();
+        assert_eq!(second_output.recv().await.unwrap(), b"history");
+        // The second Hello response follows the drain after the first, so
+        // any leaked replay has reached the client before we inspect it.
+        first.hello().await.unwrap();
+        first.hello().await.unwrap();
+        assert!(
+            first_output.try_recv().is_err(),
+            "a second attach replayed history to the first viewer"
+        );
+
+        publish_test_output(&session, b"live").await;
+        assert_eq!(first_output.recv().await.unwrap(), b"live");
+        assert_eq!(second_output.recv().await.unwrap(), b"live");
+        first_task.abort();
+        second_task.abort();
+    }
+
+    #[tokio::test]
+    async fn attaching_has_no_gap_or_duplicate_between_snapshot_and_live_output() {
+        use super::*;
+
+        let (state, session) = output_test_session(8).await;
+        publish_test_output(&session, b"history").await;
+        let mut replay = session.replay.lock().await;
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let session_id = session.session_id.clone();
+        let attach = tokio::spawn(async move {
+            let mut attached = HashMap::new();
+            started.send(()).unwrap();
+            let response = handle_request(
+                ClientRequest::Attach {
+                    request_id: 1,
+                    session_id,
+                },
+                state,
+                &mut attached,
+            )
+            .await;
+            assert!(matches!(response, ServerResponse::Attached { .. }));
+            attached
+        });
+        // Attach parks on the replay lock while the producer publishes the
+        // next chunk. That chunk must appear in the snapshot exactly once.
+        ready.await.unwrap();
+        replay.extend_from_slice(b"during");
+        let _ = session
+            .frame_tx
+            .send(SessionFrame::Output(b"during".to_vec()));
+        drop(replay);
+        let mut attached = attach.await.unwrap();
+        let subscription = attached.get_mut(&session.session_id).unwrap();
+        let Some(SessionFrame::Output(snapshot)) = subscription.backlog.pop_front() else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(snapshot, b"historyduring");
+        assert!(subscription.backlog.is_empty());
+        publish_test_output(&session, b"after").await;
+        let SessionFrame::Output(live) = subscription.rx.try_recv().unwrap() else {
+            panic!("expected live output");
+        };
+        assert_eq!(live, b"after");
+        assert!(matches!(
+            subscription.rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn lagged_output_resets_and_replays_instead_of_skipping_bytes() {
+        let (state, session) = output_test_session(2).await;
+        let (client, task) = output_test_client(state);
+        let mut output = client.attach(session.session_id.clone()).await.unwrap();
+        let mut healthy = super::subscribe(&session, b"").await;
+        // The current-thread runtime cannot drain the connection during this
+        // burst, so overflowing its two-frame broadcast is deterministic.
+        for bytes in [b"one".as_slice(), b"two", b"three", b"four"] {
+            publish_test_output(&session, bytes).await;
+            let super::SessionFrame::Output(live) = healthy.rx.try_recv().unwrap() else {
+                panic!("expected live output");
+            };
+            assert_eq!(live, bytes);
+        }
+        let replay = tokio::time::timeout(std::time::Duration::from_secs(1), output.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay, b"\x18\x1bconetwothreefour", "lag must cancel any partial escape sequence, reset the terminal, and replay a fresh snapshot");
+        client.hello().await.unwrap();
+        assert!(
+            output.try_recv().is_err(),
+            "snapshot bytes were also delivered as live output"
+        );
+        assert!(
+            healthy.rx.try_recv().is_err(),
+            "recovery replay reached a healthy viewer"
+        );
+        publish_test_output(&session, b"next").await;
+        assert_eq!(output.recv().await.unwrap(), b"next");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn lagged_output_recovers_after_the_exited_session_is_removed() {
+        use super::*;
+
+        let (state, session) = output_test_session(2).await;
+        let (client, task) = output_test_client(state.clone());
+        let mut output = client.attach(session.session_id.clone()).await.unwrap();
+        for bytes in [b"one".as_slice(), b"two", b"three"] {
+            publish_test_output(&session, bytes).await;
+        }
+        {
+            let mut exit_code = session.exit_code.lock().await;
+            *exit_code = Some(7);
+            let _ = session.frame_tx.send(SessionFrame::Exited(7));
+        }
+        state.lock().await.sessions.remove(&session.session_id);
+        let replay = tokio::time::timeout(Duration::from_secs(1), output.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay, b"\x18\x1bconetwothree");
+        assert!(tokio::time::timeout(Duration::from_secs(1), output.recv())
+            .await
+            .unwrap()
+            .is_none());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn attaching_during_exit_delivers_the_exit_once() {
+        use super::*;
+
+        let (_state, session) = output_test_session(2).await;
+        let mut exit_code = session.exit_code.lock().await;
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let attaching = session.clone();
+        let attach = tokio::spawn(async move {
+            started.send(()).unwrap();
+            subscribe(&attaching, b"").await
+        });
+        ready.await.unwrap();
+        *exit_code = Some(7);
+        let _ = session.frame_tx.send(SessionFrame::Exited(7));
+        drop(exit_code);
+        let mut subscription = attach.await.unwrap();
+        assert!(matches!(
+            subscription.backlog.pop_front(),
+            Some(SessionFrame::Exited(7))
+        ));
+        assert!(subscription.backlog.is_empty());
+        assert!(matches!(
+            subscription.rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemon_write_reports_flush_failure() {
+        use super::*;
+
+        struct FailingFlush;
+        impl std::io::Write for FailingFlush {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("flush failed"))
+            }
+        }
+        let (state, session) = output_test_session(2).await;
+        *session.writer.lock().await = Box::new(FailingFlush);
+        let response = handle_request(
+            ClientRequest::Write {
+                request_id: 1,
+                session_id: session.session_id.clone(),
+                data_b64: base64::engine::general_purpose::STANDARD.encode(b"input"),
+            },
+            state,
+            &mut HashMap::new(),
+        )
+        .await;
+        assert!(
+            matches!(response, ServerResponse::Error { request_id: 1, message } if message.contains("flush failed"))
+        );
+    }
 
     #[test]
     fn pid_file_is_socket_path_plus_pid_suffix() {

@@ -891,6 +891,7 @@ pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: Co
             let session_id = request.params.get("session_id").and_then(Value::as_str).map(str::to_string);
             let data = request.params.get("data").and_then(Value::as_str).unwrap_or_default().to_string();
             crate::terminal::write_to_pty(pty_state, app_state, data, session_id)
+                .await
                 .map(|_| serde_json::json!({ "written": true }))
         }
         "read_terminal" => {
