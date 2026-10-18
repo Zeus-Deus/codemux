@@ -9,6 +9,7 @@
 //! reopened chat. Providers that can't fork natively are refused.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
@@ -21,7 +22,7 @@ use crate::agent_provider::chat_fork::{
 };
 use crate::agent_provider::codex::protocol::ThreadRollbackParams;
 use crate::agent_provider::side_chat::{codex_fork_base_params, provider_label, supports_native_fork};
-use crate::agent_provider::{ProviderKind, ThreadId};
+use crate::agent_provider::{AgentProvider, ProviderKind, ThreadId};
 use crate::database::chat_fork::{ChatForkOrigin, ForkedImage, NewChatFork};
 use crate::database::{AgentChatSessionRecord, DatabaseStore};
 use crate::json_rpc_child::JsonRpcChild;
@@ -40,6 +41,9 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// the provider's copy and the transcript copy see the same conversation.
 struct ForkPlan {
     _source_guards: (OwnedMutexGuard<()>, OwnedMutexGuard<()>),
+    live: Arc<dyn AgentProvider>,
+    /// The source's newest user message when the fork was planned.
+    user_head: Option<i64>,
     source: AgentChatSessionRecord,
     provider: ProviderKind,
     native_id: String,
@@ -87,6 +91,9 @@ async fn plan_fork<R: Runtime>(
 ) -> Result<ForkPlan, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    // Hold the source still before reading it: no send, revert, restart or
+    // handoff can change it between these checks and the transcript copy.
+    let source_guards = hold_thread_for_fork(app, source_thread_id).await;
     let db: State<'_, DatabaseStore> = app.state();
     let source = db
         .get_agent_chat_session(source_thread_id)
@@ -145,12 +152,10 @@ async fn plan_fork<R: Runtime>(
     }
     let registry: State<'_, ProviderRegistry> = app.state();
     let live = lookup_provider(&registry, provider).await?;
-    // No turn may start (or revert run) between this check and the fork's
-    // transcript copy.
-    let source_guards = hold_thread_for_fork(app, source_thread_id).await;
     if live.turn_active(&ThreadId(source_thread_id.to_string())).await {
-        return Err("Wait for the current turn to finish, then fork the chat.".into());
+        return Err(BUSY.into());
     }
+    let (_, user_head) = db.agent_chat_fork_heads(source_thread_id);
     let cut = match (before_message_id, provider) {
         (None, _) => Cut::Latest,
         (Some(before), ProviderKind::Codex) => Cut::Codex {
@@ -170,6 +175,8 @@ async fn plan_fork<R: Runtime>(
     };
     Ok(ForkPlan {
         _source_guards: source_guards,
+        live,
+        user_head,
         source,
         provider,
         native_id,
@@ -177,6 +184,27 @@ async fn plan_fork<R: Runtime>(
         workspace_id,
         target_cwd,
         cut,
+    })
+}
+
+const BUSY: &str = "Wait for the current turn to finish, then fork the chat.";
+
+/// After the provider forked, confirm the source is still where the plan
+/// saw it and return the transcript bound to copy before. The guards stop
+/// sends and reverts, but a provider can still start a queued turn on its
+/// own once the previous one ends; a fork that raced one is refused rather
+/// than pairing the provider's copy with a different transcript.
+async fn settled_bound(plan: &ForkPlan, db: &DatabaseStore) -> Result<Option<i64>, String> {
+    let thread = &plan.source.thread_id;
+    let (head, user_head) = db.agent_chat_fork_heads(thread);
+    if user_head != plan.user_head || plan.live.turn_active(&ThreadId(thread.clone())).await {
+        return Err(format!("The chat started another turn while it was being forked. {BUSY}"));
+    }
+    Ok(match plan.cut.before() {
+        Some(before) => Some(before),
+        // Freeze the latest copy here, so nothing the source writes after
+        // this check can slip into the fork.
+        None => head.map(|head| head + 1),
     })
 }
 
@@ -211,12 +239,13 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
         ProviderKind::Claude => fork_claude(&plan).await?,
         _ => fork_codex(&plan).await?,
     };
+    let db: State<'_, DatabaseStore> = app.state();
+    let cut_before = settled_bound(&plan, &db).await?;
     let thread_id = uuid::Uuid::new_v4().to_string();
     let title = fork_title(plan.source.title.as_deref());
     let cwd = plan.target_cwd.to_string_lossy().into_owned();
     let source_images = chat_images_dir_pub(&plan.source.thread_id);
     let fork_images = chat_images_dir_pub(&thread_id);
-    let db: State<'_, DatabaseStore> = app.state();
     let images = db.create_agent_chat_fork(&NewChatFork {
         thread_id: &thread_id,
         source: &plan.source,
@@ -224,11 +253,13 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
         workspace_id: &plan.workspace_id,
         cwd: &cwd,
         title: &title,
-        cut_before: plan.cut.before(),
+        cut_before,
         image_dirs: source_images.as_deref().zip(fork_images.as_deref()),
     })?;
-    drop(plan);
+    // Still holding the source: a revert or delete waiting on it would
+    // remove the images this copies.
     copy_inherited_images(images).await;
+    drop(plan);
     Ok(ChatForkCreated {
         thread_id,
         provider,

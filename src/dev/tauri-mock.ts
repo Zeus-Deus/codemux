@@ -5157,7 +5157,12 @@ const handlers: Record<string, Handler> = {
       const record = mockWorkflowSessionRecord(workflowEntry[0]);
       return record ? [record] : [];
     }
+    const forks = [...mockForkRecords.values()]
+      .filter((record) => record.workspace_id === (workspaceId ?? "ws-codemux-chat"))
+      .reverse();
+    if (forks.length > 0 && workspaceId !== "ws-codemux-chat") return forks;
     return [
+      ...forks,
       {
         thread_id: MOCK_CHAT_THREAD_ID,
         sdk_session_id: "sdk-mock-chat",

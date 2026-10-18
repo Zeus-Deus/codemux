@@ -11,6 +11,7 @@ import {
   findCut,
   forkClaudeSession,
   projectDirName,
+  syntheticUserMessages,
   type ForkSessionDeps,
 } from "../src/fork-session.ts";
 
@@ -74,6 +75,21 @@ describe("findCut", () => {
     expect(findCut(expanded, { prompts: ["fix it", "/review continue"], cutIndex: 1 })).toBe("sa1");
   });
 
+  test("skips compaction summaries the CLI wrote as user messages", () => {
+    const compacted = [
+      user("c0", "This session is being continued from a previous conversation…"),
+      assistant("ca0"),
+      user("c1", "now add tests"),
+      assistant("ca1"),
+      user("c2", "continue"),
+      assistant("ca2"),
+    ];
+    // The chat still lists the prompt the summary replaced.
+    const prompts = ["fix the parser", "now add tests", "continue"];
+    expect(findCut(compacted, { prompts, cutIndex: 2 }, new Set(["c0"]))).toBe("ca1");
+    expect(() => findCut(compacted, { prompts, cutIndex: 2 })).toThrow("fork_point_not_found");
+  });
+
   test("refuses a cut it can't place with certainty", () => {
     // The lists don't line up: a checkable prompt differs.
     expect(() => findCut(TRANSCRIPT, { prompts: ["fix the parser", "something else", "continue"], cutIndex: 2 })).toThrow(
@@ -87,6 +103,29 @@ describe("findCut", () => {
     expect(() => findCut(TRANSCRIPT, { prompts: ["old", "fix the parser", "now add tests", "continue"], cutIndex: 0 })).toThrow(
       "fork_point_not_found",
     );
+  });
+});
+
+describe("syntheticUserMessages", () => {
+  test("reads the flags getSessionMessages drops", async () => {
+    const config = mkdtempSync(join(tmpdir(), "codemux-fork-flags-"));
+    try {
+      const dir = join(config, "projects", "-repo");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, "s.jsonl"),
+        [
+          JSON.stringify({ type: "user", uuid: "u1", message: { content: "hi" } }),
+          JSON.stringify({ type: "user", uuid: "c1", isCompactSummary: true, message: { content: "summary" } }),
+          JSON.stringify({ type: "user", uuid: "m1", isMeta: true, message: { content: "meta" } }),
+          '{"type":"user","uuid":"torn","isMeta":tr',
+        ].join("\n"),
+      );
+      expect([...(await syntheticUserMessages(config, "s"))].sort()).toEqual(["c1", "m1"]);
+      expect((await syntheticUserMessages(config, "missing")).size).toBe(0);
+    } finally {
+      rmSync(config, { recursive: true, force: true });
+    }
   });
 });
 

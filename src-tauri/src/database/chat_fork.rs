@@ -15,7 +15,7 @@ pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
             thread_id TEXT PRIMARY KEY,
             source_thread_id TEXT NOT NULL,
             source_title TEXT,
-            -- The source row the fork was cut before; NULL for the latest.
+            -- The source row the fork's copy stopped before.
             source_cut_message_id INTEGER,
             -- The fork's last copied row: later rows are its own.
             boundary_message_id INTEGER,
@@ -195,6 +195,23 @@ impl DatabaseStore {
         .map_err(|e| format!("Failed to record the fork: {e}"))?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(images)
+    }
+
+    /// The newest row and the newest user message of a thread.
+    pub fn agent_chat_fork_heads(&self, thread_id: &str) -> (Option<i64>, Option<i64>) {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT MAX(id),
+                        MAX(CASE WHEN json_valid(payload)
+                                  AND json_extract(payload, '$.type') = 'user_message'
+                             THEN id END)
+                 FROM agent_chat_messages WHERE thread_id = ?1",
+                params![thread_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or((None, None))
     }
 
     /// Lineage of `thread_id`, or `None` when it is not a fork.
@@ -389,6 +406,15 @@ mod tests {
         assert!(db.agent_chat_fork_prompts("src", reply).is_err());
         assert!(db.agent_chat_fork_prompts("src", steered).is_err(), "a steer is not a turn");
         assert!(db.agent_chat_fork_prompts("other", next).is_err());
+    }
+
+    #[test]
+    fn heads_track_the_newest_row_and_user_message() {
+        let db = store_with_source();
+        assert_eq!(db.agent_chat_fork_heads("src"), (None, None));
+        let user = append(&db, serde_json::json!({"type":"user_message","text":"one"}));
+        let done = append(&db, serde_json::json!({"type":"turn_completed"}));
+        assert_eq!(db.agent_chat_fork_heads("src"), (Some(done), Some(user)));
     }
 
     #[test]

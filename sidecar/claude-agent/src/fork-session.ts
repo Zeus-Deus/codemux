@@ -18,9 +18,9 @@ import {
   getSessionMessages as sdkGetSessionMessages,
   type SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { copyFile, mkdir, readdir, realpath, rename, unlink } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, realpath, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 /** Every user prompt the chat holds, as typed (Codemux keeps the text
  *  before skills and attachments expand it), and the position of the first
@@ -61,7 +61,8 @@ export async function forkClaudeSession(
   let upToMessageId: string | undefined;
   if (input.cut) {
     const messages = await deps.getSessionMessages(input.sessionId, { dir: input.dir });
-    upToMessageId = findCut(messages, input.cut);
+    const synthetic = await syntheticUserMessages(deps.configDir(), input.sessionId);
+    upToMessageId = findCut(messages, input.cut, synthetic);
   }
   const { sessionId } = await deps.forkSession(input.sessionId, {
     dir: input.dir,
@@ -114,10 +115,16 @@ const NOT_FOUND = "fork_point_not_found: that turn isn't in this Claude session"
  * Every prompt that can be checked must then be contained in the one it
  * lines up with (Codemux may wrap a prompt with attached context); any
  * mismatch means the lists don't line up, and the fork is refused.
+ * `synthetic` holds user messages the CLI wrote itself (compaction
+ * summaries, meta notes), which are not prompts.
  */
-export function findCut(messages: SessionMessage[], cut: ForkCut): string {
+export function findCut(
+  messages: SessionMessage[],
+  cut: ForkCut,
+  synthetic: ReadonlySet<string> = new Set(),
+): string {
   const prompts = messages.flatMap((message, index) => {
-    const text = promptText(message);
+    const text = synthetic.has(message.uuid) ? null : promptText(message);
     return text === null ? [] : [{ index, text: normalize(text) }];
   });
   const offset = cut.prompts.length - prompts.length;
@@ -143,6 +150,38 @@ export function projectDirName(path: string): string {
   return `${name.slice(0, 200)}-${Math.abs(hash).toString(36)}`;
 }
 
+/** The session's transcript file, in whichever project folder holds it. */
+async function findSessionFile(configDir: string, sessionId: string): Promise<string | undefined> {
+  const projects = join(configDir, "projects");
+  const file = `${sessionId}.jsonl`;
+  for (const entry of await readdir(projects, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const dir = join(projects, entry.name);
+    if ((await readdir(dir)).includes(file)) return join(dir, file);
+  }
+  return undefined;
+}
+
+/** Uuids of the user messages the CLI wrote itself. `getSessionMessages`
+ *  drops the flags that mark them, so they are read from the transcript. */
+export async function syntheticUserMessages(configDir: string, sessionId: string): Promise<Set<string>> {
+  const synthetic = new Set<string>();
+  const path = await findSessionFile(configDir, sessionId).catch(() => undefined);
+  if (!path) return synthetic;
+  for (const line of (await readFile(path, "utf8")).split("\n")) {
+    if (!line.includes('"isCompactSummary"') && !line.includes('"isMeta"')) continue;
+    try {
+      const entry = JSON.parse(line) as { uuid?: unknown; isCompactSummary?: unknown; isMeta?: unknown };
+      if (typeof entry.uuid === "string" && (entry.isCompactSummary === true || entry.isMeta === true)) {
+        synthetic.add(entry.uuid);
+      }
+    } catch {
+      // A torn last line while the CLI writes; it can't be a prompt we cut at.
+    }
+  }
+  return synthetic;
+}
+
 async function moveToProject(configDir: string, sessionId: string, targetDir: string) {
   const projects = join(configDir, "projects");
   let target: string;
@@ -153,16 +192,9 @@ async function moveToProject(configDir: string, sessionId: string, targetDir: st
   }
   const destinationDir = join(projects, projectDirName(target));
   const file = `${sessionId}.jsonl`;
-  let source: string | undefined;
-  for (const entry of await readdir(projects, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const dir = join(projects, entry.name);
-    if ((await readdir(dir)).includes(file)) {
-      source = dir;
-      break;
-    }
-  }
-  if (!source) throw new Error(`the forked session ${sessionId} wasn't written`);
+  const found = await findSessionFile(configDir, sessionId);
+  if (!found) throw new Error(`the forked session ${sessionId} wasn't written`);
+  const source = dirname(found);
   if (source === destinationDir) return;
   await mkdir(destinationDir, { recursive: true });
   try {
