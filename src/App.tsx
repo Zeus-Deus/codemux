@@ -16,6 +16,8 @@ import { useTerminalCacheGc } from "@/hooks/use-terminal-cache-gc";
 import { useTerminalThemeSync } from "@/hooks/use-terminal-theme-sync";
 import { useTerminalCwdPoll } from "@/hooks/use-terminal-cwd-poll";
 import { useAutomationFireToast } from "@/hooks/use-automation-fire-toast";
+import { useWorktreeCleanupToast } from "@/components/worktree-cleanup/use-worktree-cleanup-toast";
+import { useWorktreeCleanupStore } from "@/components/worktree-cleanup/worktree-cleanup-store";
 import { useWebNotifications } from "@/hooks/use-web-notifications";
 import { useNotificationActivate } from "@/hooks/use-notification-activate";
 import { useEnvironmentRuntime } from "@/environments/use-environment-runtime";
@@ -66,6 +68,12 @@ const ShortcutsSheet = lazy(() =>
   })),
 );
 
+const WorktreeCleanupDialog = lazy(() =>
+  import("@/components/worktree-cleanup/worktree-cleanup-dialog").then((module) => ({
+    default: module.WorktreeCleanupDialog,
+  })),
+);
+
 const CloseGuardDialog = lazy(() =>
   import("@/components/overlays/close-guard-dialog").then((module) => ({
     default: module.CloseGuardDialog,
@@ -85,6 +93,7 @@ function App() {
   const showShortcutsSheet = useUIStore((s) => s.showShortcutsSheet);
   const remotePathRequest = useRemotePathPickerStore((s) => s.request);
   const closeGuardPrompt = useCloseGuardStore((s) => s.prompt);
+  const worktreeCleanupOpen = useWorktreeCleanupStore((s) => s.open);
   const postPaintStartupBegan = useRef(false);
 
   useEffect(() => {
@@ -176,6 +185,7 @@ function App() {
   useTerminalThemeSync();
   useTerminalCwdPoll();
   useAutomationFireToast();
+  useWorktreeCleanupToast();
   useActiveWorkspacePersistenceErrors();
   useAgentChatWarnings();
   // Default short Linux wheel glides; native WebKit animation stays off.
@@ -241,6 +251,16 @@ function App() {
           presentation="overlay"
         >
           <CloseGuardDialog />
+        </LazyBoundary>
+      )}
+      {/* App-level: opened from the cleanup toast and Settings → Archive. */}
+      {worktreeCleanupOpen && (
+        <LazyBoundary
+          label="worktree cleanup"
+          className="fixed inset-0 z-50 h-screen"
+          presentation="overlay"
+        >
+          <WorktreeCleanupDialog />
         </LazyBoundary>
       )}
       <UpdateToast />
