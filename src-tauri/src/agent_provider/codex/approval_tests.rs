@@ -160,6 +160,14 @@ async fn approvals_resolve_on_answer_and_settle_when_their_turn_ends() {
     .await;
     assert_eq!(first, Some(serde_json::to_value(allow).unwrap()));
     turn_completed(&mut rx).await;
+    // Codex reads any decision but its own v2 names as a denial.
+    let wire = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
+    let reply = wire
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|message| message["id"] == 101 && message.get("method").is_none())
+        .expect("approval reply on the wire");
+    assert_eq!(reply["result"], json!({"decision": "accept"}));
 
     // Stop during an approval settles it and unblocks the next send.
     session.enqueue_or_send(turn("second")).await.unwrap();
