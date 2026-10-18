@@ -2275,6 +2275,7 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
     }
 
     let _timeline_guard = turn_checkpoint_lock_for(&thread_id).lock_owned().await;
+    super::provider_switch::refuse_while_switching(&thread_id)?;
     if provider.turn_active(&ThreadId(thread_id.clone())).await {
         return Err("Wait for the active turn to finish before reverting.".to_string());
     }

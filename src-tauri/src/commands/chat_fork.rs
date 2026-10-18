@@ -103,6 +103,7 @@ async fn plan_fork<R: Runtime>(
     // Hold the source still before reading it: no send, restart or handoff
     // can change it between these checks and the transcript copy.
     let dispatch = fork_dispatch_guard(app, source_thread_id).await;
+    super::provider_switch::refuse_while_switching(source_thread_id)?;
     let db: State<'_, DatabaseStore> = app.state();
     let source = db
         .get_agent_chat_session(source_thread_id)

@@ -9,11 +9,12 @@
 //!
 //! The thread is held still while the switch is planned, with the same
 //! dispatch and timeline locks a fork takes, and a switch is refused while
-//! a turn runs or messages are queued, so nothing queued is lost. Starting
-//! the new provider needs the dispatch lock itself, so from then until the
-//! switch returns the thread is marked as switching and every send is
-//! refused (see [`refuse_stale_send`]): none can run on the old provider or
-//! revive it.
+//! a turn runs or messages are queued, so nothing queued is lost. Stopping
+//! and starting a session take the dispatch lock themselves, so the switch
+//! holds neither lock across them; instead the thread is marked as
+//! switching until the switch returns, and sends, turn reverts and forks
+//! are refused meanwhile ([`refuse_stale_send`], [`refuse_while_switching`]):
+//! none can run on the old provider, revive it, or change what was read.
 //!
 //! An account switch (provider accounts) is the same-provider counterpart:
 //! it serializes on the same per-thread dispatch gate, so the two never
@@ -23,7 +24,6 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
-use tokio::sync::OwnedMutexGuard;
 
 use crate::agent_provider::side_chat::provider_label;
 use crate::agent_provider::{ProviderKind, ProviderRuntimeEvent, StartSessionInput, ThreadId};
@@ -76,6 +76,20 @@ fn slug(provider: ProviderKind) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_default()
+}
+
+/// Refuse what would change or copy the chat mid-switch: a turn revert
+/// (it would trim the transcript after the handoff was read from it) or a
+/// fork (it would copy a session that is being stopped). Callers check
+/// under the lock they already take: the timeline lock for a revert, the
+/// dispatch lock for a fork. The switch takes both while it plans, and
+/// holds neither across stopping and starting the session, which take
+/// dispatch themselves.
+pub(crate) fn refuse_while_switching(thread_id: &str) -> Result<(), String> {
+    if switching().lock().unwrap().contains(thread_id) {
+        return Err("This chat is switching providers. Try again once it's done.".into());
+    }
+    Ok(())
 }
 
 /// Refuse a send that would reach the wrong provider: one arriving while
@@ -237,11 +251,6 @@ fn seed_text(
 
 /// What the switch carries over, read while the thread is held still.
 struct Plan {
-    /// Held until the old provider's revert points are dropped, so no revert
-    /// can change the transcript after the handoff was read from it.
-    /// Neither stopping nor starting a session takes it, and sends are
-    /// refused before they would.
-    timeline: OwnedMutexGuard<()>,
     context: Option<AgentChatSessionContext>,
     from_model: Option<String>,
     /// The newest transcript row before the switch.
@@ -282,15 +291,17 @@ async fn plan_switch<R: Runtime>(
         Err(error) => return Err(error),
     };
     let anchor_id = db.max_agent_chat_message_id(thread_id).unwrap_or(0);
-    drop(dispatch);
-    Ok(Plan { timeline, context, from_model, anchor_id })
+    drop((timeline, dispatch));
+    Ok(Plan { context, from_model, anchor_id })
 }
 
 /// Revert points are turns of the provider the chat left; the new one
 /// can't roll them back. Dropped only once it has started, so a failed
-/// switch leaves the old provider's history revertible. The caller holds
-/// the timeline lock.
-fn invalidate_checkpoints<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Result<(), String> {
+/// switch leaves the old provider's history revertible. Reverts are
+/// refused meanwhile ([`refuse_while_switching`]), so these are still the
+/// points the handoff was read against.
+async fn invalidate_checkpoints<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Result<(), String> {
+    let _timeline = fork_timeline_guard(thread_id).await;
     let db: State<'_, DatabaseStore> = app.state();
     if !db.has_agent_chat_turn_checkpoints(thread_id) {
         return Ok(());
@@ -357,10 +368,9 @@ pub async fn agent_chat_switch_provider<R: Runtime>(
 
     // Sends are still refused (the mark), so no new-provider turn can have
     // taken a checkpoint yet.
-    if let Err(error) = invalidate_checkpoints(&app, &thread_id) {
+    if let Err(error) = invalidate_checkpoints(&app, &thread_id).await {
         eprintln!("[codemux::provider_switch] {error}");
     }
-    drop(plan.timeline);
     let db: State<'_, DatabaseStore> = app.state();
     let mut handoff_kind = plan
         .context
@@ -535,6 +545,8 @@ mod tests {
         assert!(refuse_stale_send(&db, ProviderKind::Claude, "unsaved").is_ok());
         let mark = SwitchMark::claim("t").unwrap();
         assert!(SwitchMark::claim("t").is_err(), "one switch at a time");
+        assert!(refuse_while_switching("t").is_err());
+        assert!(refuse_while_switching("other").is_ok());
         assert_eq!(refuse_stale_send(&db, ProviderKind::Codex, "t").unwrap_err(), SWITCHING);
         drop(mark);
         assert!(refuse_stale_send(&db, ProviderKind::Codex, "t").is_ok());
