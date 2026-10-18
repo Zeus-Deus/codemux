@@ -21,6 +21,7 @@ import {
 import type { ApprovalDecision } from "../permissions.ts";
 import { currentQueryFactory } from "../session.ts";
 import { SideChat, type SideChatStartInput } from "../side-chat.ts";
+import { forkClaudeSession, type ForkSessionInput } from "../fork-session.ts";
 import { getUsage } from "./get-usage.ts";
 import { listCommands } from "./list-commands.ts";
 import { listModels } from "./list-models.ts";
@@ -461,6 +462,31 @@ const stopSideChat: MethodHandler = async () => {
   return {};
 };
 
+const forkSessionMethod: MethodHandler = async (params) => {
+  const p = asObject(params, "fork-session");
+  const sessionId = asString(p["sessionId"], "sessionId");
+  if (!sessionId.trim()) throw new InvalidParamsError("sessionId must name the session to fork");
+  const input: ForkSessionInput = {
+    sessionId,
+    dir: asString(p["dir"], "dir"),
+    targetDir: asString(p["targetDir"], "targetDir"),
+  };
+  const cut = optRecord(p["cut"], "cut");
+  if (cut) {
+    const keepPrompts = cut["keepPrompts"];
+    const occurrence = cut["occurrence"];
+    if (!Number.isInteger(keepPrompts) || !Number.isInteger(occurrence)) {
+      throw new InvalidParamsError("cut.keepPrompts and cut.occurrence must be integers");
+    }
+    input.cut = {
+      keepPrompts: keepPrompts as number,
+      occurrence: occurrence as number,
+      nextPrompt: asString(cut["nextPrompt"], "cut.nextPrompt"),
+    };
+  }
+  return forkClaudeSession(input);
+};
+
 // ---------------------------------------------------------------------------
 // Public: build the registry
 // ---------------------------------------------------------------------------
@@ -489,6 +515,7 @@ export function buildMethods(emit: EventEmitter): Record<string, MethodHandler> 
     "start-side-chat": makeStartSideChat(emit),
     "side-chat-send": sideChatSend,
     "stop-side-chat": stopSideChat,
+    "fork-session": forkSessionMethod,
   };
 }
 

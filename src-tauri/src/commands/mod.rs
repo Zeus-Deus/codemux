@@ -39,6 +39,7 @@ pub mod workspaces_sync;
 pub mod workflows;
 pub mod pr_watch;
 pub mod turn_diff;
+pub mod chat_fork;
 
 pub use agent_chat::*;
 pub use ai::*;

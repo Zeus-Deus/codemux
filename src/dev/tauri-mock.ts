@@ -8,6 +8,7 @@ import type {
 import type {
   AgentChatProviderKind,
   AgentChatTurnDiff,
+  ChatForkOrigin,
   ProjectScripts,
 } from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
@@ -218,6 +219,11 @@ const mockLocalSessions: LocalChatSession[] = [
 ];
 const mockImportedRecords = new Map<string, AgentChatSessionRecord>();
 const mockImportedPayloads = new Map<string, string[]>();
+// Chat forks made in this session: the fork's session row, its copied
+// transcript, and where it came from.
+const mockForkRecords = new Map<string, AgentChatSessionRecord>();
+const mockForkPayloads = new Map<string, string[]>();
+const mockForkOrigins = new Map<string, ChatForkOrigin>();
 let stressDeltaTimer: number | null = null;
 let stressDeltaCount = 0;
 let providerRuntimeCommandCount = 0;
@@ -1918,6 +1924,8 @@ const mockThreadRowCache = new Map<string, MockMessageRow[]>();
 function mockThreadPayloads(threadId: string): string[] {
   const imported = mockImportedPayloads.get(threadId);
   if (imported) return imported;
+  const forked = mockForkPayloads.get(threadId);
+  if (forked) return forked;
   const delegated = mockDelegatedChildTranscript(threadId);
   if (delegated) return delegated;
   if (delegationScenario && threadId === MOCK_CHAT_THREAD_ID) return [];
@@ -5449,6 +5457,7 @@ const handlers: Record<string, Handler> = {
   agent_chat_get_session: (a) => {
     const threadId = a.threadId as string;
     if (mockImportedRecords.has(threadId)) return mockImportedRecords.get(threadId);
+    if (mockForkRecords.has(threadId)) return mockForkRecords.get(threadId);
     // A delegated child's row holds what the backend wrote at hand-off:
     // the requested model and effort, the task title, full access.
     const delegated = mockDelegatedChild(threadId);
@@ -7939,6 +7948,7 @@ const handlers: Record<string, Handler> = {
       // session on it.
       if (threadId) {
         root.thread_id = threadId;
+        root.provider = (a.provider as AgentChatProviderKind | null) ?? root.provider;
         emitAppState();
       }
       return root.pane_id;
@@ -8216,7 +8226,80 @@ const handlers: Record<string, Handler> = {
     return removed;
   },
   pr_watch_status: (a) => prWatches.get(a.threadId as string) ?? null,
+  // Chat forks: same validation order and messages as `commands::chat_fork`.
+  agent_chat_fork_check: (a) => {
+    mockForkPlan(a.sourceThreadId as string, (a.beforeMessageId as number | null) ?? null);
+    return undefined;
+  },
+  agent_chat_fork_thread: (a) => {
+    const sourceThreadId = a.sourceThreadId as string;
+    const before = (a.beforeMessageId as number | null) ?? null;
+    const { source, kept } = mockForkPlan(sourceThreadId, before);
+    const workspace = a.workspaceId ? findWorkspace(a.workspaceId) : null;
+    const threadId = `mock-fork-${mockForkRecords.size + 1}`;
+    const title = `${source.title?.trim() || "Chat"} (fork)`;
+    const now = new Date().toISOString();
+    const record: AgentChatSessionRecord = {
+      ...source,
+      thread_id: threadId,
+      sdk_session_id: `sdk-${threadId}`,
+      imported_from: null,
+      workspace_id: workspace?.workspace_id ?? source.workspace_id,
+      cwd: workspace?.cwd ?? source.cwd,
+      title,
+      created_at: now,
+      last_active_at: now,
+    };
+    const payloads = kept.map((payload) => {
+      const value = JSON.parse(payload) as Record<string, unknown>;
+      if (typeof value.thread_id === "string") value.thread_id = threadId;
+      return JSON.stringify(value);
+    });
+    mockForkRecords.set(threadId, record);
+    mockForkPayloads.set(threadId, payloads);
+    mockForkOrigins.set(threadId, {
+      source_thread_id: sourceThreadId,
+      source_title: source.title ?? null,
+      source_exists: true,
+      boundary_message_id: payloads.length > 0 ? payloads.length : null,
+    });
+    return {
+      thread_id: threadId,
+      provider: record.provider,
+      title,
+      workspace_id: record.workspace_id,
+      cwd: record.cwd ?? "",
+    };
+  },
+  agent_chat_fork_origin: (a) => mockForkOrigins.get(a.threadId as string) ?? null,
 };
+
+/** Validate a mock fork and return the source row plus the transcript the
+ *  fork keeps (row ids are one-based per thread in the mock). */
+function mockForkPlan(
+  sourceThreadId: string,
+  before: number | null,
+): { source: AgentChatSessionRecord; kept: string[] } {
+  const source = handlers.agent_chat_get_session({ threadId: sourceThreadId }) as
+    | AgentChatSessionRecord
+    | null
+    | undefined;
+  if (!source) throw "This chat no longer exists.";
+  if (source.provider !== "claude" && source.provider !== "codex") {
+    throw `Forking isn't available for ${source.provider} chats yet.`;
+  }
+  if (source.imported_from) throw "This chat was imported read-only, so it can't be forked.";
+  if (!source.sdk_session_id) {
+    throw "This chat has no agent session yet. Wait for the first reply, then fork it.";
+  }
+  const visible = mockVisibleThreadRows(sourceThreadId).length;
+  const payloads = mockThreadPayloads(sourceThreadId).slice(0, visible);
+  if (before === null) return { source, kept: payloads };
+  if (!mockPayloadIsUserMessage(payloads[before - 1] ?? "")) {
+    throw "That message doesn't start a turn, so the chat can't be forked there.";
+  }
+  return { source, kept: payloads.slice(0, before - 1) };
+}
 
 // Archive entries whose (simulated) worktree is dirty: deleting them
 // with forceDelete=false rejects with the /use force/i message. Seeded

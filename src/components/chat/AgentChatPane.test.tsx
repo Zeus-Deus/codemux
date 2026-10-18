@@ -542,6 +542,7 @@ vi.mock("@/tauri/commands", () => ({
   // divider unless a test seeds a record.
   agentChatListSessions: vi.fn().mockResolvedValue([]),
   agentChatListTurnCheckpoints: vi.fn().mockResolvedValue([]),
+  agentChatForkOrigin: vi.fn().mockResolvedValue(null),
   agentChatRevertTurnCheckpoint: vi.fn().mockResolvedValue([]),
   agentChatUndoTurnRevert: vi.fn().mockResolvedValue(undefined),
   agentChatRespondToRequest: vi.fn().mockResolvedValue(undefined),

@@ -15,6 +15,7 @@ import {
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { ChatForkMenuItems } from "@/components/chat/ChatFork";
 import {
   SessionHistoryList,
   useSessionHistory,
@@ -492,6 +493,13 @@ function ActiveChatTab({
                 onNewChat={handleNewChat}
                 onDelete={handleDelete}
                 closeMenu={() => setOpen(false)}
+                footerItem={
+                  <ChatForkMenuItems
+                    threadId={pane.thread_id}
+                    provider={pane.provider ?? "claude"}
+                    workspaceId={workspaceId}
+                  />
+                }
               />
             </DropdownMenuContent>
           </DropdownMenu>

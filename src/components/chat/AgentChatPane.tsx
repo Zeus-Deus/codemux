@@ -146,6 +146,7 @@ import type {
 } from "@/tauri/types";
 
 import { ChatTranscript } from "./ChatTranscript";
+import { ChatForkProvider } from "./ChatFork";
 import { DelegateTaskDialog } from "./DelegateTaskDialog";
 import { RemoteTaskDetail } from "./RemoteTaskDetail";
 import { projectRemoteTasks } from "./remote-task-projection";
@@ -4324,6 +4325,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           ) : transcriptMessages.length === 0 ? (
             <TranscriptSkeleton />
           ) : (
+            <ChatForkProvider
+              threadId={threadId}
+              provider={provider}
+              workspaceId={workspaceIdForPane}
+              messages={transcriptMessages}
+              checkpointByNonce={turnCheckpointByNonce}
+              busy={transcriptStreaming}
+              enabled={conversationWritable}
+            >
             <ChatTranscript
               messages={transcriptMessages}
               streaming={transcriptStreaming}
@@ -4357,6 +4367,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               cwd={cwd}
               onReadingBackChange={handleReadingBackChange}
             />
+            </ChatForkProvider>
           )}
           {/* Composer region (design D10): groups the whole composer
               column — AskUserQuestion panel, debug banner, the strip and

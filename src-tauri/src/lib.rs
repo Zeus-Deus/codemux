@@ -3138,6 +3138,10 @@ fn build_core_app<R: tauri::Runtime>(
             commands::secrets_delete,
             // Per-turn git diffs for agent chat.
             commands::turn_diff::agent_chat_get_turn_diff,
+            // Fork a chat into a new, independent thread.
+            commands::chat_fork::agent_chat_fork_check,
+            commands::chat_fork::agent_chat_fork_thread,
+            commands::chat_fork::agent_chat_fork_origin,
         ])
 }
 

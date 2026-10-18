@@ -14,6 +14,8 @@ import type {
   AgentBrowserSession,
   AgentChatProviderKind,
   AgentChatTurnDiff,
+  ChatForkCreated,
+  ChatForkOrigin,
   ModelSelection,
   OpenCodeAvailability,
   OpenCodeProviderEntry,
@@ -3853,3 +3855,28 @@ export const prWatchStop = (threadId: string) =>
 
 export const prWatchStatus = (threadId: string) =>
   invoke<import("./types").PrWatchStatus | null>("pr_watch_status", { threadId });
+
+/** Check that a chat could be forked from this point, without forking it.
+ *  `beforeMessageId` is the user message row that starts the first turn the
+ *  fork leaves out; `null` forks from the latest message. */
+export const agentChatForkCheck = (
+  sourceThreadId: string,
+  beforeMessageId: number | null,
+) => invoke<void>("agent_chat_fork_check", { sourceThreadId, beforeMessageId });
+
+/** Fork a chat into a new, independent thread that continues the agent's
+ *  own session. `workspaceId: null` keeps the fork in the source's folder. */
+export const agentChatForkThread = (
+  sourceThreadId: string,
+  beforeMessageId: number | null,
+  workspaceId: string | null,
+) =>
+  invoke<ChatForkCreated>("agent_chat_fork_thread", {
+    sourceThreadId,
+    beforeMessageId,
+    workspaceId,
+  });
+
+/** Where a forked chat came from; `null` for a chat that isn't a fork. */
+export const agentChatForkOrigin = (threadId: string) =>
+  invoke<ChatForkOrigin | null>("agent_chat_fork_origin", { threadId });

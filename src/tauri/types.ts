@@ -1954,3 +1954,21 @@ export interface AgentChatTurnDiff {
   /** Files were left out of `files` or lost their patch to the budget. */
   truncated: boolean;
 }
+
+/** A chat forked by `agent_chat_fork_thread`, ready to open. */
+export interface ChatForkCreated {
+  thread_id: string;
+  provider: AgentChatProviderKind;
+  title: string;
+  workspace_id: string;
+  cwd: string;
+}
+
+/** Where a forked chat came from (`agent_chat_fork_origin`). */
+export interface ChatForkOrigin {
+  source_thread_id: string;
+  source_title: string | null;
+  source_exists: boolean;
+  /** The fork's last copied transcript row; later rows are its own. */
+  boundary_message_id: number | null;
+}
