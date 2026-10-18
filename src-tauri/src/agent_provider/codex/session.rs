@@ -27,7 +27,7 @@ use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 use crate::mcp::registry::McpRegistry;
 
 use super::protocol::{
-    AccountReadResponse, ApprovalResponse, Capabilities, ClientInfo, CollaborationMode,
+    AccountReadResponse, Capabilities, ClientInfo, CollaborationMode,
     CollaborationModeSettings, DynamicToolCallParams, DynamicToolSpec,
     GetAccountRateLimitsResponse, InitializeParams, NotificationMessage, ServerRequestMessage,
     ThreadResumeParams, ThreadRollbackParams, ThreadStartParams, ThreadStartResponse,
@@ -156,6 +156,8 @@ pub(crate) struct PendingApproval {
     /// requests when its turn ends, so they settle with that turn.
     codex_thread_id: Option<String>,
     turn_id: Option<String>,
+    /// The request itself; the reply's shape depends on its method.
+    request: ServerRequestMessage,
 }
 
 /// Runtime-mutable state inside a [`CodexSession`].
@@ -1845,7 +1847,7 @@ impl CodexSession {
                 }
             })?
         };
-        let payload = serde_json::to_value(ApprovalResponse::from(decision.clone())).unwrap();
+        let payload = pending.request.response(decision.clone());
         child
             .respond(pending.rpc_id, Ok(payload))
             .await
@@ -2596,6 +2598,7 @@ fn spawn_incoming_requests_task(
                             rpc_id: req.id,
                             codex_thread_id: field("threadId"),
                             turn_id: field("turnId"),
+                            request: msg,
                         };
                         let mut state = session.state.lock().await;
                         let thread = pending.codex_thread_id.as_ref().unwrap_or(&state.codex_thread_id);

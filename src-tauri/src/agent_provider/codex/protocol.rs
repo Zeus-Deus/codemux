@@ -21,8 +21,8 @@
 //!   discriminated on the JSON-RPC `method` field.
 //! * [`ServerRequestMessage`] — server → client requests requiring a
 //!   response, discriminated on method.
-//! * [`ApprovalResponse`] — the payload we send back to resolve any of the
-//!   four `*requestApproval` / `requestUserInput` methods.
+//! * [`ServerRequestMessage::response`] — the payload we send back to
+//!   resolve one, shaped per method as the app-server v2 protocol expects.
 //!
 //! # Fallback variants
 //!
@@ -34,7 +34,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::agent_provider::ApprovalDecision;
 
@@ -1268,8 +1268,8 @@ pub struct ItemEnvelope {
 // ---------------------------------------------------------------------------
 
 /// A server-initiated request that expects a response. Callers resolve it
-/// via `JsonRpcChild::respond` with the original id and an
-/// [`ApprovalResponse`] payload.
+/// via `JsonRpcChild::respond` with the original id and the payload from
+/// [`ServerRequestMessage::response`].
 #[derive(Debug, Clone)]
 pub enum ServerRequestMessage {
     /// `item/commandExecution/requestApproval`.
@@ -1291,6 +1291,8 @@ pub enum ServerRequestMessage {
     ToolCall(Value),
     /// Unknown method — treated as an approval-shaped request so the
     /// runtime can still resolve it with a `cancel` decision if needed.
+    /// `mcpServer/elicitation/request` also lands here; only its reply
+    /// differs.
     Unknown {
         /// Original method string.
         method: String,
@@ -1348,56 +1350,83 @@ impl ServerRequestMessage {
 // Approval response (client → server, in reply to a server-initiated req)
 // ---------------------------------------------------------------------------
 
-/// Response payload we send to resolve any of the four approval-style
-/// server-initiated requests.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApprovalResponse {
-    /// Literal decision string — `"allow"`, `"allowForSession"`,
-    /// `"deny"`, or `"cancel"`.
-    pub decision: String,
-    /// Optional edited input the user wants applied in place of the
-    /// agent's original tool input. Only meaningful when
-    /// `decision == "allow"`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_input: Option<Value>,
-    /// Optional human-visible rejection reason. Only meaningful when
-    /// `decision == "deny"`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
-
-impl From<ApprovalDecision> for ApprovalResponse {
-    fn from(value: ApprovalDecision) -> Self {
-        match value {
-            ApprovalDecision::Allow {
-                updated_input,
-                // Codex has no analogue to Claude's updatedPermissions —
-                // the "always allow" path will surface through Codex's
-                // sandbox policy instead. Drop the rules on the floor.
-                updated_permissions: _,
-            } => Self {
-                decision: "allow".to_string(),
-                updated_input,
-                message: None,
-            },
-            ApprovalDecision::AllowForSession => Self {
-                decision: "allowForSession".to_string(),
-                updated_input: None,
-                message: None,
-            },
-            ApprovalDecision::Deny { message } => Self {
-                decision: "deny".to_string(),
-                updated_input: None,
-                message: Some(message),
-            },
-            ApprovalDecision::Cancel | ApprovalDecision::ProviderOption { .. } => Self {
-                decision: "cancel".to_string(),
-                updated_input: None,
-                message: None,
-            },
+impl ServerRequestMessage {
+    /// The reply Codex expects for this request. Each method has its own
+    /// shape, and Codex reads a reply it cannot parse as a denial.
+    pub fn response(&self, decision: ApprovalDecision) -> Value {
+        use ApprovalDecision::{Allow, AllowForSession, Cancel, Deny, ProviderOption};
+        match self {
+            Self::UserInputRequest(params) => user_input_response(params, decision),
+            Self::PermissionsApproval(params) => {
+                // Granting the requested profile grants all of it; an empty
+                // profile grants nothing.
+                let requested = || params.get("permissions").cloned().unwrap_or_else(|| json!({}));
+                let (permissions, scope) = match decision {
+                    Allow { .. } => (requested(), "turn"),
+                    AllowForSession => (requested(), "session"),
+                    Deny { .. } | Cancel | ProviderOption { .. } => (json!({}), "turn"),
+                };
+                json!({ "permissions": permissions, "scope": scope })
+            }
+            Self::Unknown { method, .. } if method == "mcpServer/elicitation/request" => {
+                let (action, content, meta) = match decision {
+                    Allow { updated_input, .. } => {
+                        ("accept", updated_input.unwrap_or(Value::Null), Value::Null)
+                    }
+                    // Codex's own MCP tool approvals read this as "allow for
+                    // the session"; other servers ignore it.
+                    AllowForSession => ("accept", Value::Null, json!({ "persist": "session" })),
+                    Deny { .. } => ("decline", Value::Null, Value::Null),
+                    Cancel | ProviderOption { .. } => ("cancel", Value::Null, Value::Null),
+                };
+                json!({ "action": action, "content": content, "_meta": meta })
+            }
+            // Command and file-change approvals share these decisions. Codex
+            // takes no edited input or denial message for either.
+            _ => json!({
+                "decision": match decision {
+                    Allow { .. } => "accept",
+                    AllowForSession => "acceptForSession",
+                    Deny { .. } => "decline",
+                    Cancel | ProviderOption { .. } => "cancel",
+                }
+            }),
         }
     }
+}
+
+/// Codex keys answers by question id and takes a list per question. The UI
+/// answers with one string per question, keyed by the question's text.
+/// A skipped or cancelled question set is sent as no answers, as Codex
+/// itself does when the client fails to answer.
+fn user_input_response(params: &Value, decision: ApprovalDecision) -> Value {
+    let ApprovalDecision::Allow {
+        updated_input: Some(input),
+        ..
+    } = decision
+    else {
+        return json!({ "answers": {} });
+    };
+    let questions = params
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut answers = serde_json::Map::new();
+    for (key, answer) in input.get("answers").and_then(Value::as_object).into_iter().flatten() {
+        let id = questions
+            .iter()
+            .find(|question| question.get("question").and_then(Value::as_str) == Some(key))
+            .and_then(|question| question.get("id").and_then(Value::as_str))
+            .unwrap_or(key);
+        let list = match answer {
+            Value::String(text) => vec![text.clone()],
+            Value::Array(items) => items.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+            _ => continue,
+        };
+        answers.insert(id.to_owned(), json!({ "answers": list }));
+    }
+    json!({ "answers": answers })
 }
 
 // ---------------------------------------------------------------------------
@@ -1618,34 +1647,145 @@ mod tests {
         );
     }
 
-    #[test]
-    fn approval_response_from_allow_omits_message() {
-        let r = ApprovalResponse::from(ApprovalDecision::Allow {
-            updated_input: Some(json!({"x": 1})),
+    fn allow() -> ApprovalDecision {
+        ApprovalDecision::Allow {
+            updated_input: None,
             updated_permissions: None,
-        });
-        assert_eq!(r.decision, "allow");
-        assert_eq!(r.updated_input, Some(json!({"x": 1})));
-        assert!(r.message.is_none());
+        }
     }
 
-    #[test]
-    fn approval_response_from_deny_carries_message() {
-        let r = ApprovalResponse::from(ApprovalDecision::Deny {
+    fn deny() -> ApprovalDecision {
+        ApprovalDecision::Deny {
             message: "no".into(),
-        });
-        assert_eq!(r.decision, "deny");
-        assert_eq!(r.message.as_deref(), Some("no"));
-        assert!(r.updated_input.is_none());
+        }
     }
 
+    /// Exact replies the app-server v2 protocol accepts
+    /// (`CommandExecutionApprovalDecision`, `FileChangeApprovalDecision`).
     #[test]
-    fn approval_response_serializes_skipping_none_fields() {
-        let r = ApprovalResponse::from(ApprovalDecision::Cancel);
-        let v = serde_json::to_value(&r).unwrap();
-        assert_eq!(v["decision"], "cancel");
-        assert!(v.get("updatedInput").is_none());
-        assert!(v.get("message").is_none());
+    fn command_and_file_change_replies_use_v2_decisions() {
+        for method in [
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        ] {
+            let request = ServerRequestMessage::from_raw(method, json!({"itemId": "i"}));
+            let edited = ApprovalDecision::Allow {
+                updated_input: Some(json!({"command": "ls -a"})),
+                updated_permissions: Some(vec![json!({"rule": "x"})]),
+            };
+            assert_eq!(request.response(edited), json!({"decision": "accept"}));
+            assert_eq!(
+                request.response(ApprovalDecision::AllowForSession),
+                json!({"decision": "acceptForSession"})
+            );
+            assert_eq!(request.response(deny()), json!({"decision": "decline"}));
+            assert_eq!(
+                request.response(ApprovalDecision::Cancel),
+                json!({"decision": "cancel"})
+            );
+            assert_eq!(
+                request.response(ApprovalDecision::ProviderOption {
+                    option_id: "x".into()
+                }),
+                json!({"decision": "cancel"})
+            );
+        }
+    }
+
+    /// `PermissionsRequestApprovalResponse`: a granted profile plus scope.
+    #[test]
+    fn permissions_reply_grants_the_requested_profile() {
+        let permissions = json!({
+            "network": {"enabled": true},
+            "fileSystem": {"read": null, "write": ["/tmp/out"]}
+        });
+        let request = ServerRequestMessage::from_raw(
+            "item/permissions/requestApproval",
+            json!({"itemId": "i", "cwd": "/tmp", "reason": null, "permissions": permissions}),
+        );
+        assert_eq!(
+            request.response(allow()),
+            json!({"permissions": permissions, "scope": "turn"})
+        );
+        assert_eq!(
+            request.response(ApprovalDecision::AllowForSession),
+            json!({"permissions": permissions, "scope": "session"})
+        );
+        for decision in [deny(), ApprovalDecision::Cancel] {
+            assert_eq!(
+                request.response(decision),
+                json!({"permissions": {}, "scope": "turn"})
+            );
+        }
+    }
+
+    /// `ToolRequestUserInputResponse`: answers keyed by question id.
+    #[test]
+    fn user_input_reply_keys_answers_by_question_id() {
+        let questions = json!([
+            {"id": "scope", "header": "Scope", "question": "Which files?", "options": null},
+            {"id": "mode", "header": "Mode", "question": "Fast or safe?", "options": [
+                {"label": "Fast", "description": "Skip checks"}
+            ]}
+        ]);
+        let request = ServerRequestMessage::from_raw(
+            "item/tool/requestUserInput",
+            json!({"threadId": "t", "turnId": "u", "itemId": "i", "questions": questions}),
+        );
+        // The shape the composer submits: the original questions plus one
+        // answer per question text.
+        let answered = ApprovalDecision::Allow {
+            updated_input: Some(json!({
+                "questions": questions,
+                "answers": {"Which files?": "Only src", "Fast or safe?": "Fast"}
+            })),
+            updated_permissions: None,
+        };
+        assert_eq!(
+            request.response(answered),
+            json!({"answers": {
+                "scope": {"answers": ["Only src"]},
+                "mode": {"answers": ["Fast"]}
+            }})
+        );
+        for decision in [deny(), ApprovalDecision::Cancel, allow()] {
+            assert_eq!(request.response(decision), json!({"answers": {}}));
+        }
+    }
+
+    /// `McpServerElicitationRequestResponse`: action, content, and `_meta`.
+    #[test]
+    fn mcp_elicitation_reply_uses_actions() {
+        let request = ServerRequestMessage::from_raw(
+            "mcpServer/elicitation/request",
+            json!({"threadId": "t", "turnId": null, "serverName": "s", "mode": "form",
+                   "_meta": null, "message": "Run tool?", "requestedSchema": {"type": "object", "properties": {}}}),
+        );
+        assert_eq!(request.request_kind(), "unknown");
+        assert_eq!(
+            request.response(allow()),
+            json!({"action": "accept", "content": null, "_meta": null})
+        );
+        let filled = ApprovalDecision::Allow {
+            updated_input: Some(json!({"name": "x"})),
+            updated_permissions: None,
+        };
+        assert_eq!(
+            request.response(filled),
+            json!({"action": "accept", "content": {"name": "x"}, "_meta": null})
+        );
+        assert_eq!(
+            request.response(ApprovalDecision::AllowForSession),
+            json!({"action": "accept", "content": null, "_meta": {"persist": "session"}})
+        );
+        assert_eq!(
+            request.response(deny()),
+            json!({"action": "decline", "content": null, "_meta": null})
+        );
+        assert_eq!(
+            request.response(ApprovalDecision::Cancel),
+            json!({"action": "cancel", "content": null, "_meta": null})
+        );
     }
 
     #[test]
