@@ -404,6 +404,10 @@ export class ClaudeSession {
    *  `ensureLiveQuery`, since a rebuilt query is a fresh CLI boot that
    *  deserves its own restore attempt. */
   private bypassRestoreAttempted = false;
+  /** Steer uuids no top-level `result` has echoed as consumed yet. */
+  private readonly pendingSteers = new Set<string>();
+  /** True while a Stop ends the CLI process; see `retireForStop`. */
+  private retiring = false;
 
   constructor(input: SessionStartInput, emit: EventEmitter) {
     this.threadId = input.threadId;
@@ -476,6 +480,7 @@ export class ClaudeSession {
           break;
         }
         this.observeSdkSessionId(message);
+        this.settleSteers(message);
         this.emitter.notification("sdk-message", {
           threadId: this.threadId,
           message,
@@ -524,7 +529,7 @@ export class ClaudeSession {
       }
       // Interrupt-driven abort: same silent, mark-dead handling as the
       // clean-exit path above.
-      if (this.interrupting && !this.closed && isAbortLikeError(err)) {
+      if (this.interrupting && !this.closed && (isAbortLikeError(err) || this.retiring)) {
         this.queryDead = true;
         return;
       }
@@ -690,6 +695,9 @@ export class ClaudeSession {
       }
     }
     const msg = this.buildUserMessage(input.text, input.images);
+    // The CLI echoes a prompt's uuid in `user_message_uuids` only when the
+    // prompt carries one; the host relies on that echo to steer.
+    msg.uuid = crypto.randomUUID();
     // Retain the turn and grant it one stale-resume recovery attempt
     // before it's dispatched, so a self-heal can replay it verbatim.
     this.lastUserMessage = msg;
@@ -714,6 +722,60 @@ export class ClaudeSession {
     msg.priority = "next";
     msg.uuid = input.uuid as NonNullable<SDKUserMessage["uuid"]>;
     this.promptQueue.push(msg);
+    this.pendingSteers.add(input.uuid);
+  }
+
+  /** Forget steers a top-level `result` reports as consumed. */
+  private settleSteers(message: SDKMessage): void {
+    if (this.pendingSteers.size === 0) return;
+    const m = message as unknown as {
+      type?: unknown;
+      parent_tool_use_id?: unknown;
+      user_message_uuids?: unknown;
+    };
+    if (m.type !== "result" || m.parent_tool_use_id) return;
+    if (!Array.isArray(m.user_message_uuids)) return;
+    for (const uuid of m.user_message_uuids) {
+      if (typeof uuid === "string") this.pendingSteers.delete(uuid);
+    }
+  }
+
+  /** Stop with guidance still unread. `query.interrupt()` is soft: the CLI
+   *  keeps queued prompts and runs the guidance as its next turn, so Stop
+   *  would not win. End the CLI process instead; the next `sendTurn`
+   *  rebuilds a resumed query, as after any interrupt that killed it. */
+  private async retireForStop(): Promise<void> {
+    this.interrupting = true;
+    this.retiring = true;
+    this.pendingSteers.clear();
+    try {
+      try {
+        this.query.close();
+      } catch (err) {
+        logger.warn("query.close during stop threw", {
+          threadId: this.threadId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        this.iterationTask,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, interruptExitTimeoutMs);
+        }),
+      ]);
+      if (timer !== undefined) clearTimeout(timer);
+      // The process is gone either way; never reuse its query.
+      this.queryDead = true;
+      if (!this.closed) {
+        this.emitter.notification("turn-interrupted", {
+          threadId: this.threadId,
+        });
+      }
+    } finally {
+      this.retiring = false;
+      this.interrupting = false;
+    }
   }
 
   /** Stage 6 — when images are attached we build a multi-block content
@@ -757,6 +819,7 @@ export class ClaudeSession {
    *  over but the session lives. */
   async interrupt(): Promise<void> {
     if (this.closed || this.queryDead) return;
+    if (this.pendingSteers.size > 0) return this.retireForStop();
     this.interrupting = true;
     try {
       await this.query.interrupt();
@@ -818,6 +881,7 @@ export class ClaudeSession {
     }
 
     this.queryDead = false;
+    this.pendingSteers.clear();
     // A rebuilt query is a fresh CLI boot that may or may not be
     // downgraded on its own; give it a fresh restore attempt.
     this.bypassRestoreAttempted = false;

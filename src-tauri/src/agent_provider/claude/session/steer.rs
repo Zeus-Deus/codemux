@@ -10,7 +10,8 @@
 //! attributed and the follow-up queue cannot dispatch into the gap.
 //!
 //! A newer Stop always wins: guidance is refused into a turn being stopped,
-//! and guidance the stopped turn never read dies with it.
+//! and guidance the stopped turn never read dies with it (the sidecar ends
+//! the CLI process rather than leave it queued there).
 //!
 //! Without the echo nothing can tell the two cases apart, so steering waits
 //! until this CLI has been seen echoing prompt uuids.
@@ -63,11 +64,14 @@ impl SteerState {
         self.echoes = true;
     }
 
-    /// The interrupt RPC failed, so `turn` keeps running.
-    pub fn stop_failed(&mut self, turn: &Option<TurnId>) {
+    /// The interrupt RPC failed, so the stopped work runs on. Returns whether
+    /// guidance is still pending, which needs a continuation if the stopped
+    /// turn already ended.
+    pub fn stop_failed(&mut self, turn: &Option<TurnId>) -> bool {
         if &self.stopping == turn {
             self.stopping = None;
         }
+        !self.pending.is_empty()
     }
 
     /// The SDK query ended or was rebuilt, losing any guidance it held.
@@ -81,8 +85,10 @@ impl SteerState {
     /// pending, which the CLI runs next as a turn of its own.
     fn settle_result(&mut self, result: &Value, ended: Option<&TurnId>) -> bool {
         if ended.is_some() && ended == self.stopping.as_ref() {
-            // The aborted turn's result: its unread guidance dies with it.
-            self.drop_pending();
+            // The stopped turn's result. Its unread guidance dies with it once
+            // the interrupt is confirmed; if that fails, `stop_failed` says so.
+            self.continuation = None;
+            self.unannounced = None;
             return false;
         }
         match result.get("user_message_uuids").and_then(Value::as_array) {
@@ -330,9 +336,21 @@ impl ClaudeSession {
         result: &Value,
         ended: Option<TurnId>,
     ) {
-        if !state.steer.settle_result(result, ended.as_ref())
-            || !matches!(state.status, SessionStatus::Ready)
-        {
+        if state.steer.settle_result(result, ended.as_ref()) {
+            self.begin_continuation(state);
+        }
+    }
+
+    /// The interrupt failed: guidance the stopped turn left unread will run
+    /// as the CLI's next turn, if that turn already ended.
+    pub(super) fn recover_failed_stop(&self, state: &mut ClaudeSessionState, stopped: &Option<TurnId>) {
+        if state.steer.stop_failed(stopped) && state.active_turn.is_none() {
+            self.begin_continuation(state);
+        }
+    }
+
+    fn begin_continuation(&self, state: &mut ClaudeSessionState) {
+        if !matches!(state.status, SessionStatus::Ready) {
             return;
         }
         let turn = TurnId(format!("claude-turn-{}", uuid::Uuid::new_v4()));
@@ -399,12 +417,14 @@ mod tests {
     }
 
     #[test]
-    fn the_stopped_turns_result_drops_its_unread_guidance() {
+    fn the_stopped_turns_result_waits_for_the_stop_outcome() {
         let turn = TurnId("t".into());
         let mut steer = steer_with(&["s1"]);
         steer.stop(Some(turn.clone()));
         assert!(!steer.settle_result(&json!({"user_message_uuids": ["p"]}), Some(&turn)));
-        assert!(steer.pending.is_empty());
+        // A failed stop then reports the guidance as still to run.
+        assert!(steer.stop_failed(&Some(turn)));
+        assert_eq!(steer.pending, ["s1"]);
     }
 
     #[test]
@@ -412,7 +432,7 @@ mod tests {
         let turn = TurnId("t".into());
         let mut steer = steer_with(&["s1"]);
         steer.stop(Some(turn.clone()));
-        steer.stop_failed(&Some(turn.clone()));
+        assert!(steer.stop_failed(&Some(turn.clone())));
         assert!(steer.stopping.is_none());
         // The turn ran on and finished without reading the guidance.
         assert!(steer.settle_result(&json!({"user_message_uuids": ["p"]}), Some(&turn)));

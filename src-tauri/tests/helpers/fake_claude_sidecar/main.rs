@@ -25,7 +25,8 @@
 //!     responding to this method. Used to simulate crashes.
 //!   * `FAKE_CLAUDE_STEER_ERROR=<code>:<message>` — reject `steer-turn`,
 //!     after `FAKE_CLAUDE_STEER_DELAY_MS` when set.
-//!   * `FAKE_CLAUDE_INTERRUPT_ERROR=<message>` — reject `interrupt`.
+//!   * `FAKE_CLAUDE_INTERRUPT_ERROR=<message>` — reject `interrupt`, after
+//!     `FAKE_CLAUDE_INTERRUPT_DELAY_MS` when set.
 //!
 //! A scripted `"user_message_uuids": "$steered"` is replaced with the
 //! uuids of every `steer-turn` received so far, the way the CLI echoes
@@ -311,6 +312,13 @@ fn main() {
                 }
             }
             "interrupt" if std::env::var("FAKE_CLAUDE_INTERRUPT_ERROR").is_ok() => {
+                fire_script_entries_for(method, &script);
+                if let Some(delay) = std::env::var("FAKE_CLAUDE_INTERRUPT_DELAY_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
                 if let Some(id) = id {
                     write_line(&json!({
                         "jsonrpc": "2.0",
@@ -321,7 +329,6 @@ fn main() {
                         },
                     }));
                 }
-                fire_script_entries_for(method, &script);
             }
             "interrupt" | "set-model" | "set-permission-mode" => {
                 if method == "interrupt" {

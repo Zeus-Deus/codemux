@@ -2,6 +2,8 @@
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
 
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+
 import {
   ClaudeSession,
   resetInterruptExitTimeoutForTests,
@@ -62,9 +64,10 @@ test("steerTurn pushes next-priority guidance carrying the host uuid", async () 
   const content = steer?.message.content as Array<{ type: string; text?: string }>;
   expect(content.map((block) => block.type)).toEqual(["image", "text"]);
   expect(content[1]?.text).toBe("also do this");
-  // Ordinary turns stay untouched.
+  // Ordinary turns are not prioritised, but carry a uuid so the CLI echoes
+  // them, which the host waits for before steering.
   expect(fake.capturedPrompts[0]?.priority).toBeUndefined();
-  expect(fake.capturedPrompts[0]?.uuid).toBeUndefined();
+  expect(typeof fake.capturedPrompts[0]?.uuid).toBe("string");
   await session.close();
 });
 
@@ -115,4 +118,48 @@ test("steer-turn RPC validates params and forwards to the session", async () => 
   const prompt = (fakes[0] as FakeQuery).capturedPrompts[0];
   expect(prompt?.uuid as string).toBe("steer-4");
   expect(prompt?.message.content).toBe("guidance");
+});
+
+function events(): { emit: EventEmitter; methods: string[] } {
+  const methods: string[] = [];
+  return { emit: { notification: (method) => methods.push(method) }, methods };
+}
+
+test("Stop with unread guidance ends the CLI process instead of a soft interrupt", async () => {
+  // A soft interrupt leaves queued prompts in the CLI, which runs the
+  // guidance as its next turn: the newer Stop would not win.
+  const { emit: recording, methods } = events();
+  const session = new ClaudeSession(input(), recording);
+  await session.sendTurn({ text: "first" });
+  await session.steerTurn({ text: "guidance", uuid: "steer-5" });
+  const fake = fakes[0] as FakeQuery;
+  await session.interrupt();
+  expect(fake.interruptCalls).toBe(0);
+  expect(fake.closed).toBe(true);
+  expect(methods).toContain("turn-interrupted");
+  expect(methods).not.toContain("session-ended");
+  expect(methods).not.toContain("session-error");
+  // The next turn resumes on a fresh query.
+  await session.sendTurn({ text: "next" });
+  await settle();
+  expect(fakes).toHaveLength(2);
+  expect(fakes[1]?.capturedPrompts[0]?.message.content).toBe("next");
+  await session.close();
+});
+
+test("Stop after the guidance was consumed interrupts softly", async () => {
+  const session = new ClaudeSession(input(), emit);
+  await session.steerTurn({ text: "guidance", uuid: "steer-6" });
+  const fake = fakes[0] as FakeQuery;
+  fake.emit({
+    type: "result",
+    subtype: "success",
+    parent_tool_use_id: null,
+    user_message_uuids: ["first", "steer-6"],
+  } as unknown as SDKMessage);
+  await settle();
+  await session.interrupt();
+  expect(fake.interruptCalls).toBe(1);
+  expect(fake.closed).toBe(false);
+  await session.close();
 });

@@ -1104,7 +1104,8 @@ impl ClaudeSession {
             .request(METHOD_INTERRUPT, serde_json::to_value(&params).unwrap())
             .await
         {
-            self.state.lock().await.steer.stop_failed(&active);
+            self.recover_failed_stop(&mut *self.state.lock().await, &active);
+            self.announce_steer_continuation().await;
             return Err(ProviderError::RpcError {
                 message: format!("interrupt RPC failed: {e}"),
             });

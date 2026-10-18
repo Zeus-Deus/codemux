@@ -2669,6 +2669,29 @@ async fn a_failed_stop_keeps_tracking_delivered_guidance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_that_fails_after_the_turn_ended_still_tracks_the_guidance() {
+    // The turn ends while the interrupt is in flight and the interrupt then
+    // fails: the guidance it never read runs next and must be tracked.
+    let thread = "t-steer-stop-late-fail";
+    let f = steer_fixture(
+        thread,
+        vec![result_after("interrupt", 20, thread, json!(["first-prompt"]))],
+        &[
+            ("FAKE_CLAUDE_INTERRUPT_ERROR", "interrupt failed"),
+            ("FAKE_CLAUDE_INTERRUPT_DELAY_MS", "200"),
+        ],
+    )
+    .await;
+    assert!(f.provider.steer_turn(turn_input(thread, "guidance")).await.unwrap().steered);
+    let mut stream = f.provider.event_stream();
+    assert!(f.provider.interrupt_turn(f.thread.clone(), None).await.is_err());
+    let events = lifecycle_until(&mut stream, 300, |_| false).await;
+    assert_eq!(running_turns(&events).len(), 1, "{events:?}");
+    assert!(f.provider.turn_active(&f.thread).await);
+    f.provider.stop_session(f.thread).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_steer_strands_nothing() {
     let thread = "t-steer-fail";
     let f = steer_fixture(thread, vec![], &[("FAKE_CLAUDE_STEER_ERROR", "-32603:boom")]).await;
