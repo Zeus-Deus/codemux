@@ -1317,6 +1317,9 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
     let close_result = state
         .close_workspace(&workspace_id)
         .map_err(|e| format!("Failed to close workspace: {e}"))?;
+    // Before any await below: a chat closed just before this may still be
+    // stopping, and its result must not be lost if it finishes meanwhile.
+    let earlier_stops = crate::commands::agent_chat::snapshot_pending_stops(&workspace_id);
 
     // Reconcile only after the state mutation succeeds. A duplicate workspace
     // at the same checkout still owns the shared path-level config; deleting
@@ -1409,7 +1412,7 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         // that was not acknowledged keeps the files.
         crate::commands::agent_chat::shutdown_agent_chat_threads_and_wait(
             &app,
-            &workspace_id,
+            earlier_stops,
             close_result.removed_agent_chat_threads,
         )
         .await
