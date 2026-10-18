@@ -14,13 +14,17 @@ const mocks = vi.hoisted(() => ({
   epoch: 0,
   /** Set to hold `prWatchStatus` until the test resolves it. */
   deferred: null as null | { resolve: (s: PrWatchStatus | null) => void },
+  readFails: false,
+  /** Set to hold listener registration until the test releases it. */
+  registration: null as null | { release: () => void },
 }));
 
 vi.mock("@/tauri/commands", () => ({
   prWatchStatus: vi.fn(
     (thread: string) =>
-      new Promise<PrWatchStatus | null>((resolve) => {
-        if (mocks.deferred) mocks.deferred.resolve = resolve;
+      new Promise<PrWatchStatus | null>((resolve, reject) => {
+        if (mocks.readFails) reject("bridge unavailable");
+        else if (mocks.deferred) mocks.deferred.resolve = resolve;
         else resolve(thread === "thread-1" ? mocks.status : null);
       }),
   ),
@@ -30,6 +34,11 @@ vi.mock("@/tauri/commands", () => ({
 vi.mock("@/tauri/events", () => ({
   onPrWatchChanged: vi.fn(async (cb: typeof mocks.listener) => {
     mocks.listener = cb;
+    if (mocks.registration) {
+      await new Promise<void>((release) => {
+        if (mocks.registration) mocks.registration.release = release;
+      });
+    }
     return () => {
       mocks.listener = null;
     };
@@ -85,6 +94,8 @@ beforeEach(() => {
   mocks.focused = "thread-1";
   mocks.epoch = 0;
   mocks.deferred = null;
+  mocks.readFails = false;
+  mocks.registration = null;
   mocks.start.mockReset().mockImplementation(async () => watch());
   mocks.stop.mockReset().mockResolvedValue(true);
   mocks.failure.mockReset();
@@ -172,6 +183,45 @@ describe("PrWatchRow", () => {
     mocks.epoch = 1;
     rerender(<PrWatchRow workspace={workspace({ title: "reconnected" })} />);
     await waitFor(() => expect(row).toHaveTextContent("Stopped"));
+  });
+
+  it("reads the status only once it is listening", async () => {
+    const { prWatchStatus } = await import("@/tauri/commands");
+    vi.mocked(prWatchStatus).mockClear();
+    mocks.registration = { release: () => {} };
+    render(<PrWatchRow workspace={workspace()} />);
+    await waitFor(() => expect(mocks.listener).not.toBeNull());
+    expect(prWatchStatus).not.toHaveBeenCalled();
+    await act(async () => mocks.registration?.release());
+    await waitFor(() => expect(prWatchStatus).toHaveBeenCalledWith("thread-1"));
+  });
+
+  it("keeps a newer event over a slower reply", async () => {
+    let finish: () => void = () => {};
+    mocks.status = watch();
+    mocks.stop.mockImplementationOnce(() => new Promise<boolean>((resolve) => (finish = () => resolve(true))));
+    render(<PrWatchRow workspace={workspace()} />);
+    const row = await screen.findByTestId("workspace-details-pr-watch");
+    await waitFor(() => expect(row).toHaveTextContent("On"));
+    fireEvent.click(row);
+    // Another client re-arms before this stop's reply lands.
+    act(() => mocks.listener?.({ thread_id: "thread-1", watch: watch({ attempts: 1 }) }));
+    await act(async () => finish());
+    expect(row).toHaveTextContent("On · 1/3");
+  });
+
+  it("offers a retry when the status cannot be read", async () => {
+    mocks.readFails = true;
+    mocks.status = watch({ attempts: 2 });
+    render(<PrWatchRow workspace={workspace()} />);
+    const row = await screen.findByTestId("workspace-details-pr-watch");
+    await waitFor(() => expect(row).toHaveTextContent("Retry"));
+    expect(row).toBeEnabled();
+
+    mocks.readFails = false;
+    fireEvent.click(row);
+    await waitFor(() => expect(row).toHaveTextContent("On · 2/3"));
+    expect(mocks.start).not.toHaveBeenCalled();
   });
 
   it("is absent without an open pull request on GitHub", () => {
