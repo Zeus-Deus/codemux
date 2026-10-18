@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { useUIStore } from "@/stores/ui-store";
 import type { AgentChatTurnDiff } from "@/tauri/types";
@@ -116,5 +116,69 @@ describe("TurnDiffDialog", () => {
     getTurnDiff.mockRejectedValue("git diff failed");
     open();
     expect(await screen.findByText(/Couldn't load .*git diff failed/)).toBeInTheDocument();
+  });
+
+  it("asks again while the turn is still being captured", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      getTurnDiff
+        .mockResolvedValueOnce({ ...ready, status: "in_progress", files: [] })
+        .mockResolvedValue(ready);
+      open();
+      expect(await screen.findByText(/still running/)).toBeInTheDocument();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      expect(await screen.findByText("before")).toBeInTheDocument();
+      expect(getTurnDiff).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("names renamed files and labels changes without content", async () => {
+    getTurnDiff.mockResolvedValue({
+      ...ready,
+      files: [
+        {
+          ...ready.files[0],
+          path: "src/b.ts",
+          old_path: "src/a.ts",
+          change: "renamed",
+        },
+        {
+          path: "docs/new.md",
+          old_path: "docs/old.md",
+          change: "renamed",
+          additions: 0,
+          deletions: 0,
+          binary: false,
+          patch: "diff --git a/docs/old.md b/docs/new.md\nsimilarity index 100%\nrename from docs/old.md\nrename to docs/new.md\n",
+          patch_omitted: null,
+        },
+      ],
+      files_changed: 2,
+    });
+    open();
+    expect(await screen.findByText("src/a.ts → src/b.ts")).toBeInTheDocument();
+    const pure = screen.getByTestId("turn-diff-omitted");
+    expect(pure).toHaveTextContent("docs/old.md → docs/new.md");
+    expect(pure).toHaveTextContent("Renamed");
+  });
+
+  it("returns focus to the element that opened it", async () => {
+    getTurnDiff.mockResolvedValue(null);
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    const ref = { current: opener };
+    const { rerender } = render(
+      <TurnDiffDialog open onOpenChange={() => {}} threadId="t1" turnId="turn-1" returnFocusRef={ref} />,
+    );
+    await screen.findByText(/weren't captured/);
+    rerender(
+      <TurnDiffDialog open={false} onOpenChange={() => {}} threadId="t1" turnId="turn-1" returnFocusRef={ref} />,
+    );
+    await vi.waitFor(() => expect(document.activeElement).toBe(opener));
+    opener.remove();
   });
 });

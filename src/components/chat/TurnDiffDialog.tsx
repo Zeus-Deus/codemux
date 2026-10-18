@@ -1,5 +1,5 @@
 import { FileText } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode, type RefObject } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -28,14 +28,35 @@ const OMITTED_REASON: Record<NonNullable<TurnDiffFile["patch_omitted"]>, string>
   budget: "Not shown: this turn's diff is too large",
 };
 
+/** How often an open dialog asks again while the turn's end is captured. */
+const IN_PROGRESS_POLL_MS = 2000;
+
+/** What a patch with no hunks records: a rename, copy or mode change. */
+function metadataOnlyReason(file: TurnDiffFile): string {
+  switch (file.change) {
+    case "renamed":
+      return "Renamed";
+    case "copied":
+      return "Copied";
+    case "type_changed":
+      return "File type changed";
+    default:
+      return "Mode changed";
+  }
+}
+
+function hasHunks(patch: string): boolean {
+  return /^@@ /m.test(patch);
+}
+
 function fileLabel(file: TurnDiffFile): string {
   return file.old_path ? `${file.old_path} → ${file.path}` : file.path;
 }
 
 /** A file that changed but has no patch to show: its path, line counts and
  *  why the patch is missing, in the same frame as a `DiffView`. */
-function OmittedFile({ file }: { file: TurnDiffFile }) {
-  const reason = file.patch_omitted ? OMITTED_REASON[file.patch_omitted] : "No textual changes";
+function OmittedFile({ file, reason }: { file: TurnDiffFile; reason?: string }) {
+  reason ??= file.patch_omitted ? OMITTED_REASON[file.patch_omitted] : "No textual changes";
   return (
     <div
       className="flex items-center justify-between gap-3 rounded-lg border border-hairline bg-surface-1 px-[13px] py-[9px]"
@@ -93,29 +114,41 @@ export function TurnDiffDialog({
   threadId,
   turnId,
   workspaceId,
+  returnFocusRef,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   threadId: string;
   turnId: string;
   workspaceId?: string | null;
+  /** Gets focus back when the dialog closes; it is not a Radix trigger. */
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }) {
   const [load, setLoad] = useState<Load>({ state: "loading" });
 
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     setLoad({ state: "loading" });
-    agentChatGetTurnDiff(threadId, turnId).then(
-      (diff) => {
-        if (!cancelled) setLoad({ state: "loaded", diff });
-      },
-      (error: unknown) => {
-        if (!cancelled) setLoad({ state: "error", message: String(error) });
-      },
-    );
+    const fetchDiff = () => {
+      agentChatGetTurnDiff(threadId, turnId).then(
+        (diff) => {
+          if (cancelled) return;
+          setLoad({ state: "loaded", diff });
+          // A turn's end snapshot lands just after it settles, and a running
+          // turn finishes while the dialog is open: ask again until ready.
+          if (diff?.status === "in_progress") retry = setTimeout(fetchDiff, IN_PROGRESS_POLL_MS);
+        },
+        (error: unknown) => {
+          if (!cancelled) setLoad({ state: "error", message: String(error) });
+        },
+      );
+    };
+    fetchDiff();
     return () => {
       cancelled = true;
+      clearTimeout(retry);
     };
   }, [open, threadId, turnId]);
 
@@ -148,15 +181,22 @@ export function TurnDiffDialog({
       <ChatFileLinkContext.Provider value={{ workspaceId, cwd: diff.repo_root }}>
         <div className="flex flex-col gap-3" data-testid="turn-diff-files">
           {diff.files.map((file) =>
-            file.patch !== null ? (
-              <DiffView
-                key={file.path}
-                filename={file.path}
-                patch={file.patch}
-                copyText={file.patch}
-              />
-            ) : (
+            file.patch === null ? (
               <OmittedFile key={file.path} file={file} />
+            ) : !hasHunks(file.patch) ? (
+              <OmittedFile key={file.path} file={file} reason={metadataOnlyReason(file)} />
+            ) : (
+              <div key={file.path} className="flex flex-col gap-1">
+                {file.old_path ? (
+                  <span
+                    className="truncate px-1 font-mono text-caption text-muted-foreground"
+                    title={fileLabel(file)}
+                  >
+                    {fileLabel(file)}
+                  </span>
+                ) : null}
+                <DiffView filename={file.path} patch={file.patch} copyText={file.patch} />
+              </div>
             ),
           )}
           {diff.truncated ? (
@@ -175,6 +215,13 @@ export function TurnDiffDialog({
       <DialogContent
         className="flex max-h-[calc(100dvh-4rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl"
         data-testid="turn-diff-dialog"
+        onCloseAutoFocus={(event) => {
+          const target = returnFocusRef?.current;
+          if (target) {
+            event.preventDefault();
+            target.focus();
+          }
+        }}
       >
         <DialogHeader className="border-b border-hairline px-4 py-3">
           <DialogTitle>Changes in this turn</DialogTitle>

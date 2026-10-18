@@ -1,5 +1,5 @@
 import { FileDiff } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { Eyebrow } from "@/components/ui/eyebrow";
 import {
@@ -51,6 +51,7 @@ export function TurnChangesChip({
 }) {
   const [diffOpen, setDiffOpen] = useState(false);
   const [listOpen, setListOpen] = useState(false);
+  const chipRef = useRef<HTMLButtonElement>(null);
   const count = changes.files.length;
   const label = `${count} ${count === 1 ? "file" : "files"} changed`;
   const showsDiff = Boolean(threadId && turnId);
@@ -65,6 +66,7 @@ export function TurnChangesChip({
     >
       <HoverCardTrigger asChild>
         <button
+          ref={chipRef}
           type="button"
           onClick={() => {
             if (showsDiff) {
@@ -119,6 +121,7 @@ export function TurnChangesChip({
         threadId={threadId}
         turnId={turnId}
         workspaceId={workspaceId}
+        returnFocusRef={chipRef}
       />
     ) : null}
     </>
