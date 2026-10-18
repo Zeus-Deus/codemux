@@ -42,9 +42,20 @@ impl QueueHold {
     }
 
     /// An explicit send of queued item `id`: let it through a held queue.
-    pub fn release_with(&mut self, id: &str) {
+    /// Returns the release it replaced, for [`revert_release`](Self::revert_release).
+    pub fn release_with(&mut self, id: &str) -> Option<String> {
         if self.held {
-            self.release = Some(id.to_owned());
+            self.release.replace(id.to_owned())
+        } else {
+            None
+        }
+    }
+
+    /// The send of `id` failed before dispatch: give the release back to the
+    /// item it replaced, unless a Stop or another send has moved on since.
+    pub fn revert_release(&mut self, id: &str, previous: Option<String>) {
+        if self.release.as_deref() == Some(id) {
+            self.release = previous;
         }
     }
 
@@ -143,6 +154,21 @@ mod tests {
         let was_held = hold.take();
         hold.restore(was_held);
         assert!(hold.admits(Some("m")));
+    }
+
+    #[test]
+    fn failed_send_now_returns_the_release_it_replaced() {
+        let mut hold = QueueHold::default();
+        hold.hold();
+        hold.release_with("m");
+        let previous = hold.release_with("q");
+        hold.revert_release("q", previous);
+        assert!(hold.admits(Some("m")));
+        // A Stop in between wins.
+        let previous = hold.release_with("q");
+        hold.hold();
+        hold.revert_release("q", previous);
+        assert!(!hold.admits(Some("m")));
     }
 
     #[test]

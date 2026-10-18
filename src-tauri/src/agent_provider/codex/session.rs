@@ -1248,12 +1248,12 @@ impl CodexSession {
     /// the promoted message stays queued until then.
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
         let outbound = self.outbound.lock().await;
-        let (has_active_turn, original_index) = {
+        let (has_active_turn, original_index, previous_release) = {
             let mut state = self.state.lock().await;
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
                 Some(idx) => {
-                    state.queue_hold.release_with(queued_id);
-                    (state.active_turn.is_some(), idx)
+                    let previous = state.queue_hold.release_with(queued_id);
+                    (state.active_turn.is_some(), idx, previous)
                 }
                 // Unknown / already-dispatched / cancelled — no-op.
                 None => return Ok(()),
@@ -1265,7 +1265,7 @@ impl CodexSession {
                 Err(err) => {
                     let mut state = self.state.lock().await;
                     restore_queued_position(&mut state.queued_turns, queued_id, original_index);
-                    state.queue_hold.settle(queued_id, false);
+                    state.queue_hold.revert_release(queued_id, previous_release);
                     Err(err)
                 }
             }

@@ -886,10 +886,10 @@ impl OpenCodeSession {
             // Keep the queue unchanged if the abort fails. The outbound lock
             // prevents the completion worker from draining before promotion.
             // Mark the release first so a Stop during the abort clears it.
-            self.queue_hold().release_with(id);
+            let previous_release = self.queue_hold().release_with(id);
             if self.turn_active().await {
                 if let Err(error) = self.until_closed(self.interrupt()).await {
-                    self.queue_hold().settle(id, false);
+                    self.queue_hold().revert_release(id, previous_release);
                     return Err(error);
                 }
             }

@@ -148,15 +148,13 @@ struct State {
 }
 impl State {
     /// The next queued turn to dispatch, unless a user Stop holds the queue.
-    /// A popped item dispatches as a turn at once, so a release settles here.
+    /// A released item settles in the worker, once its prompt is admitted.
     fn next_queued(&mut self) -> Option<Queued> {
         let front = self.queued.front().map(|queued| queued.id.as_str());
         if !self.queue_hold.admits(front) {
             return None;
         }
-        let queued = self.queued.pop_front()?;
-        self.queue_hold.settle(&queued.id, true);
-        Some(queued)
+        self.queued.pop_front()
     }
 }
 struct Session {
@@ -1646,7 +1644,7 @@ impl Session {
         let session = self.clone();
         let worker_turn = turn.clone();
         tokio::spawn(async move {
-            session.worker(worker_turn, input).await;
+            session.worker(worker_turn, input, None).await;
         });
         Ok(TurnStartResult {
             steered: false,
@@ -1675,7 +1673,14 @@ impl Session {
             cancelled.await;
         }
     }
-    async fn worker(self: Arc<Self>, mut turn: TurnId, mut input: SendTurnInput) {
+    /// `queued_id` names the queued item this turn came from, so a release
+    /// through a Stop-held queue settles on whether its prompt was admitted.
+    async fn worker(
+        self: Arc<Self>,
+        mut turn: TurnId,
+        mut input: SendTurnInput,
+        mut queued_id: Option<String>,
+    ) {
         loop {
             if self.turn_admitted(&turn).await {
                 if let Some(checkpoint) = &input.turn_checkpoint {
@@ -1717,6 +1722,9 @@ impl Session {
                 }
                 Err(protocol("ACP turn configuration could not be applied"))
             } else {
+                if let Some(id) = queued_id.take() {
+                    self.state.lock().await.queue_hold.settle(&id, true);
+                }
                 self.status(SessionStatus::Running {
                     active_turn: turn.clone(),
                 })
@@ -1789,6 +1797,11 @@ impl Session {
                 }
             };
             drop(control);
+            // Cancelled or misconfigured before its prompt: the rest of a held
+            // queue stays held.
+            if let Some(id) = queued_id.take() {
+                self.state.lock().await.queue_hold.settle(&id, false);
+            }
             // The pinned request is now dropped; teardown cannot deadlock on
             // the stdin writer mutex held by an unpolled request future.
             #[cfg(test)]
@@ -1862,7 +1875,7 @@ impl Session {
                 self.emit(ProviderRuntimeEvent::QueuedTurnDispatched {
                     steered: false,
                     thread_id: self.thread.clone(),
-                    queued_id: queued.id,
+                    queued_id: queued.id.clone(),
                     turn_id: turn.clone(),
                     text: queued
                         .input
@@ -1871,6 +1884,7 @@ impl Session {
                         .unwrap_or_else(|| queued.input.text.clone()),
                 });
                 input = queued.input;
+                queued_id = Some(queued.id);
                 drop(state);
             } else {
                 return;
@@ -2090,15 +2104,14 @@ impl AgentProvider for GenericAcpProvider {
             s.queued.push_front(queued);
             let turn = s.active.clone();
             drop(s);
-            let result = session.interrupt(turn).await;
-            if result.is_err() {
-                session.state.lock().await.queue_hold.settle(&id, false);
-            }
-            return result;
+            // A failed interrupt leaves the item first in line, released, so
+            // it still goes first once the running turn ends.
+            return session.interrupt(turn).await;
         }
-        s.queue_hold.take();
         // Idle with a queue only happens while a Stop holds it, so nothing
-        // will drain this item: dispatch it as the worker would.
+        // will drain this item: dispatch it as the worker would. The hold
+        // lifts once its prompt is admitted.
+        s.queue_hold.release_with(&id);
         let turn = TurnId(format!("acp-turn-{}", Uuid::new_v4()));
         s.active = Some(turn.clone());
         s.interrupted = false;
@@ -2114,7 +2127,7 @@ impl AgentProvider for GenericAcpProvider {
                 .unwrap_or_else(|| queued.input.text.clone()),
         });
         drop(s);
-        tokio::spawn(session.clone().worker(turn, queued.input));
+        tokio::spawn(session.clone().worker(turn, queued.input, Some(id)));
         Ok(())
     }
     fn event_stream(&self) -> ProviderEventStream {

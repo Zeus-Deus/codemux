@@ -1630,11 +1630,9 @@ impl AcpSession {
         } else if should_interrupt {
             // The promoted item is already first in line before cancellation,
             // so prompt completion cannot race past it.
-            let result = self.interrupt(None).await;
-            if result.is_err() {
-                self.state.lock().await.queue_hold.settle(queued_id, false);
-            }
-            result
+            // A failed interrupt leaves the item first in line, released, so
+            // it still goes first once the running turn ends.
+            self.interrupt(None).await
         } else {
             Ok(())
         };

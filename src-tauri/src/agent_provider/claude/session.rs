@@ -888,7 +888,7 @@ impl ClaudeSession {
     /// longer waits on a zombie approval — the following drain dispatches
     /// it as soon as the turn ends.
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
-        let (has_active_turn, original_index) = {
+        let (has_active_turn, original_index, previous_release) = {
             let mut state = self.state.lock().await;
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
                 // `turn_busy`, not `active_turn`: an SDK-initiated turn
@@ -896,8 +896,8 @@ impl ClaudeSession {
                 // would just leave the item stuck behind the callback.
                 // Interrupting aborts the callback sidecar-side.
                 Some(idx) => {
-                    state.queue_hold.release_with(queued_id);
-                    (state.turn_busy(), idx)
+                    let previous = state.queue_hold.release_with(queued_id);
+                    (state.turn_busy(), idx, previous)
                 }
                 // Unknown / already-dispatched / cancelled — no-op.
                 None => return Ok(()),
@@ -915,7 +915,7 @@ impl ClaudeSession {
                     {
                         let mut state = self.state.lock().await;
                         restore_queued_position(&mut state.queued_turns, queued_id, original_index);
-                        state.queue_hold.settle(queued_id, false);
+                        state.queue_hold.revert_release(queued_id, previous_release);
                     }
                     Err(err)
                 }
