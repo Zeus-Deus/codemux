@@ -5153,13 +5153,13 @@ const handlers: Record<string, Handler> = {
     const workflowEntry = Object.entries(WORKFLOW_THREAD_WORKSPACE).find(
       ([, loc]) => loc.workspaceId === workspaceId,
     );
-    if (workflowEntry) {
-      const record = mockWorkflowSessionRecord(workflowEntry[0]);
-      return record ? [record] : [];
-    }
     const forks = [...mockForkRecords.values()]
       .filter((record) => record.workspace_id === (workspaceId ?? "ws-codemux-chat"))
       .reverse();
+    if (workflowEntry) {
+      const record = mockWorkflowSessionRecord(workflowEntry[0]);
+      return record ? [...forks, record] : forks;
+    }
     if (forks.length > 0 && workspaceId !== "ws-codemux-chat") return forks;
     return [
       ...forks,

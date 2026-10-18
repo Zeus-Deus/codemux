@@ -152,10 +152,13 @@ async fn plan_fork<R: Runtime>(
     }
     let registry: State<'_, ProviderRegistry> = app.state();
     let live = lookup_provider(&registry, provider).await?;
+    // Baseline first, then idle: a queued turn the provider starts on its
+    // own after this point either still runs or has moved the head when
+    // `settled_bound` looks again.
+    let (_, user_head) = db.agent_chat_fork_heads(source_thread_id);
     if live.turn_active(&ThreadId(source_thread_id.to_string())).await {
         return Err(BUSY.into());
     }
-    let (_, user_head) = db.agent_chat_fork_heads(source_thread_id);
     let cut = match (before_message_id, provider) {
         (None, _) => Cut::Latest,
         (Some(before), ProviderKind::Codex) => Cut::Codex {
