@@ -1794,7 +1794,7 @@ export const agentChatStartSession = async (
   }
   if (provider === "claude" || provider === "codex") {
     const { withAccountPick } = await import("@/stores/provider-accounts-store");
-    input = withAccountPick(input);
+    input = withAccountPick(provider, input);
   }
   if (provider === "acp") {
     const { useCustomAcp, acpLifecycleEpoch } = await import("@/stores/custom-acp-store");

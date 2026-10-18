@@ -1,7 +1,6 @@
 import type { MessageDelivery } from "@/lib/agent-chat/message-delivery";
 import { COMPOSER_ROUND_CONTROL, COMPOSER_SEND } from "./composer-surface";
 import { ChatGptPlanUsage } from "./chatgpt-plan-usage";
-import { ProviderAccountChip } from "./provider-account-chip";
 import { MessageDeliveryPicker } from "./MessageDeliveryPicker";
 import {
   ArrowUp,
@@ -403,7 +402,6 @@ export function ComposerFooter({
       </div>
     </div>
     <ChatGptPlanUsage provider={provider} />
-    <ProviderAccountChip provider={provider} threadId={hermesThreadId} disabled={streaming} />
     </>
   );
 }

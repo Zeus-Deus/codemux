@@ -177,7 +177,9 @@ export function ProviderAccountsSettings({ provider }: { provider: AccountProvid
                   <div className={cn("truncate text-label", signedOut ? "text-status-attention" : "text-muted-foreground")}>
                     {signedOut
                       ? "Not signed in"
-                      : [account.identity.email, account.identity.plan, account.identity.organization]
+                      : account.identity.signed_in === null
+                        ? "Checking sign-in…"
+                        : [account.identity.email, account.identity.plan, account.identity.organization]
                           .filter(Boolean)
                           .join(" · ") || (extra ? "Signed in" : `The ${PROVIDER_NAME[provider]} CLI's own sign-in`)}
                   </div>

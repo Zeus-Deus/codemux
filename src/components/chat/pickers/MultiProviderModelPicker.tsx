@@ -19,6 +19,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
 import {
   Tooltip,
   TooltipContent,
@@ -60,6 +61,10 @@ import {
 } from "./footer-trigger";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { useDisabledProviders } from "@/lib/agent-chat/provider-enablement";
+import { accountName, useProviderAccounts } from "@/stores/provider-accounts-store";
+import type { ProviderAccount } from "@/tauri/commands";
+import { accountSummary, useThreadAccount, type ThreadAccountView } from "../use-thread-account";
+import { AccountBadge, AccountFooter, AccountListHeader } from "./provider-account-parts";
 
 /**
  * Step 12 Stage 4 — unified provider + model picker.
@@ -272,6 +277,37 @@ export function MultiProviderModelPicker({
   const [railAcpAgentId, setRailAcpAgentId] = useState<string | null>(activeAcpAgentId);
   const [query, setQuery] = useState("");
 
+  // A provider signed in more than once shows each account as its own
+  // rail entry; the chat's account rides on the trigger's logo.
+  const claudeAccount = useThreadAccount("claude", hermesThreadId);
+  const codexAccount = useThreadAccount("codex", hermesThreadId);
+  const accountView = (kind: RailKey): ThreadAccountView | null =>
+    kind === "claude" && claudeAccount.multi
+      ? claudeAccount
+      : kind === "codex" && codexAccount.multi
+        ? codexAccount
+        : null;
+  const currentAccount = accountView(provider)?.current ?? null;
+  // The usage-limit notice's "Choose account…" opens the picker on the
+  // limited provider.
+  const pickerRequest = useProviderAccounts((s) => s.pickerRequest);
+  const lastPickerRequest = useRef(pickerRequest?.seq);
+  const requestedRail = useRef<RailKey | null>(null);
+  useEffect(() => {
+    if (!pickerRequest || pickerRequest.seq === lastPickerRequest.current) return;
+    lastPickerRequest.current = pickerRequest.seq;
+    if (pickerRequest.threadId !== hermesThreadId || disabled) return;
+    requestedRail.current = pickerRequest.provider;
+    setOpen(true);
+  }, [pickerRequest, hermesThreadId, disabled]);
+  useEffect(() => {
+    if (!open) return;
+    if (claudeAccount.multi) claudeAccount.refreshIdentities();
+    if (codexAccount.multi) codexAccount.refreshIdentities();
+    // Once per opening; the views re-render as answers arrive.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
   // Consume the open signal exactly once per increment. Tracking the
   // last-seen value in a ref (instead of gating on `openSignal &&
   // !disabled`) prevents the picker from spontaneously reopening every
@@ -333,7 +369,8 @@ export function MultiProviderModelPicker({
   // open.
   useEffect(() => {
     if (open) {
-      setRailKey(provider);
+      setRailKey(requestedRail.current ?? provider);
+      requestedRail.current = null;
       setRailAcpAgentId(activeAcpAgentId);
       setQuery("");
     }
@@ -519,9 +556,13 @@ export function MultiProviderModelPicker({
   // visible label with the description (e.g.
   // "Opus · Opus 4.8 with 1M context · Best for everyday, complex tasks").
   const triggerTitle = useMemo(() => {
+    // Signed in more than once: name the account, never its email.
+    if (currentAccount) {
+      return `${triggerLabel} · ${providerDisplayLabel(provider)} · ${accountName(currentAccount)}`;
+    }
     const description = resolvedModel?.description ?? null;
     return description ? `${triggerLabel} · ${description}` : triggerLabel;
-  }, [resolvedModel, triggerLabel]);
+  }, [resolvedModel, triggerLabel, currentAccount, provider]);
 
   return (
     <Popover open={open} onOpenChange={(v) => !disabled && setOpen(v)}>
@@ -545,7 +586,14 @@ export function MultiProviderModelPicker({
           }
           aria-label={iconOnly ? `Model: ${triggerLabel}` : undefined}
         >
-          <ProviderLogo provider={provider} className="size-3.5 shrink-0" />
+          {currentAccount ? (
+            <span className="relative mr-1 inline-flex shrink-0">
+              <ProviderLogo provider={provider} className="size-3.5 shrink-0" />
+              <AccountBadge account={currentAccount} current />
+            </span>
+          ) : (
+            <ProviderLogo provider={provider} className="size-3.5 shrink-0" />
+          )}
           {!iconOnly && (
             <>
               <span className="max-w-[180px] truncate">
@@ -596,6 +644,12 @@ export function MultiProviderModelPicker({
               setQuery("");
             }}
             selected={railKey}
+            accountView={accountView}
+            onChooseAccount={(kind, account) => {
+              setRailKey(kind);
+              setQuery("");
+              void accountView(kind)?.choose(account);
+            }}
             favoritesCount={visibleFavoritesCount}
             getCount={(kind) => rowsByProvider[kind]?.length ?? 0}
             getError={(kind) =>
@@ -631,6 +685,12 @@ export function MultiProviderModelPicker({
                 onValueChange={setQuery}
                 className="h-9 text-label"
               />
+              {(() => {
+                const view = accountView(railKey);
+                return view && !query.trim() ? (
+                  <AccountListHeader view={view} providerLabel={providerDisplayLabel(railKey as AgentChatProviderKind)} />
+                ) : null;
+              })()}
               {/* Override cmdk's default `no-scrollbar max-h-72` so the
                   list fills the popover and shows a real scrollbar
                   when models overflow (Claude has 5, Codex 4, but
@@ -711,6 +771,10 @@ export function MultiProviderModelPicker({
             </Command>}
           </div>
         </div>
+        {(() => {
+          const view = accountView(railKey);
+          return view ? <AccountFooter view={view} onManage={() => setOpen(false)} /> : null;
+        })()}
         {/* Defensive: keep the cmdk-required outer Command wrapper out of
             the visible flow when no rows pass the filter — cmdk would
             otherwise refuse to render `<CommandEmpty>` because we
@@ -728,6 +792,8 @@ function ProviderRail({
   selectedAcpAgentId,
   onSelectAcp,
   selected,
+  accountView = () => null,
+  onChooseAccount = () => {},
   favoritesCount,
   getCount,
   getError,
@@ -738,6 +804,9 @@ function ProviderRail({
   selectedAcpAgentId: string | null;
   onSelectAcp: (agentId: string) => void;
   selected: RailKey;
+  /** Accounts of a provider signed in more than once, one entry each. */
+  accountView?: (kind: RailKey) => ThreadAccountView | null;
+  onChooseAccount?: (kind: AgentChatProviderKind, account: ProviderAccount) => void;
   favoritesCount: number;
   getCount: (kind: AgentChatProviderKind) => number;
   getError: (kind: AgentChatProviderKind) => string | null;
@@ -811,6 +880,20 @@ function ProviderRail({
           // just a rail-level heads-up.
           const parsedError = parseProviderError(error);
           const isUnavailable = parsedError !== null;
+          const view = accountView(p.kind);
+          if (view) {
+            return view.options.map((account) => (
+              <AccountRailEntry
+                key={`${p.kind}:${account.id}`}
+                kind={p.kind}
+                label={p.label}
+                account={account}
+                view={view}
+                selected={isSelected && account.id === view.current?.id}
+                onChoose={() => onChooseAccount(p.kind, account)}
+              />
+            ));
+          }
           return (
             <div key={p.kind} className="relative shrink-0">
               {isSelected && (
@@ -898,6 +981,72 @@ function ProviderRail({
         })}
       </div>
     </TooltipProvider>
+  );
+}
+
+/** One account of a provider signed in more than once. Choosing it is a
+ *  draft's pick, or moves a started chat there with its conversation. */
+function AccountRailEntry({
+  kind,
+  label,
+  account,
+  view,
+  selected,
+  onChoose,
+}: {
+  kind: AgentChatProviderKind;
+  label: string;
+  account: ProviderAccount;
+  view: ThreadAccountView;
+  selected: boolean;
+  onChoose: () => void;
+}) {
+  const isCurrent = account.id === view.current?.id;
+  // Moving needs a signed-in account and an idle chat.
+  const blocked =
+    !isCurrent &&
+    (account.identity.signed_in === false || (view.bound && (view.busy || view.switching !== null)));
+  const name = accountName(account);
+  return (
+    <div className="relative shrink-0">
+      {selected && (
+        <span
+          className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
+          aria-hidden
+        />
+      )}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            onClick={onChoose}
+            disabled={blocked}
+            data-testid={`provider-rail-${kind}-${account.id}`}
+            data-selected={selected || undefined}
+            aria-label={`${label} · ${name}`}
+            aria-pressed={isCurrent}
+            className={cn(
+              "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
+              "hover:bg-muted disabled:opacity-40 disabled:hover:bg-transparent",
+              selected && "bg-background text-foreground shadow-sm",
+            )}
+          >
+            <span className="relative inline-flex">
+              <ProviderLogo provider={kind} className="size-5 shrink-0" />
+              <AccountBadge account={account} current={isCurrent} size="md" />
+            </span>
+            {view.switching === account.id && (
+              <span className="absolute inset-0 flex items-center justify-center rounded-sm bg-background/70">
+                <Spinner className="size-3" aria-hidden />
+              </span>
+            )}
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="right" sideOffset={8}>
+          {label} <span className="text-muted-foreground">·</span> {accountSummary(account)}
+        </TooltipContent>
+      </Tooltip>
+    </div>
   );
 }
 

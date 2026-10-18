@@ -24,7 +24,9 @@ interface ProviderAccountsStore {
   accounts: ProviderAccount[] | null;
   /** App-wide default per provider; absent means the CLI's own sign-in. */
   defaults: Record<string, string>;
-  /** Account picked for a chat that has not started yet, by thread id. */
+  /** Account picked for a chat that has not started yet, by
+   *  `pickKey(provider, threadId)`: a draft that changes provider starts
+   *  over from that provider's default. */
   picks: Record<string, string>;
   load: (force?: boolean) => Promise<void>;
   /** Also asks Codex who each home is signed in as (spawns the CLI). */
@@ -33,8 +35,14 @@ interface ProviderAccountsStore {
   rename: (accountId: string, label: string) => Promise<void>;
   remove: (accountId: string) => Promise<void>;
   setDefault: (provider: AccountProvider, accountId: string | null, workspaceId?: string | null) => Promise<void>;
-  pick: (threadId: string, accountId: string) => void;
+  pick: (provider: AccountProvider, threadId: string, accountId: string) => void;
+  /** Ask the composer's model picker to open on `provider`'s accounts
+   *  (the usage-limit notice's "Choose account…"). */
+  pickerRequest: { provider: AccountProvider; threadId: string; seq: number } | null;
+  requestPicker: (provider: AccountProvider, threadId: string) => void;
 }
+
+export const pickKey = (provider: string, threadId: string) => `${provider}:${threadId}`;
 
 let loadFlight: Promise<void> | null = null;
 
@@ -70,7 +78,11 @@ export const useProviderAccounts = create<ProviderAccountsStore>((set, get) => (
   },
   setDefault: async (provider, accountId, workspaceId = null) =>
     accept(await providerAccountSetDefault(provider, accountId, workspaceId)),
-  pick: (threadId, accountId) => set((s) => ({ picks: { ...s.picks, [threadId]: accountId } })),
+  pick: (provider, threadId, accountId) =>
+    set((s) => ({ picks: { ...s.picks, [pickKey(provider, threadId)]: accountId } })),
+  pickerRequest: null,
+  requestPicker: (provider, threadId) =>
+    set((s) => ({ pickerRequest: { provider, threadId, seq: (s.pickerRequest?.seq ?? 0) + 1 } })),
 }));
 
 /** Every account of `provider`, CLI sign-in first. */
@@ -86,8 +98,11 @@ export function accountName(account: ProviderAccount | undefined | null): string
 
 /** Attach the account picked for a not-yet-started chat to its start. The
  *  backend ignores it once the thread is pinned to an account. */
-export function withAccountPick(input: AgentChatStartSessionInput): AgentChatStartSessionInput {
-  const picked = useProviderAccounts.getState().picks[input.thread_id];
+export function withAccountPick(
+  provider: AccountProvider,
+  input: AgentChatStartSessionInput,
+): AgentChatStartSessionInput {
+  const picked = useProviderAccounts.getState().picks[pickKey(provider, input.thread_id)];
   if (!picked) return input;
   const extra =
     input.extra && typeof input.extra === "object" && !Array.isArray(input.extra)
@@ -109,9 +124,12 @@ export async function startsOnSignedInAccount(
     const store = useProviderAccounts.getState();
     await store.load(true);
     const resolved = await providerAccountThread(threadId, provider, workspaceId);
-    const id = (resolved.bound ? null : useProviderAccounts.getState().picks[threadId]) ?? resolved.account_id;
-    const account = accountsFor(useProviderAccounts.getState().accounts, provider).find((a) => a.id === id);
-    return !!account && account.id !== DEFAULT_ACCOUNT_ID && account.identity.signed_in !== false;
+    const id = (resolved.bound ? null : useProviderAccounts.getState().picks[pickKey(provider, threadId)]) ?? resolved.account_id;
+    if (id === DEFAULT_ACCOUNT_ID) return false;
+    const find = () => accountsFor(useProviderAccounts.getState().accounts, provider).find((a) => a.id === id);
+    // Not probed since launch (a keyring sign-in leaves no file to see): ask.
+    if (find()?.identity.signed_in === null) await store.refresh();
+    return find()?.identity.signed_in === true;
   } catch {
     return false;
   }

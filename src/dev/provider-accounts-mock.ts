@@ -1,7 +1,7 @@
 /**
  * Dev-mock backend for several accounts per provider: Claude has the CLI's
- * own sign-in plus a "Work" account; Codex has its own sign-in plus a
- * signed-out "Side project" account. Chats start on the app default and
+ * own sign-in plus a "Work" account; Codex has its own sign-in, a "Work"
+ * account and a signed-out "Side project" account. Chats start on the app default and
  * can be switched; usage and limits carry a per-account split.
  */
 
@@ -44,6 +44,14 @@ let accounts: MockAccount[] = [
     login_command: "codex login",
   },
   {
+    id: "codex-work-5c1d22",
+    provider: "codex",
+    label: "Work",
+    home: `${ROOT}/codex/codex-work-5c1d22`,
+    identity: { signed_in: true, email: "dev@acme.example", organization: "Acme", plan: "ChatGPT Pro" },
+    login_command: `CODEX_HOME='${ROOT}/codex/codex-work-5c1d22' codex login`,
+  },
+  {
     id: "codex-side-project-8b2e40",
     provider: "codex",
     label: "Side project",
@@ -52,7 +60,7 @@ let accounts: MockAccount[] = [
     login_command: `CODEX_HOME='${ROOT}/codex/codex-side-project-8b2e40' codex login`,
   },
 ];
-const defaults: Record<string, string> = { claude: "claude-work-3f9a1c" };
+const defaults: Record<string, string> = { claude: "claude-work-3f9a1c", codex: "codex-work-5c1d22" };
 const workspaceDefaults = new Map<string, Record<string, string>>();
 const bindings = new Map<string, string>();
 let seq = 0;

@@ -87,8 +87,8 @@ it("makes an account the default and adds a new one", async () => {
   expect(invoke).toHaveBeenCalledWith("provider_account_add", { provider: "claude", label: "Side" });
 });
 
-it("a pick for a chat that has not started rides along on its start", () => {
-  useProviderAccounts.getState().pick("draft-1", "claude-work-1");
+it("a pick for a chat that has not started rides along on its start, for its provider only", () => {
+  useProviderAccounts.getState().pick("claude", "draft-1", "claude-work-1");
   const input = {
     thread_id: "draft-1",
     cwd: "/repo",
@@ -99,8 +99,10 @@ it("a pick for a chat that has not started rides along on its start", () => {
     env: null,
     extra: { keep: 1 },
   };
-  expect(withAccountPick(input).extra).toEqual({ keep: 1, provider_account_id: "claude-work-1" });
-  expect(withAccountPick({ ...input, thread_id: "other" })).toEqual({ ...input, thread_id: "other" });
+  expect(withAccountPick("claude", input).extra).toEqual({ keep: 1, provider_account_id: "claude-work-1" });
+  expect(withAccountPick("claude", { ...input, thread_id: "other" })).toEqual({ ...input, thread_id: "other" });
+  // The draft switched to Codex: the Claude pick does not follow it.
+  expect(withAccountPick("codex", input)).toEqual(input);
 });
 
 it("quota keys split into provider and account", () => {
