@@ -4,6 +4,7 @@ import type {
   HostView,
   LocalChatSession,
   SecretMeta,
+  StaleWorktree,
 } from "@/tauri/commands";
 import type {
   AgentChatProviderKind,
@@ -8277,6 +8278,72 @@ const handlers: Record<string, Handler> = {
     };
   },
   agent_chat_fork_origin: (a) => mockForkOrigins.get(a.threadId as string) ?? null,
+
+  // ── Stale worktree cleanup ──
+  //
+  // A fixed set of stale worktrees (one kept because it holds work);
+  // removal drops the removable ones. `__codemuxMockWorktreeCleanup()`
+  // fires the background sweep's toast.
+  worktree_cleanup_scan: () => mockStaleWorktrees.map((w) => ({ ...w })),
+  worktree_cleanup_remove: (a) => {
+    const paths = new Set(Array.isArray(a.paths) ? (a.paths as string[]) : []);
+    const removed = mockStaleWorktrees.filter(
+      (w) => paths.has(w.path) && w.kept_because === null,
+    );
+    mockStaleWorktrees = mockStaleWorktrees.filter((w) => !removed.includes(w));
+    return { removed, kept: [] };
+  },
+  worktree_cleanup_set_auto: () => undefined,
+};
+
+let mockStaleWorktrees: StaleWorktree[] = [
+  {
+    path: "/home/dev/.codemux/worktrees/codemux/feature-payments-flow",
+    title: "payments-flow",
+    branch: "feature/payments-flow",
+    project: "codemux",
+    source: "archived",
+    reason: { kind: "pr_merged", number: 412 },
+    kept_because: null,
+  },
+  {
+    path: "/home/dev/.codemux/worktrees/ledger-api/fix-rounding",
+    title: "fix-rounding",
+    branch: "fix/rounding",
+    project: "ledger-api",
+    source: "closed",
+    reason: { kind: "branch_merged", base: "main" },
+    kept_because: null,
+  },
+  {
+    path: "/home/dev/.codemux/worktrees/old-blog/chore-draft-cleanup",
+    title: "draft-cleanup",
+    branch: "chore/draft-cleanup",
+    project: "old-blog",
+    source: "archived",
+    reason: { kind: "idle", days: 45 },
+    kept_because: null,
+  },
+  {
+    path: "/home/dev/.codemux/worktrees/vexis/spike-new-installer",
+    title: "new-installer",
+    branch: "spike/new-installer",
+    project: "vexis",
+    source: "closed",
+    reason: { kind: "idle", days: 62 },
+    kept_because: "2 uncommitted or untracked files",
+  },
+];
+
+(
+  window as unknown as { __codemuxMockWorktreeCleanup: (auto?: boolean) => string }
+).__codemuxMockWorktreeCleanup = (auto = false) => {
+  const removable = mockStaleWorktrees.filter((w) => w.kept_because === null);
+  emitEvent("worktree-cleanup", {
+    removed: auto ? removable : [],
+    available: auto ? [] : removable,
+  });
+  return auto ? "fired the automatic-cleanup receipt" : "fired the cleanup offer";
 };
 
 /** Validate a mock fork and return the source row plus the transcript the

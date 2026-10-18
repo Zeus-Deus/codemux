@@ -92,6 +92,10 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   "workflows.size": "standard",
   "workflows.token_budget": "",
   "workflows.composer_button": "false",
+  // Whether the backend's stale-worktree sweep removes what it finds instead
+  // of offering it in a toast. Written through `worktree_cleanup_set_auto`
+  // so enabling it sweeps right away. See worktree_cleanup.rs.
+  "worktree_cleanup.auto": "false",
 };
 
 /** Color palette variant. */

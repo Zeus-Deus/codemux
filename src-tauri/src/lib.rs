@@ -88,6 +88,7 @@ pub mod hosts_inventory;
 pub mod workspace_paths;
 pub mod project_identity;
 pub mod workspaces_sync;
+pub mod worktree_cleanup;
 pub mod workflows;
 pub mod state;
 pub mod hooks;
@@ -1989,6 +1990,11 @@ fn build_core_app<R: tauri::Runtime>(
             //     exists when we read state) even if it raced into
             //     `tracked` — so a session can never be reaped moments
             //     after it was created.
+            // Stale worktree sweep: offers (or, when opted in, performs)
+            // removal of merged / long-retired worktrees. See
+            // `worktree_cleanup` for the safety rules.
+            worktree_cleanup::spawn_sweeper(app.handle().clone());
+
             let sweep_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 const SWEEP_INTERVAL_SECS: u64 = 300;
@@ -3142,6 +3148,10 @@ fn build_core_app<R: tauri::Runtime>(
             commands::chat_fork::agent_chat_fork_check,
             commands::chat_fork::agent_chat_fork_thread,
             commands::chat_fork::agent_chat_fork_origin,
+            // Stale worktree cleanup (Settings → Archive, cleanup toast).
+            worktree_cleanup::worktree_cleanup_scan,
+            worktree_cleanup::worktree_cleanup_remove,
+            worktree_cleanup::worktree_cleanup_set_auto,
         ])
 }
 

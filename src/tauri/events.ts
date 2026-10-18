@@ -742,3 +742,14 @@ export const onPrWatchChanged = (
   cb: EventCallback<PrWatchChangedPayload>,
 ): Promise<UnlistenFn> =>
   listen<PrWatchChangedPayload>("pr-watch-changed", (e) => cb(e.payload));
+/** A background worktree sweep finished: `removed` when automatic cleanup is
+ *  on, otherwise `available` lists worktrees newly found removable. */
+export interface WorktreeCleanupEvent {
+  removed: import("./commands").StaleWorktree[];
+  available: import("./commands").StaleWorktree[];
+}
+
+export const onWorktreeCleanup = (
+  cb: EventCallback<WorktreeCleanupEvent>,
+): Promise<UnlistenFn> =>
+  listen<WorktreeCleanupEvent>("worktree-cleanup", (e) => cb(e.payload));

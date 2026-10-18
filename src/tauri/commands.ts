@@ -3880,3 +3880,39 @@ export const agentChatForkThread = (
 /** Where a forked chat came from; `null` for a chat that isn't a fork. */
 export const agentChatForkOrigin = (threadId: string) =>
   invoke<ChatForkOrigin | null>("agent_chat_fork_origin", { threadId });
+
+// ── Stale worktree cleanup (backend: worktree_cleanup.rs) ──
+
+/** Why a worktree no live workspace uses counts as stale. */
+export type WorktreeStaleReason =
+  | { kind: "branch_merged"; base: string }
+  | { kind: "pr_merged"; number: number }
+  | { kind: "idle"; days: number };
+
+export interface StaleWorktree {
+  path: string;
+  title: string;
+  branch: string | null;
+  /** Repository directory name. */
+  project: string;
+  source: "archived" | "closed";
+  reason: WorktreeStaleReason;
+  /** Why it stays on disk despite being stale; null when removable. */
+  kept_because: string | null;
+}
+
+export interface WorktreeCleanupOutcome {
+  removed: StaleWorktree[];
+  /** Requested but kept (changed since the review, or git refused). */
+  kept: StaleWorktree[];
+}
+
+export const worktreeCleanupScan = () =>
+  invoke<StaleWorktree[]>("worktree_cleanup_scan");
+
+export const worktreeCleanupRemove = (paths: string[]) =>
+  invoke<WorktreeCleanupOutcome>("worktree_cleanup_remove", { paths });
+
+/** Persists the automatic-cleanup setting and, when enabling, sweeps now. */
+export const worktreeCleanupSetAuto = (enabled: boolean) =>
+  invoke<void>("worktree_cleanup_set_auto", { enabled });

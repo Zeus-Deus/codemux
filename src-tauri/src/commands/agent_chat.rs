@@ -5642,13 +5642,16 @@ pub async fn agent_chat_stop_session_guarded<R: Runtime>(
 /// [`SubagentTracker::delegated_work_holding_turn`] — which
 /// `agent_chat_turn_active` reads — so a reopened thread would hydrate as
 /// a phantom live run until the stall watchdog tombstoned it.
+///
+/// Returns a handle on these stops' outcome for callers that must know
+/// when (and whether) they finished; others can ignore it.
 pub fn shutdown_agent_chat_threads<R: Runtime>(
     app: &AppHandle<R>,
     threads: Vec<(ProviderKind, String)>,
-) {
+) -> EarlierStops {
     let threads = begin_agent_chat_thread_shutdown(app, threads);
     if threads.is_empty() {
-        return;
+        return EarlierStops(Vec::new());
     }
     // Registered before the spawn so a worktree deletion that starts right
     // after this call still finds the stop and waits for it.
@@ -5659,6 +5662,7 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
         .map(|id| db.as_ref()?.get_agent_chat_session(id).map(|s| s.workspace_id))
         .collect();
     let (done, result) = tokio::sync::watch::channel(None);
+    let stopped_workspaces: Vec<String> = workspaces.iter().flatten().cloned().collect();
     {
         let mut pending = pending_stops().lock().unwrap();
         for (thread_id, workspace_id) in thread_ids.iter().zip(workspaces) {
@@ -5668,9 +5672,14 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
             );
         }
     }
+    let handle = EarlierStops(vec![result.clone()]);
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let outcome = stop_agent_chat_threads(&app_handle, threads).await;
+        if outcome.is_err() {
+            // Keeps these workspaces' checkouts out of worktree cleanup.
+            crate::worktree_cleanup::note_failed_stop(&stopped_workspaces);
+        }
         done.send_replace(Some(outcome));
         let mut pending = pending_stops().lock().unwrap();
         for thread_id in thread_ids {
@@ -5682,6 +5691,7 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
             }
         }
     });
+    handle
 }
 
 /// A fire-and-forget stop still in flight, with the workspace its session
@@ -5718,7 +5728,7 @@ pub fn snapshot_pending_stops(workspace_id: &str) -> EarlierStops {
 }
 
 /// Wait for `stops` to finish. Errs when any of them failed.
-async fn wait_for_stops(stops: EarlierStops) -> Result<(), String> {
+pub(crate) async fn wait_for_stops(stops: EarlierStops) -> Result<(), String> {
     let mut first_error = None;
     for mut result in stops.0 {
         let outcome = match result.wait_for(Option::is_some).await {

@@ -29,6 +29,7 @@ import {
 } from "@/stores/app-store";
 import { useForceDelete } from "@/hooks/use-force-delete";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { WorktreeCleanupSettings } from "@/components/worktree-cleanup/worktree-cleanup-settings";
 
 /**
  * Settings → Archive.
@@ -364,6 +365,7 @@ export function ArchiveSection() {
     return (
       <div className="space-y-8">
         <LocalSessionImportEntry />
+        <WorktreeCleanupSettings />
         <div className="flex flex-col items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-10 text-center">
         <Archive className="size-5 text-muted-foreground/50" />
         <p className="text-body text-muted-foreground">
@@ -381,6 +383,7 @@ export function ArchiveSection() {
   return (
     <div className="space-y-8">
       <LocalSessionImportEntry />
+      <WorktreeCleanupSettings />
       <div className="relative">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground/60 pointer-events-none" />
         <Input
