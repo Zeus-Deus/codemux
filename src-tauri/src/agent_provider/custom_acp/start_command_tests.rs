@@ -487,45 +487,56 @@ async fn review5_invalid_replacement_effort_never_prompts_or_persists_invalid_va
 #[tokio::test]
 async fn ownership_pending_control_command_queue_invalid_effort_uses_ack_membership() { combined_model_effort(true, true).await; }
 
-/// A message sent from a Stop-held queue that fails its turn configuration
-/// never reached `session/prompt`, so the rest of the queue stays held.
-async fn held_queue_survives_failed_promoted_config(idle: bool) {
+#[derive(Clone, Copy, PartialEq)]
+enum HeldSend { IdleSendNow, SettlingSendNow, DirectSend }
+/// A message sent while a Stop holds the queue that fails its turn
+/// configuration never reached `session/prompt`, so the queue stays held.
+async fn held_queue_survives_failed_config(send: HeldSend) {
     let f = Fixture::new("dynamic-review5-queue").await;
+    let misconfigured = json!({"thread_id":f.thread.0,"text":"misconfigured","model_override":"vendor:model [1m]","effort_override":" A effort "});
     f.start(None, None).await.unwrap();
     let mut events = f.provider.event_stream();
     f.command_send(json!({"thread_id":f.thread.0,"text":"first held prompt"})).await.unwrap();
     wait_marker(&f.dir.path().join("wire.jsonl.ready")).await;
-    let q1 = f.command_send(json!({"thread_id":f.thread.0,"text":"misconfigured promoted","model_override":"vendor:model [1m]","effort_override":" A effort "})).await.unwrap().queued_id.unwrap();
-    let q2 = f.command_send(json!({"thread_id":f.thread.0,"text":"must stay held"})).await.unwrap().queued_id.unwrap();
+    let q1 = if send == HeldSend::DirectSend { None } else { f.command_send(misconfigured.clone()).await.unwrap().queued_id };
+    let held = f.command_send(json!({"thread_id":f.thread.0,"text":"must stay held"})).await.unwrap().queued_id.unwrap();
     f.provider.interrupt_turn(f.thread.clone(), None).await.unwrap();
-    if !idle { f.provider.send_queued_turn_now(f.thread.clone(), q1.clone()).await.unwrap(); }
+    if send == HeldSend::SettlingSendNow { f.provider.send_queued_turn_now(f.thread.clone(), q1.clone().unwrap()).await.unwrap(); }
     std::fs::write(f.dir.path().join("wire.jsonl.release"), b"release").unwrap();
     let mut observed = Vec::new();
-    let mut q1_turn = None;
+    let mut failing_turn = None;
     let mut completed = 0;
-    tokio::time::timeout(Duration::from_secs(4), async { while q1_turn.is_none() || completed < 2 {
+    tokio::time::timeout(Duration::from_secs(4), async { while failing_turn.is_none() || completed < 2 {
         let event = events.next().await.unwrap();
         if let ProviderRuntimeEvent::TurnCompleted { .. } = &event {
             completed += 1;
-            if completed == 1 && idle { f.provider.send_queued_turn_now(f.thread.clone(), q1.clone()).await.unwrap(); }
+            if completed == 1 {
+                match send {
+                    HeldSend::IdleSendNow => f.provider.send_queued_turn_now(f.thread.clone(), q1.clone().unwrap()).await.unwrap(),
+                    HeldSend::DirectSend => failing_turn = Some(f.provider.send_turn(serde_json::from_value(misconfigured.clone()).unwrap()).await.unwrap().turn_id),
+                    HeldSend::SettlingSendNow => {}
+                }
+            }
         }
         if let ProviderRuntimeEvent::QueuedTurnDispatched { queued_id, turn_id, .. } = &event {
-            if queued_id == &q1 { q1_turn = Some(turn_id.clone()); }
+            if Some(queued_id) == q1.as_ref() { failing_turn = Some(turn_id.clone()); }
         }
         observed.push(event);
     }}).await.unwrap();
-    // Anything the held queue would dispatch arrives promptly after Q1 fails.
+    // Anything the held queue would dispatch arrives promptly after the failure.
     let _ = tokio::time::timeout(Duration::from_millis(300), async { while let Some(event) = events.next().await { observed.push(event); } }).await;
     f.provider.stop_session(f.thread.clone()).await.unwrap();
-    let wire = ownership_evidence(&f, if idle { "held-idle-config" } else { "held-busy-config" }, json!({"events":format!("{observed:?}")}));
-    assert!(observed.iter().any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { turn_id, status: TurnStatus::Error { .. }, .. } if Some(turn_id) == q1_turn.as_ref())), "Q1 configuration must fail: {observed:?}");
-    assert!(!observed.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnDispatched { queued_id, .. } if queued_id == &q2)), "a failed promoted message released the held queue: {observed:?}");
+    let wire = ownership_evidence(&f, "held-config", json!({"events":format!("{observed:?}")}));
+    assert!(observed.iter().any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { turn_id, status: TurnStatus::Error { .. }, .. } if Some(turn_id) == failing_turn.as_ref())), "the sent message's configuration must fail: {observed:?}");
+    assert!(!observed.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnDispatched { queued_id, .. } if queued_id == &held)), "a failed send released the held queue: {observed:?}");
     assert_eq!(wire.iter().filter(|v| v["method"] == "session/prompt").count(), 1);
 }
 #[tokio::test]
-async fn held_queue_survives_failed_idle_send_now_config() { held_queue_survives_failed_promoted_config(true).await; }
+async fn held_queue_survives_failed_idle_send_now_config() { held_queue_survives_failed_config(HeldSend::IdleSendNow).await; }
 #[tokio::test]
-async fn held_queue_survives_failed_settling_send_now_config() { held_queue_survives_failed_promoted_config(false).await; }
+async fn held_queue_survives_failed_settling_send_now_config() { held_queue_survives_failed_config(HeldSend::SettlingSendNow).await; }
+#[tokio::test]
+async fn held_queue_survives_failed_direct_send_config() { held_queue_survives_failed_config(HeldSend::DirectSend).await; }
 async fn synthetic_turn(f: &Fixture) -> TurnStatus {
     let mut events = f.provider.event_stream();
     let turn = f.provider.send_turn(serde_json::from_value(json!({"thread_id":f.thread.0,"text":"synthetic mode update"})).unwrap()).await.unwrap().turn_id;

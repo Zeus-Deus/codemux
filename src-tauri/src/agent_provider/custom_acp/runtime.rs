@@ -157,6 +157,22 @@ impl State {
         self.queued.pop_front()
     }
 }
+/// What a turn owes a Stop-held queue, settled when its prompt is admitted
+/// or abandoned before it.
+enum HoldClaim {
+    /// A queued item sent through the held queue.
+    Release(String),
+    /// A message sent by hand that lifted the hold.
+    Taken,
+}
+impl HoldClaim {
+    fn settle(self, hold: &mut crate::agent_provider::queue_hold::QueueHold, started: bool) {
+        match self {
+            Self::Release(id) => hold.settle(&id, started),
+            Self::Taken => hold.restore(!started),
+        }
+    }
+}
 struct Session {
     thread: ThreadId,
     launch: AcpLaunchConfig,
@@ -1638,13 +1654,14 @@ impl Session {
         let turn = TurnId(format!("acp-turn-{}", Uuid::new_v4()));
         s.active = Some(turn.clone());
         s.interrupted = false;
-        // A message sent by hand goes first; the held queue follows it.
-        s.queue_hold.take();
+        // A message sent by hand goes first; the held queue follows it once
+        // its prompt is admitted.
+        let claim = s.queue_hold.take().then_some(HoldClaim::Taken);
         drop(s);
         let session = self.clone();
         let worker_turn = turn.clone();
         tokio::spawn(async move {
-            session.worker(worker_turn, input, None).await;
+            session.worker(worker_turn, input, claim).await;
         });
         Ok(TurnStartResult {
             steered: false,
@@ -1673,13 +1690,13 @@ impl Session {
             cancelled.await;
         }
     }
-    /// `queued_id` names the queued item this turn came from, so a release
-    /// through a Stop-held queue settles on whether its prompt was admitted.
+    /// `claim` is what this turn owes a Stop-held queue; it settles on
+    /// whether the prompt was admitted.
     async fn worker(
         self: Arc<Self>,
         mut turn: TurnId,
         mut input: SendTurnInput,
-        mut queued_id: Option<String>,
+        mut claim: Option<HoldClaim>,
     ) {
         loop {
             if self.turn_admitted(&turn).await {
@@ -1722,8 +1739,8 @@ impl Session {
                 }
                 Err(protocol("ACP turn configuration could not be applied"))
             } else {
-                if let Some(id) = queued_id.take() {
-                    self.state.lock().await.queue_hold.settle(&id, true);
+                if let Some(claim) = claim.take() {
+                    claim.settle(&mut self.state.lock().await.queue_hold, true);
                 }
                 self.status(SessionStatus::Running {
                     active_turn: turn.clone(),
@@ -1799,8 +1816,8 @@ impl Session {
             drop(control);
             // Cancelled or misconfigured before its prompt: the rest of a held
             // queue stays held.
-            if let Some(id) = queued_id.take() {
-                self.state.lock().await.queue_hold.settle(&id, false);
+            if let Some(claim) = claim.take() {
+                claim.settle(&mut self.state.lock().await.queue_hold, false);
             }
             // The pinned request is now dropped; teardown cannot deadlock on
             // the stdin writer mutex held by an unpolled request future.
@@ -1884,7 +1901,7 @@ impl Session {
                         .unwrap_or_else(|| queued.input.text.clone()),
                 });
                 input = queued.input;
-                queued_id = Some(queued.id);
+                claim = Some(HoldClaim::Release(queued.id));
                 drop(state);
             } else {
                 return;
@@ -2127,7 +2144,7 @@ impl AgentProvider for GenericAcpProvider {
                 .unwrap_or_else(|| queued.input.text.clone()),
         });
         drop(s);
-        tokio::spawn(session.clone().worker(turn, queued.input, Some(id)));
+        tokio::spawn(session.clone().worker(turn, queued.input, Some(HoldClaim::Release(id))));
         Ok(())
     }
     fn event_stream(&self) -> ProviderEventStream {
