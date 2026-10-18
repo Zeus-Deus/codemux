@@ -198,8 +198,9 @@ async fn restore_hold_unless_started(
     was_held: bool,
     result: &Result<crate::agent_provider::TurnStartResult, ProviderError>,
 ) {
-    if !matches!(result, Ok(started) if !started.steered) {
-        state.lock().await.queue_hold.restore(was_held);
+    if was_held {
+        let started = matches!(result, Ok(started) if !started.steered);
+        state.lock().await.queue_hold.settle_take(was_held, started);
     }
 }
 
@@ -866,7 +867,7 @@ impl CodexSession {
                 };
                 // Sent by hand while a Stop settles: it goes first and
                 // releases the held queue behind it once it starts.
-                if state.queue_hold.is_held() {
+                if state.queue_hold.goes_first() {
                     state.queued_turns.push_front(queued);
                     state.queue_hold.release_with(&queued_id);
                 } else {
@@ -910,10 +911,12 @@ impl CodexSession {
                 if let Some(checkpoint) = checkpoint.as_ref() {
                     checkpoint.abort().await;
                 }
-                self.state.lock().await.queue_hold.restore(was_held);
                 Err(error)
             }
         };
+        if was_held {
+            self.state.lock().await.queue_hold.settle_take(was_held, outcome.is_ok());
+        }
         drop(outbound);
         if was_held && outcome.is_ok() {
             // The turn may have settled before its start response while

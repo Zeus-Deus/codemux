@@ -29,6 +29,12 @@ impl QueueHold {
         self.held
     }
 
+    /// Whether a message sent by hand now goes ahead of the queue: a Stop
+    /// holds it, or another manual send has the hold taken and may restore it.
+    pub fn goes_first(&self) -> bool {
+        self.held || self.taken
+    }
+
     /// Whether a drain may dispatch the queue's `front` item. An empty queue
     /// has nothing to hold, so the hold clears.
     pub fn admits(&mut self, front: Option<&str>) -> bool {
@@ -73,10 +79,10 @@ impl QueueHold {
         }
     }
 
-    /// A message sent directly by hand: lift the hold, returning whether it
-    /// was held so a failed send can [`restore`](Self::restore) it. A pending
-    /// release survives for that restore; only a newer [`hold`](Self::hold)
-    /// drops it, and it is ignored while the queue is not held.
+    /// A message sent directly by hand: lift the hold while it is in flight,
+    /// returning whether it was held. Settle it with
+    /// [`settle_take`](Self::settle_take). A pending release survives the
+    /// take; only a newer [`hold`](Self::hold) drops it.
     pub fn take(&mut self) -> bool {
         let was_held = std::mem::take(&mut self.held);
         if was_held {
@@ -85,12 +91,21 @@ impl QueueHold {
         was_held
     }
 
-    /// Undo [`take`](Self::take) after a send that did not start a turn.
-    pub fn restore(&mut self, was_held: bool) {
-        if was_held {
-            self.held = true;
-            self.taken = false;
+    /// Settle a [`take`](Self::take): a send that started a turn lifts the
+    /// hold for good; one that did not restores it, with any release recorded
+    /// meanwhile. Returns false when there was nothing to settle, including
+    /// when a newer Stop has already held the queue again.
+    pub fn settle_take(&mut self, was_held: bool, started: bool) -> bool {
+        if !was_held || !self.taken {
+            return false;
         }
+        self.taken = false;
+        if started {
+            self.release = None;
+        } else {
+            self.held = true;
+        }
+        true
     }
 }
 
@@ -145,11 +160,11 @@ mod tests {
         hold.hold();
         let was_held = hold.take();
         assert!(!hold.is_held());
-        hold.restore(was_held);
+        hold.settle_take(was_held, false);
         assert!(hold.is_held());
         let mut unheld = QueueHold::default();
         let was_held = unheld.take();
-        unheld.restore(was_held);
+        unheld.settle_take(was_held, false);
         assert!(!unheld.is_held());
     }
 
@@ -161,7 +176,7 @@ mod tests {
         hold.hold();
         hold.release_with("m");
         let was_held = hold.take();
-        hold.restore(was_held);
+        hold.settle_take(was_held, false);
         assert!(hold.admits(Some("m")));
     }
 
@@ -188,7 +203,7 @@ mod tests {
         hold.hold();
         let was_held = hold.take();
         hold.release_with("q");
-        hold.restore(was_held);
+        hold.settle_take(was_held, false);
         assert!(hold.admits(Some("q")));
         // A Stop in between still wins.
         let mut hold = QueueHold::default();
@@ -196,8 +211,28 @@ mod tests {
         let was_held = hold.take();
         hold.release_with("q");
         hold.hold();
-        hold.restore(was_held);
+        hold.settle_take(was_held, false);
         assert!(!hold.admits(Some("q")));
+    }
+
+    #[test]
+    fn manual_send_during_a_taken_hold_goes_first_until_the_take_settles() {
+        let mut hold = QueueHold::default();
+        hold.hold();
+        let was_held = hold.take();
+        // A second manual message N while M is in flight goes ahead.
+        assert!(hold.goes_first());
+        hold.release_with("n");
+        // M fails before its prompt: N is let through the restored hold.
+        assert!(hold.settle_take(was_held, false));
+        assert!(hold.admits(Some("n")));
+        // Had M started instead, the take ends and later sends are ordinary.
+        let mut hold = QueueHold::default();
+        hold.hold();
+        let was_held = hold.take();
+        assert!(hold.settle_take(was_held, true));
+        assert!(!hold.goes_first());
+        assert!(!hold.is_held());
     }
 
     #[test]
@@ -207,7 +242,7 @@ mod tests {
         hold.release_with("m");
         let was_held = hold.take();
         hold.hold();
-        hold.restore(was_held);
+        hold.settle_take(was_held, false);
         assert!(!hold.admits(Some("m")));
     }
 }

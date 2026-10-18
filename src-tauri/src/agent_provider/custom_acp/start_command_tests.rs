@@ -537,6 +537,48 @@ async fn held_queue_survives_failed_idle_send_now_config() { held_queue_survives
 async fn held_queue_survives_failed_settling_send_now_config() { held_queue_survives_failed_config(HeldSend::SettlingSendNow).await; }
 #[tokio::test]
 async fn held_queue_survives_failed_direct_send_config() { held_queue_survives_failed_config(HeldSend::DirectSend).await; }
+
+/// While manual message M has the hold taken and waits for configuration,
+/// a second manual message N goes first; M then fails before its prompt, and
+/// N runs ahead of the older held Q.
+#[tokio::test]
+async fn second_manual_send_goes_first_when_the_first_fails_config() {
+    let f = Fixture::new("dynamic-review5-queue").await;
+    f.start(None, None).await.unwrap();
+    let mut events = f.provider.event_stream();
+    f.command_send(json!({"thread_id":f.thread.0,"text":"first held prompt"})).await.unwrap();
+    wait_marker(&f.dir.path().join("wire.jsonl.ready")).await;
+    let held = f.command_send(json!({"thread_id":f.thread.0,"text":"older held Q"})).await.unwrap().queued_id.unwrap();
+    f.provider.interrupt_turn(f.thread.clone(), None).await.unwrap();
+    std::fs::write(f.dir.path().join("wire.jsonl.release"), b"release").unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async { loop {
+        if let Some(ProviderRuntimeEvent::TurnCompleted { .. }) = events.next().await { break; }
+    }}).await.unwrap();
+    let session = f.provider.session(&f.thread).await.unwrap();
+    let gate = session.control.lock().await;
+    let m = f.provider.send_turn(serde_json::from_value(json!({"thread_id":f.thread.0,"text":"misconfigured M","model_override":"vendor:model [1m]","effort_override":" A effort "})).unwrap()).await.unwrap();
+    let n = f.provider.send_turn(serde_json::from_value(json!({"thread_id":f.thread.0,"text":"manual N"})).unwrap()).await.unwrap().queued_id.unwrap();
+    drop(gate);
+    let mut observed = Vec::new();
+    let mut n_turn = None;
+    tokio::time::timeout(Duration::from_secs(4), async { while n_turn.is_none() {
+        let event = events.next().await.unwrap();
+        if let ProviderRuntimeEvent::QueuedTurnDispatched { queued_id, turn_id, .. } = &event {
+            if queued_id == &n { n_turn = Some(turn_id.clone()); }
+        }
+        observed.push(event);
+    }}).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_millis(300), async { while let Some(event) = events.next().await { observed.push(event); } }).await;
+    drop(session);
+    f.provider.stop_session(f.thread.clone()).await.unwrap();
+    let wire = ownership_evidence(&f, "held-second-manual", json!({"events":format!("{observed:?}")}));
+    assert!(observed.iter().any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { turn_id, status: TurnStatus::Error { .. }, .. } if turn_id == &m.turn_id)), "M's configuration must fail: {observed:?}");
+    // N runs first; once it has started the hold lifts and Q follows it.
+    let dispatched = |id: &str| observed.iter().position(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnDispatched { queued_id, .. } if queued_id == id));
+    assert!(dispatched(&n).is_some(), "N must dispatch: {observed:?}");
+    assert!(dispatched(&held).is_none_or(|q| q > dispatched(&n).unwrap()), "the older held message ran first: {observed:?}");
+    assert!(wire.iter().any(|v| v["method"] == "session/prompt" && v["params"]["prompt"][0]["text"] == "manual N"));
+}
 async fn synthetic_turn(f: &Fixture) -> TurnStatus {
     let mut events = f.provider.event_stream();
     let turn = f.provider.send_turn(serde_json::from_value(json!({"thread_id":f.thread.0,"text":"synthetic mode update"})).unwrap()).await.unwrap().turn_id;

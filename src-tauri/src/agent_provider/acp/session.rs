@@ -862,7 +862,7 @@ impl AcpSession {
             };
             // Sent by hand while a Stop settles: it goes first and releases
             // the held queue behind it once it starts.
-            if state.queue_hold.is_held() {
+            if state.queue_hold.goes_first() {
                 state.queued.push_front(queued);
                 state.queue_hold.release_with(&queued_id);
             } else {
@@ -885,14 +885,17 @@ impl AcpSession {
         // A message sent by hand goes first; the held queue follows it.
         let was_held = state.queue_hold.take();
         drop(state);
-        match self.dispatch_turn(input, None, generation).await {
+        let outcome = match self.dispatch_turn(input, None, generation).await {
             Ok(turn_id) => Ok(SendOutcome::Started(turn_id)),
             Err(error) => {
                 self.release_dispatch_reservation().await;
-                self.state.lock().await.queue_hold.restore(was_held);
                 Err(error)
             }
+        };
+        if was_held {
+            self.state.lock().await.queue_hold.settle_take(was_held, outcome.is_ok());
         }
+        outcome
     }
 
     async fn dispatch_turn(
@@ -1636,8 +1639,8 @@ impl AcpSession {
         } else {
             Ok(())
         };
-        if result.is_err() {
-            self.state.lock().await.queue_hold.restore(was_held);
+        if was_held {
+            self.state.lock().await.queue_hold.settle_take(was_held, result.is_ok());
         }
         result
     }

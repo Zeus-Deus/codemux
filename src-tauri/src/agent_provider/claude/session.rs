@@ -653,7 +653,7 @@ impl ClaudeSession {
                 };
                 // Sent by hand while a Stop settles: it goes first and
                 // releases the held queue behind it once it starts.
-                if state.queue_hold.is_held() {
+                if state.queue_hold.goes_first() {
                     state.queued_turns.push_front(queued);
                     state.queue_hold.release_with(&queued_id);
                 } else {
@@ -693,9 +693,7 @@ impl ClaudeSession {
         if was_held {
             let mut state = self.state.lock().await;
             state.dispatching = false;
-            if sent.is_err() {
-                state.queue_hold.restore(true);
-            }
+            state.queue_hold.settle_take(was_held, sent.is_ok());
         }
         let outcome = match sent {
             Ok(turn_id) => {

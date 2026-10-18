@@ -169,7 +169,9 @@ impl HoldClaim {
     fn settle(self, hold: &mut crate::agent_provider::queue_hold::QueueHold, started: bool) {
         match self {
             Self::Release(id) => hold.settle(&id, started),
-            Self::Taken => hold.restore(!started),
+            Self::Taken => {
+                hold.settle_take(true, started);
+            }
         }
     }
 }
@@ -1639,7 +1641,7 @@ impl Session {
             };
             // Sent by hand while a Stop settles: it goes first and releases
             // the held queue behind it once it starts.
-            if s.queue_hold.is_held() {
+            if s.queue_hold.goes_first() {
                 s.queued.push_front(queued);
                 s.queue_hold.release_with(&id);
             } else {

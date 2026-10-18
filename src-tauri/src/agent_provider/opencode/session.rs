@@ -612,7 +612,7 @@ impl OpenCodeSession {
         let turn_active = self.turn_active().await;
         // A message sent by hand after a Stop goes first; the held queue
         // follows it once it starts.
-        let held = self.queue_hold().is_held();
+        let held = self.queue_hold().goes_first();
         if turn_active {
             let result = self.queue_input(input, None).await;
             if held {
@@ -697,22 +697,24 @@ impl OpenCodeSession {
         result: &Result<crate::agent_provider::TurnStartResult, ProviderError>,
     ) {
         match result {
-            Ok(started) if !started.steered && started.queued_id.is_none() => {}
             Ok(deferred) if was_held && deferred.queued_id.is_some() => {
                 let id = deferred.queued_id.as_deref().unwrap_or_default();
                 let mut queue = self.queued.lock().await;
                 let mut hold = self.queue_hold();
-                if hold.is_held() {
+                if !hold.settle_take(was_held, false) {
+                    // A Stop arrived meanwhile and holds the queue.
                     return;
                 }
                 if let Some(index) = queue.iter().position(|(key, _)| key == id) {
                     let item = queue.remove(index).unwrap();
                     queue.push_front(item);
                 }
-                hold.restore(true);
                 hold.release_with(id);
             }
-            _ => self.queue_hold().restore(was_held),
+            _ => {
+                let started = matches!(result, Ok(started) if !started.steered && started.queued_id.is_none());
+                self.queue_hold().settle_take(was_held, started);
+            }
         }
     }
 
