@@ -141,6 +141,36 @@ struct PendingSnapshot {
     after_ref: String,
 }
 
+/// Where `prepare` leaves its snapshot for `commit` or `abort`. Shared with
+/// the blocking task taking the snapshot, so an awaiting task that gets
+/// cancelled cannot strand it: whoever lets go of the slot last discards a
+/// snapshot nobody committed.
+struct PendingSlot {
+    thread_id: String,
+    snapshot: Mutex<Option<PendingSnapshot>>,
+}
+
+impl PendingSlot {
+    fn replace(&self, next: Option<PendingSnapshot>) {
+        let previous = std::mem::replace(&mut *self.snapshot.lock().unwrap(), next);
+        if let Some(previous) = previous {
+            discard_pending(&self.thread_id, &previous);
+        }
+    }
+
+    fn take(&self) -> Option<PendingSnapshot> {
+        self.snapshot.lock().unwrap().take()
+    }
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        if let Some(pending) = self.snapshot.get_mut().unwrap().take() {
+            discard_pending(&self.thread_id, &pending);
+        }
+    }
+}
+
 /// Drop a dispatch that will never get a row: its bookkeeping and both refs.
 fn discard_pending(thread_id: &str, pending: &PendingSnapshot) {
     take_prepared(thread_id, &pending.after_ref);
@@ -173,6 +203,12 @@ fn snapshot_before_dispatch(
 ) -> Result<Option<PendingSnapshot>, String> {
     let lock = thread_lock(thread_id);
     let _guard = lock.lock().unwrap();
+    // A preparation delayed past the thread's deletion must not write refs
+    // or an index the deletion has already swept.
+    if db.get_agent_chat_session(thread_id).is_none() {
+        captures().lock().unwrap().remove(thread_id);
+        return Ok(None);
+    }
     let token = unique_token();
     let before_ref = turn_diff_ref_name(thread_id, &token, "before");
     let Some(before) = crate::turn_diff::snapshot(
@@ -402,7 +438,7 @@ pub(crate) struct TurnDiffCapture<R: Runtime> {
     repo_path: String,
     client_nonce: String,
     inner: Option<Arc<dyn TurnDispatchCheckpoint>>,
-    pending: Mutex<Option<PendingSnapshot>>,
+    pending: Arc<PendingSlot>,
 }
 
 impl<R: Runtime> std::fmt::Debug for TurnDiffCapture<R> {
@@ -440,16 +476,11 @@ pub(crate) fn wrap_dispatch_checkpoint<R: Runtime>(
         repo_path,
         client_nonce: client_nonce.to_string(),
         inner,
-        pending: Mutex::new(None),
+        pending: Arc::new(PendingSlot {
+            thread_id: thread_id.to_string(),
+            snapshot: Mutex::new(None),
+        }),
     }))
-}
-
-impl<R: Runtime> TurnDiffCapture<R> {
-    fn discard(&self, pending: Option<PendingSnapshot>) {
-        if let Some(pending) = pending {
-            discard_pending(&self.thread_id, &pending);
-        }
-    }
 }
 
 #[async_trait::async_trait]
@@ -468,27 +499,29 @@ impl<R: Runtime> TurnDispatchCheckpoint for TurnDiffCapture<R> {
         let app = self.app.clone();
         let thread_id = self.thread_id.clone();
         let repo_path = self.repo_path.clone();
-        let snapshot = tauri::async_runtime::spawn_blocking(move || {
-            let db = app.try_state::<DatabaseStore>()?;
-            snapshot_before_dispatch(&db, &thread_id, &repo_path)
+        let slot = self.pending.clone();
+        // The task files its snapshot itself, so it is never lost if this
+        // await is cancelled.
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let Some(db) = app.try_state::<DatabaseStore>() else {
+                return;
+            };
+            let snapshot = snapshot_before_dispatch(&db, &thread_id, &repo_path)
                 .inspect_err(|error| {
                     eprintln!("[codemux::turn_diff] before-turn snapshot failed: {error}")
                 })
                 .ok()
-                .flatten()
+                .flatten();
+            slot.replace(snapshot);
         })
-        .await
-        .ok()
-        .flatten();
-        let previous = std::mem::replace(&mut *self.pending.lock().unwrap(), snapshot);
-        self.discard(previous);
+        .await;
     }
 
     async fn commit(&self) {
         if let Some(inner) = &self.inner {
             inner.commit().await;
         }
-        let Some(pending) = self.pending.lock().unwrap().take() else {
+        let Some(pending) = self.pending.take() else {
             return;
         };
         let app = self.app.clone();
@@ -515,8 +548,9 @@ impl<R: Runtime> TurnDispatchCheckpoint for TurnDiffCapture<R> {
         if let Some(inner) = &self.inner {
             inner.abort().await;
         }
-        let pending = self.pending.lock().unwrap().take();
-        self.discard(pending);
+        if let Some(pending) = self.pending.take() {
+            discard_pending(&self.thread_id, &pending);
+        }
     }
 }
 
@@ -775,10 +809,49 @@ mod tests {
     }
 
     #[test]
+    fn a_preparation_delayed_past_deletion_writes_nothing() {
+        let (_dir, repo, db) = setup("t-late-prepare");
+        let cleanup = thread_cleanup(&db, "t-late-prepare");
+        db.delete_agent_chat_session("t-late-prepare").unwrap();
+        forget_thread(cleanup);
+
+        assert!(snapshot_before_dispatch(&db, "t-late-prepare", &repo).unwrap().is_none());
+        let refs = std::process::Command::new("git")
+            .args(["for-each-ref", "refs/codemux/turn-diffs/"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(refs.stdout.is_empty(), "{}", String::from_utf8_lossy(&refs.stdout));
+    }
+
+    #[test]
+    fn an_abandoned_snapshot_is_discarded_with_its_slot() {
+        let (_dir, repo, db) = setup("t-abandoned");
+        let pending = snapshot_before_dispatch(&db, "t-abandoned", &repo).unwrap().unwrap();
+        let before_ref = pending.before_ref.clone();
+        let slot = Arc::new(PendingSlot {
+            thread_id: "t-abandoned".into(),
+            snapshot: Mutex::new(None),
+        });
+        // The task finishes after its awaiting side was cancelled: the slot
+        // is the last owner.
+        slot.replace(Some(pending));
+        drop(slot);
+        let left = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &before_ref])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(!left.success(), "the abandoned snapshot ref survived");
+    }
+
+    #[test]
     fn non_git_folders_are_not_captured() {
         let dir = tempfile::tempdir().unwrap();
         let db = DatabaseStore::new_in_memory();
         let folder = dir.path().to_string_lossy().to_string();
+        db.upsert_agent_chat_session("t-plain", "ws", Some(&folder), "claude")
+            .unwrap();
         assert!(snapshot_before_dispatch(&db, "t-plain", &folder)
             .unwrap()
             .is_none());
