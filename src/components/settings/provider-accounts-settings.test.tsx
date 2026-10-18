@@ -8,7 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 import { ProviderAccountsSettings } from "./provider-accounts-settings";
 import { AccountsSection } from "./usage-accounts";
 import { parseQuotaKey } from "./usage-filter";
-import { useProviderAccounts, withAccountPick } from "@/stores/provider-accounts-store";
+import { startsOnSignedInAccount, useProviderAccounts, withAccountPick } from "@/stores/provider-accounts-store";
 
 const account = (over: Partial<ProviderAccount>): ProviderAccount => ({
   id: "default",
@@ -133,4 +133,21 @@ it("the usage split shows each account with its share and plan left", () => {
   expect(screen.getByLabelText(/25% of Claude/)).toBeTruthy();
   expect(screen.getByText("10%")).toBeTruthy();
   expect(screen.getByText("1 session")).toBeTruthy();
+});
+
+it("a draft on an account last seen signed out asks again before it is refused", async () => {
+  // Signed in through the keyring in a terminal since: only a probe can tell.
+  const signedIn = { signed_in: true, email: null, organization: null, plan: null };
+  invoke.mockImplementation(async (cmd: string) => {
+    if (cmd === "provider_accounts_list") return state;
+    if (cmd === "provider_accounts_refresh") {
+      return { ...state, accounts: state.accounts.map((a) => (a.id === "claude-work-1" ? { ...a, identity: signedIn } : a)) };
+    }
+    if (cmd === "provider_account_thread") {
+      return { account_id: "claude-work-1", bound: false, workspace_id: null, workspace_default: null };
+    }
+    return null;
+  });
+  expect(await startsOnSignedInAccount("claude", "draft-2", null)).toBe(true);
+  expect(invoke.mock.calls.some(([cmd]) => cmd === "provider_accounts_refresh")).toBe(true);
 });

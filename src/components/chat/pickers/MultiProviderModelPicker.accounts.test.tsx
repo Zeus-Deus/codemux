@@ -4,7 +4,10 @@ import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@t
 
 const { thread, switchThread } = vi.hoisted(() => ({
   thread: { current: { account_id: "codex-work", bound: false, workspace_id: "ws-1", workspace_default: null as string | null } },
-  switchThread: vi.fn(async (_threadId: string, accountId: string) => ({ account_id: accountId, carried: true })),
+  switchThread: vi.fn(async (_threadId: string, accountId: string) => {
+    thread.current = { ...thread.current, account_id: accountId };
+    return { account_id: accountId, carried: true };
+  }),
 }));
 
 vi.mock("@/tauri/commands", async (importOriginal) => ({
@@ -29,6 +32,7 @@ import { pickKey, useProviderAccounts } from "@/stores/provider-accounts-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { MultiProviderModelPicker } from "./MultiProviderModelPicker";
 import { useUsageLimitOccupant } from "../use-composer-strip-occupants";
+import { useThreadAccount } from "../use-thread-account";
 
 const account = (over: Partial<ProviderAccount>): ProviderAccount => ({
   id: "default",
@@ -141,6 +145,7 @@ it("on a started chat, choosing another account moves it, but not while a turn r
 
   cleanup();
   switchThread.mockClear();
+  thread.current = { ...thread.current, account_id: "codex-work" };
   setStreaming(true);
   renderPicker();
   fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
@@ -177,4 +182,18 @@ it("the usage-limit notice offers the switch, and Choose account… opens the pi
 
   act(() => result.current?.summary.action?.onClick());
   await waitFor(() => expect(switchThread).toHaveBeenCalledWith("t1", "default"));
+});
+
+it("a switch made from one view moves every view of the chat", async () => {
+  thread.current = { ...thread.current, bound: true };
+  // The limit notice and the model chip each hold their own view.
+  const { result } = renderHook(() => ({
+    strip: useThreadAccount("codex", "t1"),
+    chip: useThreadAccount("codex", "t1"),
+  }));
+  await waitFor(() => expect(result.current.chip.current?.id).toBe("codex-work"));
+  await act(async () => {
+    await result.current.strip.choose(ACCOUNTS[0]);
+  });
+  await waitFor(() => expect(result.current.chip.current?.id).toBe("default"));
 });

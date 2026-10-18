@@ -73,6 +73,9 @@ export function useThreadAccount(
     threadId && supported ? s.picks[pickKey(provider, threadId)] : undefined,
   );
   const streaming = useAgentChatStore((s) => (threadId ? !!s.threads[threadId]?.streaming : false));
+  const revision = useProviderAccounts((s) =>
+    threadId && supported ? (s.bindingRevisions[pickKey(provider, threadId)] ?? 0) : 0,
+  );
   // A draft aimed at an existing workspace resolves that workspace's default.
   const draftWorkspace = useChatDraftStore((s) => {
     const target = Object.values(s.draftsById).find((d) => d.threadId === threadId)?.target;
@@ -112,7 +115,7 @@ export function useThreadAccount(
   // so a just-started chat shows itself as pinned.
   useEffect(() => {
     if (multi) void reload();
-  }, [reload, multi, streaming]);
+  }, [reload, multi, streaming, revision]);
 
   const bound = thread?.bound ?? false;
   const currentId = bound ? thread!.account_id : (picked ?? thread?.account_id ?? DEFAULT_ACCOUNT_ID);
@@ -131,6 +134,9 @@ export function useThreadAccount(
     setSwitching(account.id);
     try {
       const outcome = await providerAccountSwitchThread(threadId, account.id);
+      // Every view of this chat (model chip, picker, limit notice) re-reads
+      // where it now runs, this one included.
+      useProviderAccounts.getState().bindingChanged(provider, threadId);
       // The limit belonged to the account the chat just left. Its record
       // stays in the transcript; the standing notice does not.
       useAgentChatStore.setState((s) => {
@@ -142,7 +148,6 @@ export function useThreadAccount(
           ? "The conversation continues on this account."
           : "This account starts with fresh context; the transcript stays visible here.",
       });
-      await reload();
     } catch (error) {
       toast.failure(`Couldn't switch to ${accountName(account)}`, error);
     } finally {

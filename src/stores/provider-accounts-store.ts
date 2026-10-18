@@ -39,6 +39,10 @@ interface ProviderAccountsStore {
   /** Ask the composer's model picker to open on `provider`'s accounts
    *  (the usage-limit notice's "Choose account…"). */
   pickerRequest: { provider: AccountProvider; threadId: string; seq: number } | null;
+  /** Bumped by `pickKey(provider, threadId)` when a chat moves account, so
+   *  every view of that chat re-reads where it runs. */
+  bindingRevisions: Record<string, number>;
+  bindingChanged: (provider: AccountProvider, threadId: string) => void;
   requestPicker: (provider: AccountProvider, threadId: string) => void;
 }
 
@@ -81,6 +85,12 @@ export const useProviderAccounts = create<ProviderAccountsStore>((set, get) => (
   pick: (provider, threadId, accountId) =>
     set((s) => ({ picks: { ...s.picks, [pickKey(provider, threadId)]: accountId } })),
   pickerRequest: null,
+  bindingRevisions: {},
+  bindingChanged: (provider, threadId) =>
+    set((s) => {
+      const key = pickKey(provider, threadId);
+      return { bindingRevisions: { ...s.bindingRevisions, [key]: (s.bindingRevisions[key] ?? 0) + 1 } };
+    }),
   requestPicker: (provider, threadId) =>
     set((s) => ({ pickerRequest: { provider, threadId, seq: (s.pickerRequest?.seq ?? 0) + 1 } })),
 }));
@@ -127,8 +137,11 @@ export async function startsOnSignedInAccount(
     const id = (resolved.bound ? null : useProviderAccounts.getState().picks[pickKey(provider, threadId)]) ?? resolved.account_id;
     if (id === DEFAULT_ACCOUNT_ID) return false;
     const find = () => accountsFor(useProviderAccounts.getState().accounts, provider).find((a) => a.id === id);
-    // Not probed since launch (a keyring sign-in leaves no file to see): ask.
-    if (find()?.identity.signed_in === null) await store.refresh();
+    // Not known signed in: ask before refusing. A keyring sign-in leaves no
+    // file to see, so neither "not probed yet" nor an answer from before a
+    // terminal sign-in is final. This only runs when the CLI's own login
+    // would otherwise block the draft.
+    if (find()?.identity.signed_in !== true) await store.refresh();
     return find()?.identity.signed_in === true;
   } catch {
     return false;
