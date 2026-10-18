@@ -102,6 +102,7 @@ import type { WorkspaceSnapshot } from "@/tauri/types";
 import { EditorMenuItems } from "../editor-menu-items";
 import { PaneActionButton } from "../right-panel/pane-actions";
 import { RunButton } from "../run-button";
+import { PrWatchRow } from "./pr-watch-row";
 import {
   DETAILS_CHEVRON,
   DETAILS_ICON,
@@ -641,6 +642,7 @@ function VersionControlSection({
     <Section testId="workspace-details-git">
       <BranchRow workspace={workspace} branch={branch} />
       <PullRequestRow workspace={workspace} onOpened={onClose} />
+      <PrWatchRow workspace={workspace} />
       {/* Push / pull / fetch / publish and the upstream probe run git in a
           local path. A workspace on another device (or attached in place
           there) has no local checkout to run them in, so — like the right

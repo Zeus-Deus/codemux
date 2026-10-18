@@ -3719,6 +3719,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           isHomeWorkspace={isHomeWorkspace}
           branch={paneWorkspaceBranch ?? null}
           settings={settings}
+          threadId={threadId}
         />
       )
     : undefined;
