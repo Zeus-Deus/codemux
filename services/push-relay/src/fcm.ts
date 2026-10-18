@@ -53,6 +53,8 @@ export function createFcmSender(options: FcmOptions, now: () => number = Date.no
 
   return async (target, message) => {
     const android: Record<string, unknown> = {
+      // Only the allowlisted package may receive it, whatever the token.
+      restricted_package_name: target.appId,
       priority: "HIGH",
       ttl: `${message.ttlSeconds}s`,
       notification: {

@@ -152,14 +152,15 @@ export function createPushRelay(options: PushRelayOptions): PushRelay {
   async function rotate(request: Request, deviceId: string): Promise<Response> {
     const device = await authorize(request, deviceId, "manage");
     const body = asObject(await readJson(request));
-    if (body.token === undefined && body.mutedCategories === undefined) {
-      throw invalid("token or mutedCategories is required");
+    if (body.token === undefined && body.mutedCategories === undefined && body.apnsEnvironment === undefined) {
+      throw invalid("token, apnsEnvironment or mutedCategories is required");
     }
+    // Validate everything before writing anything.
     const muted = body.mutedCategories === undefined ? undefined : parseMuted(body.mutedCategories);
-    if (body.token !== undefined) {
-      const token = parseToken(device.platform, body.token);
-      const apnsEnvironment = parseApnsEnvironment(device.platform, body.apnsEnvironment);
-      await store.updateToken(device.deviceId, token, apnsEnvironment);
+    const token = body.token === undefined ? undefined : parseToken(device.platform, body.token);
+    const apnsEnvironment = parseApnsEnvironment(device.platform, body.apnsEnvironment);
+    if (token !== undefined || apnsEnvironment !== undefined) {
+      await store.updateToken(device.deviceId, token ?? device.token, apnsEnvironment);
     }
     if (muted) await store.setMutedCategories(device.deviceId, muted);
     return noContent();

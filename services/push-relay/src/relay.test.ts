@@ -330,6 +330,18 @@ describe("APNs delivery", () => {
     expect(t.apnsCalls[0].body.aps["thread-id"]).toBe("test");
   });
 
+  it("signs one provider token for concurrent sends, cold and after expiry", async () => {
+    const t = setup();
+    const device = await t.register("ios");
+    await Promise.all([t.notify(device), t.notify(device), t.notify(device)]);
+    t.advance(51 * 60 * 1000);
+    await Promise.all([t.notify(device), t.notify(device)]);
+    const tokens = t.apnsCalls.map((call) => call.headers.authorization);
+    expect(new Set(tokens.slice(0, 3)).size).toBe(1);
+    expect(new Set(tokens.slice(3)).size).toBe(1);
+    expect(tokens[3]).not.toBe(tokens[0]);
+  });
+
   it("caches the provider token for 50 minutes", async () => {
     const t = setup();
     const device = await t.register("ios");
@@ -430,6 +442,8 @@ describe("FCM delivery", () => {
         notification: { title: "Input needed", body: "Pick a branch" },
         data: { category: "input", workspaceId: "ws-2" },
         android: {
+          // FCM refuses delivery when the token belongs to another package.
+          restricted_package_name: APP_ID,
           priority: "HIGH",
           ttl: "120s",
           collapse_key: "ws-2",
@@ -444,7 +458,12 @@ describe("FCM delivery", () => {
     const device = await t.register("android");
     await t.notify(device, { title: "PR merged", body: "", category: "pr" });
     const message = JSON.parse(String(t.fetchCalls[1].init.body)).message;
-    expect(message.android).toEqual({ priority: "HIGH", ttl: "3600s", notification: { channel_id: "activity" } });
+    expect(message.android).toEqual({
+      restricted_package_name: APP_ID,
+      priority: "HIGH",
+      ttl: "3600s",
+      notification: { channel_id: "activity" },
+    });
   });
 
   it("caches the access token until 60 seconds before expiry", async () => {
@@ -537,6 +556,22 @@ describe("device management", () => {
     expect((await t.call("PUT", path, { mutedCategories: [] }, { authorization: `Bearer ${device.manageKey}` })).status).toBe(204);
     expect(await (await t.notify(device, finished)).json()).toEqual({ delivered: true });
     expect((await t.call("PUT", path, {}, { authorization: `Bearer ${device.manageKey}` })).status).toBe(400);
+  });
+
+  it("changes the APNs environment on its own, keeping the token", async () => {
+    const t = setup();
+    const device = await t.register("ios");
+    const path = `/v1/devices/${device.deviceId}`;
+    const auth = { authorization: `Bearer ${device.manageKey}` };
+    expect((await t.call("PUT", path, { apnsEnvironment: "sandbox" }, auth)).status).toBe(204);
+    expect(await t.store.get(device.deviceId)).toMatchObject({ token: IOS_TOKEN, apnsEnvironment: "sandbox" });
+    // Alongside preferences, both apply.
+    const both = { apnsEnvironment: "production", mutedCategories: ["pr"] };
+    expect((await t.call("PUT", path, both, auth)).status).toBe(204);
+    expect(await t.store.get(device.deviceId)).toMatchObject({ apnsEnvironment: "production", mutedCategories: ["pr"] });
+    // A bad field rejects the whole update.
+    expect((await t.call("PUT", path, { apnsEnvironment: "nope", mutedCategories: [] }, auth)).status).toBe(400);
+    expect((await t.store.get(device.deviceId))?.mutedCategories).toEqual(["pr"]);
   });
 
   it("deletes a device with DELETE", async () => {

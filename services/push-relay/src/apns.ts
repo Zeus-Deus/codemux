@@ -27,10 +27,9 @@ export function createApnsSender(options: ApnsOptions, now: () => number = Date.
   const send = options.send ?? createHttp2Transport();
   let key: Promise<CryptoKey> | undefined;
   let cached: { jwt: string; issuedAt: number } | undefined;
+  let signing: Promise<string> | undefined;
 
-  async function providerToken(): Promise<string> {
-    const t = now();
-    if (cached && t - cached.issuedAt < PROVIDER_TOKEN_TTL_MS) return cached.jwt;
+  async function signFresh(t: number): Promise<string> {
     key ??= importPrivateKey(options.privateKeyPem, "ES256");
     const jwt = await signJwt(
       await key,
@@ -39,6 +38,15 @@ export function createApnsSender(options: ApnsOptions, now: () => number = Date.
     );
     cached = { jwt, issuedAt: t };
     return jwt;
+  }
+
+  // Concurrent sends share one signing: Apple throttles a connection that
+  // presents more than one new provider token per 20 minutes.
+  function providerToken(): Promise<string> {
+    const t = now();
+    if (cached && t - cached.issuedAt < PROVIDER_TOKEN_TTL_MS) return Promise.resolve(cached.jwt);
+    signing ??= signFresh(t).finally(() => (signing = undefined));
+    return signing;
   }
 
   return async (target, message) => {
