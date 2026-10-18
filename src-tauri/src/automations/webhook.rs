@@ -170,16 +170,49 @@ fn lookup<'a>(root: &'a Value, segments: &[&str]) -> Option<&'a Value> {
     })
 }
 
-/// Strings and numbers render as text, objects and arrays as JSON. `null`
-/// counts as missing.
-fn stringify(value: &Value) -> Option<String> {
-    match value {
-        Value::Null => None,
-        Value::String(text) => Some(text.clone()),
-        Value::Bool(flag) => Some(flag.to_string()),
-        Value::Number(number) => Some(number.to_string()),
-        other => serde_json::to_string_pretty(other).ok(),
+/// A rendered value would push the prompt past its byte budget.
+struct OverBudget;
+
+/// Collects output until `limit` bytes, then refuses more, so pretty
+/// printing a deeply nested body stops early instead of ballooning.
+struct BoundedWriter {
+    buf: Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for BoundedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() + data.len() > self.limit {
+            return Err(std::io::Error::other("over budget"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
     }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Strings and numbers render as text, objects and arrays as JSON. `null`
+/// counts as missing. Fails once the text would exceed `limit` bytes.
+fn stringify(value: &Value, limit: usize) -> Result<Option<String>, OverBudget> {
+    let text = match value {
+        Value::Null => return Ok(None),
+        Value::String(text) if text.len() > limit => return Err(OverBudget),
+        Value::String(text) => text.clone(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number.to_string(),
+        other => {
+            let mut out = BoundedWriter { buf: Vec::new(), limit };
+            serde_json::to_writer_pretty(&mut out, other).map_err(|_| OverBudget)?;
+            String::from_utf8(out.buf).map_err(|_| OverBudget)?
+        }
+    };
+    if text.len() > limit {
+        return Err(OverBudget);
+    }
+    Ok(Some(text))
 }
 
 fn format_request(request: &WebhookRequest) -> String {
@@ -240,6 +273,7 @@ pub fn render_prompt(
         let root = parts.next().unwrap_or_default();
         let segments: Vec<&str> = parts.collect();
 
+        let remaining = max_bytes - prompt.len();
         let value: Option<String> = match root {
             "request" if segments.is_empty() => Some(
                 whole_request
@@ -249,13 +283,16 @@ pub fn render_prompt(
             "body" if segments.is_empty() => {
                 Some(body_text.get_or_insert_with(|| request.body_text()).clone())
             }
-            "body" => parsed
+            "body" => match parsed
                 .get_or_insert_with(|| parse_body(request))
                 .as_ref()
                 .and_then(|body| lookup(body, &segments))
-                .and_then(stringify),
+            {
+                Some(found) => stringify(found, remaining).ok()?,
+                None => None,
+            },
             "headers" if segments.is_empty() => {
-                stringify(&Value::Object(redact_headers(&request.headers)))
+                stringify(&Value::Object(redact_headers(&request.headers)), remaining).ok()?
             }
             "headers" => request
                 .headers
@@ -266,7 +303,7 @@ pub fn render_prompt(
                     url::form_urlencoded::parse(redact_query(&request.query).as_bytes())
                         .map(|(key, value)| (key.into_owned(), Value::String(value.into_owned())))
                         .collect();
-                stringify(&Value::Object(fields))
+                stringify(&Value::Object(fields), remaining).ok()?
             }
             "query" => {
                 let name = segments.join(".");
@@ -469,13 +506,31 @@ pub fn accept_delivery(
         _ => return Err(DeliveryRejection::SignatureUnavailable),
     }
 
-    // The URL token must never reach the agent, even when the route passes
-    // the full request path and `{{request}}` renders it.
+    // The URL token must never reach the agent. It can arrive in the path,
+    // the query, a proxy header such as `x-original-uri`, or the body (a
+    // GitHub `ping` carries the hook URL), literally or percent-encoded.
+    let token_pattern = Regex::new(&format!("(?i){}", regex::escape(expected)))
+        .map_err(|e| DeliveryRejection::Storage(e.to_string()))?;
+    let scrub = |text: &str| -> String {
+        let replaced = token_pattern.replace_all(text, REDACTED).into_owned();
+        let decoded = urlencoding::decode(&replaced).map(|d| d.into_owned());
+        match decoded {
+            Ok(decoded) if token_pattern.is_match(&decoded) => REDACTED.to_string(),
+            _ => replaced,
+        }
+    };
     let mut visible = request.clone();
-    visible.path = visible.path.replace(expected, REDACTED);
-    visible.query = visible.query.replace(expected, REDACTED);
-    let rendered = render_prompt(&automation.prompt, &visible, MAX_RENDERED_PROMPT_BYTES)
+    visible.path = scrub(&visible.path);
+    visible.query = scrub(&visible.query);
+    for value in visible.headers.values_mut() {
+        *value = scrub(value);
+    }
+    let mut rendered = render_prompt(&automation.prompt, &visible, MAX_RENDERED_PROMPT_BYTES)
         .ok_or(DeliveryRejection::PromptTooLarge)?;
+    // Catches decoded query and form values and literal copies in the body.
+    rendered.prompt = token_pattern
+        .replace_all(&rendered.prompt, REDACTED)
+        .into_owned();
     if rendered.prompt.trim().is_empty() {
         return Err(DeliveryRejection::EmptyPrompt);
     }
@@ -896,15 +951,43 @@ mod tests {
     #[test]
     fn the_url_token_never_reaches_the_prompt() {
         let db = crate::database::init_test_database();
-        let a = webhook_automation(&db, "{{request}}");
+        let a = webhook_automation(
+            &db,
+            "{{request}}|{{query.t}}|{{query.e}}|{{headers.x-original-uri}}|{{body.hook.url}}",
+        );
         let (id, token) = (a.webhook_id.clone().unwrap(), a.webhook_token.clone().unwrap());
         let path = format!("/hooks/automations/{id}/{token}");
-        let query = format!("t={token}");
-        let req = WebhookRequest::new("POST", &path, &query, [], b"hi".to_vec());
+        // The token percent-encoded, one byte at a time.
+        let encoded: String = token.bytes().map(|b| format!("%{b:02X}")).collect();
+        let query = format!("t={token}&e={encoded}");
+        let original_uri = format!("/hooks/automations/{id}/{encoded}");
+        let body = format!(r#"{{"hook":{{"url":"https://example.test{path}"}}}}"#);
+        let req = WebhookRequest::new(
+            "POST",
+            &path,
+            &query,
+            [
+                ("Content-Type", "application/json"),
+                ("X-Original-URI", original_uri.as_str()),
+            ],
+            body.into_bytes(),
+        );
 
         let prompt = accept_delivery(&db, &id, &token, &req, at(0)).unwrap().automation.prompt;
-        assert!(!prompt.contains(&token), "{prompt}");
+        assert!(!prompt.to_lowercase().contains(&token), "{prompt}");
+        assert!(!prompt.contains(&encoded), "{prompt}");
         assert!(prompt.starts_with(&format!("POST /hooks/automations/{id}/[redacted]?")));
+    }
+
+    #[test]
+    fn nested_json_cannot_balloon_past_the_budget() {
+        // Pretty printing indents every element by its depth, so a ~1 KB
+        // body of deeply nested numbers renders to ~100 KB.
+        let items = vec!["1"; 500].join(",");
+        let nested = format!("{}{items}{}", "[".repeat(100), "]".repeat(100));
+        let req = request("application/json", &format!(r#"{{"a":{nested}}}"#));
+        assert!(render_prompt("{{body.a}}", &req, 10_000).is_none());
+        assert!(render_prompt("{{body}}", &req, 10_000).is_some());
     }
 
     #[test]

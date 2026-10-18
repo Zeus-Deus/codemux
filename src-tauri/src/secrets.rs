@@ -111,45 +111,43 @@ fn master_key() -> Result<[u8; KEY_LEN], String> {
 }
 
 /// Read the master key, creating it (owner read/write only) on first use.
-/// `create_new` makes a concurrent first use settle on one key.
+///
+/// A new key is written and synced to a temporary file, then published
+/// with a no-overwrite link, so readers never see a partial key and a
+/// concurrent first use settles on whichever key landed first.
 fn load_or_create_key(path: &Path) -> Result<[u8; KEY_LEN], String> {
     use std::io::{ErrorKind, Write};
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+    if !path.exists() {
+        let dir = path.parent().ok_or("The secrets key has no directory")?;
+        std::fs::create_dir_all(dir)
             .map_err(|e| format!("Could not create the secrets directory: {e}"))?;
+        // `tempfile` creates the file owner-only (0600 on Unix).
+        let mut temp = tempfile::NamedTempFile::new_in(dir)
+            .map_err(|e| format!("Could not create the secrets key: {e}"))?;
+        let mut key = [0u8; KEY_LEN];
+        OsRng.fill_bytes(&mut key);
+        temp.write_all(&key)
+            .and_then(|()| temp.as_file().sync_all())
+            .map_err(|e| format!("Could not write the secrets key: {e}"))?;
+        match temp.persist_noclobber(path) {
+            Ok(_) => return Ok(key),
+            // Another caller published first; use its key.
+            Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("Could not save the secrets key: {}", error.error)),
+        }
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
+
+    let bytes = std::fs::read(path).map_err(|e| format!("Could not read the secrets key: {e}"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        // Tighten a key file whose mode was widened since creation.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
-    match options.open(path) {
-        Ok(mut file) => {
-            let mut key = [0u8; KEY_LEN];
-            OsRng.fill_bytes(&mut key);
-            file.write_all(&key)
-                .and_then(|()| file.sync_all())
-                .map_err(|e| format!("Could not write the secrets key: {e}"))?;
-            Ok(key)
-        }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            let bytes =
-                std::fs::read(path).map_err(|e| format!("Could not read the secrets key: {e}"))?;
-            #[cfg(unix)]
-            {
-                // Tighten a key file whose mode was widened since creation.
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-            }
-            bytes
-                .try_into()
-                .map_err(|_| "The secrets key file is damaged".to_string())
-        }
-        Err(error) => Err(format!("Could not create the secrets key: {error}")),
-    }
+    bytes
+        .try_into()
+        .map_err(|_| "The secrets key file is damaged".to_string())
 }
 
 #[cfg(test)]
@@ -195,6 +193,21 @@ mod tests {
         }
         std::fs::write(&path, b"short").unwrap();
         assert!(load_or_create_key(&path).is_err());
+    }
+
+    #[test]
+    fn concurrent_first_use_agrees_on_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.key");
+        let keys: Vec<[u8; KEY_LEN]> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| load_or_create_key(&path).unwrap()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(keys.iter().all(|key| *key == keys[0]));
+        // No temporary files are left behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
