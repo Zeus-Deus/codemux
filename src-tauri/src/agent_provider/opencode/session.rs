@@ -868,10 +868,14 @@ impl OpenCodeSession {
         } else {
             // Keep the queue unchanged if the abort fails. The outbound lock
             // prevents the completion worker from draining before promotion.
-            if self.turn_active().await {
-                self.until_closed(self.interrupt()).await?;
-            }
+            // Mark the release first so a Stop during the abort clears it.
             self.queue_hold().release_with(id);
+            if self.turn_active().await {
+                if let Err(error) = self.until_closed(self.interrupt()).await {
+                    self.queue_hold().settle(id, false);
+                    return Err(error);
+                }
+            }
             let mut queue = self.queued.lock().await;
             if let Some(index) = queue.iter().position(|(key, _)| key == id) {
                 let item = queue.remove(index).unwrap();
@@ -2570,6 +2574,45 @@ pub(crate) mod tests {
         assert_eq!(session.queued.lock().await.len(), 1);
         first_post.assert_async().await;
         second_post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_stop_during_send_now_interrupt_wins() {
+        let mut server = Server::new_async().await;
+        let queued_post = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .with_status(204)
+            .expect(0)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        let stopper = session.clone();
+        let abort = server
+            .mock("POST", "/session/sess_1/abort")
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                // The user presses Stop while "send now" is interrupting.
+                stopper.hold_queue();
+                b"true".to_vec()
+            })
+            .create_async()
+            .await;
+        session.event_ctx.lock().await.turn_active = true;
+        let queued = session
+            .enqueue_or_send(delivery_input("Queued"))
+            .await
+            .unwrap();
+        session.hold_queue();
+        session
+            .send_queued_now(queued.queued_id.as_ref().unwrap(), false)
+            .await
+            .unwrap();
+        session.event_ctx.lock().await.turn_active = false;
+        session.drain_queue().await;
+        assert!(session.queue_hold().is_held());
+        assert_eq!(session.queued.lock().await.len(), 1);
+        abort.assert_async().await;
+        queued_post.assert_async().await;
     }
 
     #[tokio::test]

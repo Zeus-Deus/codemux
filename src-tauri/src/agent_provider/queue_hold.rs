@@ -59,9 +59,10 @@ impl QueueHold {
     }
 
     /// A message sent directly by hand: lift the hold, returning whether it
-    /// was held so a failed send can [`restore`](Self::restore) it.
+    /// was held so a failed send can [`restore`](Self::restore) it. A pending
+    /// release survives for that restore; only a newer [`hold`](Self::hold)
+    /// drops it, and it is ignored while the queue is not held.
     pub fn take(&mut self) -> bool {
-        self.release = None;
         std::mem::take(&mut self.held)
     }
 
@@ -130,5 +131,28 @@ mod tests {
         let was_held = unheld.take();
         unheld.restore(was_held);
         assert!(!unheld.is_held());
+    }
+
+    #[test]
+    fn restored_hold_keeps_an_earlier_release() {
+        // A message sent while the stopped turn settles goes first; a steer
+        // that does not start a turn must not strand it.
+        let mut hold = QueueHold::default();
+        hold.hold();
+        hold.release_with("m");
+        let was_held = hold.take();
+        hold.restore(was_held);
+        assert!(hold.admits(Some("m")));
+    }
+
+    #[test]
+    fn stop_during_a_taken_hold_drops_the_release() {
+        let mut hold = QueueHold::default();
+        hold.hold();
+        hold.release_with("m");
+        let was_held = hold.take();
+        hold.hold();
+        hold.restore(was_held);
+        assert!(!hold.admits(Some("m")));
     }
 }
