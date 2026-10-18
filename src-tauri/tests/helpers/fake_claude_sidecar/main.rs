@@ -137,7 +137,7 @@ fn fire_script_entries_for(method: &str, script: &[ScriptEntry]) {
                             .append(true)
                             .open(&path)
                             .expect("open emitted marker");
-                        let _ = writeln!(f, "{}", entry.method);
+                        let _ = writeln!(f, "{} {}", entry.method, entry.params);
                     }
                 }
                 "server_request" => {

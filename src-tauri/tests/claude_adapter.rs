@@ -2965,7 +2965,7 @@ async fn a_compaction_torn_down_keeps_its_output_hidden_and_its_queue_closed() {
     .await;
     let emitted = std::fs::read_to_string(&marker).unwrap_or_default();
     assert!(
-        emitted.contains("sdk-message"),
+        emitted.contains("Late compaction output"),
         "the fixture must really write the late output during teardown"
     );
     assert!(queued.is_some());
