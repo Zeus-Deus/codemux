@@ -1,8 +1,9 @@
 //! Automations — scheduled agent runs on a chosen host.
 //!
-//! An automation is a named prompt + agent + recurrence. The schedule
-//! fires on a host the user picks; each fire creates a fresh workspace
-//! and runs the agent in it.
+//! An automation is a named prompt + agent + trigger. A scheduled
+//! automation fires on its recurrence, on a host the user picks; a webhook
+//! automation fires when its URL receives a request (`webhook`). Each fire
+//! creates a fresh workspace and runs the agent in it.
 //!
 //! This module owns the recurrence engine. The rest of the feature is
 //! split across the codebase by layer:
@@ -19,3 +20,4 @@ pub mod executor;
 pub mod recurrence;
 pub mod scheduler;
 pub mod service;
+pub mod webhook;

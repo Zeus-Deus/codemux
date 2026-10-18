@@ -3181,6 +3181,45 @@ export interface AutomationView {
   created_at: string;
   updated_at: string;
   dirty: boolean;
+  /** What starts runs. Fixed at creation. */
+  trigger_type: AutomationTrigger;
+  /** Webhook setup for webhook automations, `null` otherwise. The URL
+   *  token is fetched separately with `automationsWebhookCredentials`. */
+  webhook: AutomationWebhookView | null;
+}
+
+/** `schedule` runs on the recurrence; `webhook` runs when the
+ *  automation's URL receives a request. The prompt of a webhook
+ *  automation can read the request with `{{body.path}}`,
+ *  `{{headers.name}}`, `{{query.name}}`, `{{body}}` and `{{request}}`. */
+export type AutomationTrigger = "schedule" | "webhook";
+
+/** An HMAC-SHA256 check over the raw request body. GitHub sends
+ *  `x-hub-signature-256` with prefix `sha256=` and a hex digest. */
+export interface WebhookSignature {
+  header: string;
+  encoding: "hex" | "base64";
+  prefix: string;
+}
+
+export interface AutomationWebhookView {
+  id: string;
+  signature: WebhookSignature | null;
+  /** Id of the stored signing secret, never its value. */
+  secret_ref: string | null;
+}
+
+/** The two halves of a webhook automation's URL. */
+export interface WebhookCredentials {
+  webhook_id: string;
+  token: string;
+}
+
+/** A secret held by the backend. The value is never returned. */
+export interface SecretMeta {
+  id: string;
+  label: string;
+  created_at: string;
 }
 
 /** Result of probing whether a host can reach an automation's repo. */
@@ -3207,6 +3246,8 @@ export interface AutomationRunView {
   pr_url: string | null;
   error: string | null;
   created_at: string;
+  /** What started the run. */
+  trigger_type: AutomationTrigger;
 }
 
 /** Editable fields of an automation, shared by create and update.
@@ -3222,6 +3263,9 @@ export interface AutomationInput {
   project_path: string | null;
   project_remote?: string | null;
   retention_limit: number;
+  /** Only read on create (default `schedule`). A webhook automation
+   *  ignores `schedule` and must leave `host_id` null. */
+  trigger_type?: AutomationTrigger;
 }
 
 export const automationsList = () =>
@@ -3258,6 +3302,34 @@ export const automationsCheckRepoAccess = (
     projectPath,
     projectRemote,
   });
+
+export const automationsWebhookCredentials = (id: number) =>
+  invoke<WebhookCredentials>("automations_webhook_credentials", { id });
+
+/** Issue a new URL token; the old URL stops working at once. */
+export const automationsRotateWebhookToken = (id: number) =>
+  invoke<WebhookCredentials>("automations_rotate_webhook_token", { id });
+
+/** Set (or, with `null`, clear) the signature check. `secret_ref` is the
+ *  id `secretsStore` returned. */
+export const automationsSetWebhookSignature = (
+  id: number,
+  signature: (WebhookSignature & { secret_ref: string }) | null,
+) =>
+  invoke<AutomationView>("automations_set_webhook_signature", {
+    id,
+    signature,
+  });
+
+/** Encrypt and store a secret. Only its id and label come back. */
+export const secretsStore = (label: string, value: string) =>
+  invoke<SecretMeta>("secrets_store", { label, value });
+
+export const secretsList = () => invoke<SecretMeta[]>("secrets_list");
+
+/** Fails while an automation still uses the secret. */
+export const secretsDelete = (id: string) =>
+  invoke<void>("secrets_delete", { id });
 
 export interface WorkspacePushOutcome {
   ok: boolean;

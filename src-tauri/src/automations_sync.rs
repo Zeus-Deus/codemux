@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
 use crate::auth::{api_base_url, is_token_expired, load_token};
+use crate::database::automation_triggers::AutomationTrigger;
 use crate::database::{AutomationRecord, DatabaseStore};
 
 /// Wire shape from `GET /api/automations` and `POST /api/automations`.
@@ -246,6 +247,16 @@ pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
     let mut any_failed = false;
 
     for row in &dirty {
+        // Webhook automations stay on this device: the API has no trigger
+        // field, so another device would read one as a broken schedule.
+        // Clear `dirty` instead, which also lets a tombstone be purged.
+        if row.trigger_type == AutomationTrigger::Webhook {
+            if let Err(error) = db.mark_automation_synced(row.id, None) {
+                eprintln!("[automations-sync] could not settle local id {}: {error}", row.id);
+                any_failed = true;
+            }
+            continue;
+        }
         let result = if row.deleted_at.is_some() {
             push_delete(&client, &base, token, row, db).await
         } else if row.server_id.is_none() {
@@ -401,6 +412,7 @@ mod tests {
             project_path: Some("/repo".to_string()),
             project_remote: None,
             retention_limit: 10,
+            trigger_type: None,
         }
     }
 
@@ -518,6 +530,36 @@ mod tests {
         let row = db.get_automation(created.id).unwrap();
         assert!(!row.dirty, "a pushed row is no longer dirty");
         assert_eq!(row.server_id.as_deref(), Some("srv-9"));
+        std::env::remove_var("CODEMUX_API_URL");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_keeps_webhook_automations_on_this_device() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let mock = server
+            .mock("POST", "/api/automations")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let db = init_test_database();
+        let created = db
+            .insert_automation(&AutomationInput {
+                schedule: String::new(),
+                trigger_type: Some(AutomationTrigger::Webhook),
+                ..sample_input()
+            })
+            .unwrap();
+        assert!(created.dirty);
+
+        push("token", &db).await.unwrap();
+        mock.assert_async().await;
+
+        let row = db.get_automation(created.id).unwrap();
+        assert!(!row.dirty);
+        assert!(row.server_id.is_none());
         std::env::remove_var("CODEMUX_API_URL");
     }
 }

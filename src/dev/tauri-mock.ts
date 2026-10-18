@@ -3,6 +3,7 @@ import type {
   HostStatusView,
   HostView,
   LocalChatSession,
+  SecretMeta,
 } from "@/tauri/commands";
 import type { AgentChatProviderKind, ProjectScripts } from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
@@ -4233,6 +4234,9 @@ const MOCK_SEARCH_PATHS = [
   "docs/screenshots/dashboard.png",
 ];
 
+// Stored secrets for the mock `secrets_*` handlers. Metadata only.
+const mockSecrets: SecretMeta[] = [];
+
 // ── Devices (SSH hosts) ─────────────────────────────────────────────
 //
 // Mutable so Settings → Devices can add, rename, set up and remove devices
@@ -6617,6 +6621,34 @@ const handlers: Record<string, Handler> = {
     ok: true,
     message: "This host can reach the repository.",
   }),
+  automations_webhook_credentials: () => ({
+    webhook_id: "0f3c9a1e5b7d4c2a9e8f6b1d3a5c7e90",
+    token: "mock-webhook-token",
+  }),
+  automations_rotate_webhook_token: () => ({
+    webhook_id: "0f3c9a1e5b7d4c2a9e8f6b1d3a5c7e90",
+    token: `mock-webhook-token-${Date.now()}`,
+  }),
+  automations_set_webhook_signature: () =>
+    Promise.reject("No automations exist in the mock."),
+  // Secrets: metadata only, mirroring the backend, which never returns a
+  // stored value.
+  secrets_store: (a) => {
+    const meta = {
+      id: `secret_mock${mockSecrets.length + 1}`,
+      label: String(a.label ?? "").trim(),
+      created_at: new Date().toISOString(),
+    };
+    mockSecrets.unshift(meta);
+    return { ...meta };
+  },
+  secrets_list: () => mockSecrets.map((secret) => ({ ...secret })),
+  secrets_delete: (a) => {
+    const index = mockSecrets.findIndex((secret) => secret.id === a.id);
+    if (index === -1) return Promise.reject("No such secret");
+    mockSecrets.splice(index, 1);
+    return undefined;
+  },
 
   // ── Devices (SSH hosts) ──
   //
