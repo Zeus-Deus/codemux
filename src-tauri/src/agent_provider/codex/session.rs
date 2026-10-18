@@ -1829,6 +1829,14 @@ impl CodexSession {
         request_id: RequestId,
         decision: ApprovalDecision,
     ) -> Result<(), ProviderError> {
+        let child = self.child().await;
+        // Hold the notification demux from claiming the request until its
+        // resolution is published, so a turn completion (whether Codex emits
+        // it in reaction to this reply or a concurrent Stop settled the
+        // turn) is always broadcast after it: late resolutions re-arm
+        // mid-turn tracking. Lock order matches the notifications task:
+        // demux, then state.
+        let _demux = self.notification_demux.lock().await;
         let pending = {
             let mut state = self.state.lock().await;
             state.pending_approvals.remove(&request_id).ok_or_else(|| {
@@ -1838,11 +1846,6 @@ impl CodexSession {
             })?
         };
         let payload = serde_json::to_value(ApprovalResponse::from(decision.clone())).unwrap();
-        let child = self.child().await;
-        // Hold the notification demux until the resolution is published, so
-        // a turn completion Codex emits in reaction to this reply is always
-        // broadcast after it (late resolutions re-arm mid-turn tracking).
-        let _demux = self.notification_demux.lock().await;
         child
             .respond(pending.rpc_id, Ok(payload))
             .await
