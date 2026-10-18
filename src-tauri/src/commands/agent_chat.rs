@@ -3568,11 +3568,12 @@ async fn send_turn_internal<R: Runtime>(
         provider,
         &skill_invocations,
     )?;
+    let switch_nonce = input.client_nonce.clone().unwrap_or_default();
     let (rendered_text, switch_seed) = super::provider_switch::seed_turn(
         &db,
         &thread_id_for_persist,
         provider,
-        input.delivery == MessageDelivery::Steer,
+        &switch_nonce,
         rendered_text,
     );
     // A non-checkpointed turn makes every older provider-relative target
@@ -3731,7 +3732,7 @@ async fn send_turn_internal<R: Runtime>(
     }
     drop(dispatch_guard);
     let result = sent.map_err(provider_err)?;
-    super::provider_switch::seed_delivered(&db, &thread_id_for_persist, provider, switch_seed);
+    super::provider_switch::seed_delivered(&db, &thread_id_for_persist, provider, &switch_nonce, switch_seed);
     if let Some(queued_id) = &result.queued_id {
         // Do not acknowledge queued acceptance without durable evidence.
         // The event bridge may lag, or dispatch/cancellation may beat this ACK.

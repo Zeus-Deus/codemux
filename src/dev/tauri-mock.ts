@@ -8441,7 +8441,10 @@ const handlers: Record<string, Handler> = {
     const payload = JSON.stringify(event);
     mockFullPayloadById.set(id, payload);
     rows.push({ id, payload, created_at_ms: Date.now() });
-    emitChatEvent(started, event);
+    // Carry the row id, as the backend does for a persisted event, so a
+    // warm remount's tail read doesn't replay the divider a second time.
+    const entry = chatChannels.get(started);
+    if (entry) chatChannelPush(entry, { thread_id: started, event, persisted_id: id });
     return started;
   },
 };

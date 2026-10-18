@@ -104,35 +104,42 @@ fn stored_label(provider: &str) -> &str {
         .unwrap_or(provider)
 }
 
-/// The text a turn sends: `text` with the pending switch seed for
-/// `provider` in front, when there is one, plus the seed to clear once the
-/// provider accepts the turn. A steer joins a running turn, which the seed
-/// would already have reached.
+/// The text a turn sends: `text` with the switch seed for `provider` in
+/// front, unless a turn that carried it is still in the transcript after
+/// the switch. Returns the seed to record against `nonce` once the provider
+/// accepts the turn. A turn whose seeded message is still queued gets the
+/// seed too: a queue entry a crash left behind can't be told apart from a
+/// live one, and a repeated handoff costs tokens where a lost one loses the
+/// conversation.
 pub(crate) fn seed_turn(
     db: &DatabaseStore,
     thread_id: &str,
     provider: ProviderKind,
-    steer: bool,
+    nonce: &str,
     text: String,
 ) -> (String, Option<String>) {
-    if steer {
+    let Some(seed) = db.provider_switch_seed(thread_id, &slug(provider)) else {
+        return (text, None);
+    };
+    let delivered = seed.sent_nonce.as_deref().is_some_and(|sent| {
+        db.agent_chat_has_user_message_after(thread_id, sent, seed.anchor_id)
+    });
+    if delivered || nonce.is_empty() {
         return (text, None);
     }
-    match db.provider_switch_seed(thread_id, &slug(provider)) {
-        Some(seed) => (format!("{seed}\n\n{text}"), Some(seed)),
-        None => (text, None),
-    }
+    (format!("{}\n\n{text}", seed.content), Some(seed.content))
 }
 
-/// The turn carrying `seed` was accepted: the new provider has the context.
+/// The turn sent with `nonce` carried `seed` and was accepted.
 pub(crate) fn seed_delivered(
     db: &DatabaseStore,
     thread_id: &str,
     provider: ProviderKind,
+    nonce: &str,
     seed: Option<String>,
 ) {
     if let Some(seed) = seed {
-        if let Err(error) = db.clear_provider_switch_seed(thread_id, &slug(provider), &seed) {
+        if let Err(error) = db.mark_provider_switch_seed_sent(thread_id, &slug(provider), &seed, nonce) {
             eprintln!("[codemux::provider_switch] {error}");
         }
     }
@@ -180,6 +187,8 @@ fn seed_text(
 struct Plan {
     context: Option<AgentChatSessionContext>,
     from_model: Option<String>,
+    /// The newest transcript row before the switch.
+    anchor_id: i64,
 }
 
 async fn plan_switch<R: Runtime>(
@@ -230,8 +239,9 @@ async fn plan_switch<R: Runtime>(
             ThreadId(thread_id.to_string()),
         );
     }
+    let anchor_id = db.max_agent_chat_message_id(thread_id).unwrap_or(0);
     drop((timeline, dispatch));
-    Ok(Plan { context, from_model })
+    Ok(Plan { context, from_model, anchor_id })
 }
 
 /// Move the chat bound to `pane_id` from `from_provider` to `provider`,
@@ -270,8 +280,11 @@ pub async fn agent_chat_switch_provider<R: Runtime>(
         eprintln!("[codemux::provider_switch] stopping {from_provider:?}: {error}");
     }
     // Native ids don't cross providers: start clean, never from a cursor.
+    // Hermes keeps its own binding per thread and resumes that conversation
+    // on a return trip; it refuses a fresh start over it.
     input.resume_cursor = None;
-    input.fresh_session = true;
+    input.fresh_session = !(provider == ProviderKind::Hermes
+        && app.state::<DatabaseStore>().hermes_binding(&thread_id)?.is_some());
     let to_model = input.model.clone();
     let started =
         agent_chat_start_session(app.clone(), pane_id, provider, input, Some(thread_id.clone()))
@@ -280,7 +293,9 @@ pub async fn agent_chat_switch_provider<R: Runtime>(
     let db: State<'_, DatabaseStore> = app.state();
     if let Some(context) = &plan.context {
         let seed = seed_text(from_provider, plan.from_model.as_deref(), &started.0, context);
-        if let Err(error) = db.put_provider_switch_seed(&started.0, &slug(provider), &seed) {
+        if let Err(error) =
+            db.put_provider_switch_seed(&started.0, &slug(provider), &seed, plan.anchor_id)
+        {
             // The switch itself happened; the provider just starts without
             // the earlier context, which the notice below admits.
             eprintln!("[codemux::provider_switch] {error}");
@@ -350,19 +365,45 @@ mod tests {
         assert!(!summary.contains("left out"));
     }
 
+    fn user_message(db: &DatabaseStore, nonce: &str) -> i64 {
+        db.append_agent_chat_message(
+            "t",
+            &serde_json::json!({"type": "user_message", "text": "go", "client_nonce": nonce}).to_string(),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
     #[test]
-    fn the_first_turn_to_the_new_provider_carries_the_seed_once() {
+    fn the_new_provider_gets_the_seed_until_a_turn_carrying_it_is_in_the_transcript() {
         let db = store();
-        db.put_provider_switch_seed("t", "codex", "SEED").unwrap();
-        let (steer, none) = seed_turn(&db, "t", ProviderKind::Codex, true, "go".into());
-        assert_eq!((steer.as_str(), none), ("go", None));
-        let (other, none) = seed_turn(&db, "t", ProviderKind::Claude, false, "go".into());
+        let anchor = user_message(&db, "before-switch");
+        db.put_provider_switch_seed("t", "codex", "SEED", anchor).unwrap();
+        let (other, none) = seed_turn(&db, "t", ProviderKind::Claude, "n0", "go".into());
         assert_eq!((other.as_str(), none), ("go", None));
-        let (text, seed) = seed_turn(&db, "t", ProviderKind::Codex, false, "go".into());
+        let (text, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n1", "go".into());
         assert_eq!(text, "SEED\n\ngo");
-        seed_delivered(&db, "t", ProviderKind::Codex, seed);
-        let (next, none) = seed_turn(&db, "t", ProviderKind::Codex, false, "again".into());
-        assert_eq!((next.as_str(), none), ("again", None));
+        seed_delivered(&db, "t", ProviderKind::Codex, "n1", seed);
+        // Accepted but not in the transcript yet (queued): still carried.
+        let (queued, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n2", "again".into());
+        assert_eq!(queued, "SEED\n\nagain");
+        seed_delivered(&db, "t", ProviderKind::Codex, "n2", seed);
+        user_message(&db, "n2");
+        let (next, none) = seed_turn(&db, "t", ProviderKind::Codex, "n3", "more".into());
+        assert_eq!((next.as_str(), none), ("more", None));
+    }
+
+    #[test]
+    fn a_reverted_seeded_turn_hands_the_seed_to_the_next_one() {
+        let db = store();
+        db.put_provider_switch_seed("t", "codex", "SEED", 0).unwrap();
+        let (_, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n1", "go".into());
+        seed_delivered(&db, "t", ProviderKind::Codex, "n1", seed);
+        let row = user_message(&db, "n1");
+        db.finalize_agent_chat_turn_revert("t", 0, row - 1).unwrap();
+        let (text, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n2", "retry".into());
+        assert_eq!(text, "SEED\n\nretry");
+        assert!(seed.is_some());
     }
 
     #[test]
