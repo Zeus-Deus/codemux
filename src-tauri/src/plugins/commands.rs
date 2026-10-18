@@ -339,8 +339,8 @@ fn finish_plan(
     catalog_id: Option<String>,
     fetched: install::Fetched,
 ) -> Result<Plan, String> {
-    let replaces = match install::existing(root, &id)? {
-        Existing::Installed(marker) => Some(marker.sha),
+    let installed = match install::existing(root, &id)? {
+        Existing::Installed(marker) => Some(marker),
         Existing::Local => {
             return Err(format!("A Local plugin folder named \"{id}\" already exists. Remove it first."))
         }
@@ -360,6 +360,11 @@ fn finish_plan(
         name: Some(name.clone()),
         description: fetched.meta.description.clone(),
     };
+    // Only an update of the same plugin keeps the user's on/off decision.
+    if let Some(installed) = &installed {
+        install::check_replacement(&id, installed, &marker)?;
+    }
+    let replaces = installed.map(|installed| installed.sha);
     Ok(Plan {
         preview: InstallPreview {
             id,
@@ -500,4 +505,53 @@ pub async fn plugins_remove<R: Runtime>(
     }
     let _ = app.emit_to("main", watch::CHANGED_EVENT, watch::Changed { id: Some(id) });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(root: &std::path::Path, source: &str, repo: &str) -> Result<Plan, String> {
+        finish_plan(
+            root,
+            "hello".into(),
+            source,
+            repo.into(),
+            "unverified".into(),
+            (source == "catalog").then(|| "hello".to_string()),
+            install::Fetched {
+                sha: "a".repeat(40),
+                git_ref: None,
+                subdir: None,
+                files: vec![(super::super::ENTRY_FILE.into(), b"original".to_vec())],
+                meta: install::ScannedMeta { id: Some("hello".into()), ..Default::default() },
+            },
+        )
+    }
+
+    #[test]
+    fn plugin_install_identity_is_checked_in_the_preview() {
+        let repo = "https://github.com/owner/hello";
+        for (source, other) in [("git", "catalog"), ("catalog", "git")] {
+            let root = tempfile::tempdir().unwrap();
+            let fresh = plan(root.path(), source, repo).unwrap();
+            assert_eq!(fresh.preview.replaces, None);
+            install::write_install(root.path(), "hello", &fresh.files, &fresh.marker).unwrap();
+            let update = plan(root.path(), source, "https://github.com/Owner/Hello").unwrap();
+            assert_eq!(update.preview.replaces.as_deref(), Some(fresh.marker.sha.as_str()));
+
+            let error = plan(root.path(), other, repo).err().expect("another source must not be an update");
+            assert!(error.contains("this install is from") && error.contains("Remove it first"), "{error}");
+
+            // Git: another repository declaring the id is refused. Catalog: the
+            // entry is the same plugin even after its repository moves.
+            let moved = plan(root.path(), source, "https://github.com/fork/hello");
+            if source == "git" {
+                let error = moved.err().unwrap();
+                assert!(error.contains("this install is from GitHub (https://github.com/fork/hello)"), "{error}");
+            } else {
+                assert_eq!(moved.unwrap().preview.replaces.as_deref(), Some(fresh.marker.sha.as_str()));
+            }
+        }
+    }
 }
