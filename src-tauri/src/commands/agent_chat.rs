@@ -5669,15 +5669,19 @@ async fn wait_for_stops(stops: EarlierStops) -> Result<(), String> {
 }
 
 /// [`shutdown_agent_chat_threads`], but resolves only once every session has
-/// stopped, including the `earlier` stops of chats closed before the
-/// workspace. Worktree deletion awaits this so no agent is still running in
-/// the directory when its files are removed. Errs when a provider did not
+/// stopped, including stops of chats closed before the workspace: the
+/// `earlier` snapshot taken when it closed, plus any still in flight now (a
+/// chat closed concurrently may register its stop after that snapshot).
+/// Worktree deletion awaits this so no agent is still running in the
+/// directory when its files are removed. Errs when a provider did not
 /// acknowledge a stop; a session that was not running counts as stopped.
 pub async fn shutdown_agent_chat_threads_and_wait<R: Runtime>(
     app: &AppHandle<R>,
-    earlier: EarlierStops,
+    workspace_id: &str,
+    mut earlier: EarlierStops,
     threads: Vec<(ProviderKind, String)>,
 ) -> Result<(), String> {
+    earlier.0.extend(snapshot_pending_stops(workspace_id).0);
     let threads = begin_agent_chat_thread_shutdown(app, threads);
     let stopped = stop_agent_chat_threads(app, threads).await;
     stopped.and(wait_for_stops(earlier).await)
@@ -10839,7 +10843,7 @@ mod tests {
         let earlier = snapshot_pending_stops(&workspace);
         let wait = tokio::spawn(async move {
             shutdown_agent_chat_threads_and_wait(
-                &handle, earlier, vec![(ProviderKind::Codex, "live-chat".into())],
+                &handle, &workspace, earlier, vec![(ProviderKind::Codex, "live-chat".into())],
             ).await
         });
         tokio::time::timeout(Duration::from_secs(5), provider.stop_started.notified()).await.unwrap();
@@ -10873,11 +10877,39 @@ mod tests {
         done.send_replace(Some(Err("closed chat did not stop".into())));
         pending_stops().lock().unwrap().remove("closed-chat");
         let error = shutdown_agent_chat_threads_and_wait(
-            app.handle(), earlier, vec![(ProviderKind::Codex, "live-chat".into())],
+            app.handle(), &workspace, earlier, vec![(ProviderKind::Codex, "live-chat".into())],
         )
         .await
         .expect_err("an earlier failed stop must block deletion");
         assert!(error.contains("closed chat did not stop"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_waits_for_stops_registered_after_the_close() {
+        if worktree_close_fixture_child("worktree_deletion_waits_for_stops_registered_after_the_close") {
+            return;
+        }
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app("live-chat", None, provider).await;
+        app.manage(SubagentTracker::default());
+        let earlier = snapshot_pending_stops(&workspace);
+        // A tab closed concurrently registers its stop only after the
+        // workspace closed and took its snapshot.
+        let (done, result) = tokio::sync::watch::channel(None);
+        pending_stops().lock().unwrap().insert(
+            "late-chat".into(),
+            PendingStop { workspace_id: Some(workspace.clone()), result },
+        );
+        let handle = app.handle().clone();
+        let mut wait = tokio::spawn(async move {
+            shutdown_agent_chat_threads_and_wait(&handle, &workspace, earlier, Vec::new()).await
+        });
+        let waited = tokio::time::timeout(Duration::from_millis(100), &mut wait).await.is_err();
+        done.send_replace(Some(Err("late chat did not stop".into())));
+        pending_stops().lock().unwrap().remove("late-chat");
+        let error = wait.await.unwrap().expect_err("a late failed stop must block deletion");
+        assert!(waited, "deletion must wait for a stop registered after the close");
+        assert!(error.contains("late chat did not stop"), "unexpected error: {error}");
     }
 
     #[tokio::test]
