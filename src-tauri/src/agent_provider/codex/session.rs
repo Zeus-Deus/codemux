@@ -1754,33 +1754,30 @@ impl CodexSession {
     /// that carry no turn id are treated as belonging to whichever turn of
     /// their thread ends.
     pub(crate) async fn settle_turn_approvals(&self, codex_thread_id: &str, turn_id: &str) {
-        let settled: Vec<RequestId> = {
-            let mut state = self.state.lock().await;
-            if state.settled_turns.len() == 64 {
-                state.settled_turns.pop_front();
-            }
-            state
-                .settled_turns
-                .push_back((codex_thread_id.to_owned(), turn_id.to_owned()));
-            let parent = state.codex_thread_id == codex_thread_id;
-            let ids: Vec<RequestId> = state
-                .pending_approvals
-                .iter()
-                .filter(|(_, pending)| {
-                    pending
-                        .codex_thread_id
-                        .as_deref()
-                        .map_or(parent, |thread| thread == codex_thread_id)
-                        && pending.turn_id.as_deref().is_none_or(|turn| turn == turn_id)
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in &ids {
-                state.pending_approvals.remove(id);
-            }
-            ids
-        };
-        for request_id in settled {
+        let mut state = self.state.lock().await;
+        if state.settled_turns.len() == 64 {
+            state.settled_turns.pop_front();
+        }
+        state
+            .settled_turns
+            .push_back((codex_thread_id.to_owned(), turn_id.to_owned()));
+        let parent = state.codex_thread_id == codex_thread_id;
+        let ids: Vec<RequestId> = state
+            .pending_approvals
+            .iter()
+            .filter(|(_, pending)| {
+                pending
+                    .codex_thread_id
+                    .as_deref()
+                    .map_or(parent, |thread| thread == codex_thread_id)
+                    && pending.turn_id.as_deref().is_none_or(|turn| turn == turn_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        // Broadcast under the lock, so a concurrent settler that finds
+        // nothing left cannot publish the turn's completion first.
+        for request_id in ids {
+            state.pending_approvals.remove(&request_id);
             let _ = self.event_tx.send(ProviderRuntimeEvent::RequestResolved {
                 thread_id: self.thread_id.clone(),
                 request_id,
@@ -1854,6 +1851,13 @@ impl CodexSession {
                 // request as orphaned instead of a retryable failure.
                 crate::json_rpc_child::RpcChildError::ChildExited { .. }
                 | crate::json_rpc_child::RpcChildError::AlreadyShutdown => {
+                    ProviderError::SessionClosed {
+                        thread_id: self.thread_id.clone(),
+                    }
+                }
+                crate::json_rpc_child::RpcChildError::IoError(e)
+                    if e.kind() == std::io::ErrorKind::BrokenPipe =>
+                {
                     ProviderError::SessionClosed {
                         thread_id: self.thread_id.clone(),
                     }
@@ -2582,7 +2586,7 @@ fn spawn_incoming_requests_task(
                     }
                     let request_id = mint_request_id();
                     let event = translate_server_request(&session.thread_id, &request_id, &msg);
-                    let turn_ended = {
+                    {
                         let payload = msg.payload();
                         let field = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_owned);
                         let pending = PendingApproval {
@@ -2596,30 +2600,19 @@ fn spawn_incoming_requests_task(
                             state.settled_turns.iter().any(|(t, u)| t == thread && u == turn)
                         });
                         // The crash watchdog marks the session dead before it
-                        // drains this map under the same lock, so a request
-                        // admitted after that drain is expired here instead.
-                        let dead = session.dead.load(Ordering::Relaxed);
-                        if !turn_ended && !dead {
-                            state.pending_approvals.insert(request_id.clone(), pending);
+                        // drains this map under the same lock. A request whose
+                        // turn already settled, or that arrives after that
+                        // drain, is dead on arrival: Codex aborted it, so it
+                        // is dropped unpublished rather than shown and
+                        // cancelled after its turn completed.
+                        if turn_ended || session.dead.load(Ordering::Relaxed) {
+                            continue;
                         }
+                        state.pending_approvals.insert(request_id.clone(), pending);
                         // Publish while still holding the lock: a settlement
                         // on another worker must not broadcast this
                         // request's resolution ahead of its opening.
                         let _ = event_tx.send(event);
-                        if dead {
-                            let _ = event_tx.send(crate::agent_provider::expired_request_event(
-                                session.thread_id.clone(),
-                                request_id.clone(),
-                            ));
-                        }
-                        turn_ended && !dead
-                    };
-                    if turn_ended {
-                        let _ = event_tx.send(ProviderRuntimeEvent::RequestResolved {
-                            thread_id: session.thread_id.clone(),
-                            request_id,
-                            decision: ApprovalDecision::Cancel,
-                        });
                     }
                 }
             }

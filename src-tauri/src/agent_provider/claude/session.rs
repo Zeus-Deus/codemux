@@ -1228,6 +1228,13 @@ impl ClaudeSession {
             ) => Err(ProviderError::SessionClosed {
                 thread_id: self.thread_id.clone(),
             }),
+            Err(crate::json_rpc_child::RpcChildError::IoError(e))
+                if e.kind() == std::io::ErrorKind::BrokenPipe =>
+            {
+                Err(ProviderError::SessionClosed {
+                    thread_id: self.thread_id.clone(),
+                })
+            }
             Err(crate::json_rpc_child::RpcChildError::RpcError(_)) if !self.sidecar.is_alive() => {
                 Err(ProviderError::SessionClosed {
                     thread_id: self.thread_id.clone(),

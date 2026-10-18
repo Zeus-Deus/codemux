@@ -170,12 +170,36 @@ async fn approvals_resolve_on_answer_and_settle_when_their_turn_ends() {
     turn_completed(&mut rx).await;
 
     // A turn that ends with its approval unanswered settles it too. The
-    // request and the completion race on separate tasks, so either may be
-    // handled first; both orders must settle it.
+    // request and the completion race on separate tasks: either the request
+    // is published and cancelled before the completion, or it arrives after
+    // the turn settled and is dropped unpublished. Nothing may follow it.
     let third = session.enqueue_or_send(turn("third")).await.unwrap();
     assert!(matches!(third, SendOutcome::Started(_)), "{third:?}");
-    let request = opened(&mut rx).await;
-    assert_eq!(resolved(&mut rx).await, (request, json!({"decision": "cancel"})));
+    let mut opened_ids = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("expected provider event")
+            .unwrap()
+        {
+            ProviderRuntimeEvent::RequestOpened { request_id, .. } => opened_ids.push(request_id),
+            ProviderRuntimeEvent::RequestResolved {
+                request_id,
+                decision: ApprovalDecision::Cancel,
+                ..
+            } => opened_ids.retain(|id| id != &request_id),
+            ProviderRuntimeEvent::TurnCompleted { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(opened_ids.is_empty(), "unsettled at completion: {opened_ids:?}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    while let Ok(event) = rx.try_recv() {
+        assert!(
+            !matches!(event, ProviderRuntimeEvent::RequestOpened { .. } | ProviderRuntimeEvent::RequestResolved { .. }),
+            "request event after completion: {event:?}"
+        );
+    }
     assert!(session.state.lock().await.pending_approvals.is_empty());
 
     // A sub-agent approval outlives the parent turn, then the app-server
