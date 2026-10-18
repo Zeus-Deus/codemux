@@ -562,13 +562,30 @@ function isSliceBusy(slice: ChatThreadSlice): boolean {
 }
 
 /**
+ * While a queued turn is being edited in a thread's composer, the edit owns
+ * that composer's draft: a cancelled turn's text is handed to it instead of
+ * being added to the draft. Set by `useQueuedTurnEditor`.
+ */
+const queuedEditDraftOwners = new Map<string, (queuedId: string, text: string) => void>();
+
+export function setQueuedEditDraftOwner(
+  threadId: string,
+  owner: ((queuedId: string, text: string) => void) | null,
+): void {
+  if (owner) queuedEditDraftOwners.set(threadId, owner);
+  else queuedEditDraftOwners.delete(threadId);
+}
+
+/**
  * The composer draft after a queued turn is cancelled — by the user's Cancel
  * button, a session error or close, or a failed dispatch. The text goes back
  * into the draft so the user does not lose it; appended so several
- * cancellations keep their queue order.
+ * cancellations keep their queue order. During a queued edit it goes to the
+ * edit instead (see `setQueuedEditDraftOwner`).
  */
 function draftAfterQueuedCancel(
   slice: ChatThreadSlice,
+  threadId: string,
   queuedId: string,
 ): string {
   const queued = slice.messages.find(
@@ -576,6 +593,11 @@ function draftAfterQueuedCancel(
   );
   const text = queued?.kind === "user_message" ? queued.text : "";
   if (!text.trim()) return slice.inputDraft;
+  const owner = queuedEditDraftOwners.get(threadId);
+  if (owner) {
+    owner(queuedId, text);
+    return slice.inputDraft;
+  }
   return slice.inputDraft.trim().length > 0
     ? `${slice.inputDraft}\n${text}`
     : text;
@@ -597,7 +619,7 @@ function reduceThreadEvent(
   let resumeCursor = slice.resumeCursor;
   let inputDraft = slice.inputDraft;
   if (event.type === "queued_turn_cancelled") {
-    inputDraft = draftAfterQueuedCancel(slice, event.queued_id);
+    inputDraft = draftAfterQueuedCancel(slice, event.thread_id, event.queued_id);
   } else if (event.type === "session_state_changed") {
     if (event.status.status === "running") {
       activeTurnId = event.status.active_turn;

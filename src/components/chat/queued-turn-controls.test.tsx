@@ -347,6 +347,28 @@ describe("useQueuedTurnEditor", () => {
     expect(draft()).toBe("D\nfirst lint\nrun tests");
   });
 
+  it("keeps a repeated-line edit whole when the cancellation wins the save", async () => {
+    const original = { ...item("a"), text: "run tests" };
+    seed("D", [original]);
+    let resolve: (value: boolean) => void = () => {};
+    commands.agentChatEditQueuedTurn.mockImplementation(() => new Promise((r) => { resolve = r; }));
+    const hook = renderHook(() => useQueuedTurnEditor({ threadId: thread, provider: "claude" }));
+    act(() => hook.result.current.begin(original));
+    act(() => useAgentChatStore.getState().setInputDraft(thread, "run tests\nrun tests"));
+    let saving: Promise<void> = Promise.resolve();
+    act(() => {
+      saving = hook.result.current.save("run tests\nrun tests");
+    });
+    act(() => {
+      useAgentChatStore.getState().applyEvent(thread, { type: "queued_turn_cancelled", thread_id: thread, queued_id: "a" });
+    });
+    await act(async () => {
+      resolve(false);
+      await saving;
+    });
+    expect(draft()).toBe("D\nrun tests\nrun tests");
+  });
+
   it("returns the edited turn's words once when it is cancelled mid-edit", () => {
     const cancel = () =>
       act(() => {

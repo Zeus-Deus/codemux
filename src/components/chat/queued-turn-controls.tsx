@@ -40,7 +40,7 @@ import { replaceTranscriptItem } from "@/lib/agent-chat/subagents";
 import type { ChatThreadState, UserMessageItem } from "@/lib/agent-chat/types";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
-import { useAgentChatStore } from "@/stores/agent-chat-store";
+import { setQueuedEditDraftOwner, useAgentChatStore } from "@/stores/agent-chat-store";
 import {
   agentChatCancelSavedQueuedTurn,
   agentChatEditQueuedTurn,
@@ -79,14 +79,6 @@ function joinDrafts(first: string, second: string): string {
   return `${first}\n${second}`;
 }
 
-/** `current` without `text`, when the store appended it as it does for a
- *  cancelled turn (on a new line, or alone in an empty composer). */
-function withoutReturned(current: string, text: string): string | null {
-  if (!text.trim()) return null;
-  if (current === text) return "";
-  return current.endsWith(`\n${text}`) ? current.slice(0, -(text.length + 1)) : null;
-}
-
 /** The composer region the queue list belongs to: its nearest ancestor
  *  holding a composer input. */
 function composerRegionOf(element: HTMLElement | null): HTMLElement | null {
@@ -119,7 +111,7 @@ export function useQueuedTurnEditor({
     draft: string;
     original: string;
     saving?: string;
-    /** The turn was cancelled; its returned copy is already stripped. */
+    /** The turn was cancelled while being edited. */
     cancelled?: boolean;
   } | null>(null);
 
@@ -133,6 +125,7 @@ export function useQueuedTurnEditor({
       setEditingId(null);
       setEditingHasImages(false);
       if (!edit) return;
+      setQueuedEditDraftOwner(edit.threadId, null);
       setInputDraft(
         edit.threadId,
         mode === "restore" ? edit.draft : joinDrafts(edit.draft, draftOf(edit.threadId)),
@@ -140,6 +133,17 @@ export function useQueuedTurnEditor({
     },
     [setInputDraft],
   );
+
+  // While editing, a cancelled turn's text comes here instead of into the
+  // composer (see `setQueuedEditDraftOwner`): the composer holds the edit.
+  // The edited turn's own words are already in the composer; another
+  // turn's join the displaced draft.
+  const ownDraft = useCallback((queuedId: string, text: string) => {
+    const edit = editRef.current;
+    if (!edit) return;
+    if (queuedId === edit.queuedId) edit.cancelled = true;
+    else edit.draft = joinDrafts(edit.draft, text);
+  }, []);
 
   const begin = useCallback(
     (item: UserMessageItem) => {
@@ -153,11 +157,12 @@ export function useQueuedTurnEditor({
         draft,
         original: item.text,
       };
+      setQueuedEditDraftOwner(threadId, ownDraft);
       setEditingId(item.queued.queuedId);
       setEditingHasImages((item.images?.length ?? 0) > 0);
       setInputDraft(threadId, item.text);
     },
-    [threadId, setInputDraft],
+    [threadId, setInputDraft, ownDraft],
   );
 
   const cancel = useCallback(() => finish("restore"), [finish]);
@@ -191,56 +196,20 @@ export function useQueuedTurnEditor({
     [provider, finish],
   );
 
-  // Queued text as of the last render, to recognise what a removal hands
-  // back to the composer.
-  const queuedTextRef = useRef(new Map<string, string>());
+  // The edited turn left the queue: a save in flight settles the edit
+  // itself; a cancellation keeps the composer's words (the original or the
+  // edit), below the displaced draft; a dispatch keeps a changed draft and
+  // otherwise puts the earlier one back.
   useEffect(() => {
-    const before = queuedTextRef.current;
-    const now = new Map<string, string>();
-    for (const m of messages ?? []) {
-      if (m.kind === "user_message" && m.queued) now.set(m.queued.queuedId, m.text);
-    }
-    queuedTextRef.current = now;
     const edit = editRef.current;
     if (!edit || !messages) return;
-    // Removing another queued turn returns its text to the composer, which
-    // holds this edit. Move it onto the displaced draft, so it is there
-    // whichever way the edit ends.
-    for (const [queuedId, text] of before) {
-      if (queuedId === edit.queuedId || now.has(queuedId)) continue;
-      const rest = withoutReturned(draftOf(edit.threadId), text);
-      if (rest === null) continue;
-      setInputDraft(edit.threadId, rest);
-      edit.draft = joinDrafts(edit.draft, text);
-    }
-    // The edited turn left the queue.
-    if (now.has(edit.queuedId)) return;
-    const cancelled = !messages.some((m) => m.id === edit.itemId);
-    if (cancelled && !edit.cancelled) {
-      // Its text came back to the composer too. Drop that copy: the words
-      // in the composer (the original or the user's edit) are what return.
-      edit.cancelled = true;
-      // The copy is its text when cancelled: as last shown, or as a save in
-      // flight just changed it. Longest first: the shown text can be the
-      // tail of the edited one, and stripping only that tail would leave
-      // the rest of the copy behind.
-      const current = draftOf(edit.threadId);
-      const returned = [before.get(edit.queuedId) ?? edit.original, edit.saving]
-        .filter((text): text is string => text !== undefined)
-        .sort((a, b) => b.length - a.length);
-      for (const text of returned) {
-        const rest = withoutReturned(current, text);
-        if (rest === null) continue;
-        setInputDraft(edit.threadId, rest);
-        break;
-      }
-    }
-    // A save in flight settles the edit itself.
-    if (edit.saving !== undefined) return;
-    if (cancelled) return finish("keep");
-    // It dispatched: keep a changed draft, otherwise put the earlier one back.
+    const queued = messages.some(
+      (m) => m.kind === "user_message" && m.queued?.queuedId === edit.queuedId,
+    );
+    if (queued || edit.saving !== undefined) return;
+    if (edit.cancelled || !messages.some((m) => m.id === edit.itemId)) return finish("keep");
     finish(draftOf(edit.threadId).trim() === edit.original.trim() ? "restore" : "keep");
-  }, [messages, finish, setInputDraft]);
+  }, [messages, finish]);
 
   // A different thread is a different composer.
   useEffect(() => {
@@ -254,7 +223,9 @@ export function useQueuedTurnEditor({
     () => () => {
       const edit = editRef.current;
       editRef.current = null;
-      if (edit) useAgentChatStore.getState().setInputDraft(edit.threadId, edit.draft);
+      if (!edit) return;
+      setQueuedEditDraftOwner(edit.threadId, null);
+      useAgentChatStore.getState().setInputDraft(edit.threadId, edit.draft);
     },
     [],
   );
