@@ -115,6 +115,7 @@ import {
   mockSetUsagePriceOverride,
   mockWebRemotePairing,
   mockWebRemoteSessions,
+  mockPushDevices,
   richChatTurnEnvelopes,
   monitoringEnvelopes,
   usageLimitEnvelopes,
@@ -8345,6 +8346,7 @@ const handlers: Record<string, Handler> = {
     return { removed, kept: [] };
   },
   worktree_cleanup_set_auto: () => undefined,
+  web_remote_push_devices: () => mockPushDevices(),
 };
 
 let mockStaleWorktrees: StaleWorktree[] = [

@@ -11,6 +11,7 @@ pub mod chat_fork;
 mod delegation;
 pub mod pr_watch;
 pub mod turn_diffs;
+pub mod mobile_push;
 
 fn agent_chat_session(conn: &Connection, thread_id: &str) -> Option<AgentChatSessionRecord> {
         conn.query_row(
@@ -1173,6 +1174,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     automation_triggers::create_schema(conn)?;
     turn_diffs::create_schema(conn)?;
     chat_fork::create_schema(conn)?;
+    mobile_push::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new

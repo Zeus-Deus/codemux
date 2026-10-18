@@ -3916,3 +3916,9 @@ export const worktreeCleanupRemove = (paths: string[]) =>
 /** Persists the automatic-cleanup setting and, when enabling, sweeps now. */
 export const worktreeCleanupSetAuto = (enabled: boolean) =>
   invoke<void>("worktree_cleanup_set_auto", { enabled });
+
+// ── Phone-app push ──
+
+/** Paired sessions running the Codemux phone app with relay push on. */
+export const webRemotePushDevices = () =>
+  invoke<import("./types").MobilePushDevice[]>("web_remote_push_devices");

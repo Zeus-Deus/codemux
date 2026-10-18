@@ -15,7 +15,7 @@
 //! consumer). The payload is a stable envelope:
 //!
 //! ```json
-//! { "api_version": 1, "app_state": <AppStateSnapshot>, "status": <WebRemoteStatus> }
+//! { "api_version": 1, "app_state": <AppStateSnapshot>, "status": <WebRemoteStatus>, "desktop_name": "<hostname>" }
 //! ```
 //!
 //! - `app_state` is byte-for-byte the value the `get_app_state` command
@@ -86,6 +86,8 @@ fn snapshot_json(app_state: &crate::state::AppStateSnapshot, status: &super::Web
         "api_version": API_VERSION,
         "app_state": app_state,
         "status": status,
+        // Additive: lets the phone app name the machine it paired with.
+        "desktop_name": super::registration::device_name(),
     })
 }
 
@@ -185,6 +187,7 @@ mod tests {
 
         // Versioned envelope.
         assert_eq!(body["api_version"], 1);
+        assert!(body["desktop_name"].as_str().is_some_and(|name| !name.is_empty()));
 
         // `app_state` is the serialized AppStateSnapshot — spot-check its
         // stable shape so a field rename can't silently change the contract.

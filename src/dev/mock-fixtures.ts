@@ -48,6 +48,7 @@ import type {
   WebRemoteEndpoint,
   WebRemotePairingInfo,
   WebRemoteSessionView,
+  MobilePushDevice,
   WorkspaceSnapshot,
 } from "@/tauri/types";
 import { STRESS_THREAD_PREFIX, getStressFixture } from "./stress-fixture";
@@ -2830,6 +2831,32 @@ export function mockWebRemoteSessions(): WebRemoteSessionView[] {
       approved: false,
       connected: false,
       source: "pair",
+    },
+    {
+      id: "sess-pixel-app",
+      name: "Pixel 9",
+      user_agent: "CodemuxMobile/0.1.0 (android 16; Pixel 9)",
+      created_at: iso(26 * 60 * 60 * 1000),
+      last_seen_at: iso(9000),
+      approved: true,
+      connected: true,
+      source: "pair",
+    },
+  ];
+}
+
+/** The phone-app session above, registered for relay push. */
+export function mockPushDevices(): MobilePushDevice[] {
+  return [
+    {
+      session_id: "sess-pixel-app",
+      relay_url: "https://api.codemux.org/api/push",
+      device_id: "mock-device-pixel-0001",
+      platform: "android",
+      label: "Pixel 9",
+      categories: JSON.stringify({ attention: true, complete: true, failure: true, pr: true }),
+      created_at_ms: Date.now() - 26 * 60 * 60 * 1000,
+      updated_at_ms: Date.now() - 60 * 1000,
     },
   ];
 }

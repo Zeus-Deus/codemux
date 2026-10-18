@@ -3155,6 +3155,8 @@ fn build_core_app<R: tauri::Runtime>(
             worktree_cleanup::worktree_cleanup_scan,
             worktree_cleanup::worktree_cleanup_remove,
             worktree_cleanup::worktree_cleanup_set_auto,
+            // Phone-app sessions registered for push through the relay.
+            web_remote::native_push::web_remote_push_devices,
         ])
 }
 
