@@ -85,8 +85,12 @@ struct Live {
     /// Automatic resumes in a row behind a thread's current turn. Cleared by
     /// the user's next message.
     chain: HashMap<String, i64>,
-    /// Threads resumed this run whose resume turn has not ended yet.
+    /// Threads being resumed this run, from reopening the session until the
+    /// resume turn ends.
     resuming: HashSet<String>,
+    /// Threads whose provider started a fresh conversation while they were
+    /// being resumed.
+    lost: HashSet<String>,
     /// Chats the launch pass has taken but not decided yet. The user acting
     /// on one first (a send, a Stop) takes it out of the pass.
     candidates: HashSet<String>,
@@ -171,7 +175,9 @@ pub(crate) fn on_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEv
         ProviderRuntimeEvent::ResumeCursorUpdated { thread_id, resume_cursor }
             if resume_cursor.is_null() =>
         {
-            if live().resuming.remove(&thread_id.0) {
+            let mut live = live();
+            if live.resuming.remove(&thread_id.0) {
+                live.lost.insert(thread_id.0.clone());
                 eprintln!(
                     "[codemux::restart_resume] thread={} resumed without its conversation; \
                      saved queue stays manual",
@@ -245,6 +251,7 @@ pub(super) fn forget_stopped_thread<R: Runtime>(app: &AppHandle<R>, thread_id: &
     {
         let mut live = live();
         live.resuming.remove(thread_id);
+        live.lost.remove(thread_id);
         live.chain.remove(thread_id);
         live.candidates.remove(thread_id);
         live.draining.remove(thread_id);
@@ -435,22 +442,40 @@ async fn dispatch<R: Runtime>(
     row: &RestartResumeRecord,
 ) -> Result<(), String> {
     let thread_id = ThreadId(row.thread_id.clone());
-    // Reopen the original conversation first. The send path would quietly
-    // start a fresh one if it can't, and the note means nothing there.
-    super::agent_chat::ensure_live_session_mode(app, provider, &thread_id, true)
-        .await
-        .map_err(|error| format!("{CONVERSATION_LOST}: {error}"))?;
+    let abandon = || {
+        let mut live = live();
+        live.resuming.remove(&row.thread_id);
+        live.lost.remove(&row.thread_id);
+        live.chain.remove(&row.thread_id);
+    };
     {
         let mut live = live();
-        live.chain.insert(row.thread_id.clone(), row.chain + 1);
+        live.lost.remove(&row.thread_id);
+        // Watched from here on: a provider can fall back to a fresh
+        // conversation while the session is still reopening.
         live.resuming.insert(row.thread_id.clone());
+        live.chain.insert(row.thread_id.clone(), row.chain + 1);
+    }
+    // Reopen the original conversation first. The send path would quietly
+    // start a fresh one if it can't, and the note means nothing there.
+    let reopened = super::agent_chat::ensure_live_session_mode(app, provider, &thread_id, true).await;
+    let lost = live().lost.remove(&row.thread_id);
+    if let Err(error) = reopened {
+        abandon();
+        return Err(format!("{CONVERSATION_LOST}: {error}"));
+    }
+    if lost {
+        abandon();
+        return Err(format!("{CONVERSATION_LOST}: the provider started a fresh one"));
+    }
+    if super::queued_turns::exiting() {
+        abandon();
+        return Err("the app is quitting".into());
     }
     let input = queued_turn(thread_id, resume_note(row.quit_at_ms.is_some()));
     let result = send_turn_with_origin(app.clone(), provider, input, TurnOrigin::RestartResume).await;
     if result.is_err() {
-        let mut live = live();
-        live.resuming.remove(&row.thread_id);
-        live.chain.remove(&row.thread_id);
+        abandon();
     }
     result.map(drop)
 }
@@ -528,7 +553,11 @@ async fn resume_after_restart<R: Runtime>(
 /// A Stop on the chat ends the drain before its next send, and the first
 /// failure ends it too; what is left stays saved.
 async fn drain_saved_queue<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId, token: u64) {
-    let cancelled = || live().draining.get(&thread_id.0) != Some(&token);
+    // A quit also ends it: a send accepted now would leave its row neither
+    // saved nor recorded as running for the next launch.
+    let cancelled = || {
+        super::queued_turns::exiting() || live().draining.get(&thread_id.0) != Some(&token)
+    };
     let finish = || {
         let mut live = live();
         if live.draining.get(&thread_id.0) == Some(&token) {

@@ -668,3 +668,33 @@ async fn a_resume_that_fell_back_to_a_fresh_conversation_keeps_the_queue_manual(
     assert_eq!(h.sent("rr-fresh").len(), 1);
     assert_eq!(h.db().list_queued_turns("rr-fresh").len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_conversation_while_reopening_sends_nothing() {
+    let h = harness().await;
+    h.chat("rr-fresh-early");
+    h.saved("rr-fresh-early", "q-1", "saved");
+    h.running("rr-fresh-early", "turn-1");
+    let (entered, release) = h.provider.hold_next_start();
+    let pass = tokio::spawn({
+        let handle = h.handle();
+        async move { resume_after_restart_for_test(&handle, "launch-2").await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+    // The provider gives up on the saved conversation before any turn starts.
+    forward_event(
+        &h.handle(),
+        ProviderRuntimeEvent::ResumeCursorUpdated {
+            thread_id: ThreadId("rr-fresh-early".into()),
+            resume_cursor: serde_json::Value::Null,
+        },
+    );
+    release.notify_one();
+    let decisions = pass.await.unwrap();
+    assert_eq!(
+        decision(&decisions, "rr-fresh-early"),
+        Some(ResumeDecision::Skip(SkipReason::ConversationLost))
+    );
+    assert!(h.sent("rr-fresh-early").is_empty());
+    assert_eq!(h.db().list_queued_turns("rr-fresh-early").len(), 1);
+}

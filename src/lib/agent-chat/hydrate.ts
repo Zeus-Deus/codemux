@@ -445,8 +445,9 @@ function finalizeReplay(
  * `unconfirmed` — the call started, and whether it finished is unknown.
  *
  * With no run live, every such call is cut off. With one live, a call is
- * cut off only once a later user message started another turn; a message
- * steered into the call's own turn is no boundary.
+ * cut off only once the provider has produced output for a different turn
+ * after it. User bubbles prove nothing here: a steered message joins the
+ * running turn, and an optimistic one isn't confirmed yet.
  */
 function settleCutOffToolCalls(
   messages: ChatViewItem[],
@@ -454,20 +455,21 @@ function settleCutOffToolCalls(
   settledAt: number,
 ): ChatViewItem[] {
   let next = messages;
-  // Turns started by user messages after the current index, walking back.
-  const laterTurns = new Set<string | undefined>();
+  // Turns the provider produced output for after the current index.
+  const laterTurns = new Set<string>();
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
-    if (m.kind === "user_message" && !m.queued) {
-      laterTurns.add(m.turn_id ?? undefined);
-      continue;
+    if (m.kind === "tool_call" && m.status === "running") {
+      const turn = m.turn_id ?? "";
+      const superseded = [...laterTurns].some((t) => t !== turn);
+      if (!runLive || superseded) {
+        if (next === messages) next = messages.slice();
+        next[i] = { ...m, status: "unconfirmed", completed_at: settledAt };
+      }
     }
-    if (m.kind !== "tool_call" || m.status !== "running") continue;
-    const turn = m.turn_id ?? undefined;
-    const superseded = [...laterTurns].some((t) => t === undefined || t !== turn);
-    if (runLive && !superseded) continue;
-    if (next === messages) next = messages.slice();
-    next[i] = { ...m, status: "unconfirmed", completed_at: settledAt };
+    if (m.kind !== "user_message" && "turn_id" in m && typeof m.turn_id === "string" && m.turn_id) {
+      laterTurns.add(m.turn_id);
+    }
   }
   return next;
 }

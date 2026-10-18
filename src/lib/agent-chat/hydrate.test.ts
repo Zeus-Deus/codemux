@@ -9,7 +9,7 @@ import {
   replayPayloads,
   replayTimed,
 } from "./hydrate";
-import { applyEvent, createEmptyThreadState } from "./reducer";
+import { appendUserMessage, applyEvent, createEmptyThreadState } from "./reducer";
 import {
   findSubagentView,
   runningSubagentEntries,
@@ -279,6 +279,21 @@ describe("replayPayloads", () => {
       expect(status(state, "tu-1")).toBe("running");
     });
 
+    it("keeps a live turn's call running past an optimistic bubble", () => {
+      // The composer appends the bubble before the backend confirms it was
+      // queued or steered; a warm merge in that window must not settle.
+      const slice = appendUserMessage(
+        replayPayloads([user("run the tests"), toolUse("turn-1", "tu-1")], { runLive: true }),
+        "also lint",
+      );
+      const merged = applyReplayTail(slice, parseReplayPayloads([]), {
+        runLive: true,
+        previousUnsettled: slice.turnUnsettled,
+        provider: "claude",
+      });
+      expect(status(merged, "tu-1")).toBe("running");
+    });
+
     it("settles a cut-off turn's call on a live tail merge too", () => {
       const slice = replayPayloads([user("run the tests"), toolUse("turn-1", "tu-1")], {
         runLive: true,
@@ -288,12 +303,7 @@ describe("replayPayloads", () => {
       const merged = applyReplayTail(
         slice,
         parseReplayPayloads([
-          JSON.stringify({
-            type: "user_message",
-            thread_id: "t",
-            text: "[Resumed automatically after an app restart.]",
-            turn_id: "turn-2",
-          }),
+          user("[Resumed automatically after an app restart.]"),
           toolUse("turn-2", "tu-2"),
         ]),
         { runLive: true, previousUnsettled: slice.turnUnsettled, provider: "claude" },
