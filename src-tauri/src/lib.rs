@@ -97,6 +97,7 @@ pub mod utility_ai;
 // Opt-in cloud-push diagnostic tracing. Defines the crate-wide
 // `trace_cloud_push!` macro (gated on `CODEMUX_TRACE_CLOUD_PUSH`).
 pub mod trace;
+pub mod turn_diff;
 // WebKitGTK renderer transport + smooth-scrolling tuning (Linux). Also owns
 // the startup crash sentinel that picks the renderer flags for this process.
 pub mod webview_tuning;
@@ -3135,6 +3136,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::secrets_store,
             commands::secrets_list,
             commands::secrets_delete,
+            // Per-turn git diffs for agent chat.
+            commands::turn_diff::agent_chat_get_turn_diff,
         ])
 }
 

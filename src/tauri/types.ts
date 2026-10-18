@@ -1907,3 +1907,49 @@ export interface PrWatchStatus {
   created_at_ms: number;
   updated_at_ms: number;
 }
+
+export type TurnDiffChange =
+  | "added"
+  | "modified"
+  | "deleted"
+  | "renamed"
+  | "copied"
+  | "type_changed";
+
+/** Why a file in a turn diff carries no patch: a binary file, a file over
+ *  the per-file limit, or the turn's patch budget running out first. */
+export type TurnDiffPatchOmitted = "binary" | "too_large" | "budget";
+
+export interface TurnDiffFile {
+  /** Path after the turn, relative to the repository root. */
+  path: string;
+  /** Path before the turn, for renames and copies. */
+  old_path: string | null;
+  change: TurnDiffChange;
+  additions: number;
+  deletions: number;
+  binary: boolean;
+  /** This file's unified diff, starting at its `diff --git` header. */
+  patch: string | null;
+  patch_omitted: TurnDiffPatchOmitted | null;
+}
+
+/** What one agent turn changed: a git diff between worktree snapshots taken
+ *  right before and right after the turn. Untracked files are included;
+ *  ignored files are not. */
+export interface AgentChatTurnDiff {
+  thread_id: string;
+  turn_id: string;
+  /** `in_progress` while the turn runs; `files` is empty until it settles. */
+  status: "ready" | "in_progress";
+  repo_path: string;
+  before_commit: string;
+  after_commit: string | null;
+  /** Capped list; the counts below cover every changed file. */
+  files: TurnDiffFile[];
+  files_changed: number;
+  additions: number;
+  deletions: number;
+  /** Files were left out of `files` or lost their patch to the budget. */
+  truncated: boolean;
+}

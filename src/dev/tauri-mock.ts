@@ -5,7 +5,11 @@ import type {
   LocalChatSession,
   SecretMeta,
 } from "@/tauri/commands";
-import type { AgentChatProviderKind, ProjectScripts } from "@/tauri/types";
+import type {
+  AgentChatProviderKind,
+  AgentChatTurnDiff,
+  ProjectScripts,
+} from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
 /**
  * Dev-only Tauri runtime shim.
@@ -2350,6 +2354,83 @@ function mockChatTranscript(threadId = MOCK_CHAT_THREAD_ID): string[] {
 }
 
 let mockChatRevertCutoff: number | null = null;
+
+/** A settled turn's git diff for the mock chat: one edit, one new file and
+ *  one binary asset, so every file state renders. */
+function mockTurnDiff(threadId: string, turnId: string): AgentChatTurnDiff {
+  const files: AgentChatTurnDiff["files"] = [
+    {
+      path: "src/lib/format.ts",
+      old_path: null,
+      change: "modified",
+      additions: 3,
+      deletions: 1,
+      binary: false,
+      patch: [
+        "diff --git a/src/lib/format.ts b/src/lib/format.ts",
+        "index 3b18e51..a1f0c2d 100644",
+        "--- a/src/lib/format.ts",
+        "+++ b/src/lib/format.ts",
+        "@@ -1,4 +1,6 @@",
+        " export function formatBytes(bytes: number): string {",
+        "-  return `${bytes} B`;",
+        "+  if (bytes < 1024) return `${bytes} B`;",
+        "+  const kib = bytes / 1024;",
+        "+  return kib < 1024 ? `${kib.toFixed(1)} KiB` : `${(kib / 1024).toFixed(1)} MiB`;",
+        " }",
+        " ",
+        "",
+      ].join("\n"),
+      patch_omitted: null,
+    },
+    {
+      path: "src/lib/format.test.ts",
+      old_path: null,
+      change: "added",
+      additions: 5,
+      deletions: 0,
+      binary: false,
+      patch: [
+        "diff --git a/src/lib/format.test.ts b/src/lib/format.test.ts",
+        "new file mode 100644",
+        "index 0000000..9c2e4b1",
+        "--- /dev/null",
+        "+++ b/src/lib/format.test.ts",
+        "@@ -0,0 +1,5 @@",
+        '+import { formatBytes } from "./format";',
+        "+",
+        '+test("formats kibibytes", () => {',
+        '+  expect(formatBytes(2048)).toBe("2.0 KiB");',
+        "+});",
+        "",
+      ].join("\n"),
+      patch_omitted: null,
+    },
+    {
+      path: "docs/assets/size-chart.png",
+      old_path: null,
+      change: "added",
+      additions: 0,
+      deletions: 0,
+      binary: true,
+      patch: null,
+      patch_omitted: "binary",
+    },
+  ];
+  return {
+    thread_id: threadId,
+    turn_id: turnId,
+    status: "ready",
+    repo_path: `${MOCK_HOME_DIR}/projects/codemux`,
+    before_commit: "4f1c2a9e8b7d6c5b4a3928170615f4e3d2c1b0a9",
+    after_commit: "9a0b1c2d3e4f5061728394a5b6c7d8e9f0a1b2c3",
+    files,
+    files_changed: files.length,
+    additions: files.reduce((sum, file) => sum + file.additions, 0),
+    deletions: files.reduce((sum, file) => sum + file.deletions, 0),
+    truncated: false,
+  };
+}
 
 function mockTailTurnCheckpoint() {
   const clientNonce = "seed-nonce-subagents";
@@ -5858,6 +5939,10 @@ const handlers: Record<string, Handler> = {
     }
     return undefined;
   },
+  agent_chat_get_turn_diff: (a) =>
+    a.threadId === MOCK_CHAT_THREAD_ID
+      ? mockTurnDiff(String(a.threadId), String(a.turnId))
+      : null,
   grep_count_pattern: () => 0,
 
   // Clipboard-image paste fallback (agent-chat composer). The real

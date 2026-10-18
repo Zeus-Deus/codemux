@@ -9,6 +9,7 @@ pub mod custom_acp;
 pub(crate) mod local_sessions;
 mod delegation;
 pub mod pr_watch;
+pub mod turn_diffs;
 
 fn agent_chat_session(conn: &Connection, thread_id: &str) -> Option<AgentChatSessionRecord> {
         conn.query_row(
@@ -1169,6 +1170,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     follow_ups::create_schema(conn)?;
     pr_watch::create_schema(conn)?;
     automation_triggers::create_schema(conn)?;
+    turn_diffs::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new
