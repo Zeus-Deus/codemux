@@ -227,6 +227,55 @@ describe("replayPayloads", () => {
     });
   });
 
+  describe("tool calls a dead run left running", () => {
+    const toolUse = (turn: string, id: string) =>
+      event({
+        type: "item_completed",
+        thread_id: "t",
+        turn_id: turn,
+        item: { kind: "tool_use", tool_name: "Bash", input: { command: "npm test" }, tool_use_id: id },
+      });
+    const status = (state: ChatThreadState, id: string) => {
+      const call = state.messages.find((m) => m.kind === "tool_call" && m.tool_use_id === id);
+      return call?.kind === "tool_call" ? call.status : undefined;
+    };
+
+    it("settles a call cut off by a crash or quit as unconfirmed, not running", () => {
+      const state = replayPayloads([user("run the tests"), toolUse("turn-1", "tu-1")]);
+      expect(status(state, "tu-1")).toBe("unconfirmed");
+      expect(state.interrupted).toBe(true);
+    });
+
+    it("settles the cut-off turn's call when the resumed turn is the live one", () => {
+      const state = replayPayloads(
+        [
+          user("run the tests"),
+          toolUse("turn-1", "tu-1"),
+          user("[Resumed automatically after an app restart. Check the state first.]"),
+          toolUse("turn-2", "tu-2"),
+        ],
+        { runLive: true },
+      );
+      expect(status(state, "tu-1")).toBe("unconfirmed");
+      // The resumed turn is still executing its own call.
+      expect(status(state, "tu-2")).toBe("running");
+    });
+
+    it("leaves a finished call alone", () => {
+      const state = replayPayloads([
+        user("run the tests"),
+        toolUse("turn-1", "tu-1"),
+        event({
+          type: "item_completed",
+          thread_id: "t",
+          turn_id: "turn-1",
+          item: { kind: "tool_result", tool_use_id: "tu-1", content: "ok", is_error: false },
+        }),
+      ]);
+      expect(status(state, "tu-1")).toBe("done");
+    });
+  });
+
   it("links a permission_request to its tool_call by tool_use_id", () => {
     const state = replayPayloads([
       event({

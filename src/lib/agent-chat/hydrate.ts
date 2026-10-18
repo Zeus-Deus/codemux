@@ -393,6 +393,7 @@ function finalizeReplay(
   // the transcript from persisted rows alone, where a `running` snapshot
   // with no terminal successor genuinely means "never settled".)
   if (!skipSettlePasses) {
+    messages = settleCutOffToolCalls(messages, runLive, settledAt);
     messages = interruptRunningSubagents(messages, settledAt);
     messages = messages.map((m) =>
       m.kind === "workflow_run" && m.status === "running"
@@ -432,6 +433,40 @@ function finalizeReplay(
     // Transient — never persisted, so a hydrated thread always starts clear.
     stalled: null,
   };
+}
+
+/**
+ * Settle tool calls that a dead run left `running`: the process that ran
+ * them went with the session (a crash, a quit, a stopped provider), so no
+ * result will ever arrive and the row must not read as live. They become
+ * `unconfirmed` — the call started, and whether it finished is unknown.
+ *
+ * Calls before the transcript's last user turn are always cut off (a later
+ * turn started). Calls after it are cut off only when no run is live; with
+ * one live they belong to the turn still executing.
+ */
+function settleCutOffToolCalls(
+  messages: ChatViewItem[],
+  runLive: boolean,
+  settledAt: number,
+): ChatViewItem[] {
+  let lastUserTurn = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.kind === "user_message" && !m.queued) {
+      lastUserTurn = i;
+      break;
+    }
+  }
+  let next = messages;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.kind !== "tool_call" || m.status !== "running") continue;
+    if (runLive && i > lastUserTurn) continue;
+    if (next === messages) next = messages.slice();
+    next[i] = { ...m, status: "unconfirmed", completed_at: settledAt };
+  }
+  return next;
 }
 
 /**
