@@ -78,6 +78,10 @@ export function webhookEndpoints(
 ): WebRemoteEndpoint[] {
   return endpoints.filter((endpoint) => {
     if (!/^https?:\/\//.test(endpoint.url)) return false;
+    // The listener binds IPv4 (`0.0.0.0` or `127.0.0.1`); only the tailscale
+    // scope also binds the tailnet's own addresses, which may be IPv6.
+    const ipv6 = endpoint.host.includes(":");
+    if (ipv6 && !(bindScope === "tailscale" && endpoint.group === "tailscale")) return false;
     if (bindScope === "loopback") return endpoint.group === "this_device";
     if (bindScope === "tailscale") {
       return endpoint.group === "this_device" || endpoint.group === "tailscale";

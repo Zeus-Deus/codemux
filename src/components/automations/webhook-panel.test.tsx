@@ -163,7 +163,7 @@ describe("WebhookPanel", () => {
     const endpoint = (group: string, url: string) => ({
       kind: "lan",
       group,
-      host: url,
+      host: new URL(url).hostname.replace(/^\[|\]$/g, ""),
       port: 4377,
       url,
       secure: false,
@@ -175,6 +175,8 @@ describe("WebhookPanel", () => {
       endpoint("local_network", "http://192.168.1.20:4377"),
       endpoint("tailscale", "https://box.tail.ts.net"),
       endpoint("other", "iroh://node"),
+      endpoint("local_network", "http://[fe80::1]:4377"),
+      endpoint("tailscale", "http://[fd7a::5]:4377"),
     ];
     const urls = (scope?: "all" | "tailscale" | "loopback") =>
       webhookEndpoints(all, scope).map((e) => e.url);
@@ -184,7 +186,11 @@ describe("WebhookPanel", () => {
       "https://box.tail.ts.net",
     ]);
     expect(urls(undefined)).toEqual(urls("all"));
-    expect(urls("tailscale")).toEqual(["http://127.0.0.1:4377", "https://box.tail.ts.net"]);
+    expect(urls("tailscale")).toEqual([
+      "http://127.0.0.1:4377",
+      "https://box.tail.ts.net",
+      "http://[fd7a::5]:4377",
+    ]);
     expect(urls("loopback")).toEqual(["http://127.0.0.1:4377"]);
   });
 });

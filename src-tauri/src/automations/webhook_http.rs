@@ -9,16 +9,30 @@
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, State},
+    Extension,
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
 use serde_json::json;
-use tauri::{AppHandle, Manager, Runtime};
-use tokio::sync::Semaphore;
+use tauri::{AppHandle, Runtime};
+use tokio::sync::{watch, Semaphore};
 
 use super::webhook::{DeliveryRejection, WebhookRequest, MAX_WEBHOOK_BODY_BYTES};
+
+/// The shutdown flag of the listener that serves a request, attached by
+/// `web_remote::start_server`. `true` once that listener is stopped or
+/// replaced; graceful shutdown still lets in-flight requests finish, and
+/// those must not start runs.
+#[derive(Clone)]
+pub struct ListenerLife(pub watch::Receiver<bool>);
+
+impl ListenerLife {
+    fn live(&self) -> bool {
+        !*self.0.borrow()
+    }
+}
 
 /// Deliveries validated at once. Acceptance locks the database and may read
 /// the secrets key file, so it runs on the blocking pool, and this cap keeps
@@ -41,23 +55,18 @@ pub fn router<R: Runtime>() -> Router<AppHandle<R>> {
 
 async fn receive<R: Runtime>(
     State(app): State<AppHandle<R>>,
+    life: Option<Extension<ListenerLife>>,
     Path((webhook_id, token)): Path<(String, String)>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Graceful shutdown lets a request that was still uploading complete
-    // after Remote access is switched off; it must not start a run then.
-    let listening = app
-        .try_state::<crate::web_remote::WebRemoteState>()
-        .is_some_and(|state| state.lan_listening());
-    if !listening {
-        return respond(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({ "error": "Remote access is off" }),
-        );
-    }
+    // Without a live listener (stopped, rebound, or a router built without
+    // one) nothing may run.
+    let Some(Extension(life)) = life.filter(|Extension(life)| life.live()) else {
+        return listener_gone();
+    };
     let request = WebhookRequest::new(
         method.as_str(),
         uri.path(),
@@ -67,18 +76,30 @@ async fn receive<R: Runtime>(
             .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?))),
         body.to_vec(),
     );
-    let Ok(_permit) = ACCEPT_PERMITS.acquire().await else {
-        return respond(StatusCode::SERVICE_UNAVAILABLE, json!({ "error": "Shutting down" }));
+    let Ok(permit) = ACCEPT_PERMITS.acquire().await else {
+        return listener_gone();
     };
+    // The permit moves into the blocking task, so a sender that disconnects
+    // cannot free it while the work is still running.
     let dispatched = tauri::async_runtime::spawn_blocking(move || {
-        super::executor::dispatch_webhook(&app, &webhook_id, &token, &request)
+        let _permit = permit;
+        // Re-check after waiting for a permit: the listener may have been
+        // stopped meanwhile.
+        if !life.live() {
+            return None;
+        }
+        Some(super::executor::dispatch_webhook(&app, &webhook_id, &token, &request))
     })
     .await;
-    let Ok(dispatched) = dispatched else {
-        return respond(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": "Could not record the run" }),
-        );
+    let dispatched = match dispatched {
+        Ok(Some(dispatched)) => dispatched,
+        Ok(None) => return listener_gone(),
+        Err(_) => {
+            return respond(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": "Could not record the run" }),
+            )
+        }
     };
     match dispatched {
         Ok(accepted) => respond(
@@ -95,6 +116,10 @@ async fn receive<R: Runtime>(
             )
         }
     }
+}
+
+fn listener_gone() -> Response {
+    respond(StatusCode::SERVICE_UNAVAILABLE, json!({ "error": "Remote access is off" }))
 }
 
 /// HTTP status for each rejection. An unknown webhook and a wrong token
@@ -133,7 +158,12 @@ mod tests {
     use tauri::Manager;
     use tower::ServiceExt;
 
-    fn app_with_webhook() -> (tauri::App<tauri::test::MockRuntime>, String, String, i64) {
+    struct Harness {
+        app: tauri::App<tauri::test::MockRuntime>,
+        shutdown: watch::Sender<bool>,
+    }
+
+    fn app_with_webhook() -> (Harness, String, String, i64) {
         let app = tauri::test::mock_app();
         let db = crate::database::init_test_database();
         let automation = db
@@ -153,11 +183,8 @@ mod tests {
         // No project, so an accepted run fails fast at repo resolution and
         // never launches an agent.
         app.manage(db);
-        let remote = crate::web_remote::WebRemoteState::default();
-        remote.set_lan_listening_for_test(true);
-        app.manage(remote);
         (
-            app,
+            Harness { app, shutdown: watch::channel(false).0 },
             automation.webhook_id.unwrap(),
             automation.webhook_token.unwrap(),
             automation.id,
@@ -165,12 +192,13 @@ mod tests {
     }
 
     async fn post_to(
-        app: &tauri::App<tauri::test::MockRuntime>,
+        harness: &Harness,
         path: &str,
         body: Vec<u8>,
     ) -> (StatusCode, serde_json::Value) {
         let response = router::<tauri::test::MockRuntime>()
-            .with_state(app.handle().clone())
+            .layer(Extension(ListenerLife(harness.shutdown.subscribe())))
+            .with_state(harness.app.handle().clone())
             .oneshot(
                 Request::post(path)
                     .header("content-type", "application/json")
@@ -205,7 +233,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(body["missing"], serde_json::json!([]));
-        let runs = app.state::<DatabaseStore>().list_automation_runs(automation_id, 10);
+        let runs = app.app.state::<DatabaseStore>().list_automation_runs(automation_id, 10);
         assert_eq!(runs.len(), 1);
         assert_eq!(body["run_id"], runs[0].id);
         assert_eq!(runs[0].trigger_type, AutomationTrigger::Webhook);
@@ -214,7 +242,7 @@ mod tests {
     #[tokio::test]
     async fn a_paused_automation_answers_conflict_without_a_run() {
         let (app, id, token, automation_id) = app_with_webhook();
-        let db = app.state::<DatabaseStore>();
+        let db = app.app.state::<DatabaseStore>();
         db.set_automation_enabled(automation_id, false).unwrap();
         let (status, body) =
             post_to(&app, &format!("{WEBHOOK_PATH_PREFIX}/{id}/{token}"), b"{}".to_vec()).await;
@@ -226,12 +254,12 @@ mod tests {
     #[tokio::test]
     async fn nothing_runs_once_remote_access_is_off() {
         let (app, id, token, automation_id) = app_with_webhook();
-        app.state::<crate::web_remote::WebRemoteState>()
-            .set_lan_listening_for_test(false);
+        // The listener that serves the request has been stopped or replaced.
+        app.shutdown.send_replace(true);
         let (status, _) =
             post_to(&app, &format!("{WEBHOOK_PATH_PREFIX}/{id}/{token}"), b"{}".to_vec()).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(app.state::<DatabaseStore>().list_automation_runs(automation_id, 10).is_empty());
+        assert!(app.app.state::<DatabaseStore>().list_automation_runs(automation_id, 10).is_empty());
     }
 
     #[tokio::test]
@@ -244,7 +272,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-        let db = app.state::<DatabaseStore>();
+        let db = app.app.state::<DatabaseStore>();
         assert!(db.list_automation_runs(automation_id, 10).is_empty());
     }
 
