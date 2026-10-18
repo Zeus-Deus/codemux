@@ -703,10 +703,14 @@ fn is_busy(path: &Path, cwds: &[PathBuf]) -> bool {
 
 /// What still runs in `path`, if anything Codemux can see.
 fn activity(path: &Path, cwds: &[PathBuf]) -> Option<&'static str> {
+    // A plain workspace may run from a folder inside the worktree, so a
+    // hold anywhere under it counts.
+    let key = path_key(path);
     let stopping = STOPPING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains_key(&path_key(path));
+        .keys()
+        .any(|held| held.starts_with(&key));
     if stopping {
         Some("A chat that ran in it hasn't confirmed it stopped")
     } else if is_busy(path, cwds) {
@@ -1309,11 +1313,18 @@ mod tests {
     fn an_unconfirmed_chat_stop_holds_the_worktree() {
         let dir = tempfile::tempdir().unwrap();
         let key = path_key(dir.path());
+        let nested = key.join("src");
         STOPPING.lock().unwrap().insert(key.clone(), 1);
         let held = activity(dir.path(), &[]);
         STOPPING.lock().unwrap().remove(&key);
         assert!(held.is_some_and(|reason| reason.contains("chat")));
         assert_eq!(activity(dir.path(), &[]), None);
+
+        // A workspace that ran from a folder inside the worktree.
+        STOPPING.lock().unwrap().insert(nested.clone(), 1);
+        let held = activity(dir.path(), &[]);
+        STOPPING.lock().unwrap().remove(&nested);
+        assert!(held.is_some());
     }
 
     #[test]
