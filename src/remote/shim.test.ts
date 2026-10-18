@@ -112,8 +112,9 @@ describe("terminal attach serialization", () => {
     const b = internals().invoke("attach_pty_output", { sessionId: "b" });
     await flushMicrotasks();
     expect(attaches(ws)).toHaveLength(1);
-    // Other commands are not held behind the replay.
-    void internals().invoke("get_app_state", {});
+    // Other commands are not held behind the replay. Never answered, so
+    // closing the transport in teardown rejects it.
+    void internals().invoke("get_app_state", {}).catch(() => undefined);
     expect(ws.lastSent()).toMatchObject({ cmd: "get_app_state" });
 
     ws.recvText({ t: "ok", id: attaches(ws)[0].id, data: 1 });

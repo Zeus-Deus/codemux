@@ -14,6 +14,8 @@ export * from "./ui";
 export * as icons from "lucide-react";
 export { create } from "zustand";
 export { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+/** The engraved plates the empty sidebar draws, and the one it showed last. */
+export { PLATES, readLastPlate, type PlateEntry } from "@/lib/plates";
 
 export type {
   CodemuxPlugin,
@@ -26,6 +28,7 @@ export type { Contribution } from "@/contrib/types";
 export type { BundledPluginMeta } from "@/contrib/bundled";
 export type { PluginChatEvent } from "@/contrib/chat-events";
 export type { CompactionRefusal, CompactionRequestResult, ThreadStatus } from "@/contrib/ipc";
+export type { Host } from "./host";
 export type {
   ComposerActionData,
   ComposerApi,

@@ -3257,6 +3257,10 @@ pub enum TurnOrigin {
     Delegation,
     /// App-owned, correlated remote result; idle-only and non-interrupting.
     RemoteDelegation,
+    /// A watched pull request changed (`crate::pr_watch`). Not user
+    /// activity: it must not start a delegation round or forget a pending
+    /// usage resume, and it always queues behind a busy turn.
+    PrWatch,
 }
 
 /// The one send path behind [`agent_chat_send_turn`] and the usage-limit
@@ -3276,7 +3280,23 @@ pub async fn send_turn_with_origin<R: Runtime>(
     input: SendTurnCommandInput,
     origin: TurnOrigin,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
-    send_turn_internal(app, provider, input, origin, None).await
+    send_turn_internal(app, provider, input, origin, None, None).await
+}
+
+/// [`send_turn_with_origin`] for an app-owned sender that must know whether
+/// a failed send could have reached the provider. On `Err`, `reached` says
+/// whether the provider dispatch was attempted: `false` is a definite
+/// rejection the caller may retry without risking a duplicate turn.
+pub async fn send_turn_reporting_dispatch<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    input: SendTurnCommandInput,
+    origin: TurnOrigin,
+) -> Result<crate::agent_provider::TurnStartResult, (String, bool)> {
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    send_turn_internal(app, provider, input, origin, None, Some(reached.clone()))
+        .await
+        .map_err(|error| (error, reached.load(Ordering::SeqCst)))
 }
 
 pub async fn send_turn_with_control<R: Runtime>(
@@ -3285,7 +3305,7 @@ pub async fn send_turn_with_control<R: Runtime>(
     input: SendTurnCommandInput,
     control: Option<NativeControlGuard>,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
-    send_turn_internal(app, provider, input, TurnOrigin::User, control).await
+    send_turn_internal(app, provider, input, TurnOrigin::User, control, None).await
 }
 
 async fn send_turn_internal<R: Runtime>(
@@ -3294,6 +3314,7 @@ async fn send_turn_internal<R: Runtime>(
     mut input: SendTurnCommandInput,
     origin: TurnOrigin,
     control: Option<NativeControlGuard>,
+    dispatch_reached: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
     let native_gate = native_thread_gate(&app, &input.thread_id.0);
     let native_generation = native_gate.generation();
@@ -3628,6 +3649,9 @@ async fn send_turn_internal<R: Runtime>(
     ) {
         pending_send_images().lock().unwrap().remove(&pending_key);
         return Err(error);
+    }
+    if let Some(reached) = &dispatch_reached {
+        reached.store(true, Ordering::SeqCst);
     }
     let sent = match input.delivery {
         MessageDelivery::Steer => impl_.steer_turn(provider_input).await,

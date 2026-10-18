@@ -139,10 +139,41 @@ struct State {
     interrupted: bool,
     pending: HashMap<RequestId, Pending>,
     queued: VecDeque<Queued>,
+    /// Holds the queue after a user Stop until an explicit send.
+    queue_hold: crate::agent_provider::queue_hold::QueueHold,
     prose: String,
     thoughts: String,
     output_bytes: [usize; 2],
     tools: HashSet<String>,
+}
+impl State {
+    /// The next queued turn to dispatch, unless a user Stop holds the queue.
+    /// A released item settles in the worker, once its prompt is admitted.
+    fn next_queued(&mut self) -> Option<Queued> {
+        let front = self.queued.front().map(|queued| queued.id.as_str());
+        if !self.queue_hold.admits(front) {
+            return None;
+        }
+        self.queued.pop_front()
+    }
+}
+/// What a turn owes a Stop-held queue, settled when its prompt is admitted
+/// or abandoned before it.
+enum HoldClaim {
+    /// A queued item sent through the held queue.
+    Release(String),
+    /// A message sent by hand that lifted the hold.
+    Taken,
+}
+impl HoldClaim {
+    fn settle(self, hold: &mut crate::agent_provider::queue_hold::QueueHold, started: bool) {
+        match self {
+            Self::Release(id) => hold.settle(&id, started),
+            Self::Taken => {
+                hold.settle_take(true, started);
+            }
+        }
+    }
 }
 struct Session {
     thread: ThreadId,
@@ -498,6 +529,7 @@ impl Session {
                 interrupted: false,
                 pending: HashMap::new(),
                 queued: VecDeque::new(),
+                queue_hold: Default::default(),
                 prose: String::new(),
                 thoughts: String::new(),
                 output_bytes: [0; 2],
@@ -1603,10 +1635,18 @@ impl Session {
                     .clone()
                     .unwrap_or_else(|| input.text.clone()),
             });
-            s.queued.push_back(Queued {
+            let queued = Queued {
                 id: id.clone(),
                 input,
-            });
+            };
+            // Sent by hand while a Stop settles: it goes first and releases
+            // the held queue behind it once it starts.
+            if s.queue_hold.goes_first() {
+                s.queued.push_front(queued);
+                s.queue_hold.release_with(&id);
+            } else {
+                s.queued.push_back(queued);
+            }
             return Ok(TurnStartResult {
                 steered: false,
                 turn_id: TurnId(String::new()),
@@ -1616,11 +1656,14 @@ impl Session {
         let turn = TurnId(format!("acp-turn-{}", Uuid::new_v4()));
         s.active = Some(turn.clone());
         s.interrupted = false;
+        // A message sent by hand goes first; the held queue follows it once
+        // its prompt is admitted.
+        let claim = s.queue_hold.take().then_some(HoldClaim::Taken);
         drop(s);
         let session = self.clone();
         let worker_turn = turn.clone();
         tokio::spawn(async move {
-            session.worker(worker_turn, input).await;
+            session.worker(worker_turn, input, claim).await;
         });
         Ok(TurnStartResult {
             steered: false,
@@ -1649,7 +1692,14 @@ impl Session {
             cancelled.await;
         }
     }
-    async fn worker(self: Arc<Self>, mut turn: TurnId, mut input: SendTurnInput) {
+    /// `claim` is what this turn owes a Stop-held queue; it settles on
+    /// whether the prompt was admitted.
+    async fn worker(
+        self: Arc<Self>,
+        mut turn: TurnId,
+        mut input: SendTurnInput,
+        mut claim: Option<HoldClaim>,
+    ) {
         loop {
             if self.turn_admitted(&turn).await {
                 if let Some(checkpoint) = &input.turn_checkpoint {
@@ -1691,6 +1741,9 @@ impl Session {
                 }
                 Err(protocol("ACP turn configuration could not be applied"))
             } else {
+                if let Some(claim) = claim.take() {
+                    claim.settle(&mut self.state.lock().await.queue_hold, true);
+                }
                 self.status(SessionStatus::Running {
                     active_turn: turn.clone(),
                 })
@@ -1763,6 +1816,11 @@ impl Session {
                 }
             };
             drop(control);
+            // Cancelled or misconfigured before its prompt: the rest of a held
+            // queue stays held.
+            if let Some(claim) = claim.take() {
+                claim.settle(&mut self.state.lock().await.queue_hold, false);
+            }
             // The pinned request is now dropped; teardown cannot deadlock on
             // the stdin writer mutex held by an unpolled request future.
             #[cfg(test)]
@@ -1829,14 +1887,14 @@ impl Session {
                 thread_id: self.thread.clone(),
                 status: SessionStatus::Ready,
             });
-            let next = state.queued.pop_front();
+            let next = state.next_queued();
             if let Some(queued) = next {
                 turn = TurnId(format!("acp-turn-{}", Uuid::new_v4()));
                 state.active = Some(turn.clone());
                 self.emit(ProviderRuntimeEvent::QueuedTurnDispatched {
                     steered: false,
                     thread_id: self.thread.clone(),
-                    queued_id: queued.id,
+                    queued_id: queued.id.clone(),
                     turn_id: turn.clone(),
                     text: queued
                         .input
@@ -1845,6 +1903,7 @@ impl Session {
                         .unwrap_or_else(|| queued.input.text.clone()),
                 });
                 input = queued.input;
+                claim = Some(HoldClaim::Release(queued.id));
                 drop(state);
             } else {
                 return;
@@ -1964,7 +2023,13 @@ impl AgentProvider for GenericAcpProvider {
         thread: ThreadId,
         turn: Option<TurnId>,
     ) -> Result<(), ProviderError> {
-        self.session(&thread).await?.interrupt(turn).await
+        let session = self.session(&thread).await?;
+        // A blanket Stop is the user's Stop button: hold the queue rather
+        // than dispatch the next message the moment this turn settles.
+        if turn.is_none() {
+            session.state.lock().await.queue_hold.hold();
+        }
+        session.interrupt(turn).await
     }
     async fn respond_to_request(
         &self,
@@ -2046,17 +2111,43 @@ impl AgentProvider for GenericAcpProvider {
         id: String,
     ) -> Result<(), ProviderError> {
         let session = self.session(&thread).await?;
-        let turn = {
-            let mut s = session.state.lock().await;
-            if let Some(index) = s.queued.iter().position(|q| q.id == id) {
-                let queued = s.queued.remove(index).unwrap();
-                s.queued.push_front(queued);
-                s.active.clone()
-            } else {
-                return Ok(());
-            }
+        let mut s = session.state.lock().await;
+        let Some(index) = s.queued.iter().position(|q| q.id == id) else {
+            return Ok(());
         };
-        session.interrupt(turn).await
+        let queued = s.queued.remove(index).unwrap();
+        if s.active.is_some() {
+            // The promoted item goes through a held queue; the hold lifts
+            // once it dispatches.
+            s.queue_hold.release_with(&id);
+            s.queued.push_front(queued);
+            let turn = s.active.clone();
+            drop(s);
+            // A failed interrupt leaves the item first in line, released, so
+            // it still goes first once the running turn ends.
+            return session.interrupt(turn).await;
+        }
+        // Idle with a queue only happens while a Stop holds it, so nothing
+        // will drain this item: dispatch it as the worker would. The hold
+        // lifts once its prompt is admitted.
+        s.queue_hold.release_with(&id);
+        let turn = TurnId(format!("acp-turn-{}", Uuid::new_v4()));
+        s.active = Some(turn.clone());
+        s.interrupted = false;
+        session.emit(ProviderRuntimeEvent::QueuedTurnDispatched {
+            steered: false,
+            thread_id: thread,
+            queued_id: queued.id,
+            turn_id: turn.clone(),
+            text: queued
+                .input
+                .display_text
+                .clone()
+                .unwrap_or_else(|| queued.input.text.clone()),
+        });
+        drop(s);
+        tokio::spawn(session.clone().worker(turn, queued.input, Some(HoldClaim::Release(id))));
+        Ok(())
     }
     fn event_stream(&self) -> ProviderEventStream {
         crate::agent_provider::provider::broadcast_event_stream(&self.inner.events, self.kind())

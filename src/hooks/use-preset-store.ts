@@ -17,12 +17,27 @@ export function usePresetStore(): PresetStoreSnapshot | null {
   );
 
   useEffect(() => {
+    let cancelled = false;
+    let sawLiveUpdate = false;
+    let unlisten: (() => void) | undefined;
     getPresets()
-      .then((s) => setPresetStore(s))
+      .then((snapshot) => {
+        if (!cancelled && !sawLiveUpdate) setPresetStore(snapshot);
+      })
       .catch(console.error);
-    const unlisten = onPresetsChanged((snapshot) => setPresetStore(snapshot));
+    void onPresetsChanged((snapshot) => {
+      if (cancelled) return;
+      sawLiveUpdate = true;
+      setPresetStore(snapshot);
+    })
+      .then((dispose) => {
+        if (cancelled) dispose();
+        else unlisten = dispose;
+      })
+      .catch(console.error);
     return () => {
-      unlisten.then((fn) => fn());
+      cancelled = true;
+      unlisten?.();
     };
   }, []);
 

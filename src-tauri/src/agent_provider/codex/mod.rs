@@ -374,6 +374,11 @@ impl AgentProvider for CodexAgentProvider {
             sessions.get(&thread_id).cloned()
         };
         let session = session.ok_or(ProviderError::SessionNotFound { thread_id })?;
+        // A blanket Stop is the user's Stop button: hold the queue rather
+        // than dispatch the next message the moment this turn settles.
+        if turn_id.is_none() {
+            session.hold_queue().await;
+        }
         session.interrupt_turn(turn_id).await
     }
 

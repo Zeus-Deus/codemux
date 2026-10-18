@@ -1234,6 +1234,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_attach_to_exited_session_replays_only_to_that_client() {
+        use super::*;
+
+        let (state, session) = output_test_session(8).await;
+        publish_test_output(&session, b"history").await;
+        let mut existing = HashMap::new();
+        handle_request(
+            ClientRequest::Attach {
+                request_id: 1,
+                session_id: session.session_id.clone(),
+            },
+            state.clone(),
+            &mut existing,
+        )
+        .await;
+        let existing = existing.get_mut(&session.session_id).unwrap();
+        existing.backlog.clear();
+
+        *session.exit_code.lock().await = Some(17);
+        let mut late = HashMap::new();
+        let response = handle_request(
+            ClientRequest::Attach {
+                request_id: 2,
+                session_id: session.session_id.clone(),
+            },
+            state,
+            &mut late,
+        )
+        .await;
+        assert!(matches!(response, ServerResponse::Attached { .. }));
+        let late = late.get_mut(&session.session_id).unwrap();
+        assert!(matches!(
+            late.backlog.pop_front(),
+            Some(SessionFrame::Output(data)) if data == b"history"
+        ));
+        assert!(matches!(late.backlog.pop_front(), Some(SessionFrame::Exited(17))));
+        // The late attach must not re-send scrollback or the exit to a viewer
+        // that is already attached.
+        assert!(matches!(
+            existing.rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn daemon_write_reports_flush_failure() {
         use super::*;
 

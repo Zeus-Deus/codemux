@@ -87,7 +87,7 @@ import {
   META_CLUSTER_MIN_WIDTH,
   metaClusterWidth,
 } from "./sidebar-inbox-card";
-import { activateWorkspace } from "@/tauri/commands";
+import { activateWorkspace, getGithubIssue } from "@/tauri/commands";
 import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
 
 const HOUR = 3_600_000;
@@ -163,6 +163,7 @@ function metaLine(container: HTMLElement) {
 
 beforeEach(() => {
   vi.mocked(activateWorkspace).mockClear();
+  vi.mocked(getGithubIssue).mockClear();
   hosts = [];
   useSidebarDensityStore.setState({
     statusSince: {},
@@ -886,6 +887,50 @@ describe("SidebarInboxCard — device label", () => {
     const { container } = renderCard();
     expect(screen.queryByRole("img", { name: /^Runs on/ })).toBeNull();
     expect(metaLine(container).firstElementChild).toHaveTextContent("main");
+  });
+});
+
+describe("SidebarInboxCard — another machine's workspace", () => {
+  const machine = { name: "ai-node", live: true };
+
+  it("marks the card with the machine glyph and names it in the tooltip", () => {
+    const { container } = renderCard({ machine });
+    const marker = within(metaLine(container)).getByRole("img", { name: "Runs on ai-node" });
+    expect(marker).toHaveAttribute("title", "Runs on ai-node");
+    expect(marker).not.toHaveTextContent("ai-node");
+  });
+
+  it("says when the machine is offline", () => {
+    renderCard({ machine: { name: "studio", live: false } });
+    expect(screen.getByRole("img", { name: "Runs on studio (offline)" })).toBeInTheDocument();
+  });
+
+  it("offers no local lifecycle actions and does not open locally", async () => {
+    const { props, card } = renderCard({ machine, status: "review" });
+    expect(screen.queryByRole("button", { name: /^Settle/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Pin/ })).toBeNull();
+    expect(within(card).getByText("Done · review")).toBeInTheDocument();
+    await userEvent.click(card);
+    expect(props.onSelect).not.toHaveBeenCalled();
+    expect(activateWorkspace).not.toHaveBeenCalled();
+  });
+
+  // The local backend cannot resolve another machine's workspace id, so the
+  // linked-issue chip must not open the popover that looks the issue up.
+  it("shows the linked issue without asking the local backend for it", async () => {
+    renderCard({
+      machine,
+      workspace: makeWorkspace({
+        workspace_id: "device-2/ws-1",
+        linked_issue: { number: 42, title: "Fix it", state: "Open", labels: [] },
+      }),
+    });
+
+    const chip = screen.getByText("#42");
+    expect(chip.closest("button")).toBeNull();
+    await userEvent.click(chip);
+    expect(getGithubIssue).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("issue-detail-content")).toBeNull();
   });
 });
 

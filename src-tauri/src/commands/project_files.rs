@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
@@ -80,8 +80,46 @@ struct CacheEntry {
     scanned_at: Instant,
 }
 
-static CACHE: LazyLock<Mutex<HashMap<PathBuf, CacheEntry>>> =
+type CacheSlot = OnceLock<Arc<CacheEntry>>;
+
+static CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<CacheSlot>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cached_project(cwd: &Path) -> Arc<CacheEntry> {
+    cached_project_with(cwd, walk_project)
+}
+
+fn cached_project_with(cwd: &Path, walk: impl FnOnce(&Path) -> CacheEntry) -> Arc<CacheEntry> {
+    let slot = {
+        let mut cache = CACHE.lock().unwrap();
+        // An uninitialized slot already owns this folder's in-flight walk.
+        // Expired initialized slots are replaced atomically by a new generation.
+        if let Some(slot) = cache
+            .get(cwd)
+            .filter(|slot| {
+                slot.get()
+                    .is_none_or(|entry| entry.scanned_at.elapsed() < CACHE_TTL)
+            })
+            .cloned()
+        {
+            slot
+        } else {
+            cache.retain(|_, slot| {
+                Arc::strong_count(slot) > 1
+                    || slot
+                        .get()
+                        .is_some_and(|entry| entry.scanned_at.elapsed() < CACHE_TTL)
+            });
+            let slot = Arc::new(CacheSlot::new());
+            cache.insert(cwd.to_path_buf(), slot.clone());
+            slot
+        }
+    };
+
+    // Only callers for this folder wait on initialization. In-flight slots
+    // survive eviction, and old snapshot readers retain their immutable entry.
+    slot.get_or_init(|| Arc::new(walk(cwd))).clone()
+}
 
 /// List project files under `cwd`, fuzzy-ranked by `query` if present.
 ///
@@ -100,6 +138,16 @@ pub async fn list_project_files(
     query: Option<String>,
     limit: usize,
 ) -> Result<Vec<FileMatch>, String> {
+    tokio::task::spawn_blocking(move || list_project_files_blocking(cwd, query, limit))
+        .await
+        .map_err(|e| format!("list_project_files task join failed: {e}"))?
+}
+
+fn list_project_files_blocking(
+    cwd: String,
+    query: Option<String>,
+    limit: usize,
+) -> Result<Vec<FileMatch>, String> {
     let cwd_path = Path::new(&cwd);
     if !cwd_path.is_dir() {
         return Ok(Vec::new());
@@ -112,22 +160,9 @@ pub async fn list_project_files(
         return Ok(Vec::new());
     }
 
-    // The walker holds the lock briefly to read or repopulate the
-    // cache. The fuzzy match runs on the cloned inner Vecs so other
-    // callers don't block on I/O for the rare cache-miss path.
-    let (paths, absolute) = {
-        let mut cache = CACHE.lock().unwrap();
-        let needs_refresh = cache
-            .get(&canonical_cwd)
-            .map(|e| e.scanned_at.elapsed() >= CACHE_TTL)
-            .unwrap_or(true);
-        if needs_refresh {
-            let entry = walk_project(&canonical_cwd);
-            cache.insert(canonical_cwd.clone(), entry);
-        }
-        let entry = cache.get(&canonical_cwd).unwrap();
-        (entry.paths.clone(), entry.absolute.clone())
-    };
+    let entry = cached_project(&canonical_cwd);
+    let paths = &entry.paths;
+    let absolute = &entry.absolute;
 
     let trimmed_query = query.as_deref().map(str::trim).unwrap_or("");
 
@@ -252,6 +287,16 @@ pub async fn list_project_folders(
     query: Option<String>,
     limit: usize,
 ) -> Result<Vec<FolderMatch>, String> {
+    tokio::task::spawn_blocking(move || list_project_folders_blocking(cwd, query, limit))
+        .await
+        .map_err(|e| format!("list_project_folders task join failed: {e}"))?
+}
+
+fn list_project_folders_blocking(
+    cwd: String,
+    query: Option<String>,
+    limit: usize,
+) -> Result<Vec<FolderMatch>, String> {
     let cwd_path = Path::new(&cwd);
     if !cwd_path.is_dir() {
         return Ok(Vec::new());
@@ -267,18 +312,8 @@ pub async fn list_project_folders(
     // Reuse the same cache the file walker maintains. If absent, walk
     // once now — single source of truth means folder ↔ file lists
     // never drift.
-    let paths = {
-        let mut cache = CACHE.lock().unwrap();
-        let needs_refresh = cache
-            .get(&canonical_cwd)
-            .map(|e| e.scanned_at.elapsed() >= CACHE_TTL)
-            .unwrap_or(true);
-        if needs_refresh {
-            let entry = walk_project(&canonical_cwd);
-            cache.insert(canonical_cwd.clone(), entry);
-        }
-        cache.get(&canonical_cwd).unwrap().paths.clone()
-    };
+    let entry = cached_project(&canonical_cwd);
+    let paths = &entry.paths;
 
     // Derive directory prefixes + immediate-children counts from the
     // cached file list. Walking the path components builds every
@@ -286,7 +321,7 @@ pub async fn list_project_folders(
     // counting paths whose parent equals each candidate dir.
     let mut item_counts: HashMap<String, usize> = HashMap::new();
     let mut dirs: HashSet<String> = HashSet::new();
-    for rel in &paths {
+    for rel in paths {
         let mut current = String::new();
         let segments: Vec<&str> = rel.split('/').collect();
         // Every prefix except the last (which is the file itself) is
@@ -325,9 +360,6 @@ pub async fn list_project_folders(
         if dir == parent {
             continue; // skip self-reference (the root entry)
         }
-        if !dirs.contains(parent) && !parent.is_empty() {
-            // Dir's parent isn't yet a known directory entry; still count it.
-        }
         *item_counts.entry(parent.to_string()).or_insert(0) += 1;
     }
 
@@ -337,9 +369,8 @@ pub async fn list_project_folders(
     // Skip the empty-string root entry from the surfaced list — users
     // typically don't want to "attach the project root" via a popup
     // pick (they'd just message the agent without an attachment).
-    let candidate_dirs: Vec<String> = dirs.into_iter().filter(|d| !d.is_empty()).collect();
-    let mut sorted_dirs = candidate_dirs.clone();
-    sorted_dirs.sort();
+    let mut candidate_dirs: Vec<String> = dirs.into_iter().filter(|d| !d.is_empty()).collect();
+    candidate_dirs.sort();
 
     let make_match = |dir: &str, score: u32| -> FolderMatch {
         let abs = canonical_cwd.join(dir).to_string_lossy().to_string();
@@ -352,7 +383,7 @@ pub async fn list_project_folders(
     };
 
     if trimmed_query.is_empty() {
-        return Ok(sorted_dirs
+        return Ok(candidate_dirs
             .iter()
             .take(limit)
             .map(|d| make_match(d, 0))
@@ -360,20 +391,11 @@ pub async fn list_project_folders(
     }
 
     let pattern = Pattern::parse(trimmed_query, CaseMatching::Smart, Normalization::Smart);
-    let dir_to_idx: HashMap<&str, usize> = candidate_dirs
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.as_str(), i))
-        .collect();
     let scored = pattern.match_list(candidate_dirs.iter().map(String::as_str), &mut matcher);
     let results: Vec<FolderMatch> = scored
         .into_iter()
         .take(limit)
-        .filter_map(|(matched_str, score)| {
-            dir_to_idx
-                .get(matched_str)
-                .map(|&i| make_match(&candidate_dirs[i], score))
-        })
+        .map(|(matched_str, score)| make_match(matched_str, score))
         .collect();
     Ok(results)
 }
@@ -397,6 +419,18 @@ pub struct FolderAttachmentInfo {
 /// and reports the true item count even when the tree is truncated.
 #[tauri::command]
 pub async fn read_folder_for_attachment(
+    absolute_path: String,
+    cwd: Option<String>,
+    max_depth: usize,
+) -> Result<FolderAttachmentInfo, String> {
+    tokio::task::spawn_blocking(move || {
+        read_folder_for_attachment_blocking(absolute_path, cwd, max_depth)
+    })
+    .await
+    .map_err(|e| format!("read_folder_for_attachment task join failed: {e}"))?
+}
+
+fn read_folder_for_attachment_blocking(
     absolute_path: String,
     cwd: Option<String>,
     max_depth: usize,
@@ -614,6 +648,15 @@ pub struct FileAttachmentInfo {
 /// the chip needs to render.
 #[tauri::command]
 pub async fn read_file_for_attachment(
+    absolute_path: String,
+    cwd: Option<String>,
+) -> Result<FileAttachmentInfo, String> {
+    tokio::task::spawn_blocking(move || read_file_for_attachment_blocking(absolute_path, cwd))
+        .await
+        .map_err(|e| format!("read_file_for_attachment task join failed: {e}"))?
+}
+
+fn read_file_for_attachment_blocking(
     absolute_path: String,
     cwd: Option<String>,
 ) -> Result<FileAttachmentInfo, String> {
@@ -842,6 +885,180 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    async fn assert_yields_while_cache_is_locked<F: std::future::Future>(future: F) -> F::Output {
+        use std::sync::mpsc;
+        use std::task::{Context, Waker};
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = CACHE.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            // Bound the old synchronous implementation's deadlock so a
+            // regression fails instead of hanging the test process.
+            let _ = release_rx.recv_timeout(Duration::from_secs(1));
+        });
+        locked_rx.recv().unwrap();
+
+        let mut future = std::pin::pin!(future);
+        let first_poll = future.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        let _ = release_tx.send(());
+        blocker.join().unwrap();
+        assert!(first_poll.is_pending(), "project filesystem work blocked the async executor");
+        future.await
+    }
+
+    #[tokio::test]
+    async fn file_listing_yields_instead_of_blocking_the_async_executor() {
+        let dir = tempdir().unwrap();
+        seed_project(dir.path());
+        let results = assert_yields_while_cache_is_locked(list_project_files(
+            dir.path().to_string_lossy().into_owned(), None, 100,
+        )).await.unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn folder_listing_yields_instead_of_blocking_the_async_executor() {
+        let dir = tempdir().unwrap();
+        seed_project(dir.path());
+        let results = assert_yields_while_cache_is_locked(list_project_folders(
+            dir.path().to_string_lossy().into_owned(), None, 100,
+        )).await.unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn cached_paths_are_shared_and_refresh_preserves_existing_readers() {
+        let dir = tempdir().unwrap();
+        seed_project(dir.path());
+        let cwd = dir.path().canonicalize().unwrap();
+        let first = cached_project(&cwd);
+        assert!(Arc::ptr_eq(&first, &cached_project(&cwd)));
+
+        let mut expired = walk_project(&cwd);
+        expired.scanned_at = Instant::now() - CACHE_TTL;
+        let expired = Arc::new(expired);
+        CACHE
+            .lock()
+            .unwrap()
+            .insert(cwd.clone(), Arc::new(CacheSlot::from(expired.clone())));
+        fs::write(cwd.join("new.txt"), "fresh").unwrap();
+
+        let other = tempdir().unwrap();
+        cached_project(other.path());
+        assert!(!CACHE.lock().unwrap().contains_key(&cwd));
+
+        let refreshed = cached_project(&cwd);
+        assert!(!Arc::ptr_eq(&expired, &refreshed));
+        assert!(!expired.paths.iter().any(|path| path == "new.txt"));
+        assert!(refreshed.paths.iter().any(|path| path == "new.txt"));
+        assert!(Arc::ptr_eq(&refreshed, &cached_project(&cwd)));
+    }
+
+    fn assert_concurrent_walks_share_one_entry(expired: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        let dir = tempdir().unwrap();
+        seed_project(dir.path());
+        let cwd = dir.path().canonicalize().unwrap();
+        if expired {
+            let mut entry = walk_project(&cwd);
+            entry.scanned_at = Instant::now() - CACHE_TTL;
+            CACHE
+                .lock()
+                .unwrap()
+                .insert(cwd.clone(), Arc::new(CacheSlot::from(Arc::new(entry))));
+        }
+        fs::write(cwd.join("fresh.txt"), "fresh generation").unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (walking_tx, walking_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_cwd = cwd.clone();
+        let first_calls = calls.clone();
+        let first = std::thread::spawn(move || {
+            cached_project_with(&first_cwd, |path| {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                let entry = walk_project(path);
+                walking_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                entry
+            })
+        });
+        walking_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second_cwd = cwd.clone();
+        let second_calls = calls.clone();
+        let second = std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            let entry = cached_project_with(&second_cwd, |path| {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                walk_project(path)
+            });
+            second_done_tx.send(()).unwrap();
+            entry
+        });
+        second_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        // Another directory must remain usable while the first directory's
+        // walk is paused, including when its cache entry is created now.
+        let unrelated = tempdir().unwrap();
+        fs::write(unrelated.path().join("other.txt"), "other project").unwrap();
+        let unrelated_cwd = unrelated.path().canonicalize().unwrap();
+        let (unrelated_tx, unrelated_rx) = mpsc::channel();
+        let other = std::thread::spawn(move || {
+            let entry = cached_project(&unrelated_cwd);
+            unrelated_tx
+                .send(entry.paths.iter().any(|path| path == "other.txt"))
+                .unwrap();
+        });
+        let unrelated_ready = unrelated_rx.recv_timeout(Duration::from_secs(2));
+        let second_finished_early = second_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+
+        // Release and join every worker before assertions so a failure never
+        // leaves a paused scanner or a cache lock behind for peer tests.
+        let _ = release_tx.send(());
+        let first_entry = first.join().unwrap();
+        let second_entry = second.join().unwrap();
+        other.join().unwrap();
+
+        assert_eq!(
+            unrelated_ready.unwrap(),
+            true,
+            "one folder blocked another folder's cache"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "each generation must perform exactly one walk"
+        );
+        assert!(
+            !second_finished_early,
+            "a concurrent caller started another walk"
+        );
+        assert!(Arc::ptr_eq(&first_entry, &second_entry));
+        assert!(first_entry.paths.iter().any(|path| path == "fresh.txt"));
+        assert!(Arc::ptr_eq(&first_entry, &cached_project(&cwd)));
+    }
+
+    #[test]
+    fn concurrent_cold_cache_requests_share_one_walk_without_blocking_other_projects() {
+        assert_concurrent_walks_share_one_entry(false);
+    }
+
+    #[test]
+    fn concurrent_expired_cache_requests_share_one_walk_without_blocking_other_projects() {
+        assert_concurrent_walks_share_one_entry(true);
+    }
 
     fn seed_project(root: &Path) {
         fs::create_dir_all(root.join("src/components/chat")).unwrap();

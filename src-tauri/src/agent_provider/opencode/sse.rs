@@ -316,9 +316,11 @@ async fn consume_stream(
         // Walk the buffer for complete events (record terminator is a
         // blank line — `\n\n`). Keep any trailing partial record in
         // the buffer for the next chunk.
-        while let Some(end) = find_record_end(&buffer) {
-            let record_bytes = buffer.drain(..end).collect::<Vec<u8>>();
-            let record = String::from_utf8_lossy(&record_bytes).into_owned();
+        let mut consumed = 0;
+        while let Some(length) = find_record_end(&buffer[consumed..]) {
+            let end = consumed + length;
+            let record = String::from_utf8_lossy(&buffer[consumed..end]);
+            consumed = end;
             if peer.api == super::api::OpenCodeApi::V2
                 && parse_sse_record(&record)
                     .and_then(|s| serde_json::from_str::<super::v2::Event>(&s).ok())
@@ -339,29 +341,30 @@ async fn consume_stream(
             }
             handle_record(&record, peer, event_tx).await;
         }
+        // Shift a partial trailing record once per network chunk instead of
+        // copying the remaining buffer for every complete event.
+        buffer.drain(..consumed);
     }
     // Stream closed: drain any final record without a trailing blank
     // line (some upstream tooling forgets that suffix).
     if !buffer.is_empty() {
-        let record = String::from_utf8_lossy(&buffer).into_owned();
+        let record = String::from_utf8_lossy(&buffer);
         handle_record(&record, peer, event_tx).await;
         buffer.clear();
     }
 }
 
-/// Find the byte index AFTER the first `\n\n` (or `\r\n\r\n`) record
-/// terminator. Returns `None` if the buffer does not yet contain a
-/// complete record.
+/// Find the earliest blank line, allowing LF and CRLF line endings to mix.
+/// Returns the byte index after its terminator, or `None` for a partial record.
 fn find_record_end(buffer: &[u8]) -> Option<usize> {
-    // Look for both `\n\n` and `\r\n\r\n`. SSE spec accepts both.
-    for (i, window) in buffer.windows(4).enumerate() {
-        if window == b"\r\n\r\n" {
-            return Some(i + 4);
-        }
-    }
-    for (i, window) in buffer.windows(2).enumerate() {
-        if window == b"\n\n" {
-            return Some(i + 2);
+    for (i, byte) in buffer.iter().enumerate() {
+        if *byte == b'\n' {
+            if buffer.get(i + 1) == Some(&b'\n') {
+                return Some(i + 2);
+            }
+            if buffer.get(i + 1) == Some(&b'\r') && buffer.get(i + 2) == Some(&b'\n') {
+                return Some(i + 3);
+            }
         }
     }
     None
@@ -782,9 +785,12 @@ async fn native_watermark(
     let mut buffer = Vec::new();
     while let Some(chunk) = stream.next().await {
         buffer.extend_from_slice(&chunk.map_err(|e| e.to_string())?);
-        while let Some(end) = find_record_end(&buffer) {
-            let record = buffer.drain(..end).collect::<Vec<_>>();
-            let Some(data) = parse_sse_record(&String::from_utf8_lossy(&record)) else {
+        let mut consumed = 0;
+        while let Some(length) = find_record_end(&buffer[consumed..]) {
+            let end = consumed + length;
+            let record = &buffer[consumed..end];
+            consumed = end;
+            let Some(data) = parse_sse_record(&String::from_utf8_lossy(record)) else {
                 continue;
             };
             let value: serde_json::Value =
@@ -801,6 +807,7 @@ async fn native_watermark(
                 .map(|seq| seq.as_u64().ok_or("invalid synced durable sequence".into()))
                 .transpose();
         }
+        buffer.drain(..consumed);
     }
     Err("native durable log was missing its synced marker".into())
 }
@@ -5517,6 +5524,51 @@ mod tests {
         let buf = b"data: foo\r\n\r\nrest";
         let end = find_record_end(buf).unwrap();
         assert_eq!(&buf[..end], b"data: foo\r\n\r\n");
+    }
+
+    #[test]
+    fn find_record_end_keeps_mixed_newline_records_separate() {
+        let mut buffer = b"data: first\n\ndata: second\r\n\r\n".to_vec();
+        let end = find_record_end(&buffer).unwrap();
+        let first = buffer.drain(..end).collect::<Vec<_>>();
+        assert_eq!(
+            parse_sse_record(std::str::from_utf8(&first).unwrap()).as_deref(),
+            Some("first")
+        );
+        let end = find_record_end(&buffer).unwrap();
+        assert_eq!(&buffer[..end], b"data: second\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn consume_stream_preserves_mixed_newline_events_and_final_partial_record() {
+        let mut server = mockito::Server::new_async().await;
+        let record = |text: &str| {
+            format!("data: {}", serde_json::json!({
+                "type":"message.part.delta",
+                "properties":{"sessionID":"s1","messageID":"m1","partID":"p1","field":"text","delta":text}
+            }))
+        };
+        let body = format!(
+            "{}\n\n{}\r\n\r\n{}",
+            record("first"), record("second"), record("last")
+        );
+        let feed = server.mock("GET", "/feed")
+            .with_status(200).with_body(body).create_async().await;
+        let response = reqwest::get(format!("{}/feed", server.url())).await.unwrap();
+        let peer = peer("s1");
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut attempt = 0;
+        consume_stream(response, &peer, &tx, &server.url(), "fixture", &mut attempt).await;
+        let text: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                ProviderRuntimeEvent::ContentDelta {
+                    delta: crate::agent_provider::ContentDelta::Text { text }, ..
+                } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, ["first", "second", "last"]);
+        feed.assert_async().await;
     }
 
     fn delta_event(session_id: &str) -> OpenCodeEvent {

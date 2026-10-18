@@ -69,6 +69,8 @@ interface Props {
   /** Derived agent status. Every caller — rail, inbox card, settled row —
    *  computes it from the live pane statuses; null means genuinely idle. */
   status: ActivePaneStatus | null;
+  /** Set for a workspace on another of the account's machines. */
+  deviceName?: string;
   children: React.ReactNode;
 }
 
@@ -110,6 +112,7 @@ export function WorkspaceHoverCard({
   workspace,
   repo,
   status,
+  deviceName,
   children,
 }: Props) {
   const groupActive = useHoverCardGroupActive();
@@ -253,6 +256,7 @@ export function WorkspaceHoverCard({
           workspace={workspace}
           repo={repo}
           status={status}
+          deviceName={deviceName}
         />
       </HoverCardContent>
     </HoverCard>
@@ -267,10 +271,13 @@ export function WorkspaceHoverCardBody({
   workspace,
   repo,
   status,
+  deviceName,
 }: {
   workspace: WorkspaceSnapshot;
   repo: HoverCardRepo;
   status: ActivePaneStatus | null;
+  /** The machine a workspace from another environment lives on. */
+  deviceName?: string;
 }) {
   const appearance = useProjectAppearance(repo.path);
   const homeDir = useHomeDir();
@@ -344,11 +351,12 @@ export function WorkspaceHoverCardBody({
   // `host_id` alone decides remote-ness. The hosts list loads asynchronously,
   // so a name may not be resolvable yet — fall back to a neutral label rather
   // than letting an unresolved lookup claim the workspace is local.
-  const isRemote = workspace.host_id != null;
+  const isRemote = deviceName != null || workspace.host_id != null;
   const host = isRemote
     ? (hosts.find((h) => h.id === workspace.host_id) ?? null)
     : null;
-  const location = isRemote ? (host?.name ?? "Another device") : "This device";
+  const location =
+    deviceName ?? (isRemote ? (host?.name ?? "Another device") : "This device");
 
   // The worktree checkout is the path the user actually works in; remote_cwd
   // is the real path on the host for an attach-in-place workspace.

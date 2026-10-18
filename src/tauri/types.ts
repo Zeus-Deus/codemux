@@ -1878,3 +1878,32 @@ export interface WebRemoteEndpoint {
   /** Short human hint for the settings UI. */
   label: string;
 }
+
+/** `active` is sweeping; `exhausted` stopped after its automatic attempts
+ *  (see `stop_reason`); `ended` stopped because the pull request was merged
+ *  or closed, or the chat or workspace went away. */
+export type PrWatchState = "active" | "exhausted" | "ended";
+
+/** A chat's watch on a pull request (`pr_watch_status`). */
+export interface PrWatchStatus {
+  thread_id: string;
+  workspace_id: string;
+  pr_number: number;
+  pr_url: string | null;
+  status: PrWatchState;
+  /** Automatic fix attempts (failing checks or a conflict) allowed. */
+  max_attempts: number;
+  /** Fix attempts spent since the checks were last all green. */
+  attempts: number;
+  /** Comment-only wakes since the head last moved. */
+  comment_streak: number;
+  head_sha: string | null;
+  last_checked_at_ms: number | null;
+  last_wake_at_ms: number | null;
+  /** e.g. "2 checks failed, 1 new comment". */
+  last_wake_summary: string | null;
+  last_error: string | null;
+  stop_reason: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}

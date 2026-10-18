@@ -8,6 +8,7 @@ pub mod acp;
 pub mod claude;
 pub mod codex;
 pub mod questions;
+pub(crate) mod queue_hold;
 pub use questions::{
     AnswerQuestionInput, QuestionDelivery, QuestionDeliveryError, QuestionResolution, UserQuestion,
     UserQuestionSet,

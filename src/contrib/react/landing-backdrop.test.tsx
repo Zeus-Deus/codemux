@@ -64,6 +64,25 @@ describe("LandingBackdropHost", () => {
     expect(container.firstElementChild?.tagName).toBe("MAIN");
   });
 
+  it("tells subscribers when the headline may have moved", () => {
+    let calls = 0;
+    function Backdrop({ onCalmChange }: LandingBackdropProps) {
+      useEffect(() => onCalmChange(() => (calls += 1)), [onCalmChange]);
+      return <canvas data-testid="calm-canvas" />;
+    }
+    let off = () => {};
+    act(() => {
+      off = registry.register({ id: "test:calm", area: LANDING_BACKDROP_AREA, render: Backdrop });
+    });
+    const { getByTestId } = render(<Landing />);
+    // Scroll events from inside the landing bubble to the host in capture.
+    fireEvent.scroll(getByTestId("landing"));
+    expect(calls).toBe(1);
+    act(() => off());
+    fireEvent.scroll(getByTestId("landing"));
+    expect(calls).toBe(1);
+  });
+
   it("keeps the landing alive when a backdrop or a pulse handler throws", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     function Broken({ onPulse }: LandingBackdropProps) {

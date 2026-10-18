@@ -112,6 +112,7 @@ pub mod web_remote;
 // Identity of this backend and native client connections to the account's
 // other Codemux backends (docs/plans/environments.md).
 pub mod environments;
+pub mod pr_watch;
 
 /// Which surface the app is booting. The GUI desktop build runs
 /// [`AppMode::Gui`] on Wry; the headless `codemux serve` daemon boots the
@@ -1513,6 +1514,10 @@ fn build_core_app<R: tauri::Runtime>(
                         // Delegation backstop: finalizes children whose turn
                         // end was lost and retries due result deliveries.
                         commands::delegation::spawn_sweep(registry_handle.clone());
+                        // Pull-request watches: wake linked chats when CI
+                        // fails or someone else comments. Started after the
+                        // providers so a wake can always be dispatched.
+                        pr_watch::spawn(registry_handle.clone());
                     });
                 }
             }
@@ -3119,6 +3124,11 @@ fn build_core_app<R: tauri::Runtime>(
             // VS Code Marketplace theme import (Settings → Theme).
             vscode_marketplace::vscode_marketplace_search,
             vscode_marketplace::vscode_marketplace_fetch_themes,
+            // A chat watches its pull request and wakes on CI failures,
+            // reviews and conflicts.
+            commands::pr_watch::pr_watch_start,
+            commands::pr_watch::pr_watch_stop,
+            commands::pr_watch::pr_watch_status,
         ])
 }
 

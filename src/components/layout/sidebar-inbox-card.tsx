@@ -169,6 +169,11 @@ interface Props {
    *  than the parent snapshot so the parent's own ticks never re-render this
    *  card. */
   parentTitle?: string | null;
+  /** Set for a workspace that lives on another of the account's machines. It
+   *  renders like any other card, marked with a machine glyph that names it
+   *  on hover. Lifecycle actions stay off until they can be routed to the
+   *  owning machine. */
+  machine?: { name: string; live: boolean } | null;
 }
 
 /** "from <parent>" line on a follow-up child's card. The card itself stays an
@@ -248,6 +253,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   onSelect,
   onMarkUnread,
   parentTitle = null,
+  machine = null,
 }: Props) {
   const appearance = useProjectAppearance(repo.path);
   const hosts = useHosts();
@@ -284,6 +290,9 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   };
 
   const handleActivate = () => {
+    // Opening another machine's workspace needs commands routed to it, which
+    // is the next layer of the environments work.
+    if (machine) return;
     activateWorkspaceInteraction(workspace.workspace_id).catch(console.error);
   };
 
@@ -296,6 +305,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   };
 
   const handleClick = (e: React.MouseEvent) => {
+    if (machine) return;
     const mode =
       e.metaKey || e.ctrlKey ? "toggle" : e.shiftKey ? "range" : null;
     if (mode) {
@@ -311,7 +321,13 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
     selectAndActivate();
   };
 
-  const deviceName = workspaceDeviceName(workspace.host_id, hosts);
+  const machineLabel = machine
+    ? machine.live
+      ? machine.name
+      : `${machine.name} (offline)`
+    : null;
+  const deviceName = machine?.name ?? workspaceDeviceName(workspace.host_id, hosts);
+  const deviceLabel = machineLabel ?? deviceName;
 
   const isWorking = status === "working";
   const isNeeds = status === "permission";
@@ -352,7 +368,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // workspace left babysitting CI is exactly the kind of thing a user parks.
   // Pinned cards are exempt: the pin is a visibility override that parking
   // would silently defeat.
-  const canSettle = !pinned && status !== "working" && status !== "permission";
+  const canSettle =
+    !machine && !pinned && status !== "working" && status !== "permission";
 
   // Snooze hides the card just as thoroughly as Settle does, so it rides the
   // same guardrail rather than restating it — a second copy of the condition
@@ -489,11 +506,34 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
               "opacity-70 group-hover/card:opacity-100 group-focus-within/card:opacity-100",
           )}
         >
-          <IssueDetailPopover
-            providerKind={workspace.provider_kind}
-            workspaceId={workspace.workspace_id}
-            issue={workspace.linked_issue}
-          />
+          {machine ? (
+            // The popover fetches issue details through this machine's
+            // backend, which does not know another machine's workspace, so
+            // a remote card shows the same mark as a static summary.
+            <span
+              data-linked-issue-summary
+              title={`#${workspace.linked_issue.number} ${workspace.linked_issue.title}`}
+              className="inline-flex shrink-0 items-center gap-1"
+            >
+              <span
+                className={cn(
+                  "size-1.5 rounded-full",
+                  workspace.linked_issue.state === "Open"
+                    ? "bg-success"
+                    : "bg-muted-foreground",
+                )}
+              />
+              <span className="tabular-nums text-caption">
+                #{workspace.linked_issue.number}
+              </span>
+            </span>
+          ) : (
+            <IssueDetailPopover
+              providerKind={workspace.provider_kind}
+              workspaceId={workspace.workspace_id}
+              issue={workspace.linked_issue}
+            />
+          )}
         </span>
       )}
     </div>
@@ -582,35 +622,9 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
     </span>
   );
 
-  return (
-    <WorkspaceInboxMenu
-      workspace={workspace}
-      repo={repo}
-      settleAction={
-        canSettle && !leaving
-          ? { kind: "settle", onAction: () => onSettle(workspace.workspace_id) }
-          : undefined
-      }
-      snoozeAction={
-        canSnooze && !leaving
-          ? {
-              kind: "snooze",
-              offered: true,
-              onSnooze: (until) => onSnooze(workspace.workspace_id, until),
-              // An active card can only defer, never wake — waking belongs to
-              // the snoozed row shape, which passes kind: "wake" instead.
-              onWake: () => {},
-            }
-          : undefined
-      }
-      unreadAction={
-        // Offering "Mark unread" on a card that already reads as unread would
-        // be a menu entry that visibly does nothing.
-        unread
-          ? undefined
-          : { onMarkUnread: () => onMarkUnread(workspace.workspace_id) }
-      }
-    >
+  // The animated wrapper, shared by both shapes below. Another machine's
+  // workspace gets no context menu: every entry acts on a local workspace.
+  const card = (
       <div
         className={cn(
           "overflow-hidden transition-[max-height,opacity] duration-250 ease-out",
@@ -643,7 +657,12 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
         {/* Hover details live on the inner card, not on the animation wrapper
             above — that wrapper is already the ContextMenuTrigger, and two
             `asChild` triggers must not compose onto the same node. */}
-        <WorkspaceHoverCard workspace={workspace} repo={repo} status={status}>
+        <WorkspaceHoverCard
+          workspace={workspace}
+          repo={repo}
+          status={status}
+          deviceName={machineLabel ?? undefined}
+        >
             <div
               role="button"
               tabIndex={0}
@@ -763,6 +782,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     the least discoverable thing the card can do. Snooze and
                     Settle ride the settle guardrail together, so a live or
                     blocked agent reveals a pin and nothing else. */}
+                {!machine && (
                 <span
                   className={cn(
                     "row-in shrink-0 items-center gap-[7px]",
@@ -868,6 +888,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     </button>
                   )}
                 </span>
+                )}
                 {stateCluster}
                 {/* The held-Alt jump hint belongs to the eyebrow's right-hand
                     readout, not to the card border. A quiet keycap here keeps
@@ -1053,8 +1074,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   {deviceName && (
                     <span
                       role="img"
-                      aria-label={`Runs on ${deviceName}`}
-                      title={`Runs on ${deviceName}`}
+                      aria-label={`Runs on ${deviceLabel}`}
+                      title={`Runs on ${deviceLabel}`}
                       className={cn(
                         "flex max-w-[72px] shrink-0 items-center gap-1 transition-colors duration-150",
                         visuallyReceded
@@ -1063,7 +1084,12 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       )}
                     >
                       <Server aria-hidden className="size-3 shrink-0" />
-                      <span className="min-w-0 truncate">{deviceName}</span>
+                      {/* Another environment's card marks itself with the
+                          glyph alone; the machine is named by the tooltip and
+                          the hover card, so the branch keeps its room. */}
+                      {!machine && (
+                        <span className="min-w-0 truncate">{deviceName}</span>
+                      )}
                     </span>
                   )}
                   {/* Long-running process. Distinct from the agent-state
@@ -1117,6 +1143,40 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
             </div>
         </WorkspaceHoverCard>
       </div>
+  );
+
+  if (machine) return card;
+
+  return (
+    <WorkspaceInboxMenu
+      workspace={workspace}
+      repo={repo}
+      settleAction={
+        canSettle && !leaving
+          ? { kind: "settle", onAction: () => onSettle(workspace.workspace_id) }
+          : undefined
+      }
+      snoozeAction={
+        canSnooze && !leaving
+          ? {
+              kind: "snooze",
+              offered: true,
+              onSnooze: (until) => onSnooze(workspace.workspace_id, until),
+              // An active card can only defer, never wake — waking belongs to
+              // the snoozed row shape, which passes kind: "wake" instead.
+              onWake: () => {},
+            }
+          : undefined
+      }
+      unreadAction={
+        // Offering "Mark unread" on a card that already reads as unread would
+        // be a menu entry that visibly does nothing.
+        unread
+          ? undefined
+          : { onMarkUnread: () => onMarkUnread(workspace.workspace_id) }
+      }
+    >
+      {card}
     </WorkspaceInboxMenu>
   );
 });

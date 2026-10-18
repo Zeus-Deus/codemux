@@ -45,6 +45,7 @@ import { createAgentConnectorMock } from "./agent-connector-mock";
 import { workflowMockHandlers } from "./workflow-mock";
 import { createCustomAcpMock } from "./custom-acp-mock";
 import { pluginMockHandlers } from "./plugin-mock";
+import { seedEnvironmentsFromSearch } from "./environments-mock";
 import {
   delegationScenarioFromSearch,
   mockDelegatedChild,
@@ -135,6 +136,7 @@ import type {
   CheckInfo,
   ChatModelInfo,
   FeatureFlags,
+  GitHubIssue,
   PaneStatus,
   PaneNodeSnapshot,
   PresetStoreSnapshot,
@@ -158,6 +160,7 @@ import type {
   WebRemoteSessionView,
   WebRemoteStatus,
   WorkspaceSnapshot,
+  PrWatchStatus,
 } from "@/tauri/types";
 
 console.log(
@@ -180,6 +183,7 @@ const MOCK_RECENT_PROJECTS = [
   { path: `${MOCK_HOME_DIR}/code/field-notes`, name: "field-notes", last_opened_at: "2026-10-03T16:40:00Z" },
   { path: `${MOCK_HOME_DIR}/code/api-gateway`, name: "api-gateway", last_opened_at: "2026-09-29T11:05:00Z" },
 ];
+seedEnvironmentsFromSearch(window.location.search);
 // `?mockScenario=delegation…`: the seeded chat starts empty, as a Claude chat
 // in Full access, and plays the delegation flow once its channel attaches.
 const delegationScenario = delegationScenarioFromSearch(window.location.search);
@@ -221,6 +225,38 @@ const PROVIDER_RUNTIME_COMMANDS = new Set([
 
 function findWorkspace(id: unknown): WorkspaceSnapshot | undefined {
   return appState.workspaces.find((w) => w.workspace_id === id);
+}
+
+function mockGithubIssue(linked: NonNullable<WorkspaceSnapshot["linked_issue"]>): GitHubIssue {
+  return {
+    ...linked,
+    assignees: ["mock-dev"],
+    url: `https://github.com/mock/repo/issues/${linked.number}`,
+    body:
+      "Seeded by the dev mock runtime so the issue-detail popover is " +
+      "fully exercisable in a plain browser.\n\nIn the real app this " +
+      "body comes from `gh issue view`.",
+    comments: [],
+    totalComments: 0,
+    updatedAt: null,
+  };
+}
+
+function mockGithubIssuesByPath(path: string, search: unknown): GitHubIssue[] {
+  const workspace = appState.workspaces.find((candidate) =>
+    candidate.cwd === path || candidate.worktree_path === path || candidate.project_root === path,
+  );
+  if (!workspace) return [];
+  const root = workspace.project_root ?? workspace.cwd;
+  const issues = new Map<number, GitHubIssue>();
+  for (const candidate of appState.workspaces) {
+    if ((candidate.project_root ?? candidate.cwd) !== root || !candidate.linked_issue) continue;
+    issues.set(candidate.linked_issue.number, mockGithubIssue(candidate.linked_issue));
+  }
+  const query = String(search ?? "").trim().replace(/^#/, "").toLowerCase();
+  return [...issues.values()].filter((issue) =>
+    !query || String(issue.number).includes(query) || issue.title.toLowerCase().includes(query),
+  );
 }
 
 function firstLeafPaneId(node: PaneNodeSnapshot): string | null {
@@ -4346,6 +4382,10 @@ function streamMockSideAnswer(sideId: string, question: string, first: boolean):
   }, at + 60));
 }
 
+// Pull-request watches by thread. In-memory only: the mock has no sweep,
+// so a watch stays `active` until stopped.
+const prWatches = new Map<string, PrWatchStatus>();
+
 const handlers: Record<string, Handler> = {
   follow_up_providers: () => [
     { id: "claude", label: "Claude", installed: true },
@@ -4357,6 +4397,10 @@ const handlers: Record<string, Handler> = {
   follow_up_merge_all: (a) => mockFollowUpMergeAll(a),
   ...customAcpMock.handlers,
   ...agentConnectorMock.handlers,
+  // Remote delegations start empty. These reads run for every chat pane;
+  // falling back to null would display an error in an otherwise healthy chat.
+  delegation_list: () => [],
+  delegation_grants: () => [],
   get_chatgpt_status: mockChatGptRead,
   get_local_workbench: () => mockLocalWorkbench,
   set_local_workbench: (a) => { mockLocalWorkbench = a.enabled === true; },
@@ -6106,21 +6150,18 @@ const handlers: Record<string, Handler> = {
   get_github_issue: (a) => {
     const linked = findWorkspace(a.workspaceId)?.linked_issue;
     if (!linked || linked.number !== (a.issueNumber as number)) return null;
-    return {
-      number: linked.number,
-      title: linked.title,
-      state: linked.state,
-      labels: linked.labels,
-      assignees: ["mock-dev"],
-      url: `https://github.com/mock/repo/issues/${linked.number}`,
-      body:
-        "Seeded by the dev mock runtime so the issue-detail popover is " +
-        "fully exercisable in a plain browser.\n\nIn the real app this " +
-        "body comes from `gh issue view`.",
-      comments: [],
-      totalComments: 0,
-      updatedAt: null,
-    };
+    return mockGithubIssue(linked);
+  },
+  list_github_issues: (a) => {
+    const workspace = findWorkspace(a.workspaceId);
+    return workspace ? mockGithubIssuesByPath(workspace.cwd, a.search) : [];
+  },
+  list_github_issues_by_path: (a) => mockGithubIssuesByPath(String(a.path ?? ""), a.search),
+  get_github_issue_by_path: (a) => {
+    const issue = mockGithubIssuesByPath(String(a.path ?? ""), undefined)
+      .find((candidate) => candidate.number === Number(a.issueNumber));
+    if (!issue) throw new Error("Issue not found in this mock repository");
+    return issue;
   },
   list_incoming_prs: () => [],
 
@@ -7582,6 +7623,15 @@ const handlers: Record<string, Handler> = {
    */
   create_tab: (a) => {
     const ws = findWorkspace(a.workspaceId);
+    if (ws && a.kind === "editor") {
+      const tabId = `tab-mock-editor-${++mockTabSeq}`;
+      replaceWorkspace(ws.workspace_id, () => ({
+        tabs: [...ws.tabs, { tab_id: tabId, kind: "editor", title: "Editor", surface_id: null, browser_id: null, icon: null }],
+        active_tab_id: tabId,
+      }));
+      emitAppState();
+      return tabId;
+    }
     if (!ws || a.kind !== "terminal") return `tab-mock-${Date.now()}`;
     const n = ++mockTabSeq;
     const paneId = `pane-mock-tab-${n}`;
@@ -8001,6 +8051,45 @@ const handlers: Record<string, Handler> = {
     emitAppState();
     return undefined;
   },
+  pr_watch_start: (a) => {
+    const threadId = a.threadId as string;
+    const workspace =
+      (threadId === MOCK_CHAT_THREAD_ID ? findWorkspace("ws-codemux-chat") : undefined) ??
+      findWorkspace(appState.active_workspace_id);
+    if (!workspace) return Promise.reject("The chat's workspace is not open");
+    const prNumber = (a.prNumber as number | null) ?? workspace.pr_number;
+    if (prNumber == null) return Promise.reject("This workspace has no linked pull request");
+    const now = Date.now();
+    const previous = prWatches.get(threadId);
+    const watch: PrWatchStatus = {
+      thread_id: threadId,
+      workspace_id: workspace.workspace_id,
+      pr_number: prNumber,
+      pr_url: workspace.pr_number === prNumber ? (workspace.pr_url ?? null) : null,
+      status: "active",
+      max_attempts: (a.maxAttempts as number | null) ?? 3,
+      attempts: 0,
+      comment_streak: 0,
+      head_sha: null,
+      last_checked_at_ms: null,
+      last_wake_at_ms: null,
+      last_wake_summary: null,
+      last_error: null,
+      stop_reason: null,
+      created_at_ms: previous?.created_at_ms ?? now,
+      updated_at_ms: now,
+    };
+    prWatches.set(threadId, watch);
+    emitEvent("pr-watch-changed", { thread_id: threadId, watch });
+    return watch;
+  },
+  pr_watch_stop: (a) => {
+    const threadId = a.threadId as string;
+    const removed = prWatches.delete(threadId);
+    if (removed) emitEvent("pr-watch-changed", { thread_id: threadId, watch: null });
+    return removed;
+  },
+  pr_watch_status: (a) => prWatches.get(a.threadId as string) ?? null,
 };
 
 // Archive entries whose (simulated) worktree is dirty: deleting them

@@ -76,16 +76,17 @@ export function shareStructural<T>(prev: T, next: T): T {
     const prevArr = prev as unknown[];
     const nextArr = next as unknown[];
     const len = nextArr.length;
-    const reconciled = new Array(len);
-    // Lengths must match for the whole array to be reusable; a length change
-    // guarantees the top-level array ref is new.
-    let allSame = prevArr.length === len;
+    // Most backend ticks are unchanged. Allocate a replacement only once a
+    // difference is found, retaining the already-reconciled prefix from prev.
+    let reconciled: unknown[] | null = prevArr.length === len ? null : new Array(len);
     for (let i = 0; i < len; i++) {
       const child = shareStructural(prevArr[i], nextArr[i]);
-      reconciled[i] = child;
-      if (allSame && !Object.is(child, prevArr[i])) allSame = false;
+      if (reconciled === null && !Object.is(child, prevArr[i])) {
+        reconciled = prevArr.slice(0, i);
+      }
+      if (reconciled !== null) reconciled[i] = child;
     }
-    return (allSame ? prev : (reconciled as unknown)) as T;
+    return (reconciled ?? prev) as T;
   }
 
   if (isPlainObject(next) && isPlainObject(prev)) {
@@ -93,21 +94,28 @@ export function shareStructural<T>(prev: T, next: T): T {
     const nextObj = next as Record<string, unknown>;
     const nextKeys = Object.keys(nextObj);
     const prevKeys = Object.keys(prevObj);
-    const reconciled: Record<string, unknown> = {};
-    // Identical key sets are required to reuse `prev`. Different key sets
-    // (optional-field presence differences, added/removed Record entries)
-    // force a new object.
-    let allSame = nextKeys.length === prevKeys.length;
-    for (const key of nextKeys) {
-      const child = shareStructural(prevObj[key], nextObj[key]);
-      reconciled[key] = child;
-      if (allSame) {
-        if (!(key in prevObj) || !Object.is(child, prevObj[key])) {
-          allSame = false;
+    const prototype = Object.getPrototypeOf(nextObj);
+    let reconciled: Record<string, unknown> | null =
+      nextKeys.length === prevKeys.length && Object.getPrototypeOf(prevObj) === prototype
+        ? null
+        : { ...nextObj };
+    for (let i = 0; i < nextKeys.length; i++) {
+      const key = nextKeys[i];
+      const hadKey = Object.prototype.hasOwnProperty.call(prevObj, key);
+      const child = hadKey ? shareStructural(prevObj[key], nextObj[key]) : nextObj[key];
+      if (reconciled === null && (!hadKey || !Object.is(child, prevObj[key]))) {
+        // Spread defines own data properties, including a literal __proto__
+        // key from JSON, rather than invoking Object.prototype's setter.
+        reconciled = { ...nextObj };
+        for (let j = 0; j < i; j++) {
+          const sharedKey = nextKeys[j];
+          reconciled[sharedKey] = prevObj[sharedKey];
         }
       }
+      if (reconciled !== null) reconciled[key] = child;
     }
-    return (allSame ? prev : (reconciled as unknown)) as T;
+    if (reconciled !== null && prototype === null) Object.setPrototypeOf(reconciled, null);
+    return (reconciled ?? prev) as T;
   }
 
   // Primitives, type mismatch, null, or non-plain objects → compare by

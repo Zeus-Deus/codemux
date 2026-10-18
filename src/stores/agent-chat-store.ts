@@ -562,6 +562,26 @@ function isSliceBusy(slice: ChatThreadSlice): boolean {
 }
 
 /**
+ * The composer draft after a queued turn is cancelled — by the user's Cancel
+ * button, a session error or close, or a failed dispatch. The text goes back
+ * into the draft so the user does not lose it; appended so several
+ * cancellations keep their queue order.
+ */
+function draftAfterQueuedCancel(
+  slice: ChatThreadSlice,
+  queuedId: string,
+): string {
+  const queued = slice.messages.find(
+    (m) => m.kind === "user_message" && m.queued?.queuedId === queuedId,
+  );
+  const text = queued?.kind === "user_message" ? queued.text : "";
+  if (!text.trim()) return slice.inputDraft;
+  return slice.inputDraft.trim().length > 0
+    ? `${slice.inputDraft}\n${text}`
+    : text;
+}
+
+/**
  * One provider event folded into one slice. Returns the SAME slice object
  * when nothing changed, which is what keeps `updateSlice` from cloning the
  * threads map (and, in a batch, what lets a no-op event drop out for free).
@@ -575,7 +595,10 @@ function reduceThreadEvent(
   // to interrupt_turn if the provider wants a specific turn.
   let activeTurnId = slice.activeTurnId;
   let resumeCursor = slice.resumeCursor;
-  if (event.type === "session_state_changed") {
+  let inputDraft = slice.inputDraft;
+  if (event.type === "queued_turn_cancelled") {
+    inputDraft = draftAfterQueuedCancel(slice, event.queued_id);
+  } else if (event.type === "session_state_changed") {
     if (event.status.status === "running") {
       activeTurnId = event.status.active_turn;
     } else if (
@@ -595,11 +618,12 @@ function reduceThreadEvent(
   if (
     applied === (slice as ChatThreadState) &&
     activeTurnId === slice.activeTurnId &&
-    resumeCursor === slice.resumeCursor
+    resumeCursor === slice.resumeCursor &&
+    inputDraft === slice.inputDraft
   ) {
     return slice;
   }
-  return { ...slice, ...applied, activeTurnId, resumeCursor };
+  return { ...slice, ...applied, activeTurnId, resumeCursor, inputDraft };
 }
 
 export const useAgentChatStore = create<AgentChatStore>((set) => ({

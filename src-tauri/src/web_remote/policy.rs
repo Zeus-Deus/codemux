@@ -12,6 +12,11 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "submit_pr_review"
             | "add_pr_inline_comment"
             | "submit_pr_review_with_comments"
+            // A paired client can already run the chat; watching only
+            // schedules turns that chat would get anyway.
+            | "pr_watch_start"
+            | "pr_watch_stop"
+            | "pr_watch_status"
             | "create_preset"
             | "update_preset"
             | "delete_preset"

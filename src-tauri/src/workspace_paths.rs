@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 /// else becomes `-`, then trim leading/trailing `-`. Shared by every path
 /// helper here so the layout is identical across push, pull, and adopt.
 fn sanitize_segment(s: &str) -> String {
-    s.chars()
+    let segment = s.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
                 c
@@ -23,7 +23,14 @@ fn sanitize_segment(s: &str) -> String {
         })
         .collect::<String>()
         .trim_matches('-')
-        .to_string()
+        .to_string();
+    // These are filesystem navigation components even though their
+    // characters otherwise belong to the allowed set.
+    if segment == "." || segment == ".." {
+        String::new()
+    } else {
+        segment
+    }
 }
 
 /// The project's worktree-tree directory component.
@@ -177,6 +184,20 @@ mod tests {
             p.to_string_lossy(),
             "~/.codemux/worktrees/workspace/main",
         );
+    }
+
+    #[test]
+    fn dot_segments_cannot_escape_the_workspace_directory() {
+        for segment in [".", "..", "--..--"] {
+            assert_eq!(
+                conventional_remote_path(segment, segment),
+                PathBuf::from("~/.codemux/worktrees/workspace/main"),
+            );
+            assert_eq!(
+                conventional_remote_root_path(segment),
+                PathBuf::from("~/.codemux/projects/workspace"),
+            );
+        }
     }
 
     #[test]
