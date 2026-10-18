@@ -3019,6 +3019,54 @@ async fn a_compaction_torn_down_keeps_its_output_hidden_and_its_queue_closed() {
     assert_eq!(provider.request_compaction(&id).await, Err("no_session"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torn_down_compaction_reports_compacting_until_its_child_is_reaped() {
+    // A fork reads `compacting` to wait out a compaction. Teardown marks the
+    // session dead before its child exits; the run may still write history
+    // until then, so the status must not vanish early.
+    let thread = "t-compact-draining";
+    let home = compaction_home(&[]);
+    let script = write_script(json!([
+        compaction_sdk(thread, 5, "send-turn",
+            json!({"type": "result", "subtype": "success", "num_turns": 1})),
+        compaction_sdk(thread, 5, "compact-idle",
+            json!({"type": "system", "subtype": "status", "status": "compacting"})),
+    ]));
+    let script_env = script.path.to_string_lossy().to_string();
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CLAUDE_SIDECAR_SCRIPT", &script_env),
+        ("FAKE_CLAUDE_LINGER_AFTER_EOF_MS", "1000"),
+    ]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    let id = ThreadId(thread.into());
+    provider.start_session(compaction_start(thread, &home)).await.unwrap();
+    assert!(provider.set_compaction_timeout_for_tests(&id, Duration::from_millis(200)).await);
+    let mut stream = provider.event_stream();
+    provider.send_turn(turn_input(thread, "big task")).await.unwrap();
+    wait_turn_completed(&mut stream).await;
+    provider.request_compaction(&id).await.expect("compaction starts");
+
+    let mut draining_seen = false;
+    let reaped = timeout(Duration::from_secs(10), async {
+        loop {
+            let dead = !provider.has_session(&id).await;
+            match provider.runtime_status(&id).await {
+                Some(status) if dead => {
+                    assert!(status.compacting, "{status:?}");
+                    draining_seen = true;
+                }
+                None if dead => return,
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(reaped.is_ok(), "the status never cleared after teardown");
+    assert!(draining_seen, "the status vanished before the child was reaped");
+    drop(script);
+}
+
 // ===========================================================================
 // Steering
 // ===========================================================================

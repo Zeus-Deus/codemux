@@ -450,7 +450,9 @@ impl AgentProvider for ClaudeAgentProvider {
         thread_id: &ThreadId,
     ) -> Option<crate::agent_provider::ThreadRuntimeStatus> {
         let session = self.sessions.read().await.get(thread_id).cloned()?;
-        if session.is_dead() {
+        // A dead session has no status, except while an abandoned
+        // compaction's child drains: it is still compacting until reaped.
+        if session.is_dead() && !session.compaction_draining().await {
             return None;
         }
         Some(session.runtime_status().await)

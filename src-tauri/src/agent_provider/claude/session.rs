@@ -121,6 +121,9 @@ pub(crate) struct IdleRun {
     /// The run outlived its timeout and is being stopped; the claim stays
     /// until that is confirmed (see `abandon_idle_compaction`).
     abandoning: bool,
+    /// The stop was never confirmed and the session is torn down, but its
+    /// child is not reaped yet, so the run may still write native history.
+    draining: bool,
 }
 
 /// What one sidecar notification means for an idle compaction that owned
@@ -780,6 +783,7 @@ impl ClaudeSession {
                 settled: false,
                 stopped: false,
                 abandoning: false,
+                draining: false,
             });
             // Announced with the claim, so no event of the run (which can
             // only start once the RPC below reaches the sidecar) can
@@ -931,6 +935,7 @@ impl ClaudeSession {
             // Under the lifecycle lock: from here the provider treats the
             // session as gone, and the app's next send rebuilds it.
             self.dead.store(true, Ordering::Relaxed);
+            run.draining = true;
             let settled = run.settled;
             run.settled = true;
             settled
@@ -942,7 +947,24 @@ impl ClaudeSession {
         // filter stays on while the child drains; the watchdog cancels the
         // queue when it exits, as for any dead sidecar.
         let _ = self.sidecar.shutdown().await;
+        if let Some(run) = self.state.lock().await.idle_compaction.as_mut() {
+            if run.id == id {
+                run.draining = false;
+            }
+        }
         self.cancel_all_queued().await;
+    }
+
+    /// Whether a compaction torn down by
+    /// [`abandon_idle_compaction`](Self::abandon_idle_compaction) may still
+    /// be writing: the session is already dead, but its child is not reaped
+    /// yet.
+    pub(crate) async fn compaction_draining(&self) -> bool {
+        self.state
+            .lock()
+            .await
+            .idle_compaction
+            .is_some_and(|run| run.draining)
     }
 
     /// Route the events of one notification that arrived while compaction
