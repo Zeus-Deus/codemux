@@ -64,6 +64,53 @@ describe("agent-chat-store", () => {
     resetStore();
   });
 
+  describe("queued turns cancelled by the backend", () => {
+    function queue(thread: string, queuedId: string, text: string) {
+      useAgentChatStore.getState().applyEvent(thread, {
+        type: "turn_queued",
+        thread_id: thread,
+        queued_id: queuedId,
+        client_nonce: null,
+        text,
+      });
+    }
+    function cancel(thread: string, queuedId: string) {
+      useAgentChatStore.getState().applyEvent(thread, {
+        type: "queued_turn_cancelled",
+        thread_id: thread,
+        queued_id: queuedId,
+      });
+    }
+
+    it("returns their text to the composer in queue order", () => {
+      resetStore();
+      const store = useAgentChatStore.getState();
+      store.ensureThread("t");
+      store.setInputDraft("t", "typed now");
+      queue("t", "q1", "first queued");
+      queue("t", "q2", "second queued");
+      // A session error cancels the whole queue.
+      cancel("t", "q1");
+      cancel("t", "q2");
+      const slice = useAgentChatStore.getState().threads.t;
+      expect(slice.inputDraft).toBe("typed now\nfirst queued\nsecond queued");
+      expect(
+        slice.messages.some((m) => m.kind === "user_message" && m.queued),
+      ).toBe(false);
+    });
+
+    it("leaves the draft alone for an unknown or already-dispatched id", () => {
+      resetStore();
+      const store = useAgentChatStore.getState();
+      store.ensureThread("t");
+      store.setInputDraft("t", "typed now");
+      cancel("t", "never-queued");
+      expect(useAgentChatStore.getState().threads.t.inputDraft).toBe(
+        "typed now",
+      );
+    });
+  });
+
   describe("ensureThread / emptySlice defaults", () => {
     it("seeds a fresh slice with effort=null and contextWindow=null", () => {
       useAgentChatStore.getState().ensureThread("t1");

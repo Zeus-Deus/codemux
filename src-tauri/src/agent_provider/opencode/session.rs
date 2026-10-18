@@ -202,6 +202,8 @@ pub struct OpenCodeSession {
     ready: tokio::sync::watch::Receiver<bool>,
     outbound: Mutex<()>,
     queued: Mutex<VecDeque<(String, crate::agent_provider::SendTurnInput)>>,
+    /// Holds the queue after a user Stop until an explicit send.
+    queue_hold: std::sync::Mutex<crate::agent_provider::queue_hold::QueueHold>,
     queue_worker: Mutex<Option<JoinHandle<()>>>,
     native_requests: Mutex<Vec<JoinHandle<()>>>,
     native_admissions: Mutex<Vec<NativeAdmission>>,
@@ -510,6 +512,7 @@ impl OpenCodeSession {
             ready,
             outbound: Mutex::new(()),
             queued: Mutex::new(VecDeque::new()),
+            queue_hold: Default::default(),
             queue_worker: Mutex::new(None),
             native_requests: Mutex::new(Vec::new()),
             native_admissions: Mutex::new(Vec::new()),
@@ -606,10 +609,38 @@ impl OpenCodeSession {
                 thread_id: self.thread_id.clone(),
             });
         }
-        if self.turn_active().await || !self.queued.lock().await.is_empty() {
+        let turn_active = self.turn_active().await;
+        // A message sent by hand after a Stop goes first; the held queue
+        // follows it once it starts.
+        let held = self.queue_hold().goes_first();
+        if turn_active {
+            let result = self.queue_input(input, None).await;
+            if held {
+                // Still settling the stopped turn: queue it ahead instead.
+                let mut queue = self.queued.lock().await;
+                if let Some(item) = queue.pop_back() {
+                    self.queue_hold().release_with(&item.0);
+                    queue.push_front(item);
+                }
+            }
+            return Ok(result);
+        }
+        if !held && !self.queued.lock().await.is_empty() {
             return Ok(self.queue_input(input, None).await);
         }
-        self.dispatch_input(input, false, None).await
+        let was_held = self.queue_hold().take();
+        let result = self.dispatch_input(input, false, None).await;
+        self.restore_hold_unless_started(was_held, &result).await;
+        result
+    }
+
+    fn queue_hold(&self) -> std::sync::MutexGuard<'_, crate::agent_provider::queue_hold::QueueHold> {
+        self.queue_hold.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Keep queued turns queued after a user Stop; see `queue_hold`.
+    pub fn hold_queue(&self) {
+        self.queue_hold().hold();
     }
 
     async fn queue_input(
@@ -649,7 +680,42 @@ impl OpenCodeSession {
         input: crate::agent_provider::SendTurnInput,
     ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
         let _outbound = self.outbound.lock().await;
-        self.dispatch_input(input, true, None).await
+        let was_held = self.queue_hold().take();
+        let result = self.dispatch_input(input, true, None).await;
+        self.restore_hold_unless_started(was_held, &result).await;
+        result
+    }
+
+    /// A send that started a new turn is a message sent by hand, which
+    /// releases a queue held by Stop. Guidance or a failure restores the hold
+    /// taken before it (a Stop meanwhile holds it anyway). A send deferred
+    /// into the queue is still sent by hand: it goes first through the
+    /// restored hold, unless a Stop arrived meanwhile.
+    async fn restore_hold_unless_started(
+        &self,
+        was_held: bool,
+        result: &Result<crate::agent_provider::TurnStartResult, ProviderError>,
+    ) {
+        match result {
+            Ok(deferred) if was_held && deferred.queued_id.is_some() => {
+                let id = deferred.queued_id.as_deref().unwrap_or_default();
+                let mut queue = self.queued.lock().await;
+                let mut hold = self.queue_hold();
+                if !hold.settle_take(was_held, false) {
+                    // A Stop arrived meanwhile and holds the queue.
+                    return;
+                }
+                if let Some(index) = queue.iter().position(|(key, _)| key == id) {
+                    let item = queue.remove(index).unwrap();
+                    queue.push_front(item);
+                }
+                hold.release_with(id);
+            }
+            _ => {
+                let started = matches!(result, Ok(started) if !started.steered && started.queued_id.is_none());
+                self.queue_hold().settle_take(was_held, started);
+            }
+        }
     }
 
     async fn dispatch_input(
@@ -713,9 +779,15 @@ impl OpenCodeSession {
             return;
         }
         while !self.turn_active().await {
-            let Some((id, input)) = self.queued.lock().await.pop_front() else {
+            let mut queue = self.queued.lock().await;
+            let front = queue.front().map(|(id, _)| id.clone());
+            if !self.queue_hold().admits(front.as_deref()) {
+                return;
+            }
+            let Some((id, input)) = queue.pop_front() else {
                 return;
             };
+            drop(queue);
             let text = input
                 .display_text
                 .clone()
@@ -723,6 +795,7 @@ impl OpenCodeSession {
             match self.dispatch_input(input, false, Some(id.clone())).await {
                 Ok(result) if result.queued_id.is_some() => return,
                 Ok(result) => {
+                    self.queue_hold().settle(&id, true);
                     let _ = self
                         .event_tx
                         .send(ProviderRuntimeEvent::QueuedTurnDispatched {
@@ -735,6 +808,7 @@ impl OpenCodeSession {
                     return;
                 }
                 Err(error) => {
+                    self.queue_hold().settle(&id, false);
                     let _ = self.event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                         thread_id: Some(self.thread_id.clone()),
                         message: format!("Queued message failed: {error}"),
@@ -793,7 +867,10 @@ impl OpenCodeSession {
                 .display_text
                 .clone()
                 .unwrap_or_else(|| input.text.clone());
-            let result = self.dispatch_input(input, true, Some(id.into())).await?;
+            let was_held = self.queue_hold().take();
+            let result = self.dispatch_input(input, true, Some(id.into())).await;
+            self.restore_hold_unless_started(was_held, &result).await;
+            let result = result?;
             if result.queued_id.is_some() {
                 return Ok(());
             }
@@ -810,8 +887,13 @@ impl OpenCodeSession {
         } else {
             // Keep the queue unchanged if the abort fails. The outbound lock
             // prevents the completion worker from draining before promotion.
+            // Mark the release first so a Stop during the abort clears it.
+            let previous_release = self.queue_hold().release_with(id);
             if self.turn_active().await {
-                self.until_closed(self.interrupt()).await?;
+                if let Err(error) = self.until_closed(self.interrupt()).await {
+                    self.queue_hold().revert_release(id, previous_release);
+                    return Err(error);
+                }
             }
             let mut queue = self.queued.lock().await;
             if let Some(index) = queue.iter().position(|(key, _)| key == id) {
@@ -2394,6 +2476,229 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_stop_holds_queue_until_manual_send() {
+        let mut server = Server::new_async().await;
+        let prompt = |text: &str| {
+            mockito::Matcher::PartialJson(serde_json::json!({"parts":[{"type":"text","text":text}]}))
+        };
+        let queued_post = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .match_body(prompt("Queued"))
+            .with_status(204)
+            .expect(0)
+            .create_async()
+            .await;
+        let manual_post = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .match_body(prompt("Manual"))
+            .with_status(204)
+            .expect(1)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        session.event_ctx.lock().await.turn_active = true;
+        let queued = session
+            .enqueue_or_send(delivery_input("Queued"))
+            .await
+            .unwrap();
+        assert!(queued.queued_id.is_some());
+        // The user presses Stop and the stopped turn settles.
+        session.hold_queue();
+        session.event_ctx.lock().await.turn_active = false;
+        session.drain_queue().await;
+        assert_eq!(session.queued.lock().await.len(), 1);
+        // A message sent by hand goes first, ahead of the held queue.
+        let manual = session
+            .enqueue_or_send(delivery_input("Manual"))
+            .await
+            .unwrap();
+        assert!(manual.queued_id.is_none());
+        assert_eq!(session.queued.lock().await.len(), 1);
+        queued_post.assert_async().await;
+        manual_post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_send_while_stop_settles_goes_first() {
+        let mut server = Server::new_async().await;
+        let post = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"parts":[{"type":"text","text":"Manual"}]}),
+            ))
+            .with_status(204)
+            .expect(1)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        session.event_ctx.lock().await.turn_active = true;
+        session
+            .enqueue_or_send(delivery_input("Queued"))
+            .await
+            .unwrap();
+        session.hold_queue();
+        // Sent before the stopped turn has settled.
+        let manual = session
+            .enqueue_or_send(delivery_input("Manual"))
+            .await
+            .unwrap();
+        assert!(manual.queued_id.is_some());
+        session.event_ctx.lock().await.turn_active = false;
+        session.drain_queue().await;
+        let queue = session.queued.lock().await;
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].1.text, "Queued");
+        drop(queue);
+        post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_failed_send_now_keeps_rest_of_queue_held() {
+        let mut server = Server::new_async().await;
+        let prompt = |text: &str| {
+            mockito::Matcher::PartialJson(serde_json::json!({"parts":[{"type":"text","text":text}]}))
+        };
+        let first_post = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .match_body(prompt("First"))
+            .with_status(500)
+            .expect(1)
+            .create_async()
+            .await;
+        let second_post = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .match_body(prompt("Second"))
+            .with_status(204)
+            .expect(0)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        session.event_ctx.lock().await.turn_active = true;
+        let first = session
+            .enqueue_or_send(delivery_input("First"))
+            .await
+            .unwrap();
+        session
+            .enqueue_or_send(delivery_input("Second"))
+            .await
+            .unwrap();
+        session.hold_queue();
+        session.event_ctx.lock().await.turn_active = false;
+        session
+            .send_queued_now(first.queued_id.as_ref().unwrap(), false)
+            .await
+            .unwrap();
+        // The promoted message failed to start, so the rest stays held.
+        assert!(session.queue_hold().is_held());
+        assert_eq!(session.queued.lock().await.len(), 1);
+        first_post.assert_async().await;
+        second_post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_stop_during_send_now_interrupt_wins() {
+        let mut server = Server::new_async().await;
+        let queued_post = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .with_status(204)
+            .expect(0)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        let stopper = session.clone();
+        let abort = server
+            .mock("POST", "/session/sess_1/abort")
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                // The user presses Stop while "send now" is interrupting.
+                stopper.hold_queue();
+                b"true".to_vec()
+            })
+            .create_async()
+            .await;
+        session.event_ctx.lock().await.turn_active = true;
+        let queued = session
+            .enqueue_or_send(delivery_input("Queued"))
+            .await
+            .unwrap();
+        session.hold_queue();
+        session
+            .send_queued_now(queued.queued_id.as_ref().unwrap(), false)
+            .await
+            .unwrap();
+        session.event_ctx.lock().await.turn_active = false;
+        session.drain_queue().await;
+        assert!(session.queue_hold().is_held());
+        assert_eq!(session.queued.lock().await.len(), 1);
+        abort.assert_async().await;
+        queued_post.assert_async().await;
+    }
+
+    fn deferred(id: &str) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
+        Ok(crate::agent_provider::TurnStartResult {
+            turn_id: TurnId(String::new()),
+            queued_id: Some(id.into()),
+            steered: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn delivery_deferred_send_goes_first_through_held_queue() {
+        let server = Server::new_async().await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        session.queued.lock().await.extend([
+            ("a".to_string(), delivery_input("A")),
+            ("b".to_string(), delivery_input("B")),
+        ]);
+        session.hold_queue();
+        session.queue_hold().release_with("a");
+        // Steering B is deferred into the queue by the native runtime.
+        let was_held = session.queue_hold().take();
+        session.restore_hold_unless_started(was_held, &deferred("b")).await;
+        assert_eq!(session.queued.lock().await[0].0, "b");
+        assert!(session.queue_hold().admits(Some("b")));
+    }
+
+    #[tokio::test]
+    async fn delivery_stop_during_deferred_send_keeps_queue_held() {
+        let server = Server::new_async().await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        session.queued.lock().await.extend([
+            ("a".to_string(), delivery_input("A")),
+            ("b".to_string(), delivery_input("B")),
+        ]);
+        session.hold_queue();
+        let was_held = session.queue_hold().take();
+        session.hold_queue();
+        session.restore_hold_unless_started(was_held, &deferred("b")).await;
+        assert_eq!(session.queued.lock().await[0].0, "a");
+        assert!(!session.queue_hold().admits(Some("a")));
+    }
+
+    #[tokio::test]
+    async fn delivery_failed_steer_keeps_queue_held() {
+        let mut server = Server::new_async().await;
+        let post = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .with_status(500)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        session.event_ctx.lock().await.turn_active = true;
+        session
+            .enqueue_or_send(delivery_input("Queued"))
+            .await
+            .unwrap();
+        session.hold_queue();
+        session.event_ctx.lock().await.turn_active = false;
+        assert!(session.steer_turn(delivery_input("Steer")).await.is_err());
+        assert!(session.queue_hold().is_held());
+        session.drain_queue().await;
+        assert_eq!(session.queued.lock().await.len(), 1);
+        post.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn attaches_shared_gateway_through_opencode_runtime_api() {
         let mut server = Server::new_async().await;
         let attach = server
@@ -2613,6 +2918,7 @@ pub(crate) mod tests {
             ready,
             outbound: Mutex::new(()),
             queued: Mutex::new(VecDeque::new()),
+            queue_hold: Default::default(),
             queue_worker: Mutex::new(None),
             native_requests: Mutex::new(Vec::new()),
             native_admissions: Mutex::new(Vec::new()),

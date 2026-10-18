@@ -242,6 +242,8 @@ pub(crate) struct AcpSessionState {
     config_options: Vec<Value>,
     pending: HashMap<RequestId, PendingRequest>,
     queued: VecDeque<QueuedTurn>,
+    /// Holds the queue after a user Stop until an explicit send.
+    queue_hold: crate::agent_provider::queue_hold::QueueHold,
     selected_queued: Option<Arc<QueuedDispatch>>,
     assistant_text: String,
     thinking_text: String,
@@ -315,6 +317,15 @@ impl AcpSessionState {
             return true;
         }
         false
+    }
+
+    /// The next queued turn to dispatch, unless a user Stop holds the queue.
+    fn next_queued(&mut self) -> Option<QueuedTurn> {
+        let front = self.queued.front().map(|queued| queued.id.as_str());
+        if !self.queue_hold.admits(front) {
+            return None;
+        }
+        self.queued.pop_front()
     }
 
     /// Release the prompt slot. Drops any Stop still aimed at the
@@ -649,6 +660,7 @@ impl AcpSession {
                 config_options: config_options(&setup),
                 pending: HashMap::new(),
                 queued: VecDeque::new(),
+                queue_hold: Default::default(),
                 selected_queued: None,
                 assistant_text: String::new(),
                 thinking_text: String::new(),
@@ -843,11 +855,19 @@ impl AcpSession {
         }
         if state.active_turn.is_some() {
             let queued_id = self.opaque_id("queued");
-            state.queued.push_back(QueuedTurn {
+            let queued = QueuedTurn {
                 id: queued_id.clone(),
                 input: input.clone(),
                 dispatch: None,
-            });
+            };
+            // Sent by hand while a Stop settles: it goes first and releases
+            // the held queue behind it once it starts.
+            if state.queue_hold.goes_first() {
+                state.queued.push_front(queued);
+                state.queue_hold.release_with(&queued_id);
+            } else {
+                state.queued.push_back(queued);
+            }
             drop(state);
             let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
                 thread_id: self.thread_id.clone(),
@@ -862,14 +882,20 @@ impl AcpSession {
         // idle session and start concurrent `session/prompt` requests.
         state.active_turn = Some(self.dispatching_turn_id());
         let generation = state.claim_turn();
+        // A message sent by hand goes first; the held queue follows it.
+        let was_held = state.queue_hold.take();
         drop(state);
-        match self.dispatch_turn(input, None, generation).await {
+        let outcome = match self.dispatch_turn(input, None, generation).await {
             Ok(turn_id) => Ok(SendOutcome::Started(turn_id)),
             Err(error) => {
                 self.release_dispatch_reservation().await;
                 Err(error)
             }
+        };
+        if was_held {
+            self.state.lock().await.queue_hold.settle_take(was_held, outcome.is_ok());
         }
+        outcome
     }
 
     async fn dispatch_turn(
@@ -1122,6 +1148,7 @@ impl AcpSession {
                 .await
             {
                 Ok((next_turn_id, next_prompt)) => {
+                    self.state.lock().await.queue_hold.settle(&queued.id, true);
                     turn_id = next_turn_id;
                     prompt = next_prompt;
                     break;
@@ -1131,6 +1158,7 @@ impl AcpSession {
                     // Keep the single-prompt reservation while selecting the
                     // next input. Stop still drains the queue and closes us.
                     let mut state = self.state.lock().await;
+                    state.queue_hold.settle(&queued.id, false);
                     state.release_turn();
                     state.status = SessionStatus::Ready;
                     let cancelled = if self.is_dead() {
@@ -1140,7 +1168,7 @@ impl AcpSession {
                         next = None;
                         state.queued.drain(..).map(|queued| queued.id).collect::<Vec<_>>()
                     } else {
-                        next = state.queued.pop_front().map(|queued| {
+                        next = state.next_queued().map(|queued| {
                             self.claim_queued_turn(&mut state, queued)
                         });
                         Vec::new()
@@ -1495,7 +1523,7 @@ impl AcpSession {
             // generation for any queued turn — is what stops it becoming
             // an instant cancellation of somebody else's turn.
             state.interrupt_generation = None;
-            match state.queued.pop_front() {
+            match state.next_queued() {
                 Some(queued) => {
                     // Reserve the dispatch slot before releasing the lock.
                     // Without this marker a concurrent send could observe
@@ -1517,6 +1545,11 @@ impl AcpSession {
                 status: SessionStatus::Ready,
             });
         next
+    }
+
+    /// Keep queued turns queued after a user Stop; see `queue_hold`.
+    pub async fn hold_queue(&self) {
+        self.state.lock().await.queue_hold.hold();
     }
 
     /// Record a Stop against the turn that is claimed right now.
@@ -1562,7 +1595,7 @@ impl AcpSession {
     }
 
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
-        let (ready_to_dispatch, should_interrupt) = {
+        let (ready_to_dispatch, should_interrupt, was_held) = {
             let mut state = self.state.lock().await;
             let queued = state
                 .queued
@@ -1570,32 +1603,46 @@ impl AcpSession {
                 .position(|queued| queued.id == queued_id)
                 .and_then(|index| state.queued.remove(index));
             match queued {
+                // The promoted item goes through a held queue; the hold
+                // lifts once it starts.
                 Some(queued) if state.active_turn.is_some() => {
+                    state.queue_hold.release_with(queued_id);
                     state.queued.push_front(queued);
-                    (None, true)
+                    (None, true, false)
                 }
                 Some(queued) => {
-                    (Some(self.claim_queued_turn(&mut state, queued)), false)
+                    let was_held = state.queue_hold.take();
+                    (Some(self.claim_queued_turn(&mut state, queued)), false, was_held)
                 }
-                None => (None, false),
+                None => (None, false, false),
             }
         };
-        if let Some((queued, generation)) = ready_to_dispatch {
+        let result = if let Some((queued, generation)) = ready_to_dispatch {
             let queued_id = queued.id.clone();
-            if let Err(error) = self
+            match self
                 .dispatch_turn(queued.input, queued.dispatch.clone(), generation)
                 .await
             {
-                self.release_dispatch_reservation().await;
-                self.cancel_selected_queued(&queued_id).await;
-                return Err(error);
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    self.release_dispatch_reservation().await;
+                    self.cancel_selected_queued(&queued_id).await;
+                    Err(error)
+                }
             }
         } else if should_interrupt {
             // The promoted item is already first in line before cancellation,
             // so prompt completion cannot race past it.
-            self.interrupt(None).await?;
+            // A failed interrupt leaves the item first in line, released, so
+            // it still goes first once the running turn ends.
+            self.interrupt(None).await
+        } else {
+            Ok(())
+        };
+        if was_held {
+            self.state.lock().await.queue_hold.settle_take(was_held, result.is_ok());
         }
-        Ok(())
+        result
     }
 
     async fn release_dispatch_reservation(&self) {
@@ -4594,6 +4641,7 @@ mod tests {
             config_options: vec![],
             pending: HashMap::new(),
             queued: VecDeque::new(),
+            queue_hold: Default::default(),
             selected_queued: None,
             assistant_text: String::new(),
             thinking_text: String::new(),

@@ -1764,6 +1764,24 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
     await waitFor(() => expect(anchorNonce(container)).toBe("2"));
   });
 
+  it("keeps text typed while a failed send was in flight", async () => {
+    const { agentChatSendTurn } = await import("@/tauri/commands");
+    vi.mocked(agentChatSendTurn).mockImplementationOnce(async () => {
+      // The composer stays editable while the send is in flight.
+      currentSliceOverrides = { "thread-x": { inputDraft: "typed meanwhile" } };
+      throw new Error("boom");
+    });
+    const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+    fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
+    await waitFor(() => {
+      expect(setInputDraftMock).toHaveBeenCalledWith(
+        "thread-x",
+        "hello there\ntyped meanwhile",
+      );
+    });
+  });
+
   it("anchors a queued follow-up dispatched with 'send now'", async () => {
     // The bubble already exists (appended optimistically when it queued),
     // so its own nonce is the identity to anchor on.
@@ -1823,7 +1841,9 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
     await waitFor(() => expect(anchorClientNonce(container)).toBe(""));
   });
 
-  it("restores a queued message only when the backend actually cancels it", async () => {
+  it("leaves restoring a cancelled queued message to its cancellation event", async () => {
+    // The store restores the text when `queued_turn_cancelled` arrives, so a
+    // cancel racing a session failure cannot lose it or restore it twice.
     currentSliceOverrides = {
       "thread-x": { inputDraft: "draft already in progress" },
     };
@@ -1839,10 +1859,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
         "q-1",
       );
     });
-    expect(setInputDraftMock).toHaveBeenCalledWith(
-      "thread-x",
-      "queued follow-up\ndraft already in progress",
-    );
+    expect(setInputDraftMock).not.toHaveBeenCalled();
   });
 
   it("does not resurrect an already-dispatched queued message in the composer", async () => {
