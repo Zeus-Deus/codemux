@@ -912,8 +912,9 @@ pub enum ProviderRuntimeEvent {
         to_provider: ProviderKind,
         #[serde(default)]
         to_model: Option<String>,
-        /// `summary` (Utility agent) or `direct` (budgeted transcript):
-        /// how the conversation so far reaches the new provider.
+        /// How the conversation so far reaches the new provider: `summary`
+        /// (Utility agent), `direct` (budgeted transcript), `none` (nothing
+        /// said yet) or `failed` (the handoff couldn't be saved).
         handoff_kind: String,
         /// Older middle turns were left out to fit the budget.
         #[serde(default)]

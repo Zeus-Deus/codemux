@@ -41,6 +41,7 @@ describe("provider switch", () => {
     expect(handoffLabel("direct", false)).toBe("context carried over");
     expect(handoffLabel("direct", true)).toBe("recent context carried over");
     expect(handoffLabel("none", false)).toBe("nothing to carry yet");
+    expect(handoffLabel("failed", false)).toBe("context couldn't be carried over");
     expect(endpointLabel("codex", "GPT-5.5")).toBe("Codex · GPT-5.5");
     expect(endpointLabel("opencode", null)).toBe("OpenCode");
     expect(modelLabel("claude-opus-4-8", null)).toBe("Claude Opus 4.8");

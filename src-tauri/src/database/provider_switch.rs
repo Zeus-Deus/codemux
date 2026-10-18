@@ -107,27 +107,52 @@ impl DatabaseStore {
             .map_err(|e| format!("Failed to record the provider switch context: {e}"))
     }
 
-    /// Whether the transcript after row `after_id` holds the user message
-    /// sent with `nonce`.
-    pub fn agent_chat_has_user_message_after(&self, thread_id: &str, nonce: &str, after_id: i64) -> bool {
+    /// Whether the turn sent with `nonce` reached the provider: its user
+    /// message is in the transcript after row `after_id`, and a completed
+    /// item follows it. A turn stopped or rejected before the provider took
+    /// it leaves no reply behind.
+    pub fn agent_chat_turn_answered_after(&self, thread_id: &str, nonce: &str, after_id: i64) -> bool {
         self.conn
             .lock()
             .unwrap()
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM agent_chat_messages
-                    WHERE thread_id = ?1 AND id > ?3 AND json_valid(payload)
-                      AND json_extract(payload, '$.type') = 'user_message'
-                      AND json_extract(payload, '$.client_nonce') = ?2)",
+                "SELECT EXISTS(SELECT 1 FROM agent_chat_messages u
+                    WHERE u.thread_id = ?1 AND u.id > ?3 AND json_valid(u.payload)
+                      AND json_extract(u.payload, '$.type') = 'user_message'
+                      AND json_extract(u.payload, '$.client_nonce') = ?2
+                      AND EXISTS(SELECT 1 FROM agent_chat_messages r
+                          WHERE r.thread_id = u.thread_id AND r.id > u.id AND json_valid(r.payload)
+                            AND json_extract(r.payload, '$.type') = 'item_completed'))",
                 params![thread_id, nonce, after_id],
                 |row| row.get(0),
             )
             .unwrap_or(false)
+    }
+
+    /// Give a fork its source's seed. Its copied transcript keeps the
+    /// carrying turn's nonce, so the same check tells whether the fork's
+    /// own provider session holds the handoff; row ids differ, so the whole
+    /// fork transcript is searched.
+    pub fn copy_provider_switch_seed(&self, source: &str, fork: &str) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT OR IGNORE INTO agent_chat_provider_switch_seeds
+                    (thread_id, provider, content, anchor_id, sent_nonce)
+                 SELECT ?2, provider, content, 0, sent_nonce
+                 FROM agent_chat_provider_switch_seeds WHERE thread_id = ?1",
+                params![source, fork],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("Failed to copy the provider switch context: {e}"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn store() -> DatabaseStore {
         let db = DatabaseStore::new_in_memory();
@@ -160,22 +185,31 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_carrying_user_message_only_after_the_anchor() {
+    fn a_turn_counts_as_answered_once_a_reply_follows_it_after_the_anchor() {
         let db = store();
-        let row = |nonce: &str| {
-            db.append_agent_chat_message(
-                "t",
-                &serde_json::json!({"type": "user_message", "text": "go", "client_nonce": nonce}).to_string(),
-            )
-            .unwrap()
-            .unwrap()
+        let append = |thread: &str, payload: serde_json::Value| {
+            db.append_agent_chat_message(thread, &payload.to_string()).unwrap().unwrap()
         };
-        let before = row("n1");
-        assert!(!db.agent_chat_has_user_message_after("t", "n1", before));
-        assert!(db.agent_chat_has_user_message_after("t", "n1", before - 1));
-        row("n2");
-        assert!(db.agent_chat_has_user_message_after("t", "n2", before));
-        assert!(!db.agent_chat_has_user_message_after("t", "n3", 0));
+        let user = |nonce: &str| json!({"type": "user_message", "text": "go", "client_nonce": nonce});
+        let reply = json!({"type": "item_completed"});
+        let first = append("t", user("n1"));
+        assert!(!db.agent_chat_turn_answered_after("t", "n1", 0), "no reply yet");
+        append("t", reply.clone());
+        assert!(db.agent_chat_turn_answered_after("t", "n1", 0));
+        assert!(!db.agent_chat_turn_answered_after("t", "n1", first), "before the anchor");
+        assert!(!db.agent_chat_turn_answered_after("t", "n2", 0));
+    }
+
+    #[test]
+    fn a_fork_inherits_the_seed_with_its_delivery_and_no_anchor() {
+        let db = store();
+        db.upsert_agent_chat_session("fork", "ws", Some("/repo"), "claude").unwrap();
+        db.put_provider_switch_seed("t", "claude", "SEED", 7).unwrap();
+        db.mark_provider_switch_seed_sent("t", "claude", "SEED", "n1").unwrap();
+        db.copy_provider_switch_seed("t", "fork").unwrap();
+        db.copy_provider_switch_seed("none", "fork").unwrap();
+        let seed = db.provider_switch_seed("fork", "claude").unwrap();
+        assert_eq!((seed.content.as_str(), seed.anchor_id, seed.sent_nonce.as_deref()), ("SEED", 0, Some("n1")));
     }
 
     #[test]

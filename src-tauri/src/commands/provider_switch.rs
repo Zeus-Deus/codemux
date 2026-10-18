@@ -106,7 +106,7 @@ fn stored_label(provider: &str) -> &str {
 
 /// The text a turn sends: `text` with the switch seed for `provider` in
 /// front, unless a turn that carried it is still in the transcript after
-/// the switch. Returns the seed to record against `nonce` once the provider
+/// the switch, answered. Returns the seed to record against `nonce` once the provider
 /// accepts the turn. A turn whose seeded message is still queued gets the
 /// seed too: a queue entry a crash left behind can't be told apart from a
 /// live one, and a repeated handoff costs tokens where a lost one loses the
@@ -122,12 +122,20 @@ pub(crate) fn seed_turn(
         return (text, None);
     };
     let delivered = seed.sent_nonce.as_deref().is_some_and(|sent| {
-        db.agent_chat_has_user_message_after(thread_id, sent, seed.anchor_id)
+        db.agent_chat_turn_answered_after(thread_id, sent, seed.anchor_id)
     });
     if delivered || nonce.is_empty() {
         return (text, None);
     }
     (format!("{}\n\n{text}", seed.content), Some(seed.content))
+}
+
+/// A fork continues its source's provider session, so it inherits the
+/// source's seed and whether that session already holds it.
+pub(crate) fn carry_into_fork(db: &DatabaseStore, source: &str, fork: &str) {
+    if let Err(error) = db.copy_provider_switch_seed(source, fork) {
+        eprintln!("[codemux::provider_switch] {error}");
+    }
 }
 
 /// The turn sent with `nonce` carried `seed` and was accepted.
@@ -291,14 +299,19 @@ pub async fn agent_chat_switch_provider<R: Runtime>(
             .await?;
 
     let db: State<'_, DatabaseStore> = app.state();
+    let mut handoff_kind = plan
+        .context
+        .as_ref()
+        .map_or_else(|| "none".to_string(), |context| context.handoff_kind.clone());
     if let Some(context) = &plan.context {
         let seed = seed_text(from_provider, plan.from_model.as_deref(), &started.0, context);
         if let Err(error) =
             db.put_provider_switch_seed(&started.0, &slug(provider), &seed, plan.anchor_id)
         {
             // The switch itself happened; the provider just starts without
-            // the earlier context, which the notice below admits.
+            // the earlier context, and the divider says so.
             eprintln!("[codemux::provider_switch] {error}");
+            handoff_kind = "failed".into();
         }
     }
     forward_event(
@@ -309,10 +322,7 @@ pub async fn agent_chat_switch_provider<R: Runtime>(
             from_model: plan.from_model,
             to_provider: provider,
             to_model,
-            handoff_kind: plan
-                .context
-                .as_ref()
-                .map_or_else(|| "none".to_string(), |context| context.handoff_kind.clone()),
+            handoff_kind,
             truncated: plan.context.as_ref().is_some_and(|context| context.truncated),
         },
     );
@@ -389,7 +399,13 @@ mod tests {
         assert_eq!(queued, "SEED\n\nagain");
         seed_delivered(&db, "t", ProviderKind::Codex, "n2", seed);
         user_message(&db, "n2");
-        let (next, none) = seed_turn(&db, "t", ProviderKind::Codex, "n3", "more".into());
+        // Dispatched, but stopped before the provider answered: still carried.
+        let (stopped, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n3", "stop".into());
+        assert_eq!(stopped, "SEED\n\nstop");
+        seed_delivered(&db, "t", ProviderKind::Codex, "n3", seed);
+        user_message(&db, "n3");
+        db.append_agent_chat_message("t", r#"{"type":"item_completed"}"#).unwrap();
+        let (next, none) = seed_turn(&db, "t", ProviderKind::Codex, "n4", "more".into());
         assert_eq!((next.as_str(), none), ("more", None));
     }
 
@@ -400,6 +416,9 @@ mod tests {
         let (_, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n1", "go".into());
         seed_delivered(&db, "t", ProviderKind::Codex, "n1", seed);
         let row = user_message(&db, "n1");
+        db.append_agent_chat_message("t", r#"{"type":"item_completed"}"#).unwrap();
+        let (answered, none) = seed_turn(&db, "t", ProviderKind::Codex, "n2", "next".into());
+        assert_eq!((answered.as_str(), none), ("next", None));
         db.finalize_agent_chat_turn_revert("t", 0, row - 1).unwrap();
         let (text, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n2", "retry".into());
         assert_eq!(text, "SEED\n\nretry");

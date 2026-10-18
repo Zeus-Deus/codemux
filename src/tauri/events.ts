@@ -668,7 +668,8 @@ export type ProviderRuntimeEvent =
       from_model?: string | null;
       to_provider: AgentChatProviderKind;
       to_model?: string | null;
-      /** `summary`, `direct` (transcript), or `none` (nothing said yet). */
+      /** `summary`, `direct` (transcript), `none` (nothing said yet), or
+       *  `failed` (the handoff couldn't be saved). */
       handoff_kind: string;
       truncated?: boolean;
     };

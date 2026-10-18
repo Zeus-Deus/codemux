@@ -10,6 +10,8 @@ export function handoffLabel(handoffKind: string, truncated: boolean): string {
       return "summary carried over";
     case "direct":
       return truncated ? "recent context carried over" : "context carried over";
+    case "failed":
+      return "context couldn't be carried over";
     default:
       return "nothing to carry yet";
   }

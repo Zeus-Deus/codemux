@@ -306,6 +306,9 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
     })?;
     // The fork resumes on the account that holds its native session.
     db.copy_provider_account_bindings(&plan.source.thread_id, &thread_id)?;
+    // A source that switched providers may still owe its session the
+    // conversation from before the switch; so does the fork.
+    super::provider_switch::carry_into_fork(&db, &plan.source.thread_id, &thread_id);
     // Still holding the source: a revert or delete waiting on it would
     // remove the images this copies.
     copy_inherited_images(images).await;

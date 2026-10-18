@@ -430,7 +430,8 @@ export interface ProviderSwitchItem {
   fromModel: string | null;
   toProvider: AgentChatProviderKind;
   toModel: string | null;
-  /** `summary`, `direct` (transcript), or `none` (nothing said yet). */
+  /** `summary`, `direct` (transcript), `none` (nothing said yet), or
+   *  `failed` (the handoff couldn't be saved). */
   handoffKind: string;
   truncated: boolean;
 }
