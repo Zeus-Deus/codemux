@@ -3,7 +3,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -179,7 +179,8 @@ describe("forkClaudeSession", () => {
       d,
     );
     expect(options).toEqual({ dir: "/src", upToMessageId: "a2" });
-    const moved = join(root!, "projects", projectDirName(target));
+    // The fork lands under the resolved path (Windows expands 8.3 names).
+    const moved = join(root!, "projects", projectDirName(realpathSync(target).normalize("NFC")));
     expect(readdirSync(moved)).toEqual(["fork-1.jsonl"]);
     expect(readdirSync(join(root!, "projects", "-src"))).toEqual([]);
   });
