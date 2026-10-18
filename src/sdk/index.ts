@@ -25,6 +25,7 @@ export type {
 export type { Contribution } from "@/contrib/types";
 export type { BundledPluginMeta } from "@/contrib/bundled";
 export type { PluginChatEvent } from "@/contrib/chat-events";
+export type { CompactionRefusal, CompactionRequestResult, ThreadStatus } from "@/contrib/ipc";
 export type {
   ComposerActionData,
   ComposerApi,

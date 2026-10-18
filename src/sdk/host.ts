@@ -27,6 +27,12 @@ import type { WorkspaceSnapshot } from "@/tauri/types";
 import { bindOwner, currentOwner, ownedDisposer, type Owner } from "@/contrib/lifetime";
 import { focusedComposer } from "@/contrib/composer-registry";
 import { subscribeChatEvents, type PluginChatEvent } from "@/contrib/chat-events";
+import {
+  pluginsChatRequestCompaction,
+  pluginsChatStatus,
+  type CompactionRequestResult,
+  type ThreadStatus,
+} from "@/contrib/ipc";
 
 // ── Area payload types ────────────────────────────────────────────────
 
@@ -125,6 +131,38 @@ function currentWorkspace(): WorkspaceSnapshot | null {
   return state.appState?.workspaces.find((w) => w.workspace_id === id) ?? null;
 }
 
+const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+
+function osReducedMotion(): MediaQueryList | null {
+  return typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? window.matchMedia(REDUCED_MOTION_QUERY)
+    : null;
+}
+
+/** The app's reduce-motion setting OR the OS `prefers-reduced-motion`. */
+function reducedMotion(): boolean {
+  return selectReduceMotion(useSettingsStore.getState()) || (osReducedMotion()?.matches ?? false);
+}
+
+/** Notify `run` with the new value whenever either source flips it. */
+function watchReducedMotion(run: (reduced: boolean) => void): () => void {
+  let last = reducedMotion();
+  const check = () => {
+    const next = reducedMotion();
+    if (next !== last) {
+      last = next;
+      run(next);
+    }
+  };
+  const unsubscribeSettings = useSettingsStore.subscribe(check);
+  const media = osReducedMotion();
+  media?.addEventListener?.("change", check);
+  return () => {
+    unsubscribeSettings();
+    media?.removeEventListener?.("change", check);
+  };
+}
+
 export interface ThreadSnapshot {
   threadId: string;
   /** Live reducer state when the thread is mounted, else null. */
@@ -174,7 +212,10 @@ export function createHost(bound: Owner | null) {
       cssVar,
     },
 
-    reducedMotion: (): boolean => selectReduceMotion(useSettingsStore.getState()),
+    /** True when the app's reduce-motion setting or the OS `prefers-reduced-motion` is on. */
+    reducedMotion,
+    /** Called with the new `reducedMotion()` value whenever it changes. */
+    onReducedMotionChange: (fn: (reduced: boolean) => void) => subscription(fn, watchReducedMotion),
 
     notify({ kind = "info", message, description }: { kind?: NotifyKind; message: string; description?: string }) {
       toast[kind](message, description ? { description } : undefined);
@@ -247,6 +288,21 @@ export function createHost(bound: Owner | null) {
       },
       /** Threads with live state in this window. */
       listThreads: (): string[] => Object.keys(useAgentChatStore.getState().threads),
+      /**
+       * What the thread's live session is doing: `{ busy, queued, status,
+       * provider, compacting }`, or `null` when it has no live session.
+       * `queued` is `null` for providers that keep no follow-up queue.
+       */
+      getStatus: (threadId: string): Promise<ThreadStatus | null> => pluginsChatStatus(threadId),
+      /**
+       * Compact an idle Claude chat now. The app owns every safety rule: it
+       * refuses when the session is busy, queued, not ready, closed, not
+       * Claude, or Claude Code's own compaction opt-outs are set; otherwise
+       * it claims the session (sends made meanwhile queue behind it), hides
+       * the compaction's output and adds an info notice to the transcript.
+       */
+      requestCompaction: (threadId: string): Promise<CompactionRequestResult> =>
+        pluginsChatRequestCompaction(threadId),
       /** Same path as pressing send. Queues behind an active turn. */
       async sendTurn(threadId: string, text: string) {
         const session = await agentChatGetSession(threadId);
