@@ -9,8 +9,11 @@
 //! pending after a result gets a continuation turn, so its output is
 //! attributed and the follow-up queue cannot dispatch into the gap.
 //!
-//! A newer Stop always wins: `interrupt` drops pending guidance and refuses
-//! new guidance into the turn it is ending.
+//! A newer Stop always wins: guidance is refused into a turn being stopped,
+//! and guidance the stopped turn never read dies with it.
+//!
+//! Without the echo nothing can tell the two cases apart, so steering waits
+//! until this CLI has been seen echoing prompt uuids.
 
 use std::sync::Arc;
 
@@ -41,13 +44,23 @@ pub(crate) struct SteerState {
     continuation: Option<TurnId>,
     /// A continuation whose `Running` state has not been announced yet.
     unannounced: Option<TurnId>,
+    /// The CLI reports consumed prompts (`user_message_uuids`).
+    echoes: bool,
 }
 
 impl SteerState {
-    /// An interrupt is ending `turn`: guidance pending in it dies with it.
+    /// An interrupt is ending `turn`; it takes no more guidance.
     pub fn stop(&mut self, turn: Option<TurnId>) {
-        self.drop_pending();
         self.stopping = turn;
+    }
+
+    /// The interrupt was confirmed: guidance the turn never read died with it.
+    pub fn stopped(&mut self) {
+        self.drop_pending();
+    }
+
+    pub fn observe_echo(&mut self) {
+        self.echoes = true;
     }
 
     /// The interrupt RPC failed, so `turn` keeps running.
@@ -64,9 +77,14 @@ impl SteerState {
         self.unannounced = None;
     }
 
-    /// A top-level `result`. Returns whether guidance is still pending, which
-    /// the CLI runs next as a turn of its own.
-    fn settle_result(&mut self, result: &Value) -> bool {
+    /// A top-level `result` ending `ended`. Returns whether guidance is still
+    /// pending, which the CLI runs next as a turn of its own.
+    fn settle_result(&mut self, result: &Value, ended: Option<&TurnId>) -> bool {
+        if ended.is_some() && ended == self.stopping.as_ref() {
+            // The aborted turn's result: its unread guidance dies with it.
+            self.drop_pending();
+            return false;
+        }
         match result.get("user_message_uuids").and_then(Value::as_array) {
             Some(consumed) => self
                 .pending
@@ -113,6 +131,7 @@ fn plan(state: &mut ClaudeSessionState, input: &SendTurnInput) -> Result<Plan, P
         return Ok(Plan::Send);
     };
     if state.queue_hold.is_held()
+        || !state.steer.echoes
         || state.steer.stopping.as_ref() == Some(&turn)
         || input.dispatch_guard.is_some()
     {
@@ -151,7 +170,7 @@ impl ClaudeSession {
         let plan = plan(&mut *self.state.lock().await, &input)?;
         match plan {
             Plan::Steer { turn, uuid } => {
-                self.deliver_steer(&uuid, &input).await?;
+                self.deliver_steer(&uuid, &input, |_| {}).await?;
                 Ok(TurnStartResult {
                     steered: true,
                     turn_id: turn,
@@ -202,36 +221,45 @@ impl ClaudeSession {
                 }
             }
         };
-        if let Err(error) = self.deliver_steer(&uuid, &queued.input).await {
-            let mut state = self.state.lock().await;
-            if matches!(state.status, SessionStatus::Closed | SessionStatus::Error { .. }) {
-                // The session cancelled its queue while this was out of it.
-                drop(state);
-                let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                    thread_id: self.thread_id.clone(),
-                    queued_id: queued.queued_id,
-                });
-            } else {
-                let index = index.min(state.queued_turns.len());
-                state.queued_turns.insert(index, queued);
-            }
-            return Err(error);
+        let input = queued.input.clone();
+        let mut cancelled = None;
+        let delivered = self
+            .deliver_steer(&uuid, &input, |state| {
+                if matches!(state.status, SessionStatus::Closed | SessionStatus::Error { .. }) {
+                    // The session cancelled its queue while this was out of it.
+                    cancelled = Some(queued.queued_id);
+                } else {
+                    let index = index.min(state.queued_turns.len());
+                    state.queued_turns.insert(index, queued);
+                }
+            })
+            .await;
+        if let Some(queued_id) = cancelled {
+            let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                thread_id: self.thread_id.clone(),
+                queued_id,
+            });
         }
-        let text = queued.input.display_text.unwrap_or(queued.input.text);
+        delivered?;
+        let text = input.display_text.unwrap_or(input.text);
         let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnDispatched {
             steered: true,
             thread_id: self.thread_id.clone(),
-            queued_id: queued.queued_id,
+            queued_id: queued_id.to_owned(),
             turn_id: turn,
             text,
         });
         Ok(())
     }
 
+    /// On failure `restore` runs under the same lock that settles the
+    /// guidance, before the queue drains, so nothing overtakes what it puts
+    /// back.
     async fn deliver_steer(
         self: &Arc<Self>,
         uuid: &str,
         input: &SendTurnInput,
+        restore: impl FnOnce(&mut ClaudeSessionState),
     ) -> Result<(), ProviderError> {
         let params = SteerTurnParams {
             thread_id: self.thread_id.0.clone(),
@@ -246,10 +274,15 @@ impl ClaudeSession {
         else {
             return Ok(());
         };
-        let orphan = self.state.lock().await.steer.forget(uuid);
-        if let Some(turn) = orphan {
-            self.settle_orphaned_continuation(&turn).await;
+        {
+            let mut state = self.state.lock().await;
+            if let Some(turn) = state.steer.forget(uuid) {
+                self.settle_orphaned_continuation(&mut state, &turn);
+            }
+            restore(&mut state);
         }
+        // The turn may have ended while this was in flight.
+        self.drain_queue().await;
         Err(match error {
             RpcChildError::RpcError(error) if error.code == -32601 => {
                 ProviderError::ValidationError {
@@ -271,32 +304,35 @@ impl ClaudeSession {
 
     /// A continuation started for guidance that then failed to deliver will
     /// never see a result. Return the session to idle.
-    async fn settle_orphaned_continuation(self: &Arc<Self>, turn: &TurnId) {
-        {
-            let mut state = self.state.lock().await;
-            if state.active_turn.as_ref() != Some(turn) {
-                return;
-            }
-            self.native_authority.finish(&turn.0);
-            state.active_turn = None;
-            if matches!(state.status, SessionStatus::Running { .. }) {
-                state.status = SessionStatus::Ready;
-                let _ = self
-                    .event_tx
-                    .send(ProviderRuntimeEvent::SessionStateChanged {
-                        thread_id: self.thread_id.clone(),
-                        status: SessionStatus::Ready,
-                    });
-            }
+    fn settle_orphaned_continuation(&self, state: &mut ClaudeSessionState, turn: &TurnId) {
+        if state.active_turn.as_ref() != Some(turn) {
+            return;
         }
-        self.drain_queue().await;
+        self.native_authority.finish(&turn.0);
+        state.active_turn = None;
+        if matches!(state.status, SessionStatus::Running { .. }) {
+            state.status = SessionStatus::Ready;
+            let _ = self
+                .event_tx
+                .send(ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: self.thread_id.clone(),
+                    status: SessionStatus::Ready,
+                });
+        }
     }
 
     /// Called with the turn's `result`, after it cleared the active turn.
     /// Guidance the turn did not consume runs next as the CLI's own turn;
     /// mark it running now so nothing dispatches into the gap.
-    pub(super) fn continue_unconsumed_steers(&self, state: &mut ClaudeSessionState, result: &Value) {
-        if !state.steer.settle_result(result) || !matches!(state.status, SessionStatus::Ready) {
+    pub(super) fn continue_unconsumed_steers(
+        &self,
+        state: &mut ClaudeSessionState,
+        result: &Value,
+        ended: Option<TurnId>,
+    ) {
+        if !state.steer.settle_result(result, ended.as_ref())
+            || !matches!(state.status, SessionStatus::Ready)
+        {
             return;
         }
         let turn = TurnId(format!("claude-turn-{}", uuid::Uuid::new_v4()));
@@ -344,35 +380,53 @@ mod tests {
     #[test]
     fn result_that_consumed_the_guidance_settles_it() {
         let mut steer = steer_with(&["s1"]);
-        assert!(!steer.settle_result(&json!({"type": "result", "user_message_uuids": ["p", "s1"]})));
+        assert!(!steer.settle_result(&json!({"type": "result", "user_message_uuids": ["p", "s1"]}), None));
         assert!(steer.pending.is_empty());
     }
 
     #[test]
     fn guidance_missing_from_the_result_stays_pending() {
         let mut steer = steer_with(&["s1", "s2"]);
-        assert!(steer.settle_result(&json!({"type": "result", "user_message_uuids": ["p", "s1"]})));
+        assert!(steer.settle_result(&json!({"type": "result", "user_message_uuids": ["p", "s1"]}), None));
         assert_eq!(steer.pending, ["s2"]);
     }
 
     #[test]
     fn result_without_an_echo_assumes_consumed() {
         let mut steer = steer_with(&["s1"]);
-        assert!(!steer.settle_result(&json!({"type": "result"})));
+        assert!(!steer.settle_result(&json!({"type": "result"}), None));
         assert!(steer.pending.is_empty());
     }
 
     #[test]
-    fn stop_drops_pending_guidance() {
+    fn the_stopped_turns_result_drops_its_unread_guidance() {
+        let turn = TurnId("t".into());
+        let mut steer = steer_with(&["s1"]);
+        steer.stop(Some(turn.clone()));
+        assert!(!steer.settle_result(&json!({"user_message_uuids": ["p"]}), Some(&turn)));
+        assert!(steer.pending.is_empty());
+    }
+
+    #[test]
+    fn a_failed_stop_keeps_pending_guidance() {
+        let turn = TurnId("t".into());
+        let mut steer = steer_with(&["s1"]);
+        steer.stop(Some(turn.clone()));
+        steer.stop_failed(&Some(turn.clone()));
+        assert!(steer.stopping.is_none());
+        // The turn ran on and finished without reading the guidance.
+        assert!(steer.settle_result(&json!({"user_message_uuids": ["p"]}), Some(&turn)));
+        assert_eq!(steer.pending, ["s1"]);
+    }
+
+    #[test]
+    fn a_confirmed_stop_drops_pending_guidance() {
         let mut steer = steer_with(&["s1"]);
         steer.continuation = Some(TurnId("c".into()));
-        steer.stop(Some(TurnId("t".into())));
+        steer.stop(Some(TurnId("c".into())));
+        steer.stopped();
         assert!(steer.pending.is_empty());
         assert!(steer.continuation.is_none());
-        assert_eq!(steer.stopping, Some(TurnId("t".into())));
-        assert!(!steer.settle_result(&json!({"user_message_uuids": ["p"]})));
-        steer.stop_failed(&Some(TurnId("t".into())));
-        assert!(steer.stopping.is_none());
     }
 
     #[test]

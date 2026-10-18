@@ -640,7 +640,8 @@ impl ClaudeSession {
         // the callback is answered.
         let was_held = {
             let mut state = self.state.lock().await;
-            if state.turn_busy() {
+            // A reserved dispatch is about to start a turn; go behind it.
+            if state.turn_busy() || state.dispatching {
                 if input.dispatch_guard.is_some() {
                     return Err(ProviderError::ValidationError {
                         message: "Guarded result cannot queue behind a busy parent".into(),
@@ -1125,6 +1126,11 @@ impl ClaudeSession {
         // meanwhile is never clobbered.
         {
             let mut state = self.state.lock().await;
+            // The stopped turn's undelivered guidance died with it, unless a
+            // newer turn has already started and owns the pending set.
+            if state.active_turn.is_none() || state.active_turn == active {
+                state.steer.stopped();
+            }
             let still_idle = active.is_none()
                 && state.active_turn.is_none()
                 && matches!(state.status, SessionStatus::Ready);
@@ -2056,6 +2062,9 @@ async fn mutate_state_from_notification(
             state.steer.drop_pending();
         }
         SidecarNotification::SdkMessage { message, .. } => {
+            if message.get("user_message_uuids").is_some() {
+                session.state.lock().await.steer.observe_echo();
+            }
             // The SDK's `result` message marks the end of a single
             // turn. The session stays alive (the prompt queue is
             // persistent) so `session-ended` does NOT fire between
@@ -2080,11 +2089,11 @@ async fn mutate_state_from_notification(
                 // Invalidate the generation even before active_turn is bound;
                 // the delayed acknowledgement must not revive its authority.
                 session.native_authority.finish_current();
-                state.active_turn = None;
+                let ended = state.active_turn.take();
                 if matches!(state.status, SessionStatus::Running { .. }) {
                     state.status = SessionStatus::Ready;
                 }
-                session.continue_unconsumed_steers(&mut state, message);
+                session.continue_unconsumed_steers(&mut state, message, ended);
             }
         }
         SidecarNotification::SessionEnded { reason, .. } => {

@@ -23,7 +23,9 @@
 //!   * `FAKE_CLAUDE_SIDECAR_SCRIPT` — path to the JSON script.
 //!   * `FAKE_CLAUDE_SIDECAR_EXIT_AFTER=<method>` — exit 0 after
 //!     responding to this method. Used to simulate crashes.
-//!   * `FAKE_CLAUDE_STEER_ERROR=<code>:<message>` — reject `steer-turn`.
+//!   * `FAKE_CLAUDE_STEER_ERROR=<code>:<message>` — reject `steer-turn`,
+//!     after `FAKE_CLAUDE_STEER_DELAY_MS` when set.
+//!   * `FAKE_CLAUDE_INTERRUPT_ERROR=<message>` — reject `interrupt`.
 //!
 //! A scripted `"user_message_uuids": "$steered"` is replaced with the
 //! uuids of every `steer-turn` received so far, the way the CLI echoes
@@ -281,6 +283,18 @@ fn main() {
             "steer-turn" => {
                 capture_params(method, &msg.params);
                 let rejection = std::env::var("FAKE_CLAUDE_STEER_ERROR").ok();
+                if rejection.is_none() {
+                    if let Some(uuid) = msg.params.get("uuid").and_then(Value::as_str) {
+                        STEERED.lock().unwrap().push(uuid.to_owned());
+                    }
+                }
+                fire_script_entries_for(method, &script);
+                if let Some(delay) = std::env::var("FAKE_CLAUDE_STEER_DELAY_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
                 if let Some(id) = id {
                     match rejection.as_deref().and_then(|r| r.split_once(':')) {
                         Some((code, message)) => write_line(&json!({
@@ -288,21 +302,26 @@ fn main() {
                             "id": id,
                             "error": { "code": code.parse::<i64>().unwrap(), "message": message },
                         })),
-                        None => {
-                            if let Some(uuid) = msg.params.get("uuid").and_then(Value::as_str) {
-                                STEERED.lock().unwrap().push(uuid.to_owned());
-                            }
-                            write_line(&json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": { "steered": true },
-                            }));
-                        }
+                        None => write_line(&json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "steered": true },
+                        })),
                     }
                 }
-                if rejection.is_none() {
-                    fire_script_entries_for(method, &script);
+            }
+            "interrupt" if std::env::var("FAKE_CLAUDE_INTERRUPT_ERROR").is_ok() => {
+                if let Some(id) = id {
+                    write_line(&json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32603,
+                            "message": std::env::var("FAKE_CLAUDE_INTERRUPT_ERROR").unwrap(),
+                        },
+                    }));
                 }
+                fire_script_entries_for(method, &script);
             }
             "interrupt" | "set-model" | "set-permission-mode" => {
                 if method == "interrupt" {
