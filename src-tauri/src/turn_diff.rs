@@ -13,7 +13,7 @@
 //! are always complete.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -125,13 +125,18 @@ fn git_with(
     let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to run git: {e}"))?;
-    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        pipe.write_all(input)
-            .map_err(|e| format!("Failed to write to git: {e}"))?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to run git: {e}"))?;
+    // Feed stdin from another thread while stdout drains here: git can
+    // answer before it has read everything (`cat-file --batch-check`), and
+    // with both pipes full each side would wait on the other.
+    let output = std::thread::scope(|scope| {
+        if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            scope.spawn(move || {
+                let _ = pipe.write_all(input);
+            });
+        }
+        child.wait_with_output()
+    })
+    .map_err(|e| format!("Failed to run git: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -449,11 +454,12 @@ fn parse_raw(out: &[u8]) -> Result<Vec<RawEntry>, String> {
     Ok(entries)
 }
 
-/// Parse `git diff --numstat -z` into `(additions, deletions)`, `None` for a
-/// binary file. Renames carry an empty path field followed by both paths.
-fn parse_numstat(out: &[u8]) -> Result<Vec<Option<(u64, u64)>>, String> {
+/// Parse `git diff --numstat -z` into `(additions, deletions)` by the
+/// file's new path, `None` for a binary file. Renames carry an empty path
+/// field followed by both paths.
+fn parse_numstat(out: &[u8]) -> Result<HashMap<String, Option<(u64, u64)>>, String> {
     let fields = split_nul(out);
-    let mut stats = Vec::new();
+    let mut stats = HashMap::new();
     let mut index = 0;
     while index < fields.len() {
         let record = &fields[index];
@@ -467,11 +473,17 @@ fn parse_numstat(out: &[u8]) -> Result<Vec<Option<(u64, u64)>>, String> {
         let path = parts
             .next()
             .ok_or_else(|| format!("Unexpected git numstat record: {record}"))?;
-        stats.push(match (added.parse(), deleted.parse()) {
+        let counts = match (added.parse(), deleted.parse()) {
             (Ok(a), Ok(d)) => Some((a, d)),
             _ => None,
-        });
-        index += if path.is_empty() { 3 } else { 1 };
+        };
+        let (path, step) = if path.is_empty() {
+            (fields.get(index + 2).cloned().unwrap_or_default(), 3)
+        } else {
+            (path.to_string(), 1)
+        };
+        stats.insert(path, counts);
+        index += step;
     }
     Ok(stats)
 }
@@ -685,7 +697,12 @@ fn fetch_patches(
                 continue;
             }
             let (sections, _) = stream_patches(repo, from, to, &pathspecs(file), &mut budget)?;
-            let mut chunks = sections.into_iter().map(|section| section.chunk);
+            // A literal pathspec also matches paths beneath it (`foo` deleted,
+            // `foo/x` added), so keep only this file's own sections.
+            let mut chunks = sections
+                .into_iter()
+                .filter(|section| header_matches(&section.header, file))
+                .map(|section| section.chunk);
             let first = chunks.next().unwrap_or(PatchChunk::Patch(String::new()));
             // More than one section for one file: keep them together.
             patches.push(chunks.fold(first, |joined, next| match (joined, next) {
@@ -704,7 +721,7 @@ fn fetch_patches(
 fn blob_sizes<'a>(
     repo: &Path,
     ids: impl Iterator<Item = &'a str>,
-) -> Result<std::collections::HashMap<String, u64>, String> {
+) -> Result<HashMap<String, u64>, String> {
     let input: String = ids.map(|id| format!("{id}\n")).collect();
     if input.is_empty() {
         return Ok(Default::default());
@@ -727,26 +744,52 @@ fn blob_sizes<'a>(
 /// Diff two snapshot commits taken in `repo`.
 pub fn diff_snapshots(repo: &Path, from: &str, to: &str) -> Result<TurnDiff, String> {
     let raw = parse_raw(&git(repo, &diff_args(&["--raw", "-z", "--no-abbrev"], from, to))?)?;
-    let numstat = parse_numstat(&git(repo, &diff_args(&["--numstat", "-z"], from, to))?)?;
-    if raw.len() != numstat.len() {
-        return Err(format!(
-            "git listed {} changed files but {} line counts",
-            raw.len(),
-            numstat.len()
-        ));
+
+    // A `diff` attribute can force a text diff past core.bigFileThreshold,
+    // so oversized blobs are found by size and kept out of every text pass,
+    // line counts included: git would hold them in memory to diff them.
+    let sizes = blob_sizes(repo, raw.iter().flat_map(|e| e.blobs.iter().map(String::as_str)))?;
+    let oversized: Vec<bool> = raw
+        .iter()
+        .map(|entry| {
+            entry
+                .blobs
+                .iter()
+                .any(|id| sizes.get(id).is_some_and(|size| *size > MAX_PATCH_BLOB_BYTES))
+        })
+        .collect();
+    let excludes: Vec<String> = raw
+        .iter()
+        .zip(&oversized)
+        .filter(|(_, big)| **big)
+        .flat_map(|(entry, _)| entry.old_path.iter().chain([&entry.path]))
+        .map(|path| format!(":(exclude,top,literal){path}"))
+        .collect();
+    let mut numstat_args = diff_args(&["--numstat", "-z"], from, to);
+    if !excludes.is_empty() {
+        numstat_args.extend(["--", ":/"]);
+        numstat_args.extend(excludes.iter().map(String::as_str));
     }
+    let numstat = parse_numstat(&git(repo, &numstat_args)?)?;
 
     let mut diff = TurnDiff {
         files_changed: raw.len(),
         ..TurnDiff::default()
     };
-    let mut blobs = Vec::new();
-    for (entry, stats) in raw.into_iter().zip(numstat) {
+    let mut too_big = Vec::new();
+    for (entry, big) in raw.into_iter().zip(oversized) {
+        // Oversized files have no line counts; anything git did not count
+        // reads as zero rather than failing the whole turn.
+        let stats = if big {
+            Some((0, 0))
+        } else {
+            numstat.get(&entry.path).copied().unwrap_or(Some((0, 0)))
+        };
         let (additions, deletions) = stats.unwrap_or((0, 0));
         diff.additions += additions;
         diff.deletions += deletions;
         if diff.files.len() < MAX_FILES {
-            blobs.push(entry.blobs);
+            too_big.push(big);
             diff.files.push(TurnDiffFile {
                 path: entry.path,
                 old_path: entry.old_path,
@@ -761,26 +804,15 @@ pub fn diff_snapshots(repo: &Path, from: &str, to: &str) -> Result<TurnDiff, Str
     }
     diff.truncated = diff.files.len() < diff.files_changed;
 
-    // Choose which files get a patch from their line counts, before asking
-    // git to render anything.
-    let sizes = blob_sizes(
-        repo,
-        diff.files
-            .iter()
-            .zip(&blobs)
-            .filter(|(file, _)| !file.binary)
-            .flat_map(|(_, ids)| ids.iter().map(String::as_str)),
-    )?;
+    // Choose which files get a patch from their size and line counts,
+    // before asking git to render anything.
     let mut lines_budget = MAX_TOTAL_PATCH_LINES;
     let mut wanted = Vec::new();
-    for (index, (file, ids)) in diff.files.iter_mut().zip(&blobs).enumerate() {
+    for (index, (file, oversized)) in diff.files.iter_mut().zip(too_big).enumerate() {
         if file.binary {
             continue;
         }
         let lines = file.additions + file.deletions;
-        let oversized = ids
-            .iter()
-            .any(|id| sizes.get(id).is_some_and(|size| *size > MAX_PATCH_BLOB_BYTES));
         if oversized || lines > MAX_FILE_PATCH_LINES {
             file.patch_omitted = Some(TurnDiffPatchOmitted::TooLarge);
         } else if lines > lines_budget {
@@ -913,7 +945,7 @@ mod tests {
             (0..lines).map(|i| format!("{i}\n")).collect::<String>(),
         )
         .unwrap();
-        // Over core.bigFileThreshold: git treats it as binary outright.
+        // Over the 4 MiB blob cap.
         fs::write(repo.join("blob.txt"), "a\n".repeat(3 * 1024 * 1024)).unwrap();
         fs::write(repo.join("small.txt"), "ok\n").unwrap();
         let after = snap(&repo, "after");
@@ -923,9 +955,10 @@ mod tests {
         assert_eq!(huge.additions, lines as u64);
         assert_eq!(huge.patch, None);
         assert_eq!(huge.patch_omitted, Some(TurnDiffPatchOmitted::TooLarge));
+        // Over the blob size cap: never line-counted or rendered.
         let blob = file(&diff, "blob.txt");
-        assert!(blob.binary);
-        assert_eq!(blob.patch_omitted, Some(TurnDiffPatchOmitted::Binary));
+        assert_eq!((blob.additions, blob.deletions), (0, 0));
+        assert_eq!(blob.patch_omitted, Some(TurnDiffPatchOmitted::TooLarge));
         assert!(file(&diff, "small.txt").patch.is_some());
         assert!(!diff.truncated);
     }
@@ -967,6 +1000,7 @@ mod tests {
         assert_eq!(diff.files_changed, 51);
     }
 
+    #[cfg(unix)]
     #[test]
     fn turn_diff_keeps_both_halves_of_a_type_change() {
         let (_dir, repo) = init_repo();
@@ -995,8 +1029,24 @@ mod tests {
         let after = snap(&repo, "after");
         let diff = diff_snapshots(&repo, &before, &after).unwrap();
         let data = file(&diff, "data.json");
-        assert!(!data.binary, "the attribute forces a text diff");
+        assert!(!data.binary);
+        assert_eq!((data.additions, data.deletions), (0, 0), "never line-counted");
         assert_eq!(data.patch_omitted, Some(TurnDiffPatchOmitted::TooLarge));
+    }
+
+    #[test]
+    fn a_file_replaced_by_a_directory_keeps_only_its_own_patch() {
+        let (_dir, repo) = init_repo();
+        let before = snap(&repo, "before");
+        fs::remove_file(repo.join("gone.txt")).unwrap();
+        fs::create_dir_all(repo.join("gone.txt")).unwrap();
+        fs::write(repo.join("gone.txt/inner.txt"), "inside\n").unwrap();
+        let after = snap(&repo, "after");
+        let diff = diff_snapshots(&repo, &before, &after).unwrap();
+        let gone = file(&diff, "gone.txt").patch.as_deref().unwrap();
+        assert!(gone.contains("-bye") && !gone.contains("inside"), "{gone}");
+        let inner = file(&diff, "gone.txt/inner.txt").patch.as_deref().unwrap();
+        assert!(inner.contains("+inside"), "{inner}");
     }
 
     #[test]
