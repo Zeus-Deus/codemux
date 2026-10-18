@@ -7,6 +7,7 @@
 //! deliberately has no foreign key to the source, which may be deleted
 //! while the fork lives on.
 use super::*;
+use std::path::Path;
 
 pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -41,7 +42,15 @@ pub struct NewChatFork<'a> {
     pub title: &'a str,
     /// Copy only rows before this source row id; `None` copies them all.
     pub cut_before: Option<i64>,
+    /// The source's and the fork's chat-image folders. Inherited images are
+    /// re-pointed into the fork's own folder, so deleting or reverting the
+    /// source can't break them.
+    pub image_dirs: Option<(&'a Path, &'a Path)>,
 }
+
+/// An inherited image the fork's transcript now points at: copy `from` to
+/// `to` once the fork is written.
+pub type ForkedImage = (PathBuf, PathBuf);
 
 /// Where a fork came from, for the "Forked from" marker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -55,12 +64,15 @@ pub struct ChatForkOrigin {
 }
 
 /// Rewrite one copied transcript row for the fork: the envelope's
-/// `thread_id` names the fork, and a user-turn journal row points at the
-/// fork's copy of its user message.
+/// `thread_id` names the fork, a user-turn journal row points at the fork's
+/// copy of its user message, and a user message's images inside the
+/// source's image folder move to the fork's (recorded in `images`).
 pub(crate) fn rewrite_forked_payload(
     payload: &str,
     fork_thread_id: &str,
     copied_ids: &HashMap<i64, i64>,
+    image_dirs: Option<(&Path, &Path)>,
+    images: &mut Vec<ForkedImage>,
 ) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
         return payload.to_string();
@@ -77,6 +89,23 @@ pub(crate) fn rewrite_forked_payload(
             object.insert("user_message_id".into(), (*copied).into());
         }
     }
+    if let (Some((source_dir, fork_dir)), Some(list)) = (
+        image_dirs,
+        object.get_mut("images").and_then(serde_json::Value::as_array_mut),
+    ) {
+        for image in list {
+            let Some(path) = image.get("path").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let from = PathBuf::from(path);
+            let Ok(rest) = from.strip_prefix(source_dir) else {
+                continue;
+            };
+            let to = fork_dir.join(rest);
+            image["path"] = to.to_string_lossy().into_owned().into();
+            images.push((from, to));
+        }
+    }
     value.to_string()
 }
 
@@ -84,7 +113,11 @@ impl DatabaseStore {
     /// Create the fork thread in one transaction: its session row, its copy
     /// of the source transcript, and its lineage row. Fails if the thread id
     /// is already taken, so a retried fork never merges into another chat.
-    pub fn create_agent_chat_fork(&self, fork: &NewChatFork<'_>) -> Result<(), String> {
+    /// Returns the inherited images the caller copies into the fork's folder.
+    pub fn create_agent_chat_fork(
+        &self,
+        fork: &NewChatFork<'_>,
+    ) -> Result<Vec<ForkedImage>, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let source = fork.source;
@@ -128,8 +161,15 @@ impl DatabaseStore {
         };
         let mut copied_ids = HashMap::new();
         let mut boundary = None;
+        let mut images = Vec::new();
         for (id, payload, created_at) in rows {
-            let payload = rewrite_forked_payload(&payload, fork.thread_id, &copied_ids);
+            let payload = rewrite_forked_payload(
+                &payload,
+                fork.thread_id,
+                &copied_ids,
+                fork.image_dirs,
+                &mut images,
+            );
             tx.execute(
                 "INSERT INTO agent_chat_messages (thread_id, payload, created_at)
                  VALUES (?1, ?2, ?3)",
@@ -153,7 +193,8 @@ impl DatabaseStore {
             ],
         )
         .map_err(|e| format!("Failed to record the fork: {e}"))?;
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(images)
     }
 
     /// Lineage of `thread_id`, or `None` when it is not a fork.
@@ -182,48 +223,49 @@ impl DatabaseStore {
             .flatten()
     }
 
-    /// The source rows a fork cut needs: the `user_message` rows before
-    /// `before` (their text, in order) and the row at `before` itself, which
-    /// must be a user message that starts its own turn.
+    /// What a Claude cut before row `before` needs: the text of every user
+    /// message in the thread, in order (each clipped to
+    /// [`FORK_PROMPT_CHARS`]), and the position of the one at `before`,
+    /// which must start its own turn.
     pub fn agent_chat_fork_prompts(
         &self,
         thread_id: &str,
         before: i64,
-    ) -> Result<(Vec<String>, String), String> {
+    ) -> Result<(Vec<String>, usize), String> {
         let conn = self.conn.lock().unwrap();
-        let cut: Option<String> = conn
-            .query_row(
-                "SELECT payload FROM agent_chat_messages WHERE thread_id = ?1 AND id = ?2",
-                params![thread_id, before],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        let cut = cut
-            .as_deref()
-            .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
-            .filter(|value| value.get("type").and_then(serde_json::Value::as_str) == Some("user_message"))
-            .filter(|value| value.get("steered_turn_id").is_none())
-            .and_then(|value| value.get("text").and_then(serde_json::Value::as_str).map(str::to_string))
-            .ok_or("That message doesn't start a turn, so the chat can't be forked there.")?;
         let mut stmt = conn
             .prepare(
-                "SELECT json_extract(payload, '$.text') FROM agent_chat_messages
-                 WHERE thread_id = ?1 AND id < ?2
+                "SELECT id, payload FROM agent_chat_messages
+                 WHERE thread_id = ?1
                    AND json_valid(payload) AND json_extract(payload, '$.type') = 'user_message'
                  ORDER BY id ASC",
             )
             .map_err(|e| e.to_string())?;
-        let earlier = stmt
-            .query_map(params![thread_id, before], |row| {
-                row.get::<_, Option<String>>(0).map(Option::unwrap_or_default)
+        let rows = stmt
+            .query_map(params![thread_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        Ok((earlier, cut))
+        let mut prompts = Vec::with_capacity(rows.len());
+        let mut cut = None;
+        for (id, payload) in rows {
+            let value: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+            if id == before && value.get("steered_turn_id").is_none() {
+                cut = Some(prompts.len());
+            }
+            let text = value.get("text").and_then(serde_json::Value::as_str).unwrap_or("");
+            prompts.push(text.chars().take(FORK_PROMPT_CHARS).collect());
+        }
+        let cut = cut.ok_or("That message doesn't start a turn, so the chat can't be forked there.")?;
+        Ok((prompts, cut))
     }
 }
+
+/// How much of each prompt a Claude cut compares: enough to tell turns
+/// apart without shipping whole pasted documents to the sidecar.
+pub const FORK_PROMPT_CHARS: usize = 500;
 
 #[cfg(test)]
 mod tests {
@@ -243,17 +285,38 @@ mod tests {
     #[test]
     fn rewrite_points_copied_rows_at_the_fork() {
         let ids = HashMap::from([(7, 70)]);
+        let mut images = Vec::new();
         let row = rewrite_forked_payload(
             r#"{"type":"native_user_control","thread_id":"src","user_message_id":7}"#,
             "fork",
             &ids,
+            None,
+            &mut images,
         );
         let row: serde_json::Value = serde_json::from_str(&row).unwrap();
         assert_eq!(row["thread_id"], "fork");
         assert_eq!(row["user_message_id"], 70);
-        assert_eq!(rewrite_forked_payload("not json", "fork", &ids), "not json");
-        let untouched = rewrite_forked_payload(r#"{"type":"turn_completed"}"#, "fork", &ids);
+        assert_eq!(rewrite_forked_payload("not json", "fork", &ids, None, &mut images), "not json");
+        let untouched =
+            rewrite_forked_payload(r#"{"type":"turn_completed"}"#, "fork", &ids, None, &mut images);
         assert_eq!(untouched, r#"{"type":"turn_completed"}"#);
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn rewrite_moves_inherited_images_into_the_forks_folder() {
+        let mut images = Vec::new();
+        let row = rewrite_forked_payload(
+            r#"{"type":"user_message","text":"look","images":[{"path":"/img/src/a.png","media_type":"image/png"},{"path":"/elsewhere/b.png"}]}"#,
+            "fork",
+            &HashMap::new(),
+            Some((Path::new("/img/src"), Path::new("/img/fork"))),
+            &mut images,
+        );
+        let row: serde_json::Value = serde_json::from_str(&row).unwrap();
+        assert_eq!(row["images"][0]["path"], "/img/fork/a.png");
+        assert_eq!(row["images"][1]["path"], "/elsewhere/b.png", "only the source's own folder moves");
+        assert_eq!(images, vec![(PathBuf::from("/img/src/a.png"), PathBuf::from("/img/fork/a.png"))]);
     }
 
     #[test]
@@ -272,6 +335,7 @@ mod tests {
             cwd: "/worktree",
             title: "Fix the parser (fork)",
             cut_before: Some(second),
+            image_dirs: None,
         })
         .unwrap();
 
@@ -304,24 +368,26 @@ mod tests {
             cwd: "/repo",
             title: "t",
             cut_before: None,
+            image_dirs: None,
         };
         assert!(db.create_agent_chat_fork(&fork).is_err());
         assert!(db.agent_chat_fork_origin("src").is_none(), "nothing half-written");
     }
 
     #[test]
-    fn fork_prompts_need_a_turn_starting_user_message() {
+    fn fork_prompts_list_every_user_message_and_place_the_cut() {
         let db = store_with_source();
         append(&db, serde_json::json!({"type":"user_message","text":"one"}));
         let reply = append(&db, serde_json::json!({"type":"turn_completed"}));
         let steered = append(&db, serde_json::json!({"type":"user_message","text":"also","steered_turn_id":"t1"}));
         let next = append(&db, serde_json::json!({"type":"user_message","text":"two"}));
-        assert_eq!(
-            db.agent_chat_fork_prompts("src", next).unwrap(),
-            (vec!["one".to_string(), "also".to_string()], "two".to_string()),
-        );
+        append(&db, serde_json::json!({"type":"user_message","text":"x".repeat(FORK_PROMPT_CHARS + 9)}));
+        let (prompts, cut) = db.agent_chat_fork_prompts("src", next).unwrap();
+        assert_eq!(&prompts[..3], ["one", "also", "two"]);
+        assert_eq!(prompts[3].chars().count(), FORK_PROMPT_CHARS);
+        assert_eq!(cut, 2);
         assert!(db.agent_chat_fork_prompts("src", reply).is_err());
-        assert!(db.agent_chat_fork_prompts("src", steered).is_err());
+        assert!(db.agent_chat_fork_prompts("src", steered).is_err(), "a steer is not a turn");
         assert!(db.agent_chat_fork_prompts("other", next).is_err());
     }
 
@@ -337,6 +403,7 @@ mod tests {
             cwd: "/repo",
             title: "t",
             cut_before: None,
+            image_dirs: None,
         })
         .unwrap();
         db.delete_agent_chat_session("src").unwrap();

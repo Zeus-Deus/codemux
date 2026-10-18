@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use tauri::{AppHandle, Manager, Runtime, State};
+use tokio::sync::OwnedMutexGuard;
 
 use crate::agent_provider::chat_fork::{
     claude_fork_session_id, claude_fork_session_params, codex_persistent_fork_id,
@@ -21,19 +22,24 @@ use crate::agent_provider::chat_fork::{
 use crate::agent_provider::codex::protocol::ThreadRollbackParams;
 use crate::agent_provider::side_chat::{codex_fork_base_params, provider_label, supports_native_fork};
 use crate::agent_provider::{ProviderKind, ThreadId};
-use crate::database::chat_fork::{ChatForkOrigin, NewChatFork};
+use crate::database::chat_fork::{ChatForkOrigin, ForkedImage, NewChatFork};
 use crate::database::{AgentChatSessionRecord, DatabaseStore};
 use crate::json_rpc_child::JsonRpcChild;
 use crate::observability::ObservabilityStore;
 use crate::state::AppStateStore;
 
-use super::agent_chat::{feature_flag_on, lookup_provider, ProviderRegistry};
+use super::agent_chat::{
+    chat_images_dir_pub, feature_flag_on, hold_thread_for_fork, lookup_provider, ProviderRegistry,
+};
 use super::side_chat::{codex_initialize, codex_mcp_servers, spawn_claude_sidecar, spawn_codex};
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Where the fork goes and from which point, validated against the source.
+/// Holds the source still (see [`hold_thread_for_fork`]) until it drops, so
+/// the provider's copy and the transcript copy see the same conversation.
 struct ForkPlan {
+    _source_guards: (OwnedMutexGuard<()>, OwnedMutexGuard<()>),
     source: AgentChatSessionRecord,
     provider: ProviderKind,
     native_id: String,
@@ -130,12 +136,20 @@ async fn plan_fork<R: Runtime>(
             target_cwd.display()
         ));
     }
+    if provider == ProviderKind::Codex
+        && crate::agent_provider::codex::chatgpt::owner().managed_selected_now()
     {
-        let registry: State<'_, ProviderRegistry> = app.state();
-        let live = lookup_provider(&registry, provider).await?;
-        if live.turn_active(&ThreadId(source_thread_id.to_string())).await {
-            return Err("Wait for the current turn to finish, then fork the chat.".into());
-        }
+        // Its threads live in the app-owned Codex home that only the main
+        // adapter's token-bound launch uses (see side chats).
+        return Err("Forking isn't available while Codex uses your ChatGPT plan connection yet.".into());
+    }
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let live = lookup_provider(&registry, provider).await?;
+    // No turn may start (or revert run) between this check and the fork's
+    // transcript copy.
+    let source_guards = hold_thread_for_fork(app, source_thread_id).await;
+    if live.turn_active(&ThreadId(source_thread_id.to_string())).await {
+        return Err("Wait for the current turn to finish, then fork the chat.".into());
     }
     let cut = match (before_message_id, provider) {
         (None, _) => Cut::Latest,
@@ -147,14 +161,15 @@ async fn plan_fork<R: Runtime>(
             )?,
         },
         (Some(before), _) => {
-            let (earlier, next) = db.agent_chat_fork_prompts(source_thread_id, before)?;
+            let (prompts, cut_index) = db.agent_chat_fork_prompts(source_thread_id, before)?;
             Cut::Claude {
                 before,
-                cut: ClaudeForkCut::new(&earlier, next),
+                cut: ClaudeForkCut { prompts, cut_index },
             }
         }
     };
     Ok(ForkPlan {
+        _source_guards: source_guards,
         source,
         provider,
         native_id,
@@ -190,6 +205,8 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
     workspace_id: Option<String>,
 ) -> Result<ChatForkCreated, String> {
     let plan = plan_fork(&app, &source_thread_id, before_message_id, workspace_id).await?;
+    let provider = plan.source.provider.clone();
+    let workspace_id = plan.workspace_id.clone();
     let native_fork = match plan.provider {
         ProviderKind::Claude => fork_claude(&plan).await?,
         _ => fork_codex(&plan).await?,
@@ -197,8 +214,10 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
     let thread_id = uuid::Uuid::new_v4().to_string();
     let title = fork_title(plan.source.title.as_deref());
     let cwd = plan.target_cwd.to_string_lossy().into_owned();
+    let source_images = chat_images_dir_pub(&plan.source.thread_id);
+    let fork_images = chat_images_dir_pub(&thread_id);
     let db: State<'_, DatabaseStore> = app.state();
-    db.create_agent_chat_fork(&NewChatFork {
+    let images = db.create_agent_chat_fork(&NewChatFork {
         thread_id: &thread_id,
         source: &plan.source,
         sdk_session_id: &native_fork,
@@ -206,14 +225,43 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
         cwd: &cwd,
         title: &title,
         cut_before: plan.cut.before(),
+        image_dirs: source_images.as_deref().zip(fork_images.as_deref()),
     })?;
+    drop(plan);
+    copy_inherited_images(images).await;
     Ok(ChatForkCreated {
         thread_id,
-        provider: plan.source.provider,
+        provider,
         title,
-        workspace_id: plan.workspace_id,
+        workspace_id,
         cwd,
     })
+}
+
+/// Copy the fork's inherited images into its own folder. Best effort: the
+/// fork is already written, and a missing image only shows as broken.
+async fn copy_inherited_images(images: Vec<ForkedImage>) {
+    if images.is_empty() {
+        return;
+    }
+    let copied = tokio::task::spawn_blocking(move || {
+        for (from, to) in images {
+            let result = to
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|_| std::fs::copy(&from, &to).map(|_| ()));
+            if let Err(error) = result {
+                eprintln!(
+                    "[codemux::chat_fork] couldn't copy {} into the fork: {error}",
+                    from.display()
+                );
+            }
+        }
+    })
+    .await;
+    if let Err(error) = copied {
+        eprintln!("[codemux::chat_fork] image copy task failed: {error}");
+    }
 }
 
 /// Where a chat was forked from, or `None` for a chat that isn't a fork.
@@ -253,11 +301,6 @@ async fn fork_claude(plan: &ForkPlan) -> Result<String, String> {
 // ── Codex ───────────────────────────────────────────────────────────────
 
 async fn fork_codex(plan: &ForkPlan) -> Result<String, String> {
-    if crate::agent_provider::codex::chatgpt::owner().managed_selected_now() {
-        // Its threads live in the app-owned Codex home that only the main
-        // adapter's token-bound launch uses (see side chats).
-        return Err("Forking isn't available while Codex uses your ChatGPT plan connection yet.".into());
-    }
     let rollback = match plan.cut {
         Cut::Codex { rollback, .. } => Some(rollback),
         _ => None,

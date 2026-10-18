@@ -3,11 +3,10 @@
 //
 // The agent SDK's own `forkSession` does the copy (fresh message uuids, the
 // source file untouched); `upToMessageId` cuts it at an earlier turn. Codemux
-// addresses that turn by its user prompt, so the cut is found here: the
-// first prompt the fork leaves out is located in the SDK transcript, by
-// count when the counts agree and by text otherwise, and the fork keeps
-// everything before it. A prompt that can't be found refuses the fork
-// rather than cutting somewhere else.
+// addresses that turn by its user prompt, so the cut is found here by lining
+// the chat's prompts up with the session's (see `findCut`); the fork keeps
+// everything before the first prompt it leaves out. A cut that can't be
+// placed with certainty refuses the fork rather than cutting elsewhere.
 //
 // The SDK writes the fork next to the source transcript. Claude only
 // resumes a session from the project directory of the folder it runs in,
@@ -23,12 +22,12 @@ import { copyFile, mkdir, readdir, realpath, rename, unlink } from "node:fs/prom
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-/** Keep `keepPrompts` user prompts; the next one reads `nextPrompt`.
- *  `occurrence` counts the kept prompts with exactly that text. */
+/** Every user prompt the chat holds, as typed (Codemux keeps the text
+ *  before skills and attachments expand it), and the position of the first
+ *  one the fork leaves out. */
 export interface ForkCut {
-  keepPrompts: number;
-  nextPrompt: string;
-  occurrence: number;
+  prompts: string[];
+  cutIndex: number;
 }
 
 export interface ForkSessionInput {
@@ -75,7 +74,8 @@ export async function forkClaudeSession(
 }
 
 /** A user message that is a prompt: typed text or images, not a tool
- *  result, and not the CLI's own "[Request interrupted by user]" marker. */
+ *  result, not the CLI's own "[Request interrupted by user]" marker, and not
+ *  the output a local slash command echoes back. */
 function promptText(message: SessionMessage): string | null {
   if (message.type !== "user") return null;
   const content = (message.message as { content?: unknown } | null)?.content;
@@ -92,30 +92,43 @@ function promptText(message: SessionMessage): string | null {
   } else {
     return null;
   }
-  if (/^\s*\[Request interrupted by user/.test(text)) return null;
+  if (/^\s*(\[Request interrupted by user|<local-command-)/.test(text)) return null;
   return text;
 }
 
 const normalize = (text: string) => text.replace(/\s+/g, " ").trim();
 
-/** The uuid of the last message the fork keeps: the one just before the
- *  first prompt it leaves out. Codemux may wrap a prompt (skills, attached
- *  context), so a prompt matches when it contains the typed text. */
+/** A typed prompt Claude received verbatim: no skill command or mention
+ *  token for Codemux to have expanded. Only these can confirm a match. */
+const checkable = (typed: string) => typed !== "" && !typed.startsWith("/") && !/(^|\s)@\S/.test(typed);
+
+const NOT_FOUND = "fork_point_not_found: that turn isn't in this Claude session";
+
+/**
+ * The uuid of the last message the fork keeps: the one just before the
+ * first prompt it leaves out.
+ *
+ * Claude's session holds the chat's most recent prompts; an older prefix
+ * can be missing (sent to another provider before a handoff, or before a
+ * stale session restarted fresh), so the two lists line up from the end.
+ * Every prompt that can be checked must then be contained in the one it
+ * lines up with (Codemux may wrap a prompt with attached context); any
+ * mismatch means the lists don't line up, and the fork is refused.
+ */
 export function findCut(messages: SessionMessage[], cut: ForkCut): string {
   const prompts = messages.flatMap((message, index) => {
     const text = promptText(message);
     return text === null ? [] : [{ index, text: normalize(text) }];
   });
-  const wanted = normalize(cut.nextPrompt);
-  const matches = (text: string) => (wanted ? text.includes(wanted) : text === "");
-  let target = prompts[cut.keepPrompts];
-  if (!target || !matches(target.text)) {
-    // The counts disagree (a prompt the SDK never saw, such as one sent
-    // before a provider handoff): fall back to the prompt's own text.
-    target = wanted ? prompts.filter((prompt) => matches(prompt.text))[cut.occurrence] : undefined;
-  }
-  const kept = target ? messages[target.index - 1] : undefined;
-  if (!kept) throw new Error("fork_point_not_found: that turn isn't in this Claude session");
+  const offset = cut.prompts.length - prompts.length;
+  const target = prompts[cut.cutIndex - offset];
+  if (offset < 0 || !target) throw new Error(NOT_FOUND);
+  prompts.forEach((prompt, i) => {
+    const typed = normalize(cut.prompts[i + offset] ?? "");
+    if (checkable(typed) && !prompt.text.includes(typed)) throw new Error(NOT_FOUND);
+  });
+  const kept = messages[target.index - 1];
+  if (!kept) throw new Error(NOT_FOUND);
   return kept.uuid;
 }
 

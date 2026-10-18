@@ -42,21 +42,49 @@ const TRANSCRIPT = [
 ];
 
 describe("findCut", () => {
+  const typed = ["fix the parser", "now add tests", "continue"];
+
   test("keeps everything before the first prompt left out", () => {
-    expect(findCut(TRANSCRIPT, { keepPrompts: 1, nextPrompt: "now add tests", occurrence: 0 })).toBe("i1");
-    expect(findCut(TRANSCRIPT, { keepPrompts: 2, nextPrompt: "continue", occurrence: 0 })).toBe("a2");
+    expect(findCut(TRANSCRIPT, { prompts: typed, cutIndex: 1 })).toBe("i1");
+    expect(findCut(TRANSCRIPT, { prompts: typed, cutIndex: 2 })).toBe("a2");
   });
 
-  test("falls back to the prompt's text when the counts disagree", () => {
-    // Codemux saw an extra prompt the SDK never received.
-    expect(findCut(TRANSCRIPT, { keepPrompts: 3, nextPrompt: "continue", occurrence: 0 })).toBe("a2");
+  test("lines up from the end when older prompts went to another provider", () => {
+    const repeated = [
+      user("r1", "one"),
+      assistant("ra1"),
+      user("r2", "continue"),
+      assistant("ra2"),
+      user("r3", "continue"),
+      assistant("ra3"),
+    ];
+    // Cutting before the first "continue" must not keep it.
+    expect(findCut(repeated, { prompts: ["handed off", "one", "continue", "continue"], cutIndex: 2 })).toBe(
+      "ra1",
+    );
   });
 
-  test("refuses a cut it can't find instead of guessing", () => {
-    expect(() => findCut(TRANSCRIPT, { keepPrompts: 2, nextPrompt: "something else", occurrence: 0 })).toThrow(
+  test("places a cut after a prompt Codemux expanded from a skill", () => {
+    const expanded = [
+      user("s1", "fix it"),
+      assistant("sa1"),
+      user("s2", [{ type: "text", text: "<skill name=review>…</skill>" }, { type: "text", text: "continue" }]),
+      assistant("sa2"),
+    ];
+    expect(findCut(expanded, { prompts: ["fix it", "/review continue"], cutIndex: 1 })).toBe("sa1");
+  });
+
+  test("refuses a cut it can't place with certainty", () => {
+    // The lists don't line up: a checkable prompt differs.
+    expect(() => findCut(TRANSCRIPT, { prompts: ["fix the parser", "something else", "continue"], cutIndex: 2 })).toThrow(
       "fork_point_not_found",
     );
-    expect(() => findCut(TRANSCRIPT, { keepPrompts: 0, nextPrompt: "fix the parser", occurrence: 0 })).toThrow(
+    // Claude holds prompts the chat never sent.
+    expect(() => findCut(TRANSCRIPT, { prompts: ["now add tests", "continue"], cutIndex: 1 })).toThrow(
+      "fork_point_not_found",
+    );
+    // The turn predates this Claude session.
+    expect(() => findCut(TRANSCRIPT, { prompts: ["old", "fix the parser", "now add tests", "continue"], cutIndex: 0 })).toThrow(
       "fork_point_not_found",
     );
   });
@@ -108,7 +136,7 @@ describe("forkClaudeSession", () => {
     const target = join(root!, "worktree");
     mkdirSync(target);
     await forkClaudeSession(
-      { sessionId: "s", dir: "/src", targetDir: target, cut: { keepPrompts: 2, nextPrompt: "continue", occurrence: 0 } },
+      { sessionId: "s", dir: "/src", targetDir: target, cut: { prompts: ["fix the parser", "now add tests", "continue"], cutIndex: 2 } },
       d,
     );
     expect(options).toEqual({ dir: "/src", upToMessageId: "a2" });

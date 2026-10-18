@@ -919,6 +919,27 @@ pub(crate) fn thread_runs_on_device_pub<R: Runtime>(app: &AppHandle<R>, thread_i
     thread_runs_on_device(app, thread_id)
 }
 
+/// Hold a thread still while a chat fork copies it: the dispatch lock a send
+/// holds, then the turn-checkpoint timeline lock (the order a send takes
+/// them), so no turn starts and no revert runs until the guards drop.
+pub(crate) async fn hold_thread_for_fork<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+) -> (tokio::sync::OwnedMutexGuard<()>, tokio::sync::OwnedMutexGuard<()>) {
+    let dispatch = native_thread_gate(app, thread_id)
+        .dispatch
+        .clone()
+        .lock_owned()
+        .await;
+    let timeline = turn_checkpoint_lock_for(thread_id).lock_owned().await;
+    (dispatch, timeline)
+}
+
+/// Crate-visible: where a thread's sent chat images live.
+pub(crate) fn chat_images_dir_pub(thread_id: &str) -> Option<std::path::PathBuf> {
+    chat_images_dir(thread_id)
+}
+
 fn thread_runs_on_device<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> bool {
     app.try_state::<AppStateStore>().is_some_and(|state| {
         let db = app.try_state::<DatabaseStore>();

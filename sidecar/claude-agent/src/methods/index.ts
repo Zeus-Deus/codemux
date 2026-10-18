@@ -473,16 +473,13 @@ const forkSessionMethod: MethodHandler = async (params) => {
   };
   const cut = optRecord(p["cut"], "cut");
   if (cut) {
-    const keepPrompts = cut["keepPrompts"];
-    const occurrence = cut["occurrence"];
-    if (!Number.isInteger(keepPrompts) || !Number.isInteger(occurrence)) {
-      throw new InvalidParamsError("cut.keepPrompts and cut.occurrence must be integers");
+    const prompts = optArray(cut["prompts"], "cut.prompts");
+    const cutIndex = cut["cutIndex"];
+    if (!prompts || !prompts.every((prompt) => typeof prompt === "string")) {
+      throw new InvalidParamsError("cut.prompts must be an array of strings");
     }
-    input.cut = {
-      keepPrompts: keepPrompts as number,
-      occurrence: occurrence as number,
-      nextPrompt: asString(cut["nextPrompt"], "cut.nextPrompt"),
-    };
+    if (!Number.isInteger(cutIndex)) throw new InvalidParamsError("cut.cutIndex must be an integer");
+    input.cut = { prompts: prompts as string[], cutIndex: cutIndex as number };
   }
   return forkClaudeSession(input);
 };

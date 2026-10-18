@@ -77,29 +77,14 @@ pub fn fork_error(message: &str) -> String {
     }
 }
 
-/// An earlier-turn Claude cut: keep `keep_prompts` user prompts; the next
-/// one should read `next_prompt`. `occurrence` counts the kept prompts with
-/// exactly that text, so the sidecar can find it by text when the counts
-/// disagree (a prompt the SDK never saw, such as one sent before a handoff).
+/// An earlier-turn Claude cut: every user prompt the chat holds, as typed
+/// (the transcript keeps the text before skills and attachments expand it),
+/// and the position of the first one the fork leaves out. The sidecar lines
+/// these up with the prompts in Claude's own session.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaudeForkCut {
-    pub keep_prompts: usize,
-    pub next_prompt: String,
-    pub occurrence: usize,
-}
-
-impl ClaudeForkCut {
-    pub fn new(earlier_prompts: &[String], next_prompt: String) -> Self {
-        let key = next_prompt.trim();
-        Self {
-            keep_prompts: earlier_prompts.len(),
-            occurrence: earlier_prompts
-                .iter()
-                .filter(|prompt| prompt.trim() == key)
-                .count(),
-            next_prompt,
-        }
-    }
+    pub prompts: Vec<String>,
+    pub cut_index: usize,
 }
 
 /// `fork-session` params for the Claude sidecar. `dir` is where the source
@@ -117,9 +102,8 @@ pub fn claude_fork_session_params(
     });
     if let Some(cut) = cut {
         params["cut"] = json!({
-            "keepPrompts": cut.keep_prompts,
-            "nextPrompt": cut.next_prompt,
-            "occurrence": cut.occurrence,
+            "prompts": cut.prompts,
+            "cutIndex": cut.cut_index,
         });
     }
     params
@@ -193,14 +177,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_cuts_count_prompts_and_repeats() {
-        let earlier = vec!["go".to_string(), "continue".into(), " continue ".into()];
-        let cut = ClaudeForkCut::new(&earlier, "continue".into());
-        assert_eq!(cut.keep_prompts, 3);
-        assert_eq!(cut.occurrence, 2);
+    fn claude_cuts_carry_the_chats_prompts() {
+        let cut = ClaudeForkCut {
+            prompts: vec!["go".into(), "continue".into()],
+            cut_index: 1,
+        };
         let params = claude_fork_session_params("s", "/repo", "/wt", Some(&cut));
-        assert_eq!(params["cut"]["keepPrompts"], 3);
-        assert_eq!(params["cut"]["nextPrompt"], "continue");
+        assert_eq!(params["cut"]["prompts"], json!(["go", "continue"]));
+        assert_eq!(params["cut"]["cutIndex"], 1);
         assert_eq!(params["targetDir"], "/wt");
         let latest = claude_fork_session_params("s", "/repo", "/repo", None);
         assert!(latest.get("cut").is_none());
