@@ -4014,10 +4014,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         : null,
     [conversationWritable, messages, handleRespond],
   );
-  // Hidden in a subagent drill-in: the design only shows it in the
-  // conversation view. Keyed by thread so the open list never leaks
+  const remoteTasksRow = conversationWritable &&
+    remoteTasksOccupant(remoteTasks, () => void remoteTasks.retrySubscription());
+  // A subagent drill-in keeps only the remote-task failure: the design shows
+  // the rest in the conversation view, but the parent stays subscribed and
+  // its Retry still applies. Keyed by thread so the open list never leaks
   // across a thread switch.
-  const stripEl = enteredSubagent ? null : (
+  const stripEl = enteredSubagent ? (
+    <ComposerStrip key={threadId ?? "no-thread"} occupants={[remoteTasksRow]} />
+  ) : (
     <ComposerStrip
       key={threadId ?? "no-thread"}
       goal={stripGoal}
@@ -4029,8 +4034,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         delegationOccupant,
         subagentOccupant,
         queuedOccupant(queued, handleCancelQueued),
-        conversationWritable &&
-          remoteTasksOccupant(remoteTasks, () => void remoteTasks.retrySubscription()),
+        remoteTasksRow,
       ]}
     />
   );

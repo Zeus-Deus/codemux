@@ -2008,6 +2008,20 @@ describe("AgentChatPane subagent drill-in (viewMode swap)", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     expect(container.querySelector(runningRow)).not.toBeNull();
   });
+
+  it("keeps a remote-task failure and its Retry in the strip while drilled in", async () => {
+    vi.mocked(onDelegationChanged).mockRejectedValueOnce(new Error("Task listener offline"));
+    currentSliceOverrides = { "thread-x": { model: "already-seeded" } };
+    const view = render(<AgentChatPane pane={pane} />);
+    expect(await view.findByText("Remote task updates paused")).toBeInTheDocument();
+
+    fireEvent.click(view.container.querySelector('[data-testid="enter-subagent"]')!);
+    const rows = view.container.querySelectorAll('[data-testid="composer-strip-row"]');
+    expect([...rows].map((row) => row.getAttribute("data-kind"))).toEqual(["error"]);
+    fireEvent.click(view.getByRole("button", { name: "Retry remote task updates" }));
+    await waitFor(() => expect(view.queryByText("Remote task updates paused")).not.toBeInTheDocument());
+    expect(view.container.querySelector('[data-testid="composer-strip"]')).toBeNull();
+  });
 });
 
 describe("AgentChatPane hydrate-on-mount (cursor resume)", () => {
