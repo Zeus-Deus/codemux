@@ -323,6 +323,30 @@ describe("useQueuedTurnEditor", () => {
     }
   });
 
+  it("strips the whole edited copy when the edit keeps the original as its last line", async () => {
+    const original = { ...item("a"), text: "run tests" };
+    seed("D", [original]);
+    let resolve: (value: boolean) => void = () => {};
+    commands.agentChatEditQueuedTurn.mockImplementation(() => new Promise((r) => { resolve = r; }));
+    const hook = renderHook(() => useQueuedTurnEditor({ threadId: thread, provider: "claude" }));
+    act(() => hook.result.current.begin(original));
+    act(() => useAgentChatStore.getState().setInputDraft(thread, "first lint\nrun tests"));
+    let saving: Promise<void> = Promise.resolve();
+    act(() => {
+      saving = hook.result.current.save("first lint\nrun tests");
+    });
+    act(() => {
+      const store = useAgentChatStore.getState();
+      store.applyEvent(thread, { type: "queued_turn_edited", thread_id: thread, queued_id: "a", text: "first lint\nrun tests" });
+      store.applyEvent(thread, { type: "queued_turn_cancelled", thread_id: thread, queued_id: "a" });
+    });
+    await act(async () => {
+      resolve(true);
+      await saving;
+    });
+    expect(draft()).toBe("D\nfirst lint\nrun tests");
+  });
+
   it("returns the edited turn's words once when it is cancelled mid-edit", () => {
     const cancel = () =>
       act(() => {

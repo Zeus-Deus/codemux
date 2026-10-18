@@ -221,10 +221,13 @@ export function useQueuedTurnEditor({
       // in the composer (the original or the user's edit) are what return.
       edit.cancelled = true;
       // The copy is its text when cancelled: as last shown, or as a save in
-      // flight just changed it.
+      // flight just changed it. Longest first: the shown text can be the
+      // tail of the edited one, and stripping only that tail would leave
+      // the rest of the copy behind.
       const current = draftOf(edit.threadId);
       const returned = [before.get(edit.queuedId) ?? edit.original, edit.saving]
-        .filter((text): text is string => text !== undefined);
+        .filter((text): text is string => text !== undefined)
+        .sort((a, b) => b.length - a.length);
       for (const text of returned) {
         const rest = withoutReturned(current, text);
         if (rest === null) continue;
