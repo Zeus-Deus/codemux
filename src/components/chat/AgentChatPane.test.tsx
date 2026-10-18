@@ -562,6 +562,7 @@ vi.mock("@/tauri/commands", () => ({
   agentChatSetPermissionMode: vi.fn().mockResolvedValue(undefined),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
+  agentChatSwitchProvider: vi.fn().mockResolvedValue("thread-x"),
   // Picker handlers (design G) mirror every change into this DB-only
   // persist command, fire-and-forget. Default no-op.
   agentChatUpdateSessionConfig: vi.fn().mockResolvedValue(undefined),
@@ -818,6 +819,7 @@ import {
   agentChatSetPermissionMode,
   agentChatStartSession,
   agentChatStopSession,
+  agentChatSwitchProvider,
   agentChatUpdateSessionConfig,
   grepCountPattern,
   checkProviderAuth,
@@ -3639,8 +3641,8 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
     );
     // Hold the provider switch open so its restart guard is still owned
     // when the stale model change reports back.
-    vi.mocked(agentChatStopSession).mockImplementationOnce(
-      () => new Promise<void>(() => {}),
+    vi.mocked(agentChatSwitchProvider).mockImplementationOnce(
+      () => new Promise<string>(() => {}),
     );
 
     const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
@@ -3910,6 +3912,9 @@ describe("AgentChatPane provider handoff", () => {
     vi.mocked(agentChatStopSession)
       .mockReset()
       .mockResolvedValue(undefined);
+    vi.mocked(agentChatSwitchProvider)
+      .mockReset()
+      .mockResolvedValue("thread-x");
     setModelMock.mockClear();
     setEffortMock.mockClear();
     setContextWindowMock.mockClear();
@@ -3928,14 +3933,13 @@ describe("AgentChatPane provider handoff", () => {
     );
 
     await waitFor(() =>
-      expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(1),
+      expect(vi.mocked(agentChatSwitchProvider)).toHaveBeenCalledTimes(1),
     );
-    expect(vi.mocked(agentChatStopSession)).toHaveBeenCalledWith(
-      "claude",
-      "thread-x",
-    );
-    expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledWith(
+    // The backend switch stops the old provider itself.
+    expect(vi.mocked(agentChatStopSession)).not.toHaveBeenCalled();
+    expect(vi.mocked(agentChatSwitchProvider)).toHaveBeenCalledWith(
       "pane-1",
+      expect.objectContaining({ provider: "claude" }),
       "codex",
       expect.objectContaining({
         thread_id: "thread-x",
@@ -3946,8 +3950,6 @@ describe("AgentChatPane provider handoff", () => {
         effort: null,
         context_window: null,
       }),
-      // The handoff claims the pane against the binding it replaces.
-      "thread-x",
     );
     await waitFor(() =>
       expect(
@@ -3959,9 +3961,9 @@ describe("AgentChatPane provider handoff", () => {
   });
 
   it("restores the previous provider when the selected provider cannot start", async () => {
-    vi.mocked(agentChatStartSession)
-      .mockRejectedValueOnce(new Error("codex unavailable"))
-      .mockResolvedValueOnce("thread-x");
+    vi.mocked(agentChatSwitchProvider).mockRejectedValueOnce(
+      new Error("codex unavailable"),
+    );
     const { container } = render(<AgentChatPane pane={pane} />);
     await act(async () => {});
 
@@ -3970,10 +3972,9 @@ describe("AgentChatPane provider handoff", () => {
     );
 
     await waitFor(() =>
-      expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(2),
+      expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(1),
     );
-    expect(vi.mocked(agentChatStartSession).mock.calls[0][1]).toBe("codex");
-    expect(vi.mocked(agentChatStartSession).mock.calls[1]).toEqual([
+    expect(vi.mocked(agentChatStartSession).mock.calls[0]).toEqual([
       "pane-1",
       "claude",
       expect.objectContaining({
@@ -3984,6 +3985,27 @@ describe("AgentChatPane provider handoff", () => {
       }),
       "thread-x",
     ]);
+    expect(
+      container.querySelector('[data-testid="composer"]'),
+    ).toHaveAttribute("data-provider", "claude");
+  });
+
+  it("leaves the old provider running when the switch is refused", async () => {
+    vi.mocked(agentChatSwitchProvider).mockRejectedValueOnce(
+      new Error("provider_switch_refused: Wait for the current turn"),
+    );
+    const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+
+    fireEvent.click(
+      container.querySelector('[data-testid="provider-model-change"]')!,
+    );
+
+    await waitFor(() =>
+      expect(vi.mocked(agentChatSwitchProvider)).toHaveBeenCalledTimes(1),
+    );
+    await act(async () => {});
+    expect(vi.mocked(agentChatStartSession)).not.toHaveBeenCalled();
     expect(
       container.querySelector('[data-testid="composer"]'),
     ).toHaveAttribute("data-provider", "claude");

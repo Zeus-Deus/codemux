@@ -23,6 +23,7 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
+use tokio::sync::OwnedMutexGuard;
 
 use crate::agent_provider::side_chat::provider_label;
 use crate::agent_provider::{ProviderKind, ProviderRuntimeEvent, StartSessionInput, ThreadId};
@@ -130,12 +131,49 @@ pub(crate) fn seed_turn(
     (format!("{}\n\n{text}", seed.content), Some(seed.content))
 }
 
-/// A fork continues its source's provider session, so it inherits the
-/// source's seed and whether that session already holds it.
+/// A fork continues its source's provider session, so it owes that session
+/// whatever the source still did. When the turn that carried the source's
+/// handoff is answered in the fork's copied transcript, the fork's session
+/// has the handoff, and only its pointer to the full history is stale (it
+/// names the source): the fork's first turn carries a short correction.
+/// Otherwise the fork carries the whole handoff, pointed at the fork.
 pub(crate) fn carry_into_fork(db: &DatabaseStore, source: &str, fork: &str) {
-    if let Err(error) = db.copy_provider_switch_seed(source, fork, &history_ref(source), &history_ref(fork)) {
+    let Some((provider, seed)) = db.provider_switch_seed_of(source) else {
+        return;
+    };
+    let delivered = seed
+        .sent_nonce
+        .as_deref()
+        .is_some_and(|sent| db.agent_chat_turn_answered_after(fork, sent, 0));
+    let content = if delivered {
+        fork_correction(fork)
+    } else {
+        retarget_seed(&seed.content, source, fork)
+    };
+    let anchor = db.max_agent_chat_message_id(fork).unwrap_or(0);
+    if let Err(error) = db.put_provider_switch_seed(fork, &provider, &content, anchor) {
         eprintln!("[codemux::provider_switch] {error}");
     }
+}
+
+/// `seed` with its history pointer moved from `source` to `fork`. Only the
+/// header Codemux wrote is touched, never the conversation in the body.
+fn retarget_seed(seed: &str, source: &str, fork: &str) -> String {
+    let (header, body) = seed.split_once("\n\n").unwrap_or((seed, ""));
+    let header = header.replacen(&history_ref(source), &history_ref(fork), 1);
+    if body.is_empty() {
+        header
+    } else {
+        format!("{header}\n\n{body}")
+    }
+}
+
+/// Tells a forked session where its own full history lives.
+fn fork_correction(fork: &str) -> String {
+    format!(
+        "<codemux-provider-handoff>\nThis chat is a fork. Its complete conversation is now under {}: use that with `conversation_search` and `conversation_read`, not the conversation an earlier handoff named.\n</codemux-provider-handoff>",
+        history_ref(fork)
+    )
 }
 
 /// The turn sent with `nonce` carried `seed` and was accepted.
@@ -199,6 +237,11 @@ fn seed_text(
 
 /// What the switch carries over, read while the thread is held still.
 struct Plan {
+    /// Held until the old provider's revert points are dropped, so no revert
+    /// can change the transcript after the handoff was read from it.
+    /// Neither stopping nor starting a session takes it, and sends are
+    /// refused before they would.
+    timeline: OwnedMutexGuard<()>,
     context: Option<AgentChatSessionContext>,
     from_model: Option<String>,
     /// The newest transcript row before the switch.
@@ -239,15 +282,15 @@ async fn plan_switch<R: Runtime>(
         Err(error) => return Err(error),
     };
     let anchor_id = db.max_agent_chat_message_id(thread_id).unwrap_or(0);
-    drop((timeline, dispatch));
-    Ok(Plan { context, from_model, anchor_id })
+    drop(dispatch);
+    Ok(Plan { timeline, context, from_model, anchor_id })
 }
 
 /// Revert points are turns of the provider the chat left; the new one
 /// can't roll them back. Dropped only once it has started, so a failed
-/// switch leaves the old provider's history revertible.
-async fn invalidate_checkpoints<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Result<(), String> {
-    let _timeline = fork_timeline_guard(thread_id).await;
+/// switch leaves the old provider's history revertible. The caller holds
+/// the timeline lock.
+fn invalidate_checkpoints<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Result<(), String> {
     let db: State<'_, DatabaseStore> = app.state();
     if !db.has_agent_chat_turn_checkpoints(thread_id) {
         return Ok(());
@@ -314,9 +357,10 @@ pub async fn agent_chat_switch_provider<R: Runtime>(
 
     // Sends are still refused (the mark), so no new-provider turn can have
     // taken a checkpoint yet.
-    if let Err(error) = invalidate_checkpoints(&app, &thread_id).await {
+    if let Err(error) = invalidate_checkpoints(&app, &thread_id) {
         eprintln!("[codemux::provider_switch] {error}");
     }
+    drop(plan.timeline);
     let db: State<'_, DatabaseStore> = app.state();
     let mut handoff_kind = plan
         .context
@@ -442,6 +486,43 @@ mod tests {
         let (text, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n2", "retry".into());
         assert_eq!(text, "SEED\n\nretry");
         assert!(seed.is_some());
+    }
+
+    #[test]
+    fn a_fork_retargets_only_the_header_of_an_undelivered_seed() {
+        let db = store();
+        db.upsert_agent_chat_session("fork", "ws", Some("/repo"), "codex").unwrap();
+        let seed = seed_text(ProviderKind::Claude, None, "t", &context("direct", false))
+            + "\nUser asked to keep conversation_id `t` literally.";
+        db.put_provider_switch_seed("t", "codex", &seed, 0).unwrap();
+        carry_into_fork(&db, "t", "fork");
+        let copied = db.provider_switch_seed("fork", "codex").unwrap();
+        assert!(copied.content.contains("use `conversation_search` with conversation_id `fork`"));
+        assert!(copied.content.contains("keep conversation_id `t` literally"), "body untouched");
+        assert_eq!(copied.sent_nonce, None);
+    }
+
+    #[test]
+    fn a_fork_whose_session_has_the_handoff_gets_only_a_correction() {
+        let db = store();
+        db.upsert_agent_chat_session("fork", "ws", Some("/repo"), "codex").unwrap();
+        db.put_provider_switch_seed("t", "codex", "SEED", 0).unwrap();
+        db.mark_provider_switch_seed_sent("t", "codex", "SEED", "n1").unwrap();
+        // The fork's copy of the carrying turn, answered.
+        db.append_agent_chat_message(
+            "fork",
+            &serde_json::json!({"type": "user_message", "text": "go", "client_nonce": "n1"}).to_string(),
+        )
+        .unwrap();
+        db.append_agent_chat_message("fork", r#"{"type":"item_completed"}"#).unwrap();
+        carry_into_fork(&db, "t", "fork");
+        let copied = db.provider_switch_seed("fork", "codex").unwrap();
+        assert!(copied.content.starts_with("<codemux-provider-handoff>\nThis chat is a fork."));
+        assert!(copied.content.contains("conversation_id `fork`"));
+        let (text, seed) = seed_turn(&db, "fork", ProviderKind::Codex, "f1", "next".into());
+        assert!(text.ends_with("</codemux-provider-handoff>\n\nnext"));
+        assert!(seed.is_some());
+        carry_into_fork(&db, "none", "fork");
     }
 
     #[test]

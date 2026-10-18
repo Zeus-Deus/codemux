@@ -129,31 +129,29 @@ impl DatabaseStore {
             .unwrap_or(false)
     }
 
-    /// Give a fork its source's seed. Its copied transcript keeps the
-    /// carrying turn's nonce, so the same check tells whether the fork's
-    /// own provider session holds the handoff; row ids differ, so the whole
-    /// fork transcript is searched. `source_ref` / `fork_ref` are the
-    /// seed's history reference to the source and its replacement, so the
-    /// fork reads its own copy (the source may be deleted or out of scope).
-    pub fn copy_provider_switch_seed(
-        &self,
-        source: &str,
-        fork: &str,
-        source_ref: &str,
-        fork_ref: &str,
-    ) -> Result<(), String> {
+    /// A thread's seed and the provider it is for.
+    pub fn provider_switch_seed_of(&self, thread_id: &str) -> Option<(String, ProviderSwitchSeed)> {
         self.conn
             .lock()
             .unwrap()
-            .execute(
-                "INSERT OR IGNORE INTO agent_chat_provider_switch_seeds
-                    (thread_id, provider, content, anchor_id, sent_nonce)
-                 SELECT ?2, provider, REPLACE(content, ?3, ?4), 0, sent_nonce
-                 FROM agent_chat_provider_switch_seeds WHERE thread_id = ?1",
-                params![source, fork, source_ref, fork_ref],
+            .query_row(
+                "SELECT provider, content, anchor_id, sent_nonce FROM agent_chat_provider_switch_seeds
+                 WHERE thread_id = ?1",
+                params![thread_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        ProviderSwitchSeed {
+                            content: row.get(1)?,
+                            anchor_id: row.get(2)?,
+                            sent_nonce: row.get(3)?,
+                        },
+                    ))
+                },
             )
-            .map(|_| ())
-            .map_err(|e| format!("Failed to copy the provider switch context: {e}"))
+            .optional()
+            .ok()
+            .flatten()
     }
 }
 
@@ -209,20 +207,12 @@ mod tests {
     }
 
     #[test]
-    fn a_fork_inherits_the_seed_with_its_delivery_and_no_anchor() {
+    fn reads_a_seed_with_its_provider() {
         let db = store();
-        db.upsert_agent_chat_session("fork", "ws", Some("/repo"), "claude").unwrap();
-        db.put_provider_switch_seed("t", "claude", "SEED", 7).unwrap();
-        db.mark_provider_switch_seed_sent("t", "claude", "SEED", "n1").unwrap();
-        db.upsert_agent_chat_session("u", "ws", Some("/repo"), "claude").unwrap();
-        db.put_provider_switch_seed("u", "claude", "read id `u` for more", 0).unwrap();
-        db.upsert_agent_chat_session("fork-u", "ws", Some("/repo"), "claude").unwrap();
-        db.copy_provider_switch_seed("u", "fork-u", "id `u`", "id `fork-u`").unwrap();
-        assert_eq!(db.provider_switch_seed("fork-u", "claude").unwrap().content, "read id `fork-u` for more");
-        db.copy_provider_switch_seed("t", "fork", "id `t`", "id `fork`").unwrap();
-        db.copy_provider_switch_seed("none", "fork", "id `none`", "id `fork`").unwrap();
-        let seed = db.provider_switch_seed("fork", "claude").unwrap();
-        assert_eq!((seed.content.as_str(), seed.anchor_id, seed.sent_nonce.as_deref()), ("SEED", 0, Some("n1")));
+        assert_eq!(db.provider_switch_seed_of("t"), None);
+        db.put_provider_switch_seed("t", "codex", "SEED", 3).unwrap();
+        let (provider, seed) = db.provider_switch_seed_of("t").unwrap();
+        assert_eq!((provider.as_str(), seed.content.as_str(), seed.anchor_id), ("codex", "SEED", 3));
     }
 
     #[test]
