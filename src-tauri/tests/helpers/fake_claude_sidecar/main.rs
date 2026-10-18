@@ -145,11 +145,21 @@ fn fire_script_entries_for(method: &str, script: &[ScriptEntry]) {
             }
             match entry.emit.as_str() {
                 "notification" => {
+                    let params = substitute_steered(entry.params);
                     write_line(&json!({
                         "jsonrpc": "2.0",
                         "method": entry.method,
-                        "params": substitute_steered(entry.params),
+                        "params": params,
                     }));
+                    // Lets a test prove a late line really was written.
+                    if let Ok(path) = std::env::var("FAKE_CLAUDE_EMITTED_MARKER") {
+                        let mut f = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                            .expect("open emitted marker");
+                        let _ = writeln!(f, "{} {}", entry.method, params);
+                    }
                 }
                 "server_request" => {
                     write_line(&json!({
@@ -195,6 +205,14 @@ fn main() {
         line.clear();
         let n = stdin.read_line(&mut line).expect("read_line");
         if n == 0 {
+            // Regression fixture: keep emitting scripted output for a while
+            // after the host closed stdin, like an SDK still mid-run.
+            if let Some(ms) = std::env::var("FAKE_CLAUDE_LINGER_AFTER_EOF_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
             break;
         }
         let trimmed = line.trim();
@@ -281,6 +299,34 @@ fn main() {
                     fire_script_entries_for(method, &script);
                 }
             }
+            "compact-idle" => {
+                capture_params(method, &msg.params);
+                // Regression fixture: the whole compaction can finish before
+                // its acknowledgement reaches the host.
+                if let Some(delay) = std::env::var("FAKE_CLAUDE_COMPACT_ACK_DELAY_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    fire_script_entries_for(method, &script);
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    if let Some(id) = id {
+                        write_line(&json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "started": true },
+                        }));
+                    }
+                    continue;
+                }
+                if let Some(id) = id {
+                    write_line(&json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "started": true },
+                    }));
+                }
+                fire_script_entries_for(method, &script);
+            }
             "steer-turn" => {
                 capture_params(method, &msg.params);
                 let rejection = std::env::var("FAKE_CLAUDE_STEER_ERROR").ok();
@@ -312,6 +358,9 @@ fn main() {
                 }
             }
             "interrupt" if std::env::var("FAKE_CLAUDE_INTERRUPT_ERROR").is_ok() => {
+                // The interrupt fails with the variable's text. Scripted
+                // entries still fire: the sidecar may act on it anyway.
+                capture_params(method, &msg.params);
                 fire_script_entries_for(method, &script);
                 if let Some(delay) = std::env::var("FAKE_CLAUDE_INTERRUPT_DELAY_MS")
                     .ok()

@@ -14,7 +14,7 @@ use super::errors::ProviderError;
 use super::events::ProviderRuntimeEvent;
 use super::types::{
     ApprovalDecision, ProviderCapabilities, ProviderKind, ProviderSession, RequestId,
-    SendTurnInput, StartSessionInput, ThreadId, TurnId, TurnStartResult,
+    SendTurnInput, StartSessionInput, ThreadId, ThreadRuntimeStatus, TurnId, TurnStartResult,
 };
 
 /// Boxed, pinned, Send-capable stream of runtime events emitted by a
@@ -286,6 +286,35 @@ pub trait AgentProvider: Send + Sync {
     /// without support are safe.
     async fn turn_active(&self, _thread_id: &ThreadId) -> bool {
         false
+    }
+
+    /// What the live session bound to `thread_id` is doing, or `None`
+    /// when there is none. In-memory only. The default reports what every
+    /// provider can tell (`turn_active` and the session status); providers
+    /// that keep their own follow-up queue override it.
+    async fn runtime_status(&self, thread_id: &ThreadId) -> Option<ThreadRuntimeStatus> {
+        if !self.has_session(thread_id).await {
+            return None;
+        }
+        let status = self
+            .list_sessions()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|session| &session.thread_id == thread_id)?
+            .status;
+        Some(ThreadRuntimeStatus {
+            busy: self.turn_active(thread_id).await,
+            queued: None,
+            compacting: false,
+            status: ThreadRuntimeStatus::status_name(&status).into(),
+        })
+    }
+
+    /// Compact an idle session's context on behalf of a plugin. `Err` is
+    /// the stable refusal reason. Only Claude supports it.
+    async fn request_compaction(&self, _thread_id: &ThreadId) -> Result<(), &'static str> {
+        Err("not_claude")
     }
 
     /// Remove completed turns from the provider's durable conversation.

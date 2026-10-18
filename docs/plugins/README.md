@@ -117,7 +117,7 @@ Settings pages use `ctx.registerSettingsPage`, not an area.
 | Member | |
 |---|---|
 | `host.theme.get()`, `host.theme.subscribe(fn)`, `host.theme.cssVar(role)` | The active theme and its CSS variable names. |
-| `host.reducedMotion()` | The user's reduce-motion setting. Respect it. |
+| `host.reducedMotion()`, `host.onReducedMotionChange(fn)` | `true` when the app's reduce-motion setting **or** the OS `prefers-reduced-motion` is on. Respect it. `onReducedMotionChange` calls `fn(reduced)` whenever either source flips the result. |
 | `host.notify({ kind?, message, description? })` | A toast. It is not stamped with your plugin's name, so say who you are in the message. (Load errors, render crashes and failed commands are reported by the app, named after your plugin.) |
 | `host.openPage(id)`, `host.openSettings(section?)`, `host.openRightPane(id)` | Navigation. Ids are full contribution ids, `"<pluginId>:<localId>"`. |
 | `host.workspace.current()`, `host.workspace.subscribe(fn)` | The active workspace (`workspace_id`, name, path, …). |
@@ -125,6 +125,8 @@ Settings pages use `ctx.registerSettingsPage`, not an area.
 | `host.composer.insertText(text)`, `.getDraft()`, `.focus()` | The focused composer (or the only one). Return `false`/`null` when none is mounted. |
 | `host.chat.onEvent(fn)` | Every thread's provider events, including background threads with no pane open. `usage_recorded` carries `cacheWriteTtl` (`"1h"` / `"5m"`, Claude only) and `subagent`. The native tap runs only while someone listens. |
 | `host.chat.getThread(id)`, `host.chat.listThreads()`, `host.chat.sendTurn(id, text)` | Read a thread; send a turn the same way the send button does. |
+| `host.chat.getStatus(id)` | What the thread's live session is doing now: `{ provider, busy, queued, compacting, status }`, or `null` when it has no live session (never started, closed, or the app restarted). `busy` means a turn, a pending approval, a queued send being dispatched or a compaction is in flight. `queued` is how many sends wait behind it, or `null` for providers that keep no queue of their own (only Claude and Codex do). `status` is `starting`, `ready`, `running`, `waiting_approval`, `error` or `closed`. |
+| `host.chat.requestCompaction(id)` | Ask the app to compact an idle Claude chat now (Claude Code's `/compact`). Resolves `{ started: true }` or `{ started: false, reason }`; a refusal is a normal answer. **Your plugin decides when; the app keeps it safe:** it refuses unless the session is idle, `ready` and has nothing queued (re-checked under the session lock), claims the session so sends made meanwhile queue behind it, hides the compaction's turn and reply (no "Working" state, no bubble), adds a quiet "Compacted while idle" note to the transcript, and after 10 minutes stops a compaction that hasn't finished before running the queued sends (if the stop can't be confirmed, the session restarts and those sends are cancelled). Reasons: `busy`, `queued`, `not_ready`, `closed`, `no_session`, `not_claude`, `unsupported` (a device or workflow chat), `compaction_off` (`DISABLE_COMPACT`, `DISABLE_AUTO_COMPACT` or `autoCompactEnabled: false`), `idle_compaction_off` (`idleCompaction: false` in Claude settings), `failed`. |
 | `host.invoke(cmd, args)`, `host.listen(event, fn)` | **Unstable.** Raw app IPC with full authority. Commands and events can change between releases without notice. |
 
 The SDK also exports the app's UI kit, so plugins look native: `Button`,
@@ -177,7 +179,8 @@ A plugin's source is capped at 16 MiB.
 - **Title-bar controls must stop `pointerdown` propagation,** or a click starts a window drag.
 - **The chat tap costs nothing until you listen.** Unsubscribe when you don't need events; the native side stops emitting when the last listener leaves.
 - **One plugin can't switch another on or off.** Decisions are written only by Settings.
-- **Not on the web remote.** Plugins run only in the desktop window; the web client never loads them, and `plugins_*` commands are refused there.
+- **Not on the web remote.** Plugins run only in the desktop window; the web client never loads them, and `plugins_*` commands (including the ones behind `host.chat.getStatus` and `requestCompaction`) are refused there.
+- **Check `getStatus` before asking for a compaction, but don't rely on it.** The session can change between the two calls; `requestCompaction` re-checks everything itself and answers `busy` or `queued` if the user got there first.
 
 ## Bundled plugins
 

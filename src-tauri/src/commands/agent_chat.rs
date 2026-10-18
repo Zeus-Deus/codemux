@@ -4882,6 +4882,94 @@ pub async fn agent_chat_turn_active<R: Runtime>(
     Ok(tracker.delegated_work_holding_turn(&thread_id.0))
 }
 
+/// A thread's live state for plugins (`host.chat.getStatus`). `None` when
+/// the thread is unknown or has no live session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginThreadStatus {
+    pub provider: ProviderKind,
+    pub busy: bool,
+    pub queued: Option<usize>,
+    pub compacting: bool,
+    pub status: String,
+}
+
+fn persisted_provider<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Option<ProviderKind> {
+    let db = app.try_state::<DatabaseStore>()?;
+    let record = db.get_agent_chat_session(thread_id)?;
+    serde_json::from_value(serde_json::Value::String(record.provider)).ok()
+}
+
+/// Backs `plugins_chat_status`. Reads in-memory session state only, the
+/// same signals the send path's queue decision uses.
+pub(crate) async fn plugin_thread_status<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+) -> Result<Option<PluginThreadStatus>, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let Some(provider) = persisted_provider(app, thread_id) else {
+        return Ok(None);
+    };
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let Some(impl_) = registry.get(provider).await else {
+        return Ok(None);
+    };
+    let thread = ThreadId(thread_id.to_string());
+    let Some(live) = impl_.runtime_status(&thread).await else {
+        return Ok(None);
+    };
+    // Same second signal as `agent_chat_turn_active`: delegated work can
+    // hold a run open after the provider's own turn ended.
+    let delegated = app
+        .try_state::<SubagentTracker>()
+        .is_some_and(|tracker| tracker.delegated_work_holding_turn(thread_id));
+    Ok(Some(PluginThreadStatus {
+        provider,
+        busy: live.busy || delegated,
+        queued: live.queued,
+        compacting: live.compacting,
+        status: live.status,
+    }))
+}
+
+/// Backs `plugins_chat_request_compaction`. The provider re-checks every
+/// gate under its session lock; this adds the app-level ones. `Err` is a
+/// stable refusal reason for the plugin.
+pub(crate) async fn plugin_request_compaction<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    if feature_flag_on(&observability).is_err() {
+        return Err("unsupported".into());
+    }
+    let Some(provider) = persisted_provider(app, thread_id) else {
+        return Err("no_session".into());
+    };
+    if provider != ProviderKind::Claude {
+        return Err("not_claude".into());
+    }
+    if app
+        .try_state::<SubagentTracker>()
+        .is_some_and(|tracker| tracker.delegated_work_holding_turn(thread_id))
+    {
+        return Err("busy".into());
+    }
+    // Wait out any send that is mid-dispatch; once the session is claimed,
+    // later sends queue behind the compaction.
+    let gate = native_thread_gate(app, thread_id);
+    let _native_guard = gate.dispatch.clone().lock_owned().await;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let Some(impl_) = registry.get(provider).await else {
+        return Err("no_session".into());
+    };
+    impl_
+        .request_compaction(&ThreadId(thread_id.to_string()))
+        .await
+        .map_err(str::to_string)
+}
+
 /// Respond to a pending approval / tool / input request.
 #[tauri::command]
 pub async fn agent_chat_respond_to_request<R: Runtime>(
@@ -9028,7 +9116,10 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
     // General runtime warnings remain transient SDK diagnostics.
     if let ProviderRuntimeEvent::RuntimeWarning { thread_id, message, .. } = event {
         return thread_id.is_some()
-            && message == crate::agent_provider::hermes::USAGE_LIMIT_RECOVERY_WARNING;
+            && (message == crate::agent_provider::hermes::USAGE_LIMIT_RECOVERY_WARNING
+                // The idle-compaction notice explains why a reopened chat
+                // now remembers only a summary of its earlier history.
+                || message.starts_with(crate::agent_provider::claude::idle_compaction::NOTICE_PREFIX));
     }
     matches!(
         event,
@@ -11885,6 +11976,19 @@ mod tests {
         };
         assert!(should_persist_event(&warning(Some(tid()))));
         assert!(!should_persist_event(&warning(None)));
+    }
+
+    #[test]
+    fn should_persist_idle_compaction_notice_but_not_other_claude_warnings() {
+        let warning = |message: String| ProviderRuntimeEvent::RuntimeWarning {
+            thread_id: Some(tid()),
+            message,
+            original_payload: None,
+        };
+        assert!(should_persist_event(&warning(
+            crate::agent_provider::claude::idle_compaction::notice_message()
+        )));
+        assert!(!should_persist_event(&warning("sdk stream_event".into())));
     }
 
     // ── AgentChatChannelRegistry ──

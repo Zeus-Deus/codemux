@@ -257,6 +257,44 @@ pub fn plugins_set_event_tap<R: Runtime>(app: AppHandle<R>, on: bool) -> Result<
     Ok(())
 }
 
+// ── chat: status and compaction (host.chat) ───────────────────────────
+
+/// `host.chat.getStatus(threadId)`: what the thread's live session is doing,
+/// or `null` when it has none.
+#[tauri::command]
+pub async fn plugins_chat_status<R: Runtime>(
+    app: AppHandle<R>,
+    thread_id: String,
+) -> Result<Option<crate::commands::agent_chat::PluginThreadStatus>, String> {
+    gui(&app)?;
+    crate::commands::agent_chat::plugin_thread_status(&app, &thread_id).await
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionRequest {
+    pub started: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `host.chat.requestCompaction(threadId)`: compact an idle Claude chat now.
+/// The app owns every safety rule (see `claude/idle_compaction.rs`); a
+/// refusal is a normal answer, not an error.
+#[tauri::command]
+pub async fn plugins_chat_request_compaction<R: Runtime>(
+    app: AppHandle<R>,
+    thread_id: String,
+) -> Result<CompactionRequest, String> {
+    gui(&app)?;
+    Ok(
+        match crate::commands::agent_chat::plugin_request_compaction(&app, &thread_id).await {
+            Ok(()) => CompactionRequest { started: true, reason: None },
+            Err(reason) => CompactionRequest { started: false, reason: Some(reason) },
+        },
+    )
+}
+
 // ── catalog, install, update, remove ──────────────────────────────────
 
 /// The catalog (bundled copy until the first fetch; re-fetched every 24 h).
@@ -553,5 +591,42 @@ mod tests {
                 assert_eq!(moved.unwrap().preview.replaces.as_deref(), Some(fresh.marker.sha.as_str()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::CompactionRequest;
+    use crate::agent_provider::{ProviderKind, SessionStatus, ThreadRuntimeStatus, TurnId};
+    use crate::commands::agent_chat::PluginThreadStatus;
+    use serde_json::json;
+
+    #[test]
+    fn compaction_answers_match_the_host_api_shape() {
+        let started = CompactionRequest { started: true, reason: None };
+        assert_eq!(serde_json::to_value(&started).unwrap(), json!({ "started": true }));
+        let refused = CompactionRequest { started: false, reason: Some("busy".into()) };
+        assert_eq!(
+            serde_json::to_value(&refused).unwrap(),
+            json!({ "started": false, "reason": "busy" })
+        );
+    }
+
+    #[test]
+    fn status_serializes_camel_case_with_the_lifecycle_name() {
+        let status = PluginThreadStatus {
+            provider: ProviderKind::Claude,
+            busy: true,
+            queued: Some(2),
+            compacting: false,
+            status: ThreadRuntimeStatus::status_name(&SessionStatus::Running {
+                active_turn: TurnId("t".into()),
+            })
+            .into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&status).unwrap(),
+            json!({ "provider": "claude", "busy": true, "queued": 2, "compacting": false, "status": "running" })
+        );
     }
 }

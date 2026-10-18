@@ -203,20 +203,26 @@ async fn plan_fork<R: Runtime>(
 
 const BUSY: &str = "Wait for the current turn and any queued messages to finish, then fork the chat.";
 
-/// Whether the source has a turn running or queued messages still to send.
+/// Whether the source has a turn running, a compaction in progress, or
+/// queued messages still to send.
 /// A queued turn can finish before its dispatch is acknowledged (and its
 /// user message written), so the queue journal counts too, but only while
 /// the provider holds a session (`session_live`): entries a crash left
 /// behind can't dispatch and must not block forks forever. `turn_active`
-/// reads session state only, never the outbound lock, so it is safe under
-/// the timeline guard.
+/// and `runtime_status` read session state only, never the outbound lock,
+/// so they are safe under the timeline guard.
 async fn source_busy(
     live: &dyn AgentProvider,
     session_live: bool,
     db: &DatabaseStore,
     thread: &str,
 ) -> Result<bool, String> {
-    if live.turn_active(&ThreadId(thread.to_string())).await {
+    let id = ThreadId(thread.to_string());
+    if live.turn_active(&id).await {
+        return Ok(true);
+    }
+    // A plugin-requested compaction is rewriting the native history.
+    if live.runtime_status(&id).await.is_some_and(|status| status.compacting) {
         return Ok(true);
     }
     Ok(session_live && !db.control_unresolved_queued_ids(thread)?.is_empty())

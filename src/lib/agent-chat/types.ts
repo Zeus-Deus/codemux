@@ -389,8 +389,9 @@ export interface RuntimeNoticeItem {
   /** Visual temperature. `"error"` (red) marks a terminal failure —
    *  the session died and the message is the cause; the default
    *  (absent / `"warning"`, amber) covers advisories the run may
-   *  recover from (rate-limit rejection, resume fallback). */
-  severity?: "warning" | "error";
+   *  recover from (rate-limit rejection, resume fallback); `"info"`
+   *  (muted) is a routine fact, e.g. an idle chat was compacted. */
+  severity?: "info" | "warning" | "error";
   /** Set when the run failed because this provider's CLI is signed out.
    *  The row then renders as a card with a Sign in action rather than as
    *  a bare line. */

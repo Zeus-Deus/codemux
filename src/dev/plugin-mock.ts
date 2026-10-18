@@ -46,6 +46,9 @@ export function pluginMockHandlers(): Record<string, Handler> {
     plugins_startup_checkpoint: () => null,
     plugins_resume: () => null,
     plugins_set_event_tap: () => null,
+    // No live sessions in the mock: every thread reads as having none.
+    plugins_chat_status: () => null,
+    plugins_chat_request_compaction: () => ({ started: false, reason: "no_session" }),
     plugins_catalog: () => ({
       catalog: { schemaVersion: 1, revision: 1, plugins: [], blocked: [] },
       fetchedAt: null,

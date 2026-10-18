@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -206,6 +206,24 @@ struct PendingTurnStart {
     failed: bool,
 }
 
+/// One send counted as in flight, from leaving the queue (or the send
+/// button) until it settles, including when its future is dropped. A count,
+/// not a flag: a send that settles late must never clear the next one's.
+struct InFlightSend<'a>(&'a AtomicUsize);
+
+impl<'a> InFlightSend<'a> {
+    fn enter(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for InFlightSend<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Steering that started a new turn is a message sent by hand, which releases
 /// a queue held by Stop. Guidance inside a turn, or a failure, restores the
 /// hold taken before delivery (a Stop during delivery holds it regardless).
@@ -296,6 +314,9 @@ pub(crate) struct CodexSession {
     /// Mutable session state.
     pub state: Mutex<CodexSessionState>,
     outbound: Mutex<()>,
+    /// A send is being prepared or started (checkpoint, `turn/start` in
+    /// flight) before `active_turn` is bound. Read by `runtime_status`.
+    dispatching: AtomicUsize,
     /// Broadcast sender used to emit runtime events from methods that
     /// mutate the follow-up queue (enqueue / dispatch / cancel). The
     /// background tasks receive their own clone via spawn args.
@@ -778,6 +799,7 @@ impl CodexSession {
             notification_demux: Mutex::new(demux),
             state,
             outbound: Mutex::new(()),
+            dispatching: AtomicUsize::new(0),
             event_tx: event_tx.clone(),
             shutdown_tx: shutdown_tx.clone(),
             tasks: Mutex::new(Vec::new()),
@@ -864,7 +886,7 @@ impl CodexSession {
     ) -> Result<SendOutcome, ProviderError> {
         let outbound = self.outbound.lock().await;
         self.ensure_open().await?;
-        let was_held = {
+        let (was_held, dispatching) = {
             let mut state = self.state.lock().await;
             if state.active_turn.is_some() {
                 if input.dispatch_guard.is_some() {
@@ -900,7 +922,7 @@ impl CodexSession {
                 return Ok(SendOutcome::Queued(queued_id));
             }
             // A message sent by hand goes first; the held queue follows it.
-            state.queue_hold.take()
+            (state.queue_hold.take(), InFlightSend::enter(&self.dispatching))
         };
         let checkpoint = input.turn_checkpoint.clone();
         if let Some(checkpoint) = checkpoint.as_ref() {
@@ -934,6 +956,8 @@ impl CodexSession {
         if was_held {
             self.state.lock().await.queue_hold.settle_take(was_held, outcome.is_ok());
         }
+        // Settled while it still owns outbound, before any later send starts.
+        drop(dispatching);
         drop(outbound);
         if was_held && outcome.is_ok() {
             // The turn may have settled before its start response while
@@ -1148,9 +1172,12 @@ impl CodexSession {
                 if !state.queue_hold.admits(front.as_deref()) {
                     return;
                 }
-                state.queued_turns.pop_front()
+                state
+                    .queued_turns
+                    .pop_front()
+                    .map(|queued| (queued, InFlightSend::enter(&self.dispatching)))
             };
-            let Some(queued) = next else { return };
+            let Some((queued, _dispatching)) = next else { return };
             let text = queued
                 .input
                 .display_text
@@ -1540,6 +1567,13 @@ impl CodexSession {
     /// treated as absent by the provider so the next send auto-resumes.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
+    }
+
+    /// Whether a send is between leaving the queue (or the send button)
+    /// and Codex binding its turn. Read under the state lock for a
+    /// consistent view with `queued_turns`.
+    pub(crate) fn dispatch_in_flight(&self) -> bool {
+        self.dispatching.load(Ordering::SeqCst) > 0
     }
 
     /// A managed replacement temporarily marks its retired child dead while
@@ -2946,6 +2980,23 @@ pub(crate) mod managed_tests;
 #[cfg(all(test, unix))]
 #[path = "approval_tests.rs"]
 mod approval_tests;
+
+#[cfg(test)]
+mod in_flight_send_tests {
+    use super::InFlightSend;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_send_settling_late_never_clears_the_next_ones_dispatch() {
+        let count = AtomicUsize::new(0);
+        let first = InFlightSend::enter(&count);
+        let second = InFlightSend::enter(&count);
+        drop(first);
+        assert_eq!(count.load(Ordering::SeqCst), 1, "the second send is still in flight");
+        drop(second);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+}
 
 #[cfg(test)]
 mod tests {
