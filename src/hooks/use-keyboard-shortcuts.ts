@@ -295,6 +295,15 @@ export function dispatch(actionId: string, event?: KeyboardEvent): boolean {
   );
   const activePaneId = surface?.active_pane_id;
 
+  // Gated in `isAppShortcutApplicable` (above): the card's host is mounted
+  // only while it can show (GUI chrome, no Settings / new-project screen /
+  // utility page / draft, panel not fully expanded), so an unavailable
+  // binding neither flips the saved preference nor eats terminal input.
+  if (actionId === "toggleWorkspaceDetails") {
+    ui.toggleWorkspaceDetails();
+    return true;
+  }
+
   if (actionId === "runDevCommand") {
     runProjectDevCommand(ws.workspace_id).catch(reportFailure("Couldn't run the dev command"));
     return true;

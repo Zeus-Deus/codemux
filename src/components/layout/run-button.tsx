@@ -1,6 +1,6 @@
 import { Kbd } from "@/components/ui/kbd";
 import { useState, useEffect, useRef, type FormEvent } from "react";
-import { Check, ChevronDown, Play, Settings } from "lucide-react";
+import { Check, ChevronDown, Play, Plus, Settings } from "lucide-react";
 import {
   Tooltip,
   TooltipContent,
@@ -17,9 +17,13 @@ import { Eyebrow } from "@/components/ui/eyebrow";
 import { Input } from "@/components/ui/input";
 import { useShortcutLabel } from "@/components/ui/menu-chrome";
 import {
-  BAND_CONTROL_HOVER,
-  BAND_CONTROL_RADIUS,
-} from "@/components/layout/titlebar-control-style";
+  DETAILS_CHEVRON,
+  DETAILS_ICON,
+  DETAILS_SPLIT_GROUP,
+  DETAILS_SPLIT_PRIMARY,
+  DETAILS_SPLIT_SECONDARY,
+  DETAILS_SPLIT_SEPARATOR,
+} from "@/components/layout/workspace-details/styles";
 import { useActiveWorkspaceProjectRoot } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { cn } from "@/lib/utils";
@@ -38,11 +42,10 @@ interface RunButtonProps {
   workspaceId: string;
   /** Rendering shape. `"legacy"` (default) is the original ghost
    *  [Run/Set Run + badge] button + standalone gear pair — used by the
-   *  legacy (flag-off) PresetBar, which must stay byte-identical. `"split"` is
-   *  the GUI-chrome split button: main segment runs (green play glyph), caret
-   *  segment configures, no standalone gear. Only the GUI branch of
-   *  `title-bar.tsx` passes `"split"`. */
-  variant?: "legacy" | "split";
+   *  legacy (flag-off) PresetBar, which must stay byte-identical. `"panel"`
+   *  is the Workspace details card's split row: the main segment runs, the
+   *  chevron configures. */
+  variant?: "legacy" | "panel";
 }
 
 export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
@@ -104,66 +107,58 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
 
   const isConfigured = !!runCommand;
 
-  if (variant === "split") {
-    // GUI-chrome split button: the main segment runs, or opens the run
-    // command popover while nothing is set; the caret always opens it.
+  if (variant === "panel") {
+    // Workspace details card row: the main segment runs, or opens the run
+    // command popover while nothing is set; the chevron always opens it.
     // The popover offers detected scripts, a typed command and a link to
     // Settings, so setting up Run never leaves the workspace.
-    //
-    // The two segments carry no border, no resting fill and no divider —
-    // only a hover fill, exactly like the panel toggle at the other end of
-    // the band. A chip outline here would make Run the one boxed control
-    // in a row of borderless ones; without it the green play glyph and the
-    // semibold label are what mark it as the primary action. The inline
-    // keyboard-shortcut badge is gone — the shortcut lives in the main
-    // segment's tooltip instead of eating horizontal space.
-    const mainTooltip = isConfigured ? runCommand : "Set Run";
     return (
       <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
         <PopoverAnchor asChild>
-          <div className="flex h-7 shrink-0 items-center gap-[2px]">
+          <div role="group" className={DETAILS_SPLIT_GROUP}>
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
                   type="button"
                   onClick={isConfigured ? handleRun : () => setPopoverOpen(true)}
-                  className={cn(
-                    "flex h-7 items-center gap-1.5 px-2 text-label font-semibold text-foreground",
-                    BAND_CONTROL_RADIUS,
-                    BAND_CONTROL_HOVER,
-                    !isConfigured && "text-muted-foreground",
-                  )}
+                  // The command itself is in the tooltip; naming the button
+                  // by it would collide with the popover's detected rows.
+                  aria-label={isConfigured ? "Run" : "Set run command"}
+                  className={DETAILS_SPLIT_PRIMARY}
                 >
-                  <Play className="h-[11px] w-[11px] shrink-0 text-status-open" fill="currentColor" />
-                  <span>{isConfigured ? "Run" : "Set Run"}</span>
+                  {isConfigured ? (
+                    <Play
+                      className="size-3.5 shrink-0 text-status-open"
+                      fill="currentColor"
+                    />
+                  ) : (
+                    <Plus className={DETAILS_ICON} />
+                  )}
+                  <span className="shrink-0">
+                    {isConfigured ? "Run" : "Set run command"}
+                  </span>
+                  {isConfigured && (
+                    <span className="min-w-0 flex-1 truncate text-right font-mono text-label text-muted-foreground">
+                      {runCommand}
+                    </span>
+                  )}
                 </button>
               </TooltipTrigger>
-              <TooltipContent side="bottom" sideOffset={4} shortcut="runDevCommand">
-                {mainTooltip}
+              <TooltipContent side="left" sideOffset={8} shortcut="runDevCommand">
+                {isConfigured ? runCommand : "Set a run command"}
               </TooltipContent>
             </Tooltip>
-
-            <Tooltip>
-              <PopoverTrigger asChild>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    aria-label="Configure run command"
-                    className={cn(
-                      "flex h-7 w-5 items-center justify-center text-muted-foreground",
-                      BAND_CONTROL_RADIUS,
-                      BAND_CONTROL_HOVER,
-                      "data-[state=open]:bg-muted data-[state=open]:text-foreground dark:data-[state=open]:bg-muted/50",
-                    )}
-                  >
-                    <ChevronDown className="size-3" />
-                  </button>
-                </TooltipTrigger>
-              </PopoverTrigger>
-              <TooltipContent side="bottom" sideOffset={4}>
-                Configure run command
-              </TooltipContent>
-            </Tooltip>
+            <span aria-hidden className={DETAILS_SPLIT_SEPARATOR} />
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                aria-label="Configure run command"
+                title="Configure run command"
+                className={DETAILS_SPLIT_SECONDARY}
+              >
+                <ChevronDown className={DETAILS_CHEVRON} />
+              </button>
+            </PopoverTrigger>
           </div>
         </PopoverAnchor>
         <PopoverContent

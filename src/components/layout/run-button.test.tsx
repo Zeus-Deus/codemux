@@ -68,10 +68,10 @@ function renderRunButton(workspaceId = "ws-1") {
   );
 }
 
-function renderSplitRunButton(workspaceId = "ws-1") {
+function renderPanelRunButton(workspaceId = "ws-1") {
   return render(
     <TooltipProvider>
-      <RunButton workspaceId={workspaceId} variant="split" />
+      <RunButton workspaceId={workspaceId} variant="panel" />
     </TooltipProvider>,
   );
 }
@@ -202,14 +202,14 @@ describe("RunButton", () => {
   });
 });
 
-// GUI-chrome shape (`variant="split"`, passed only by title-bar.tsx).
+// Workspace details card row (`variant="panel"`).
 // The legacy default above stays byte-identical for the flag-off PresetBar.
-describe("RunButton — split variant", () => {
+describe("RunButton — panel variant", () => {
   it("offers desktop configuration instead of unsupported saves on a remote client", async () => {
     (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
-    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.click(screen.getByText("Set run command"));
     expect(await screen.findByText("Configure this project's run command in the desktop app.")).toBeInTheDocument();
     expect(screen.queryByLabelText("Run command")).toBeNull();
     expect(mockDetectRunCandidates).not.toHaveBeenCalled();
@@ -220,17 +220,17 @@ describe("RunButton — split variant", () => {
   it("runs an already configured command on a remote client", async () => {
     (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
     mockGetProjectScripts.mockResolvedValue({ setup: [], teardown: [], run: "npm run dev" });
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
     await userEvent.click(screen.getByText("Run"));
     expect(mockRunProjectDevCommand).toHaveBeenCalledWith("ws-1");
     expect(mockSetProjectScripts).not.toHaveBeenCalled();
   });
 
-  it('main segment shows "Set Run" and opens the popover with detected commands', async () => {
-    renderSplitRunButton();
+  it('main segment shows "Set run command" and opens the popover with detected commands', async () => {
+    renderPanelRunButton();
     await flushPromises();
-    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.click(screen.getByText("Set run command"));
     expect(await screen.findByText("pnpm run dev")).toBeInTheDocument();
     expect(screen.getByText("Cargo.toml")).toBeInTheDocument();
     expect(mockDetectRunCandidates).toHaveBeenCalledWith("/home/user/myapp");
@@ -245,7 +245,7 @@ describe("RunButton — split variant", () => {
       teardown: [],
       run: "npm run dev",
     });
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
     await userEvent.click(screen.getByText("Run"));
     expect(mockRunProjectDevCommand).toHaveBeenCalledWith("ws-1");
@@ -257,7 +257,7 @@ describe("RunButton — split variant", () => {
       teardown: [],
       run: "npm run dev",
     });
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
     await userEvent.click(
       screen.getByRole("button", { name: "Configure run command" }),
@@ -276,9 +276,9 @@ describe("RunButton — split variant", () => {
       run: null,
       worktree_includes: [".env"],
     });
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
-    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.click(screen.getByText("Set run command"));
     await userEvent.click(await screen.findByRole("button", { name: /pnpm run dev/ }));
     expect(mockSetProjectScripts).toHaveBeenCalledWith("/home/user/myapp", {
       setup: ["pnpm install"],
@@ -292,9 +292,9 @@ describe("RunButton — split variant", () => {
   });
 
   it("a typed command is saved and run on Enter", async () => {
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
-    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.click(screen.getByText("Set run command"));
     await userEvent.type(await screen.findByLabelText("Run command"), "just serve{Enter}");
     expect(mockSetProjectScripts).toHaveBeenCalledWith(
       "/home/user/myapp",
@@ -305,18 +305,18 @@ describe("RunButton — split variant", () => {
 
   it("keeps the popover open and shows the error when saving fails", async () => {
     mockSetProjectScripts.mockRejectedValue("database is locked");
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
-    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.click(screen.getByText("Set run command"));
     await userEvent.click(await screen.findByRole("button", { name: /cargo run/ }));
     expect(await screen.findByText("database is locked")).toBeInTheDocument();
     expect(mockRunProjectDevCommand).not.toHaveBeenCalled();
   });
 
   it("does not save when the existing scripts cannot be read", async () => {
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
-    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.click(screen.getByText("Set run command"));
     // Writing after a failed read would wipe setup, teardown and includes.
     mockGetProjectScripts.mockRejectedValue("read failed");
     await userEvent.click(await screen.findByRole("button", { name: /cargo run/ }));
@@ -332,7 +332,7 @@ describe("RunButton — split variant", () => {
       run: "cargo run",
       worktree_includes: [],
     });
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
     await userEvent.click(
       screen.getByRole("button", { name: "Configure run command" }),
@@ -351,7 +351,7 @@ describe("RunButton — split variant", () => {
       run: "npm run dev",
       worktree_includes: [],
     });
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
     await userEvent.click(
       screen.getByRole("button", { name: "Configure run command" }),
@@ -364,9 +364,9 @@ describe("RunButton — split variant", () => {
   });
 
   it("does not return focus to the caret after a pointer pick", async () => {
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
-    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.click(screen.getByText("Set run command"));
     await userEvent.click(await screen.findByRole("button", { name: /pnpm run dev/ }));
     await waitFor(() => expect(screen.getByText("Run")).toBeInTheDocument());
     // Focusing the caret would pop its tooltip right after the pick.
@@ -376,7 +376,7 @@ describe("RunButton — split variant", () => {
   });
 
   it("returns focus to the caret after a keyboard pick", async () => {
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
     const caret = screen.getByRole("button", { name: "Configure run command" });
     await userEvent.click(caret);
@@ -395,9 +395,9 @@ describe("RunButton — split variant", () => {
   });
 
   it("More settings opens Settings > Projects", async () => {
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
-    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.click(screen.getByText("Set run command"));
     await userEvent.click(await screen.findByText("More settings…"));
     expect(mockSetShowSettings).toHaveBeenCalledWith(true, "projects");
   });
@@ -415,10 +415,10 @@ describe("RunButton — split variant", () => {
       run: "db-cmd",
       worktree_includes: [],
     });
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
     // The backend ignores DB scripts once a config file exists.
-    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.click(screen.getByText("Set run command"));
     expect(await screen.findByText(".codemux/config.json")).toBeInTheDocument();
     // The file has no `run`, so the text asks for one instead of claiming
     // it is set.
@@ -434,7 +434,7 @@ describe("RunButton — split variant", () => {
       run: "yarn dev",
       worktree_includes: [],
     });
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
     await userEvent.click(
       screen.getByRole("button", { name: "Configure run command" }),
@@ -450,21 +450,21 @@ describe("RunButton — split variant", () => {
       run: path === "/home/user/myapp" ? "npm run dev" : null,
       worktree_includes: [],
     }));
-    const { rerender } = renderSplitRunButton();
+    const { rerender } = renderPanelRunButton();
     await flushPromises();
     expect(screen.getByText("Run")).toBeInTheDocument();
     mockActiveWorkspace = { workspace_id: "ws-2", project_root: "/home/user/other" };
     rerender(
       <TooltipProvider>
-        <RunButton workspaceId="ws-2" variant="split" />
+        <RunButton workspaceId="ws-2" variant="panel" />
       </TooltipProvider>,
     );
     await flushPromises();
-    expect(screen.getByText("Set Run")).toBeInTheDocument();
+    expect(screen.getByText("Set run command")).toBeInTheDocument();
   });
 
   it("has no inline keyboard-shortcut badge in the DOM", async () => {
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
     // The badge moved into the main segment's tooltip (mock-faithful
     // restyle) — it must not render as static DOM text any more.
@@ -472,20 +472,20 @@ describe("RunButton — split variant", () => {
   });
 
   it("shows the shortcut in the main segment's tooltip when unconfigured", async () => {
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
-    await userEvent.hover(screen.getByText("Set Run"));
+    await userEvent.hover(screen.getByText("Set run command"));
     const tooltip = await screen.findByRole("tooltip");
-    expect(tooltip).toHaveTextContent("Set Run");
+    expect(tooltip).toHaveTextContent("Set a run command");
     expect(within(tooltip).getByText("Ctrl+Shift+G")).toBeInTheDocument();
   });
 
   it("follows a rebound run shortcut in the tooltip", async () => {
     const original = useSyncedSettingsStore.getState().settings;
     try {
-      renderSplitRunButton();
+      renderPanelRunButton();
       await flushPromises();
-      await userEvent.hover(screen.getByText("Set Run"));
+      await userEvent.hover(screen.getByText("Set run command"));
       const tooltip = await screen.findByRole("tooltip");
       expect(within(tooltip).getByText("Ctrl+Shift+G")).toBeInTheDocument();
       // Rebind while the tooltip is already open: the keycap must re-render.
@@ -512,7 +512,7 @@ describe("RunButton — split variant", () => {
       teardown: [],
       run: "npm run dev",
     });
-    renderSplitRunButton();
+    renderPanelRunButton();
     await flushPromises();
     await userEvent.hover(screen.getByText("Run"));
     const tooltip = await screen.findByRole("tooltip");
@@ -520,19 +520,17 @@ describe("RunButton — split variant", () => {
     expect(within(tooltip).getByText("Ctrl+Shift+G")).toBeInTheDocument();
   });
 
-  it("renders a borderless 28px run segment plus a 20px caret segment", async () => {
-    const { container } = renderSplitRunButton();
+  it("renders one split row: a run segment and a 32px chevron", async () => {
+    const { container } = renderPanelRunButton();
     await flushPromises();
-    const outer = container.firstElementChild;
-    // No chip: in the titlebar band this control carries no border and no
-    // resting fill, only a hover fill, like the panel toggle opposite it.
-    expect(outer?.className).not.toContain("border");
-    expect(outer?.className).not.toContain("bg-secondary");
-    expect(outer?.className).toContain("h-7");
-    const buttons = container.querySelectorAll("button");
+    const group = screen.getByRole("group");
+    expect(container.firstElementChild).toBe(group);
+    // One shared hover surface, no chip border.
+    expect(group.className).not.toContain("border");
+    const buttons = group.querySelectorAll("button");
     expect(buttons).toHaveLength(2);
-    // Caret segment is 20px wide (w-5) and carries the aria-label.
     const caret = screen.getByRole("button", { name: "Configure run command" });
-    expect(caret.className).toContain("w-5");
+    expect(caret.className).toContain("w-8");
+    expect(caret.className).toContain("h-8");
   });
 });

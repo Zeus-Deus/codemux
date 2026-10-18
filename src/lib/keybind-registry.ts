@@ -43,6 +43,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "commandPalette", label: "Command palette", category: "general", defaultKeys: "Ctrl+K" },
   { id: "toggleSidebar", label: "Toggle sidebar", category: "general", defaultKeys: "Ctrl+B" },
   { id: "toggleRightPanel", label: "Toggle right panel", category: "general", defaultKeys: "Ctrl+Shift+B", description: "Show/hide the right panel (Files, Changes, Review, Orchestration)" },
+  { id: "toggleWorkspaceDetails", label: "Toggle workspace details", category: "general", defaultKeys: "Ctrl+Shift+O", description: "Show/hide the workspace details card: run, open in editor, branch, commit, changes and live agents" },
   { id: "openSettings", label: "Open settings", category: "general", defaultKeys: "Ctrl+," },
   { id: "openProject", label: "Open project", category: "general", defaultKeys: "Ctrl+O", description: "Open an existing folder as a project" },
   { id: "showShortcuts", label: "Keyboard shortcuts", category: "general", defaultKeys: "Ctrl+Shift+?", description: "Show every shortcut over the current view. Rebind them in Settings ▸ Shortcuts" },

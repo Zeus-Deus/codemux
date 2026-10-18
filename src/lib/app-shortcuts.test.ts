@@ -66,3 +66,21 @@ describe("isAppShortcut", () => {
     expect(isAppShortcut(keyEvent({ key: "r", ctrlKey: true }))).toBe(true);
   });
 });
+
+// A focused terminal yields any key that `isAppShortcut` claims. While the
+// Workspace details card cannot show (its host is unmounted), its binding
+// must stay with the terminal — e.g. a user rebinding it to Ctrl+U would
+// otherwise lose the shell's clear-line key for nothing.
+describe("isAppShortcut — toggleWorkspaceDetails", () => {
+  it("only claims the key while the card's host is mounted", async () => {
+    const { useUIStore } = await import("@/stores/ui-store");
+    updateAppShortcuts({ toggleWorkspaceDetails: "Ctrl+U" });
+    const ev = keyEvent({ key: "u", ctrlKey: true });
+
+    useUIStore.setState({ workspaceDetailsHosted: false });
+    expect(isAppShortcut(ev)).toBe(false);
+
+    useUIStore.setState({ workspaceDetailsHosted: true });
+    expect(isAppShortcut(ev)).toBe(true);
+  });
+});

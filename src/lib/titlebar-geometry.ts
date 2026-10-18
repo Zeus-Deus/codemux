@@ -38,21 +38,66 @@ export const RIGHT_PANEL_RESIZER_REACH = 3;
  */
 export const WINDOW_CONTROLS_RESERVE = 104;
 
-/** Width of one titlebar-sized `PaneActionButton` in the fixed cluster. */
+/**
+ * Every px value below is at the default 16px root. The controls they
+ * describe are rem-sized, so the interface-size setting scales them; callers
+ * pass the live root size (`useRootFontPx`) and the reserves scale with it.
+ */
+const BASE_ROOT_PX = 16;
+
+/** Width of one titlebar-sized control (`size-7`) in the fixed cluster. */
 export const PANEL_CONTROL_WIDTH = 28;
 
 /**
- * Reserved width for the open panel's two 28px controls. This includes its
- * internal 2px gap and the existing 6px breathing room around the cluster.
+ * The right-hand run's rhythm: the gap between two 28px controls.
+ *
+ * The native window buttons are 32px hover boxes laid edge to edge, so their
+ * glyphs sit 32px apart. Every 28px control to their left keeps that same
+ * 32px glyph pitch — 4px between two of them, 2px between one and the first
+ * window button — so the resource monitor, the details toggle, the panel
+ * controls and the window buttons read as one evenly spaced row.
  */
-export const PANEL_CLUSTER_WIDTH = 64;
+export const TITLEBAR_RHYTHM_GAP = 4;
 
-/** Gap between the cluster and whatever sits beside it. */
+/** The window buttons' inset from the window's right edge (`right-1`). */
+export const WINDOW_CONTROLS_INSET = 4;
+
+/** The window buttons' footprint: three 32px buttons plus their inset. */
+export const WINDOW_CONTROLS_WIDTH = 3 * 32 + WINDOW_CONTROLS_INSET;
+
+/** Web client only: the cluster's inset from the bare window edge. */
 export const PANEL_CLUSTER_GAP = 6;
 
+export interface CornerClusterShape {
+  /** The right panel is open, so its expand control is shown. */
+  panelOpen: boolean;
+  /** The resource monitor is enabled (it leads the cluster). */
+  monitor?: boolean;
+  /** The live root font size; defaults to 16. */
+  remPx?: number;
+}
+
+/** Width of the fixed corner cluster: [monitor] details [expand] panel. */
+export function cornerClusterWidth({
+  panelOpen,
+  monitor = false,
+  remPx = BASE_ROOT_PX,
+}: CornerClusterShape): number {
+  const controls = 2 + (panelOpen ? 1 : 0) + (monitor ? 1 : 0);
+  const base =
+    controls * PANEL_CONTROL_WIDTH + (controls - 1) * TITLEBAR_RHYTHM_GAP;
+  return (base * remPx) / BASE_ROOT_PX;
+}
+
 /** Distance from the window's right edge to the panel-control cluster. */
-export function panelClusterRight(remoteClient: boolean): number {
-  return remoteClient ? PANEL_CLUSTER_GAP : WINDOW_CONTROLS_RESERVE;
+export function panelClusterRight(
+  remoteClient: boolean,
+  remPx: number = BASE_ROOT_PX,
+): number {
+  // 2px, not 4: a 28px control beside a 32px window button keeps the 32px
+  // glyph pitch with half the gap (see TITLEBAR_RHYTHM_GAP).
+  const base = remoteClient ? PANEL_CLUSTER_GAP : WINDOW_CONTROLS_WIDTH + 2;
+  return (base * remPx) / BASE_ROOT_PX;
 }
 
 /**
@@ -66,8 +111,12 @@ export function panelClusterRight(remoteClient: boolean): number {
  */
 export function topRightReserve(
   remoteClient: boolean,
-  panelOpen: boolean,
+  shape: CornerClusterShape,
 ): number {
-  const clusterWidth = panelOpen ? PANEL_CLUSTER_WIDTH : PANEL_CONTROL_WIDTH;
-  return panelClusterRight(remoteClient) + clusterWidth + PANEL_CLUSTER_GAP;
+  const remPx = shape.remPx ?? BASE_ROOT_PX;
+  return (
+    panelClusterRight(remoteClient, remPx) +
+    cornerClusterWidth(shape) +
+    (TITLEBAR_RHYTHM_GAP * remPx) / BASE_ROOT_PX
+  );
 }
