@@ -7,6 +7,7 @@ pub mod hermes;
 pub mod custom_acp;
 pub(crate) mod local_sessions;
 mod delegation;
+pub mod pr_watch;
 
 fn agent_chat_session(conn: &Connection, thread_id: &str) -> Option<AgentChatSessionRecord> {
         conn.query_row(
@@ -1165,6 +1166,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     async_questions::create_schema(conn)?;
     delegated_tasks::create_schema(conn)?;
     follow_ups::create_schema(conn)?;
+    pr_watch::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new

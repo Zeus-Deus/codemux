@@ -3747,3 +3747,27 @@ export const followUpStart = (input: {
 /** Merge every finished child branch into the parent's checkout. */
 export const followUpMergeAll = (parentThreadId: string) =>
   invoke<FollowUpMergeResult>("follow_up_merge_all", { parentThreadId });
+
+// ── Pull-request watch ──
+// A chat watches its pull request and is woken with a queued turn when a
+// check fails, someone else comments or reviews, or the branch conflicts.
+
+/** Watch (or re-arm) from a chat. `prNumber` defaults to the workspace's
+ *  linked pull request; `maxAttempts` defaults to 3. */
+export const prWatchStart = (
+  threadId: string,
+  prNumber?: number | null,
+  maxAttempts?: number | null,
+) =>
+  invoke<import("./types").PrWatchStatus>("pr_watch_start", {
+    threadId,
+    prNumber: prNumber ?? null,
+    maxAttempts: maxAttempts ?? null,
+  });
+
+/** Stop watching. Resolves `true` when a watch existed. */
+export const prWatchStop = (threadId: string) =>
+  invoke<boolean>("pr_watch_stop", { threadId });
+
+export const prWatchStatus = (threadId: string) =>
+  invoke<import("./types").PrWatchStatus | null>("pr_watch_status", { threadId });

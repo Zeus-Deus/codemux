@@ -22,6 +22,9 @@ pub enum AgentNotice {
     Finished,
     /// The agent is blocked on an approval or a question.
     NeedsInput,
+    /// A watched pull request still needs work after the chat used every
+    /// automatic attempt, so Codemux stopped waking it.
+    PrWatchStopped,
 }
 
 /// Payload for the global [`NOTIFICATION_EVENT`]. Serialized snake_case so web
@@ -75,7 +78,10 @@ pub fn notify_agent<R: Runtime>(
     notice: AgentNotice,
     target: &NotificationTarget,
 ) {
-    if !should_notify(target, main_window_focused(app)) {
+    // A watch that stopped has nothing on screen saying so, so being in its
+    // workspace is no reason to stay quiet. Mute still applies.
+    let looking = main_window_focused(app) && notice != AgentNotice::PrWatchStopped;
+    if !should_notify(target, looking) {
         return;
     }
     let payload = agent_payload(notice, target);
@@ -113,6 +119,10 @@ fn agent_payload(notice: AgentNotice, target: &NotificationTarget) -> Notificati
         AgentNotice::NeedsInput => (
             "Agent needs your input",
             "Approve or answer to let it continue.",
+        ),
+        AgentNotice::PrWatchStopped => (
+            "Pull request needs you",
+            "Codemux stopped watching after its automatic fix attempts.",
         ),
     };
     NotificationPayload {
