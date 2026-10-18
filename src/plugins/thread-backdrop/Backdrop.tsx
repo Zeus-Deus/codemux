@@ -48,10 +48,32 @@ export function pickBackdropArt(avoid: string | null, rand: number): string {
   return from[Math.min(from.length - 1, Math.floor(rand * from.length))];
 }
 
+const REDUCE_QUERY = "(prefers-reduced-motion: reduce)";
+
 /** The app's reduce-motion setting or the OS preference. */
-function reducedMotion(host: Host): boolean {
-  const os = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+export function reducedMotion(host: Host): boolean {
+  const os = window.matchMedia?.(REDUCE_QUERY).matches ?? false;
   return host.reducedMotion() || os;
+}
+
+/** Calls `fn` with the combined preference whenever either source changes,
+ *  so a mounted backdrop stops animating the moment motion is reduced. */
+export function watchReducedMotion(host: Host, fn: (reduced: boolean) => void): () => void {
+  let last = reducedMotion(host);
+  const check = () => {
+    const next = reducedMotion(host);
+    if (next !== last) {
+      last = next;
+      fn(next);
+    }
+  };
+  const offSetting = host.settings.subscribe("appearance.reduce_motion", check);
+  const query = window.matchMedia?.(REDUCE_QUERY);
+  query?.addEventListener?.("change", check);
+  return () => {
+    offSetting();
+    query?.removeEventListener?.("change", check);
+  };
 }
 
 const FRAME_MS = 1000 / 30;
@@ -128,7 +150,7 @@ export function Backdrop({ onPulse, calmRect, onCalmChange, host }: LandingBackd
     // for one faint texture.
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
-    const reduced = reducedMotion(host);
+    let reduced = reducedMotion(host);
     const start = performance.now();
     let field: Field | null = null;
     let atlas: Atlas | null = null;
@@ -326,6 +348,18 @@ export function Backdrop({ onPulse, calmRect, onCalmChange, host }: LandingBackd
       kick();
     });
     const offCalm = onCalmChange(recalm);
+    const offMotion = watchReducedMotion(host, (next) => {
+      reduced = next;
+      if (!reduced) return;
+      // Jump straight to the settled frame: with `reduced` set, elapsed time
+      // reads as finished, so the next tick paints it still and parks.
+      pulses = [];
+      if (raf) {
+        cancelAnimationFrame(raf);
+        raf = 0;
+      }
+      if (!parked) kick();
+    });
     const ro = new ResizeObserver(layout);
     let themeRaf = 0;
     const offTheme = host.theme.subscribe(() => {
@@ -350,6 +384,7 @@ export function Backdrop({ onPulse, calmRect, onCalmChange, host }: LandingBackd
       disposed = true;
       offPulse();
       offCalm();
+      offMotion();
       offTheme();
       ro.disconnect();
       cancelAnimationFrame(themeRaf);
