@@ -6,14 +6,18 @@
 //! removes them, either after the user reviews the list or automatically
 //! when the user opted in (`AUTO_SETTING_KEY`).
 //!
-//! Only worktrees with no live workspace are ever considered, so no chat
-//! or terminal Codemux owns can be running in one. Within those, a worktree
-//! is *stale* when its branch is merged into the default branch, its pull
-//! request merged, or it was archived/closed at least [`IDLE_AFTER_SECS`]
-//! ago. A stale worktree is still *kept* when it holds anything that exists
-//! nowhere else: uncommitted or untracked files, a detached HEAD, commits
-//! that no remote has, a pending Hermes cleanup, or (Linux) a process whose
-//! working directory is inside it.
+//! Only worktrees under Codemux's own worktree directory that no live
+//! workspace has open are ever considered, and only once their workspace
+//! has been archived or closed for [`SETTLE_SECS`], so whatever ran in it
+//! has had time to stop. Within those, a worktree is *stale* when its branch
+//! is merged into the default branch, the pull request holding its HEAD
+//! merged, or it was archived/closed at least [`IDLE_AFTER_SECS`] ago. A
+//! stale worktree is still *kept* when it holds anything that exists nowhere
+//! else: uncommitted or untracked files, files git is told not to check
+//! (assume-unchanged / skip-worktree), ignored files that aren't build output
+//! or copies of the main checkout's, a detached HEAD, commits that no remote
+//! has, a pending Hermes cleanup, or (Linux) a process whose working
+//! directory is inside it.
 //!
 //! Removal is `git worktree remove` without `--force` (git re-checks the
 //! tree is clean) and never touches the branch, so its commits survive and
@@ -36,6 +40,20 @@ pub const AUTO_SETTING_KEY: &str = "worktree_cleanup.auto";
 const CLOSED_KEY: &str = "worktree_cleanup.closed";
 /// Same age the archive list labels "stale".
 pub const IDLE_AFTER_SECS: u64 = 30 * 86_400;
+/// Grace period after archive/close before a worktree is considered at all:
+/// a chat or terminal whose stop is still in flight (or failed) keeps
+/// running for a while after its workspace is gone.
+pub const SETTLE_SECS: u64 = 3600;
+/// Ignored directories that only hold regenerable build output or
+/// dependencies; anything else ignored counts as local data.
+const REGENERABLE_DIRS: &[&str] = &[
+    "node_modules", "target", "dist", "build", "out", ".next", ".nuxt",
+    ".svelte-kit", ".turbo", ".cache", ".parcel-cache", ".vite", "coverage",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv",
+    "venv", ".gradle", ".dart_tool", ".zig-cache", "zig-cache",
+];
+/// Ignored files the OS litters around; never worth keeping a checkout for.
+const LITTER_FILES: &[&str] = &[".DS_Store", "Thumbs.db"];
 /// Event carrying a sweep's result to the frontend.
 pub const EVENT: &str = "worktree-cleanup";
 
@@ -128,6 +146,12 @@ fn path_key(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Where Codemux creates worktrees (see `git::conventional_worktree_path`).
+/// Cleanup never touches a worktree outside it, e.g. an imported one.
+fn managed_root() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| path_key(&home.join(".codemux").join("worktrees")))
+}
+
 fn is_auto_enabled(db: &crate::database::DatabaseStore) -> bool {
     db.get_setting(AUTO_SETTING_KEY).as_deref() == Some("true")
 }
@@ -186,16 +210,25 @@ fn is_open(live: &HashSet<PathBuf>, key: &Path) -> bool {
     live.iter().any(|open| open.starts_with(key))
 }
 
-/// Archived and closed worktrees that still exist and that no live
-/// workspace has open. An archived entry wins over a closed record for the
-/// same path (archiving goes through the close path too).
-fn gather_candidates(snapshot: &AppStateSnapshot, closed: &[ClosedWorktree]) -> Vec<Candidate> {
+/// Archived and closed worktrees under `root` that still exist and that no
+/// live workspace has open. An archived entry wins over a closed record for
+/// the same path (archiving goes through the close path too).
+fn gather_candidates(
+    snapshot: &AppStateSnapshot,
+    closed: &[ClosedWorktree],
+    root: &Path,
+) -> Vec<Candidate> {
     let live = live_paths(snapshot);
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     let mut push = |candidate: Candidate| {
         let key = path_key(&candidate.path);
-        if candidate.path.is_dir() && !is_open(&live, &key) && seen.insert(key) {
+        if key != root
+            && key.starts_with(root)
+            && candidate.path.is_dir()
+            && !is_open(&live, &key)
+            && seen.insert(key)
+        {
             out.push(candidate);
         }
     };
@@ -272,6 +305,12 @@ struct Inspection {
     /// is trivially "merged" but was never worked on.
     merged_into: Option<String>,
     dirty_files: usize,
+    /// Tracked files flagged assume-unchanged or skip-worktree: git (and
+    /// so `worktree remove`) doesn't look at their contents.
+    hidden_files: usize,
+    /// Ignored entries that are neither build output nor byte-identical
+    /// copies of the main checkout's files (e.g. an edited `.env`).
+    local_ignored: Vec<String>,
     /// Commits reachable from HEAD that no remote-tracking ref has.
     unpushed: usize,
 }
@@ -298,6 +337,15 @@ fn inspect(path: &Path) -> Inspection {
     .map(|s| s.lines().filter(|l| !l.is_empty()).count())
     // A status that fails can't vouch for the tree.
     .unwrap_or(usize::MAX);
+    let hidden_files = git(path, &["ls-files", "-v", "-z"])
+        .map(|out| {
+            out.split('\0')
+                .filter(|entry| entry.starts_with(|c: char| c.is_ascii_lowercase() || c == 'S'))
+                .count()
+        })
+        .unwrap_or(usize::MAX);
+    let local_ignored = local_ignored(path, &repo_root)
+        .unwrap_or_else(|error| vec![format!("(ignored files unreadable: {error})")]);
     let unpushed = git(path, &["rev-list", "--count", "HEAD", "--not", "--remotes"])
         .ok()
         .and_then(|n| n.trim().parse().ok())
@@ -325,7 +373,47 @@ fn inspect(path: &Path) -> Inspection {
         default_branch,
         merged_into,
         dirty_files,
+        hidden_files,
+        local_ignored,
         unpushed,
+    }
+}
+
+/// Ignored entries in `path` that would be lost with it: everything git
+/// ignores except regenerable directories, OS litter, and files identical
+/// to the same file in the main checkout (`.codemuxinclude` copies).
+fn local_ignored(path: &Path, repo_root: &Path) -> Result<Vec<String>, String> {
+    let out = git(
+        path,
+        &["status", "--porcelain", "-z", "--ignored=traditional", "--untracked-files=normal"],
+    )?;
+    Ok(out
+        .split('\0')
+        .filter_map(|entry| entry.strip_prefix("!! "))
+        .filter(|rel| !is_disposable_ignored(path, repo_root, rel))
+        .map(str::to_string)
+        .collect())
+}
+
+fn is_disposable_ignored(path: &Path, repo_root: &Path, rel: &str) -> bool {
+    let trimmed = rel.trim_end_matches('/');
+    let mut components = trimmed.split('/');
+    let name = components.next_back().unwrap_or_default();
+    if rel.ends_with('/') && REGENERABLE_DIRS.contains(&name) {
+        return true;
+    }
+    if components.any(|dir| REGENERABLE_DIRS.contains(&dir)) {
+        return true;
+    }
+    if rel.ends_with('/') {
+        return false;
+    }
+    if LITTER_FILES.contains(&name) {
+        return true;
+    }
+    match (std::fs::read(path.join(trimmed)), std::fs::read(repo_root.join(trimmed))) {
+        (Ok(here), Ok(main)) => here == main,
+        _ => false,
     }
 }
 
@@ -333,15 +421,22 @@ fn inspect(path: &Path) -> Inspection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MergedPr {
     number: u32,
-    head_oid: Option<String>,
+    /// HEAD is the PR's head commit or an ancestor of it, so GitHub has
+    /// every local commit. False for a branch reused after its PR merged.
+    includes_head: bool,
 }
 
 fn merged_pr(path: &Path) -> Option<MergedPr> {
     let pr = crate::github::get_branch_pr(path).ok()??;
-    (pr.state == "MERGED").then(|| MergedPr {
-        number: pr.number,
-        head_oid: pr.head_ref_oid,
-    })
+    if pr.state != "MERGED" {
+        return None;
+    }
+    // An ancestor check needs the PR head locally; without it the answer
+    // is "not included", which only ever keeps a worktree.
+    let includes_head = pr.head_ref_oid.as_deref().is_some_and(|oid| {
+        git(path, &["merge-base", "--is-ancestor", "HEAD", oid]).is_ok()
+    });
+    Some(MergedPr { number: pr.number, includes_head })
 }
 
 /// Pure verdict for one candidate. `pr` is consulted lazily because it
@@ -362,14 +457,23 @@ fn judge(
     if inspection.branch.is_some() && inspection.branch == inspection.default_branch {
         return None;
     }
-    let idle_days = now.saturating_sub(candidate.retired_at) / 86_400;
-    let idle = now.saturating_sub(candidate.retired_at) >= IDLE_AFTER_SECS;
+    let retired_for = now.saturating_sub(candidate.retired_at);
+    if retired_for < SETTLE_SECS {
+        return None;
+    }
+    let idle_days = retired_for / 86_400;
+    let idle = retired_for >= IDLE_AFTER_SECS;
     let mut pr_cache: Option<Option<MergedPr>> = None;
     let mut merged_pr = || pr_cache.get_or_insert_with(&mut *pr).clone();
 
     let reason = if let Some(base) = &inspection.merged_into {
         StaleReason::BranchMerged { base: base.clone() }
-    } else if let Some(pr) = inspection.branch.as_ref().and_then(|_| merged_pr()) {
+    } else if let Some(pr) = inspection
+        .branch
+        .as_ref()
+        .and_then(|_| merged_pr())
+        .filter(|pr| pr.includes_head)
+    {
         StaleReason::PrMerged { number: pr.number }
     } else if idle {
         StaleReason::Idle { days: idle_days }
@@ -389,10 +493,18 @@ fn judge(
             1 => "1 uncommitted or untracked file".to_string(),
             n => format!("{n} uncommitted or untracked files"),
         })
+    } else if inspection.hidden_files > 0 {
+        Some(match inspection.hidden_files {
+            usize::MAX => "Its index could not be read".to_string(),
+            1 => "1 file is flagged assume-unchanged or skip-worktree".to_string(),
+            n => format!("{n} files are flagged assume-unchanged or skip-worktree"),
+        })
+    } else if !inspection.local_ignored.is_empty() {
+        Some(format!("Ignored files exist only here: {}", sample(&inspection.local_ignored)))
     } else if inspection.unpushed > 0
-        // Commits GitHub holds as the merged PR's head are pushed even
-        // when the remote branch has since been deleted and pruned.
-        && !merged_pr().is_some_and(|pr| pr.head_oid.is_some() && pr.head_oid == inspection.head)
+        // Commits GitHub holds in the merged PR are pushed even when the
+        // remote branch has since been deleted and pruned.
+        && !merged_pr().is_some_and(|pr| pr.includes_head)
     {
         Some(match inspection.unpushed {
             usize::MAX => "Its unpushed commits could not be counted".to_string(),
@@ -414,6 +526,16 @@ fn judge(
         reason,
         kept_because,
     })
+}
+
+/// "a, b, c and 2 more".
+fn sample(items: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let head = items.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    match items.len().saturating_sub(SHOWN) {
+        0 => head,
+        more => format!("{head} and {more} more"),
+    }
 }
 
 /// Working directories of every process on the machine (Linux only; other
@@ -474,7 +596,10 @@ fn current_candidates<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Vec<Candi
     if kept != closed {
         store_closed(&db, &kept);
     }
-    gather_candidates(&snapshot, &kept)
+    match managed_root() {
+        Some(root) => gather_candidates(&snapshot, &kept, &root),
+        None => Vec::new(),
+    }
 }
 
 async fn scan_locked<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Vec<StaleWorktree>, String> {
@@ -525,6 +650,21 @@ async fn remove_locked<R: tauri::Runtime>(
             let verdict = evaluate(&db, std::slice::from_ref(&candidate)).pop()?;
             if verdict.kept_because.is_some() {
                 return Some(verdict);
+            }
+            // Evaluation can take seconds (git, GitHub). Look again right
+            // before deleting: a workspace may have reopened it meanwhile,
+            // or a terminal started in it.
+            let key = path_key(&candidate.path);
+            let snapshot = app_for_task.state::<AppStateStore>().snapshot();
+            let late_reason = if is_open(&live_paths(&snapshot), &key) {
+                Some("A workspace opened it again")
+            } else if is_busy(&candidate.path, &process_cwds()) {
+                Some("A process is running inside it")
+            } else {
+                None
+            };
+            if let Some(reason) = late_reason {
+                return Some(StaleWorktree { kept_because: Some(reason.to_string()), ..verdict });
             }
             Some(match remove_worktree(&candidate.path) {
                 Ok(_) => verdict,
@@ -586,7 +726,10 @@ async fn sweep<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 /// whenever [`KICK`] fires.
 pub fn spawn_sweeper<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(FIRST_SWEEP_DELAY).await;
+        tokio::select! {
+            _ = tokio::time::sleep(FIRST_SWEEP_DELAY) => {}
+            _ = KICK.notified() => {}
+        }
         loop {
             sweep(&app).await;
             tokio::select! {
@@ -654,11 +797,16 @@ mod tests {
             default_branch: Some("main".into()),
             merged_into: None,
             dirty_files: 0,
+            hidden_files: 0,
+            local_ignored: Vec::new(),
             unpushed: 0,
         }
     }
 
     const NOW: u64 = 100 * 86_400;
+    /// Retired just long enough to be considered.
+    const SETTLED: u64 = NOW - SETTLE_SECS;
+    const INCLUDED: MergedPr = MergedPr { number: 7, includes_head: true };
 
     fn verdict(inspection: &Inspection, retired_at: u64, pr: Option<MergedPr>) -> Option<StaleWorktree> {
         judge(&candidate(retired_at), inspection, NOW, &mut || pr.clone(), false, false)
@@ -670,18 +818,31 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_stale_before_it_settles() {
+        let merged = Inspection { merged_into: Some("main".into()), ..clean() };
+        assert_eq!(verdict(&merged, SETTLED + 1, Some(INCLUDED)), None);
+        assert!(verdict(&merged, SETTLED, None).is_some());
+    }
+
+    #[test]
     fn merged_branch_is_stale_and_removable() {
         let inspection = Inspection { merged_into: Some("main".into()), ..clean() };
-        let stale = verdict(&inspection, NOW, None).unwrap();
+        let stale = verdict(&inspection, SETTLED, None).unwrap();
         assert_eq!(stale.reason, StaleReason::BranchMerged { base: "main".into() });
         assert_eq!(stale.kept_because, None);
     }
 
     #[test]
     fn merged_pr_is_stale() {
-        let pr = MergedPr { number: 7, head_oid: Some("abc".into()) };
-        let stale = verdict(&clean(), NOW, Some(pr)).unwrap();
+        let stale = verdict(&clean(), SETTLED, Some(INCLUDED)).unwrap();
         assert_eq!(stale.reason, StaleReason::PrMerged { number: 7 });
+    }
+
+    #[test]
+    fn a_merged_pr_that_lacks_head_is_not_a_reason() {
+        // The branch was reused for new work after its PR merged.
+        let reused = MergedPr { number: 7, includes_head: false };
+        assert_eq!(verdict(&clean(), SETTLED, Some(reused)), None);
     }
 
     #[test]
@@ -713,8 +874,10 @@ mod tests {
             Inspection { dirty_files: 2, ..merged.clone() },
             Inspection { dirty_files: usize::MAX, ..merged.clone() },
             Inspection { branch: None, ..merged.clone() },
+            Inspection { hidden_files: 1, ..merged.clone() },
+            Inspection { local_ignored: vec![".env".into()], ..merged.clone() },
         ] {
-            let stale = verdict(&inspection, NOW, None).unwrap();
+            let stale = verdict(&inspection, SETTLED, None).unwrap();
             assert!(stale.kept_because.is_some(), "{inspection:?} must be kept");
         }
     }
@@ -725,19 +888,18 @@ mod tests {
         let idle = NOW - IDLE_AFTER_SECS;
         assert!(verdict(&ahead, idle, None).unwrap().kept_because.is_some());
 
-        let other_head = MergedPr { number: 1, head_oid: Some("def".into()) };
-        assert!(verdict(&ahead, idle, Some(other_head)).unwrap().kept_because.is_some());
+        let reused = MergedPr { number: 1, includes_head: false };
+        assert!(verdict(&ahead, idle, Some(reused)).unwrap().kept_because.is_some());
 
-        let same_head = MergedPr { number: 1, head_oid: Some("abc".into()) };
-        assert_eq!(verdict(&ahead, idle, Some(same_head)).unwrap().kept_because, None);
+        assert_eq!(verdict(&ahead, idle, Some(INCLUDED)).unwrap().kept_because, None);
     }
 
     #[test]
     fn running_process_or_hermes_hold_keeps_it() {
         let merged = Inspection { merged_into: Some("main".into()), ..clean() };
-        let busy = judge(&candidate(NOW), &merged, NOW, &mut || None, true, false).unwrap();
+        let busy = judge(&candidate(SETTLED), &merged, NOW, &mut || None, true, false).unwrap();
         assert!(busy.kept_because.unwrap().contains("process"));
-        let held = judge(&candidate(NOW), &merged, NOW, &mut || None, false, true).unwrap();
+        let held = judge(&candidate(SETTLED), &merged, NOW, &mut || None, false, true).unwrap();
         assert!(held.kept_because.unwrap().contains("Hermes"));
     }
 
@@ -745,7 +907,7 @@ mod tests {
     fn pr_is_not_requested_when_a_local_reason_suffices() {
         let merged = Inspection { merged_into: Some("main".into()), ..clean() };
         let mut asked = false;
-        judge(&candidate(NOW), &merged, NOW, &mut || { asked = true; None }, false, false);
+        judge(&candidate(SETTLED), &merged, NOW, &mut || { asked = true; None }, false, false);
         assert!(!asked);
     }
 
@@ -814,6 +976,36 @@ mod tests {
     }
 
     #[test]
+    fn inspect_keeps_ignored_local_data_but_not_build_output_or_copies() {
+        let (_dir, repo, wt) = repo_with_worktree();
+        std::fs::write(repo.join(".gitignore"), ".env\nnode_modules/\ndata/\n").unwrap();
+        git(&repo, &["add", ".gitignore"]).unwrap();
+        git(&repo, &["commit", "-q", "-m", "ignore"]).unwrap();
+        git(&wt, &["merge", "-q", "--ff-only", "main"]).unwrap();
+        std::fs::create_dir_all(wt.join("node_modules/pkg")).unwrap();
+        std::fs::write(wt.join("node_modules/pkg/index.js"), "x").unwrap();
+        std::fs::write(repo.join(".env"), "TOKEN=1").unwrap();
+        std::fs::write(wt.join(".env"), "TOKEN=1").unwrap();
+        assert_eq!(inspect(&wt).local_ignored, Vec::<String>::new());
+
+        std::fs::write(wt.join(".env"), "TOKEN=edited").unwrap();
+        std::fs::create_dir(wt.join("data")).unwrap();
+        std::fs::write(wt.join("data/app.db"), "rows").unwrap();
+        assert_eq!(inspect(&wt).local_ignored, vec![".env".to_string(), "data/".to_string()]);
+    }
+
+    #[test]
+    fn inspect_flags_files_git_does_not_check() {
+        let (_dir, _repo, wt) = repo_with_worktree();
+        commit(&wt, "config.toml");
+        git(&wt, &["update-index", "--assume-unchanged", "config.toml"]).unwrap();
+        std::fs::write(wt.join("config.toml"), "local edit").unwrap();
+        let inspection = inspect(&wt);
+        assert_eq!(inspection.dirty_files, 0, "status can't see it");
+        assert_eq!(inspection.hidden_files, 1);
+    }
+
+    #[test]
     fn inspect_treats_the_main_checkout_as_unmanaged() {
         let (_dir, repo, _wt) = repo_with_worktree();
         assert!(inspect(&repo).unmanaged);
@@ -839,9 +1031,12 @@ mod tests {
     #[test]
     fn candidates_skip_live_and_missing_worktrees() {
         let dir = tempfile::tempdir().unwrap();
-        let (open, gone, closed) = (dir.path().join("open"), dir.path().join("gone"), dir.path().join("closed"));
+        let root = path_key(dir.path()).join("worktrees");
+        let (open, gone, closed) = (root.join("open"), root.join("gone"), root.join("closed"));
+        let outside = path_key(dir.path()).join("imported");
         std::fs::create_dir_all(open.join("sub")).unwrap();
         std::fs::create_dir(&closed).unwrap();
+        std::fs::create_dir(&outside).unwrap();
         let mut snapshot = AppStateStore::default().snapshot();
         snapshot.workspaces.clear();
         snapshot.archived_workspaces.clear();
@@ -851,10 +1046,13 @@ mod tests {
             branch: None,
             closed_at: 0,
         };
-        let closed_list = [record(&open), record(&gone), record(&closed)];
+        let closed_list = [record(&open), record(&gone), record(&closed), record(&outside)];
 
-        let all = gather_candidates(&snapshot, &closed_list);
-        assert_eq!(all.len(), 2, "a missing directory is never a candidate");
+        let all = gather_candidates(&snapshot, &closed_list, &root);
+        let paths: Vec<_> = all.iter().map(|c| c.path.clone()).collect();
+        // Missing directories and anything outside Codemux's worktree
+        // directory are never candidates.
+        assert_eq!(paths, vec![open.clone(), closed.clone()]);
 
         let live_paths = HashSet::from([path_key(&open.join("sub"))]);
         assert!(is_open(&live_paths, &path_key(&open)));

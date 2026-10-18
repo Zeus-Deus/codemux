@@ -1,5 +1,6 @@
 import { useCallback } from "react";
 
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
 import { toast } from "@/lib/toast";
 import { onWorktreeCleanup, type WorktreeCleanupEvent } from "@/tauri/events";
@@ -18,6 +19,8 @@ const OFFER_DURATION_MS = 15_000;
  */
 export function useWorktreeCleanupToast() {
   const handle = useCallback((event: WorktreeCleanupEvent) => {
+    // The review dialog's commands are desktop-only.
+    if (isRemoteClient()) return;
     if (event.removed.length > 0) {
       toast.success(`Cleaned up ${pluralWorktrees(event.removed.length)}`, {
         description: `Removed ${listTitles(event.removed)}. Their branches and commits were kept.`,
@@ -27,7 +30,7 @@ export function useWorktreeCleanupToast() {
     if (event.available.length > 0) {
       const n = event.available.length;
       toast.info(`${pluralWorktrees(n)} can be cleaned up`, {
-        description: `${listTitles(event.available)} ${n === 1 ? "is" : "are"} merged or long unused, with no uncommitted or unpushed work.`,
+        description: `${listTitles(event.available)} ${n === 1 ? "is" : "are"} merged or long unused, with no local-only work.`,
         duration: OFFER_DURATION_MS,
         action: { label: "Review", onClick: openWorktreeCleanup },
       });
