@@ -5,6 +5,7 @@ import {
   FileText,
   FolderSearch,
   Globe,
+  GitBranch,
   ListPlus,
   Pencil,
   Search,
@@ -12,6 +13,8 @@ import {
   Wrench,
   type LucideIcon,
 } from "lucide-react";
+
+import { isWorkspaceLaunchToolName } from "@/lib/agent-chat/workspace-launch";
 
 import { isDelegateToolName } from "@/lib/agent-chat/delegation";
 import { isSuggestToolName } from "@/lib/agent-chat/follow-ups";
@@ -53,7 +56,7 @@ export function toolCategory(toolName: string): ToolCategory {
   // `delegate_task` hands work to another agent. It normally renders as the
   // delegation card; anywhere it shows up as a plain tool row (whatever the
   // adapter's prefix), it is an agent hand-off.
-  if (isDelegateToolName(toolName) || isSuggestToolName(toolName)) return "agent";
+  if (isDelegateToolName(toolName) || isSuggestToolName(toolName) || isWorkspaceLaunchToolName(toolName)) return "agent";
   return CATEGORY_BY_TOOL[toolName] ?? "other";
 }
 
@@ -74,6 +77,7 @@ const ICON_BY_TOOL: Record<string, LucideIcon> = {
 };
 
 export function toolIcon(toolName: string): LucideIcon {
+  if (isWorkspaceLaunchToolName(toolName)) return GitBranch;
   if (isDelegateToolName(toolName)) return Bot;
   if (isSuggestToolName(toolName)) return ListPlus;
   return ICON_BY_TOOL[toolName] ?? Wrench;

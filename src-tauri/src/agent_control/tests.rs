@@ -1009,3 +1009,58 @@ async fn current_approval_status_does_not_report_previous_turn_as_settled() {
     wait["timeout_ms"] = json!(20);
     assert_eq!(execute(app.handle(), &ControlCaller::trusted(), "thread_wait", wait).await.unwrap()["timed_out"],true);
 }
+
+
+#[tokio::test]
+async fn workspace_chat_launch_shares_native_start_without_selecting_workspace() {
+    let (app, provider, root, parent) = fixture().await;
+    std::fs::create_dir(root.path().join("worktree")).unwrap();
+    let target = app.state::<crate::state::AppStateStore>().create_empty_workspace_at_path(root.path().join("worktree"));
+    app.state::<crate::state::AppStateStore>().activate_workspace(&parent);
+    let caller = ControlCaller { principal: "thread:parent".into(), access: ControlAccess::FullAccess, grant_id: None };
+    let prepared = service::PreparedWorkspaceChat::prepare(app.handle(), &caller,
+        crate::agent_provider::ProviderKind::Claude, "Fix sidebar tests".into(), "Self-contained fixture brief".into(), None, None,
+    ).await.unwrap();
+    let launched = prepared.materialize(app.handle(), &caller, target.0.clone()).await.unwrap();
+    let thread = launched["thread_id"].as_str().unwrap();
+    assert_eq!(app.state::<crate::state::AppStateStore>().snapshot().active_workspace_id.0, parent);
+    let record = app.state::<crate::database::DatabaseStore>().get_agent_chat_session(thread).unwrap();
+    assert_eq!(record.workspace_id, target.0);
+    assert_eq!(record.title.as_deref(), Some("Fix sidebar tests"));
+    assert_eq!(record.permission_mode.as_deref(), Some("bypassPermissions"));
+    assert!(provider.calls.snapshot().iter().any(|call| matches!(call,
+        mock_agent_provider::MockCall::SendTurn(id, text) if id.0 == thread && text == "Self-contained fixture brief")));
+    assert_eq!(provider.start_inputs()[0].permission_mode.as_deref(), Some("bypassPermissions"));
+}
+
+#[tokio::test]
+async fn workspace_chat_launch_validates_models_and_keeps_permission_ceiling() {
+    let (app, provider, _root, _workspace) = fixture().await;
+    let caller = ControlCaller::trusted();
+    let invalid = service::PreparedWorkspaceChat::prepare(app.handle(), &caller,
+        crate::agent_provider::ProviderKind::Claude, "Fixture".into(), "Brief".into(), Some("not-advertised".into()), None,
+    ).await.err().unwrap();
+    assert_eq!(invalid.code, "unsupported_model");
+    let invalid = service::PreparedWorkspaceChat::prepare(app.handle(), &caller,
+        crate::agent_provider::ProviderKind::Claude, "Fixture".into(), "Brief".into(), None, Some("high".into()),
+    ).await.err().unwrap();
+    assert_eq!(invalid.code, "unsupported_effort");
+    let supervised = ControlCaller { access: ControlAccess::Supervised, ..caller };
+    let denied = service::PreparedWorkspaceChat::prepare(app.handle(), &supervised,
+        crate::agent_provider::ProviderKind::Claude, "Fixture".into(), "Brief".into(), None, None,
+    ).await.err().unwrap();
+    assert_eq!(denied.code, "permission_ceiling");
+    assert!(provider.calls.snapshot().is_empty());
+}
+
+
+#[tokio::test]
+async fn workspace_chat_permission_changes_refresh_the_host_tool_catalog() {
+    let (app, _provider, _root, workspace) = fixture().await;
+    app.state::<crate::database::DatabaseStore>().upsert_agent_chat_session("parent", &workspace, None, "claude").unwrap();
+    let mut updates = app.state::<crate::mcp::registry::McpRegistry>().subscribe_status();
+    crate::commands::agent_chat::agent_chat_set_permission_mode(app.handle().clone(),
+        crate::agent_provider::ProviderKind::Claude, crate::agent_provider::ThreadId("parent".into()), "default".into(),
+    ).await.unwrap();
+    assert_eq!(updates.try_recv().unwrap().id, "codemux-host");
+}

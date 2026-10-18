@@ -2,7 +2,7 @@
 pub mod catalog;
 mod types;
 mod state;
-mod service;
+pub(crate) mod service;
 mod guard;
 pub use guard::NativeControlGuard;
 pub(crate) use guard::GuardedTurnCheckpoint;

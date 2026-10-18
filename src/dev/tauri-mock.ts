@@ -47,6 +47,7 @@ import { randomUUID } from "@/lib/uuid";
  * `app-state-changed` so the UI reflects the change; everything else
  * falls through to a logged, shape-safe default.
  */
+import { workspaceLaunchScenario, streamWorkspaceLaunch, type MockWorkspaceLaunch } from "./workspace-launch-mock";
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 import { createAgentConnectorMock } from "./agent-connector-mock";
 import { workflowMockHandlers } from "./workflow-mock";
@@ -195,7 +196,9 @@ seedEnvironmentsFromSearch(window.location.search);
 // in Full access, and plays the delegation flow once its channel attaches.
 const delegationScenario = delegationScenarioFromSearch(window.location.search);
 let delegationScenarioStarted = false;
-if (delegationScenario) {
+const workspaceScenario = workspaceLaunchScenario(window.location.search);
+let workspaceScenarioStarted = false;
+if (delegationScenario || workspaceScenario) {
   const asClaude = (node: PaneNodeSnapshot): PaneNodeSnapshot =>
     node.kind === "split"
       ? { ...node, children: node.children.map(asClaude) }
@@ -211,6 +214,13 @@ if (delegationScenario) {
         root: asClaude(surface.root),
       })),
     })),
+  };
+}
+if (workspaceScenario) {
+  appState = {
+    ...appState,
+    active_workspace_id: "ws-codemux-chat",
+    workspaces: appState.workspaces.filter((workspace) => workspace.workspace_id === "ws-codemux-chat").map((workspace) => ({ ...workspace, title: "Parallel bug fixes", linked_issue: null })),
   };
 }
 const mockLocalSessions: LocalChatSession[] = [
@@ -1929,7 +1939,7 @@ function mockThreadPayloads(threadId: string): string[] {
   if (forked) return forked;
   const delegated = mockDelegatedChildTranscript(threadId);
   if (delegated) return delegated;
-  if (delegationScenario && threadId === MOCK_CHAT_THREAD_ID) return [];
+  if ((delegationScenario || workspaceScenario) && threadId === MOCK_CHAT_THREAD_ID) return [];
   // Under a stress fixture the generated threads AND the seeded thread serve
   // the synthetic transcript — hydration cost is one of the things being
   // measured, and the curated 520-turn showcase is not that profile.
@@ -3659,6 +3669,43 @@ function openMockDelegatedTab(parentThreadId: string, child: MockDelegatedChild)
     workspaces: appState.workspaces.map((candidate) =>
       candidate === workspace ? next : candidate,
     ),
+  };
+  emitAppState();
+}
+
+function openMockLaunchedWorkspace(launch: MockWorkspaceLaunch): void {
+  const parent = findWorkspace("ws-codemux-chat");
+  if (!parent) return;
+  const workspace = buildWorktreeWorkspace(parent.project_root ?? parent.cwd, launch.branch);
+  workspace.title = launch.title;
+  workspace.base_branch = "main";
+  const surface = workspace.surfaces[0];
+  surface.title = launch.title;
+  if (surface.root.kind === "agent_chat") {
+    surface.root.thread_id = launch.threadId;
+    surface.root.provider = launch.provider;
+    surface.root.title = launch.title;
+  }
+  workspace.tabs[0].title = launch.title;
+  const turnId = `turn-${launch.threadId}`;
+  mockImportedRecords.set(launch.threadId, {
+    thread_id: launch.threadId, workspace_id: workspace.workspace_id,
+    cwd: workspace.cwd, provider: launch.provider, title: launch.title,
+    sdk_session_id: `sdk-${launch.threadId}`,
+    created_at: new Date().toISOString(), last_active_at: new Date().toISOString(),
+    model: null, effort: null, context_window: null,
+    permission_mode: launch.provider === "claude" ? "bypassPermissions" : "danger-full-access",
+  });
+  mockImportedPayloads.set(launch.threadId, [
+    { type: "user_message", thread_id: launch.threadId, text: launch.message },
+    { type: "session_state_changed", thread_id: launch.threadId, status: { status: "running", active_turn: turnId } },
+    { type: "item_completed", thread_id: launch.threadId, turn_id: turnId, item: { kind: "assistant_text", text: "I’ll investigate the bug and run the focused checks." } },
+  ].map((event) => JSON.stringify(event)));
+  chatActiveTurns.set(launch.threadId, turnId);
+  appState = {
+    ...appState,
+    workspaces: [...appState.workspaces, workspace],
+    pane_statuses: { ...appState.pane_statuses, [surface.active_pane_id]: "working" },
   };
   emitAppState();
 }
@@ -5467,7 +5514,7 @@ const handlers: Record<string, Handler> = {
     // A delegated child's row holds what the backend wrote at hand-off:
     // the requested model and effort, the task title, full access.
     const delegated = mockDelegatedChild(threadId);
-    if (delegated || (delegationScenario && threadId === MOCK_CHAT_THREAD_ID)) {
+    if (delegated || ((delegationScenario || workspaceScenario) && threadId === MOCK_CHAT_THREAD_ID)) {
       const provider = delegated?.provider ?? "claude";
       return {
         thread_id: threadId,
@@ -5994,6 +6041,10 @@ const handlers: Record<string, Handler> = {
     seedPendingAskQuestion(threadId);
     seedPendingApproval(threadId);
     seedAsyncQuestion(threadId);
+    if (workspaceScenario && !workspaceScenarioStarted && threadId === MOCK_CHAT_THREAD_ID) {
+      workspaceScenarioStarted = true;
+      window.setTimeout(() => streamWorkspaceLaunch(threadId, { emit: emitChatEvent, openWorkspace: openMockLaunchedWorkspace }), 400);
+    }
     if (
       delegationScenario &&
       !delegationScenarioStarted &&

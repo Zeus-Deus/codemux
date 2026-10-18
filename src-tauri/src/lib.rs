@@ -1394,7 +1394,10 @@ fn build_core_app<R: tauri::Runtime>(
                         // tick below can restart any of them.
                         commands::delegation::drain_journal(&registry_handle);
                         mcp_registry.set_host_tools(std::sync::Arc::new(
-                            commands::delegation::DelegationHost::new(registry_handle.clone()),
+                            mcp::registry::CompositeHostTools(vec![
+                                std::sync::Arc::new(commands::delegation::DelegationHost::new(registry_handle.clone())),
+                                std::sync::Arc::new(commands::workspace_launch::WorkspaceLaunchHost::new(registry_handle.clone())),
+                            ]),
                         ));
 
                         let mut claude_config =
