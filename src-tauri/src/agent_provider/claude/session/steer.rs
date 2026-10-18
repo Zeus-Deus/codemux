@@ -84,23 +84,23 @@ impl SteerState {
     /// A top-level `result` ending `ended`. Returns whether guidance is still
     /// pending, which the CLI runs next as a turn of its own.
     fn settle_result(&mut self, result: &Value, ended: Option<&TurnId>) -> bool {
-        if ended.is_some() && ended == self.stopping.as_ref() {
-            // The stopped turn's result. Its unread guidance dies with it once
-            // the interrupt is confirmed; if that fails, `stop_failed` says so.
-            self.continuation = None;
-            self.unannounced = None;
-            return false;
-        }
-        match result.get("user_message_uuids").and_then(Value::as_array) {
-            Some(consumed) => self
-                .pending
-                .retain(|uuid| !consumed.iter().any(|c| c.as_str() == Some(uuid))),
-            // A CLI that does not echo cannot say. Assume consumed, which is
-            // how such a CLI behaved before steering existed.
-            None => self.pending.clear(),
+        let consumed = result.get("user_message_uuids").and_then(Value::as_array);
+        if let Some(consumed) = consumed {
+            self.pending
+                .retain(|uuid| !consumed.iter().any(|c| c.as_str() == Some(uuid)));
         }
         self.continuation = None;
         self.unannounced = None;
+        if ended.is_some() && ended == self.stopping.as_ref() {
+            // The stopped turn's result. Its unread guidance dies with it once
+            // the interrupt is confirmed; if that fails, `stop_failed` says so.
+            return false;
+        }
+        if consumed.is_none() {
+            // A CLI that does not echo cannot say. Assume consumed, which is
+            // how such a CLI behaved before steering existed.
+            self.pending.clear();
+        }
         !self.pending.is_empty()
     }
 
@@ -425,6 +425,15 @@ mod tests {
         // A failed stop then reports the guidance as still to run.
         assert!(steer.stop_failed(&Some(turn)));
         assert_eq!(steer.pending, ["s1"]);
+    }
+
+    #[test]
+    fn a_failed_stop_does_not_revive_guidance_the_result_consumed() {
+        let turn = TurnId("t".into());
+        let mut steer = steer_with(&["s1"]);
+        steer.stop(Some(turn.clone()));
+        assert!(!steer.settle_result(&json!({"user_message_uuids": ["p", "s1"]}), Some(&turn)));
+        assert!(!steer.stop_failed(&Some(turn)));
     }
 
     #[test]

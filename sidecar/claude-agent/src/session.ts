@@ -408,6 +408,12 @@ export class ClaudeSession {
   private readonly pendingSteers = new Set<string>();
   /** True while a Stop ends the CLI process; see `retireForStop`. */
   private retiring = false;
+  /** Aborting it sends the query's CLI process SIGTERM at once; `close()`
+   *  alone only schedules that two seconds later. */
+  private queryAbort = new AbortController();
+  /** Set by each `sendTurn`, cleared by a Stop: guidance arriving after a
+   *  Stop must not reach the turn the CLI runs next. */
+  private acceptsSteers = false;
 
   constructor(input: SessionStartInput, emit: EventEmitter) {
     this.threadId = input.threadId;
@@ -438,6 +444,7 @@ export class ClaudeSession {
       },
     );
     const options = buildQueryOptions(input, this.canUseTool);
+    options.abortController = this.queryAbort;
 
     this.query = queryFactory({
       prompt: this.promptQueue,
@@ -698,6 +705,7 @@ export class ClaudeSession {
     // The CLI echoes a prompt's uuid in `user_message_uuids` only when the
     // prompt carries one; the host relies on that echo to steer.
     msg.uuid = crypto.randomUUID();
+    this.acceptsSteers = true;
     // Retain the turn and grant it one stale-resume recovery attempt
     // before it's dispatched, so a self-heal can replay it verbatim.
     this.lastUserMessage = msg;
@@ -715,7 +723,7 @@ export class ClaudeSession {
     if (this.closed) {
       throw new Error("session is closed");
     }
-    if (this.interrupting || this.queryDead) {
+    if (this.interrupting || this.queryDead || !this.acceptsSteers) {
       throw new Error("no running turn to steer");
     }
     const msg = this.buildUserMessage(input.text, input.images);
@@ -750,6 +758,7 @@ export class ClaudeSession {
     this.pendingSteers.clear();
     try {
       try {
+        this.queryAbort.abort();
         this.query.close();
       } catch (err) {
         logger.warn("query.close during stop threw", {
@@ -819,6 +828,7 @@ export class ClaudeSession {
    *  over but the session lives. */
   async interrupt(): Promise<void> {
     if (this.closed || this.queryDead) return;
+    this.acceptsSteers = false;
     if (this.pendingSteers.size > 0) return this.retireForStop();
     this.interrupting = true;
     try {
@@ -896,6 +906,8 @@ export class ClaudeSession {
       rebuildInput.resume = opts.resume;
     }
     const options = buildQueryOptions(rebuildInput, this.canUseTool);
+    this.queryAbort = new AbortController();
+    options.abortController = this.queryAbort;
     this.query = queryFactory({ prompt: this.promptQueue, options });
     this.currentQueryModel = rebuildInput.model;
     this.iterationTask = this.consumeMessages();

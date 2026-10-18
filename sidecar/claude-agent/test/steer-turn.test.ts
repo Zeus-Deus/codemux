@@ -107,6 +107,7 @@ test("steer-turn RPC validates params and forwards to the session", async () => 
     cwd: "/tmp/test-cwd",
     pathToClaudeCodeExecutable: "/usr/bin/claude",
   });
+  await methods["send-turn"]?.({ threadId: "t-steer", text: "first" });
   await expect(methods["steer-turn"]?.({ threadId: "t-steer", text: "x" })).rejects.toThrow();
   const result = await methods["steer-turn"]?.({
     threadId: "t-steer",
@@ -115,7 +116,7 @@ test("steer-turn RPC validates params and forwards to the session", async () => 
   });
   expect(result).toEqual({ steered: true });
   await settle();
-  const prompt = (fakes[0] as FakeQuery).capturedPrompts[0];
+  const prompt = (fakes[0] as FakeQuery).capturedPrompts[1];
   expect(prompt?.uuid as string).toBe("steer-4");
   expect(prompt?.message.content).toBe("guidance");
 });
@@ -149,6 +150,7 @@ test("Stop with unread guidance ends the CLI process instead of a soft interrupt
 
 test("Stop after the guidance was consumed interrupts softly", async () => {
   const session = new ClaudeSession(input(), emit);
+  await session.sendTurn({ text: "first" });
   await session.steerTurn({ text: "guidance", uuid: "steer-6" });
   const fake = fakes[0] as FakeQuery;
   fake.emit({
@@ -161,5 +163,34 @@ test("Stop after the guidance was consumed interrupts softly", async () => {
   await session.interrupt();
   expect(fake.interruptCalls).toBe(1);
   expect(fake.closed).toBe(false);
+  await session.close();
+});
+
+test("guidance arriving after a soft Stop is rejected until the next turn", async () => {
+  // The CLI runs whatever is queued once the stopped turn aborts, so late
+  // guidance would restart work the user just stopped.
+  const session = new ClaudeSession(input(), emit);
+  await session.sendTurn({ text: "first" });
+  await session.interrupt();
+  await expect(session.steerTurn({ text: "late", uuid: "steer-7" })).rejects.toThrow(
+    "no running turn to steer",
+  );
+  await session.sendTurn({ text: "next" });
+  await session.steerTurn({ text: "fresh", uuid: "steer-8" });
+  await settle();
+  const uuids = (fakes[0] as FakeQuery).capturedPrompts.map((p) => p.uuid as string | undefined);
+  expect(uuids).toContain("steer-8");
+  expect(uuids).not.toContain("steer-7");
+  await session.close();
+});
+
+test("each query gets an abort controller so a Stop can end its CLI at once", async () => {
+  const session = new ClaudeSession(input(), emit);
+  await session.sendTurn({ text: "first" });
+  await session.steerTurn({ text: "guidance", uuid: "steer-9" });
+  const signal = (fakes[0] as FakeQuery).capturedOptions?.abortController?.signal;
+  expect(signal?.aborted).toBe(false);
+  await session.interrupt();
+  expect(signal?.aborted).toBe(true);
   await session.close();
 });
