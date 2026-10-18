@@ -490,8 +490,11 @@ async fn start_codex<R: Runtime>(
     question: &str,
 ) -> Result<(SideChat, SideChatStarted), String> {
     // An extra provider account runs its own CLI login, never the route.
-    let on_account = main.env.contains_key(crate::provider_accounts::SESSION_ACCOUNT_ENV);
-    if !on_account && crate::agent_provider::codex::chatgpt::owner().managed_selected_now() {
+    if crate::provider_accounts::on_chatgpt_route(
+        ProviderKind::Codex,
+        &main.env,
+        crate::agent_provider::codex::chatgpt::owner().managed_selected_now(),
+    ) {
         // App-owned ChatGPT-plan routing needs the token-bound launch the
         // main adapter performs; a plain app-server would bill another
         // account or fail. Refuse honestly rather than guess.

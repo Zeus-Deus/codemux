@@ -57,6 +57,9 @@ struct ForkPlan {
     workspace_id: String,
     target_cwd: PathBuf,
     cut: Cut,
+    /// Points the fork's CLI at the source chat's provider account, which
+    /// holds its native session (empty for the CLI's own login).
+    env: HashMap<String, String>,
 }
 
 enum Cut {
@@ -149,9 +152,13 @@ async fn plan_fork<R: Runtime>(
             target_cwd.display()
         ));
     }
-    if provider == ProviderKind::Codex
-        && crate::agent_provider::codex::chatgpt::owner().managed_selected_now()
-    {
+    let env = crate::provider_accounts::session_env_for_thread(app, provider, source_thread_id);
+    // A chat on an extra account runs its own Codex login, not the route.
+    if crate::provider_accounts::on_chatgpt_route(
+        provider,
+        &env,
+        crate::agent_provider::codex::chatgpt::owner().managed_selected_now(),
+    ) {
         // Its threads live in the app-owned Codex home that only the main
         // adapter's token-bound launch uses (see side chats).
         return Err("Forking isn't available while Codex uses your ChatGPT plan connection yet.".into());
@@ -199,6 +206,7 @@ async fn plan_fork<R: Runtime>(
         workspace_id,
         target_cwd,
         cut,
+        env,
     })
 }
 
@@ -269,12 +277,9 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
     let plan = plan_fork(&app, &source_thread_id, before_message_id, workspace_id).await?;
     let provider = plan.source.provider.clone();
     let workspace_id = plan.workspace_id.clone();
-    // A chat on an extra provider account keeps its native session in that
-    // account's home, so the fork is made there.
-    let env = crate::provider_accounts::session_env_for_thread(&app, plan.provider, &plan.source.thread_id);
     let native_fork = match plan.provider {
-        ProviderKind::Claude => fork_claude(&plan, env).await?,
-        _ => fork_codex(&plan, env).await?,
+        ProviderKind::Claude => fork_claude(&plan).await?,
+        _ => fork_codex(&plan).await?,
     };
     let db: State<'_, DatabaseStore> = app.state();
     let cut_before = settled_bound(&plan, &db).await?;
@@ -347,12 +352,12 @@ pub async fn agent_chat_fork_origin(
 
 // ── Claude ──────────────────────────────────────────────────────────────
 
-async fn fork_claude(plan: &ForkPlan, env: HashMap<String, String>) -> Result<String, String> {
+async fn fork_claude(plan: &ForkPlan) -> Result<String, String> {
     let cut = match &plan.cut {
         Cut::Claude { cut, .. } => Some(cut),
         _ => None,
     };
-    let child = spawn_claude_sidecar(&plan.source_cwd, env)
+    let child = spawn_claude_sidecar(&plan.source_cwd, plan.env.clone())
         .await
         .map_err(|error| format!("Couldn't fork this chat: {error}"))?;
     let reply = child
@@ -372,12 +377,12 @@ async fn fork_claude(plan: &ForkPlan, env: HashMap<String, String>) -> Result<St
 
 // ── Codex ───────────────────────────────────────────────────────────────
 
-async fn fork_codex(plan: &ForkPlan, env: HashMap<String, String>) -> Result<String, String> {
+async fn fork_codex(plan: &ForkPlan) -> Result<String, String> {
     let rollback = match plan.cut {
         Cut::Codex { rollback, .. } => Some(rollback),
         _ => None,
     };
-    let child = spawn_codex(&plan.target_cwd, Vec::new(), env)
+    let child = spawn_codex(&plan.target_cwd, Vec::new(), plan.env.clone())
         .await
         .map_err(|error| format!("Couldn't fork this chat: {error}"))?;
     let result = codex_fork_in(&child, &plan.native_id, &plan.target_cwd, rollback).await;

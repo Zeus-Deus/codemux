@@ -406,6 +406,14 @@ pub fn session_env_for_thread<R: Runtime>(
         .unwrap_or_default()
 }
 
+/// Whether a Codex process started with `env` would run on the app-owned
+/// ChatGPT route (`route_selected`): only the CLI-login account does; an
+/// extra account always runs its own login. Side chats and forks can't
+/// follow that route, so they refuse exactly these sessions.
+pub fn on_chatgpt_route(provider: ProviderKind, env: &HashMap<String, String>, route_selected: bool) -> bool {
+    provider == ProviderKind::Codex && route_selected && !env.contains_key(SESSION_ACCOUNT_ENV)
+}
+
 /// Whether Codex's app-owned ChatGPT route serves the CLI-login account
 /// right now. That route keeps its own home, so a transcript cannot be
 /// carried into or out of it.
@@ -706,6 +714,16 @@ mod tests {
         assert_eq!(env[SESSION_ACCOUNT_ENV], "work");
         assert!(home.is_dir());
         assert_eq!(apply_env(ProviderKind::Codex, None, None), None);
+    }
+
+    #[test]
+    fn only_the_cli_login_follows_the_chatgpt_route() {
+        let cli = HashMap::new();
+        let extra = HashMap::from([(SESSION_ACCOUNT_ENV.to_string(), "work".to_string())]);
+        assert!(on_chatgpt_route(ProviderKind::Codex, &cli, true));
+        assert!(!on_chatgpt_route(ProviderKind::Codex, &extra, true));
+        assert!(!on_chatgpt_route(ProviderKind::Codex, &cli, false));
+        assert!(!on_chatgpt_route(ProviderKind::Claude, &cli, true));
     }
 
     #[test]
