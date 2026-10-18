@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use tauri::{Emitter, Manager};
 
-use crate::state::{AppStateSnapshot, AppStateStore, WorkspaceSnapshot};
+use crate::state::{AppStateSnapshot, AppStateStore, PaneNodeSnapshot, WorkspaceSnapshot};
 
 /// Local setting: "true" removes stale worktrees without asking.
 pub const AUTO_SETTING_KEY: &str = "worktree_cleanup.auto";
@@ -298,15 +298,27 @@ fn remember_closed(db: &crate::database::DatabaseStore, ws: &WorkspaceSnapshot) 
     store_closed(db, &closed);
 }
 
-/// Every path a live workspace has open, in [`path_key`] spelling.
+/// Every path a live workspace has open, in [`path_key`] spelling,
+/// including folders its chat panes were pointed at.
 fn live_paths(snapshot: &AppStateSnapshot) -> HashSet<PathBuf> {
-    snapshot
-        .workspaces
-        .iter()
-        .flat_map(|ws| [Some(ws.cwd.as_str()), ws.worktree_path.as_deref()])
-        .flatten()
-        .map(|p| path_key(Path::new(p)))
-        .collect()
+    fn chat_cwds<'a>(node: &'a PaneNodeSnapshot, out: &mut Vec<&'a str>) {
+        match node {
+            PaneNodeSnapshot::AgentChat { cwd: Some(cwd), .. } => out.push(cwd),
+            PaneNodeSnapshot::Split { children, .. } => {
+                children.iter().for_each(|child| chat_cwds(child, out))
+            }
+            _ => {}
+        }
+    }
+    let mut paths = Vec::new();
+    for ws in &snapshot.workspaces {
+        paths.push(ws.cwd.as_str());
+        paths.extend(ws.worktree_path.as_deref());
+        for surface in &ws.surfaces {
+            chat_cwds(&surface.root, &mut paths);
+        }
+    }
+    paths.into_iter().map(|p| path_key(Path::new(p))).collect()
 }
 
 /// True when a live workspace has `key` or a directory inside it open.
@@ -760,8 +772,10 @@ fn evaluate(db: &crate::database::DatabaseStore, candidates: &[Candidate]) -> Ve
 /// The current candidates, with the closed list pruned on the way.
 fn current_candidates<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Vec<Candidate> {
     let db = app.state::<crate::database::DatabaseStore>();
-    let snapshot = app.state::<AppStateStore>().snapshot();
+    // Lock before the snapshot: a close recorded after the snapshot would
+    // otherwise be pruned as still open.
     let _guard = CLOSED_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let snapshot = app.state::<AppStateStore>().snapshot();
     let closed = load_closed(&db);
     let kept = prune_closed(&snapshot, &closed);
     if kept != closed {
@@ -1255,6 +1269,34 @@ mod tests {
         let live_paths = HashSet::from([path_key(&open.join("sub"))]);
         assert!(is_open(&live_paths, &path_key(&open)));
         assert!(!is_open(&live_paths, &path_key(&closed)));
+    }
+
+    #[test]
+    fn a_chat_pane_pointed_at_a_worktree_keeps_it_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = path_key(dir.path()).join("other-worktree");
+        let mut snapshot = AppStateStore::default().snapshot();
+        snapshot.workspaces.truncate(1);
+        let surface = snapshot.workspaces[0].surfaces.first_mut().expect("default surface");
+        let previous = std::mem::replace(
+            &mut surface.root,
+            PaneNodeSnapshot::Split {
+                pane_id: crate::state::PaneId("split".into()),
+                direction: crate::state::SplitDirection::Horizontal,
+                child_sizes: vec![0.5, 0.5],
+                children: Vec::new(),
+            },
+        );
+        let PaneNodeSnapshot::Split { children, .. } = &mut surface.root else { unreachable!() };
+        children.push(previous);
+        children.push(PaneNodeSnapshot::AgentChat {
+            pane_id: crate::state::PaneId("chat".into()),
+            title: "Agent Chat".into(),
+            thread_id: None,
+            provider: None,
+            cwd: Some(other.to_string_lossy().into_owned()),
+        });
+        assert!(is_open(&live_paths(&snapshot), &other));
     }
 
     #[test]
