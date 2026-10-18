@@ -82,6 +82,9 @@ export interface LandingBackdropProps {
   onPulse: (handler: (x: number, y: number) => void) => () => void;
   /** The headline block's rect in viewport pixels (for dimming behind text), or null. */
   calmRect: () => DOMRect | null;
+  /** Called when the headline block may have moved or resized (layout change,
+   *  scroll, a notice appearing). Read `calmRect()` again. Returns an unsubscribe. */
+  onCalmChange: (handler: () => void) => () => void;
 }
 
 // ── host ──────────────────────────────────────────────────────────────

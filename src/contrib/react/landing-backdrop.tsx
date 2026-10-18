@@ -2,12 +2,13 @@
  * `landing.backdrop`: plugin contributions mounted behind the new-thread
  * landing with pointer-events: none. The host forwards left clicks on empty
  * landing space (not buttons, links or inputs) to subscribers of `onPulse`
- * and exposes the headline block's rect so a backdrop can dim behind it.
+ * and exposes the headline block's rect so a backdrop can dim behind it,
+ * with a signal when that rect may have moved (resize or scroll).
  *
  * With no contribution the wrapper is not rendered at all: the landing's DOM
  * is exactly what it was before plugins existed.
  */
-import { useCallback, useMemo, useRef, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, type ReactNode } from "react";
 import { LANDING_BACKDROP_AREA } from "@/sdk/areas";
 import type { LandingBackdropProps } from "@/sdk/host";
 import { ContribBoundary, ContribRender } from "./boundary";
@@ -32,9 +33,45 @@ export function LandingBackdropHost({ children }: { children: ReactNode }) {
       rootRef.current?.querySelector<HTMLElement>("[data-backdrop-calm]")?.getBoundingClientRect() ?? null,
     [],
   );
-  const props = useMemo<LandingBackdropProps>(() => ({ onPulse, calmRect }), [onPulse, calmRect]);
+  const calmHandlers = useRef(new Set<() => void>());
+  const onCalmChange = useCallback((handler: () => void) => {
+    calmHandlers.current.add(handler);
+    return () => {
+      calmHandlers.current.delete(handler);
+    };
+  }, []);
+  const props = useMemo<LandingBackdropProps>(
+    () => ({ onPulse, calmRect, onCalmChange }),
+    [onPulse, calmRect, onCalmChange],
+  );
 
-  if (items.length === 0) return <>{children}</>;
+  const active = items.length > 0;
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!active || !root) return;
+    const notify = () => {
+      for (const handler of [...calmHandlers.current]) {
+        try {
+          handler();
+        } catch (error) {
+          console.error("[plugins] landing backdrop onCalmChange handler threw", error);
+        }
+      }
+    };
+    // The headline moves when the landing resizes, when its column scrolls
+    // in a short pane, or when a notice above the composer changes height.
+    const ro = new ResizeObserver(notify);
+    ro.observe(root);
+    const calm = root.querySelector<HTMLElement>("[data-backdrop-calm]");
+    if (calm) ro.observe(calm);
+    root.addEventListener("scroll", notify, { capture: true, passive: true });
+    return () => {
+      ro.disconnect();
+      root.removeEventListener("scroll", notify, { capture: true });
+    };
+  }, [active]);
+
+  if (!active) return <>{children}</>;
 
   return (
     <div
