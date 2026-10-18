@@ -301,6 +301,16 @@ fn remember_closed(db: &crate::database::DatabaseStore, ws: &WorkspaceSnapshot) 
 /// Every path a live workspace has open, in [`path_key`] spelling,
 /// including folders its chat panes were pointed at.
 fn live_paths(snapshot: &AppStateSnapshot) -> HashSet<PathBuf> {
+    open_paths(snapshot, true)
+}
+
+/// The checkouts live workspaces own. A chat pane only borrows a folder,
+/// so it doesn't retire that folder's closed record.
+fn workspace_paths(snapshot: &AppStateSnapshot) -> HashSet<PathBuf> {
+    open_paths(snapshot, false)
+}
+
+fn open_paths(snapshot: &AppStateSnapshot, with_chats: bool) -> HashSet<PathBuf> {
     fn chat_cwds<'a>(node: &'a PaneNodeSnapshot, out: &mut Vec<&'a str>) {
         match node {
             PaneNodeSnapshot::AgentChat { cwd: Some(cwd), .. } => out.push(cwd),
@@ -314,8 +324,10 @@ fn live_paths(snapshot: &AppStateSnapshot) -> HashSet<PathBuf> {
     for ws in &snapshot.workspaces {
         paths.push(ws.cwd.as_str());
         paths.extend(ws.worktree_path.as_deref());
-        for surface in &ws.surfaces {
-            chat_cwds(&surface.root, &mut paths);
+        if with_chats {
+            for surface in &ws.surfaces {
+                chat_cwds(&surface.root, &mut paths);
+            }
         }
     }
     paths.into_iter().map(|p| path_key(Path::new(p))).collect()
@@ -381,7 +393,7 @@ fn gather_candidates(
 /// workspace reopened it (a reopened worktree gets a new close time when
 /// it closes again).
 fn prune_closed(snapshot: &AppStateSnapshot, closed: &[ClosedWorktree]) -> Vec<ClosedWorktree> {
-    let live = live_paths(snapshot);
+    let live = workspace_paths(snapshot);
     closed
         .iter()
         .filter(|c| {
@@ -1297,6 +1309,17 @@ mod tests {
             cwd: Some(other.to_string_lossy().into_owned()),
         });
         assert!(is_open(&live_paths(&snapshot), &other));
+
+        // Borrowing a closed worktree must not drop its closed record, or
+        // it could never be found again once the chat closes.
+        std::fs::create_dir(&other).unwrap();
+        let record = ClosedWorktree {
+            path: other.to_string_lossy().into_owned(),
+            title: "other".into(),
+            branch: None,
+            closed_at: 0,
+        };
+        assert_eq!(prune_closed(&snapshot, std::slice::from_ref(&record)), vec![record]);
     }
 
     #[test]
