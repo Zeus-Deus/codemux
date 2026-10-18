@@ -101,6 +101,18 @@ impl DatabaseStore {
         .map_err(|e| format!("Failed to clear running turn: {e}"))
     }
 
+    /// [`clear_restart_turn`](Self::clear_restart_turn), but only while the
+    /// recorded turn is still `turn_id`.
+    pub fn clear_restart_turn_if(&self, thread_id: &str, turn_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM agent_chat_restart_resumes WHERE thread_id = ?1 AND turn_id = ?2",
+            params![thread_id, turn_id],
+        )
+        .map(|changed| changed > 0)
+        .map_err(|e| format!("Failed to clear running turn: {e}"))
+    }
+
     /// Add (`open`) or remove an approval or question the running turn waits
     /// on. No-op when the thread has no running turn recorded.
     pub fn set_restart_turn_waiting(

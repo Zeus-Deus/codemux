@@ -20,9 +20,11 @@ use tauri::{Manager, State};
 use codemux_lib::agent_provider::{
     ProviderKind, ProviderRuntimeEvent, RequestId, SessionStatus, ThreadId, TurnId, TurnStatus,
 };
+use codemux_lib::agent_provider::types::MessageDelivery;
 use codemux_lib::commands::agent_chat::{
-    forward_event, AgentChatChannelRegistry, GrokUsageLedgerBridge, ProviderRegistry,
-    RunActivityTracker, SubagentTracker,
+    agent_chat_interrupt_turn, agent_chat_send_turn, forward_event, AgentChatChannelRegistry,
+    GrokUsageLedgerBridge, ProviderRegistry, RunActivityTracker, SendTurnCommandInput,
+    SubagentTracker,
 };
 use codemux_lib::commands::restart_resume::{
     on_exit, resume_after_restart_for_test, ResumeDecision, SkipReason,
@@ -193,9 +195,12 @@ async fn a_chat_running_at_a_normal_quit_resumes_once_at_the_next_launch() {
     assert_eq!(sent.len(), 1);
     assert!(sent[0].starts_with(RESTART_RESUME_NOTE_PREFIX));
     assert!(sent[0].contains("Codemux quit"));
-    // The provider reopened the saved conversation.
+    // The provider reopened the saved conversation, and only that one.
     let starts = h.provider.start_inputs();
-    assert_eq!(starts[0].resume_cursor, Some(serde_json::json!({"resume": "sdk-rr-quit"})));
+    assert_eq!(
+        starts[0].resume_cursor,
+        Some(serde_json::json!({"resume": "sdk-rr-quit", "requireOriginal": true}))
+    );
 
     // The same launch never resumes it twice.
     let again = resume_after_restart_for_test(&h.handle(), "launch-2").await;
@@ -234,7 +239,7 @@ async fn a_chat_the_user_stopped_is_not_resumed() {
     let h = harness().await;
     h.chat("rr-stopped");
     h.running("rr-stopped", "turn-1");
-    codemux_lib::commands::agent_chat::agent_chat_interrupt_turn(
+    agent_chat_interrupt_turn(
         h.handle(),
         ProviderKind::Codex,
         ThreadId("rr-stopped".into()),
@@ -459,6 +464,168 @@ async fn a_claude_chat_resumes_only_while_its_conversation_file_exists() {
     assert_eq!(decision(&decisions, "rr-claude"), Some(ResumeDecision::Resume));
     assert_eq!(
         h.provider.start_inputs()[0].resume_cursor,
-        Some(serde_json::json!({"resume": session}))
+        Some(serde_json::json!({"resume": session, "requireOriginal": true}))
     );
+}
+
+fn typed(thread: &str, text: &str) -> SendTurnCommandInput {
+    SendTurnCommandInput {
+        delivery: MessageDelivery::Queue,
+        thread_id: ThreadId(thread.into()),
+        text: text.into(),
+        display_text: None,
+        skill_ids: Vec::new(),
+        skill_text: None,
+        include_plugins: true,
+        images: Vec::new(),
+        model_override: None,
+        effort_override: None,
+        permission_mode_override: None,
+        client_nonce: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_during_the_drain_keeps_the_rest_saved() {
+    let h = harness().await;
+    h.chat("rr-drain-stop");
+    h.saved("rr-drain-stop", "q-1", "first saved");
+    h.saved("rr-drain-stop", "q-2", "second saved");
+    h.running("rr-drain-stop", "turn-1");
+    resume_after_restart_for_test(&h.handle(), "launch-2").await;
+    // Hold the first saved send, then Stop while it is in flight.
+    let (entered, release) = h.provider.hold_next_send();
+    h.running("rr-drain-stop", "turn-resume");
+    h.completed("rr-drain-stop", TurnStatus::Success);
+    tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+    let stop = tokio::spawn(agent_chat_interrupt_turn(
+        h.handle(),
+        ProviderKind::Codex,
+        ThreadId("rr-drain-stop".into()),
+        None,
+    ));
+    // The Stop has cancelled the drain before it waits for the send.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    release.notify_one();
+    stop.await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let sent = h.sent("rr-drain-stop");
+    assert_eq!(&sent[1..], ["first saved"], "{sent:?}");
+    let left: Vec<_> = h
+        .db()
+        .list_queued_turns("rr-drain-stop")
+        .into_iter()
+        .map(|row| row.queued_id)
+        .collect();
+    assert_eq!(left, ["q-2"]);
+}
+
+#[tokio::test]
+async fn the_drain_skips_a_saved_turn_that_was_already_sent() {
+    let h = harness().await;
+    h.chat("rr-drain-dup");
+    h.saved("rr-drain-dup", "q-1", "already sent");
+    h.saved("rr-drain-dup", "q-2", "not yet");
+    // The first one reached the transcript before the crash; its row outlived it.
+    h.db()
+        .append_agent_chat_message(
+            "rr-drain-dup",
+            &serde_json::json!({
+                "type": "user_message", "thread_id": "rr-drain-dup",
+                "text": "already sent", "client_nonce": "nonce-q-1",
+            })
+            .to_string(),
+        )
+        .unwrap();
+    h.running("rr-drain-dup", "turn-1");
+    resume_after_restart_for_test(&h.handle(), "launch-2").await;
+    h.running("rr-drain-dup", "turn-resume");
+    h.completed("rr-drain-dup", TurnStatus::Success);
+    let sent = wait_for_sends(&h, "rr-drain-dup", 2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(&h.sent("rr-drain-dup")[1..], ["not yet"], "{sent:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chat_the_user_takes_over_during_the_launch_pass_is_left_alone() {
+    let h = harness().await;
+    h.chat("rr-take-a");
+    h.chat("rr-take-b");
+    h.running("rr-take-a", "turn-a");
+    std::thread::sleep(Duration::from_millis(5));
+    h.running("rr-take-b", "turn-b");
+    // Chat A's session takes a while to reopen; the user writes to B meanwhile.
+    let (entered, release) = h.provider.hold_next_start();
+    let pass = tokio::spawn({
+        let handle = h.handle();
+        async move { resume_after_restart_for_test(&handle, "launch-2").await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+    agent_chat_send_turn(h.handle(), ProviderKind::Codex, typed("rr-take-b", "do this instead"))
+        .await
+        .unwrap();
+    // B's own turn finished before the pass reached it.
+    h.provider.set_turn_active("rr-take-b", false);
+    release.notify_one();
+    let decisions = pass.await.unwrap();
+    assert_eq!(decision(&decisions, "rr-take-a"), Some(ResumeDecision::Resume));
+    assert_eq!(
+        decision(&decisions, "rr-take-b"),
+        Some(ResumeDecision::Skip(SkipReason::UserTookOver))
+    );
+    assert_eq!(h.sent("rr-take-b"), ["do this instead"]);
+}
+
+#[tokio::test]
+async fn a_send_that_fails_after_running_leaves_nothing_to_resume() {
+    let h = harness().await;
+    h.chat("rr-ready");
+    h.running("rr-ready", "turn-1");
+    // The provider reported the turn, then the send failed: only `Ready` follows.
+    forward_event(
+        &h.handle(),
+        ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: ThreadId("rr-ready".into()),
+            status: SessionStatus::Ready,
+        },
+    );
+    for _ in 0..100 {
+        if h.db().get_restart_turn("rr-ready").is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(h.db().get_restart_turn("rr-ready").is_none());
+
+    // While a turn is live, `Ready` (a session finishing its setup) keeps it.
+    h.chat("rr-ready-live");
+    h.provider.set_turn_active("rr-ready-live", true);
+    h.running("rr-ready-live", "turn-1");
+    forward_event(
+        &h.handle(),
+        ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: ThreadId("rr-ready-live".into()),
+            status: SessionStatus::Ready,
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(h.db().get_restart_turn("rr-ready-live").is_some());
+}
+
+#[tokio::test]
+async fn a_conversation_that_cannot_be_reopened_is_not_resumed() {
+    let h = harness().await;
+    h.chat("rr-lost");
+    h.running("rr-lost", "turn-1");
+    h.provider.fail_next_start(codemux_lib::agent_provider::ProviderError::SessionNotFound {
+        thread_id: ThreadId("rr-lost".into()),
+    });
+    let decisions = resume_after_restart_for_test(&h.handle(), "launch-2").await;
+    assert_eq!(
+        decision(&decisions, "rr-lost"),
+        Some(ResumeDecision::Skip(SkipReason::ConversationLost))
+    );
+    // No fresh session was started in its place, and nothing was sent.
+    assert_eq!(h.provider.start_inputs().len(), 1);
+    assert!(h.sent("rr-lost").is_empty());
 }

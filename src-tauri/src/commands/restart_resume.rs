@@ -85,6 +85,14 @@ struct Live {
     chain: HashMap<String, i64>,
     /// Threads resumed this run whose resume turn has not ended yet.
     resuming: HashSet<String>,
+    /// Chats the launch pass has taken but not decided yet. The user acting
+    /// on one first (a send, a Stop) takes it out of the pass.
+    candidates: HashSet<String>,
+    /// Saved-queue drains under way, by thread, with the token each was
+    /// started under. A Stop removes the entry, which ends the drain before
+    /// its next send.
+    draining: HashMap<String, u64>,
+    next_drain: u64,
 }
 
 fn live() -> std::sync::MutexGuard<'static, Live> {
@@ -119,12 +127,18 @@ pub(crate) fn on_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEv
                 )
             }
             SessionStatus::WaitingApproval { request_id } => waiting(thread_id, &request_id.0, true),
-            // `Ready` is not an end: a session can report it while its first
-            // turn is already starting. The turn's own end clears the row.
             SessionStatus::Closed | SessionStatus::Error { .. } => {
                 db.clear_restart_turn(&thread_id.0).map(drop)
             }
-            SessionStatus::Starting | SessionStatus::Ready => return,
+            // `Ready` alone is no end: a session can report it while its
+            // first turn is already starting. But a send that fails after
+            // `Running` ends with only `Ready`, so check whether a turn is
+            // still active and clear the row if not.
+            SessionStatus::Ready => {
+                settle_if_idle(app, thread_id);
+                return;
+            }
+            SessionStatus::Starting => return,
         },
         ProviderRuntimeEvent::TurnCompleted { thread_id, status, .. } => {
             let result = db.clear_restart_turn(&thread_id.0).map(drop);
@@ -156,9 +170,40 @@ pub(crate) fn on_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEv
     }
 }
 
-/// The user sent a message: automatic resumes start counting again.
+/// Clear the thread's running turn, unless a turn is still active or a newer
+/// one replaced it meanwhile.
+fn settle_if_idle<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId) {
+    let Some(db) = app.try_state::<DatabaseStore>() else {
+        return;
+    };
+    let Some(row) = db.get_restart_turn(&thread_id.0) else {
+        return;
+    };
+    let Some(provider) = db
+        .get_agent_chat_session(&thread_id.0)
+        .and_then(|session| parse_provider(&session.provider))
+    else {
+        return;
+    };
+    let app = app.clone();
+    let thread_id = thread_id.clone();
+    tauri::async_runtime::spawn(async move {
+        if super::queued_turns::exiting() || thread_busy(&app, provider, &thread_id).await {
+            return;
+        }
+        let db: State<'_, DatabaseStore> = app.state();
+        if let Err(error) = db.clear_restart_turn_if(&thread_id.0, &row.turn_id) {
+            eprintln!("[codemux::restart_resume] {error}");
+        }
+    });
+}
+
+/// The user sent a message: automatic resumes start counting again, and a
+/// chat still waiting for the launch pass is the user's now.
 pub(super) fn on_user_activity(thread_id: &str) {
-    live().chain.remove(thread_id);
+    let mut live = live();
+    live.chain.remove(thread_id);
+    live.candidates.remove(thread_id);
 }
 
 /// The user stopped or closed the chat: nothing to resume, and its saved
@@ -171,6 +216,8 @@ pub(super) fn forget_stopped_thread<R: Runtime>(app: &AppHandle<R>, thread_id: &
         let mut live = live();
         live.resuming.remove(thread_id);
         live.chain.remove(thread_id);
+        live.candidates.remove(thread_id);
+        live.draining.remove(thread_id);
     }
     if let Some(db) = app.try_state::<DatabaseStore>() {
         if let Err(error) = db.clear_restart_turn(thread_id) {
@@ -227,6 +274,10 @@ pub enum SkipReason {
     ManualOnly,
     CapReached,
     Busy,
+    /// The provider could not reopen the original conversation.
+    ConversationLost,
+    /// The user acted on the chat before the launch pass reached it.
+    UserTookOver,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,12 +391,19 @@ fn resurface<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
     }
 }
 
+const CONVERSATION_LOST: &str = "the original conversation could not be reopened";
+
 async fn dispatch<R: Runtime>(
     app: &AppHandle<R>,
     provider: ProviderKind,
     row: &RestartResumeRecord,
 ) -> Result<(), String> {
     let thread_id = ThreadId(row.thread_id.clone());
+    // Reopen the original conversation first. The send path would quietly
+    // start a fresh one if it can't, and the note means nothing there.
+    super::agent_chat::ensure_live_session_mode(app, provider, &thread_id, true)
+        .await
+        .map_err(|error| format!("{CONVERSATION_LOST}: {error}"))?;
     {
         let mut live = live();
         live.chain.insert(row.thread_id.clone(), row.chain + 1);
@@ -367,10 +425,16 @@ async fn resume_one<R: Runtime>(app: &AppHandle<R>, row: RestartResumeRecord) ->
     // Holding the activity lock makes a user send wait for this dispatch;
     // a send already under way wins.
     let Ok(_guard) = lock.try_lock() else {
+        live().candidates.remove(&row.thread_id);
         return ResumeDecision::Skip(SkipReason::Busy);
     };
+    // Taken out under the lock: a user send or Stop either ran before this
+    // (and removed it) or waits for this decision.
+    if !live().candidates.remove(&row.thread_id) {
+        return ResumeDecision::Skip(SkipReason::UserTookOver);
+    }
     let (facts, provider) = gather_facts(app, &row).await;
-    let decision = decide(&facts);
+    let mut decision = decide(&facts);
     match (decision, provider) {
         (ResumeDecision::Resurface, _) => resurface(app, &row.thread_id),
         (ResumeDecision::Resume, Some(provider)) => {
@@ -383,6 +447,9 @@ async fn resume_one<R: Runtime>(app: &AppHandle<R>, row: RestartResumeRecord) ->
                     "[codemux::restart_resume] resume failed for thread={}: {error}",
                     row.thread_id
                 );
+                if error.starts_with(CONVERSATION_LOST) {
+                    decision = ResumeDecision::Skip(SkipReason::ConversationLost);
+                }
             }
         }
         (decision, _) => eprintln!(
@@ -409,6 +476,9 @@ async fn resume_after_restart<R: Runtime>(
             }
         }
     };
+    live()
+        .candidates
+        .extend(rows.iter().map(|row| row.thread_id.clone()));
     let mut decisions = Vec::with_capacity(rows.len());
     for row in rows {
         let thread_id = row.thread_id.clone();
@@ -419,25 +489,45 @@ async fn resume_after_restart<R: Runtime>(
 
 /// Send a resumed chat's saved queue in order, through the same command the
 /// user's Send uses. The first starts a turn and the rest queue behind it.
-/// Stops at the first failure; what is left stays saved.
+/// A Stop on the chat ends the drain before its next send, and the first
+/// failure ends it too; what is left stays saved.
 async fn drain_saved_queue<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId) {
-    let (provider, saved) = {
+    let provider = {
         let db: State<'_, DatabaseStore> = app.state();
-        let provider = db
-            .get_agent_chat_session(&thread_id.0)
-            .and_then(|session| parse_provider(&session.provider));
-        let saved: Vec<String> = db
-            .list_queued_turns(&thread_id.0)
-            .into_iter()
-            .filter(|row| row.epoch != super::queued_turns::epoch())
-            .map(|row| row.queued_id)
-            .collect();
-        (provider, saved)
+        db.get_agent_chat_session(&thread_id.0)
+            .and_then(|session| parse_provider(&session.provider))
     };
     let Some(provider) = provider else {
         return;
     };
+    // Listed through the pane's command, which drops rows whose message
+    // already reached the transcript before an earlier crash.
+    let saved: Vec<String> =
+        match super::queued_turns::agent_chat_list_queued_turns(app.clone(), thread_id.clone()).await {
+            Ok(rows) => rows.into_iter().filter(|row| row.saved).map(|row| row.queued_id).collect(),
+            Err(error) => {
+                eprintln!("[codemux::restart_resume] {error}");
+                return;
+            }
+        };
+    if saved.is_empty() {
+        return;
+    }
+    let token = {
+        let mut live = live();
+        live.next_drain += 1;
+        let token = live.next_drain;
+        live.draining.insert(thread_id.0.clone(), token);
+        token
+    };
     for queued_id in saved {
+        if live().draining.get(&thread_id.0) != Some(&token) {
+            eprintln!(
+                "[codemux::restart_resume] saved queue on thread={} stays saved: stopped",
+                thread_id.0
+            );
+            return;
+        }
         let sent = super::queued_turns::agent_chat_send_saved_queued_turn(
             app.clone(),
             provider,
@@ -451,8 +541,12 @@ async fn drain_saved_queue<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId)
                 "[codemux::restart_resume] saved turn {queued_id} on thread={} stays saved: {error}",
                 thread_id.0
             );
-            return;
+            break;
         }
+    }
+    let mut live = live();
+    if live.draining.get(&thread_id.0) == Some(&token) {
+        live.draining.remove(&thread_id.0);
     }
 }
 
