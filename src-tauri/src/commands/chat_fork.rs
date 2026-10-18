@@ -293,6 +293,8 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
     // remove the images this copies.
     copy_inherited_images(images).await;
     drop(plan);
+    // The fork may have inherited open questions.
+    super::async_questions::publish_attention(&app);
     Ok(ChatForkCreated {
         thread_id,
         provider,

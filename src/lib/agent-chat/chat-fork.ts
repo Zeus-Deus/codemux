@@ -53,7 +53,7 @@ function startsTurn(item: ChatViewItem): item is Extract<ChatViewItem, { kind: "
  * latest message; an earlier one cuts before the next turn's user
  * message, which needs a durable row id (and, for Codex, a checkpoint).
  * Nothing is offered while the chat is busy: the backend only forks a
- * chat between turns.
+ * chat between turns. Items are read in display order (`seq`, then id).
  */
 export function computeForkPoints(
   items: readonly ChatViewItem[],
@@ -63,8 +63,11 @@ export function computeForkPoints(
 ): Map<string, ForkBefore> {
   const points = new Map<string, ForkBefore>();
   if (busy || !chatForkSupported(provider)) return points;
+  // Walk the transcript as it's shown: a promoted queued prompt keeps its
+  // array slot but takes a later `seq`.
+  const ordered = [...items].sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
   let lastReply: string | null = null;
-  for (const item of items) {
+  for (const item of ordered) {
     if (item.kind === "assistant_message" && !item.streaming && item.text) {
       lastReply = item.id;
       continue;

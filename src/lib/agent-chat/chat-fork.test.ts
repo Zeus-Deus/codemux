@@ -33,7 +33,7 @@ const TRANSCRIPT: ChatViewItem[] = [
   reply("a2b"),
   user("u3", 20),
   reply("a3"),
-];
+].map((item, seq) => ({ ...item, seq }));
 
 describe("computeForkPoints", () => {
   it("offers the last reply of each finished turn, cut before the next turn", () => {
@@ -65,6 +65,23 @@ describe("computeForkPoints", () => {
     expect(chatForkSupported("codex")).toBe(true);
   });
 
+  it("reads the transcript in display order, not array order", () => {
+    // U2 and U3 were queued, then promoted with later seqs in their old slots.
+    const items = [
+      user("u1", 1, { seq: 1 }),
+      user("u2", 10, { seq: 3 }),
+      reply("a1", { seq: 2 }),
+      user("u3", 20, { seq: 5 }),
+      reply("a2", { seq: 4 }),
+      reply("a3", { seq: 6 }),
+    ];
+    expect([...computeForkPoints(items, "claude", undefined, false)]).toEqual([
+      ["a1", 10],
+      ["a2", 20],
+      ["a3", null],
+    ]);
+  });
+
   it("skips queued prompts, optimistic rows and streaming replies", () => {
     const items = [
       user("u1", 1),
@@ -72,7 +89,7 @@ describe("computeForkPoints", () => {
       user("queued", undefined, { queued: { queuedId: "q" } } as Partial<ChatViewItem>),
       user("optimistic", undefined),
       reply("a2", { streaming: true } as Partial<ChatViewItem>),
-    ];
+    ].map((item, seq) => ({ ...item, seq }));
     // a1 is followed by a sent prompt with no durable row yet: no cut.
     expect([...computeForkPoints(items, "claude", undefined, false)]).toEqual([]);
   });

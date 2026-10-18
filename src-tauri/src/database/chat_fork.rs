@@ -109,6 +109,63 @@ pub(crate) fn rewrite_forked_payload(
     value.to_string()
 }
 
+/// Carry the source's async questions into the fork as they stood at the
+/// cut, so an inherited question stays answerable. Every one routes to the
+/// fork's own native thread: the source's threads, its subagents included,
+/// aren't the fork's to steer, so an answer lands in the fork's conversation.
+fn copy_forked_questions(
+    tx: &rusqlite::Transaction<'_>,
+    source_thread_id: &str,
+    fork: &NewChatFork<'_>,
+    copied_ids: &HashMap<i64, i64>,
+) -> Result<(), String> {
+    let questions: Vec<(String, i64, String)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT question_id, source_event_id, question_json
+                 FROM agent_chat_questions WHERE thread_id = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let mapped = stmt
+            .query_map(params![source_thread_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| e.to_string())?;
+        mapped.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+    };
+    for (question_id, source_event, question_json) in questions {
+        // Asked after the cut: not part of the fork.
+        let Some(&event) = copied_ids.get(&source_event) else {
+            continue;
+        };
+        let mut question: serde_json::Value =
+            serde_json::from_str(&question_json).map_err(|e| e.to_string())?;
+        question["target"] = fork.sdk_session_id.into();
+        // The newest resolution the fork kept, as the resolution trigger
+        // in `async_questions` recomputes it.
+        let resolution: Option<String> = tx
+            .query_row(
+                "SELECT json_extract(payload, '$.resolution') FROM agent_chat_messages
+                 WHERE thread_id = ?1 AND json_valid(payload)
+                   AND json_extract(payload, '$.type') = 'question_resolved'
+                   AND json_extract(payload, '$.question_id') = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![fork.thread_id, question_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO agent_chat_questions
+                 (thread_id, question_id, source_event_id, question_json, resolution_json)
+             VALUES (?1, ?2, ?3, ?4, COALESCE(?5, '{\"status\":\"pending\"}'))",
+            params![fork.thread_id, question_id, event, question.to_string(), resolution],
+        )
+        .map_err(|e| format!("Failed to copy the chat's questions: {e}"))?;
+    }
+    Ok(())
+}
+
 impl DatabaseStore {
     /// Create the fork thread in one transaction: its session row, its copy
     /// of the source transcript, and its lineage row. Fails if the thread id
@@ -185,6 +242,7 @@ impl DatabaseStore {
             copied_ids.insert(id, copied);
             boundary = Some(copied);
         }
+        copy_forked_questions(&tx, source.thread_id.as_str(), fork, &copied_ids)?;
         tx.execute(
             "INSERT INTO agent_chat_forks
                  (thread_id, source_thread_id, source_title, source_cut_message_id, boundary_message_id)
@@ -336,7 +394,8 @@ mod tests {
             &mut images,
         );
         let row: serde_json::Value = serde_json::from_str(&row).unwrap();
-        assert_eq!(row["images"][0]["path"], "/img/fork/a.png");
+        let moved = Path::new("/img/fork").join("a.png");
+        assert_eq!(row["images"][0]["path"], moved.to_string_lossy().as_ref());
         assert_eq!(row["images"][1]["path"], "/elsewhere/b.png", "only the source's own folder moves");
         assert_eq!(images, vec![(PathBuf::from("/img/src/a.png"), PathBuf::from("/img/fork/a.png"))]);
     }
@@ -378,6 +437,53 @@ mod tests {
         assert_eq!(origin.boundary_message_id, db.max_agent_chat_message_id("fork"));
         assert_eq!(db.list_agent_chat_messages("src").len(), 5, "the source is untouched");
         assert!(db.agent_chat_fork_origin("src").is_none());
+    }
+
+    #[test]
+    fn fork_keeps_questions_as_they_stood_at_the_cut_and_answers_them_itself() {
+        use crate::agent_provider::{QuestionResolution, UserQuestion, UserQuestionSet};
+        let db = store_with_source();
+        let question = |id: &str, target: &str| UserQuestionSet {
+            id: id.into(),
+            target: target.into(),
+            source_item_id: "item".into(),
+            source_turn_id: "turn".into(),
+            text: "Which one?".into(),
+            questions: vec![UserQuestion { title: "Pick".into(), options: vec![] }],
+            subagent_id: None,
+        };
+        db.record_async_question("src", &question("open", "native-src")).unwrap();
+        db.record_async_question("src", &question("dismissed", "native-child")).unwrap();
+        db.change_async_question("src", "dismissed", &QuestionResolution::Pending, &QuestionResolution::Dismissed)
+            .unwrap()
+            .unwrap();
+        let cut = append(&db, serde_json::json!({"type":"user_message","thread_id":"src","text":"two"}));
+        // Dismissed in the source only after the cut, and asked after it.
+        db.change_async_question("src", "open", &QuestionResolution::Pending, &QuestionResolution::Dismissed)
+            .unwrap()
+            .unwrap();
+        db.record_async_question("src", &question("later", "native-src")).unwrap();
+        let source = db.get_agent_chat_session("src").unwrap();
+        db.create_agent_chat_fork(&NewChatFork {
+            thread_id: "fork",
+            source: &source,
+            sdk_session_id: "native-fork",
+            workspace_id: "ws",
+            cwd: "/repo",
+            title: "t",
+            cut_before: Some(cut),
+            image_dirs: None,
+        })
+        .unwrap();
+
+        let (open, resolution) = db.async_question("fork", "open").unwrap();
+        assert_eq!(resolution, QuestionResolution::Pending, "as it stood at the cut");
+        assert_eq!(open.target, "native-fork");
+        let (dismissed, resolution) = db.async_question("fork", "dismissed").unwrap();
+        assert_eq!(resolution, QuestionResolution::Dismissed);
+        assert_eq!(dismissed.target, "native-fork", "never steers the source's threads");
+        assert!(db.async_question("fork", "later").is_err());
+        assert_eq!(db.async_question("src", "open").unwrap().1, QuestionResolution::Dismissed, "the source is untouched");
     }
 
     #[test]
