@@ -6956,7 +6956,7 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
         tauri::async_runtime::spawn(async move {
             use futures_util::StreamExt;
             eprintln!("[codemux::agent_chat] event bridge started for {kind:?}");
-            let mut open_requests = OpenRequests::default();
+            let mut open_requests = OpenRequests::new(kind);
             while let Some(event) = stream.next().await {
                 if !requests_survive {
                     for (thread_id, request_id) in open_requests.observe(&event) {
@@ -6982,10 +6982,19 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
 /// answerable until a submit fails. The bridge expires them at the death
 /// boundary instead (only for providers whose requests do not survive a
 /// session restart).
-#[derive(Default)]
-struct OpenRequests(HashMap<ThreadId, Vec<RequestId>>);
+struct OpenRequests {
+    provider: ProviderKind,
+    open: HashMap<ThreadId, Vec<RequestId>>,
+}
 
 impl OpenRequests {
+    fn new(provider: ProviderKind) -> Self {
+        Self {
+            provider,
+            open: HashMap::new(),
+        }
+    }
+
     /// Track `event` and return the requests it leaves without a live
     /// callback: everything open on a thread whose session closed, or
     /// whose process exited mid-turn.
@@ -6994,9 +7003,17 @@ impl OpenRequests {
             ProviderRuntimeEvent::RequestOpened {
                 thread_id,
                 request_id,
+                request_kind,
                 ..
             } => {
-                let open = self.0.entry(thread_id.clone()).or_default();
+                // Claude's plan proposal parks no callback (the sidecar
+                // denies ExitPlanMode at once; accepting starts a new
+                // turn), so a restart leaves it actionable. Other
+                // providers' plan requests are real blocking callbacks.
+                if self.provider == ProviderKind::Claude && request_kind == "plan" {
+                    return Vec::new();
+                }
+                let open = self.open.entry(thread_id.clone()).or_default();
                 if !open.contains(request_id) {
                     open.push(request_id.clone());
                 }
@@ -7012,10 +7029,10 @@ impl OpenRequests {
                 request_id,
                 ..
             } => {
-                if let Some(open) = self.0.get_mut(thread_id) {
+                if let Some(open) = self.open.get_mut(thread_id) {
                     open.retain(|id| id != request_id);
                     if open.is_empty() {
-                        self.0.remove(thread_id);
+                        self.open.remove(thread_id);
                     }
                 }
                 return Vec::new();
@@ -7031,7 +7048,7 @@ impl OpenRequests {
             } if subtype == crate::agent_provider::CHILD_EXITED_SUBTYPE => thread_id,
             _ => return Vec::new(),
         };
-        self.0
+        self.open
             .remove(ended)
             .unwrap_or_default()
             .into_iter()
@@ -9194,7 +9211,7 @@ mod tests {
             },
             usage: None,
         };
-        let mut open = OpenRequests::default();
+        let mut open = OpenRequests::new(ProviderKind::Codex);
         assert!(open.observe(&opened("answered")).is_empty());
         assert!(open.observe(&opened("orphan")).is_empty());
         open.observe(&ProviderRuntimeEvent::RequestResolved {
@@ -9222,6 +9239,39 @@ mod tests {
                 status: SessionStatus::Closed,
             }),
             vec![(thread, RequestId("closing".into()))]
+        );
+    }
+
+    #[test]
+    fn open_requests_keep_claude_plan_proposals_across_a_restart() {
+        let thread = ThreadId("t".into());
+        let opened = |id: &str, kind: &str| ProviderRuntimeEvent::RequestOpened {
+            thread_id: thread.clone(),
+            turn_id: TurnId(String::new()),
+            request_id: RequestId(id.into()),
+            request_kind: kind.into(),
+            payload: json!({}),
+            tool_use_id: None,
+            subagent_id: None,
+        };
+        let closed = ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: thread.clone(),
+            status: SessionStatus::Closed,
+        };
+        // An effort change restarts Claude; its plan needs no callback.
+        let mut claude = OpenRequests::new(ProviderKind::Claude);
+        claude.observe(&opened("plan", "plan"));
+        claude.observe(&opened("approval", "tool_permission"));
+        assert_eq!(
+            claude.observe(&closed),
+            vec![(thread.clone(), RequestId("approval".into()))]
+        );
+        // Cursor's plan request is a real blocking callback.
+        let mut cursor = OpenRequests::new(ProviderKind::Cursor);
+        cursor.observe(&opened("plan", "plan"));
+        assert_eq!(
+            cursor.observe(&closed),
+            vec![(thread, RequestId("plan".into()))]
         );
     }
 
