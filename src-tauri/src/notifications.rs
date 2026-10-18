@@ -78,7 +78,10 @@ pub fn notify_agent<R: Runtime>(
     notice: AgentNotice,
     target: &NotificationTarget,
 ) {
-    if !should_notify(target, main_window_focused(app)) {
+    // A watch that stopped has nothing on screen saying so, so being in its
+    // workspace is no reason to stay quiet. Mute still applies.
+    let looking = main_window_focused(app) && notice != AgentNotice::PrWatchStopped;
+    if !should_notify(target, looking) {
         return;
     }
     let payload = agent_payload(notice, target);

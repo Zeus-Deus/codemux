@@ -36,24 +36,44 @@ pub async fn pr_watch_start<R: Runtime>(
     let pr_number = pr_number
         .or(workspace.pr_number)
         .ok_or("This workspace has no linked pull request")?;
-    let pr_url = workspace
+    let known_url = workspace
         .pr_url
         .clone()
         .filter(|_| workspace.pr_number == Some(pr_number));
 
+    // The watch is pinned to the PR's canonical URL: every sweep reads that
+    // repository, whatever the checkout points at later.
     let repo = std::path::PathBuf::from(&workspace.cwd);
-    let detected = tokio::task::spawn_blocking(move || crate::git_provider::try_detect_provider(&repo))
-        .await
-        .map_err(|e| format!("Provider detection failed: {e}"))??;
-    if detected.kind != crate::git_provider::ProviderKind::GitHub {
-        return Err("Pull request watching supports GitHub repositories only".into());
+    let pr_url = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let detected = crate::git_provider::try_detect_provider(&repo)?;
+        if detected.kind != crate::git_provider::ProviderKind::GitHub {
+            return Err("Pull request watching supports GitHub repositories only".into());
+        }
+        if let Some(url) = known_url {
+            return Ok(url);
+        }
+        let number = pr_number.to_string();
+        let json = crate::github_budget::run(
+            &repo,
+            &["pr", "view", &number, "--json", "url"],
+            std::time::Duration::from_secs(20),
+        )?;
+        serde_json::from_str::<serde_json::Value>(&json)
+            .ok()
+            .and_then(|v| v["url"].as_str().map(str::to_string))
+            .ok_or_else(|| format!("Could not find pull request #{pr_number}"))
+    })
+    .await
+    .map_err(|e| format!("Pull request lookup failed: {e}"))??;
+    if crate::pr_watch::parse_pr_url(&pr_url, pr_number).is_none() {
+        return Err(format!("{pr_url} is not the address of pull request #{pr_number}"));
     }
 
     let record = db.arm_pr_watch(
         &thread_id,
         &session.workspace_id,
         pr_number,
-        pr_url.as_deref(),
+        Some(&pr_url),
         max_attempts,
         crate::pr_watch::now_ms(),
     )?;

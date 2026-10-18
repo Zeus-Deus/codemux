@@ -2982,9 +2982,11 @@ pub fn get_check_log_excerpt(
 /// from the name (as [`get_check_log_excerpt`] does) misses ordinary
 /// `CI` / `test` pairs. Callers that have the job id from a check's details
 /// URL use this instead.
-pub fn get_job_log_excerpt(repo_path: &Path, job_id: u64) -> Result<String, String> {
+/// `repo` is a `HOST/OWNER/REPO` selector, so the job is looked up in that
+/// repository whatever the checkout's remotes currently point at.
+pub fn get_job_log_excerpt(repo_path: &Path, repo: &str, job_id: u64) -> Result<String, String> {
     let job = job_id.to_string();
-    let log = run_gh(repo_path, &["run", "view", "--job", &job, "--log-failed"])?;
+    let log = run_gh(repo_path, &["run", "view", "--job", &job, "--repo", repo, "--log-failed"])?;
     Ok(tail_check_log(&log, ""))
 }
 
@@ -3196,32 +3198,30 @@ pub fn get_pr_inline_comments(
     repo_path: &Path,
     pr_number: u32,
 ) -> Result<Vec<InlineReviewComment>, String> {
-    inline_comments(repo_path, pr_number, false)
-}
-
-/// [`get_pr_inline_comments`] past the shared read cache, for a caller that
-/// has just seen a new review and must not be answered from a list cached
-/// before that review existed.
-pub fn get_pr_inline_comments_fresh(
-    repo_path: &Path,
-    pr_number: u32,
-) -> Result<Vec<InlineReviewComment>, String> {
-    inline_comments(repo_path, pr_number, true)
-}
-
-fn inline_comments(
-    repo_path: &Path,
-    pr_number: u32,
-    fresh: bool,
-) -> Result<Vec<InlineReviewComment>, String> {
     let nwo = get_repo_nwo(repo_path)?;
     let endpoint = format!("repos/{}/pulls/{}/comments", nwo, pr_number);
-    let args = ["api", endpoint.as_str(), "--paginate"];
-    let json_str = if fresh {
-        crate::github_budget::run_fresh(repo_path, &args, Duration::from_secs(15))?
-    } else {
-        run_gh(repo_path, &args)?
-    };
+    let json_str = run_gh(repo_path, &["api", &endpoint, "--paginate"])?;
+    parse_inline_comments(&json_str)
+}
+
+/// Inline comments of `host`'s `owner/repo` pull request, past the shared
+/// read cache: the caller has just seen a new review and must not be
+/// answered from a list cached before it existed. The repository is
+/// explicit so a checkout whose remotes changed cannot redirect the read.
+pub fn get_pr_inline_comments_fresh(
+    repo_path: &Path,
+    host: &str,
+    nwo: &str,
+    pr_number: u32,
+) -> Result<Vec<InlineReviewComment>, String> {
+    let endpoint = format!("repos/{nwo}/pulls/{pr_number}/comments");
+    // The paginator expects the endpoint right after `api`.
+    let args = ["api", endpoint.as_str(), "--hostname", host, "--paginate"];
+    let json_str = crate::github_budget::run_fresh(repo_path, &args, Duration::from_secs(15))?;
+    parse_inline_comments(&json_str)
+}
+
+fn parse_inline_comments(json_str: &str) -> Result<Vec<InlineReviewComment>, String> {
     if json_str.is_empty() {
         return Ok(Vec::new());
     }

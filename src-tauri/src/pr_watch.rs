@@ -321,9 +321,6 @@ pub(crate) fn evaluate(
     let mut next = watch.clone();
     next.last_checked_at_ms = Some(now_ms);
     next.last_error = None;
-    if !view.url.is_empty() {
-        next.pr_url = Some(view.url.clone());
-    }
     if matches!(view.state.as_str(), "MERGED" | "CLOSED") {
         next.status = PR_WATCH_ENDED.into();
         next.stop_reason = Some(format!("Pull request was {}", view.state.to_ascii_lowercase()));
@@ -559,14 +556,45 @@ fn wake_nonce(watch: &PrWatchRecord, mark_seen: &[String]) -> String {
 
 // ── Fetch ──────────────────────────────────────────────────────────────
 
+/// The repository a watch is pinned to, from its canonical PR URL. Every
+/// read names it explicitly, so a checkout whose branch or remotes change
+/// cannot silently move the watch to another repository's same-numbered PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrRepo {
+    pub host: String,
+    pub nwo: String,
+}
+
+impl PrRepo {
+    /// `HOST/OWNER/REPO`, the selector `gh --repo` accepts.
+    fn selector(&self) -> String {
+        format!("{}/{}", self.host, self.nwo)
+    }
+}
+
+/// Parse `https://HOST/OWNER/REPO/pull/NUMBER`, requiring `number` to match.
+pub(crate) fn parse_pr_url(url: &str, number: u32) -> Option<PrRepo> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = match parsed.port() {
+        Some(port) => format!("{}:{port}", parsed.host_str()?),
+        None => parsed.host_str()?.to_string(),
+    };
+    let parts: Vec<&str> = parsed.path_segments()?.filter(|p| !p.is_empty()).collect();
+    match parts.as_slice() {
+        [owner, repo, "pull", n] if n.parse::<u32>().ok() == Some(number) => {
+            Some(PrRepo { host, nwo: format!("{owner}/{repo}") })
+        }
+        _ => None,
+    }
+}
+
 /// The account `gh` actually reads as. `GH_TOKEN` can differ from the
 /// configured login, so ask the API rather than local config, and remember
 /// the answer per host and credential so `gh auth switch` is noticed.
-fn viewer_login(repo: &Path) -> Result<String, String> {
+fn viewer_login(repo_path: &Path, host: &str) -> Result<String, String> {
     static VIEWERS: OnceLock<Mutex<HashMap<(String, Option<u64>), (String, Instant)>>> =
         OnceLock::new();
-    let host = crate::github_budget::host_for_path(repo)?;
-    let key = (host.clone(), crate::github::gh_credential_identity(&host));
+    let key = (host.to_string(), crate::github::gh_credential_identity(host));
     let cache = VIEWERS.get_or_init(Default::default);
     if let Some((login, at)) = cache.lock().unwrap().get(&key) {
         if at.elapsed() < VIEWER_TTL {
@@ -575,7 +603,7 @@ fn viewer_login(repo: &Path) -> Result<String, String> {
     }
     // No `--jq`: token reads go over the native HTTP transport, which only
     // accepts plain API requests.
-    let json = crate::github_budget::run(repo, &["api", "user"], GH_TIMEOUT)
+    let json = crate::github_budget::run(repo_path, &["api", "user", "--hostname", host], GH_TIMEOUT)
         .map_err(|e| format!("Could not identify the GitHub account: {e}"))?;
     let login = serde_json::from_str::<serde_json::Value>(&json)
         .ok()
@@ -586,13 +614,14 @@ fn viewer_login(repo: &Path) -> Result<String, String> {
     Ok(login)
 }
 
-fn fetch_view(repo: &Path, watch: &PrWatchRecord, seen: &HashSet<String>) -> Result<PrView, String> {
-    let viewer = viewer_login(repo)?;
+fn fetch_view(repo_path: &Path, pr: &PrRepo, watch: &PrWatchRecord, seen: &HashSet<String>) -> Result<PrView, String> {
+    let viewer = viewer_login(repo_path, &pr.host)?;
     let number = watch.pr_number.to_string();
+    let selector = pr.selector();
     let json = crate::github_budget::run(
-        repo,
+        repo_path,
         &[
-            "pr", "view", &number, "--json",
+            "pr", "view", &number, "--repo", &selector, "--json",
             "state,url,headRefOid,baseRefName,mergeable,comments,reviews,statusCheckRollup",
         ],
         GH_TIMEOUT,
@@ -600,7 +629,7 @@ fn fetch_view(repo: &Path, watch: &PrWatchRecord, seen: &HashSet<String>) -> Res
     let mut view = parse_pr_view(&json, &viewer)?;
     // Inline comments are only ever new inside a new review.
     if view.review_keys.iter().any(|key| !seen.contains(key)) {
-        let inline = crate::github::get_pr_inline_comments_fresh(repo, watch.pr_number)?;
+        let inline = crate::github::get_pr_inline_comments_fresh(repo_path, &pr.host, &pr.nwo, watch.pr_number)?;
         view.remarks.extend(inline_remarks(inline, &viewer));
     }
     Ok(view)
@@ -625,13 +654,14 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
-fn fetch_excerpts(repo: &Path, head_sha: &str, failed: &[PrCheck]) -> HashMap<String, String> {
+fn fetch_excerpts(repo: &Path, pr: &PrRepo, head_sha: &str, failed: &[PrCheck]) -> HashMap<String, String> {
+    let selector = pr.selector();
     failed
         .iter()
         .filter_map(|check| Some((check, check.actions_job_id()?)))
         .take(MAX_LOG_EXCERPTS)
         .filter_map(|(check, job)| {
-            let excerpt = strip_ansi(&crate::github::get_job_log_excerpt(repo, job).ok()?);
+            let excerpt = strip_ansi(&crate::github::get_job_log_excerpt(repo, &selector, job).ok()?);
             (!excerpt.trim().is_empty()).then(|| (check.key(head_sha), excerpt))
         })
         .collect()
@@ -679,7 +709,7 @@ async fn sweep<R: Runtime>(app: &AppHandle<R>) {
 
 /// Where a watch runs, or why it can no longer run.
 enum Target {
-    Ready { repo: PathBuf, provider: ProviderKind },
+    Ready { repo: PathBuf, pr: PrRepo, provider: ProviderKind },
     Gone(&'static str),
     /// The chat itself is gone; nobody is left to show a stopped watch to.
     Deleted,
@@ -700,13 +730,16 @@ fn resolve_target<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Targ
     if workspace.host_id.is_some() || workspace.remote_cwd.is_some() {
         return Target::Gone("Pull request watching runs for local workspaces only");
     }
-    Target::Ready { repo: PathBuf::from(workspace.cwd), provider }
+    let Some(pr) = watch.pr_url.as_deref().and_then(|url| parse_pr_url(url, watch.pr_number)) else {
+        return Target::Gone("The pull request's address is unknown; watch it again");
+    };
+    Target::Ready { repo: PathBuf::from(workspace.cwd), pr, provider }
 }
 
 async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Result<(), String> {
     let db = app.state::<DatabaseStore>();
-    let (repo, provider) = match resolve_target(app, watch) {
-        Target::Ready { repo, provider } => (repo, provider),
+    let (repo, pr, provider) = match resolve_target(app, watch) {
+        Target::Ready { repo, pr, provider } => (repo, pr, provider),
         Target::Gone(reason) => {
             let mut next = watch.clone();
             next.status = PR_WATCH_ENDED.into();
@@ -727,7 +760,8 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
     let fetch_watch = watch.clone();
     let fetch_seen = seen.clone();
     let fetch_repo = repo.clone();
-    let view = tokio::task::spawn_blocking(move || fetch_view(&fetch_repo, &fetch_watch, &fetch_seen))
+    let fetch_pr = pr.clone();
+    let view = tokio::task::spawn_blocking(move || fetch_view(&fetch_repo, &fetch_pr, &fetch_watch, &fetch_seen))
         .await
         .map_err(|e| format!("PR watch fetch failed: {e}"))??;
 
@@ -737,7 +771,7 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
         Decision::Wake(report) if !report.failed.is_empty() => {
             let failed = report.failed.clone();
             let head = view.head_sha.clone();
-            tokio::task::spawn_blocking(move || fetch_excerpts(&repo, &head, &failed))
+            tokio::task::spawn_blocking(move || fetch_excerpts(&repo, &pr, &head, &failed))
                 .await
                 .unwrap_or_default()
         }
@@ -1108,6 +1142,20 @@ mod tests {
         let (text, _) = render_wake(&w, &v, &report, &HashMap::new());
         assert!(text.contains("`gh run view --job 7 --log-failed`"));
         assert_eq!(display, "PR #42 — 1 check failed, 1 new comment");
+    }
+
+    #[test]
+    fn pr_url_pins_host_and_repository() {
+        assert_eq!(
+            parse_pr_url("https://github.com/Zeus-Deus/codemux/pull/541", 541),
+            Some(PrRepo { host: "github.com".into(), nwo: "Zeus-Deus/codemux".into() })
+        );
+        assert_eq!(
+            parse_pr_url("https://ghe.example:8443/team/app/pull/7", 7).unwrap().selector(),
+            "ghe.example:8443/team/app"
+        );
+        assert_eq!(parse_pr_url("https://github.com/o/r/pull/8", 7), None, "number must match");
+        assert_eq!(parse_pr_url("https://github.com/o/r/issues/7", 7), None);
     }
 
     #[test]

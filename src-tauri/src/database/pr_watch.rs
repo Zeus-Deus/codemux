@@ -140,7 +140,9 @@ impl DatabaseStore {
             .transaction()
             .map_err(|e| format!("Failed to open PR watch transaction: {e}"))?;
         let existing = pr_watch(&tx, thread_id)?;
-        let same_pr = existing.as_ref().is_some_and(|w| w.pr_number == pr_number);
+        let same_pr = existing
+            .as_ref()
+            .is_some_and(|w| w.pr_number == pr_number && w.pr_url.as_deref() == pr_url);
         if !same_pr {
             tx.execute("DELETE FROM pr_watch_seen WHERE thread_id = ?1", params![thread_id])
                 .map_err(|e| format!("Failed to reset PR watch history: {e}"))?;
@@ -313,7 +315,7 @@ mod tests {
             .unwrap());
 
         // Re-arming the same PR resets counters but keeps history.
-        let rearmed = db.arm_pr_watch("t1", "ws", 7, None, 5, 30).unwrap();
+        let rearmed = db.arm_pr_watch("t1", "ws", 7, Some("u"), 5, 30).unwrap();
         assert_ne!(rearmed.generation, first.generation);
         assert_eq!(rearmed.attempts, 0);
         assert_eq!(rearmed.max_attempts, 5);
