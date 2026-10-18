@@ -236,15 +236,23 @@ pub(crate) fn parse_pr_view(json: &str, viewer: &str) -> Result<PrView, String> 
         {
             continue;
         }
-        let key = format!("review:{id}");
-        review_keys.push(key.clone());
+        // Two keys per review: `review:` is the envelope, retired only once
+        // everything inside it went out (its unseen key keeps the inline
+        // comments being read); `review-body:` is the body as one remark.
+        review_keys.push(format!("review:{id}"));
         let body = text(&review["body"]);
         // An empty approval asks nothing of the agent; an empty COMMENTED
         // review is the envelope of inline comments, reported as those.
         if body.trim().is_empty() && state != "CHANGES_REQUESTED" {
             continue;
         }
-        remarks.push(Remark { key, author, body, url: None, kind: RemarkKind::Review { state } });
+        remarks.push(Remark {
+            key: format!("review-body:{id}"),
+            author,
+            body,
+            url: None,
+            kind: RemarkKind::Review { state },
+        });
     }
     let checks = v["statusCheckRollup"].as_array().into_iter().flatten().filter_map(parse_check).collect();
     Ok(PrView {
@@ -982,7 +990,7 @@ mod tests {
         }"#;
         let view = parse_pr_view(json, "Zeus-Deus").unwrap();
         let keys: Vec<_> = view.remarks.iter().map(|r| r.key.as_str()).collect();
-        assert_eq!(keys, ["comment:IC_3", "review:PRR_2"]);
+        assert_eq!(keys, ["comment:IC_3", "review-body:PRR_2"]);
         assert_eq!(view.review_keys, ["review:PRR_1", "review:PRR_2", "review:PRR_3"]);
         assert_eq!(view.head_sha, "abc");
         let states: Vec<_> = view.checks.iter().map(|c| c.state).collect();
@@ -1099,7 +1107,7 @@ mod tests {
         let mut v = view("h1", vec![], vec![check("ci", CheckState::Failure, 1)]);
         v.review_keys = vec!["review:R1".into()];
         v.remarks = vec![Remark {
-            key: "review:R1".into(),
+            key: "review-body:R1".into(),
             author: "bob".into(),
             body: "please rename".into(),
             url: None,
@@ -1225,6 +1233,51 @@ mod tests {
         assert_eq!((report.remarks.len(), report.more_remarks), (3, 0));
         assert_eq!((report.failed.len(), report.more_failed), (3, 0));
         assert!(second.delivered.contains(&"review:R".to_string()));
+    }
+
+    #[test]
+    fn a_review_stays_open_until_its_overflowing_comments_went_out() {
+        let json = r#"{
+            "state":"OPEN","url":"u","headRefOid":"h1","baseRefName":"main","mergeable":"MERGEABLE",
+            "comments":[],
+            "reviews":[{"id":"PRR_9","author":{"login":"bob"},"body":"see inline","state":"CHANGES_REQUESTED"}],
+            "statusCheckRollup":[]
+        }"#;
+        let inline = |id: u64| crate::github::InlineReviewComment {
+            id,
+            author: "bob".into(),
+            body: format!("nit {id}"),
+            path: "src/a.rs".into(),
+            line: Some(id as u32),
+            side: None,
+            created_at: String::new(),
+            in_reply_to_id: None,
+            pull_request_review_id: Some(9),
+        };
+        // What fetch_view builds: the parsed view plus the review's inline
+        // comments, read because the review envelope is unseen.
+        let fetch = |seen: &HashSet<String>| {
+            let mut v = parse_pr_view(json, "me").unwrap();
+            if v.review_keys.iter().any(|k| !seen.contains(k)) {
+                v.remarks.extend(inline_remarks((1..=12).map(inline).collect(), "me"));
+            }
+            v
+        };
+        let mut seen = HashSet::new();
+        let first = evaluate(&watch(), &fetch(&seen), &seen, 0);
+        let Decision::Wake(report) = &first.decision else { panic!() };
+        assert_eq!(report.remarks[0].key, "review-body:PRR_9");
+        assert_eq!(report.more_remarks, 3);
+        let next = commit(&first, &mut seen);
+        assert!(!seen.contains("review:PRR_9"), "envelope stays open");
+
+        let second = evaluate(&next, &fetch(&seen), &seen, 1);
+        let Decision::Wake(report) = &second.decision else { panic!() };
+        let keys: Vec<_> = report.remarks.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["inline:10", "inline:11", "inline:12"]);
+        let next = commit(&second, &mut seen);
+        assert!(seen.contains("review:PRR_9"), "retired once all went out");
+        assert!(matches!(evaluate(&next, &fetch(&seen), &seen, 2).decision, Decision::Quiet));
     }
 
     #[test]
