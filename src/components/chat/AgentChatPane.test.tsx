@@ -913,6 +913,10 @@ describe("AgentChatPane remote task launcher", () => {
     const view = render(<AgentChatPane pane={pane} />);
     expect(await view.findByText("Remote task updates paused")).toBeInTheDocument();
     expect(view.getByText("Task listener offline")).toBeInTheDocument();
+    // It is a composer-strip row now, not a card floating above the input.
+    const row = view.getByText("Remote task updates paused").closest('[data-testid="composer-strip-row"]');
+    expect(row).toHaveAttribute("data-kind", "error");
+    expect(within(row as HTMLElement).getByRole("status")).toHaveTextContent("Task listener offline");
     fireEvent.click(view.getByRole("button", { name: "Retry remote task updates" }));
     await waitFor(() => expect(view.queryByText("Remote task updates paused")).not.toBeInTheDocument());
   });

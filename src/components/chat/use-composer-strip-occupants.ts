@@ -31,6 +31,7 @@ import {
 } from "@/lib/agent-chat/usage-limit";
 import { resolveOrbState } from "@/lib/orb-state";
 import { toast } from "@/lib/toast";
+import type { DelegationTasksState } from "@/stores/delegation-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import type { ApprovalDecision } from "@/tauri/events";
 
@@ -687,6 +688,38 @@ export function sessionErrorOccupant(
     return { kind: "error", summary: row, rows: [row] };
   }
   return null;
+}
+
+/** Remote-task occupant: the SSH task list could not be read, or its live
+ *  updates stopped. A paused subscription outranks a failed read: the list
+ *  may still load, but it will not stay current. */
+export function remoteTasksOccupant(
+  state: Pick<
+    DelegationTasksState,
+    "error" | "subscriptionError" | "loading" | "subscriptionHealth"
+  >,
+  onRetry: () => void,
+): StripOccupant | null {
+  const message = state.subscriptionError ?? state.error;
+  if (!message) return null;
+  const row: StripRow = {
+    id: "remote-tasks-error",
+    mark: { kind: "error" },
+    label: state.subscriptionError
+      ? "Remote task updates paused"
+      : "Remote tasks unavailable",
+    detail: message,
+    announce: true,
+    action: {
+      label: "Retry",
+      title: "Retry remote task updates",
+      ariaLabel: "Retry remote task updates",
+      testId: "composer-strip-remote-tasks-retry",
+      disabled: state.loading || state.subscriptionHealth === "connecting",
+      onClick: onRetry,
+    },
+  };
+  return { kind: "error", summary: row, rows: [row] };
 }
 
 /**

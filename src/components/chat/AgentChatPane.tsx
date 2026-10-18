@@ -183,6 +183,7 @@ import {
   useMonitoringOccupant,
   useSubagentOccupant,
   useUsageLimitOccupant,
+  remoteTasksOccupant,
 } from "./use-composer-strip-occupants";
 import { openDelegatedChat, stopDelegatedTask } from "./delegation-actions";
 import { SubagentBreadcrumb } from "./SubagentBreadcrumb";
@@ -4028,6 +4029,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         delegationOccupant,
         subagentOccupant,
         queuedOccupant(queued, handleCancelQueued),
+        conversationWritable &&
+          remoteTasksOccupant(remoteTasks, () => void remoteTasks.retrySubscription()),
       ]}
     />
   );
@@ -4180,16 +4183,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       hasActiveGoal={hasGoal}
       zone1Override={zone1Override}
       renderContextRow={mobile ? undefined : renderContextRow}
-      stripSlot={conversationWritable ? <>
-        {stripEl}
-        {(remoteTasks.error || remoteTasks.subscriptionError) && <div role="status" className="pointer-events-auto mb-2 flex items-start gap-3 rounded-lg border border-border bg-surface-1 px-3 py-2 text-body-sm">
-          <div className="min-w-0 flex-1">
-            <p className="font-medium">{remoteTasks.subscriptionError ? "Remote task updates paused" : "Remote tasks unavailable"}</p>
-            <p className="break-words text-muted-foreground">{remoteTasks.subscriptionError ?? remoteTasks.error}</p>
-          </div>
-          <Button type="button" variant="ghost" size="sm" disabled={remoteTasks.loading || remoteTasks.subscriptionHealth === "connecting"} onClick={() => void remoteTasks.retrySubscription()}>Retry remote task updates</Button>
-        </div>}
-      </> : <>{stripEl}{conversationCheckNotice}</>}
+      stripSlot={conversationWritable ? stripEl : <>{stripEl}{conversationCheckNotice}</>}
       paneDragActive={paneDragDepth > 0}
       tasks={taskSummary}
       tasksOpen={rightPanelTab === "tasks"}
