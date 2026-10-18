@@ -621,6 +621,7 @@ impl OpenCodeSession {
                 if let Some(item) = queue.pop_back() {
                     self.queue_hold().release_with(&item.0);
                     queue.push_front(item);
+                    let _ = self.event_tx.send(crate::agent_provider::queue_edit::reordered(&queue, &self.thread_id));
                 }
             }
             return Ok(result);
@@ -708,6 +709,9 @@ impl OpenCodeSession {
                 if let Some(index) = queue.iter().position(|(key, _)| key == id) {
                     let item = queue.remove(index).unwrap();
                     queue.push_front(item);
+                    if index > 0 {
+                        let _ = self.event_tx.send(crate::agent_provider::queue_edit::reordered(&queue, &self.thread_id));
+                    }
                 }
                 hold.release_with(id);
             }
@@ -841,6 +845,37 @@ impl OpenCodeSession {
         true
     }
 
+    /// Holds `outbound` like a cancel or steer does, so an item a steer is
+    /// delivering cannot change on the way.
+    pub async fn edit_queued(&self, id: &str, text: &str) -> Result<bool, ProviderError> {
+        let _outbound = self.outbound.lock().await;
+        let mut queue = self.queued.lock().await;
+        let Some(text) = crate::agent_provider::queue_edit::edit(&mut queue, &self.thread_id, id, text)? else {
+            return Ok(false);
+        };
+        let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnEdited {
+            thread_id: self.thread_id.clone(),
+            queued_id: id.into(),
+            text,
+        });
+        Ok(true)
+    }
+
+    pub async fn move_queued(&self, id: &str, before: Option<&str>) -> Result<bool, ProviderError> {
+        let _outbound = self.outbound.lock().await;
+        let mut queue = self.queued.lock().await;
+        let moved = {
+            let hold = self.queue_hold();
+            crate::agent_provider::queue_edit::move_before(&mut queue, &self.thread_id, id, before, hold.pinned())?
+        };
+        let Some(queued_ids) = moved else { return Ok(false) };
+        let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnsReordered {
+            thread_id: self.thread_id.clone(),
+            queued_ids,
+        });
+        Ok(true)
+    }
+
     async fn cancel_all_queued(&self) {
         for (id, _) in self.queued.lock().await.drain(..) {
             let _ = self
@@ -899,6 +934,9 @@ impl OpenCodeSession {
             if let Some(index) = queue.iter().position(|(key, _)| key == id) {
                 let item = queue.remove(index).unwrap();
                 queue.push_front(item);
+                if index > 0 {
+                    let _ = self.event_tx.send(crate::agent_provider::queue_edit::reordered(&queue, &self.thread_id));
+                }
             }
         }
         drop(outbound);

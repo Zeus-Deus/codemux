@@ -439,7 +439,7 @@ pub fn detach_agent_chat_output(
     Ok(())
 }
 
-fn provider_err(err: ProviderError) -> String {
+pub(super) fn provider_err(err: ProviderError) -> String {
     let ser: SerializableProviderError = err.to_serializable();
     serde_json::to_string(&ser).unwrap_or_else(|_| "provider_error".to_string())
 }
@@ -3670,6 +3670,15 @@ async fn send_turn_internal<R: Runtime>(
         PendingQueuedTurn {
             images: saved_images.clone(),
             client_nonce: input.client_nonce.clone(),
+            replay: Some(super::queued_turns::Replay {
+                prompt: input.text.clone(),
+                skill_ids: input.skill_ids.clone(),
+                skill_text: input.skill_text.clone(),
+                include_plugins: input.include_plugins,
+                model_override: provider_input.model_override.clone(),
+                effort_override: provider_input.effort_override.clone(),
+                permission_mode_override: provider_input.permission_mode_override.clone(),
+            }),
         },
     );
     // Ordinary sends establish tracking before provider events can arrive.
@@ -4539,6 +4548,8 @@ struct PendingQueuedTurn {
     /// the deferred envelope is dedupable against it on a cursor tail
     /// read (see [`persist_user_message`]).
     client_nonce: Option<String>,
+    /// The send's framed prompt and overrides, for the saved queue.
+    replay: Option<super::queued_turns::Replay>,
 }
 
 /// Process-wide bridge carrying a QUEUED send's on-disk image records
@@ -7440,7 +7451,10 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             // same sdk_session_id as the original. Collapse the
             // duplicates so the dropdown doesn't grow unboundedly.
             match db.collapse_duplicate_agent_chat_sessions(&sdk_session_id) {
-                Ok(cleanup) => cleanup_collapsed_session_resources(cleanup),
+                Ok(cleanup) => {
+                    super::queued_turns::after_sessions_merged(app, &db, chat_images_dir);
+                    cleanup_collapsed_session_resources(cleanup)
+                }
                 Err(error) => {
                     eprintln!("[codemux::agent_chat] failed to collapse duplicates: {error}");
                 }
@@ -7483,6 +7497,23 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                 .unwrap()
                 .insert(queued_id.clone(), pending);
         }
+    }
+    if matches!(&event, ProviderRuntimeEvent::TurnQueued { .. }
+        | ProviderRuntimeEvent::QueuedTurnDispatched { .. } | ProviderRuntimeEvent::QueuedTurnCancelled { .. }
+        | ProviderRuntimeEvent::QueuedTurnEdited { .. } | ProviderRuntimeEvent::QueuedTurnsReordered { .. }) {
+        let db: State<'_, DatabaseStore> = app.state();
+        let pending = pending_queued_images().lock().unwrap();
+        let queued = match &event {
+            ProviderRuntimeEvent::TurnQueued { queued_id, .. } => pending.get(queued_id).map(|p| super::queued_turns::Queued {
+                images: p.images.iter().map(|i| crate::database::queued_turns::QueuedTurnImage {
+                    path: i.path.clone(), media_type: i.media_type.clone(),
+                }).collect(),
+                client_nonce: p.client_nonce.as_deref(),
+                replay: p.replay.as_ref(),
+            }),
+            _ => None,
+        };
+        super::queued_turns::on_event(&db, &event, queued);
     }
 
     // A queued follow-up turn just dispatched — NOW persist its
@@ -7565,8 +7596,10 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     // will never be written. Drop the stashed image records and best-effort
     // delete the orphaned on-disk copies so a cancelled attachment does not
     // leak a file forever.
+    // Quitting keeps them for the saved queue.
     if let ProviderRuntimeEvent::QueuedTurnCancelled { queued_id, .. } = &event {
-        let orphaned = pending_queued_images().lock().unwrap().remove(queued_id);
+        let orphaned = pending_queued_images().lock().unwrap().remove(queued_id)
+            .filter(|_| !super::queued_turns::exiting());
         if let Some(pending) = orphaned {
             for image in pending.images {
                 let _ = std::fs::remove_file(&image.path);
@@ -8643,6 +8676,8 @@ fn map_event_to_pane_status(
         | ProviderRuntimeEvent::TurnQueued { .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { .. }
         | ProviderRuntimeEvent::QueuedTurnCancelled { .. }
+        | ProviderRuntimeEvent::QueuedTurnEdited { .. }
+        | ProviderRuntimeEvent::QueuedTurnsReordered { .. }
         // A stall is advisory only — the run may well be fine (a long quiet
         // tool call). The sidebar dot must NOT change; the amber transcript
         // notice is the entire signal.
@@ -9346,6 +9381,8 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::TurnQueued { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, .. }
+        | ProviderRuntimeEvent::QueuedTurnEdited { thread_id, .. }
+        | ProviderRuntimeEvent::QueuedTurnsReordered { thread_id, .. }
         | ProviderRuntimeEvent::ContextCompactionChanged { thread_id, .. }
         | ProviderRuntimeEvent::ContextUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::UserMessage { thread_id, .. }

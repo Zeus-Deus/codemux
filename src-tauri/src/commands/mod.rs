@@ -42,6 +42,7 @@ pub mod workflows;
 pub mod pr_watch;
 pub mod turn_diff;
 pub mod chat_fork;
+pub mod queued_turns;
 
 pub use agent_chat::*;
 pub use ai::*;

@@ -13,6 +13,7 @@ mod delegation;
 pub mod pr_watch;
 pub mod turn_diffs;
 pub mod mobile_push;
+pub mod queued_turns;
 
 fn agent_chat_session(conn: &Connection, thread_id: &str) -> Option<AgentChatSessionRecord> {
         conn.query_row(
@@ -1177,6 +1178,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     chat_fork::create_schema(conn)?;
     provider_accounts::create_schema(conn)?;
     mobile_push::create_schema(conn)?;
+    queued_turns::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new
@@ -3761,6 +3763,7 @@ impl DatabaseStore {
         )
         .map_err(|e| format!("Failed to migrate agent_chat_messages: {e}"))?;
         turn_diffs::move_to_thread(&conn, "thread_id = ?1", params![old_thread_id, new_thread_id])?;
+        queued_turns::move_to_thread(&conn, "thread_id = ?1", params![old_thread_id, new_thread_id])?;
         conn.execute(
             "DELETE FROM agent_chat_sessions WHERE thread_id = ?1",
             params![old_thread_id],
@@ -4601,6 +4604,14 @@ impl DatabaseStore {
         )
         .map_err(|e| format!("Failed to migrate duplicate session messages: {e}"))?;
         turn_diffs::move_to_thread(
+            &transaction,
+            "thread_id IN (
+                 SELECT thread_id FROM agent_chat_sessions
+                 WHERE sdk_session_id = ?1 AND thread_id != ?2
+             )",
+            params![sdk_session_id, survivor],
+        )?;
+        queued_turns::move_to_thread(
             &transaction,
             "thread_id IN (
                  SELECT thread_id FROM agent_chat_sessions

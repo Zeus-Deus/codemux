@@ -573,13 +573,14 @@ export function useUsageLimitOccupant({
   return { kind: "usage", summary: accountRow, rows: [accountRow, stayRow] };
 }
 
-/** Follow-ups parked behind the active turn, oldest first. */
+/** Follow-ups parked behind the active turn, in dispatch order: by `seq`,
+ *  which a reorder, a goes-first send and a resent saved turn all set. */
 export function queuedMessages(messages: ChatViewItem[]): UserMessageItem[] {
   const queued: UserMessageItem[] = [];
   for (const m of messages) {
     if (m.kind === "user_message" && m.queued) queued.push(m);
   }
-  return queued;
+  return queued.sort((a, b) => a.seq - b.seq);
 }
 
 /** Queued-message occupant. Edit hands the text back to the composer

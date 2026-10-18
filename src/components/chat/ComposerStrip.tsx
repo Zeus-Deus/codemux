@@ -218,9 +218,14 @@ const GOAL_MENU_ITEM = "h-[26px] rounded-sm px-2 py-0 text-body-sm";
 export function ComposerStrip({
   occupants,
   goal = null,
+  queue = null,
 }: {
   occupants: ReadonlyArray<StripOccupant | null | undefined | false>;
   goal?: StripGoal | null;
+  /** The follow-up queue's own section, drawn first in the same shell. It
+   *  never competes for the occupant slot: queued turns stay listed while
+   *  anything else is going on. */
+  queue?: React.ReactNode;
 }) {
   const all = occupants
     .filter((o): o is StripOccupant => !!o && o.rows.length > 0)
@@ -269,7 +274,7 @@ export function ComposerStrip({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [anyOpen]);
 
-  if (total === 0 && !goal) return null;
+  if (total === 0 && !goal && !queue) return null;
   const pinnedRows = pinned.flatMap((occupant) =>
     occupant.rows.map((row) => ({ row, kind: occupant.kind })),
   );
@@ -282,7 +287,7 @@ export function ComposerStrip({
     ? false
     : open || goal
       ? present.some((o) => o.live)
-      : lead.live === true;
+      : lead?.live === true;
 
   const rest = total - 1;
   const toggle =
@@ -310,7 +315,7 @@ export function ComposerStrip({
       ref={rootRef}
       data-testid="composer-strip"
       data-open={open || undefined}
-      data-lead={goal ? "goal" : lead.kind}
+      data-lead={goal ? "goal" : (lead?.kind ?? "queue")}
       className="relative z-0 w-full px-5"
     >
       <div className="relative -mb-[18px] overflow-hidden rounded-t-[14px] border border-b-0 border-border/70 bg-muted/20 pb-[18px]">
@@ -336,7 +341,11 @@ export function ComposerStrip({
             aria-hidden
           />
         )}
-        {goal ? (
+        {queue}
+        {queue && (goal || total > 0) ? (
+          <div className="relative mx-2 h-px bg-border/60" aria-hidden />
+        ) : null}
+        {!goal && total === 0 ? null : goal ? (
           <ul aria-label="Pending activity" className="relative flex flex-col">
             {pinnedRows.map(({ row, kind }) => (
               <StripRowView key={row.id} row={row} kind={kind} trailing={null} />

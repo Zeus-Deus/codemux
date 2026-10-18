@@ -163,6 +163,17 @@ struct Job {
     chat: Arc<Chat>,
     input: SendTurnInput,
 }
+impl crate::agent_provider::queue_edit::QueueEntry for Job {
+    fn queued_id(&self) -> &str {
+        &self.id
+    }
+    fn input(&self) -> &SendTurnInput {
+        &self.input
+    }
+    fn input_mut(&mut self) -> &mut SendTurnInput {
+        &mut self.input
+    }
+}
 #[derive(Default)]
 struct Queue {
     jobs: VecDeque<Job>,
@@ -1277,6 +1288,34 @@ impl AgentProvider for HermesProvider {
         } else {
             Ok(false)
         }
+    }
+    /// The queue is profile-wide; edits and moves stay within this chat.
+    async fn edit_queued_turn(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+        text: String,
+    ) -> Result<bool, ProviderError> {
+        let chat = self.chat(&thread_id).await?;
+        let mut q = chat.runtime.queue.lock().await;
+        let Some(text) = crate::agent_provider::queue_edit::edit(&mut q.jobs, &thread_id, &queued_id, &text)? else {
+            return Ok(false);
+        };
+        self.inner.emit(ProviderRuntimeEvent::QueuedTurnEdited { thread_id, queued_id, text });
+        Ok(true)
+    }
+    async fn move_queued_turn(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+        before: Option<String>,
+    ) -> Result<bool, ProviderError> {
+        let chat = self.chat(&thread_id).await?;
+        let mut q = chat.runtime.queue.lock().await;
+        let moved = crate::agent_provider::queue_edit::move_before(&mut q.jobs, &thread_id, &queued_id, before.as_deref(), None)?;
+        let Some(queued_ids) = moved else { return Ok(false) };
+        self.inner.emit(ProviderRuntimeEvent::QueuedTurnsReordered { thread_id, queued_ids });
+        Ok(true)
     }
     async fn interrupt_turn(
         &self,

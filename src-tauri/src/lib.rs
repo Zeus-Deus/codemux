@@ -529,6 +529,8 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // Closing sessions cancel their queues; keep the saved copy.
+                commands::queued_turns::mark_exiting();
                 if let Some(coordinator) = app.try_state::<delegation::coordinator::Coordinator>() {
                     if let Err(error) = tauri::async_runtime::block_on(coordinator.shutdown()) {
                         log::error!("Delegation shutdown could not join its owners: {error}");
@@ -3170,6 +3172,12 @@ fn build_core_app<R: tauri::Runtime>(
             commands::provider_account_switch_thread,
             // Phone-app sessions registered for push through the relay.
             web_remote::native_push::web_remote_push_devices,
+            // Editable follow-up queue, saved across restarts.
+            commands::queued_turns::agent_chat_list_queued_turns,
+            commands::queued_turns::agent_chat_edit_queued_turn,
+            commands::queued_turns::agent_chat_move_queued_turn,
+            commands::queued_turns::agent_chat_cancel_saved_queued_turn,
+            commands::queued_turns::agent_chat_send_saved_queued_turn,
         ])
 }
 

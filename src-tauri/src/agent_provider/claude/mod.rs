@@ -361,6 +361,32 @@ impl AgentProvider for ClaudeAgentProvider {
         session.send_queued_now(&queued_id).await
     }
 
+    async fn edit_queued_turn(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+        text: String,
+    ) -> Result<bool, ProviderError> {
+        let session = self.sessions.read().await.get(&thread_id).cloned();
+        match session {
+            Some(session) => session.edit_queued(&queued_id, &text).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn move_queued_turn(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+        before: Option<String>,
+    ) -> Result<bool, ProviderError> {
+        let session = self.sessions.read().await.get(&thread_id).cloned();
+        match session {
+            Some(session) => session.move_queued(&queued_id, before.as_deref()).await,
+            None => Ok(false),
+        }
+    }
+
     async fn respond_to_request(
         &self,
         thread_id: ThreadId,

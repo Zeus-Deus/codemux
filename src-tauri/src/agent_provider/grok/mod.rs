@@ -233,6 +233,27 @@ impl AgentProvider for GrokAgentProvider {
             .await
     }
 
+    async fn edit_queued_turn(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+        text: String,
+    ) -> Result<bool, ProviderError> {
+        self.session(&thread_id).await?.edit_queued(&queued_id, &text).await
+    }
+
+    async fn move_queued_turn(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+        before: Option<String>,
+    ) -> Result<bool, ProviderError> {
+        self.session(&thread_id)
+            .await?
+            .move_queued(&queued_id, before.as_deref())
+            .await
+    }
+
     async fn respond_to_request(
         &self,
         thread_id: ThreadId,

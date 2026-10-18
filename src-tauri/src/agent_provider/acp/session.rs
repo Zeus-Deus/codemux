@@ -115,6 +115,9 @@ struct XAiPromptCompletion {
     announced: Option<Value>,
 }
 
+#[path = "queue_edits.rs"]
+mod queue_edits;
+
 #[derive(Debug, Clone)]
 struct QueuedTurn {
     id: String,
@@ -862,19 +865,23 @@ impl AcpSession {
             };
             // Sent by hand while a Stop settles: it goes first and releases
             // the held queue behind it once it starts.
-            if state.queue_hold.goes_first() {
+            let first = state.queue_hold.goes_first();
+            if first {
                 state.queued.push_front(queued);
                 state.queue_hold.release_with(&queued_id);
             } else {
                 state.queued.push_back(queued);
             }
-            drop(state);
             let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
                 thread_id: self.thread_id.clone(),
                 queued_id: queued_id.clone(),
                 client_nonce: input.client_nonce,
                 text: input.display_text.unwrap_or(input.text),
             });
+            if first {
+                let _ = self.event_tx.send(crate::agent_provider::queue_edit::reordered(&state.queued, &self.thread_id));
+            }
+            drop(state);
             return Ok(SendOutcome::Queued(queued_id));
         }
         // Claim the only ACP prompt slot before configuration/checkpoint
@@ -1608,6 +1615,7 @@ impl AcpSession {
                 Some(queued) if state.active_turn.is_some() => {
                     state.queue_hold.release_with(queued_id);
                     state.queued.push_front(queued);
+                    let _ = self.event_tx.send(crate::agent_provider::queue_edit::reordered(&state.queued, &self.thread_id));
                     (None, true, false)
                 }
                 Some(queued) => {

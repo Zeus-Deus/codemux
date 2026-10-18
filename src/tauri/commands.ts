@@ -4020,3 +4020,57 @@ export const providerAccountSwitchThread = (threadId: string, accountId: string)
 /** Paired sessions running the Codemux phone app with relay push on. */
 export const webRemotePushDevices = () =>
   invoke<import("./types").MobilePushDevice[]>("web_remote_push_devices");
+
+// ── Editable follow-up queue ──
+// Queued turns can be edited and moved in place. The queue is saved, so it
+// survives a restart: turns queued before it come back as `saved`, waiting
+// for the user. See src-tauri/src/commands/queued_turns.rs.
+
+/** One queued turn, in dispatch order. */
+export interface QueuedTurnView {
+  queued_id: string;
+  text: string;
+  /** Queued before this app run; no provider holds it. */
+  saved: boolean;
+  client_nonce: string;
+  images: Array<{ path: string; media_type: string }>;
+}
+
+export const agentChatListQueuedTurns = (threadId: string) =>
+  invoke<QueuedTurnView[]>("agent_chat_list_queued_turns", { threadId });
+
+/** Resolves `false` when the turn is no longer queued. */
+export const agentChatEditQueuedTurn = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+  queuedId: string,
+  text: string,
+) =>
+  invoke<boolean>("agent_chat_edit_queued_turn", { provider, threadId, queuedId, text });
+
+/** Move a queued turn to just before `before`, or to the back with `null`. */
+export const agentChatMoveQueuedTurn = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+  queuedId: string,
+  before: string | null,
+) =>
+  invoke<boolean>("agent_chat_move_queued_turn", { provider, threadId, queuedId, before });
+
+/** Remove a saved turn; its text returns to the composer. */
+export const agentChatCancelSavedQueuedTurn = (threadId: string, queuedId: string) =>
+  invoke<boolean>("agent_chat_cancel_saved_queued_turn", { threadId, queuedId });
+
+/** Send a saved turn as if just typed, with the chosen delivery. */
+export const agentChatSendSavedQueuedTurn = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+  queuedId: string,
+  delivery: "queue" | "steer" | "interrupt",
+) =>
+  invoke<TurnStartResult>("agent_chat_send_saved_queued_turn", {
+    provider,
+    threadId,
+    queuedId,
+    delivery,
+  });
