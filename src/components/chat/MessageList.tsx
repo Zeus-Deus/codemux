@@ -38,6 +38,7 @@ import {
   type PermissionRequestItem,
 } from "@/lib/agent-chat/types";
 import { isDelegationResultsText } from "@/lib/agent-chat/delegation";
+import { isRestartResumeText } from "@/lib/agent-chat/restart-resume";
 import {
   isAutoResumeText,
   usageLimitRecordText,
@@ -1752,9 +1753,10 @@ function RunInterruptedDivider() {
   );
 }
 
-/** A turn the backend sent on its own once a usage limit reset. Same
- *  hairline as the session-start marker; the label discloses the full text. */
-function AutoResumedTurnDivider({ text }: { text: string }) {
+/** A turn the backend sent on its own: once a usage limit reset, or after
+ *  the app restarted mid-run. Same hairline as the session-start marker;
+ *  the label discloses the full text. */
+function AutoResumedTurnDivider({ text, label }: { text: string; label: string }) {
   const [open, setOpen] = useState(false);
   return (
     <div data-testid="auto-resume-divider">
@@ -1768,7 +1770,7 @@ function AutoResumedTurnDivider({ text }: { text: string }) {
         <span className="h-px flex-1 bg-border/60" />
         <span className="inline-flex items-center gap-1.5 font-mono text-label font-medium tracking-wide">
           <RotateCw className="size-3 shrink-0" aria-hidden />
-          Resumed automatically after usage limit reset
+          {label}
           <ChevronDown
             className={cn(
               "size-3 shrink-0 opacity-60 transition-transform duration-150",
@@ -1925,7 +1927,16 @@ function ItemRow({
   // The backend's automatic resume after a usage limit is not something
   // the user typed: a quiet divider marks it, the text stays one click away.
   if (item.kind === "user_message" && !item.queued && isAutoResumeText(item.text)) {
-    return <AutoResumedTurnDivider text={item.text} />;
+    return (
+      <AutoResumedTurnDivider
+        text={item.text}
+        label="Resumed automatically after usage limit reset"
+      />
+    );
+  }
+  // Same for the resume of a run the app stopped mid-turn.
+  if (item.kind === "user_message" && !item.queued && isRestartResumeText(item.text)) {
+    return <AutoResumedTurnDivider text={item.text} label="Resumed after restart" />;
   }
 
   // Likewise the round of delegated-task reports Codemux posts back.

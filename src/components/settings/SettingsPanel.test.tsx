@@ -77,6 +77,7 @@ vi.mock("@/stores/settings-store", () => {
     "sidebar.auto_settle_days": "3",
     "agents.orb_match_activity": "true",
     "agents.auto_resume_usage_limit": "true",
+    "agents.auto_resume_after_restart": "true",
     "agents.cross_provider_delegation": "true",
     "chat.code_wrap": "false",
     "chat.default_checkout": "worktree",
@@ -108,6 +109,7 @@ vi.mock("@/stores/settings-store", () => {
     selectSidebarAutoSettleDays: () => 3,
     selectOrbMatchActivity: () => true,
     selectAutoResumeUsageLimit: () => true,
+    selectAutoResumeAfterRestart: () => true,
     selectCrossProviderDelegation: () => false,
     selectNewChatCheckout: () => "worktree",
     selectDiffLayoutPreference: () => "unified",
@@ -1176,6 +1178,7 @@ describe("Settings rows", () => {
     for (const name of [
       "Auto-configure MCP for workspaces",
       "Resume automatically after usage limits reset",
+      "Auto-resume agents after restart",
     ]) {
       expect(screen.getByRole("switch", { name })).toHaveAccessibleDescription(
         /Only on this device/,

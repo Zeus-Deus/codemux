@@ -1432,6 +1432,17 @@ describe("MessageList usage limit", () => {
     expect(toggle).toHaveAttribute("aria-expanded", "true");
   });
 
+  it("renders the resume after a restart as its own divider", () => {
+    const text =
+      "[Resumed automatically after an app restart. Codemux quit while you were working on this task.]";
+    renderList([userTurn, { kind: "user_message", id: "um-2", seq: 1, text }]);
+    const divider = screen.getByTestId("auto-resume-divider");
+    expect(divider).toHaveTextContent(/^Resumed after restart$/);
+    expect(screen.queryByText(text)).toBeNull();
+    fireEvent.click(divider.querySelector("button")!);
+    expect(screen.getByTestId("auto-resume-divider-text")).toHaveTextContent(text);
+  });
+
   it("renders the delegated-results turn as its divider, not a user bubble", () => {
     const text =
       '[Codemux: delegated task results]\nCodemux posted this message, not the user.\n\n<task provider="codex" status="completed" title="Add slugify helper" duration="6m 12s" thread="c1">\n<report>Done.</report>\n</task>';

@@ -531,6 +531,8 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 // Closing sessions cancel their queues; keep the saved copy.
                 commands::queued_turns::mark_exiting();
+                // Chats still running resume on the next launch.
+                commands::restart_resume::on_exit(app);
                 if let Some(coordinator) = app.try_state::<delegation::coordinator::Coordinator>() {
                     if let Err(error) = tauri::async_runtime::block_on(coordinator.shutdown()) {
                         log::error!("Delegation shutdown could not join its owners: {error}");
@@ -1517,6 +1519,13 @@ fn build_core_app<R: tauri::Runtime>(
                         // pending resume, so several windows or web-remote
                         // clients can never double-fire one.
                         commands::usage_resume::spawn_usage_resume_scheduler(
+                            registry_handle.clone(),
+                        )
+                        .await;
+                        // Chats the last run left mid-turn continue on their
+                        // own, after the delegation journal above stopped
+                        // the delegated ones.
+                        commands::restart_resume::spawn_restart_resume(
                             registry_handle.clone(),
                         )
                         .await;

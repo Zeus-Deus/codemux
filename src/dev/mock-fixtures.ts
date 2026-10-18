@@ -589,6 +589,39 @@ const wsCodemuxMonitoring = (() => {
   };
 })();
 
+/** Thread id of the seeded restart-resume demo. */
+export const MOCK_RESTART_RESUME_THREAD_ID = "thread-mock-restart-resume";
+
+/** Restart-resume demo: a run the app quit in the middle of, picked up on
+ *  its own at the next launch. Reaches the transcript's "Resumed after
+ *  restart" divider under `npm run dev`. */
+const wsCodemuxRestartResume = (() => {
+  const cwd = `${HOME}/.codemux/worktrees/codemux/demo-restart-resume`;
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-restart-resume",
+    title: "restart-resume-demo",
+    cwd,
+    worktree_path: cwd,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "worktree",
+    git_branch: "demo/restart-resume",
+  });
+  const { surface, tab } = chatSurface(
+    "Agent Chat",
+    cwd,
+    MOCK_RESTART_RESUME_THREAD_ID,
+    "claude",
+  );
+  return {
+    ...ws,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
+
 /** Thread id of the seeded usage-limit demo. */
 export const MOCK_USAGE_LIMIT_THREAD_ID = "thread-mock-usage-limit";
 
@@ -1148,6 +1181,7 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsCodemuxChatLive,
   wsCodemuxMonitoring,
   wsCodemuxUsageLimit,
+  wsCodemuxRestartResume,
   wsCodemuxSuggestedTasks,
   wsCodemuxSuggestedChild,
   wsCodemuxPorts,
@@ -2415,6 +2449,75 @@ export function monitoringEnvelopes(threadId: string): unknown[] {
       type: "turn_completed",
       thread_id: threadId,
       turn_id: turnId,
+      status: { kind: "success" },
+      usage: null,
+    },
+  ];
+}
+
+// ── Restart-resume demo transcript ───────────────────────────────────
+//
+// A run cut off when the app quit mid-turn, then the turn Codemux sent on
+// its own at the next launch, which checked the state and finished.
+
+/** Envelopes for {@link MOCK_RESTART_RESUME_THREAD_ID}. */
+export function restartResumeEnvelopes(threadId: string): unknown[] {
+  const turnId = "turn-restart-1";
+  return [
+    {
+      type: "user_message",
+      thread_id: threadId,
+      text: "Split the settings page into per-section files and keep the tests passing.",
+    },
+    {
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      item: {
+        kind: "assistant_text",
+        text:
+          "I'll move each section into `settings/sections/` and re-export them " +
+          "from the page. Starting with General and Appearance.",
+      },
+    },
+    {
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      item: {
+        kind: "tool_use",
+        tool_name: "Bash",
+        tool_use_id: "restart-tool-1",
+        input: { command: "npm run test -- settings" },
+      },
+    },
+    // The app quit here. The next launch sent this on its own.
+    {
+      type: "user_message",
+      thread_id: threadId,
+      text:
+        "[Resumed automatically after an app restart. Codemux quit while you were working on " +
+        "this task, so your last turn was cut off. Before doing anything else, check the current " +
+        "state: run git status, look at the files you were changing, check whether processes or " +
+        "servers you started are still running, and re-read your last tool results. Do not redo " +
+        "work that already finished. Then continue the task. If you need an approval or an " +
+        "answer from the user, ask again.]",
+    },
+    {
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: "turn-restart-2",
+      item: {
+        kind: "assistant_text",
+        text:
+          "`git status` shows General and Appearance already moved, and no test run is still " +
+          "going. I'll rerun the settings tests, then move the remaining four sections.",
+      },
+    },
+    {
+      type: "turn_completed",
+      thread_id: threadId,
+      turn_id: "turn-restart-2",
       status: { kind: "success" },
       usage: null,
     },

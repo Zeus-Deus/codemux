@@ -58,6 +58,11 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // before it waits for the user); the composer strip always offers a
   // manual Resume either way.
   "agents.auto_resume_usage_limit": "true",
+  // Whether a chat whose turn was running when the app quit or crashed
+  // continues on its own at the next launch, told to check the current
+  // state first. Read by the backend at launch; off leaves the manual
+  // Continue.
+  "agents.auto_resume_after_restart": "true",
   // Whether Full-access Claude and Codex chats get the `delegate_task`
   // tool, which hands a task to another installed agent in a tab beside the
   // chat. Read by the backend when it lists and runs the tool.
@@ -247,6 +252,12 @@ export const selectChatCodeWrap = (s: SettingsStore): boolean =>
 export const selectAutoResumeUsageLimit = (s: SettingsStore): boolean =>
   (s.settings["agents.auto_resume_usage_limit"] ??
     SETTINGS_DEFAULTS["agents.auto_resume_usage_limit"]!) !== "false";
+
+/** Whether chats cut off by a quit or crash continue at the next launch.
+ *  Default on. */
+export const selectAutoResumeAfterRestart = (s: SettingsStore): boolean =>
+  (s.settings["agents.auto_resume_after_restart"] ??
+    SETTINGS_DEFAULTS["agents.auto_resume_after_restart"]!) !== "false";
 
 /** Whether chats may delegate tasks to other installed agents. Default
  *  on; it only acts when the user asks for another agent. */

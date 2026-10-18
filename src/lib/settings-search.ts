@@ -90,6 +90,7 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
   { section: "agent", label: "Auto-configure MCP for workspaces", keywords: ".mcp.json mcp config" },
   { section: "agent", label: "Per-turn revert checkpoints", keywords: "checkpoints undo rewind snapshot", agentChatOnly: true },
   { section: "agent", label: "Resume automatically after usage limits reset", keywords: "auto resume rate limit", agentChatOnly: true },
+  { section: "agent", label: "Auto-resume agents after restart", keywords: "auto resume restart quit crash continue", agentChatOnly: true },
   { section: "agent", label: "Desktop-size background browser", keywords: "viewport peek screenshot", agentChatOnly: true },
   // Workflows
   { section: "workflows", label: "Which agents can be used", keywords: "providers same mix models planner", agentChatOnly: true },

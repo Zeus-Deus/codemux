@@ -53,7 +53,7 @@ pub(crate) fn exiting() -> bool {
 }
 
 /// This app run. Rows written under another epoch are saved, not live.
-fn epoch() -> &'static str {
+pub(crate) fn epoch() -> &'static str {
     static EPOCH: OnceLock<String> = OnceLock::new();
     EPOCH.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }

@@ -3296,6 +3296,10 @@ pub enum TurnOrigin {
     /// activity: it must not start a delegation round or forget a pending
     /// usage resume, and it always queues behind a busy turn.
     PrWatch,
+    /// The resume of a turn the app stopped mid-flight
+    /// (`commands::restart_resume`). Not user activity, so it never resets
+    /// the cap on resumes in a row. The caller holds the activity lock.
+    RestartResume,
 }
 
 /// The one send path behind [`agent_chat_send_turn`] and the usage-limit
@@ -7543,6 +7547,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         };
         super::queued_turns::on_event(&db, &event, queued);
     }
+    super::restart_resume::on_event(app, &event);
 
     // A queued follow-up turn just dispatched — NOW persist its
     // user-message envelope, at real turn order (it was intentionally

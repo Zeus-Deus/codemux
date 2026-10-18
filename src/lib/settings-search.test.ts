@@ -84,6 +84,7 @@ describe("searchSettings", () => {
   it.each([
     "Per-turn revert checkpoints",
     "Resume automatically after usage limits reset",
+    "Auto-resume agents after restart",
     "Desktop-size background browser",
     "Skills sync",
   ])("hides the chat-only row %s when Agent Chat is off", (query) => {
