@@ -934,7 +934,7 @@ function AutomationForm({
               disabled={!creating}
               onClick={() => patch({ trigger: value })}
               className={cn(
-                "rounded-[5px] px-3 py-1 text-body-sm transition-colors duration-150 disabled:cursor-not-allowed",
+                "rounded-sm px-3 py-1 text-body-sm transition-colors duration-150 disabled:cursor-not-allowed",
                 draft.trigger === value
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground disabled:hover:text-muted-foreground",
