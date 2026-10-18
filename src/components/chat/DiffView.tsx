@@ -1,5 +1,5 @@
 import { Check, Copy, FileText } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 import { cn } from "@/lib/utils";
 import { resolveChatFileLink } from "@/lib/agent-chat/file-links";
@@ -27,9 +27,14 @@ export function DiffView({
 }) {
   const { cwd } = useChatFileLinkContext();
   const fileMeta = filename ? resolveChatFileLink(filename, cwd) : null;
-  const rows = computeLineDiff(oldText, newText);
-  const added = rows.filter((r) => r.type === "add").length;
-  const removed = rows.filter((r) => r.type === "remove").length;
+  const { rows, added, removed } = useMemo(() => {
+    const rows = computeLineDiff(oldText, newText);
+    return {
+      rows,
+      added: rows.filter((r) => r.type === "add").length,
+      removed: rows.filter((r) => r.type === "remove").length,
+    };
+  }, [oldText, newText]);
 
   let lineNo = 0;
 
@@ -119,15 +124,50 @@ export interface DiffRow {
   text: string;
 }
 
+// The LCS table holds (old lines + 1) × (new lines + 1) cells; past this,
+// computeLineDiff only aligns the lines both sides share at the start and end.
+export const MAX_LCS_CELLS = 1_000_000;
+
 /**
  * Line-level diff via a longest-common-subsequence table. Lines present
  * in both texts (in order) become context; lines only in `oldText` are
  * removals; lines only in `newText` are additions. Deterministic:
  * removals are emitted before additions at each divergence.
+ *
+ * Inputs too large for the table keep their common leading and trailing
+ * lines as context and diff only the middle, which shows as plain removals
+ * then additions if it is still too large.
  */
 export function computeLineDiff(oldText: string, newText: string): DiffRow[] {
   const a = oldText.length ? oldText.split("\n") : [];
   const b = newText.length ? newText.split("\n") : [];
+  if ((a.length + 1) * (b.length + 1) <= MAX_LCS_CELLS) return lcsDiff(a, b);
+
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start += 1;
+  let endA = a.length;
+  let endB = b.length;
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+    endA -= 1;
+    endB -= 1;
+  }
+  const midA = a.slice(start, endA);
+  const midB = b.slice(start, endB);
+  const middle =
+    (midA.length + 1) * (midB.length + 1) <= MAX_LCS_CELLS
+      ? lcsDiff(midA, midB)
+      : [
+          ...midA.map((text): DiffRow => ({ type: "remove", text })),
+          ...midB.map((text): DiffRow => ({ type: "add", text })),
+        ];
+  return [
+    ...a.slice(0, start).map((text): DiffRow => ({ type: "context", text })),
+    ...middle,
+    ...a.slice(endA).map((text): DiffRow => ({ type: "context", text })),
+  ];
+}
+
+function lcsDiff(a: string[], b: string[]): DiffRow[] {
   const n = a.length;
   const m = b.length;
   const dp: number[][] = Array.from({ length: n + 1 }, () =>
