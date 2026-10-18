@@ -32,11 +32,13 @@ import {
 import { resolveOrbState } from "@/lib/orb-state";
 import { toast } from "@/lib/toast";
 import type { DelegationTasksState } from "@/stores/delegation-store";
+import { accountName, useProviderAccounts } from "@/stores/provider-accounts-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import type { ApprovalDecision } from "@/tauri/events";
 
 import type { StripAction, StripOccupant, StripRow } from "./ComposerStrip";
 import { isHermesPermission } from "./HermesPermissionOptions";
+import { isAccountProvider, useThreadAccount } from "./use-thread-account";
 
 /** How long the "just finished" row stays before it leaves the strip. */
 export const FINISHED_FLASH_MS = 2500;
@@ -404,6 +406,8 @@ export function useUsageLimitOccupant({
     token: number;
   } | null>(null);
   const tokenRef = useRef(0);
+  // Signed in more than once: moving to another account is the way out.
+  const account = useThreadAccount(usageLimit?.provider ?? "", threadId, !!usageLimit);
 
   useEffect(() => {
     if (!usageLimit) return;
@@ -530,7 +534,43 @@ export function useUsageLimitOccupant({
   // The disarm that precedes a manual dispatch is not news; explain only
   // what the user is left with once the resume settles.
   row.note = resuming ? null : usageResumeExplanation(usageLimit, clock);
-  return { kind: "usage", summary: row, rows: [row] };
+  const limited = phase.kind === "armed" || phase.kind === "waiting" || phase.kind === "reached";
+  const current = account.current;
+  if (!limited || !account.multi || !account.bound || !current || !threadId || !isAccountProvider(usageLimit.provider)) {
+    return { kind: "usage", summary: row, rows: [row] };
+  }
+  // The switch leads; waiting (or retrying) on this account moves to a
+  // second row the open strip shows.
+  const provider = usageLimit.provider;
+  const others = account.options.filter((a) => a.id !== current.id && a.identity.signed_in === true);
+  const moving = account.switching !== null;
+  const target = others.length === 1 ? others[0] : null;
+  const chooseAccount: StripAction = {
+    label: "Choose account…",
+    title: "Pick another account in the model picker",
+    tone: target ? "quiet" : undefined,
+    testId: "composer-strip-usage-choose-account",
+    disabled: moving,
+    onClick: () => useProviderAccounts.getState().requestPicker(provider, threadId),
+  };
+  const switchAccount: StripAction | null = target
+    ? {
+        label: moving ? "Switching…" : `Switch to ${accountName(target)}`,
+        title: "Move this chat to that account; the conversation comes along",
+        tone: "solid",
+        testId: "composer-strip-usage-switch-account",
+        disabled: moving || busy,
+        onClick: () => void account.choose(target),
+      }
+    : null;
+  const accountRow: StripRow = {
+    ...row,
+    label: `${accountName(current)} hit its limit`,
+    secondaryAction: switchAccount ? chooseAccount : null,
+    action: switchAccount ?? chooseAccount,
+  };
+  const stayRow: StripRow = { ...row, id: "usage-limit-stay", label: `Or stay on ${accountName(current)}`, note: null };
+  return { kind: "usage", summary: accountRow, rows: [accountRow, stayRow] };
 }
 
 /** Follow-ups parked behind the active turn, oldest first. */

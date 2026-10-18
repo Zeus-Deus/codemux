@@ -259,9 +259,11 @@ pub(super) fn synthesize_for_rate_limited_turn<R: Runtime>(
         db.get_agent_chat_session(&thread_id.0)
             .and_then(|record| parse_provider(&record.provider))?
     };
+    let quota_key =
+        crate::provider_accounts::quota_key_for_thread(app, &provider_id(provider), &thread_id.0);
     let fallback = app
         .try_state::<PlanQuotaStore>()
-        .and_then(|quota| quota.exhausted_reset_for(&provider_id(provider), now_ms()));
+        .and_then(|quota| quota.exhausted_reset_for(&quota_key, now_ms()));
     Some(ProviderRuntimeEvent::UsageLimitReached {
         thread_id: thread_id.clone(),
         provider,
@@ -305,8 +307,10 @@ pub(super) fn arm_usage_limit_event<R: Runtime>(
     // Assistant errors and ACP failures may report the stop without timing.
     // Use only the quota readings that the same provider actually supplied.
     if resets_at_ms.is_none() {
+        let quota_key =
+            crate::provider_accounts::quota_key_for_thread(app, &provider_id(*provider), &thread_id.0);
         if let Some((at, label)) = app.try_state::<PlanQuotaStore>()
-            .and_then(|quota| quota.exhausted_reset_for(&provider_id(*provider), now)) {
+            .and_then(|quota| quota.exhausted_reset_for(&quota_key, now)) {
             *resets_at_ms = Some(at);
             if window.is_none() { *window = label; }
         }

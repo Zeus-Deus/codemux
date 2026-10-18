@@ -92,10 +92,13 @@ fn now_ms() -> i64 {
 /// reuses its result instead of spawning another pair of CLIs.
 static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Read Claude and Codex plan limits now and record them.
+/// Read Claude and Codex plan limits now and record them, for the CLI's
+/// own sign-in and every extra provider account (keyed as
+/// `provider@account`, see `crate::provider_accounts::quota_key`).
 #[tauri::command]
 pub async fn usage_refresh_quota(
     quota: State<'_, PlanQuotaStore>,
+    db: State<'_, crate::database::DatabaseStore>,
 ) -> Result<QuotaRefreshReport, String> {
     let guard = match REFRESH_LOCK.try_lock() {
         Ok(guard) => guard,
@@ -111,15 +114,24 @@ pub async fn usage_refresh_quota(
         }
     };
 
+    let accounts = db.provider_accounts().unwrap_or_default();
+    use crate::agent_provider::ProviderKind;
+    let claude = crate::provider_accounts::probe_targets(ProviderKind::Claude, &accounts);
+    let codex = crate::provider_accounts::probe_targets(ProviderKind::Codex, &accounts);
     let (claude, codex) = tokio::join!(
-        with_timeout(probe_claude()),
-        with_timeout(probe_codex())
+        futures_util::future::join_all(claude.into_iter().map(|(key, env)| async move {
+            (key, with_timeout(probe_claude(env)).await)
+        })),
+        futures_util::future::join_all(codex.into_iter().map(|(key, env)| async move {
+            (key, with_timeout(probe_codex(env)).await)
+        })),
     );
     let now = now_ms();
-    let statuses = vec![
-        settle(&quota, "claude", claude, now),
-        settle(&quota, "codex", codex, now),
-    ];
+    let statuses = claude
+        .into_iter()
+        .chain(codex)
+        .map(|(key, result)| settle(&quota, &key, result, now))
+        .collect();
     drop(guard);
     Ok(QuotaRefreshReport {
         quota: quota.snapshot(),
@@ -185,14 +197,14 @@ fn settle(
 
 // ── Claude ──
 
-async fn probe_claude() -> Result<QuotaReading, ProbeError> {
+async fn probe_claude(env: HashMap<String, String>) -> Result<QuotaReading, ProbeError> {
     let claude_binary = which::which("claude").map_err(|_| ProbeError::NotInstalled)?;
     let sidecar = crate::agent_provider::claude::sidecar_path::resolve_sidecar_path()
         .map_err(|e| ProbeError::Failed(format!("Claude sidecar unavailable: {e:?}")))?;
     let child = JsonRpcChild::spawn(SpawnConfig {
         program: sidecar,
         args: vec![],
-        env: HashMap::new(),
+        env,
         cwd: None,
         default_timeout: PROBE_TIMEOUT,
     })
@@ -345,12 +357,12 @@ fn claude_plan_label(subscription: &str) -> String {
 
 // ── Codex ──
 
-async fn probe_codex() -> Result<QuotaReading, ProbeError> {
+async fn probe_codex(env: HashMap<String, String>) -> Result<QuotaReading, ProbeError> {
     let binary: PathBuf = which::which("codex").map_err(|_| ProbeError::NotInstalled)?;
     let child = JsonRpcChild::spawn(SpawnConfig {
         program: binary,
         args: vec!["app-server".into()],
-        env: HashMap::new(),
+        env,
         cwd: None,
         default_timeout: PROBE_TIMEOUT,
     })

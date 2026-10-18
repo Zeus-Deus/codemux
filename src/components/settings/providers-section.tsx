@@ -29,6 +29,7 @@ import { SectionHeader } from "./settings-primitives";
 import { CommandRow, DetailHeader, DetailRow, DetailSection, StatusLine, type ProviderStatus } from "./provider-parts";
 import { HermesProviderDetail } from "./hermes-setting";
 import { CustomAcpDetail } from "./custom-acp-settings";
+import { ProviderAccountsSettings } from "./provider-accounts-settings";
 
 /** The CLIs Codemux drives directly, in list order. */
 const BUILT_IN: readonly { id: AgentChatProviderKind; name: string }[] = [
@@ -384,6 +385,7 @@ function BuiltInDetail({
               <p className="text-body-sm text-muted-foreground">{report.message}</p>
             </DetailSection>
           )}
+          {report?.installed && (id === "claude" || id === "codex") && <ProviderAccountsSettings provider={id} />}
           {id === "codex" && !isRemoteClient() && <ChatGptAccounts />}
           {ready && (
             <DetailSection title="Models">

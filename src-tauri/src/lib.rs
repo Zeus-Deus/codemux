@@ -54,6 +54,7 @@ pub mod os_input;
 pub mod plugins;
 pub mod ports;
 pub mod presets;
+pub mod provider_accounts;
 pub mod project;
 // The PTY daemon is Unix-only for now. Windows builds get the in-process
 // PTY path with zero regression (the `daemon_path_viable()` gate in
@@ -3157,6 +3158,16 @@ fn build_core_app<R: tauri::Runtime>(
             worktree_cleanup::worktree_cleanup_scan,
             worktree_cleanup::worktree_cleanup_remove,
             worktree_cleanup::worktree_cleanup_set_auto,
+            // Several accounts per provider (Settings → Providers, composer).
+            commands::provider_accounts_list,
+            commands::provider_accounts_refresh,
+            commands::provider_account_add,
+            commands::provider_account_rename,
+            commands::provider_account_remove,
+            commands::provider_account_set_default,
+            commands::provider_account_open_sign_in,
+            commands::provider_account_thread,
+            commands::provider_account_switch_thread,
         ])
 }
 

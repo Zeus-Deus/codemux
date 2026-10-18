@@ -856,6 +856,7 @@ fn source_changed(db: &DatabaseStore, key: &str, signature: (i64, i64)) -> bool 
 fn materialize_rows(
     db: &DatabaseStore,
     rows: Vec<ImportedRow>,
+    owners: &HashMap<String, String>,
     report: &mut UsageImportReport,
     sessions: &mut HashSet<String>,
 ) -> Result<(), String> {
@@ -878,6 +879,7 @@ fn materialize_rows(
             }
         };
         cache_rows.push(ProviderUsageCacheRow {
+            account_id: owners.get(&row.import_key).cloned(),
             import_key: row.import_key,
             created_at: row.created_at_ms,
             thread_id: format!("{}:{}", row.provider, row.session_id),
@@ -916,11 +918,27 @@ pub async fn usage_scan_provider_history(
     let stale_version = purge_if_importer_changed(&db)?;
     report.reimported = stale_version;
 
-    let targets: [(PathBuf, &'static str); 2] = [
-        (home.join(".claude").join("projects"), "claude"),
-        (home.join(".codex").join("sessions"), "codex"),
+    // `None` is the CLI's own sign-in; extra provider accounts keep their
+    // history in their own homes and are tagged with their id.
+    use crate::agent_provider::ProviderKind;
+    use crate::provider_accounts::homes::default_home;
+    let mut targets: Vec<(PathBuf, &'static str, Option<String>)> = vec![
+        (
+            default_home(ProviderKind::Claude).unwrap_or_else(|| home.join(".claude")).join("projects"),
+            "claude",
+            None,
+        ),
+        (
+            default_home(ProviderKind::Codex).unwrap_or_else(|| home.join(".codex")).join("sessions"),
+            "codex",
+            None,
+        ),
     ];
-    for (root, provider) in targets {
+    targets.extend(crate::provider_accounts::history_roots(&db.provider_accounts()?));
+    // Import keys each account's history produced in this scan.
+    let mut account_keys: Vec<(String, String)> = Vec::new();
+    let mut default_keys: HashSet<String> = HashSet::new();
+    for (root, provider, account) in targets {
         let mut files = Vec::new();
         find_jsonl(&root, &mut files);
         for path in files {
@@ -940,6 +958,14 @@ pub async fn usage_scan_provider_history(
                 "claude" => parse_claude_transcript(lines),
                 _ => parse_codex_rollout(lines),
             };
+            for row in &rows {
+                match &account {
+                    Some(id) => account_keys.push((id.clone(), row.import_key.clone())),
+                    None => {
+                        default_keys.insert(row.import_key.clone());
+                    }
+                }
+            }
             pending_rows.extend(rows);
             completed_states.push((key, signature.0, signature.1));
         }
@@ -1032,7 +1058,18 @@ pub async fn usage_scan_provider_history(
         }
     }
 
-    materialize_rows(&db, pending_rows, &mut report, &mut sessions)?;
+    // A row is attributed once, to the history that first produced it: a
+    // chat switched to another account carries a copy of its earlier turns,
+    // and those stay with the account that ran them. The account is written
+    // with the row and never updated, so an earlier scan's owner stands; in
+    // one scan the CLI's own history wins.
+    let mut owners: HashMap<String, String> = HashMap::new();
+    for (account, key) in account_keys {
+        if !default_keys.contains(&key) {
+            owners.entry(key).or_insert(account);
+        }
+    }
+    materialize_rows(&db, pending_rows, &owners, &mut report, &mut sessions)?;
     report.sessions_found = sessions.len() as i64;
     db.set_usage_import_states(&completed_states, now_ms())?;
     // Record the version only after a complete pass so an interrupted rebuild
@@ -1507,7 +1544,7 @@ mod tests {
             .unwrap(),
         );
         let mut report = UsageImportReport::default();
-        materialize_rows(&db, rows, &mut report, &mut HashSet::new()).unwrap();
+        materialize_rows(&db, rows, &HashMap::new(), &mut report, &mut HashSet::new()).unwrap();
         assert_eq!(report.rows_updated, 3);
         let rows = db.usage_rows_since(0).unwrap();
         let claude = rows

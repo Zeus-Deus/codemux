@@ -8,6 +8,7 @@
 //! the cut, and its lineage. The fork resumes on its first send like any
 //! reopened chat. Providers that can't fork natively are refused.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +57,9 @@ struct ForkPlan {
     workspace_id: String,
     target_cwd: PathBuf,
     cut: Cut,
+    /// Points the fork's CLI at the source chat's provider account, which
+    /// holds its native session (empty for the CLI's own login).
+    env: HashMap<String, String>,
 }
 
 enum Cut {
@@ -148,9 +152,13 @@ async fn plan_fork<R: Runtime>(
             target_cwd.display()
         ));
     }
-    if provider == ProviderKind::Codex
-        && crate::agent_provider::codex::chatgpt::owner().managed_selected_now()
-    {
+    let env = crate::provider_accounts::session_env_for_thread(app, provider, source_thread_id);
+    // A chat on an extra account runs its own Codex login, not the route.
+    if crate::provider_accounts::on_chatgpt_route(
+        provider,
+        &env,
+        crate::agent_provider::codex::chatgpt::owner().managed_selected_now(),
+    ) {
         // Its threads live in the app-owned Codex home that only the main
         // adapter's token-bound launch uses (see side chats).
         return Err("Forking isn't available while Codex uses your ChatGPT plan connection yet.".into());
@@ -198,6 +206,7 @@ async fn plan_fork<R: Runtime>(
         workspace_id,
         target_cwd,
         cut,
+        env,
     })
 }
 
@@ -295,6 +304,8 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
         cut_before,
         image_dirs: source_images.as_deref().zip(fork_images.as_deref()),
     })?;
+    // The fork resumes on the account that holds its native session.
+    db.copy_provider_account_bindings(&plan.source.thread_id, &thread_id)?;
     // Still holding the source: a revert or delete waiting on it would
     // remove the images this copies.
     copy_inherited_images(images).await;
@@ -352,7 +363,7 @@ async fn fork_claude(plan: &ForkPlan) -> Result<String, String> {
         Cut::Claude { cut, .. } => Some(cut),
         _ => None,
     };
-    let child = spawn_claude_sidecar(&plan.source_cwd)
+    let child = spawn_claude_sidecar(&plan.source_cwd, plan.env.clone())
         .await
         .map_err(|error| format!("Couldn't fork this chat: {error}"))?;
     let reply = child
@@ -377,7 +388,7 @@ async fn fork_codex(plan: &ForkPlan) -> Result<String, String> {
         Cut::Codex { rollback, .. } => Some(rollback),
         _ => None,
     };
-    let child = spawn_codex(&plan.target_cwd, Vec::new())
+    let child = spawn_codex(&plan.target_cwd, Vec::new(), plan.env.clone())
         .await
         .map_err(|error| format!("Couldn't fork this chat: {error}"))?;
     let result = codex_fork_in(&child, &plan.native_id, &plan.target_cwd, rollback).await;
