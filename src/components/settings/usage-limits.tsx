@@ -11,7 +11,9 @@ import type {
 } from "@/tauri/commands";
 import { formatResetTime } from "@/lib/agent-chat/usage-limit";
 import { cn } from "@/lib/utils";
+import { accountName, accountsFor, useProviderAccounts } from "@/stores/provider-accounts-store";
 import { isKnownProvider, seriesLabel } from "./usage-format";
+import { parseQuotaKey } from "./usage-filter";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -236,16 +238,24 @@ function sortWindows(windows: PlanUsageWindow[]): PlanUsageWindow[] {
 }
 
 function ProviderLimits({
-  provider,
+  quotaKey,
   quota,
   status,
   now,
+  showAccount,
 }: {
-  provider: string;
+  /** `provider`, or `provider@account` for an extra provider account. */
+  quotaKey: string;
   quota: ProviderQuota | undefined;
   status: QuotaProbeStatus | undefined;
   now: number;
+  /** The provider has several accounts, so name the one this is. */
+  showAccount: boolean;
 }) {
+  const { provider, accountId } = parseQuotaKey(quotaKey);
+  const account = useProviderAccounts((s) =>
+    showAccount ? accountsFor(s.accounts, provider).find((a) => a.id === accountId) : undefined,
+  );
   const windows = sortWindows(quota?.windows ?? []);
   const stale = quota != null && now - quota.received_at_ms > STALE_AFTER_MS;
   // A failed read beside an older reading still shows the reading.
@@ -262,9 +272,17 @@ function ProviderLimits({
         ) : (
           <span className="h-[18px] w-[18px]" aria-hidden />
         )}
-        <h3 className="text-body font-medium">{seriesLabel(provider)}</h3>
+        <h3 className="text-body font-medium">
+          {seriesLabel(provider)}
+          {showAccount && (
+            <span className="font-normal text-muted-foreground"> · {account ? accountName(account) : accountId}</span>
+          )}
+        </h3>
         {quota?.plan_label && (
           <span className="text-label text-muted-foreground">{quota.plan_label}</span>
+        )}
+        {account?.identity.email && (
+          <span className="truncate text-label text-muted-foreground/80">{account.identity.email}</span>
         )}
         {quota && windows.length > 0 && (
           <span
@@ -356,6 +374,11 @@ export function UsageLimitsView({
   loading: boolean;
 }) {
   const statusFor = new Map(statuses.map((status) => [status.provider, status]));
+  const accounts = useProviderAccounts((s) => s.accounts);
+  const accountOrder = ["default", ...(accounts ?? []).map((a) => a.id)];
+  // A provider with an extra account names its accounts even before every
+  // one has reported limits.
+  const accountProviders = (accounts ?? []).filter((a) => a.id !== "default").map((a) => `${a.provider}@${a.id}`);
   const providers = [
     ...new Set([
       ...Object.keys(quota).filter((p) => (quota[p]?.windows.length ?? 0) > 0),
@@ -364,11 +387,20 @@ export function UsageLimitsView({
         .map((s) => s.provider),
     ]),
   ].sort((a, b) => {
-    const ra = PROVIDER_ORDER.indexOf(a);
-    const rb = PROVIDER_ORDER.indexOf(b);
+    const pa = parseQuotaKey(a);
+    const pb = parseQuotaKey(b);
+    const ra = PROVIDER_ORDER.indexOf(pa.provider);
+    const rb = PROVIDER_ORDER.indexOf(pb.provider);
     if (ra !== rb) return (ra === -1 ? 99 : ra) - (rb === -1 ? 99 : rb);
-    return a.localeCompare(b);
+    if (pa.provider !== pb.provider) return pa.provider.localeCompare(pb.provider);
+    // The CLI's own sign-in first, then accounts in the order they were added.
+    const ia = accountOrder.indexOf(pa.accountId);
+    const ib = accountOrder.indexOf(pb.accountId);
+    return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib) || a.localeCompare(b);
   });
+  const multiAccount = new Set(
+    [...providers, ...accountProviders].map((key) => parseQuotaKey(key)).filter((k) => k.accountId !== "default").map((k) => k.provider),
+  );
 
   const errorNotice = error ? (
     <p className="flex items-center gap-2 rounded-lg border border-border/60 px-4 py-2.5 text-label text-status-attention">
@@ -398,10 +430,11 @@ export function UsageLimitsView({
       {providers.map((provider) => (
         <ProviderLimits
           key={provider}
-          provider={provider}
+          quotaKey={provider}
           quota={quota[provider]}
           status={statusFor.get(provider)}
           now={now}
+          showAccount={multiAccount.has(parseQuotaKey(provider).provider)}
         />
       ))}
       <div className="flex flex-col gap-1.5 px-1 text-label leading-relaxed text-muted-foreground">

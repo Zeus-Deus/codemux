@@ -6,6 +6,7 @@ pub mod delegated_tasks;
 pub mod follow_ups;
 pub mod hermes;
 pub mod custom_acp;
+pub mod provider_accounts;
 pub(crate) mod local_sessions;
 pub mod chat_fork;
 mod delegation;
@@ -1173,6 +1174,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     automation_triggers::create_schema(conn)?;
     turn_diffs::create_schema(conn)?;
     chat_fork::create_schema(conn)?;
+    provider_accounts::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new
@@ -3123,6 +3125,10 @@ pub struct UsageLedgerRow {
     /// exact provider bills that have no separate local-history importer.
     #[serde(default)]
     pub source: String,
+    /// The extra provider account that produced the row; `None` is the
+    /// CLI's own sign-in (see `crate::provider_accounts`).
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 /// One normalized provider-history record ready for the materialized cache.
@@ -3599,7 +3605,7 @@ impl DatabaseStore {
             .prepare(
                 "SELECT created_at, thread_id, workspace_id, provider, model, subagent,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                        reasoning_tokens, cost_usd, cost_source, source
+                        reasoning_tokens, cost_usd, cost_source, source, account_id
                  FROM agent_usage_ledger
                  WHERE created_at >= ?1
                  ORDER BY created_at ASC",
@@ -3622,6 +3628,7 @@ impl DatabaseStore {
                     cost_usd: row.get(11)?,
                     cost_source: row.get(12)?,
                     source: row.get(13)?,
+                    account_id: row.get(14)?,
                 })
             })
             .map_err(|e| e.to_string())?

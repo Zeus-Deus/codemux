@@ -83,6 +83,7 @@ export function filterUsageSummary(
       cache_savings_usd: savings,
     },
     quota: filterQuota(summary.quota, hidden),
+    accounts: summary.accounts?.filter((a) => shown(a.provider)),
   };
 }
 
@@ -91,6 +92,15 @@ export function filterQuota(
   hidden: ReadonlySet<string>,
 ): Record<string, ProviderQuota> {
   return Object.fromEntries(
-    Object.entries(quota).filter(([provider]) => !hidden.has(provider)),
+    Object.entries(quota).filter(([key]) => !hidden.has(parseQuotaKey(key).provider)),
   );
+}
+
+/** Split a quota key into its provider and account: `claude` is the CLI's
+ *  own sign-in, `claude@<id>` an extra provider account. */
+export function parseQuotaKey(key: string): { provider: string; accountId: string } {
+  const at = key.indexOf("@");
+  return at < 0
+    ? { provider: key, accountId: "default" }
+    : { provider: key.slice(0, at), accountId: key.slice(at + 1) };
 }

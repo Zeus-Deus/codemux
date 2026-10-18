@@ -189,6 +189,8 @@ export function useAgentChatSessionActions(
             service_tier: record.service_tier ?? "default",
             additional_directories: [],
             env: null,
+            // The picked chat's provider account holds its transcript.
+            extra: { provider_account_from_thread: record.thread_id },
           },
           // We just stopped this pane's session, so it is still bound to
           // `threadId` while the resume starts under a fresh local id.

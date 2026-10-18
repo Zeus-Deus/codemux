@@ -916,11 +916,27 @@ pub async fn usage_scan_provider_history(
     let stale_version = purge_if_importer_changed(&db)?;
     report.reimported = stale_version;
 
-    let targets: [(PathBuf, &'static str); 2] = [
-        (home.join(".claude").join("projects"), "claude"),
-        (home.join(".codex").join("sessions"), "codex"),
+    // `None` is the CLI's own sign-in; extra provider accounts keep their
+    // history in their own homes and are tagged with their id.
+    use crate::agent_provider::ProviderKind;
+    use crate::provider_accounts::homes::default_home;
+    let mut targets: Vec<(PathBuf, &'static str, Option<String>)> = vec![
+        (
+            default_home(ProviderKind::Claude).unwrap_or_else(|| home.join(".claude")).join("projects"),
+            "claude",
+            None,
+        ),
+        (
+            default_home(ProviderKind::Codex).unwrap_or_else(|| home.join(".codex")).join("sessions"),
+            "codex",
+            None,
+        ),
     ];
-    for (root, provider) in targets {
+    targets.extend(crate::provider_accounts::history_roots(&db.provider_accounts()?));
+    // Import keys each account's history produced in this scan.
+    let mut account_keys: Vec<(String, String)> = Vec::new();
+    let mut default_keys: HashSet<String> = HashSet::new();
+    for (root, provider, account) in targets {
         let mut files = Vec::new();
         find_jsonl(&root, &mut files);
         for path in files {
@@ -940,6 +956,14 @@ pub async fn usage_scan_provider_history(
                 "claude" => parse_claude_transcript(lines),
                 _ => parse_codex_rollout(lines),
             };
+            for row in &rows {
+                match &account {
+                    Some(id) => account_keys.push((id.clone(), row.import_key.clone())),
+                    None => {
+                        default_keys.insert(row.import_key.clone());
+                    }
+                }
+            }
             pending_rows.extend(rows);
             completed_states.push((key, signature.0, signature.1));
         }
@@ -1032,7 +1056,18 @@ pub async fn usage_scan_provider_history(
         }
     }
 
+    // A row is attributed once, to the history that first produced it: a
+    // chat switched to another account carries a copy of its earlier turns,
+    // and those stay with the account that ran them.
+    let settled = db.existing_usage_import_keys(
+        &account_keys.iter().map(|(_, key)| key.as_str()).collect::<Vec<_>>(),
+    )?;
+    let mut claimed = HashSet::new();
+    account_keys.retain(|(_, key)| {
+        !settled.contains(key) && !default_keys.contains(key) && claimed.insert(key.clone())
+    });
     materialize_rows(&db, pending_rows, &mut report, &mut sessions)?;
+    db.tag_usage_rows_with_account(&account_keys)?;
     report.sessions_found = sessions.len() as i64;
     db.set_usage_import_states(&completed_states, now_ms())?;
     // Record the version only after a complete pass so an interrupted rebuild

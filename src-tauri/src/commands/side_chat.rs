@@ -203,6 +203,9 @@ struct MainSession {
     /// transcript it reads: a 1M main chat forked onto the 200k default
     /// would fail once the conversation outgrows it.
     context_window: Option<String>,
+    /// Points the CLI at the provider account the chat runs on, so the fork
+    /// finds its transcript and bills that account.
+    env: HashMap<String, String>,
 }
 
 fn main_session<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Result<MainSession, String> {
@@ -242,6 +245,7 @@ fn main_session<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Result<MainS
         model: non_blank(record.model.as_deref()),
         effort: non_blank(record.effort.as_deref()),
         context_window: non_blank(record.context_window.as_deref()),
+        env: crate::provider_accounts::session_env_for_thread(app, provider, thread_id),
     })
 }
 
@@ -265,6 +269,9 @@ pub async fn agent_chat_side_chat_start<R: Runtime>(
     if super::agent_chat::thread_runs_on_device_pub(&app, &thread_id.0) {
         return Err("Side chat isn't available for chats running on another device yet.".into());
     }
+    // Resolve the account and register the start as one step against
+    // account removal, which closes registered side chats.
+    let account_change = crate::provider_accounts::account_change_lock().await;
     let main = main_session(&app, &thread_id.0)?;
     // Make sure the provider is configured before spawning anything.
     {
@@ -279,6 +286,8 @@ pub async fn agent_chat_side_chat_start<R: Runtime>(
     // Claim the id before spawning, so a close that lands while the
     // provider starts cancels this start instead of finding nothing.
     let token = store.chats.lock().await.begin(&side_id)?;
+    crate::provider_accounts::note_side_chat(&side_id, &main.env);
+    drop(account_change);
     let result = match main.provider {
         ProviderKind::Claude => start_claude(&app, &side_id, &main, &question).await,
         _ => start_codex(&app, &side_id, &main, &question).await,
@@ -364,7 +373,7 @@ async fn start_claude<R: Runtime>(
 ) -> Result<(SideChat, SideChatStarted), String> {
     // Never touch Claude's on-disk session here: the SDK reads the main
     // transcript to fork it and, with `persistSession: false`, writes none.
-    let child = spawn_claude_sidecar(&main.cwd)
+    let child = spawn_claude_sidecar(&main.cwd, main.env.clone())
         .await
         .map_err(|error| format!("Couldn't start the side chat: {error}"))?;
     let child = Arc::new(child);
@@ -400,14 +409,18 @@ async fn start_claude<R: Runtime>(
 }
 
 /// A dedicated Claude sidecar in `cwd`, separate from the main session's.
-/// Also used by chat forks for their one-shot `fork-session` call.
-pub(crate) async fn spawn_claude_sidecar(cwd: &std::path::Path) -> Result<JsonRpcChild, String> {
+/// Also used by chat forks for their one-shot `fork-session` call. `env`
+/// points it at the chat's provider account, when it runs on one.
+pub(crate) async fn spawn_claude_sidecar(
+    cwd: &std::path::Path,
+    env: HashMap<String, String>,
+) -> Result<JsonRpcChild, String> {
     let sidecar = crate::agent_provider::claude::sidecar_path::resolve_sidecar_path()
         .map_err(|error| format!("Claude sidecar: {error}"))?;
     JsonRpcChild::spawn(SpawnConfig {
         program: sidecar,
         args: vec![],
-        env: HashMap::new(),
+        env,
         cwd: Some(cwd.to_path_buf()),
         default_timeout: SIDE_RPC_TIMEOUT,
     })
@@ -419,17 +432,19 @@ pub(crate) async fn spawn_claude_sidecar(cwd: &std::path::Path) -> Result<JsonRp
 
 /// A dedicated `codex app-server` in `cwd` with user automation switched off
 /// (see [`codex_side_chat_args`]). Also used by chat forks, which only fork
-/// and roll back a thread in it.
+/// and roll back a thread in it. `env` points it at the chat's provider
+/// account, when it runs on one.
 pub(crate) async fn spawn_codex(
     cwd: &std::path::Path,
     extra: Vec<String>,
+    env: HashMap<String, String>,
 ) -> Result<JsonRpcChild, String> {
     let mut args = extra;
     args.extend(codex_side_chat_args());
     JsonRpcChild::spawn(SpawnConfig {
         program: PathBuf::from("codex"),
         args,
-        env: HashMap::new(),
+        env,
         cwd: Some(cwd.to_path_buf()),
         default_timeout: SIDE_RPC_TIMEOUT,
     })
@@ -474,7 +489,9 @@ async fn start_codex<R: Runtime>(
     main: &MainSession,
     question: &str,
 ) -> Result<(SideChat, SideChatStarted), String> {
-    if crate::agent_provider::codex::chatgpt::owner().managed_selected_now() {
+    // An extra provider account runs its own CLI login, never the route.
+    let on_account = main.env.contains_key(crate::provider_accounts::SESSION_ACCOUNT_ENV);
+    if !on_account && crate::agent_provider::codex::chatgpt::owner().managed_selected_now() {
         // App-owned ChatGPT-plan routing needs the token-bound launch the
         // main adapter performs; a plain app-server would bill another
         // account or fail. Refuse honestly rather than guess.
@@ -483,7 +500,7 @@ async fn start_codex<R: Runtime>(
         );
     }
     let child = Arc::new(
-        spawn_codex(&main.cwd, Vec::new())
+        spawn_codex(&main.cwd, Vec::new(), main.env.clone())
             .await
             .map_err(|error| format!("Couldn't start the side chat: {error}"))?,
     );

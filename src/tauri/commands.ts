@@ -1792,6 +1792,10 @@ export const agentChatStartSession = async (
     const profile = useHermes.getState().selections[input.thread_id];
     if (profile) input = { ...input, permission_mode: useHermes.getState().modes[input.thread_id] ?? input.permission_mode, extra: { hermes_profile: profile } };
   }
+  if (provider === "claude" || provider === "codex") {
+    const { withAccountPick } = await import("@/stores/provider-accounts-store");
+    input = withAccountPick(input);
+  }
   if (provider === "acp") {
     const { useCustomAcp, acpLifecycleEpoch } = await import("@/stores/custom-acp-store");
     const state = useCustomAcp.getState();
@@ -2702,6 +2706,9 @@ export interface UsageSummary {
   /** Live plan quota keyed by provider id; providers with no reading are
    *  simply absent and render no meters. */
   quota: Record<string, ProviderQuota>;
+  /** The period split by provider account, for providers with more than
+   *  one account. Absent from older backends. */
+  accounts?: AccountUsage[];
   synced_at_ms: number;
 }
 
@@ -3916,3 +3923,94 @@ export const worktreeCleanupRemove = (paths: string[]) =>
 /** Persists the automatic-cleanup setting and, when enabling, sweeps now. */
 export const worktreeCleanupSetAuto = (enabled: boolean) =>
   invoke<void>("worktree_cleanup_set_auto", { enabled });
+
+// ── Provider accounts ──
+
+/** What is known about one account's sign-in. */
+export interface ProviderAccountIdentity {
+  /** `null` when it could not be told. */
+  signed_in: boolean | null;
+  email: string | null;
+  organization: string | null;
+  plan: string | null;
+}
+
+/** One sign-in of a provider. `id: "default"` is the CLI's own login. */
+export interface ProviderAccount {
+  id: string;
+  provider: "claude" | "codex";
+  /** `null` for the CLI's own sign-in. */
+  label: string | null;
+  home: string;
+  identity: ProviderAccountIdentity;
+  /** Signs this account in when run in a terminal. */
+  login_command: string;
+}
+
+export interface ProviderAccountsState {
+  accounts: ProviderAccount[];
+  /** App-wide default per provider; absent means the CLI's own sign-in. */
+  defaults: Record<string, string>;
+}
+
+/** Which account a chat runs (or would start) on. */
+export interface ThreadAccount {
+  account_id: string;
+  /** Started and pinned: changing it switches the running chat. */
+  bound: boolean;
+  workspace_id: string | null;
+  workspace_default: string | null;
+}
+
+export interface AccountSwitchOutcome {
+  account_id: string;
+  /** The conversation came along; `false` continues with fresh context. */
+  carried: boolean;
+}
+
+/** One account's share of the usage period. */
+export interface AccountUsage {
+  provider: string;
+  account_id: string;
+  /** `null` for the CLI's own sign-in. */
+  label: string | null;
+  tokens: number;
+  cost_usd: number;
+  session_count: number;
+}
+
+export const providerAccountsList = () => invoke<ProviderAccountsState>("provider_accounts_list");
+
+/** Like the list, after asking Codex who each home is signed in as. */
+export const providerAccountsRefresh = () => invoke<ProviderAccountsState>("provider_accounts_refresh");
+
+export const providerAccountAdd = (provider: "claude" | "codex", label: string) =>
+  invoke<ProviderAccount>("provider_account_add", { provider, label });
+
+export const providerAccountRename = (accountId: string, label: string) =>
+  invoke<ProviderAccountsState>("provider_account_rename", { accountId, label });
+
+/** Removes the account and its folder (its sign-in and chat history). */
+export const providerAccountRemove = (accountId: string) =>
+  invoke<ProviderAccountsState>("provider_account_remove", { accountId });
+
+/** App-wide when `workspaceId` is null; `accountId: null` clears it. */
+export const providerAccountSetDefault = (
+  provider: "claude" | "codex",
+  accountId: string | null,
+  workspaceId: string | null = null,
+) => invoke<ProviderAccountsState>("provider_account_set_default", { provider, accountId, workspaceId });
+
+export const providerAccountOpenSignIn = (workspaceId: string, accountId: string) =>
+  invoke<void>("provider_account_open_sign_in", { workspaceId, accountId });
+
+/** `workspaceId` is where a draft will start; a started chat uses its own. */
+export const providerAccountThread = (
+  threadId: string,
+  provider: "claude" | "codex",
+  workspaceId: string | null = null,
+) => invoke<ThreadAccount>("provider_account_thread", { threadId, provider, workspaceId });
+
+/** Move a started chat to another account, keeping its conversation. */
+export const providerAccountSwitchThread = (threadId: string, accountId: string) =>
+  invoke<AccountSwitchOutcome>("provider_account_switch_thread", { threadId, accountId });

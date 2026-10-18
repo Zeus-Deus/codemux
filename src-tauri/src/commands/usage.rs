@@ -508,6 +508,10 @@ pub struct UsageSummary {
     /// simply have no meters — the dashboard renders nothing rather than
     /// an empty bar.
     pub quota: HashMap<String, ProviderQuota>,
+    /// The period split by provider account, for providers with more than
+    /// one (see `crate::provider_accounts::usage`). Empty otherwise.
+    #[serde(default)]
+    pub accounts: Vec<crate::provider_accounts::usage::AccountUsage>,
     /// When the figures were computed. The ledger is local, so this is
     /// always "now" — the field exists so the UI can say so honestly
     /// rather than implying a remote sync that does not happen.
@@ -877,6 +881,7 @@ fn summarize_priced(
         confidence,
         models,
         quota,
+        accounts: Vec::new(),
         synced_at_ms: now_ms,
     }
 }
@@ -1116,14 +1121,21 @@ pub async fn usage_summary(
     let mut rows = db.usage_rows_since(since)?;
     let overrides = load_price_overrides(&db);
     apply_price_overrides(&mut rows, &overrides);
-    Ok(summarize_priced(
+    let mut summary = summarize_priced(
         &rows,
         period,
         now,
         tz_offset_minutes,
         quota.snapshot(),
         &overrides,
-    ))
+    );
+    summary.accounts = crate::provider_accounts::usage::account_usage(
+        &rows,
+        summary.start_ms,
+        summary.end_ms,
+        &db.provider_accounts()?,
+    );
+    Ok(summary)
 }
 
 /// The user's per-model price overrides.
@@ -1295,6 +1307,7 @@ mod tests {
             // otherwise; matches what Claude/Codex actually emit.
             cost_source: Some("table".into()),
             source: "live".into(),
+            account_id: None,
         }
     }
 

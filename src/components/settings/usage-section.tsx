@@ -50,7 +50,9 @@ import type {
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { Eyebrow } from "@/components/ui/eyebrow";
-import { filterQuota, filterUsageSummary } from "./usage-filter";
+import { filterQuota, filterUsageSummary, parseQuotaKey } from "./usage-filter";
+import { AccountsSection } from "./usage-accounts";
+import { useProviderAccounts } from "@/stores/provider-accounts-store";
 import {
   formatCount,
   formatMoney,
@@ -324,6 +326,8 @@ export function UsageSection({
   useEffect(() => {
     void scan().finally(() => setScanned(true));
     void refreshQuota();
+    // Account names and emails for the per-account rows and limits.
+    void useProviderAccounts.getState().load().catch(() => {});
     void usagePriceOverrides()
       .then(setOverrides)
       .catch(() => {});
@@ -404,7 +408,7 @@ export function UsageSection({
     [rawSummary?.quota, directQuota, hiddenProviders],
   );
   const shownStatuses = useMemo(
-    () => quotaStatuses.filter((status) => !hiddenProviders.has(status.provider)),
+    () => quotaStatuses.filter((status) => !hiddenProviders.has(parseQuotaKey(status.provider).provider)),
     [quotaStatuses, hiddenProviders],
   );
   // Every provider the page knows of, hidden ones included, so a hidden
@@ -412,7 +416,7 @@ export function UsageSection({
   const knownProviders = useMemo(() => {
     const ids = new Set<string>([
       ...(rawSummary?.providers.map((p) => p.provider) ?? []),
-      ...Object.keys(directQuota ?? {}),
+      ...Object.keys(directQuota ?? {}).map((key) => parseQuotaKey(key).provider),
       ...preferences.hiddenProviders,
     ]);
     return [...ids];
@@ -606,6 +610,14 @@ export function UsageSection({
                     setSelectedModelKey(`${model.provider}:${model.model}`)
                   }
                   onOpenPrices={() => setPricesOpen(true)}
+                  onOpenLimits={() => setMode("limits")}
+                />
+              )}
+              {summary.accounts && summary.accounts.length > 0 && (
+                <AccountsSection
+                  accounts={summary.accounts}
+                  quota={quota}
+                  metric={metric}
                   onOpenLimits={() => setMode("limits")}
                 />
               )}

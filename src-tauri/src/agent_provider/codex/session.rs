@@ -365,6 +365,9 @@ impl CodexSession {
         let mut spawn = spawn;
         // A device owns its own account; local credentials never enter SSH.
         if spawn.remote.is_some() { spawn.chatgpt_owner = None; }
+        // A chat on an extra provider account runs that account's own CLI
+        // login, not the app-owned ChatGPT route.
+        if caller_env.contains_key(crate::provider_accounts::SESSION_ACCOUNT_ENV) { spawn.chatgpt_owner = None; }
         if let (Some(home), None) = (spawn.codex_home.as_ref(), spawn.remote.as_ref()) {
             env.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
         }
