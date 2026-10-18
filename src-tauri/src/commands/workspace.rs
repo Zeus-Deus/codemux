@@ -2539,7 +2539,9 @@ pub fn notify_attention<R: tauri::Runtime>(
     let notification_id =
         state.add_notification(session_id, pane_id, message, NotificationLevel::Attention)?;
 
-    if desktop.unwrap_or(true) {
+    // Test harnesses never reach the real desktop (no popup, no focus
+    // steal); see `notifications::is_test_harness`.
+    if desktop.unwrap_or(true) && !crate::notifications::is_test_harness(&app) {
         // `notify-rust`'s Windows backend (WinRT Toast) does not expose
         // `.hint()` / `.urgency()` / `notify_rust::Hint::*` — those are
         // XDG/D-Bus concepts only available when the crate is built for
