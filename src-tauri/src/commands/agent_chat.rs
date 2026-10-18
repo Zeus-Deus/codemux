@@ -919,20 +919,26 @@ pub(crate) fn thread_runs_on_device_pub<R: Runtime>(app: &AppHandle<R>, thread_i
     thread_runs_on_device(app, thread_id)
 }
 
-/// Hold a thread still while a chat fork copies it: the dispatch lock a send
-/// holds, then the turn-checkpoint timeline lock (the order a send takes
-/// them), so no turn starts and no revert runs until the guards drop.
-pub(crate) async fn hold_thread_for_fork<R: Runtime>(
+/// Hold a thread still while a chat fork copies it. The dispatch lock a
+/// send holds comes first; the turn-checkpoint timeline lock second (the
+/// order a send takes them), so no turn starts and no revert runs until
+/// both guards drop. Split so the fork can ask the provider about the
+/// session before taking the timeline lock, which a queued checkpoint may
+/// be waiting on while it holds the session's outbound lock.
+pub(crate) async fn fork_dispatch_guard<R: Runtime>(
     app: &AppHandle<R>,
     thread_id: &str,
-) -> (tokio::sync::OwnedMutexGuard<()>, tokio::sync::OwnedMutexGuard<()>) {
-    let dispatch = native_thread_gate(app, thread_id)
+) -> tokio::sync::OwnedMutexGuard<()> {
+    native_thread_gate(app, thread_id)
         .dispatch
         .clone()
         .lock_owned()
-        .await;
-    let timeline = turn_checkpoint_lock_for(thread_id).lock_owned().await;
-    (dispatch, timeline)
+        .await
+}
+
+/// The second half of [`fork_dispatch_guard`].
+pub(crate) async fn fork_timeline_guard(thread_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    turn_checkpoint_lock_for(thread_id).lock_owned().await
 }
 
 /// Crate-visible: where a thread's sent chat images live.

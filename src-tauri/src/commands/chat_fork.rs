@@ -30,18 +30,23 @@ use crate::observability::ObservabilityStore;
 use crate::state::AppStateStore;
 
 use super::agent_chat::{
-    chat_images_dir_pub, feature_flag_on, hold_thread_for_fork, lookup_provider, ProviderRegistry,
+    chat_images_dir_pub, feature_flag_on, fork_dispatch_guard, fork_timeline_guard,
+    lookup_provider, ProviderRegistry,
 };
 use super::side_chat::{codex_initialize, codex_mcp_servers, spawn_claude_sidecar, spawn_codex};
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Where the fork goes and from which point, validated against the source.
-/// Holds the source still (see [`hold_thread_for_fork`]) until it drops, so
+/// Holds the source still (see [`fork_dispatch_guard`]) until it drops, so
 /// the provider's copy and the transcript copy see the same conversation.
 struct ForkPlan {
     _source_guards: (OwnedMutexGuard<()>, OwnedMutexGuard<()>),
     live: Arc<dyn AgentProvider>,
+    /// Whether the provider held a session for the source when planned.
+    /// With dispatch held none can start, so this never goes stale towards
+    /// "no session" (see [`source_busy`]).
+    session_live: bool,
     /// The source's newest user message when the fork was planned.
     user_head: Option<i64>,
     source: AgentChatSessionRecord,
@@ -91,9 +96,9 @@ async fn plan_fork<R: Runtime>(
 ) -> Result<ForkPlan, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
-    // Hold the source still before reading it: no send, revert, restart or
-    // handoff can change it between these checks and the transcript copy.
-    let source_guards = hold_thread_for_fork(app, source_thread_id).await;
+    // Hold the source still before reading it: no send, restart or handoff
+    // can change it between these checks and the transcript copy.
+    let dispatch = fork_dispatch_guard(app, source_thread_id).await;
     let db: State<'_, DatabaseStore> = app.state();
     let source = db
         .get_agent_chat_session(source_thread_id)
@@ -152,11 +157,16 @@ async fn plan_fork<R: Runtime>(
     }
     let registry: State<'_, ProviderRegistry> = app.state();
     let live = lookup_provider(&registry, provider).await?;
+    // Asked before the timeline lock: a Codex session answers once its
+    // outbound lock frees, and a queued turn can hold that while it waits
+    // for the timeline.
+    let session_live = live.has_session(&ThreadId(source_thread_id.to_string())).await;
+    let timeline = fork_timeline_guard(source_thread_id).await;
     // Baseline first, then idle: a queued turn the provider starts on its
     // own after this point either still runs or has moved the head when
     // `settled_bound` looks again.
     let (_, user_head) = db.agent_chat_fork_heads(source_thread_id);
-    if source_busy(&*live, &db, source_thread_id).await? {
+    if source_busy(&*live, session_live, &db, source_thread_id).await? {
         return Err(BUSY.into());
     }
     let cut = match (before_message_id, provider) {
@@ -177,8 +187,9 @@ async fn plan_fork<R: Runtime>(
         }
     };
     Ok(ForkPlan {
-        _source_guards: source_guards,
+        _source_guards: (dispatch, timeline),
         live,
+        session_live,
         user_head,
         source,
         provider,
@@ -195,18 +206,20 @@ const BUSY: &str = "Wait for the current turn and any queued messages to finish,
 /// Whether the source has a turn running or queued messages still to send.
 /// A queued turn can finish before its dispatch is acknowledged (and its
 /// user message written), so the queue journal counts too, but only while
-/// the provider holds a live session: entries a crash left behind can't
-/// dispatch and must not block forks forever.
+/// the provider holds a session (`session_live`): entries a crash left
+/// behind can't dispatch and must not block forks forever. `turn_active`
+/// reads session state only, never the outbound lock, so it is safe under
+/// the timeline guard.
 async fn source_busy(
     live: &dyn AgentProvider,
+    session_live: bool,
     db: &DatabaseStore,
     thread: &str,
 ) -> Result<bool, String> {
-    let thread_id = ThreadId(thread.to_string());
-    if live.turn_active(&thread_id).await {
+    if live.turn_active(&ThreadId(thread.to_string())).await {
         return Ok(true);
     }
-    Ok(live.has_session(&thread_id).await && !db.control_unresolved_queued_ids(thread)?.is_empty())
+    Ok(session_live && !db.control_unresolved_queued_ids(thread)?.is_empty())
 }
 
 /// After the provider forked, confirm the source is still where the plan
@@ -217,7 +230,7 @@ async fn source_busy(
 async fn settled_bound(plan: &ForkPlan, db: &DatabaseStore) -> Result<Option<i64>, String> {
     let thread = &plan.source.thread_id;
     let (head, user_head) = db.agent_chat_fork_heads(thread);
-    if user_head != plan.user_head || source_busy(&*plan.live, db, thread).await? {
+    if user_head != plan.user_head || source_busy(&*plan.live, plan.session_live, db, thread).await? {
         return Err(format!("The chat started another turn while it was being forked. {BUSY}"));
     }
     Ok(match plan.cut.before() {
