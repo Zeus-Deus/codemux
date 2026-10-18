@@ -3738,6 +3738,7 @@ impl DatabaseStore {
             params![old_thread_id, new_thread_id],
         )
         .map_err(|e| format!("Failed to migrate agent_chat_messages: {e}"))?;
+        turn_diffs::move_to_thread(&conn, "thread_id = ?1", params![old_thread_id, new_thread_id])?;
         conn.execute(
             "DELETE FROM agent_chat_sessions WHERE thread_id = ?1",
             params![old_thread_id],
@@ -4577,6 +4578,14 @@ impl DatabaseStore {
             params![sdk_session_id, survivor],
         )
         .map_err(|e| format!("Failed to migrate duplicate session messages: {e}"))?;
+        turn_diffs::move_to_thread(
+            &transaction,
+            "thread_id IN (
+                 SELECT thread_id FROM agent_chat_sessions
+                 WHERE sdk_session_id = ?1 AND thread_id != ?2
+             )",
+            params![sdk_session_id, survivor],
+        )?;
         // Delete the non-survivors.
         transaction.execute(
             "DELETE FROM agent_chat_sessions

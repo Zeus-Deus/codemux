@@ -91,6 +91,23 @@ fn turn_diff_by_id(conn: &Connection, id: i64) -> Result<AgentChatTurnDiffRecord
 /// Refs a deleted row leaves behind: `(repo_path, ref_name)`.
 pub type TurnDiffRefs = Vec<(String, String)>;
 
+/// Hand a merged-away thread's turn diffs to the thread its transcript moved
+/// to, before the cascade would drop them. `filter` selects the source rows
+/// and must bind the survivor's thread id as `?2`. Rows keep their own ref
+/// names, so their snapshots stay where they are.
+pub(super) fn move_to_thread(
+    conn: &Connection,
+    filter: &str,
+    params: impl rusqlite::Params,
+) -> Result<(), String> {
+    conn.execute(
+        &format!("UPDATE agent_chat_turn_diffs SET thread_id = ?2 WHERE {filter}"),
+        params,
+    )
+    .map(|_| ())
+    .map_err(|e| format!("Failed to migrate turn diffs: {e}"))
+}
+
 impl DatabaseStore {
     /// Record an accepted dispatch's `before` snapshot, then drop rows past
     /// the newest `keep` for the thread. Returns the new row and the refs the
@@ -229,18 +246,25 @@ impl DatabaseStore {
         .ok()
     }
 
-    /// Repositories holding a thread's turn-diff refs, for cleanup when the
-    /// thread is deleted.
-    pub fn agent_chat_turn_diff_repos(&self, thread_id: &str) -> Vec<String> {
+    /// Every ref a thread's rows hold, for cleanup when the thread is
+    /// deleted. Rows merged in from another thread keep refs named after it.
+    pub fn agent_chat_turn_diff_refs(&self, thread_id: &str) -> TurnDiffRefs {
         let conn = self.conn.lock().unwrap();
         let Ok(mut statement) = conn.prepare(
-            "SELECT DISTINCT repo_path FROM agent_chat_turn_diffs WHERE thread_id = ?1",
+            "SELECT repo_path, before_ref, after_ref FROM agent_chat_turn_diffs
+             WHERE thread_id = ?1",
         ) else {
             return Vec::new();
         };
         statement
-            .query_map(params![thread_id], |row| row.get(0))
-            .map(|rows| rows.filter_map(Result::ok).collect())
+            .query_map(params![thread_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
+            .map(|rows| {
+                rows.filter_map(Result::ok)
+                    .flat_map(|(repo, before, after)| [(repo.clone(), before), (repo, after)])
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -298,10 +322,35 @@ mod tests {
             ]
         );
         assert!(db.get_agent_chat_turn_diff("t", "turn-1").is_none());
-        assert_eq!(db.agent_chat_turn_diff_repos("t"), vec!["/repo".to_string()]);
+        assert_eq!(db.agent_chat_turn_diff_refs("t").len(), 4);
 
         db.delete_agent_chat_session("t").unwrap();
         assert!(db.open_agent_chat_turn_diffs("t").is_empty());
-        assert!(db.agent_chat_turn_diff_repos("t").is_empty());
+        assert!(db.agent_chat_turn_diff_refs("t").is_empty());
+    }
+
+    #[test]
+    fn resumed_sessions_keep_their_turn_diffs() {
+        let db = DatabaseStore::new_in_memory();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('old', 'sdk-1', 'ws', 'codex', '2025-01-01', '2025-01-01'),
+                        ('new', 'sdk-1', 'ws', 'codex', '2025-03-01', '2025-03-01')",
+            )
+            .unwrap();
+        }
+        let (row, _) = db.insert_agent_chat_turn_diff(&new_row("old", "n1", "1"), 10).unwrap();
+        db.bind_agent_chat_turn_diff("old", "n1", "turn-1").unwrap();
+        db.collapse_duplicate_agent_chat_sessions("sdk-1").unwrap();
+        let moved = db.get_agent_chat_turn_diff("new", "turn-1").unwrap();
+        assert_eq!(moved.id, row.id);
+        assert_eq!(moved.before_ref, row.before_ref);
+
+        db.upsert_agent_chat_session("other", "ws", None, "codex").unwrap();
+        db.migrate_agent_chat_session("new", "other").unwrap();
+        assert_eq!(db.get_agent_chat_turn_diff("other", "turn-1").unwrap().id, row.id);
     }
 }

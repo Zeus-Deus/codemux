@@ -17,9 +17,10 @@
 //! holds whichever comes early.
 //!
 //! Unlike the opt-in revert checkpoints, capture is always on for local git
-//! workspaces: a snapshot is a stat-cached `git add -A` into a private index
-//! plus `commit-tree`, and only the newest [`KEEP_PER_THREAD`] turns keep
-//! their refs.
+//! workspaces: a snapshot is `git add -A` into a per-thread private index
+//! whose stat cache persists, so only files changed since the last snapshot
+//! are read, plus `commit-tree`. Only the newest [`KEEP_PER_THREAD`] turns
+//! keep their refs.
 
 use crate::agent_provider::{ProviderError, TurnDispatchCheckpoint};
 use crate::database::turn_diffs::{AgentChatTurnDiffRecord, NewAgentChatTurnDiff};
@@ -127,13 +128,16 @@ fn settle(db: &DatabaseStore, row: &AgentChatTurnDiffRecord) -> Result<(), Strin
     if row.after_commit.is_some() {
         return Ok(());
     }
-    let repo = Path::new(&row.repo_path);
-    let Some(snapshot) =
-        crate::git::git_checkpoint_create(repo, &row.after_ref, "codemux turn diff: after turn")?
+    let Some(after) = crate::turn_diff::snapshot(
+        Path::new(&row.repo_path),
+        &row.thread_id,
+        &row.after_ref,
+        "codemux turn diff: after turn",
+    )?
     else {
         return Ok(());
     };
-    db.close_agent_chat_turn_diff(row.id, &snapshot.snapshot_commit)?;
+    db.close_agent_chat_turn_diff(row.id, &after)?;
     Ok(())
 }
 
@@ -146,8 +150,9 @@ fn snapshot_before_dispatch(
     let _guard = lock.lock().unwrap();
     let token = unique_token();
     let before_ref = turn_diff_ref_name(thread_id, &token, "before");
-    let Some(snapshot) = crate::git::git_checkpoint_create(
+    let Some(before) = crate::turn_diff::snapshot(
         Path::new(repo_path),
+        thread_id,
         &before_ref,
         "codemux turn diff: before turn",
     )?
@@ -158,12 +163,8 @@ fn snapshot_before_dispatch(
     // yet. This snapshot is exactly its end state.
     for open in db.open_agent_chat_turn_diffs(thread_id) {
         if open.repo_path == repo_path {
-            crate::turn_diff::point_ref(
-                Path::new(repo_path),
-                &open.after_ref,
-                &snapshot.snapshot_commit,
-            )?;
-            db.close_agent_chat_turn_diff(open.id, &snapshot.snapshot_commit)?;
+            crate::turn_diff::point_ref(Path::new(repo_path), &open.after_ref, &before)?;
+            db.close_agent_chat_turn_diff(open.id, &before)?;
         } else {
             settle(db, &open)?;
         }
@@ -171,7 +172,7 @@ fn snapshot_before_dispatch(
     Ok(Some(PendingSnapshot {
         repo_path: repo_path.to_string(),
         before_ref,
-        before_commit: snapshot.snapshot_commit,
+        before_commit: before,
         after_ref: turn_diff_ref_name(thread_id, &token, "after"),
     }))
 }
@@ -281,25 +282,54 @@ pub(crate) fn on_turn_completed<R: Runtime>(app: &AppHandle<R>, thread_id: &str,
     });
 }
 
-/// Repositories that may hold a thread's turn-diff refs. Read before the
+/// Git state a thread's turn diffs hold outside SQLite. Read it before the
 /// thread's rows are deleted.
-pub(crate) fn thread_repos(db: &DatabaseStore, thread_id: &str) -> Vec<String> {
-    let mut repos = db.agent_chat_turn_diff_repos(thread_id);
-    if let Some(cwd) = db.get_agent_chat_session(thread_id).and_then(|s| s.cwd) {
-        if !repos.contains(&cwd) {
-            repos.push(cwd);
-        }
-    }
-    repos
+pub(crate) struct ThreadCleanup {
+    thread_id: String,
+    /// Refs the rows name, including rows merged in from other threads.
+    refs: Vec<(String, String)>,
+    /// Repositories to sweep for refs and the snapshot index named after
+    /// this thread.
+    repos: Vec<String>,
 }
 
-/// Drop a deleted thread's refs and in-memory capture state.
-pub(crate) fn forget_thread(thread_id: &str, repos: &[String]) {
+pub(crate) fn thread_cleanup(db: &DatabaseStore, thread_id: &str) -> ThreadCleanup {
+    let refs = db.agent_chat_turn_diff_refs(thread_id);
+    let mut repos: Vec<String> = refs.iter().map(|(repo, _)| repo.clone()).collect();
+    repos.extend(db.get_agent_chat_session(thread_id).and_then(|s| s.cwd));
+    repos.sort();
+    repos.dedup();
+    ThreadCleanup {
+        thread_id: thread_id.to_string(),
+        refs,
+        repos,
+    }
+}
+
+/// Drop a deleted thread's refs, snapshot indexes and capture state.
+pub(crate) fn forget_thread(cleanup: ThreadCleanup) {
+    let thread_id = &cleanup.thread_id;
     captures().lock().unwrap().remove(thread_id);
-    for repo in repos {
-        if let Err(error) = crate::turn_diff::delete_thread_refs(Path::new(repo), thread_id) {
+    for repo in &cleanup.repos {
+        let listed = cleanup
+            .refs
+            .iter()
+            .filter(|(owner, _)| owner == repo)
+            .map(|(_, name)| name.as_str());
+        let swept = crate::turn_diff::delete_refs(Path::new(repo), listed)
+            .and_then(|_| crate::turn_diff::delete_thread_refs(Path::new(repo), thread_id));
+        if let Err(error) = swept {
             eprintln!("[codemux::turn_diff] failed to delete refs for {thread_id}: {error}");
         }
+    }
+}
+
+/// A thread merged into another on resume: its rows (and the refs they
+/// name) now belong to the survivor, so only per-thread caches go.
+pub(crate) fn forget_merged_thread(thread_id: &str, repos: &[String]) {
+    captures().lock().unwrap().remove(thread_id);
+    for repo in repos {
+        crate::turn_diff::forget_snapshot_index(Path::new(repo), thread_id);
     }
 }
 

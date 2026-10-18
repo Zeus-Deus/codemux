@@ -6536,12 +6536,12 @@ pub async fn agent_chat_delete_session<R: Runtime>(
             ),
         ]
     }));
-    let turn_diff_repos = super::turn_diff::thread_repos(&db, &thread_id);
+    let turn_diff_cleanup = super::turn_diff::thread_cleanup(&db, &thread_id);
     db.delete_agent_chat_session(&thread_id)?;
     super::async_questions::publish_attention(&app);
     // The thread is gone; its dispatch lock can never be contended again.
     forget_turn_checkpoint_lock(&thread_id);
-    super::turn_diff::forget_thread(&thread_id, &turn_diff_repos);
+    super::turn_diff::forget_thread(turn_diff_cleanup);
     for (repo_path, ref_name) in checkpoint_refs {
         if let Err(error) =
             crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
@@ -6560,7 +6560,7 @@ fn cleanup_collapsed_session_resources(cleanup: crate::database::AgentChatSessio
         forget_turn_checkpoint_lock(thread_id);
         let repos = cleanup.repo_paths.iter().filter(|(id, _)| id == thread_id);
         let repos = repos.map(|(_, repo)| repo.clone()).collect::<Vec<_>>();
-        super::turn_diff::forget_thread(thread_id, &repos);
+        super::turn_diff::forget_merged_thread(thread_id, &repos);
     }
     let mut refs = cleanup
         .checkpoint_refs

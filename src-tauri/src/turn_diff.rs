@@ -1,20 +1,22 @@
 //! Per-turn git diffs between two worktree snapshots.
 //!
-//! An agent turn is bracketed by two snapshots taken with
-//! [`crate::git::git_checkpoint_create`]: one right before the turn is
-//! dispatched and one when it settles. Both are full worktree trees
+//! An agent turn is bracketed by two [`snapshot`]s: one right before the
+//! turn is dispatched and one when it settles. Both are full worktree trees
 //! (tracked changes plus untracked, non-ignored files), so diffing them
 //! yields exactly what the turn changed, new files included, without
 //! touching the user's index or stash. Snapshots are anchored under
 //! [`TURN_DIFF_REF_PREFIX`] so `git gc` keeps them.
 //!
 //! Paths are relative to the repository root. Patches are capped per file
-//! and per turn so a generated lockfile or a vendored blob cannot balloon
-//! the IPC payload; the stats are always complete.
+//! and per turn while git's output is read, so a generated lockfile or a
+//! vendored blob can balloon neither memory nor the IPC payload; the stats
+//! are always complete.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use std::process::Command;
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// Ref namespace for per-turn diff snapshots:
 /// `<prefix>/<thread>/<token>/{before,after}`.
@@ -100,11 +102,32 @@ fn thread_ref_prefix(thread_id: &str) -> String {
     )
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = Command::new("git")
+/// Run git in `repo`, optionally against a private index and with `stdin`.
+fn git_with(
+    repo: &Path,
+    args: &[&str],
+    index: Option<&Path>,
+    stdin: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(repo)
-        .output()
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        pipe.write_all(input)
+            .map_err(|e| format!("Failed to write to git: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
         .map_err(|e| format!("Failed to run git: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -117,6 +140,149 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(output.stdout)
 }
 
+fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    git_with(repo, args, None, None)
+}
+
+fn git_line(repo: &Path, args: &[&str]) -> Result<String, String> {
+    git(repo, args).map(|out| String::from_utf8_lossy(&out).trim_end().to_string())
+}
+
+fn git_path(repo: &Path, path: &str) -> Result<PathBuf, String> {
+    git_line(repo, &["rev-parse", "--path-format=absolute", "--git-path", path]).map(PathBuf::from)
+}
+
+/// The private index a thread's snapshots are staged through. It persists
+/// between snapshots, so git's stat cache spares unchanged files (untracked
+/// ones included) from being read and hashed again on every turn.
+fn snapshot_index(repo: &Path, thread_id: &str) -> Result<PathBuf, String> {
+    git_path(
+        repo,
+        &format!(
+            "codemux/turn-diff-index/{}",
+            crate::git::sanitize_ref_component(thread_id)
+        ),
+    )
+}
+
+/// Start a snapshot index from the real one, so the first snapshot only
+/// hashes what differs from it. The copy keeps the real index's mtime: git
+/// trusts a cached stat only when the entry is older than its index, and a
+/// fresh mtime would wrongly trust entries written in the same second.
+fn seed_snapshot_index(repo: &Path, index: &Path) -> Result<(), String> {
+    if let Some(parent) = index.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create snapshot index dir: {e}"))?;
+    }
+    let real = git_path(repo, "index")?;
+    let Ok(mtime) = std::fs::metadata(&real).and_then(|m| m.modified()) else {
+        // No real index (fresh repository): start empty.
+        return Ok(());
+    };
+    let copied = std::fs::copy(&real, index).is_ok()
+        && std::fs::OpenOptions::new()
+            .write(true)
+            .open(index)
+            .and_then(|file| file.set_modified(mtime))
+            .is_ok();
+    if !copied {
+        // Without a trustworthy stat cache, hash everything once instead.
+        let _ = std::fs::remove_file(index);
+    }
+    Ok(())
+}
+
+fn nul_pathspecs<'a>(paths: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut specs = Vec::new();
+    for path in paths {
+        specs.extend_from_slice(b":(top,literal)");
+        specs.extend_from_slice(path);
+        specs.push(0);
+    }
+    specs
+}
+
+/// `git add -A` follows `.gitignore` only for files not yet in the index,
+/// and the private index keeps whatever it once staged. Make its ignored
+/// entries match the real index's: drop files that became ignored after
+/// they were first captured, and pick up ignored files the user force-added.
+fn sync_ignored(repo: &Path, index: &Path) -> Result<(), String> {
+    let ignored_args = ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"];
+    let staged = git_with(repo, &ignored_args, Some(index), None)?;
+    let tracked = git(repo, &ignored_args)?;
+    let staged: HashSet<&[u8]> = staged.split(|b| *b == 0).filter(|p| !p.is_empty()).collect();
+    let tracked: HashSet<&[u8]> = tracked.split(|b| *b == 0).filter(|p| !p.is_empty()).collect();
+
+    let stale = nul_pathspecs(staged.difference(&tracked).copied());
+    if !stale.is_empty() {
+        let args = [
+            "rm",
+            "--cached",
+            "-q",
+            "-f",
+            "--ignore-unmatch",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ];
+        git_with(repo, &args, Some(index), Some(&stale))?;
+    }
+    let missing = nul_pathspecs(tracked.difference(&staged).copied().filter(|path| {
+        std::fs::symlink_metadata(repo.join(String::from_utf8_lossy(path).as_ref())).is_ok()
+    }));
+    if !missing.is_empty() {
+        let args = ["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"];
+        git_with(repo, &args, Some(index), Some(&missing))?;
+    }
+    Ok(())
+}
+
+/// Snapshot the full worktree of the repository containing `repo_path`
+/// (tracked and untracked files, `.gitignore` respected) as a parentless
+/// commit anchored at `ref_name`. The user's index, worktree and stash are
+/// never touched, no hooks run, and a repository without commits works too.
+/// `Ok(None)` when `repo_path` is not inside a git worktree.
+pub fn snapshot(
+    repo_path: &Path,
+    thread_id: &str,
+    ref_name: &str,
+    message: &str,
+) -> Result<Option<String>, String> {
+    let Ok(toplevel) = git_line(repo_path, &["rev-parse", "--show-toplevel"]) else {
+        return Ok(None);
+    };
+    let repo = PathBuf::from(toplevel);
+    let index = snapshot_index(&repo, thread_id)?;
+    if !index.exists() {
+        seed_snapshot_index(&repo, &index)?;
+    }
+    let staged = git_with(&repo, &["add", "-A"], Some(&index), None)
+        .and_then(|_| sync_ignored(&repo, &index))
+        .and_then(|_| git_with(&repo, &["write-tree"], Some(&index), None));
+    let tree = match staged {
+        Ok(tree) => String::from_utf8_lossy(&tree).trim().to_string(),
+        Err(error) => {
+            // It is only a cache: rebuild it from scratch next time.
+            let _ = std::fs::remove_file(&index);
+            return Err(error);
+        }
+    };
+    let commit = git_line(
+        &repo,
+        &[
+            "-c",
+            "user.name=Codemux",
+            "-c",
+            "user.email=checkpoint@codemux.invalid",
+            "commit-tree",
+            &tree,
+            "-m",
+            message,
+        ],
+    )?;
+    git(&repo, &["update-ref", ref_name, &commit])?;
+    Ok(Some(commit))
+}
+
 /// Point `ref_name` at an existing snapshot commit, so one snapshot can end
 /// one turn and start the next under refs each row owns.
 pub fn point_ref(repo: &Path, ref_name: &str, commit: &str) -> Result<(), String> {
@@ -127,45 +293,35 @@ pub fn delete_ref(repo: &Path, ref_name: &str) -> Result<(), String> {
     git(repo, &["update-ref", "-d", ref_name]).map(|_| ())
 }
 
-/// Drop every turn-diff ref a thread left in `repo`, including any a crash
-/// orphaned before its row was written.
-pub fn delete_thread_refs(repo: &Path, thread_id: &str) -> Result<(), String> {
-    let listed = git(
-        repo,
-        &["for-each-ref", "--format=%(refname)", &thread_ref_prefix(thread_id)],
-    )?;
-    let commands: String = String::from_utf8_lossy(&listed)
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| format!("delete {line}\n"))
+/// Delete many refs in one git call. Missing refs are not an error.
+pub fn delete_refs<'a>(repo: &Path, refs: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    let commands: String = refs
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("delete {name}\n"))
         .collect();
     if commands.is_empty() {
         return Ok(());
     }
-    let mut child = Command::new("git")
-        .args(["update-ref", "--stdin"])
-        .current_dir(repo)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run git: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin
-            .write_all(commands.as_bytes())
-            .map_err(|e| format!("Failed to write ref deletions: {e}"))?;
+    git_with(repo, &["update-ref", "--stdin"], None, Some(commands.as_bytes())).map(|_| ())
+}
+
+/// Drop a thread's snapshot index, a cache that is rebuilt on demand.
+pub fn forget_snapshot_index(repo: &Path, thread_id: &str) {
+    if let Ok(index) = snapshot_index(repo, thread_id) {
+        let _ = std::fs::remove_file(index);
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to run git: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git update-ref failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
+}
+
+/// Drop every turn-diff ref named after a thread in `repo`, including any a
+/// crash orphaned before its row was written, and its snapshot index.
+pub fn delete_thread_refs(repo: &Path, thread_id: &str) -> Result<(), String> {
+    forget_snapshot_index(repo, thread_id);
+    let listed = git(
+        repo,
+        &["for-each-ref", "--format=%(refname)", &thread_ref_prefix(thread_id)],
+    )?;
+    delete_refs(repo, String::from_utf8_lossy(&listed).lines())
 }
 
 /// Options shared by every diff call, so the raw, numstat and patch passes
@@ -279,22 +435,6 @@ fn parse_numstat(out: &[u8]) -> Result<Vec<Option<(u64, u64)>>, String> {
     Ok(stats)
 }
 
-/// Split a multi-file patch at its `diff --git` headers. Every other patch
-/// line starts with a space, `+`, `-`, `@`, `\` or a header keyword, so the
-/// split is unambiguous.
-fn split_patch(text: &str) -> Vec<String> {
-    let mut chunks: Vec<String> = Vec::new();
-    for line in text.split_inclusive('\n') {
-        if line.starts_with("diff --git ") || chunks.is_empty() {
-            chunks.push(String::new());
-        }
-        if let Some(chunk) = chunks.last_mut() {
-            chunk.push_str(line);
-        }
-    }
-    chunks
-}
-
 fn literal_pathspec(path: &str) -> String {
     format!(":(top,literal){path}")
 }
@@ -307,32 +447,148 @@ fn pathspecs(file: &TurnDiffFile) -> Vec<String> {
     specs
 }
 
-fn patch_for(repo: &Path, from: &str, to: &str, specs: &[String]) -> Result<String, String> {
+/// One file's share of a patch run.
+#[derive(Debug, PartialEq, Eq)]
+enum PatchChunk {
+    Patch(String),
+    TooLarge,
+    Budget,
+}
+
+/// Turn one file's collected bytes into its chunk, charging the turn budget.
+/// Once a patch does not fit, the budget is spent: later files get none.
+fn finish_chunk(bytes: Option<Vec<u8>>, budget: &mut usize) -> PatchChunk {
+    match bytes {
+        None => PatchChunk::TooLarge,
+        Some(bytes) if bytes.len() > *budget => {
+            *budget = 0;
+            PatchChunk::Budget
+        }
+        Some(bytes) => {
+            *budget -= bytes.len();
+            PatchChunk::Patch(String::from_utf8_lossy(&bytes).into_owned())
+        }
+    }
+}
+
+/// Run one patch call for `specs` and split it per file while reading, at
+/// the `diff --git` headers (every other patch line starts with a space,
+/// `+`, `-`, `@`, `\` or a header keyword). A file's bytes are dropped as
+/// soon as they pass the per-file cap, and git is stopped once the turn
+/// budget is spent, so memory stays bounded whatever the files hold. A line
+/// is at most one text blob line, which `core.bigFileThreshold` bounds.
+/// The second value is whether reading stopped early.
+fn stream_patches(
+    repo: &Path,
+    from: &str,
+    to: &str,
+    specs: &[String],
+    budget: &mut usize,
+) -> Result<(Vec<PatchChunk>, bool), String> {
     let mut args = diff_args(&["--src-prefix=a/", "--dst-prefix=b/"], from, to);
     args.push("--");
     args.extend(specs.iter().map(String::as_str));
-    git(repo, &args).map(|out| String::from_utf8_lossy(&out).into_owned())
+    let mut child = Command::new("git")
+        .args(&args)
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    let stdout = child.stdout.take().ok_or("git diff has no output pipe")?;
+    let mut reader = BufReader::new(stdout);
+    let mut chunks = Vec::new();
+    // `None` once the file being read is over the per-file cap.
+    let mut current: Option<Option<Vec<u8>>> = None;
+    let mut line = Vec::new();
+    let mut stopped = false;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| format!("Failed to read git diff: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        if line.starts_with(b"diff --git ") || current.is_none() {
+            if let Some(done) = current.take() {
+                chunks.push(finish_chunk(done, budget));
+            }
+            if *budget == 0 {
+                stopped = true;
+                break;
+            }
+            current = Some(Some(Vec::new()));
+        }
+        if let Some(slot) = current.as_mut() {
+            match slot {
+                Some(bytes) if bytes.len() + line.len() > MAX_FILE_PATCH_BYTES => *slot = None,
+                Some(bytes) => bytes.extend_from_slice(&line),
+                None => {}
+            }
+        }
+    }
+    if let Some(done) = current.take() {
+        chunks.push(finish_chunk(done, budget));
+    }
+    if stopped {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    if !stopped && !status.success() {
+        return Err(format!("git diff failed: {status}"));
+    }
+    Ok((chunks, stopped))
 }
 
-/// Patches for `files`, in order. One git call per batch; if git's output
+/// Patches for `files`, in order. One git call per batch; if a complete run
 /// does not split into exactly one chunk per file, fetch that batch's files
-/// one by one instead of guessing which chunk is whose.
+/// one by one instead of guessing which chunk is whose. Files after the
+/// budget runs out get [`PatchChunk::Budget`] without asking git.
 fn fetch_patches(
     repo: &Path,
     from: &str,
     to: &str,
     files: &[&TurnDiffFile],
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<PatchChunk>, String> {
+    let mut budget = MAX_TOTAL_PATCH_BYTES;
     let mut patches = Vec::with_capacity(files.len());
     for batch in files.chunks(PATCH_BATCH) {
+        if budget == 0 {
+            patches.extend(batch.iter().map(|_| PatchChunk::Budget));
+            continue;
+        }
         let specs: Vec<String> = batch.iter().flat_map(|file| pathspecs(file)).collect();
-        let chunks = split_patch(&patch_for(repo, from, to, &specs)?);
-        if chunks.len() == batch.len() {
+        let (mut chunks, stopped) = stream_patches(repo, from, to, &specs, &mut budget)?;
+        if stopped || chunks.len() == batch.len() {
+            chunks.truncate(batch.len());
+            chunks.resize_with(batch.len(), || PatchChunk::Budget);
             patches.extend(chunks);
             continue;
         }
+        // Undo the mismatched run's charges before fetching file by file.
+        budget += chunks
+            .iter()
+            .map(|chunk| match chunk {
+                PatchChunk::Patch(text) => text.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
         for file in batch {
-            patches.push(patch_for(repo, from, to, &pathspecs(file))?);
+            if budget == 0 {
+                patches.push(PatchChunk::Budget);
+                continue;
+            }
+            let (chunks, _) = stream_patches(repo, from, to, &pathspecs(file), &mut budget)?;
+            patches.push(
+                chunks
+                    .into_iter()
+                    .next()
+                    .unwrap_or(PatchChunk::Patch(String::new())),
+            );
         }
     }
     Ok(patches)
@@ -393,17 +649,12 @@ pub fn diff_snapshots(repo: &Path, from: &str, to: &str) -> Result<TurnDiff, Str
     }
     let selected: Vec<&TurnDiffFile> = wanted.iter().map(|&index| &diff.files[index]).collect();
     let patches = fetch_patches(repo, from, to, &selected)?;
-
-    let mut bytes_budget = MAX_TOTAL_PATCH_BYTES;
     for (index, patch) in wanted.into_iter().zip(patches) {
         let file = &mut diff.files[index];
-        if patch.len() > MAX_FILE_PATCH_BYTES {
-            file.patch_omitted = Some(TurnDiffPatchOmitted::TooLarge);
-        } else if patch.len() > bytes_budget {
-            file.patch_omitted = Some(TurnDiffPatchOmitted::Budget);
-        } else {
-            bytes_budget -= patch.len();
-            file.patch = Some(patch);
+        match patch {
+            PatchChunk::Patch(text) => file.patch = Some(text),
+            PatchChunk::TooLarge => file.patch_omitted = Some(TurnDiffPatchOmitted::TooLarge),
+            PatchChunk::Budget => file.patch_omitted = Some(TurnDiffPatchOmitted::Budget),
         }
     }
     diff.truncated |= diff
@@ -443,11 +694,10 @@ mod tests {
         (dir, repo)
     }
 
-    fn snapshot(repo: &Path, side: &str) -> String {
-        crate::git::git_checkpoint_create(repo, &turn_diff_ref_name("thread", "t1", side), "test")
+    fn snap(repo: &Path, side: &str) -> String {
+        snapshot(repo, "thread", &turn_diff_ref_name("thread", "t1", side), "test")
             .unwrap()
             .unwrap()
-            .snapshot_commit
     }
 
     fn file<'a>(diff: &'a TurnDiff, path: &str) -> &'a TurnDiffFile {
@@ -462,7 +712,7 @@ mod tests {
         let (_dir, repo) = init_repo();
         // Pre-existing dirty state belongs to the user, not the turn.
         fs::write(repo.join("keep.txt"), "one\ntwo\nthree\nuser edit\n").unwrap();
-        let before = snapshot(&repo, "before");
+        let before = snap(&repo, "before");
 
         fs::write(repo.join("keep.txt"), "one\nTWO\nthree\nuser edit\n").unwrap();
         fs::remove_file(repo.join("gone.txt")).unwrap();
@@ -472,7 +722,7 @@ mod tests {
         fs::write(repo.join("logo.bin"), [0u8, 159, 146, 150, 0, 1]).unwrap();
         fs::create_dir_all(repo.join("ignored")).unwrap();
         fs::write(repo.join("ignored/cache.txt"), "noise\n").unwrap();
-        let after = snapshot(&repo, "after");
+        let after = snap(&repo, "after");
 
         let diff = diff_snapshots(&repo, &before, &after).unwrap();
         assert_eq!(diff.files_changed, 5, "{:?}", diff.files);
@@ -513,7 +763,7 @@ mod tests {
     #[test]
     fn turn_diff_withholds_oversized_patches_but_keeps_stats() {
         let (_dir, repo) = init_repo();
-        let before = snapshot(&repo, "before");
+        let before = snap(&repo, "before");
         let lines = (MAX_FILE_PATCH_LINES + 1) as usize;
         fs::write(
             repo.join("huge.txt"),
@@ -523,7 +773,7 @@ mod tests {
         // Over core.bigFileThreshold: git treats it as binary outright.
         fs::write(repo.join("blob.txt"), "a\n".repeat(3 * 1024 * 1024)).unwrap();
         fs::write(repo.join("small.txt"), "ok\n").unwrap();
-        let after = snapshot(&repo, "after");
+        let after = snap(&repo, "after");
 
         let diff = diff_snapshots(&repo, &before, &after).unwrap();
         let huge = file(&diff, "huge.txt");
@@ -538,10 +788,80 @@ mod tests {
     }
 
     #[test]
+    fn turn_diff_streams_patches_within_byte_caps() {
+        let (_dir, repo) = init_repo();
+        let before = snap(&repo, "before");
+        // One line, under the line and blob limits, over the per-file bytes.
+        // Sorted first, so it is read before the budget runs out.
+        fs::write(repo.join("a-wide.txt"), format!("{}\n", "x".repeat(MAX_FILE_PATCH_BYTES))).unwrap();
+        // Enough mid-sized files to spend the turn budget.
+        let body: String = (0..1000).map(|i| format!("{i:0>99}\n")).collect();
+        for i in 0..50 {
+            fs::write(repo.join(format!("mid-{i:02}.txt")), &body).unwrap();
+        }
+        let after = snap(&repo, "after");
+
+        let diff = diff_snapshots(&repo, &before, &after).unwrap();
+        let wide = file(&diff, "a-wide.txt");
+        assert_eq!(wide.additions, 1);
+        assert_eq!(wide.patch_omitted, Some(TurnDiffPatchOmitted::TooLarge));
+        let kept: usize = diff.files.iter().filter_map(|f| f.patch.as_ref()).map(String::len).sum();
+        assert!(kept <= MAX_TOTAL_PATCH_BYTES, "{kept}");
+        let spent = diff
+            .files
+            .iter()
+            .filter(|f| f.patch_omitted == Some(TurnDiffPatchOmitted::Budget))
+            .count();
+        assert!(spent > 0 && spent < 50, "{spent}");
+        // Budget is spent in order: no patch after the first omitted file.
+        let first_spent = diff
+            .files
+            .iter()
+            .position(|f| f.patch_omitted == Some(TurnDiffPatchOmitted::Budget))
+            .unwrap();
+        assert!(diff.files[first_spent..].iter().all(|f| f.patch.is_none()));
+        assert!(diff.truncated);
+        assert_eq!(diff.files_changed, 51);
+    }
+
+    #[test]
+    fn snapshot_works_before_the_first_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        run(repo, &["init", "-q", "-b", "main"]);
+        let before = snap(repo, "before");
+        fs::write(repo.join("hello.txt"), "hi\n").unwrap();
+        let after = snap(repo, "after");
+        let diff = diff_snapshots(repo, &before, &after).unwrap();
+        assert_eq!(file(&diff, "hello.txt").change, TurnDiffChange::Added);
+        // The user's index is untouched.
+        assert_eq!(run(repo, &["ls-files"]), "");
+    }
+
+    #[test]
+    fn snapshot_drops_files_that_became_ignored() {
+        let (_dir, repo) = init_repo();
+        fs::create_dir_all(repo.join("dist")).unwrap();
+        fs::write(repo.join("dist/app.js"), "built\n").unwrap();
+        let first = snap(&repo, "before");
+        let listed = |commit: &str| run(&repo, &["ls-tree", "-r", "--name-only", commit]);
+        assert!(listed(&first).contains("dist/app.js"));
+
+        fs::write(repo.join(".gitignore"), "ignored/\ndist/\n").unwrap();
+        let second = snap(&repo, "after");
+        assert!(!listed(&second).contains("dist/app.js"));
+
+        // An ignored file the user tracks stays.
+        run(&repo, &["add", "-f", "dist/app.js"]);
+        let third = snap(&repo, "after");
+        assert!(listed(&third).contains("dist/app.js"));
+    }
+
+    #[test]
     fn turn_diff_of_identical_snapshots_is_empty() {
         let (_dir, repo) = init_repo();
-        let before = snapshot(&repo, "before");
-        let after = snapshot(&repo, "after");
+        let before = snap(&repo, "before");
+        let after = snap(&repo, "after");
         assert_eq!(diff_snapshots(&repo, &before, &after).unwrap(), TurnDiff::default());
     }
 
@@ -551,9 +871,9 @@ mod tests {
         run(&repo, &["config", "diff.relative", "true"]);
         run(&repo, &["config", "diff.noprefix", "true"]);
         fs::create_dir_all(repo.join("sub")).unwrap();
-        let before = snapshot(&repo, "before");
+        let before = snap(&repo, "before");
         fs::write(repo.join("keep.txt"), "changed\n").unwrap();
-        let after = snapshot(&repo, "after");
+        let after = snap(&repo, "after");
         let diff = diff_snapshots(&repo.join("sub"), &before, &after).unwrap();
         let keep = file(&diff, "keep.txt");
         assert!(keep.patch.as_deref().unwrap().starts_with("diff --git a/keep.txt b/keep.txt"));
@@ -567,8 +887,14 @@ mod tests {
         let other = turn_diff_ref_name("thread-b", "1", "before");
         point_ref(&repo, &mine, &head).unwrap();
         point_ref(&repo, &other, &head).unwrap();
+        let index = snapshot_index(&repo, "thread-a").unwrap();
+        snapshot(&repo, "thread-a", &turn_diff_ref_name("thread-a", "2", "before"), "test")
+            .unwrap()
+            .unwrap();
+        assert!(index.exists());
         delete_thread_refs(&repo, "thread-a").unwrap();
         assert!(git(&repo, &["rev-parse", "--verify", "--quiet", &mine]).is_err());
+        assert!(!index.exists());
         assert_eq!(run(&repo, &["rev-parse", &other]), head);
         // Nothing left to delete is still a success.
         delete_thread_refs(&repo, "thread-a").unwrap();
