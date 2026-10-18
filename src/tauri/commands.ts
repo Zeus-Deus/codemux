@@ -13,6 +13,7 @@ export { Channel };
 import type {
   AgentBrowserSession,
   AgentChatProviderKind,
+  AgentChatTurnDiff,
   ModelSelection,
   OpenCodeAvailability,
   OpenCodeProviderEntry,
@@ -2396,6 +2397,15 @@ export const agentChatRevertTurnCheckpoint = (
  *  has started. */
 export const agentChatUndoTurnRevert = (threadId: string) =>
   invoke<void>("agent_chat_undo_turn_revert", { threadId });
+
+/** The git diff one agent turn made, by the turn id its transcript items
+ *  carry. `null` when the turn was not captured: not a git repository, a
+ *  device thread, or a turn from before capture (or since pruned). */
+export const agentChatGetTurnDiff = (threadId: string, turnId: string) =>
+  invoke<AgentChatTurnDiff | null>("agent_chat_get_turn_diff", {
+    threadId,
+    turnId,
+  });
 
 /**
  * Register a per-thread `Channel` that receives every live

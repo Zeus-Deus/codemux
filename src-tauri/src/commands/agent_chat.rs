@@ -253,6 +253,10 @@ struct AgentChatChannelEntry {
 pub struct AgentChatChannelRegistry {
     channels: Mutex<HashMap<String, Vec<AgentChatChannelEntry>>>,
     next_generation: AtomicU64,
+    /// Held while one payload goes to every channel of a thread, so two
+    /// producers (the event bridge and the send path) cannot interleave and
+    /// hand mirrored clients the same events in different orders.
+    fanout: Mutex<()>,
 }
 
 /// One authoritative Grok bill waiting for the immediately-following
@@ -3561,6 +3565,11 @@ async fn send_turn_internal<R: Runtime>(
         );
     }
     drop(invalidation_guard);
+    // Every local turn is also captured for its per-turn diff.
+    let cwd = db.get_agent_chat_session(&thread_id_for_persist).and_then(|s| s.cwd);
+    let nonce = input.client_nonce.as_deref();
+    let turn_checkpoint =
+        super::turn_diff::wrap_dispatch_checkpoint(&app, &thread_id_for_persist, cwd, nonce, turn_checkpoint);
     let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = match &control {
         Some(control) => Some(Arc::new(crate::agent_control::GuardedTurnCheckpoint {
             app: app.clone(), control: control.clone().retain_admission(&app), inner: turn_checkpoint,
@@ -3723,6 +3732,10 @@ async fn send_turn_internal<R: Runtime>(
                 input.client_nonce.as_deref(),
                 row_id,
             );
+            if !result.steered {
+                let nonce = input.client_nonce.as_deref();
+                super::turn_diff::on_turn_bound(&app, &thread_id_for_persist, nonce, &result.turn_id.0);
+            }
             // Then fan the row out to everyone watching this thread. The
             // sender already painted this bubble and drops the copy on its
             // nonce; any OTHER attached client (a second window, a paired
@@ -6527,10 +6540,12 @@ pub async fn agent_chat_delete_session<R: Runtime>(
             ),
         ]
     }));
+    let turn_diff_cleanup = super::turn_diff::thread_cleanup(&db, &thread_id);
     db.delete_agent_chat_session(&thread_id)?;
     super::async_questions::publish_attention(&app);
     // The thread is gone; its dispatch lock can never be contended again.
     forget_turn_checkpoint_lock(&thread_id);
+    super::turn_diff::forget_thread(turn_diff_cleanup);
     for (repo_path, ref_name) in checkpoint_refs {
         if let Err(error) =
             crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
@@ -6547,6 +6562,9 @@ fn cleanup_collapsed_session_resources(cleanup: crate::database::AgentChatSessio
             let _ = std::fs::remove_dir_all(dir);
         }
         forget_turn_checkpoint_lock(thread_id);
+        let repos = cleanup.repo_paths.iter().filter(|(id, _)| id == thread_id);
+        let repos = repos.map(|(_, repo)| repo.clone()).collect::<Vec<_>>();
+        super::turn_diff::forget_merged_thread(thread_id, &repos);
     }
     let mut refs = cleanup
         .checkpoint_refs
@@ -7250,6 +7268,10 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                 pending.client_nonce.as_deref(),
                 row_id,
             );
+            if !*steered {
+                let nonce = pending.client_nonce.as_deref();
+                super::turn_diff::on_turn_bound(app, &thread_id.0, nonce, &turn_id.0);
+            }
             // Fan the row out under its own id, so every attached client's
             // cursor moves over it instead of over it. Gated on a nonce
             // because the nonce IS the dedup key here: `TurnQueued` already
@@ -7300,9 +7322,13 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         return; // Duplicate of this turn's notice.
     }
     if let ProviderRuntimeEvent::TurnCompleted {
-        thread_id, status, ..
+        thread_id,
+        turn_id,
+        status,
+        ..
     } = &event
     {
+        super::turn_diff::on_turn_completed(app, &thread_id.0, &turn_id.0);
         if matches!(
             status,
             crate::agent_provider::TurnStatus::Error { subtype, .. }
@@ -7432,6 +7458,7 @@ pub(super) fn fan_out_to_thread_channels<R: Runtime>(
     payload: &AgentChatEventPayload,
 ) {
     let channels: State<'_, AgentChatChannelRegistry> = app.state();
+    let _in_order = channels.fanout.lock().expect("channel fan-out poisoned");
     for channel in channels.channels_for(&thread_id.0) {
         if let Err(error) = channel.send(payload.clone()) {
             eprintln!(

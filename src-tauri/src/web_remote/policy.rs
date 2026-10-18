@@ -110,6 +110,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "agent_chat_list_session_mentions"
             | "agent_chat_list_sessions"
             | "agent_chat_list_turn_checkpoints"
+            | "agent_chat_get_turn_diff"
             | "agent_chat_prime_mcp"
             | "agent_chat_question_attention"
             | "agent_chat_read_image"

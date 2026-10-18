@@ -9,6 +9,7 @@ pub mod custom_acp;
 pub(crate) mod local_sessions;
 mod delegation;
 pub mod pr_watch;
+pub mod turn_diffs;
 
 fn agent_chat_session(conn: &Connection, thread_id: &str) -> Option<AgentChatSessionRecord> {
         conn.query_row(
@@ -1169,6 +1170,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     follow_ups::create_schema(conn)?;
     pr_watch::create_schema(conn)?;
     automation_triggers::create_schema(conn)?;
+    turn_diffs::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new
@@ -3736,6 +3738,7 @@ impl DatabaseStore {
             params![old_thread_id, new_thread_id],
         )
         .map_err(|e| format!("Failed to migrate agent_chat_messages: {e}"))?;
+        turn_diffs::move_to_thread(&conn, "thread_id = ?1", params![old_thread_id, new_thread_id])?;
         conn.execute(
             "DELETE FROM agent_chat_sessions WHERE thread_id = ?1",
             params![old_thread_id],
@@ -4575,6 +4578,14 @@ impl DatabaseStore {
             params![sdk_session_id, survivor],
         )
         .map_err(|e| format!("Failed to migrate duplicate session messages: {e}"))?;
+        turn_diffs::move_to_thread(
+            &transaction,
+            "thread_id IN (
+                 SELECT thread_id FROM agent_chat_sessions
+                 WHERE sdk_session_id = ?1 AND thread_id != ?2
+             )",
+            params![sdk_session_id, survivor],
+        )?;
         // Delete the non-survivors.
         transaction.execute(
             "DELETE FROM agent_chat_sessions
