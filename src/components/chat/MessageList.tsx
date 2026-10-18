@@ -53,6 +53,7 @@ import { ChatForkMarker } from "./ChatFork";
 import { DelegationCard } from "./DelegationCard";
 import { SuggestedTasksCard } from "./SuggestedTasksCard";
 import { DelegationResultsDivider } from "./DelegationResultsDivider";
+import { ProviderSwitchDivider } from "./ProviderSwitchDivider";
 import { MessageTrail } from "./MessageTrail";
 import { PermissionRequestBlock } from "./PermissionRequestBlock";
 import { PlanProposalBlock } from "./PlanProposalBlock";
@@ -1934,6 +1935,10 @@ function ItemRow({
     isDelegationResultsText(item.text)
   ) {
     return <DelegationResultsDivider text={item.text} />;
+  }
+
+  if (item.kind === "provider_switch") {
+    return <ProviderSwitchDivider item={item} />;
   }
 
   if (item.kind === "user_message") {

@@ -901,6 +901,24 @@ pub enum ProviderRuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<UsageResumeBlockedReason>,
     },
+    /// The chat moved to another provider in place
+    /// (`commands::provider_switch`). Persisted, so the transcript keeps
+    /// the "Switched from … to …" divider where the switch happened.
+    ProviderSwitched {
+        thread_id: ThreadId,
+        from_provider: ProviderKind,
+        #[serde(default)]
+        from_model: Option<String>,
+        to_provider: ProviderKind,
+        #[serde(default)]
+        to_model: Option<String>,
+        /// `summary` (Utility agent) or `direct` (budgeted transcript):
+        /// how the conversation so far reaches the new provider.
+        handoff_kind: String,
+        /// Older middle turns were left out to fit the budget.
+        #[serde(default)]
+        truncated: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

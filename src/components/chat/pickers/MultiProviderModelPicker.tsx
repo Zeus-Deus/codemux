@@ -28,6 +28,7 @@ import {
 } from "@/components/ui/tooltip";
 import { sessionProviderLabel } from "@/lib/agent-chat/session-mentions";
 import { fallbackModelLabel } from "@/lib/agent-chat/capability-defaults";
+import { useSwitchHint } from "@/lib/agent-chat/provider-switch";
 import { cn } from "@/lib/utils";
 import {
   pickerFavoriteKey,
@@ -276,6 +277,7 @@ export function MultiProviderModelPicker({
   // own rail entry, so the kind alone doesn't identify the selection.
   const [railAcpAgentId, setRailAcpAgentId] = useState<string | null>(activeAcpAgentId);
   const [query, setQuery] = useState("");
+  const switchHint = useSwitchHint(hermesThreadId, provider, railKey);
 
   // A provider signed in more than once shows each account as its own
   // rail entry; the chat's account rides on the trigger's logo.
@@ -781,6 +783,14 @@ export function MultiProviderModelPicker({
             disabled internal filtering with `shouldFilter={false}`.
             The `selectedKey` data attr is a smoke surface for tests. */}
         <span className="sr-only" data-active-key={selectedKey} />
+        {switchHint && (
+          <div
+            data-testid="provider-switch-hint"
+            className="border-t px-3 py-1.5 text-label text-muted-foreground"
+          >
+            {switchHint}
+          </div>
+        )}
       </PopoverContent>
     </Popover>
   );

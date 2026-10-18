@@ -68,6 +68,7 @@ import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { basename } from "@/lib/path";
 import { ATTACHMENT_HARD_LIMIT } from "@/lib/agent-chat/attachment-limits";
 import { metadataFromSessionContext } from "@/lib/agent-chat/session-handoff";
+import { switchRefusal } from "@/lib/agent-chat/provider-switch";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast } from "@/lib/toast";
 import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
@@ -120,6 +121,7 @@ import {
   agentChatSetModel,
   agentChatSetPermissionMode,
   agentChatStartSession,
+  agentChatSwitchProvider,
   agentChatStopMonitoring,
   agentChatStopSession,
   agentChatUpdateSessionConfig,
@@ -3594,23 +3596,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
       void (async () => {
         try {
-          // Stop first so provider events for the shared thread id cannot
-          // race: an old Claude `closed` arriving after Codex `ready` would
-          // otherwise make the new session look dead. SessionNotFound is an
-          // idempotent success in the backend, covering restored panes whose
-          // provider process has not been rebuilt yet.
-          await agentChatStopSession(oldProvider, oldThreadId);
-
-          const startedThreadId = await agentChatStartSession(
+          // The backend holds the thread still, stops the old provider,
+          // starts this one fresh on the same thread and hands it the
+          // conversation so far (`commands::provider_switch`).
+          const startedThreadId = await agentChatSwitchProvider(
             pane.pane_id,
+            { provider: oldProvider, utilitySelection: utilitySelectionFromStores() },
             nextProvider,
             {
               thread_id: oldThreadId,
               cwd,
               model: nextModel,
-              // Provider-native cursors are not portable. The visible
-              // transcript stays on the same CodeMux thread, while the new
-              // adapter starts with clean provider-side context.
+              // Provider-native cursors are not portable.
               resume_cursor: null,
               permission_mode: nextLaunchMode,
               effort: defaults.effort,
@@ -3621,10 +3618,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               additional_directories: [],
               env: null,
             },
-            // This pane is ours and is bound to `oldThreadId`; the new
-            // adapter may hand back a different durable id, so the claim
-            // has to be made against the binding we are replacing.
-            oldThreadId,
           );
 
           if (startedThreadId !== oldThreadId) {
@@ -3644,6 +3637,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           setStoreMode(targetThreadId, "default");
           setStoreModePriorPermissionMode(targetThreadId, null);
         } catch (switchError) {
+          const refusal = switchRefusal(switchError);
+          if (refusal !== null) {
+            // Nothing changed: the old provider is still running.
+            toast.error("Can't switch providers yet", { description: refusal });
+            return;
+          }
           // The old DB row and pane binding are unchanged until the new
           // provider starts successfully. Best-effort rebuild the stopped
           // adapter so a failed switch leaves the existing chat usable.

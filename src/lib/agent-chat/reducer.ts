@@ -32,6 +32,7 @@ import {
   type ChatThreadState,
   type ChatViewItem,
   type PermissionRequestItem,
+  type ProviderSwitchItem,
   type ReasoningItem,
   type RuntimeNoticeItem,
   type SubagentRunItem,
@@ -2184,6 +2185,23 @@ function applyEventInner(
           autoResumeBlockedReason: reason,
         },
       };
+    }
+
+    case "provider_switched": {
+      const sealed = sealTrailingReasoning(state, now);
+      const { seq, next } = takeSeq(sealed);
+      const item: ProviderSwitchItem = {
+        kind: "provider_switch",
+        id: nextId("provider-switch"),
+        seq,
+        fromProvider: event.from_provider,
+        fromModel: event.from_model ?? null,
+        toProvider: event.to_provider,
+        toModel: event.to_model ?? null,
+        handoffKind: event.handoff_kind,
+        truncated: event.truncated ?? false,
+      };
+      return { ...next, messages: appendItem(next.messages, item) };
     }
 
     case "resume_cursor_updated": {

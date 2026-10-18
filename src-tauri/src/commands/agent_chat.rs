@@ -3433,6 +3433,7 @@ async fn send_turn_internal<R: Runtime>(
         &native_gate,
         native_generation,
     )?;
+    super::provider_switch::refuse_stale_send(&app.state(), provider, &input.thread_id.0)?;
     if origin == TurnOrigin::User {
         // A previously claimed resume may have hit another limit while this
         // user send waited for its dispatch to finish.
@@ -3567,6 +3568,13 @@ async fn send_turn_internal<R: Runtime>(
         provider,
         &skill_invocations,
     )?;
+    let (rendered_text, switch_seed) = super::provider_switch::seed_turn(
+        &db,
+        &thread_id_for_persist,
+        provider,
+        input.delivery == MessageDelivery::Steer,
+        rendered_text,
+    );
     // A non-checkpointed turn makes every older provider-relative target
     // unsafe. Serialize that invalidation with checkpoint commit/revert so a
     // settings or provider switch cannot race a turn currently being
@@ -3723,6 +3731,7 @@ async fn send_turn_internal<R: Runtime>(
     }
     drop(dispatch_guard);
     let result = sent.map_err(provider_err)?;
+    super::provider_switch::seed_delivered(&db, &thread_id_for_persist, provider, switch_seed);
     if let Some(queued_id) = &result.queued_id {
         // Do not acknowledge queued acceptance without durable evidence.
         // The event bridge may lag, or dispatch/cancellation may beat this ACK.
@@ -6373,6 +6382,18 @@ pub async fn agent_chat_get_session_context(
     if record.workspace_id != workspace_id {
         return Err("conversation_outside_workspace".to_string());
     }
+    session_context(&db, record, utility_selection).await
+}
+
+/// The handoff behind [`agent_chat_get_session_context`], for a source row
+/// the caller has already scoped. Also seeds an in-place provider switch
+/// (`commands::provider_switch`).
+pub(crate) async fn session_context(
+    db: &DatabaseStore,
+    record: AgentChatSessionRecord,
+    utility_selection: Option<UtilityModelSelection>,
+) -> Result<AgentChatSessionContext, String> {
+    let thread_id = record.thread_id.clone();
     // Read the revision BEFORE the messages. A message appended between the
     // two reads then leaves the summary keyed to the older revision, which is
     // a harmless cache miss on the next attach; reading it after would stamp
@@ -8685,7 +8706,8 @@ fn map_event_to_pane_status(
         // A usage-limit notice rides alongside the turn's own settlement,
         // which already moves the dot; the resume schedule is not liveness.
         | ProviderRuntimeEvent::UsageLimitReached { .. }
-        | ProviderRuntimeEvent::UsageResumeCancelled { .. } => None,
+        | ProviderRuntimeEvent::UsageResumeCancelled { .. }
+        | ProviderRuntimeEvent::ProviderSwitched { .. } => None,
         // A workflow launching/completing doesn't itself imply a pane
         // status transition — the subagents it spawns and the turn it
         // runs within already drive `Working`/`Review` via their own
@@ -9234,6 +9256,8 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
             // restart, and never resurrects a cancelled one.
             | ProviderRuntimeEvent::UsageLimitReached { .. }
             | ProviderRuntimeEvent::UsageResumeCancelled { .. }
+            // The switch divider marks where the provider changed.
+            | ProviderRuntimeEvent::ProviderSwitched { .. }
     )
     // NOTE: `UserMessage` is deliberately NOT persisted here either — it is
     // MINTED from a row `persist_user_message` has already written, and
@@ -9390,7 +9414,8 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::PlanUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::RunStalled { thread_id, .. }
         | ProviderRuntimeEvent::UsageLimitReached { thread_id, .. }
-        | ProviderRuntimeEvent::UsageResumeCancelled { thread_id, .. } => Some(thread_id.clone()),
+        | ProviderRuntimeEvent::UsageResumeCancelled { thread_id, .. }
+        | ProviderRuntimeEvent::ProviderSwitched { thread_id, .. } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
     }
 }

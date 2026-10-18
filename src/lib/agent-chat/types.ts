@@ -419,6 +419,23 @@ export interface UsageLimitItem {
 }
 
 /**
+ * The chat moved to another provider in place. A historical divider: the
+ * conversation before it reached the new provider as a handoff.
+ */
+export interface ProviderSwitchItem {
+  kind: "provider_switch";
+  id: ChatItemId;
+  seq: number;
+  fromProvider: AgentChatProviderKind;
+  fromModel: string | null;
+  toProvider: AgentChatProviderKind;
+  toModel: string | null;
+  /** `summary`, `direct` (transcript), or `none` (nothing said yet). */
+  handoffKind: string;
+  truncated: boolean;
+}
+
+/**
  * The thread's standing usage-limit stop, from the last
  * `usage_limit_reached` until the next user turn. Replayed by hydrate, so a
  * limit that stopped the run before a restart is still actionable after it.
@@ -481,7 +498,8 @@ export type ChatViewItem =
   | SubagentRunItem
   | WorkflowRunItem
   | RuntimeNoticeItem
-  | UsageLimitItem;
+  | UsageLimitItem
+  | ProviderSwitchItem;
 
 /**
  * A live provider event plus the durable row id it was persisted as

@@ -8409,6 +8409,41 @@ const handlers: Record<string, Handler> = {
   // ── Provider accounts ──
   ...createProviderAccountsMock().handlers,
   web_remote_push_devices: () => mockPushDevices(),
+  // Mirrors `commands::provider_switch`: refused while the chat is busy,
+  // otherwise the pane rebinds and the transcript gains the persisted
+  // `provider_switched` divider (kept in the thread's rows, so a remount
+  // still shows it).
+  agent_chat_switch_provider: (a) => {
+    const input = a.input as { thread_id: string; model: string | null };
+    const threadId = input.thread_id;
+    if (chatActiveTurns.has(threadId) || (chatQueues.get(threadId)?.length ?? 0) > 0) {
+      throw new Error("provider_switch_refused: Wait for the current turn and any queued messages to finish, then switch providers.");
+    }
+    const started = handlers.agent_chat_start_session({
+      paneId: a.paneId,
+      provider: a.provider,
+      input: a.input,
+      expectedThread: threadId,
+    }) as string;
+    const source = handlers.agent_chat_get_session({ threadId }) as AgentChatSessionRecord | null;
+    const event = {
+      type: "provider_switched",
+      thread_id: started,
+      from_provider: a.fromProvider,
+      from_model: source?.model ?? null,
+      to_provider: a.provider,
+      to_model: input.model,
+      handoff_kind: a.utilitySelection ? "summary" : "direct",
+      truncated: false,
+    };
+    const rows = mockThreadRows(started);
+    const id = rows.length + 1;
+    const payload = JSON.stringify(event);
+    mockFullPayloadById.set(id, payload);
+    rows.push({ id, payload, created_at_ms: Date.now() });
+    emitChatEvent(started, event);
+    return started;
+  },
 };
 
 let mockStaleWorktrees: StaleWorktree[] = [

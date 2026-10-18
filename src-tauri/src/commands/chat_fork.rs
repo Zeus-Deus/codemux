@@ -220,7 +220,7 @@ const BUSY: &str = "Wait for the current turn and any queued messages to finish,
 /// behind can't dispatch and must not block forks forever. `turn_active`
 /// and `runtime_status` read session state only, never the outbound lock,
 /// so they are safe under the timeline guard.
-async fn source_busy(
+pub(crate) async fn source_busy(
     live: &dyn AgentProvider,
     session_live: bool,
     db: &DatabaseStore,

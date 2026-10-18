@@ -136,6 +136,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "agent_chat_start_session"
             | "agent_chat_stop_monitoring"
             | "agent_chat_stop_session"
+            | "agent_chat_switch_provider"
             | "agent_chat_thread_head_id"
             | "agent_chat_turn_active"
             | "agent_chat_update_session_config"
