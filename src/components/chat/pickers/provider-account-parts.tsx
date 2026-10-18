@@ -76,7 +76,7 @@ export function AccountFooter({ view, onManage }: { view: ThreadAccountView; onM
   if (!account) return null;
   const workspaceDefault = view.thread?.workspace_default ?? null;
   const item =
-    "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-label text-foreground/90 outline-none transition-colors duration-150 hover:bg-muted focus-visible:bg-muted";
+    "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-label text-foreground/90 outline-none transition-colors duration-150 hover:bg-surface-2 focus-visible:bg-surface-2";
   return (
     <div className="flex flex-col gap-px border-t border-border/60 p-1" data-testid="provider-account-footer">
       <p className="px-2 py-1 text-caption text-muted-foreground">
@@ -98,7 +98,7 @@ export function AccountFooter({ view, onManage }: { view: ThreadAccountView; onM
           <span
             aria-hidden
             className={cn(
-              "flex size-3.5 items-center justify-center rounded-[3px] border border-border",
+              "flex size-3.5 items-center justify-center rounded-sm border border-border",
               workspaceDefault === account.id && "border-primary bg-primary text-primary-foreground",
             )}
           >

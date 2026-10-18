@@ -1027,7 +1027,7 @@ function AccountRailEntry({
             aria-pressed={isCurrent}
             className={cn(
               "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
-              "hover:bg-muted disabled:opacity-40 disabled:hover:bg-transparent",
+              "hover:bg-surface-2 disabled:opacity-40 disabled:hover:bg-transparent",
               selected && "bg-background text-foreground shadow-sm",
             )}
           >
