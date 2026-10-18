@@ -2,6 +2,7 @@ pub mod async_questions;
 pub mod agent_control;
 pub mod mcp_connector;
 pub mod delegated_tasks;
+pub mod follow_ups;
 pub mod hermes;
 pub mod custom_acp;
 pub(crate) mod local_sessions;
@@ -1163,6 +1164,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 
     async_questions::create_schema(conn)?;
     delegated_tasks::create_schema(conn)?;
+    follow_ups::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new

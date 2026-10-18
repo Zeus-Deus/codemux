@@ -724,3 +724,9 @@ export const onTunnelStatusChanged = (
   cb: EventCallback<TunnelStatusPayload>,
 ): Promise<UnlistenFn> =>
   listen<TunnelStatusPayload>("tunnel-status-changed", (e) => cb(e.payload));
+
+/** A started suggestion changed (started, finished, measured or merged). */
+export const onFollowUpChanged = (
+  cb: EventCallback<{ parent_thread_id: string }>,
+): Promise<UnlistenFn> =>
+  listen<{ parent_thread_id: string }>("follow-up-changed", (e) => cb(e.payload));

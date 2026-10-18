@@ -30,6 +30,7 @@ import { runPluginKeybind } from "@/contrib/keybinds";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import { isAppShortcutApplicable } from "@/lib/app-shortcut-applicability";
 import { getJumpTarget } from "@/components/layout/sidebar-inbox-jump";
+import { useSidebarViewStore } from "@/components/layout/sidebar-view-store";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { selectWorkspaceNavigationTarget } from "@/lib/workspace-navigation";
 import { jumpToNextNeedsYou } from "@/lib/needs-you";
@@ -173,6 +174,12 @@ export function dispatch(actionId: string, event?: KeyboardEvent): boolean {
   // ── Toggle sidebar ──
   if (actionId === "toggleSidebar") {
     ui.sidebarToggleFn?.();
+    return true;
+  }
+
+  // ── Sidebar view (Activity ⇄ Projects) ──
+  if (actionId === "toggleSidebarView") {
+    useSidebarViewStore.getState().toggleView();
     return true;
   }
 

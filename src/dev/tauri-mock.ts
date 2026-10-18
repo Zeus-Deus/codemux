@@ -68,6 +68,8 @@ import {
   MOCK_WEB_REMOTE_PORT,
   MOCK_MONITORING_THREAD_ID,
   MOCK_USAGE_LIMIT_THREAD_ID,
+  MOCK_SUGGESTED_TASKS_THREAD_ID,
+  MOCK_SUGGESTED_CHILD_THREAD_ID,
   MOCK_WORKFLOW_APPROVAL_THREAD_ID,
   MOCK_WORKFLOW_COMPLETE_THREAD_ID,
   MOCK_WORKFLOW_RUNNING_THREAD_ID,
@@ -107,6 +109,8 @@ import {
   richChatTurnEnvelopes,
   monitoringEnvelopes,
   usageLimitEnvelopes,
+  suggestedTasksEnvelopes,
+  suggestedTasksFollowUpRows,
   subagentTurnEnvelopes,
   workflowApprovalEnvelopes,
   workflowCompleteEnvelopes,
@@ -2363,6 +2367,10 @@ const WORKFLOW_THREAD_BUILDERS: Record<string, () => unknown[]> = {
   // composer strip's usage row and the transcript record are reachable.
   [MOCK_USAGE_LIMIT_THREAD_ID]: () =>
     usageLimitEnvelopes(MOCK_USAGE_LIMIT_THREAD_ID),
+  // A finished turn whose agent called `suggest_tasks`, with one task
+  // started (working in its own worktree), so the suggestions card shows.
+  [MOCK_SUGGESTED_TASKS_THREAD_ID]: () =>
+    suggestedTasksEnvelopes(MOCK_SUGGESTED_TASKS_THREAD_ID),
 };
 
 const workflowTranscriptCache = new Map<string, string[]>();
@@ -2408,7 +2416,103 @@ const WORKFLOW_THREAD_WORKSPACE: Record<
     cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/demo-usage-limit`,
     title: "Port the importer",
   },
+  [MOCK_SUGGESTED_TASKS_THREAD_ID]: {
+    workspaceId: "ws-codemux-suggested-tasks",
+    cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/demo-suggested-tasks`,
+    title: "Fix the token refresh race",
+  },
 };
+
+// ── Suggested follow-up tasks (`follow_up_*`) ──
+//
+// Started suggestions per parent thread, seeded with the demo's one started
+// task. Start appends a row and plays the backend's card row; Merge all
+// marks finished rows merged.
+const mockFollowUpRows = new Map<string, Array<Record<string, unknown>>>([
+  [MOCK_SUGGESTED_TASKS_THREAD_ID, suggestedTasksFollowUpRows() as Array<Record<string, unknown>>],
+]);
+
+function mockFollowUpStart(a: Record<string, unknown>): unknown {
+  const parent = String(a.parentThreadId ?? "");
+  const toolCallId = String(a.toolCallId ?? "");
+  const index = Number(a.index ?? 0);
+  const provider = String(a.provider ?? "claude");
+  const rows = mockFollowUpRows.get(parent) ?? [];
+  if (rows.some((row) => row.tool_call_id === toolCallId && row.index === index)) {
+    throw new Error("This task was already started.");
+  }
+  const child = `thread-mock-follow-up-${Date.now()}`;
+  const branch = `suggested-task-${index + 1}`;
+  const title = `Suggested task ${index + 1}`;
+  rows.push({
+    child_thread_id: child,
+    parent_thread_id: parent,
+    tool_call_id: toolCallId,
+    index,
+    workspace_id: "",
+    parent_workspace_id: "",
+    repo_path: "",
+    worktree_path: "",
+    branch,
+    base_sha: "0".repeat(40),
+    provider,
+    title,
+    outcome: "running",
+    additions: null,
+    deletions: null,
+    commits: null,
+    uncommitted: null,
+    merged: false,
+    created_at_ms: Date.now(),
+  });
+  mockFollowUpRows.set(parent, rows);
+  emitEvent("follow-up-changed", { parent_thread_id: parent });
+  const label = provider === "codex" ? "Codex" : provider === "claude" ? "Claude" : provider;
+  emitChatEvent(parent, {
+    type: "subagent_updated",
+    thread_id: parent,
+    subagent: {
+      subagent_id: `delegate:${child}`,
+      parent_item_id: `${toolCallId}#${index}`,
+      name: label,
+      agent_type: provider,
+      task_kind: "agent",
+      model: a.model ?? null,
+      effort: a.effort ?? null,
+      status: "running",
+      activity: "Working in its workspace",
+      provider_ref: child,
+    },
+  });
+  return { child_thread_id: child, workspace_id: "", branch };
+}
+
+function mockFollowUpMergeAll(a: Record<string, unknown>): unknown {
+  const parent = String(a.parentThreadId ?? "");
+  const rows = mockFollowUpRows.get(parent) ?? [];
+  const ready = rows.filter((row) => row.outcome === "completed" && !row.merged);
+  if (ready.length === 0) throw new Error("No finished tasks left to merge.");
+  for (const row of ready) row.merged = true;
+  emitEvent("follow-up-changed", { parent_thread_id: parent });
+  return {
+    target_branch: "fix/token-refresh-race",
+    merged: ready.map((row) => ({
+      child_thread_id: row.child_thread_id,
+      title: row.title,
+      branch: row.branch,
+    })),
+    skipped: rows
+      .filter((row) => row.outcome === "running")
+      .map((row) => ({
+        child_thread_id: row.child_thread_id,
+        title: row.title,
+        branch: row.branch,
+        reason: "Still running.",
+      })),
+    conflict: null,
+    stopped: null,
+  };
+}
 
 function mockWorkflowSessionRecord(threadId: string): unknown | null {
   const loc = WORKFLOW_THREAD_WORKSPACE[threadId];
@@ -2435,7 +2539,11 @@ let mockQueuedSeq = 0;
 // Follow-up queueing: track which threads have a turn in flight and the
 // FIFO follow-up queue behind each, so `agent_chat_send_turn` can mirror
 // the real backend (queue-while-busy) and drain on completion.
-const chatActiveTurns = new Map<string, string>();
+const chatActiveTurns = new Map<string, string>([
+  // The started suggestion's chat is seeded mid-turn (its pane reads
+  // `working`), so its liveness probe must agree.
+  [MOCK_SUGGESTED_CHILD_THREAD_ID, "seeded-suggested-child-turn"],
+]);
 interface MockQueuedTurn {
   queuedId: string;
   text: string;
@@ -4214,7 +4322,39 @@ const agentConnectorMock = createAgentConnectorMock(
 // Dev-only console hook for the outside-assistant approval screenshots.
 (window as unknown as { __codemuxAgentConnectorMock: typeof agentConnectorMock }).__codemuxAgentConnectorMock = agentConnectorMock;
 
+/** Live mock side chats and their pending stream timers. */
+const mockSideChats = new Map<string, { timers: number[] }>();
+
+/** Stream a scripted answer for a `/btw` question: a short "thinking"
+ *  pause, then markdown in small chunks, then `turn_completed`. */
+function streamMockSideAnswer(sideId: string, question: string, first: boolean): void {
+  const chat = mockSideChats.get(sideId);
+  if (!chat) return;
+  const answer = first
+    ? `Short answer: it's the **retry loop** in \`sync/worker.ts\`.\n\nFrom what this chat has covered so far:\n\n- The main agent is still refactoring the queue, so nothing here has changed yet.\n- Retries back off from 250 ms up to 8 s, then give up after 6 attempts.\n- Failures are logged once per batch, not per item.\n\n> You asked: _${question.replace(/[_*`]/g, "")}_`
+    : `Yes. The same fork keeps the context, so follow-ups like this one don't reach the main chat.\n\n\`\`\`ts\nconst delayMs = Math.min(8000, 250 * 2 ** attempt);\n\`\`\``;
+  const chunks = answer.match(/.{1,14}/gs) ?? [answer];
+  let at = 700;
+  for (const chunk of chunks) {
+    chat.timers.push(window.setTimeout(() => {
+      emitEvent("agent-chat-side-chat", { side_id: sideId, kind: "delta", text: chunk });
+    }, at));
+    at += 45;
+  }
+  chat.timers.push(window.setTimeout(() => {
+    emitEvent("agent-chat-side-chat", { side_id: sideId, kind: "turn_completed", text: answer });
+  }, at + 60));
+}
+
 const handlers: Record<string, Handler> = {
+  follow_up_providers: () => [
+    { id: "claude", label: "Claude", installed: true },
+    { id: "codex", label: "Codex", installed: true },
+    { id: "opencode", label: "OpenCode", installed: true },
+  ],
+  follow_up_list: (a) => mockFollowUpRows.get(String(a.parentThreadId ?? "")) ?? [],
+  follow_up_start: (a) => mockFollowUpStart(a),
+  follow_up_merge_all: (a) => mockFollowUpMergeAll(a),
   ...customAcpMock.handlers,
   ...agentConnectorMock.handlers,
   get_chatgpt_status: mockChatGptRead,
@@ -5207,6 +5347,23 @@ const handlers: Record<string, Handler> = {
         permission_mode: "danger-full-access",
       };
     }
+    if (threadId === MOCK_SUGGESTED_CHILD_THREAD_ID) {
+      // The row `follow_up_start` writes for the demo's started suggestion.
+      return {
+        thread_id: threadId,
+        sdk_session_id: `sdk-${threadId}`,
+        workspace_id: "ws-codemux-suggested-child",
+        cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/add-refresh-retry-tests`,
+        provider: "codex",
+        title: "Add refresh retry tests",
+        created_at: new Date().toISOString(),
+        last_active_at: new Date().toISOString(),
+        model: "gpt-5.6-luna",
+        effort: "medium",
+        context_window: null,
+        permission_mode: "danger-full-access",
+      };
+    }
     return mockWorkflowSessionRecord(threadId);
   },
   // DB-only config persist (design G). The mock has no SQLite, so this
@@ -5527,6 +5684,34 @@ const handlers: Record<string, Handler> = {
   agent_chat_turn_active: (a) => {
     const { threadId } = a as { threadId: string };
     return chatActiveTurns.has(threadId);
+  },
+  // `/btw` side chats: a scripted fork that streams a canned answer on the
+  // `agent-chat-side-chat` event, so the pane can be exercised in `npm run dev`.
+  agent_chat_side_chat_start: (a) => {
+    const { sideId, threadId, text } = a as { sideId: string; threadId: string; text: string };
+    if (!threadId) throw new Error("This chat hasn't started a session yet.");
+    mockSideChats.set(sideId, { timers: [] });
+    streamMockSideAnswer(sideId, text, true);
+    // Like the backend: the model and effort read off the main chat's
+    // persisted row (null = provider default, so the pane keeps the
+    // thread's own picker value).
+    const record = handlers.agent_chat_get_session?.({ threadId }) as
+      | { model?: string | null; effort?: string | null }
+      | null
+      | undefined;
+    return { model: record?.model ?? null, effort: record?.effort ?? null };
+  },
+  agent_chat_side_chat_send: (a) => {
+    const { sideId, text } = a as { sideId: string; text: string };
+    if (!mockSideChats.has(sideId)) throw new Error("This side chat has ended. Start a new one with /btw.");
+    streamMockSideAnswer(sideId, text, false);
+  },
+  agent_chat_side_chat_close: (a) => {
+    const { sideId } = a as { sideId: string };
+    const chat = mockSideChats.get(sideId);
+    if (!chat) return;
+    chat.timers.forEach((t) => window.clearTimeout(t));
+    mockSideChats.delete(sideId);
   },
   // Real backend hands the decision to the provider, which resolves the
   // request and echoes `request_resolved` back over the thread channel.

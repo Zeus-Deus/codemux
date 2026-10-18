@@ -42,6 +42,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   // ── General ──
   { id: "commandPalette", label: "Command palette", category: "general", defaultKeys: "Ctrl+K" },
   { id: "toggleSidebar", label: "Toggle sidebar", category: "general", defaultKeys: "Ctrl+B" },
+  { id: "toggleSidebarView", label: "Switch sidebar view", category: "general", defaultKeys: "Ctrl+Shift+O", description: "Flip the sidebar between Activity (the inbox) and Projects (grouped by project)" },
   { id: "toggleRightPanel", label: "Toggle right panel", category: "general", defaultKeys: "Ctrl+Shift+B", description: "Show/hide the right panel (Files, Changes, Review, Orchestration)" },
   { id: "toggleWorkspaceDetails", label: "Toggle workspace details", category: "general", defaultKeys: "Ctrl+Shift+O", description: "Show/hide the workspace details card: run, open in editor, branch, commit, changes and live agents" },
   { id: "openSettings", label: "Open settings", category: "general", defaultKeys: "Ctrl+," },
@@ -116,6 +117,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
 
   // ── Chat ──
   { id: "interruptAgent", label: "Stop the agent", category: "chat", defaultKeys: "Escape", when: "composer", description: "From the chat composer while the agent works. Ctrl+C in an empty composer stops it too" },
+  { id: "sideQuestion", label: "Ask a side question", category: "chat", defaultKeys: "Ctrl+;", when: "composer", description: "Start a /btw question in the chat composer. It uses the chat's context, answers in the right panel and adds nothing to the chat" },
 
   // ── Terminal (handled inside xterm) ──
   { id: "copySelection", label: "Copy selection", category: "terminal", defaultKeys: "Ctrl+Shift+C", when: "terminal" },

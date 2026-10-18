@@ -29,6 +29,7 @@ import {
   MonitorSmartphone,
   Keyboard,
   LayoutGrid,
+  ListTree,
   Maximize2,
   MessageSquareText,
   Palette,
@@ -434,6 +435,7 @@ export const PALETTE_COMMANDS: PaletteCommand[] = [
 
   // View
   { id: "toggle-sidebar", label: "Toggle sidebar", icon: PanelLeft, actionId: "toggleSidebar" },
+  { id: "toggle-sidebar-view", label: "Switch sidebar view", icon: ListTree, actionId: "toggleSidebarView", keywords: "activity projects inbox group" },
   { id: "toggle-right-panel", label: "Toggle right panel", icon: Columns2, actionId: "toggleRightPanel", requiresWorkspace: true },
   { id: "toggle-workspace-details", label: "Toggle workspace details", icon: SquareMenu, keywords: "run editor commit branch changes agents", actionId: "toggleWorkspaceDetails", requiresWorkspace: true },
   {

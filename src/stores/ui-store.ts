@@ -22,6 +22,7 @@ export type RightPanelCorePane =
   | "workflows"
   | "tasks"
   | "subagents"
+  | "side-chat"
   | "diff"
   | "browser";
 

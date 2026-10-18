@@ -164,6 +164,7 @@ import {
   shouldAutoSettle,
   MAX_TIMER_DELAY_MS,
 } from "./sidebar-inbox";
+import { InboxLifecycle } from "./use-inbox-lifecycle";
 import { META_CLUSTER_MIN_WIDTH } from "./sidebar-inbox-card";
 import { isPrOnCurrentBranch } from "@/components/github/pr-status-icon";
 import {
@@ -246,6 +247,7 @@ async function renderInbox() {
   const utils = render(
     <TooltipProvider>
       <SidebarInbox />
+      <InboxLifecycle />
     </TooltipProvider>,
   );
   // Flush the settled-list load promise.
@@ -273,6 +275,7 @@ async function rerenderInbox(rerender: (ui: React.ReactElement) => void) {
   rerender(
     <TooltipProvider>
       <SidebarInbox />
+      <InboxLifecycle />
     </TooltipProvider>,
   );
   for (let i = 0; i < 3; i += 1) {
@@ -832,6 +835,7 @@ describe("SidebarInbox — project filter", () => {
     rerender(
       <TooltipProvider>
         <SidebarInbox />
+        <InboxLifecycle />
       </TooltipProvider>,
     );
     await act(async () => {
@@ -854,6 +858,7 @@ describe("SidebarInbox — settle / un-settle", () => {
       render(
         <TooltipProvider>
           <SidebarInbox />
+          <InboxLifecycle />
         </TooltipProvider>,
       );
       await act(async () => {
@@ -1396,6 +1401,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     rerender(
       <TooltipProvider>
         <SidebarInbox />
+        <InboxLifecycle />
       </TooltipProvider>,
     );
     await act(async () => {
@@ -1447,6 +1453,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     rerender(
       <TooltipProvider>
         <SidebarInbox />
+        <InboxLifecycle />
       </TooltipProvider>,
     );
     await act(async () => {
@@ -1543,6 +1550,7 @@ describe("SidebarInbox — settle / un-settle", () => {
       const { unmount } = render(
         <TooltipProvider>
           <SidebarInbox />
+          <InboxLifecycle />
         </TooltipProvider>,
       );
       await act(async () => {
@@ -2438,6 +2446,7 @@ describe("SidebarInbox — snooze shelf", () => {
       const { container } = render(
         <TooltipProvider>
           <SidebarInbox />
+          <InboxLifecycle />
         </TooltipProvider>,
       );
       await act(async () => {
@@ -2904,6 +2913,7 @@ describe("SidebarInbox — forward navigation on park", () => {
       render(
         <TooltipProvider>
           <SidebarInbox />
+          <InboxLifecycle />
         </TooltipProvider>,
       );
       await act(async () => {
@@ -2932,6 +2942,7 @@ describe("SidebarInbox — forward navigation on park", () => {
       render(
         <TooltipProvider>
           <SidebarInbox />
+          <InboxLifecycle />
         </TooltipProvider>,
       );
       await act(async () => {
@@ -3611,5 +3622,53 @@ describe("SidebarInbox — new workspace arrival", () => {
     });
     await rerenderInbox(rerender);
     expect(container.querySelector("[data-creating-card]")).toBeNull();
+  });
+});
+
+describe("SidebarInbox — follow-up children", () => {
+  it("links a child card back to its parent, and the link activates the parent", async () => {
+    const parent = makeWorkspace({ title: "sidebar-view-toggle" });
+    const child = makeWorkspace({
+      title: "Nest delegated chats",
+      parent_workspace_id: parent.workspace_id,
+    });
+    workspaces = [parent, child];
+    const { container } = await flushRender();
+
+    // The child stays an ordinary card of its own.
+    const childCard = container.querySelector(
+      `[data-inbox-card="${child.workspace_id}"]`,
+    ) as HTMLElement;
+    expect(childCard).not.toBeNull();
+    const link = within(childCard).getByRole("button", {
+      name: "Open parent workspace sidebar-view-toggle",
+    });
+    expect(childCard).toHaveTextContent("from");
+
+    fireEvent.click(link);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(activateWorkspace).toHaveBeenCalledWith(parent.workspace_id);
+    expect(activateWorkspace).not.toHaveBeenCalledWith(child.workspace_id);
+
+    // The parent itself carries no link.
+    const parentCard = container.querySelector(
+      `[data-inbox-card="${parent.workspace_id}"]`,
+    ) as HTMLElement;
+    expect(parentCard.querySelector("[data-parent-link]")).toBeNull();
+  });
+
+  it("omits the link when the parent workspace is gone", async () => {
+    const child = makeWorkspace({
+      title: "Orphan follow-up",
+      parent_workspace_id: "ws-missing",
+    });
+    workspaces = [child];
+    const { container } = await flushRender();
+    expect(container.querySelector("[data-parent-link]")).toBeNull();
+    expect(
+      container.querySelector(`[data-inbox-card="${child.workspace_id}"]`),
+    ).not.toBeNull();
   });
 });

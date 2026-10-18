@@ -910,6 +910,11 @@ fn workspace_runs_on_device(
     on_device
 }
 
+/// Crate-visible wrapper for side chats, which refuse device threads.
+pub(crate) fn thread_runs_on_device_pub<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> bool {
+    thread_runs_on_device(app, thread_id)
+}
+
 fn thread_runs_on_device<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> bool {
     app.try_state::<AppStateStore>().is_some_and(|state| {
         let db = app.try_state::<DatabaseStore>();
@@ -10158,6 +10163,7 @@ mod tests {
             imported_snapshot_only: Some(false),
             last_active_at: None,
             last_visited_at: None,
+            parent_workspace_id: None,
         }
     }
 

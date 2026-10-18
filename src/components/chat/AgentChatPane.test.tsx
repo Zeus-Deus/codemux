@@ -3,6 +3,11 @@ import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
 const workflowMocks = vi.hoisted(() => ({ launch: vi.fn(), available: true }));
+const sideChatMocks = vi.hoisted(() => ({ start: vi.fn(), setRightPanelTab: vi.fn() }));
+vi.mock("@/lib/agent-chat/side-chat", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/agent-chat/side-chat")>(),
+  startSideChat: sideChatMocks.start,
+}));
 vi.mock("@/components/workflows/launch-chat-workflow", () => ({ launchChatWorkflow: workflowMocks.launch }));
 vi.mock("@/components/workflows/use-workflows-available", () => ({ useWorkflowsAvailable: () => workflowMocks.available }));
 
@@ -476,6 +481,7 @@ vi.mock("@/stores/ui-store", () => ({
       getState: () => ({
         rightPanelTabs: {},
         setShowNewWorkspaceDialog: setShowNewWorkspaceDialogMock,
+        setRightPanelTab: sideChatMocks.setRightPanelTab,
       }),
     },
   ),
@@ -4670,6 +4676,66 @@ it("refreshes the Codex catalog when startup falls back from a saved tier", asyn
   } finally {
     refresh.mockRestore();
   }
+});
+
+describe("AgentChatPane /btw", () => {
+  beforeEach(() => {
+    sideChatMocks.start.mockReset();
+    sideChatMocks.start.mockResolvedValue("side-1");
+    vi.mocked(agentChatSendTurn).mockClear();
+    setInputDraftMock.mockClear();
+  });
+  afterEach(() => cleanup());
+
+  async function submit(draft: string, overrides: Partial<typeof pane> = {}) {
+    currentMessages = [{ kind: "user_message", id: "m1", seq: 1, source_event_id: 7 }];
+    currentSliceOverrides = { "thread-x": { inputDraft: draft } };
+    const view = render(<AgentChatPane pane={{ ...pane, ...overrides }} />);
+    await act(async () => {});
+    fireEvent.click(view.container.querySelector('[data-testid="composer-submit"]')!);
+    await act(async () => {});
+    return view;
+  }
+
+  it("asks a side chat and never sends the question to the main session", async () => {
+    await submit("/btw what does the retry loop do?");
+    expect(sideChatMocks.start).toHaveBeenCalledWith({
+      threadId: "thread-x",
+      workspaceId: "ws-home",
+      provider: "claude",
+      question: "what does the retry loop do?",
+    });
+    expect(sideChatMocks.setRightPanelTab).toHaveBeenCalledWith("ws-home", "side-chat");
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    expect(setInputDraftMock).toHaveBeenCalledWith("thread-x", "");
+  });
+
+  it("refuses staged attachments instead of dropping them, keeping the draft", async () => {
+    const error = vi.spyOn(toast, "error");
+    currentMessages = [{ kind: "user_message", id: "m1", seq: 1, source_event_id: 7 }];
+    currentSliceOverrides = { "thread-x": {
+      inputDraft: "/btw what is in this screenshot?",
+      stagedAttachments: [{ id: "img", kind: "image", ref: "shot.png", metadata: { label: "shot.png" } }],
+    } };
+    const view = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+    fireEvent.click(view.container.querySelector('[data-testid="composer-submit"]')!);
+    await act(async () => {});
+    expect(sideChatMocks.start).not.toHaveBeenCalled();
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    expect(setInputDraftMock).not.toHaveBeenCalledWith("thread-x", "");
+    expect(error).toHaveBeenCalledWith("Side chats can't take attachments yet", expect.objectContaining({
+      description: "Remove the attachments or send this as a normal message.",
+    }));
+    error.mockRestore();
+  });
+
+  it("refuses unsupported providers and keeps the draft", async () => {
+    await submit("/btw anything", { provider: "cursor" as never });
+    expect(sideChatMocks.start).not.toHaveBeenCalled();
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    expect(setInputDraftMock).not.toHaveBeenCalledWith("thread-x", "");
+  });
 });
 
 describe("AgentChatPane /workflow", () => {

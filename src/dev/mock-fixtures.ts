@@ -621,6 +621,73 @@ const wsCodemuxUsageLimit = (() => {
     surfaces: [surface],
   };
 })();
+
+/** Thread id of the seeded suggested-tasks demo (`suggest_tasks`). */
+export const MOCK_SUGGESTED_TASKS_THREAD_ID = "thread-mock-suggested-tasks";
+/** The `suggest_tasks` call's tool_use_id in that thread. */
+export const MOCK_SUGGESTED_TASKS_CALL_ID = "toolu-suggest-tasks-1";
+/** Child thread of the one suggestion already started. */
+export const MOCK_SUGGESTED_CHILD_THREAD_ID = "thread-mock-suggested-child";
+
+/** Suggested-tasks demo: a Claude chat that finished its fix and suggested
+ *  three follow-ups, one of which the user already started in its own
+ *  worktree (working). Reaches the suggestions card under `npm run dev`. */
+const wsCodemuxSuggestedTasks = (() => {
+  const cwd = `${HOME}/.codemux/worktrees/codemux/demo-suggested-tasks`;
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-suggested-tasks",
+    title: "suggested-tasks-demo",
+    cwd,
+    worktree_path: cwd,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "worktree",
+    git_branch: "fix/token-refresh-race",
+  });
+  const { surface, tab } = chatSurface(
+    "Agent Chat",
+    cwd,
+    MOCK_SUGGESTED_TASKS_THREAD_ID,
+    "claude",
+  );
+  return {
+    ...ws,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
+
+/** The started suggestion's own workspace, linked to the parent. */
+const wsCodemuxSuggestedChild = (() => {
+  const cwd = `${HOME}/.codemux/worktrees/codemux/add-refresh-retry-tests`;
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-suggested-child",
+    title: "Add refresh retry tests",
+    cwd,
+    worktree_path: cwd,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "worktree",
+    git_branch: "add-refresh-retry-tests",
+  });
+  const { pane, surface, tab } = chatSurface(
+    "Agent Chat",
+    cwd,
+    MOCK_SUGGESTED_CHILD_THREAD_ID,
+    "codex",
+  );
+  paneStatuses[pane.pane_id] = "working";
+  return {
+    ...ws,
+    parent_workspace_id: "ws-codemux-suggested-tasks",
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
 /** A workspace that split one plan into a stack of pull requests — the shape
  *  an agent produces when it is asked for reviewable increments: a branch and
  *  a PR per concern, each based on the one below it. The early PRs have landed
@@ -782,6 +849,125 @@ const wsCodemuxWorkflowComplete = (() => {
     surfaces: [surface],
   };
 })();
+
+// Follow-up children: workspaces a parent chat started for out-of-scope
+// work (`parent_workspace_id`). They hang off `chat-streaming` so the
+// Projects view shows them nested under that row and the Activity view
+// shows each as its own card with a "from chat-streaming" link. Each gets
+// its own worktree and an unbound chat pane (no shared transcript).
+
+/** Build a follow-up child of `parentId` in the codemux project. */
+function followUpChild(seed: {
+  workspace_id: string;
+  title: string;
+  slug: string;
+  parentId: string;
+  status: PaneStatus;
+  provider: AgentChatProviderKind;
+  lastActiveAgoMs: number;
+  git_additions?: number;
+  git_deletions?: number;
+}): WorkspaceSnapshot {
+  const cwd = `${HOME}/.codemux/worktrees/codemux/${seed.slug}`;
+  const ws = makeWorkspace({
+    workspace_id: seed.workspace_id,
+    title: seed.title,
+    cwd,
+    worktree_path: cwd,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "worktree",
+    git_branch: `codemux/${seed.slug}`,
+    git_additions: seed.git_additions ?? 0,
+    git_deletions: seed.git_deletions ?? 0,
+  });
+  const { pane, surface, tab } = chatSurface("Agent Chat", cwd, null, seed.provider);
+  if (seed.status !== "idle") paneStatuses[pane.pane_id] = seed.status;
+  return {
+    ...ws,
+    parent_workspace_id: seed.parentId,
+    last_active_at: Date.now() - seed.lastActiveAgoMs,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+}
+
+const wsFollowUpNest = followUpChild({
+  workspace_id: "ws-followup-nest",
+  title: "Nest delegated chats under parent",
+  slug: "followup-nest-children",
+  parentId: "ws-codemux-chat-live",
+  status: "working",
+  provider: "claude",
+  lastActiveAgoMs: 60_000,
+});
+
+const wsFollowUpShortcut = followUpChild({
+  workspace_id: "ws-followup-shortcut",
+  title: "Shortcut for the view switch",
+  slug: "followup-view-shortcut",
+  parentId: "ws-codemux-chat-live",
+  status: "review",
+  provider: "codex",
+  lastActiveAgoMs: 4 * 60_000,
+  git_additions: 24,
+  git_deletions: 3,
+});
+
+const wsFollowUpFolds = followUpChild({
+  workspace_id: "ws-followup-folds",
+  title: "Remember folded projects",
+  slug: "followup-remember-folds",
+  parentId: "ws-codemux-chat-live",
+  status: "idle",
+  provider: "claude",
+  lastActiveAgoMs: 25 * 60_000,
+});
+
+// No-project chats: conversations started from the header's New agent
+// button, rooted at the home directory rather than a repository. The
+// Projects view lists them under "Chats".
+
+function homeChat(seed: {
+  workspace_id: string;
+  title: string;
+  lastActiveAgoMs: number;
+}): WorkspaceSnapshot {
+  const ws = makeWorkspace({
+    workspace_id: seed.workspace_id,
+    title: seed.title,
+    // "standard", not "home": the mock's `get_or_create_home_workspace`
+    // reuses the first Home-type workspace, and these are conversations,
+    // not the Home terminal. Rooted at HOME, they still group as chats.
+    cwd: HOME,
+    project_root: HOME,
+    is_git: false,
+  });
+  const { surface, tab } = chatSurface("Agent Chat", HOME, null, "claude");
+  return {
+    ...ws,
+    last_active_at: Date.now() - seed.lastActiveAgoMs,
+    last_visited_at: Date.now() - seed.lastActiveAgoMs + 1_000,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+}
+
+const wsHomeChatFrameClocks = homeChat({
+  workspace_id: "ws-home-chat-frame-clocks",
+  title: "Explain WebKit frame clocks",
+  lastActiveAgoMs: 3 * 3_600_000,
+});
+
+const wsHomeChatReleaseNotes = homeChat({
+  workspace_id: "ws-home-chat-release-notes",
+  title: "Draft v0.9 release notes",
+  lastActiveAgoMs: 26 * 3_600_000,
+});
 
 // Project 2 — vexis: 1 primary + 3 worktrees (one in `permission`).
 //
@@ -961,6 +1147,8 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsCodemuxChatLive,
   wsCodemuxMonitoring,
   wsCodemuxUsageLimit,
+  wsCodemuxSuggestedTasks,
+  wsCodemuxSuggestedChild,
   wsCodemuxPorts,
   wsCodemuxStack,
   wsCodemuxWorkflowApproval,
@@ -975,6 +1163,11 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsLedgerMain,
   wsLedgerRates,
   wsScratchpad,
+  wsHomeChatReleaseNotes,
+  wsHomeChatFrameClocks,
+  wsFollowUpFolds,
+  wsFollowUpShortcut,
+  wsFollowUpNest,
 ];
 
 // ── Archived workspaces ─────────────────────────────────────────────
@@ -2364,6 +2557,134 @@ function stressWorkspaces(target: number): WorkspaceSnapshot[] {
 
   stressWorkspacesCache = [...ALL_WORKSPACES, ...generated];
   return stressWorkspacesCache;
+}
+
+// ── Suggested-tasks demo transcript ──────────────────────────────────
+//
+// The agent fixed the bug it was asked about, noticed three things outside
+// the request and called `suggest_tasks` instead of listing them. The user
+// started the second one (Codex, its own worktree), which is still working:
+// the backend's `delegate:<child>` row carries
+// `parent_item_id = "<call id>#1"`, so the card shows it as a live row.
+
+/** Envelopes for {@link MOCK_SUGGESTED_TASKS_THREAD_ID}. */
+export function suggestedTasksEnvelopes(threadId: string): unknown[] {
+  const turnId = "turn-suggested-tasks";
+  const callId = MOCK_SUGGESTED_TASKS_CALL_ID;
+  const tasks = [
+    {
+      title: "Share the token cache across tabs",
+      task: "Each browser tab keeps its own token cache in src/lib/auth/token-cache.ts, so two tabs refresh at once. Move the cache to a BroadcastChannel-backed store, keep the public API, and add a test that two tabs share one refresh.",
+      provider: "claude",
+    },
+    {
+      title: "Add refresh retry tests",
+      task: "src/lib/auth/refresh.ts retries a failed refresh once, but nothing tests it. Add table tests in refresh.test.ts for: success, one 401 then success, two 401s (gives up), and a network error. Use the existing fetch mock helpers.",
+      provider: "codex",
+    },
+    {
+      title: "Document the auth flow",
+      task: "docs/auth.md predates the refresh queue. Rewrite its Refresh section to describe the single-flight queue in src/lib/auth/refresh.ts and the 30 s skew window, with a short sequence diagram in Mermaid.",
+    },
+  ];
+  return [
+    {
+      type: "user_message",
+      thread_id: threadId,
+      text: "Fix the race where two requests refresh the auth token at the same time.",
+    },
+    {
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      item: {
+        kind: "assistant_message",
+        text:
+          "Fixed: `refreshToken()` now goes through a single-flight queue, so " +
+          "concurrent 401s wait for one refresh instead of racing. Tests pass.",
+      },
+    },
+    {
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      item: {
+        kind: "tool_use",
+        tool_name: "mcp__codemux__mcp__codemux__suggest_tasks",
+        tool_use_id: callId,
+        input: { tasks },
+      },
+    },
+    {
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      item: {
+        kind: "tool_result",
+        tool_use_id: callId,
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ suggested: 3, note: "Shown to the user as cards." }),
+          },
+        ],
+        is_error: false,
+      },
+    },
+    {
+      type: "turn_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      status: { kind: "success" },
+      usage: null,
+    },
+    {
+      type: "subagent_updated",
+      thread_id: threadId,
+      subagent: {
+        subagent_id: `delegate:${MOCK_SUGGESTED_CHILD_THREAD_ID}`,
+        parent_item_id: `${callId}#1`,
+        name: "Codex",
+        agent_type: "codex",
+        description: "Add refresh retry tests",
+        task_kind: "agent",
+        model: "gpt-5.6-luna",
+        effort: "medium",
+        status: "running",
+        activity: "Working in its workspace",
+        result_text: null,
+        duration_ms: null,
+        provider_ref: MOCK_SUGGESTED_CHILD_THREAD_ID,
+      },
+    },
+  ];
+}
+
+/** `follow_up_list` rows for the demo's started suggestion. */
+export function suggestedTasksFollowUpRows(): unknown[] {
+  return [
+    {
+      child_thread_id: MOCK_SUGGESTED_CHILD_THREAD_ID,
+      parent_thread_id: MOCK_SUGGESTED_TASKS_THREAD_ID,
+      tool_call_id: MOCK_SUGGESTED_TASKS_CALL_ID,
+      index: 1,
+      workspace_id: "ws-codemux-suggested-child",
+      parent_workspace_id: "ws-codemux-suggested-tasks",
+      repo_path: codemuxRoot,
+      worktree_path: `${HOME}/.codemux/worktrees/codemux/add-refresh-retry-tests`,
+      branch: "add-refresh-retry-tests",
+      base_sha: "4f1c2a9e0b7d3c5a8e6f1d2c3b4a5f6e7d8c9b0a",
+      provider: "codex",
+      title: "Add refresh retry tests",
+      outcome: "running",
+      additions: null,
+      deletions: null,
+      commits: null,
+      uncommitted: null,
+      merged: false,
+      created_at_ms: Date.now() - 4 * 60_000,
+    },
+  ];
 }
 
 /**

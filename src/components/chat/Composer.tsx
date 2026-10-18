@@ -1,4 +1,5 @@
 import { useWorkflowsAvailable } from "@/components/workflows/use-workflows-available";
+import { COMPOSER_CARD } from "./composer-surface";
 import { useWorkflowSettings } from "@/lib/workflows/workflow-settings";
 import { usePopupArrowNavigation } from "./use-popup-arrow-navigation";
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
@@ -62,6 +63,7 @@ import {
   buildProviderCommands,
   buildSubcommandItems,
   buildWorkflowCommand,
+  buildSideChatCommand,
   filterCommandMenuItems,
   filterSlashItems,
   findMentionAtCursor,
@@ -130,6 +132,10 @@ import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
 import { COMPOSER_OVERLAY_CARD } from "./composer-overlay";
 import { interruptUnlessClaimed, isInterruptKey } from "./composer-interrupt";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
+import { matchesKeyCombo } from "@/lib/keybind-utils";
+import { sideChatSupported, sideChatUnavailableMessage } from "@/lib/agent-chat/side-chat";
+import { withBtwPrefix } from "@/lib/agent-chat/side-chat-launch";
+import { toast } from "@/lib/toast";
 
 const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_FILE_MATCHES: FileMatch[] = [];
@@ -830,6 +836,17 @@ export function Composer({
     [workflowsAvailable],
   );
 
+  // `/btw` — a side question answered by a read-only fork of this chat.
+  // Shown for every provider so it stays discoverable; disabled with the
+  // reason where the provider can't fork a session.
+  const sideChatCommand = useMemo(
+    () => buildSideChatCommand({
+      supported: sideChatSupported(provider),
+      providerLabel: sessionProviderLabel(provider),
+    }),
+    [provider],
+  );
+
   // ─── Skills (Cursor-style inline tokens) ─────────────────────────
   // Lazy-load on first popup open. Picking a skill expands the typed
   // `/<query>` to the full `/<skill-name>` in the textarea — the slash
@@ -881,6 +898,7 @@ export function Composer({
       "permissions",
       "help", "skills", "settings", "usage",
       "workflow",
+      "btw",
       "queue", "steer", "interrupt",
     ]);
     if (provider === "codex") names.add("hooks");
@@ -973,6 +991,9 @@ export function Composer({
         group: "MESSAGE DELIVERY", onSelect: () => {},
       })) : []),
       ...(slashLeadsMessage || helpOpen ? providerCommandItems : []),
+      // Kept beside the other CHAT rows: arrow keys walk this flat list,
+      // and the popup draws it grouped, so a group must stay contiguous.
+      sideChatCommand,
       {
         id: "composer:help", label: "Commands and skills", command: "/help", icon: SquareSlash,
         description: "Browse available commands and controls for this provider", group: "CHAT",
@@ -1018,6 +1039,7 @@ export function Composer({
       skillsLoading, providerCommandsEntry.loading, loadSkills, loadProviderCommands, cwd, provider, threadId,
       modeCommands,
       workflowCommand,
+      sideChatCommand,
       modelCommand,
       skillItems,
       providerCommandItems,
@@ -1962,6 +1984,7 @@ export function Composer({
               },
             ]
           : []),
+        sideChatCommand,
         {
           id: "attach:file",
           label: "File…",
@@ -2160,6 +2183,7 @@ export function Composer({
     modelSupportsImages,
     workflowCommand,
     workflowsAvailable,
+    sideChatCommand,
     configurationEnabled,
     onDelegateTask,
     readOnly,
@@ -2340,6 +2364,12 @@ export function Composer({
       if (item.id === "workflow") {
         insertAtCursor("/workflow ");
         closeAttachPopup();
+        return;
+      }
+      if (item.id === "btw") {
+        if (!item.disabled) onDraftChange(withBtwPrefix(draft));
+        closeAttachPopup();
+        requestAnimationFrame(() => textareaRef.current?.focus());
         return;
       }
       // File / folder picks: insert the inline token, dispatch the
@@ -2567,7 +2597,8 @@ export function Composer({
         item.id.startsWith("provider-command:") ||
         item.id.startsWith("subcommand:") ||
         item.id.startsWith("delivery:") ||
-        item.id === "workflow"
+        item.id === "workflow" ||
+        item.id === "btw"
       ) {
         // Inline token expansion. Replace the typed `/<query>` with
         // the full `/<skill-name> `, `/workflow `, provider
@@ -2960,7 +2991,9 @@ export function Composer({
     });
   });
 
-  const interruptKeys = useResolvedKeybinds().getKeysForAction("interruptAgent");
+  const resolvedKeybinds = useResolvedKeybinds();
+  const interruptKeys = resolvedKeybinds.getKeysForAction("interruptAgent");
+  const sideQuestionKeys = resolvedKeybinds.getKeysForAction("sideQuestion");
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (composingRef.current || e.nativeEvent.isComposing) return;
@@ -3043,6 +3076,23 @@ export function Composer({
           return;
         }
       }
+    }
+
+    // Ctrl+; starts a `/btw` side question in this draft. It never sends:
+    // the user finishes the question and presses Enter as usual.
+    if (sideQuestionKeys && matchesKeyCombo(e.nativeEvent, sideQuestionKeys)) {
+      e.preventDefault();
+      if (!sideChatSupported(provider)) {
+        toast.info(sideChatUnavailableMessage(provider));
+        return;
+      }
+      const next = withBtwPrefix(draft);
+      onDraftChange(next);
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (el) el.setSelectionRange(next.length, next.length);
+      });
+      return;
     }
 
     // Popups had first claim on Escape above; with none open it stops the run.
@@ -3163,26 +3213,8 @@ export function Composer({
           className={cn(
             // Stacks above the strip, whose 18px seam tucks under the pill.
             "relative z-[1] flex flex-col",
-            // Composer pill / card: 22px radius in both states (a 44px
-            // pill is a stadium; the expanded card keeps the same corner),
-            // a hairline border, and a deep low-opacity shadow so the card
-            // lifts off the pane background. The border stays identical at
-            // rest and on focus — focus comes from surface and elevation.
-            // The surface is the muted tint pre-composited over the pane
-            // background: opaque, so the strip's seam never shows through.
-            "rounded-[22px] border border-border/80 bg-[color-mix(in_oklab,var(--muted)_40%,var(--background))]",
-            // Geometry and color split so the tint stays a themeable
-            // utility rather than a baked-in rgba literal.
-            "shadow-[0_12px_28px_-18px] shadow-black/40",
-            // Composer is mounted for the entire chat session and re-
-            // renders frequently as the draft / attachments change.
-            // `transition-all` would animate every property change;
-            // scope to the properties that actually transition here
-            // (drag-state border + tinted background, plus focus-within
-            // border shift) so the compositor only has work to do on
-            // those changes.
-            "transition-[box-shadow,border-color,background-color] duration-150",
-            "focus-within:bg-[color-mix(in_oklab,var(--muted)_60%,var(--background))] focus-within:shadow-[0_16px_38px_-14px] focus-within:shadow-black/60",
+            // The shared composer surface (pill / card, see composer-surface).
+            COMPOSER_CARD,
             // Drag-over uses a neutral foreground-tinted ring instead
             // of the primary accent: the chat-ui skill reserves accent
             // for the app shell, and the brightness shift alone is
@@ -3901,7 +3933,10 @@ export function Composer({
       </div>
       {provider === "codex" && <HooksManager open={hooksOpen} onOpenChange={setHooksOpen} cwd={cwd ?? null} threadId={threadId ?? null} />}
       <ProviderCommandsDialog open={helpOpen} onOpenChange={setHelpOpen} providerLabel={sessionProviderLabel(provider)} items={allSlashItems} loading={skillsLoading || providerCommandsEntry.loading} error={providerCommandsEntry.error ?? skillsError ?? skillAdapterError ?? null} onSelect={(item) => {
-        if (item.id.startsWith("skill:") || item.id.startsWith("provider-command:") || item.id.startsWith("delivery:") || item.id === "workflow") {
+        if (item.id === "btw") {
+          if (!item.disabled) onDraftChange(withBtwPrefix(draft));
+          requestAnimationFrame(() => textareaRef.current?.focus());
+        } else if (item.id.startsWith("skill:") || item.id.startsWith("provider-command:") || item.id.startsWith("delivery:") || item.id === "workflow") {
           onDraftChange(`${item.command} ${draft}`);
           requestAnimationFrame(() => textareaRef.current?.focus());
         }
