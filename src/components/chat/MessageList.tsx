@@ -49,6 +49,7 @@ import type { AgentChatTurnCheckpointRecord } from "@/tauri/commands";
 
 import { ActivityBlock } from "./ActivityBlock";
 import { AssistantMessage } from "./AssistantMessage";
+import { ChatForkMarker } from "./ChatFork";
 import { DelegationCard } from "./DelegationCard";
 import { SuggestedTasksCard } from "./SuggestedTasksCard";
 import { DelegationResultsDivider } from "./DelegationResultsDivider";
@@ -1391,6 +1392,7 @@ export const MessageList = memo(function MessageList({
             "calc(30px + var(--composer-overlay-height, 0px))",
         }}
       >
+        <ChatForkMarker messages={ordered} />
         {showStalled && (
           <div className="mt-[13px]">
             <RunStalledNotice

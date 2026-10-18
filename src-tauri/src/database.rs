@@ -7,6 +7,7 @@ pub mod follow_ups;
 pub mod hermes;
 pub mod custom_acp;
 pub(crate) mod local_sessions;
+pub mod chat_fork;
 mod delegation;
 pub mod pr_watch;
 pub mod turn_diffs;
@@ -1171,6 +1172,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     pr_watch::create_schema(conn)?;
     automation_triggers::create_schema(conn)?;
     turn_diffs::create_schema(conn)?;
+    chat_fork::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new

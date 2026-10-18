@@ -919,6 +919,33 @@ pub(crate) fn thread_runs_on_device_pub<R: Runtime>(app: &AppHandle<R>, thread_i
     thread_runs_on_device(app, thread_id)
 }
 
+/// Hold a thread still while a chat fork copies it. The dispatch lock a
+/// send holds comes first; the turn-checkpoint timeline lock second (the
+/// order a send takes them), so no turn starts and no revert runs until
+/// both guards drop. Split so the fork can ask the provider about the
+/// session before taking the timeline lock, which a queued checkpoint may
+/// be waiting on while it holds the session's outbound lock.
+pub(crate) async fn fork_dispatch_guard<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    native_thread_gate(app, thread_id)
+        .dispatch
+        .clone()
+        .lock_owned()
+        .await
+}
+
+/// The second half of [`fork_dispatch_guard`].
+pub(crate) async fn fork_timeline_guard(thread_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    turn_checkpoint_lock_for(thread_id).lock_owned().await
+}
+
+/// Crate-visible: where a thread's sent chat images live.
+pub(crate) fn chat_images_dir_pub(thread_id: &str) -> Option<std::path::PathBuf> {
+    chat_images_dir(thread_id)
+}
+
 fn thread_runs_on_device<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> bool {
     app.try_state::<AppStateStore>().is_some_and(|state| {
         let db = app.try_state::<DatabaseStore>();

@@ -66,18 +66,24 @@ pub const SIDE_CHAT_EVENT: &str = "agent-chat-side-chat";
 /// Instructions given to the fork so it answers instead of continuing work.
 pub const SIDE_CHAT_INSTRUCTIONS: &str = "You are in a side chat. The user is asking a quick side question about the conversation so far while the main session keeps working. Answer only that question, directly and concisely. This side chat is read-only: do not edit files, run commands that change anything, or continue the main task. The main session may still be running, so the transcript you see can stop mid-task and its work may already be further along: never take over, finish or report on the main task's unfinished steps unless the user asks about them. Use only the read-only tools you have; if one is unavailable, answer from what you can read. Nothing you say here is added to the main conversation.";
 
-/// Whether `provider` can fork a side chat. Refusals are user-facing.
-pub fn ensure_side_chat_supported(provider: ProviderKind) -> Result<(), String> {
-    match provider {
-        ProviderKind::Claude | ProviderKind::Codex => Ok(()),
-        other => Err(format!(
-            "Side chat isn't available for {} yet.",
-            provider_label(other)
-        )),
-    }
+/// Whether `provider` can fork its own session natively. Shared by `/btw`
+/// side chats and persistent chat forks.
+pub fn supports_native_fork(provider: ProviderKind) -> bool {
+    matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
 }
 
-fn provider_label(provider: ProviderKind) -> &'static str {
+/// Whether `provider` can fork a side chat. Refusals are user-facing.
+pub fn ensure_side_chat_supported(provider: ProviderKind) -> Result<(), String> {
+    if supports_native_fork(provider) {
+        return Ok(());
+    }
+    Err(format!(
+        "Side chat isn't available for {} yet.",
+        provider_label(provider)
+    ))
+}
+
+pub fn provider_label(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Claude => "Claude",
         ProviderKind::Codex => "Codex",
@@ -135,18 +141,15 @@ pub fn codex_enabled_mcp_servers(config: &Value) -> Vec<String> {
     names
 }
 
-/// `thread/fork` params: an ephemeral (never written to disk) read-only fork
-/// that can never ask for approval. MCP servers are disabled per name with a
-/// nested override; the dotted-key form is rejected by Codex 0.162.
-pub fn codex_fork_params(main_thread_id: &str, cwd: &str, mcp_servers: &[String]) -> Value {
+/// The `thread/fork` params every fork shares: the source thread, the fork's
+/// working directory, no turns echoed back, and the named MCP servers left
+/// unstarted in the forking process (a nested override; the dotted-key form
+/// is rejected by Codex 0.162).
+pub fn codex_fork_base_params(thread_id: &str, cwd: &str, mcp_servers: &[String]) -> Value {
     let mut params = json!({
-        "threadId": main_thread_id,
-        "ephemeral": true,
+        "threadId": thread_id,
         "excludeTurns": true,
         "cwd": cwd,
-        "sandbox": "read-only",
-        "approvalPolicy": "never",
-        "developerInstructions": SIDE_CHAT_INSTRUCTIONS,
     });
     if !mcp_servers.is_empty() {
         let disabled: serde_json::Map<String, Value> = mcp_servers
@@ -155,6 +158,17 @@ pub fn codex_fork_params(main_thread_id: &str, cwd: &str, mcp_servers: &[String]
             .collect();
         params["config"] = json!({ "mcp_servers": disabled });
     }
+    params
+}
+
+/// `thread/fork` params: an ephemeral (never written to disk) read-only fork
+/// that can never ask for approval, with its MCP servers disabled.
+pub fn codex_fork_params(main_thread_id: &str, cwd: &str, mcp_servers: &[String]) -> Value {
+    let mut params = codex_fork_base_params(main_thread_id, cwd, mcp_servers);
+    params["ephemeral"] = json!(true);
+    params["sandbox"] = json!("read-only");
+    params["approvalPolicy"] = json!("never");
+    params["developerInstructions"] = json!(SIDE_CHAT_INSTRUCTIONS);
     params
 }
 
@@ -280,15 +294,8 @@ pub fn codex_side_update(
 /// asked for, and return its thread id. A server that ignored either
 /// override must not run the side question.
 pub fn codex_validate_fork(response: &Value) -> Result<String, String> {
-    let thread = response
-        .get("thread")
-        .ok_or("Codex returned no forked thread")?;
-    let id = thread
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .ok_or("Codex returned a fork without an id")?;
-    if thread.get("ephemeral") != Some(&json!(true)) {
+    let id = codex_fork_thread_id(response)?;
+    if response.pointer("/thread/ephemeral") != Some(&json!(true)) {
         return Err("Codex did not keep the side chat off disk".into());
     }
     if response.pointer("/sandbox/type").and_then(Value::as_str) != Some("readOnly") {
@@ -297,7 +304,20 @@ pub fn codex_validate_fork(response: &Value) -> Result<String, String> {
     if response.get("approvalPolicy").and_then(Value::as_str) != Some("never") {
         return Err("Codex did not disable approvals for the side chat".into());
     }
-    Ok(id.to_string())
+    Ok(id)
+}
+
+/// The id of the thread a `thread/fork` response created.
+pub fn codex_fork_thread_id(response: &Value) -> Result<String, String> {
+    let thread = response
+        .get("thread")
+        .ok_or("Codex returned no forked thread")?;
+    thread
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Codex returned a fork without an id".to_string())
 }
 
 /// Renderer-minted side-chat ids are UUIDs; anything else is refused so the

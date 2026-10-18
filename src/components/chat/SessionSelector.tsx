@@ -43,6 +43,8 @@ export interface SessionSelectorProps {
   /** Same purpose as `sessionsOverride` — skips the delete invoke so
    *  tests can assert behaviour without a real backend. */
   onDeleteOverride?: (threadId: string) => void;
+  /** Extra rows under New Chat (see `SessionHistoryList.footerItem`). */
+  footerItem?: React.ReactNode;
 }
 
 export function SessionSelector({
@@ -53,6 +55,7 @@ export function SessionSelector({
   onNewChat,
   sessionsOverride,
   onDeleteOverride,
+  footerItem,
 }: SessionSelectorProps) {
   const [open, setOpen] = useState(false);
   const { sessions, loading, handleDelete } = useSessionHistory({
@@ -101,6 +104,7 @@ export function SessionSelector({
           onNewChat={onNewChat}
           onDelete={handleDelete}
           closeMenu={() => setOpen(false)}
+          footerItem={footerItem}
         />
       </DropdownMenuContent>
     </DropdownMenu>

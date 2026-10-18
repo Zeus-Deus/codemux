@@ -31,6 +31,7 @@ pub mod types;
 pub mod side_chat;
 pub mod slash_commands;
 pub mod usage_limit;
+pub mod chat_fork;
 
 pub use context_usage::ContextUsageTracker;
 pub use errors::{ProviderError, SerializableProviderError};
