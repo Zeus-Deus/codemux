@@ -84,3 +84,39 @@ describe("DiffView", () => {
     ).toBeInTheDocument();
   });
 });
+
+describe("DiffView with a git patch", () => {
+  const patch = [
+    "diff --git a/src/a.ts b/src/a.ts",
+    "index 1111111..2222222 100644",
+    "--- a/src/a.ts",
+    "+++ b/src/a.ts",
+    "@@ -10,3 +10,3 @@ function a() {",
+    " keep ten",
+    "-old eleven",
+    "+new eleven",
+    " keep twelve",
+    "@@ -40,2 +40,3 @@",
+    " keep forty",
+    "+added forty-one",
+    " keep forty-two",
+    "",
+  ].join("\n");
+
+  it("renders hunks with their real line numbers and counts", () => {
+    const { container } = render(
+      <DiffView filename="src/a.ts" patch={patch} copyText={patch} />,
+    );
+    expect(screen.getByText("+2")).toBeInTheDocument();
+    expect(screen.getByText("−1")).toBeInTheDocument();
+    expect(screen.getByText("@@ -10,3 +10,3 @@ function a() {")).toBeInTheDocument();
+    expect(screen.getByText("@@ -40,2 +40,3 @@")).toBeInTheDocument();
+    // Context lines carry the file's own line numbers, not a running count.
+    expect(screen.getByText("keep ten").previousSibling).toHaveTextContent("10");
+    expect(screen.getByText("keep forty-two").previousSibling).toHaveTextContent("42");
+    // File headers are not rows, and the trailing newline adds no empty row.
+    expect(screen.queryByText(/index 1111111/)).not.toBeInTheDocument();
+    const rows = container.querySelectorAll(".code-surface > div");
+    expect(rows).toHaveLength(9);
+  });
+});

@@ -1310,6 +1310,7 @@ export const MessageList = memo(function MessageList({
           }
           workspaceId={workspaceId}
           cwd={cwd}
+          threadId={threadKey}
           referenceCwd={referenceCwdByMessageId.get(slot.messageId)}
           referencePaths={referencePathsByMessageId.get(slot.messageId)}
           onRespondToRequest={onRespondToRequest}
@@ -1345,6 +1346,7 @@ export const MessageList = memo(function MessageList({
       turnCheckpointByNonce,
       workspaceId,
       cwd,
+      threadKey,
       pluginToolRenderers,
     ],
   );
@@ -2168,6 +2170,7 @@ function TurnFoldRow({
   changes,
   workspaceId,
   cwd,
+  threadId,
   onToggleTurnFold,
 }: {
   turnId: string;
@@ -2178,6 +2181,7 @@ function TurnFoldRow({
   changes?: TurnChangeSummary;
   workspaceId?: string | null;
   cwd?: string | null;
+  threadId?: string | null;
   onToggleTurnFold: (turnId: string, pinnedBy: readonly string[]) => void;
 }) {
   const Icon = expanded ? ChevronDown : ChevronRight;
@@ -2198,7 +2202,13 @@ function TurnFoldRow({
         <Icon className="size-3.5" aria-hidden />
       </button>
       {changes ? (
-        <TurnChangesChip changes={changes} workspaceId={workspaceId} cwd={cwd} />
+        <TurnChangesChip
+          changes={changes}
+          workspaceId={workspaceId}
+          cwd={cwd}
+          threadId={threadId}
+          turnId={turnId}
+        />
       ) : null}
     </div>
   );
@@ -2230,6 +2240,7 @@ function SlotRow({
   subagentName,
   workspaceId,
   cwd,
+  threadId,
   referenceCwd,
   referencePaths,
   onRespondToRequest,
@@ -2253,6 +2264,8 @@ function SlotRow({
   subagentName: string | null;
   workspaceId?: string | null;
   cwd?: string | null;
+  /** The thread whose turns these are; lets a turn's chip fetch its diff. */
+  threadId?: string | null;
   referenceCwd?: string | null;
   referencePaths?: readonly string[];
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
@@ -2302,6 +2315,7 @@ function SlotRow({
           changes={slot.body.changes}
           workspaceId={workspaceId}
           cwd={cwd}
+          threadId={threadId}
           onToggleTurnFold={onToggleTurnFold}
         />
       ) : slot.body.kind === "delegation" ? (

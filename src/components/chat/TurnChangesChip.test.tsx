@@ -1,8 +1,13 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { useUIStore } from "@/stores/ui-store";
+
+const getTurnDiff = vi.fn();
+vi.mock("@/tauri/commands", () => ({
+  agentChatGetTurnDiff: (...args: unknown[]) => getTurnDiff(...args),
+}));
 
 import { TurnChangesChip } from "./TurnChangesChip";
 
@@ -42,5 +47,24 @@ describe("TurnChangesChip", () => {
     expect(screen.getByTestId("turn-changes-chip")).toHaveTextContent(
       "1 file changed",
     );
+  });
+
+  it("opens the turn's git diff when it knows the turn", async () => {
+    getTurnDiff.mockResolvedValue(null);
+    render(
+      <TurnChangesChip
+        changes={changes}
+        workspaceId="ws-1"
+        cwd="/repo"
+        threadId="t1"
+        turnId="turn-1"
+      />,
+    );
+    const chip = screen.getByTestId("turn-changes-chip");
+    expect(chip).toHaveAccessibleName(/Show this turn's diff/);
+    fireEvent.click(chip);
+    expect(await screen.findByTestId("turn-diff-dialog")).toBeInTheDocument();
+    expect(getTurnDiff).toHaveBeenCalledWith("t1", "turn-1");
+    expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBeUndefined();
   });
 });
