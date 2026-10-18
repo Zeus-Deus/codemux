@@ -147,8 +147,13 @@ impl DatabaseStore {
         let rows: Vec<(i64, String, String)> = {
             let mut stmt = tx
                 .prepare(
+                    // The source's queue journal stays behind: the fork has
+                    // no queue, and an admission whose dispatch falls after
+                    // the cut would read as a message still waiting to send.
                     "SELECT id, payload, created_at FROM agent_chat_messages
                      WHERE thread_id = ?1 AND (?2 IS NULL OR id < ?2)
+                       AND NOT (json_valid(payload)
+                                AND json_extract(payload, '$.type') = 'native_queue_control')
                      ORDER BY id ASC",
                 )
                 .map_err(|e| e.to_string())?;
@@ -341,6 +346,7 @@ mod tests {
         let db = store_with_source();
         append(&db, serde_json::json!({"type":"user_message","thread_id":"src","text":"one"}));
         append(&db, serde_json::json!({"type":"turn_completed","thread_id":"src"}));
+        append(&db, serde_json::json!({"type":"native_queue_control","thread_id":"src","queued_id":"q","disposition":"accepted"}));
         let second = append(&db, serde_json::json!({"type":"user_message","thread_id":"src","text":"two"}));
         append(&db, serde_json::json!({"type":"turn_completed","thread_id":"src"}));
         let source = db.get_agent_chat_session("src").unwrap();
@@ -357,7 +363,8 @@ mod tests {
         .unwrap();
 
         let copied = db.list_agent_chat_messages("fork");
-        assert_eq!(copied.len(), 2, "rows from the cut on stay in the source");
+        assert_eq!(copied.len(), 2, "rows from the cut on, and the queue journal, stay behind");
+        assert!(db.control_unresolved_queued_ids("fork").unwrap().is_empty());
         assert!(copied.iter().all(|row| row.contains(r#""thread_id":"fork""#)));
         let record = db.get_agent_chat_session("fork").unwrap();
         assert_eq!(record.sdk_session_id.as_deref(), Some("native-fork"));
@@ -369,7 +376,7 @@ mod tests {
         assert_eq!(origin.source_title.as_deref(), Some("Fix the parser"));
         assert!(origin.source_exists);
         assert_eq!(origin.boundary_message_id, db.max_agent_chat_message_id("fork"));
-        assert_eq!(db.list_agent_chat_messages("src").len(), 4, "the source is untouched");
+        assert_eq!(db.list_agent_chat_messages("src").len(), 5, "the source is untouched");
         assert!(db.agent_chat_fork_origin("src").is_none());
     }
 

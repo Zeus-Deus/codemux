@@ -93,14 +93,14 @@ export function ChatForkProvider({
   messages: readonly ChatViewItem[];
   checkpointByNonce?: ReadonlyMap<string, AgentChatTurnCheckpointRecord>;
   busy: boolean;
-  /** False for a read-only view of the chat (a remote mirror). */
+  /** False for a read-only view of the chat. Paired browsers never fork. */
   enabled: boolean;
   children: React.ReactNode;
 }) {
   const [store] = useState(createForkPointStore);
   useEffect(() => {
     store.set(
-      enabled && threadId && workspaceId
+      enabled && threadId && workspaceId && !isRemoteClient()
         ? computeForkPoints(messages, provider, checkpointByNonce, busy)
         : new Map(),
     );
@@ -213,7 +213,8 @@ export function ChatForkMenuItems({
   workspaceId: string | null | undefined;
 }) {
   const canUseWorktree = useWorkspaceCanFork(workspaceId);
-  if (!threadId || !workspaceId || !chatForkSupported(provider)) return null;
+  // Forking runs local provider processes; a paired browser can't reach it.
+  if (!threadId || !workspaceId || !chatForkSupported(provider) || isRemoteClient()) return null;
   return (
     <ForkMenuRows
       before={null}

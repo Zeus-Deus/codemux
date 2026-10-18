@@ -156,7 +156,7 @@ async fn plan_fork<R: Runtime>(
     // own after this point either still runs or has moved the head when
     // `settled_bound` looks again.
     let (_, user_head) = db.agent_chat_fork_heads(source_thread_id);
-    if live.turn_active(&ThreadId(source_thread_id.to_string())).await {
+    if source_busy(&*live, &db, source_thread_id).await? {
         return Err(BUSY.into());
     }
     let cut = match (before_message_id, provider) {
@@ -190,17 +190,34 @@ async fn plan_fork<R: Runtime>(
     })
 }
 
-const BUSY: &str = "Wait for the current turn to finish, then fork the chat.";
+const BUSY: &str = "Wait for the current turn and any queued messages to finish, then fork the chat.";
+
+/// Whether the source has a turn running or queued messages still to send.
+/// A queued turn can finish before its dispatch is acknowledged (and its
+/// user message written), so the queue journal counts too, but only while
+/// the provider holds a live session: entries a crash left behind can't
+/// dispatch and must not block forks forever.
+async fn source_busy(
+    live: &dyn AgentProvider,
+    db: &DatabaseStore,
+    thread: &str,
+) -> Result<bool, String> {
+    let thread_id = ThreadId(thread.to_string());
+    if live.turn_active(&thread_id).await {
+        return Ok(true);
+    }
+    Ok(live.has_session(&thread_id).await && !db.control_unresolved_queued_ids(thread)?.is_empty())
+}
 
 /// After the provider forked, confirm the source is still where the plan
 /// saw it and return the transcript bound to copy before. The guards stop
-/// sends and reverts, but a provider can still start a queued turn on its
-/// own once the previous one ends; a fork that raced one is refused rather
-/// than pairing the provider's copy with a different transcript.
+/// sends and reverts, but a provider starts a queued turn on its own once
+/// the previous one ends; a fork that raced one is refused rather than
+/// pairing the provider's copy with a different transcript.
 async fn settled_bound(plan: &ForkPlan, db: &DatabaseStore) -> Result<Option<i64>, String> {
     let thread = &plan.source.thread_id;
     let (head, user_head) = db.agent_chat_fork_heads(thread);
-    if user_head != plan.user_head || plan.live.turn_active(&ThreadId(thread.clone())).await {
+    if user_head != plan.user_head || source_busy(&*plan.live, db, thread).await? {
         return Err(format!("The chat started another turn while it was being forked. {BUSY}"));
     }
     Ok(match plan.cut.before() {
