@@ -479,7 +479,8 @@ pub struct AgentChatTurnDiff {
     pub thread_id: String,
     pub turn_id: String,
     pub status: AgentChatTurnDiffStatus,
-    pub repo_path: String,
+    /// Root of the repository the file paths are relative to.
+    pub repo_root: String,
     pub before_commit: String,
     pub after_commit: Option<String>,
     pub files: Vec<TurnDiffFile>,
@@ -501,14 +502,11 @@ pub async fn agent_chat_get_turn_diff(
     let Some(record) = db.get_agent_chat_turn_diff(&thread_id, &turn_id) else {
         return Ok(None);
     };
-    if !Path::new(&record.repo_path).is_dir() {
-        return Ok(None);
-    }
     let mut result = AgentChatTurnDiff {
         thread_id,
         turn_id,
         status: AgentChatTurnDiffStatus::InProgress,
-        repo_path: record.repo_path.clone(),
+        repo_root: String::new(),
         before_commit: record.before_commit.clone(),
         after_commit: record.after_commit.clone(),
         files: Vec::new(),
@@ -517,14 +515,27 @@ pub async fn agent_chat_get_turn_diff(
         deletions: 0,
         truncated: false,
     };
-    let Some(after) = record.after_commit else {
-        return Ok(Some(result));
-    };
-    let diff = tauri::async_runtime::spawn_blocking(move || {
-        crate::turn_diff::diff_snapshots(Path::new(&record.repo_path), &record.before_commit, &after)
+    let computed = tauri::async_runtime::spawn_blocking(move || {
+        let repo = Path::new(&record.repo_path);
+        // The workspace (or its repository) may be gone by now.
+        let Some(root) = crate::turn_diff::repo_root(repo) else {
+            return Ok(None);
+        };
+        let diff = match &record.after_commit {
+            Some(after) => Some(crate::turn_diff::diff_snapshots(repo, &record.before_commit, after)?),
+            None => None,
+        };
+        Ok::<_, String>(Some((root, diff)))
     })
     .await
     .map_err(|e| format!("agent_chat_get_turn_diff task join failed: {e}"))??;
+    let Some((root, diff)) = computed else {
+        return Ok(None);
+    };
+    result.repo_root = root;
+    let Some(diff) = diff else {
+        return Ok(Some(result));
+    };
     result.status = AgentChatTurnDiffStatus::Ready;
     result.files = diff.files;
     result.files_changed = diff.files_changed;

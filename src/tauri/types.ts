@@ -1942,7 +1942,8 @@ export interface AgentChatTurnDiff {
   turn_id: string;
   /** `in_progress` while the turn runs; `files` is empty until it settles. */
   status: "ready" | "in_progress";
-  repo_path: string;
+  /** Root of the repository the file paths are relative to. */
+  repo_root: string;
   before_commit: string;
   after_commit: string | null;
   /** Capped list; the counts below cover every changed file. */

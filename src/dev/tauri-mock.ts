@@ -2421,7 +2421,7 @@ function mockTurnDiff(threadId: string, turnId: string): AgentChatTurnDiff {
     thread_id: threadId,
     turn_id: turnId,
     status: "ready",
-    repo_path: `${MOCK_HOME_DIR}/projects/codemux`,
+    repo_root: `${MOCK_HOME_DIR}/projects/codemux`,
     before_commit: "4f1c2a9e8b7d6c5b4a3928170615f4e3d2c1b0a9",
     after_commit: "9a0b1c2d3e4f5061728394a5b6c7d8e9f0a1b2c3",
     files,

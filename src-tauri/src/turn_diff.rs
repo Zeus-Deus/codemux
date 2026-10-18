@@ -270,6 +270,15 @@ fn sync_ignored(repo: &Path, index: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Root of the git worktree containing `path`, or `None` when `path` is
+/// gone or not inside one.
+pub fn repo_root(path: &Path) -> Option<String> {
+    if !path.is_dir() {
+        return None;
+    }
+    git_line(path, &["rev-parse", "--show-toplevel"]).ok()
+}
+
 /// Snapshot the full worktree of the repository containing `repo_path`
 /// (tracked and untracked files, `.gitignore` respected) as a parentless
 /// commit anchored at `ref_name`. The user's index, worktree and stash are
@@ -1111,6 +1120,10 @@ mod tests {
         fs::write(repo.join("keep.txt"), "changed\n").unwrap();
         let after = snap(&repo, "after");
         let diff = diff_snapshots(&repo.join("sub"), &before, &after).unwrap();
+        // Paths are relative to the root the command reports, not the cwd.
+        let root = repo_root(&repo.join("sub")).unwrap();
+        assert_eq!(Path::new(&root).canonicalize().unwrap(), repo.canonicalize().unwrap());
+        assert_eq!(repo_root(&repo.join("missing")), None);
         let keep = file(&diff, "keep.txt");
         assert!(keep.patch.as_deref().unwrap().starts_with("diff --git a/keep.txt b/keep.txt"));
     }
