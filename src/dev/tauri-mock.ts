@@ -3,7 +3,6 @@ import type {
   HostStatusView,
   HostView,
   LocalChatSession,
-  SecretMeta,
   StaleWorktree,
 } from "@/tauri/commands";
 import type {
@@ -54,6 +53,7 @@ import { workflowMockHandlers } from "./workflow-mock";
 import { createCustomAcpMock } from "./custom-acp-mock";
 import { pluginMockHandlers } from "./plugin-mock";
 import { seedEnvironmentsFromSearch } from "./environments-mock";
+import { automationMockHandlers } from "./automations-mock";
 import {
   delegationScenarioFromSearch,
   mockDelegatedChild,
@@ -4380,9 +4380,6 @@ const MOCK_SEARCH_PATHS = [
   "docs/screenshots/dashboard.png",
 ];
 
-// Stored secrets for the mock `secrets_*` handlers. Metadata only.
-const mockSecrets: SecretMeta[] = [];
-
 // ── Devices (SSH hosts) ─────────────────────────────────────────────
 //
 // Mutable so Settings → Devices can add, rename, set up and remove devices
@@ -4742,6 +4739,7 @@ const handlers: Record<string, Handler> = {
   get_feature_flags: () => FEATURE_FLAGS,
   // Empty by default: plugins never alter a clean core-only UI.
   ...pluginMockHandlers(),
+  ...automationMockHandlers(),
   ...workflowMockHandlers((event) => emitEvent("workflow-changed", event)),
   get_package_format: () =>
     updateMockScenario === "pacman" || updateMockScenario === "other"
@@ -6769,44 +6767,6 @@ const handlers: Record<string, Handler> = {
     const reviewer = String(a.reviewer ?? "").trim();
     if (!reviewer) return Promise.reject("A reviewer name is required.");
     if (!pr.review_requests.includes(reviewer)) pr.review_requests.push(reviewer);
-    return undefined;
-  },
-
-  // ── Automations ──
-  // Empty list, so the Automations page opens on its "create" state
-  // instead of crashing on a null list.
-  automations_list: () => [],
-  automations_runs: () => [],
-  automations_check_repo_access: () => ({
-    ok: true,
-    message: "This host can reach the repository.",
-  }),
-  automations_webhook_credentials: () => ({
-    webhook_id: "0f3c9a1e5b7d4c2a9e8f6b1d3a5c7e90",
-    token: "mock-webhook-token",
-  }),
-  automations_rotate_webhook_token: () => ({
-    webhook_id: "0f3c9a1e5b7d4c2a9e8f6b1d3a5c7e90",
-    token: `mock-webhook-token-${Date.now()}`,
-  }),
-  automations_set_webhook_signature: () =>
-    Promise.reject("No automations exist in the mock."),
-  // Secrets: metadata only, mirroring the backend, which never returns a
-  // stored value.
-  secrets_store: (a) => {
-    const meta = {
-      id: `secret_mock${mockSecrets.length + 1}`,
-      label: String(a.label ?? "").trim(),
-      created_at: new Date().toISOString(),
-    };
-    mockSecrets.unshift(meta);
-    return { ...meta };
-  },
-  secrets_list: () => mockSecrets.map((secret) => ({ ...secret })),
-  secrets_delete: (a) => {
-    const index = mockSecrets.findIndex((secret) => secret.id === a.id);
-    if (index === -1) return Promise.reject("No such secret");
-    mockSecrets.splice(index, 1);
     return undefined;
   },
 

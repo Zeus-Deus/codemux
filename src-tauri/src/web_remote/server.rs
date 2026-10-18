@@ -357,6 +357,8 @@ pub fn router<R: Runtime>(app: AppHandle<R>) -> Router {
         .route("/proxy/browser/:port/api/*rest", any(super::proxy::http_forward::<R>))
         .route("/ws", get(ws_upgrade::<R>))
         .merge(crate::mcp_connector::router::<R>())
+        // Webhook-triggered automations; the URL token is the credential.
+        .merge(crate::automations::webhook_http::router::<R>())
         .merge(compressible)
         .with_state(app)
 }

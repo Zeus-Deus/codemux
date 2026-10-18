@@ -21,3 +21,4 @@ pub mod recurrence;
 pub mod scheduler;
 pub mod service;
 pub mod webhook;
+pub mod webhook_http;
