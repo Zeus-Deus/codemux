@@ -194,3 +194,41 @@ test("each query gets an abort controller so a Stop can end its CLI at once", as
   expect(signal?.aborted).toBe(true);
   await session.close();
 });
+
+test("a retired query that exits late stays silent once its replacement runs", async () => {
+  const methods: string[] = [];
+  const messages: unknown[] = [];
+  const session = new ClaudeSession(input(), {
+    notification(method, params) {
+      methods.push(method);
+      if (method === "sdk-message") messages.push((params as { message: unknown }).message);
+    },
+  });
+  await session.sendTurn({ text: "first" });
+  await session.steerTurn({ text: "guidance", uuid: "steer-10" });
+  const old = fakes[0] as FakeQuery;
+  // The old CLI outlives the retirement timeout.
+  old.close = () => {
+    old.closed = true;
+  };
+  await session.interrupt();
+  expect(methods).toContain("turn-interrupted");
+  await session.sendTurn({ text: "next" });
+  expect(fakes).toHaveLength(2);
+
+  old.emit({ type: "assistant", parent_tool_use_id: null } as unknown as SDKMessage);
+  old.errorStream(new Error("SIGTERM"));
+  await settle();
+  expect(messages).toHaveLength(0);
+  expect(methods).not.toContain("session-ended");
+  expect(methods).not.toContain("session-error");
+
+  // The replacement is still the live query: a steer reaches it and a new
+  // turn does not rebuild it.
+  await session.steerTurn({ text: "fresh", uuid: "steer-11" });
+  await session.sendTurn({ text: "again" });
+  await settle();
+  expect(fakes).toHaveLength(2);
+  expect(fakes[1]?.capturedPrompts.map((p) => p.uuid as string)).toContain("steer-11");
+  await session.close();
+});

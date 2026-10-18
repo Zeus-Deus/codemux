@@ -406,8 +406,9 @@ export class ClaudeSession {
   private bypassRestoreAttempted = false;
   /** Steer uuids no top-level `result` has echoed as consumed yet. */
   private readonly pendingSteers = new Set<string>();
-  /** True while a Stop ends the CLI process; see `retireForStop`. */
-  private retiring = false;
+  /** Queries a Stop ended; see `retireForStop`. Their consumer loops may
+   *  outlive the Stop, so they must stay silent once a replacement runs. */
+  private readonly retiredQueries = new WeakSet<Query>();
   /** Aborting it sends the query's CLI process SIGTERM at once; `close()`
    *  alone only schedules that two seconds later. */
   private queryAbort = new AbortController();
@@ -465,9 +466,10 @@ export class ClaudeSession {
    *  RPC layer. Unknown / not-yet-enumerated variants are forwarded
    *  raw; classification lives on the Rust side. */
   private async consumeMessages(): Promise<void> {
+    const query = this.query;
     try {
-      for await (const message of this.query) {
-        if (this.closed) break;
+      for await (const message of query) {
+        if (this.closed || this.retiredQueries.has(query)) break;
         // Stale-resume self-heal: the SDK reported that the JSONL for
         // the session we asked to resume is gone from disk. Rather than
         // let the error surface (which permanently wedges the thread),
@@ -494,6 +496,8 @@ export class ClaudeSession {
         });
         this.emitSpecialCases(message);
       }
+      // A Stop retired this query; `retireForStop` reports the outcome.
+      if (this.retiredQueries.has(query)) return;
       // A stale-resume recovery rebuilt the query on a fresh iteration
       // task; this OLD loop must unwind without emitting anything and
       // without touching the NEW query's state.
@@ -516,6 +520,7 @@ export class ClaudeSession {
         });
       }
     } catch (err) {
+      if (this.retiredQueries.has(query)) return;
       // Stale-resume can also surface as a thrown error from the
       // iterator rather than a `result` message. Same self-heal.
       if (
@@ -536,7 +541,7 @@ export class ClaudeSession {
       }
       // Interrupt-driven abort: same silent, mark-dead handling as the
       // clean-exit path above.
-      if (this.interrupting && !this.closed && (isAbortLikeError(err) || this.retiring)) {
+      if (this.interrupting && !this.closed && isAbortLikeError(err)) {
         this.queryDead = true;
         return;
       }
@@ -754,7 +759,7 @@ export class ClaudeSession {
    *  rebuilds a resumed query, as after any interrupt that killed it. */
   private async retireForStop(): Promise<void> {
     this.interrupting = true;
-    this.retiring = true;
+    this.retiredQueries.add(this.query);
     this.pendingSteers.clear();
     try {
       try {
@@ -782,7 +787,6 @@ export class ClaudeSession {
         });
       }
     } finally {
-      this.retiring = false;
       this.interrupting = false;
     }
   }
