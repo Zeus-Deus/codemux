@@ -6,14 +6,16 @@
 //! Everything past the HTTP shape is `webhook::accept_delivery`. The route
 //! answers as soon as the run is recorded and never waits for the agent.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::{
-    body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
-    Extension,
+    body::Body,
+    extract::{Path, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::post,
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde_json::json;
 use tauri::{AppHandle, Runtime};
@@ -34,38 +36,78 @@ impl ListenerLife {
     }
 }
 
-/// Deliveries validated at once. Acceptance locks the database and may read
-/// the secrets key file, so it runs on the blocking pool, and this cap keeps
-/// a burst of requests from taking that pool over.
-static ACCEPT_PERMITS: Semaphore = Semaphore::const_new(4);
+/// Requests one listener handles at once, from reading the body through
+/// validation. Extra requests are refused before their bodies are read, so
+/// at most this many bodies (each up to `MAX_WEBHOOK_BODY_BYTES`) are held in
+/// memory and at most this many validations (database lock, key-file read)
+/// occupy the blocking pool. Nothing queues.
+const MAX_IN_FLIGHT: usize = 8;
+
+/// How long an admitted sender may take to finish uploading its body.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct Admission(Arc<Semaphore>);
 
 /// Path prefix of webhook URLs; the full path is
 /// `{WEBHOOK_PATH_PREFIX}/<webhook_id>/<token>`.
 pub const WEBHOOK_PATH_PREFIX: &str = "/hooks/automations";
 
 pub fn router<R: Runtime>() -> Router<AppHandle<R>> {
+    router_with_admission(Arc::new(Semaphore::new(MAX_IN_FLIGHT)))
+}
+
+fn router_with_admission<R: Runtime>(slots: Arc<Semaphore>) -> Router<AppHandle<R>> {
     Router::new()
         .route(
             &format!("{WEBHOOK_PATH_PREFIX}/:webhook_id/:token"),
             post(receive::<R>),
         )
-        // Larger bodies are refused with 413 before they are buffered.
-        .layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES))
+        .layer(Extension(Admission(slots)))
 }
 
 async fn receive<R: Runtime>(
     State(app): State<AppHandle<R>>,
     life: Option<Extension<ListenerLife>>,
+    Extension(Admission(slots)): Extension<Admission>,
     Path((webhook_id, token)): Path<(String, String)>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     // Without a live listener (stopped, rebound, or a router built without
     // one) nothing may run.
     let Some(Extension(life)) = life.filter(|Extension(life)| life.live()) else {
         return listener_gone();
+    };
+    // Admit before reading the body, and refuse rather than queue, so a
+    // flood of uploads (no valid token needed to send one) cannot pile up
+    // buffered bodies. The slot is held until validation finishes.
+    let Ok(slot) = slots.try_acquire_owned() else {
+        let mut response = respond(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": "Too many webhook requests; retry shortly" }),
+        );
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        return response;
+    };
+    let body = match tokio::time::timeout(
+        UPLOAD_TIMEOUT,
+        axum::body::to_bytes(body, MAX_WEBHOOK_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(error)) => return body_error(error),
+        Err(_) => {
+            return respond(
+                StatusCode::REQUEST_TIMEOUT,
+                json!({ "error": "The request body took too long to arrive" }),
+            )
+        }
     };
     let request = WebhookRequest::new(
         method.as_str(),
@@ -76,15 +118,12 @@ async fn receive<R: Runtime>(
             .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?))),
         body.to_vec(),
     );
-    let Ok(permit) = ACCEPT_PERMITS.acquire().await else {
-        return listener_gone();
-    };
-    // The permit moves into the blocking task, so a sender that disconnects
+    // The slot moves into the blocking task, so a sender that disconnects
     // cannot free it while the work is still running.
     let dispatched = tauri::async_runtime::spawn_blocking(move || {
-        let _permit = permit;
-        // Re-check after waiting for a permit: the listener may have been
-        // stopped meanwhile.
+        let _slot = slot;
+        // Re-check after the upload: the listener may have been stopped
+        // meanwhile.
         if !life.live() {
             return None;
         }
@@ -115,6 +154,23 @@ async fn receive<R: Runtime>(
                 json!({ "error": rejection.to_string() }),
             )
         }
+    }
+}
+
+/// 413 for a body over the limit; 400 for one that could not be read.
+fn body_error(error: axum::Error) -> Response {
+    let too_large = std::error::Error::source(&error)
+        .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+    if too_large {
+        respond(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({ "error": DeliveryRejection::PayloadTooLarge.to_string() }),
+        )
+    } else {
+        respond(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "Could not read the request body" }),
+        )
     }
 }
 
@@ -259,6 +315,27 @@ mod tests {
         let (status, _) =
             post_to(&app, &format!("{WEBHOOK_PATH_PREFIX}/{id}/{token}"), b"{}".to_vec()).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(app.app.state::<DatabaseStore>().list_automation_runs(automation_id, 10).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_full_listener_refuses_without_reading_the_body() {
+        let (app, id, token, automation_id) = app_with_webhook();
+        let slots = Arc::new(Semaphore::new(1));
+        // Another request holds the only slot.
+        let _held = slots.clone().try_acquire_owned().unwrap();
+        let response = router_with_admission::<tauri::test::MockRuntime>(slots)
+            .layer(Extension(ListenerLife(app.shutdown.subscribe())))
+            .with_state(app.app.handle().clone())
+            .oneshot(
+                Request::post(format!("{WEBHOOK_PATH_PREFIX}/{id}/{token}"))
+                    .body(Body::from(b"{}".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
         assert!(app.app.state::<DatabaseStore>().list_automation_runs(automation_id, 10).is_empty());
     }
 
