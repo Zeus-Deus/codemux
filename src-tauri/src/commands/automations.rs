@@ -9,7 +9,8 @@
 //! the same `dirty` flag as hosts, so a future `automations_sync` can
 //! push deltas without any change to this surface.
 
-use crate::automations::recurrence;
+use crate::automations::{recurrence, webhook};
+use crate::database::automation_triggers::{AutomationTrigger, SignatureEncoding, WebhookSignature};
 use crate::database::{AutomationInput, AutomationRecord, AutomationRunRecord, DatabaseStore};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,39 @@ pub struct AutomationView {
     pub created_at: String,
     pub updated_at: String,
     pub dirty: bool,
+    pub trigger_type: AutomationTrigger,
+    /// Webhook setup, for webhook automations. Leaves out the URL token,
+    /// since this view also reaches agents over MCP; the desktop UI reads
+    /// it with `automations_webhook_credentials`.
+    pub webhook: Option<WebhookView>,
+}
+
+/// A webhook automation's public setup.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WebhookView {
+    pub id: String,
+    /// The signature check, if one is configured.
+    pub signature: Option<WebhookSignature>,
+    /// `secrets.id` of the signing secret. Never the value.
+    pub secret_ref: Option<String>,
+}
+
+/// The two halves of a webhook automation's URL.
+#[derive(Debug, Serialize)]
+pub struct WebhookCredentials {
+    pub webhook_id: String,
+    pub token: String,
+}
+
+/// A signature check to save, naming its stored signing secret.
+#[derive(Debug, Deserialize)]
+pub struct WebhookSignatureInput {
+    pub header: String,
+    pub encoding: SignatureEncoding,
+    #[serde(default)]
+    pub prefix: String,
+    /// `secrets.id` returned by `secrets_store`.
+    pub secret_ref: String,
 }
 
 impl From<AutomationRecord> for AutomationView {
@@ -74,6 +108,12 @@ impl From<AutomationRecord> for AutomationView {
             created_at: r.created_at,
             updated_at: r.updated_at,
             dirty: r.dirty,
+            trigger_type: r.trigger_type,
+            webhook: r.webhook_id.map(|id| WebhookView {
+                id,
+                signature: r.webhook_signature,
+                secret_ref: r.webhook_secret_ref,
+            }),
         }
     }
 }
@@ -108,7 +148,16 @@ fn resolve_project_remote(project_path: &str) -> Option<String> {
 
 /// Normalise and validate user input shared by create and update.
 /// Returns a cleaned `AutomationInput` (trimmed strings) on success.
-fn clean_input(mut input: AutomationInput) -> Result<AutomationInput, String> {
+/// `trigger` is the automation's trigger, which input cannot change.
+fn clean_input(
+    mut input: AutomationInput,
+    trigger: AutomationTrigger,
+) -> Result<AutomationInput, String> {
+    input.trigger_type = Some(trigger);
+    if trigger == AutomationTrigger::Webhook {
+        // No recurrence; a leftover one would only mislead.
+        input.schedule.clear();
+    }
     input.name = input.name.trim().to_string();
     input.agent = input.agent.trim().to_string();
     input.schedule = input.schedule.trim().to_string();
@@ -161,18 +210,31 @@ fn clean_input(mut input: AutomationInput) -> Result<AutomationInput, String> {
     if input.retention_limit < 1 || input.retention_limit > MAX_RETENTION {
         return Err(format!("Retention limit must be between 1 and {MAX_RETENTION}"));
     }
-    // The schedule must be a valid RFC 5545 recurrence — reject garbage
-    // at the boundary so the host scheduler never has to.
-    recurrence::validate(&input.schedule)?;
+    match trigger {
+        // The schedule must be a valid RFC 5545 recurrence — reject garbage
+        // at the boundary so the host scheduler never has to.
+        AutomationTrigger::Schedule => recurrence::validate(&input.schedule)?,
+        AutomationTrigger::Webhook => {
+            // Requests arrive at this machine, and webhook automations do
+            // not sync to hosts, so the run must happen here too.
+            if input.host_id.is_some() {
+                return Err("A webhook automation runs on this machine; clear the host".into());
+            }
+        }
+    }
     Ok(input)
 }
 
 /// Recompute and persist `next_run_at` from the current time. The
 /// schedule is already validated by `clean_input`, so a parse failure
 /// here is unexpected — surface it rather than silently swallowing it.
-fn refresh_next_run(db: &DatabaseStore, id: i64, schedule: &str) -> Result<(), String> {
-    let next = recurrence::next_occurrence(schedule, Utc::now())?;
-    db.set_automation_next_run(id, next.map(|dt| dt.to_rfc3339()).as_deref())
+/// A webhook automation has no next run.
+fn refresh_next_run(db: &DatabaseStore, record: &AutomationRecord) -> Result<(), String> {
+    if record.trigger_type == AutomationTrigger::Webhook {
+        return db.set_automation_next_run(record.id, None);
+    }
+    let next = recurrence::next_occurrence(&record.schedule, Utc::now())?;
+    db.set_automation_next_run(record.id, next.map(|dt| dt.to_rfc3339()).as_deref())
 }
 
 // ── Shared implementation ──
@@ -210,9 +272,10 @@ pub fn create_automation_impl(
     db: &DatabaseStore,
     input: AutomationInput,
 ) -> Result<AutomationView, String> {
-    let input = clean_input(input)?;
+    let trigger = input.trigger_type.unwrap_or_default();
+    let input = clean_input(input, trigger)?;
     let record = db.insert_automation(&input)?;
-    refresh_next_run(db, record.id, &record.schedule)?;
+    refresh_next_run(db, &record)?;
     db.get_automation(record.id)
         .map(Into::into)
         .ok_or_else(|| "Automation disappeared immediately after creation".to_string())
@@ -223,10 +286,19 @@ pub fn update_automation_impl(
     id: i64,
     input: AutomationInput,
 ) -> Result<AutomationView, String> {
-    let input = clean_input(input)?;
+    let existing = db
+        .get_automation(id)
+        .ok_or_else(|| format!("No automation with id {id}"))?;
+    if input
+        .trigger_type
+        .is_some_and(|trigger| trigger != existing.trigger_type)
+    {
+        return Err("An automation's trigger can't be changed. Create a new automation instead.".into());
+    }
+    let input = clean_input(input, existing.trigger_type)?;
     let record = db.update_automation(id, &input)?;
     // The schedule may have changed — recompute the next fire time.
-    refresh_next_run(db, id, &record.schedule)?;
+    refresh_next_run(db, &record)?;
     db.get_automation(id)
         .map(Into::into)
         .ok_or_else(|| format!("No automation with id {id}"))
@@ -241,7 +313,7 @@ pub fn set_automation_enabled_impl(
 ) -> Result<AutomationView, String> {
     let record = db.set_automation_enabled(id, enabled)?;
     if enabled {
-        refresh_next_run(db, id, &record.schedule)?;
+        refresh_next_run(db, &record)?;
     } else {
         db.set_automation_next_run(id, None)?;
     }
@@ -263,6 +335,46 @@ pub fn list_automation_runs_impl(
 ) -> Vec<AutomationRunRecord> {
     let limit = limit.unwrap_or(20).clamp(1, 100);
     db.list_automation_runs(automation_id, limit)
+}
+
+fn webhook_credentials(record: AutomationRecord) -> Result<WebhookCredentials, String> {
+    match (record.webhook_id, record.webhook_token) {
+        (Some(webhook_id), Some(token)) => Ok(WebhookCredentials { webhook_id, token }),
+        _ => Err(format!("Automation {} is not triggered by a webhook", record.id)),
+    }
+}
+
+/// The URL id and token of a webhook automation.
+pub fn webhook_credentials_impl(db: &DatabaseStore, id: i64) -> Result<WebhookCredentials, String> {
+    let record = db
+        .get_automation(id)
+        .ok_or_else(|| format!("No automation with id {id}"))?;
+    webhook_credentials(record)
+}
+
+/// Replace a webhook automation's URL token. The old URL stops working.
+pub fn rotate_webhook_token_impl(db: &DatabaseStore, id: i64) -> Result<WebhookCredentials, String> {
+    webhook_credentials(db.rotate_automation_webhook_token(id)?)
+}
+
+/// Set or clear a webhook automation's signature check.
+pub fn set_webhook_signature_impl(
+    db: &DatabaseStore,
+    id: i64,
+    signature: Option<WebhookSignatureInput>,
+) -> Result<AutomationView, String> {
+    let record = match signature {
+        Some(input) => {
+            let signature = webhook::clean_signature(WebhookSignature {
+                header: input.header,
+                encoding: input.encoding,
+                prefix: input.prefix,
+            })?;
+            db.set_automation_webhook_signature(id, Some((&signature, input.secret_ref.trim())))?
+        }
+        None => db.set_automation_webhook_signature(id, None)?,
+    };
+    Ok(record.into())
 }
 
 /// Fire-and-forget background sync after a mutation, so the user's
@@ -345,6 +457,34 @@ pub fn automations_runs(
     limit: Option<u32>,
 ) -> Vec<AutomationRunRecord> {
     list_automation_runs_impl(db.inner(), automation_id, limit)
+}
+
+// Webhook settings are device-local (see `database::automation_triggers`),
+// so these commands skip the account sync the other mutations trigger.
+
+#[tauri::command]
+pub fn automations_webhook_credentials(
+    db: State<'_, DatabaseStore>,
+    id: i64,
+) -> Result<WebhookCredentials, String> {
+    webhook_credentials_impl(db.inner(), id)
+}
+
+#[tauri::command]
+pub fn automations_rotate_webhook_token(
+    db: State<'_, DatabaseStore>,
+    id: i64,
+) -> Result<WebhookCredentials, String> {
+    rotate_webhook_token_impl(db.inner(), id)
+}
+
+#[tauri::command]
+pub fn automations_set_webhook_signature(
+    db: State<'_, DatabaseStore>,
+    id: i64,
+    signature: Option<WebhookSignatureInput>,
+) -> Result<AutomationView, String> {
+    set_webhook_signature_impl(db.inner(), id, signature)
 }
 
 // ── Repo-access preflight ──
@@ -471,7 +611,121 @@ pub async fn automations_check_repo_access(
 
 #[cfg(test)]
 mod tests {
-    use super::interpret_repo_probe;
+    use super::*;
+
+    fn input(trigger: Option<AutomationTrigger>) -> AutomationInput {
+        AutomationInput {
+            name: "On push".into(),
+            prompt: "Review {{body.head_commit.id}}".into(),
+            agent: "claude".into(),
+            schedule: "DTSTART:20260101T090000Z\nRRULE:FREQ=DAILY".into(),
+            timezone: "UTC".into(),
+            host_id: None,
+            project_path: None,
+            project_remote: None,
+            retention_limit: 10,
+            trigger_type: trigger,
+        }
+    }
+
+    #[test]
+    fn webhook_automation_has_no_schedule_or_next_run() {
+        let db = crate::database::init_test_database();
+        let view = create_automation_impl(&db, input(Some(AutomationTrigger::Webhook))).unwrap();
+        assert_eq!(view.trigger_type, AutomationTrigger::Webhook);
+        assert_eq!(view.schedule, "");
+        assert!(view.next_run_at.is_none());
+        let webhook = view.webhook.expect("webhook setup");
+        assert!(webhook.signature.is_none());
+
+        // Resuming must not compute a next run from an empty schedule.
+        set_automation_enabled_impl(&db, view.id, false).unwrap();
+        let resumed = set_automation_enabled_impl(&db, view.id, true).unwrap();
+        assert!(resumed.next_run_at.is_none());
+
+        // The view never carries the URL token; the credentials call does.
+        let json = serde_json::to_string(&get_automation_impl(&db, view.id).unwrap()).unwrap();
+        let credentials = webhook_credentials_impl(&db, view.id).unwrap();
+        assert_eq!(credentials.webhook_id, webhook.id);
+        assert!(!json.contains(&credentials.token));
+    }
+
+    #[test]
+    fn webhook_schedule_is_not_validated_and_must_run_locally() {
+        let db = crate::database::init_test_database();
+        let mut garbage = input(Some(AutomationTrigger::Webhook));
+        garbage.schedule = "not a recurrence".into();
+        assert!(create_automation_impl(&db, garbage).is_ok());
+
+        let mut remote = input(Some(AutomationTrigger::Webhook));
+        remote.host_id = Some(3);
+        assert!(create_automation_impl(&db, remote).is_err());
+    }
+
+    #[test]
+    fn the_trigger_cannot_change_on_update() {
+        let db = crate::database::init_test_database();
+        let scheduled = create_automation_impl(&db, input(None)).unwrap();
+        assert_eq!(scheduled.trigger_type, AutomationTrigger::Schedule);
+        assert!(scheduled.webhook.is_none());
+        assert!(
+            update_automation_impl(&db, scheduled.id, input(Some(AutomationTrigger::Webhook)))
+                .is_err()
+        );
+        // Omitting the trigger keeps it.
+        let updated = update_automation_impl(&db, scheduled.id, input(None)).unwrap();
+        assert_eq!(updated.trigger_type, AutomationTrigger::Schedule);
+        assert!(updated.next_run_at.is_some());
+        assert!(webhook_credentials_impl(&db, scheduled.id).is_err());
+    }
+
+    #[test]
+    fn signature_setup_round_trips_and_validates() {
+        let db = crate::database::init_test_database();
+        let view = create_automation_impl(&db, input(Some(AutomationTrigger::Webhook))).unwrap();
+        let secret = crate::secrets::store(&db, "GitHub", "shh").unwrap();
+
+        let saved = set_webhook_signature_impl(
+            &db,
+            view.id,
+            Some(WebhookSignatureInput {
+                header: "X-Hub-Signature-256".into(),
+                encoding: SignatureEncoding::Hex,
+                prefix: "sha256=".into(),
+                secret_ref: secret.id.clone(),
+            }),
+        )
+        .unwrap();
+        let webhook = saved.webhook.unwrap();
+        assert_eq!(webhook.signature.unwrap().header, "x-hub-signature-256");
+        assert_eq!(webhook.secret_ref.as_deref(), Some(secret.id.as_str()));
+
+        assert!(set_webhook_signature_impl(
+            &db,
+            view.id,
+            Some(WebhookSignatureInput {
+                header: "bad header".into(),
+                encoding: SignatureEncoding::Hex,
+                prefix: String::new(),
+                secret_ref: secret.id,
+            }),
+        )
+        .is_err());
+
+        let cleared = set_webhook_signature_impl(&db, view.id, None).unwrap();
+        assert!(cleared.webhook.unwrap().signature.is_none());
+    }
+
+    #[test]
+    fn rotating_changes_only_the_token() {
+        let db = crate::database::init_test_database();
+        let view = create_automation_impl(&db, input(Some(AutomationTrigger::Webhook))).unwrap();
+        let before = webhook_credentials_impl(&db, view.id).unwrap();
+        let after = rotate_webhook_token_impl(&db, view.id).unwrap();
+        assert_eq!(before.webhook_id, after.webhook_id);
+        assert_ne!(before.token, after.token);
+        assert_eq!(after.token.len(), 64);
+    }
 
     #[test]
     fn repo_probe_succeeds_when_the_marker_is_present() {

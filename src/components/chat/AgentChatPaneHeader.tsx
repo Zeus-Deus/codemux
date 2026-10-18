@@ -1,5 +1,6 @@
 import { SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
 
+import { ChatForkMenuItems } from "@/components/chat/ChatFork";
 import { SessionSelector } from "@/components/chat/SessionSelector";
 import { Button } from "@/components/ui/button";
 import { ShortcutTooltip } from "@/components/ui/tooltip";
@@ -69,6 +70,13 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
             activeThreadId={pane.thread_id}
             onSelect={handleSelect}
             onNewChat={handleNewChat}
+            footerItem={
+              <ChatForkMenuItems
+                threadId={pane.thread_id}
+                provider={pane.provider ?? "claude"}
+                workspaceId={workspaceId}
+              />
+            }
           />
         ) : (
           <span className="px-1.5 text-label text-muted-foreground">Agent Chat</span>

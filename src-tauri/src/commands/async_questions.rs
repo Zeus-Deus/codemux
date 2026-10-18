@@ -9,7 +9,7 @@ use super::agent_chat::{
     run_checkpoints_enabled, AgentChatEventPayload, GitTurnDispatchCheckpoint, ProviderRegistry,
 };
 use crate::agent_provider::{
-    AnswerQuestionInput, ProviderKind, ProviderRuntimeEvent, QuestionDeliveryError,
+    AnswerQuestionInput, ProviderKind, ProviderRuntimeEvent, QuestionDelivery, QuestionDeliveryError,
     QuestionResolution, ThreadId, TurnDispatchCheckpoint,
 };
 use crate::database::DatabaseStore;
@@ -172,9 +172,14 @@ pub async fn agent_chat_answer_question<R: Runtime>(
         },
         Ok(()) => {
             let checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = if run_checkpoints_enabled() && provider.capabilities().supports_conversation_rollback {
-                record.cwd.map(|cwd| Arc::new(GitTurnDispatchCheckpoint::new(app.clone(), thread_id.0.clone(), record.workspace_id, cwd, Some(submission_id.clone()))) as Arc<dyn TurnDispatchCheckpoint>)
+                record.cwd.clone().map(|cwd| Arc::new(GitTurnDispatchCheckpoint::new(app.clone(), thread_id.0.clone(), record.workspace_id, cwd, Some(submission_id.clone()))) as Arc<dyn TurnDispatchCheckpoint>)
             } else { None };
-            provider.answer_question(AnswerQuestionInput { thread_id: thread_id.clone(), question, answers: answers.clone(), submission_id: submission_id.clone(), checkpoint }).await
+            let checkpoint = super::turn_diff::wrap_dispatch_checkpoint(&app, &thread_id.0, record.cwd, Some(&submission_id), checkpoint);
+            let delivered = provider.answer_question(AnswerQuestionInput { thread_id: thread_id.clone(), question, answers: answers.clone(), submission_id: submission_id.clone(), checkpoint }).await;
+            if let Ok(QuestionDelivery::NewTurn { turn_id }) = &delivered {
+                super::turn_diff::on_turn_bound(&app, &thread_id.0, Some(&submission_id), &turn_id.0);
+            }
+            delivered
         }
     };
     let resolution = match result {

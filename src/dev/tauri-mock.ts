@@ -3,8 +3,15 @@ import type {
   HostStatusView,
   HostView,
   LocalChatSession,
+  SecretMeta,
+  StaleWorktree,
 } from "@/tauri/commands";
-import type { AgentChatProviderKind, ProjectScripts } from "@/tauri/types";
+import type {
+  AgentChatProviderKind,
+  AgentChatTurnDiff,
+  ChatForkOrigin,
+  ProjectScripts,
+} from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
 /**
  * Dev-only Tauri runtime shim.
@@ -40,6 +47,7 @@ import { randomUUID } from "@/lib/uuid";
  * `app-state-changed` so the UI reflects the change; everything else
  * falls through to a logged, shape-safe default.
  */
+import { workspaceLaunchScenario, streamWorkspaceLaunch, type MockWorkspaceLaunch } from "./workspace-launch-mock";
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 import { createAgentConnectorMock } from "./agent-connector-mock";
 import { workflowMockHandlers } from "./workflow-mock";
@@ -188,7 +196,9 @@ seedEnvironmentsFromSearch(window.location.search);
 // in Full access, and plays the delegation flow once its channel attaches.
 const delegationScenario = delegationScenarioFromSearch(window.location.search);
 let delegationScenarioStarted = false;
-if (delegationScenario) {
+const workspaceScenario = workspaceLaunchScenario(window.location.search);
+let workspaceScenarioStarted = false;
+if (delegationScenario || workspaceScenario) {
   const asClaude = (node: PaneNodeSnapshot): PaneNodeSnapshot =>
     node.kind === "split"
       ? { ...node, children: node.children.map(asClaude) }
@@ -206,6 +216,13 @@ if (delegationScenario) {
     })),
   };
 }
+if (workspaceScenario) {
+  appState = {
+    ...appState,
+    active_workspace_id: "ws-codemux-chat",
+    workspaces: appState.workspaces.filter((workspace) => workspace.workspace_id === "ws-codemux-chat").map((workspace) => ({ ...workspace, title: "Parallel bug fixes", linked_issue: null })),
+  };
+}
 const mockLocalSessions: LocalChatSession[] = [
   { source_id: "claude:synthetic-parser", provider: "claude", title: "Fix the parser edge case", cwd: "/demo/parser", last_active_at: "2026-09-29T10:00:00Z", message_count: 2, already_imported: false },
   { source_id: "codex:synthetic-tests", provider: "codex", title: "Review the parser tests", cwd: "/demo/parser", last_active_at: "2026-09-28T14:00:00Z", message_count: 2, already_imported: false },
@@ -213,6 +230,11 @@ const mockLocalSessions: LocalChatSession[] = [
 ];
 const mockImportedRecords = new Map<string, AgentChatSessionRecord>();
 const mockImportedPayloads = new Map<string, string[]>();
+// Chat forks made in this session: the fork's session row, its copied
+// transcript, and where it came from.
+const mockForkRecords = new Map<string, AgentChatSessionRecord>();
+const mockForkPayloads = new Map<string, string[]>();
+const mockForkOrigins = new Map<string, ChatForkOrigin>();
 let stressDeltaTimer: number | null = null;
 let stressDeltaCount = 0;
 let providerRuntimeCommandCount = 0;
@@ -1913,9 +1935,11 @@ const mockThreadRowCache = new Map<string, MockMessageRow[]>();
 function mockThreadPayloads(threadId: string): string[] {
   const imported = mockImportedPayloads.get(threadId);
   if (imported) return imported;
+  const forked = mockForkPayloads.get(threadId);
+  if (forked) return forked;
   const delegated = mockDelegatedChildTranscript(threadId);
   if (delegated) return delegated;
-  if (delegationScenario && threadId === MOCK_CHAT_THREAD_ID) return [];
+  if ((delegationScenario || workspaceScenario) && threadId === MOCK_CHAT_THREAD_ID) return [];
   // Under a stress fixture the generated threads AND the seeded thread serve
   // the synthetic transcript — hydration cost is one of the things being
   // measured, and the curated 520-turn showcase is not that profile.
@@ -2349,6 +2373,92 @@ function mockChatTranscript(threadId = MOCK_CHAT_THREAD_ID): string[] {
 }
 
 let mockChatRevertCutoff: number | null = null;
+
+/** A settled turn's git diff for the mock chat, matching the seeded
+ *  traceback fix: the edit the transcript shows, a regression test written
+ *  from the shell (which the edit-tool summary cannot see), and a binary
+ *  asset, so every file state renders. */
+function mockTurnDiff(threadId: string, turnId: string): AgentChatTurnDiff {
+  const files: AgentChatTurnDiff["files"] = [
+    {
+      path: "gateway/run.py",
+      old_path: null,
+      change: "modified",
+      additions: 1,
+      deletions: 1,
+      binary: false,
+      patch: [
+        "diff --git a/gateway/run.py b/gateway/run.py",
+        "index 3b18e51..a1f0c2d 100644",
+        "--- a/gateway/run.py",
+        "+++ b/gateway/run.py",
+        "@@ -219,7 +219,7 @@ def exception_chain(exc):",
+        "     seen = set()",
+        "     cur = exc",
+        "     while cur is not None and id(cur) not in seen:",
+        "         seen.add(id(cur))",
+        "         chain.append(cur)",
+        "-        cur = cur.__cause__ or cur.__context__",
+        '+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)',
+        "     return chain",
+        "",
+      ].join("\n"),
+      patch_omitted: null,
+    },
+    {
+      path: "tests/test_traceback.py",
+      old_path: null,
+      change: "modified",
+      additions: 9,
+      deletions: 0,
+      binary: false,
+      patch: [
+        "diff --git a/tests/test_traceback.py b/tests/test_traceback.py",
+        "index 9c2e4b1..5d7a0f3 100644",
+        "--- a/tests/test_traceback.py",
+        "+++ b/tests/test_traceback.py",
+        "@@ -41,3 +41,12 @@ def test_chain_stops_at_cycles():",
+        "     chain = exception_chain(err)",
+        "     assert len(chain) == 2",
+        " ",
+        "+",
+        "+def test_chain_tolerates_exceptions_without_cause():",
+        "+    class Bare:",
+        "+        pass",
+        "+",
+        "+    err = Bare()",
+        "+    chain = exception_chain(err)",
+        "+    assert chain == [err]",
+        "+",
+        "",
+      ].join("\n"),
+      patch_omitted: null,
+    },
+    {
+      path: "docs/assets/traceback-chain.png",
+      old_path: null,
+      change: "added",
+      additions: 0,
+      deletions: 0,
+      binary: true,
+      patch: null,
+      patch_omitted: "binary",
+    },
+  ];
+  return {
+    thread_id: threadId,
+    turn_id: turnId,
+    status: "ready",
+    repo_root: `${MOCK_HOME_DIR}/projects/codemux`,
+    before_commit: "4f1c2a9e8b7d6c5b4a3928170615f4e3d2c1b0a9",
+    after_commit: "9a0b1c2d3e4f5061728394a5b6c7d8e9f0a1b2c3",
+    files,
+    files_changed: files.length,
+    additions: files.reduce((sum, file) => sum + file.additions, 0),
+    deletions: files.reduce((sum, file) => sum + file.deletions, 0),
+    truncated: false,
+  };
+}
 
 function mockTailTurnCheckpoint() {
   const clientNonce = "seed-nonce-subagents";
@@ -3563,6 +3673,43 @@ function openMockDelegatedTab(parentThreadId: string, child: MockDelegatedChild)
   emitAppState();
 }
 
+function openMockLaunchedWorkspace(launch: MockWorkspaceLaunch): void {
+  const parent = findWorkspace("ws-codemux-chat");
+  if (!parent) return;
+  const workspace = buildWorktreeWorkspace(parent.project_root ?? parent.cwd, launch.branch);
+  workspace.title = launch.title;
+  workspace.base_branch = "main";
+  const surface = workspace.surfaces[0];
+  surface.title = launch.title;
+  if (surface.root.kind === "agent_chat") {
+    surface.root.thread_id = launch.threadId;
+    surface.root.provider = launch.provider;
+    surface.root.title = launch.title;
+  }
+  workspace.tabs[0].title = launch.title;
+  const turnId = `turn-${launch.threadId}`;
+  mockImportedRecords.set(launch.threadId, {
+    thread_id: launch.threadId, workspace_id: workspace.workspace_id,
+    cwd: workspace.cwd, provider: launch.provider, title: launch.title,
+    sdk_session_id: `sdk-${launch.threadId}`,
+    created_at: new Date().toISOString(), last_active_at: new Date().toISOString(),
+    model: null, effort: null, context_window: null,
+    permission_mode: launch.provider === "claude" ? "bypassPermissions" : "danger-full-access",
+  });
+  mockImportedPayloads.set(launch.threadId, [
+    { type: "user_message", thread_id: launch.threadId, text: launch.message },
+    { type: "session_state_changed", thread_id: launch.threadId, status: { status: "running", active_turn: turnId } },
+    { type: "item_completed", thread_id: launch.threadId, turn_id: turnId, item: { kind: "assistant_text", text: "I’ll investigate the bug and run the focused checks." } },
+  ].map((event) => JSON.stringify(event)));
+  chatActiveTurns.set(launch.threadId, turnId);
+  appState = {
+    ...appState,
+    workspaces: [...appState.workspaces, workspace],
+    pane_statuses: { ...appState.pane_statuses, [surface.active_pane_id]: "working" },
+  };
+  emitAppState();
+}
+
 /** Script the cross-provider delegation flow (see `delegation-mock.ts`) on
  *  the active chat, or on `threadId` when given. */
 function streamMockDelegatedTask(
@@ -4233,6 +4380,9 @@ const MOCK_SEARCH_PATHS = [
   "docs/screenshots/dashboard.png",
 ];
 
+// Stored secrets for the mock `secrets_*` handlers. Metadata only.
+const mockSecrets: SecretMeta[] = [];
+
 // ── Devices (SSH hosts) ─────────────────────────────────────────────
 //
 // Mutable so Settings → Devices can add, rename, set up and remove devices
@@ -4830,7 +4980,7 @@ const handlers: Record<string, Handler> = {
           ? CURSOR_CAPABILITIES
           : a.provider === "grok"
             ? GROK_CAPABILITIES
-            : EMPTY_CAPABILITIES), supports_steering: a.provider === "codex" || a.provider === "opencode" }),
+            : EMPTY_CAPABILITIES), supports_steering: a.provider === "claude" || a.provider === "codex" || a.provider === "opencode" }),
   // Provider commands mirror only surfaces our adapters can execute.
   // Codex actions route to app-server; OpenCode commands use its command API.
   list_chat_slash_commands: (a) =>
@@ -5051,11 +5201,16 @@ const handlers: Record<string, Handler> = {
     const workflowEntry = Object.entries(WORKFLOW_THREAD_WORKSPACE).find(
       ([, loc]) => loc.workspaceId === workspaceId,
     );
+    const forks = [...mockForkRecords.values()]
+      .filter((record) => record.workspace_id === (workspaceId ?? "ws-codemux-chat"))
+      .reverse();
     if (workflowEntry) {
       const record = mockWorkflowSessionRecord(workflowEntry[0]);
-      return record ? [record] : [];
+      return record ? [...forks, record] : forks;
     }
+    if (forks.length > 0 && workspaceId !== "ws-codemux-chat") return forks;
     return [
+      ...forks,
       {
         thread_id: MOCK_CHAT_THREAD_ID,
         sdk_session_id: "sdk-mock-chat",
@@ -5355,10 +5510,11 @@ const handlers: Record<string, Handler> = {
   agent_chat_get_session: (a) => {
     const threadId = a.threadId as string;
     if (mockImportedRecords.has(threadId)) return mockImportedRecords.get(threadId);
+    if (mockForkRecords.has(threadId)) return mockForkRecords.get(threadId);
     // A delegated child's row holds what the backend wrote at hand-off:
     // the requested model and effort, the task title, full access.
     const delegated = mockDelegatedChild(threadId);
-    if (delegated || (delegationScenario && threadId === MOCK_CHAT_THREAD_ID)) {
+    if (delegated || ((delegationScenario || workspaceScenario) && threadId === MOCK_CHAT_THREAD_ID)) {
       const provider = delegated?.provider ?? "claude";
       return {
         thread_id: threadId,
@@ -5565,7 +5721,7 @@ const handlers: Record<string, Handler> = {
     };
     const threadId = input.thread_id;
     if (input.delivery === "steer" && chatActiveTurns.has(threadId)) {
-      if (a.provider !== "codex" && a.provider !== "opencode") throw new Error("Safe steering is unavailable for this provider.");
+      if (a.provider !== "claude" && a.provider !== "codex" && a.provider !== "opencode") throw new Error("Safe steering is unavailable for this provider.");
       const turnId = chatActiveTurns.get(threadId)!;
       emitChatEvent(threadId, { type: "user_message", thread_id: threadId, text: input.display_text ?? input.text, client_nonce: input.client_nonce ?? undefined, steered_turn_id: turnId });
       return { turn_id: turnId, queued_id: null, steered: true };
@@ -5638,7 +5794,7 @@ const handlers: Record<string, Handler> = {
     // real backend.
     if (!q || idx < 0) return undefined;
     if (delivery === "steer" && chatActiveTurns.has(threadId)) {
-      if (a.provider !== "codex" && a.provider !== "opencode") throw new Error("Safe steering is unavailable for this provider.");
+      if (a.provider !== "claude" && a.provider !== "codex" && a.provider !== "opencode") throw new Error("Safe steering is unavailable for this provider.");
       const [item] = q.splice(idx, 1);
       emitChatEvent(threadId, { type: "queued_turn_dispatched", thread_id: threadId, queued_id: queuedId, text: item.text, turn_id: chatActiveTurns.get(threadId)!, steered: true });
       return undefined;
@@ -5854,6 +6010,10 @@ const handlers: Record<string, Handler> = {
     }
     return undefined;
   },
+  agent_chat_get_turn_diff: (a) =>
+    a.threadId === MOCK_CHAT_THREAD_ID
+      ? mockTurnDiff(String(a.threadId), String(a.turnId))
+      : null,
   grep_count_pattern: () => 0,
 
   // Clipboard-image paste fallback (agent-chat composer). The real
@@ -5881,6 +6041,10 @@ const handlers: Record<string, Handler> = {
     seedPendingAskQuestion(threadId);
     seedPendingApproval(threadId);
     seedAsyncQuestion(threadId);
+    if (workspaceScenario && !workspaceScenarioStarted && threadId === MOCK_CHAT_THREAD_ID) {
+      workspaceScenarioStarted = true;
+      window.setTimeout(() => streamWorkspaceLaunch(threadId, { emit: emitChatEvent, openWorkspace: openMockLaunchedWorkspace }), 400);
+    }
     if (
       delegationScenario &&
       !delegationScenarioStarted &&
@@ -6617,6 +6781,34 @@ const handlers: Record<string, Handler> = {
     ok: true,
     message: "This host can reach the repository.",
   }),
+  automations_webhook_credentials: () => ({
+    webhook_id: "0f3c9a1e5b7d4c2a9e8f6b1d3a5c7e90",
+    token: "mock-webhook-token",
+  }),
+  automations_rotate_webhook_token: () => ({
+    webhook_id: "0f3c9a1e5b7d4c2a9e8f6b1d3a5c7e90",
+    token: `mock-webhook-token-${Date.now()}`,
+  }),
+  automations_set_webhook_signature: () =>
+    Promise.reject("No automations exist in the mock."),
+  // Secrets: metadata only, mirroring the backend, which never returns a
+  // stored value.
+  secrets_store: (a) => {
+    const meta = {
+      id: `secret_mock${mockSecrets.length + 1}`,
+      label: String(a.label ?? "").trim(),
+      created_at: new Date().toISOString(),
+    };
+    mockSecrets.unshift(meta);
+    return { ...meta };
+  },
+  secrets_list: () => mockSecrets.map((secret) => ({ ...secret })),
+  secrets_delete: (a) => {
+    const index = mockSecrets.findIndex((secret) => secret.id === a.id);
+    if (index === -1) return Promise.reject("No such secret");
+    mockSecrets.splice(index, 1);
+    return undefined;
+  },
 
   // ── Devices (SSH hosts) ──
   //
@@ -7813,6 +8005,7 @@ const handlers: Record<string, Handler> = {
       // session on it.
       if (threadId) {
         root.thread_id = threadId;
+        root.provider = (a.provider as AgentChatProviderKind | null) ?? root.provider;
         emitAppState();
       }
       return root.pane_id;
@@ -8090,7 +8283,146 @@ const handlers: Record<string, Handler> = {
     return removed;
   },
   pr_watch_status: (a) => prWatches.get(a.threadId as string) ?? null,
+  // Chat forks: same validation order and messages as `commands::chat_fork`.
+  agent_chat_fork_check: (a) => {
+    mockForkPlan(a.sourceThreadId as string, (a.beforeMessageId as number | null) ?? null);
+    return undefined;
+  },
+  agent_chat_fork_thread: (a) => {
+    const sourceThreadId = a.sourceThreadId as string;
+    const before = (a.beforeMessageId as number | null) ?? null;
+    const { source, kept } = mockForkPlan(sourceThreadId, before);
+    const workspace = a.workspaceId ? findWorkspace(a.workspaceId) : null;
+    const threadId = `mock-fork-${mockForkRecords.size + 1}`;
+    const title = `${source.title?.trim() || "Chat"} (fork)`;
+    const now = new Date().toISOString();
+    const record: AgentChatSessionRecord = {
+      ...source,
+      thread_id: threadId,
+      sdk_session_id: `sdk-${threadId}`,
+      imported_from: null,
+      workspace_id: workspace?.workspace_id ?? source.workspace_id,
+      cwd: workspace?.cwd ?? source.cwd,
+      title,
+      created_at: now,
+      last_active_at: now,
+    };
+    const payloads = kept.map((payload) => {
+      const value = JSON.parse(payload) as Record<string, unknown>;
+      if (typeof value.thread_id === "string") value.thread_id = threadId;
+      return JSON.stringify(value);
+    });
+    mockForkRecords.set(threadId, record);
+    mockForkPayloads.set(threadId, payloads);
+    mockForkOrigins.set(threadId, {
+      source_thread_id: sourceThreadId,
+      source_title: source.title ?? null,
+      source_exists: true,
+      boundary_message_id: payloads.length > 0 ? payloads.length : null,
+    });
+    return {
+      thread_id: threadId,
+      provider: record.provider,
+      title,
+      workspace_id: record.workspace_id,
+      cwd: record.cwd ?? "",
+    };
+  },
+  agent_chat_fork_origin: (a) => mockForkOrigins.get(a.threadId as string) ?? null,
+
+  // ── Stale worktree cleanup ──
+  //
+  // A fixed set of stale worktrees (one kept because it holds work);
+  // removal drops the removable ones. `__codemuxMockWorktreeCleanup()`
+  // fires the background sweep's toast.
+  worktree_cleanup_scan: () => mockStaleWorktrees.map((w) => ({ ...w })),
+  worktree_cleanup_remove: (a) => {
+    const paths = new Set(Array.isArray(a.paths) ? (a.paths as string[]) : []);
+    const removed = mockStaleWorktrees.filter(
+      (w) => paths.has(w.path) && w.kept_because === null,
+    );
+    mockStaleWorktrees = mockStaleWorktrees.filter((w) => !removed.includes(w));
+    return { removed, kept: [] };
+  },
+  worktree_cleanup_set_auto: () => undefined,
 };
+
+let mockStaleWorktrees: StaleWorktree[] = [
+  {
+    path: "/home/dev/.codemux/worktrees/codemux/feature-payments-flow",
+    title: "payments-flow",
+    branch: "feature/payments-flow",
+    project: "codemux",
+    source: "archived",
+    reason: { kind: "pr_merged", number: 412 },
+    kept_because: null,
+  },
+  {
+    path: "/home/dev/.codemux/worktrees/ledger-api/fix-rounding",
+    title: "fix-rounding",
+    branch: "fix/rounding",
+    project: "ledger-api",
+    source: "closed",
+    reason: { kind: "branch_merged", base: "main" },
+    kept_because: null,
+  },
+  {
+    path: "/home/dev/.codemux/worktrees/old-blog/chore-draft-cleanup",
+    title: "draft-cleanup",
+    branch: "chore/draft-cleanup",
+    project: "old-blog",
+    source: "archived",
+    reason: { kind: "idle", days: 45 },
+    kept_because: null,
+  },
+  {
+    path: "/home/dev/.codemux/worktrees/vexis/spike-new-installer",
+    title: "new-installer",
+    branch: "spike/new-installer",
+    project: "vexis",
+    source: "closed",
+    reason: { kind: "idle", days: 62 },
+    kept_because: "2 uncommitted or untracked files",
+  },
+];
+
+(
+  window as unknown as { __codemuxMockWorktreeCleanup: (auto?: boolean) => string }
+).__codemuxMockWorktreeCleanup = (auto = false) => {
+  const removable = mockStaleWorktrees.filter((w) => w.kept_because === null);
+  emitEvent("worktree-cleanup", {
+    removed: auto ? removable : [],
+    available: auto ? [] : removable,
+  });
+  return auto ? "fired the automatic-cleanup receipt" : "fired the cleanup offer";
+};
+
+/** Validate a mock fork and return the source row plus the transcript the
+ *  fork keeps (row ids are one-based per thread in the mock). */
+function mockForkPlan(
+  sourceThreadId: string,
+  before: number | null,
+): { source: AgentChatSessionRecord; kept: string[] } {
+  const source = handlers.agent_chat_get_session({ threadId: sourceThreadId }) as
+    | AgentChatSessionRecord
+    | null
+    | undefined;
+  if (!source) throw "This chat no longer exists.";
+  if (source.provider !== "claude" && source.provider !== "codex") {
+    throw `Forking isn't available for ${source.provider} chats yet.`;
+  }
+  if (source.imported_from) throw "This chat was imported read-only, so it can't be forked.";
+  if (!source.sdk_session_id) {
+    throw "This chat has no agent session yet. Wait for the first reply, then fork it.";
+  }
+  const visible = mockVisibleThreadRows(sourceThreadId).length;
+  const payloads = mockThreadPayloads(sourceThreadId).slice(0, visible);
+  if (before === null) return { source, kept: payloads };
+  if (!mockPayloadIsUserMessage(payloads[before - 1] ?? "")) {
+    throw "That message doesn't start a turn, so the chat can't be forked there.";
+  }
+  return { source, kept: payloads.slice(0, before - 1) };
+}
 
 // Archive entries whose (simulated) worktree is dirty: deleting them
 // with forceDelete=false rejects with the /use force/i message. Seeded
@@ -8832,6 +9164,25 @@ function kickPrOverview(): void {
   return on
     ? "host CLIs now report signed out (across reloads)"
     : "host CLIs signed in again — an open Review pane picks it up";
+};
+
+// Dev affordance for the pull-request watch UI. The mock has no sweep, so
+// this stands in for one: patch the chat's watch and emit the change.
+//
+//   __codemuxMockPrWatch({ attempts: 1, last_wake_summary: "1 check failed" })
+//   __codemuxMockPrWatch({ status: "exhausted", attempts: 3,
+//     stop_reason: "Still failing after 3 automatic fix attempts" })
+(
+  window as unknown as {
+    __codemuxMockPrWatch: (patch: Partial<PrWatchStatus>, threadId?: string) => string;
+  }
+).__codemuxMockPrWatch = (patch, threadId = MOCK_CHAT_THREAD_ID) => {
+  const current = prWatches.get(threadId);
+  if (!current) return "start a watch first (Workspace details → Watch CI & reviews)";
+  const watch = { ...current, ...patch, updated_at_ms: Date.now() };
+  prWatches.set(threadId, watch);
+  emitEvent("pr-watch-changed", { thread_id: threadId, watch });
+  return `watch is now ${watch.status}`;
 };
 
 export {};

@@ -109,6 +109,15 @@ export interface SendTurnInput {
   images?: Array<{ mediaType: string; dataBase64: string }>;
 }
 
+/** Parameters for `steer-turn`: guidance for the running turn. */
+export interface SteerTurnInput {
+  text: string;
+  /** Host-chosen prompt uuid. The CLI echoes it in `user_message_uuids` on
+   *  the `result` of whichever turn consumed the message. */
+  uuid: string;
+  images?: Array<{ mediaType: string; dataBase64: string }>;
+}
+
 // ---------------------------------------------------------------------------
 // Dependency-injection seam for tests. Real RPCs use the SDK's `query`;
 // tests swap in a `FakeQuery` factory.
@@ -395,6 +404,17 @@ export class ClaudeSession {
    *  `ensureLiveQuery`, since a rebuilt query is a fresh CLI boot that
    *  deserves its own restore attempt. */
   private bypassRestoreAttempted = false;
+  /** Steer uuids no top-level `result` has echoed as consumed yet. */
+  private readonly pendingSteers = new Set<string>();
+  /** Queries a Stop ended; see `retireForStop`. Their consumer loops may
+   *  outlive the Stop, so they must stay silent once a replacement runs. */
+  private readonly retiredQueries = new WeakSet<Query>();
+  /** Aborting it sends the query's CLI process SIGTERM at once; `close()`
+   *  alone only schedules that two seconds later. */
+  private queryAbort = new AbortController();
+  /** Set by each `sendTurn`, cleared by a Stop: guidance arriving after a
+   *  Stop must not reach the turn the CLI runs next. */
+  private acceptsSteers = false;
 
   constructor(input: SessionStartInput, emit: EventEmitter) {
     this.threadId = input.threadId;
@@ -425,6 +445,7 @@ export class ClaudeSession {
       },
     );
     const options = buildQueryOptions(input, this.canUseTool);
+    options.abortController = this.queryAbort;
 
     this.query = queryFactory({
       prompt: this.promptQueue,
@@ -445,9 +466,10 @@ export class ClaudeSession {
    *  RPC layer. Unknown / not-yet-enumerated variants are forwarded
    *  raw; classification lives on the Rust side. */
   private async consumeMessages(): Promise<void> {
+    const query = this.query;
     try {
-      for await (const message of this.query) {
-        if (this.closed) break;
+      for await (const message of query) {
+        if (this.closed || this.retiredQueries.has(query)) break;
         // Stale-resume self-heal: the SDK reported that the JSONL for
         // the session we asked to resume is gone from disk. Rather than
         // let the error surface (which permanently wedges the thread),
@@ -467,12 +489,15 @@ export class ClaudeSession {
           break;
         }
         this.observeSdkSessionId(message);
+        this.settleSteers(message);
         this.emitter.notification("sdk-message", {
           threadId: this.threadId,
           message,
         });
         this.emitSpecialCases(message);
       }
+      // A Stop retired this query; `retireForStop` reports the outcome.
+      if (this.retiredQueries.has(query)) return;
       // A stale-resume recovery rebuilt the query on a fresh iteration
       // task; this OLD loop must unwind without emitting anything and
       // without touching the NEW query's state.
@@ -495,6 +520,7 @@ export class ClaudeSession {
         });
       }
     } catch (err) {
+      if (this.retiredQueries.has(query)) return;
       // Stale-resume can also surface as a thrown error from the
       // iterator rather than a `result` message. Same self-heal.
       if (
@@ -680,13 +706,101 @@ export class ClaudeSession {
         });
       }
     }
-    const preparedText = applyClaudePromptEffortPrefix(input.text, this.effort);
-    // Stage 6 — when images are attached we build a multi-block
-    // content array per Anthropic's vision spec: image blocks come
-    // BEFORE the text block ("describe these images" pattern). The
-    // text-only fast path keeps the string-content shape so existing
-    // unit tests that match on `content === text` stay green.
-    const images = input.images ?? [];
+    const msg = this.buildUserMessage(input.text, input.images);
+    // The CLI echoes a prompt's uuid in `user_message_uuids` only when the
+    // prompt carries one; the host relies on that echo to steer.
+    msg.uuid = crypto.randomUUID();
+    this.acceptsSteers = true;
+    // Retain the turn and grant it one stale-resume recovery attempt
+    // before it's dispatched, so a self-heal can replay it verbatim.
+    this.lastUserMessage = msg;
+    this.resumeFallbackAttempted = false;
+    this.promptQueue.push(msg);
+  }
+
+  /** Steer the running turn: push guidance into the live prompt stream
+   *  without interrupting. With `priority: "next"` the CLI reads it when it
+   *  builds its next API request, usually after the current tool returns. If
+   *  the turn ends first, the CLI runs it as a turn of its own. The host
+   *  tells the two apart by `uuid`. Rejected while an interrupt is ending
+   *  the query, which would silently drop the message. */
+  async steerTurn(input: SteerTurnInput): Promise<void> {
+    if (this.closed) {
+      throw new Error("session is closed");
+    }
+    if (this.interrupting || this.queryDead || !this.acceptsSteers) {
+      throw new Error("no running turn to steer");
+    }
+    const msg = this.buildUserMessage(input.text, input.images);
+    msg.priority = "next";
+    msg.uuid = input.uuid as NonNullable<SDKUserMessage["uuid"]>;
+    this.promptQueue.push(msg);
+    this.pendingSteers.add(input.uuid);
+  }
+
+  /** Forget steers a top-level `result` reports as consumed. */
+  private settleSteers(message: SDKMessage): void {
+    if (this.pendingSteers.size === 0) return;
+    const m = message as unknown as {
+      type?: unknown;
+      parent_tool_use_id?: unknown;
+      user_message_uuids?: unknown;
+    };
+    if (m.type !== "result" || m.parent_tool_use_id) return;
+    if (!Array.isArray(m.user_message_uuids)) return;
+    for (const uuid of m.user_message_uuids) {
+      if (typeof uuid === "string") this.pendingSteers.delete(uuid);
+    }
+  }
+
+  /** Stop with guidance still unread. `query.interrupt()` is soft: the CLI
+   *  keeps queued prompts and runs the guidance as its next turn, so Stop
+   *  would not win. End the CLI process instead; the next `sendTurn`
+   *  rebuilds a resumed query, as after any interrupt that killed it. */
+  private async retireForStop(): Promise<void> {
+    this.interrupting = true;
+    this.retiredQueries.add(this.query);
+    this.pendingSteers.clear();
+    try {
+      try {
+        this.queryAbort.abort();
+        this.query.close();
+      } catch (err) {
+        logger.warn("query.close during stop threw", {
+          threadId: this.threadId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        this.iterationTask,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, interruptExitTimeoutMs);
+        }),
+      ]);
+      if (timer !== undefined) clearTimeout(timer);
+      // The process is gone either way; never reuse its query.
+      this.queryDead = true;
+      if (!this.closed) {
+        this.emitter.notification("turn-interrupted", {
+          threadId: this.threadId,
+        });
+      }
+    } finally {
+      this.interrupting = false;
+    }
+  }
+
+  /** Stage 6 — when images are attached we build a multi-block content
+   *  array per Anthropic's vision spec: image blocks come BEFORE the text
+   *  block ("describe these images" pattern). The text-only fast path keeps
+   *  the string-content shape so existing unit tests that match on
+   *  `content === text` stay green. */
+  private buildUserMessage(
+    text: string,
+    images: SendTurnInput["images"] = [],
+  ): SDKUserMessage {
+    const preparedText = applyClaudePromptEffortPrefix(text, this.effort);
     const content =
       images.length === 0
         ? preparedText
@@ -701,7 +815,7 @@ export class ClaudeSession {
             })),
             { type: "text" as const, text: preparedText },
           ];
-    const msg: SDKUserMessage = {
+    return {
       type: "user",
       message: {
         role: "user",
@@ -709,11 +823,6 @@ export class ClaudeSession {
       },
       parent_tool_use_id: null,
     };
-    // Retain the turn and grant it one stale-resume recovery attempt
-    // before it's dispatched, so a self-heal can replay it verbatim.
-    this.lastUserMessage = msg;
-    this.resumeFallbackAttempted = false;
-    this.promptQueue.push(msg);
   }
 
   /** Idle compaction: run Claude Code's `/compact` on the live query
@@ -744,6 +853,8 @@ export class ClaudeSession {
    *  over but the session lives. */
   async interrupt(): Promise<void> {
     if (this.closed || this.queryDead) return;
+    this.acceptsSteers = false;
+    if (this.pendingSteers.size > 0) return this.retireForStop();
     this.interrupting = true;
     try {
       await this.query.interrupt();
@@ -805,6 +916,7 @@ export class ClaudeSession {
     }
 
     this.queryDead = false;
+    this.pendingSteers.clear();
     // A rebuilt query is a fresh CLI boot that may or may not be
     // downgraded on its own; give it a fresh restore attempt.
     this.bypassRestoreAttempted = false;
@@ -819,6 +931,8 @@ export class ClaudeSession {
       rebuildInput.resume = opts.resume;
     }
     const options = buildQueryOptions(rebuildInput, this.canUseTool);
+    this.queryAbort = new AbortController();
+    options.abortController = this.queryAbort;
     this.query = queryFactory({ prompt: this.promptQueue, options });
     this.currentQueryModel = rebuildInput.model;
     this.iterationTask = this.consumeMessages();

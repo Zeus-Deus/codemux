@@ -253,6 +253,10 @@ struct AgentChatChannelEntry {
 pub struct AgentChatChannelRegistry {
     channels: Mutex<HashMap<String, Vec<AgentChatChannelEntry>>>,
     next_generation: AtomicU64,
+    /// Held while one payload goes to every channel of a thread, so two
+    /// producers (the event bridge and the send path) cannot interleave and
+    /// hand mirrored clients the same events in different orders.
+    fanout: Mutex<()>,
 }
 
 /// One authoritative Grok bill waiting for the immediately-following
@@ -913,6 +917,33 @@ fn workspace_runs_on_device(
 /// Crate-visible wrapper for side chats, which refuse device threads.
 pub(crate) fn thread_runs_on_device_pub<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> bool {
     thread_runs_on_device(app, thread_id)
+}
+
+/// Hold a thread still while a chat fork copies it. The dispatch lock a
+/// send holds comes first; the turn-checkpoint timeline lock second (the
+/// order a send takes them), so no turn starts and no revert runs until
+/// both guards drop. Split so the fork can ask the provider about the
+/// session before taking the timeline lock, which a queued checkpoint may
+/// be waiting on while it holds the session's outbound lock.
+pub(crate) async fn fork_dispatch_guard<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    native_thread_gate(app, thread_id)
+        .dispatch
+        .clone()
+        .lock_owned()
+        .await
+}
+
+/// The second half of [`fork_dispatch_guard`].
+pub(crate) async fn fork_timeline_guard(thread_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    turn_checkpoint_lock_for(thread_id).lock_owned().await
+}
+
+/// Crate-visible: where a thread's sent chat images live.
+pub(crate) fn chat_images_dir_pub(thread_id: &str) -> Option<std::path::PathBuf> {
+    chat_images_dir(thread_id)
 }
 
 fn thread_runs_on_device<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> bool {
@@ -2680,7 +2711,7 @@ impl HermesSendGate {
 /// duplicated here as a cheap `&'static str` rather than building the full
 /// capabilities bundle (which allocates the model list) just to read one
 /// field. OpenCode has no permission modes, so it stays `None`.
-pub(super) fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
+pub(crate) fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
     match provider {
         ProviderKind::Claude => Some("bypassPermissions"),
         ProviderKind::Codex => Some("danger-full-access"),
@@ -3561,6 +3592,11 @@ async fn send_turn_internal<R: Runtime>(
         );
     }
     drop(invalidation_guard);
+    // Every local turn is also captured for its per-turn diff.
+    let cwd = db.get_agent_chat_session(&thread_id_for_persist).and_then(|s| s.cwd);
+    let nonce = input.client_nonce.as_deref();
+    let turn_checkpoint =
+        super::turn_diff::wrap_dispatch_checkpoint(&app, &thread_id_for_persist, cwd, nonce, turn_checkpoint);
     let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = match &control {
         Some(control) => Some(Arc::new(crate::agent_control::GuardedTurnCheckpoint {
             app: app.clone(), control: control.clone().retain_admission(&app), inner: turn_checkpoint,
@@ -3723,6 +3759,10 @@ async fn send_turn_internal<R: Runtime>(
                 input.client_nonce.as_deref(),
                 row_id,
             );
+            if !result.steered {
+                let nonce = input.client_nonce.as_deref();
+                super::turn_diff::on_turn_bound(&app, &thread_id_for_persist, nonce, &result.turn_id.0);
+            }
             // Then fan the row out to everyone watching this thread. The
             // sender already painted this bubble and drops the copy on its
             // nonce; any OTHER attached client (a second window, a paired
@@ -5279,6 +5319,12 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
     {
         Ok(()) => {
             record_native_worker_mode(&app, &thread_id.0, provider, Some(mode));
+            if provider == ProviderKind::Claude {
+                // Full-access host tools follow Claude's live permission mode.
+                if let Some(mcp) = app.try_state::<crate::mcp::registry::McpRegistry>() {
+                    mcp.notify_host_tools_changed();
+                }
+            }
             Ok(())
         }
         Err(ProviderError::SessionNotFound { .. }) => {
@@ -5690,14 +5736,133 @@ pub async fn agent_chat_stop_session_guarded<R: Runtime>(
 /// [`SubagentTracker::delegated_work_holding_turn`] — which
 /// `agent_chat_turn_active` reads — so a reopened thread would hydrate as
 /// a phantom live run until the stall watchdog tombstoned it.
+///
+/// Returns a handle on these stops' outcome for callers that must know
+/// when (and whether) they finished; others can ignore it.
 pub fn shutdown_agent_chat_threads<R: Runtime>(
     app: &AppHandle<R>,
     threads: Vec<(ProviderKind, String)>,
-) {
+) -> EarlierStops {
+    let threads = begin_agent_chat_thread_shutdown(app, threads);
     if threads.is_empty() {
-        return;
+        return EarlierStops(Vec::new());
     }
-    // Synchronous and before the spawn: the pane is already gone, so the
+    // Registered before the spawn so a worktree deletion that starts right
+    // after this call still finds the stop and waits for it.
+    let thread_ids: Vec<String> = threads.iter().map(|(_, id, _)| id.clone()).collect();
+    let db = app.try_state::<DatabaseStore>();
+    let workspaces: Vec<Option<String>> = thread_ids
+        .iter()
+        .map(|id| db.as_ref()?.get_agent_chat_session(id).map(|s| s.workspace_id))
+        .collect();
+    let (done, result) = tokio::sync::watch::channel(None);
+    let stopped_workspaces: Vec<String> = workspaces.iter().flatten().cloned().collect();
+    {
+        let mut pending = pending_stops().lock().unwrap();
+        for (thread_id, workspace_id) in thread_ids.iter().zip(workspaces) {
+            pending.insert(
+                thread_id.clone(),
+                PendingStop { workspace_id, result: result.clone() },
+            );
+        }
+    }
+    let handle = EarlierStops(vec![result.clone()]);
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome = stop_agent_chat_threads(&app_handle, threads).await;
+        if outcome.is_err() {
+            // Keeps these workspaces' checkouts out of worktree cleanup.
+            crate::worktree_cleanup::note_failed_stop(&stopped_workspaces);
+        }
+        done.send_replace(Some(outcome));
+        let mut pending = pending_stops().lock().unwrap();
+        for thread_id in thread_ids {
+            if pending
+                .get(&thread_id)
+                .is_some_and(|stop| stop.result.same_channel(&result))
+            {
+                pending.remove(&thread_id);
+            }
+        }
+    });
+    handle
+}
+
+/// A fire-and-forget stop still in flight, with the workspace its session
+/// was recorded under (`None` when no session row exists).
+struct PendingStop {
+    workspace_id: Option<String>,
+    result: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+}
+
+/// In-flight stops by thread id. A chat closed just before its workspace is
+/// deleted is no longer in the workspace, so deletion finds its stop here.
+fn pending_stops() -> &'static Mutex<HashMap<String, PendingStop>> {
+    static PENDING: OnceLock<Mutex<HashMap<String, PendingStop>>> = OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+
+/// Stops in flight for a workspace's chats, taken by [`snapshot_pending_stops`].
+pub struct EarlierStops(Vec<tokio::sync::watch::Receiver<Option<Result<(), String>>>>);
+
+/// In-flight stops of sessions in `workspace_id`, or whose workspace is
+/// unknown. Take this synchronously as soon as the workspace is closed: a
+/// stop that finishes later leaves the registry, and its result must still
+/// reach [`shutdown_agent_chat_threads_and_wait`].
+pub fn snapshot_pending_stops(workspace_id: &str) -> EarlierStops {
+    EarlierStops(
+        pending_stops()
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|stop| stop.workspace_id.as_deref().is_none_or(|id| id == workspace_id))
+            .map(|stop| stop.result.clone())
+            .collect(),
+    )
+}
+
+/// Wait for `stops` to finish. Errs when any of them failed.
+pub(crate) async fn wait_for_stops(stops: EarlierStops) -> Result<(), String> {
+    let mut first_error = None;
+    for mut result in stops.0 {
+        let outcome = match result.wait_for(Option::is_some).await {
+            Ok(outcome) => outcome.clone().unwrap_or(Ok(())),
+            Err(_) => Err("agent shutdown ended without reporting".to_string()),
+        };
+        if let Err(error) = outcome {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// [`shutdown_agent_chat_threads`], but resolves only once every session has
+/// stopped, including stops of chats closed before the workspace: the
+/// `earlier` snapshot taken when it closed, plus any still in flight now (a
+/// chat closed concurrently may register its stop after that snapshot).
+/// Worktree deletion awaits this so no agent is still running in the
+/// directory when its files are removed. Errs when a provider did not
+/// acknowledge a stop; a session that was not running counts as stopped.
+pub async fn shutdown_agent_chat_threads_and_wait<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace_id: &str,
+    mut earlier: EarlierStops,
+    threads: Vec<(ProviderKind, String)>,
+) -> Result<(), String> {
+    earlier.0.extend(snapshot_pending_stops(workspace_id).0);
+    let threads = begin_agent_chat_thread_shutdown(app, threads);
+    let stopped = stop_agent_chat_threads(app, threads).await;
+    stopped.and(wait_for_stops(earlier).await)
+}
+
+fn begin_agent_chat_thread_shutdown<R: Runtime>(
+    app: &AppHandle<R>,
+    threads: Vec<(ProviderKind, String)>,
+) -> Vec<(ProviderKind, String, Arc<ThreadGate>)> {
+    if threads.is_empty() {
+        return Vec::new();
+    }
+    // Synchronous and before any await: the pane is already gone, so the
     // tracking is dead the moment we are called, and this must not depend
     // on the async cleanup task being scheduled.
     let tracker: State<'_, SubagentTracker> = app.state();
@@ -5706,39 +5871,55 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
         super::usage_resume::cancel_for_stopped_thread(app, thread_id);
         super::delegation::on_thread_stopped(app, thread_id, super::delegation::StopKind::Close);
     }
-    let threads: Vec<_> = threads
+    threads
         .into_iter()
         .map(|(kind, thread_id)| {
             let gate = native_thread_gate(app, &thread_id);
             gate.cancel();
             (kind, thread_id, gate)
         })
-        .collect();
-    let app_handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let registry: State<'_, ProviderRegistry> = app_handle.state();
-        for (kind, thread_id, gate) in threads {
-            let _activity_guard = super::usage_resume::activity_lock(&thread_id)
-                .lock_owned()
-                .await;
-            super::usage_resume::cancel_for_stopped_thread(&app_handle, &thread_id);
-            let _native_guard = gate.dispatch.clone().lock_owned().await;
-            let Some(impl_) = registry.get(kind).await else {
-                continue;
-            };
-            if let Err(error) = impl_.stop_session(ThreadId(thread_id.clone())).await {
+        .collect()
+}
+
+async fn stop_agent_chat_threads<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    threads: Vec<(ProviderKind, String, Arc<ThreadGate>)>,
+) -> Result<(), String> {
+    if threads.is_empty() {
+        return Ok(());
+    }
+    let registry: State<'_, ProviderRegistry> = app_handle.state();
+    let mut first_error = None;
+    for (kind, thread_id, gate) in threads {
+        let _activity_guard = super::usage_resume::activity_lock(&thread_id)
+            .lock_owned()
+            .await;
+        super::usage_resume::cancel_for_stopped_thread(app_handle, &thread_id);
+        let _native_guard = gate.dispatch.clone().lock_owned().await;
+        let Some(impl_) = registry.get(kind).await else {
+            continue;
+        };
+        match impl_.stop_session(ThreadId(thread_id.clone())).await {
+            Ok(()) => {
+                if let Some(state) = app_handle.try_state::<NativeControlState>() {
+                    state.clear_worker(&thread_id);
+                    state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id: ThreadId(thread_id.clone()),
+                        status: SessionStatus::Closed,
+                    });
+                }
+            }
+            // Nothing was running, so nothing can still be using the files.
+            Err(ProviderError::SessionNotFound { .. } | ProviderError::SessionClosed { .. }) => {}
+            Err(error) => {
                 eprintln!(
                     "[agent_chat] cleanup stop_session failed for {kind:?} {thread_id}: {error:?}"
                 );
-            } else if let Some(state) = app_handle.try_state::<NativeControlState>() {
-                state.clear_worker(&thread_id);
-                state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {
-                    thread_id: ThreadId(thread_id.clone()),
-                    status: SessionStatus::Closed,
-                });
+                first_error.get_or_insert_with(|| format!("{kind:?} {thread_id}: {error}"));
             }
         }
-    });
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 // ── Session history (for the pane-header dropdown) ──────────────────
@@ -6490,10 +6671,12 @@ pub async fn agent_chat_delete_session<R: Runtime>(
             ),
         ]
     }));
+    let turn_diff_cleanup = super::turn_diff::thread_cleanup(&db, &thread_id);
     db.delete_agent_chat_session(&thread_id)?;
     super::async_questions::publish_attention(&app);
     // The thread is gone; its dispatch lock can never be contended again.
     forget_turn_checkpoint_lock(&thread_id);
+    super::turn_diff::forget_thread(turn_diff_cleanup);
     for (repo_path, ref_name) in checkpoint_refs {
         if let Err(error) =
             crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
@@ -6510,6 +6693,9 @@ fn cleanup_collapsed_session_resources(cleanup: crate::database::AgentChatSessio
             let _ = std::fs::remove_dir_all(dir);
         }
         forget_turn_checkpoint_lock(thread_id);
+        let repos = cleanup.repo_paths.iter().filter(|(id, _)| id == thread_id);
+        let repos = repos.map(|(_, repo)| repo.clone()).collect::<Vec<_>>();
+        super::turn_diff::forget_merged_thread(thread_id, &repos);
     }
     let mut refs = cleanup
         .checkpoint_refs
@@ -6897,16 +7083,108 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
     for (kind, provider) in providers {
         let app = app.clone();
         let mut stream = provider.event_stream();
+        let requests_survive = provider.pending_requests_survive_session_restart();
         tauri::async_runtime::spawn(async move {
             use futures_util::StreamExt;
             eprintln!("[codemux::agent_chat] event bridge started for {kind:?}");
+            let mut open_requests = OpenRequests::new(kind);
             while let Some(event) = stream.next().await {
+                if !requests_survive {
+                    for (thread_id, request_id) in open_requests.observe(&event) {
+                        forward_event(
+                            &app,
+                            crate::agent_provider::expired_request_event(thread_id, request_id),
+                        );
+                    }
+                }
                 forward_event(&app, event);
             }
             eprintln!(
                 "[codemux::agent_chat] event bridge for {kind:?} ended (provider stream closed)"
             );
         });
+    }
+}
+
+/// Requests each thread still has open on one provider's event stream.
+///
+/// A crashed or closed session takes its process-local callbacks with it,
+/// yet nothing else settles the requests it raised, so their cards stay
+/// answerable until a submit fails. The bridge expires them at the death
+/// boundary instead (only for providers whose requests do not survive a
+/// session restart).
+struct OpenRequests {
+    provider: ProviderKind,
+    open: HashMap<ThreadId, Vec<RequestId>>,
+}
+
+impl OpenRequests {
+    fn new(provider: ProviderKind) -> Self {
+        Self {
+            provider,
+            open: HashMap::new(),
+        }
+    }
+
+    /// Track `event` and return the requests it leaves without a live
+    /// callback: everything open on a thread whose session closed, or
+    /// whose process exited mid-turn.
+    fn observe(&mut self, event: &ProviderRuntimeEvent) -> Vec<(ThreadId, RequestId)> {
+        let ended = match event {
+            ProviderRuntimeEvent::RequestOpened {
+                thread_id,
+                request_id,
+                request_kind,
+                ..
+            } => {
+                // Claude's plan proposal parks no callback (the sidecar
+                // denies ExitPlanMode at once; accepting starts a new
+                // turn), so a restart leaves it actionable. Other
+                // providers' plan requests are real blocking callbacks.
+                if self.provider == ProviderKind::Claude && request_kind == "plan" {
+                    return Vec::new();
+                }
+                let open = self.open.entry(thread_id.clone()).or_default();
+                if !open.contains(request_id) {
+                    open.push(request_id.clone());
+                }
+                return Vec::new();
+            }
+            ProviderRuntimeEvent::RequestResolved {
+                thread_id,
+                request_id,
+                ..
+            }
+            | ProviderRuntimeEvent::RequestResponseFailed {
+                thread_id,
+                request_id,
+                ..
+            } => {
+                if let Some(open) = self.open.get_mut(thread_id) {
+                    open.retain(|id| id != request_id);
+                    if open.is_empty() {
+                        self.open.remove(thread_id);
+                    }
+                }
+                return Vec::new();
+            }
+            ProviderRuntimeEvent::SessionStateChanged {
+                thread_id,
+                status: SessionStatus::Closed,
+            } => thread_id,
+            ProviderRuntimeEvent::TurnCompleted {
+                thread_id,
+                status: crate::agent_provider::TurnStatus::Error { subtype, .. },
+                ..
+            } if subtype == crate::agent_provider::CHILD_EXITED_SUBTYPE => thread_id,
+            _ => return Vec::new(),
+        };
+        self.open
+            .remove(ended)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|request_id| (ended.clone(), request_id))
+            .collect()
     }
 }
 
@@ -7213,6 +7491,10 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                 pending.client_nonce.as_deref(),
                 row_id,
             );
+            if !*steered {
+                let nonce = pending.client_nonce.as_deref();
+                super::turn_diff::on_turn_bound(app, &thread_id.0, nonce, &turn_id.0);
+            }
             // Fan the row out under its own id, so every attached client's
             // cursor moves over it instead of over it. Gated on a nonce
             // because the nonce IS the dedup key here: `TurnQueued` already
@@ -7263,9 +7545,13 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         return; // Duplicate of this turn's notice.
     }
     if let ProviderRuntimeEvent::TurnCompleted {
-        thread_id, status, ..
+        thread_id,
+        turn_id,
+        status,
+        ..
     } = &event
     {
+        super::turn_diff::on_turn_completed(app, &thread_id.0, &turn_id.0);
         if matches!(
             status,
             crate::agent_provider::TurnStatus::Error { subtype, .. }
@@ -7395,6 +7681,7 @@ pub(super) fn fan_out_to_thread_channels<R: Runtime>(
     payload: &AgentChatEventPayload,
 ) {
     let channels: State<'_, AgentChatChannelRegistry> = app.state();
+    let _in_order = channels.fanout.lock().expect("channel fan-out poisoned");
     for channel in channels.channels_for(&thread_id.0) {
         if let Err(error) = channel.send(payload.clone()) {
             eprintln!(
@@ -9035,6 +9322,92 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::PathBuf;
+
+    #[test]
+    fn open_requests_expire_when_their_session_closes_or_crashes() {
+        let thread = ThreadId("t".into());
+        let opened = |id: &str| ProviderRuntimeEvent::RequestOpened {
+            thread_id: thread.clone(),
+            turn_id: TurnId("turn".into()),
+            request_id: RequestId(id.into()),
+            request_kind: "user-input".into(),
+            payload: json!({}),
+            tool_use_id: None,
+            subagent_id: None,
+        };
+        let crashed = ProviderRuntimeEvent::TurnCompleted {
+            thread_id: thread.clone(),
+            turn_id: TurnId("turn".into()),
+            status: crate::agent_provider::TurnStatus::Error {
+                subtype: crate::agent_provider::CHILD_EXITED_SUBTYPE.into(),
+                message: "dead".into(),
+            },
+            usage: None,
+        };
+        let mut open = OpenRequests::new(ProviderKind::Codex);
+        assert!(open.observe(&opened("answered")).is_empty());
+        assert!(open.observe(&opened("orphan")).is_empty());
+        open.observe(&ProviderRuntimeEvent::RequestResolved {
+            thread_id: thread.clone(),
+            request_id: RequestId("answered".into()),
+            decision: ApprovalDecision::Cancel,
+        });
+        // A recoverable error keeps the callback alive.
+        assert!(open
+            .observe(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: thread.clone(),
+                status: SessionStatus::Error { message: "turn failed".into() },
+            })
+            .is_empty());
+        assert_eq!(
+            open.observe(&crashed),
+            vec![(thread.clone(), RequestId("orphan".into()))]
+        );
+        assert!(open.observe(&crashed).is_empty());
+
+        open.observe(&opened("closing"));
+        assert_eq!(
+            open.observe(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: thread.clone(),
+                status: SessionStatus::Closed,
+            }),
+            vec![(thread, RequestId("closing".into()))]
+        );
+    }
+
+    #[test]
+    fn open_requests_keep_claude_plan_proposals_across_a_restart() {
+        let thread = ThreadId("t".into());
+        let opened = |id: &str, kind: &str| ProviderRuntimeEvent::RequestOpened {
+            thread_id: thread.clone(),
+            turn_id: TurnId(String::new()),
+            request_id: RequestId(id.into()),
+            request_kind: kind.into(),
+            payload: json!({}),
+            tool_use_id: None,
+            subagent_id: None,
+        };
+        let closed = ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: thread.clone(),
+            status: SessionStatus::Closed,
+        };
+        // An effort change restarts Claude; its plan needs no callback.
+        let mut claude = OpenRequests::new(ProviderKind::Claude);
+        claude.observe(&opened("plan", "plan"));
+        claude.observe(&opened("approval", "tool_permission"));
+        assert_eq!(
+            claude.observe(&closed),
+            vec![(thread.clone(), RequestId("approval".into()))]
+        );
+        // Cursor's plan request is a real blocking callback.
+        let mut cursor = OpenRequests::new(ProviderKind::Cursor);
+        cursor.observe(&opened("plan", "plan"));
+        assert_eq!(
+            cursor.observe(&closed),
+            vec![(thread, RequestId("plan".into()))]
+        );
+    }
 
     #[tokio::test]
     async fn hermes_stop_during_lazy_resume_prevents_later_dispatch() {
@@ -10494,6 +10867,9 @@ mod tests {
         live: Mutex<std::collections::HashSet<String>>,
         stopped: Mutex<Vec<String>>,
         started_on: Mutex<Vec<Option<i64>>>,
+        stop_started: tokio::sync::Notify,
+        stop_release: Option<Arc<tokio::sync::Notify>>,
+        fail_stop: bool,
     }
 
     #[async_trait::async_trait]
@@ -10557,6 +10933,16 @@ mod tests {
             unimplemented!()
         }
         async fn stop_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+            self.stop_started.notify_one();
+            if let Some(release) = &self.stop_release {
+                release.notified().await;
+            }
+            if self.fail_stop {
+                return Err(ProviderError::ProcessError {
+                    message: "test shutdown was not acknowledged".into(),
+                    source: None,
+                });
+            }
             self.stopped.lock().unwrap().push(thread_id.0.clone());
             self.live.lock().unwrap().remove(&thread_id.0);
             Ok(())
@@ -10673,6 +11059,246 @@ mod tests {
             .unwrap()
             .contains("other-workspace-thread"));
         assert!(!session_hosts().lock().unwrap().contains_key(thread));
+    }
+
+    // Workspace close emits state and schedules layout persistence. Isolate
+    // that write in a subprocess so these fixtures never touch the user's layout.
+    fn worktree_close_fixture_child(test: &str) -> bool {
+        if std::env::var_os("CODEMUX_TEST_LAYOUT_PATH").is_some() {
+            return false;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("commands::agent_chat::tests::{test}"), "--nocapture"])
+            .env("CODEMUX_TEST_LAYOUT_PATH", root.path().join("layout.json"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "workspace close fixture: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
+
+    async fn worktree_close_app(
+        thread: &str,
+        provider: Arc<PlacementProvider>,
+    ) -> (tempfile::TempDir, tauri::App<tauri::test::MockRuntime>, String, PathBuf) {
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "initial"],
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        }
+        let worktree = crate::git::git_create_worktree(repo.path(), "close-agent", true, None, None).unwrap();
+        provider.live.lock().unwrap().insert(thread.to_string());
+        let (app, workspace) = placement_app(thread, None, provider).await;
+        app.manage(crate::terminal::PtyState::default());
+        app.manage(SubagentTracker::default());
+        let state = app.state::<AppStateStore>();
+        let mut snapshot = state.snapshot();
+        let ws = snapshot.workspaces.iter_mut().find(|ws| ws.workspace_id.0 == workspace).unwrap();
+        ws.cwd = worktree.clone();
+        ws.worktree_path = Some(worktree.clone());
+        ws.git_branch = Some("close-agent".into());
+        ws.workspace_kind = Some("worktree".into());
+        ws.protected = false;
+        state.replace_snapshot(snapshot);
+        (repo, app, workspace, PathBuf::from(worktree))
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_waits_for_agent_shutdown() {
+        if worktree_close_fixture_child("worktree_deletion_waits_for_agent_shutdown") {
+            return;
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(PlacementProvider {
+            stop_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let (_repo, app, workspace, worktree) = worktree_close_app("close-wait", provider.clone()).await;
+        let handle = app.handle().clone();
+        let mut close = tokio::spawn(async move {
+            super::super::workspace::close_workspace_with_worktree_impl(
+                handle.clone(), &handle.state::<AppStateStore>(), &handle.state::<DatabaseStore>(),
+                workspace, true, Some(false), Some(true),
+            ).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), provider.stop_started.notified()).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(100), &mut close).await;
+        let waited = result.is_err();
+        let retained_while_stopping = worktree.exists();
+        release.notify_one();
+        match result {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => close.await.unwrap().unwrap(),
+        }
+        assert!(waited, "workspace deletion completed before its agent stopped");
+        assert!(retained_while_stopping, "worktree must exist while the agent is stopping");
+        assert!(!worktree.exists(), "worktree should be removed after shutdown");
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_waits_for_stop_of_chat_closed_earlier() {
+        if worktree_close_fixture_child("worktree_deletion_waits_for_stop_of_chat_closed_earlier") {
+            return;
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(PlacementProvider {
+            stop_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let thread = "close-pane-first";
+        let (_repo, app, workspace, worktree) = worktree_close_app(thread, provider.clone()).await;
+        let handle = app.handle().clone();
+        // What `agent_chat_close_pane` does: the pane leaves the workspace and
+        // its stop runs in the background.
+        {
+            let state = handle.state::<AppStateStore>();
+            let pane = state.agent_chat_pane_id_for_thread(thread).unwrap();
+            state.close_pane_with_selection(&pane, true).unwrap();
+        }
+        shutdown_agent_chat_threads(&handle, vec![(ProviderKind::Codex, thread.to_string())]);
+        tokio::time::timeout(Duration::from_secs(5), provider.stop_started.notified()).await.unwrap();
+
+        let mut close = tokio::spawn(async move {
+            super::super::workspace::close_workspace_with_worktree_impl(
+                handle.clone(), &handle.state::<AppStateStore>(), &handle.state::<DatabaseStore>(),
+                workspace, true, Some(false), Some(true),
+            ).await
+        });
+        let result = tokio::time::timeout(Duration::from_millis(100), &mut close).await;
+        let waited = result.is_err();
+        let retained_while_stopping = worktree.exists();
+        release.notify_one();
+        match result {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => close.await.unwrap().unwrap(),
+        }
+        assert!(waited, "workspace deletion completed before the closed chat's agent stopped");
+        assert!(retained_while_stopping, "worktree must exist while the agent is stopping");
+        assert!(!worktree.exists(), "worktree should be removed after shutdown");
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_keeps_failures_of_stops_finishing_while_waiting() {
+        if worktree_close_fixture_child("worktree_deletion_keeps_failures_of_stops_finishing_while_waiting") {
+            return;
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(PlacementProvider {
+            stop_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let (app, workspace) = placement_app("live-chat", None, provider.clone()).await;
+        app.manage(SubagentTracker::default());
+        // A chat closed earlier whose background stop is still running.
+        let (done, result) = tokio::sync::watch::channel(None);
+        pending_stops().lock().unwrap().insert(
+            "closed-chat".into(),
+            PendingStop { workspace_id: Some(workspace.clone()), result },
+        );
+        let handle = app.handle().clone();
+        let earlier = snapshot_pending_stops(&workspace);
+        let wait = tokio::spawn(async move {
+            shutdown_agent_chat_threads_and_wait(
+                &handle, &workspace, earlier, vec![(ProviderKind::Codex, "live-chat".into())],
+            ).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), provider.stop_started.notified()).await.unwrap();
+        // The earlier stop fails and leaves the registry while the live chat
+        // is still stopping.
+        done.send_replace(Some(Err("closed chat did not stop".into())));
+        pending_stops().lock().unwrap().remove("closed-chat");
+        release.notify_one();
+        let error = wait.await.unwrap().expect_err("an earlier failed stop must block deletion");
+        assert!(error.contains("closed chat did not stop"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_keeps_failures_of_stops_finishing_before_the_wait() {
+        if worktree_close_fixture_child("worktree_deletion_keeps_failures_of_stops_finishing_before_the_wait") {
+            return;
+        }
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app("live-chat", None, provider).await;
+        app.manage(SubagentTracker::default());
+        // A chat closed earlier whose background stop is still running when
+        // the workspace is closed for deletion.
+        let (done, result) = tokio::sync::watch::channel(None);
+        pending_stops().lock().unwrap().insert(
+            "closed-chat".into(),
+            PendingStop { workspace_id: Some(workspace.clone()), result },
+        );
+        let earlier = snapshot_pending_stops(&workspace);
+        // It fails and leaves the registry during the close's awaits, before
+        // the deletion starts waiting.
+        done.send_replace(Some(Err("closed chat did not stop".into())));
+        pending_stops().lock().unwrap().remove("closed-chat");
+        let error = shutdown_agent_chat_threads_and_wait(
+            app.handle(), &workspace, earlier, vec![(ProviderKind::Codex, "live-chat".into())],
+        )
+        .await
+        .expect_err("an earlier failed stop must block deletion");
+        assert!(error.contains("closed chat did not stop"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_waits_for_stops_registered_after_the_close() {
+        if worktree_close_fixture_child("worktree_deletion_waits_for_stops_registered_after_the_close") {
+            return;
+        }
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app("live-chat", None, provider).await;
+        app.manage(SubagentTracker::default());
+        let earlier = snapshot_pending_stops(&workspace);
+        // A tab closed concurrently registers its stop only after the
+        // workspace closed and took its snapshot.
+        let (done, result) = tokio::sync::watch::channel(None);
+        pending_stops().lock().unwrap().insert(
+            "late-chat".into(),
+            PendingStop { workspace_id: Some(workspace.clone()), result },
+        );
+        let handle = app.handle().clone();
+        let mut wait = tokio::spawn(async move {
+            shutdown_agent_chat_threads_and_wait(&handle, &workspace, earlier, Vec::new()).await
+        });
+        let waited = tokio::time::timeout(Duration::from_millis(100), &mut wait).await.is_err();
+        done.send_replace(Some(Err("late chat did not stop".into())));
+        pending_stops().lock().unwrap().remove("late-chat");
+        let error = wait.await.unwrap().expect_err("a late failed stop must block deletion");
+        assert!(waited, "deletion must wait for a stop registered after the close");
+        assert!(error.contains("late chat did not stop"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_retains_files_when_agent_shutdown_fails() {
+        if worktree_close_fixture_child("worktree_deletion_retains_files_when_agent_shutdown_fails") {
+            return;
+        }
+        let provider = Arc::new(PlacementProvider { fail_stop: true, ..Default::default() });
+        let (_repo, app, workspace, worktree) = worktree_close_app("close-failed-stop", provider).await;
+        let handle = app.handle();
+        let result = super::super::workspace::close_workspace_with_worktree_impl(
+            handle.clone(), &handle.state::<AppStateStore>(), &handle.state::<DatabaseStore>(),
+            workspace, true, Some(false), Some(true),
+        ).await;
+        let retained = worktree.exists();
+        if retained {
+            crate::git::git_remove_worktree(&worktree, None, true).unwrap();
+        }
+        let error = result.expect_err("unacknowledged shutdown must refuse file deletion");
+        assert!(error.contains("test shutdown was not acknowledged"), "unexpected error: {error}");
+        assert!(retained, "failed agent shutdown must retain the worktree");
     }
 
     /// Give `workspace` an absolute folder on its device, so a session can

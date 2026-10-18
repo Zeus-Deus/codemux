@@ -2,41 +2,79 @@ import { Check, Copy, FileText } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { cn } from "@/lib/utils";
+import { parseDiff } from "@/lib/diff-parser";
 import { resolveChatFileLink } from "@/lib/agent-chat/file-links";
 import { MarkdownFileLink } from "./MarkdownFileLink";
 import { useChatFileLinkContext } from "./chat-file-link-context";
 
+type DiffViewSource =
+  | { oldText: string; newText: string; patch?: undefined }
+  /** One file's unified diff (from `git diff`), rendered hunk by hunk with
+   *  the file's real line numbers. */
+  | { patch: string; oldText?: undefined; newText?: undefined };
+
+/** A rendered row: a diff line with its gutter, or a hunk separator. */
+interface DisplayRow {
+  type: DiffRowType | "hunk";
+  text: string;
+  gutter: string;
+}
+
+function textRows(oldText: string, newText: string): DisplayRow[] {
+  let lineNo = 0;
+  return computeLineDiff(oldText, newText).map((row) => {
+    if (row.type === "context" || row.type === "add") lineNo += 1;
+    const gutter =
+      row.type === "remove" ? "−" : row.type === "add" ? "+" : String(lineNo);
+    return { ...row, gutter };
+  });
+}
+
+function patchRows(patch: string): DisplayRow[] {
+  // A trailing newline would parse as one more (empty) context line.
+  return parseDiff(patch.replace(/\r?\n$/, "")).map((line): DisplayRow => {
+    switch (line.type) {
+      case "hunk-header":
+        return { type: "hunk", text: line.content, gutter: "" };
+      case "add":
+        return { type: "add", text: line.content, gutter: "+" };
+      case "del":
+        return { type: "remove", text: line.content, gutter: "−" };
+      default:
+        return { type: "context", text: line.content, gutter: String(line.newLine ?? "") };
+    }
+  });
+}
+
 /**
- * Diff surface (design D7). Computes a line-level diff from the tool
- * input (old/new text) — context lines dimmed with a running line number,
- * removed lines red on a faint red wash with a `−` gutter, added lines
- * green on a faint green wash with a `+` gutter. Horizontal overflow
+ * Diff surface (design D7). Renders a line-level diff computed from the
+ * tool input (old/new text), or a file's unified `patch` — context lines
+ * dimmed with their line number, removed lines red on a faint red wash with
+ * a `−` gutter, added lines green on a faint green wash with a `+` gutter,
+ * and a patch's hunks separated by their `@@` header. Horizontal overflow
  * scrolls inside the card. The +N/−N counts and copy target come from the
- * computed rows, not the model's prose.
+ * rows, not the model's prose.
  */
 export function DiffView({
   filename,
-  oldText,
-  newText,
   copyText,
+  ...source
 }: {
   filename: string | null;
-  oldText: string;
-  newText: string;
   copyText: string;
-}) {
+} & DiffViewSource) {
   const { cwd } = useChatFileLinkContext();
   const fileMeta = filename ? resolveChatFileLink(filename, cwd) : null;
+  const { oldText, newText, patch } = source;
   const { rows, added, removed } = useMemo(() => {
-    const rows = computeLineDiff(oldText, newText);
+    const rows =
+      patch !== undefined ? patchRows(patch) : textRows(oldText ?? "", newText ?? "");
     return {
       rows,
       added: rows.filter((r) => r.type === "add").length,
       removed: rows.filter((r) => r.type === "remove").length,
     };
-  }, [oldText, newText]);
-
-  let lineNo = 0;
+  }, [oldText, newText, patch]);
 
   return (
     <div className="overflow-hidden rounded-lg border border-hairline bg-surface-1">
@@ -66,9 +104,20 @@ export function DiffView({
       </div>
       <div className="code-surface select-text overflow-x-auto py-[9px]">
         {rows.map((row, i) => {
-          if (row.type === "context" || row.type === "add") lineNo += 1;
-          const gutter =
-            row.type === "remove" ? "−" : row.type === "add" ? "+" : String(lineNo);
+          if (row.type === "hunk") {
+            return (
+              <div
+                key={i}
+                className={cn(
+                  "flex w-max min-w-full bg-muted/30 text-muted-foreground/60",
+                  i > 0 && "mt-[9px]",
+                )}
+              >
+                <span className="w-[42px] shrink-0" aria-hidden />
+                <span className="whitespace-pre pr-4">{row.text}</span>
+              </div>
+            );
+          }
           return (
             <div
               key={i}
@@ -85,7 +134,7 @@ export function DiffView({
                   row.type === "context" ? "opacity-60" : "opacity-70",
                 )}
               >
-                {gutter}
+                {row.gutter}
               </span>
               <span className="whitespace-pre pr-4">{row.text}</span>
             </div>

@@ -38,6 +38,8 @@ use super::protocol::{
 };
 use super::translate::{translate_notification_with, SubagentDemux};
 use crate::agent_provider::ImageInput;
+
+mod steer;
 use base64::Engine;
 
 /// Default per-RPC timeout for the sidecar. Matches the value
@@ -99,6 +101,8 @@ pub(crate) struct ClaudeSessionState {
     pub idle_compaction: Option<IdleRun>,
     /// Holds the queue after a user Stop until an explicit send.
     pub(crate) queue_hold: crate::agent_provider::queue_hold::QueueHold,
+    /// Guidance delivered into the running turn; see [`steer`].
+    pub(crate) steer: steer::SteerState,
 }
 
 /// One idle compaction in flight. The claim is released only once the SDK
@@ -629,6 +633,7 @@ impl ClaudeSession {
             dispatching: false,
             idle_compaction: None,
             queue_hold: Default::default(),
+            steer: Default::default(),
         });
         let compaction = CompactionSupport {
             eligible: managed.is_none() && input.remote.is_none(),
@@ -1077,7 +1082,9 @@ impl ClaudeSession {
         // the callback is answered.
         let was_held = {
             let mut state = self.state.lock().await;
-            if state.sdk_busy() {
+            // A reserved dispatch is about to start a turn; go behind it.
+            // An idle compaction holds the SDK the same way a turn does.
+            if state.sdk_busy() || state.dispatching {
                 if input.dispatch_guard.is_some() {
                     return Err(ProviderError::ValidationError {
                         message: "Guarded result cannot queue behind a busy parent".into(),
@@ -1510,7 +1517,7 @@ impl ClaudeSession {
             self.native_authority.invalidate();
         }
         let active = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             if let Some(requested) = turn_id.as_ref() {
                 let active = state.active_turn.as_ref().ok_or_else(|| {
                     ProviderError::ValidationError {
@@ -1528,17 +1535,25 @@ impl ClaudeSession {
                 // Keep selection and revocation atomic with turn transitions.
                 self.native_authority.invalidate();
             }
-            state.active_turn.clone()
+            // A newer Stop wins over guidance sent into this turn.
+            let active = state.active_turn.clone();
+            state.steer.stop(active.clone());
+            active
         };
         let params = InterruptParams {
             thread_id: self.thread_id.0.clone(),
         };
-        self.sidecar
+        if let Err(e) = self
+            .sidecar
             .request(METHOD_INTERRUPT, serde_json::to_value(&params).unwrap())
             .await
-            .map_err(|e| ProviderError::RpcError {
+        {
+            self.recover_failed_stop(&mut *self.state.lock().await, &active);
+            self.announce_steer_continuation().await;
+            return Err(ProviderError::RpcError {
                 message: format!("interrupt RPC failed: {e}"),
-            })?;
+            });
+        }
         // By the time the RPC returns, the sidecar's `turn-interrupted`
         // notification may ALREADY have been processed by the
         // notifications task, which may already have flipped the session
@@ -1556,6 +1571,11 @@ impl ClaudeSession {
         // meanwhile is never clobbered.
         {
             let mut state = self.state.lock().await;
+            // The stopped turn's undelivered guidance died with it, unless a
+            // newer turn has already started and owns the pending set.
+            if state.active_turn.is_none() || state.active_turn == active {
+                state.steer.stopped();
+            }
             let still_idle = active.is_none()
                 && state.active_turn.is_none()
                 && matches!(state.status, SessionStatus::Ready);
@@ -1660,6 +1680,28 @@ impl ClaudeSession {
                 if is_request_not_pending_rpc(&err) =>
             {
                 Err(ProviderError::RequestNotPending { request_id })
+            }
+            // A dead sidecar cannot receive this answer: report the request
+            // as orphaned instead of a retryable failure. A reply still
+            // outstanding when the child exits fails as a plain RPC error,
+            // after the child is already marked not alive.
+            Err(
+                crate::json_rpc_child::RpcChildError::ChildExited { .. }
+                | crate::json_rpc_child::RpcChildError::AlreadyShutdown,
+            ) => Err(ProviderError::SessionClosed {
+                thread_id: self.thread_id.clone(),
+            }),
+            Err(crate::json_rpc_child::RpcChildError::IoError(e))
+                if e.kind() == std::io::ErrorKind::BrokenPipe =>
+            {
+                Err(ProviderError::SessionClosed {
+                    thread_id: self.thread_id.clone(),
+                })
+            }
+            Err(crate::json_rpc_child::RpcChildError::RpcError(_)) if !self.sidecar.is_alive() => {
+                Err(ProviderError::SessionClosed {
+                    thread_id: self.thread_id.clone(),
+                })
             }
             Err(e) => Err(ProviderError::RpcError {
                 message: format!("respond-to-request RPC failed: {e}"),
@@ -1955,6 +1997,12 @@ fn spawn_notifications_task(
                             };
                             let idle_signal = IdleSignal::of(&structured);
                             mutate_state_from_notification(&session, &structured).await;
+                            let opened_request = match &structured {
+                                SidecarNotification::RequestOpened { request_id, .. } => {
+                                    Some(RequestId(request_id.clone()))
+                                }
+                                _ => None,
+                            };
                             // Catch any panic in the pure translator so
                             // a bug can't kill this task.
                             let events = std::panic::catch_unwind(
@@ -1989,6 +2037,22 @@ fn spawn_notifications_task(
                                 stamp_turn_id(&mut e, active_turn.as_ref());
                                 let _ = event_tx.send(e);
                             }
+                            // The crash watchdog may have drained (and
+                            // expired) pending requests before this one was
+                            // published. It marks the session dead before
+                            // taking the state lock, so checking under that
+                            // lock catches every request it missed.
+                            if let Some(request_id) = opened_request {
+                                let mut state = session.state.lock().await;
+                                if session.dead.load(Ordering::Relaxed) {
+                                    state.pending_approvals.remove(&request_id);
+                                    let _ = event_tx.send(crate::agent_provider::expired_request_event(
+                                        session.thread_id.clone(),
+                                        request_id,
+                                    ));
+                                }
+                            }
+                            session.announce_steer_continuation().await;
                             // Follow-up queue: a notification may have
                             // just returned the session to idle (SDK
                             // `result` → Ready) or torn it down
@@ -2380,14 +2444,24 @@ fn spawn_child_exit_watchdog(
                             // both Running and WaitingApproval) BEFORE clearing
                             // it, so the watchdog can settle it with a synthetic
                             // terminal `TurnCompleted`.
-                            let active_turn = {
+                            let (active_turn, orphaned) = {
                                 let mut state = session.state.lock().await;
                                 let active_turn = state.active_turn.take();
                                 state.status = SessionStatus::Error {
                                     message: msg.clone(),
                                 };
-                                active_turn
+                                // Background subagents can hold approvals
+                                // after the parent turn ended; expire them all.
+                                let orphaned: Vec<RequestId> =
+                                    state.pending_approvals.drain().map(|(id, _)| id).collect();
+                                (active_turn, orphaned)
                             };
+                            for request_id in orphaned {
+                                let _ = event_tx.send(crate::agent_provider::expired_request_event(
+                                    session.thread_id.clone(),
+                                    request_id,
+                                ));
+                            }
                             // TurnCompleted(child_exited) first, then the Error
                             // state — see `child_exit_events` for why the order
                             // matters.
@@ -2439,8 +2513,12 @@ async fn mutate_state_from_notification(
             // flight and stays `Running` until its real `result` lands.
             let mut state = session.state.lock().await;
             state.sdk_session_id = None;
+            state.steer.drop_pending();
         }
         SidecarNotification::SdkMessage { message, .. } => {
+            if message.get("user_message_uuids").is_some() {
+                session.state.lock().await.steer.observe_echo();
+            }
             // The SDK's `result` message marks the end of a single
             // turn. The session stays alive (the prompt queue is
             // persistent) so `session-ended` does NOT fire between
@@ -2465,10 +2543,11 @@ async fn mutate_state_from_notification(
                 // Invalidate the generation even before active_turn is bound;
                 // the delayed acknowledgement must not revive its authority.
                 session.native_authority.finish_current();
-                state.active_turn = None;
+                let ended = state.active_turn.take();
                 if matches!(state.status, SessionStatus::Running { .. }) {
                     state.status = SessionStatus::Ready;
                 }
+                session.continue_unconsumed_steers(&mut state, message, ended);
             }
         }
         SidecarNotification::SessionEnded { reason, .. } => {
@@ -2479,6 +2558,7 @@ async fn mutate_state_from_notification(
             if reason != "iteration-complete" {
                 session.native_authority.revoke();
             }
+            state.steer.drop_pending();
             state.active_turn = None;
             state.status = if reason == "iteration-complete" {
                 SessionStatus::Ready
@@ -2492,6 +2572,7 @@ async fn mutate_state_from_notification(
             // only from Running, so we never resurrect a session that has
             // since gone Closed / Error.
             let mut state = session.state.lock().await;
+            state.steer.drop_pending();
             state.active_turn = None;
             if matches!(state.status, SessionStatus::Running { .. }) {
                 state.status = SessionStatus::Ready;
@@ -2512,6 +2593,7 @@ async fn mutate_state_from_notification(
         SidecarNotification::SessionError { error, .. } => {
             session.native_authority.finish_current();
             let mut state = session.state.lock().await;
+            state.steer.drop_pending();
             state.status = SessionStatus::Error {
                 message: error.message.clone(),
             };

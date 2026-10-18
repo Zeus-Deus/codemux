@@ -245,10 +245,6 @@ fn main_session<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Result<MainS
     })
 }
 
-fn spawn_error(what: &str, error: impl std::fmt::Display) -> String {
-    format!("Couldn't start the side chat: {what}: {error}")
-}
-
 /// Start a side chat that forks `thread_id`'s provider session and asks
 /// `text`. Returns once the fork exists and the first turn is running, with
 /// the model and effort the fork runs on; the answer streams on
@@ -368,17 +364,9 @@ async fn start_claude<R: Runtime>(
 ) -> Result<(SideChat, SideChatStarted), String> {
     // Never touch Claude's on-disk session here: the SDK reads the main
     // transcript to fork it and, with `persistSession: false`, writes none.
-    let sidecar = crate::agent_provider::claude::sidecar_path::resolve_sidecar_path()
-        .map_err(|error| spawn_error("Claude sidecar", error))?;
-    let child = JsonRpcChild::spawn(SpawnConfig {
-        program: sidecar,
-        args: vec![],
-        env: HashMap::new(),
-        cwd: Some(main.cwd.clone()),
-        default_timeout: SIDE_RPC_TIMEOUT,
-    })
-    .await
-    .map_err(|error| spawn_error("Claude sidecar", error))?;
+    let child = spawn_claude_sidecar(&main.cwd)
+        .await
+        .map_err(|error| format!("Couldn't start the side chat: {error}"))?;
     let child = Arc::new(child);
     let pump = spawn_pump(app.clone(), side_id.to_string(), Arc::clone(&child), None);
     let model = main.model.as_deref().map(|model| {
@@ -411,9 +399,31 @@ async fn start_claude<R: Runtime>(
     ))
 }
 
+/// A dedicated Claude sidecar in `cwd`, separate from the main session's.
+/// Also used by chat forks for their one-shot `fork-session` call.
+pub(crate) async fn spawn_claude_sidecar(cwd: &std::path::Path) -> Result<JsonRpcChild, String> {
+    let sidecar = crate::agent_provider::claude::sidecar_path::resolve_sidecar_path()
+        .map_err(|error| format!("Claude sidecar: {error}"))?;
+    JsonRpcChild::spawn(SpawnConfig {
+        program: sidecar,
+        args: vec![],
+        env: HashMap::new(),
+        cwd: Some(cwd.to_path_buf()),
+        default_timeout: SIDE_RPC_TIMEOUT,
+    })
+    .await
+    .map_err(|error| format!("Claude sidecar: {error}"))
+}
+
 // ── Codex ───────────────────────────────────────────────────────────────
 
-async fn spawn_codex(cwd: &std::path::Path, extra: Vec<String>) -> Result<JsonRpcChild, String> {
+/// A dedicated `codex app-server` in `cwd` with user automation switched off
+/// (see [`codex_side_chat_args`]). Also used by chat forks, which only fork
+/// and roll back a thread in it.
+pub(crate) async fn spawn_codex(
+    cwd: &std::path::Path,
+    extra: Vec<String>,
+) -> Result<JsonRpcChild, String> {
     let mut args = extra;
     args.extend(codex_side_chat_args());
     JsonRpcChild::spawn(SpawnConfig {
@@ -424,10 +434,10 @@ async fn spawn_codex(cwd: &std::path::Path, extra: Vec<String>) -> Result<JsonRp
         default_timeout: SIDE_RPC_TIMEOUT,
     })
     .await
-    .map_err(|error| spawn_error("codex app-server", error))
+    .map_err(|error| format!("codex app-server: {error}"))
 }
 
-async fn codex_initialize(child: &JsonRpcChild) -> Result<(), String> {
+pub(crate) async fn codex_initialize(child: &JsonRpcChild) -> Result<(), String> {
     child
         .request(
             "initialize",
@@ -437,11 +447,25 @@ async fn codex_initialize(child: &JsonRpcChild) -> Result<(), String> {
             }),
         )
         .await
-        .map_err(|error| format!("Couldn't start the side chat: {error}"))?;
+        .map_err(|error| error.to_string())?;
     child
         .notify("initialized", json!({}))
         .await
-        .map_err(|error| format!("Couldn't start the side chat: {error}"))
+        .map_err(|error| error.to_string())
+}
+
+/// The names of the MCP servers `child`'s Codex config would start in `cwd`.
+pub(crate) async fn codex_mcp_servers(
+    child: &JsonRpcChild,
+    cwd: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let config = child
+        .request("config/read", json!({ "includeLayers": false, "cwd": cwd }))
+        .await
+        .map_err(|error| format!("Couldn't read Codex configuration: {error}"))?;
+    Ok(codex_enabled_mcp_servers(
+        config.get("config").unwrap_or(&Value::Null),
+    ))
 }
 
 async fn start_codex<R: Runtime>(
@@ -458,17 +482,16 @@ async fn start_codex<R: Runtime>(
             "Side chat isn't available while Codex uses your ChatGPT plan connection yet.".into(),
         );
     }
-    let child = Arc::new(spawn_codex(&main.cwd, Vec::new()).await?);
-    let result = async {
-        codex_initialize(&child).await?;
-        let config = child
-            .request(
-                "config/read",
-                json!({ "includeLayers": false, "cwd": main.cwd }),
-            )
+    let child = Arc::new(
+        spawn_codex(&main.cwd, Vec::new())
             .await
-            .map_err(|error| format!("Couldn't read Codex configuration: {error}"))?;
-        let mcp_servers = codex_enabled_mcp_servers(config.get("config").unwrap_or(&Value::Null));
+            .map_err(|error| format!("Couldn't start the side chat: {error}"))?,
+    );
+    let result = async {
+        codex_initialize(&child)
+            .await
+            .map_err(|error| format!("Couldn't start the side chat: {error}"))?;
+        let mcp_servers = codex_mcp_servers(&child, &main.cwd).await?;
         let fork = child
             .request(
                 "thread/fork",

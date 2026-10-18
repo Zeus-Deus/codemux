@@ -23,6 +23,14 @@
 //!   * `FAKE_CLAUDE_SIDECAR_SCRIPT` — path to the JSON script.
 //!   * `FAKE_CLAUDE_SIDECAR_EXIT_AFTER=<method>` — exit 0 after
 //!     responding to this method. Used to simulate crashes.
+//!   * `FAKE_CLAUDE_STEER_ERROR=<code>:<message>` — reject `steer-turn`,
+//!     after `FAKE_CLAUDE_STEER_DELAY_MS` when set.
+//!   * `FAKE_CLAUDE_INTERRUPT_ERROR=<message>` — reject `interrupt`, after
+//!     `FAKE_CLAUDE_INTERRUPT_DELAY_MS` when set.
+//!
+//! A scripted `"user_message_uuids": "$steered"` is replaced with the
+//! uuids of every `steer-turn` received so far, the way the CLI echoes
+//! the prompts a turn consumed.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -55,6 +63,18 @@ struct ScriptEntry {
     method: String,
     #[serde(default)]
     params: Value,
+}
+
+/// Prompt uuids received via `steer-turn`, for `$steered` substitution.
+static STEERED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn substitute_steered(mut params: Value) -> Value {
+    if let Some(uuids) = params.pointer_mut("/message/user_message_uuids") {
+        if uuids == "$steered" {
+            *uuids = json!(*STEERED.lock().unwrap());
+        }
+    }
+    params
 }
 
 /// Append the raw params of a received RPC to the capture file named by
@@ -125,10 +145,11 @@ fn fire_script_entries_for(method: &str, script: &[ScriptEntry]) {
             }
             match entry.emit.as_str() {
                 "notification" => {
+                    let params = substitute_steered(entry.params);
                     write_line(&json!({
                         "jsonrpc": "2.0",
                         "method": entry.method,
-                        "params": entry.params,
+                        "params": params,
                     }));
                     // Lets a test prove a late line really was written.
                     if let Ok(path) = std::env::var("FAKE_CLAUDE_EMITTED_MARKER") {
@@ -137,7 +158,7 @@ fn fire_script_entries_for(method: &str, script: &[ScriptEntry]) {
                             .append(true)
                             .open(&path)
                             .expect("open emitted marker");
-                        let _ = writeln!(f, "{} {}", entry.method, entry.params);
+                        let _ = writeln!(f, "{} {}", entry.method, params);
                     }
                 }
                 "server_request" => {
@@ -306,18 +327,57 @@ fn main() {
                 }
                 fire_script_entries_for(method, &script);
             }
-            "interrupt" if std::env::var("FAKE_CLAUDE_INTERRUPT_ERROR").is_ok() => {
-                // Regression fixture: the interrupt's outcome is unknown to
-                // the host, while the sidecar may still act on it.
+            "steer-turn" => {
                 capture_params(method, &msg.params);
+                let rejection = std::env::var("FAKE_CLAUDE_STEER_ERROR").ok();
+                if rejection.is_none() {
+                    if let Some(uuid) = msg.params.get("uuid").and_then(Value::as_str) {
+                        STEERED.lock().unwrap().push(uuid.to_owned());
+                    }
+                }
+                fire_script_entries_for(method, &script);
+                if let Some(delay) = std::env::var("FAKE_CLAUDE_STEER_DELAY_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
+                if let Some(id) = id {
+                    match rejection.as_deref().and_then(|r| r.split_once(':')) {
+                        Some((code, message)) => write_line(&json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": code.parse::<i64>().unwrap(), "message": message },
+                        })),
+                        None => write_line(&json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "steered": true },
+                        })),
+                    }
+                }
+            }
+            "interrupt" if std::env::var("FAKE_CLAUDE_INTERRUPT_ERROR").is_ok() => {
+                // The interrupt fails with the variable's text. Scripted
+                // entries still fire: the sidecar may act on it anyway.
+                capture_params(method, &msg.params);
+                fire_script_entries_for(method, &script);
+                if let Some(delay) = std::env::var("FAKE_CLAUDE_INTERRUPT_DELAY_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
                 if let Some(id) = id {
                     write_line(&json!({
                         "jsonrpc": "2.0",
                         "id": id,
-                        "error": { "code": -32000, "message": "interrupt outcome unknown" },
+                        "error": {
+                            "code": -32603,
+                            "message": std::env::var("FAKE_CLAUDE_INTERRUPT_ERROR").unwrap(),
+                        },
                     }));
                 }
-                fire_script_entries_for(method, &script);
             }
             "interrupt" | "set-model" | "set-permission-mode" => {
                 if method == "interrupt" {

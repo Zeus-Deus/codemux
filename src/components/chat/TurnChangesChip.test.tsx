@@ -1,5 +1,5 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { useUIStore } from "@/stores/ui-store";
@@ -42,5 +42,17 @@ describe("TurnChangesChip", () => {
     expect(screen.getByTestId("turn-changes-chip")).toHaveTextContent(
       "1 file changed",
     );
+  });
+
+  it("hands itself to onShowDiff instead of opening the Changes pane", () => {
+    const onShowDiff = vi.fn();
+    render(
+      <TurnChangesChip changes={changes} workspaceId="ws-1" cwd="/repo" onShowDiff={onShowDiff} />,
+    );
+    const chip = screen.getByTestId("turn-changes-chip");
+    expect(chip).toHaveAccessibleName(/Show this turn's diff/);
+    fireEvent.click(chip);
+    expect(onShowDiff).toHaveBeenCalledWith(chip);
+    expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBeUndefined();
   });
 });

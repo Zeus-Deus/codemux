@@ -9,6 +9,9 @@
 //! 3. records the terminal `succeeded` / `failed` status (and the
 //!    workspace path) back on the run row.
 //!
+//! A webhook delivery takes the same path through `dispatch_webhook`,
+//! with the prompt already rendered from the request.
+//!
 //! The pure pieces — `agent_command`, `automation_branch` — are unit
 //! tested; `prepare_worktree` is covered against a real temp repo.
 
@@ -21,15 +24,18 @@ use crate::database::{AutomationRecord, AutomationRunRecord, DatabaseStore};
 
 /// Map an agent name to the headless CLI invocation that runs a single
 /// prompt to completion. Pure.
+///
+/// `--` ends option parsing, so a prompt that starts with `-` (a webhook
+/// body of `--help`, say) is read as the prompt and not as a flag.
 pub fn agent_command(agent: &str, prompt: &str) -> Result<(String, Vec<String>), String> {
     match agent {
         "claude" => Ok((
             "claude".to_string(),
-            vec!["--print".to_string(), prompt.to_string()],
+            vec!["--print".to_string(), "--".to_string(), prompt.to_string()],
         )),
         "codex" => Ok((
             "codex".to_string(),
-            vec!["exec".to_string(), prompt.to_string()],
+            vec!["exec".to_string(), "--".to_string(), prompt.to_string()],
         )),
         other => Err(format!(
             "Automation agent '{other}' is not supported (expected 'claude' or 'codex')"
@@ -360,6 +366,33 @@ pub async fn execute_run<RT: tauri::Runtime>(
     with_db(&handle, |db| apply_outcome(db, run.id, &outcome));
 }
 
+/// Webhook entry point for the HTTP route: validate the request with
+/// `webhook::accept_delivery`, then announce and execute the run in the
+/// background, like a scheduled fire. Returns once the run is recorded, so
+/// the route can answer the sender without waiting for the agent.
+pub fn dispatch_webhook<RT: tauri::Runtime>(
+    handle: &AppHandle<RT>,
+    webhook_id: &str,
+    token: &str,
+    request: &super::webhook::WebhookRequest,
+) -> Result<AutomationRunRecord, super::webhook::DeliveryRejection> {
+    use tauri::Emitter;
+
+    let accepted = with_db(handle, |db| {
+        super::webhook::accept_delivery(db, webhook_id, token, request, Utc::now())
+    })?;
+    if let Err(error) = handle.emit("automations://fire", &accepted.run) {
+        eprintln!("[codemux::automations] failed to emit fire event: {error}");
+    }
+    let run = accepted.run.clone();
+    tauri::async_runtime::spawn(execute_run(
+        handle.clone(),
+        accepted.automation,
+        accepted.run,
+    ));
+    Ok(run)
+}
+
 /// Fallible body of `execute_run`. On success returns the worktree path
 /// and any PR URL detected; on failure returns the worktree path (when
 /// one was created) alongside the error, so the run row can still point
@@ -417,14 +450,22 @@ mod tests {
     fn agent_command_maps_claude_to_print_mode() {
         let (program, args) = agent_command("claude", "do the thing").unwrap();
         assert_eq!(program, "claude");
-        assert_eq!(args, vec!["--print".to_string(), "do the thing".to_string()]);
+        assert_eq!(args, ["--print", "--", "do the thing"]);
     }
 
     #[test]
     fn agent_command_maps_codex_to_exec_mode() {
         let (program, args) = agent_command("codex", "do the thing").unwrap();
         assert_eq!(program, "codex");
-        assert_eq!(args, vec!["exec".to_string(), "do the thing".to_string()]);
+        assert_eq!(args, ["exec", "--", "do the thing"]);
+    }
+
+    #[test]
+    fn agent_command_keeps_a_dash_prompt_after_the_option_terminator() {
+        for agent in ["claude", "codex"] {
+            let (_, args) = agent_command(agent, "--help").unwrap();
+            assert_eq!(args[args.len() - 2..], ["--", "--help"]);
+        }
     }
 
     #[test]
@@ -555,6 +596,11 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
             dirty: false,
+            trigger_type: Default::default(),
+            webhook_id: None,
+            webhook_token: None,
+            webhook_signature: None,
+            webhook_secret_ref: None,
         }
     }
 

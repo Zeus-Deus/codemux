@@ -46,7 +46,7 @@ use crate::agent_provider::{
     TurnId, TurnStartResult,
 };
 
-use self::protocol::{ApprovalResponse, ClientInfo};
+use self::protocol::ClientInfo;
 use self::session::{CodexSession, CodexSpawnConfig};
 
 /// Configuration for the [`CodexAgentProvider`].
@@ -436,8 +436,7 @@ impl AgentProvider for CodexAgentProvider {
             sessions.get(&thread_id).cloned()
         };
         let session = session.ok_or(ProviderError::SessionNotFound { thread_id })?;
-        let response = ApprovalResponse::from(decision);
-        session.respond_to_request(request_id, response).await
+        session.respond_to_request(request_id, decision).await
     }
 
     async fn set_model(&self, thread_id: ThreadId, model: String) -> Result<(), ProviderError> {

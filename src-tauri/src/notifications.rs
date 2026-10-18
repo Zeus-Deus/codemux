@@ -60,6 +60,27 @@ fn should_notify(target: &NotificationTarget, window_focused: bool) -> bool {
     !target.muted && !(window_focused && target.in_active_workspace)
 }
 
+/// Whether `app` is a test harness rather than a real Codemux app. Tests
+/// build their apps on `tauri::test::MockRuntime` and manage no
+/// [`crate::AppMode`], so [`crate::app_mode`] reads them as GUI and native
+/// alerts would reach the developer's desktop: every `cargo test` run left
+/// popups like "Agent finished — .tmpXXXXXX". The only production app on
+/// `MockRuntime` is headless serve, which is excluded here so its behavior is
+/// unchanged; the desktop app runs on Wry. A runtime check rather than
+/// `cfg(test)` also covers the integration tests under `tests/`, which link
+/// the library without `cfg(test)`.
+pub(crate) fn is_test_harness<R: Runtime>(app: &AppHandle<R>) -> bool {
+    std::any::TypeId::of::<R>() == std::any::TypeId::of::<tauri::test::MockRuntime>()
+        && crate::app_mode(app) != crate::AppMode::ServeHeadless
+}
+
+/// Whether to raise the native popup and sound. Only the real GUI does:
+/// headless serve has no notification daemon, focusable window, or audio
+/// device, and tests must stay off the developer's desktop.
+fn native_alerts_enabled<R: Runtime>(app: &AppHandle<R>) -> bool {
+    crate::app_mode(app) == crate::AppMode::Gui && !is_test_harness(app)
+}
+
 fn main_window_focused<R: Runtime>(app: &AppHandle<R>) -> bool {
     app.get_webview_window("main")
         .and_then(|w| w.is_focused().ok())
@@ -86,10 +107,11 @@ pub fn notify_agent<R: Runtime>(
     }
     let payload = agent_payload(notice, target);
 
-    // Gated on GUI mode: under headless serve there is no notification
-    // daemon, focusable window, or audio device. The global `notification`
-    // event below still fires unconditionally — the web client consumes it.
-    if crate::app_mode(app) == crate::AppMode::Gui {
+    // Only the real GUI raises the native popup and sound (see
+    // [`native_alerts_enabled`]); headless serve and tests skip them. The
+    // global `notification` event below still fires unconditionally — the
+    // web client consumes it.
+    if native_alerts_enabled(app) {
         let prefs = crate::settings_sync::load_cache()
             .map(|settings| settings.notifications)
             .unwrap_or_default();
@@ -268,6 +290,7 @@ fn play_completion_sound() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauri::Listener;
 
     fn target() -> NotificationTarget {
         NotificationTarget {
@@ -317,6 +340,42 @@ mod tests {
             ..target()
         };
         assert!(!should_notify(&muted, false));
+    }
+
+    #[test]
+    fn test_and_headless_apps_never_raise_native_alerts() {
+        // A bare mock app manages no AppMode, so `app_mode` reads it as GUI.
+        // It must still stay off the real desktop.
+        let app = tauri::test::mock_app();
+        assert_eq!(crate::app_mode(app.handle()), crate::AppMode::Gui);
+        assert!(is_test_harness(app.handle()));
+        assert!(!native_alerts_enabled(app.handle()));
+
+        // Headless serve also runs on MockRuntime but is a real app: it is
+        // not a test harness, and it skips native alerts on its own.
+        let headless = tauri::test::mock_app();
+        headless.manage(crate::AppMode::ServeHeadless);
+        assert!(!is_test_harness(headless.handle()));
+        assert!(!native_alerts_enabled(headless.handle()));
+    }
+
+    #[test]
+    fn notify_agent_still_emits_the_web_event_without_native_alerts() {
+        let app = tauri::test::mock_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.listen_any(NOTIFICATION_EVENT, move |event| {
+            let _ = tx.send(event.payload().to_string());
+        });
+
+        notify_agent(app.handle(), AgentNotice::Finished, &target());
+
+        let payload: serde_json::Value = serde_json::from_str(
+            &rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("notification event"),
+        )
+        .unwrap();
+        assert_eq!(payload["title"], "Agent finished — My Project");
+        assert_eq!(payload["pane_id"], "pane-7");
     }
 
     #[test]

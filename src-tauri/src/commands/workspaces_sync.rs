@@ -1201,6 +1201,9 @@ async fn adopt_worktree_via_repo_rsync<R: tauri::Runtime>(
         }
 
         // ── 3. prune stale host worktrees + recreate the branch locally ──
+        // Recreating can reuse a checkout already on disk, so keep worktree
+        // cleanup from deleting it until the workspace is registered.
+        let opening = crate::worktree_cleanup::opening_guard().await;
         let repo_for_blocking = local_project_path.clone();
         let branch_for_blocking = branch.clone();
         let worktree_actual_path = tokio::task::spawn_blocking(move || {
@@ -1261,6 +1264,7 @@ async fn adopt_worktree_via_repo_rsync<R: tauri::Runtime>(
         );
         drop(app_state);
         drop(db);
+        drop(opening);
 
         if let Err(e) = crate::workspaces_sync::try_sync_with_app(&app).await {
             eprintln!(
@@ -1439,23 +1443,34 @@ pub async fn workspaces_adopt_via_clone<R: tauri::Runtime>(
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
     let branch_clone = branch.clone();
     let project_path_clone = project_path.clone();
-    let clone_result = tokio::task::spawn_blocking(move || {
-        // Phase 1: clone the bare-ish project (no checkout —
-        // worktree-add picks the right branch).
-        crate::git::git_clone(&project_remote, &project_path_clone)?;
-        // Phase 2: add the worktree at the requested branch.
-        crate::git::git_create_worktree(
-            project_path_clone.as_path(),
-            &branch_clone,
-            // `new_branch=false` — we want the existing branch from
-            // the remote, not a new one.
-            false,
-            None,
-            None,
-        )
+    // Phase 1: clone the bare-ish project (no checkout — worktree-add
+    // picks the right branch).
+    let clone_project_path = project_path.clone();
+    let cloned = tokio::task::spawn_blocking(move || {
+        crate::git::git_clone(&project_remote, &clone_project_path)
     })
     .await
     .map_err(|e| format!("git_clone join failed: {e}"))?;
+    // The new worktree can land on a path an old archive entry still
+    // names, so keep worktree cleanup off it until it is registered.
+    let opening = crate::worktree_cleanup::opening_guard().await;
+    let clone_result = match cloned {
+        Err(e) => Err(e),
+        // Phase 2: add the worktree at the requested branch.
+        Ok(_) => tokio::task::spawn_blocking(move || {
+            crate::git::git_create_worktree(
+                project_path_clone.as_path(),
+                &branch_clone,
+                // `new_branch=false` — we want the existing branch from
+                // the remote, not a new one.
+                false,
+                None,
+                None,
+            )
+        })
+        .await
+        .map_err(|e| format!("git worktree add join failed: {e}"))?,
+    };
 
     let worktree_actual_path = clone_result.map_err(|e| {
         // Roll back the cloned project dir on failure so a retry
@@ -1493,6 +1508,7 @@ pub async fn workspaces_adopt_via_clone<R: tauri::Runtime>(
     // (and being re-adopted as a duplicate). Recomputing from the local
     // checkout mirrors every other create path.
     app_state.set_workspace_project_root(&workspace_id.0, project_path_str.clone());
+    drop(opening);
 
     // Nothing else on this path emits, so without this the brand-new workspace
     // stays invisible in the sidebar and the overview until some unrelated

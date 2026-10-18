@@ -74,6 +74,7 @@ pub mod ssh;
 pub mod resource_metrics;
 pub mod scripts;
 pub mod scrollback;
+pub mod secrets;
 pub mod skills;
 pub mod skills_sync;
 pub mod session_adapters;
@@ -87,6 +88,7 @@ pub mod hosts_inventory;
 pub mod workspace_paths;
 pub mod project_identity;
 pub mod workspaces_sync;
+pub mod worktree_cleanup;
 pub mod workflows;
 pub mod state;
 pub mod hooks;
@@ -96,6 +98,7 @@ pub mod utility_ai;
 // Opt-in cloud-push diagnostic tracing. Defines the crate-wide
 // `trace_cloud_push!` macro (gated on `CODEMUX_TRACE_CLOUD_PUSH`).
 pub mod trace;
+pub mod turn_diff;
 // WebKitGTK renderer transport + smooth-scrolling tuning (Linux). Also owns
 // the startup crash sentinel that picks the renderer flags for this process.
 pub mod webview_tuning;
@@ -1391,7 +1394,10 @@ fn build_core_app<R: tauri::Runtime>(
                         // tick below can restart any of them.
                         commands::delegation::drain_journal(&registry_handle);
                         mcp_registry.set_host_tools(std::sync::Arc::new(
-                            commands::delegation::DelegationHost::new(registry_handle.clone()),
+                            mcp::registry::CompositeHostTools(vec![
+                                std::sync::Arc::new(commands::delegation::DelegationHost::new(registry_handle.clone())),
+                                std::sync::Arc::new(commands::workspace_launch::WorkspaceLaunchHost::new(registry_handle.clone())),
+                            ]),
                         ));
 
                         let mut claude_config =
@@ -1987,6 +1993,11 @@ fn build_core_app<R: tauri::Runtime>(
             //     exists when we read state) even if it raced into
             //     `tracked` — so a session can never be reaped moments
             //     after it was created.
+            // Stale worktree sweep: offers (or, when opted in, performs)
+            // removal of merged / long-retired worktrees. See
+            // `worktree_cleanup` for the safety rules.
+            worktree_cleanup::spawn_sweeper(app.handle().clone());
+
             let sweep_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 const SWEEP_INTERVAL_SECS: u64 = 300;
@@ -3129,6 +3140,23 @@ fn build_core_app<R: tauri::Runtime>(
             commands::pr_watch::pr_watch_start,
             commands::pr_watch::pr_watch_stop,
             commands::pr_watch::pr_watch_status,
+            // Webhook-triggered automations and the private secret store.
+            commands::automations_webhook_credentials,
+            commands::automations_rotate_webhook_token,
+            commands::automations_set_webhook_signature,
+            commands::secrets_store,
+            commands::secrets_list,
+            commands::secrets_delete,
+            // Per-turn git diffs for agent chat.
+            commands::turn_diff::agent_chat_get_turn_diff,
+            // Fork a chat into a new, independent thread.
+            commands::chat_fork::agent_chat_fork_check,
+            commands::chat_fork::agent_chat_fork_thread,
+            commands::chat_fork::agent_chat_fork_origin,
+            // Stale worktree cleanup (Settings → Archive, cleanup toast).
+            worktree_cleanup::worktree_cleanup_scan,
+            worktree_cleanup::worktree_cleanup_remove,
+            worktree_cleanup::worktree_cleanup_set_auto,
         ])
 }
 

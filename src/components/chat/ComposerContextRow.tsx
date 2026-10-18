@@ -53,6 +53,8 @@ interface Props {
   branch: string | null;
   /** The composer's model, effort and access pickers. */
   settings: ReactNode;
+  /** The pane's chat, for its pull-request watch chip. */
+  threadId?: string | null;
 }
 
 /**
@@ -69,6 +71,7 @@ export function ComposerContextRow({
   isHomeWorkspace,
   branch,
   settings,
+  threadId,
 }: Props) {
   const rowRef = useRef<HTMLDivElement | null>(null);
   const gapRef = useRef<HTMLDivElement | null>(null);
@@ -191,7 +194,7 @@ export function ComposerContextRow({
           {/* The pipe belongs to the cluster: `empty:hidden` drops both
               when the cluster renders nothing. */}
           <div className="flex shrink-0 items-center before:mx-1 before:h-3.5 before:w-px before:bg-border/60 before:content-[''] empty:hidden">
-            <WorkspaceStatusCluster />
+            <WorkspaceStatusCluster threadId={threadId} />
           </div>
         </div>
       </div>

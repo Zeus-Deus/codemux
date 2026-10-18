@@ -16,11 +16,13 @@ import type { EventEmitter } from "../session.ts";
 import {
   ClaudeSession,
   type SendTurnInput,
+  type SteerTurnInput,
   type SessionStartInput,
 } from "../session.ts";
 import type { ApprovalDecision } from "../permissions.ts";
 import { currentQueryFactory } from "../session.ts";
 import { SideChat, type SideChatStartInput } from "../side-chat.ts";
+import { forkClaudeSession, type ForkSessionInput } from "../fork-session.ts";
 import { getUsage } from "./get-usage.ts";
 import { listCommands } from "./list-commands.ts";
 import { listModels } from "./list-models.ts";
@@ -230,18 +232,35 @@ const sendTurn: MethodHandler = async (params) => {
   // JSON-RPC frame stays text-only; we don't decode them here, the
   // SDK accepts the same shape verbatim as part of its multimodal
   // user message content array.
-  const rawImages = optArray(p["images"], "images");
-  if (rawImages && rawImages.length > 0) {
-    input.images = rawImages.map((raw, idx) => {
-      const obj = asObject(raw, `images[${idx}]`);
-      return {
-        mediaType: asString(obj["mediaType"], `images[${idx}].mediaType`),
-        dataBase64: asString(obj["dataBase64"], `images[${idx}].dataBase64`),
-      };
-    });
-  }
+  const images = parseImages(p["images"]);
+  if (images) input.images = images;
   await session.sendTurn(input);
   return { turnStarted: true };
+};
+
+function parseImages(raw: unknown): SendTurnInput["images"] {
+  const rawImages = optArray(raw, "images");
+  if (!rawImages || rawImages.length === 0) return undefined;
+  return rawImages.map((item, idx) => {
+    const obj = asObject(item, `images[${idx}]`);
+    return {
+      mediaType: asString(obj["mediaType"], `images[${idx}].mediaType`),
+      dataBase64: asString(obj["dataBase64"], `images[${idx}].dataBase64`),
+    };
+  });
+}
+
+const steerTurn: MethodHandler = async (params) => {
+  const p = asObject(params, "steer-turn");
+  const session = getSession(asString(p["threadId"], "threadId"));
+  const input: SteerTurnInput = {
+    text: asString(p["text"], "text"),
+    uuid: asString(p["uuid"], "uuid"),
+  };
+  const images = parseImages(p["images"]);
+  if (images) input.images = images;
+  await session.steerTurn(input);
+  return { steered: true };
 };
 
 const interrupt: MethodHandler = async (params) => {
@@ -467,6 +486,28 @@ const stopSideChat: MethodHandler = async () => {
   return {};
 };
 
+const forkSessionMethod: MethodHandler = async (params) => {
+  const p = asObject(params, "fork-session");
+  const sessionId = asString(p["sessionId"], "sessionId");
+  if (!sessionId.trim()) throw new InvalidParamsError("sessionId must name the session to fork");
+  const input: ForkSessionInput = {
+    sessionId,
+    dir: asString(p["dir"], "dir"),
+    targetDir: asString(p["targetDir"], "targetDir"),
+  };
+  const cut = optRecord(p["cut"], "cut");
+  if (cut) {
+    const prompts = optArray(cut["prompts"], "cut.prompts");
+    const cutIndex = cut["cutIndex"];
+    if (!prompts || !prompts.every((prompt) => typeof prompt === "string")) {
+      throw new InvalidParamsError("cut.prompts must be an array of strings");
+    }
+    if (!Number.isInteger(cutIndex)) throw new InvalidParamsError("cut.cutIndex must be an integer");
+    input.cut = { prompts: prompts as string[], cutIndex: cutIndex as number };
+  }
+  return forkClaudeSession(input);
+};
+
 // ---------------------------------------------------------------------------
 // Public: build the registry
 // ---------------------------------------------------------------------------
@@ -479,6 +520,7 @@ export function buildMethods(emit: EventEmitter): Record<string, MethodHandler> 
     ping: (params) => ping((params ?? {}) as Record<string, unknown>),
     "start-session": makeStartSession(emit),
     "send-turn": sendTurn,
+    "steer-turn": steerTurn,
     interrupt,
     "compact-idle": compactIdle,
     "set-model": setModel,
@@ -496,6 +538,7 @@ export function buildMethods(emit: EventEmitter): Record<string, MethodHandler> 
     "start-side-chat": makeStartSideChat(emit),
     "side-chat-send": sideChatSend,
     "stop-side-chat": stopSideChat,
+    "fork-session": forkSessionMethod,
   };
 }
 

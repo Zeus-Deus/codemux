@@ -1,7 +1,11 @@
 import { memo } from "react";
 
+import { ChatForkButton } from "@/components/chat/ChatFork";
 import { MessageCopyButton } from "@/components/chat/MessageCopyButton";
-import { MESSAGE_GROUP_CLASS } from "@/components/chat/message-action";
+import {
+  MESSAGE_ACTION_ROW_CLASS,
+  MESSAGE_GROUP_CLASS,
+} from "@/components/chat/message-action";
 import type { AssistantMessageItem } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 
@@ -17,7 +21,7 @@ import { ChatMarkdown } from "./ChatMarkdown";
  *
  * A turn's settled final answer gets a footer strip under the prose that fades
  * in on hover or keyboard focus, holding a copy action aligned to the start of
- * the text. It copies `item.text` — the markdown source, not the rendered DOM —
+ * the text, and a fork action where the chat can be forked from this reply. It copies `item.text` — the markdown source, not the rendered DOM —
  * so pasting into another editor keeps the formatting. It stays hidden while
  * the message streams, where only half the answer exists yet, and on
  * `commentary` (narration between work), where the strip's reserved height
@@ -57,11 +61,10 @@ export const AssistantMessage = memo(function AssistantMessage({
         {item.text}
       </ChatMarkdown>
       {!item.streaming && !commentary && item.text ? (
-        <MessageCopyButton
-          text={item.text}
-          label="Copy response"
-          className="mt-1"
-        />
+        <div className={cn(MESSAGE_ACTION_ROW_CLASS, "mt-1")}>
+          <MessageCopyButton text={item.text} label="Copy response" />
+          <ChatForkButton itemId={item.id} />
+        </div>
       ) : null}
     </div>
   );

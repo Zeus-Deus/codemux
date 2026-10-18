@@ -2884,7 +2884,10 @@ pub fn git_create_worktree(
         }
 
         // Open existing branch: if the branch has a remote counterpart, use -B
-        // to reset the local branch to the remote tip, avoiding stale checkouts.
+        // to move the local branch to the remote tip, avoiding stale checkouts —
+        // but only when that cannot drop commits (no local branch yet, or the
+        // local tip is an ancestor of the remote). A local branch that is ahead
+        // or diverged is checked out as it is so unpushed work survives.
         // If not found locally, fetch it from origin first (common for PR branches
         // that were never pulled, or fork PRs that need pull/<n>/head).
         if find_remote_ref(repo_path, branch).is_none() {
@@ -2903,13 +2906,20 @@ pub fn git_create_worktree(
                 }
             }
         }
-        if let Some(remote_ref) = find_remote_ref(repo_path, branch) {
+        let local_ref = format!("refs/heads/{branch}");
+        let remote_ref = find_remote_ref(repo_path, branch).filter(|remote_ref| {
+            run_git(repo_path, &["rev-parse", "--verify", "--quiet", &local_ref]).is_err()
+                || run_git(repo_path, &["merge-base", "--is-ancestor", &local_ref, remote_ref])
+                    .is_ok()
+        });
+        if let Some(remote_ref) = remote_ref {
             run_git(
                 repo_path,
                 &["worktree", "add", "-B", branch, &path_str, &remote_ref],
             )?;
         } else {
-            // Branch exists locally after fetch (or was already local)
+            // Branch exists locally after fetch (or was already local, or
+            // holds commits the remote lacks)
             run_git(repo_path, &["worktree", "add", &path_str, branch])?;
         }
     }
@@ -2928,8 +2938,13 @@ pub fn git_create_worktree(
 /// /use force/i on the error message, so the "Use force to override."
 /// suffix in both errors is load-bearing. Do not reword it.
 pub(crate) fn ensure_worktree_removable(worktree_path: &Path) -> Result<(), String> {
-    // Check for uncommitted changes
-    let status = run_git_permissive(worktree_path, &["status", "--porcelain"]);
+    // Check for uncommitted changes. Untracked files are listed explicitly:
+    // `status.showUntrackedFiles=no` would otherwise hide files that the
+    // forced removal goes on to delete.
+    let status = run_git_permissive(
+        worktree_path,
+        &["status", "--porcelain", "--untracked-files=all"],
+    );
     let dirty_count = status.lines().filter(|l| !l.is_empty()).count();
     if dirty_count > 0 {
         return Err(format!(
@@ -6844,6 +6859,65 @@ mod tests {
     }
 
     #[test]
+    fn test_worktree_open_existing_preserves_local_ahead_commits() {
+        assert_worktree_open_preserves_local_commits(false);
+    }
+
+    #[test]
+    fn test_worktree_open_existing_preserves_local_diverged_commits() {
+        assert_worktree_open_preserves_local_commits(true);
+    }
+
+    fn assert_worktree_open_preserves_local_commits(diverged: bool) {
+        let (_dir, repo) = setup_test_repo();
+        let branch = if diverged { "local-diverged" } else { "local-ahead" };
+        let base = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        run_git(&repo, &["checkout", "-b", branch]).unwrap();
+        std::fs::write(repo.join("local.txt"), "unpushed work").unwrap();
+        run_git(&repo, &["add", "local.txt"]).unwrap();
+        run_git(
+            &repo,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "local work"],
+        ).unwrap();
+        let local_tip = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        run_git(&repo, &["checkout", "--detach", &base]).unwrap();
+        if diverged {
+            run_git(
+                &repo,
+                &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "remote work"],
+            ).unwrap();
+        }
+        run_git(&repo, &["update-ref", &format!("refs/remotes/origin/{branch}"), "HEAD"]).unwrap();
+        if !diverged {
+            run_git(&repo, &["checkout", branch]).unwrap();
+        }
+
+        let wt = git_create_worktree(&repo, branch, false, None, None).unwrap();
+        let checked_out_tip = run_git(Path::new(&wt), &["rev-parse", "HEAD"]).unwrap();
+        let branch_tip = run_git(&repo, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap();
+        git_remove_worktree(Path::new(&wt), None, true).unwrap();
+
+        assert_eq!(checked_out_tip, local_tip, "worktree must retain unpushed commits");
+        assert_eq!(branch_tip, local_tip, "opening a worktree must not discard local history");
+    }
+
+    #[test]
+    fn test_worktree_open_existing_remote_only_creates_local_branch() {
+        let (_dir, repo) = setup_test_repo();
+        run_git(&repo, &["update-ref", "refs/remotes/origin/remote-only", "HEAD"]).unwrap();
+        let expected_tip = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        let wt = git_create_worktree(&repo, "remote-only", false, None, None).unwrap();
+        let tip = run_git(Path::new(&wt), &["rev-parse", "HEAD"]).unwrap();
+        let branch = current_branch(Path::new(&wt));
+        git_remove_worktree(Path::new(&wt), Some("remote-only"), true).unwrap();
+
+        assert_eq!(tip, expected_tip);
+        assert_eq!(branch.as_deref(), Some("remote-only"));
+    }
+
+    #[test]
     fn test_worktree_open_existing_local_only_works() {
         let (_dir, repo) = setup_test_repo();
         run_git(&repo, &["branch", "local-feat"]).expect("create branch");
@@ -7475,6 +7549,22 @@ mod worktree_guard_tests {
             err.contains("Use force to override."),
             "guard error lost the frontend's /use force/i contract suffix: {err}"
         );
+    }
+
+    #[test]
+    fn worktree_guard_detects_untracked_files_hidden_by_config() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        run(tmp.path(), &["config", "status.showUntrackedFiles", "no"]);
+        std::fs::create_dir(tmp.path().join("untracked")).unwrap();
+        std::fs::write(tmp.path().join("untracked/notes.txt"), "local work").unwrap();
+        assert!(run_git(tmp.path(), &["status", "--porcelain"]).unwrap().is_empty());
+
+        let error = ensure_worktree_removable(tmp.path())
+            .expect_err("hidden untracked files must block workspace deletion");
+        assert!(error.contains("uncommitted change(s)"));
+        assert!(error.contains("Use force to override."));
+        assert!(tmp.path().join("untracked/notes.txt").exists());
     }
 
     #[test]

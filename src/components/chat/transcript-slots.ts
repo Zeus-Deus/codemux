@@ -1,3 +1,4 @@
+import { isWorkspaceLaunchCall } from "@/lib/agent-chat/workspace-launch";
 import {
   isDelegatedRun,
   isDelegateToolCall,
@@ -148,6 +149,7 @@ function isQuietObservationalTool(step: ActivityStep): boolean {
  *  - `html_render` pages — the page is part of the reply, not process.
  *  - `delegate_task` calls — they render as the delegation card.
  *  - `suggest_tasks` calls — they render as the suggested-tasks card.
+ *  - `workspace_launch` calls — the hand-off stays visible beside the reply.
  * (`subagent_run` items are not tool calls; the slot builder joins them into
  * the same work-log line separately.)
  */
@@ -158,7 +160,8 @@ function isGroupableTool(item: ChatViewItem): item is ToolCallItem {
     !isTaskSummaryTool(item) &&
     !isInlineHtmlRender(item) &&
     !isDelegateToolCall(item) &&
-    !isSuggestToolCall(item)
+    !isSuggestToolCall(item) &&
+    !isWorkspaceLaunchCall(item)
   );
 }
 
@@ -243,9 +246,15 @@ function isFoldableSettledItem(
   terminalId: string | null,
   pendingRequestIds: ReadonlySet<string>,
 ): boolean {
-  // A delegation outlives its turn and stays where it was handed off, and
-  // suggested tasks wait for the user after it.
-  if (isDelegationItem(item) || isSuggestToolCall(item)) return false;
+  // A delegation outlives its turn and stays where it was handed off,
+  // suggested tasks wait for the user after it, and a workspace launch
+  // stays beside the reply that announced it.
+  if (
+    isDelegationItem(item) ||
+    isSuggestToolCall(item) ||
+    (item.kind === "tool_call" && isWorkspaceLaunchCall(item))
+  )
+    return false;
   switch (item.kind) {
     case "assistant_message":
       return item.id !== terminalId;

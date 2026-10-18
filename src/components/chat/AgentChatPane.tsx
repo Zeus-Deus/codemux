@@ -146,6 +146,7 @@ import type {
 } from "@/tauri/types";
 
 import { ChatTranscript } from "./ChatTranscript";
+import { ChatForkProvider } from "./ChatFork";
 import { DelegateTaskDialog } from "./DelegateTaskDialog";
 import { RemoteTaskDetail } from "./RemoteTaskDetail";
 import { projectRemoteTasks } from "./remote-task-projection";
@@ -183,6 +184,7 @@ import {
   useMonitoringOccupant,
   useSubagentOccupant,
   useUsageLimitOccupant,
+  remoteTasksOccupant,
 } from "./use-composer-strip-occupants";
 import { openDelegatedChat, stopDelegatedTask } from "./delegation-actions";
 import { SubagentBreadcrumb } from "./SubagentBreadcrumb";
@@ -3717,6 +3719,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           isHomeWorkspace={isHomeWorkspace}
           branch={paneWorkspaceBranch ?? null}
           settings={settings}
+          threadId={threadId}
         />
       )
     : undefined;
@@ -4013,10 +4016,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         : null,
     [conversationWritable, messages, handleRespond],
   );
-  // Hidden in a subagent drill-in: the design only shows it in the
-  // conversation view. Keyed by thread so the open list never leaks
+  const remoteTasksRow = conversationWritable &&
+    remoteTasksOccupant(remoteTasks, () => void remoteTasks.retrySubscription());
+  // A subagent drill-in keeps only the remote-task failure: the design shows
+  // the rest in the conversation view, but the parent stays subscribed and
+  // its Retry still applies. Keyed by thread so the open list never leaks
   // across a thread switch.
-  const stripEl = enteredSubagent ? null : (
+  const stripEl = enteredSubagent ? (
+    <ComposerStrip key={threadId ?? "no-thread"} occupants={[remoteTasksRow]} />
+  ) : (
     <ComposerStrip
       key={threadId ?? "no-thread"}
       goal={stripGoal}
@@ -4028,6 +4036,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         delegationOccupant,
         subagentOccupant,
         queuedOccupant(queued, handleCancelQueued),
+        remoteTasksRow,
       ]}
     />
   );
@@ -4180,16 +4189,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       hasActiveGoal={hasGoal}
       zone1Override={zone1Override}
       renderContextRow={mobile ? undefined : renderContextRow}
-      stripSlot={conversationWritable ? <>
-        {stripEl}
-        {(remoteTasks.error || remoteTasks.subscriptionError) && <div role="status" className="pointer-events-auto mb-2 flex items-start gap-3 rounded-lg border border-border bg-surface-1 px-3 py-2 text-body-sm">
-          <div className="min-w-0 flex-1">
-            <p className="font-medium">{remoteTasks.subscriptionError ? "Remote task updates paused" : "Remote tasks unavailable"}</p>
-            <p className="break-words text-muted-foreground">{remoteTasks.subscriptionError ?? remoteTasks.error}</p>
-          </div>
-          <Button type="button" variant="ghost" size="sm" disabled={remoteTasks.loading || remoteTasks.subscriptionHealth === "connecting"} onClick={() => void remoteTasks.retrySubscription()}>Retry remote task updates</Button>
-        </div>}
-      </> : <>{stripEl}{conversationCheckNotice}</>}
+      stripSlot={conversationWritable ? stripEl : <>{stripEl}{conversationCheckNotice}</>}
       paneDragActive={paneDragDepth > 0}
       tasks={taskSummary}
       tasksOpen={rightPanelTab === "tasks"}
@@ -4324,6 +4324,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           ) : transcriptMessages.length === 0 ? (
             <TranscriptSkeleton />
           ) : (
+            <ChatForkProvider
+              threadId={threadId}
+              provider={provider}
+              workspaceId={workspaceIdForPane}
+              messages={transcriptMessages}
+              checkpointByNonce={turnCheckpointByNonce}
+              busy={transcriptStreaming}
+              enabled={conversationWritable}
+            >
             <ChatTranscript
               messages={transcriptMessages}
               streaming={transcriptStreaming}
@@ -4357,6 +4366,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               cwd={cwd}
               onReadingBackChange={handleReadingBackChange}
             />
+            </ChatForkProvider>
           )}
           {/* Composer region (design D10): groups the whole composer
               column — AskUserQuestion panel, debug banner, the strip and

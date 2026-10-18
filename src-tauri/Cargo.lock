@@ -1211,6 +1211,7 @@ dependencies = [
  "glob",
  "gtk",
  "hkdf",
+ "hmac",
  "hostname",
  "if-addrs",
  "ignore",

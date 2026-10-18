@@ -726,6 +726,44 @@ describe("MessageList activity blocks", () => {
     );
   });
 
+  it("keeps a turn's diff open after the row that opened it goes away", async () => {
+    const turn: ChatViewItem[] = [
+      { kind: "user_message", id: "user-diff", seq: 0, text: "Fix it", created_at: 1_000 },
+      {
+        kind: "tool_call",
+        id: "edit-diff",
+        seq: 1,
+        turn_id: "turn-diff",
+        tool_use_id: "edit-use-diff",
+        tool_name: "Edit",
+        input: { file_path: "/repo/a.ts", old_string: "a", new_string: "b" },
+        status: "done",
+        result_content: null,
+        approval_request_id: null,
+      },
+      {
+        kind: "turn_ended",
+        id: "ended-diff",
+        seq: 2,
+        turn_id: "turn-diff",
+        status: { kind: "success" },
+        completed_at: 6_000,
+      },
+    ];
+    const view = render(<MessageList messages={turn} threadKey="t-diff" {...noopHandlers} />);
+    fireEvent.click(screen.getByTestId("turn-changes-chip"));
+    expect(await screen.findByTestId("turn-diff-dialog")).toBeInTheDocument();
+
+    // Following the live edge can recycle the fold row out of the list.
+    view.rerender(<MessageList messages={[turn[0]]} threadKey="t-diff" {...noopHandlers} />);
+    expect(screen.queryByTestId("turn-changes-chip")).toBeNull();
+    expect(screen.getByTestId("turn-diff-dialog")).toBeInTheDocument();
+
+    // A different thread's transcript does not inherit it.
+    view.rerender(<MessageList messages={[turn[0]]} threadKey="t-other" {...noopHandlers} />);
+    expect(screen.queryByTestId("turn-diff-dialog")).toBeNull();
+  });
+
   it("keeps a work log the user opened mid-run on screen when the turn settles", () => {
     const running: ChatViewItem[] = [
       { kind: "user_message", id: "user-live", seq: 0, text: "Check it", created_at: 1_000 },

@@ -20,14 +20,14 @@ pub(crate) use managed_runtime::read_model_catalog;
 use tokio::task::JoinHandle;
 
 use crate::agent_provider::{
-    PlanAuthMode, ProviderError, ProviderRuntimeEvent, ProviderSessionId, RequestId, SendOutcome,
-    SendTurnInput, SessionStatus, ThreadId, TurnId, UsageBaseline,
+    ApprovalDecision, PlanAuthMode, ProviderError, ProviderRuntimeEvent, ProviderSessionId,
+    RequestId, SendOutcome, SendTurnInput, SessionStatus, ThreadId, TurnId, UsageBaseline,
 };
 use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 use crate::mcp::registry::McpRegistry;
 
 use super::protocol::{
-    AccountReadResponse, ApprovalResponse, Capabilities, ClientInfo, CollaborationMode,
+    AccountReadResponse, Capabilities, ClientInfo, CollaborationMode,
     CollaborationModeSettings, DynamicToolCallParams, DynamicToolSpec,
     GetAccountRateLimitsResponse, InitializeParams, NotificationMessage, ServerRequestMessage,
     ThreadResumeParams, ThreadRollbackParams, ThreadStartParams, ThreadStartResponse,
@@ -148,6 +148,18 @@ pub struct CodexSpawnConfig {
     pub remote: Option<crate::agent_provider::types::RemoteSpawnTarget>,
 }
 
+/// A Codex server request awaiting the user's answer.
+pub(crate) struct PendingApproval {
+    /// Raw JSON-RPC id to reply to.
+    rpc_id: Value,
+    /// Codex thread and turn that raised it. Codex abandons a thread's
+    /// requests when its turn ends, so they settle with that turn.
+    codex_thread_id: Option<String>,
+    turn_id: Option<String>,
+    /// The request itself; the reply's shape depends on its method.
+    request: ServerRequestMessage,
+}
+
 /// Runtime-mutable state inside a [`CodexSession`].
 pub(crate) struct CodexSessionState {
     /// Codex's own thread identifier (different from the runtime's
@@ -158,9 +170,13 @@ pub(crate) struct CodexSessionState {
     pub active_turn: Option<TurnId>,
     // Notifications can finish a turn before its start response is consumed.
     pending_turn_start: Option<PendingTurnStart>,
-    /// Map from synthesised [`RequestId`] to the raw JSON-RPC id we need
-    /// to reply to.
-    pub pending_approvals: HashMap<RequestId, Value>,
+    /// Map from synthesised [`RequestId`] to the server request awaiting
+    /// the user's answer.
+    pub pending_approvals: HashMap<RequestId, PendingApproval>,
+    /// Recently ended `(codex thread, turn)` pairs. Requests and
+    /// notifications arrive on separate tasks, so a request can be
+    /// recorded after its turn already settled; this catches it.
+    settled_turns: VecDeque<(String, String)>,
     /// Lifecycle status.
     pub status: SessionStatus,
     /// Current model override (session-wide default).
@@ -763,6 +779,7 @@ impl CodexSession {
             active_turn: None,
             pending_turn_start: None,
             pending_approvals: HashMap::new(),
+            settled_turns: VecDeque::new(),
             status: SessionStatus::Ready,
             model,
             default_effort: effort,
@@ -1747,7 +1764,7 @@ impl CodexSession {
             (state.codex_thread_id.clone(), active_turn.clone())
         };
         let params = TurnInterruptParams {
-            thread_id: codex_thread_id,
+            thread_id: codex_thread_id.clone(),
             turn_id: active_turn.0.clone(),
         };
         let params_value = serde_json::to_value(&params).unwrap();
@@ -1757,7 +1774,52 @@ impl CodexSession {
             .map_err(|e| ProviderError::RpcError {
                 message: format!("turn/interrupt failed: {e}"),
             })?;
+        // Codex answers `turn/interrupt` once the turn is aborted, so its
+        // approvals are already dead; settle them without waiting for the
+        // completion notification.
+        self.settle_turn_approvals(&codex_thread_id, &active_turn.0).await;
         Ok(())
+    }
+
+    /// Settle the approvals a finished Codex turn left unanswered.
+    ///
+    /// Codex aborts a thread's server requests when its turn completes or
+    /// is interrupted, but never tells the client. Dropping them here
+    /// unblocks follow-up sends and queue draining; the `Cancel`
+    /// resolution closes the card and is persisted for hydration. Requests
+    /// that carry no turn id are treated as belonging to whichever turn of
+    /// their thread ends.
+    pub(crate) async fn settle_turn_approvals(&self, codex_thread_id: &str, turn_id: &str) {
+        let mut state = self.state.lock().await;
+        if state.settled_turns.len() == 64 {
+            state.settled_turns.pop_front();
+        }
+        state
+            .settled_turns
+            .push_back((codex_thread_id.to_owned(), turn_id.to_owned()));
+        let parent = state.codex_thread_id == codex_thread_id;
+        let ids: Vec<RequestId> = state
+            .pending_approvals
+            .iter()
+            .filter(|(_, pending)| {
+                pending
+                    .codex_thread_id
+                    .as_deref()
+                    .map_or(parent, |thread| thread == codex_thread_id)
+                    && pending.turn_id.as_deref().is_none_or(|turn| turn == turn_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        // Broadcast under the lock, so a concurrent settler that finds
+        // nothing left cannot publish the turn's completion first.
+        for request_id in ids {
+            state.pending_approvals.remove(&request_id);
+            let _ = self.event_tx.send(ProviderRuntimeEvent::RequestResolved {
+                thread_id: self.thread_id.clone(),
+                request_id,
+                decision: ApprovalDecision::Cancel,
+            });
+        }
     }
 
     /// Remove completed tail turns from Codex's own durable thread.
@@ -1801,9 +1863,17 @@ impl CodexSession {
     pub async fn respond_to_request(
         &self,
         request_id: RequestId,
-        response: ApprovalResponse,
+        decision: ApprovalDecision,
     ) -> Result<(), ProviderError> {
-        let jsonrpc_id = {
+        let child = self.child().await;
+        // Hold the notification demux from claiming the request until its
+        // resolution is published, so a turn completion (whether Codex emits
+        // it in reaction to this reply or a concurrent Stop settled the
+        // turn) is always broadcast after it: late resolutions re-arm
+        // mid-turn tracking. Lock order matches the notifications task:
+        // demux, then state.
+        let _demux = self.notification_demux.lock().await;
+        let pending = {
             let mut state = self.state.lock().await;
             state.pending_approvals.remove(&request_id).ok_or_else(|| {
                 ProviderError::RequestNotPending {
@@ -1811,13 +1881,37 @@ impl CodexSession {
                 }
             })?
         };
-        let payload = serde_json::to_value(&response).unwrap();
-        self.child().await
-            .respond(jsonrpc_id, Ok(payload))
+        let payload = pending.request.response(decision.clone());
+        child
+            .respond(pending.rpc_id, Ok(payload))
             .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("respond failed: {e}"),
+            .map_err(|e| match e {
+                // A dead child cannot receive this answer: report the
+                // request as orphaned instead of a retryable failure.
+                crate::json_rpc_child::RpcChildError::ChildExited { .. }
+                | crate::json_rpc_child::RpcChildError::AlreadyShutdown => {
+                    ProviderError::SessionClosed {
+                        thread_id: self.thread_id.clone(),
+                    }
+                }
+                crate::json_rpc_child::RpcChildError::IoError(e)
+                    if e.kind() == std::io::ErrorKind::BrokenPipe =>
+                {
+                    ProviderError::SessionClosed {
+                        thread_id: self.thread_id.clone(),
+                    }
+                }
+                e => ProviderError::RpcError {
+                    message: format!("respond failed: {e}"),
+                },
             })?;
+        // Codex sends no confirmation of its own; without this the card
+        // stays "responding" and hydration later reports it expired.
+        let _ = self.event_tx.send(ProviderRuntimeEvent::RequestResolved {
+            thread_id: self.thread_id.clone(),
+            request_id,
+            decision,
+        });
         Ok(())
     }
 
@@ -2403,6 +2497,9 @@ fn spawn_notifications_task(
                             // Update local state for a few special
                             // notifications before broadcasting.
                             update_state_from_notification(&session, &msg).await;
+                            if let NotificationMessage::TurnCompleted(p) = &msg {
+                                session.settle_turn_approvals(&p.thread_id, &p.turn_id).await;
+                            }
                             let mut demux=session.notification_demux.lock().await;
                             // Codex never states a model on the usage
                             // notification, so the ledger has to learn it
@@ -2527,12 +2624,36 @@ fn spawn_incoming_requests_task(
                         continue;
                     }
                     let request_id = mint_request_id();
-                    {
-                        let mut state = session.state.lock().await;
-                        state.pending_approvals.insert(request_id.clone(), req.id);
-                    }
                     let event = translate_server_request(&session.thread_id, &request_id, &msg);
-                    let _ = event_tx.send(event);
+                    {
+                        let payload = msg.payload();
+                        let field = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_owned);
+                        let pending = PendingApproval {
+                            rpc_id: req.id,
+                            codex_thread_id: field("threadId"),
+                            turn_id: field("turnId"),
+                            request: msg,
+                        };
+                        let mut state = session.state.lock().await;
+                        let thread = pending.codex_thread_id.as_ref().unwrap_or(&state.codex_thread_id);
+                        let turn_ended = pending.turn_id.as_ref().is_some_and(|turn| {
+                            state.settled_turns.iter().any(|(t, u)| t == thread && u == turn)
+                        });
+                        // The crash watchdog marks the session dead before it
+                        // drains this map under the same lock. A request whose
+                        // turn already settled, or that arrives after that
+                        // drain, is dead on arrival: Codex aborted it, so it
+                        // is dropped unpublished rather than shown and
+                        // cancelled after its turn completed.
+                        if turn_ended || session.dead.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        state.pending_approvals.insert(request_id.clone(), pending);
+                        // Publish while still holding the lock: a settlement
+                        // on another worker must not broadcast this
+                        // request's resolution ahead of its opening.
+                        let _ = event_tx.send(event);
+                    }
                 }
             }
         }
@@ -2737,14 +2858,25 @@ fn spawn_child_exit_watchdog(
                             // Recover the in-flight turn id before clearing it so
                             // the watchdog can settle it with a synthetic terminal
                             // `TurnCompleted` ahead of the Error state.
-                            let active_turn = {
+                            let (active_turn, orphaned) = {
                                 let mut state = session.state.lock().await;
                                 let active_turn = state.active_turn.take();
                                 state.status = SessionStatus::Error {
                                     message: msg.clone(),
                                 };
-                                active_turn
+                                // A sub-agent can still be waiting on an
+                                // approval after the parent turn ended, so
+                                // expire every callback, not just the turn's.
+                                let orphaned: Vec<RequestId> =
+                                    state.pending_approvals.drain().map(|(id, _)| id).collect();
+                                (active_turn, orphaned)
                             };
+                            for request_id in orphaned {
+                                let _ = event_tx.send(crate::agent_provider::expired_request_event(
+                                    session.thread_id.clone(),
+                                    request_id,
+                                ));
+                            }
                             // TurnCompleted(child_exited) first, then the Error
                             // state — see `child_exit_events` for the ordering
                             // contract.
@@ -2844,6 +2976,10 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
 #[cfg(all(test,unix))]
 #[path="managed_tests.rs"]
 pub(crate) mod managed_tests;
+
+#[cfg(all(test, unix))]
+#[path = "approval_tests.rs"]
+mod approval_tests;
 
 #[cfg(test)]
 mod in_flight_send_tests {

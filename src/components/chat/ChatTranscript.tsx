@@ -17,6 +17,7 @@ import { AsyncQuestionThreadContext } from "./AsyncQuestionPanel";
 import { ChatMarkdownPassiveContext } from "./chat-markdown-passive";
 import { RemoteTaskContext, type RemoteTaskScope } from "./remote-task-context";
 import { ChatProviderContext } from "./chat-provider-context";
+import { ChatForkContext } from "./ChatFork";
 import type { SendAnchorRequest } from "./send-scroll-state";
 
 interface Props {
@@ -143,6 +144,7 @@ export const ChatTranscript = memo(function ChatTranscript({
   onReadingBackChange,
 }: Props) {
   const binding = useContext(TranscriptBindingContext);
+  const chatFork = useContext(ChatForkContext);
   const cacheKey = binding && binding.workspaceId === workspaceId && binding.threadKey === threadKey &&
     binding.provider === provider && binding.cwd === cwd ? binding.key : null;
   const rootRef = useRef<HTMLDivElement>(null);
@@ -164,6 +166,7 @@ export const ChatTranscript = memo(function ChatTranscript({
       <RemoteTaskContext.Provider value={remoteTaskScope}>
       <AsyncQuestionThreadContext.Provider value={passive ? null : (threadKey ?? null)}>
       <ChatProviderContext.Provider value={provider ?? null}>
+      <ChatForkContext.Provider value={chatFork}>
       <MessageList
         messages={messages}
         showThinking={showThinking}
@@ -195,6 +198,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         cwd={cwd}
         onReadingBackChange={onReadingBackChange}
       />
+      </ChatForkContext.Provider>
       </ChatProviderContext.Provider>
       </AsyncQuestionThreadContext.Provider>
       </RemoteTaskContext.Provider>
