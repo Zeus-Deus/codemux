@@ -17,7 +17,8 @@
 //! * [`event_stream`](CodexAgentProvider::event_stream) hands out fresh
 //!   subscribers. The broadcast channel has a fixed capacity
 //!   ([`CodexProviderConfig::event_channel_capacity`]); slow subscribers
-//!   lose old events — this is a deliberate UI-compatible semantic.
+//!   lose old events and receive a `provider_event_lag` `RuntimeWarning`
+//!   in their place.
 //! * Dropping the provider signals every live session to shut down. Any
 //!   background tasks still awaiting on the broadcaster observe
 //!   `Closed` and exit cleanly.
@@ -33,11 +34,9 @@ pub mod translate;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_core::Stream;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::agent_provider::{
@@ -597,17 +596,7 @@ impl AgentProvider for CodexAgentProvider {
     }
 
     fn event_stream(&self) -> ProviderEventStream {
-        let rx = self.event_tx.subscribe();
-        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-            loop {
-                match rx.recv().await {
-                    Ok(item) => return Some((item, rx)),
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
-            }
-        });
-        Box::pin(stream) as Pin<Box<dyn Stream<Item = ProviderRuntimeEvent> + Send + 'static>>
+        super::provider::broadcast_event_stream(&self.event_tx, self.kind())
     }
 
     fn managed_event_stream(&self, thread_id: &ThreadId) -> ProviderEventStream {
@@ -621,5 +610,53 @@ impl AgentProvider for CodexAgentProvider {
                 },(rx,id))),
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod event_stream_tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn provider_event_delivery_reports_lag_and_keeps_retained_events() {
+        let provider = CodexAgentProvider::new(CodexProviderConfig {
+            event_channel_capacity: 16,
+            ..Default::default()
+        });
+        let mut slow = provider.event_stream();
+        let mut fast = provider.event_stream();
+        for i in 0..20 {
+            provider
+                .event_tx
+                .send(ProviderRuntimeEvent::ItemCompleted {
+                    thread_id: ThreadId("lagging-thread".into()),
+                    turn_id: TurnId("turn-1".into()),
+                    subagent_id: None,
+                    item: crate::agent_provider::CompletedItem::AssistantText {
+                        text: i.to_string(),
+                    },
+                })
+                .unwrap();
+            assert!(matches!(
+                fast.next().await,
+                Some(ProviderRuntimeEvent::ItemCompleted { .. })
+            ));
+        }
+
+        let warning = slow.next().await.unwrap();
+        assert!(
+            matches!(warning, ProviderRuntimeEvent::RuntimeWarning {
+            thread_id: None, original_payload: Some(ref details), ..
+        } if details["code"] == "provider_event_lag" && details["dropped_events"] == 4),
+            "{warning:?}"
+        );
+        for i in 4..20 {
+            assert!(
+                matches!(slow.next().await, Some(ProviderRuntimeEvent::ItemCompleted {
+                item: crate::agent_provider::CompletedItem::AssistantText { text }, ..
+            }) if text == i.to_string())
+            );
+        }
     }
 }

@@ -23,6 +23,7 @@ vi.mock("@/hooks/use-renderer-mode", () => ({ useRendererModeInit: vi.fn() }));
 vi.mock("@/hooks/use-ensure-draft-when-empty", () => ({ useEnsureDraftWhenEmpty: vi.fn() }));
 vi.mock("@/hooks/use-transcript-selection-highlight", () => ({ useTranscriptSelectionHighlight: vi.fn() }));
 vi.mock("@/hooks/use-active-workspace-persistence-errors", () => ({ useActiveWorkspacePersistenceErrors: vi.fn() }));
+vi.mock("@/hooks/use-agent-chat-warnings", () => ({ useAgentChatWarnings: vi.fn() }));
 vi.mock("@/hooks/use-post-paint-session-refresh", () => ({ usePostPaintPendingSessionRefresh: vi.fn() }));
 vi.mock("@/stores/feature-flags", () => ({ useFeatureFlagsInit: vi.fn() }));
 vi.mock("@/components/auth/login-screen", () => ({ LoginScreen: () => <div>account login</div> }));
