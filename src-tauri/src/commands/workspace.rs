@@ -1317,6 +1317,9 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
     let close_result = state
         .close_workspace(&workspace_id)
         .map_err(|e| format!("Failed to close workspace: {e}"))?;
+    // Before any await below: a chat closed just before this may still be
+    // stopping, and its result must not be lost if it finishes meanwhile.
+    let earlier_stops = crate::commands::agent_chat::snapshot_pending_stops(&workspace_id);
 
     // Reconcile only after the state mutation succeeds. A duplicate workspace
     // at the same checkout still owns the shared path-level config; deleting
@@ -1402,10 +1405,27 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
     }
 
-    crate::commands::agent_chat::shutdown_agent_chat_threads(
-        &app,
-        close_result.removed_agent_chat_threads,
-    );
+    let deleting_files = remove_worktree && worktree_path.is_some();
+    if deleting_files {
+        // Agents run inside the worktree; deleting it while one is still
+        // stopping would pull files out from under a live process. A stop
+        // that was not acknowledged keeps the files.
+        crate::commands::agent_chat::shutdown_agent_chat_threads_and_wait(
+            &app,
+            &workspace_id,
+            earlier_stops,
+            close_result.removed_agent_chat_threads,
+        )
+        .await
+        .map_err(|error| {
+            format!("Agent session did not stop ({error}); worktree files retained.")
+        })?;
+    } else {
+        crate::commands::agent_chat::shutdown_agent_chat_threads(
+            &app,
+            close_result.removed_agent_chat_threads,
+        );
+    }
 
     if remove_worktree {
         if let Some(wt_path) = worktree_path {
@@ -2670,6 +2690,13 @@ pub fn close_tab<R: tauri::Runtime>(
 ) -> Result<(), String> {
     let result = state.close_tab(&workspace_id, &tab_id)?;
 
+    // Straight after the removal: a worktree deletion that no longer sees
+    // these chats in the workspace finds their stops in flight instead.
+    crate::commands::agent_chat::shutdown_agent_chat_threads(
+        &app,
+        result.removed_agent_chat_threads,
+    );
+
     // Kill the PTY child + process group for every terminal session that
     // was attached to this tab. `state.close_tab` already removed them from
     // the store, so we go straight to the PTY helper.
@@ -2682,11 +2709,6 @@ pub fn close_tab<R: tauri::Runtime>(
         // Tab close is cleanup, not explicit dismissal — agent can reopen the pane.
         state.detach_agent_browser_from_pane(&browser_id.0, false);
     }
-
-    crate::commands::agent_chat::shutdown_agent_chat_threads(
-        &app,
-        result.removed_agent_chat_threads,
-    );
 
     crate::state::emit_app_state(&app);
     Ok(())
