@@ -506,11 +506,34 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
               "opacity-70 group-hover/card:opacity-100 group-focus-within/card:opacity-100",
           )}
         >
-          <IssueDetailPopover
-            providerKind={workspace.provider_kind}
-            workspaceId={workspace.workspace_id}
-            issue={workspace.linked_issue}
-          />
+          {machine ? (
+            // The popover fetches issue details through this machine's
+            // backend, which does not know another machine's workspace, so
+            // a remote card shows the same mark as a static summary.
+            <span
+              data-linked-issue-summary
+              title={`#${workspace.linked_issue.number} ${workspace.linked_issue.title}`}
+              className="inline-flex shrink-0 items-center gap-1"
+            >
+              <span
+                className={cn(
+                  "size-1.5 rounded-full",
+                  workspace.linked_issue.state === "Open"
+                    ? "bg-success"
+                    : "bg-muted-foreground",
+                )}
+              />
+              <span className="tabular-nums text-caption">
+                #{workspace.linked_issue.number}
+              </span>
+            </span>
+          ) : (
+            <IssueDetailPopover
+              providerKind={workspace.provider_kind}
+              workspaceId={workspace.workspace_id}
+              issue={workspace.linked_issue}
+            />
+          )}
         </span>
       )}
     </div>

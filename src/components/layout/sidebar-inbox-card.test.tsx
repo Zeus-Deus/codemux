@@ -87,7 +87,7 @@ import {
   META_CLUSTER_MIN_WIDTH,
   metaClusterWidth,
 } from "./sidebar-inbox-card";
-import { activateWorkspace } from "@/tauri/commands";
+import { activateWorkspace, getGithubIssue } from "@/tauri/commands";
 import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
 
 const HOUR = 3_600_000;
@@ -163,6 +163,7 @@ function metaLine(container: HTMLElement) {
 
 beforeEach(() => {
   vi.mocked(activateWorkspace).mockClear();
+  vi.mocked(getGithubIssue).mockClear();
   hosts = [];
   useSidebarDensityStore.setState({
     statusSince: {},
@@ -912,6 +913,24 @@ describe("SidebarInboxCard — another machine's workspace", () => {
     await userEvent.click(card);
     expect(props.onSelect).not.toHaveBeenCalled();
     expect(activateWorkspace).not.toHaveBeenCalled();
+  });
+
+  // The local backend cannot resolve another machine's workspace id, so the
+  // linked-issue chip must not open the popover that looks the issue up.
+  it("shows the linked issue without asking the local backend for it", async () => {
+    renderCard({
+      machine,
+      workspace: makeWorkspace({
+        workspace_id: "device-2/ws-1",
+        linked_issue: { number: 42, title: "Fix it", state: "Open", labels: [] },
+      }),
+    });
+
+    const chip = screen.getByText("#42");
+    expect(chip.closest("button")).toBeNull();
+    await userEvent.click(chip);
+    expect(getGithubIssue).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("issue-detail-content")).toBeNull();
   });
 });
 
