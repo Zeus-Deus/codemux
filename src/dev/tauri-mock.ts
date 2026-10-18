@@ -4932,7 +4932,7 @@ const handlers: Record<string, Handler> = {
           ? CURSOR_CAPABILITIES
           : a.provider === "grok"
             ? GROK_CAPABILITIES
-            : EMPTY_CAPABILITIES), supports_steering: a.provider === "codex" || a.provider === "opencode" }),
+            : EMPTY_CAPABILITIES), supports_steering: a.provider === "claude" || a.provider === "codex" || a.provider === "opencode" }),
   // Provider commands mirror only surfaces our adapters can execute.
   // Codex actions route to app-server; OpenCode commands use its command API.
   list_chat_slash_commands: (a) =>
@@ -5673,7 +5673,7 @@ const handlers: Record<string, Handler> = {
     };
     const threadId = input.thread_id;
     if (input.delivery === "steer" && chatActiveTurns.has(threadId)) {
-      if (a.provider !== "codex" && a.provider !== "opencode") throw new Error("Safe steering is unavailable for this provider.");
+      if (a.provider !== "claude" && a.provider !== "codex" && a.provider !== "opencode") throw new Error("Safe steering is unavailable for this provider.");
       const turnId = chatActiveTurns.get(threadId)!;
       emitChatEvent(threadId, { type: "user_message", thread_id: threadId, text: input.display_text ?? input.text, client_nonce: input.client_nonce ?? undefined, steered_turn_id: turnId });
       return { turn_id: turnId, queued_id: null, steered: true };
@@ -5746,7 +5746,7 @@ const handlers: Record<string, Handler> = {
     // real backend.
     if (!q || idx < 0) return undefined;
     if (delivery === "steer" && chatActiveTurns.has(threadId)) {
-      if (a.provider !== "codex" && a.provider !== "opencode") throw new Error("Safe steering is unavailable for this provider.");
+      if (a.provider !== "claude" && a.provider !== "codex" && a.provider !== "opencode") throw new Error("Safe steering is unavailable for this provider.");
       const [item] = q.splice(idx, 1);
       emitChatEvent(threadId, { type: "queued_turn_dispatched", thread_id: threadId, queued_id: queuedId, text: item.text, turn_id: chatActiveTurns.get(threadId)!, steered: true });
       return undefined;

@@ -23,6 +23,7 @@ use crate::agent_provider::ApprovalDecision;
 pub const METHOD_PING: &str = "ping";
 pub const METHOD_START_SESSION: &str = "start-session";
 pub const METHOD_SEND_TURN: &str = "send-turn";
+pub const METHOD_STEER_TURN: &str = "steer-turn";
 pub const METHOD_INTERRUPT: &str = "interrupt";
 pub const METHOD_SET_MODEL: &str = "set-model";
 pub const METHOD_SET_PERMISSION_MODE: &str = "set-permission-mode";
@@ -139,6 +140,18 @@ pub struct SendTurnImage {
     pub media_type: String,
     /// Standard (non-URL-safe) base64 of the raw bytes.
     pub data_base64: String,
+}
+
+/// Guidance pushed into the running turn. `uuid` is echoed back in the
+/// `user_message_uuids` of the `result` whose turn consumed it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteerTurnParams {
+    pub thread_id: String,
+    pub text: String,
+    pub uuid: String,
+    #[serde(default)]
+    pub images: Vec<SendTurnImage>,
 }
 
 #[derive(Debug, Clone, Serialize)]

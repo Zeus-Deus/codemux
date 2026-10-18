@@ -41,7 +41,7 @@ pub enum ProviderKind {
 impl ProviderKind {
     /// Only adapters with verified non-interrupting native input opt in.
     pub fn supports_steering(self) -> bool {
-        matches!(self, Self::Codex | Self::OpenCode)
+        matches!(self, Self::Claude | Self::Codex | Self::OpenCode)
     }
 }
 
