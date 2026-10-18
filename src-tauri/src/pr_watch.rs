@@ -487,6 +487,11 @@ pub(crate) fn render_wake(
                 lines.push("  ```".into());
                 lines.extend(clip(excerpt, MAX_EXCERPT_CHARS).lines().map(|l| format!("  {l}")));
                 lines.push("  ```".into());
+            } else if let Some(job) = check.actions_job_id() {
+                // gh serves job logs only once the whole run has finished.
+                lines.push(format!(
+                    "  Log: `gh run view --job {job} --log-failed` (available once its workflow run finishes)"
+                ));
             }
         }
         if report.failed.len() > MAX_LISTED {
@@ -555,23 +560,29 @@ fn wake_nonce(watch: &PrWatchRecord, mark_seen: &[String]) -> String {
 // ── Fetch ──────────────────────────────────────────────────────────────
 
 /// The account `gh` actually reads as. `GH_TOKEN` can differ from the
-/// configured login, so ask the API rather than local config.
+/// configured login, so ask the API rather than local config, and remember
+/// the answer per host and credential so `gh auth switch` is noticed.
 fn viewer_login(repo: &Path) -> Result<String, String> {
-    static VIEWERS: OnceLock<Mutex<HashMap<PathBuf, (String, Instant)>>> = OnceLock::new();
+    static VIEWERS: OnceLock<Mutex<HashMap<(String, Option<u64>), (String, Instant)>>> =
+        OnceLock::new();
+    let host = crate::github_budget::host_for_path(repo)?;
+    let key = (host.clone(), crate::github::gh_credential_identity(&host));
     let cache = VIEWERS.get_or_init(Default::default);
-    if let Some((login, at)) = cache.lock().unwrap().get(repo) {
+    if let Some((login, at)) = cache.lock().unwrap().get(&key) {
         if at.elapsed() < VIEWER_TTL {
             return Ok(login.clone());
         }
     }
-    let login = crate::github_budget::run(repo, &["api", "user", "--jq", ".login"], GH_TIMEOUT)
-        .map_err(|e| format!("Could not identify the GitHub account: {e}"))?
-        .trim()
-        .to_string();
-    if login.is_empty() {
-        return Err("Could not identify the GitHub account".into());
-    }
-    cache.lock().unwrap().insert(repo.to_path_buf(), (login.clone(), Instant::now()));
+    // No `--jq`: token reads go over the native HTTP transport, which only
+    // accepts plain API requests.
+    let json = crate::github_budget::run(repo, &["api", "user"], GH_TIMEOUT)
+        .map_err(|e| format!("Could not identify the GitHub account: {e}"))?;
+    let login = serde_json::from_str::<serde_json::Value>(&json)
+        .ok()
+        .and_then(|v| v["login"].as_str().map(str::to_string))
+        .filter(|login| !login.is_empty())
+        .ok_or("Could not identify the GitHub account")?;
+    cache.lock().unwrap().insert(key, (login.clone(), Instant::now()));
     Ok(login)
 }
 
@@ -589,7 +600,7 @@ fn fetch_view(repo: &Path, watch: &PrWatchRecord, seen: &HashSet<String>) -> Res
     let mut view = parse_pr_view(&json, &viewer)?;
     // Inline comments are only ever new inside a new review.
     if view.review_keys.iter().any(|key| !seen.contains(key)) {
-        let inline = crate::github::get_pr_inline_comments(repo, watch.pr_number)?;
+        let inline = crate::github::get_pr_inline_comments_fresh(repo, watch.pr_number)?;
         view.remarks.extend(inline_remarks(inline, &viewer));
     }
     Ok(view)
@@ -782,13 +793,13 @@ fn notify_stopped<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) {
     // then opens the workspace.
     let target = state.notification_target_for_thread(&watch.thread_id).or_else(|| {
         let workspace = state.find_workspace(&watch.workspace_id)?;
-        let active = state.snapshot().active_workspace_id == workspace.workspace_id;
         Some(crate::state::NotificationTarget {
             workspace_id: workspace.workspace_id.0.clone(),
             workspace_title: workspace.title.clone(),
             pane_id: String::new(),
             muted: workspace.notifications_muted,
-            in_active_workspace: active,
+            // No pane shows this chat, so the user cannot be looking at it.
+            in_active_workspace: false,
         })
     });
     match target {
@@ -1092,6 +1103,10 @@ mod tests {
         assert!(text.contains("alice on src/lib.rs:12"));
         assert!(text.contains("  > this unwrap panics"));
         assert!(text.contains("automatic fix attempt 1 of 3"));
+
+        // Without an excerpt the agent is told how to fetch the log itself.
+        let (text, _) = render_wake(&w, &v, &report, &HashMap::new());
+        assert!(text.contains("`gh run view --job 7 --log-failed`"));
         assert_eq!(display, "PR #42 — 1 check failed, 1 new comment");
     }
 

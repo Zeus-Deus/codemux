@@ -3196,9 +3196,32 @@ pub fn get_pr_inline_comments(
     repo_path: &Path,
     pr_number: u32,
 ) -> Result<Vec<InlineReviewComment>, String> {
+    inline_comments(repo_path, pr_number, false)
+}
+
+/// [`get_pr_inline_comments`] past the shared read cache, for a caller that
+/// has just seen a new review and must not be answered from a list cached
+/// before that review existed.
+pub fn get_pr_inline_comments_fresh(
+    repo_path: &Path,
+    pr_number: u32,
+) -> Result<Vec<InlineReviewComment>, String> {
+    inline_comments(repo_path, pr_number, true)
+}
+
+fn inline_comments(
+    repo_path: &Path,
+    pr_number: u32,
+    fresh: bool,
+) -> Result<Vec<InlineReviewComment>, String> {
     let nwo = get_repo_nwo(repo_path)?;
     let endpoint = format!("repos/{}/pulls/{}/comments", nwo, pr_number);
-    let json_str = run_gh(repo_path, &["api", &endpoint, "--paginate"])?;
+    let args = ["api", endpoint.as_str(), "--paginate"];
+    let json_str = if fresh {
+        crate::github_budget::run_fresh(repo_path, &args, Duration::from_secs(15))?
+    } else {
+        run_gh(repo_path, &args)?
+    };
     if json_str.is_empty() {
         return Ok(Vec::new());
     }
