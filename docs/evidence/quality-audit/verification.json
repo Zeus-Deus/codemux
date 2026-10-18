@@ -1,0 +1,111 @@
+{
+  "date": "2026-10-17",
+  "baseline_commit": "464e3840408365112a06728469e10ab7870f4345",
+  "environment": "Linux, Node v26.11.1, Bun1.3.12, rustc1.99.0",
+  "checks": [
+    {
+      "command": "npm run check",
+      "exit_code": 0
+    },
+    {
+      "command": "npm run build",
+      "exit_code": 0
+    },
+    {
+      "command": "npm run test -- src/components/github/picker-request-lifecycle.test.tsx src/components/github/issue-picker.test.tsx src/hooks/use-scrollback-serializer.test.tsx src/components/terminal/TerminalPane.teardown.test.tsx src/hooks/use-app-state.test.ts src/hooks/use-tauri-event.test.tsx src/hooks/use-auth-events.test.ts src/hooks/use-agent-chat-turn-checkpoints.test.tsx src/hooks/use-live-settings-snapshots.test.tsx src/components/layout/agent-launcher.test.tsx src/components/settings/mcp-section.test.tsx src/components/editor/EditorPane.test.tsx src/dev/remote-delegation-mock.test.ts src/dev/seeded-chat-consistency.test.ts src/App.auth.test.tsx src/components/chat/Composer.attach.test.tsx src/dev/issue-picker-mock.test.ts src/dev/editor-tab-mock.test.ts src/dev/multi-tab-mock.test.ts src/lib/structural-share.test.ts src/stores/app-store.test.ts src/stores/ai-commit-store.test.ts src/remote/transport.test.ts src/remote/shim.test.ts src/remote/hosted-connect.test.ts src/remote/hosted-bootstrap.test.tsx src/remote/bootstrap.test.tsx",
+      "exit_code": 0,
+      "files_passed": 27,
+      "tests_passed": 415,
+      "tests_failed": 0
+    },
+    {
+      "command": "cargo test -j 2 --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=2 commands::project_files::tests:: indexing::tests:: pty_daemon:: scripts::tests:: workspace_paths::tests:: git::tests::parse_ git::tests::staged_vs_unstaged_parsing git::tests::test_git_status_ git::tests::test_get_commit_files_ git::tests::source_control_preserves_unusual_file_names_end_to_end git::tests::test_git_diff_base_branch remote::pty::tests:: agent_provider::opencode::sse::tests:: web_remote::proxy::tests:: unsupported_additional_directory_capability_still_validates_its_wire_shape acp_v1_resume_only_and_version_validation",
+      "exit_code": 0,
+      "tests_passed": 203,
+      "tests_failed": 0,
+      "tests_ignored": 1,
+      "ignored_test": "commands::project_files::tests::smoke_against_codemux_worktree"
+    },
+    {
+      "command": "cargo check -j 2 --manifest-path src-tauri/Cargo.toml",
+      "exit_code": 0
+    },
+    {
+      "cwd": "sidecar/claude-agent",
+      "command": "bun run typecheck",
+      "exit_code": 0
+    },
+    {
+      "cwd": "sidecar/managed-workflow",
+      "command": "bun run typecheck",
+      "exit_code": 0
+    },
+    {
+      "cwd": "sidecar/claude-agent",
+      "command": "bun test test/session.test.ts test/permissions.test.ts test/mcp-bridge.test.ts",
+      "exit_code": 0,
+      "tests_passed": 82,
+      "tests_failed": 0
+    },
+    {
+      "cwd": "sidecar/managed-workflow",
+      "command": "bun test test/rpc.test.ts test/opencode.test.ts test/cursor.test.ts",
+      "exit_code": 0,
+      "tests_passed": 57,
+      "tests_failed": 0
+    },
+    {
+      "command": "python3 -m unittest discover -s sidecar/managed-workflow -p test_hermes.py",
+      "exit_code": 0,
+      "tests_passed": 13
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0
+    }
+  ],
+  "browser": {
+    "url": "http://localhost:1422",
+    "runtime": "development Tauri mock",
+    "automation": "isolated agent-browser Chromium session after preview interaction timeouts and unavailable browser integration",
+    "verified": [
+      "issue search146 and selection into draft",
+      "PR search172 and selection into draft",
+      "file search opens editor tab",
+      "typing marks editor dirty",
+      "Ctrl+S saves",
+      "close and reopen preserves saved content and clean state",
+      "original mock contents/draft restored afterward"
+    ],
+    "screenshots": [
+      "editor-open.png",
+      "editor-reopened.png",
+      "editor-saved.png",
+      "editor-unsaved.png",
+      "issue-search.png",
+      "issue-selected.png",
+      "pr-search.png",
+      "pr-selected.png",
+      "before-issue-search.png",
+      "after-issue-search.png"
+    ],
+    "owned_server_and_browser": "stopped after verification",
+    "before_after_comparison": "before-after-browser.json"
+  },
+  "limits": [
+    "Focused checks only; repository-wide suites remain with CI.",
+    "Live authenticated providers, SSH, relay transports, Windows/macOS, and release packaging not exercised.",
+    "Fresh Cargo checks use the documented sidecar builds and the CI-style codemux-remote packaging resource placeholder.",
+    "Slow-client queue growth and inactive rate-limit entry retention are unmeasured follow-up candidates."
+  ],
+  "review": "Claude Opus 5.5 on high reviewed the full diff and follow-ups in three rounds, including Node 22/26 test execution and mutation checks; see independent-review.json.",
+  "failure_evidence": "before-fix-failures.txt (baseline failures and one explicitly labelled intermediate audit regression)",
+  "targeted_tests_passed_total": 770,
+  "review_fix_evidence": [
+    "project-files-review-checks.txt",
+    "http-compatibility-review-checks.txt",
+    "native-tests-final.txt"
+  ],
+  "ci_followup": "ci-followup.json (Node 22 fixture correction and expanded remote-consumer validation; overlaps initial counts)",
+  "initial_audit_head": "a59f7f1f08c02fe3f087eec21cc6b8ee96dc5223"
+}

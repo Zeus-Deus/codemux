@@ -90,7 +90,6 @@ export function IssuePickerPanel({
   const [serverResults, setServerResults] = useState<GitHubIssue[] | null>(null);
   const [serverSearching, setServerSearching] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   const fetchIssues = useCallback(
     async (search?: string): Promise<GitHubIssue[]> => {
@@ -136,11 +135,14 @@ export function IssuePickerPanel({
       });
 
     // Focus input after panel renders — use rAF to ensure DOM is ready
-    requestAnimationFrame(() => {
+    const focusFrame = requestAnimationFrame(() => {
       inputRef.current?.focus();
     });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(focusFrame);
+    };
   }, [open, workspaceId, projectPath, fetchIssues]);
 
   const filteredIssues = useMemo(() => {
@@ -165,31 +167,31 @@ export function IssuePickerPanel({
     setFocusIndex(0);
   }, [displayIssues.length]);
 
-  const triggerServerSearch = useCallback(
-    (query: string) => {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-      if (!query.trim()) {
-        setServerResults(null);
-        setServerSearching(false);
-        return;
-      }
-      debounceRef.current = setTimeout(() => {
-        setServerSearching(true);
-        fetchIssues(query.replace(/^#/, ""))
-          .then((results) => {
-            setServerResults(results);
-            setServerSearching(false);
-          })
-          .catch(() => setServerSearching(false));
-      }, 300);
-    },
-    [fetchIssues],
-  );
+  useEffect(() => {
+    setServerResults(null);
+    setServerSearching(false);
+    if (!open || (!workspaceId && !projectPath) || !search.trim()) return;
 
-  const handleSearchChange = (value: string) => {
-    setSearch(value);
-    triggerServerSearch(value);
-  };
+    // A query belongs to this open picker and repository. Invalidate both
+    // its debounce and response when any of those inputs change.
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      setServerSearching(true);
+      fetchIssues(search.replace(/^#/, ""))
+        .then((results) => {
+          if (!cancelled) setServerResults(results);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled) setServerSearching(false);
+        });
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [open, workspaceId, projectPath, search, fetchIssues]);
 
   const handleSelectIssue = useCallback(
     (issue: GitHubIssue) => {
@@ -236,7 +238,7 @@ export function IssuePickerPanel({
           <input
             ref={inputRef}
             value={search}
-            onChange={(e) => handleSearchChange(e.target.value)}
+            onChange={(e) => setSearch(e.target.value)}
             placeholder="Search issues..."
             className="flex-1 bg-transparent text-label text-foreground placeholder:text-muted-foreground/50 outline-none min-w-0"
           />

@@ -205,6 +205,102 @@ describe("useAppStateInit — activation snapshots bypass the debounce", () => {
   });
 });
 
+describe("useAppStateInit — lifecycle boundaries", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    deliverSnapshot = null;
+    deliverDelta = null;
+    deliverRevision = null;
+    getAppStateMock.mockReset();
+    getAppStateMock.mockImplementation(() => new Promise<never>(() => {}));
+    useAppStore.setState({ appState: null, lastSeenRevision: 0, backendInstance: null, resyncInFlight: false, resyncRequestId: 0, deltaBuffer: new Map(), gapWindowId: 0 });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    useAppStore.setState({ appState: null, lastSeenRevision: 0, backendInstance: null, resyncInFlight: false, resyncRequestId: 0, deltaBuffer: new Map(), gapWindowId: 0 });
+  });
+
+  it("cancels a queued snapshot when the hook unmounts", () => {
+    const { unmount } = renderHook(() => useAppStateInit());
+    act(() => { deliverSnapshot!(makeAppState("ws-A")); });
+    unmount();
+    act(() => { vi.advanceTimersByTime(16); });
+    expect(useAppStore.getState().appState).toBeNull();
+  });
+
+  it("does not fetch or subscribe while initialization is skipped", () => {
+    renderHook(() => useAppStateInit(true));
+    expect(getAppStateMock).not.toHaveBeenCalled();
+    expect(deliverSnapshot).toBeNull();
+    expect(deliverDelta).toBeNull();
+    expect(deliverRevision).toBeNull();
+  });
+
+  it("discards queued and late events when initialization becomes skipped", () => {
+    const { rerender } = renderHook(({ skip }) => useAppStateInit(skip), { initialProps: { skip: false } });
+    const lateSnapshot = deliverSnapshot!;
+    act(() => { lateSnapshot(makeAppState("ws-A")); });
+    rerender({ skip: true });
+    act(() => {
+      vi.advanceTimersByTime(16);
+      lateSnapshot(makeAppState("ws-B"));
+      vi.advanceTimersByTime(16);
+    });
+    expect(useAppStore.getState().appState).toBeNull();
+  });
+
+  it("ignores an initial fetch that resolves after unmount", async () => {
+    let resolve!: (snapshot: AppStateSnapshot) => void;
+    getAppStateMock.mockReturnValueOnce(new Promise((done) => { resolve = done; }));
+    const { unmount } = renderHook(() => useAppStateInit());
+    unmount();
+    await act(async () => { resolve(makeAppState("ws-A")); });
+    expect(useAppStore.getState().appState).toBeNull();
+  });
+
+  it("ignores an initial fetch after initialization becomes skipped", async () => {
+    let resolve!: (snapshot: AppStateSnapshot) => void;
+    getAppStateMock.mockReturnValueOnce(new Promise((done) => { resolve = done; }));
+    const { rerender } = renderHook(({ skip }) => useAppStateInit(skip), { initialProps: { skip: false } });
+    rerender({ skip: true });
+    await act(async () => { resolve(makeAppState("ws-A")); });
+    expect(useAppStore.getState().appState).toBeNull();
+  });
+
+  it("abandons an in-flight resync when unmounted without applying its late snapshot", async () => {
+    let resolve!: (snapshot: AppStateSnapshot) => void;
+    const { unmount } = renderHook(() => useAppStateInit());
+    getAppStateMock.mockReturnValueOnce(new Promise((done) => { resolve = done; }));
+    act(() => { useAppStore.getState().requestResync(); });
+    unmount();
+    await act(async () => { resolve(makeAppState("ws-A")); });
+    expect(useAppStore.getState().appState).toBeNull();
+    expect(useAppStore.getState().resyncInFlight).toBe(false);
+  });
+
+  it("does not let an obsolete resync close a new resync window", async () => {
+    let resolveOld!: (snapshot: AppStateSnapshot) => void;
+    let resolveNew!: (snapshot: AppStateSnapshot) => void;
+    const first = renderHook(() => useAppStateInit());
+    getAppStateMock.mockReturnValueOnce(new Promise((done) => { resolveOld = done; }));
+    act(() => { useAppStore.getState().requestResync(); });
+    first.unmount();
+    // Explicitly open a distinct window as a resumed runtime does.
+    useAppStore.getState().endResync();
+    const second = renderHook(() => useAppStateInit());
+    getAppStateMock.mockReturnValueOnce(new Promise((done) => { resolveNew = done; }));
+    act(() => { useAppStore.getState().requestResync(); });
+    await act(async () => { resolveOld(makeAppState("ws-A")); });
+    expect(useAppStore.getState().resyncInFlight).toBe(true);
+    await act(async () => { resolveNew(makeAppState("ws-B")); });
+    expect(useAppStore.getState().appState?.active_workspace_id).toBe("ws-B");
+    expect(useAppStore.getState().resyncInFlight).toBe(false);
+    second.unmount();
+  });
+});
+
 // ── Domain deltas + revision heartbeat (Phase 6) ────────────────────────
 
 describe("useAppStateInit — deltas, gaps and the revision heartbeat", () => {

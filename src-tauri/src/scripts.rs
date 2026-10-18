@@ -182,6 +182,7 @@ fn copy_matching_files(
     let output = crate::execution::host_command("git")
         .args([
             "ls-files",
+            "-z",
             "--others",
             "--ignored",
             &format!("--exclude-from={}", exclude_file.display()),
@@ -195,13 +196,24 @@ fn copy_matching_files(
         return Err(format!("git ls-files failed: {stderr}"));
     }
 
-    let file_list = String::from_utf8_lossy(&output.stdout);
     let mut copied = Vec::new();
 
-    for relative_path in file_list.lines() {
-        if relative_path.is_empty() {
+    // NUL records preserve Unicode and embedded newlines without Git's
+    // C-style quoting. Unix paths may also contain non-UTF-8 bytes.
+    for raw_path in output.stdout.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
             continue;
         }
+        #[cfg(unix)]
+        let relative_path = {
+            use std::os::unix::ffi::OsStrExt;
+            Path::new(std::ffi::OsStr::from_bytes(raw_path))
+        };
+        #[cfg(not(unix))]
+        let relative_path = Path::new(
+            std::str::from_utf8(raw_path)
+                .map_err(|e| format!("Invalid worktree include path: {e}"))?,
+        );
 
         let src = root_path.join(relative_path);
         let dst = worktree_path.join(relative_path);
@@ -233,7 +245,7 @@ fn copy_matching_files(
 
         std::fs::copy(&src, &dst)
             .map_err(|e| format!("Failed to copy {} → {}: {e}", src.display(), dst.display()))?;
-        copied.push(relative_path.to_string());
+        copied.push(relative_path.to_string_lossy().into_owned());
     }
 
     Ok(copied)
@@ -944,6 +956,34 @@ mod tests {
             fs::read_to_string(root.path().join(".env")).unwrap(),
             "FROM_ROOT=ok"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_worktree_includes_preserves_unusual_file_names() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let names = [".env.über", ".env.\"quoted\"", ".env.line\nbreak"];
+        for name in names {
+            fs::write(root.path().join(name), format!("SOURCE={name}"))
+                .unwrap();
+        }
+
+        let result = process_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
+        assert_eq!(result.copied.len(), names.len());
+        for name in names {
+            assert!(result.copied.iter().any(|copied| copied == name));
+            let expected = format!("SOURCE={name}");
+            assert_eq!(fs::read_to_string(worktree.path().join(name)).unwrap(), expected);
+            assert_eq!(fs::read_to_string(root.path().join(name)).unwrap(), expected);
+        }
     }
 
     #[test]

@@ -150,6 +150,22 @@ fn acp_v1_resume_only_and_version_validation() {
 }
 
 #[test]
+fn unsupported_additional_directory_capability_still_validates_its_wire_shape() {
+    assert!(
+        Negotiation::parse(&json!({
+            "protocolVersion":1,
+            "agentCapabilities":{"sessionCapabilities":{"additionalDirectories":{}}}
+        })).is_ok()
+    );
+    assert!(
+        Negotiation::parse(&json!({
+            "protocolVersion":1,
+            "agentCapabilities":{"sessionCapabilities":{"additionalDirectories":true}}
+        })).is_err()
+    );
+}
+
+#[test]
 fn grouped_model_values_remain_opaque() {
     let parsed = parse_options(&json!([{
         "id":" Model/ID ", "name":"Models", "category":"model", "type":"select",
