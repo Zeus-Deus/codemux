@@ -67,6 +67,7 @@ async fn harness_for(kind: ProviderKind) -> Harness {
     let provider = Arc::new(MockAgentProvider::new(kind));
     match kind {
         ProviderKind::Claude => registry.set_claude(provider.clone() as _).await,
+        ProviderKind::OpenCode => registry.set_opencode(provider.clone() as _).await,
         _ => registry.set_codex(provider.clone() as _).await,
     }
     app.manage(registry);
@@ -75,7 +76,11 @@ async fn harness_for(kind: ProviderKind) -> Harness {
     let workspace = state.create_workspace_at_path(dir.path().into()).0;
     Harness {
         app,
-        kind: if kind == ProviderKind::Claude { "claude" } else { "codex" },
+        kind: match kind {
+            ProviderKind::Claude => "claude",
+            ProviderKind::OpenCode => "opencode",
+            _ => "codex",
+        },
         provider,
         workspace,
         dir,
@@ -628,4 +633,38 @@ async fn a_conversation_that_cannot_be_reopened_is_not_resumed() {
     // No fresh session was started in its place, and nothing was sent.
     assert_eq!(h.provider.start_inputs().len(), 1);
     assert!(h.sent("rr-lost").is_empty());
+}
+
+#[tokio::test]
+async fn providers_that_would_start_a_fresh_conversation_stay_manual() {
+    let h = harness_for(ProviderKind::OpenCode).await;
+    h.chat("rr-opencode");
+    h.running("rr-opencode", "turn-1");
+    let decisions = resume_after_restart_for_test(&h.handle(), "launch-2").await;
+    assert_eq!(
+        decision(&decisions, "rr-opencode"),
+        Some(ResumeDecision::Skip(SkipReason::ManualOnly))
+    );
+    assert!(h.sent("rr-opencode").is_empty());
+}
+
+#[tokio::test]
+async fn a_resume_that_fell_back_to_a_fresh_conversation_keeps_the_queue_manual() {
+    let h = harness().await;
+    h.chat("rr-fresh");
+    h.saved("rr-fresh", "q-1", "saved");
+    h.running("rr-fresh", "turn-1");
+    resume_after_restart_for_test(&h.handle(), "launch-2").await;
+    // The provider could not resume and rebuilt a fresh session.
+    forward_event(
+        &h.handle(),
+        ProviderRuntimeEvent::ResumeCursorUpdated {
+            thread_id: ThreadId("rr-fresh".into()),
+            resume_cursor: serde_json::Value::Null,
+        },
+    );
+    h.completed("rr-fresh", TurnStatus::Success);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(h.sent("rr-fresh").len(), 1);
+    assert_eq!(h.db().list_queued_turns("rr-fresh").len(), 1);
 }

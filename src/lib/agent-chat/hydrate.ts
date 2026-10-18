@@ -392,8 +392,11 @@ function finalizeReplay(
   // still executing. (A cold replay always runs them — it is rebuilding
   // the transcript from persisted rows alone, where a `running` snapshot
   // with no terminal successor genuinely means "never settled".)
+  // Unlike the passes below, this one runs on live tail merges too: it
+  // leaves the live turn's own calls alone, and a cut-off turn's calls
+  // must settle even when a newer turn is live.
+  messages = settleCutOffToolCalls(messages, runLive, settledAt);
   if (!skipSettlePasses) {
-    messages = settleCutOffToolCalls(messages, runLive, settledAt);
     messages = interruptRunningSubagents(messages, settledAt);
     messages = messages.map((m) =>
       m.kind === "workflow_run" && m.status === "running"
@@ -441,28 +444,28 @@ function finalizeReplay(
  * result will ever arrive and the row must not read as live. They become
  * `unconfirmed` — the call started, and whether it finished is unknown.
  *
- * Calls before the transcript's last user turn are always cut off (a later
- * turn started). Calls after it are cut off only when no run is live; with
- * one live they belong to the turn still executing.
+ * With no run live, every such call is cut off. With one live, a call is
+ * cut off only once a later user message started another turn; a message
+ * steered into the call's own turn is no boundary.
  */
 function settleCutOffToolCalls(
   messages: ChatViewItem[],
   runLive: boolean,
   settledAt: number,
 ): ChatViewItem[] {
-  let lastUserTurn = -1;
+  let next = messages;
+  // Turns started by user messages after the current index, walking back.
+  const laterTurns = new Set<string | undefined>();
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m.kind === "user_message" && !m.queued) {
-      lastUserTurn = i;
-      break;
+      laterTurns.add(m.turn_id ?? undefined);
+      continue;
     }
-  }
-  let next = messages;
-  for (let i = 0; i < messages.length; i++) {
-    const m = messages[i];
     if (m.kind !== "tool_call" || m.status !== "running") continue;
-    if (runLive && i > lastUserTurn) continue;
+    const turn = m.turn_id ?? undefined;
+    const superseded = [...laterTurns].some((t) => t === undefined || t !== turn);
+    if (runLive && !superseded) continue;
     if (next === messages) next = messages.slice();
     next[i] = { ...m, status: "unconfirmed", completed_at: settledAt };
   }

@@ -2480,7 +2480,7 @@ export function SettingsView() {
                     <Separator />
                     <SettingRow
                       label="Auto-resume agents after restart"
-                      description="When Codemux quits or crashes mid-run, the agent continues on its next launch. It checks the current state first. Chats waiting on you are flagged instead."
+                      description="When Codemux quits or crashes mid-run, Claude and Codex chats continue on the next launch. They check the current state first. Chats waiting on you are flagged instead."
                       scope="device"
                     >
                       <Switch

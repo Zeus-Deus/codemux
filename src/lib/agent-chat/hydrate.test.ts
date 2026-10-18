@@ -261,6 +261,47 @@ describe("replayPayloads", () => {
       expect(status(state, "tu-2")).toBe("running");
     });
 
+    it("keeps a live turn's call running across a message steered into it", () => {
+      const state = replayPayloads(
+        [
+          user("run the tests"),
+          toolUse("turn-1", "tu-1"),
+          JSON.stringify({
+            type: "user_message",
+            thread_id: "t",
+            text: "use the fast config",
+            client_nonce: "steer-1",
+            steered_turn_id: "turn-1",
+          }),
+        ],
+        { runLive: true },
+      );
+      expect(status(state, "tu-1")).toBe("running");
+    });
+
+    it("settles a cut-off turn's call on a live tail merge too", () => {
+      const slice = replayPayloads([user("run the tests"), toolUse("turn-1", "tu-1")], {
+        runLive: true,
+      });
+      expect(status(slice, "tu-1")).toBe("running");
+      // The app restarted; the resumed turn is live when the pane merges its tail.
+      const merged = applyReplayTail(
+        slice,
+        parseReplayPayloads([
+          JSON.stringify({
+            type: "user_message",
+            thread_id: "t",
+            text: "[Resumed automatically after an app restart.]",
+            turn_id: "turn-2",
+          }),
+          toolUse("turn-2", "tu-2"),
+        ]),
+        { runLive: true, previousUnsettled: slice.turnUnsettled, provider: "claude" },
+      );
+      expect(status(merged, "tu-1")).toBe("unconfirmed");
+      expect(status(merged, "tu-2")).toBe("running");
+    });
+
     it("leaves a finished call alone", () => {
       const state = replayPayloads([
         user("run the tests"),

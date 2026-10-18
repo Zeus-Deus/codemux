@@ -58,8 +58,8 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // before it waits for the user); the composer strip always offers a
   // manual Resume either way.
   "agents.auto_resume_usage_limit": "true",
-  // Whether a chat whose turn was running when the app quit or crashed
-  // continues on its own at the next launch, told to check the current
+  // Whether a Claude or Codex chat whose turn was running when the app quit
+  // or crashed continues on its own at the next launch, told to check the current
   // state first. Read by the backend at launch; off leaves the manual
   // Continue.
   "agents.auto_resume_after_restart": "true",

@@ -15,8 +15,10 @@
 //! * **Checked, then sent.** A chat waiting on an approval or question is
 //!   surfaced for the user instead. A stopped chat has no row (stopping
 //!   clears it). Closed workspaces, missing worktrees, chats on another
-//!   device, delegated children, providers that cannot reopen the
-//!   conversation and chats already running are skipped. Resumes in a row
+//!   device, delegated children and chats already running are skipped, as
+//!   are chats whose conversation can't be reopened as it was: only Claude
+//!   and Codex refuse a lost conversation instead of starting a fresh one,
+//!   so the other providers keep the manual Continue. Resumes in a row
 //!   are capped, so a turn that keeps taking the app down cannot loop.
 //!   The rest get one short turn through the normal send path telling the
 //!   agent to check the current state before it continues.
@@ -142,13 +144,41 @@ pub(crate) fn on_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEv
         },
         ProviderRuntimeEvent::TurnCompleted { thread_id, status, .. } => {
             let result = db.clear_restart_turn(&thread_id.0).map(drop);
-            let resumed = live().resuming.remove(&thread_id.0);
-            if resumed && matches!(status, TurnStatus::Success) {
+            let drain = {
+                let mut live = live();
+                let resumed = live.resuming.remove(&thread_id.0);
+                // Registered before the drain starts, so a Stop from here on
+                // always finds it.
+                (resumed && matches!(status, TurnStatus::Success)).then(|| {
+                    live.next_drain += 1;
+                    let token = live.next_drain;
+                    live.draining.insert(thread_id.0.clone(), token);
+                    token
+                })
+            };
+            if let Some(token) = drain {
                 let app = app.clone();
                 let thread_id = thread_id.clone();
-                tauri::async_runtime::spawn(async move { drain_saved_queue(&app, &thread_id).await });
+                tauri::async_runtime::spawn(async move {
+                    drain_saved_queue(&app, &thread_id, token).await
+                });
             }
             result
+        }
+        // The provider could not reopen the conversation and started a
+        // fresh one: the resumed turn has no history behind it, so its end
+        // must not send the saved queue on top.
+        ProviderRuntimeEvent::ResumeCursorUpdated { thread_id, resume_cursor }
+            if resume_cursor.is_null() =>
+        {
+            if live().resuming.remove(&thread_id.0) {
+                eprintln!(
+                    "[codemux::restart_resume] thread={} resumed without its conversation; \
+                     saved queue stays manual",
+                    thread_id.0
+                );
+            }
+            return;
         }
         ProviderRuntimeEvent::RequestOpened { thread_id, request_id, .. } => {
             waiting(thread_id, &request_id.0, true)
@@ -256,7 +286,8 @@ pub struct ResumeFacts {
     pub local: bool,
     pub worktree_exists: bool,
     pub delegated_child: bool,
-    /// The provider can reopen this conversation with its history.
+    /// The provider can reopen this conversation with its history, and
+    /// refuses rather than starting over when it can't.
     pub provider_resumes: bool,
     /// Something is already running on the chat, or a usage-limit resume
     /// owns it.
@@ -357,9 +388,14 @@ async fn gather_facts<R: Runtime>(
     facts.delegated_child = super::delegation::is_delegated_child(app, &row.thread_id);
     if let Some(provider) = provider {
         let registry: State<'_, ProviderRegistry> = app.state();
-        let resumable = lookup_provider(&registry, provider)
-            .await
-            .is_ok_and(|impl_| impl_.capabilities().supports_session_resume);
+        // Only providers that refuse, rather than quietly replace, a
+        // conversation they can't reopen (see `dispatch`). The others start
+        // a fresh session inside the adapter and stay on the manual
+        // Continue.
+        let resumable = matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
+            && lookup_provider(&registry, provider)
+                .await
+                .is_ok_and(|impl_| impl_.capabilities().supports_session_resume);
         // Without its saved conversation the provider would start over, and
         // the note would make no sense to it. Claude's lives in a local file
         // the session start would drop the id for.
@@ -491,13 +527,21 @@ async fn resume_after_restart<R: Runtime>(
 /// user's Send uses. The first starts a turn and the rest queue behind it.
 /// A Stop on the chat ends the drain before its next send, and the first
 /// failure ends it too; what is left stays saved.
-async fn drain_saved_queue<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId) {
+async fn drain_saved_queue<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId, token: u64) {
+    let cancelled = || live().draining.get(&thread_id.0) != Some(&token);
+    let finish = || {
+        let mut live = live();
+        if live.draining.get(&thread_id.0) == Some(&token) {
+            live.draining.remove(&thread_id.0);
+        }
+    };
     let provider = {
         let db: State<'_, DatabaseStore> = app.state();
         db.get_agent_chat_session(&thread_id.0)
             .and_then(|session| parse_provider(&session.provider))
     };
     let Some(provider) = provider else {
+        finish();
         return;
     };
     // Listed through the pane's command, which drops rows whose message
@@ -507,21 +551,12 @@ async fn drain_saved_queue<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId)
             Ok(rows) => rows.into_iter().filter(|row| row.saved).map(|row| row.queued_id).collect(),
             Err(error) => {
                 eprintln!("[codemux::restart_resume] {error}");
+                finish();
                 return;
             }
         };
-    if saved.is_empty() {
-        return;
-    }
-    let token = {
-        let mut live = live();
-        live.next_drain += 1;
-        let token = live.next_drain;
-        live.draining.insert(thread_id.0.clone(), token);
-        token
-    };
     for queued_id in saved {
-        if live().draining.get(&thread_id.0) != Some(&token) {
+        if cancelled() {
             eprintln!(
                 "[codemux::restart_resume] saved queue on thread={} stays saved: stopped",
                 thread_id.0
@@ -544,10 +579,7 @@ async fn drain_saved_queue<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId)
             break;
         }
     }
-    let mut live = live();
-    if live.draining.get(&thread_id.0) == Some(&token) {
-        live.draining.remove(&thread_id.0);
-    }
+    finish();
 }
 
 /// Resume the chats the last run left running. Called once from app setup,
