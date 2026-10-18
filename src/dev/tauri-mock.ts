@@ -8960,4 +8960,23 @@ function kickPrOverview(): void {
     : "host CLIs signed in again — an open Review pane picks it up";
 };
 
+// Dev affordance for the pull-request watch UI. The mock has no sweep, so
+// this stands in for one: patch the chat's watch and emit the change.
+//
+//   __codemuxMockPrWatch({ attempts: 1, last_wake_summary: "1 check failed" })
+//   __codemuxMockPrWatch({ status: "exhausted", attempts: 3,
+//     stop_reason: "Still failing after 3 automatic fix attempts" })
+(
+  window as unknown as {
+    __codemuxMockPrWatch: (patch: Partial<PrWatchStatus>, threadId?: string) => string;
+  }
+).__codemuxMockPrWatch = (patch, threadId = MOCK_CHAT_THREAD_ID) => {
+  const current = prWatches.get(threadId);
+  if (!current) return "start a watch first (Workspace details → Watch CI & reviews)";
+  const watch = { ...current, ...patch, updated_at_ms: Date.now() };
+  prWatches.set(threadId, watch);
+  emitEvent("pr-watch-changed", { thread_id: threadId, watch });
+  return `watch is now ${watch.status}`;
+};
+
 export {};

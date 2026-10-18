@@ -26,6 +26,7 @@ import {
   useBackgroundBrowserSession,
 } from "@/components/browser/background-browser-indicator";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
+import { PrWatchChip } from "./PrWatchChip";
 import { showNoGitState, useInitializeGit } from "@/hooks/use-initialize-git";
 import { getGithubPrByPath, gitPullChanges } from "@/tauri/commands";
 import type { PullRequestInfo } from "@/tauri/types";
@@ -76,7 +77,12 @@ import {
  * project folders (`showNoGitState`) get the compact "Initialize Git"
  * chip instead of the git cluster.
  */
-export function WorkspaceStatusCluster() {
+export function WorkspaceStatusCluster({
+  threadId,
+}: {
+  /** The chat this row belongs to; shows its pull-request watch chip. */
+  threadId?: string | null;
+} = {}) {
   const workspace = useActiveWorkspace();
   const homeDir = useHomeDir();
   const hosts = useHosts();
@@ -257,6 +263,8 @@ export function WorkspaceStatusCluster() {
                 : provider.shortNoun}
             </button>
           )}
+
+          {prState && threadId && <PrWatchChip threadId={threadId} />}
 
           {/* Never folds: the details popover can't open the issue. */}
           {issueChip}
