@@ -10,10 +10,20 @@ const mocks = vi.hoisted(() => ({
   stop: vi.fn(),
   listener: null as ((payload: { thread_id: string; watch: PrWatchStatus | null }) => void) | null,
   failure: vi.fn(),
+  focused: "thread-1",
+  epoch: 0,
+  /** Set to hold `prWatchStatus` until the test resolves it. */
+  deferred: null as null | { resolve: (s: PrWatchStatus | null) => void },
 }));
 
 vi.mock("@/tauri/commands", () => ({
-  prWatchStatus: vi.fn(async () => mocks.status),
+  prWatchStatus: vi.fn(
+    (thread: string) =>
+      new Promise<PrWatchStatus | null>((resolve) => {
+        if (mocks.deferred) mocks.deferred.resolve = resolve;
+        else resolve(thread === "thread-1" ? mocks.status : null);
+      }),
+  ),
   prWatchStart: mocks.start,
   prWatchStop: mocks.stop,
 }));
@@ -27,7 +37,10 @@ vi.mock("@/tauri/events", () => ({
 }));
 vi.mock("@/lib/toast", () => ({ toast: { failure: mocks.failure } }));
 vi.mock("@/hooks/use-active-chat-tasks", () => ({
-  useActiveChatTasks: () => ({ threadId: "thread-1", tasks: null }),
+  useActiveChatTasks: () => ({ threadId: mocks.focused, tasks: null }),
+}));
+vi.mock("@/remote/remote-connection-store", () => ({
+  useRemoteReconnectEpoch: () => mocks.epoch,
 }));
 
 import { PrWatchChip } from "@/components/chat/PrWatchChip";
@@ -69,6 +82,9 @@ const workspace = (patch: Partial<WorkspaceSnapshot> = {}) =>
 
 beforeEach(() => {
   mocks.status = null;
+  mocks.focused = "thread-1";
+  mocks.epoch = 0;
+  mocks.deferred = null;
   mocks.start.mockReset().mockImplementation(async () => watch());
   mocks.stop.mockReset().mockResolvedValue(true);
   mocks.failure.mockReset();
@@ -113,6 +129,49 @@ describe("PrWatchRow", () => {
       expect(mocks.failure).toHaveBeenCalledWith("Couldn't watch the pull request", "gh is signed out"),
     );
     expect(row).toHaveTextContent("Stopped");
+  });
+
+  it("cannot toggle until the status is known", async () => {
+    mocks.deferred = { resolve: () => {} };
+    render(<PrWatchRow workspace={workspace()} />);
+    const row = await screen.findByTestId("workspace-details-pr-watch");
+    expect(row).toBeDisabled();
+    fireEvent.click(row);
+    expect(mocks.start).not.toHaveBeenCalled();
+
+    await act(async () => mocks.deferred?.resolve(watch({ attempts: 2 })));
+    expect(row).toBeEnabled();
+    expect(row).toHaveTextContent("On · 2/3");
+  });
+
+  it("drops a late answer for the chat it no longer shows", async () => {
+    let finish: (s: PrWatchStatus) => void = () => {};
+    mocks.start.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+    const { rerender } = render(<PrWatchRow workspace={workspace()} />);
+    const row = await screen.findByTestId("workspace-details-pr-watch");
+    await waitFor(() => expect(row).toBeEnabled());
+    fireEvent.click(row);
+
+    mocks.focused = "thread-2";
+    rerender(<PrWatchRow workspace={workspace({ title: "switched" })} />);
+    await waitFor(() => expect(row).toBeEnabled());
+    await act(async () => finish(watch()));
+    expect(row).toHaveTextContent("Off");
+    act(() => mocks.listener?.({ thread_id: "thread-1", watch: watch() }));
+    expect(row).toHaveTextContent("Off");
+  });
+
+  it("rereads the status after a remote reconnect", async () => {
+    mocks.status = watch();
+    const { rerender } = render(<PrWatchRow workspace={workspace()} />);
+    const row = await screen.findByTestId("workspace-details-pr-watch");
+    await waitFor(() => expect(row).toHaveTextContent("On"));
+
+    // Stopped elsewhere while this client was away: no event arrives.
+    mocks.status = watch({ status: "exhausted" });
+    mocks.epoch = 1;
+    rerender(<PrWatchRow workspace={workspace({ title: "reconnected" })} />);
+    await waitFor(() => expect(row).toHaveTextContent("Stopped"));
   });
 
   it("is absent without an open pull request on GitHub", () => {
