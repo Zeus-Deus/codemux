@@ -25,9 +25,12 @@ pub struct HttpMcpClient {
 impl HttpMcpClient {
     pub async fn connect(config: &McpServerConfig) -> Result<Self, String> {
         let headers = headers_from_config(config)?;
+        let mut http = reqwest::Client::builder();
+        // Local MCP credentials must never travel through an environment
+        // proxy. Remote servers retain the user's normal proxy settings.
+        if loopback_url(&config.command) { http = http.no_proxy(); }
         let client = Self {
-            http: reqwest::Client::builder()
-                .build()
+            http: http.build()
                 .map_err(|error| format!("build HTTP client: {error}"))?,
             url: config.command.clone(),
             headers,
@@ -191,6 +194,14 @@ impl HttpMcpClient {
 
         serde_json::from_str(&body).map_err(|error| format!("decode JSON response: {error}"))
     }
+}
+
+fn loopback_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else { return false; };
+    let Some(host) = url.host_str() else { return false; };
+    let host = host.trim_end_matches('.');
+    host == "localhost" || host.ends_with(".localhost")
+        || host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 #[derive(Default)]
@@ -432,5 +443,78 @@ mod live_tests {
             values.extend(decoder.push(&[*byte]).unwrap());
         }
         assert_eq!(values, vec![json!({"text":"画像"})]);
+    }
+
+    #[test]
+    fn plugin_mcp_loopback_host_classification() {
+        for url in ["http://127.0.0.1/mcp", "https://127.9.8.7/mcp", "http://[::1]/mcp", "http://localhost/mcp", "http://localhost./mcp", "http://app.localhost/mcp"] {
+            assert!(loopback_url(url), "{url}");
+        }
+        for url in ["https://example.com/mcp", "http://localhost.example/mcp", "http://192.168.1.1/mcp"] {
+            assert!(!loopback_url(url), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_http_proxy_is_bypassed_only_for_loopback() {
+        // Environment proxy discovery is process-global. Run alone in a child
+        // test process instead of changing the other tests' environment.
+        if std::env::var_os("CODEMUX_TEST_MCP_PROXY_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "mcp::http_client::live_tests::plugin_mcp_http_proxy_is_bypassed_only_for_loopback", "--test-threads=1", "--nocapture"])
+                .env("CODEMUX_TEST_MCP_PROXY_CHILD", "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use axum::{body::Bytes, extract::State, http::{HeaderMap, StatusCode}, response::IntoResponse, Json, Router};
+        use std::sync::{Arc, Mutex};
+        async fn peer(State(auth): State<Arc<Mutex<Vec<String>>>>, headers: HeaderMap, body: Bytes) -> axum::response::Response {
+            auth.lock().unwrap().push(headers.get("authorization").and_then(|h|h.to_str().ok()).unwrap_or("").into());
+            if body.is_empty() {
+                return ([("content-type", "text/event-stream")], "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n").into_response();
+            }
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            if request.get("id").is_none() { return StatusCode::ACCEPTED.into_response(); }
+            let result = if request["method"] == "initialize" {
+                json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"proxy-fixture","version":"1"}})
+            } else { json!({"tools":[]}) };
+            Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result})).into_response()
+        }
+        async fn server(auth: Arc<Mutex<Vec<String>>>) -> (String, tokio::task::JoinHandle<()>) {
+            let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", socket.local_addr().unwrap());
+            let app = Router::new().fallback(peer).with_state(auth);
+            let task = tokio::spawn(async move { axum::serve(socket, app).await.unwrap(); });
+            (url, task)
+        }
+        let proxied = Arc::new(Mutex::new(Vec::new()));
+        let local = Arc::new(Mutex::new(Vec::new()));
+        let (proxy, proxy_task) = server(proxied.clone()).await;
+        let (target, target_task) = server(local.clone()).await;
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] { std::env::set_var(key, &proxy); }
+        for key in ["NO_PROXY", "no_proxy"] { std::env::remove_var(key); }
+
+        // Confirm the original default-client behavior in this same harness.
+        reqwest::Client::new().get(format!("{target}/mcp")).header("authorization", "Bearer loopback-test").send().await.unwrap();
+        assert_eq!(*proxied.lock().unwrap(), vec!["Bearer loopback-test"]);
+        proxied.lock().unwrap().clear();
+
+        let config = |url: String, token: &str| McpServerConfig {
+            id:"proxy-fixture".into(),name:"Proxy fixture".into(),sources:vec![super::super::McpConfigSource::Plugin],command:url,args:vec![],env:Default::default(),disabled:false,transport:super::super::McpTransport::Http,
+            raw:json!({"headers":{"Authorization":format!("Bearer {token}")}}),
+        };
+        let client = HttpMcpClient::connect(&config(format!("{target}/mcp"), "loopback-test")).await.unwrap();
+        client.request("tools/list", json!({})).await.unwrap();
+        let mut notifications = client.notifications();
+        client.listen_notifications().await;
+        assert_eq!(notifications.try_recv().unwrap().method, "notifications/tools/list_changed");
+        assert!(proxied.lock().unwrap().is_empty(), "loopback credentials reached proxy");
+        assert_eq!(local.lock().unwrap().len(), 4);
+        assert!(local.lock().unwrap().iter().all(|auth| auth == "Bearer loopback-test"));
+
+        HttpMcpClient::connect(&config("http://remote-mcp.invalid/mcp".into(), "remote-test")).await.unwrap();
+        assert_eq!(*proxied.lock().unwrap(), vec!["Bearer remote-test", "Bearer remote-test"]);
+        proxy_task.abort(); target_task.abort();
     }
 }
