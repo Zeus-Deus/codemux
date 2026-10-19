@@ -209,6 +209,13 @@ async function openPicker(user: ReturnType<typeof userEvent.setup>) {
   await screen.findByPlaceholderText("Search models...");
 }
 
+/** Focus opens the trigger's tooltip at once (hover waits out a delay);
+ *  its accessible copy carries the full one-line text. */
+function triggerTooltip() {
+  fireEvent.focus(screen.getByTestId("multi-provider-model-picker-trigger"));
+  return screen.getByRole("tooltip");
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 describe("MultiProviderModelPicker — trigger", () => {
@@ -218,11 +225,42 @@ describe("MultiProviderModelPicker — trigger", () => {
       .toHaveTextContent("Claude Opus 4.7");
   });
 
-  it("renders sub_provider · label when active model is OpenCode", () => {
+  it("keeps the OpenCode sub_provider in a hover reveal beside the model name", () => {
     renderPicker({ provider: "opencode", model: "openai/gpt-5" });
-    const trigger = screen.getByTestId("multi-provider-model-picker-trigger");
-    expect(trigger).toHaveTextContent("openai");
-    expect(trigger).toHaveTextContent("GPT-5");
+    const reveal = screen.getByTestId("multi-provider-model-picker-reveal");
+    expect(reveal).toHaveTextContent(/^openai·$/);
+    // Collapsed until the pill is hovered or focused.
+    expect(reveal).toHaveClass("w-0", "opacity-0");
+    expect(screen.getByTestId("multi-provider-model-picker-trigger"))
+      .toHaveTextContent(/GPT-5$/);
+  });
+
+  it("drops the reveal when the composer narrows to leaf labels", () => {
+    renderPicker({ provider: "opencode", model: "openai/gpt-5", leafLabel: true });
+    expect(screen.queryByTestId("multi-provider-model-picker-reveal")).toBeNull();
+  });
+
+  it("has no reveal when the model has no sub_provider", () => {
+    renderPicker({ provider: "claude", model: "claude-opus-4-7" });
+    expect(screen.queryByTestId("multi-provider-model-picker-reveal")).toBeNull();
+  });
+
+  it("names the OpenCode sub_provider in the icon-only tooltip", () => {
+    renderPicker({ provider: "opencode", model: "openai/gpt-5", iconOnly: true });
+    expect(triggerTooltip()).toHaveTextContent(/^GPT-5 · via openai/);
+  });
+
+  it("opens no tooltip when the pill has a reveal", () => {
+    renderPicker({ provider: "opencode", model: "openai/gpt-5" });
+    fireEvent.focus(screen.getByTestId("multi-provider-model-picker-trigger"));
+    expect(screen.queryByRole("tooltip")).toBeNull();
+  });
+
+  it("reveals in the context row without a tooltip", () => {
+    renderPicker({ provider: "opencode", model: "openai/gpt-5", placement: "context-row" });
+    expect(screen.getByTestId("multi-provider-model-picker-reveal")).toHaveTextContent(/^openai·$/);
+    fireEvent.focus(screen.getByTestId("multi-provider-model-picker-trigger"));
+    expect(screen.queryByRole("tooltip")).toBeNull();
   });
 
   it("falls back to 'Loading…' when caps + model are absent", () => {
@@ -261,8 +299,9 @@ describe("MultiProviderModelPicker — trigger", () => {
     const trigger = screen.getByTestId("multi-provider-model-picker-trigger");
     expect(trigger).toHaveTextContent("Claude Opus 4.7");
     expect(trigger).not.toHaveTextContent("default");
-    expect(trigger).toHaveAttribute(
-      "title",
+    cleanup();
+    renderPicker({ provider: "claude", model: "default", iconOnly: true });
+    expect(triggerTooltip()).toHaveTextContent(
       "Claude Opus 4.7 · Opus 4.8 with 1M context · Best for everyday, complex tasks",
     );
   });
@@ -321,21 +360,24 @@ describe("MultiProviderModelPicker — model descriptions", () => {
     expect(subtitle!).toHaveAttribute("title", "Claude");
   });
 
-  it("surfaces the active model's description in the trigger tooltip", () => {
-    renderPicker({ provider: "claude", model: "claude-opus-4-7" });
-    expect(
-      screen.getByTestId("multi-provider-model-picker-trigger"),
-    ).toHaveAttribute(
-      "title",
+  it("surfaces the active model's description in the icon-only tooltip", () => {
+    renderPicker({ provider: "claude", model: "claude-opus-4-7", iconOnly: true });
+    expect(triggerTooltip()).toHaveTextContent(
       "Claude Opus 4.7 · Opus 4.8 with 1M context · Best for everyday, complex tasks",
     );
   });
 
+  it("keeps the trigger tooltip closed while the picker is open", async () => {
+    const user = userEvent.setup();
+    renderPicker({ iconOnly: true });
+    await openPicker(user);
+    fireEvent.focus(screen.getByTestId("multi-provider-model-picker-trigger"));
+    expect(screen.queryByRole("tooltip")).toBeNull();
+  });
+
   it("trigger tooltip is just the label when the active model has no description", () => {
-    renderPicker({ provider: "claude", model: "claude-haiku-4-5" });
-    expect(
-      screen.getByTestId("multi-provider-model-picker-trigger"),
-    ).toHaveAttribute("title", "Claude Haiku 4.5");
+    renderPicker({ provider: "claude", model: "claude-haiku-4-5", iconOnly: true });
+    expect(triggerTooltip()).toHaveTextContent(/^Claude Haiku 4\.5$/);
   });
 });
 
