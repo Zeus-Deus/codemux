@@ -188,10 +188,11 @@ shell offers **Open in side panel** only while that pane is registered.
 `PeekRenderProps` supplies `workspaceId`, `size: { width, height }`, `close()`
 and `onStatusChange(status, label?)`. Status is `"live" | "connecting" | "stale"
 | "error"`; it starts as `connecting`. A label overrides the dot's accessible
-name and tooltip. Late status callbacks from a previous open are ignored.
+name and tooltip. Late `close` and status callbacks from a previous open are ignored.
 
 `host.peek.open` defaults to the active workspace and never switches it.
-`toggle` closes an already open id; `close` affects only its named id.
+`toggle` closes an already open id; `host.peek.close(id)` closes the current
+view with that id. Use the render's `close()` for async work tied to one open.
 `subscribe` reports subsequent plugin-view changes and is owner-cleaned like
 other host subscriptions. Browser opening reports `null`. Only size persists;
 views remain closed after restart.

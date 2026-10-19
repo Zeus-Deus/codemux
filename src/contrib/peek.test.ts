@@ -84,3 +84,15 @@ it("does not let an old incarnation close its replacement's view", () => {
   expect(current.isOpen("demo:live")).toBe(true);
   expect(old.toggle("demo:live")).toBe(false);
 });
+
+it("lets a live owner's explicit close target the current open after reopening", () => {
+  const peek = api();
+  peek.open("demo:live");
+  const original = useBrowserPeekStore.getState().pluginPeek;
+  peek.close("demo:live");
+  peek.open("demo:live");
+  expect(useBrowserPeekStore.getState().pluginPeek).not.toBe(original);
+  expect(peek.isOpen("demo:live")).toBe(true);
+  peek.close("demo:live");
+  expect(peek.isOpen("demo:live")).toBe(false);
+});

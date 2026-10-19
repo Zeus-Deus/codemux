@@ -21,14 +21,18 @@ export function PluginPeekOverlay() {
     if (generation !== undefined) useBrowserPeekStore.getState().setPluginStatus(generation, status, label);
   }, [generation]);
   useEffect(() => {
-    if (peek && peek.workspaceId !== workspaceId) useBrowserPeekStore.getState().closePlugin(peek.id);
+    const store = useBrowserPeekStore.getState();
+    if (peek && peek.workspaceId !== workspaceId && store.pluginPeek?.generation === peek.generation) store.closePlugin(peek.id);
   }, [peek, workspaceId]);
   let content: PeekContent | null = null;
   if (peek && workspaceId === peek.workspaceId && contribution?.render) {
     const render = contribution.render;
     const data = contribution.data as PeekData | undefined;
     const Icon = data?.icon;
-    const close = () => useBrowserPeekStore.getState().closePlugin(peek.id);
+    const isCurrent = () => useBrowserPeekStore.getState().pluginPeek?.generation === peek.generation;
+    const close = () => {
+      if (isCurrent()) useBrowserPeekStore.getState().closePlugin(peek.id);
+    };
     const dockPane = panes.find((c) => c.id === data?.dockPaneId && c.source === contribution.source);
     content = {
       id: peek.id,
@@ -42,7 +46,7 @@ export function PluginPeekOverlay() {
       statusLabel: peek.statusLabel,
       close,
       available: () => registry.getArea(PEEK_AREA).includes(contribution),
-      dock: dockPane ? () => { if (host.openRightPane(dockPane.id)) close(); } : undefined,
+      dock: dockPane ? () => { if (isCurrent() && host.openRightPane(dockPane.id)) close(); } : undefined,
       render: ({ size }) => <ContribBoundary id={contribution.id} variant="block">
         <ContribRender<PeekRenderProps> render={render} props={{ workspaceId, size, close, onStatusChange }} />
       </ContribBoundary>,

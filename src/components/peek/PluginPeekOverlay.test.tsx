@@ -112,6 +112,21 @@ it("drops unloaded bodies immediately instead of retaining them for exit animati
   expect(useBrowserPeekStore.getState().pluginPeek).toBeNull();
 });
 
+it("does not close a replacement opened while docking the previous view", () => {
+  register("demo:pane");
+  disposers.push(registry.register({ id: "demo:pane", area: RIGHT_PANEL_AREA, source: "plugin:demo" }));
+  show();
+  const original = useBrowserPeekStore.getState().pluginPeek;
+  state.dock.mockImplementationOnce(() => {
+    useBrowserPeekStore.getState().openPlugin("demo:live", "ws-1");
+    return true;
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Open in side panel" }));
+  expect(state.dock).toHaveBeenCalledWith("demo:pane");
+  expect(useBrowserPeekStore.getState().pluginPeek).not.toBeNull();
+  expect(useBrowserPeekStore.getState().pluginPeek).not.toBe(original);
+});
+
 it("never displays the old plugin alongside a replacement browser peek", () => {
   register();
   show();
@@ -133,6 +148,23 @@ it("closes on workspace switch and ignores callbacks from an earlier open", () =
   view.rerender(<TooltipProvider><PluginPeekOverlay /></TooltipProvider>);
   expect(useBrowserPeekStore.getState().pluginPeek).toBeNull();
   expect(screen.queryByRole("dialog")).toBeNull();
+});
+
+it.each(["reopen", "workspace switch", "plugin reload"])("ignores a retained close callback after %s", (kind) => {
+  const unload = register();
+  const view = show();
+  const oldClose = latest.close;
+  act(() => useBrowserPeekStore.getState().closePlugin("demo:live"));
+  if (kind === "plugin reload") act(() => { unload(); register(); });
+  if (kind === "workspace switch") state.workspaceId = "ws-2";
+  act(() => useBrowserPeekStore.getState().openPlugin("demo:live", state.workspaceId));
+  view.rerender(<TooltipProvider><PluginPeekOverlay /></TooltipProvider>);
+  const replacement = useBrowserPeekStore.getState().pluginPeek;
+  act(oldClose);
+  expect(useBrowserPeekStore.getState().pluginPeek).toBe(replacement);
+  expect(screen.getByRole("dialog", { name: "Unity preview" })).toBeInTheDocument();
+  act(() => latest.close());
+  expect(useBrowserPeekStore.getState().pluginPeek).toBeNull();
 });
 
 it.each(["app", "OS"])("skips exit motion with %s reduced motion", (kind) => {
