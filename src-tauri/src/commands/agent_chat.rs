@@ -8443,17 +8443,16 @@ impl SubagentTracker {
             .is_some_and(ThreadSubagentState::review_pending)
     }
 
-    /// Whether agent work that the thread's settled parent turn delegated
-    /// may still be running. Unlike [`Self::delegated_work_holding_turn`],
-    /// the stall watchdog doesn't end it: silence is not death, and a fork
-    /// or provider switch would copy or stop the conversation under that
-    /// work. A terminal snapshot, a Stop, the next turn or session teardown
-    /// does.
+    /// Whether agent work the thread delegated may still be running.
+    /// Unlike [`Self::delegated_work_holding_turn`], neither the parent's
+    /// turn end nor the stall watchdog is consulted: a provider clears its
+    /// turn before that end reaches the app, and silence is not death,
+    /// while a fork or provider switch would copy or stop the conversation
+    /// under that work. A terminal snapshot, a Stop, the next turn or
+    /// session teardown ends it.
     pub fn delegated_work_live(&self, thread_id: &str) -> bool {
         let threads = self.threads.lock().expect("subagent tracker poisoned");
-        threads
-            .get(thread_id)
-            .is_some_and(|state| state.turn_settled && state.has_agents())
+        threads.get(thread_id).is_some_and(ThreadSubagentState::has_agents)
     }
 
     /// Drop `thread_id`'s watch-loop tasks and report the status the pane

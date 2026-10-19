@@ -512,6 +512,24 @@ mod tests {
         Arc<MockAgentProvider>,
         tempfile::TempDir,
     ) {
+        let (app, provider, root) = parent_running_subagent(thread).await;
+        // Claude yields to wait on the Task it spawned.
+        forward_event(app.handle(), ProviderRuntimeEvent::TurnCompleted {
+            thread_id: ThreadId(thread.into()),
+            turn_id: TurnId("parent-turn".into()),
+            status: TurnStatus::Success,
+            usage: None,
+        });
+        (app, provider, root)
+    }
+
+    /// A live Claude chat with a running subagent and no turn of its own:
+    /// the provider has cleared it, but its end hasn't been forwarded yet.
+    async fn parent_running_subagent(thread: &str) -> (
+        tauri::App<tauri::test::MockRuntime>,
+        Arc<MockAgentProvider>,
+        tempfile::TempDir,
+    ) {
         let app = tauri::test::mock_app();
         let root = tempfile::tempdir().unwrap();
         let state = AppStateStore::default();
@@ -535,21 +553,13 @@ mod tests {
         let provider = Arc::new(MockAgentProvider::new(ProviderKind::Claude));
         app.state::<ProviderRegistry>().set_claude(provider.clone()).await;
         provider.start_session(start_input(thread, root.path())).await.unwrap();
-        let thread_id = ThreadId(thread.into());
         forward_event(app.handle(), ProviderRuntimeEvent::SubagentUpdated {
-            thread_id: thread_id.clone(),
+            thread_id: ThreadId(thread.into()),
             subagent: SubagentSnapshot {
                 subagent_id: "child".into(),
                 status: SubagentStatus::Running,
                 ..Default::default()
             },
-        });
-        // Claude yields to wait on the Task it spawned.
-        forward_event(app.handle(), ProviderRuntimeEvent::TurnCompleted {
-            thread_id,
-            turn_id: TurnId("parent-turn".into()),
-            status: TurnStatus::Success,
-            usage: None,
         });
         (app, provider, root)
     }
@@ -611,6 +621,26 @@ mod tests {
         let error = switch().await.unwrap_err();
         assert!(!error.starts_with("provider_switch_refused: "), "{error}");
         assert_eq!(stops(&provider), 1);
+    }
+
+    /// Claude clears its turn before its end reaches the app: in between,
+    /// the provider is idle but the subagent already runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subagent_blocks_fork_and_switch_before_the_parent_turn_end_arrives() {
+        const THREAD: &str = "handoff-parent";
+        let (app, provider, root) = parent_running_subagent(THREAD).await;
+        let refused = agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await;
+        assert_eq!(refused.unwrap_err(), "Wait for the chat's subagents to finish, then fork the chat.");
+        let switched = super::super::provider_switch::agent_chat_switch_provider(
+            app.handle().clone(),
+            "pane".into(),
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            start_input(THREAD, root.path()),
+            None,
+        );
+        assert!(switched.await.unwrap_err().starts_with("provider_switch_refused: Wait for the chat's subagents"));
+        assert_eq!(stops(&provider), 0);
     }
 
     /// The stall watchdog settles the pane of a subagent silent for ten
