@@ -235,9 +235,9 @@ cancels in-flight calls. `await dispose()` is safe to call manually and resolves
 only after the stdio child has exited and in-flight calls have ended. Status
 moves through `stopping`, then `stopped` only after confirmed exit. Default
 `shutdown: "graceful"` closes stdin and permits two seconds before killing the
-child. `shutdown: "immediate"` skips that grace: on Linux it immediately kills
-the owned process group; on other platforms it terminates the owned child.
-Linux is live-tested; macOS and Windows are not. Cleanup
+child. `shutdown: "immediate"` skips that grace: on Linux and macOS it immediately kills
+the owned process group. Windows currently terminates only the direct child;
+wrapper descendants are not contained. Linux is live-tested; macOS and Windows are not. Cleanup
 still runs if the plugin unloads before `registerMcpServer` resolves. Registrations
 are ephemeral; server disable switches use stable plugin + local-server ids and
 survive reloads and app restarts. Settings → MCP labels each server with its plugin
@@ -259,14 +259,14 @@ provider schemas, live lists and plugin UI lists see the same description.
 Limits: 128 entries, 2,000 UTF-8 bytes per append/replace, and 16 KiB total for
 keys plus text. Prefer short instructions for the specific tools that need them.
 
-`toolPrefix` has 1–32 ASCII letters, digits, underscores or dashes. Registrations
+`toolPrefix` has 1–32 ASCII letters, digits, underscores or dashes. `mcp` and prefixes starting with `codemux` are reserved (case-insensitive). Registrations
 may share it when their workspace scopes are disjoint. Models see
 `<toolPrefix>__<rawToolName>` (Claude adds `mcp__codemux__`). Registry names
 are bounded to 50 ASCII letters, digits, underscores or dashes, reserving 14
 characters for that observed Claude envelope so full provider names fit 64.
 If replacement or truncation is necessary, the name is truncated to 37 characters and suffixed with `_` plus 12 SHA-256 hex characters
 of the complete original name. A collision visible in one workspace is refused.
-HTTP URLs must explicitly use http(s), without embedded credentials or fragments.
+HTTP URLs require HTTPS outside loopback, without embedded credentials or fragments. Loopback bypasses environment proxies; MCP HTTP clients do not follow redirects. Settings listings redact environment and header values.
 Commands/args are argv, never shell text. `cwd` must be absolute. Env/headers are
 bounded to 128 entries and 64 KiB total (16 KiB per value).
 
@@ -283,8 +283,13 @@ ctx.host.mcp.onActivity("editor-project-a", (event) => {
 The runtime follows all `tools/list` pages and re-lists on
 `notifications/tools/list_changed`. Claude refreshes its live SDK server; the
 HTTP gateway emits the same notification to connected clients. Claude catalog
-swaps wait until the current turn ends, preserving in-flight tool results. Plugins loaded
-after a chat starts use those same paths.
+swaps wait until the current turn ends, preserving in-flight tool results.
+Claude also receives `codemux_list_plugin_tools` and `codemux_call_plugin_tool`:
+use them when an Editor or another integration connects during the current turn,
+while its newly added tools are absent from ToolSearch. Native refresh remains
+available at the next safe boundary. The list marks tools already in this
+session's native snapshot with `directlyCallable`. Plugins loaded
+after a chat starts use those same paths. OpenCode chats see only globally scoped plugin tools in this PR; workspace scoping for OpenCode follows in the gateway-identity PR.
 
 **Codex:** its installed 0.162.1 app-server fixed dynamic schemas at thread start
 in our probe. HTTP MCP notification/reload attempts did not update that running
