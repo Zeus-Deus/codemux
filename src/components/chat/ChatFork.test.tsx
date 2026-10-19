@@ -45,5 +45,11 @@ describe("useChatForkOrigin", () => {
     act(() => events.merged?.({ survivor: "reopened", merged: ["fork"] }));
     await waitFor(() => expect(result.current).toEqual(origin));
     expect(commands.agentChatForkOrigin).toHaveBeenLastCalledWith("reopened");
+
+    // Its source reopened in another pane: the link must follow it.
+    const moved = { ...origin, source_thread_id: "source-reopened" };
+    commands.agentChatForkOrigin.mockResolvedValue(moved);
+    act(() => events.merged?.({ survivor: "source-reopened", merged: ["source"] }));
+    await waitFor(() => expect(result.current).toEqual(moved));
   });
 });

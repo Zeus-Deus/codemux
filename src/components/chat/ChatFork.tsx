@@ -240,17 +240,21 @@ async function openOriginal(threadId: string): Promise<void> {
 }
 
 /** This chat's fork origin, or `null` when it isn't a fork. Read again when
- *  a chat reopened from history is merged into this one: the pane is bound
- *  to its new thread before the lineage moves there. */
+ *  a reopen from history merges into this chat (the pane is bound to its
+ *  new thread before the lineage moves there) or merges its source away. */
 export function useChatForkOrigin(threadId: string | null): ChatForkOrigin | null {
   const [origin, setOrigin] = useState<{ threadId: string; origin: ChatForkOrigin | null } | null>(null);
   const [merges, setMerges] = useState(0);
+  const source = useRef<string | null>(null);
+  source.current = origin?.threadId === threadId ? (origin.origin?.source_thread_id ?? null) : null;
   useEffect(() => {
     if (!threadId) return;
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     onAgentChatSessionsMerged((payload) => {
-      if (payload.survivor === threadId) setMerges((count) => count + 1);
+      const ours = payload.survivor === threadId;
+      const ourSource = source.current !== null && payload.merged.includes(source.current);
+      if (ours || ourSource) setMerges((count) => count + 1);
     })
       .then((fn) => {
         if (cancelled) fn();
