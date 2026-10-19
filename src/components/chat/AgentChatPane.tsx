@@ -3159,7 +3159,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         try {
           await agentChatSetPermissionMode(provider, threadId, restore);
         } catch (err) {
-          toast.error(`Failed to leave plan mode: ${err}`);
+          toast.failure("Couldn't leave Plan mode", err);
           return;
         }
         setSessionLaunchMode(threadId, restore);

@@ -1084,11 +1084,18 @@ impl OpenCodeSession {
     /// Switch the native agent unless it is already applied. Returns whether
     /// OpenCode will queue a Plan mode reminder for the switch.
     async fn switch_native_agent(&self, agent: &'static str) -> Result<bool, ProviderError> {
-        let previous = *self.applied_agent.lock().await;
+        let mut previous = *self.applied_agent.lock().await;
+        let unknown = previous.is_none();
+        if unknown {
+            // A resumed session keeps whatever agent it last ran; leaving a
+            // native Plan queues a reminder too.
+            previous = self.native_agent().await;
+        }
         if previous == Some(agent) {
+            *self.applied_agent.lock().await = Some(agent);
             return Ok(false);
         }
-        if previous.is_none() && agent == "plan" {
+        if unknown && agent == "plan" {
             // OpenCode 2.0 starts a directory's Plan reminder listener lazily
             // and drops the switch that wakes it. Listing the directory's
             // agents starts it first.
@@ -1098,10 +1105,35 @@ impl OpenCodeSession {
         self.ensure_open()?;
         *self.applied_agent.lock().await = Some(agent);
         let reminder = agent == "plan" || previous == Some("plan");
-        if reminder {
+        // A running turn takes the reminder at its next step.
+        if reminder && !self.turn_active().await {
             self.reminder_pending.store(true, Ordering::Relaxed);
         }
         Ok(reminder)
+    }
+
+    /// The session's current native agent from its latest agent switch.
+    /// `None` when unknown, never switched (its default agent) or custom.
+    async fn native_agent(&self) -> Option<&'static str> {
+        let response = self
+            .http
+            .get(format!(
+                "{}/api/session/{}/message?type=agent-switched&order=desc&limit=1",
+                self.server_handle.base_url.trim_end_matches('/'),
+                urlencoding::encode(&self.provider_session_id.0)
+            ))
+            .basic_auth("opencode", Some(&self.server_handle.server_password))
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .ok()
+            .filter(|response| response.status().is_success())?;
+        let page: serde_json::Value = response.json().await.ok()?;
+        match page["data"][0]["agent"].as_str()? {
+            "plan" => Some("plan"),
+            "build" => Some("build"),
+            _ => None,
+        }
     }
 
     /// Best-effort: the directory comes from the client's default header.
@@ -1288,16 +1320,20 @@ impl OpenCodeSession {
             // resumed session. Compaction is agent-agnostic.
             if let Some(agent) = agent.filter(|_| !steer && !matches!(native, Some(("compact", _))))
             {
-                if self.switch_native_agent(agent).await? {
-                    self.wait_for_native_reminder().await;
-                    self.ensure_open()?;
-                }
+                self.switch_native_agent(agent).await?;
             }
             // OpenCode runs pending steers before queued prompts, so a queued
             // prompt after a switch would first get a reply to the mode
-            // reminder alone. Steering it batches both into one step.
+            // reminder alone. Steering it batches both into one step. A
+            // command's own execution takes the reminder instead.
             let reminder_pending =
-                !steer && native.is_none() && self.reminder_pending.swap(false, Ordering::Relaxed);
+                !steer && self.reminder_pending.swap(false, Ordering::Relaxed) && native.is_none();
+            if reminder_pending {
+                // OpenCode queues it asynchronously; a prompt sent right after
+                // the toggle can still overtake it.
+                self.wait_for_native_reminder().await;
+                self.ensure_open()?;
+            }
             let files: Vec<_> = prompt
                 .parts
                 .iter()
@@ -3000,9 +3036,8 @@ pub(crate) mod tests {
         .await
         .expect("OpenCode session should start");
         for (agent, word) in [("plan", "one"), ("build", "two")] {
+            // Send right after toggling: the reminder is queued asynchronously.
             session.select_agent(agent).await.unwrap();
-            // The user types the next prompt after toggling the mode.
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             let turn = session
                 .send_turn(
                     format!("Reply with just the word {word}."),
@@ -3510,6 +3545,14 @@ pub(crate) mod tests {
         .await;
         session.select_agent("plan").await.unwrap();
         agent.assert_async().await;
+        // An immediate send still waits for the asynchronous reminder.
+        let inbox = server
+            .mock("GET", "/api/session/s/inbox")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"r","type":"synthetic","delivery":"steer"}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
         let steered = server
             .mock("POST", "/api/session/s/prompt")
             .match_body(mockito::Matcher::PartialJson(
@@ -3525,7 +3568,102 @@ pub(crate) mod tests {
             .await
             .unwrap();
         steered.assert_async().await;
+        inbox.assert_async().await;
         assert!(!session.reminder_pending.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn resumed_native_plan_is_left_with_a_batched_reminder() {
+        let mut server = Server::new_async().await;
+        let _current = server
+            .mock("GET", "/api/session/s/message")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "type".into(),
+                "agent-switched".into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"m","type":"agent-switched","agent":"plan"}]}"#)
+            .create_async()
+            .await;
+        let build = server
+            .mock("POST", "/api/session/s/agent")
+            .match_body(mockito::Matcher::Json(serde_json::json!({"agent":"build"})))
+            .with_status(204)
+            .create_async()
+            .await;
+        let _inbox = server
+            .mock("GET", "/api/session/s/inbox")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"r","type":"synthetic","delivery":"steer"}]}"#)
+            .create_async()
+            .await;
+        let steered = server
+            .mock("POST", "/api/session/s/prompt")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"delivery":"steer"}),
+            ))
+            .expect(2)
+            .with_status(200)
+            .with_body(r#"{"data":{"id":"u","sessionID":"s","type":"user"}}"#)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        // A resumed session's first turn reconciles to build.
+        *session.agent.lock().await = Some("build");
+        session
+            .send_turn("hi".into(), vec![], None, None)
+            .await
+            .unwrap();
+        build.assert_async().await;
+        steered.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn native_agent_already_selected_is_not_switched() {
+        let mut server = Server::new_async().await;
+        let _current = server
+            .mock("GET", "/api/session/s/message")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"m","type":"agent-switched","agent":"build"}]}"#)
+            .create_async()
+            .await;
+        let agent = server
+            .mock("POST", "/api/session/s/agent")
+            .expect(0)
+            .create_async()
+            .await;
+        let queued = server
+            .mock("POST", "/api/session/s/prompt")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"delivery":"queue"}),
+            ))
+            .expect(2)
+            .with_status(200)
+            .with_body(r#"{"data":{"id":"u","sessionID":"s","type":"user"}}"#)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        *session.agent.lock().await = Some("build");
+        session
+            .send_turn("hi".into(), vec![], None, None)
+            .await
+            .unwrap();
+        agent.assert_async().await;
+        queued.assert_async().await;
+        assert_eq!(*session.applied_agent.lock().await, Some("build"));
     }
 
     #[tokio::test]
