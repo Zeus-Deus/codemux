@@ -607,7 +607,7 @@ export function MultiProviderModelPicker({
                         iconOnly ? FOOTER_TRIGGER_ICON_ONLY : "min-w-[60px] shrink",
                       ),
                   showReveal && [
-                    "relative z-10 transition-[color,background-color,margin] duration-200 ease-out motion-reduce:transition-none",
+                    "relative z-10 transition-[color,background-color,margin] duration-150 ease-out motion-reduce:transition-none",
                     "hover:-ml-(--model-reveal-w) focus-visible:-ml-(--model-reveal-w) data-[state=open]:-ml-(--model-reveal-w)",
                     // Opaque, so the open pill covers what it overlaps: the
                     // hover tint over the surface the pill sits on.
@@ -639,7 +639,7 @@ export function MultiProviderModelPicker({
                           ref={revealRef}
                           data-testid="multi-provider-model-picker-reveal"
                           className={cn(
-                            "inline-flex w-0 shrink-0 overflow-hidden whitespace-nowrap opacity-0 transition-[width,opacity] duration-200 ease-out motion-reduce:transition-none",
+                            "inline-flex w-0 shrink-0 overflow-hidden whitespace-nowrap opacity-0 transition-[width,opacity] duration-150 ease-out motion-reduce:transition-none",
                             "group-hover/model:w-(--model-reveal-w) group-hover/model:opacity-70",
                             "group-focus-visible/model:w-(--model-reveal-w) group-focus-visible/model:opacity-70",
                             "group-data-[state=open]/model:w-(--model-reveal-w) group-data-[state=open]/model:opacity-70",
