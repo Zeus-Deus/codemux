@@ -785,6 +785,7 @@ impl CodexSession {
             }
         };
         let codex_thread_id = thread.thread_id().to_string();
+        let resumed_plan = thread.plan_mode();
         // A chat that names no model runs on Codex's configured default. Keep
         // the model Codex reports, since each turn's runtime identity and tool
         // guidance ride on collaboration-mode settings, which require one.
@@ -829,7 +830,10 @@ impl CodexSession {
             managed: managed.clone(),
             host_caller,
             guidance: dynamic_tools.as_deref().and_then(developer_guidance),
-            plan_mode: AtomicBool::new(false),
+            // A resumed thread continues in its last turn's mode until a
+            // composer send names one, so restart auto-resume, and answers
+            // given right after a rebuild, keep an interrupted Plan task in Plan.
+            plan_mode: AtomicBool::new(resumed_plan),
         });
 
         // Emit SessionConfigured up front so subscribers see the thread

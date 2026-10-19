@@ -210,6 +210,10 @@ pub enum ThreadStartResponse {
         /// own config when the request names none.
         #[serde(default)]
         model: Option<String>,
+        /// The thread's effective collaboration mode: on `thread/resume`, the
+        /// mode its last turn ran in. Absent from older servers.
+        #[serde(default, rename = "collaborationMode")]
+        collaboration_mode: Option<ReportedCollaborationMode>,
     },
     /// Legacy shape: flat `threadId` string.
     Flat {
@@ -236,6 +240,21 @@ impl ThreadStartResponse {
             Self::Flat { .. } => None,
         }
     }
+
+    /// Whether the thread's last turn ran in Codex's `plan` collaboration
+    /// mode, as reported when it is resumed.
+    pub fn plan_mode(&self) -> bool {
+        matches!(
+            self,
+            Self::Nested { collaboration_mode: Some(mode), .. } if mode.mode == "plan"
+        )
+    }
+}
+
+/// The part of a reported collaboration mode Codemux reads.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReportedCollaborationMode {
+    pub mode: String,
 }
 
 /// Nested thread info inside [`ThreadStartResponse::Nested`].

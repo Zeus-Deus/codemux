@@ -19,7 +19,8 @@ for line in sys.stdin:
  with (root/'wire.jsonl').open('a') as f: f.write(json.dumps(m)+'\n')
  if 'id' not in m or method is None: continue
  if method=='account/read': result={'account':None,'requiresOpenaiAuth':False}
- elif method in ['thread/start','thread/resume']: result={'thread':{'id':'fixture-thread'},'model':'fixture-model'}
+ elif method=='thread/start': result={'thread':{'id':'fixture-thread'},'model':'fixture-model'}
+ elif method=='thread/resume': result={'thread':{'id':'fixture-thread'},'model':'fixture-model','collaborationMode':{'mode':'plan','settings':{'model':'fixture-model'}}}
  elif method=='thread/read': result={'thread':{'id':'fixture-thread','turns':[]}}
  elif method=='turn/start':
   count+=1;result={'turn':{'id':'turn-'+str(count),'status':'inProgress'}}
@@ -150,5 +151,30 @@ async fn the_plan_pill_on_each_send_picks_the_turns_collaboration_mode() {
         .set_permission_mode(thread.clone(), "plan".into())
         .await
         .is_err());
+    let _ = provider.stop_session(thread).await;
+}
+
+#[tokio::test]
+async fn a_resumed_plan_thread_continues_in_plan_until_a_send_names_a_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = CodexAgentProvider::new(CodexProviderConfig {
+        codex_binary: fixture_binary(dir.path()),
+        ..Default::default()
+    });
+    let thread = ThreadId("resumed".into());
+    let mut input = start_input(dir.path(), &thread);
+    // Restart auto-resume reopens the thread, which Codex reports in Plan, and
+    // sends its continuation without a mode.
+    input.resume_cursor = Some(json!({"threadId": "fixture-thread"}));
+    provider.start_session(input).await.unwrap();
+    send(&provider, &thread, None).await;
+    send(&provider, &thread, Some("danger-full-access")).await;
+
+    let modes: Vec<_> = wire(dir.path())
+        .into_iter()
+        .filter(|(method, _)| method == "turn/start")
+        .map(|(_, mode)| mode.unwrap())
+        .collect();
+    assert_eq!(modes, ["plan", "default"]);
     let _ = provider.stop_session(thread).await;
 }
