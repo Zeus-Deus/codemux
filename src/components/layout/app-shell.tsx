@@ -389,10 +389,10 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
               </LazyBoundary>
             </div>
           )}
-          {/* GUI-mode background browser peek — absolutely positioned
+          {/* Shared browser/plugin peek — absolutely positioned
               inside this `relative` SidebarInset, so it floats over
-              WorkspaceMain without resizing it. Renders nothing unless
-              GUI chrome applies and the peek is explicitly opened. */}
+              WorkspaceMain without resizing it. Browser views retain their
+              GUI-chrome gate; plugin views open through host.peek. */}
           {(browserPeekOpen || browserPeekMounted) && !utilityPage && (
             <LazyBoundary
               label="browser peek"

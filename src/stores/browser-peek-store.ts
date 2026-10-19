@@ -44,12 +44,12 @@ function validPeekSize(value: unknown): PeekSize {
 }
 
 /**
- * Peek-overlay state for the GUI-mode background browser.
+ * Shared transient state for browser and plugin peeks.
  *
- * A single `openWorkspaceId` (not a per-workspace map): the peek is a
+ * One browser or plugin peek (not a per-workspace map): the peek is a
  * transient "look at this now" affordance, so at most one can be open and
  * it must not silently re-open when the user later returns to a workspace
- * where it was left open. `BrowserPeekOverlay` additionally closes the peek
+ * where it was left open. The shell additionally closes the peek
  * whenever the active workspace changes, so switching away always dismisses
  * it. Only the user's chosen `size` is persisted; open state never is.
  */

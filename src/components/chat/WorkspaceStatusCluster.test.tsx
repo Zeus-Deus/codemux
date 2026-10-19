@@ -68,6 +68,8 @@ vi.mock("./PrWatchChip", () => ({
 import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
 import { toast } from "@/lib/toast";
 import { useBrowserPeekStore } from "@/stores/browser-peek-store";
+import { registry } from "@/contrib/registry";
+import { COMPOSER_STATUS_AREA } from "@/sdk/areas";
 
 function makeWorkspace(
   overrides: Partial<WorkspaceSnapshot> = {},
@@ -134,6 +136,20 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("WorkspaceStatusCluster", () => {
+  it("mounts plugin status inside the existing compact cluster with workspace and thread props", () => {
+    mocks.workspace = makeWorkspace();
+    const off = registry.register({
+      id: "demo:status", area: COMPOSER_STATUS_AREA,
+      render: ({ workspaceId, threadId }: { workspaceId: string; threadId: string | null }) =>
+        <button type="button">{workspaceId}:{threadId}</button>,
+    });
+    try {
+      const view = render(<WorkspaceStatusCluster threadId="thread-1" />);
+      expect(screen.getByRole("button", { name: "ws-1:thread-1" }).parentElement).toBe(view.container.firstElementChild);
+      expect(view.container.children).toHaveLength(1);
+    } finally { cleanup(); off(); }
+  });
+
   it("keeps the pane's watch chip without a PR badge", () => {
     // A watch is pinned to its PR; after the workspace loses the association
     // (e.g. back on the default branch) its stop control must remain.

@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 // ── Mutable mock state ──
 let hasWorkspacesFlag = false;
+let activeWorkspaceIdFlag = "ws-1";
 let enableLazyFlag = false;
 let enableAgentChatFlag = false;
 let flagsLoadedFlag = true;
@@ -105,6 +106,7 @@ vi.mock("@/components/ui/sidebar", () => ({
 }));
 
 vi.mock("@/stores/app-store", () => ({
+  useActiveWorkspaceId: () => hasWorkspacesFlag ? activeWorkspaceIdFlag : null,
   useAppStore: Object.assign(
     vi.fn((selector: (s: unknown) => unknown) =>
       selector({
@@ -212,6 +214,7 @@ vi.mock("@/lib/idle-prefetch", () => ({
 }));
 
 import { AppShell } from "./app-shell";
+import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 
 afterEach(() => {
   cleanup();
@@ -219,7 +222,9 @@ afterEach(() => {
 });
 
 function resetMockState() {
+  useBrowserPeekStore.getState().closeAll();
   hasWorkspacesFlag = false;
+  activeWorkspaceIdFlag = "ws-1";
   enableLazyFlag = false;
   enableAgentChatFlag = false;
   flagsLoadedFlag = true;
@@ -245,6 +250,18 @@ function resetMockState() {
 
 describe("AppShell rendering gates", () => {
   beforeEach(resetMockState);
+
+  it("mounts the shared overlay for a plugin and closes it on workspace switch even in Settings", async () => {
+    hasWorkspacesFlag = true;
+    useBrowserPeekStore.getState().openPlugin("demo:live", "ws-1");
+    const view = render(<AppShell />);
+    expect(await view.findByTestId("browser-peek-overlay")).toBeInTheDocument();
+    showSettingsFlag = true;
+    view.rerender(<AppShell />);
+    activeWorkspaceIdFlag = "ws-2";
+    view.rerender(<AppShell />);
+    expect(useBrowserPeekStore.getState().pluginPeek).toBeNull();
+  });
 
   it("keeps the import overlay mounted across the first-workspace emission and Settings", async () => {
     showImportFlag = true;

@@ -682,7 +682,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         </div>
       </div>
 
-      <TitlebarActions className="absolute top-1 z-20 h-8" style={{ right: panelClusterRight(remoteClient, remPx) - 4 }} />
+      <TitlebarActions floating className="fixed top-1 z-40 h-8 rounded-md bg-card" style={{ right: panelClusterRight(remoteClient, remPx) - 4 }} />
 
       {/* Panel controls. Fixed to the window's top-right corner, just inside
           the native buttons — the one cluster in this band whose position

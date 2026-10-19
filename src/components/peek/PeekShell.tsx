@@ -1,8 +1,9 @@
 import { PanelRightOpen, X } from "lucide-react";
-import { useEffect, useRef, useState, type CSSProperties, type ReactNode, type ComponentType } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { PanelHeader } from "@/components/ui/panel-header";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { selectReduceMotion, useSettingsStore } from "@/stores/settings-store";
 import { clampPeekSize, useBrowserPeekStore, type PeekSize, type PeekStatusKind } from "@/stores/browser-peek-store";
 import { PeekStatus } from "./PeekStatus";
 
@@ -11,7 +12,7 @@ export interface PeekContent {
   workspaceId: string;
   title: string;
   ariaLabel: string;
-  icon?: ComponentType<{ className?: string }>;
+  icon?: ReactNode;
   status: PeekStatusKind;
   statusLabel?: string;
   close: () => void;
@@ -34,6 +35,8 @@ export function PeekShell({ content, workspaceId, allowExit = true }: {
   allowExit?: boolean;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
+  const resizeCleanup = useRef<(() => void) | null>(null);
+  const appReducedMotion = useSettingsStore(selectReduceMotion);
   const lastShown = useRef<PeekContent | null>(null);
   if (content) lastShown.current = content;
   else if (lastShown.current?.workspaceId !== workspaceId || !allowExit || lastShown.current?.available?.() === false) lastShown.current = null;
@@ -43,6 +46,13 @@ export function PeekShell({ content, workspaceId, allowExit = true }: {
   const setStoredSize = useBrowserPeekStore((s) => s.setSize);
   const [dragSize, setDragSize] = useState<PeekSize | null>(null);
   const [winSize, setWinSize] = useState<PeekSize>(windowSize);
+  useEffect(() => {
+    setDragSize(null);
+    return () => {
+      resizeCleanup.current?.();
+      resizeCleanup.current = null;
+    };
+  }, [open, content?.id, workspaceId]);
   useEffect(() => {
     if (open) { setExitDone(false); return; }
     const timer = setTimeout(() => { lastShown.current = null; setExitDone(true); }, EXIT_MS);
@@ -74,13 +84,13 @@ export function PeekShell({ content, workspaceId, allowExit = true }: {
     document.addEventListener("pointerdown", onPointerDown);
     return () => document.removeEventListener("pointerdown", onPointerDown);
   }, [close]);
-  const shown = content ?? (!exitDone && !reducedMotion() ? lastShown.current : null);
+  const shown = content ?? (!exitDone && !appReducedMotion && !reducedMotion() ? lastShown.current : null);
   if (!shown) return null;
   const size = clampPeekSize(dragSize ?? storedSize, winSize);
-  const Icon = shown.icon;
   const startResize = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
     e.preventDefault();
+    resizeCleanup.current?.();
     const handle = e.currentTarget;
     const origin = { x: e.clientX, y: e.clientY, ...size };
     let latest = size;
@@ -89,16 +99,26 @@ export function PeekShell({ content, workspaceId, allowExit = true }: {
       latest = clampPeekSize({ width: origin.width + origin.x - ev.clientX, height: origin.height + ev.clientY - origin.y }, windowSize());
       setDragSize(latest);
     };
-    const onEnd = () => {
+    const cleanup = () => {
       handle.removeEventListener("pointermove", onMove);
       handle.removeEventListener("pointerup", onEnd);
       handle.removeEventListener("pointercancel", onEnd);
+      handle.removeEventListener("lostpointercapture", onEnd);
+      try {
+        if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId);
+      } catch { /* The element or pointer may already be gone. */ }
+      resizeCleanup.current = null;
+    };
+    const onEnd = () => {
+      cleanup();
       setDragSize(null);
       setStoredSize(latest);
     };
+    resizeCleanup.current = cleanup;
     handle.addEventListener("pointermove", onMove);
     handle.addEventListener("pointerup", onEnd);
     handle.addEventListener("pointercancel", onEnd);
+    handle.addEventListener("lostpointercapture", onEnd);
   };
   return (
     <div ref={panelRef} role="dialog" aria-label={shown.ariaLabel} data-state={open ? "open" : "closed"}
@@ -111,7 +131,7 @@ export function PeekShell({ content, workspaceId, allowExit = true }: {
       )}>
       <PanelHeader>
         <PeekStatus status={shown.status} label={shown.statusLabel} />
-        {Icon && <Icon className="size-3.5 shrink-0 text-muted-foreground" />}
+        {shown.icon}
         <span className="min-w-0 flex-1 truncate rounded-md border border-border px-2 py-1 font-mono text-label text-muted-foreground">{shown.title}</span>
         {shown.dock && <Tooltip>
           <TooltipTrigger asChild>

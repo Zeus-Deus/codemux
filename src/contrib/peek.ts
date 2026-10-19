@@ -38,12 +38,17 @@ export function createPeekHost(
     const active = selectActiveWorkspaceId(useAppStore.getState());
     const workspaceId = options?.workspaceId ?? active;
     if (!workspaceId || workspaceId !== active || !registry.getArea(PEEK_AREA).some((c) => c.id === id && c.render)) return false;
-    if (!isOpen(id)) useBrowserPeekStore.getState().openPlugin(id, workspaceId);
+    const current = useBrowserPeekStore.getState().pluginPeek;
+    if (current?.id !== id || current.workspaceId !== workspaceId) {
+      useBrowserPeekStore.getState().openPlugin(id, workspaceId);
+    }
     return true;
   };
   return {
     open,
-    close: (id: string) => { useBrowserPeekStore.getState().closePlugin(id); },
+    close: (id: string) => {
+      if (!ownerNow()?.ended) useBrowserPeekStore.getState().closePlugin(id);
+    },
     toggle: (id: string, options?: { workspaceId?: string }): boolean => {
       if (ownerNow()?.ended) return false;
       if (isOpen(id)) { useBrowserPeekStore.getState().closePlugin(id); return true; }

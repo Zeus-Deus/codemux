@@ -25,7 +25,9 @@ export function PluginPeekOverlay() {
   }, [peek, workspaceId]);
   let content: PeekContent | null = null;
   if (peek && workspaceId === peek.workspaceId && contribution?.render) {
+    const render = contribution.render;
     const data = contribution.data as PeekData | undefined;
+    const Icon = data?.icon;
     const close = () => useBrowserPeekStore.getState().closePlugin(peek.id);
     const dockPane = panes.find((c) => c.id === data?.dockPaneId && c.source === contribution.source);
     content = {
@@ -33,14 +35,16 @@ export function PluginPeekOverlay() {
       workspaceId,
       title: contribution.title ?? "Preview",
       ariaLabel: `${contribution.title ?? "Plugin"} preview`,
-      icon: data?.icon,
+      icon: Icon ? <ContribBoundary id={`${contribution.id}:icon`}>
+        <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+      </ContribBoundary> : undefined,
       status: peek.status,
       statusLabel: peek.statusLabel,
       close,
       available: () => registry.getArea(PEEK_AREA).includes(contribution),
       dock: dockPane ? () => { if (host.openRightPane(dockPane.id)) close(); } : undefined,
       render: ({ size }) => <ContribBoundary id={contribution.id} variant="block">
-        <ContribRender<PeekRenderProps> render={contribution.render!} props={{ workspaceId, size, close, onStatusChange }} />
+        <ContribRender<PeekRenderProps> render={render} props={{ workspaceId, size, close, onStatusChange }} />
       </ContribBoundary>,
     };
   }

@@ -101,7 +101,8 @@ export function WindowControls() {
  */
 export function WindowChrome() {
   // On the web remote client there is no OS window to drag or control, so the
-  // whole strip (drag region + controls) is inert. Render nothing — callers
+  // drag region + window controls are inert; plugin actions still mount.
+  // With no contributions this renders nothing — callers
   // reserve the top spacing (`pt-7`) themselves, so layout stays stable and
   // the strip's `data-tauri-drag-region` overlay never becomes a click dead
   // zone in the browser. Desktop behavior is unchanged.

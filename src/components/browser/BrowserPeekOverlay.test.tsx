@@ -137,7 +137,7 @@ beforeEach(() => {
   mocks.dockBrowserInRightPanel.mockReset().mockResolvedValue(undefined);
   mocks.toastError.mockClear();
   useUIStore.setState({ rightPanelTabs: {}, rightPanelPanes: {} });
-  useBrowserPeekStore.setState({ openWorkspaceId: null, size: DEFAULT_PEEK_SIZE });
+  useBrowserPeekStore.setState({ openWorkspaceId: null, pluginPeek: null, size: DEFAULT_PEEK_SIZE });
 });
 
 afterEach(() => {
