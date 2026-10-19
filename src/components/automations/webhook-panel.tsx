@@ -59,6 +59,24 @@ function errorText(err: unknown): string {
   return typeof err === "string" ? err : err instanceof Error ? err.message : String(err);
 }
 
+/** The secret store's label limit, in UTF-8 bytes (`MAX_LABEL_LEN`). */
+const MAX_SECRET_LABEL_BYTES = 200;
+
+/** Label for an automation's signing secret: its name, cut to fit the
+ *  store's limit, then the automation id so a cut name stays traceable. */
+function webhookSecretLabel(automation: AutomationView): string {
+  const suffix = ` webhook (#${automation.id})`;
+  const encoder = new TextEncoder();
+  let budget = MAX_SECRET_LABEL_BYTES - encoder.encode(suffix).length;
+  let name = "";
+  for (const char of automation.name.trim()) {
+    budget -= encoder.encode(char).length;
+    if (budget < 0) break;
+    name += char;
+  }
+  return `${name.trimEnd()}${suffix}`;
+}
+
 const ENDPOINT_GROUPS: Record<string, string> = {
   this_device: "This device",
   local_network: "Local network",
@@ -384,7 +402,7 @@ function SignatureEditor({
     const oldSecret = automation.webhook?.secret_ref ?? null;
     let stored: SecretMeta | null = null;
     try {
-      stored = await secretsStore(`${automation.name} webhook`, secret);
+      stored = await secretsStore(webhookSecretLabel(automation), secret);
       // Drop the plaintext from component state as soon as it is stored.
       setSecret("");
       const updated = await automationsSetWebhookSignature(automation.id, {
