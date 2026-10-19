@@ -41,6 +41,12 @@ import {
 } from "@/lib/agent-chat/cursor-hydrate";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
 import {
+  QueuedTurnsList,
+  useQueuedTurnEditor,
+  useSavedQueueRestore,
+} from "@/components/chat/queued-turn-controls";
+import { withoutQueuedTurns } from "@/lib/agent-chat/queue-edits";
+import {
   enqueueAgentChatEvent,
   flushAgentChatEvents,
 } from "@/lib/agent-chat/event-batcher";
@@ -97,6 +103,7 @@ import {
 import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
 import {
   agentChatCancelQueuedTurn,
+  agentChatCancelSavedQueuedTurn,
   agentChatCancelUsageResume,
   agentChatResumeAfterUsageLimit,
   agentChatSendQueuedTurnNow,
@@ -178,7 +185,6 @@ import { ComposerStrip, type StripGoal } from "./ComposerStrip";
 import {
   approvalOccupant,
   queuedMessages,
-  queuedOccupant,
   sessionErrorOccupant,
   useDelegationOccupant,
   useMonitoringOccupant,
@@ -774,7 +780,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   }), [pane.pane_id, conversationWritable, openRemoteTask]);
   const chatWorkflowLinks = useWorkflowUIStore((state) => (threadId ? state.chatRuns[threadId] : undefined) ?? NO_CHAT_WORKFLOWS);
   const transcriptMessages = useMemo(
-    () => projectChatWorkflows(projectRemoteTasks(messages, remoteTasks.tasks), chatWorkflowLinks, threadId),
+    () => projectChatWorkflows(projectRemoteTasks(withoutQueuedTurns(messages), remoteTasks.tasks), chatWorkflowLinks, threadId),
     [messages, remoteTasks.tasks, chatWorkflowLinks, threadId],
   );
   const viewedRemoteTask = remoteTaskView?.threadId === threadId
@@ -899,6 +905,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // completion lifecycle cannot be invalidated by a mid-turn family switch.
   const grokConfigurationBusy =
     provider === "grok" && (transcriptStreaming || activeTurnId != null);
+  // Counts finished transcript replays (hydrate, revert), so work that must
+  // follow every replay (the saved queue) reruns for the same thread.
+  const [hydrationPass, setHydrationPass] = useState(0);
   const lastRevertRefreshRef = useRef<{
     key: string;
     promise: Promise<void>;
@@ -924,6 +933,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           runLive,
           provider,
         });
+        setHydrationPass((pass) => pass + 1);
         setSendAnchor(null);
         sendAnchorPositionedNonceRef.current = null;
       })();
@@ -1341,7 +1351,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     hydrateAttemptedRef.current = threadId;
     let cancelled = false;
     void hydrateThreadByCursor(threadId, provider, () => cancelled).finally(() => {
-      if (!cancelled) setHydratedThreadId(threadId);
+      if (!cancelled) {
+        setHydratedThreadId(threadId);
+        setHydrationPass((pass) => pass + 1);
+      }
       // Nonempty transcripts report readiness from their visible rows, not
       // this promise: the virtualizer can still be measuring hidden content.
       if (!cancelled && !useAgentChatStore.getState().threads[threadId]?.messages.length) {
@@ -1628,6 +1641,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     adoptPaneBinding,
   ]);
 
+  // A queued turn loaded into the composer for editing: the next submit
+  // saves onto it instead of sending.
+  const queueEditor = useQueuedTurnEditor({ threadId, provider });
   const handleSubmit = useCallback(
     (textOverride?: string, options?: { continueRun?: boolean }) => {
     // Synchronous ref check BEFORE any React state reads — closes the
@@ -1648,6 +1664,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // attachments; resuming a dead run should leave that draft + its chips
     // untouched and send a plain "Continue" with no images.
     const isContinue = options?.continueRun === true;
+      if (queueEditor.editingId && !isContinue && typeof textOverride !== "string") {
+        void queueEditor.save(draft);
+        return;
+      }
       const originalDraft = (typeof textOverride === "string" ? textOverride : draft).trim();
       const delivery = parseMessageDelivery(originalDraft);
       const rawText = delivery.text;
@@ -1997,6 +2017,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           // has no Running event yet, so the optimistic flag must settle now.
           sendInFlightRef.current = false;
           setIsSending(false);
+          // A queued turn waits in the queue list, not the transcript.
+          clearSendAnchor(clientNonce);
         }
         if (result.steered) toast.success("Guidance accepted", { description: "The agent will use it at its next safe opportunity." });
         // The turn was accepted, so the provider runtime is alive and
@@ -2059,6 +2081,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     paneWorkspaceId,
     model,
     workflowsAvailable,
+    queueEditor,
   ],
   );
 
@@ -2632,7 +2655,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleCancelQueued = useCallback(
     (queuedId: string) => {
       if (!threadId) return;
-      agentChatCancelQueuedTurn(provider, threadId, queuedId).catch((err) => {
+      // A saved turn (restored after a restart) is held by Codemux, not the provider.
+      const saved = useAgentChatStore.getState().threads[threadId]?.messages.some(
+        (m) => m.kind === "user_message" && m.queued?.queuedId === queuedId && m.queued.saved,
+      );
+      (saved
+        ? agentChatCancelSavedQueuedTurn(threadId, queuedId)
+        : agentChatCancelQueuedTurn(provider, threadId, queuedId)
+      ).catch((err) => {
         toast.error(`Failed to cancel queued message: ${err}`);
       });
     },
@@ -3866,6 +3896,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     onStop: handleStopMonitoring,
   });
   const queued = useMemo(() => queuedMessages(messages), [messages]);
+  useSavedQueueRestore(threadId, hydratedThreadId === threadId, hydrationPass);
   const errorOccupant = useMemo(
     () => sessionErrorOccupant(messages, transcriptStreaming),
     [messages, transcriptStreaming],
@@ -4016,6 +4047,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         : null,
     [conversationWritable, messages, handleRespond],
   );
+  // Composer shortcuts: steer with the first live queued turn, or load the
+  // newest queued turn into the composer.
+  const steerNextQueued = useCallback(() => {
+    const next = queued.find((m) => !m.queued?.saved);
+    if (!next?.queued || !conversationWritable || !capabilities?.supports_steering || !transcriptStreaming) {
+      return false;
+    }
+    handleSteerQueued(next.queued.queuedId);
+    return true;
+  }, [queued, conversationWritable, capabilities?.supports_steering, transcriptStreaming, handleSteerQueued]);
+  const editLastQueued = useCallback(() => {
+    const last = queued[queued.length - 1];
+    if (!last || !conversationWritable || queueEditor.editingId) return false;
+    queueEditor.begin(last);
+    return true;
+  }, [queued, conversationWritable, queueEditor]);
   const remoteTasksRow = conversationWritable &&
     remoteTasksOccupant(remoteTasks, () => void remoteTasks.retrySubscription());
   // A subagent drill-in keeps only the remote-task failure: the design shows
@@ -4035,9 +4082,25 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         monitoringOccupant,
         delegationOccupant,
         subagentOccupant,
-        queuedOccupant(queued, handleCancelQueued),
         remoteTasksRow,
       ]}
+      queue={
+        threadId && queued.length > 0 ? (
+          <QueuedTurnsList
+            threadId={threadId}
+            provider={provider}
+            queued={queued}
+            editor={queueEditor}
+            streaming={transcriptStreaming}
+            canSteer={conversationWritable && !!capabilities?.supports_steering}
+            onSteer={handleSteerQueued}
+            onInterrupt={handleSendQueuedNow}
+            onRemove={handleCancelQueued}
+            requestSendAnchor={requestSendAnchor}
+            clearSendAnchor={clearSendAnchor}
+          />
+        ) : null
+      }
     />
   );
 
@@ -4189,6 +4252,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       hasActiveGoal={hasGoal}
       zone1Override={zone1Override}
       renderContextRow={mobile ? undefined : renderContextRow}
+      onSteerNextQueued={steerNextQueued}
+      onEditLastQueued={editLastQueued}
+      submitHint={queueEditor.editingId ? "Enter to save the queued message · Esc to cancel" : null}
+      submitWhenEmpty={queueEditor.editingHasImages}
       stripSlot={conversationWritable ? stripEl : <>{stripEl}{conversationCheckNotice}</>}
       paneDragActive={paneDragDepth > 0}
       tasks={taskSummary}

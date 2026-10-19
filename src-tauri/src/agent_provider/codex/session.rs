@@ -16,6 +16,8 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex, RwLock};
 #[path="managed_runtime.rs"]
 mod managed_runtime;
+#[path="queue_edits.rs"]
+mod queue_edits;
 pub(crate) use managed_runtime::read_model_catalog;
 use tokio::task::JoinHandle;
 
@@ -250,10 +252,8 @@ pub(crate) struct QueuedTurn {
 
 /// Mint a queue id unique within this process.
 fn mint_queued_id() -> String {
-    format!(
-        "codex-queued-{}",
-        NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-    )
+    // Unique across app runs: the saved queue outlives this process.
+    format!("codex-queued-{}", uuid::Uuid::new_v4())
 }
 
 /// Move the queued turn with `queued_id` to the front of `queue` so it
@@ -909,12 +909,14 @@ impl CodexSession {
                 };
                 // Sent by hand while a Stop settles: it goes first and
                 // releases the held queue behind it once it starts.
-                if state.queue_hold.goes_first() {
+                let first = state.queue_hold.goes_first();
+                if first {
                     state.queued_turns.push_front(queued);
                     state.queue_hold.release_with(&queued_id);
                 } else {
                     state.queued_turns.push_back(queued);
                 }
+                let order = first.then(|| crate::agent_provider::queue_edit::reordered(&state.queued_turns, &self.thread_id));
                 drop(state);
                 let _ = self.event_tx().send(ProviderRuntimeEvent::TurnQueued {
                     thread_id: self.thread_id.clone(),
@@ -922,6 +924,9 @@ impl CodexSession {
                     client_nonce,
                     text,
                 });
+                if let Some(order) = order {
+                    let _ = self.event_tx().send(order);
+                }
                 return Ok(SendOutcome::Queued(queued_id));
             }
             // A message sent by hand goes first; the held queue follows it.
@@ -1303,6 +1308,9 @@ impl CodexSession {
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
                 Some(idx) => {
                     let previous = state.queue_hold.release_with(queued_id);
+                    if idx > 0 {
+                        let _ = self.event_tx().send(crate::agent_provider::queue_edit::reordered(&state.queued_turns, &self.thread_id));
+                    }
                     (state.active_turn.is_some(), idx, previous)
                 }
                 // Unknown / already-dispatched / cancelled — no-op.
@@ -1316,6 +1324,9 @@ impl CodexSession {
                     let mut state = self.state.lock().await;
                     restore_queued_position(&mut state.queued_turns, queued_id, original_index);
                     state.queue_hold.revert_release(queued_id, previous_release);
+                    if original_index > 0 {
+                        let _ = self.event_tx().send(crate::agent_provider::queue_edit::reordered(&state.queued_turns, &self.thread_id));
+                    }
                     Err(err)
                 }
             }

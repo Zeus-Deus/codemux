@@ -2698,6 +2698,36 @@ interface MockQueuedTurn {
   clientNonce: string | null;
 }
 const chatQueues = new Map<string, MockQueuedTurn[]>();
+// The saved queue: turns queued before a simulated restart, which no
+// provider holds. Seeded on the second chat so its pane shows a restore.
+const mockSavedQueues = new Map<string, MockQueuedTurn[]>([
+  [
+    MOCK_SECOND_CHAT_THREAD_ID,
+    [
+      {
+        queuedId: "mock-saved-1",
+        text: "After the refactor lands, run the full test suite and summarize any failures.",
+        clientNonce: "mock-saved-nonce-1",
+      },
+      {
+        queuedId: "mock-saved-2",
+        text: "Then update the changelog entry for the queue work.",
+        clientNonce: "mock-saved-nonce-2",
+      },
+    ],
+  ],
+]);
+
+/** Move `id` to just before `before` (or last), mirroring the backend. */
+function moveMockQueued(q: MockQueuedTurn[], id: string, before: string | null): boolean {
+  const from = q.findIndex((e) => e.queuedId === id);
+  if (from < 0) return false;
+  if (before === id) return true;
+  const [item] = q.splice(from, 1);
+  const to = before === null ? q.length : q.findIndex((e) => e.queuedId === before);
+  q.splice(to < 0 ? from : to, 0, item);
+  return true;
+}
 // The active streaming turn's interval id per thread, so a soft interrupt
 // (stop button / "Send now" steer) can end the turn early — mirroring the
 // real backend's `interrupt`, which preserves the session and transcript.
@@ -8293,6 +8323,72 @@ const handlers: Record<string, Handler> = {
     };
   },
   agent_chat_fork_origin: (a) => mockForkOrigins.get(a.threadId as string) ?? null,
+  agent_chat_list_queued_turns: (a) => {
+    const threadId = a.threadId as string;
+    const view = (saved: boolean) => (e: MockQueuedTurn) => ({
+      queued_id: e.queuedId,
+      text: e.text,
+      saved,
+      client_nonce: e.clientNonce ?? e.queuedId,
+      images: [],
+    });
+    return [
+      ...(mockSavedQueues.get(threadId) ?? []).map(view(true)),
+      ...(chatQueues.get(threadId) ?? []).map(view(false)),
+    ];
+  },
+  agent_chat_edit_queued_turn: (a) => {
+    const threadId = a.threadId as string;
+    const text = String(a.text).trim();
+    if (!text) throw new Error("A queued message can't be empty. Cancel it instead.");
+    const item = [...(mockSavedQueues.get(threadId) ?? []), ...(chatQueues.get(threadId) ?? [])]
+      .find((e) => e.queuedId === a.queuedId);
+    if (!item) return false;
+    item.text = text;
+    emitChatEvent(threadId, { type: "queued_turn_edited", thread_id: threadId, queued_id: item.queuedId, text });
+    return true;
+  },
+  agent_chat_move_queued_turn: (a) => {
+    const threadId = a.threadId as string;
+    const id = a.queuedId as string;
+    const before = (a.before as string | null) ?? null;
+    const saved = mockSavedQueues.get(threadId) ?? [];
+    const q = saved.some((e) => e.queuedId === id) ? saved : (chatQueues.get(threadId) ?? []);
+    if (!moveMockQueued(q, id, before)) return false;
+    emitChatEvent(threadId, {
+      type: "queued_turns_reordered",
+      thread_id: threadId,
+      queued_ids: q.map((e) => e.queuedId),
+    });
+    return true;
+  },
+  agent_chat_cancel_saved_queued_turn: (a) => {
+    const threadId = a.threadId as string;
+    const saved = mockSavedQueues.get(threadId) ?? [];
+    const index = saved.findIndex((e) => e.queuedId === a.queuedId);
+    if (index < 0) return false;
+    saved.splice(index, 1);
+    emitChatEvent(threadId, { type: "queued_turn_cancelled", thread_id: threadId, queued_id: a.queuedId as string });
+    return true;
+  },
+  agent_chat_send_saved_queued_turn: async (a) => {
+    const threadId = a.threadId as string;
+    const saved = mockSavedQueues.get(threadId) ?? [];
+    const index = saved.findIndex((e) => e.queuedId === a.queuedId);
+    if (index < 0) throw new Error("This message is no longer saved.");
+    const [item] = saved.splice(index, 1);
+    const nonce = item.clientNonce ?? item.queuedId;
+    const busy = chatActiveTurns.has(threadId);
+    const result = await handlers.agent_chat_send_turn({
+      provider: a.provider,
+      input: { thread_id: threadId, text: item.text, client_nonce: nonce, delivery: a.delivery },
+    }) as { queued_id: string | null; steered?: boolean };
+    // The real send path fans the started turn out; that promotes the bubble.
+    if (!busy && !result.queued_id) {
+      emitChatEvent(threadId, { type: "user_message", thread_id: threadId, text: item.text, client_nonce: nonce });
+    }
+    return result;
+  },
 
   // ── Stale worktree cleanup ──
   //

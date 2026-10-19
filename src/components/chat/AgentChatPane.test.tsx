@@ -499,6 +499,7 @@ vi.mock("@/tauri/events", () => ({
   onAgentChatTurnCheckpoint: vi.fn().mockResolvedValue(() => {}),
   onAgentChatTurnCheckpointReverted: vi.fn().mockResolvedValue(() => {}),
   onAgentChatTurnCheckpointsInvalidated: vi.fn().mockResolvedValue(() => {}),
+  onAgentChatQueuedTurnsChanged: vi.fn().mockResolvedValue(() => {}),
 }));
 
 vi.mock("@/tauri/commands", () => ({
@@ -537,6 +538,11 @@ vi.mock("@/tauri/commands", () => ({
   // hydrate path. Default to `false` (no live turn) so hydrate keeps its
   // resume-path behavior unless a test opts into the live-run case.
   agentChatTurnActive: vi.fn().mockResolvedValue(false),
+  agentChatListQueuedTurns: vi.fn().mockResolvedValue([]),
+  agentChatCancelSavedQueuedTurn: vi.fn().mockResolvedValue(true),
+  agentChatEditQueuedTurn: vi.fn().mockResolvedValue(true),
+  agentChatMoveQueuedTurn: vi.fn().mockResolvedValue(true),
+  agentChatSendSavedQueuedTurn: vi.fn().mockResolvedValue({ turn_id: "", queued_id: null }),
   // The D2 session-start marker effect looks the active thread up in the
   // persisted sessions list; default to empty so it clears to the plain
   // divider unless a test seeds a record.

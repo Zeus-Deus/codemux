@@ -274,6 +274,17 @@ interface Props {
    *  is why the pill paints an opaque surface. `undefined`/`null` renders
    *  nothing. */
   stripSlot?: React.ReactNode;
+  /** Composer shortcuts for the follow-up queue (`steerNextQueued`,
+   *  `editLastQueued`). Each returns whether it acted, so an unused key
+   *  keeps its usual meaning. */
+  onSteerNextQueued?: () => boolean;
+  onEditLastQueued?: () => boolean;
+  /** Replaces the footer's submit hint, e.g. while Enter saves a queued
+   *  message's edit instead of sending. */
+  submitHint?: string | null;
+  /** Submit an empty draft too: a queued message's edit may drop its
+   *  words while keeping its images. */
+  submitWhenEmpty?: boolean;
   /** Floor for the textarea box, padding included. Defaults to
    *  {@link MIN_TEXTAREA_PX} when `isDraft` (a spacious prompt card) and
    *  to a single line otherwise. */
@@ -534,6 +545,10 @@ export function Composer({
   belowComposerSlot,
   renderContextRow,
   stripSlot,
+  onSteerNextQueued,
+  onEditLastQueued,
+  submitHint = null,
+  submitWhenEmpty = false,
   minTextareaPx,
   paneDragActive = false,
   contextUsage = null,
@@ -2942,7 +2957,7 @@ export function Composer({
   }, [fitFooter, footerKey, footerFit]);
   const steeringUnavailable = streaming && delivery.delivery === "steer" && !supportsSteering;
   const discoveringCommands = draftLeadsWithSlash && providerCommandsEntry.loading && !providerCommandsEntry.loaded;
-  const canSubmit = !remoteDisconnected && (provider !== "acp" || (acp.ready && !acp.busy && customAgentsAllowed && !unsupportedAcpImages)) && sessionReady && !sending && !discoveringCommands && delivery.text.length > 0 && !steeringUnavailable;
+  const canSubmit = !remoteDisconnected && (provider !== "acp" || (acp.ready && !acp.busy && customAgentsAllowed && !unsupportedAcpImages)) && sessionReady && !sending && !discoveringCommands && (delivery.text.length > 0 || submitWhenEmpty) && !steeringUnavailable;
   // Subtle affordance so the user knows Enter will queue rather than
   // interrupt, shown only while a turn streams and there's text to send.
   const showQueueHint = streaming && draft.trim().length > 0;
@@ -2994,6 +3009,8 @@ export function Composer({
   const resolvedKeybinds = useResolvedKeybinds();
   const interruptKeys = resolvedKeybinds.getKeysForAction("interruptAgent");
   const sideQuestionKeys = resolvedKeybinds.getKeysForAction("sideQuestion");
+  const steerQueuedKeys = resolvedKeybinds.getKeysForAction("steerNextQueued");
+  const editQueuedKeys = resolvedKeybinds.getKeysForAction("editLastQueued");
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (composingRef.current || e.nativeEvent.isComposing) return;
@@ -3076,6 +3093,15 @@ export function Composer({
           return;
         }
       }
+    }
+
+    if (steerQueuedKeys && matchesKeyCombo(e.nativeEvent, steerQueuedKeys) && onSteerNextQueued?.()) {
+      e.preventDefault();
+      return;
+    }
+    if (editQueuedKeys && matchesKeyCombo(e.nativeEvent, editQueuedKeys) && onEditLastQueued?.()) {
+      e.preventDefault();
+      return;
     }
 
     // Ctrl+; starts a `/btw` side question in this draft. It never sends:
@@ -3871,6 +3897,10 @@ export function Composer({
                   className="conversation-text truncate leading-5 text-muted-foreground/60"
                 >
                   {placeholderText}
+                </span>
+              ) : submitHint ? (
+                <span className="truncate text-label leading-none text-muted-foreground/70">
+                  {submitHint}
                 </span>
               ) : showQueueHint ? (
                 <span className="truncate text-label leading-none text-muted-foreground/70">

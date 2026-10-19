@@ -39,6 +39,7 @@ use super::protocol::{
 use super::translate::{translate_notification_with, SubagentDemux};
 use crate::agent_provider::ImageInput;
 
+mod queue_edits;
 mod steer;
 use base64::Engine;
 
@@ -1124,19 +1125,24 @@ impl ClaudeSession {
                 };
                 // Sent by hand while a Stop settles: it goes first and
                 // releases the held queue behind it once it starts.
-                if state.queue_hold.goes_first() {
+                let first = state.queue_hold.goes_first();
+                if first {
                     state.queued_turns.push_front(queued);
                     state.queue_hold.release_with(&queued_id);
                 } else {
                     state.queued_turns.push_back(queued);
                 }
-                drop(state);
                 let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
                     thread_id: self.thread_id.clone(),
                     queued_id: queued_id.clone(),
                     client_nonce,
                     text,
                 });
+                if first {
+                    let order = crate::agent_provider::queue_edit::reordered(&state.queued_turns, &self.thread_id);
+                    let _ = self.event_tx.send(order);
+                }
+                drop(state);
                 return Ok(SendOutcome::Queued(queued_id));
             }
             // A message sent by hand goes first; the held queue follows it.
@@ -1367,6 +1373,9 @@ impl ClaudeSession {
                 // Interrupting aborts the callback sidecar-side.
                 Some(idx) => {
                     let previous = state.queue_hold.release_with(queued_id);
+                    if idx > 0 {
+                        let _ = self.event_tx.send(crate::agent_provider::queue_edit::reordered(&state.queued_turns, &self.thread_id));
+                    }
                     (state.turn_busy(), idx, previous)
                 }
                 // Unknown / already-dispatched / cancelled — no-op.
@@ -1386,6 +1395,9 @@ impl ClaudeSession {
                         let mut state = self.state.lock().await;
                         restore_queued_position(&mut state.queued_turns, queued_id, original_index);
                         state.queue_hold.revert_release(queued_id, previous_release);
+                        if original_index > 0 {
+                            let _ = self.event_tx.send(crate::agent_provider::queue_edit::reordered(&state.queued_turns, &self.thread_id));
+                        }
                     }
                     Err(err)
                 }

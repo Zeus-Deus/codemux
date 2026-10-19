@@ -118,6 +118,8 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   // ── Chat ──
   { id: "interruptAgent", label: "Stop the agent", category: "chat", defaultKeys: "Escape", when: "composer", description: "From the chat composer while the agent works. Ctrl+C in an empty composer stops it too" },
   { id: "sideQuestion", label: "Ask a side question", category: "chat", defaultKeys: "Ctrl+;", when: "composer", description: "Start a /btw question in the chat composer. It uses the chat's context, answers in the right panel and adds nothing to the chat" },
+  { id: "steerNextQueued", label: "Steer with the next queued message", category: "chat", defaultKeys: "Ctrl+Alt+Enter", when: "composer", description: "Guide the running task with the first queued message, without stopping it. Only for agents that can be steered" },
+  { id: "editLastQueued", label: "Edit the last queued message", category: "chat", defaultKeys: "Alt+ArrowUp", when: "composer", description: "Load the newest queued message into the composer. Sending saves the edit; Escape keeps the original" },
 
   // ── Terminal (handled inside xterm) ──
   { id: "copySelection", label: "Copy selection", category: "terminal", defaultKeys: "Ctrl+Shift+C", when: "terminal" },

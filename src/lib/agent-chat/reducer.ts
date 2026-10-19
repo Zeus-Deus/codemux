@@ -45,6 +45,7 @@ import {
   type WorkflowRunItem,
 } from "./types";
 import { mergeWorkflowSnapshot, newWorkflowRunItem } from "./workflows";
+import { editQueuedTurn, reorderQueuedTurns } from "./queue-edits";
 import {
   applyGoalFromUserMessage,
   goalStateFromMessages,
@@ -2259,6 +2260,12 @@ function applyEventInner(
       if (idx < 0) return state;
       return { ...state, messages: state.messages.filter((_, i) => i !== idx) };
     }
+
+    case "queued_turn_edited":
+      return editQueuedTurn(state, event);
+
+    case "queued_turns_reordered":
+      return reorderQueuedTurns(state, event);
 
     // Legacy usage events are discarded by `forward_event` before fan-out,
     // so one should never reach here. Ignored

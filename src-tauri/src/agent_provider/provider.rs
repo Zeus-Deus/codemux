@@ -166,6 +166,35 @@ pub trait AgentProvider: Send + Sync {
         Ok(())
     }
 
+    /// Replace a queued turn's text in place, keeping its position and
+    /// attachments; see [`queue_edit`](super::queue_edit). Returns whether it
+    /// was still queued, emitting [`ProviderRuntimeEvent::QueuedTurnEdited`]
+    /// when it was. Every provider that queues turns overrides this.
+    async fn edit_queued_turn(
+        &self,
+        _thread_id: ThreadId,
+        _queued_id: String,
+        _text: String,
+    ) -> Result<bool, ProviderError> {
+        Err(ProviderError::ValidationError {
+            message: "This provider can't edit queued messages.".into(),
+        })
+    }
+
+    /// Move a queued turn to just before `before`, or to the back of the
+    /// queue. Returns whether it was still queued, emitting
+    /// [`ProviderRuntimeEvent::QueuedTurnsReordered`] when it was.
+    async fn move_queued_turn(
+        &self,
+        _thread_id: ThreadId,
+        _queued_id: String,
+        _before: Option<String>,
+    ) -> Result<bool, ProviderError> {
+        Err(ProviderError::ValidationError {
+            message: "This provider can't reorder queued messages.".into(),
+        })
+    }
+
     /// Adapter opt-in, independent of the selected model's tool catalog.
     fn supports_async_questions(&self) -> bool {
         false

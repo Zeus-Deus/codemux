@@ -217,6 +217,10 @@ impl ClaudeSession {
                 Ok(Plan::Send) => {
                     state.queued_turns.push_front(queued);
                     state.queue_hold.release_with(queued_id);
+                    if index > 0 {
+                        let order = crate::agent_provider::queue_edit::reordered(&state.queued_turns, &self.thread_id);
+                        let _ = self.event_tx.send(order);
+                    }
                     drop(state);
                     self.drain_queue().await;
                     return Ok(());

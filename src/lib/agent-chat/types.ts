@@ -80,7 +80,12 @@ export interface UserMessageItem {
    *  active turn (rendered greyed-out with a "Queued" pill + cancel X).
    *  Removed when the turn dispatches (`queued_turn_dispatched`) and the
    *  bubble promotes to a normal user message. */
-  queued?: { queuedId: string };
+  queued?: {
+    queuedId: string;
+    /** Restored from the saved queue after a restart: no provider holds
+     *  it, so it waits for the user to send it. */
+    saved?: boolean;
+  };
   /** Optimistic-send correlation token. Set when the bubble was
    *  optimistically appended by the composer; lets the `turn_queued`
    *  event reconcile against this exact item instead of appending a

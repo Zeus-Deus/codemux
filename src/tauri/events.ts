@@ -611,6 +611,19 @@ export type ProviderRuntimeEvent =
       thread_id: string;
       queued_id: string;
     }
+  /** A queued turn's text was edited in place. */
+  | {
+      type: "queued_turn_edited";
+      thread_id: string;
+      queued_id: string;
+      text: string;
+    }
+  /** The thread's queue (or saved queue) in its new order. */
+  | {
+      type: "queued_turns_reordered";
+      thread_id: string;
+      queued_ids: string[];
+    }
   // Stall watchdog (mirrors `ProviderRuntimeEvent::RunStalled` in
   // src-tauri/src/agent_provider/events.rs). Emitted when a mid-turn
   // thread has produced no runtime events past the stall threshold.
@@ -753,3 +766,10 @@ export const onWorktreeCleanup = (
   cb: EventCallback<WorktreeCleanupEvent>,
 ): Promise<UnlistenFn> =>
   listen<WorktreeCleanupEvent>("worktree-cleanup", (e) => cb(e.payload));
+
+/** Saved queue rows moved to this thread (a history resume merged
+ *  sessions); its pane should list the queue again. */
+export const onAgentChatQueuedTurnsChanged = (
+  cb: EventCallback<string>,
+): Promise<UnlistenFn> =>
+  listen<string>("agent-chat-queued-turns-changed", (e) => cb(e.payload));

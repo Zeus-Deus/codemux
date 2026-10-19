@@ -129,6 +129,17 @@ struct Queued {
     id: String,
     input: SendTurnInput,
 }
+impl crate::agent_provider::queue_edit::QueueEntry for Queued {
+    fn queued_id(&self) -> &str {
+        &self.id
+    }
+    fn input(&self) -> &SendTurnInput {
+        &self.input
+    }
+    fn input_mut(&mut self) -> &mut SendTurnInput {
+        &mut self.input
+    }
+}
 struct Pending {
     rpc_id: Value,
     options: Vec<Value>,
@@ -1644,6 +1655,7 @@ impl Session {
             if s.queue_hold.goes_first() {
                 s.queued.push_front(queued);
                 s.queue_hold.release_with(&id);
+                self.emit(crate::agent_provider::queue_edit::reordered(&s.queued, &self.thread));
             } else {
                 s.queued.push_back(queued);
             }
@@ -2105,6 +2117,35 @@ impl AgentProvider for GenericAcpProvider {
             Ok(false)
         }
     }
+    async fn edit_queued_turn(
+        &self,
+        thread: ThreadId,
+        id: String,
+        text: String,
+    ) -> Result<bool, ProviderError> {
+        let session = self.session(&thread).await?;
+        let mut s = session.state.lock().await;
+        let Some(text) = crate::agent_provider::queue_edit::edit(&mut s.queued, &thread, &id, &text)? else {
+            return Ok(false);
+        };
+        session.emit(ProviderRuntimeEvent::QueuedTurnEdited { thread_id: thread, queued_id: id, text });
+        Ok(true)
+    }
+    async fn move_queued_turn(
+        &self,
+        thread: ThreadId,
+        id: String,
+        before: Option<String>,
+    ) -> Result<bool, ProviderError> {
+        let session = self.session(&thread).await?;
+        let mut s = session.state.lock().await;
+        let s = &mut *s;
+        let pinned = s.queue_hold.pinned();
+        let moved = crate::agent_provider::queue_edit::move_before(&mut s.queued, &thread, &id, before.as_deref(), pinned)?;
+        let Some(queued_ids) = moved else { return Ok(false) };
+        session.emit(ProviderRuntimeEvent::QueuedTurnsReordered { thread_id: thread, queued_ids });
+        Ok(true)
+    }
     async fn send_queued_turn_now(
         &self,
         thread: ThreadId,
@@ -2121,6 +2162,7 @@ impl AgentProvider for GenericAcpProvider {
             // once it dispatches.
             s.queue_hold.release_with(&id);
             s.queued.push_front(queued);
+            session.emit(crate::agent_provider::queue_edit::reordered(&s.queued, &thread));
             let turn = s.active.clone();
             drop(s);
             // A failed interrupt leaves the item first in line, released, so

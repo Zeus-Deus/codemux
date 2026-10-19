@@ -733,6 +733,19 @@ pub enum ProviderRuntimeEvent {
         thread_id: ThreadId,
         queued_id: String,
     },
+    /// The user edited a queued turn in place. `text` is the new
+    /// user-visible text; the item keeps its id, position and attachments.
+    QueuedTurnEdited {
+        thread_id: ThreadId,
+        queued_id: String,
+        text: String,
+    },
+    /// The user moved a queued turn. `queued_ids` is the thread's whole
+    /// queue (or saved queue) in its new dispatch order.
+    QueuedTurnsReordered {
+        thread_id: ThreadId,
+        queued_ids: Vec<String>,
+    },
     /// Emitted by the stall watchdog when a mid-turn thread has produced no
     /// runtime events for longer than the stall threshold. Advisory only —
     /// the session is NOT killed; the UI renders an amber notice.

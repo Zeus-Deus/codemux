@@ -29,6 +29,12 @@ impl QueueHold {
         self.held
     }
 
+    /// The item an explicit send let through the hold, which must stay at
+    /// the front of the queue to dispatch.
+    pub fn pinned(&self) -> Option<&str> {
+        self.release.as_deref().filter(|_| self.held || self.taken)
+    }
+
     /// Whether a message sent by hand now goes ahead of the queue: a Stop
     /// holds it, or another manual send has the hold taken and may restore it.
     pub fn goes_first(&self) -> bool {
