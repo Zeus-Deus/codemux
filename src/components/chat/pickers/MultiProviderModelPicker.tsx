@@ -588,8 +588,12 @@ export function MultiProviderModelPicker({
     <Popover open={open} onOpenChange={(v) => !disabled && setOpen(v)}>
       <TooltipProvider delayDuration={250}>
         <Tooltip open={!showReveal && tooltipOpen && !open} onOpenChange={setTooltipOpen}>
-          <TooltipTrigger asChild>
-            <PopoverTrigger asChild>
+          {/* Popover outside the tooltip: Radix spreads incoming props
+              after its own `data-state`, so the outer trigger's state is the
+              one the button keeps, and the reveal and open styling key on
+              the popover's. */}
+          <PopoverTrigger asChild>
+            <TooltipTrigger asChild>
               <button
                 type="button"
                 disabled={disabled}
@@ -663,8 +667,8 @@ export function MultiProviderModelPicker({
                   </>
                 )}
               </button>
-            </PopoverTrigger>
-          </TooltipTrigger>
+            </TooltipTrigger>
+          </PopoverTrigger>
           <TooltipContent
             side="top"
             sideOffset={6}

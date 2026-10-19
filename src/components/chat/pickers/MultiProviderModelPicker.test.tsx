@@ -367,6 +367,17 @@ describe("MultiProviderModelPicker — model descriptions", () => {
     );
   });
 
+  it("keeps the trigger's open state while focus is in the picker", async () => {
+    const user = userEvent.setup();
+    renderPicker({ provider: "opencode", model: "openai/gpt-5" });
+    await openPicker(user);
+    expect(screen.getByPlaceholderText("Search models...")).toHaveFocus();
+    // The reveal and open styling key on the popover's `data-state`; the
+    // tooltip around the same button must not overwrite it.
+    expect(screen.getByTestId("multi-provider-model-picker-trigger"))
+      .toHaveAttribute("data-state", "open");
+  });
+
   it("keeps the trigger tooltip closed while the picker is open", async () => {
     const user = userEvent.setup();
     renderPicker({ iconOnly: true });
