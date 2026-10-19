@@ -110,6 +110,9 @@ export function ComputerSettings({ controller, peek, initialCommand, onCommand, 
             <Button size="sm" variant="outline" disabled={state.phase !== "active"}
               onClick={() => { if (state.workspace) peek.open(state.workspace.id); }}><icons.Monitor />Live view</Button>
           </div>}
+          {state.phase === "active" && <Notice>
+            Using Claude? Send a new message after enabling this window. Tools refresh between turns.
+          </Notice>}
           <Notice>Only background click, type and scroll are allowed. Actions an application refuses stay blocked.
             {isLinuxWayland(state.doctor) && " Linux XWayland capture works; native Wayland capture may be unavailable."}
           </Notice>

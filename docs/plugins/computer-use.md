@@ -9,6 +9,10 @@ window, and select **Enable for this window**. The workspace choice is saved on
 this device. The selected window and active control are never restored after a
 restart. Switching workspaces stops control.
 
+After enabling a window, send a new message in Claude. A turn already in
+progress may not have the newly enabled tools; Claude refreshes them between
+turns.
+
 Install cua-driver yourself using the [official installation guide](https://cua.ai/docs/cua-driver/quickstart).
 Codemux does not run the installer or grant operating-system permissions. This
 plugin currently requires version **0.21.0**, whose policy and exact-window
