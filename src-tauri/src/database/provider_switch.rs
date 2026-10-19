@@ -29,6 +29,67 @@ pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
     .map_err(|e| format!("Failed to create provider switch table: {e}"))
 }
 
+/// How a seed names the chat whose full history it points at.
+pub(crate) fn history_ref(thread_id: &str) -> String {
+    format!("conversation_id `{thread_id}`")
+}
+
+/// `seed` with its history pointer moved from `from` to `to`. Only the
+/// header Codemux wrote is touched, never the conversation in the body.
+pub(crate) fn retarget_seed(seed: &str, from: &str, to: &str) -> String {
+    let (header, body) = seed.split_once("\n\n").unwrap_or((seed, ""));
+    let header = header.replacen(&history_ref(from), &history_ref(to), 1);
+    if body.is_empty() {
+        header
+    } else {
+        format!("{header}\n\n{body}")
+    }
+}
+
+/// A history reopen merges `merged` into `survivor`
+/// (`merge_agent_chat_session_rows`). Unless the survivor has a seed of its
+/// own, it takes the newest of theirs as it stood, delivery state included,
+/// with its history pointer moved to the survivor: the merged ids are gone.
+pub(super) fn move_to_thread(conn: &Connection, merged: &[String], survivor: &str) -> Result<(), String> {
+    let read_error = |e: rusqlite::Error| format!("Failed to read the provider switch context: {e}");
+    let own: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_chat_provider_switch_seeds WHERE thread_id = ?1)",
+            params![survivor],
+            |row| row.get(0),
+        )
+        .map_err(read_error)?;
+    if own {
+        return Ok(());
+    }
+    let mut newest: Option<(&String, String, String, i64, Option<String>, String)> = None;
+    for thread in merged {
+        let seed = conn
+            .query_row(
+                "SELECT provider, content, anchor_id, sent_nonce, created_at
+                 FROM agent_chat_provider_switch_seeds WHERE thread_id = ?1",
+                params![thread],
+                |row| Ok((thread, row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()
+            .map_err(read_error)?;
+        if let Some(seed) = seed.filter(|seed| newest.as_ref().map_or(true, |n| seed.5 > n.5)) {
+            newest = Some(seed);
+        }
+    }
+    let Some((from, provider, content, anchor_id, sent_nonce, created_at)) = newest else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT INTO agent_chat_provider_switch_seeds
+            (thread_id, provider, content, anchor_id, sent_nonce, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![survivor, provider, retarget_seed(&content, from, survivor), anchor_id, sent_nonce, created_at],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("Failed to keep the provider switch context: {e}"))
+}
+
 /// A thread's switch seed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSwitchSeed {
@@ -213,6 +274,48 @@ mod tests {
         db.put_provider_switch_seed("t", "codex", "SEED", 3).unwrap();
         let (provider, seed) = db.provider_switch_seed_of("t").unwrap();
         assert_eq!((provider.as_str(), seed.content.as_str(), seed.anchor_id), ("codex", "SEED", 3));
+    }
+
+    /// `old` and its history reopen `new`, sharing one native session.
+    fn reopened(db: &DatabaseStore) {
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('old', 'sdk-1', 'ws', 'codex', '2025-01-01', '2025-01-01'),
+                        ('new', 'sdk-1', 'ws', 'codex', '2025-03-01', '2025-03-01')",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn reopening_from_history_keeps_the_seed_and_where_it_stands() {
+        let db = DatabaseStore::new_in_memory();
+        reopened(&db);
+        let seed = "<codemux-provider-handoff>\nSee conversation_id `old`.\n</codemux-provider-handoff>\n\nuser: conversation_id `old`";
+        db.put_provider_switch_seed("old", "codex", seed, 7).unwrap();
+        db.mark_provider_switch_seed_sent("old", "codex", seed, "n1").unwrap();
+        db.collapse_duplicate_agent_chat_sessions("sdk-1").unwrap();
+        let moved = db.provider_switch_seed("new", "codex").unwrap();
+        assert_eq!(
+            moved.content,
+            "<codemux-provider-handoff>\nSee conversation_id `new`.\n</codemux-provider-handoff>\n\nuser: conversation_id `old`",
+            "only the header's history pointer follows the chat"
+        );
+        assert_eq!((moved.anchor_id, moved.sent_nonce.as_deref()), (7, Some("n1")));
+    }
+
+    #[test]
+    fn reopening_keeps_a_seed_the_survivor_already_has() {
+        let db = DatabaseStore::new_in_memory();
+        reopened(&db);
+        db.put_provider_switch_seed("old", "codex", "older", 1).unwrap();
+        db.put_provider_switch_seed("new", "claude", "newer", 2).unwrap();
+        db.collapse_duplicate_agent_chat_sessions("sdk-1").unwrap();
+        let (provider, seed) = db.provider_switch_seed_of("new").unwrap();
+        assert_eq!((provider.as_str(), seed.content.as_str()), ("claude", "newer"));
     }
 
     #[test]

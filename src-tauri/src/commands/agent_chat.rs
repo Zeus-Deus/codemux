@@ -1151,6 +1151,14 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
         fast_mode: Some(input.fast_mode),
         service_tier: input.service_tier.clone(),
     };
+    // A history pick names the persisted chat it reopens under this fresh
+    // thread id; that chat is merged into this one once the session runs.
+    let reopened_from = input
+        .extra
+        .get(crate::provider_accounts::FROM_THREAD_EXTRA_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|from| *from != input.thread_id.0)
+        .map(str::to_string);
     // A restart of an existing durable CodeMux thread must not depend solely
     // on the frontend's in-memory cursor. That slice can be cold after sleep,
     // remount, or event-stream recovery even though the authoritative session
@@ -1586,6 +1594,22 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
             // The row now exists. Project the latest acknowledged binding,
             // including updates accepted while startup was completing.
             db.project_acp_binding(&session.thread_id.0)?;
+        }
+        // Fold the reopened chat into this thread now rather than waiting
+        // for a matching provider session id: Codex reports its id only at
+        // start (and one that never finished a turn resumes under a new
+        // id), and Claude's arrives after the first prompt was sent. A chat
+        // still open in another pane is left alone.
+        if let Some(from) = reopened_from
+            .as_deref()
+            .filter(|from| state.agent_chat_pane_id_for_thread(from).is_none())
+        {
+            match db.merge_reopened_agent_chat_session(from, &session.thread_id.0) {
+                Ok(cleanup) => agent_chat_sessions_merged(&app, &db, cleanup),
+                Err(error) => {
+                    eprintln!("[codemux::agent_chat] failed to merge the reopened chat: {error}");
+                }
+            }
         }
         if persisted {
             // The pane may have read its task list while the row was missing
@@ -6780,6 +6804,36 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     Ok(())
 }
 
+/// Chats were merged into a survivor (a history reopen): payload
+/// `{ survivor, merged }`. A pane already bound to the survivor re-reads
+/// state that has no change event of its own, such as fork lineage.
+pub const AGENT_CHAT_SESSIONS_MERGED_EVENT: &str = "agent-chat-sessions-merged";
+
+/// Chats were merged into `cleanup.survivor`: adopt queued images, drop
+/// what the merged-away rows owned outside SQLite, and have the survivor's
+/// pane re-read the per-chat state that moved onto it.
+fn agent_chat_sessions_merged<R: Runtime>(
+    app: &AppHandle<R>,
+    db: &DatabaseStore,
+    cleanup: crate::database::AgentChatSessionCleanup,
+) {
+    super::queued_turns::after_sessions_merged(app, db, chat_images_dir);
+    if !cleanup.thread_ids.is_empty() {
+        let survivor = cleanup.survivor.clone();
+        let _ = app.emit(
+            AGENT_CHAT_SESSIONS_MERGED_EVENT,
+            serde_json::json!({ "survivor": survivor, "merged": cleanup.thread_ids }),
+        );
+        if let Ok(Some(watch)) = db.get_pr_watch(&survivor) {
+            crate::pr_watch::emit_changed(app, &survivor, Some(watch));
+        }
+        if !db.list_follow_up_tasks(&survivor).is_empty() {
+            super::follow_ups::emit_changed(app, &survivor);
+        }
+    }
+    cleanup_collapsed_session_resources(cleanup)
+}
+
 fn cleanup_collapsed_session_resources(cleanup: crate::database::AgentChatSessionCleanup) {
     for thread_id in &cleanup.thread_ids {
         if let Some(dir) = chat_images_dir(thread_id) {
@@ -7495,10 +7549,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             // same sdk_session_id as the original. Collapse the
             // duplicates so the dropdown doesn't grow unboundedly.
             match db.collapse_duplicate_agent_chat_sessions(&sdk_session_id) {
-                Ok(cleanup) => {
-                    super::queued_turns::after_sessions_merged(app, &db, chat_images_dir);
-                    cleanup_collapsed_session_resources(cleanup)
-                }
+                Ok(cleanup) => agent_chat_sessions_merged(app, &db, cleanup),
                 Err(error) => {
                     eprintln!("[codemux::agent_chat] failed to collapse duplicates: {error}");
                 }
@@ -9638,6 +9689,7 @@ mod tests {
             thread_ids: vec![thread_id.to_string()],
             repo_paths: vec![(thread_id.to_string(), repo.to_string_lossy().to_string())],
             checkpoint_refs: vec![(repo.to_string_lossy().to_string(), checkpoint_ref.clone())],
+            ..Default::default()
         });
 
         for ref_name in [checkpoint_ref, safety_ref, failed_safety_ref] {

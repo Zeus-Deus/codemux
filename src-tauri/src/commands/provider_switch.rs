@@ -32,6 +32,7 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::agent_provider::side_chat::provider_label;
 use crate::agent_provider::{ProviderKind, ProviderRuntimeEvent, StartSessionInput, ThreadId};
+use crate::database::provider_switch::{history_ref, retarget_seed};
 use crate::database::DatabaseStore;
 use crate::observability::ObservabilityStore;
 use crate::utility_ai::UtilityModelSelection;
@@ -192,18 +193,6 @@ pub(crate) fn carry_into_fork(db: &DatabaseStore, source: &str, fork: &str) {
     }
 }
 
-/// `seed` with its history pointer moved from `source` to `fork`. Only the
-/// header Codemux wrote is touched, never the conversation in the body.
-fn retarget_seed(seed: &str, source: &str, fork: &str) -> String {
-    let (header, body) = seed.split_once("\n\n").unwrap_or((seed, ""));
-    let header = header.replacen(&history_ref(source), &history_ref(fork), 1);
-    if body.is_empty() {
-        header
-    } else {
-        format!("{header}\n\n{body}")
-    }
-}
-
 /// Tells a forked session where its own full history lives.
 fn fork_correction(fork: &str) -> String {
     format!(
@@ -225,11 +214,6 @@ pub(crate) fn seed_delivered(
             eprintln!("[codemux::provider_switch] {error}");
         }
     }
-}
-
-/// How a seed names the chat whose full history it points at.
-fn history_ref(thread_id: &str) -> String {
-    format!("conversation_id `{thread_id}`")
 }
 
 /// The handoff block the new provider reads before the user's next message.

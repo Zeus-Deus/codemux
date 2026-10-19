@@ -4,7 +4,8 @@
 //! comment, review and conflict the chat was already told about, so a
 //! restart never wakes it twice for the same event. Deliberately no foreign
 //! keys, like the delegated-task journal: the sweep drops a watch whose
-//! session row is gone.
+//! session row is gone. A chat reopened from history takes its watch along
+//! ([`move_to_thread`]).
 use super::*;
 
 pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
@@ -120,6 +121,44 @@ fn pr_watch(conn: &Connection, thread_id: &str) -> Result<Option<PrWatchRecord>,
     )
     .optional()
     .map_err(|e| format!("Failed to read PR watch: {e}"))
+}
+
+/// A history reopen merges `merged` into `survivor`
+/// (`merge_agent_chat_session_rows`). Unless the survivor watches already,
+/// it takes over the most recently updated of their watches, with the
+/// events it was told about and its generation, so a sweep that read the
+/// watch under its old id writes nothing. The rest go with their chat.
+pub(super) fn move_to_thread(conn: &Connection, merged: &[String], survivor: &str) -> Result<(), String> {
+    let mut newest: Option<PrWatchRecord> = None;
+    if pr_watch(conn, survivor)?.is_none() {
+        for thread in merged {
+            if let Some(watch) = pr_watch(conn, thread)?
+                .filter(|watch| newest.as_ref().map_or(true, |n| watch.updated_at_ms > n.updated_at_ms))
+            {
+                newest = Some(watch);
+            }
+        }
+    }
+    let move_error = |e: rusqlite::Error| format!("Failed to keep the PR watch: {e}");
+    if let Some(watch) = newest {
+        conn.execute(
+            "UPDATE pr_watches SET thread_id = ?2 WHERE thread_id = ?1",
+            params![watch.thread_id, survivor],
+        )
+        .map_err(move_error)?;
+        conn.execute(
+            "UPDATE pr_watch_seen SET thread_id = ?2 WHERE thread_id = ?1",
+            params![watch.thread_id, survivor],
+        )
+        .map_err(move_error)?;
+    }
+    for thread in merged {
+        conn.execute("DELETE FROM pr_watch_seen WHERE thread_id = ?1", params![thread])
+            .map_err(move_error)?;
+        conn.execute("DELETE FROM pr_watches WHERE thread_id = ?1", params![thread])
+            .map_err(move_error)?;
+    }
+    Ok(())
 }
 
 impl DatabaseStore {
@@ -358,6 +397,39 @@ mod tests {
         assert!(!switched.baselined);
         assert_eq!(switched.head_sha, None);
         assert!(db.pr_watch_seen_keys("t1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn reopening_from_history_keeps_the_watch_and_what_it_saw() {
+        let db = DatabaseStore::new_in_memory();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('old', 'sdk-1', 'ws', 'codex', '2025-01-01', '2025-01-01'),
+                        ('new', 'sdk-1', 'ws', 'codex', '2025-03-01', '2025-03-01')",
+            )
+            .unwrap();
+        let armed = db.arm_pr_watch("old", "ws", 7, Some("u"), 3, 10).unwrap();
+        let mut progress = armed.clone();
+        progress.attempts = 2;
+        progress.baselined = true;
+        assert!(db.save_pr_watch_progress(&progress, &["check:a".into()], 20).unwrap());
+
+        db.collapse_duplicate_agent_chat_sessions("sdk-1").unwrap();
+
+        assert!(db.get_pr_watch("old").unwrap().is_none());
+        assert!(db.pr_watch_seen_keys("old").unwrap().is_empty());
+        let moved = db.get_pr_watch("new").unwrap().unwrap();
+        assert_eq!((moved.pr_number, moved.attempts, moved.baselined), (7, 2, true));
+        assert_eq!(moved.generation, armed.generation);
+        assert_eq!(db.pr_watch_seen_keys("new").unwrap(), HashSet::from(["check:a".to_string()]));
+        assert_eq!(db.active_pr_watches().unwrap().len(), 1);
+        // A sweep that read the watch under its old id writes nowhere.
+        assert!(!db.save_pr_watch_progress(&progress, &["check:b".into()], 30).unwrap());
+        assert!(db.pr_watch_seen_keys("old").unwrap().is_empty());
     }
 
     #[test]

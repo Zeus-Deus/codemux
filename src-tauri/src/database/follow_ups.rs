@@ -37,6 +37,21 @@ pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
     .map_err(|e| format!("Failed to create follow-up task table: {e}"))
 }
 
+/// A history reopen merges `merged` into `survivor`
+/// (`merge_agent_chat_session_rows`): tasks started from a merged chat's
+/// suggestions belong to the survivor, whose transcript now holds them.
+pub(super) fn move_to_thread(conn: &Connection, merged: &[String], survivor: &str) -> Result<(), String> {
+    for thread in merged {
+        conn.execute(
+            "UPDATE OR IGNORE agent_follow_up_tasks SET parent_thread_id = ?2
+             WHERE parent_thread_id = ?1",
+            params![thread, survivor],
+        )
+        .map_err(|e| format!("Failed to keep the started follow-up tasks: {e}"))?;
+    }
+    Ok(())
+}
+
 /// One started suggestion. `outcome` is `running`, `completed`, `failed`
 /// or `stopped`; the git stats are filled when the task finishes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,6 +363,26 @@ mod tests {
         assert_eq!(all.iter().map(|t| t.index).collect::<Vec<_>>(), vec![0, 1]);
         db.delete_follow_up_task("c3").unwrap();
         assert!(db.get_follow_up_task("c3").is_none());
+    }
+
+    #[test]
+    fn reopening_the_parent_from_history_keeps_its_started_tasks() {
+        let db = DatabaseStore::new_in_memory();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('parent', 'sdk-1', 'ws', 'claude', '2025-01-01', '2025-01-01'),
+                        ('reopened', 'sdk-1', 'ws', 'claude', '2025-03-01', '2025-03-01')",
+            )
+            .unwrap();
+        db.insert_follow_up_task(&task("c1", "call", 0)).unwrap();
+        db.collapse_duplicate_agent_chat_sessions("sdk-1").unwrap();
+        assert!(db.list_follow_up_tasks("parent").is_empty());
+        let row = db.get_follow_up_for_suggestion("reopened", "call", 0).unwrap();
+        assert_eq!(row.child_thread_id, "c1");
     }
 
     #[test]

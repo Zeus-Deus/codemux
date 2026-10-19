@@ -5,7 +5,8 @@
 //! forked session as its resume cursor. This table only records lineage, so
 //! the fork can say where it came from. The row cascades with the fork; it
 //! deliberately has no foreign key to the source, which may be deleted
-//! while the fork lives on.
+//! while the fork lives on. Reopening either from history keeps the link
+//! ([`move_to_thread`]).
 use super::*;
 use std::path::Path;
 
@@ -28,6 +29,28 @@ pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
             ON agent_chat_forks(source_thread_id);",
     )
     .map_err(|e| format!("Failed to create chat fork table: {e}"))
+}
+
+/// A history reopen merges `merged` into `survivor`
+/// (`merge_agent_chat_session_rows`): the survivor keeps the lineage of the
+/// fork it continues, unless it has its own, and forks of a merged chat now
+/// come from the survivor.
+pub(super) fn move_to_thread(conn: &Connection, merged: &[String], survivor: &str) -> Result<(), String> {
+    let move_error = |e: rusqlite::Error| format!("Failed to keep the fork's origin: {e}");
+    for thread in merged {
+        conn.execute(
+            "UPDATE OR IGNORE agent_chat_forks SET thread_id = ?2 WHERE thread_id = ?1",
+            params![thread, survivor],
+        )
+        .map_err(move_error)?;
+        conn.execute(
+            "UPDATE agent_chat_forks SET source_thread_id = ?2
+             WHERE source_thread_id = ?1 AND thread_id != ?2",
+            params![thread, survivor],
+        )
+        .map_err(move_error)?;
+    }
+    Ok(())
 }
 
 /// The new thread a fork creates: its session row (copied from the source,
@@ -528,6 +551,47 @@ mod tests {
         let user = append(&db, serde_json::json!({"type":"user_message","text":"one"}));
         let done = append(&db, serde_json::json!({"type":"turn_completed"}));
         assert_eq!(db.agent_chat_fork_heads("src"), (Some(done), Some(user)));
+    }
+
+    #[test]
+    fn reopening_a_fork_or_its_source_from_history_keeps_the_lineage() {
+        let db = store_with_source();
+        append(&db, serde_json::json!({"type":"user_message","thread_id":"src","text":"one"}));
+        let source = db.get_agent_chat_session("src").unwrap();
+        db.create_agent_chat_fork(&NewChatFork {
+            thread_id: "fork",
+            source: &source,
+            sdk_session_id: "native-fork",
+            workspace_id: "ws",
+            cwd: "/repo",
+            title: "Fix the parser (fork)",
+            cut_before: None,
+            image_dirs: None,
+        })
+        .unwrap();
+        let boundary = db.agent_chat_fork_origin("fork").unwrap().boundary_message_id;
+        db.set_agent_chat_sdk_session_id("src", "native-src").unwrap();
+        // Each is reopened from history under a fresh thread id.
+        for (thread, sdk) in [("src2", "native-src"), ("fork2", "native-fork")] {
+            db.upsert_agent_chat_session(thread, "ws", Some("/repo"), "claude").unwrap();
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE agent_chat_sessions SET sdk_session_id = ?2,
+                         last_active_at = datetime('now', '+1 day') WHERE thread_id = ?1",
+                    params![thread, sdk],
+                )
+                .unwrap();
+            db.collapse_duplicate_agent_chat_sessions(sdk).unwrap();
+        }
+
+        assert!(db.agent_chat_fork_origin("fork").is_none());
+        let origin = db.agent_chat_fork_origin("fork2").unwrap();
+        assert_eq!(origin.source_thread_id, "src2");
+        assert!(origin.source_exists);
+        assert_eq!(origin.source_title.as_deref(), Some("Fix the parser"));
+        assert_eq!(origin.boundary_message_id, boundary);
     }
 
     #[test]
