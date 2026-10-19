@@ -299,5 +299,4 @@ user's message in the app transcript, queues, forks or provider handoffs. A new
 chat is unnecessary for late tools. Older resumed Codex threads whose saved
 snapshot predates these bridge tools need a new chat to acquire the bridge.
 
-See [`examples/mcp-tools/`](./examples/mcp-tools/) for a worked plugin and
-reproducible provider probe.
+See [`examples/mcp-tools/`](./examples/mcp-tools/) for a worked plugin.
