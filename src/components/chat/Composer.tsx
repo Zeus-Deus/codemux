@@ -1043,7 +1043,7 @@ export function Composer({
       },
       {
         id: "composer:mcp", label: "MCP servers", command: "/mcp", icon: Server,
-        description: provider === "acp" ? "Host MCP injection is unavailable for custom harnesses" : "View and manage connected tools", disabled: provider === "acp", group: "CHAT",
+        description: "View and manage connected tools", group: "CHAT",
         onSelect: () => { setAttachOpen(true); setAttachSubmode("mcp"); setAttachQuery(""); },
       },
     ],
@@ -2079,8 +2079,7 @@ export function Composer({
         {
           id: "attach:mcp",
           label: "MCP Servers…",
-          description: provider === "acp" ? "Host MCP injection unavailable for custom harnesses" : "Toggle integrations the agent can call",
-          disabled: provider === "acp",
+          description: "Toggle integrations the agent can call",
           command: "",
           icon: Server,
           group: "INTEGRATIONS",

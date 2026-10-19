@@ -501,3 +501,10 @@ it("selects a custom instance and its null default through the actual unified pi
   expect(onChange).toHaveBeenCalledWith("acp", null);
   expect(invoke).not.toHaveBeenCalledWith("acp_probe", expect.anything());
 });
+it("offers MCP servers to custom harnesses, which receive Codemux's tools", () => {
+  render(<TooltipProvider><Composer {...props()} /></TooltipProvider>);
+  fireEvent.click(screen.getByTestId("composer-attach-button"));
+  const mcp = screen.getByTestId("slash-item-attach:mcp");
+  expect(mcp).toHaveAttribute("aria-disabled", "false");
+  expect(mcp).toHaveAttribute("title", "Toggle integrations the agent can call");
+});
