@@ -40,9 +40,10 @@ export function DoctorDiagnostics({ report }: { report: DoctorReport }) {
   </div>;
 }
 
-export function ComputerSettings({ controller, peek, initialCommand, onCommand, onOptIn }: {
+export function ComputerSettings({ controller, peek, showWorkspace, initialCommand, onCommand, onOptIn }: {
   controller: ComputerUseController;
   peek: Pick<Host["peek"], "open">;
+  showWorkspace: Host["showWorkspace"];
   initialCommand: string;
   onCommand(command: string): void;
   onOptIn(value: boolean): void;
@@ -107,7 +108,7 @@ export function ComputerSettings({ controller, peek, initialCommand, onCommand, 
           {state.target && <div style={{ ...row, justifyContent: "space-between" }}>
             <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>{state.target.title || state.target.appName || "Selected window"}</span>
             <Button size="sm" variant="outline" disabled={state.phase !== "active"}
-              onClick={() => { if (state.workspace) peek.open("computer-use:live", { workspaceId: state.workspace.id }); }}><icons.Monitor />Live view</Button>
+              onClick={() => { if (state.workspace && showWorkspace()) peek.open("computer-use:live", { workspaceId: state.workspace.id }); }}><icons.Monitor />Live view</Button>
           </div>}
           {state.phase === "active" && <Notice>
             Using Claude? Send a new message after enabling this window. Tools refresh between turns.
@@ -122,7 +123,7 @@ export function ComputerSettings({ controller, peek, initialCommand, onCommand, 
   );
 }
 
-export function ComputerIndicator({ controller, peek }: { controller: ComputerUseController; peek: Pick<Host["peek"], "open"> }) {
+export function ComputerIndicator({ controller, peek, showWorkspace }: { controller: ComputerUseController; peek: Pick<Host["peek"], "open">; showWorkspace: Host["showWorkspace"] }) {
   const state = useComputer(controller);
   if (!state.target && state.phase !== "stopping") return null;
   const stopping = state.phase === "stopping";
@@ -134,7 +135,7 @@ export function ComputerIndicator({ controller, peek }: { controller: ComputerUs
   }} onPointerDown={(event) => event.stopPropagation()}>
     <Button size="xs" variant="ghost" aria-label={`View computer use${state.target ? ` in ${state.target.title || name}` : ""}`}
       title={label} disabled={state.phase !== "active"} style={{ minWidth: 0, maxWidth: 230 }}
-      onClick={() => { if (state.workspace) peek.open("computer-use:live", { workspaceId: state.workspace.id }); }}>
+      onClick={() => { if (state.workspace && showWorkspace()) peek.open("computer-use:live", { workspaceId: state.workspace.id }); }}>
       <span aria-hidden style={{ width: 6, height: 6, borderRadius: "50%", flexShrink: 0 }}
         className={state.phase === "error" ? "bg-warning" : state.activeCalls ? "bg-destructive" : "bg-muted-foreground"} />
       <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>

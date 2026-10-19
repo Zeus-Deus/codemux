@@ -25,7 +25,7 @@ export default definePlugin({
     });
     ctx.register({
       id: "stop", area: TITLEBAR_ACTIONS_AREA,
-      render: () => <ComputerIndicator controller={controller} peek={peek} />,
+      render: () => <ComputerIndicator controller={controller} peek={peek} showWorkspace={ctx.host.showWorkspace} />,
     });
     ctx.register({
       id: "status", area: COMPOSER_STATUS_AREA,
@@ -34,7 +34,7 @@ export default definePlugin({
     });
     ctx.registerSettingsPage({
       title: "Computer use",
-      render: () => <ComputerSettings controller={controller} peek={peek}
+      render: () => <ComputerSettings controller={controller} peek={peek} showWorkspace={ctx.host.showWorkspace}
         initialCommand={ctx.storage.get("executable", "")}
         onCommand={(command) => ctx.storage.set("executable", command)}
         onOptIn={(value) => {

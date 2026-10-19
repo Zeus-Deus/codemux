@@ -43,9 +43,32 @@ async function activeController() {
 describe("computer-use status controls", () => {
   it("shows the resolved executable in the installation diagnostics", async () => {
     const { controller, peek, release } = await activeController();
-    render(<ComputerSettings controller={controller} peek={peek} initialCommand="" onCommand={() => {}} onOptIn={() => {}} />);
+    render(<ComputerSettings controller={controller} peek={peek} showWorkspace={() => true} initialCommand="" onCommand={() => {}} onOptIn={() => {}} />);
     expect(screen.getByLabelText("Resolved cua-driver executable")).toBeVisible();
     expect(screen.getByLabelText("Resolved cua-driver executable")).toHaveTextContent("/demo/cua-driver");
+    release();
+    await controller.dispose();
+  });
+
+  it.each(["settings", "title bar"])("returns to the workspace before opening Live view from %s", async (surface) => {
+    const { controller, release } = await activeController();
+    const order: string[] = [];
+    let available = true;
+    const showWorkspace = () => { order.push("workspace"); return available; };
+    const peek = { open: vi.fn(() => { order.push("peek"); return true; }) };
+    render(surface === "settings"
+      ? <ComputerSettings controller={controller} peek={peek} showWorkspace={showWorkspace} initialCommand="" onCommand={() => {}} onOptIn={() => {}} />
+      : <ComputerIndicator controller={controller} peek={peek} showWorkspace={showWorkspace} />);
+    const user = userEvent.setup();
+    const button = screen.getByRole("button", { name: surface === "settings" ? "Live view" : /^View computer use/ });
+    await user.click(button);
+    expect(order).toEqual(["workspace", "peek"]);
+    expect(peek.open).toHaveBeenCalledWith("computer-use:live", { workspaceId: "demo" });
+    available = false;
+    order.length = 0;
+    await user.click(button);
+    expect(order).toEqual(["workspace"]);
+    expect(peek.open).toHaveBeenCalledTimes(1);
     release();
     await controller.dispose();
   });
@@ -65,7 +88,7 @@ describe("computer-use status controls", () => {
   it("lets the keyboard reach Stop and waits for confirmed exit", async () => {
     const { controller, peek, release } = await activeController();
     const user = userEvent.setup();
-    render(<ComputerIndicator controller={controller} peek={peek} />);
+    render(<ComputerIndicator controller={controller} peek={peek} showWorkspace={() => true} />);
     await user.tab();
     await user.tab();
     expect(screen.getByRole("button", { name: "Stop computer use" })).toHaveFocus();
