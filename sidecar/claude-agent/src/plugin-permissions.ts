@@ -114,6 +114,8 @@ export interface PluginBridgeGuard {
 }
 const NO_CHECK =
   "Codemux couldn't verify Claude's permission check for this plugin tool. Hooks may be disabled or this workspace may be untrusted; call the tool directly or enable hooks.";
+const APPROVAL_EXPIRED =
+  "This approval expired; ask the agent to run the tool again.";
 function fingerprint(input: unknown): string {
   const json = JSON.stringify(input, (_key, value: unknown) =>
     object(value)
@@ -149,6 +151,7 @@ export function createPluginPermissions(input: {
       approved: boolean;
       mode: string | undefined;
       expires: number;
+      promptPending: boolean;
     }
   >();
   const issue = (
@@ -158,24 +161,30 @@ export function createPluginPermissions(input: {
     mode: string | undefined,
   ) => {
     for (const [id, ticket] of tickets)
-      if (ticket.expires < Date.now()) tickets.delete(id);
-    if (tickets.size >= 128) tickets.delete(tickets.keys().next().value!);
+      if (!ticket.promptPending && ticket.expires < Date.now()) tickets.delete(id);
+    if (tickets.size >= 128) {
+      const evictable = [...tickets].find(([, ticket]) => !ticket.promptPending);
+      if (!evictable)
+        throw new PluginPermissionError(
+          "Too many plugin tool approvals are pending; finish one and try again.",
+        );
+      tickets.delete(evictable[0]);
+    }
     tickets.set(id, {
       hash: fingerprint(call),
       ready,
       approved: false,
       mode,
       expires: Date.now() + 10 * 60_000,
+      promptPending: false,
     });
   };
   const ticketFor = (id: string, call: unknown) => {
     const ticket = tickets.get(id);
-    if (
-      !ticket ||
-      ticket.expires < Date.now() ||
-      ticket.hash !== fingerprint(call)
-    )
+    if (!ticket || ticket.hash !== fingerprint(call))
       throw new PluginPermissionError(NO_CHECK);
+    if (!ticket.promptPending && ticket.expires < Date.now())
+      throw new PluginPermissionError(APPROVAL_EXPIRED);
     return ticket;
   };
   const remember = (updates: PermissionUpdate[] | undefined) => {
@@ -339,6 +348,9 @@ export function createPluginPermissions(input: {
           updatedInput: { ...args, arguments: call.args },
         };
       }
+      // The user may leave a prompt open indefinitely. Keep its ticket until
+      // they answer; Stop/rebuild still invalidates it through clearTickets.
+      ticket.promptPending = true;
       const result = await input.canUseTarget(call.name, call.args, {
         ...options,
         title: `Use ${call.name}?`,
@@ -357,8 +369,8 @@ export function createPluginPermissions(input: {
         return result;
       }
       // Stop/rebuild invalidates an outstanding approval's old ticket too.
-      if (ticketFor(options.toolUseID, call) !== ticket)
-        throw new PluginPermissionError(NO_CHECK);
+      if (tickets.get(options.toolUseID) !== ticket)
+        throw new PluginPermissionError(APPROVAL_EXPIRED);
       const updated = {
         name: call.name,
         args: result.updatedInput ?? call.args,
@@ -366,6 +378,8 @@ export function createPluginPermissions(input: {
       ticket.hash = fingerprint(updated);
       ticket.ready = true;
       ticket.approved = true;
+      ticket.promptPending = false;
+      ticket.expires = Date.now() + 10 * 60_000;
       const updates = result.updatedPermissions?.map((update) =>
         "rules" in update
           ? {

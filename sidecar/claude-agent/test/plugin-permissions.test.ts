@@ -68,6 +68,87 @@ const decision = async (
   return "hookSpecificOutput" in result ? result.hookSpecificOutput : undefined;
 };
 describe("Claude plugin bridge permissions", () => {
+  test.each([false, true])("pending approvals survive catalog-call pressure (expired: %s)", async (expired) => {
+    const clock = spyOn(Date, "now").mockReturnValue(1_000);
+    let approve!: (result: PermissionResult) => void;
+    let prompt!: () => void;
+    const prompted = new Promise<void>((resolve) => {
+      prompt = resolve;
+    });
+    const gate = createPluginPermissions({
+      threadId: "fixture",
+      getQuery: () => ({
+        getSettings: async () => ({ effective: { permissions: {} } }),
+      }),
+      getMode: () => "default",
+      canUseTool: async () => ({ behavior: "deny", message: "unused" }),
+      canUseTarget: () => {
+        prompt();
+        return new Promise((resolve) => {
+          approve = resolve;
+        });
+      },
+    });
+    try {
+      await decision(gate, "x");
+      const pending = gate.canUseTool(
+        bridge,
+        { name: "fixture__x", arguments: { value: 7 } },
+        { toolUseID: "call", signal: new AbortController().signal },
+      );
+      await prompted;
+      if (expired) clock.mockReturnValue(11 * 60_000);
+      for (let i = 0; i < 129; i++) {
+        await gate.hook(
+          { ...hookInput("y"), tool_use_id: `other-${i}` },
+          `other-${i}`,
+          { signal: new AbortController().signal },
+        );
+      }
+      approve({ behavior: "allow" });
+      expect(await pending).toMatchObject({ behavior: "allow" });
+      await expect(gate.authorizeCall(
+        { name: "fixture__x", arguments: { value: 7 } },
+        { _meta: { "claudecode/toolUseId": "call" } },
+      )).resolves.toBeUndefined();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+  test("an invalidated approval has its own actionable message", async () => {
+    let approve!: (result: PermissionResult) => void;
+    let prompt!: () => void;
+    const prompted = new Promise<void>((resolve) => {
+      prompt = resolve;
+    });
+    const gate = createPluginPermissions({
+      threadId: "fixture",
+      getQuery: () => ({
+        getSettings: async () => ({ effective: { permissions: {} } }),
+      }),
+      getMode: () => "default",
+      canUseTool: async () => ({ behavior: "deny", message: "unused" }),
+      canUseTarget: () => {
+        prompt();
+        return new Promise((resolve) => {
+          approve = resolve;
+        });
+      },
+    });
+    await decision(gate, "x");
+    const pending = gate.canUseTool(
+      bridge,
+      { name: "fixture__x", arguments: { value: 7 } },
+      { toolUseID: "call", signal: new AbortController().signal },
+    );
+    await prompted;
+    gate.clearTickets();
+    approve({ behavior: "allow" });
+    expect(await pending).toEqual({
+      behavior: "deny",
+      message: "This approval expired; ask the agent to run the tool again.",
+    });
+  });
   test("round 4: missing permissions fails closed even in bypass", async () => {
     const { gate, settings } = setup("bypassPermissions");
     settings({ effective: {} });
