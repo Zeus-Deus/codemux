@@ -1054,7 +1054,12 @@ mod tests {
         let text: Value =
             serde_json::from_str(echo["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(text["env"], "intact");
-        assert_eq!(text["cwd"], std::env::temp_dir().display().to_string());
+        // getcwd normalizes separators (and may resolve symlinks). Compare the
+        // selected directory rather than its platform-specific spelling.
+        assert_eq!(
+            std::fs::canonicalize(text["cwd"].as_str().unwrap()).unwrap(),
+            std::fs::canonicalize(std::env::temp_dir()).unwrap()
+        );
         registry.shutdown_all().await;
     }
     #[tokio::test]

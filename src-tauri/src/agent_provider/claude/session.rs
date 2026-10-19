@@ -2917,15 +2917,65 @@ mod tests {
 
     #[tokio::test]
     async fn local_session_publishes_and_runs_shared_tools() {
-        let (_server, registry, call) =
+        let (mut server, registry, call) =
             crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
         let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
         assert_eq!(
             collect_mcp_tools(local.as_ref(), &test_caller())
                 .await
                 .len(),
-            3
+            1
         );
+        // An empty visible registration must add both bridge tools before an
+        // external app connects, without changing the existing native tool.
+        server
+            .mock("POST", "/empty")
+            .match_body(mockito::Matcher::PartialJson(json!({"method":"initialize"})))
+            .with_body(json!({
+                "jsonrpc":"2.0", "id":1,
+                "result":{"protocolVersion":"2025-06-18","capabilities":{}}
+            }).to_string())
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/empty")
+            .match_body(mockito::Matcher::PartialJson(
+                json!({"method":"notifications/initialized"}),
+            ))
+            .with_status(202)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/empty")
+            .match_body(mockito::Matcher::PartialJson(
+                json!({"method":"tools/list"}),
+            ))
+            .with_body(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[]}}).to_string())
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/empty")
+            .with_status(405)
+            .create_async()
+            .await;
+        registry
+            .register_plugin_server::<tauri::Wry>(
+                None, "empty", "token".into(),
+                serde_json::from_value(json!({
+                    "id":"empty", "name":"Empty", "toolPrefix":"empty",
+                    "scope":"all", "transport":"http", "url":format!("{}/empty",server.url())
+                })).unwrap(),
+            )
+            .await
+            .unwrap();
+        let tools = collect_mcp_tools(local.as_ref(), &test_caller()).await;
+        assert_eq!(tools.len(), 3);
+        assert!(tools
+            .iter()
+            .any(|tool| tool.prefixed_name == "codemux_list_plugin_tools"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool.prefixed_name == "codemux_call_plugin_tool"));
         let (payload, failure) = run_mcp_tool_call(
             local.as_ref(),
             &test_caller(),
@@ -2939,6 +2989,7 @@ mod tests {
         assert_eq!(payload["content"][0]["text"], "routed");
         assert!(failure.is_none());
         call.assert_async().await;
+        registry.shutdown_all().await;
     }
 
     #[tokio::test]
