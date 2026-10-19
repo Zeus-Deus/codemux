@@ -34,7 +34,7 @@ pub struct RunInput {
     pub max_output_bytes: Option<usize>,
     pub workspace_id: Option<String>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunResult {
     pub code: Option<i32>,
@@ -340,6 +340,16 @@ fn output(mut bytes: Vec<u8>, capped: bool) -> String {
 }
 
 pub(super) async fn run(input: RunInput, permit: RunPermit) -> Result<RunResult, String> {
+    run_with_resolver(input, permit, executable).await
+}
+
+async fn run_with_resolver(
+    input: RunInput,
+    permit: RunPermit,
+    resolver: impl FnOnce(&str, &Path, &HashMap<String, Option<String>>) -> Option<PathBuf>
+        + Send
+        + 'static,
+) -> Result<RunResult, String> {
     validate_command(&input.command)?;
     if input.args.len() > 256
         || input
@@ -372,25 +382,67 @@ pub(super) async fn run(input: RunInput, permit: RunPermit) -> Result<RunResult,
     if timeout == 0 || timeout > MAX_TIMEOUT_MS || max == 0 || max > MAX_OUTPUT {
         return Err("Process timeout/output limit is out of range".into());
     }
-    let cwd = match input.cwd {
-        Some(path) => super::data::absolute_path(&path)?,
-        None => std::env::current_dir().map_err(|e| e.to_string())?,
-    };
-    let program = executable(&input.command, &cwd, &input.env)
-        .ok_or_else(|| format!("Command not found on PATH: {}", input.command))?;
-    validate_program(&program, cfg!(windows))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout);
     let mut cancel = permit.cancellation();
     if *cancel.borrow() {
         return Ok(RunResult {
-            code: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            timed_out: false,
-            truncated: false,
-            pipes_held_open: false,
             cancelled: true,
+            ..RunResult::default()
         });
     }
+
+    // A dead PATH mount or cwd lookup must not occupy an async worker or
+    // postpone the deadline. This task only resolves; it can never spawn.
+    let mut preflight = tokio::task::spawn_blocking(move || {
+        let cwd = match input.cwd.as_deref() {
+            Some(path) => super::data::absolute_path(path)?,
+            None => std::env::current_dir().map_err(|e| e.to_string())?,
+        };
+        let program = resolver(&input.command, &cwd, &input.env)
+            .ok_or_else(|| format!("Command not found on PATH: {}", input.command))?;
+        validate_program(&program, cfg!(windows))?;
+        Ok::<_, String>((input, program, cwd))
+    });
+    let (input, program, cwd) = tokio::select! {
+        biased;
+        _ = cancelled(&mut cancel) => return Ok(RunResult { cancelled: true, ..RunResult::default() }),
+        _ = tokio::time::sleep_until(deadline) => return Ok(RunResult { timed_out: true, ..RunResult::default() }),
+        result = &mut preflight => result.map_err(|e| e.to_string())??,
+    };
+
+    // OS process creation can block too. If it has already begun when the
+    // deadline fires, a supervisor retains ownership and reaps any late child.
+    let launch_cancel = cancel.clone();
+    let mut launch = tokio::task::spawn_blocking(move || {
+        if *launch_cancel.borrow() || tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        spawn_process(input, program, cwd).map(Some)
+    });
+    let process = tokio::select! {
+        biased;
+        _ = cancelled(&mut cancel) => {
+            tokio::spawn(cleanup_launch(launch, permit));
+            return Ok(RunResult { cancelled: true, ..RunResult::default() });
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            tokio::spawn(cleanup_launch(launch, permit));
+            return Ok(RunResult { timed_out: true, ..RunResult::default() });
+        }
+        result = &mut launch => result.map_err(|e| e.to_string())??,
+    };
+    let Some(process) = process else {
+        let cancelled = *cancel.borrow();
+        return Ok(RunResult {
+            cancelled,
+            timed_out: !cancelled,
+            ..RunResult::default()
+        });
+    };
+    supervise(process, permit, max, deadline, cancel).await
+}
+
+fn spawn_process(input: RunInput, program: PathBuf, cwd: PathBuf) -> Result<Process, String> {
     let mut command = Command::new(program);
     command
         .args(input.args)
@@ -412,12 +464,48 @@ pub(super) async fn run(input: RunInput, permit: RunPermit) -> Result<RunResult,
     #[cfg(windows)]
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     let child = command.spawn().map_err(|e| e.to_string())?;
-    let mut process = Process {
+    Ok(Process {
         group: child
             .id()
             .filter(|_| cfg!(any(target_os = "linux", target_os = "macos"))),
         child,
-    };
+    })
+}
+
+async fn cleanup_launch(
+    launch: tokio::task::JoinHandle<Result<Option<Process>, String>>,
+    _permit: RunPermit,
+) {
+    if let Ok(Ok(Some(mut process))) = launch.await {
+        // A late launcher may already have detached a child with inherited
+        // pipes. Keep those readers alive just as for a normal completed run.
+        if let Some(mut stdout) = process.child.stdout.take() {
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
+            });
+        }
+        if let Some(mut stderr) = process.child.stderr.take() {
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+            });
+        }
+        if let Err(error) = process.kill() {
+            log::warn!("Plugin process late-launch cleanup: {error}");
+        }
+        if let Err(error) = process.child.wait().await {
+            log::warn!("Plugin process late-launch wait: {error}");
+        }
+        process.group = None;
+    }
+}
+
+async fn supervise(
+    mut process: Process,
+    _permit: RunPermit,
+    max: usize,
+    deadline: tokio::time::Instant,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<RunResult, String> {
     let remaining = Arc::new(AtomicUsize::new(max));
     let truncated = Arc::new(AtomicBool::new(false));
     let stdout = process.child.stdout.take().ok_or("Missing stdout pipe")?;
@@ -448,9 +536,9 @@ pub(super) async fn run(input: RunInput, permit: RunPermit) -> Result<RunResult,
         TimedOut,
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let ended = tokio::select! { biased; _=cancelled(&mut cancel)=>End::Cancelled,_=tokio::time::sleep(Duration::from_millis(timeout))=>End::TimedOut,result=leader_exited(process.group.unwrap())=>{result?;End::Exited} };
+    let ended = tokio::select! { biased; _=cancelled(&mut cancel)=>End::Cancelled,_=tokio::time::sleep_until(deadline)=>End::TimedOut,result=leader_exited(process.group.unwrap())=>{result?;End::Exited} };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let ended = tokio::select! { biased; _=cancelled(&mut cancel)=>End::Cancelled,_=tokio::time::sleep(Duration::from_millis(timeout))=>End::TimedOut,result=process.child.wait()=>{result.map_err(|e|e.to_string())?;End::Exited} };
+    let ended = tokio::select! { biased; _=cancelled(&mut cancel)=>End::Cancelled,_=tokio::time::sleep_until(deadline)=>End::TimedOut,result=process.child.wait()=>{result.map_err(|e|e.to_string())?;End::Exited} };
     if !matches!(ended, End::Exited) {
         process.kill()?;
     }
@@ -515,6 +603,140 @@ mod tests {
     fn permit(host: &PluginHostState) -> RunPermit {
         host.acquire(0, "demo", "test").unwrap();
         host.begin("demo", "test").unwrap()
+    }
+    #[cfg(target_os = "linux")]
+    async fn stalled_preflight(dispose: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("launched");
+        let host = Arc::new(PluginHostState::default());
+        let mut request = input("mark", &[marker.to_str().unwrap()]);
+        request.timeout_ms = Some(if dispose { 5000 } else { 40 });
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (finished, resolved) = tokio::sync::oneshot::channel();
+        let mut task = tokio::spawn(run_with_resolver(
+            request,
+            permit(&host),
+            move |command, cwd, env| {
+                let _ = started.send(());
+                let _ = blocked.recv_timeout(Duration::from_secs(3));
+                let result = executable(command, cwd, env);
+                let _ = finished.send(());
+                result
+            },
+        ));
+        ready.await.unwrap();
+        let mut cleanup = if dispose {
+            let host = host.clone();
+            Some(tokio::spawn(
+                async move { host.release("demo", "test").await },
+            ))
+        } else {
+            None
+        };
+        let completed = tokio::time::timeout(Duration::from_millis(250), &mut task).await;
+        let returned_while_blocked = completed.is_ok();
+        let disposal_finished_while_blocked = if let Some(cleanup) = cleanup.as_mut() {
+            match tokio::time::timeout(Duration::from_millis(100), cleanup).await {
+                Ok(result) => {
+                    result.unwrap();
+                    true
+                }
+                Err(_) => false,
+            }
+        } else {
+            true
+        };
+        let _ = release.send(());
+        let result = match completed {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => task.await.unwrap().unwrap(),
+        };
+        resolved.await.unwrap();
+        if !disposal_finished_while_blocked {
+            if let Some(cleanup) = cleanup {
+                cleanup.await.unwrap();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            returned_while_blocked,
+            "preflight must not block the deadline or disposal"
+        );
+        assert!(
+            disposal_finished_while_blocked,
+            "disposal must not wait for read-only lookup"
+        );
+        assert_eq!(result.timed_out, !dispose);
+        assert_eq!(result.cancelled, dispose);
+        assert!(result.code.is_none());
+        assert!(
+            !marker.exists(),
+            "a late resolver must never launch the child"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_host_stalled_preflight_times_out_without_a_late_launch() {
+        stalled_preflight(false).await;
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_host_stalled_preflight_cancels_without_a_late_launch() {
+        stalled_preflight(true).await;
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn plugin_host_preflight_and_child_share_one_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("heartbeat");
+        let host = PluginHostState::default();
+        let mut request = input("heartbeat", &[marker.to_str().unwrap(), "stdout"]);
+        request.timeout_ms = Some(350);
+        let result = run_with_resolver(request, permit(&host), |command, cwd, env| {
+            std::thread::sleep(Duration::from_millis(150));
+            executable(command, cwd, env)
+        })
+        .await
+        .unwrap();
+        assert!(result.timed_out);
+        assert!(!result.cancelled);
+        assert!(
+            !marker.exists(),
+            "child must not receive a fresh timeout after lookup"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn plugin_host_late_launch_cleanup_waits_for_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let heartbeat = root.path().join("late-launch");
+        let host = Arc::new(PluginHostState::default());
+        let permit = permit(&host);
+        let request = input("tree", &[heartbeat.to_str().unwrap()]);
+        let cwd = std::env::current_dir().unwrap();
+        let program = executable(&request.command, &cwd, &request.env).unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let launch = tokio::task::spawn_blocking(move || {
+            let process = spawn_process(request, program, cwd)?;
+            let _ = blocked.recv_timeout(Duration::from_secs(3));
+            Ok(Some(process))
+        });
+        wait_for(&heartbeat).await;
+        let cleanup = tokio::spawn(cleanup_launch(launch, permit));
+        let owner = host.clone();
+        let mut disposal = tokio::spawn(async move { owner.release("demo", "test").await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut disposal)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        cleanup.await.unwrap();
+        disposal.await.unwrap();
+        let stopped = std::fs::metadata(&heartbeat).unwrap().len();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(std::fs::metadata(&heartbeat).unwrap().len(), stopped);
     }
     #[test]
     fn plugin_host_resolves_path_and_windows_pathext_in_order() {

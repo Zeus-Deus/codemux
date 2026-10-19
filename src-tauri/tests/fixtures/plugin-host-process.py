@@ -15,6 +15,8 @@ elif mode == 'output':
     os.write(2, b'b' * 65536)
 elif mode == 'invalid-utf8':
     os.write(1, b'\xff' * 10 + b'abc')
+elif mode == 'mark':
+    Path(sys.argv[2]).write_text('launched')
 elif mode == 'heartbeat':
     if len(sys.argv) > 3:
         # First write follows the host's bounded drain window.

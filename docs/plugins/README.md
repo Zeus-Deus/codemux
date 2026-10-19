@@ -385,7 +385,11 @@ Without `cwd`, the child uses the app’s current directory, not a workspace pat
 Inputs allow up to 256 arguments (16 KiB each, 1 MiB combined) and 128 environment
 overrides (16 KiB per value, 64 KiB combined).
 
-The default timeout is 30 seconds (maximum 10 minutes). The combined stdout and
+The default timeout is 30 seconds (maximum 10 minutes), shared by executable
+lookup, local cwd resolution, startup and execution. Filesystem lookup and OS
+process creation run off the async workers. A lookup finishing after timeout or
+disposal cannot launch a child; a process creation already in progress is
+supervised until its result can be killed and reaped. The combined stdout and
 stderr cap defaults to 1 MiB (maximum 8 MiB); excess bytes are drained and discarded,
 with `truncated: true`. Timeout or plugin disposal kills the owned process group
 on Linux and macOS, then waits for the child to exit. On normal launcher exit,
@@ -416,6 +420,9 @@ const text = await ctx.host.fs.readText(absolutePath, { maxBytes: 1024 * 1024, w
 
 `readText` reads UTF-8 regular files and refuses files larger than `maxBytes`
 (default 1 MiB, maximum 8 MiB). `listDir` refuses more than 10,000 entries.
+These filesystem calls (and `which`) run on blocking workers. They have no
+per-operation timeout: an OS call stalled on a dead mount cannot be interrupted.
+App-exit cleanup waits at most three seconds for such calls.
 
 For CLI policies and manifests, the only supported write route is plugin-owned data:
 
