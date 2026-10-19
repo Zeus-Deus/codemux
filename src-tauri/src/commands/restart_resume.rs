@@ -502,12 +502,16 @@ async fn gather_facts<R: Runtime>(
                 .await
                 .is_ok_and(|impl_| impl_.capabilities().supports_session_resume);
         // Without its saved conversation the provider would start over, and
-        // the note would make no sense to it. Claude's lives in a local file
-        // the session start would drop the id for.
+        // the note would make no sense to it. Claude's lives in a local file,
+        // in the home of the account the thread is bound to, and the session
+        // start would drop the id if it were gone.
         let conversation = session.sdk_session_id.as_deref().is_some_and(|id| {
             provider != ProviderKind::Claude
                 || !facts.local
-                || !super::agent_chat::claude_session_file_missing(id)
+                || !crate::provider_accounts::claude_session_missing(
+                    Some(&crate::provider_accounts::session_env_for_thread(app, provider, &row.thread_id)),
+                    id,
+                )
         });
         facts.provider_resumes = resumable && conversation && session.imported_from.is_none();
         facts.busy = thread_busy(app, provider, &ThreadId(row.thread_id.clone())).await

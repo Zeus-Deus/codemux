@@ -471,6 +471,29 @@ async fn a_claude_chat_resumes_only_while_its_conversation_file_exists() {
         h.provider.start_inputs()[0].resume_cursor,
         Some(serde_json::json!({"resume": session, "requireOriginal": true}))
     );
+
+    // A chat on another Claude account keeps its conversation in that
+    // account's home, not the default one, which lacks it here.
+    let account_home = tempfile::tempdir().unwrap();
+    let account_project = account_home.path().join("projects").join("-workdir");
+    std::fs::create_dir_all(&account_project).unwrap();
+    let other = "00000000-0000-4000-8000-0000000acc07";
+    std::fs::write(account_project.join(format!("{other}.jsonl")), b"{}").unwrap();
+    h.db()
+        .insert_provider_account(&codemux_lib::database::provider_accounts::ProviderAccountRow {
+            id: "work".into(),
+            provider: "claude".into(),
+            label: "Work".into(),
+            home: account_home.path().to_string_lossy().into_owned(),
+            created_at_ms: 1,
+        })
+        .unwrap();
+    h.chat("rr-claude-work");
+    h.db().set_provider_account_binding("rr-claude-work", "claude", "work").unwrap();
+    h.db().set_agent_chat_sdk_session_id("rr-claude-work", other).unwrap();
+    h.running("rr-claude-work", "turn-1");
+    let decisions = resume_after_restart_for_test(&h.handle(), "launch-4").await;
+    assert_eq!(decision(&decisions, "rr-claude-work"), Some(ResumeDecision::Resume));
 }
 
 fn typed(thread: &str, text: &str) -> SendTurnCommandInput {
