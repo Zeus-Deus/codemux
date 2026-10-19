@@ -2348,16 +2348,30 @@ async fn attach_mcp_gateway_scoped(
     server: &OpenCodeServerHandle,
     registry: &McpRegistry,
     directory: Option<&std::path::Path>,
-    _workspace_id: Option<&str>,
+    workspace_id: Option<&str>,
 ) -> Result<(), ProviderError> {
-    let connection =
-        registry
-            .gateway_connection()
-            .await
-            .map_err(|message| ProviderError::ProcessError {
-                message: "failed to start Codemux MCP gateway".into(),
-                source: Some(message),
-            })?;
+    // A V2 registration is scoped to one directory, so it gets a token bound
+    // to that directory's workspace. The V1 registration is instance-global
+    // and keeps the shared token, which has no workspace.
+    let workspace_id = workspace_id.filter(|_| server.api == super::api::OpenCodeApi::V2);
+    let connection = match workspace_id {
+        Some(workspace_id) => {
+            registry
+                .gateway_chat_connection(
+                    &format!("opencode-workspace:{workspace_id}"),
+                    crate::mcp::gateway::GatewayCaller {
+                        workspace_id: Some(workspace_id.to_string()),
+                        native_sources: crate::mcp::gateway::OPENCODE_NATIVE_SOURCES.to_vec(),
+                    },
+                )
+                .await
+        }
+        None => registry.gateway_connection().await,
+    }
+    .map_err(|message| ProviderError::ProcessError {
+        message: "failed to start Codemux MCP gateway".into(),
+        source: Some(message),
+    })?;
     if server.api == super::api::OpenCodeApi::V2 {
         let mut request = http.put(format!(
             "{}/api/experimental/mcp/codemux",
