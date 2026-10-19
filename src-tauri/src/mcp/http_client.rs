@@ -1,6 +1,6 @@
 //! Minimal MCP Streamable HTTP client owned by the cross-provider registry.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::json_rpc_child::Notification;
 use futures_util::StreamExt;
@@ -12,6 +12,17 @@ use tokio::sync::{broadcast, watch, Mutex};
 use super::McpServerConfig;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+pub(super) const NOTIFICATION_STREAM_ERROR: &str = "codemux/notification_stream_error";
+const INITIAL_GET_ATTEMPTS: usize = 6;
+
+pub(super) struct CatalogRefresh<'a>(&'a HttpMcpClient);
+impl Drop for CatalogRefresh<'_> {
+    fn drop(&mut self) {
+        self.0
+            .catalog_refresh_active
+            .store(false, Ordering::Release);
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 struct HttpSession {
@@ -29,6 +40,9 @@ pub struct HttpMcpClient {
     initialize_lock: Mutex<()>,
     session_changed: watch::Sender<u64>,
     next_id: AtomicU64,
+    catalog_refresh_active: AtomicBool,
+    catalog_refresh_renewed: AtomicBool,
+    skip_reconnect_reconcile: AtomicBool,
     notifications: broadcast::Sender<Notification>,
 }
 
@@ -54,9 +68,12 @@ impl HttpMcpClient {
             initialize_lock: Mutex::new(()),
             session_changed: watch::channel(0).0,
             next_id: AtomicU64::new(1),
+            catalog_refresh_active: AtomicBool::new(false),
+            catalog_refresh_renewed: AtomicBool::new(false),
+            skip_reconnect_reconcile: AtomicBool::new(false),
             notifications: broadcast::channel(256).0,
         };
-        client.ensure_session(None).await?;
+        client.ensure_session(None, false).await?;
         Ok(client)
     }
 
@@ -64,23 +81,64 @@ impl HttpMcpClient {
         self.notifications.subscribe()
     }
 
-    /// GET/SSE is optional. Only reconnect after a real SSE stream opened,
-    /// except that a session-bearing 404 always requires a fresh handshake.
+    /// The registry serializes each paginated refresh. Renewal is limited to
+    /// once for that whole fetch, and cannot enqueue another fetch itself.
+    pub(super) fn begin_catalog_refresh(&self) -> CatalogRefresh<'_> {
+        self.catalog_refresh_renewed.store(false, Ordering::Release);
+        self.catalog_refresh_active.store(true, Ordering::Release);
+        CatalogRefresh(self)
+    }
+
+    fn reserve_catalog_renewal(&self) -> Result<(), String> {
+        if self.catalog_refresh_active.load(Ordering::Acquire)
+            && self.catalog_refresh_renewed.swap(true, Ordering::AcqRel)
+        {
+            return Err(
+                "MCP session expired repeatedly during tools/list; restart this server".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn notifications_error(&self, message: String) {
+        self.emit_notification(
+            &json!({"method":NOTIFICATION_STREAM_ERROR,"params":{"message":message}}),
+        );
+    }
+
+    fn initial_retries_exhausted(&self, opened: bool, attempts: &mut usize, reason: &str) -> bool {
+        if opened {
+            return false;
+        }
+        *attempts += 1;
+        if *attempts < INITIAL_GET_ATTEMPTS {
+            return false;
+        }
+        self.notifications_error(format!("Live MCP tool updates stopped after {INITIAL_GET_ATTEMPTS} transient GET failures ({reason}); restart this server"));
+        true
+    }
+
+    /// GET/SSE is optional. Definitive no-stream responses stop immediately;
+    /// transient startup failures get a finite budget before surfacing an error.
     pub async fn listen_notifications(&self) {
         let mut backoff = Duration::from_millis(100);
         let mut opened = false;
+        let mut initial_failures = 0;
         let mut renewed = false;
         let mut changes = self.session_changed.subscribe();
         loop {
-            // A failed renewal stays pending. Never fall back to sessionless
-            // GETs (a stateful server correctly rejects those with 400).
             let needs_initialization = self.session.lock().await.needs_initialization;
-            if needs_initialization {
-                if self.ensure_session(None).await.is_err() {
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                    continue;
+            if needs_initialization && self.ensure_session(None, true).await.is_err() {
+                if self.initial_retries_exhausted(
+                    opened,
+                    &mut initial_failures,
+                    "session initialization failed",
+                ) {
+                    return;
                 }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                continue;
             }
             changes.borrow_and_update();
             let session = self.session.lock().await.clone();
@@ -93,24 +151,32 @@ impl HttpMcpClient {
             if let Some(id) = &session.id {
                 request = request.header("mcp-session-id", id);
             }
-            // Only bound connection/headers, not the lifetime of a healthy SSE.
             let response = tokio::select! {
                 response = tokio::time::timeout(Duration::from_secs(5), request.send()) => response.ok().and_then(Result::ok),
                 _ = changes.changed() => continue,
             };
             if let Some(response) = response {
                 let status = response.status();
-                if matches!(status.as_u16(), 405 | 501) {
+                if matches!(status.as_u16(), 405 | 501)
+                    || (session.id.is_none() && matches!(status.as_u16(), 400 | 404))
+                {
                     return;
                 }
                 if status == reqwest::StatusCode::NOT_FOUND {
-                    // One renewal per disconnected episode; a persistent 404
-                    // must not create an initialize/list polling loop.
-                    if renewed || (!opened && session.id.is_none()) {
+                    if renewed {
+                        self.notifications_error("MCP notification session expired again after renewal; restart this server".into());
                         return;
                     }
                     renewed = true;
-                    let _ = self.ensure_session(Some(&session)).await;
+                    if self.ensure_session(Some(&session), true).await.is_err()
+                        && self.initial_retries_exhausted(
+                            opened,
+                            &mut initial_failures,
+                            "session initialization failed",
+                        )
+                    {
+                        return;
+                    }
                 } else if status.is_success()
                     && response
                         .headers()
@@ -122,12 +188,18 @@ impl HttpMcpClient {
                                 .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
                         })
                 {
+                    let was_opened = opened;
                     opened = true;
                     renewed = false;
                     let connected_at = std::time::Instant::now();
-                    // Covers changes missed while disconnected, including the
-                    // initial gap between tools/list and the first GET stream.
-                    self.emit_notification(&json!({"method":"notifications/tools/list_changed"}));
+                    let coalesced = self.skip_reconnect_reconcile.swap(false, Ordering::AcqRel);
+                    // The initial GET still closes the discovery race. A stream
+                    // reopened because of renewal shares that renewal's refresh.
+                    if !was_opened || !coalesced {
+                        self.emit_notification(
+                            &json!({"method":"notifications/tools/list_changed"}),
+                        );
+                    }
                     let mut stream = response.bytes_stream();
                     let mut decoder = SseDecoder::default();
                     loop {
@@ -148,10 +220,28 @@ impl HttpMcpClient {
                     if connected_at.elapsed() >= Duration::from_secs(5) {
                         backoff = Duration::from_millis(100);
                     }
-                } else if status.is_success() || !opened {
+                } else if status.is_success() {
+                    return;
+                } else if retryable_get_status(status) {
+                    if self.initial_retries_exhausted(
+                        opened,
+                        &mut initial_failures,
+                        &format!("HTTP {}", status.as_u16()),
+                    ) {
+                        return;
+                    }
+                } else {
+                    self.notifications_error(format!(
+                        "MCP notification GET returned HTTP {}; restart this server",
+                        status.as_u16()
+                    ));
                     return;
                 }
-            } else if !opened {
+            } else if self.initial_retries_exhausted(
+                opened,
+                &mut initial_failures,
+                "connection failed or timed out",
+            ) {
                 return;
             }
             tokio::time::sleep(backoff).await;
@@ -161,7 +251,11 @@ impl HttpMcpClient {
 
     /// Coalesce expiry reports from concurrent GET/POST requests. Retain the
     /// pending state until BOTH initialize and initialized have succeeded.
-    async fn ensure_session(&self, expired: Option<&HttpSession>) -> Result<(), String> {
+    async fn ensure_session(
+        &self,
+        expired: Option<&HttpSession>,
+        notify_catalog: bool,
+    ) -> Result<(), String> {
         let _initializing = self.initialize_lock.lock().await;
         {
             let mut session = self.session.lock().await;
@@ -211,9 +305,12 @@ impl HttpMcpClient {
                     session.id = id;
                     session.needs_initialization = false;
                     session.generation += 1;
+                    if renewing {
+                        self.skip_reconnect_reconcile.store(true, Ordering::Release);
+                    }
                     self.session_changed.send_replace(session.generation);
                     drop(session);
-                    if renewing {
+                    if renewing && notify_catalog {
                         self.emit_notification(
                             &json!({"method":"notifications/tools/list_changed"}),
                         );
@@ -261,14 +358,33 @@ impl HttpMcpClient {
     }
 
     async fn post(&self, message: Value) -> Result<Value, String> {
-        self.ensure_session(None).await?;
+        let catalog = message["method"] == "tools/list";
+        let pending = self.session.lock().await;
+        if catalog && pending.needs_initialization && pending.generation > 0 {
+            self.reserve_catalog_renewal()?;
+        }
+        drop(pending);
+        self.ensure_session(None, !catalog).await?;
         let session = self.session.lock().await.clone();
         let mut response = self.send_post(&message, session.id.as_deref()).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND && session.id.is_some() {
-            self.ensure_session(Some(&session)).await?;
+            if catalog {
+                self.reserve_catalog_renewal()?;
+            }
+            self.ensure_session(Some(&session), !catalog).await?;
             let session = self.session.lock().await.clone();
             // Retry only an expired-session 404, never an ambiguous tool error.
             response = self.send_post(&message, session.id.as_deref()).await?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                let reason = self
+                    .read_response(&message, response)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| "HTTP status 404".into());
+                return Err(format!(
+                    "{reason}; MCP session expired again after renewal; restart this server"
+                ));
+            }
         }
         self.read_response(&message, response).await
     }
@@ -353,6 +469,11 @@ impl HttpMcpClient {
 
         serde_json::from_str(&body).map_err(|error| format!("decode JSON response: {error}"))
     }
+}
+
+fn retryable_get_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || (status.is_server_error() && status != reqwest::StatusCode::NOT_IMPLEMENTED)
 }
 
 pub(super) fn loopback_url(value: &str) -> bool {
@@ -631,7 +752,7 @@ mod live_tests {
     }
     #[tokio::test]
     async fn plugin_mcp_http_without_an_event_stream_stops_without_reconciliation() {
-        for status in [404, 405, 501, 503, 200] {
+        for status in [400, 404, 405, 501, 200] {
             let fixture = Fixture {
                 ready: Arc::new(AtomicBool::new(false)),
                 connected: Arc::new(AtomicBool::new(false)),
@@ -883,9 +1004,9 @@ mod live_tests {
                 client.request("tools/list", json!({})).await.unwrap(),
                 json!({"tools":[]})
             );
-            assert_eq!(
-                notifications.try_recv().unwrap().method,
-                "notifications/tools/list_changed"
+            assert!(
+                notifications.try_recv().is_err(),
+                "tools/list renewal notified its own caller"
             );
             let mut expected = vec![
                 "initialize:none",
@@ -905,6 +1026,217 @@ mod live_tests {
             }
             assert_eq!(*log.lock().unwrap(), expected);
             server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_http_initial_transient_get_reaches_live_catalog() {
+        use axum::response::IntoResponse;
+        let fixture = Fixture {
+            ready: Arc::new(AtomicBool::new(false)),
+            connected: Arc::new(AtomicBool::new(false)),
+            changes: broadcast::channel(8).0,
+        };
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = requests.clone();
+        let app = Router::new()
+            .route(
+                "/mcp",
+                post(handle).get(move |State(state): State<Fixture>| {
+                    let count = count.clone();
+                    async move {
+                        if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        let notification = futures_util::stream::once(async move {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            state.ready.store(true, Ordering::SeqCst);
+                            Ok::<_, std::convert::Infallible>(Event::default().data(
+                                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                            ))
+                        })
+                        .chain(futures_util::stream::pending());
+                        Sse::new(notification).into_response()
+                    }
+                }),
+            )
+            .with_state(fixture);
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", socket.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(socket, app).await.unwrap();
+        });
+        let registry = McpRegistry::new();
+        registry.register_plugin_server::<tauri::Wry>(None,"demo","token".into(),serde_json::from_value(json!({"id":"first","name":"First GET","toolPrefix":"first","scope":"all","transport":"http","url":url})).unwrap()).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            while registry
+                .list_tools_for_server("plugin:demo:first")
+                .await
+                .len()
+                != 2
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        registry.shutdown_all().await;
+        server.abort();
+        assert!(
+            result.is_ok(),
+            "first GET 503 disabled live discovery; GET count {}",
+            requests.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_http_initial_transient_get_stops_at_retry_cap_with_status() {
+        let fixture = Fixture {
+            ready: Arc::new(AtomicBool::new(false)),
+            connected: Arc::new(AtomicBool::new(false)),
+            changes: broadcast::channel(8).0,
+        };
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = requests.clone();
+        let app = Router::new()
+            .route(
+                "/mcp",
+                post(handle).get(move || {
+                    let count = count.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }),
+            )
+            .with_state(fixture);
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", socket.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(socket, app).await.unwrap();
+        });
+        let registry = McpRegistry::new();
+        registry.register_plugin_server::<tauri::Wry>(None,"demo","token".into(),serde_json::from_value(json!({"id":"limit","name":"Retry cap","toolPrefix":"limit","scope":"all","transport":"http","url":url})).unwrap()).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(row) = registry.plugin_status("plugin:demo:limit").await {
+                    if let super::super::runtime::McpServerStatus::Errored { message } = row.status
+                    {
+                        break message;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        registry.shutdown_all().await;
+        server.abort();
+        assert!(
+            result
+                .as_ref()
+                .is_ok_and(|message| message.contains("6") && message.contains("restart")),
+            "retry cap did not surface an actionable status: {result:?}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_http_catalog_expiry_does_not_retrigger_its_own_refresh() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        for paginated in [false, true] {
+            let fixture = Fixture {
+                ready: Arc::new(AtomicBool::new(false)),
+                connected: Arc::new(AtomicBool::new(false)),
+                changes: broadcast::channel(8).0,
+            };
+            let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let initializes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fail = Arc::new(AtomicBool::new(false));
+            let (list_count, init_count, broken) =
+                (lists.clone(), initializes.clone(), fail.clone());
+            let app = Router::new()
+            .route(
+                "/mcp",
+                post(
+                    move |State(state): State<Fixture>,
+                          headers: HeaderMap,
+                          Json(request): Json<Value>| {
+                        let lists = list_count.clone();
+                        let initializes = init_count.clone();
+                        let fail = broken.clone();
+                        async move {
+                            if request["method"] == "initialize" {
+                                assert!(headers.get("mcp-session-id").is_none());
+                                let session =
+                                    initializes.fetch_add(1, Ordering::SeqCst).to_string();
+                                let mut result = handle(State(state), Json(request)).await;
+                                result
+                                    .headers_mut()
+                                    .insert("mcp-session-id", session.parse().unwrap());
+                                return result;
+                            }
+                            if request["method"] == "tools/list" {
+                                lists.fetch_add(1, Ordering::SeqCst);
+                                if fail.load(Ordering::SeqCst) {
+                                    if paginated && headers.get("mcp-session-id").unwrap() != "0"
+                                        && request["params"]["cursor"].is_null()
+                                    {
+                                        return Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"tools":[],"nextCursor":"second"}})).into_response();
+                                    }
+                                    return (
+                                        StatusCode::NOT_FOUND,
+                                        "fixture catalog session expired",
+                                    )
+                                        .into_response();
+                                }
+                            }
+                            handle(State(state), Json(request)).await
+                        }
+                    },
+                )
+                .get(events),
+            )
+            .with_state(fixture.clone());
+            let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/mcp", socket.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(socket, app).await.unwrap();
+            });
+            let registry = McpRegistry::new();
+            registry.register_plugin_server::<tauri::Wry>(None,"demo","token".into(),serde_json::from_value(json!({"id":"loop","name":"Expiry loop","toolPrefix":"loop","scope":"all","transport":"http","url":url})).unwrap()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while lists.load(Ordering::SeqCst) < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let before = lists.load(Ordering::SeqCst);
+            fail.store(true, Ordering::SeqCst);
+            fixture.changes.send(()).unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let count = lists.load(Ordering::SeqCst);
+            let status = registry.plugin_status("plugin:demo:loop").await.unwrap();
+            registry.shutdown_all().await;
+            server.abort();
+            assert!(
+                count <= before + if paginated { 3 } else { 2 },
+                "renewal fed its own reconciliation: {} lists and {} initializations",
+                count,
+                initializes.load(Ordering::SeqCst)
+            );
+            assert_eq!(
+                initializes.load(Ordering::SeqCst),
+                2,
+                "more than one renewal in a paginated refresh"
+            );
+            assert!(
+                matches!(status.status,super::super::runtime::McpServerStatus::Errored{ref message} if message.contains("restart")),
+                "{status:?}"
+            );
         }
     }
 
@@ -1130,6 +1462,20 @@ mod live_tests {
             elapsed < std::time::Duration::from_millis(500),
             "healthy reconnect retained stale backoff: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn plugin_mcp_http_retryable_statuses_are_separate_from_no_stream_responses() {
+        for status in [429, 500, 502, 503, 504, 599] {
+            assert!(retryable_get_status(
+                reqwest::StatusCode::from_u16(status).unwrap()
+            ));
+        }
+        for status in [200, 400, 401, 403, 404, 405, 501] {
+            assert!(!retryable_get_status(
+                reqwest::StatusCode::from_u16(status).unwrap()
+            ));
+        }
     }
 
     #[test]

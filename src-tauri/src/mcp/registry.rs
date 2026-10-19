@@ -626,12 +626,25 @@ impl McpRegistry {
             let _stream_guard = StreamGuard(stream_task.take());
             let mut reconcile_now = child.is_some();
             loop {
+                let mut stream_error = None;
                 // Stdio needs an immediate race-closing fetch. HTTP reconciles
                 // only after a real GET stream opens or a session is renewed.
                 if !reconcile_now {
                     loop {
                         match notifications.recv().await {
                             Ok(n) if n.method == "notifications/tools/list_changed" => break,
+                            Ok(n)
+                                if remote.is_some()
+                                    && n.method == super::http_client::NOTIFICATION_STREAM_ERROR =>
+                            {
+                                stream_error = Some(
+                                    n.params["message"]
+                                        .as_str()
+                                        .unwrap_or("MCP notifications stopped; restart this server")
+                                        .to_owned(),
+                                );
+                                break;
+                            }
                             Ok(_) => {}
                             Err(broadcast::error::RecvError::Lagged(_)) => break,
                             Err(broadcast::error::RecvError::Closed) => return,
@@ -639,11 +652,15 @@ impl McpRegistry {
                     }
                 }
                 reconcile_now = false;
-                let result = if let Some(c) = child.as_ref() {
+                let terminal = stream_error.is_some();
+                let result = if let Some(error) = stream_error {
+                    Err(error)
+                } else if let Some(c) = child.as_ref() {
                     super::runtime::list_stdio_tools(c, &config)
                         .await
                         .map_err(|e| e.to_string())
                 } else if let Some(r) = remote.as_ref() {
+                    let _refresh = r.begin_catalog_refresh();
                     super::runtime::list_http_tools(r, &config).await
                 } else {
                     return;
@@ -687,13 +704,20 @@ impl McpRegistry {
                         Err(error) => {
                             h.tools.clear();
                             h.status = McpServerStatus::Errored {
-                                message: format!("tools/list refresh failed: {error}"),
+                                message: if terminal {
+                                    error
+                                } else {
+                                    format!("tools/list refresh failed: {error}")
+                                },
                             };
                         }
                     }
                     McpServerRuntime::from_handle(h)
                 };
                 emit_status_with_bus(app.as_ref(), &registry.status_tx, &row);
+                if terminal {
+                    return;
+                }
             }
         });
         let mut inner = self.inner.lock().await;
