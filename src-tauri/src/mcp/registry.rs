@@ -321,6 +321,13 @@ impl McpRegistry {
         Ok(self.gateway().await?.chat_connection(key, caller))
     }
 
+    /// The process-wide gateway, started on first use. For callers that must
+    /// issue a chat connection synchronously, inside their own critical
+    /// section.
+    pub async fn gateway_runtime(&self) -> Result<Arc<super::gateway::McpGatewayRuntime>, String> {
+        self.gateway().await.cloned()
+    }
+
     async fn gateway(&self) -> Result<&Arc<super::gateway::McpGatewayRuntime>, String> {
         let registry = self.clone();
         self.gateway

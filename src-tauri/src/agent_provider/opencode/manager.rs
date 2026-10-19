@@ -98,22 +98,54 @@ pub struct OpenCodeServerHandle {
 /// only, never another workspace's. The set only grows, so it can't fall
 /// back to a single, wrong workspace; it resets with the server, whose MCP
 /// entries go with it.
-#[derive(Debug, Default)]
-pub struct GatewayDirectoryWorkspaces(
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::collections::BTreeSet<Option<String>>>>,
-);
+#[derive(Default)]
+pub struct GatewayDirectoryWorkspaces {
+    members: std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, std::collections::BTreeSet<Option<String>>>,
+    >,
+    /// Runs after a chat's membership is recorded and before its gateway
+    /// authority is published, so tests can force concurrent orderings.
+    #[cfg(test)]
+    pub(crate) after_record: std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>,
+}
+
+impl std::fmt::Debug for GatewayDirectoryWorkspaces {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayDirectoryWorkspaces").finish_non_exhaustive()
+    }
+}
 
 impl GatewayDirectoryWorkspaces {
-    /// Record `workspace` attaching in `directory` and return the workspace
-    /// the directory's gateway token may act for.
-    pub fn record(&self, directory: &std::path::Path, workspace: Option<&str>) -> Option<String> {
-        let mut map = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    #[cfg(test)]
+    pub(crate) fn run_after_record(&self) {
+        let hook = self.after_record.lock().unwrap().take();
+        if let Some(mut hook) = hook {
+            hook();
+        }
+    }
+
+    /// Record `workspace` attaching in `directory`, then `publish` the
+    /// workspace the directory's gateway token may act for: the only member,
+    /// else none. Both happen under one lock, so concurrent attaches in a
+    /// directory publish in the order they recorded and the last publication
+    /// always reflects every member; a chat that recorded while it was the
+    /// only member can't publish that stale view after a second one joined.
+    pub fn record_and_publish<R>(
+        &self,
+        directory: &std::path::Path,
+        workspace: Option<&str>,
+        publish: impl FnOnce(Option<String>) -> R,
+    ) -> R {
+        let mut map = self.members.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let members = map.entry(directory.to_path_buf()).or_default();
         members.insert(workspace.map(str::to_owned));
-        match members.iter().collect::<Vec<_>>().as_slice() {
+        let authority = match members.iter().collect::<Vec<_>>().as_slice() {
             [only] => (*only).clone(),
             _ => None,
-        }
+        };
+        #[cfg(test)]
+        self.run_after_record();
+        publish(authority)
     }
 }
 
@@ -417,18 +449,19 @@ mod gateway_workspace_tests {
     #[test]
     fn a_directory_acts_for_its_only_workspace_and_for_none_once_shared() {
         let seen = GatewayDirectoryWorkspaces::default();
-        let checkout = Path::new("/repo");
-        assert_eq!(seen.record(checkout, Some("ws-a")).as_deref(), Some("ws-a"));
-        assert_eq!(seen.record(checkout, Some("ws-a")).as_deref(), Some("ws-a"));
-        assert_eq!(seen.record(checkout, Some("ws-b")), None);
+        let record = |directory: &str, workspace: Option<&str>| {
+            seen.record_and_publish(Path::new(directory), workspace, |authority| authority)
+        };
+        assert_eq!(record("/repo", Some("ws-a")).as_deref(), Some("ws-a"));
+        assert_eq!(record("/repo", Some("ws-a")).as_deref(), Some("ws-a"));
+        assert_eq!(record("/repo", Some("ws-b")), None);
         // Never falls back to one workspace once the directory was shared.
-        assert_eq!(seen.record(checkout, Some("ws-a")), None);
+        assert_eq!(record("/repo", Some("ws-a")), None);
         // Other directories are independent.
-        assert_eq!(seen.record(Path::new("/other"), Some("ws-b")).as_deref(), Some("ws-b"));
+        assert_eq!(record("/other", Some("ws-b")).as_deref(), Some("ws-b"));
         // A chat without a workspace shares the entry too, so it counts.
-        let worktree = Path::new("/worktree");
-        assert_eq!(seen.record(worktree, None), None);
-        assert_eq!(seen.record(worktree, Some("ws-c")), None);
+        assert_eq!(record("/worktree", None), None);
+        assert_eq!(record("/worktree", Some("ws-c")), None);
     }
 }
 

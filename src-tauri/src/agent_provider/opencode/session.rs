@@ -2360,17 +2360,19 @@ async fn attach_mcp_gateway_scoped(
     let connection = match directory.filter(|_| server.api == super::api::OpenCodeApi::V2) {
         Some(directory) => {
             let key = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
-            let workspace_id = server.gateway_workspaces.record(&key, workspace_id);
-            registry
-                .gateway_chat_connection(
-                    &format!("opencode-directory:{}", key.display()),
-                    crate::mcp::gateway::GatewayCaller {
-                        workspace_id,
-                        native_sources: crate::mcp::gateway::OPENCODE_NATIVE_SOURCES.to_vec(),
-                        flat_tool_names: false,
-                    },
-                )
-                .await
+            let token_key = format!("opencode-directory:{}", key.display());
+            registry.gateway_runtime().await.map(|gateway| {
+                server.gateway_workspaces.record_and_publish(&key, workspace_id, |authority| {
+                    gateway.chat_connection(
+                        &token_key,
+                        crate::mcp::gateway::GatewayCaller {
+                            workspace_id: authority,
+                            native_sources: crate::mcp::gateway::OPENCODE_NATIVE_SOURCES.to_vec(),
+                            flat_tool_names: false,
+                        },
+                    )
+                })
+            })
         }
         None => registry.gateway_connection().await,
     }
@@ -3472,6 +3474,125 @@ pub(crate) mod tests {
         let names = listed(first).await;
         assert!(!names.iter().any(|name| name.starts_with("fixture__")), "{names:?}");
         put.assert_async().await;
+    }
+
+    /// Two chats start in one directory at once. Chat A pauses after
+    /// recording itself as the directory's only member and before publishing
+    /// its gateway authority, while chat B attaches. However they interleave,
+    /// the directory token must end up acting for no workspace, so neither
+    /// chat can list or call tools scoped to workspace A.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v2_concurrent_shared_directory_attaches_never_publish_a_stale_workspace() {
+        let registry = McpRegistry::new();
+        let fixture: crate::mcp::registry::PluginMcpServer = serde_json::from_value(serde_json::json!({
+            "id": "fixture", "name": "Fixture", "toolPrefix": "fixture",
+            "scope": {"workspaceIds": ["workspace-a"]},
+            "transport": "stdio", "command": "python3",
+            "args": [format!("{}/tests/fixtures/plugin_mcp.py", env!("CARGO_MANIFEST_DIR"))],
+        }))
+        .unwrap();
+        registry
+            .register_plugin_server::<tauri::Wry>(None, "demo", "token-1".into(), fixture)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while registry.list_tools_for_workspace(&[], Some("workspace-a")).await.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fixture tools load");
+
+        let mut mock = Server::new_async().await;
+        let registrations = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let seen = registrations.clone();
+        let _put = mock
+            .mock("PUT", "/api/experimental/mcp/codemux")
+            .match_query(mockito::Matcher::Any)
+            .with_status(204)
+            .with_body_from_request(move |request| {
+                let body: serde_json::Value = serde_json::from_slice(request.body().unwrap()).unwrap();
+                seen.lock().unwrap().push(body["config"].clone());
+                Vec::new()
+            })
+            .expect(2)
+            .create_async()
+            .await;
+        let _get = mock
+            .mock("GET", "/api/mcp")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"name":"codemux","status":{"status":"connected"}}]}"#)
+            .create_async()
+            .await;
+        let server = OpenCodeServerHandle {
+            base_url: mock.url(),
+            server_password: "fixture".into(),
+            api: super::super::api::OpenCodeApi::V2,
+            gateway_workspaces: Default::default(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        *server.gateway_workspaces.after_record.lock().unwrap() = Some(Box::new(move || {
+            reached_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        }));
+        let attach = |workspace: &'static str| {
+            let (server, registry, directory) =
+                (server.clone(), registry.clone(), directory.path().to_path_buf());
+            tokio::spawn(async move {
+                attach_mcp_gateway_scoped(
+                    &reqwest::Client::new(),
+                    &server,
+                    &registry,
+                    Some(&directory),
+                    Some(workspace),
+                )
+                .await
+            })
+        };
+
+        let a = attach("workspace-a");
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .expect("chat A recorded its membership");
+        let b = attach("workspace-b");
+        // Room for B to finish first if nothing orders the two publications.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        release_tx.send(()).unwrap();
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+
+        let config = registrations.lock().unwrap()[0].clone();
+        let call = |body: serde_json::Value| {
+            let config = config.clone();
+            async move {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap()
+                    .post(config["url"].as_str().unwrap())
+                    .header("authorization", config["headers"]["Authorization"].as_str().unwrap())
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap()
+            }
+        };
+        let listed = call(serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
+        assert!(
+            !listed.to_string().contains("fixture__"),
+            "the shared directory token lists workspace A's tools: {listed}"
+        );
+        let called = call(serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "fixture__echo", "arguments": {}}}))
+        .await;
+        assert_eq!(called["result"]["isError"], true, "{called}");
     }
 
     #[tokio::test]
