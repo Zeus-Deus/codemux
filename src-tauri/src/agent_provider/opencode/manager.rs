@@ -81,6 +81,40 @@ pub struct OpenCodeServerHandle {
     pub base_url: String,
     pub server_password: String,
     pub api: super::api::OpenCodeApi,
+    /// Which workspaces attached the MCP gateway in each directory of this
+    /// server process; shared by every handle to it.
+    pub gateway_workspaces: std::sync::Arc<GatewayDirectoryWorkspaces>,
+}
+
+/// Workspaces whose chats attached the Codemux MCP gateway, per directory,
+/// for the life of one `opencode serve`.
+///
+/// OpenCode v2 keys MCP entries by name and `location[directory]` only (its
+/// API has no per-session or per-prompt MCP selection), so every chat in a
+/// directory shares one `codemux` entry and one gateway token. That token
+/// may act for a workspace only while a single workspace uses the
+/// directory. Once a second one (or a chat with no workspace) attaches, it
+/// acts for none: OpenCode chats there see globally scoped plugin tools
+/// only, never another workspace's. The set only grows, so it can't fall
+/// back to a single, wrong workspace; it resets with the server, whose MCP
+/// entries go with it.
+#[derive(Debug, Default)]
+pub struct GatewayDirectoryWorkspaces(
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::collections::BTreeSet<Option<String>>>>,
+);
+
+impl GatewayDirectoryWorkspaces {
+    /// Record `workspace` attaching in `directory` and return the workspace
+    /// the directory's gateway token may act for.
+    pub fn record(&self, directory: &std::path::Path, workspace: Option<&str>) -> Option<String> {
+        let mut map = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let members = map.entry(directory.to_path_buf()).or_default();
+        members.insert(workspace.map(str::to_owned));
+        match members.iter().collect::<Vec<_>>().as_slice() {
+            [only] => (*only).clone(),
+            _ => None,
+        }
+    }
 }
 
 /// Singleton supervisor for the OpenCode HTTP server child.
@@ -229,6 +263,7 @@ fn handle_from(server: &OpenCodeServer) -> OpenCodeServerHandle {
         base_url: server.base_url().to_string(),
         api: server.api(),
         server_password: server.server_password().to_string(),
+        gateway_workspaces: server.gateway_workspaces(),
     }
 }
 
@@ -371,6 +406,29 @@ impl DisposableHttpServer {
     pub(crate) async fn kill(self) {
         self.handle.abort();
         let _ = self.handle.await;
+    }
+}
+
+#[cfg(test)]
+mod gateway_workspace_tests {
+    use super::GatewayDirectoryWorkspaces;
+    use std::path::Path;
+
+    #[test]
+    fn a_directory_acts_for_its_only_workspace_and_for_none_once_shared() {
+        let seen = GatewayDirectoryWorkspaces::default();
+        let checkout = Path::new("/repo");
+        assert_eq!(seen.record(checkout, Some("ws-a")).as_deref(), Some("ws-a"));
+        assert_eq!(seen.record(checkout, Some("ws-a")).as_deref(), Some("ws-a"));
+        assert_eq!(seen.record(checkout, Some("ws-b")), None);
+        // Never falls back to one workspace once the directory was shared.
+        assert_eq!(seen.record(checkout, Some("ws-a")), None);
+        // Other directories are independent.
+        assert_eq!(seen.record(Path::new("/other"), Some("ws-b")).as_deref(), Some("ws-b"));
+        // A chat without a workspace shares the entry too, so it counts.
+        let worktree = Path::new("/worktree");
+        assert_eq!(seen.record(worktree, None), None);
+        assert_eq!(seen.record(worktree, Some("ws-c")), None);
     }
 }
 
