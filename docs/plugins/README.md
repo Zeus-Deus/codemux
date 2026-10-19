@@ -196,3 +196,86 @@ The app itself ships plugins in `src/plugins/<id>/`:
 
 Choices the spec left open are recorded one per line in
 [`DECISIONS.md`](./DECISIONS.md), each with how to revert it.
+
+## MCP servers and live tools
+
+A desktop plugin can register stdio or Streamable HTTP servers. Await registration
+before using `ctx.host.mcp`. It installs the registration immediately; the MCP
+handshake continues in the background. Inspect `getStatus` or `onStatus` for readiness.
+
+```ts
+const dispose = await ctx.registerMcpServer({
+  id: "editor-project-a",             // unique within this plugin
+  name: "Unity Editor",              // Settings → MCP label
+  toolPrefix: "unity",                // defaults to the plugin id
+  scope: { workspaceIds: [workspaceId] }, // or "all"
+  transport: "stdio",
+  command: "unity", args: ["mcp", "--project-path", projectPath],
+  cwd: projectPath,                   // optional absolute path
+  env: {},
+});
+// HTTP alternative: transport: "http", url: "http://localhost:1234/mcp",
+// headers: { Authorization: "Bearer …" }.
+const stop = ctx.host.mcp.onStatus("editor-project-a", (status) => {
+  // status is null after removal; otherwise { id, name, status, toolsCount,
+  // errorMessage, stderrTail, startedAtMs }. status.kind is discovered,
+  // starting, running, errored or stopped (running has toolCount).
+});
+const tools = await ctx.host.mcp.listTools("editor-project-a");
+const result = await ctx.host.mcp.callTool("editor-project-a", "screenshot", {});
+// result.content includes original text/image/resource blocks; base64 image
+// data, mimeType, structuredContent and result extension fields are preserved.
+```
+
+Registrations and subscriptions are owned by that loaded plugin incarnation.
+Turning it off, removing it or reloading it removes its servers and tools, and
+cancels in-flight calls. The disposer is also safe to call manually. Cleanup
+still runs if the plugin unloads before `registerMcpServer` resolves. Registrations
+are ephemeral; server disable switches use stable plugin + local-server ids and
+survive reloads and app restarts. Settings → MCP labels each server with its plugin
+and retains the usual tool list, restart and disable controls.
+
+Both tool discovery and dispatch enforce workspace scope. A scoped server is
+hidden from chats without a matching workspace, including calls to a previously
+known tool name. Plugins can inspect and call only their own registered servers
+through the supported API, outside any chat. Plugin code remains unsandboxed;
+this API is a typed lifecycle route, not a new security boundary. Remote/SSH
+provider sessions receive no local registry tools.
+
+`toolPrefix` has 1–32 ASCII letters, digits, underscores or dashes. Registrations
+may share it when their workspace scopes are disjoint. Models see
+`<toolPrefix>__<rawToolName>`. Names are bounded to 64 ASCII letters, digits,
+underscores or dashes: if replacement or truncation is necessary, the name is
+truncated to 51 characters and suffixed with `_` plus 12 SHA-256 hex characters
+of the complete original name. A collision visible in one workspace is refused.
+HTTP URLs must explicitly use http(s), without embedded credentials or fragments.
+Commands/args are argv, never shell text. `cwd` must be absolute. Env/headers are
+bounded to 128 entries and 64 KiB total (16 KiB per value).
+
+For a live indicator, subscribe to activity:
+
+```ts
+ctx.host.mcp.onActivity("editor-project-a", (event) => {
+  // {phase: "start" | "end", callId, toolName, prefixedName, workspaceId,
+  //  isError?, durationMs?}. Exactly one end follows each start, including
+  // errors, timeouts and disposal. Arguments and images are never copied.
+});
+```
+
+The runtime follows all `tools/list` pages and re-lists on
+`notifications/tools/list_changed`. Claude refreshes its live SDK server; the
+HTTP gateway emits the same notification to connected clients. Plugins loaded
+after a chat starts use those same paths.
+
+**Codex:** its installed 0.162.1 app-server fixed dynamic schemas at thread start
+in our probe. HTTP MCP notification/reload attempts did not update that running
+thread's model tools. Codemux therefore offers initial plugin tools directly,
+with their schemas, plus two stable tools in every local Codex chat:
+`codemux_list_plugin_tools` and `codemux_call_plugin_tool`. They discover and call
+the current workspace's tools, including ones that appear after an Editor
+connects. The list includes `directlyCallable` for the initial snapshot. A new
+chat is unnecessary for late tools. Older resumed Codex threads whose saved
+snapshot predates these bridge tools need a new chat to acquire the bridge.
+
+See [`examples/mcp-tools/`](./examples/mcp-tools/) for a worked plugin and
+reproducible provider probe.

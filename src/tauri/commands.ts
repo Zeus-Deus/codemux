@@ -2947,6 +2947,7 @@ export const SKILLS_CHANGED_EVENT = "skills-changed";
 
 export type McpConfigSource =
   | "codemux"
+  | "plugin"
   | "codemuxUser"
   | "codemuxProject"
   | "claudeUser"

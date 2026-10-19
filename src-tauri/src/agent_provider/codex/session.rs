@@ -314,6 +314,7 @@ pub(crate) struct CodexSession {
     /// Mutable session state.
     pub state: Mutex<CodexSessionState>,
     outbound: Mutex<()>,
+    direct_tool_names: Vec<String>,
     /// A send is being prepared or started (checkpoint, `turn/start` in
     /// flight) before `active_turn` is bound. Read by `runtime_status`.
     dispatching: AtomicUsize,
@@ -812,6 +813,7 @@ impl CodexSession {
             managed: managed.clone(),
             host_caller,
             guidance: dynamic_tools.as_deref().and_then(developer_guidance),
+            direct_tool_names: dynamic_tools.as_deref().unwrap_or_default().iter().map(|DynamicToolSpec::Function { name, .. }| registry_tool_name(name)).collect(),
         });
 
         // Emit SessionConfigured up front so subscribers see the thread
@@ -2625,7 +2627,7 @@ fn spawn_incoming_requests_task(
                             mcp_registry.as_ref(),
                             session.workspace_id.as_deref(),
                             Some((&session.host_caller, session.provider_session_id.0.as_str())),
-                            params, actor,
+                            params, actor, &session.direct_tool_names,
                         )
                         .await;
                         if let Err(error) = child.respond(req.id, Ok(result)).await {
@@ -2686,13 +2688,14 @@ async fn dynamic_tool_specs(
 ) -> Option<Vec<DynamicToolSpec>> {
     let registry = registry?;
     let mut tools = if codex_home_managed {
-        registry.list_all_tools().await
+        registry.list_tools_for_workspace(&[], host_caller.workspace_id.as_deref()).await
     } else {
         registry
-            .list_all_tools_excluding_source(crate::mcp::McpConfigSource::CodexUser)
+            .list_tools_for_workspace(&[crate::mcp::McpConfigSource::CodexUser], host_caller.workspace_id.as_deref())
             .await
     };
     tools.extend(registry.host_tools(host_caller));
+    tools.extend(crate::mcp::registry::plugin_bridge_tools());
     Some(
         tools
             .into_iter()
@@ -2729,7 +2732,7 @@ async fn handle_dynamic_tool_call(
     host: Option<(&crate::mcp::registry::HostCaller, &str)>,
     raw: Value,
 ) -> Value {
-    handle_dynamic_tool_call_native(registry, workspace_id, host, raw, None).await
+    handle_dynamic_tool_call_native(registry, workspace_id, host, raw, None, &[]).await
 }
 
 async fn handle_dynamic_tool_call_native(
@@ -2738,6 +2741,7 @@ async fn handle_dynamic_tool_call_native(
     host: Option<(&crate::mcp::registry::HostCaller, &str)>,
     raw: Value,
     actor: Option<crate::delegation::app::NativeActor>,
+    direct_tools: &[String],
 ) -> Value {
     let parsed = serde_json::from_value::<DynamicToolCallParams>(raw);
     let dispatched = match (registry, parsed) {
@@ -2764,7 +2768,9 @@ async fn handle_dynamic_tool_call_native(
                         })
                 }
             });
+            let bridge = registry.call_plugin_bridge(&name, call.arguments.clone(), workspace_id, direct_tools).await;
             match host {
+                _ if bridge.is_some() => bridge.unwrap(),
                 Some(result) => Ok(result),
                 None => match actor {
                     Some(actor) => registry.dispatch_native_tool_call(&name, call.arguments, actor).await,
@@ -2805,7 +2811,7 @@ async fn handle_dynamic_tool_call_native(
 fn codex_dynamic_tool_name(registry_name: &str) -> String {
     match registry_name.strip_prefix("mcp__") {
         Some(name) => format!("codemux_mcp__{name}"),
-        None => format!("codemux_mcp__{registry_name}"),
+        None => registry_name.to_owned(),
     }
 }
 

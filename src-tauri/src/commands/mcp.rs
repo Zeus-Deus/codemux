@@ -27,8 +27,7 @@ use crate::mcp::{
 /// configs that show up in multiple sources. Stateless — no spawn, no
 /// caching. Per-file errors are logged on stderr and the offending file
 /// is dropped from the result rather than failing the whole list.
-#[tauri::command]
-pub async fn list_mcp_servers(
+async fn discover_mcp_servers(
     project_root: Option<String>,
 ) -> Result<Vec<McpServerConfig>, String> {
     let project_path: Option<PathBuf> = project_root.map(PathBuf::from);
@@ -81,6 +80,13 @@ pub async fn list_mcp_servers(
     });
 
     Ok(dedupe_servers(servers))
+}
+
+#[tauri::command]
+pub async fn list_mcp_servers(registry: State<'_, McpRegistry>, project_root: Option<String>) -> Result<Vec<McpServerConfig>, String> {
+    let mut servers = discover_mcp_servers(project_root).await?;
+    servers.extend(registry.plugin_configs().await);
+    Ok(servers)
 }
 
 // ── Stage 2 runtime commands ────────────────────────────────────────────
@@ -137,7 +143,7 @@ pub async fn start_mcp_server_cmd<R: Runtime>(
     project_root: Option<String>,
 ) -> Result<McpServerRuntime, String> {
     let project_path: Option<PathBuf> = project_root.map(PathBuf::from);
-    let cfg = find_config(&id, project_path.as_deref())
+    let cfg = registry.plugin_configs().await.into_iter().find(|cfg| cfg.id == id).or_else(|| find_config(&id, project_path.as_deref()))
         .ok_or_else(|| format!("no config found for server id {id}"))?;
     Ok(registry.ensure_started(Some(&app), cfg).await)
 }
@@ -225,7 +231,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_at_least_codemux_self() {
-        let result = list_mcp_servers(None).await.unwrap();
+        let result = discover_mcp_servers(None).await.unwrap();
         assert!(result
             .iter()
             .any(|s| s.primary_source() == McpConfigSource::Codemux));
@@ -244,7 +250,7 @@ mod tests {
         .unwrap();
 
         let project_root = project.path().display().to_string();
-        let result = list_mcp_servers(Some(project_root)).await.unwrap();
+        let result = discover_mcp_servers(Some(project_root)).await.unwrap();
 
         let demo = result.iter().find(|s| s.name == "demo");
         assert!(demo.is_some(), "expected demo server in {:?}", result);
@@ -257,7 +263,7 @@ mod tests {
         fs::write(project.path().join(".mcp.json"), "not valid json").unwrap();
 
         let project_root = project.path().display().to_string();
-        let result = list_mcp_servers(Some(project_root)).await.unwrap();
+        let result = discover_mcp_servers(Some(project_root)).await.unwrap();
         // Codemux self still present even though the project file failed.
         assert!(result
             .iter()
@@ -282,7 +288,7 @@ mod tests {
         .unwrap();
 
         let result =
-            list_mcp_servers(Some(project.path().display().to_string()))
+            discover_mcp_servers(Some(project.path().display().to_string()))
                 .await
                 .unwrap();
 

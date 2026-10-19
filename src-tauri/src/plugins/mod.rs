@@ -13,6 +13,7 @@
 
 pub mod catalog;
 pub mod commands;
+pub mod mcp;
 pub mod install;
 pub mod paths;
 pub mod registry;

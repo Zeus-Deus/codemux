@@ -2333,11 +2333,11 @@ async fn collect_shared_tools_for_claude(
     caller: &crate::mcp::registry::HostCaller,
 ) -> Vec<crate::mcp::runtime::McpTool> {
     let mut tools = registry
-        .list_all_tools_excluding_sources(&[
+        .list_tools_for_workspace(&[
             crate::mcp::McpConfigSource::ClaudeUser,
             crate::mcp::McpConfigSource::ClaudeLocal,
             crate::mcp::McpConfigSource::ClaudeProject,
-        ])
+        ], caller.workspace_id.as_deref())
         .await;
     tools.extend(registry.host_tools(caller));
     tools

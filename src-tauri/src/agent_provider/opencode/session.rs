@@ -243,6 +243,7 @@ impl OpenCodeSession {
         // starts fresh. See `OpenCodeAgentProvider::usage_states`.
         carried_usage: Option<Arc<Mutex<OpenCodeUsageState>>>,
         directory: Option<std::path::PathBuf>,
+        workspace_id: Option<String>,
     ) -> Result<Arc<Self>, ProviderError> {
         let server_handle = manager.ensure_running().await.map_err(|err| {
             if err == "opencode_not_installed" {
@@ -286,7 +287,7 @@ impl OpenCodeSession {
         // Failures surface as a RuntimeWarning instead of killing the session.
         if let Some(registry) = mcp_registry.as_ref() {
             if let Err(error) =
-                attach_mcp_gateway_scoped(&http, &server_handle, registry, directory.as_deref())
+                attach_mcp_gateway_scoped(&http, &server_handle, registry, directory.as_deref(), workspace_id.as_deref())
                     .await
             {
                 eprintln!("[codemux::opencode] shared MCP gateway attach failed: {error}");
@@ -2339,7 +2340,7 @@ async fn attach_mcp_gateway(
     server: &OpenCodeServerHandle,
     registry: &McpRegistry,
 ) -> Result<(), ProviderError> {
-    attach_mcp_gateway_scoped(http, server, registry, None).await
+    attach_mcp_gateway_scoped(http, server, registry, None, None).await
 }
 
 async fn attach_mcp_gateway_scoped(
@@ -2347,10 +2348,11 @@ async fn attach_mcp_gateway_scoped(
     server: &OpenCodeServerHandle,
     registry: &McpRegistry,
     directory: Option<&std::path::Path>,
+    workspace_id: Option<&str>,
 ) -> Result<(), ProviderError> {
     let connection =
         registry
-            .gateway_connection()
+            .gateway_connection_for_workspace(if server.api == super::api::OpenCodeApi::V2 { workspace_id } else { None })
             .await
             .map_err(|message| ProviderError::ProcessError {
                 message: "failed to start Codemux MCP gateway".into(),
@@ -2988,6 +2990,7 @@ pub(crate) mod tests {
             tx,
             None,
             None,
+            None,
         )
         .await;
 
@@ -3121,6 +3124,7 @@ pub(crate) mod tests {
             None,
             None,
             tx,
+            None,
             None,
             None,
         )
@@ -3338,6 +3342,7 @@ pub(crate) mod tests {
             &server,
             &McpRegistry::new(),
             Some(directory.path()),
+            Some("workspace-fixture"),
         )
         .await
         .unwrap();
@@ -5725,6 +5730,7 @@ pub(crate) mod tests {
             None,
             Some("ses_keep".into()),
             tx,
+            None,
             None,
             None,
         )

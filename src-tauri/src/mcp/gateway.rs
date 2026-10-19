@@ -8,12 +8,14 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use rand::distributions::{Alphanumeric, DistString};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::registry::McpRegistry;
@@ -26,22 +28,13 @@ use super::McpConfigSource;
 /// ever attaches, the gateway will need per-consumer identity (a token or path
 /// per consumer) instead of this fixed list.
 ///
-/// Per-CALL identity can travel in-band: a `tools/call` request may carry
-/// `_meta[WORKSPACE_META_KEY]`, which the gateway forwards to the registry
-/// so workspace-scoped built-in tools bind to the caller's workspace.
-///
-/// OpenCode remains on the legacy cwd fallback. Codemux runs ONE
-/// `opencode serve` process for every chat session and registers this
-/// gateway once, by name, on that shared instance (`attach_mcp_gateway`);
-/// OpenCode's MCP registrations are instance-global and its client sends no
-/// per-session `_meta`, so there is no channel through which an OpenCode
-/// tool call can identify its session or workspace. Fixing that means
-/// moving the OpenCode adapter to per-directory instances, which is a
-/// separate change. Until then OpenCode's browser/git/conversation tools
-/// bind to whatever `resolve_workspace_id_by_cwd` finds for the process
-/// cwd — see the note in `opencode/server.rs`.
-const GATEWAY_NATIVE_SOURCES: [McpConfigSource; 2] =
-    [McpConfigSource::OpenCodeUser, McpConfigSource::OpenCodeProject];
+/// A directory-scoped OpenCode registration carries an app-supplied
+/// workspaceId in its gateway URL, binding both discovery and calls. Legacy
+/// clients without caller context receive only globally visible plugin tools.
+const GATEWAY_NATIVE_SOURCES: [McpConfigSource; 2] = [
+    McpConfigSource::OpenCodeUser,
+    McpConfigSource::OpenCodeProject,
+];
 
 /// Connection details handed to a provider adapter. The token is generated
 /// once per Codemux process and never written to disk.
@@ -117,7 +110,7 @@ fn router(state: GatewayState) -> Router {
         .route(
             "/mcp",
             post(handle_post)
-                .get(method_not_allowed)
+                .get(handle_events)
                 .delete(method_not_allowed),
         )
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
@@ -128,8 +121,45 @@ async fn method_not_allowed() -> StatusCode {
     StatusCode::METHOD_NOT_ALLOWED
 }
 
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GatewayQuery {
+    workspace_id: Option<String>,
+    #[serde(default)]
+    plugin_only: bool,
+}
+
+async fn handle_events(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    if !origin_allowed(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !authenticated(&headers, &state.bearer_token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let rx = state.registry.subscribe_status();
+    let stream = futures_util::stream::unfold(rx, |mut rx| async {
+        loop {
+            match rx.recv().await {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    return Some((
+                        Ok::<_, std::convert::Infallible>(Event::default().event("message").data(
+                            r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                        )),
+                        rx,
+                    ))
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
 async fn handle_post(
     State(state): State<GatewayState>,
+    Query(query): Query<GatewayQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -170,7 +200,7 @@ async fn handle_post(
                 id,
                 json!({
                     "protocolVersion": version,
-                    "capabilities": { "tools": { "listChanged": false } },
+                    "capabilities": { "tools": { "listChanged": true } },
                     "serverInfo": {
                         "name": "codemux",
                         "title": "Codemux MCP Gateway",
@@ -183,12 +213,14 @@ async fn handle_post(
         }
         "ping" => rpc_result(id, json!({})).into_response(),
         "tools/list" => {
-            let tools = state
+            let mut tools = state
                 .registry
-                .list_all_tools_excluding_sources(&GATEWAY_NATIVE_SOURCES)
+                .list_tools_for_workspace(&GATEWAY_NATIVE_SOURCES, query.workspace_id.as_deref())
                 .await;
+            tools.extend(super::registry::plugin_bridge_tools());
             let data: Vec<Value> = tools
                 .into_iter()
+                .filter(|tool| !query.plugin_only || tool.server_id.starts_with("plugin:"))
                 .map(|tool| {
                     json!({
                         "name": tool.prefixed_name,
@@ -211,16 +243,31 @@ async fn handle_post(
             // carries it, so built-in workspace-scoped tools route to the
             // calling session's workspace. Absent for OpenCode (see the
             // module note on `GATEWAY_NATIVE_SOURCES`).
-            let workspace_id = params
-                .get("_meta")
-                .and_then(|meta| meta.get(super::WORKSPACE_META_KEY))
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty());
-            match state
-                .registry
-                .dispatch_tool_call(name, arguments, workspace_id)
-                .await
+            let workspace_id = query.workspace_id.as_deref();
+            if query.plugin_only
+                && !state
+                    .registry
+                    .list_tools_for_workspace(&[], workspace_id)
+                    .await
+                    .iter()
+                    .any(|tool| tool.server_id.starts_with("plugin:") && tool.prefixed_name == name)
             {
+                return rpc_error(id, -32602, "Unknown plugin MCP tool").into_response();
+            }
+            let bridge = state
+                .registry
+                .call_plugin_bridge(name, arguments.clone(), workspace_id, &[])
+                .await;
+            let result = match bridge {
+                Some(result) => result,
+                None => {
+                    state
+                        .registry
+                        .dispatch_tool_call(name, arguments, workspace_id)
+                        .await
+                }
+            };
+            match result {
                 Ok(result) => rpc_result(id, result).into_response(),
                 Err(message) => rpc_result(
                     id,
@@ -323,7 +370,7 @@ mod tests {
         assert_eq!(value["result"]["protocolVersion"], "2025-11-25");
         assert_eq!(
             value["result"]["capabilities"]["tools"]["listChanged"],
-            false
+            true
         );
     }
 
@@ -364,7 +411,15 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, vec!["mcp__shared__tool"], "{value}");
+        assert_eq!(
+            names,
+            vec![
+                "mcp__shared__tool",
+                "codemux_list_plugin_tools",
+                "codemux_call_plugin_tool"
+            ],
+            "{value}"
+        );
     }
 
     #[tokio::test]
@@ -380,5 +435,31 @@ mod tests {
             .unwrap();
         let response = router(state()).oneshot(foreign).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    #[tokio::test]
+    async fn plugin_mcp_gateway_emits_list_changed() {
+        use futures_util::StreamExt;
+        let state = state();
+        let registry = state.registry.clone();
+        let response = router(state)
+            .oneshot(
+                Request::get("/mcp")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        registry.notify_host_tools_changed();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&frame)
+            .unwrap()
+            .contains("notifications/tools/list_changed"));
     }
 }

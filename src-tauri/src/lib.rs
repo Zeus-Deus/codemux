@@ -789,6 +789,10 @@ fn build_core_app<R: tauri::Runtime>(
                     webview_recovery::release_page_subscribers(webview.app_handle());
                     // The old page's plugin chat listeners are gone too.
                     plugins::tap::set_enabled(false);
+                    let app = webview.app_handle().clone();
+                    let registry = app.state::<mcp::registry::McpRegistry>().inner().clone();
+                    registry.invalidate_plugin_page();
+                    tauri::async_runtime::spawn(async move { registry.clear_stale_plugin_servers(Some(&app)).await; });
                 }
                 return;
             }
@@ -2681,6 +2685,11 @@ fn build_core_app<R: tauri::Runtime>(
             plugins::commands::plugins_startup_checkpoint,
             plugins::commands::plugins_resume,
             plugins::commands::plugins_set_event_tap,
+            plugins::mcp::plugins_mcp_register,
+            plugins::mcp::plugins_mcp_unregister,
+            plugins::mcp::plugins_mcp_list_tools,
+            plugins::mcp::plugins_mcp_call_tool,
+            plugins::mcp::plugins_mcp_status,
             plugins::commands::plugins_chat_status,
             plugins::commands::plugins_chat_request_compaction,
             plugins::commands::plugins_catalog,

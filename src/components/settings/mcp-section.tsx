@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { listen } from "@tauri-apps/api/event";
 import { Info, RotateCw, Server } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -110,6 +111,16 @@ function OutboundMcpSection({ projectRoot }: Props) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    let ended = false;
+    let unlisten: (() => void) | undefined;
+    void listen<McpServerRuntime>("mcp-status-changed", (event) => {
+      if (!event.payload.id.startsWith("plugin:")) return;
+      void listMcpServers(projectRoot).then((rows) => { if (!ended) setServers(rows); }).catch((error) => console.warn("[mcp] refresh plugin servers failed", error));
+    }).then((stop) => { if (ended) stop(); else unlisten = stop; }).catch(() => {});
+    return () => { ended = true; unlisten?.(); };
+  }, [projectRoot]);
 
   const groups = useMemo(() => groupByPrimarySource(servers), [servers]);
   const collidingNames = useMemo(() => collidingNameSet(servers), [servers]);
@@ -337,6 +348,9 @@ function ServerRow({
           >
             {server.name}
           </span>
+          {server.sources.includes("plugin") && (
+            <Badge variant="outline" className="text-caption">Plugin: {server.id.split(":")[1]}</Badge>
+          )}
           {showSourceDisambiguator && (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -520,6 +534,8 @@ function commandPreview(server: McpServerConfig): string {
 
 function sourceHeading(source: McpConfigSource): string {
   switch (source) {
+    case "plugin":
+      return "Plugins";
     case "codemux":
       return "Codemux";
     case "codemuxUser":
@@ -546,6 +562,7 @@ function sourceHeading(source: McpConfigSource): string {
 }
 
 const SOURCE_ORDER: McpConfigSource[] = [
+  "plugin",
   "codemux",
   "codemuxUser",
   "codemuxProject",

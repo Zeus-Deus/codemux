@@ -274,6 +274,7 @@ impl AgentProvider for OpenCodeAgentProvider {
             self.event_tx.clone(),
             carried_usage,
             Some(input.cwd.clone()),
+            input.workspace_id.clone(),
         )
         .await?;
         // Seed before registering: no turn can reach the session until then.

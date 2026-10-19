@@ -31,6 +31,8 @@ pub const WORKSPACE_META_KEY: &str = "codemux/workspace_id";
 pub enum McpConfigSource {
     /// Codemux's own hardcoded MCP server (always-on, not user-toggleable).
     Codemux,
+    /// A server contributed by a live desktop plugin.
+    Plugin,
     /// `~/.codemux/mcp.json` — the canonical Codemux-managed MCPs.
     CodemuxUser,
     /// `<project>/.codemux/mcp.json`
@@ -117,6 +119,7 @@ pub fn mcp_server_id(config_path: &str, server_name: &str) -> String {
 pub fn source_rank(s: McpConfigSource) -> u8 {
     match s {
         McpConfigSource::Codemux => 0,
+        McpConfigSource::Plugin => 11,
         McpConfigSource::CodemuxUser => 1,
         McpConfigSource::CodemuxProject => 2,
         McpConfigSource::ClaudeUser => 3,

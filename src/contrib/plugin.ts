@@ -4,6 +4,7 @@
  * source as `plugin:<pluginId>`, and tracks every disposer so turning the
  * plugin off (or hot-reloading it) runs every cleanup.
  */
+import { registerMcpServer, type PluginMcpServer } from "./mcp";
 import type { ReactNode } from "react";
 import { registry } from "./registry";
 import type { Contribution } from "./types";
@@ -50,6 +51,7 @@ export interface PluginContext {
   readonly source: string;
   readonly tier: PluginTier;
   register: (c: PluginContribution) => () => void;
+  registerMcpServer: (server: PluginMcpServer) => Promise<() => void>;
   registerMany: (cs: PluginContribution[]) => () => void;
   /** A page under Settings → Plugins → this plugin. */
   registerSettingsPage: (page: PluginSettingsPage) => () => void;
@@ -124,6 +126,7 @@ export function createPluginContext(pluginId: string, tier: PluginTier, owner: O
     id: pluginId,
     source,
     tier,
+    registerMcpServer: (server) => registerMcpServer(owner, server),
     register: (c) => track(registry.register(scope(c))),
     registerMany: (cs) => track(registry.registerMany(cs.map(scope))),
     registerSettingsPage: (page) =>
