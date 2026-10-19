@@ -32,7 +32,19 @@ struct Upstream {
     /// In-flight requests and the event-stream listener. Each holds a sender
     /// to stdout, so they are cancelled when the agent hangs up; otherwise the
     /// writer, and with it the process, would outlive the agent.
-    tasks: Arc<Mutex<JoinSet<()>>>,
+    tasks: Arc<Mutex<Tasks>>,
+    /// Runs in `initialize`'s task just before it starts the listener, so
+    /// tests can force shutdown into that window.
+    #[cfg(test)]
+    before_listen: Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>,
+}
+
+#[derive(Default)]
+struct Tasks {
+    running: JoinSet<()>,
+    /// Set at shutdown. A task started afterwards, such as the listener an
+    /// in-flight `initialize` starts once its reply is in, is never admitted.
+    closed: bool,
 }
 
 pub async fn run() -> Result<(), String> {
@@ -69,6 +81,8 @@ pub async fn run() -> Result<(), String> {
         session: Arc::default(),
         out,
         tasks: Arc::default(),
+        #[cfg(test)]
+        before_listen: Arc::default(),
     };
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
@@ -88,17 +102,27 @@ pub async fn run() -> Result<(), String> {
         }
     }
     // The agent closed stdin: it is done with this server.
-    upstream.tasks.lock().unwrap_or_else(|p| p.into_inner()).abort_all();
+    upstream.shutdown();
     drop(upstream);
     let _ = writer.await;
     Ok(())
 }
 
 impl Upstream {
+    /// Cancel every request and the listener, and admit no new task.
+    fn shutdown(&self) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
+        tasks.closed = true;
+        tasks.running.abort_all();
+    }
+
     fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
         let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
-        while tasks.try_join_next().is_some() {}
-        tasks.spawn(task);
+        if tasks.closed {
+            return;
+        }
+        while tasks.running.try_join_next().is_some() {}
+        tasks.running.spawn(task);
     }
 
     fn send(&self, message: &Value) {
@@ -148,6 +172,10 @@ impl Upstream {
             }
         }
         if is_initialize {
+            #[cfg(test)]
+            if let Some(mut hook) = self.before_listen.lock().unwrap().take() {
+                hook();
+            }
             self.spawn(self.clone().listen());
         }
     }
@@ -160,7 +188,7 @@ impl Upstream {
     }
 
     /// Relay the server's GET event stream. A server without one answers 405
-    /// (today's gateway) and the bridge simply doesn't listen.
+    /// and the bridge simply doesn't listen.
     async fn listen(self) {
         let response = self
             .client
@@ -266,6 +294,7 @@ mod tests {
             session: Arc::default(),
             out: out.clone(),
             tasks: Arc::default(),
+            before_listen: Arc::default(),
         };
 
         let chat = upstream(&connection.bearer_token);
@@ -288,6 +317,52 @@ mod tests {
         let reply: Value = serde_json::from_str(&replies.recv().await.unwrap()).unwrap();
         assert_eq!(reply["id"], 3);
         assert!(reply["error"]["message"].as_str().unwrap().contains("401"), "{reply}");
+    }
+
+    /// The agent hangs up while `initialize`'s reply is already in and its
+    /// task is about to start the event-stream listener. Shutdown must still
+    /// release every stdout sender, or the writer, and the process, never end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn shutdown_racing_initialize_lets_the_writer_finish() {
+        let registry = crate::mcp::registry::McpRegistry::new();
+        let connection = registry
+            .gateway_chat_connection("thread", Default::default())
+            .await
+            .unwrap();
+        let (out, mut replies) = mpsc::unbounded_channel();
+        let upstream = Upstream {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            url: connection.url.clone(),
+            authorization: HeaderValue::from_str(&format!("Bearer {}", connection.bearer_token)).unwrap(),
+            session: Arc::default(),
+            out,
+            tasks: Arc::default(),
+            before_listen: Arc::default(),
+        };
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        *upstream.before_listen.lock().unwrap() = Some(Box::new(move || {
+            reached_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        }));
+        upstream.spawn(
+            upstream
+                .clone()
+                .forward(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})),
+        );
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .expect("initialize reached the listener spawn");
+
+        upstream.shutdown();
+        release_tx.send(()).unwrap();
+        drop(upstream);
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while replies.recv().await.is_some() {}
+        })
+        .await;
+        assert!(drained.is_ok(), "a listener started after shutdown kept stdout open");
     }
 
     #[test]
