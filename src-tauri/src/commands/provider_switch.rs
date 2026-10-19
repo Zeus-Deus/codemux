@@ -149,6 +149,12 @@ pub(crate) fn seed_turn(
     nonce: &str,
     text: String,
 ) -> (String, Option<String>) {
+    // A native command (`/review`, `/compact`, a Claude skill command) is
+    // recognised by its leading slash; a prefix would turn it into a prompt.
+    // The seed waits for the next conversational turn instead.
+    if crate::agent_provider::slash_commands::leading_command(&text).is_some() {
+        return (text, None);
+    }
     let Some(seed) = db.provider_switch_seed(thread_id, &slug(provider)) else {
         return (text, None);
     };
@@ -501,6 +507,25 @@ mod tests {
         db.append_agent_chat_message("t", r#"{"type":"item_completed"}"#).unwrap();
         let (next, none) = seed_turn(&db, "t", ProviderKind::Codex, "n4", "more".into());
         assert_eq!((next.as_str(), none), ("more", None));
+    }
+
+    #[test]
+    fn native_commands_keep_their_dispatch_and_leave_the_seed_for_the_next_prompt() {
+        let db = store();
+        db.put_provider_switch_seed("t", "codex", "SEED", 0).unwrap();
+        for command in ["/review branch main", "/compact", "  /my-skill fix the parser"] {
+            let (text, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n0", command.into());
+            assert_eq!((text.as_str(), seed), (command, None));
+        }
+        // Codex still dispatches them natively.
+        let review = crate::agent_provider::codex::slash_commands::request("/review branch main", "t");
+        assert_eq!(review.unwrap().unwrap().0, "review/start");
+        let compact = crate::agent_provider::codex::slash_commands::request("/compact", "t");
+        assert_eq!(compact.unwrap().unwrap().0, "thread/compact/start");
+        // A path is prose and still carries the seed, as does the next prompt.
+        let (path, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n1", "/tmp/x is broken".into());
+        assert_eq!(path, "SEED\n\n/tmp/x is broken");
+        assert!(seed.is_some());
     }
 
     #[test]
