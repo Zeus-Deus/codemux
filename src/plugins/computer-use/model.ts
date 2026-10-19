@@ -27,6 +27,12 @@ function positiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
+function validateTarget(target: WindowTarget) {
+  if (!positiveInteger(target.pid) || !positiveInteger(target.windowId)) {
+    throw new Error("Choose a current application window before enabling computer use.");
+  }
+}
+
 function parseJson(text: string): unknown {
   try {
     return JSON.parse(text);
@@ -77,16 +83,41 @@ export function readWindows(result: unknown): WindowTarget[] {
   });
 }
 
-const OBSERVATION_TOOLS = [
+export const OBSERVATION_TOOLS = [
   "list_windows", "get_window_state", "get_screen_size", "get_config",
   "start_session", "get_session", "list_sessions", "end_session",
 ] as const;
-const INPUT_TOOLS = ["click", "type_text", "scroll"] as const;
+export const INPUT_TOOLS = ["click", "type_text", "scroll"] as const;
+
+export function discoveryFiles(): { policy: string; manifest: string } {
+  const tools = ["list_windows", "get_screen_size", "get_config"];
+  return {
+    policy: JSON.stringify({ allow: { tools } }),
+    manifest: JSON.stringify({
+      version: 3, expires_after: "1h", idle_timeout: "10m",
+      allow: { tools }, resources: { desktop: { display: true } },
+    }),
+  };
+}
+
+export function viewFiles(target: WindowTarget): { policy: string; manifest: string } {
+  validateTarget(target);
+  const manifest = {
+    version: 3, expires_after: "1h", idle_timeout: "10m",
+    allow: { tools: ["get_window_state"] },
+    resources: { desktop: { windows: [{ pid: target.pid, window_id: target.windowId }], display: false } },
+  };
+  return { policy: JSON.stringify({ allow: { tools: ["get_window_state"] } }), manifest: JSON.stringify(manifest) };
+}
+
+export function controlInstructions(target: WindowTarget): string {
+  return `Use structured browser/Unity tools first. Only target pid ${target.pid}, window_id ${target.windowId}. ` +
+    'Input requires pid, window_id and delivery_mode:"background"; click also requires modifier:[]. ' +
+    'Use fresh element tokens. Do not retry refused actions in the foreground or capture the full desktop.';
+}
 
 export function controlFiles(target: WindowTarget): { policy: string; manifest: string } {
-  if (!positiveInteger(target.pid) || !positiveInteger(target.windowId)) {
-    throw new Error("Choose a current application window before enabling computer use.");
-  }
+  validateTarget(target);
   // The policy filters tools/list; the manifest separately limits resources.
   const policy = {
     allow: {
