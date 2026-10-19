@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import type { PluginMcpActivity, PluginMcpCallResult } from "@codemux/sdk";
-import type { DesktopAdapter, DriverConnection, DriverOptions, OsInfo } from "./adapter";
-import { ComputerUseController } from "./controller";
+import type { PluginMcpActivity, PluginMcpCallResult, PluginMcpServer, PluginOsInfo } from "@codemux/sdk";
+import { ComputerUseController, type ComputerUseServices } from "./controller";
 
 function deferred() {
   let resolve = () => {};
@@ -11,8 +10,7 @@ function deferred() {
 
 function fakeDesktop() {
   const registrations: {
-    options: DriverOptions;
-    connection: DriverConnection;
+    options: PluginMcpServer;
     activity?: (event: PluginMcpActivity) => void;
     calls: string[];
     stopped: boolean;
@@ -21,47 +19,53 @@ function fakeDesktop() {
   let stopGate: Promise<void> | undefined;
   let registerGate: Promise<void> | undefined;
   let snapshotGate: Promise<void> | undefined;
-  const desktop: DesktopAdapter = {
-    which: async () => "/demo/cua-driver",
-    osInfo: async () => ({ platform: "linux", arch: "x86_64", homeDir: "/home/demo", configDir: null, dataDir: null, localDataDir: null }),
-    run: async ({ args }) => ({
-      code: 0, stdout: args?.[0] === "--version" ? "cua-driver 0.21.0\n" : '{"ok":true,"probes":[]}',
-      stderr: "", timedOut: false, truncated: false, cancelled: false,
-    }),
-    writeDataFile: async (name) => `/plugin-data/${name}`,
-    removeDataFile: async (name) => { removed.push(name); },
-    register: async (options) => {
-      const row: (typeof registrations)[number] = {
-        options, calls: [], stopped: false,
-        connection: {
-          call: async (tool): Promise<PluginMcpCallResult> => {
-            row.calls.push(tool);
-            if (tool === "list_windows") return { content: [], structuredContent: { windows: [
-              { pid: 42, window_id: 123, title: "Demo", app_name: "Demo App" },
-            ] } };
-            if (tool === "get_screen_size") return { content: [], structuredContent: { width: 1024, height: 768 } };
-            await snapshotGate;
-            return { content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }] };
-          },
-          status: async () => ({
-            id: options.id, name: options.name, status: { kind: "running", toolCount: 3 },
-            toolsCount: 3, errorMessage: null, stderrTail: null, startedAtMs: 0,
-          }),
-          onStatus: () => () => {},
-          onActivity: (fn) => { row.activity = fn; return () => { row.activity = undefined; }; },
-          stop: async () => {
-            if (options.scope !== "plugin") await stopGate;
-            row.stopped = true;
-          },
-        },
-      };
+  const rowFor = (id: string) => {
+    const row = registrations.find((item) => item.options.id === id);
+    if (!row) throw new Error(`Unknown test registration ${id}`);
+    return row;
+  };
+  const services: ComputerUseServices = {
+    process: {
+      which: async () => "/demo/cua-driver",
+      run: async ({ args }) => ({
+        code: 0, stdout: args?.[0] === "--version" ? "cua-driver 0.21.0\n" : '{"ok":true,"probes":[]}',
+        stderr: "", timedOut: false, truncated: false, pipesHeldOpen: false, cancelled: false,
+      }),
+    },
+    os: { info: async () => ({ platform: "linux", arch: "x86_64", homeDir: "/home/demo", configDir: null, dataDir: null, localDataDir: null }) },
+    fs: {
+      writeDataFile: async (name) => `/plugin-data/${name}`,
+      removeDataFile: async (name) => { removed.push(name); },
+    },
+    registerMcpServer: async (options) => {
+      const row = { options, calls: [], stopped: false };
       registrations.push(row);
       if (options.scope !== "plugin") await registerGate;
-      return row.connection;
+      return async () => {
+        if (options.scope !== "plugin") await stopGate;
+        row.stopped = true;
+      };
+    },
+    mcp: {
+      callTool: async (id, tool): Promise<PluginMcpCallResult> => {
+        rowFor(id).calls.push(tool);
+        if (tool === "list_windows") return { content: [], structuredContent: { windows: [
+          { pid: 42, window_id: 123, title: "Demo", app_name: "Demo App" },
+        ] } };
+        if (tool === "get_screen_size") return { content: [], structuredContent: { width: 1024, height: 768 } };
+        await snapshotGate;
+        return { content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }] };
+      },
+      getStatus: async (id) => ({
+        id, name: rowFor(id).options.name, status: { kind: "running", toolCount: 3 },
+        toolsCount: 3, errorMessage: null, stderrTail: null, startedAtMs: 0,
+      }),
+      onStatus: () => () => {},
+      onActivity: (id, fn) => { const row = rowFor(id); row.activity = fn; return () => { row.activity = undefined; }; },
     },
   };
   return {
-    desktop, registrations, removed,
+    services, registrations, removed,
     holdStop: (gate: Promise<void>) => { stopGate = gate; },
     holdRegistration: (gate: Promise<void>) => { registerGate = gate; },
     holdSnapshot: (gate: Promise<void>) => { snapshotGate = gate; },
@@ -79,7 +83,7 @@ async function chooseWindow(controller: ComputerUseController) {
 
 describe("computer-use lifecycle", () => {
   it.each<{
-    platform: OsInfo["platform"];
+    platform: PluginOsInfo["platform"];
     homeDir: string | null;
     localDataDir: string | null;
     expected: string;
@@ -92,12 +96,12 @@ describe("computer-use lifecycle", () => {
     { platform: "macos", homeDir: "/Users/demo", localDataDir: null, expected: "/Users/demo/.local/bin/cua-driver" },
   ])("finds a standard $platform installation outside PATH", async ({ platform, homeDir, localDataDir, expected, requested }) => {
     const fake = fakeDesktop();
-    fake.desktop.which = vi.fn(async (command) => command === expected ? expected : null);
-    fake.desktop.osInfo = async () => ({ platform, arch: "x86_64", homeDir, configDir: null, dataDir: null, localDataDir });
-    const run = vi.spyOn(fake.desktop, "run");
-    const controller = new ComputerUseController(fake.desktop);
+    fake.services.process.which = vi.fn(async (command) => command === expected ? expected : null);
+    fake.services.os.info = async () => ({ platform, arch: "x86_64", homeDir, configDir: null, dataDir: null, localDataDir });
+    const run = vi.spyOn(fake.services.process, "run");
+    const controller = new ComputerUseController(fake.services);
     await controller.detect(requested);
-    expect(fake.desktop.which).toHaveBeenNthCalledWith(1, "cua-driver");
+    expect(fake.services.process.which).toHaveBeenNthCalledWith(1, "cua-driver");
     expect(controller.getState().error).toBeNull();
     expect(controller.getState().executable).toBe(expected);
     expect(run).toHaveBeenCalledWith(expect.objectContaining({ command: expected, args: ["--version"] }));
@@ -107,11 +111,11 @@ describe("computer-use lifecycle", () => {
 
   it.each([undefined, "/chosen/cua-driver"])("keeps PATH or custom executable precedence (%s)", async (command) => {
     const fake = fakeDesktop();
-    fake.desktop.which = vi.fn(async () => "/resolved/cua-driver");
-    const directories = vi.spyOn(fake.desktop, "osInfo");
-    const controller = new ComputerUseController(fake.desktop);
+    fake.services.process.which = vi.fn(async () => "/resolved/cua-driver");
+    const directories = vi.spyOn(fake.services.os, "info");
+    const controller = new ComputerUseController(fake.services);
     await controller.detect(command);
-    expect(fake.desktop.which).toHaveBeenCalledExactlyOnceWith(command ?? "cua-driver");
+    expect(fake.services.process.which).toHaveBeenCalledExactlyOnceWith(command ?? "cua-driver");
     expect(directories).not.toHaveBeenCalled();
     expect(controller.getState().executable).toBe("/resolved/cua-driver");
     await controller.dispose();
@@ -119,10 +123,10 @@ describe("computer-use lifecycle", () => {
 
   it("does not silently replace a missing custom executable", async () => {
     const fake = fakeDesktop();
-    fake.desktop.which = vi.fn(async () => null);
-    const directories = vi.spyOn(fake.desktop, "osInfo");
-    const run = vi.spyOn(fake.desktop, "run");
-    const controller = new ComputerUseController(fake.desktop);
+    fake.services.process.which = vi.fn(async () => null);
+    const directories = vi.spyOn(fake.services.os, "info");
+    const run = vi.spyOn(fake.services.process, "run");
+    const controller = new ComputerUseController(fake.services);
     await controller.detect("/missing/cua-driver");
     expect(directories).not.toHaveBeenCalled();
     expect(run).not.toHaveBeenCalled();
@@ -132,12 +136,12 @@ describe("computer-use lifecycle", () => {
 
   it("handles unavailable home directories without constructing a relative fallback", async () => {
     const fake = fakeDesktop();
-    fake.desktop.which = vi.fn(async () => null);
-    fake.desktop.osInfo = async () => ({ platform: "linux", arch: "aarch64", homeDir: null, configDir: null, dataDir: null, localDataDir: null });
-    const run = vi.spyOn(fake.desktop, "run");
-    const controller = new ComputerUseController(fake.desktop);
+    fake.services.process.which = vi.fn(async () => null);
+    fake.services.os.info = async () => ({ platform: "linux", arch: "aarch64", homeDir: null, configDir: null, dataDir: null, localDataDir: null });
+    const run = vi.spyOn(fake.services.process, "run");
+    const controller = new ComputerUseController(fake.services);
     await controller.detect();
-    expect(fake.desktop.which).toHaveBeenCalledExactlyOnceWith("cua-driver");
+    expect(fake.services.process.which).toHaveBeenCalledExactlyOnceWith("cua-driver");
     expect(run).not.toHaveBeenCalled();
     expect(controller.getState().error).toContain("Install it or enter its executable path");
     await controller.dispose();
@@ -145,7 +149,7 @@ describe("computer-use lifecycle", () => {
 
   it("never registers tools without workspace opt-in", async () => {
     const fake = fakeDesktop();
-    const controller = new ComputerUseController(fake.desktop);
+    const controller = new ComputerUseController(fake.services);
     await controller.setWorkspace({ id: "workspace-a", title: "Demo", local: true }, false);
     await controller.detect();
     await controller.discover();
@@ -156,7 +160,7 @@ describe("computer-use lifecycle", () => {
 
   it("does not route a remote workspace's agents to this desktop", async () => {
     const fake = fakeDesktop();
-    const controller = new ComputerUseController(fake.desktop);
+    const controller = new ComputerUseController(fake.services);
     await controller.detect();
     await controller.setWorkspace({ id: "remote", title: "Remote workspace", local: false }, true);
     await controller.discover();
@@ -167,11 +171,11 @@ describe("computer-use lifecycle", () => {
 
   it("does not assume another driver version honours the evaluated policy", async () => {
     const fake = fakeDesktop();
-    const run = fake.desktop.run;
-    fake.desktop.run = async (options) => options.args?.[0] === "--version"
-      ? { code: 0, stdout: "cua-driver 0.22.0", stderr: "", timedOut: false, truncated: false, cancelled: false }
+    const run = fake.services.process.run;
+    fake.services.process.run = async (options) => options.args?.[0] === "--version"
+      ? { code: 0, stdout: "cua-driver 0.22.0", stderr: "", timedOut: false, truncated: false, pipesHeldOpen: false, cancelled: false }
       : run(options);
-    const controller = new ComputerUseController(fake.desktop);
+    const controller = new ComputerUseController(fake.services);
     await controller.setWorkspace({ id: "workspace-a", title: "Demo", local: true }, true);
     await controller.detect();
     expect(controller.getState().error).toContain("0.22.0 has not been validated");
@@ -180,9 +184,25 @@ describe("computer-use lifecycle", () => {
     await controller.dispose();
   });
 
+  it.each(["--version", "doctor"])("refuses incomplete %s output when a descendant retains the pipes", async (stage) => {
+    const fake = fakeDesktop();
+    const run = fake.services.process.run;
+    fake.services.process.run = async (options) => ({
+      ...await run(options), pipesHeldOpen: options.args?.[0] === stage,
+    });
+    const controller = new ComputerUseController(fake.services);
+    await controller.setWorkspace({ id: "workspace-a", title: "Demo", local: true }, true);
+    await controller.detect();
+    expect(controller.getState().doctor).toBeNull();
+    expect(controller.getState().error).not.toBeNull();
+    await controller.discover();
+    expect(fake.registrations).toHaveLength(0);
+    await controller.dispose();
+  });
+
   it("keeps discovery and preview out of agent scope and tracks overlapping calls", async () => {
     const fake = fakeDesktop();
-    const controller = new ComputerUseController(fake.desktop);
+    const controller = new ComputerUseController(fake.services);
     const target = await chooseWindow(controller);
     expect(fake.registrations[0].options.scope).toBe("plugin");
     expect(fake.registrations[0].stopped).toBe(true);
@@ -190,7 +210,7 @@ describe("computer-use lifecycle", () => {
     const control = fake.registrations.find((row) => row.options.scope !== "plugin");
     const view = fake.registrations.find((row) => row.options.id.startsWith("cua-view-"));
     expect(control?.options.scope).toEqual({ workspaceIds: ["workspace-a"] });
-    expect(control?.options.args).toEqual(["mcp", "--direct", "--no-overlay"]);
+    expect(control?.options.transport === "stdio" ? control.options.args : undefined).toEqual(["mcp", "--direct", "--no-overlay"]);
     expect(control?.options.toolDescriptions?.click.append).toContain("structured browser/Unity tools first");
     expect(control?.options.shutdown).toBe("immediate");
     await controller.refreshPreview();
@@ -208,7 +228,7 @@ describe("computer-use lifecycle", () => {
 
   it("keeps Stop pending until the input child confirms exit", async () => {
     const fake = fakeDesktop();
-    const controller = new ComputerUseController(fake.desktop);
+    const controller = new ComputerUseController(fake.services);
     await controller.enable(await chooseWindow(controller));
     const gate = deferred();
     fake.holdStop(gate.promise);
@@ -226,7 +246,7 @@ describe("computer-use lifecycle", () => {
 
   it("stops a registration that finishes after the user has pressed Stop", async () => {
     const fake = fakeDesktop();
-    const controller = new ComputerUseController(fake.desktop);
+    const controller = new ComputerUseController(fake.services);
     const target = await chooseWindow(controller);
     const gate = deferred();
     fake.holdRegistration(gate.promise);
@@ -243,7 +263,7 @@ describe("computer-use lifecycle", () => {
 
   it("dispatches Stop while a setup capture is still pending", async () => {
     const fake = fakeDesktop();
-    const controller = new ComputerUseController(fake.desktop);
+    const controller = new ComputerUseController(fake.services);
     const target = await chooseWindow(controller);
     const gate = deferred();
     fake.holdSnapshot(gate.promise);
@@ -261,7 +281,7 @@ describe("computer-use lifecycle", () => {
 
   it("keeps the target visible when child shutdown cannot be confirmed", async () => {
     const fake = fakeDesktop();
-    const controller = new ComputerUseController(fake.desktop);
+    const controller = new ComputerUseController(fake.services);
     await controller.enable(await chooseWindow(controller));
     let rejectStop = (_reason: Error) => {};
     fake.holdStop(new Promise<void>((_resolve, reject) => { rejectStop = reject; }));

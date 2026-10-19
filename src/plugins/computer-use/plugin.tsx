@@ -1,23 +1,17 @@
-import { TITLEBAR_ACTIONS_AREA, definePlugin, icons } from "@codemux/sdk";
-import { desktopAdapter, peekAdapter, type PeekBodyProps } from "./adapter";
+import { PEEK_AREA, COMPOSER_STATUS_AREA, TITLEBAR_ACTIONS_AREA, definePlugin, icons, type PeekRenderProps } from "@codemux/sdk";
 import { ComputerUseController } from "./controller";
-import { ComputerChatChip, ComputerIndicator, ComputerPreview, ComputerSettings, UnavailableSettings } from "./views";
+import { ComputerChatChip, ComputerIndicator, ComputerPreview, ComputerSettings } from "./views";
 
 export default definePlugin({
   id: "computer-use",
   register(ctx) {
-    const desktop = desktopAdapter(ctx);
-    const peek = peekAdapter(ctx);
-    if (!desktop || !peek) {
-      ctx.registerSettingsPage({ title: "Computer use", render: UnavailableSettings });
-      return;
-    }
-    const controller = new ComputerUseController(desktop);
+    const peek = ctx.host.peek;
+    const controller = new ComputerUseController({ ...ctx.host, registerMcpServer: ctx.registerMcpServer });
     const synchronizeWorkspace = () => {
       const workspace = ctx.host.workspace.current();
       const before = controller.getState();
       const optedIn = workspace ? ctx.storage.get<boolean>(`workspace.${workspace.workspace_id}`, false) === true : false;
-      if (before.workspace?.id !== workspace?.workspace_id || before.optedIn !== optedIn) peek.close();
+      if (before.workspace?.id !== workspace?.workspace_id || before.optedIn !== optedIn) peek.close(`${ctx.id}:live`);
       void controller.setWorkspace(workspace ? {
         id: workspace.workspace_id, title: workspace.title,
         local: workspace.host_id == null && workspace.remote_cwd == null && !workspace.attach_only,
@@ -26,17 +20,17 @@ export default definePlugin({
     synchronizeWorkspace();
     ctx.host.workspace.subscribe(synchronizeWorkspace);
     ctx.register({
-      id: "live", area: peek.area, title: "Computer use", data: { icon: icons.Monitor },
-      render: (props: PeekBodyProps) => <ComputerPreview {...props} controller={controller} />,
+      id: "live", area: PEEK_AREA, title: "Computer use", data: { icon: icons.Monitor },
+      render: (props: PeekRenderProps) => <ComputerPreview {...props} controller={controller} />,
     });
     ctx.register({
       id: "stop", area: TITLEBAR_ACTIONS_AREA,
       render: () => <ComputerIndicator controller={controller} peek={peek} />,
     });
     ctx.register({
-      id: "status", area: peek.composerStatusArea,
+      id: "status", area: COMPOSER_STATUS_AREA,
       render: ({ workspaceId }: { workspaceId: string | null; threadId: string | null }) =>
-        <ComputerChatChip controller={controller} peek={peek} workspaceId={workspaceId} />,
+        <ComputerChatChip controller={controller} workspaceId={workspaceId} />,
     });
     ctx.registerSettingsPage({
       title: "Computer use",
@@ -51,7 +45,7 @@ export default definePlugin({
         }} />,
     });
     ctx.onDispose(() => {
-      peek.close();
+      peek.close(`${ctx.id}:live`);
       void controller.dispose().catch((error: unknown) => console.error("[computer-use] Could not confirm driver shutdown", error));
     });
   },

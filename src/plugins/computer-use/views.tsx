@@ -1,6 +1,5 @@
 import { useEffect, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
-import { Badge, Button, icons, Input, Switch, host } from "@codemux/sdk";
-import type { PeekAdapter, PeekBodyProps } from "./adapter";
+import { Badge, Button, icons, Input, Switch, host, PeekChip, type Host, type PeekRenderProps } from "@codemux/sdk";
 import { ComputerUseController } from "./controller";
 import { INSTALL_URL, isLinuxWayland, type DoctorProbe, type DoctorReport } from "./model";
 
@@ -43,7 +42,7 @@ export function DoctorDiagnostics({ report }: { report: DoctorReport }) {
 
 export function ComputerSettings({ controller, peek, initialCommand, onCommand, onOptIn }: {
   controller: ComputerUseController;
-  peek: PeekAdapter;
+  peek: Pick<Host["peek"], "open">;
   initialCommand: string;
   onCommand(command: string): void;
   onOptIn(value: boolean): void;
@@ -108,7 +107,7 @@ export function ComputerSettings({ controller, peek, initialCommand, onCommand, 
           {state.target && <div style={{ ...row, justifyContent: "space-between" }}>
             <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>{state.target.title || state.target.appName || "Selected window"}</span>
             <Button size="sm" variant="outline" disabled={state.phase !== "active"}
-              onClick={() => { if (state.workspace) peek.open(state.workspace.id); }}><icons.Monitor />Live view</Button>
+              onClick={() => { if (state.workspace) peek.open("computer-use:live", { workspaceId: state.workspace.id }); }}><icons.Monitor />Live view</Button>
           </div>}
           {state.phase === "active" && <Notice>
             Using Claude? Send a new message after enabling this window. Tools refresh between turns.
@@ -123,7 +122,7 @@ export function ComputerSettings({ controller, peek, initialCommand, onCommand, 
   );
 }
 
-export function ComputerIndicator({ controller, peek }: { controller: ComputerUseController; peek: PeekAdapter }) {
+export function ComputerIndicator({ controller, peek }: { controller: ComputerUseController; peek: Pick<Host["peek"], "open"> }) {
   const state = useComputer(controller);
   if (!state.target && state.phase !== "stopping") return null;
   const stopping = state.phase === "stopping";
@@ -135,7 +134,7 @@ export function ComputerIndicator({ controller, peek }: { controller: ComputerUs
   }} onPointerDown={(event) => event.stopPropagation()}>
     <Button size="xs" variant="ghost" aria-label={`View computer use${state.target ? ` in ${state.target.title || name}` : ""}`}
       title={label} disabled={state.phase !== "active"} style={{ minWidth: 0, maxWidth: 230 }}
-      onClick={() => { if (state.workspace) peek.open(state.workspace.id); }}>
+      onClick={() => { if (state.workspace) peek.open("computer-use:live", { workspaceId: state.workspace.id }); }}>
       <span aria-hidden style={{ width: 6, height: 6, borderRadius: "50%", flexShrink: 0 }}
         className={state.phase === "error" ? "bg-warning" : state.activeCalls ? "bg-destructive" : "bg-muted-foreground"} />
       <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
@@ -144,18 +143,16 @@ export function ComputerIndicator({ controller, peek }: { controller: ComputerUs
   </div>;
 }
 
-export function ComputerChatChip({ controller, peek, workspaceId }: {
-  controller: ComputerUseController; peek: PeekAdapter; workspaceId: string | null;
+export function ComputerChatChip({ controller, workspaceId }: {
+  controller: ComputerUseController; workspaceId: string | null;
 }) {
   const state = useComputer(controller);
   if (!state.target || state.workspace?.id !== workspaceId) return null;
-  return peek.chip({
-    label: "Computer", icon: icons.Monitor,
-    status: state.phase === "error" ? "error" : state.phase === "stopping" ? "stale" : state.phase === "starting" ? "connecting" : "live",
-  });
+  return <PeekChip peekId="computer-use:live" label="Computer" icon={icons.Monitor}
+    status={state.phase === "error" ? "error" : state.phase === "stopping" ? "stale" : state.phase === "starting" ? "connecting" : "live"} />;
 }
 
-export function ComputerPreview({ controller, workspaceId, onStatusChange }: { controller: ComputerUseController } & PeekBodyProps) {
+export function ComputerPreview({ controller, workspaceId, onStatusChange }: { controller: ComputerUseController } & PeekRenderProps) {
   const state = useComputer(controller);
   const active = state.phase === "active" && state.workspace?.id === workspaceId;
   useEffect(() => {
@@ -180,8 +177,4 @@ export function ComputerPreview({ controller, workspaceId, onStatusChange }: { c
         </div>}
     </div>
   </div>;
-}
-
-export function UnavailableSettings() {
-  return <Notice>Computer use requires a desktop build with plugin process, file and peek support.</Notice>;
 }

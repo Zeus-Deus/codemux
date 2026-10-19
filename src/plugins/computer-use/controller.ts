@@ -1,10 +1,19 @@
-import type { DesktopAdapter, DriverConnection } from "./adapter";
+import { randomUUID, type Host, type PluginContext } from "@codemux/sdk";
+
 import {
   connectionFailure, controlFiles, controlInstructions, discoveryFiles, parseDoctor, parseVersion,
   readFrame, readWindows, toolText, viewFiles,
   OBSERVATION_TOOLS, INPUT_TOOLS,
   type DoctorReport, type PreviewFrame, type WindowTarget,
 } from "./model";
+
+export interface ComputerUseServices {
+  process: Host["process"];
+  os: Host["os"];
+  fs: Pick<Host["fs"], "writeDataFile" | "removeDataFile">;
+  mcp: Pick<Host["mcp"], "callTool" | "getStatus" | "onStatus" | "onActivity">;
+  registerMcpServer: PluginContext["registerMcpServer"];
+}
 
 export interface Workspace {
   id: string;
@@ -27,7 +36,8 @@ export interface ComputerUseState {
 }
 
 interface Resource {
-  connection: DriverConnection;
+  id: string;
+  stop(): Promise<void>;
   files: string[];
   unsubscribe: (() => void)[];
   stopping?: Promise<void>;
@@ -49,7 +59,7 @@ export class ComputerUseController {
   private previewBusy = false;
   private disposed = false;
 
-  constructor(private readonly desktop: DesktopAdapter) {}
+  constructor(private readonly services: ComputerUseServices) {}
 
   getState = () => this.state;
   subscribe = (fn: () => void) => {
@@ -92,11 +102,11 @@ export class ComputerUseController {
 
   private async findExecutable(command: string | undefined, signal: AbortSignal): Promise<string> {
     const requested = command?.trim();
-    const found = await this.desktop.which(requested || "cua-driver");
+    const found = await this.services.process.which(requested || "cua-driver");
     this.check(signal);
     if (found) return found;
     if (requested && requested !== "cua-driver") throw new Error(`No executable was found at ${requested}. Check the path, then try again.`);
-    const os = await this.desktop.osInfo();
+    const os = await this.services.os.info();
     this.check(signal);
     const userBin = os.homeDir ? `${os.homeDir.replace(/\/+$/, "")}/.local/bin/cua-driver` : null;
     const candidates: string[] = [];
@@ -109,7 +119,7 @@ export class ComputerUseController {
       candidates.push(userBin);
     }
     for (const candidate of candidates) {
-      const executable = await this.desktop.which(candidate);
+      const executable = await this.services.process.which(candidate);
       this.check(signal);
       if (executable) return executable;
     }
@@ -124,23 +134,23 @@ export class ComputerUseController {
       const executable = await this.findExecutable(command, signal);
       this.check(signal);
       this.update({ executable });
-      const versionResult = await this.desktop.run({
+      const versionResult = await this.services.process.run({
         command: executable, args: ["--version"], timeoutMs: 5_000, maxOutputBytes: 16_384,
         workspaceId: this.state.workspace?.id, env: { CUA_DRIVER_EMBEDDED: "1" },
       });
       this.check(signal);
       const version = parseVersion(versionResult.stdout);
-      if (versionResult.code !== 0 || !version || versionResult.cancelled || versionResult.truncated || versionResult.timedOut) {
+      if (versionResult.code !== 0 || !version || versionResult.cancelled || versionResult.truncated || versionResult.pipesHeldOpen || versionResult.timedOut) {
         throw new Error(versionResult.stderr || "Could not read the cua-driver version.");
       }
       if (version !== "0.21.0") throw new Error(`cua-driver ${version} has not been validated with this plugin. Use version 0.21.0.`);
-      const result = await this.desktop.run({
+      const result = await this.services.process.run({
         command: executable, args: ["doctor", "--json"], timeoutMs: 15_000, maxOutputBytes: 262_144,
         env: { CUA_DRIVER_RS_TELEMETRY_ENABLED: "0", CUA_DRIVER_EMBEDDED: "1" }, workspaceId: this.state.workspace?.id,
       });
       this.check(signal);
       const doctor = parseDoctor(result.stdout);
-      if (!doctor || result.cancelled || result.truncated || result.timedOut) {
+      if (!doctor || result.cancelled || result.truncated || result.pipesHeldOpen || result.timedOut) {
         throw new Error(result.stderr || "cua-driver did not return a complete diagnostic report.");
       }
       this.update({ executable, version, doctor, phase: "idle", error: doctor.ok ? null : "cua-driver reported a setup problem. Review its diagnostics." });
@@ -163,15 +173,15 @@ export class ComputerUseController {
     target?: WindowTarget,
   ): Promise<Resource> {
     const { workspace, executable } = this.authorized();
-    const id = `cua-${kind}-${crypto.randomUUID()}`;
+    const id = `cua-${kind}-${randomUUID()}`;
     const names = [`${id}.yaml`, `${id}.json`];
     let resource: Resource | null = null;
     try {
-      const policy = await this.desktop.writeDataFile(names[0], files.policy);
+      const policy = await this.services.fs.writeDataFile(names[0], files.policy);
       this.check(signal);
-      const manifest = await this.desktop.writeDataFile(names[1], files.manifest);
+      const manifest = await this.services.fs.writeDataFile(names[1], files.manifest);
       this.check(signal);
-      const connection = await this.desktop.register({
+      const stop = await this.services.registerMcpServer({
         id, name: kind === "control" ? "Computer use" : "Computer use preview",
         scope: kind === "control" ? { workspaceIds: [workspace.id] } : "plugin",
         toolPrefix: kind === "control" ? "computer-use" : `computer-use-${kind}`,
@@ -186,13 +196,13 @@ export class ComputerUseController {
           CUA_DRIVER_RS_TELEMETRY_ENABLED: "0", CUA_DRIVER_EMBEDDED: "1",
         },
       });
-      resource = { connection, files: names, unsubscribe: [] };
+      resource = { id, stop, files: names, unsubscribe: [] };
       this.resources.add(resource);
       this.check(signal);
       const deadline = Date.now() + 15_000;
       while (Date.now() < deadline) {
         this.check(signal);
-        const runtime = await connection.status();
+        const runtime = await this.services.mcp.getStatus(id);
         this.check(signal);
         if (runtime?.status.kind === "running") return resource;
         if (runtime?.status.kind === "errored") throw new Error(runtime.status.message);
@@ -202,7 +212,7 @@ export class ComputerUseController {
       throw new Error("cua-driver did not become ready.");
     } catch (error) {
       if (resource) await this.release(resource);
-      else await Promise.all(names.map((name) => this.desktop.removeDataFile(name).catch(() => {})));
+      else await Promise.all(names.map((name) => this.services.fs.removeDataFile(name).catch(() => {})));
       throw error;
     }
   }
@@ -223,11 +233,11 @@ export class ComputerUseController {
       this.authorized();
       this.update({ phase: "discovering", windows: [], target: null, frame: null, error: null });
       const discovery = await this.open("discovery", discoveryFiles(), signal);
-      const diagnostic = await discovery.connection.call("get_screen_size");
+      const diagnostic = await this.services.mcp.callTool(discovery.id, "get_screen_size");
       this.check(signal);
       const failure = connectionFailure(diagnostic);
       if (failure) throw new Error(failure);
-      const result = await discovery.connection.call("list_windows");
+      const result = await this.services.mcp.callTool(discovery.id, "list_windows");
       this.check(signal);
       if (result.isError) throw new Error(toolText(result) ?? "The driver could not list application windows.");
       const windows = readWindows(result);
@@ -249,17 +259,17 @@ export class ComputerUseController {
       // Polling in a separate read-only runtime leaves the agent's element tokens intact.
       const view = await this.open("view", viewFiles(target), signal, target);
       const args = { pid: target.pid, window_id: target.windowId, include_screenshot: true };
-      const snapshot = await view.connection.call("get_window_state", args);
+      const snapshot = await this.services.mcp.callTool(view.id, "get_window_state", args);
       this.check(signal);
       if (snapshot.isError) throw new Error(toolText(snapshot) ?? "The selected window is no longer available.");
       const control = await this.open("control", controlFiles(target), signal, target);
-      control.unsubscribe.push(control.connection.onActivity((event) => {
+      control.unsubscribe.push(this.services.mcp.onActivity(control.id, (event) => {
         if (this.abort.signal !== signal || event.workspaceId !== workspace.id) return;
         if (event.phase === "start") this.calls.add(event.callId);
         else this.calls.delete(event.callId);
         this.update({ activeCalls: this.calls.size });
       }));
-      control.unsubscribe.push(control.connection.onStatus((runtime) => {
+      control.unsubscribe.push(this.services.mcp.onStatus(control.id, (runtime) => {
         if (this.abort.signal !== signal || this.disposed) return;
         if (runtime?.status.kind === "errored") this.update({ phase: "error", error: runtime.status.message });
         if (runtime?.status.kind === "stopped") void this.stop();
@@ -277,7 +287,7 @@ export class ComputerUseController {
     const signal = this.abort.signal;
     this.previewBusy = true;
     try {
-      const result = await view.connection.call("get_window_state", {
+      const result = await this.services.mcp.callTool(view.id, "get_window_state", {
         pid: target.pid, window_id: target.windowId, include_screenshot: true,
       });
       if (!signal.aborted && this.view === view) this.update({ frame: readFrame(result) });
@@ -288,11 +298,11 @@ export class ComputerUseController {
 
   private release(resource: Resource): Promise<void> {
     resource.stopping ??= (async () => {
-      await resource.connection.stop();
+      await resource.stop();
       for (const unsubscribe of resource.unsubscribe) unsubscribe();
       this.resources.delete(resource);
       if (this.view === resource) this.view = null;
-      await Promise.all(resource.files.map((name) => this.desktop.removeDataFile(name).catch(() => {})));
+      await Promise.all(resource.files.map((name) => this.services.fs.removeDataFile(name).catch(() => {})));
     })();
     return resource.stopping;
   }

@@ -2,8 +2,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { DesktopAdapter, PeekAdapter } from "./adapter";
-import { ComputerUseController } from "./controller";
+import { PEEK_AREA, type Host } from "@codemux/sdk";
+import { registry } from "@/contrib/registry";
+import { ComputerUseController, type ComputerUseServices } from "./controller";
 import { ComputerChatChip, ComputerIndicator, ComputerSettings, DoctorDiagnostics } from "./views";
 
 vi.mock("@/lib/toast", () => ({ toast: { error: vi.fn(), info: vi.fn(), success: vi.fn(), warning: vi.fn() } }));
@@ -16,27 +17,26 @@ const healthy = { ok: true, probes: [{ label: "X11 connection", status: "ok" as 
 async function activeController() {
   let release = () => {};
   const exit = new Promise<void>((resolve) => { release = resolve; });
-  const desktop: DesktopAdapter = {
-    which: async () => "/demo/cua-driver",
-    osInfo: async () => ({ platform: "linux", arch: "x86_64", homeDir: "/home/demo", configDir: null, dataDir: null, localDataDir: null }),
-    run: async ({ args }) => ({ code: 0, stdout: args?.[0] === "--version" ? "cua-driver 0.21.0" : JSON.stringify(healthy), stderr: "", timedOut: false, truncated: false, cancelled: false }),
-    writeDataFile: async (name) => `/demo/${name}`, removeDataFile: async () => {},
-    register: async (options) => ({
-      call: async (tool) => ({ content: [], ...(tool === "list_windows" ? { structuredContent: { windows: [{ pid: 42, window_id: 123, title: "Counter", app_name: "Counter" }] } } : {}) }),
-      status: async () => ({ id: options.id, name: options.name, status: { kind: "running", toolCount: 1 }, toolsCount: 1, errorMessage: null, stderrTail: null, startedAtMs: 0 }),
+  const services: ComputerUseServices = {
+    process: {
+      which: async () => "/demo/cua-driver",
+      run: async ({ args }) => ({ code: 0, stdout: args?.[0] === "--version" ? "cua-driver 0.21.0" : JSON.stringify(healthy), stderr: "", timedOut: false, truncated: false, pipesHeldOpen: false, cancelled: false }),
+    },
+    os: { info: async () => ({ platform: "linux", arch: "x86_64", homeDir: "/home/demo", configDir: null, dataDir: null, localDataDir: null }) },
+    fs: { writeDataFile: async (name) => `/demo/${name}`, removeDataFile: async () => {} },
+    registerMcpServer: async (options) => async () => { if (options.scope !== "plugin") await exit; },
+    mcp: {
+      callTool: async (_id, tool) => ({ content: [], ...(tool === "list_windows" ? { structuredContent: { windows: [{ pid: 42, window_id: 123, title: "Counter", app_name: "Counter" }] } } : {}) }),
+      getStatus: async (id) => ({ id, name: "Computer use", status: { kind: "running", toolCount: 1 }, toolsCount: 1, errorMessage: null, stderrTail: null, startedAtMs: 0 }),
       onStatus: () => () => {}, onActivity: () => () => {},
-      stop: async () => { if (options.scope !== "plugin") await exit; },
-    }),
+    },
   };
-  const controller = new ComputerUseController(desktop);
+  const controller = new ComputerUseController(services);
   await controller.setWorkspace({ id: "demo", title: "Demo", local: true }, true);
   await controller.detect();
   await controller.discover();
   await controller.enable(controller.getState().windows[0]);
-  const peek: PeekAdapter = {
-    area: "peek", composerStatusArea: "composer.status", open: () => true, close: () => {},
-    chip: ({ label }) => <button>{label}</button>,
-  };
+  const peek: Pick<Host["peek"], "open"> = { open: () => true };
   return { controller, peek, release };
 }
 
@@ -78,11 +78,13 @@ describe("computer-use status controls", () => {
   });
 
   it("shows the live-view chip only in the opted-in workspace", async () => {
-    const { controller, peek, release } = await activeController();
-    const { rerender } = render(<ComputerChatChip controller={controller} peek={peek} workspaceId="other" />);
-    expect(screen.queryByRole("button", { name: "Computer" })).toBeNull();
-    rerender(<ComputerChatChip controller={controller} peek={peek} workspaceId="demo" />);
-    expect(screen.getByRole("button", { name: "Computer" })).toBeVisible();
+    const { controller, release } = await activeController();
+    const unregister = registry.register({ id: "computer-use:live", source: "test", area: PEEK_AREA, render: () => null });
+    const { rerender } = render(<ComputerChatChip controller={controller} workspaceId="other" />);
+    expect(screen.queryByRole("button", { name: "View Computer preview" })).toBeNull();
+    rerender(<ComputerChatChip controller={controller} workspaceId="demo" />);
+    expect(screen.getByRole("button", { name: "View Computer preview" })).toBeVisible();
+    unregister();
     release();
     await controller.dispose();
   });
