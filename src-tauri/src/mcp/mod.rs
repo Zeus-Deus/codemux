@@ -95,12 +95,45 @@ pub struct McpServerConfig {
 impl McpServerConfig {
     /// Listing is informational. Runtime credentials remain native-only.
     pub fn redacted(mut self) -> Self {
+        if !self.args.is_empty() {
+            self.args = vec!["…".into()];
+        }
+        let redact_url = |value: &str| -> String {
+            let Ok(mut url) = url::Url::parse(value) else {
+                return "[redacted URL]".into();
+            };
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        };
+        if self.transport == McpTransport::Http {
+            self.command = redact_url(&self.command);
+        }
         for value in self.env.values_mut() {
             *value = "[redacted]".into();
         }
         if let Some(raw) = self.raw.as_object_mut() {
             raw.remove("pluginRegistrationToken");
             raw.remove("runtimeGeneration");
+            if raw
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|args| !args.is_empty())
+            {
+                raw.insert("args".into(), serde_json::json!(["…"]));
+            }
+            for key in ["url", "serverUrl"] {
+                if let Some(value) = raw.get_mut(key) {
+                    if let Some(url) = value.as_str() {
+                        *value = serde_json::json!(redact_url(url));
+                    }
+                }
+            }
+            if self.transport == McpTransport::Http && raw.contains_key("command") {
+                raw.insert("command".into(), serde_json::json!(self.command));
+            }
             for key in ["env", "headers", "http_headers"] {
                 if let Some(serde_json::Value::Object(values)) = raw.get_mut(key) {
                     for value in values.values_mut() {

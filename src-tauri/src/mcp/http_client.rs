@@ -87,6 +87,7 @@ impl HttpMcpClient {
             }
             if let Ok(response) = request.send().await {
                 if response.status().is_success() {
+                    let connected_at = std::time::Instant::now();
                     // Reconcile after reconnect even if changes occurred while
                     // disconnected and the server sends no fresh notification.
                     self.emit_notification(&json!({"method":"notifications/tools/list_changed"}));
@@ -99,6 +100,9 @@ impl HttpMcpClient {
                         for value in messages {
                             self.emit_notification(&value);
                         }
+                    }
+                    if connected_at.elapsed() >= std::time::Duration::from_secs(5) {
+                        backoff = std::time::Duration::from_millis(100);
                     }
                 } else if response.status() == reqwest::StatusCode::NOT_FOUND {
                     // An expired server-side session needs a new initialize.
@@ -630,6 +634,90 @@ mod live_tests {
         registry.clear_plugin_servers::<tauri::Wry>(None).await;
         task.abort();
     }
+    #[tokio::test]
+    async fn plugin_mcp_http_backoff_resets_after_healthy_stream() {
+        use axum::response::IntoResponse;
+        use futures_util::StreamExt;
+        let fixture = Fixture {
+            ready: Arc::new(AtomicBool::new(false)),
+            connected: Arc::new(AtomicBool::new(false)),
+            changes: broadcast::channel(8).0,
+        };
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (events, mut times) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new()
+            .route(
+                "/mcp",
+                post(handle).get(move || {
+                    let count = count.clone();
+                    let events = events.clone();
+                    async move {
+                        match count.fetch_add(1, Ordering::SeqCst) {
+                            0..=2 => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                            3 => {
+                                let stream = futures_util::stream::iter([Ok::<
+                                    _,
+                                    std::convert::Infallible,
+                                >(
+                                    axum::body::Bytes::from(": connected\n\n"),
+                                )])
+                                .chain(
+                                    futures_util::stream::once(async move {
+                                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                        let _ = events.send(std::time::Instant::now());
+                                        Ok(axum::body::Bytes::from(": healthy stream ended\n\n"))
+                                    }),
+                                );
+                                let mut response = axum::response::Response::new(
+                                    axum::body::Body::from_stream(stream),
+                                );
+                                response
+                                    .headers_mut()
+                                    .insert("content-type", "text/event-stream".parse().unwrap());
+                                response
+                            }
+                            _ => {
+                                let _ = events.send(std::time::Instant::now());
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                            }
+                        }
+                    }
+                }),
+            )
+            .with_state(fixture);
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = McpServerConfig {
+            id: "backoff".into(),
+            name: "backoff".into(),
+            sources: vec![],
+            command: format!("http://{}/mcp", socket.local_addr().unwrap()),
+            args: vec![],
+            env: Default::default(),
+            disabled: false,
+            transport: super::super::McpTransport::Http,
+            raw: json!({}),
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(socket, app).await.unwrap();
+        });
+        let client = HttpMcpClient::connect(&config).await.unwrap();
+        let listener = tokio::spawn(async move {
+            client.listen_notifications().await;
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let ended = times.recv().await.unwrap();
+            times.recv().await.unwrap().duration_since(ended)
+        })
+        .await;
+        listener.abort();
+        server.abort();
+        let elapsed = result.unwrap();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "healthy reconnect retained stale backoff: {elapsed:?}"
+        );
+    }
+
     #[test]
     fn plugin_mcp_sse_decodes_split_utf8_and_multiline_frames() {
         let mut decoder = SseDecoder::default();

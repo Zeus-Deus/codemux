@@ -8,14 +8,13 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use rand::distributions::{Alphanumeric, DistString};
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::registry::McpRegistry;
@@ -121,12 +120,6 @@ async fn method_not_allowed() -> StatusCode {
     StatusCode::METHOD_NOT_ALLOWED
 }
 
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GatewayQuery {
-    workspace_id: Option<String>,
-}
-
 async fn handle_events(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
     if !origin_allowed(&headers) {
         return StatusCode::FORBIDDEN.into_response();
@@ -157,7 +150,6 @@ async fn handle_events(State(state): State<GatewayState>, headers: HeaderMap) ->
 
 async fn handle_post(
     State(state): State<GatewayState>,
-    Query(query): Query<GatewayQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -213,7 +205,7 @@ async fn handle_post(
         "tools/list" => {
             let mut tools = state
                 .registry
-                .list_tools_for_workspace(&GATEWAY_NATIVE_SOURCES, query.workspace_id.as_deref())
+                .list_tools_for_workspace(&GATEWAY_NATIVE_SOURCES, None)
                 .await;
             tools.extend(super::registry::plugin_bridge_tools());
             let data: Vec<Value> = tools
@@ -236,11 +228,9 @@ async fn handle_post(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            // Forward the caller's workspace identity when the request
-            // carries it, so built-in workspace-scoped tools route to the
-            // calling session's workspace. Absent for OpenCode (see the
-            // module note on `GATEWAY_NATIVE_SOURCES`).
-            let workspace_id = query.workspace_id.as_deref();
+            // Shared gateway tokens do not authenticate a workspace. Caller
+            // identity must come from a native token binding, never the URL.
+            let workspace_id = None;
             let bridge = state
                 .registry
                 .call_plugin_bridge(name, arguments.clone(), workspace_id, &[])
@@ -426,16 +416,83 @@ mod tests {
     #[tokio::test]
     async fn plugin_mcp_gateway_never_exposes_plugin_only_scope() {
         let registry = super::super::registry::test_support::plugin_fixture("plugin").await;
-        let app = router(GatewayState { registry: registry.clone(), bearer_token: Arc::from("test-token") });
-        let response = app.clone().oneshot(request(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))).await.unwrap();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let app = router(GatewayState {
+            registry: registry.clone(),
+            bearer_token: Arc::from("test-token"),
+        });
+        let response = app
+            .clone()
+            .oneshot(request(
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            ))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
-        assert!(value["result"]["tools"].as_array().unwrap().iter().all(|tool| !tool["name"].as_str().unwrap().starts_with("fixture__")));
-        for params in [json!({"name":"fixture__new_tool","arguments":{}}), json!({"name":"codemux_call_plugin_tool","arguments":{"name":"fixture__new_tool","arguments":{}}})] {
-            let response = app.clone().oneshot(request(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":params}))).await.unwrap();
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(value["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| !tool["name"].as_str().unwrap().starts_with("fixture__")));
+        for params in [
+            json!({"name":"fixture__new_tool","arguments":{}}),
+            json!({"name":"codemux_call_plugin_tool","arguments":{"name":"fixture__new_tool","arguments":{}}}),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":params}),
+                ))
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
             let value: Value = serde_json::from_slice(&body).unwrap();
             assert!(value.get("error").is_some() || value["result"]["isError"] == true);
+        }
+        registry.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_gateway_ignores_untrusted_workspace_query() {
+        let registry = super::super::registry::test_support::plugin_fixture(
+            r#"{"workspaceIds":["other-workspace"]}"#,
+        )
+        .await;
+        let app = router(GatewayState {
+            registry: registry.clone(),
+            bearer_token: Arc::from("test-token"),
+        });
+        for method in ["tools/list", "tools/call"] {
+            let mut req = request(
+                json!({"jsonrpc":"2.0","id":1,"method":method,"params":{"name":"fixture__new_tool","arguments":{}}}),
+            );
+            *req.uri_mut() = "/mcp?workspaceId=other-workspace".parse().unwrap();
+            let response = app.clone().oneshot(req).await.unwrap();
+            let value: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            if method == "tools/list" {
+                assert!(
+                    value["result"]["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|tool| !tool["name"].as_str().unwrap().starts_with("fixture__")),
+                    "{value}"
+                );
+            } else {
+                assert!(
+                    value.get("error").is_some() || value["result"]["isError"] == true,
+                    "{value}"
+                );
+            }
         }
         registry.shutdown_all().await;
     }

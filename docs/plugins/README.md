@@ -266,7 +266,7 @@ are bounded to 50 ASCII letters, digits, underscores or dashes, reserving 14
 characters for that observed Claude envelope so full provider names fit 64.
 If replacement or truncation is necessary, the name is truncated to 37 characters and suffixed with `_` plus 12 SHA-256 hex characters
 of the complete original name. A collision visible in one workspace is refused.
-HTTP URLs require HTTPS outside loopback, without embedded credentials or fragments. Loopback bypasses environment proxies; MCP HTTP clients do not follow redirects. Settings listings redact environment and header values.
+HTTP URLs require HTTPS outside loopback, without embedded credentials or fragments. Loopback bypasses environment proxies; MCP HTTP clients do not follow redirects. Settings listings redact environment/header values, stdio arguments, URL queries and embedded URL credentials.
 Commands/args are argv, never shell text. `cwd` must be absolute. Env/headers are
 bounded to 128 entries and 64 KiB total (16 KiB per value).
 
@@ -287,7 +287,11 @@ swaps wait until the current turn ends, preserving in-flight tool results.
 Claude also receives `codemux_list_plugin_tools` and `codemux_call_plugin_tool`:
 use them when an Editor or another integration connects during the current turn,
 while its newly added tools are absent from ToolSearch. Native refresh remains
-available at the next safe boundary. The list marks tools already in this
+available at the next safe boundary. Claude receives the two catalog tools only
+when a plugin registration is visible to that workspace, even if its tool list
+is still empty. A first plugin loaded during a turn becomes available at the
+next safe boundary. A hung refresh times out after five seconds; the next turn
+resumes the conversation with the pending catalog. The list marks tools already in this
 session's native snapshot with `directlyCallable`. Plugins loaded
 after a chat starts use those same paths. OpenCode chats see only globally scoped plugin tools in this PR; workspace scoping for OpenCode follows in the gateway-identity PR.
 
@@ -305,3 +309,23 @@ chat is unnecessary for late tools. Older resumed Codex threads whose saved
 snapshot predates these bridge tools need a new chat to acquire the bridge.
 
 See [`examples/mcp-tools/`](./examples/mcp-tools/) for a worked plugin.
+
+Claude bridge approvals use the target tool's native name and arguments. A deny
+rule on that name also denies bridge calls; an allow for X does not allow Y.
+The guard reads the CLI's effective permission rules through the installed SDK's
+`getSettings()` control method. This runtime method is pinned by a compatibility
+test; if it is unavailable or its response changes, calls fail closed with a
+visible explanation to call the tool directly or update Codemux. Managed-only
+permission state that the settings view cannot expose also fails closed.
+
+Codex's registry tools, both native `dynamicTools` and bridge calls, use the
+app-server's `item/tool/call` path. That path has no Claude-style per-tool
+allow/deny rules or approval dialog in Codemux. Codex shell/file approval and
+sandbox settings do not add per-tool approval to these app-hosted tools. The
+bridge uses the same workspace visibility and dispatch checks as native tools.
+The catalog tools stay present in every local Codex chat because its dynamic
+schemas cannot add them later.
+
+Plugin stdio servers on Linux and macOS use a 2 MiB limit per JSON-RPC frame,
+including image results. Windows and macOS shutdown behavior remains untested
+live.

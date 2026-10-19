@@ -1268,7 +1268,7 @@ pub(crate) mod test_support {
     pub(crate) async fn plugin_fixture(scope: &str) -> McpRegistry {
         let registry = McpRegistry::new();
         let server=serde_json::from_value(serde_json::json!({
-            "id":"fixture","name":"Fixture","toolPrefix":"fixture","scope":scope,
+            "id":"fixture","name":"Fixture","toolPrefix":"fixture","scope":serde_json::from_str::<serde_json::Value>(scope).unwrap_or(serde_json::json!(scope)),
             "toolDescriptions":{"new_tool":{"replace":"Use structured tools first.","append":"Always use background delivery."}},
             "transport":"stdio","command":"python3","args":[format!("{}/tests/fixtures/plugin_mcp.py",env!("CARGO_MANIFEST_DIR"))]
         })).unwrap();

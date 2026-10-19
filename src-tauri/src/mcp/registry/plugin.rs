@@ -657,6 +657,12 @@ pub fn plugin_bridge_tools() -> Vec<McpTool> {
     ]
 }
 impl McpRegistry {
+    pub async fn has_visible_plugin_servers(&self, workspace: Option<&str>) -> bool {
+        let inner = self.inner.lock().await;
+        inner.plugins.iter().any(|(id, registration)| {
+            registration.scope.visible(workspace) && !inner.disabled_ids.contains(id)
+        })
+    }
     pub async fn plugin_catalog(&self, workspace: Option<&str>) -> Vec<McpTool> {
         self.list_tools_for_workspace(&[], workspace)
             .await
@@ -844,7 +850,7 @@ mod tests {
                 None,
                 "demo",
                 "private-token".into(),
-                server(PluginMcpScope::All("all".into()), vec![]),
+                server(PluginMcpScope::All("all".into()), vec!["arg-secret".into()]),
             )
             .await
             .unwrap();
@@ -857,7 +863,7 @@ mod tests {
         http.id = "http".into();
         http.tool_prefix = Some("httpfixture".into());
         http.transport = PluginMcpTransport::Http {
-            url: "https://example.invalid/mcp".into(),
+            url: "https://example.invalid/mcp?token=query-secret".into(),
             headers: HashMap::from([("authorization".into(), "header-secret".into())]),
         };
         registry
@@ -872,6 +878,7 @@ mod tests {
             .await
             .unwrap();
         let http_output = serde_json::to_string(&registry.plugin_configs().await).unwrap();
+        assert!(!http_output.contains("query-secret"), "URL query leaked");
         assert!(!http_output.contains("header-secret"));
         assert!(!http_output.contains("http-token"));
         assert!(!http_output.contains("runtimeGeneration"));
@@ -881,6 +888,7 @@ mod tests {
             "registration token leaked"
         );
         assert!(!output.contains("intact"), "environment value leaked");
+        assert!(!output.contains("arg-secret"), "stdio arg leaked");
     }
     #[tokio::test]
     async fn plugin_mcp_review_collisions_include_host_and_bridge_tools() {
