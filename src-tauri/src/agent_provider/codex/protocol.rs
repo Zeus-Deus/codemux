@@ -287,7 +287,9 @@ pub struct CollaborationMode {
 pub struct CollaborationModeSettings {
     pub model: String,
     pub reasoning_effort: Option<String>,
-    pub developer_instructions: String,
+    /// Serialized even when `None`: `null` selects Codex's built-in
+    /// instructions for the mode.
+    pub developer_instructions: Option<String>,
 }
 
 /// A single item in [`TurnStartParams::input`].
@@ -1631,7 +1633,7 @@ mod tests {
                 settings: CollaborationModeSettings {
                     model: "gpt-5.6-sol".into(),
                     reasoning_effort: Some("high".into()),
-                    developer_instructions: "runtime identity".into(),
+                    developer_instructions: Some("runtime identity".into()),
                 },
             }),
         };

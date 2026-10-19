@@ -20,6 +20,7 @@ import {
   type StartedTaskState,
   type SuggestedTask,
 } from "@/lib/agent-chat/follow-ups";
+import { codexTurnPermissionOverride } from "@/lib/agent-chat/mode-compatibility";
 import { sessionProviderLabel } from "@/lib/agent-chat/session-mentions";
 import { statusTone } from "@/lib/agent-chat/subagents";
 import type { SubagentView, SubagentViewStatus, ToolCallItem } from "@/lib/agent-chat/types";
@@ -231,6 +232,7 @@ export const SuggestedTasksCard = memo(function SuggestedTasksCard({
   const doItHere = async (index: number) => {
     if (!threadId || !chatProvider) return;
     const turn = doItHereTurn(tasks[index]);
+    const slice = useAgentChatStore.getState().threads[threadId];
     try {
       await agentChatSendTurn(chatProvider, {
         thread_id: threadId,
@@ -238,7 +240,12 @@ export const SuggestedTasksCard = memo(function SuggestedTasksCard({
         display_text: turn.displayText,
         model_override: null,
         effort_override: null,
-        permission_mode_override: null,
+        // Runs in the chat's current mode, like a message sent by hand.
+        permission_mode_override: codexTurnPermissionOverride(
+          chatProvider,
+          slice?.mode ?? "default",
+          slice?.permissionMode ?? null,
+        ),
       });
     } catch (error) {
       toast.error("Couldn't send the task to this chat", { description: errorText(error) });

@@ -23,6 +23,8 @@ pub enum QuestionAction {
         submission_id: String,
         #[serde(default)]
         retry_unknown: bool,
+        #[serde(default)]
+        permission_mode_override: Option<String>,
     },
     Dismiss,
     Reopen,
@@ -108,6 +110,10 @@ pub async fn agent_chat_answer_question<R: Runtime>(
     }
     let (question, previous) = db.async_question(&thread_id.0, &question_id)?;
 
+    let permission_mode_override = match &action {
+        QuestionAction::Answer { permission_mode_override, .. } => permission_mode_override.clone(),
+        _ => None,
+    };
     let (submission_id, answers, reconcile) = match action {
         QuestionAction::Dismiss | QuestionAction::Reopen => {
             let next = match (&action, &previous) {
@@ -139,6 +145,7 @@ pub async fn agent_chat_answer_question<R: Runtime>(
             answers,
             submission_id,
             retry_unknown,
+            ..
         } => {
             // Reject arbitrary oversized identifiers before they reach RPC or DB.
             uuid::Uuid::parse_str(&submission_id).map_err(|_| "Invalid submission ID.")?;
@@ -175,7 +182,7 @@ pub async fn agent_chat_answer_question<R: Runtime>(
                 record.cwd.clone().map(|cwd| Arc::new(GitTurnDispatchCheckpoint::new(app.clone(), thread_id.0.clone(), record.workspace_id, cwd, Some(submission_id.clone()))) as Arc<dyn TurnDispatchCheckpoint>)
             } else { None };
             let checkpoint = super::turn_diff::wrap_dispatch_checkpoint(&app, &thread_id.0, record.cwd, Some(&submission_id), checkpoint);
-            let delivered = provider.answer_question(AnswerQuestionInput { thread_id: thread_id.clone(), question, answers: answers.clone(), submission_id: submission_id.clone(), checkpoint }).await;
+            let delivered = provider.answer_question(AnswerQuestionInput { thread_id: thread_id.clone(), question, answers: answers.clone(), submission_id: submission_id.clone(), checkpoint, permission_mode_override }).await;
             if let Ok(QuestionDelivery::NewTurn { turn_id }) = &delivered {
                 super::turn_diff::on_turn_bound(&app, &thread_id.0, Some(&submission_id), &turn_id.0);
             }
