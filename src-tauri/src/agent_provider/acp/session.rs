@@ -452,7 +452,7 @@ impl AcpSession {
             None => JsonRpcChild::spawn(SpawnConfig {
                 program: spawn.binary,
                 args: dialect.spawn_args(),
-                env: child_env.clone(),
+                env: super::mcp::with_loopback_no_proxy(child_env.clone()),
                 cwd: Some(cwd.clone()),
                 default_timeout: RPC_TIMEOUT,
             })

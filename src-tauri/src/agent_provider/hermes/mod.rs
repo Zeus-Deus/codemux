@@ -363,7 +363,7 @@ impl Inner {
         // Do not overlay caller credentials, disable configured MCP, or mutate active_profile.
         let child = JsonRpcChild::spawn(SpawnConfig {
             program: profile.installation.clone(), args: vec!["--profile".into(), profile.id.clone(), "acp".into()],
-            env: HashMap::from([("HERMES_HOME".into(), profile.root.to_string_lossy().into_owned())]),
+            env: crate::agent_provider::acp::mcp::with_loopback_no_proxy(HashMap::from([("HERMES_HOME".into(), profile.root.to_string_lossy().into_owned())])),
             cwd: Some(profile.home.clone()), default_timeout: Duration::from_secs(60),
         }).await.map_err(|e| invalid(format!("setup_required: launch official Hermes with ACP dependencies (`hermes acp --check`): {e}")))?;
         let mut notifications = child.notifications();

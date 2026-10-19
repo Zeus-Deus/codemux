@@ -505,7 +505,7 @@ impl Session {
             JsonRpcChild::spawn_strict(SpawnConfig {
                 program: PathBuf::from(&launch.agent.executable),
                 args: launch.agent.args.clone(),
-                env: launch.environment.clone(),
+                env: crate::agent_provider::acp::mcp::with_loopback_no_proxy(launch.environment.clone()),
                 cwd: Some(cwd.clone()),
                 default_timeout: RPC_TIMEOUT,
             })

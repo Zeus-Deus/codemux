@@ -28,6 +28,30 @@ pub const GROK_NATIVE_SOURCES: &[McpConfigSource] = &[
     McpConfigSource::CursorProject,
 ];
 
+/// Hosts an agent must reach directly: the gateway listens on loopback.
+const LOOPBACK_HOSTS: &str = "127.0.0.1,localhost,::1";
+
+/// `env` plus `NO_PROXY`/`no_proxy` that exempt loopback, for a local agent
+/// that gets the gateway. HTTP clients such as Hermes's httpx 0.28.1 send
+/// even loopback requests through an ambient `HTTP_PROXY`, which breaks
+/// every tool call and hands the proxy the chat's token. An existing value,
+/// from `env` or this process, is kept.
+pub fn with_loopback_no_proxy(
+    mut env: std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    let existing = ["NO_PROXY", "no_proxy"]
+        .iter()
+        .find_map(|name| env.get(*name).cloned().or_else(|| std::env::var(name).ok()))
+        .filter(|value| !value.trim().is_empty());
+    let value = match existing {
+        Some(existing) => format!("{existing},{LOOPBACK_HOSTS}"),
+        None => LOOPBACK_HOSTS.to_string(),
+    };
+    env.insert("NO_PROXY".into(), value.clone());
+    env.insert("no_proxy".into(), value);
+    env
+}
+
 /// How the agent reaches the gateway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -85,6 +109,22 @@ pub async fn session_mcp_servers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_is_exempted_from_proxies_and_existing_entries_are_kept() {
+        let env = with_loopback_no_proxy(std::collections::HashMap::from([
+            ("NO_PROXY".to_string(), "corp.example".to_string()),
+            ("OTHER".to_string(), "kept".to_string()),
+        ]));
+        assert_eq!(env["NO_PROXY"], "corp.example,127.0.0.1,localhost,::1");
+        assert_eq!(env["no_proxy"], env["NO_PROXY"]);
+        assert_eq!(env["OTHER"], "kept");
+        let env = with_loopback_no_proxy(std::collections::HashMap::from([(
+            "no_proxy".to_string(),
+            " ".to_string(),
+        )]));
+        assert!(env["NO_PROXY"].ends_with("127.0.0.1,localhost,::1"));
+    }
 
     #[test]
     fn http_only_when_advertised() {
