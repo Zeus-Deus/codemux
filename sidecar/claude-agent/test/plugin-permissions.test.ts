@@ -1,5 +1,8 @@
 import { describe, test, expect, spyOn } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   query,
   type CanUseTool,
@@ -399,21 +402,30 @@ test("pinned SDK 0.2.114 getSettings control contract (review this test on SDK b
     await readFile(new URL("package.json", entry), "utf8"),
   );
   expect(pkg.version).toBe("0.2.114");
+  const root = await mkdtemp(join(tmpdir(), "codemux-sdk-settings-"));
+  const fixture = pathToFileURL(join(root, "settings fixture.mjs"));
   const prompts = new AsyncPromptQueue<
     import("@anthropic-ai/claude-agent-sdk").SDKUserMessage
   >();
-  const q = query({
-    prompt: prompts,
-    options: {
-      pathToClaudeCodeExecutable: new URL(
-        "./fixtures/settings-cli.mjs",
-        import.meta.url,
-      ).pathname,
-      executable: "node",
-      settingSources: [],
-    },
-  });
+  let q: ReturnType<typeof query> | undefined;
   try {
+    await copyFile(new URL("./fixtures/settings-cli.mjs", import.meta.url), fixture);
+    q = query({
+      prompt: prompts,
+      options: {
+        // pathname leaves /C:/ on Windows and percent-escapes spaces.
+        pathToClaudeCodeExecutable: fileURLToPath(fixture),
+        executable: "node",
+        settingSources: [],
+        env: {
+          PATH: process.env.PATH,
+          SystemRoot: process.env.SystemRoot,
+          HOME: root,
+          USERPROFILE: root,
+          CLAUDE_CONFIG_DIR: root,
+        },
+      },
+    });
     await q.initializationResult();
     const raw = await queryPermissionSettings(q);
     expect(readEffectiveRules(raw)).toEqual({
@@ -423,6 +435,7 @@ test("pinned SDK 0.2.114 getSettings control contract (review this test on SDK b
     });
   } finally {
     prompts.close();
-    q.close();
+    q?.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
