@@ -603,3 +603,25 @@ async fn s4_actual_native_and_transport_stdin_keep_canonical_leases_through_posi
         }
     }
 }
+#[test]
+fn new_chat_list_is_empty_until_its_session_is_persisted() {
+    use tauri::Listener;
+    let dir=tempfile::TempDir::new().unwrap();
+    let app=tauri::test::mock_app();
+    let state=AppStateStore::default();
+    let ws=state.snapshot().active_workspace_id.0;
+    let pane=state.create_agent_chat_pane(&ws,Some(ProviderKind::Codex),None,None,Some("new-chat".into())).unwrap().0;
+    app.manage(state);app.manage(DatabaseStore::new_in_memory());app.manage(Arc::new(journal::Journal::open(dir.path()).unwrap()));
+    let events=Arc::new(std::sync::atomic::AtomicUsize::new(0)); let count=events.clone();
+    app.listen("delegation-changed",move|_|{count.fetch_add(1,std::sync::atomic::Ordering::SeqCst);});
+    let invoke=|command:&str,args:serde_json::Value|tauri::async_runtime::block_on(app::invoke(app.handle(),command,args));
+    let list=||invoke("delegation_list",serde_json::json!({"paneId":pane}));
+    assert_eq!(list().unwrap(),serde_json::json!([]),"a bound pane awaiting its first session reported an error");
+    assert!(invoke("delegation_grants",serde_json::json!({"paneId":pane})).is_err(),"only the list read may answer before the parent exists");
+    let (_,_,input)=tests::fixture();
+    assert!(invoke("delegate_task",serde_json::json!({"paneId":pane,"input":input})).is_err(),"an unpersisted parent admitted a task");
+    assert!(invoke("delegation_list",serde_json::json!({"paneId":"missing-pane"})).is_err(),"an unknown pane must still be rejected");
+    assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst),0,"reads and rejected mutations invalidated the renderer");
+    app.state::<DatabaseStore>().upsert_agent_chat_session("new-chat",&ws,Some("/synthetic/parent"),"codex").unwrap();
+    assert_eq!(list().unwrap(),serde_json::json!([]));
+}

@@ -1542,14 +1542,17 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
         // start-time persist below records any cursor returned by the new
         // adapter. Keeping this inside one SQL statement avoids a second
         // clear racing a new provider's cursor event.
-        if let Err(error) = db.upsert_agent_chat_session(
-            &session.thread_id.0,
-            &workspace_id,
-            cwd_for_persist.as_deref(),
-            provider_str,
-        ) {
-            eprintln!("[codemux::agent_chat] failed to persist session record: {error}");
-        }
+        let persisted = db
+            .upsert_agent_chat_session(
+                &session.thread_id.0,
+                &workspace_id,
+                cwd_for_persist.as_deref(),
+                provider_str,
+            )
+            .inspect_err(|error| {
+                eprintln!("[codemux::agent_chat] failed to persist session record: {error}");
+            })
+            .is_ok();
         // Persist a provider-returned resume cursor NOW, after the row
         // exists. The async `ResumeCursorUpdated` persist path is a plain
         // UPDATE racing this upsert across a spawned bridge task — when the
@@ -1583,6 +1586,11 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
             // The row now exists. Project the latest acknowledged binding,
             // including updates accepted while startup was completing.
             db.project_acp_binding(&session.thread_id.0)?;
+        }
+        if persisted {
+            // The pane may have read its task list while the row was missing
+            // or held the previous provider and config; have it read again.
+            crate::delegation::app::changed(&app, &session.thread_id.0);
         }
         // Checkpoints are captured at each provider's real dispatch boundary,
         // not at session start. That keeps queued prompts aligned with both
