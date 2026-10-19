@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
+use futures_util::StreamExt;
+use crate::json_rpc_child::Notification;
 
 use super::McpServerConfig;
 
@@ -17,6 +19,7 @@ pub struct HttpMcpClient {
     headers: HeaderMap,
     session_id: Mutex<Option<String>>,
     next_id: AtomicU64,
+    notifications: broadcast::Sender<Notification>,
 }
 
 impl HttpMcpClient {
@@ -30,6 +33,7 @@ impl HttpMcpClient {
             headers,
             session_id: Mutex::new(None),
             next_id: AtomicU64::new(1),
+            notifications: broadcast::channel(256).0,
         };
         let initialized = client
             .request(
@@ -55,6 +59,29 @@ impl HttpMcpClient {
             .notify("notifications/initialized", json!({}))
             .await?;
         Ok(client)
+    }
+
+    pub fn notifications(&self) -> broadcast::Receiver<Notification> { self.notifications.subscribe() }
+
+    /// A server may refuse GET (405) when it has no unsolicited events.
+    pub async fn listen_notifications(&self) {
+        let mut request = self.http.get(&self.url).headers(self.headers.clone()).header(ACCEPT, "text/event-stream").header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
+        if let Some(id) = self.session_id.lock().await.clone() { request = request.header("mcp-session-id", id); }
+        let Ok(response) = request.send().await else { return; };
+        if !response.status().is_success() { return; }
+        let mut stream = response.bytes_stream();
+        let mut decoder = SseDecoder::default();
+        while let Some(Ok(bytes)) = stream.next().await {
+            let Ok(messages) = decoder.push(&bytes) else { return; };
+            for value in messages { self.emit_notification(&value); }
+        }
+    }
+    fn emit_notification(&self, value: &Value) {
+        if value.get("id").is_none() {
+            if let Some(method) = value.get("method").and_then(Value::as_str) {
+                let _ = self.notifications.send(Notification { method: method.into(), params: value.get("params").cloned().unwrap_or(Value::Null) });
+            }
+        }
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -116,35 +143,50 @@ impl HttpMcpClient {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| format!("read HTTP response: {error}"))?;
-        if !status.is_success() {
-            return Err(format!("HTTP status {}: {body}", status.as_u16()));
-        }
-        if body.trim().is_empty() {
-            return Ok(Value::Null);
-        }
+        if !status.is_success() { return Err(format!("HTTP status {}", status.as_u16())); }
         if content_type.contains("text/event-stream") {
-            return parse_sse_json(&body);
+            let expected_id = message.get("id");
+            let mut stream = response.bytes_stream();
+            let mut decoder = SseDecoder::default();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| format!("read SSE: {e}"))?;
+                for value in decoder.push(&chunk)? {
+                    self.emit_notification(&value);
+                    if expected_id.is_some() && value.get("id") == expected_id { return Ok(value); }
+                }
+            }
+            return Err("SSE response ended before request result".into());
         }
+        let body = response.text().await.map_err(|e| format!("read HTTP response: {e}"))?;
+        if body.trim().is_empty() { return Ok(Value::Null); }
+
         serde_json::from_str(&body).map_err(|error| format!("decode JSON response: {error}"))
     }
 }
 
-fn parse_sse_json(body: &str) -> Result<Value, String> {
-    for line in body.lines() {
-        if let Some(data) = line.strip_prefix("data:") {
-            let data = data.trim();
-            if data.is_empty() {
-                continue;
-            }
-            return serde_json::from_str(data)
-                .map_err(|error| format!("decode SSE JSON response: {error}"));
+#[derive(Default)]
+struct SseDecoder { buffer: Vec<u8>, data: Vec<String> }
+impl SseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<Value>, String> {
+        self.buffer.extend_from_slice(chunk);
+        if self.buffer.len() + self.data.iter().map(String::len).sum::<usize>() > 16 * 1024 * 1024 { return Err("SSE event exceeds 16 MiB".into()); }
+        let mut out = Vec::new();
+        while let Some(end) = self.buffer.iter().position(|b| *b == b'\n') {
+            let line: Vec<_> = self.buffer.drain(..=end).collect();
+            let line = std::str::from_utf8(&line).map_err(|e| e.to_string())?.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                if !self.data.is_empty() {
+                    let data = self.data.join("\n"); self.data.clear();
+                    out.push(serde_json::from_str(&data).map_err(|e| format!("decode SSE JSON: {e}"))?);
+                }
+            } else if let Some(data) = line.strip_prefix("data:") { self.data.push(data.strip_prefix(' ').unwrap_or(data).into()); }
         }
+        Ok(out)
     }
-    Err("SSE response contained no JSON data event".into())
+}
+#[cfg(test)]
+fn parse_sse_json(body: &str) -> Result<Value, String> {
+    SseDecoder::default().push(body.as_bytes())?.into_iter().next().ok_or("SSE response contained no JSON data event".into())
 }
 
 fn headers_from_config(config: &McpServerConfig) -> Result<HeaderMap, String> {
@@ -229,5 +271,68 @@ mod tests {
             "Bearer secret"
         );
         std::env::remove_var("CODEMUX_MCP_HTTP_TEST");
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use axum::{Router, Json, extract::State, routing::post, response::sse::{Sse, Event}};
+    use crate::mcp::registry::McpRegistry;
+
+    #[derive(Clone)]
+    struct Fixture { ready: Arc<AtomicBool>, connected: Arc<AtomicBool>, changes: broadcast::Sender<()> }
+    async fn handle(State(state): State<Fixture>, Json(request): Json<Value>) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let Some(id) = request.get("id") else { return axum::http::StatusCode::ACCEPTED.into_response(); };
+        let result = match request["method"].as_str().unwrap() {
+            "initialize" => json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"fixture","version":"1"}}),
+            "tools/list" if !state.ready.load(Ordering::SeqCst) => json!({"tools":[]}),
+            "tools/list" if request["params"]["cursor"].is_null() => json!({"tools":[{"name":"first","inputSchema":{"type":"object"}}],"nextCursor":"second"}),
+            "tools/list" => json!({"tools":[{"name":"second","inputSchema":{"type":"object"}}]}),
+            "tools/call" => json!({"content":[{"type":"image","mimeType":"image/jpeg","data":"/9j/intact"}]}),
+            _ => json!({}),
+        };
+        Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
+    }
+    async fn events(State(state): State<Fixture>) -> Sse<impl futures_core::Stream<Item=Result<Event, std::convert::Infallible>>> {
+        let rx = state.changes.subscribe();
+        state.connected.store(true, Ordering::SeqCst);
+        Sse::new(futures_util::stream::unfold(rx, |mut rx| async {
+            rx.recv().await.ok()?;
+            Some((Ok(Event::default().data(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#)), rx))
+        }))
+    }
+    #[tokio::test]
+    async fn plugin_mcp_http_pagination_and_live_notification() {
+        let fixture = Fixture { ready: Arc::new(AtomicBool::new(false)), connected: Arc::new(AtomicBool::new(false)), changes: broadcast::channel(8).0 };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let app = Router::new().route("/mcp", post(handle).get(events)).with_state(fixture.clone());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let registry = McpRegistry::new();
+        registry.register_plugin_server::<tauri::Wry>(None, "demo", "http".into(), serde_json::from_value(json!({"id":"http","name":"HTTP fixture","toolPrefix":"httpfixture","scope":"all","transport":"http","url":url,"headers":{}})).unwrap()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !fixture.connected.load(Ordering::SeqCst) { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+        }).await.unwrap();
+        fixture.ready.store(true, Ordering::SeqCst);
+        fixture.changes.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while registry.list_tools_for_server("plugin:demo:http").await.len() != 2 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+        }).await.unwrap();
+        let result = registry.dispatch_tool_call("httpfixture__second", json!({}), None).await.unwrap();
+        assert_eq!(result["content"][0]["data"], "/9j/intact");
+        registry.clear_plugin_servers::<tauri::Wry>(None).await;
+        task.abort();
+    }
+    #[test]
+    fn plugin_mcp_sse_decodes_split_utf8_and_multiline_frames() {
+        let mut decoder = SseDecoder::default();
+        let data = "event: message\r\ndata: {\"text\":\"画像\"}\r\n\r\n".as_bytes();
+        let mut values = Vec::new();
+        for byte in data { values.extend(decoder.push(&[*byte]).unwrap()); }
+        assert_eq!(values, vec![json!({"text":"画像"})]);
     }
 }

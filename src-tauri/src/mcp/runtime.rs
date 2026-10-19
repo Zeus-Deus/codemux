@@ -160,7 +160,7 @@ pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
         program: PathBuf::from(&config.command),
         args: config.args.clone(),
         env: config.env.clone(),
-        cwd: None,
+        cwd: config.raw.get("cwd").and_then(Value::as_str).map(PathBuf::from),
         default_timeout: DEFAULT_REQUEST_TIMEOUT,
     };
 
@@ -252,12 +252,12 @@ async fn start_http_mcp_server(config: McpServerConfig) -> McpServerHandle {
             let client = Arc::new(client);
             match tokio::time::timeout(
                 HANDSHAKE_TIMEOUT,
-                client.request("tools/list", json!({})),
+                list_http_tools(&client, &config),
             )
             .await
             {
                 Ok(Ok(response)) => {
-                    let tools = parse_tools_list(&response, &config.id, &config.name);
+                    let tools = response;
                     let tool_count = tools.len();
                     McpServerHandle {
                         server_info: Some(McpServerInfo {
@@ -340,17 +340,67 @@ async fn handshake(
     //    before any further requests.
     child.notify("notifications/initialized", json!({})).await?;
 
-    // 3. tools/list — paginated per spec but we read one page for v1.
-    //    Servers with > 100 tools paginate via `nextCursor` which we
-    //    deliberately don't follow yet (no real-world server has needed
-    //    a second page so far).
-    let list_response = child
-        .request_with_timeout("tools/list", json!({}), HANDSHAKE_TIMEOUT)
-        .await?;
-
-    let tools = parse_tools_list(&list_response, &config.id, &config.name);
+    let tools = list_stdio_tools(child, config).await?;
 
     Ok((server_info, tools))
+}
+
+/// Fetch every page atomically. Reject looping cursors rather than publishing
+/// a partial catalog or keeping a refresh alive forever.
+pub async fn list_stdio_tools(child: &JsonRpcChild, config: &McpServerConfig) -> Result<Vec<McpTool>, RpcChildError> {
+    let mut tools = Vec::new();
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let params = cursor.as_ref().map(|c| json!({"cursor": c})).unwrap_or_else(|| json!({}));
+        let response = child.request_with_timeout("tools/list", params, HANDSHAKE_TIMEOUT).await?;
+        tools.extend(parse_config_tools(&response, config));
+        cursor = response.get("nextCursor").and_then(Value::as_str).map(str::to_owned);
+        match cursor.as_ref() {
+            None => return Ok(tools),
+            Some(c) if seen.len() < 1024 && seen.insert(c.clone()) => {},
+            _ => return Err(RpcChildError::ProtocolError("tools/list repeated cursor or exceeded 1024 pages".into())),
+        }
+    }
+}
+
+pub async fn list_http_tools(client: &HttpMcpClient, config: &McpServerConfig) -> Result<Vec<McpTool>, String> {
+    let mut tools = Vec::new();
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let params = cursor.as_ref().map(|c| json!({"cursor": c})).unwrap_or_else(|| json!({}));
+        let response = client.request("tools/list", params).await?;
+        tools.extend(parse_config_tools(&response, config));
+        cursor = response.get("nextCursor").and_then(Value::as_str).map(str::to_owned);
+        match cursor.as_ref() {
+            None => return Ok(tools),
+            Some(c) if seen.len() < 1024 && seen.insert(c.clone()) => {},
+            _ => return Err("tools/list repeated cursor or exceeded 1024 pages".into()),
+        }
+    }
+}
+
+fn parse_config_tools(response: &Value, config: &McpServerConfig) -> Vec<McpTool> {
+    let mut tools = parse_tools_list(response, &config.id, &config.name);
+    if let Some(prefix) = config.raw.get("pluginToolPrefix").and_then(Value::as_str) {
+        for tool in &mut tools {
+            tool.prefixed_name = plugin_tool_name(prefix, &tool.name);
+        }
+    }
+    tools
+}
+
+/// Provider-safe ASCII identifiers. Altered names receive a hash of the full
+/// original, so truncation and replacement do not silently alias two tools.
+pub fn plugin_tool_name(prefix: &str, name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let original = format!("{prefix}__{name}");
+    let clean: String = original.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
+    if clean == original && clean.len() <= 64 { return clean; }
+    let hash = Sha256::digest(original.as_bytes());
+    let suffix: String = hash.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("{}_{}", &clean[..clean.len().min(51)], suffix)
 }
 
 fn parse_server_info(response: &Value) -> McpServerInfo {
