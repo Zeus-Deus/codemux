@@ -2746,7 +2746,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
    * keeps the visible transcript authoritative even if native resume
    * ultimately has to fall back.
    *
-   * Declared above the mode handlers so `handleModeRemove` can use
+   * Declared above the mode handlers so `removeMode` can use
    * it for the silent-restart restore path (the SDK rejects live
    * `setPermissionMode("bypassPermissions")` even when the launch
    * carried `--dangerously-skip-permissions`).
@@ -3025,7 +3025,57 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // prior picker value is stashed so toggle-off can restore it.
   // Debug doesn't override permission_mode — it's prompt-wrapper-only
   // enforcement, so the slice flip is the entire activation.
-  const handleModeActivate = useCallback(
+  /** Turn the Plan or Ask pill off and put the session back in the mode the
+   *  pill was turned on from. Resolves false, leaving the pill on, when the
+   *  provider refuses. Shared by the pill's remove button and by moving from
+   *  Plan or Ask to Debug, which must not leave the session read-only. */
+  const leavePlanPill = useCallback(async (): Promise<boolean> => {
+    if (!threadId) return false;
+    const currentSlice = useAgentChatStore.getState().threads[threadId];
+    if (!currentSlice) return false;
+    if (provider === "codex") {
+      // The session never left its mode; the next send runs without Plan.
+      setStoreMode(threadId, "default");
+      return true;
+    }
+    const restore =
+      currentSlice.modePriorPermissionMode ??
+      providerDefaultPermissionMode ??
+      DEFAULT_THREAD_PERMISSION_MODE;
+    if (provider === "opencode") {
+      // OpenCode switches back to its build agent live; a restart would
+      // interrupt work and drop queued turns.
+      try {
+        await agentChatSetPermissionMode(provider, threadId, restore);
+      } catch (err) {
+        toast.failure("Couldn't leave Plan mode", err);
+        return false;
+      }
+      setSessionLaunchMode(threadId, restore);
+      setStorePermissionMode(threadId, restore);
+      setStoreMode(threadId, "default");
+      setStoreModePriorPermissionMode(threadId, null);
+      return true;
+    }
+    // Snap the slice for immediate UI feedback (picker reappears,
+    // pill drops). The restart sets sessionLaunchMode itself.
+    setStorePermissionMode(threadId, restore);
+    restartSessionWith({ permissionMode: restore });
+    setStoreMode(threadId, "default");
+    setStoreModePriorPermissionMode(threadId, null);
+    return true;
+  }, [
+    threadId,
+    provider,
+    providerDefaultPermissionMode,
+    setSessionLaunchMode,
+    setStorePermissionMode,
+    setStoreMode,
+    setStoreModePriorPermissionMode,
+    restartSessionWith,
+  ]);
+
+  const activateMode = useCallback(
     async (newMode: ActivePillMode) => {
       if (!threadId) return;
       if (grokConfigurationBusy || restartInFlightRef.current) return;
@@ -3036,6 +3086,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const currentSlice = useAgentChatStore.getState().threads[threadId];
       if (!currentSlice) return;
       if (currentSlice.mode === newMode) return;
+      const inPlan = currentSlice.mode === "plan" || currentSlice.mode === "ask";
+      if (inPlan && (newMode === "plan" || newMode === "ask")) {
+        // Plan and Ask share the session's read-only mode: only the pill
+        // changes, and the mode to restore stays the one Plan came from.
+        setStoreMode(threadId, newMode);
+        return;
+      }
       if (provider === "codex" && (newMode === "plan" || newMode === "ask")) {
         // Codex plans per turn: each send carries the pill (see the send
         // path), so its session and permission mode stay as they are.
@@ -3073,6 +3130,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           );
         });
       } else {
+        // Debug edits code, so Plan or Ask is left before it turns on.
+        if (inPlan && !(await leavePlanPill())) return;
         setStoreMode(threadId, newMode);
       }
     },
@@ -3084,6 +3143,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       setStorePermissionMode,
       setSessionLaunchMode,
       setStoreMode,
+      leavePlanPill,
     ],
   );
 
@@ -3161,42 +3221,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // markers exist; otherwise it just flips the slice back to default.
   // Missing prior falls back to the provider's default mode so the
   // session is never left in an orphan state.
-  const handleModeRemove = useCallback(async () => {
+  const removeMode = useCallback(async () => {
     if (!threadId) return;
     if (grokConfigurationBusy || restartInFlightRef.current) return;
     const currentSlice = useAgentChatStore.getState().threads[threadId];
     if (!currentSlice) return;
     if (currentSlice.mode === "plan" || currentSlice.mode === "ask") {
-      if (provider === "codex") {
-        // The session never left its mode; the next send runs without Plan.
-        setStoreMode(threadId, "default");
-        return;
-      }
-      const restore =
-        currentSlice.modePriorPermissionMode ??
-        providerDefaultPermissionMode ??
-        DEFAULT_THREAD_PERMISSION_MODE;
-      if (provider === "opencode") {
-        // OpenCode switches back to its build agent live; a restart would
-        // interrupt work and drop queued turns.
-        try {
-          await agentChatSetPermissionMode(provider, threadId, restore);
-        } catch (err) {
-          toast.failure("Couldn't leave Plan mode", err);
-          return;
-        }
-        setSessionLaunchMode(threadId, restore);
-        setStorePermissionMode(threadId, restore);
-        setStoreMode(threadId, "default");
-        setStoreModePriorPermissionMode(threadId, null);
-        return;
-      }
-      // Snap the slice for immediate UI feedback (picker reappears,
-      // pill drops). The restart sets sessionLaunchMode itself.
-      setStorePermissionMode(threadId, restore);
-      restartSessionWith({ permissionMode: restore });
-      setStoreMode(threadId, "default");
-      setStoreModePriorPermissionMode(threadId, null);
+      await leavePlanPill();
       return;
     }
     if (currentSlice.mode === "debug") {
@@ -3216,17 +3247,38 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStoreModePriorPermissionMode(threadId, null);
   }, [
     threadId,
-    provider,
     grokConfigurationBusy,
-    setStorePermissionMode,
-    setSessionLaunchMode,
     setStoreMode,
     setStoreModePriorPermissionMode,
-    restartSessionWith,
-    providerDefaultPermissionMode,
+    leavePlanPill,
     confirmDebugExit,
     triggerDebugCleanup,
   ]);
+
+  // A mode change can wait on the provider; a second Shift+Tab meanwhile
+  // would apply a stale change after it. Ignore presses until it settles.
+  const modeChangeInFlightRef = useRef(false);
+  const serializeModeChange = useCallback(
+    async (change: () => Promise<void>) => {
+      if (modeChangeInFlightRef.current) return;
+      modeChangeInFlightRef.current = true;
+      try {
+        await change();
+      } finally {
+        modeChangeInFlightRef.current = false;
+      }
+    },
+    [],
+  );
+  const handleModeActivate = useCallback(
+    (newMode: ActivePillMode) =>
+      serializeModeChange(() => activateMode(newMode)),
+    [serializeModeChange, activateMode],
+  );
+  const handleModeRemove = useCallback(
+    () => serializeModeChange(removeMode),
+    [serializeModeChange, removeMode],
+  );
 
   // Design G: mirror every picker change into the persisted session
   // row so the user's choice survives an app restart even when no live
