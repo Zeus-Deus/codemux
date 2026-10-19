@@ -3996,6 +3996,8 @@ function formatMcpRowStatus(
       } running`;
     case "starting":
       return "starting…";
+    case "stopping":
+      return "stopping…";
     case "errored":
       return `errored — ${runtime.status.message}`;
     case "stopped":

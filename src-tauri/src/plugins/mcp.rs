@@ -34,8 +34,7 @@ pub async fn plugins_mcp_unregister<R: Runtime>(
     super::commands::gui(&app)?;
     registry
         .unregister_plugin_server(Some(&app), &plugin_id, &local_id, &token)
-        .await;
-    Ok(())
+        .await
 }
 #[tauri::command]
 pub async fn plugins_mcp_list_tools<R: Runtime>(

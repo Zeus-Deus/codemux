@@ -2796,6 +2796,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_mcp_claude_payload_has_guidance_and_hides_private_servers() {
+        for scope in ["all","plugin"] {
+            let registry=crate::mcp::registry::test_support::plugin_fixture(scope).await;
+            let tools=collect_mcp_tools(Some(&registry),&test_caller()).await;
+            if scope=="plugin" {assert!(tools.is_empty());}
+            else {let tool=tools.iter().find(|t|t.name=="new_tool").unwrap();assert_eq!(tool.description.as_deref(),Some("Use structured tools first.\n\nAlways use background delivery."));}
+            registry.shutdown_all().await;
+        }
+    }
+
+    #[tokio::test]
     async fn local_session_publishes_and_runs_shared_tools() {
         let (_server, registry, call) =
             crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;

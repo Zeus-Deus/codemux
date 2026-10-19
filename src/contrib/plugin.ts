@@ -51,7 +51,7 @@ export interface PluginContext {
   readonly source: string;
   readonly tier: PluginTier;
   register: (c: PluginContribution) => () => void;
-  registerMcpServer: (server: PluginMcpServer) => Promise<() => void>;
+  registerMcpServer: (server: PluginMcpServer) => Promise<() => Promise<void>>;
   registerMany: (cs: PluginContribution[]) => () => void;
   /** A page under Settings → Plugins → this plugin. */
   registerSettingsPage: (page: PluginSettingsPage) => () => void;

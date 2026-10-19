@@ -1309,3 +1309,24 @@ test("compact-idle RPC routes to the thread's session", async () => {
   await methods["stop-session"]!({ threadId: "t-1" });
   _resetSessionsForTests();
 });
+
+
+test("MCP replacement waits for result, coalesces changes and preserves session settings", async () => {
+  const {emit,events}=recordingEmitter();
+  const session=new ClaudeSession(minimalInput({model:"claude-sonnet",permissionMode:"bypassPermissions"}),emit);
+  const tool=(name:string)=>({name,prefixedName:name,description:name,inputSchema:{type:"object"},serverId:"fixture"});
+  await session.sendTurn({text:"run the long tool"});
+  await session.updateMcpTools([tool("first")]);
+  await session.updateMcpTools([tool("last")]);
+  expect(fake.setMcpServersCalls).toEqual([]);
+  fake.emit({type:"result",subtype:"success",session_id:"same-session",uuid:"result-1",result:"LONG-CALL-COMPLETED"} as unknown as SDKMessage);
+  await new Promise(resolve=>setTimeout(resolve,0));
+  expect(fake.setMcpServersCalls).toEqual([[],["codemux"]]);
+  expect(fake.setModelCalls).toEqual([]);
+  expect(fake.setPermissionModeCalls).toEqual([]);
+  expect(fake.capturedOptions?.model).toBe("claude-sonnet");
+  expect(fake.capturedOptions?.permissionMode).toBe("bypassPermissions");
+  expect(events.filter(e=>e.method==="sdk-message")).toHaveLength(1);
+  expect(fake.capturedPrompts.map(x=>x.message.content)).toEqual(["run the long tool"]);
+  await session.close();
+});

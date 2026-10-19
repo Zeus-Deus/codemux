@@ -20,7 +20,7 @@
 //   always-on; toggling it is suppressed at the command layer.
 
 mod plugin;
-pub use plugin::{PluginMcpActivity, PluginMcpServer, plugin_server_id, plugin_bridge_tools};
+pub use plugin::{PluginMcpActivity, PluginMcpServer, plugin_server_id, plugin_bridge_tools, plugin_catalog_key, plugin_catalog_notice, strip_plugin_catalog_notice};
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -37,7 +37,7 @@ use super::parser::{
 };
 use super::paths::{enumerate_mcp_paths, is_claude_wrapped_path};
 use super::runtime::{
-    start_mcp_server, McpServerHandle, McpServerStatus, McpTool,
+    McpServerHandle, McpServerStatus, McpTool,
 };
 use super::{McpConfigSource, McpServerConfig};
 
@@ -103,6 +103,7 @@ pub struct McpRegistry {
     /// touched is already `Starting`/`Running`, so the second prime is the
     /// cheap no-op the design wants.
     prime_lock: Arc<Mutex<()>>,
+    lifecycle: Arc<Mutex<()>>,
     /// Lazily-started authenticated loopback gateway shared by provider
     /// adapters that need a remote MCP URL (OpenCode and future providers).
     gateway: Arc<OnceCell<Arc<super::gateway::McpGatewayRuntime>>>,
@@ -191,6 +192,7 @@ struct RegistryInner {
     plugins: HashMap<String, plugin::PluginRegistration>,
     watchers: HashMap<String, tokio::task::AbortHandle>,
     cancel_calls: HashMap<String, tokio::sync::watch::Sender<bool>>,
+    calls_in_flight: HashMap<String, Arc<plugin::CallTracker>>,
     /// Keyed by `McpServerConfig.id`. Codemux's hardcoded row is also
     /// in here under `"codemux-self"` once spawned.
     handles: HashMap<String, McpServerHandle>,
@@ -214,10 +216,12 @@ impl Default for McpRegistry {
                 plugins: HashMap::new(),
                 watchers: HashMap::new(),
                 cancel_calls: HashMap::new(),
+                calls_in_flight: HashMap::new(),
                 disabled_ids: HashSet::new(),
             })),
             status_tx,
             prime_lock: Arc::new(Mutex::new(())),
+            lifecycle: Arc::new(Mutex::new(())),
             gateway: Arc::new(OnceCell::new()),
             native_delegation: Arc::new(std::sync::Mutex::new(None)),
             host: Arc::new(std::sync::OnceLock::new()),
@@ -393,6 +397,7 @@ impl McpRegistry {
         app: Option<&AppHandle<R>>,
         mut config: McpServerConfig,
     ) -> McpServerRuntime {
+        let lifecycle = self.lifecycle.lock().await;
         let id = config.id.clone();
 
         // Codemux self is always-on regardless of disabled set; everyone
@@ -421,7 +426,8 @@ impl McpRegistry {
         config.raw.as_object_mut().map(|raw| raw.insert("runtimeGeneration".into(), serde_json::json!(generation)));
         if !config.raw.is_object() { config.raw = serde_json::json!({"runtimeGeneration": generation}); }
         let starting_ms = now_ms();
-        let mut start_cancelled;
+        let start_cancelled;
+        let _start_guard;
         {
             let mut inner = self.inner.lock().await;
             if let Some(existing) = inner.handles.get(&id) {
@@ -436,6 +442,9 @@ impl McpRegistry {
             let (tx, rx) = tokio::sync::watch::channel(false);
             start_cancelled = rx;
             inner.cancel_calls.insert(id.clone(), tx);
+            let tracker = Arc::new(plugin::CallTracker::default());
+            _start_guard = plugin::CallGuard::new(tracker.clone(), None);
+            inner.calls_in_flight.insert(id.clone(), tracker);
             inner.handles.insert(id.clone(), placeholder);
         }
         emit_status_with_bus(
@@ -452,14 +461,11 @@ impl McpRegistry {
             },
         );
 
+        drop(lifecycle);
         // Drop the lock for the actual spawn — the handshake can take
         // up to HANDSHAKE_TIMEOUT seconds and we don't want to block
         // every other command on it.
-        let mut handle = tokio::select! {
-            biased;
-            _ = start_cancelled.changed() => return self.plugin_status(&id).await.unwrap_or(McpServerRuntime { id, name: config.name.clone(), status: McpServerStatus::Stopped, tools_count: 0, error_message: None, stderr_tail: None, started_at_ms: None }),
-            handle = start_mcp_server(config.clone()) => handle,
-        };
+        let mut handle = super::runtime::start_mcp_server_cancellable(config.clone(), Some(start_cancelled)).await;
         let row;
         {
             let mut inner = self.inner.lock().await;
@@ -471,7 +477,6 @@ impl McpRegistry {
             }
             if let Some(error) = plugin::tool_collision(&inner, &id, &handle.tools) { handle.tools.clear(); handle.status = McpServerStatus::Errored { message: error }; }
             row = McpServerRuntime::from_handle(&handle);
-            inner.cancel_calls.insert(id.clone(), tokio::sync::watch::channel(false).0);
             inner.handles.insert(id.clone(), handle);
         }
         emit_status_with_bus(app, &self.status_tx, &row);
@@ -540,42 +545,34 @@ impl McpRegistry {
 
     /// Stop a server (graceful EOF then kill, 2s budget) and mark it
     /// Stopped. Idempotent: stopping an already-stopped server is fine.
-    pub async fn stop_server<R: Runtime>(
-        &self,
-        app: Option<&AppHandle<R>>,
-        id: &str,
-    ) -> Result<McpServerRuntime, String> {
-        let child = {
+    pub async fn stop_server<R: Runtime>(&self, app: Option<&AppHandle<R>>, id: &str) -> Result<McpServerRuntime, String> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let (child, tracker, stopping) = {
             let mut inner = self.inner.lock().await;
             if let Some(task) = inner.watchers.remove(id) { task.abort(); }
             inner.cancel_calls.remove(id);
-            let handle = match inner.handles.get_mut(id) {
-                Some(h) => h,
-                None => return Err(format!("no such server: {id}")),
-            };
+            let tracker = inner.calls_in_flight.remove(id);
+            let handle = inner.handles.get_mut(id).ok_or_else(|| format!("no such server: {id}"))?;
             let child = handle.child.take();
             handle.remote.take();
-            handle.status = McpServerStatus::Stopped;
+            handle.status = McpServerStatus::Stopping;
             handle.tools.clear();
-            handle.server_info = None;
-            handle.started_at_ms = None;
-            child
+            (child, tracker, McpServerRuntime::from_handle(handle))
         };
-
-        if let Some(child) = child {
-            let _ = child.shutdown().await;
-        }
-
+        emit_status_with_bus(app, &self.status_tx, &stopping);
+        let result = match child.as_ref() { Some(child) => child.shutdown().await.map_err(|e| e.to_string()), None => Ok(()) };
+        if let Some(tracker) = tracker { tracker.wait_idle().await; }
         let row = {
-            let inner = self.inner.lock().await;
-            inner
-                .handles
-                .get(id)
-                .map(McpServerRuntime::from_handle)
-                .ok_or_else(|| format!("server vanished after stop: {id}"))?
+            let mut inner = self.inner.lock().await;
+            let handle = inner.handles.get_mut(id).ok_or_else(|| format!("server vanished after stop: {id}"))?;
+            match &result {
+                Ok(()) => { handle.status = McpServerStatus::Stopped; handle.server_info = None; handle.started_at_ms = None; },
+                Err(message) => { handle.status = McpServerStatus::Errored { message: format!("Could not confirm MCP shutdown: {message}") }; handle.child = child; },
+            }
+            McpServerRuntime::from_handle(handle)
         };
         emit_status_with_bus(app, &self.status_tx, &row);
-        Ok(row)
+        result.map(|_| row)
     }
 
     /// Stop then re-start. Used by the manual "Restart" affordance for
@@ -775,7 +772,7 @@ impl McpRegistry {
     }
 
     async fn dispatch_tool_call_inner(&self, prefixed_name: &str, arguments: serde_json::Value, workspace_id: Option<&str>, owned_server: Option<&str>) -> Result<serde_json::Value, String> {
-        let (raw_name, is_codemux_self, child, remote, mut cancelled, mut activity) = {
+        let (raw_name, is_codemux_self, child, remote, mut cancelled, mut call_guard) = {
             let inner = self.inner.lock().await;
             let mut found = None;
             for handle in inner.handles.values() {
@@ -810,7 +807,9 @@ impl McpRegistry {
                             emit(event.clone());
                             plugin::ActivityGuard { event, started: std::time::Instant::now(), emit: emit.clone() }
                         }));
-                        found = Some((tool.name.clone(), is_self, child, remote, cancelled, activity));
+                        let tracker = inner.calls_in_flight.get(&handle.config.id).cloned().unwrap_or_default();
+                        let guard = plugin::CallGuard::new(tracker, activity);
+                        found = Some((tool.name.clone(), is_self, child, remote, cancelled, guard));
                         break;
                     }
                 }
@@ -840,7 +839,7 @@ impl McpRegistry {
         };
         let cancellation = async { match cancelled.as_mut() { Some(rx) => { let _ = rx.changed().await; }, None => std::future::pending::<()>().await } };
         let result = tokio::select! { biased; _ = cancellation => Err("MCP server stopped during tools/call".into()), result = call => result };
-        if let Some(guard) = activity.as_mut() { guard.event.is_error = Some(result.as_ref().map(|r| r.get("isError").and_then(serde_json::Value::as_bool).unwrap_or(false)).unwrap_or(true)); }
+        if let Some(guard) = call_guard.activity.as_mut() { guard.event.is_error = Some(result.as_ref().map(|r| r.get("isError").and_then(serde_json::Value::as_bool).unwrap_or(false)).unwrap_or(true)); }
         result
     }
 
@@ -986,6 +985,22 @@ pub(crate) mod test_support {
     use super::*;
     use crate::mcp::{McpConfigSource, McpServerConfig, McpTransport};
     use mockito::Matcher;
+
+    pub(crate) async fn plugin_fixture(scope: &str) -> McpRegistry {
+        let registry=McpRegistry::new();
+        let server=serde_json::from_value(serde_json::json!({
+            "id":"fixture","name":"Fixture","toolPrefix":"fixture","scope":scope,
+            "toolDescriptions":{"new_tool":{"replace":"Use structured tools first.","append":"Always use background delivery."}},
+            "transport":"stdio","command":"python3","args":[format!("{}/tests/fixtures/plugin_mcp.py",env!("CARGO_MANIFEST_DIR"))]
+        })).unwrap();
+        registry.register_plugin_server::<tauri::Wry>(None,"test-plugin","token".into(),server).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10),async{
+            while registry.list_tools_for_server("plugin:test-plugin:fixture").await.len()!=4 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        registry
+    }
 
     /// One mock `codemux-remote` server exposing a single `echo` tool. The
     /// returned `Mock` is the `tools/call` expectation: it only matches a

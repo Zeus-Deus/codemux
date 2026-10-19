@@ -1,6 +1,6 @@
 import json,subprocess,tempfile,threading,time,queue,pathlib,os
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
-out=pathlib.Path('/tmp/codemux-plugin-probe');out.mkdir(exist_ok=True)
+out=pathlib.Path.home()/'.cache/codemux-agents/proof/codemux-plugin-probe';out.mkdir(parents=True,exist_ok=True)
 log=[];events=queue.Queue();stage=0;stop=threading.Event()
 def note(kind,**data):
  entry={'kind':kind,**data};log.append(entry);print(json.dumps(entry),flush=True)
@@ -42,7 +42,7 @@ class Handler(BaseHTTPRequestHandler):
    return
   body=json.dumps({'jsonrpc':'2.0','id':d['id'],'result':result}).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(body)));self.send_header('Mcp-Session-Id','probe-session');self.end_headers();self.wfile.write(body)
 server=ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=server.serve_forever,daemon=True).start();port=server.server_port
-home=tempfile.mkdtemp(prefix='codemux-codex-probe-')
+home=tempfile.mkdtemp(prefix='codemux-codex-probe-',dir=out)
 env=dict(os.environ,CODEX_HOME=home,PROBE_MCP_TOKEN='probe-token')
 args=['codex','app-server','--listen','stdio://','-c','model_provider="probe"','-c','model_providers.probe.name="Probe"','-c',f'model_providers.probe.base_url="http://127.0.0.1:{port}/v1"','-c','model_providers.probe.wire_api="responses"','-c','model_providers.probe.requires_openai_auth=false','-c',f'mcp_servers.probe.url="http://127.0.0.1:{port}/mcp"','-c','mcp_servers.probe.bearer_token_env_var="PROBE_MCP_TOKEN"','-c','model="gpt-5.4"']
 p=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=open(out/'stderr.log','w'),text=True,env=env)

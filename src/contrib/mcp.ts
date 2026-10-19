@@ -2,16 +2,22 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { McpServerRuntime, McpTool } from "@/tauri/commands";
 import { useMcpStore } from "@/stores/mcp-store";
-import { ownedDisposer, type Owner } from "./lifetime";
+import { type Owner } from "./lifetime";
 
-export type PluginMcpScope = "all" | { workspaceIds: string[] };
+export type PluginMcpScope = "all" | "plugin" | { workspaceIds: string[] };
 export type PluginMcpServer = {
   id: string;
   name: string;
   /** 1–32 ASCII letters, digits, underscores or dashes; defaults to plugin id.
    * May repeat across registrations with disjoint workspace scopes. */
   toolPrefix?: string;
+  /** Applied to raw tool names for every provider and the live catalog.
+   * 128 entries, 2000 UTF-8 bytes per text, 16 KiB total. */
+  toolDescriptions?: Record<string, { append?: string; replace?: string }>;
   scope: PluginMcpScope;
+  /** Immediate skips EOF grace: Linux kills the owned process group;
+   * other platforms terminate the owned child. Default: graceful. */
+  shutdown?: "graceful" | "immediate";
 } & (
   | { transport: "stdio"; command: string; args?: string[]; env?: Record<string, string>; cwd?: string }
   | { transport: "http"; url: string; headers?: Record<string, string> }
@@ -48,7 +54,7 @@ function tokenFor(owner: Owner | null, id: string): { pluginId: string; localId:
   if (!owner || !token) throw new Error("Plugin MCP registration is no longer active; use ctx.host.mcp");
   return { pluginId: owner.pluginId, localId: id, token };
 }
-export async function registerMcpServer(owner: Owner, server: PluginMcpServer): Promise<() => void> {
+export async function registerMcpServer(owner: Owner, server: PluginMcpServer): Promise<() => Promise<void>> {
   if (owner.ended) throw new Error("Plugin has been disposed");
   // The persisted switch is stable across incarnations, including registrations
   // that arrive before Settings or the first chat has mounted.
@@ -59,10 +65,15 @@ export async function registerMcpServer(owner: Owner, server: PluginMcpServer): 
   const map = registrations.get(owner) ?? new Map<string, string>();
   registrations.set(owner, map);
   map.set(server.id, token);
-  return ownedDisposer(owner, () => {
+  let stopped: Promise<void> | undefined;
+  const stop = () => stopped ??= (async () => {
+    await invoke("plugins_mcp_unregister", { pluginId: owner.pluginId, localId: server.id, token });
     if (map.get(server.id) === token) map.delete(server.id);
-    void invoke("plugins_mcp_unregister", { pluginId: owner.pluginId, localId: server.id, token }).catch((error) => console.error(`[plugins] ${owner.pluginId}: MCP cleanup failed`, error));
-  });
+  })();
+  const release = owner.track(() => { void stop().catch((error) => console.error(`[plugins] ${owner.pluginId}: MCP cleanup failed`, error)); });
+  const dispose = () => { release(); return stop(); };
+  if (owner.ended) await dispose();
+  return dispose;
 }
 
 export function createMcpHost(ownerNow: () => Owner | null, subscription: <A extends unknown[]>(fn: (...args: A) => void, attach: (run: (...args: A) => void) => () => void) => () => void) {

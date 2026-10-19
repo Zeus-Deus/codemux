@@ -80,11 +80,16 @@ pub enum McpServerStatus {
     /// Child spawned, handshake in progress.
     Starting,
     /// `initialize` + `tools/list` succeeded; ready for `tools/call`.
-    Running { tool_count: usize },
+    Running {
+        tool_count: usize,
+    },
     /// Spawn or handshake failed. `message` is short; `stderr_tail` (on
     /// `McpServerHandle`) carries the details.
-    Errored { message: String },
+    Errored {
+        message: String,
+    },
     /// Gracefully shut down via `stop_server`.
+    Stopping,
     Stopped,
 }
 
@@ -137,8 +142,19 @@ impl McpServerHandle {
 /// `None` (we drop the child handle so the watchdog reaps it).
 ///
 pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
+    start_mcp_server_cancellable(config, None).await
+}
+
+pub async fn start_mcp_server_cancellable(
+    config: McpServerConfig,
+    mut cancelled: Option<tokio::sync::watch::Receiver<bool>>,
+) -> McpServerHandle {
     if matches!(config.transport, McpTransport::Http) {
-        return start_http_mcp_server(config).await;
+        return tokio::select! {
+            biased;
+            _ = cancellation(&mut cancelled) => stopped_handle(config.clone()),
+            handle = start_http_mcp_server(config.clone()) => handle,
+        };
     }
 
     if config.command.is_empty() {
@@ -172,7 +188,9 @@ pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
         default_timeout: DEFAULT_REQUEST_TIMEOUT,
     };
 
-    let child = match JsonRpcChild::spawn(spawn).await {
+    let immediate = config.raw.get("pluginImmediateShutdown").and_then(Value::as_bool) == Some(true);
+    let spawned = if immediate { JsonRpcChild::spawn_immediate(spawn).await } else { JsonRpcChild::spawn(spawn).await };
+    let child = match spawned {
         Ok(c) => Arc::new(c),
         Err(err) => {
             return McpServerHandle {
@@ -190,7 +208,17 @@ pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
         }
     };
 
-    match handshake(&child, &config).await {
+    let result = tokio::select! {
+        biased;
+        _ = cancellation(&mut cancelled) => {
+            let result = child.shutdown().await;
+            let mut handle = stopped_handle(config);
+            if let Err(error) = result { handle.status = McpServerStatus::Errored { message: format!("Could not confirm startup shutdown: {error}") }; handle.child = Some(child); }
+            return handle;
+        },
+        result = handshake(&child, &config) => result,
+    };
+    match result {
         Ok((server_info, tools)) => {
             let tool_count = tools.len();
             McpServerHandle {
@@ -207,13 +235,11 @@ pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
         Err(err) => {
             // Tear down the child so its watchdog reaps the process.
             let stderr_tail = stderr_tail_from(&err);
-            let child_clone = Arc::clone(&child);
-            tokio::spawn(async move {
-                let _ = child_clone.shutdown().await;
-            });
+            let shutdown = child.shutdown().await;
+            let retained = if shutdown.is_err() { Some(child) } else { None };
             McpServerHandle {
                 stderr_tail,
-                child: None,
+                child: retained,
                 remote: None,
                 tools: Vec::new(),
                 server_info: None,
@@ -225,6 +251,20 @@ pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
             }
         }
     }
+}
+
+async fn cancellation(cancelled: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match cancelled {
+        Some(rx) => {
+            let _ = rx.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+fn stopped_handle(config: McpServerConfig) -> McpServerHandle {
+    let mut handle = McpServerHandle::discovered(config);
+    handle.status = McpServerStatus::Stopped;
+    handle
 }
 
 async fn start_http_mcp_server(config: McpServerConfig) -> McpServerHandle {
@@ -415,11 +455,27 @@ fn parse_config_tools(response: &Value, config: &McpServerConfig) -> Vec<McpTool
             tool.prefixed_name = plugin_tool_name(prefix, &tool.name);
         }
     }
+    if let Some(overrides) = config.raw.get("pluginToolDescriptions").and_then(Value::as_object) {
+        for tool in &mut tools {
+            if let Some(edit) = overrides.get(&tool.name) {
+                if let Some(text) = edit.get("replace").and_then(Value::as_str) {
+                    tool.description = Some(text.to_owned());
+                }
+                if let Some(text) = edit.get("append").and_then(Value::as_str) {
+                    let description = tool.description.get_or_insert_with(String::new);
+                    if !description.is_empty() { description.push_str("\n\n"); }
+                    description.push_str(text);
+                }
+            }
+        }
+    }
     tools
 }
 
 /// Provider-safe ASCII identifiers. Altered names receive a hash of the full
 /// original, so truncation and replacement do not silently alias two tools.
+/// Reserve 14 bytes for Claude's `mcp__codemux__` envelope so the full
+/// model-facing name remains within 64 bytes.
 pub fn plugin_tool_name(prefix: &str, name: &str) -> String {
     use sha2::{Digest, Sha256};
     let original = format!("{prefix}__{name}");
@@ -433,12 +489,12 @@ pub fn plugin_tool_name(prefix: &str, name: &str) -> String {
             }
         })
         .collect();
-    if clean == original && clean.len() <= 64 {
+    if clean == original && clean.len() <= 50 {
         return clean;
     }
     let hash = Sha256::digest(original.as_bytes());
     let suffix: String = hash.iter().take(6).map(|b| format!("{b:02x}")).collect();
-    format!("{}_{}", &clean[..clean.len().min(51)], suffix)
+    format!("{}_{}", &clean[..clean.len().min(37)], suffix)
 }
 
 fn parse_server_info(response: &Value) -> McpServerInfo {

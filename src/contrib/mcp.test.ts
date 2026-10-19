@@ -28,6 +28,23 @@ describe("plugin MCP", () => {
     dispose(); owner.end();
     expect(mocks.invoke.mock.calls.filter(([name]) => name === "plugins_mcp_unregister")).toHaveLength(1);
   });
+  it("awaits confirmed native stop and shares one stop promise", async () => {
+    const owner = new Owner("unity");
+    const dispose = await registerMcpServer(owner, { ...server, shutdown: "immediate" });
+    let finish!: () => void;
+    mocks.invoke.mockImplementation((name: string) => name === "plugins_mcp_unregister" ? new Promise<void>((resolve) => { finish = resolve; }) : Promise.resolve());
+    let ended = false;
+    const first = dispose();
+    const second = dispose();
+    void first.then(() => { ended = true; });
+    await flush();
+    expect(ended).toBe(false);
+    expect(first).toBe(second);
+    finish(); await first;
+    expect(ended).toBe(true);
+    owner.end();
+    expect(mocks.invoke.mock.calls.filter(([name]) => name === "plugins_mcp_unregister")).toHaveLength(1);
+  });
   it("tears down when disabled before async registration settles", async () => {
     let finish!: () => void;
     mocks.invoke.mockImplementation((name: string) => name === "plugins_mcp_register" ? new Promise<void>((resolve) => { finish = resolve; }) : Promise.resolve());

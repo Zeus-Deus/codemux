@@ -415,6 +415,9 @@ export class ClaudeSession {
   /** Set by each `sendTurn`, cleared by a Stop: guidance arriving after a
    *  Stop must not reach the turn the CLI runs next. */
   private acceptsSteers = false;
+  private mcpTurnActive = false;
+  private pendingMcpTools: RegisteredMcpTool[] | null = null;
+  private mcpRefreshTask: Promise<void> | null = null;
 
   constructor(input: SessionStartInput, emit: EventEmitter) {
     this.threadId = input.threadId;
@@ -487,6 +490,10 @@ export class ClaudeSession {
         ) {
           this.recoverFromStaleResume();
           break;
+        }
+        if (message.type === "result") {
+          this.mcpTurnActive = false;
+          await this.flushMcpTools();
         }
         this.observeSdkSessionId(message);
         this.settleSteers(message);
@@ -706,6 +713,8 @@ export class ClaudeSession {
         });
       }
     }
+    await this.flushMcpTools();
+    this.mcpTurnActive = true;
     const msg = this.buildUserMessage(input.text, input.images);
     // The CLI echoes a prompt's uuid in `user_message_uuids` only when the
     // prompt carries one; the host relies on that echo to steer.
@@ -838,6 +847,7 @@ export class ClaudeSession {
     if (this.closed) return { started: false, reason: "closed" };
     if (this.queryDead) return { started: false, reason: "query_dead" };
     this.lastUserMessage = null;
+    this.mcpTurnActive = true;
     this.promptQueue.push({
       type: "user",
       message: { role: "user", content: "/compact" },
@@ -938,33 +948,45 @@ export class ClaudeSession {
     this.iterationTask = this.consumeMessages();
   }
 
-  /** Stage 4 — push an updated MCP tool list to the live SDK
-   *  session. The Rust runtime calls this whenever a server
-   *  transitions Discovered → Running so tools that came up after
-   *  `start-session` become visible without forcing a chat restart.
-   *
-   *  Empty `tools` removes the codemux MCP entirely; the SDK
-   *  silently ignores requests for unregistered tool names so this
-   *  is the right shape for "user disabled all MCPs". Idempotent. */
+  /** Stage changes during a turn: replacing the shared SDK server must
+   * not interrupt any of its in-flight tool calls. The result boundary and
+   * next send both flush, coalescing changes to the latest catalog. */
   async updateMcpTools(tools: RegisteredMcpTool[]): Promise<void> {
     if (this.closed) return;
-    // Record first so a rebuild after an interrupt keeps the latest
-    // tool list even if the live query call below throws / is skipped.
     this.startInput.mcpTools = tools;
-    if (this.queryDead) return;
-    const servers: Record<string, ReturnType<typeof buildCodemuxMcpServer>> =
-      tools.length > 0 ? { codemux: buildCodemuxMcpServer(tools) } : {};
-    try {
-      await this.query.setMcpServers(
-        servers as unknown as Parameters<Query["setMcpServers"]>[0],
-      );
-    } catch (err) {
-      logger.warn("setMcpServers failed", {
-        threadId: this.threadId,
-        toolCount: tools.length,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    }
+    this.pendingMcpTools = tools;
+    if (!this.mcpTurnActive) await this.flushMcpTools();
+  }
+
+  private async flushMcpTools(): Promise<void> {
+    if (this.mcpRefreshTask) return this.mcpRefreshTask;
+    if (this.closed || this.queryDead || this.mcpTurnActive || !this.pendingMcpTools) return;
+    this.mcpRefreshTask = (async () => {
+      while (this.pendingMcpTools && !this.closed && !this.queryDead && !this.mcpTurnActive) {
+        const tools = this.pendingMcpTools;
+        this.pendingMcpTools = null;
+        try {
+          // The SDK retains an in-process instance when its name stays
+          // present. Explicit removal connects the replacement catalog.
+          await this.query.setMcpServers({});
+          const result = await this.query.setMcpServers(
+            tools.length > 0 ? { codemux: buildCodemuxMcpServer(tools) } : {},
+          );
+          if (Object.keys(result.errors ?? {}).length > 0) {
+            throw new Error(`MCP refresh failed: ${JSON.stringify(result.errors)}`);
+          }
+        } catch (err) {
+          this.pendingMcpTools ??= tools;
+          logger.warn("setMcpServers failed", {
+            threadId: this.threadId,
+            toolCount: tools.length,
+            err: err instanceof Error ? err.message : String(err),
+          });
+          break;
+        }
+      }
+    })();
+    try { await this.mcpRefreshTask; } finally { this.mcpRefreshTask = null; }
   }
 
   /** Swap the session's default model. `undefined` reverts to the

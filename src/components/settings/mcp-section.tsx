@@ -462,7 +462,7 @@ function McpStatusBadge({
     );
   }
 
-  if (runtime.status.kind === "starting") {
+  if (runtime.status.kind === "starting" || runtime.status.kind === "stopping") {
     const startedAt = runtime.startedAtMs ?? Date.now();
     const elapsedMs = Date.now() - startedAt;
     const slow = elapsedMs > SLOW_START_THRESHOLD_MS;
@@ -470,10 +470,10 @@ function McpStatusBadge({
       <span
         className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-muted-foreground"
         data-testid={`mcp-row-${server.id}-status`}
-        data-status={slow ? "starting-slow" : "starting"}
+        data-status={runtime.status.kind === "stopping" ? "stopping" : slow ? "starting-slow" : "starting"}
       >
         <Spinner className="size-3" aria-hidden />
-        {slow ? "slow start — taking longer than usual" : "starting…"}
+        {runtime.status.kind === "stopping" ? "stopping…" : slow ? "slow start — taking longer than usual" : "starting…"}
       </span>
     );
   }

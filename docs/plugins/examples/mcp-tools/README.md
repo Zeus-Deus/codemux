@@ -32,7 +32,8 @@ header, the client opened `GET /mcp`. Its initial `tools/list` returned zero too
 Sending `notifications/tools/list_changed` did not produce another `tools/list`.
 `config/mcpServer/reload` returned `{}` but the next inference still lacked
 `probe_new_tool`. The probe logs a summary and saves structured evidence under
-`/tmp/codemux-plugin-probe/`. No provider configuration files are changed.
+`~/.cache/codemux-agents/proof/codemux-plugin-probe/`. No provider configuration files are changed.
 
-Separate live model/Codemux evidence is recorded when that verification runs.
 Windows and macOS have not been exercised on this Linux machine.
+
+Real native model and shutdown observations: [EVIDENCE.md](./EVIDENCE.md).

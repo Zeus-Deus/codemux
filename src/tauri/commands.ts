@@ -2999,6 +2999,7 @@ export const MCP_STATUS_CHANGED_EVENT = "mcp-status-changed";
 export type McpServerStatusKind =
   | "discovered"
   | "starting"
+  | "stopping"
   | "running"
   | "errored"
   | "stopped";
@@ -3008,6 +3009,7 @@ export type McpServerStatusKind =
 export type McpServerStatus =
   | { kind: "discovered" }
   | { kind: "starting" }
+  | { kind: "stopping" }
   | { kind: "running"; toolCount: number }
   | { kind: "errored"; message: string }
   | { kind: "stopped" };

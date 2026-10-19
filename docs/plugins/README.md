@@ -201,14 +201,16 @@ Choices the spec left open are recorded one per line in
 
 A desktop plugin can register stdio or Streamable HTTP servers. Await registration
 before using `ctx.host.mcp`. It installs the registration immediately; the MCP
-handshake continues in the background. Inspect `getStatus` or `onStatus` for readiness.
+stdio child starts immediately in the background (not on the first chat or call). Register only workspaces you need. The handshake also runs in the background. Inspect `getStatus` or `onStatus` for readiness.
 
 ```ts
 const dispose = await ctx.registerMcpServer({
   id: "editor-project-a",             // unique within this plugin
   name: "Unity Editor",              // Settings → MCP label
   toolPrefix: "unity",                // defaults to the plugin id
-  scope: { workspaceIds: [workspaceId] }, // or "all"
+  scope: { workspaceIds: [workspaceId] }, // or "all", or "plugin" for UI only
+  toolDescriptions: { manage_scene: { append: "Use structured Unity tools first." } },
+  shutdown: "graceful",               // or "immediate" for input drivers
   transport: "stdio",
   command: "unity", args: ["mcp", "--project-path", projectPath],
   cwd: projectPath,                   // optional absolute path
@@ -219,7 +221,7 @@ const dispose = await ctx.registerMcpServer({
 const stop = ctx.host.mcp.onStatus("editor-project-a", (status) => {
   // status is null after removal; otherwise { id, name, status, toolsCount,
   // errorMessage, stderrTail, startedAtMs }. status.kind is discovered,
-  // starting, running, errored or stopped (running has toolCount).
+  // starting, running, errored, stopping or stopped (running has toolCount).
 });
 const tools = await ctx.host.mcp.listTools("editor-project-a");
 const result = await ctx.host.mcp.callTool("editor-project-a", "screenshot", {});
@@ -229,7 +231,13 @@ const result = await ctx.host.mcp.callTool("editor-project-a", "screenshot", {})
 
 Registrations and subscriptions are owned by that loaded plugin incarnation.
 Turning it off, removing it or reloading it removes its servers and tools, and
-cancels in-flight calls. The disposer is also safe to call manually. Cleanup
+cancels in-flight calls. `await dispose()` is safe to call manually and resolves
+only after the stdio child has exited and in-flight calls have ended. Status
+moves through `stopping`, then `stopped` only after confirmed exit. Default
+`shutdown: "graceful"` closes stdin and permits two seconds before killing the
+child. `shutdown: "immediate"` skips that grace: on Linux it immediately kills
+the owned process group; on other platforms it terminates the owned child.
+Linux is live-tested; macOS and Windows are not. Cleanup
 still runs if the plugin unloads before `registerMcpServer` resolves. Registrations
 are ephemeral; server disable switches use stable plugin + local-server ids and
 survive reloads and app restarts. Settings → MCP labels each server with its plugin
@@ -240,13 +248,23 @@ hidden from chats without a matching workspace, including calls to a previously
 known tool name. Plugins can inspect and call only their own registered servers
 through the supported API, outside any chat. Plugin code remains unsandboxed;
 this API is a typed lifecycle route, not a new security boundary. Remote/SSH
-provider sessions receive no local registry tools.
+provider sessions receive no local registry tools. `scope: "plugin"` makes a
+server available exclusively through its owner's `host.mcp` API: agents,
+bridges and the gateway neither list nor dispatch it. An empty `workspaceIds`
+array is rejected.
+
+`toolDescriptions` is a per-raw-tool-name map of `{replace?: string, append?: string}`.
+Replace runs first, then append adds a blank line and the supplied text. All
+provider schemas, live lists and plugin UI lists see the same description.
+Limits: 128 entries, 2,000 UTF-8 bytes per append/replace, and 16 KiB total for
+keys plus text. Prefer short instructions for the specific tools that need them.
 
 `toolPrefix` has 1–32 ASCII letters, digits, underscores or dashes. Registrations
 may share it when their workspace scopes are disjoint. Models see
-`<toolPrefix>__<rawToolName>`. Names are bounded to 64 ASCII letters, digits,
-underscores or dashes: if replacement or truncation is necessary, the name is
-truncated to 51 characters and suffixed with `_` plus 12 SHA-256 hex characters
+`<toolPrefix>__<rawToolName>` (Claude adds `mcp__codemux__`). Registry names
+are bounded to 50 ASCII letters, digits, underscores or dashes, reserving 14
+characters for that observed Claude envelope so full provider names fit 64.
+If replacement or truncation is necessary, the name is truncated to 37 characters and suffixed with `_` plus 12 SHA-256 hex characters
 of the complete original name. A collision visible in one workspace is refused.
 HTTP URLs must explicitly use http(s), without embedded credentials or fragments.
 Commands/args are argv, never shell text. `cwd` must be absolute. Env/headers are
@@ -264,7 +282,8 @@ ctx.host.mcp.onActivity("editor-project-a", (event) => {
 
 The runtime follows all `tools/list` pages and re-lists on
 `notifications/tools/list_changed`. Claude refreshes its live SDK server; the
-HTTP gateway emits the same notification to connected clients. Plugins loaded
+HTTP gateway emits the same notification to connected clients. Claude catalog
+swaps wait until the current turn ends, preserving in-flight tool results. Plugins loaded
 after a chat starts use those same paths.
 
 **Codex:** its installed 0.162.1 app-server fixed dynamic schemas at thread start
@@ -273,7 +292,10 @@ thread's model tools. Codemux therefore offers initial plugin tools directly,
 with their schemas, plus two stable tools in every local Codex chat:
 `codemux_list_plugin_tools` and `codemux_call_plugin_tool`. They discover and call
 the current workspace's tools, including ones that appear after an Editor
-connects. The list includes `directlyCallable` for the initial snapshot. A new
+connects. The list includes `directlyCallable` for the initial snapshot. When the
+visible plugin catalog changes, Codemux adds one bounded reminder to the next
+provider turn, so models know to check the live catalog. It does not change the
+user's message in the app transcript, queues, forks or provider handoffs. A new
 chat is unnecessary for late tools. Older resumed Codex threads whose saved
 snapshot predates these bridge tools need a new chat to acquire the bridge.
 
