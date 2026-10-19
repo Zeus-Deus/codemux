@@ -457,6 +457,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_mcp_gateway_preserves_structured_results_for_native_and_bridge() {
+        let registry = super::super::registry::test_support::plugin_fixture("all").await;
+        let expected = registry
+            .plugin_call("plugin:test-plugin:fixture", "image", json!({}))
+            .await
+            .unwrap();
+        let app = router(GatewayState {
+            registry: registry.clone(),
+            bearer_token: Arc::from("test-token"),
+        });
+        for params in [
+            json!({"name":"fixture__image","arguments":{}}),
+            json!({"name":"codemux_call_plugin_tool","arguments":{"name":"fixture__image","arguments":{}}}),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":params}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["result"], expected);
+            assert_eq!(value.to_string().matches("STRUCTURED-581").count(), 1);
+        }
+        registry.shutdown_all().await;
+    }
+
+    #[tokio::test]
     async fn plugin_mcp_gateway_ignores_untrusted_workspace_query() {
         let registry = super::super::registry::test_support::plugin_fixture(
             r#"{"workspaceIds":["other-workspace"]}"#,

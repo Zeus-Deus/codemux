@@ -334,6 +334,13 @@ app-server's `item/tool/call` path. That path has no Claude-style per-tool
 allow/deny rules or approval dialog in Codemux. Codex shell/file approval and
 sandbox settings do not add per-tool approval to these app-hosted tools. The
 bridge uses the same workspace visibility and dispatch checks as native tools.
+MCP results can carry `structuredContent` alongside text and images. Codex's
+dynamic-tool protocol has no structured-result field, so Codemux appends one
+JSON text block when the server has not already included an equivalent JSON
+text block. This generated block is limited to 64 KiB of UTF-8, including a
+clear truncation marker when needed; original text and image blocks are kept.
+Claude's SDK server and the gateway forward the full MCP result unchanged.
+
 The catalog tools stay present in every local Codex chat because its dynamic
 schemas cannot add them later.
 

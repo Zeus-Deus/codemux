@@ -1,0 +1,19 @@
+{
+  "content": [
+    {
+      "type": "image",
+      "mimeType": "image/png",
+      "data": "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKklEQVR4nGOwbvpGU8QwasGoBaMWjFowasGoBaMWjFowasGoBaMWDBULAEoszFv/SWGdAAAAAElFTkSuQmCC"
+    },
+    {
+      "type": "text",
+      "text": "[0] Window\n[1] Text input"
+    }
+  ],
+  "structuredContent": {
+    "intact": true,
+    "snapshot_id": "fixture-snapshot-742",
+    "element_token": "fixture-element-742",
+    "verification_word": "STRUCTURED-581"
+  }
+}

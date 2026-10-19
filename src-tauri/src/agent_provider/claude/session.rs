@@ -2863,6 +2863,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_mcp_claude_preserves_structured_results_for_native_and_bridge() {
+        let registry = crate::mcp::registry::test_support::plugin_fixture("all").await;
+        let expected = registry
+            .plugin_call("plugin:test-plugin:fixture", "image", json!({}))
+            .await
+            .unwrap();
+        for (name, arguments) in [
+            ("fixture__image", json!({})),
+            (
+                "codemux_call_plugin_tool",
+                json!({"name":"fixture__image","arguments":{}}),
+            ),
+        ] {
+            let (result, failure) = run_mcp_tool_call(
+                Some(&registry),
+                &test_caller(),
+                Some("ws-42"),
+                name,
+                arguments,
+                None,
+                &[],
+            )
+            .await;
+            assert!(failure.is_none());
+            assert_eq!(result, expected);
+            assert_eq!(result.to_string().matches("STRUCTURED-581").count(), 1);
+        }
+        registry.shutdown_all().await;
+    }
+
+    #[tokio::test]
     async fn plugin_mcp_claude_bridge_lists_and_calls_live_tools_with_scope() {
         for scope in ["all", "plugin"] {
             let registry = crate::mcp::registry::test_support::plugin_fixture(scope).await;

@@ -97,7 +97,9 @@ def handle(message):
         if name == "slow":
             time.sleep(float(params.get("arguments", {}).get("seconds", args.slow_seconds)))
         if name == "image":
-            result = {"content": [{"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jfsoAAAAASUVORK5CYII="}], "structuredContent": {"intact": True}}
+            result = json.loads(Path(__file__).with_name("plugin_mcp_result.json").read_text(encoding="utf-8"))
+            if params.get("arguments", {}).get("includeStructuredText"):
+                result["content"].append({"type": "text", "text": json.dumps(result["structuredContent"], indent=2)})
         else:
             result = {"content": [{"type": "text", "text": "ORCHID-742" if name == "new_tool" else "LONG-CALL-COMPLETED" if name == "slow" else json.dumps({"cwd": os.getcwd(), "arguments": params.get("arguments", {}), "env": os.getenv("PLUGIN_FIXTURE_ENV")})}]}
     else:

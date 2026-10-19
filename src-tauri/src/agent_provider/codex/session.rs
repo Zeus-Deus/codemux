@@ -2855,13 +2855,50 @@ async fn handle_dynamic_tool_call_native(
         ),
     };
 
-    let content_items = result
+    let content_items = mcp_result_content_to_codex(&result);
+    json!({ "contentItems": content_items, "success": success })
+}
+
+const CODEX_STRUCTURED_CONTENT_MAX_BYTES: usize = 64 * 1024;
+const CODEX_STRUCTURED_CONTENT_TRUNCATED: &str = "\n[Codemux: structuredContent truncated]";
+
+/// Dynamic tool results accept content items, without MCP's structured field.
+/// Keep the server's blocks and add a bounded JSON copy only when needed.
+fn mcp_result_content_to_codex(result: &Value) -> Vec<Value> {
+    let blocks = result
         .get("content")
         .and_then(Value::as_array)
-        .map(|items| items.iter().map(mcp_content_to_codex).collect::<Vec<_>>())
-        .filter(|items| !items.is_empty())
-        .unwrap_or_else(|| vec![json!({ "type": "inputText", "text": result.to_string() })]);
-    json!({ "contentItems": content_items, "success": success })
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut items: Vec<Value> = blocks.iter().map(mcp_content_to_codex).collect();
+    if let Some(structured) = result.get("structuredContent") {
+        let has_json_copy = blocks.iter().any(|block| {
+            block.get("type").and_then(Value::as_str) == Some("text")
+                && block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                    .as_ref()
+                    == Some(structured)
+        });
+        if !has_json_copy {
+            let mut text = structured.to_string();
+            if text.len() > CODEX_STRUCTURED_CONTENT_MAX_BYTES {
+                let mut end =
+                    CODEX_STRUCTURED_CONTENT_MAX_BYTES - CODEX_STRUCTURED_CONTENT_TRUNCATED.len();
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                text.push_str(CODEX_STRUCTURED_CONTENT_TRUNCATED);
+            }
+            items.push(json!({ "type": "inputText", "text": text }));
+        }
+    }
+    if items.is_empty() {
+        items.push(json!({ "type": "inputText", "text": result.to_string() }));
+    }
+    items
 }
 
 /// Codex reserves the `mcp__` prefix for MCP servers configured directly in
@@ -3381,6 +3418,86 @@ mod tests {
                 "data": "YWJj"
             })),
             json!({"type": "inputImage", "imageUrl": "data:image/png;base64,YWJj"})
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_codex_preserves_structured_results_once_for_native_and_bridge() {
+        let registry = crate::mcp::registry::test_support::plugin_fixture("all").await;
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/plugin_mcp_result.json"
+        ))
+        .unwrap();
+        for bridge in [false, true] {
+            for include_copy in [false, true] {
+                let arguments = json!({"includeStructuredText": include_copy});
+                let response = handle_dynamic_tool_call(
+                    Some(&registry),
+                    Some("ws-42"),
+                    None,
+                    json!({
+                        "threadId": "thread", "turnId": "turn", "callId": "call",
+                        "tool": if bridge { "codemux_call_plugin_tool" } else { "fixture__image" },
+                        "arguments": if bridge { json!({"name":"fixture__image","arguments":arguments}) } else { arguments }
+                    }),
+                ).await;
+                assert_eq!(response["success"], true, "{response}");
+                let items = response["contentItems"].as_array().unwrap();
+                assert_eq!(
+                    items.len(),
+                    3,
+                    "bridge={bridge}, copy={include_copy}: {response}"
+                );
+                assert_eq!(
+                    items[0],
+                    json!({"type":"inputImage","imageUrl":format!("data:image/png;base64,{}", fixture["content"][0]["data"].as_str().unwrap())})
+                );
+                assert_eq!(
+                    items[1],
+                    json!({"type":"inputText","text":"[0] Window\n[1] Text input"})
+                );
+                let structured: Value =
+                    serde_json::from_str(items[2]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(structured["snapshot_id"], "fixture-snapshot-742");
+                assert_eq!(structured["element_token"], "fixture-element-742");
+                assert_eq!(response.to_string().matches("STRUCTURED-581").count(), 1);
+            }
+        }
+        registry.shutdown_all().await;
+    }
+
+    #[test]
+    fn mcp_structured_content_fallback_is_bounded_and_utf8_safe() {
+        let result = json!({"content": [], "structuredContent": {"value": "界".repeat(40_000)}});
+        let items = mcp_result_content_to_codex(&result);
+        assert_eq!(items.len(), 1);
+        let text = items[0]["text"].as_str().unwrap();
+        assert!(text.len() <= CODEX_STRUCTURED_CONTENT_MAX_BYTES);
+        let prefix = text
+            .strip_suffix(CODEX_STRUCTURED_CONTENT_TRUNCATED)
+            .unwrap();
+        assert_eq!(prefix.chars().last(), Some('界'));
+        assert!(!text.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn mcp_structured_content_only_and_existing_json_copy_are_not_duplicated() {
+        let data = json!({"snapshot_id": "snapshot", "element_token": "element"});
+        let only = mcp_result_content_to_codex(&json!({"structuredContent": data}));
+        assert_eq!(
+            only,
+            vec![json!({"type":"inputText","text":data.to_string()})]
+        );
+        let copy = " \n{\"snapshot_id\": \"snapshot\", \"element_token\": \"element\"}\n";
+        let existing = json!({"content":[{"type":"text","text":copy}],"structuredContent":data});
+        assert_eq!(
+            mcp_result_content_to_codex(&existing),
+            vec![json!({"type":"inputText","text":copy})]
+        );
+        let empty = json!({"content":[]});
+        assert_eq!(
+            mcp_result_content_to_codex(&empty),
+            vec![json!({"type":"inputText","text":empty.to_string()})]
         );
     }
 
