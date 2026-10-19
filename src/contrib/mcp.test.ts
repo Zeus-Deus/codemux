@@ -13,6 +13,7 @@ function api(owner: Owner) {
   return createMcpHost(() => owner, (fn, attach) => ownedDisposer(owner, attach(fn)));
 }
 beforeEach(() => {
+  Object.assign(window, { __CODEMUX_PLUGIN_PAGE_EPOCH__: 7 });
   vi.clearAllMocks();
   mocks.sync.mockResolvedValue(undefined);
   mocks.invoke.mockResolvedValue(undefined);
@@ -24,7 +25,7 @@ describe("plugin MCP", () => {
     const dispose = await registerMcpServer(owner, server);
     expect(mocks.sync).toHaveBeenCalledOnce();
     expect(mocks.sync.mock.invocationCallOrder[0]).toBeLessThan(mocks.invoke.mock.invocationCallOrder[0]);
-    expect(mocks.invoke).toHaveBeenCalledWith("plugins_mcp_register", expect.objectContaining({ pluginId: "unity", server }));
+    expect(mocks.invoke).toHaveBeenCalledWith("plugins_mcp_register", expect.objectContaining({ pluginId: "unity", pageEpoch: 7, server }));
     dispose(); owner.end();
     expect(mocks.invoke.mock.calls.filter(([name]) => name === "plugins_mcp_unregister")).toHaveLength(1);
   });

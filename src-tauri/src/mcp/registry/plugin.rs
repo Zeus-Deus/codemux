@@ -95,10 +95,46 @@ pub fn plugin_server_id(plugin: &str, local: &str) -> String {
     format!("plugin:{plugin}:{local}")
 }
 
-pub(super) fn tool_collision(inner: &RegistryInner, id: &str, tools: &[McpTool]) -> Option<String> {
+fn prefix_collision(
+    inner: &RegistryInner,
+    id: &str,
+    prefix: &str,
+    scope: &PluginMcpScope,
+) -> Option<String> {
+    inner
+        .plugins
+        .iter()
+        .find(|(other_id, registration)| {
+            other_id.as_str() != id
+                && registration.prefix == prefix
+                && registration.scope.overlaps(scope)
+        })
+        .map(|(other_id, _)| format!("MCP tool prefix '{prefix}' overlaps server {other_id}"))
+}
+
+pub(super) fn tool_collision(
+    inner: &RegistryInner,
+    id: &str,
+    tools: &[McpTool],
+    host_tools: &[McpTool],
+) -> Option<String> {
     let candidate = inner.plugins.get(id);
     let mut names = HashSet::new();
     for tool in tools {
+        if candidate.is_some()
+            && (matches!(
+                tool.prefixed_name.as_str(),
+                LIST_PLUGIN_TOOLS | CALL_PLUGIN_TOOL
+            ) || tool.prefixed_name.starts_with("mcp__codemux__")
+                || host_tools
+                    .iter()
+                    .any(|host| host.prefixed_name == tool.prefixed_name))
+        {
+            return Some(format!(
+                "MCP tool name '{}' is reserved by Codemux",
+                tool.prefixed_name
+            ));
+        }
         if !names.insert(&tool.prefixed_name) {
             return Some(format!("Duplicate MCP tool name: {}", tool.prefixed_name));
         }
@@ -148,6 +184,10 @@ impl PluginMcpServer {
             return Err(
                 "toolPrefix must have 1–32 ASCII letters, digits, underscores or dashes".into(),
             );
+        }
+        if prefix.eq_ignore_ascii_case("mcp") || prefix.to_ascii_lowercase().starts_with("codemux")
+        {
+            return Err("toolPrefix uses a reserved Codemux namespace".into());
         }
         match &self.scope {
             PluginMcpScope::All(s) if s == "all" || s == "plugin" => {}
@@ -203,6 +243,9 @@ impl PluginMcpServer {
                             .into(),
                     );
                 }
+                if parsed.scheme() == "http" && !super::super::http_client::loopback_url(url) {
+                    return Err("MCP HTTP URLs require HTTPS unless the host is loopback".into());
+                }
                 validate_map(headers, true)?;
                 (
                     url.clone(),
@@ -240,7 +283,8 @@ impl PluginMcpServer {
             .iter()
             .map(|(name, value)| (name, json!({"append":value.append,"replace":value.replace})))
             .collect::<HashMap<_, _>>());
-        raw["pluginImmediateShutdown"] = json!(matches!(self.shutdown, PluginMcpShutdown::Immediate));
+        raw["pluginImmediateShutdown"] =
+            json!(matches!(self.shutdown, PluginMcpShutdown::Immediate));
         raw["pluginId"] = json!(plugin);
         raw["pluginToolPrefix"] = json!(prefix);
         Ok(McpServerConfig {
@@ -278,6 +322,7 @@ fn validate_map(values: &HashMap<String, String>, headers: bool) -> Result<(), S
 }
 
 impl McpRegistry {
+    #[cfg(test)]
     pub async fn register_plugin_server<R: Runtime>(
         &self,
         app: Option<&AppHandle<R>>,
@@ -285,49 +330,68 @@ impl McpRegistry {
         token: String,
         server: PluginMcpServer,
     ) -> Result<(), String> {
-        let epoch = self.plugin_epoch.load(std::sync::atomic::Ordering::SeqCst);
-        let mut config = server.config(plugin)?;
-        config.raw["pluginRegistrationToken"] = json!(token);
+        self.register_plugin_server_for_page(app, self.plugin_page_epoch(), plugin, token, server)
+            .await
+    }
+    pub fn plugin_page_epoch(&self) -> u64 {
+        self.plugin_epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub async fn register_plugin_server_for_page<R: Runtime>(
+        &self,
+        app: Option<&AppHandle<R>>,
+        epoch: u64,
+        plugin: &str,
+        token: String,
+        server: PluginMcpServer,
+    ) -> Result<(), String> {
+        let config = server.config(plugin)?;
         if token.is_empty() || token.len() > 128 {
             return Err("Invalid registration token".into());
         }
-        let _gate = self.prime_lock.lock().await;
+        let server_lock = self.server_lock(&config.id);
+        let _gate = server_lock.lock().await;
         if self.plugin_epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch {
             return Err("Plugin page reloaded during registration".into());
         }
         let prefix = server.tool_prefix.clone().unwrap_or_else(|| plugin.into());
         {
             let inner = self.inner.lock().await;
-            for (id, registration) in &inner.plugins {
-                if id != &config.id
-                    && registration.prefix == prefix
-                    && registration.scope.overlaps(&server.scope)
-                {
-                    return Err(format!("MCP tool prefix '{prefix}' overlaps server {id}"));
-                }
+            if let Some(error) = prefix_collision(&inner, &config.id, &prefix, &server.scope) {
+                return Err(error);
             }
         }
-        self.remove_plugin_server_inner(app, &config.id, None)
+        self.remove_plugin_server_locked(app, &config.id, None)
             .await?;
-        self.inner.lock().await.plugins.insert(
-            config.id.clone(),
-            PluginRegistration {
-                plugin_id: plugin.into(),
-                epoch,
-                token,
-                scope: server.scope,
-                prefix,
-            },
-        );
-        // Keep disabled registrations discoverable and restartable too.
-        self.inner.lock().await.handles.insert(
-            config.id.clone(),
-            McpServerHandle::discovered(config.clone()),
-        );
+        {
+            let mut inner = self.inner.lock().await;
+            if self.plugin_epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+                return Err("Plugin page reloaded during registration".into());
+            }
+            if let Some(error) = prefix_collision(&inner, &config.id, &prefix, &server.scope) {
+                return Err(error);
+            }
+            inner.plugins.insert(
+                config.id.clone(),
+                PluginRegistration {
+                    plugin_id: plugin.into(),
+                    epoch,
+                    token: token.clone(),
+                    scope: server.scope,
+                    prefix,
+                },
+            );
+            // Keep disabled registrations discoverable and restartable too.
+            inner.handles.insert(
+                config.id.clone(),
+                McpServerHandle::discovered(config.clone()),
+            );
+        }
         let registry = self.clone();
         let app = app.cloned();
         tokio::spawn(async move {
-            registry.ensure_started(app.as_ref(), config).await;
+            registry
+                .ensure_started_owned(app.as_ref(), config, Some(&token))
+                .await;
         });
         Ok(())
     }
@@ -338,11 +402,20 @@ impl McpRegistry {
         local: &str,
         token: &str,
     ) -> Result<(), String> {
-        let _gate = self.prime_lock.lock().await;
         self.remove_plugin_server_inner(app, &plugin_server_id(plugin, local), Some(token))
             .await
     }
     async fn remove_plugin_server_inner<R: Runtime>(
+        &self,
+        app: Option<&AppHandle<R>>,
+        id: &str,
+        token: Option<&str>,
+    ) -> Result<(), String> {
+        let server_lock = self.server_lock(id);
+        let _gate = server_lock.lock().await;
+        self.remove_plugin_server_locked(app, id, token).await
+    }
+    async fn remove_plugin_server_locked<R: Runtime>(
         &self,
         app: Option<&AppHandle<R>>,
         id: &str,
@@ -358,7 +431,7 @@ impl McpRegistry {
         {
             return Ok(());
         }
-        self.stop_server(app, id).await?;
+        self.stop_server_locked(app, id).await?;
         let mut inner = self.inner.lock().await;
         inner.plugins.remove(id);
         inner.handles.remove(id);
@@ -371,7 +444,6 @@ impl McpRegistry {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     pub async fn clear_stale_plugin_servers<R: Runtime>(&self, app: Option<&AppHandle<R>>) {
-        let _gate = self.prime_lock.lock().await;
         let epoch = self.plugin_epoch.load(std::sync::atomic::Ordering::SeqCst);
         let ids: Vec<_> = self
             .inner
@@ -380,16 +452,18 @@ impl McpRegistry {
             .plugins
             .iter()
             .filter(|(_, r)| r.epoch < epoch)
-            .map(|(id, _)| id.clone())
+            .map(|(id, registration)| (id.clone(), registration.token.clone()))
             .collect();
-        for id in ids {
-            if let Err(error) = self.remove_plugin_server_inner(app, &id, None).await {
+        for (id, token) in ids {
+            if let Err(error) = self
+                .remove_plugin_server_inner(app, &id, Some(&token))
+                .await
+            {
                 eprintln!("[plugins] MCP cleanup failed: {error}");
             }
         }
     }
     pub async fn clear_plugin_servers<R: Runtime>(&self, app: Option<&AppHandle<R>>) {
-        let _gate = self.prime_lock.lock().await;
         let ids: Vec<_> = self.inner.lock().await.plugins.keys().cloned().collect();
         for id in ids {
             if let Err(error) = self.remove_plugin_server_inner(app, &id, None).await {
@@ -402,7 +476,7 @@ impl McpRegistry {
         inner
             .plugins
             .keys()
-            .filter_map(|id| inner.handles.get(id).map(|h| h.config.clone()))
+            .filter_map(|id| inner.handles.get(id).map(|h| h.config.clone().redacted()))
             .collect()
     }
     pub async fn owned_plugin_server(
@@ -531,7 +605,7 @@ pub const PLUGIN_NOTICE_END: &str = "</codemux_plugin_tools_notice>";
 
 pub fn strip_plugin_catalog_notice(text: &str) -> String {
     if let Some(rest) = text.trim_start().strip_prefix(PLUGIN_NOTICE_START) {
-        if let Some((_,user_text)) = rest.split_once(PLUGIN_NOTICE_END) {
+        if let Some((_, user_text)) = rest.split_once(PLUGIN_NOTICE_END) {
             return user_text.trim_start_matches('\n').to_owned();
         }
     }
@@ -540,18 +614,37 @@ pub fn strip_plugin_catalog_notice(text: &str) -> String {
 
 pub fn plugin_catalog_notice(tools: &[McpTool]) -> String {
     let mut sorted: Vec<_> = tools.iter().collect();
-    sorted.sort_by(|a,b|a.prefixed_name.cmp(&b.prefixed_name));
-    let entries: Vec<_> = sorted.iter().take(8).map(|tool| {
-        let description: String = tool.description.as_deref().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ").replace('<', "‹").replace('>', "›").chars().take(120).collect();
-        format!("{}: {}", tool.prefixed_name, description)
-    }).collect();
+    sorted.sort_by(|a, b| a.prefixed_name.cmp(&b.prefixed_name));
+    let entries: Vec<_> = sorted
+        .iter()
+        .take(8)
+        .map(|tool| {
+            let description: String = tool
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .replace('<', "‹")
+                .replace('>', "›")
+                .chars()
+                .take(120)
+                .collect();
+            format!("{}: {}", tool.prefixed_name, description)
+        })
+        .collect();
     format!("{PLUGIN_NOTICE_START}\nCodemux: plugin tools changed. Current tools ({} total): {}. For tools absent from your direct tools, use codemux_list_plugin_tools for schemas, then codemux_call_plugin_tool by name. These tools are available for integration tasks now.\n{PLUGIN_NOTICE_END}", tools.len(), if entries.is_empty() {"none".into()} else {entries.join("; ")})
 }
 
 pub fn plugin_catalog_key(tools: &[McpTool]) -> String {
-    let mut sorted=tools.to_vec();sorted.sort_by(|a,b|a.prefixed_name.cmp(&b.prefixed_name));
-    use sha2::{Digest,Sha256};
-    format!("{:x}",Sha256::digest(serde_json::to_vec(&sorted).unwrap_or_default()))
+    let mut sorted = tools.to_vec();
+    sorted.sort_by(|a, b| a.prefixed_name.cmp(&b.prefixed_name));
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&sorted).unwrap_or_default())
+    )
 }
 
 /// Stable entry points for clients whose per-thread tool schemas are fixed.
@@ -565,7 +658,11 @@ pub fn plugin_bridge_tools() -> Vec<McpTool> {
 }
 impl McpRegistry {
     pub async fn plugin_catalog(&self, workspace: Option<&str>) -> Vec<McpTool> {
-        self.list_tools_for_workspace(&[], workspace).await.into_iter().filter(|tool|tool.server_id.starts_with("plugin:")).collect()
+        self.list_tools_for_workspace(&[], workspace)
+            .await
+            .into_iter()
+            .filter(|tool| tool.server_id.starts_with("plugin:"))
+            .collect()
     }
     pub async fn call_plugin_bridge(
         &self,
@@ -649,6 +746,220 @@ mod tests {
         })
         .await
         .expect("fixture reaches expected tool count");
+    }
+    #[tokio::test]
+    async fn plugin_mcp_review_old_page_cannot_register_after_invalidation() {
+        let registry = McpRegistry::new();
+        let old_epoch = registry.plugin_page_epoch();
+        registry.invalidate_plugin_page();
+        registry
+            .clear_stale_plugin_servers::<tauri::Wry>(None)
+            .await;
+        let rejected = registry
+            .register_plugin_server_for_page::<tauri::Wry>(
+                None,
+                old_epoch,
+                "demo",
+                "old-page".into(),
+                server(PluginMcpScope::All("all".into()), vec![]),
+            )
+            .await
+            .is_err();
+        registry.clear_plugin_servers::<tauri::Wry>(None).await;
+        assert!(rejected, "old-page registration survived invalidation");
+        assert!(registry.plugin_configs().await.is_empty());
+        registry
+            .register_plugin_server::<tauri::Wry>(
+                None,
+                "demo",
+                "new-page".into(),
+                server(PluginMcpScope::All("all".into()), vec![]),
+            )
+            .await
+            .unwrap();
+        wait_count(&registry, 4).await;
+        registry.shutdown_all().await;
+    }
+    #[tokio::test]
+    async fn plugin_mcp_review_slow_stop_does_not_block_another_server() {
+        let registry = McpRegistry::new();
+        registry
+            .register_plugin_server::<tauri::Wry>(
+                None,
+                "demo",
+                "one".into(),
+                server(
+                    PluginMcpScope::All("all".into()),
+                    vec!["--ignore-eof".into()],
+                ),
+            )
+            .await
+            .unwrap();
+        wait_count(&registry, 4).await;
+        let r = registry.clone();
+        let stop = tokio::spawn(async move {
+            r.unregister_plugin_server::<tauri::Wry>(None, "demo", "fixture", "one")
+                .await
+        });
+        loop {
+            if registry
+                .plugin_status("plugin:demo:fixture")
+                .await
+                .is_some_and(|row| matches!(row.status, McpServerStatus::Stopping))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let mut other = server(PluginMcpScope::All("all".into()), vec![]);
+        other.id = "other".into();
+        other.tool_prefix = Some("other".into());
+        let result = tokio::time::timeout(Duration::from_millis(500), async {
+            registry
+                .register_plugin_server::<tauri::Wry>(None, "demo", "two".into(), other)
+                .await
+                .unwrap();
+            while !registry
+                .plugin_status("plugin:demo:other")
+                .await
+                .is_some_and(|row| row.status.is_running())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        stop.await.unwrap().unwrap();
+        registry.shutdown_all().await;
+        assert!(result.is_ok(), "unrelated server waited for graceful stop");
+    }
+    #[tokio::test]
+    async fn plugin_mcp_review_listing_redacts_secrets() {
+        let registry = McpRegistry::new();
+        registry
+            .set_disabled_ids::<tauri::Wry>(None, vec!["plugin:demo:fixture".into()])
+            .await
+            .unwrap();
+        registry
+            .register_plugin_server::<tauri::Wry>(
+                None,
+                "demo",
+                "private-token".into(),
+                server(PluginMcpScope::All("all".into()), vec![]),
+            )
+            .await
+            .unwrap();
+        let output = serde_json::to_string(&registry.plugin_configs().await).unwrap();
+        let native = registry.inner.lock().await.handles["plugin:demo:fixture"]
+            .config
+            .clone();
+        assert!(native.raw.get("pluginRegistrationToken").is_none());
+        let mut http = server(PluginMcpScope::All("all".into()), vec![]);
+        http.id = "http".into();
+        http.tool_prefix = Some("httpfixture".into());
+        http.transport = PluginMcpTransport::Http {
+            url: "https://example.invalid/mcp".into(),
+            headers: HashMap::from([("authorization".into(), "header-secret".into())]),
+        };
+        registry
+            .set_disabled_ids::<tauri::Wry>(
+                None,
+                vec!["plugin:demo:fixture".into(), "plugin:demo:http".into()],
+            )
+            .await
+            .unwrap();
+        registry
+            .register_plugin_server::<tauri::Wry>(None, "demo", "http-token".into(), http)
+            .await
+            .unwrap();
+        let http_output = serde_json::to_string(&registry.plugin_configs().await).unwrap();
+        assert!(!http_output.contains("header-secret"));
+        assert!(!http_output.contains("http-token"));
+        assert!(!http_output.contains("runtimeGeneration"));
+        registry.shutdown_all().await;
+        assert!(
+            !output.contains("private-token"),
+            "registration token leaked"
+        );
+        assert!(!output.contains("intact"), "environment value leaked");
+    }
+    #[tokio::test]
+    async fn plugin_mcp_review_collisions_include_host_and_bridge_tools() {
+        let registry = McpRegistry::new();
+        let mut inner = registry.inner.lock().await;
+        inner.plugins.insert(
+            "plugin:demo:fixture".into(),
+            PluginRegistration {
+                plugin_id: "demo".into(),
+                epoch: 0,
+                token: "one".into(),
+                scope: PluginMcpScope::All("all".into()),
+                prefix: "fixture".into(),
+            },
+        );
+        let tool = |name: &str| McpTool {
+            name: "x".into(),
+            prefixed_name: name.into(),
+            description: None,
+            input_schema: json!({}),
+            server_id: "plugin:demo:fixture".into(),
+        };
+        for name in [LIST_PLUGIN_TOOLS, CALL_PLUGIN_TOOL, "mcp__codemux__echo"] {
+            assert!(tool_collision(&inner, "plugin:demo:fixture", &[tool(name)], &[]).is_some());
+        }
+        let host = tool("custom_host_name");
+        assert!(tool_collision(&inner, "plugin:demo:fixture", &[host.clone()], &[host]).is_some());
+    }
+    #[test]
+    fn plugin_mcp_review_http_requires_tls_outside_loopback() {
+        let mut config = server(PluginMcpScope::All("all".into()), vec![]);
+        for (url, valid) in [
+            ("http://127.0.0.1/mcp", true),
+            ("http://[::1]/mcp", true),
+            ("https://example.com/mcp", true),
+            ("http://example.com/mcp", false),
+        ] {
+            config.transport = PluginMcpTransport::Http {
+                url: url.into(),
+                headers: HashMap::new(),
+            };
+            assert_eq!(config.config("demo").is_ok(), valid, "{url}");
+        }
+    }
+    #[test]
+    fn plugin_mcp_review_reserved_prefixes() {
+        for prefix in ["mcp", "codemux", "codemux_mcp", "codemux_list_plugin_tools"] {
+            let mut config = server(PluginMcpScope::All("all".into()), vec![]);
+            config.tool_prefix = Some(prefix.into());
+            assert!(
+                config.config("demo").is_err(),
+                "reserved prefix accepted: {prefix}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn plugin_mcp_review_reenable_starts_registration() {
+        let registry = McpRegistry::new();
+        registry
+            .set_disabled_ids::<tauri::Wry>(None, vec!["plugin:demo:fixture".into()])
+            .await
+            .unwrap();
+        registry
+            .register_plugin_server::<tauri::Wry>(
+                None,
+                "demo",
+                "one".into(),
+                server(PluginMcpScope::All("all".into()), vec![]),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        registry
+            .set_disabled_ids::<tauri::Wry>(None, vec![])
+            .await
+            .unwrap();
+        let running = tokio::time::timeout(Duration::from_secs(2), wait_count(&registry, 4)).await;
+        registry.shutdown_all().await;
+        assert!(running.is_ok(), "re-enabled plugin never restarted");
     }
     #[tokio::test]
     async fn plugin_mcp_pagination_refresh_workspace_and_bridge() {
@@ -764,7 +1075,8 @@ mod tests {
         assert_eq!(start.phase, "start");
         registry
             .unregister_plugin_server::<tauri::Wry>(None, "demo", "fixture", "one")
-            .await.unwrap();
+            .await
+            .unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(1), call)
             .await
             .unwrap()
@@ -801,7 +1113,8 @@ mod tests {
         }
         registry
             .unregister_plugin_server::<tauri::Wry>(None, "demo", "fixture", "one")
-            .await.unwrap();
+            .await
+            .unwrap();
         assert!(registry
             .owned_plugin_server("demo", "fixture", "two")
             .await
@@ -848,16 +1161,52 @@ mod tests {
     #[tokio::test]
     async fn plugin_mcp_private_scope_never_reaches_agent_or_bridge() {
         let registry = McpRegistry::new();
-        registry.register_plugin_server::<tauri::Wry>(None, "demo", "one".into(), server(PluginMcpScope::All("plugin".into()), vec![])).await.unwrap();
+        registry
+            .register_plugin_server::<tauri::Wry>(
+                None,
+                "demo",
+                "one".into(),
+                server(PluginMcpScope::All("plugin".into()), vec![]),
+            )
+            .await
+            .unwrap();
         wait_count(&registry, 4).await;
-        assert_eq!(registry.list_tools_for_server("plugin:demo:fixture").await.len(), 4);
-        assert!(registry.plugin_call("plugin:demo:fixture", "new_tool", json!({})).await.is_ok());
+        assert_eq!(
+            registry
+                .list_tools_for_server("plugin:demo:fixture")
+                .await
+                .len(),
+            4
+        );
+        assert!(registry
+            .plugin_call("plugin:demo:fixture", "new_tool", json!({}))
+            .await
+            .is_ok());
         for workspace in [None, Some("a")] {
-            assert!(registry.list_tools_for_workspace(&[], workspace).await.is_empty());
-            assert!(registry.dispatch_tool_call("fixture__new_tool", json!({}), workspace).await.is_err());
-            let catalog=registry.call_plugin_bridge(LIST_PLUGIN_TOOLS,json!({}),workspace,&[]).await.unwrap().unwrap();
+            assert!(registry
+                .list_tools_for_workspace(&[], workspace)
+                .await
+                .is_empty());
+            assert!(registry
+                .dispatch_tool_call("fixture__new_tool", json!({}), workspace)
+                .await
+                .is_err());
+            let catalog = registry
+                .call_plugin_bridge(LIST_PLUGIN_TOOLS, json!({}), workspace, &[])
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(catalog["structuredContent"]["tools"], json!([]));
-            assert!(registry.call_plugin_bridge(CALL_PLUGIN_TOOL,json!({"name":"fixture__new_tool"}),workspace,&[]).await.unwrap().is_err());
+            assert!(registry
+                .call_plugin_bridge(
+                    CALL_PLUGIN_TOOL,
+                    json!({"name":"fixture__new_tool"}),
+                    workspace,
+                    &[]
+                )
+                .await
+                .unwrap()
+                .is_err());
         }
         registry.shutdown_all().await;
     }
@@ -866,43 +1215,109 @@ mod tests {
     #[tokio::test]
     async fn plugin_mcp_immediate_stop_halts_effects_and_graceful_keeps_eof_budget() {
         for immediate in [true, false] {
-            let dir=tempfile::tempdir().unwrap();
-            let effects=dir.path().join("effects");
-            let pid_file=dir.path().join("pid");
-            let mut config=server(PluginMcpScope::All("all".into()),vec!["--effects".into(),effects.display().to_string(),"--ignore-eof".into(),"--ignore-term".into(),"--pid-file".into(),pid_file.display().to_string()]);
-            if immediate {config.shutdown=PluginMcpShutdown::Immediate;}
-            let registry=McpRegistry::new();
-            registry.register_plugin_server::<tauri::Wry>(None,"demo","one".into(),config).await.unwrap();
-            wait_count(&registry,4).await;
-            let started=std::time::Instant::now();
-            let mut clock:libc::timespec=unsafe{std::mem::zeroed()};
-            assert_eq!(unsafe{libc::clock_gettime(libc::CLOCK_MONOTONIC,&mut clock)},0);
-            let stop_ns=clock.tv_sec as u128*1_000_000_000+clock.tv_nsec as u128;
-            registry.unregister_plugin_server::<tauri::Wry>(None,"demo","fixture","one").await.unwrap();
-            let elapsed=started.elapsed();
-            let timestamps=std::fs::read_to_string(&effects).unwrap();
-            let pid:i32=std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
-            assert_eq!(unsafe{libc::kill(pid,0)},-1,"disposer confirms process exit");
-            tokio::time::sleep(Duration::from_millis(40)).await;
-            assert_eq!(std::fs::read_to_string(&effects).unwrap(),timestamps);
+            let dir = tempfile::tempdir().unwrap();
+            let effects = dir.path().join("effects");
+            let pid_file = dir.path().join("pid");
+            let mut config = server(
+                PluginMcpScope::All("all".into()),
+                vec![
+                    "--effects".into(),
+                    effects.display().to_string(),
+                    "--ignore-eof".into(),
+                    "--ignore-term".into(),
+                    "--pid-file".into(),
+                    pid_file.display().to_string(),
+                ],
+            );
             if immediate {
-                let last:u128=timestamps.lines().last().unwrap().parse().unwrap();
-                assert!(last<=stop_ns+10_000_000,"effects continued beyond one interval");
-                assert!(elapsed<Duration::from_millis(100),"immediate elapsed {elapsed:?}");
-                println!("immediate stop confirmed in {elapsed:?}; effects after request: {}ns",last.saturating_sub(stop_ns));
+                config.shutdown = PluginMcpShutdown::Immediate;
             }
-            else { assert!(elapsed>=Duration::from_secs(2));assert!(timestamps.lines().count()>100); }
+            let registry = McpRegistry::new();
+            registry
+                .register_plugin_server::<tauri::Wry>(None, "demo", "one".into(), config)
+                .await
+                .unwrap();
+            wait_count(&registry, 4).await;
+            let started = std::time::Instant::now();
+            let mut clock: libc::timespec = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock) },
+                0
+            );
+            let stop_ns = clock.tv_sec as u128 * 1_000_000_000 + clock.tv_nsec as u128;
+            registry
+                .unregister_plugin_server::<tauri::Wry>(None, "demo", "fixture", "one")
+                .await
+                .unwrap();
+            let elapsed = started.elapsed();
+            let timestamps = std::fs::read_to_string(&effects).unwrap();
+            let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "disposer confirms process exit"
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert_eq!(std::fs::read_to_string(&effects).unwrap(), timestamps);
+            if immediate {
+                let last: u128 = timestamps.lines().last().unwrap().parse().unwrap();
+                assert!(
+                    last <= stop_ns + 10_000_000,
+                    "effects continued beyond one interval"
+                );
+                assert!(
+                    elapsed < Duration::from_millis(100),
+                    "immediate elapsed {elapsed:?}"
+                );
+                println!(
+                    "immediate stop confirmed in {elapsed:?}; effects after request: {}ns",
+                    last.saturating_sub(stop_ns)
+                );
+            } else {
+                assert!(elapsed >= Duration::from_secs(2));
+                assert!(timestamps.lines().count() > 100);
+            }
         }
     }
 
     #[tokio::test]
     async fn plugin_mcp_startup_dispose_waits_for_child_exit() {
-        let dir=tempfile::tempdir().unwrap();let pid_file=dir.path().join("pid");
-        let registry=McpRegistry::new();
-        registry.register_plugin_server::<tauri::Wry>(None,"demo","one".into(),server(PluginMcpScope::All("all".into()),vec!["--init-delay".into(),"5".into(),"--pid-file".into(),pid_file.display().to_string()])).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5),async{while !pid_file.exists(){tokio::time::sleep(Duration::from_millis(5)).await;}}).await.unwrap();
-        registry.unregister_plugin_server::<tauri::Wry>(None,"demo","fixture","one").await.unwrap();
-        #[cfg(unix)] {let pid:i32=std::fs::read_to_string(pid_file).unwrap().parse().unwrap();assert_eq!(unsafe{libc::kill(pid,0)},-1);}
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let registry = McpRegistry::new();
+        registry
+            .register_plugin_server::<tauri::Wry>(
+                None,
+                "demo",
+                "one".into(),
+                server(
+                    PluginMcpScope::All("all".into()),
+                    vec![
+                        "--init-delay".into(),
+                        "5".into(),
+                        "--pid-file".into(),
+                        pid_file.display().to_string(),
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pid_file.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        registry
+            .unregister_plugin_server::<tauri::Wry>(None, "demo", "fixture", "one")
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        {
+            let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        }
         assert!(registry.plugin_configs().await.is_empty());
     }
 

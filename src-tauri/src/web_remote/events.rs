@@ -43,7 +43,7 @@ impl EventHub {
     pub fn subscribe<R: Runtime>(&self, app: &AppHandle<R>, conn_id: u64, event: &str, out: OutboundTx) {
         // Desktop-only surfaces: plugin file changes and the plugin chat tap
         // never reach a web client.
-        if event.starts_with("plugins_") || event.starts_with("plugin_") {
+        if event.starts_with("plugins_") || event.starts_with("plugin_") || event.starts_with("plugin-") {
             return;
         }
         let mut map = self.inner.lock().unwrap();
@@ -107,6 +107,7 @@ impl EventHub {
 /// verbatim (parsed back to a value so it nests, not double-encodes).
 fn fan_out(inner: &Arc<Mutex<HashMap<String, EventEntry>>>, event: &str, payload: &str) {
     let data: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    if event == crate::mcp::registry::MCP_STATUS_CHANGED_EVENT && super::dispatch::plugin_mcp_row(&data) { return; }
     let frame = json!({ "t": "event", "event": event, "payload": data }).to_string();
     let map = inner.lock().unwrap();
     if let Some(entry) = map.get(event) {
@@ -169,11 +170,20 @@ mod tests {
 mod plugins_boundary_tests {
     use super::*;
     #[test]
+    fn plugin_mcp_status_is_not_forwarded() {
+        let (out, mut frames) = crate::web_remote::server::test_outbound();
+        let inner = Arc::new(Mutex::new(HashMap::from([("mcp-status-changed".into(), EventEntry { handler_id: 0, subscribers: HashMap::from([(1, out)]) })])));
+        fan_out(&inner, "mcp-status-changed", r#"{"id":"plugin:demo:private"}"#);
+        assert!(frames.try_recv().is_err());
+        fan_out(&inner, "mcp-status-changed", r#"{"id":"user"}"#);
+        assert!(frames.try_recv().is_ok());
+    }
+    #[test]
     fn plugin_streams_never_register_remote_subscribers() {
         let app = tauri::test::mock_app();
         let hub = EventHub::default();
         let (out, _) = crate::web_remote::server::test_outbound();
-        for name in ["plugins_changed", "plugin_agent_event", "plugin_future"] {
+        for name in ["plugins_changed", "plugin_agent_event", "plugin_future", "plugin-mcp-activity"] {
             hub.subscribe(app.handle(), 1, name, out.clone());
             assert_eq!(hub.subscriber_count(name), 0);
         }

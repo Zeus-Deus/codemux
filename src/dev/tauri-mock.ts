@@ -8974,6 +8974,9 @@ const internals: TauriInternals = {
   window as unknown as { __TAURI_INTERNALS__: TauriInternals }
 ).__TAURI_INTERNALS__ = internals;
 
+// Native page-load completion supplies this epoch before plugin MCP IPC.
+Object.assign(window, { __CODEMUX_PLUGIN_PAGE_EPOCH__: 0 });
+
 (
   window as unknown as {
     __TAURI_EVENT_PLUGIN_INTERNALS__: {

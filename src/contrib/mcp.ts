@@ -15,8 +15,8 @@ export type PluginMcpServer = {
    * 128 entries, 2000 UTF-8 bytes per text, 16 KiB total. */
   toolDescriptions?: Record<string, { append?: string; replace?: string }>;
   scope: PluginMcpScope;
-  /** Immediate skips EOF grace: Linux kills the owned process group;
-   * other platforms terminate the owned child. Default: graceful. */
+  /** Immediate skips EOF grace: Linux and macOS kill the owned process group;
+   * Windows terminates the owned child. Default: graceful. */
   shutdown?: "graceful" | "immediate";
 } & (
   | { transport: "stdio"; command: string; args?: string[]; env?: Record<string, string>; cwd?: string }
@@ -54,6 +54,19 @@ function tokenFor(owner: Owner | null, id: string): { pluginId: string; localId:
   if (!owner || !token) throw new Error("Plugin MCP registration is no longer active; use ctx.host.mcp");
   return { pluginId: owner.pluginId, localId: id, token };
 }
+let pageEpoch: Promise<number> | undefined;
+function pluginPageEpoch(): Promise<number> {
+  return pageEpoch ??= new Promise((resolve) => {
+    const read = () => {
+      const epoch = (window as Window & { __CODEMUX_PLUGIN_PAGE_EPOCH__?: number }).__CODEMUX_PLUGIN_PAGE_EPOCH__;
+      if (epoch === undefined) return;
+      window.removeEventListener("codemux-plugin-page-ready", read);
+      resolve(epoch);
+    };
+    window.addEventListener("codemux-plugin-page-ready", read);
+    read();
+  });
+}
 export async function registerMcpServer(owner: Owner, server: PluginMcpServer): Promise<() => Promise<void>> {
   if (owner.ended) throw new Error("Plugin has been disposed");
   // The persisted switch is stable across incarnations, including registrations
@@ -61,7 +74,9 @@ export async function registerMcpServer(owner: Owner, server: PluginMcpServer): 
   await useMcpStore.getState().syncToBackend();
   if (owner.ended) throw new Error("Plugin has been disposed");
   const token = crypto.randomUUID();
-  await invoke("plugins_mcp_register", { pluginId: owner.pluginId, token, server });
+  const epoch = await pluginPageEpoch();
+  if (owner.ended) throw new Error("Plugin has been disposed");
+  await invoke("plugins_mcp_register", { pluginId: owner.pluginId, token, pageEpoch: epoch, server });
   const map = registrations.get(owner) ?? new Map<string, string>();
   registrations.set(owner, map);
   map.set(server.id, token);

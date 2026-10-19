@@ -245,9 +245,18 @@ pub async fn dispatch_invoke<R: Runtime>(
     mut args: Value,
 ) {
     // Deny before channel rewriting or native invocation.
-    if cmd.starts_with("plugins_") {
+    if cmd.starts_with("plugins_") || plugin_mcp_command(&cmd, &args) {
         let _ = out.send(err_text(id, "REMOTE_UNSUPPORTED: plugins require the desktop app"));
         return;
+    }
+    if cmd == "set_mcp_disabled_ids" {
+        if let Some(registry) = app.try_state::<crate::mcp::registry::McpRegistry>() {
+            if let Some(ids) = args.get_mut("ids").and_then(Value::as_array_mut) {
+                // Remote Settings owns only non-plugin switches. A full-set
+                // update must preserve desktop-only disabled registrations.
+                ids.extend(registry.disabled_plugin_ids().await.into_iter().map(Value::String));
+            }
+        }
     }
     if cmd.starts_with("web_push_") {
         let shared = app.state::<super::WebRemoteState>().shared();
@@ -321,7 +330,7 @@ pub async fn dispatch_invoke<R: Runtime>(
     };
 
     let request = InvokeRequest {
-        cmd,
+        cmd: cmd.clone(),
         callback: CallbackFn(0),
         error: CallbackFn(1),
         url,
@@ -345,11 +354,35 @@ pub async fn dispatch_invoke<R: Runtime>(
     });
 
     let frame = match rx.await {
-        Ok(InvokeResponse::Ok(body)) => ok_frame(id, body),
+        Ok(InvokeResponse::Ok(body)) => ok_frame(id, remote_mcp_response(&cmd, body)),
         Ok(InvokeResponse::Err(err)) => err_value(id, err.0),
         Err(_) => err_text(id, "web-remote: command dropped without responding"),
     };
     let _ = out.send(frame);
+}
+
+fn plugin_mcp_command(command: &str, args: &Value) -> bool {
+    (matches!(command, "start_mcp_server_cmd" | "stop_mcp_server_cmd" | "restart_mcp_server_cmd" | "list_mcp_tools_for_server")
+        && args.get("id").and_then(Value::as_str).is_some_and(|id| id.starts_with("plugin:")))
+        || (command == "set_mcp_disabled_ids" && args.get("ids").and_then(Value::as_array)
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str().is_some_and(|id| id.starts_with("plugin:")))))
+}
+
+pub(super) fn plugin_mcp_row(row: &Value) -> bool {
+    ["id", "serverId"].iter().any(|key| row.get(key).and_then(Value::as_str).is_some_and(|id| id.starts_with("plugin:")))
+        || row.get("sources").and_then(Value::as_array).is_some_and(|sources| sources.iter().any(|source| source == "plugin"))
+}
+
+fn remote_mcp_response(command: &str, body: InvokeResponseBody) -> InvokeResponseBody {
+    if matches!(command, "list_mcp_servers" | "get_mcp_runtime_status" | "prime_mcp_runtime" | "list_mcp_tools") {
+        if let InvokeResponseBody::Json(ref text) = body {
+            if let Ok(mut rows) = serde_json::from_str::<Vec<Value>>(text) {
+                rows.retain(|row| !plugin_mcp_row(row));
+                return InvokeResponseBody::Json(serde_json::to_string(&rows).unwrap());
+            }
+        }
+    }
+    body
 }
 
 /// `{"t":"ok","id":…,"data":…}` from a resolved [`InvokeResponseBody`].
@@ -605,6 +638,31 @@ mod delegation_boundary_tests {
 #[cfg(test)]
 mod plugins_boundary_tests {
     use super::*;
+    #[test]
+    fn plugin_mcp_rows_and_commands_stay_desktop_only() {
+        for command in ["start_mcp_server_cmd", "stop_mcp_server_cmd", "restart_mcp_server_cmd", "list_mcp_tools_for_server"] {
+            assert!(plugin_mcp_command(command, &json!({"id":"plugin:demo:private"})));
+            assert!(!plugin_mcp_command(command, &json!({"id":"user-server"})));
+        }
+        assert!(plugin_mcp_command("set_mcp_disabled_ids", &json!({"ids":["plugin:demo:private"]})));
+        for command in ["list_mcp_servers", "get_mcp_runtime_status", "prime_mcp_runtime", "list_mcp_tools"] {
+            let body = InvokeResponseBody::Json(json!([{"id":"user"},{"id":"plugin:demo:private"},{"serverId":"plugin:demo:private"}]).to_string());
+            let InvokeResponseBody::Json(body) = remote_mcp_response(command, body) else { panic!("JSON expected"); };
+            assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), json!([{"id":"user"}]));
+        }
+    }
+    #[tokio::test]
+    async fn plugin_mcp_admin_is_denied_before_desktop_dispatch() {
+        let app = tauri::test::mock_app();
+        let router = Arc::new(ChannelRouter::default());
+        let (out, mut frames) = crate::web_remote::server::test_outbound();
+        for command in ["start_mcp_server_cmd", "stop_mcp_server_cmd", "restart_mcp_server_cmd", "list_mcp_tools_for_server", "set_mcp_disabled_ids"] {
+            dispatch_invoke(app.handle(), &router, 7, &out, 1, command.into(), json!({"id":"plugin:demo:private", "ids":["plugin:demo:private"]})).await;
+            let Message::Text(frame) = frames.recv().await.unwrap() else { panic!("Expected rejection"); };
+            assert!(frame.contains("REMOTE_UNSUPPORTED"), "{command}: {frame}");
+            assert!(router.routes.lock().unwrap().is_empty());
+        }
+    }
     #[tokio::test]
     async fn plugin_commands_are_denied_before_any_channel_is_allocated() {
         let app = tauri::test::mock_app();

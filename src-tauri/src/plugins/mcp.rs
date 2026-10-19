@@ -12,6 +12,7 @@ pub async fn plugins_mcp_register<R: Runtime>(
     registry: State<'_, McpRegistry>,
     plugin_id: String,
     token: String,
+    page_epoch: u64,
     server: PluginMcpServer,
 ) -> Result<(), String> {
     super::commands::gui(&app)?;
@@ -20,7 +21,7 @@ pub async fn plugins_mcp_register<R: Runtime>(
         let _ = emitter.emit_to("main", "plugin-mcp-activity", event);
     }));
     registry
-        .register_plugin_server(Some(&app), &plugin_id, token, server)
+        .register_plugin_server_for_page(Some(&app), page_epoch, &plugin_id, token, server)
         .await
 }
 #[tauri::command]

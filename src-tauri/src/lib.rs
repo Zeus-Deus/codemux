@@ -798,6 +798,10 @@ fn build_core_app<R: tauri::Runtime>(
             }
             webview_tuning::apply_to_webview(webview);
             if mode == AppMode::Gui && webview.label() == "main" {
+                // Bind registrations to this document, not to the time its
+                // queued IPC happens to reach the native command handler.
+                let epoch = webview.app_handle().state::<mcp::registry::McpRegistry>().plugin_page_epoch();
+                let _ = webview.eval(format!("window.__CODEMUX_PLUGIN_PAGE_EPOCH__ = {epoch}; window.dispatchEvent(new Event('codemux-plugin-page-ready'));"));
                 diagnostics::record_startup_milestone("startup.main-page-loaded");
                 webview_tuning::mark_startup_successful();
             }

@@ -93,6 +93,30 @@ pub struct McpServerConfig {
 }
 
 impl McpServerConfig {
+    /// Listing is informational. Runtime credentials remain native-only.
+    pub fn redacted(mut self) -> Self {
+        for value in self.env.values_mut() {
+            *value = "[redacted]".into();
+        }
+        if let Some(raw) = self.raw.as_object_mut() {
+            raw.remove("pluginRegistrationToken");
+            raw.remove("runtimeGeneration");
+            for key in ["env", "headers", "http_headers"] {
+                if let Some(serde_json::Value::Object(values)) = raw.get_mut(key) {
+                    for value in values.values_mut() {
+                        *value = serde_json::json!("[redacted]");
+                    }
+                }
+            }
+            for key in ["bearer_token", "bearerToken"] {
+                if let Some(value) = raw.get_mut(key) {
+                    *value = serde_json::json!("[redacted]");
+                }
+            }
+        }
+        self
+    }
+
     /// Lowest-rank (most canonical) source for this entry. After dedupe
     /// `sources[0]` is always the canonical one because we sort before
     /// merging.

@@ -20,7 +20,10 @@
 //   always-on; toggling it is suppressed at the command layer.
 
 mod plugin;
-pub use plugin::{PluginMcpActivity, PluginMcpServer, plugin_server_id, plugin_bridge_tools, plugin_catalog_key, plugin_catalog_notice, strip_plugin_catalog_notice};
+pub use plugin::{
+    plugin_bridge_tools, plugin_catalog_key, plugin_catalog_notice, plugin_server_id,
+    strip_plugin_catalog_notice, PluginMcpActivity, PluginMcpServer,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -36,9 +39,7 @@ use super::parser::{
     parse_opencode_config_file,
 };
 use super::paths::{enumerate_mcp_paths, is_claude_wrapped_path};
-use super::runtime::{
-    McpServerHandle, McpServerStatus, McpTool,
-};
+use super::runtime::{McpServerHandle, McpServerStatus, McpTool};
 use super::{McpConfigSource, McpServerConfig};
 
 /// Tauri event the frontend listens to for live status updates.
@@ -90,20 +91,10 @@ impl McpServerRuntime {
 pub struct McpRegistry {
     inner: Arc<Mutex<RegistryInner>>,
     status_tx: broadcast::Sender<McpServerRuntime>,
-    /// Serializes concurrent [`prime_for_chat`](Self::prime_for_chat) runs so
-    /// two primes racing on the same registry (the eager
-    /// `agent_chat_prime_mcp` warm-up firing as a draft surface mounts, and
-    /// the correctness-backstop prime inside `agent_chat_start_session`)
-    /// cannot both slip past `ensure_started`'s fast-path check and
-    /// double-spawn the same MCP child. `ensure_started` drops its lock
-    /// between the "already running?" probe and inserting the `Starting`
-    /// placeholder, so without this gate the two callers can each observe a
-    /// server as absent and each launch it. Held across the whole prime loop:
-    /// by the time the second prime acquires it every server the first prime
-    /// touched is already `Starting`/`Running`, so the second prime is the
-    /// cheap no-op the design wants.
+    /// Coalesces concurrent config discovery for chat priming. Plugin
+    /// registration and shutdown use independent per-server locks.
     prime_lock: Arc<Mutex<()>>,
-    lifecycle: Arc<Mutex<()>>,
+    lifecycle: Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>,
     /// Lazily-started authenticated loopback gateway shared by provider
     /// adapters that need a remote MCP URL (OpenCode and future providers).
     gateway: Arc<OnceCell<Arc<super::gateway::McpGatewayRuntime>>>,
@@ -154,11 +145,21 @@ pub struct CompositeHostTools(pub Vec<Arc<dyn HostTools>>);
 
 impl HostTools for CompositeHostTools {
     fn tools_for(&self, caller: &HostCaller) -> Vec<McpTool> {
-        self.0.iter().flat_map(|host| host.tools_for(caller)).collect()
+        self.0
+            .iter()
+            .flat_map(|host| host.tools_for(caller))
+            .collect()
     }
 
-    fn call(&self, caller: &HostCaller, name: &str, arguments: &serde_json::Value) -> Option<serde_json::Value> {
-        self.0.iter().find_map(|host| host.call(caller, name, arguments))
+    fn call(
+        &self,
+        caller: &HostCaller,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        self.0
+            .iter()
+            .find_map(|host| host.call(caller, name, arguments))
     }
 }
 
@@ -221,7 +222,7 @@ impl Default for McpRegistry {
             })),
             status_tx,
             prime_lock: Arc::new(Mutex::new(())),
-            lifecycle: Arc::new(Mutex::new(())),
+            lifecycle: Arc::new(std::sync::Mutex::new(HashMap::new())),
             gateway: Arc::new(OnceCell::new()),
             native_delegation: Arc::new(std::sync::Mutex::new(None)),
             host: Arc::new(std::sync::OnceLock::new()),
@@ -231,9 +232,20 @@ impl Default for McpRegistry {
     }
 }
 
-pub(crate) type NativeDelegationHandler=Arc<dyn Fn(crate::delegation::app::NativeActor,String,serde_json::Value)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<serde_json::Value,String>>+Send>>+Send+Sync>;
+pub(crate) type NativeDelegationHandler = Arc<
+    dyn Fn(
+            crate::delegation::app::NativeActor,
+            String,
+            serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>,
+        > + Send
+        + Sync,
+>;
 impl McpRegistry {
-    pub(crate) fn set_native_delegation_handler(&self,handler:NativeDelegationHandler){*self.native_delegation.lock().unwrap()=Some(handler);}
+    pub(crate) fn set_native_delegation_handler(&self, handler: NativeDelegationHandler) {
+        *self.native_delegation.lock().unwrap() = Some(handler);
+    }
     pub(crate) async fn dispatch_native_tool_call(
         &self,
         name: &str,
@@ -282,7 +294,9 @@ impl McpRegistry {
         self.dispatch_tool_call(name, arguments, actor.workspace_id.as_deref())
             .await
     }
-    pub fn set_activity_emitter(&self, emit: Arc<dyn Fn(PluginMcpActivity) + Send + Sync>) { let _ = self.activity.set(emit); }
+    pub fn set_activity_emitter(&self, emit: Arc<dyn Fn(PluginMcpActivity) + Send + Sync>) {
+        let _ = self.activity.set(emit);
+    }
 
     pub fn new() -> Self {
         Self::default()
@@ -290,9 +304,7 @@ impl McpRegistry {
 
     /// Return the process-wide authenticated MCP gateway, starting it on an
     /// ephemeral loopback port on first use.
-    pub async fn gateway_connection(
-        &self,
-    ) -> Result<super::gateway::McpGatewayConnection, String> {
+    pub async fn gateway_connection(&self) -> Result<super::gateway::McpGatewayConnection, String> {
         let registry = self.clone();
         let runtime = self
             .gateway
@@ -301,16 +313,6 @@ impl McpRegistry {
             })
             .await?;
         Ok(runtime.connection())
-    }
-
-    /// The URL's caller context is app-supplied configuration, never a tool
-    /// argument. Token-bound caller identities can replace this seam.
-    pub async fn gateway_connection_for_workspace(&self, workspace: Option<&str>) -> Result<super::gateway::McpGatewayConnection, String> {
-        let mut connection = self.gateway_connection().await?;
-        if let Some(id) = workspace {
-            connection.url = format!("{}?workspaceId={}", connection.url, urlencoding::encode(id));
-        }
-        Ok(connection)
     }
 
     /// Install the process-wide host tools. Only the first call wins; every
@@ -327,6 +329,15 @@ impl McpRegistry {
             .get()
             .map(|host| host.tools_for(caller))
             .unwrap_or_default()
+    }
+
+    fn collision_host_tools(&self) -> Vec<McpTool> {
+        self.host_tools(&HostCaller {
+            thread_id: String::new(),
+            provider: crate::agent_provider::ProviderKind::Claude,
+            workspace_id: None,
+            permission_mode: Some("bypassPermissions".into()),
+        })
     }
 
     /// Answer `prefixed_name` if it is a host tool; `None` means "not mine,
@@ -365,13 +376,26 @@ impl McpRegistry {
         ids: Vec<String>,
     ) -> Result<(), String> {
         let mut to_stop: Vec<String> = Vec::new();
+        let to_start;
         {
             let mut inner = self.inner.lock().await;
-            inner.disabled_ids = ids.iter().cloned().collect();
+            let next: HashSet<String> = ids.iter().cloned().collect();
+            to_start = inner
+                .plugins
+                .keys()
+                .filter(|id| inner.disabled_ids.contains(*id) && !next.contains(*id))
+                .filter_map(|id| inner.handles.get(id).map(|handle| handle.config.clone()))
+                .collect::<Vec<_>>();
+            inner.disabled_ids = next;
             // Codemux self can't be disabled.
             inner.disabled_ids.remove("codemux-self");
             for (id, handle) in inner.handles.iter() {
-                if inner.disabled_ids.contains(id) && matches!(handle.status, McpServerStatus::Running { .. } | McpServerStatus::Starting) {
+                if inner.disabled_ids.contains(id)
+                    && matches!(
+                        handle.status,
+                        McpServerStatus::Running { .. } | McpServerStatus::Starting
+                    )
+                {
                     to_stop.push(id.clone());
                 }
             }
@@ -380,7 +404,21 @@ impl McpRegistry {
         for id in to_stop {
             let _ = self.stop_server(app, &id).await;
         }
+        for config in to_start {
+            self.ensure_started(app, config).await;
+        }
         Ok(())
+    }
+
+    pub async fn disabled_plugin_ids(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .await
+            .disabled_ids
+            .iter()
+            .filter(|id| id.starts_with("plugin:"))
+            .cloned()
+            .collect()
     }
 
     /// Whether a server id is currently in the disabled set.
@@ -389,16 +427,47 @@ impl McpRegistry {
         inner.disabled_ids.contains(id)
     }
 
+    fn server_lock(&self, id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.lifecycle.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(id).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(id.into(), Arc::downgrade(&lock));
+        lock
+    }
+
     /// Start the given config if not already running. Idempotent: a
     /// second call against an already-running id is a no-op. Emits
     /// `mcp-status-changed` on every transition.
     pub async fn ensure_started<R: Runtime>(
         &self,
         app: Option<&AppHandle<R>>,
-        mut config: McpServerConfig,
+        config: McpServerConfig,
     ) -> McpServerRuntime {
-        let lifecycle = self.lifecycle.lock().await;
+        let (config, token) = if config.sources.contains(&McpConfigSource::Plugin) {
+            let inner = self.inner.lock().await;
+            match (inner.plugins.get(&config.id), inner.handles.get(&config.id)) {
+                (Some(owner), Some(handle)) => (handle.config.clone(), Some(owner.token.clone())),
+                _ => return McpServerRuntime::from_handle(&McpServerHandle::discovered(config)),
+            }
+        } else {
+            (config, None)
+        };
+        self.ensure_started_owned(app, config, token.as_deref())
+            .await
+    }
+
+    async fn ensure_started_owned<R: Runtime>(
+        &self,
+        app: Option<&AppHandle<R>>,
+        mut config: McpServerConfig,
+        token: Option<&str>,
+    ) -> McpServerRuntime {
         let id = config.id.clone();
+        let server_lock = self.server_lock(&id);
+        let lifecycle = server_lock.lock().await;
 
         // Codemux self is always-on regardless of disabled set; everyone
         // else respects the user's toggle.
@@ -423,18 +492,34 @@ impl McpRegistry {
         // Reserve the generation under one lock; stop/unregister can revoke
         // it while the handshake is in flight without resurrecting a child.
         let generation = uuid::Uuid::new_v4().to_string();
-        config.raw.as_object_mut().map(|raw| raw.insert("runtimeGeneration".into(), serde_json::json!(generation)));
-        if !config.raw.is_object() { config.raw = serde_json::json!({"runtimeGeneration": generation}); }
+        config
+            .raw
+            .as_object_mut()
+            .map(|raw| raw.insert("runtimeGeneration".into(), serde_json::json!(generation)));
+        if !config.raw.is_object() {
+            config.raw = serde_json::json!({"runtimeGeneration": generation});
+        }
         let starting_ms = now_ms();
         let start_cancelled;
         let _start_guard;
         {
             let mut inner = self.inner.lock().await;
             if let Some(existing) = inner.handles.get(&id) {
-                if matches!(existing.status, McpServerStatus::Running { .. } | McpServerStatus::Starting) { return McpServerRuntime::from_handle(existing); }
+                if matches!(
+                    existing.status,
+                    McpServerStatus::Running { .. } | McpServerStatus::Starting
+                ) {
+                    return McpServerRuntime::from_handle(existing);
+                }
             }
-            if config.sources.contains(&McpConfigSource::Plugin) && !inner.plugins.get(&id).is_some_and(|r| config.raw.get("pluginRegistrationToken").and_then(serde_json::Value::as_str) == Some(r.token.as_str())) {
-                let h = McpServerHandle::discovered(config); return McpServerRuntime::from_handle(&h);
+            if config.sources.contains(&McpConfigSource::Plugin)
+                && !inner
+                    .plugins
+                    .get(&id)
+                    .is_some_and(|r| token == Some(r.token.as_str()))
+            {
+                let h = McpServerHandle::discovered(config);
+                return McpServerRuntime::from_handle(&h);
             }
             let mut placeholder = McpServerHandle::discovered(config.clone());
             placeholder.status = McpServerStatus::Starting;
@@ -465,17 +550,35 @@ impl McpRegistry {
         // Drop the lock for the actual spawn — the handshake can take
         // up to HANDSHAKE_TIMEOUT seconds and we don't want to block
         // every other command on it.
-        let mut handle = super::runtime::start_mcp_server_cancellable(config.clone(), Some(start_cancelled)).await;
+        let mut handle =
+            super::runtime::start_mcp_server_cancellable(config.clone(), Some(start_cancelled))
+                .await;
         let row;
+        let host_tools = self.collision_host_tools();
         {
             let mut inner = self.inner.lock().await;
-            let current = inner.handles.get(&id).is_some_and(|h| matches!(h.status, McpServerStatus::Starting) && h.config.raw.get("runtimeGeneration").and_then(serde_json::Value::as_str) == Some(&generation));
+            let current = inner.handles.get(&id).is_some_and(|h| {
+                matches!(h.status, McpServerStatus::Starting)
+                    && h.config
+                        .raw
+                        .get("runtimeGeneration")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(&generation)
+            });
             if !current {
                 drop(inner);
-                if let Some(child) = handle.child.take() { let _ = child.shutdown().await; }
-                return self.plugin_status(&id).await.unwrap_or_else(|| McpServerRuntime::from_handle(&handle));
+                if let Some(child) = handle.child.take() {
+                    let _ = child.shutdown().await;
+                }
+                return self
+                    .plugin_status(&id)
+                    .await
+                    .unwrap_or_else(|| McpServerRuntime::from_handle(&handle));
             }
-            if let Some(error) = plugin::tool_collision(&inner, &id, &handle.tools) { handle.tools.clear(); handle.status = McpServerStatus::Errored { message: error }; }
+            if let Some(error) = plugin::tool_collision(&inner, &id, &handle.tools, &host_tools) {
+                handle.tools.clear();
+                handle.status = McpServerStatus::Errored { message: error };
+            }
             row = McpServerRuntime::from_handle(&handle);
             inner.handles.insert(id.clone(), handle);
         }
@@ -487,44 +590,92 @@ impl McpRegistry {
     async fn watch_tool_changes<R: Runtime>(&self, app: Option<AppHandle<R>>, id: &str) {
         let (config, child, remote) = {
             let inner = self.inner.lock().await;
-            let Some(h) = inner.handles.get(id).filter(|h| h.status.is_running()) else { return; };
+            let Some(h) = inner.handles.get(id).filter(|h| h.status.is_running()) else {
+                return;
+            };
             (h.config.clone(), h.child.clone(), h.remote.clone())
         };
         // Subscribe before the reconciliation fetch: notifications during
         // initialize/list, before registry installation, cannot leave stale tools.
         let mut notifications = if let Some(child) = child.as_ref() {
             child.notifications()
-        } else if let Some(remote) = remote.as_ref() { remote.notifications() } else { return; };
+        } else if let Some(remote) = remote.as_ref() {
+            remote.notifications()
+        } else {
+            return;
+        };
         let registry = self.clone();
         let server_id = id.to_owned();
         let task = tokio::spawn(async move {
             let mut stream_task = remote.as_ref().map(|r| {
                 let r = r.clone();
-                tokio::spawn(async move { r.listen_notifications().await; }).abort_handle()
+                tokio::spawn(async move {
+                    r.listen_notifications().await;
+                })
+                .abort_handle()
             });
             // An abort-on-drop guard also cancels HTTP GET on unregister/restart.
             struct StreamGuard(Option<tokio::task::AbortHandle>);
-            impl Drop for StreamGuard { fn drop(&mut self) { if let Some(t) = self.0.take() { t.abort(); } } }
+            impl Drop for StreamGuard {
+                fn drop(&mut self) {
+                    if let Some(t) = self.0.take() {
+                        t.abort();
+                    }
+                }
+            }
             let _stream_guard = StreamGuard(stream_task.take());
             loop {
                 let result = if let Some(c) = child.as_ref() {
-                    super::runtime::list_stdio_tools(c, &config).await.map_err(|e| e.to_string())
+                    super::runtime::list_stdio_tools(c, &config)
+                        .await
+                        .map_err(|e| e.to_string())
                 } else if let Some(r) = remote.as_ref() {
                     super::runtime::list_http_tools(r, &config).await
-                } else { return; };
+                } else {
+                    return;
+                };
+                let host_tools = registry.collision_host_tools();
                 let row = {
                     let mut inner = registry.inner.lock().await;
-                    let result = result.and_then(|tools| match plugin::tool_collision(&inner, &server_id, &tools) { Some(error) => Err(error), None => Ok(tools) });
-                    let Some(h) = inner.handles.get_mut(&server_id) else { return; };
+                    let result = result.and_then(|tools| {
+                        match plugin::tool_collision(&inner, &server_id, &tools, &host_tools) {
+                            Some(error) => Err(error),
+                            None => Ok(tools),
+                        }
+                    });
+                    let Some(h) = inner.handles.get_mut(&server_id) else {
+                        return;
+                    };
                     let same = match (&h.child, &child, &h.remote, &remote) {
                         (Some(a), Some(b), _, _) => Arc::ptr_eq(a, b),
                         (_, _, Some(a), Some(b)) => Arc::ptr_eq(a, b),
                         _ => false,
                     };
-                    if !same || !h.status.is_running() { return; }
+                    if !same
+                        || matches!(
+                            h.status,
+                            McpServerStatus::Stopping
+                                | McpServerStatus::Stopped
+                                | McpServerStatus::Starting
+                                | McpServerStatus::Discovered
+                        )
+                    {
+                        return;
+                    }
                     match result {
-                        Ok(tools) => { h.tools = tools; h.status = McpServerStatus::Running { tool_count: h.tools.len() }; h.stderr_tail = None; },
-                        Err(error) => { h.tools.clear(); h.status = McpServerStatus::Errored { message: format!("tools/list refresh failed: {error}") }; },
+                        Ok(tools) => {
+                            h.tools = tools;
+                            h.status = McpServerStatus::Running {
+                                tool_count: h.tools.len(),
+                            };
+                            h.stderr_tail = None;
+                        }
+                        Err(error) => {
+                            h.tools.clear();
+                            h.status = McpServerStatus::Errored {
+                                message: format!("tools/list refresh failed: {error}"),
+                            };
+                        }
                     }
                     McpServerRuntime::from_handle(h)
                 };
@@ -532,7 +683,7 @@ impl McpRegistry {
                 loop {
                     match notifications.recv().await {
                         Ok(n) if n.method == "notifications/tools/list_changed" => break,
-                        Ok(_) => {},
+                        Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(_)) => break,
                         Err(broadcast::error::RecvError::Closed) => return,
                     }
@@ -540,19 +691,39 @@ impl McpRegistry {
             }
         });
         let mut inner = self.inner.lock().await;
-        if let Some(old) = inner.watchers.insert(id.into(), task.abort_handle()) { old.abort(); }
+        if let Some(old) = inner.watchers.insert(id.into(), task.abort_handle()) {
+            old.abort();
+        }
     }
 
     /// Stop a server (graceful EOF then kill, 2s budget) and mark it
     /// Stopped. Idempotent: stopping an already-stopped server is fine.
-    pub async fn stop_server<R: Runtime>(&self, app: Option<&AppHandle<R>>, id: &str) -> Result<McpServerRuntime, String> {
-        let _lifecycle = self.lifecycle.lock().await;
+    pub async fn stop_server<R: Runtime>(
+        &self,
+        app: Option<&AppHandle<R>>,
+        id: &str,
+    ) -> Result<McpServerRuntime, String> {
+        let server_lock = self.server_lock(id);
+        let _lifecycle = server_lock.lock().await;
+        self.stop_server_locked(app, id).await
+    }
+
+    async fn stop_server_locked<R: Runtime>(
+        &self,
+        app: Option<&AppHandle<R>>,
+        id: &str,
+    ) -> Result<McpServerRuntime, String> {
         let (child, tracker, stopping) = {
             let mut inner = self.inner.lock().await;
-            if let Some(task) = inner.watchers.remove(id) { task.abort(); }
+            if let Some(task) = inner.watchers.remove(id) {
+                task.abort();
+            }
             inner.cancel_calls.remove(id);
             let tracker = inner.calls_in_flight.remove(id);
-            let handle = inner.handles.get_mut(id).ok_or_else(|| format!("no such server: {id}"))?;
+            let handle = inner
+                .handles
+                .get_mut(id)
+                .ok_or_else(|| format!("no such server: {id}"))?;
             let child = handle.child.take();
             handle.remote.take();
             handle.status = McpServerStatus::Stopping;
@@ -560,14 +731,31 @@ impl McpRegistry {
             (child, tracker, McpServerRuntime::from_handle(handle))
         };
         emit_status_with_bus(app, &self.status_tx, &stopping);
-        let result = match child.as_ref() { Some(child) => child.shutdown().await.map_err(|e| e.to_string()), None => Ok(()) };
-        if let Some(tracker) = tracker { tracker.wait_idle().await; }
+        let result = match child.as_ref() {
+            Some(child) => child.shutdown().await.map_err(|e| e.to_string()),
+            None => Ok(()),
+        };
+        if let Some(tracker) = tracker {
+            tracker.wait_idle().await;
+        }
         let row = {
             let mut inner = self.inner.lock().await;
-            let handle = inner.handles.get_mut(id).ok_or_else(|| format!("server vanished after stop: {id}"))?;
+            let handle = inner
+                .handles
+                .get_mut(id)
+                .ok_or_else(|| format!("server vanished after stop: {id}"))?;
             match &result {
-                Ok(()) => { handle.status = McpServerStatus::Stopped; handle.server_info = None; handle.started_at_ms = None; },
-                Err(message) => { handle.status = McpServerStatus::Errored { message: format!("Could not confirm MCP shutdown: {message}") }; handle.child = child; },
+                Ok(()) => {
+                    handle.status = McpServerStatus::Stopped;
+                    handle.server_info = None;
+                    handle.started_at_ms = None;
+                }
+                Err(message) => {
+                    handle.status = McpServerStatus::Errored {
+                        message: format!("Could not confirm MCP shutdown: {message}"),
+                    };
+                    handle.child = child;
+                }
             }
             McpServerRuntime::from_handle(handle)
         };
@@ -627,8 +815,11 @@ impl McpRegistry {
     /// retained from earlier attempts.
     pub async fn list_runtime(&self) -> Vec<McpServerRuntime> {
         let inner = self.inner.lock().await;
-        let mut out: Vec<McpServerRuntime> =
-            inner.handles.values().map(McpServerRuntime::from_handle).collect();
+        let mut out: Vec<McpServerRuntime> = inner
+            .handles
+            .values()
+            .map(McpServerRuntime::from_handle)
+            .collect();
         out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         out
     }
@@ -642,10 +833,7 @@ impl McpRegistry {
     /// Running tools except servers already native to `source`. This lets a
     /// provider keep its own authenticated/native MCPs while Codemux injects
     /// only the tools it would otherwise be missing.
-    pub async fn list_all_tools_excluding_source(
-        &self,
-        source: McpConfigSource,
-    ) -> Vec<McpTool> {
+    pub async fn list_all_tools_excluding_source(&self, source: McpConfigSource) -> Vec<McpTool> {
         self.list_all_tools_excluding_sources(&[source]).await
     }
 
@@ -660,11 +848,21 @@ impl McpRegistry {
         self.list_tools_for_workspace(sources, None).await
     }
 
-    pub async fn list_tools_for_workspace(&self, sources: &[McpConfigSource], workspace_id: Option<&str>) -> Vec<McpTool> {
+    pub async fn list_tools_for_workspace(
+        &self,
+        sources: &[McpConfigSource],
+        workspace_id: Option<&str>,
+    ) -> Vec<McpTool> {
         let inner = self.inner.lock().await;
         let mut tools = Vec::new();
         for handle in inner.handles.values() {
-            if inner.plugins.get(&handle.config.id).is_some_and(|r| !r.scope.visible(workspace_id)) { continue; }
+            if inner
+                .plugins
+                .get(&handle.config.id)
+                .is_some_and(|r| !r.scope.visible(workspace_id))
+            {
+                continue;
+            }
             let provider_native = handle
                 .config
                 .sources
@@ -672,9 +870,15 @@ impl McpRegistry {
                 .any(|source| sources.contains(source));
             if handle.status.is_running() && !provider_native {
                 let is_self = handle.config.sources.contains(&McpConfigSource::Codemux);
-                tools.extend(handle.tools.iter().filter(|tool|
-                    !is_self || !crate::agent_control::is_native_tool(&tool.name)
-                ).cloned());
+                tools.extend(
+                    handle
+                        .tools
+                        .iter()
+                        .filter(|tool| {
+                            !is_self || !crate::agent_control::is_native_tool(&tool.name)
+                        })
+                        .cloned(),
+                );
             }
         }
         tools
@@ -685,8 +889,14 @@ impl McpRegistry {
         let config = super::codemux_self::codemux_self_config();
         let mut handle = McpServerHandle::discovered(config);
         handle.tools = crate::mcp_server::remote_delegation_tools_for_test();
-        handle.status = McpServerStatus::Running { tool_count: handle.tools.len() };
-        self.inner.lock().await.handles.insert(handle.config.id.clone(), handle);
+        handle.status = McpServerStatus::Running {
+            tool_count: handle.tools.len(),
+        };
+        self.inner
+            .lock()
+            .await
+            .handles
+            .insert(handle.config.id.clone(), handle);
     }
     /// Stage a running server with a single tool, for tests in sibling
     /// modules (the gateway) that need a populated registry without
@@ -768,16 +978,32 @@ impl McpRegistry {
         arguments: serde_json::Value,
         workspace_id: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        self.dispatch_tool_call_inner(prefixed_name, arguments, workspace_id, None).await
+        self.dispatch_tool_call_inner(prefixed_name, arguments, workspace_id, None)
+            .await
     }
 
-    async fn dispatch_tool_call_inner(&self, prefixed_name: &str, arguments: serde_json::Value, workspace_id: Option<&str>, owned_server: Option<&str>) -> Result<serde_json::Value, String> {
+    async fn dispatch_tool_call_inner(
+        &self,
+        prefixed_name: &str,
+        arguments: serde_json::Value,
+        workspace_id: Option<&str>,
+        owned_server: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
         let (raw_name, is_codemux_self, child, remote, mut cancelled, mut call_guard) = {
             let inner = self.inner.lock().await;
             let mut found = None;
             for handle in inner.handles.values() {
-                if owned_server.is_some_and(|id| id != handle.config.id) { continue; }
-                if owned_server.is_none() && inner.plugins.get(&handle.config.id).is_some_and(|r| !r.scope.visible(workspace_id)) { continue; }
+                if owned_server.is_some_and(|id| id != handle.config.id) {
+                    continue;
+                }
+                if owned_server.is_none()
+                    && inner
+                        .plugins
+                        .get(&handle.config.id)
+                        .is_some_and(|r| !r.scope.visible(workspace_id))
+                {
+                    continue;
+                }
                 for tool in &handle.tools {
                     if tool.prefixed_name == prefixed_name {
                         if !handle.status.is_running() {
@@ -801,13 +1027,36 @@ impl McpRegistry {
                             .config
                             .sources
                             .contains(&super::McpConfigSource::Codemux);
-                        let cancelled = inner.cancel_calls.get(&handle.config.id).map(|tx| tx.subscribe());
-                        let activity = inner.plugins.get(&handle.config.id).and_then(|r| self.activity.get().map(|emit| {
-                            let event = PluginMcpActivity { plugin_id: r.plugin_id.clone(), server_id: handle.config.id.clone(), phase: "start".into(), call_id: uuid::Uuid::new_v4().to_string(), tool_name: tool.name.clone(), prefixed_name: tool.prefixed_name.clone(), workspace_id: workspace_id.map(str::to_owned), is_error: None, duration_ms: None };
-                            emit(event.clone());
-                            plugin::ActivityGuard { event, started: std::time::Instant::now(), emit: emit.clone() }
-                        }));
-                        let tracker = inner.calls_in_flight.get(&handle.config.id).cloned().unwrap_or_default();
+                        let cancelled = inner
+                            .cancel_calls
+                            .get(&handle.config.id)
+                            .map(|tx| tx.subscribe());
+                        let activity = inner.plugins.get(&handle.config.id).and_then(|r| {
+                            self.activity.get().map(|emit| {
+                                let event = PluginMcpActivity {
+                                    plugin_id: r.plugin_id.clone(),
+                                    server_id: handle.config.id.clone(),
+                                    phase: "start".into(),
+                                    call_id: uuid::Uuid::new_v4().to_string(),
+                                    tool_name: tool.name.clone(),
+                                    prefixed_name: tool.prefixed_name.clone(),
+                                    workspace_id: workspace_id.map(str::to_owned),
+                                    is_error: None,
+                                    duration_ms: None,
+                                };
+                                emit(event.clone());
+                                plugin::ActivityGuard {
+                                    event,
+                                    started: std::time::Instant::now(),
+                                    emit: emit.clone(),
+                                }
+                            })
+                        });
+                        let tracker = inner
+                            .calls_in_flight
+                            .get(&handle.config.id)
+                            .cloned()
+                            .unwrap_or_default();
                         let guard = plugin::CallGuard::new(tracker, activity);
                         found = Some((tool.name.clone(), is_self, child, remote, cancelled, guard));
                         break;
@@ -832,14 +1081,42 @@ impl McpRegistry {
         let params = tool_call_params(&raw_name, arguments, is_codemux_self, workspace_id);
         let call = async {
             if let Some(child) = child {
-                child.request("tools/call", params).await.map_err(|e| format!("tools/call failed: {e}"))
+                child
+                    .request("tools/call", params)
+                    .await
+                    .map_err(|e| format!("tools/call failed: {e}"))
             } else if let Some(remote) = remote {
-                tokio::time::timeout(super::runtime::DEFAULT_REQUEST_TIMEOUT, remote.request("tools/call", params)).await.map_err(|_| "tools/call timed out".to_string())?
-            } else { Err("MCP transport disappeared before tools/call".into()) }
+                tokio::time::timeout(
+                    super::runtime::DEFAULT_REQUEST_TIMEOUT,
+                    remote.request("tools/call", params),
+                )
+                .await
+                .map_err(|_| "tools/call timed out".to_string())?
+            } else {
+                Err("MCP transport disappeared before tools/call".into())
+            }
         };
-        let cancellation = async { match cancelled.as_mut() { Some(rx) => { let _ = rx.changed().await; }, None => std::future::pending::<()>().await } };
+        let cancellation = async {
+            match cancelled.as_mut() {
+                Some(rx) => {
+                    let _ = rx.changed().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
         let result = tokio::select! { biased; _ = cancellation => Err("MCP server stopped during tools/call".into()), result = call => result };
-        if let Some(guard) = call_guard.activity.as_mut() { guard.event.is_error = Some(result.as_ref().map(|r| r.get("isError").and_then(serde_json::Value::as_bool).unwrap_or(false)).unwrap_or(true)); }
+        if let Some(guard) = call_guard.activity.as_mut() {
+            guard.event.is_error = Some(
+                result
+                    .as_ref()
+                    .map(|r| {
+                        r.get("isError")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(true),
+            );
+        }
         result
     }
 
@@ -851,7 +1128,9 @@ impl McpRegistry {
             let mut inner = self.inner.lock().await;
             let mut out = Vec::new();
             inner.cancel_calls.clear();
-            for (_, task) in inner.watchers.drain() { task.abort(); }
+            for (_, task) in inner.watchers.drain() {
+                task.abort();
+            }
             for handle in inner.handles.values_mut() {
                 if let Some(child) = handle.child.take() {
                     out.push(child);
@@ -987,18 +1266,28 @@ pub(crate) mod test_support {
     use mockito::Matcher;
 
     pub(crate) async fn plugin_fixture(scope: &str) -> McpRegistry {
-        let registry=McpRegistry::new();
+        let registry = McpRegistry::new();
         let server=serde_json::from_value(serde_json::json!({
             "id":"fixture","name":"Fixture","toolPrefix":"fixture","scope":scope,
             "toolDescriptions":{"new_tool":{"replace":"Use structured tools first.","append":"Always use background delivery."}},
             "transport":"stdio","command":"python3","args":[format!("{}/tests/fixtures/plugin_mcp.py",env!("CARGO_MANIFEST_DIR"))]
         })).unwrap();
-        registry.register_plugin_server::<tauri::Wry>(None,"test-plugin","token".into(),server).await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10),async{
-            while registry.list_tools_for_server("plugin:test-plugin:fixture").await.len()!=4 {
+        registry
+            .register_plugin_server::<tauri::Wry>(None, "test-plugin", "token".into(), server)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while registry
+                .list_tools_for_server("plugin:test-plugin:fixture")
+                .await
+                .len()
+                != 4
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         registry
     }
 
@@ -1012,7 +1301,9 @@ pub(crate) mod test_support {
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/mcp")
-            .match_body(Matcher::PartialJson(serde_json::json!({ "method": "initialize" })))
+            .match_body(Matcher::PartialJson(
+                serde_json::json!({ "method": "initialize" }),
+            ))
             .with_header("content-type", "application/json")
             .with_body(
                 serde_json::json!({
@@ -1038,7 +1329,9 @@ pub(crate) mod test_support {
             .await;
         server
             .mock("POST", "/mcp")
-            .match_body(Matcher::PartialJson(serde_json::json!({ "method": "tools/list" })))
+            .match_body(Matcher::PartialJson(
+                serde_json::json!({ "method": "tools/list" }),
+            ))
             .with_header("content-type", "application/json")
             .with_body(
                 serde_json::json!({
@@ -1137,8 +1430,9 @@ mod tests {
             prefixed_name: &str,
             _arguments: &serde_json::Value,
         ) -> Option<serde_json::Value> {
-            (prefixed_name == "mcp__codemux__echo")
-                .then(|| serde_json::json!({ "content": [{"type": "text", "text": caller.thread_id}] }))
+            (prefixed_name == "mcp__codemux__echo").then(
+                || serde_json::json!({ "content": [{"type": "text", "text": caller.thread_id}] }),
+            )
         }
     }
 
@@ -1146,7 +1440,9 @@ mod tests {
     #[tokio::test]
     async fn local_and_remote_delegation_keep_distinct_real_prefixes_when_local_is_disabled() {
         use crate::agent_provider::ProviderKind;
-        use crate::commands::delegation::{DelegationHost, DelegationState, DELEGATION_SETTING_KEY};
+        use crate::commands::delegation::{
+            DelegationHost, DelegationState, DELEGATION_SETTING_KEY,
+        };
         use tauri::Manager;
         let app = tauri::test::mock_app();
         app.manage(crate::database::DatabaseStore::new_in_memory());
@@ -1272,15 +1568,21 @@ mod tests {
             permission_mode: None,
         };
         assert!(reg.host_tools(&caller).is_empty(), "nothing before install");
-        assert!(reg.host_call(&caller, "mcp__codemux__echo", &serde_json::json!({})).is_none());
+        assert!(reg
+            .host_call(&caller, "mcp__codemux__echo", &serde_json::json!({}))
+            .is_none());
 
         // Installing through a clone reaches every other clone.
         reg.clone_handle().set_host_tools(Arc::new(EchoHost));
         let tools = reg.host_tools(&caller);
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].description.as_deref(), Some("thread-1"));
-        assert!(reg.host_call(&caller, "mcp__codemux__echo", &serde_json::json!({})).is_some());
-        assert!(reg.host_call(&caller, "mcp__codemux__other", &serde_json::json!({})).is_none());
+        assert!(reg
+            .host_call(&caller, "mcp__codemux__echo", &serde_json::json!({}))
+            .is_some());
+        assert!(reg
+            .host_call(&caller, "mcp__codemux__other", &serde_json::json!({}))
+            .is_none());
 
         // The gateway / `codemux mcp` surfaces stay unaware of host tools.
         assert!(reg.list_all_tools().await.is_empty());
@@ -1300,30 +1602,58 @@ mod tests {
             handle.tools[0].name = "thread_launch".into();
             handle.tools[0].prefixed_name = "mcp__codemux__thread_launch".into();
         }
-        let call = server.mock("POST", "/mcp")
-            .match_body(Matcher::PartialJson(serde_json::json!({"method":"tools/call","params":{"name":"thread_launch"}})))
+        let call = server
+            .mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(
+                serde_json::json!({"method":"tools/call","params":{"name":"thread_launch"}}),
+            ))
             .with_header("content-type", "application/json")
-            .with_body(serde_json::json!({"jsonrpc":"2.0","id":3,"result":{"content":[]}}).to_string())
-            .expect(0).create_async().await;
+            .with_body(
+                serde_json::json!({"jsonrpc":"2.0","id":3,"result":{"content":[]}}).to_string(),
+            )
+            .expect(0)
+            .create_async()
+            .await;
         let result = registry.dispatch_tool_call("mcp__codemux__thread_launch",
             serde_json::json!({"workspace_id":"worker-ws","provider":"codex","permission_mode":"danger-full-access","client_request_id":"nested"}),
             Some("worker-ws")).await;
-        assert!(result.is_err(), "provider relay must not confer trusted native-controller authority: {result:?}");
+        assert!(
+            result.is_err(),
+            "provider relay must not confer trusted native-controller authority: {result:?}"
+        );
         assert!(result.unwrap_err().starts_with("provider_control_denied:"));
         call.assert_async().await;
-        assert!(!registry.list_all_tools().await.iter().any(|t| t.name == "thread_launch"),
-            "provider snapshot must not advertise an unusable trusted control route");
-        assert!(!registry.list_all_tools_excluding_source(McpConfigSource::CodexUser).await.iter().any(|t| t.name == "thread_launch"));
+        assert!(
+            !registry
+                .list_all_tools()
+                .await
+                .iter()
+                .any(|t| t.name == "thread_launch"),
+            "provider snapshot must not advertise an unusable trusted control route"
+        );
+        assert!(!registry
+            .list_all_tools_excluding_source(McpConfigSource::CodexUser)
+            .await
+            .iter()
+            .any(|t| t.name == "thread_launch"));
         // Controller discovery itself and Settings retain the native catalog.
-        assert!(crate::agent_control::native_tools().iter().any(|t| t.name == "thread_launch"));
-        assert!(registry.list_tools_for_server("codemux-remote").await.iter().any(|t| t.name == "thread_launch"));
+        assert!(crate::agent_control::native_tools()
+            .iter()
+            .any(|t| t.name == "thread_launch"));
+        assert!(registry
+            .list_tools_for_server("codemux-remote")
+            .await
+            .iter()
+            .any(|t| t.name == "thread_launch"));
     }
 
     #[tokio::test]
     async fn ensure_started_marks_errored_on_bad_command() {
         let reg = McpRegistry::new();
         let cfg = make_config("bad", "bad", "/no/such/binary/at/all");
-        let row = reg.ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, cfg).await;
+        let row = reg
+            .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, cfg)
+            .await;
         assert!(matches!(row.status, McpServerStatus::Errored { .. }));
         assert!(row.error_message.is_some());
     }
@@ -1331,11 +1661,16 @@ mod tests {
     #[tokio::test]
     async fn disabled_ids_short_circuit_ensure_started() {
         let reg = McpRegistry::new();
-        reg.set_disabled_ids(None::<&tauri::AppHandle<tauri::Wry>>, vec!["disabled-srv".into()])
-            .await
-            .unwrap();
+        reg.set_disabled_ids(
+            None::<&tauri::AppHandle<tauri::Wry>>,
+            vec!["disabled-srv".into()],
+        )
+        .await
+        .unwrap();
         let cfg = make_config("disabled-srv", "disabled", "/no/such/binary");
-        let row = reg.ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, cfg).await;
+        let row = reg
+            .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, cfg)
+            .await;
         assert!(matches!(row.status, McpServerStatus::Stopped));
         // No handle should have been inserted because we short-circuited.
         let listed = reg.list_runtime().await;
@@ -1345,9 +1680,12 @@ mod tests {
     #[tokio::test]
     async fn codemux_self_cannot_be_disabled() {
         let reg = McpRegistry::new();
-        reg.set_disabled_ids(None::<&tauri::AppHandle<tauri::Wry>>, vec!["codemux-self".into()])
-            .await
-            .unwrap();
+        reg.set_disabled_ids(
+            None::<&tauri::AppHandle<tauri::Wry>>,
+            vec!["codemux-self".into()],
+        )
+        .await
+        .unwrap();
         // The set should ignore the codemux-self id.
         assert!(!reg.is_disabled("codemux-self").await);
     }
@@ -1360,17 +1698,25 @@ mod tests {
         {
             let mut inner = reg.inner.lock().await;
             let mut h = McpServerHandle::discovered(make_config("x", "x", "/bin/true"));
-            h.status = McpServerStatus::Errored { message: "boom".into() };
+            h.status = McpServerStatus::Errored {
+                message: "boom".into(),
+            };
             inner.handles.insert("x".into(), h);
         }
-        let row = reg.stop_server(None::<&tauri::AppHandle<tauri::Wry>>, "x").await.unwrap();
+        let row = reg
+            .stop_server(None::<&tauri::AppHandle<tauri::Wry>>, "x")
+            .await
+            .unwrap();
         assert!(matches!(row.status, McpServerStatus::Stopped));
     }
 
     #[tokio::test]
     async fn stop_server_unknown_id_errors() {
         let reg = McpRegistry::new();
-        let err = reg.stop_server(None::<&tauri::AppHandle<tauri::Wry>>, "nope").await.unwrap_err();
+        let err = reg
+            .stop_server(None::<&tauri::AppHandle<tauri::Wry>>, "nope")
+            .await
+            .unwrap_err();
         assert!(err.contains("no such server"));
     }
 
@@ -1556,8 +1902,7 @@ mod tests {
         // against the built-in server must produce an outbound `tools/call`
         // whose params carry `_meta[WORKSPACE_META_KEY]` — the mock only
         // answers a request that has it.
-        let (_server, reg, call) =
-            super::test_support::codemux_remote_server("ws-42").await;
+        let (_server, reg, call) = super::test_support::codemux_remote_server("ws-42").await;
         let result = reg
             .dispatch_tool_call(
                 "mcp__codemux-remote__echo",
@@ -1587,7 +1932,9 @@ mod tests {
             let mut inner = reg.inner.lock().await;
             let mut h = McpServerHandle::discovered(make_config("github", "github", "/bin/true"));
             // Errored — has tools metadata but no live child.
-            h.status = McpServerStatus::Errored { message: "x".into() };
+            h.status = McpServerStatus::Errored {
+                message: "x".into(),
+            };
             h.tools.push(McpTool {
                 name: "create_issue".into(),
                 prefixed_name: "mcp__github__create_issue".into(),
@@ -1690,13 +2037,12 @@ mod tests {
         let row = reg
             .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
             .await;
-        assert!(matches!(row.status, McpServerStatus::Running { tool_count: 1 }));
+        assert!(matches!(
+            row.status,
+            McpServerStatus::Running { tool_count: 1 }
+        ));
         let result = reg
-            .dispatch_tool_call(
-                "mcp__remote__echo",
-                serde_json::json!({"text": "hi"}),
-                None,
-            )
+            .dispatch_tool_call("mcp__remote__echo", serde_json::json!({"text": "hi"}), None)
             .await
             .unwrap();
         assert_eq!(result["content"][0]["text"], "hi");
@@ -1719,7 +2065,10 @@ mod tests {
         let row = reg
             .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
             .await;
-        assert!(matches!(row.status, McpServerStatus::Running { .. }), "{row:?}");
+        assert!(
+            matches!(row.status, McpServerStatus::Running { .. }),
+            "{row:?}"
+        );
         let tool = reg
             .list_all_tools()
             .await
@@ -1734,7 +2083,10 @@ mod tests {
             )
             .await
             .expect("real MCP tool call should succeed");
-        assert!(result.get("content").and_then(serde_json::Value::as_array).is_some());
+        assert!(result
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .is_some());
         reg.shutdown_all().await;
     }
 
@@ -1747,7 +2099,9 @@ mod tests {
             h.status = McpServerStatus::Running { tool_count: 0 };
             inner.handles.insert("x".into(), h);
         }
-        reg.set_disabled_ids(None::<&tauri::AppHandle<tauri::Wry>>, vec!["x".into()]).await.unwrap();
+        reg.set_disabled_ids(None::<&tauri::AppHandle<tauri::Wry>>, vec!["x".into()])
+            .await
+            .unwrap();
         let rows = reg.list_runtime().await;
         let row = rows.iter().find(|r| r.id == "x").unwrap();
         assert!(matches!(row.status, McpServerStatus::Stopped));

@@ -25,12 +25,15 @@ pub struct HttpMcpClient {
 impl HttpMcpClient {
     pub async fn connect(config: &McpServerConfig) -> Result<Self, String> {
         let headers = headers_from_config(config)?;
-        let mut http = reqwest::Client::builder();
+        let mut http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
         // Local MCP credentials must never travel through an environment
         // proxy. Remote servers retain the user's normal proxy settings.
-        if loopback_url(&config.command) { http = http.no_proxy(); }
+        if loopback_url(&config.command) {
+            http = http.no_proxy();
+        }
         let client = Self {
-            http: http.build()
+            http: http
+                .build()
                 .map_err(|error| format!("build HTTP client: {error}"))?,
             url: config.command.clone(),
             headers,
@@ -68,32 +71,45 @@ impl HttpMcpClient {
         self.notifications.subscribe()
     }
 
-    /// A server may refuse GET (405) when it has no unsolicited events.
+    /// Streamable HTTP GET is optional. Retry even a 405: a restarted
+    /// server may gain notification support, and finite streams need renewal.
     pub async fn listen_notifications(&self) {
-        let mut request = self
-            .http
-            .get(&self.url)
-            .headers(self.headers.clone())
-            .header(ACCEPT, "text/event-stream")
-            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
-        if let Some(id) = self.session_id.lock().await.clone() {
-            request = request.header("mcp-session-id", id);
-        }
-        let Ok(response) = request.send().await else {
-            return;
-        };
-        if !response.status().is_success() {
-            return;
-        }
-        let mut stream = response.bytes_stream();
-        let mut decoder = SseDecoder::default();
-        while let Some(Ok(bytes)) = stream.next().await {
-            let Ok(messages) = decoder.push(&bytes) else {
-                return;
-            };
-            for value in messages {
-                self.emit_notification(&value);
+        let mut backoff = std::time::Duration::from_millis(100);
+        loop {
+            let mut request = self
+                .http
+                .get(&self.url)
+                .headers(self.headers.clone())
+                .header(ACCEPT, "text/event-stream")
+                .header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
+            if let Some(id) = self.session_id.lock().await.clone() {
+                request = request.header("mcp-session-id", id);
             }
+            if let Ok(response) = request.send().await {
+                if response.status().is_success() {
+                    // Reconcile after reconnect even if changes occurred while
+                    // disconnected and the server sends no fresh notification.
+                    self.emit_notification(&json!({"method":"notifications/tools/list_changed"}));
+                    let mut stream = response.bytes_stream();
+                    let mut decoder = SseDecoder::default();
+                    while let Some(Ok(bytes)) = stream.next().await {
+                        let Ok(messages) = decoder.push(&bytes) else {
+                            break;
+                        };
+                        for value in messages {
+                            self.emit_notification(&value);
+                        }
+                    }
+                } else if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    // An expired server-side session needs a new initialize.
+                    *self.session_id.lock().await = None;
+                    if self.request("initialize", json!({"protocolVersion":MCP_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"codemux","version":env!("CARGO_PKG_VERSION")}})).await.is_ok() {
+                        let _ = self.notify("notifications/initialized", json!({})).await;
+                    }
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
         }
     }
     fn emit_notification(&self, value: &Value) {
@@ -167,7 +183,22 @@ impl HttpMcpClient {
             .unwrap_or_default()
             .to_string();
         if !status.is_success() {
-            return Err(format!("HTTP status {}", status.as_u16()));
+            let mut stream = response.bytes_stream();
+            let mut body = Vec::new();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while let Some(Ok(chunk)) = stream.next().await {
+                    body.extend_from_slice(&chunk[..chunk.len().min(4096 - body.len())]);
+                    if body.len() == 4096 {
+                        break;
+                    }
+                }
+            })
+            .await;
+            return Err(format!(
+                "HTTP status {}: {}",
+                status.as_u16(),
+                String::from_utf8_lossy(&body)
+            ));
         }
         if content_type.contains("text/event-stream") {
             let expected_id = message.get("id");
@@ -196,12 +227,20 @@ impl HttpMcpClient {
     }
 }
 
-fn loopback_url(value: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(value) else { return false; };
-    let Some(host) = url.host_str() else { return false; };
+pub(super) fn loopback_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
     let host = host.trim_end_matches('.');
-    host == "localhost" || host.ends_with(".localhost")
-        || host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 #[derive(Default)]
@@ -389,6 +428,163 @@ mod live_tests {
         }))
     }
     #[tokio::test]
+    async fn plugin_mcp_http_redirects_do_not_forward_custom_credentials() {
+        use axum::{extract::State, response::IntoResponse};
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let destination = Router::new()
+            .route(
+                "/",
+                post(
+                    |State(count): State<Arc<std::sync::atomic::AtomicUsize>>| async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "destination"
+                    },
+                ),
+            )
+            .with_state(received.clone());
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = format!("http://{}/", socket.local_addr().unwrap());
+        let target = tokio::spawn(async move {
+            axum::serve(socket, destination).await.unwrap();
+        });
+        let redirect = Router::new().route(
+            "/",
+            post(move || {
+                let location = location.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [("location", location)],
+                        "fixture redirect",
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", socket.local_addr().unwrap());
+        let source = tokio::spawn(async move {
+            axum::serve(socket, redirect).await.unwrap();
+        });
+        // Establish the pre-fix reqwest behaviour with synthetic credentials.
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(&url)
+            .header("x-api-key", "fixture-only")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(received.load(Ordering::SeqCst), 1);
+        let config = McpServerConfig {
+            id: "redirect".into(),
+            name: "redirect".into(),
+            sources: vec![],
+            command: url,
+            args: vec![],
+            env: Default::default(),
+            disabled: false,
+            transport: super::super::McpTransport::Http,
+            raw: json!({"headers":{"x-api-key":"fixture-only"}}),
+        };
+        let error = HttpMcpClient::connect(&config).await.unwrap_err();
+        assert!(
+            error.contains("307") && error.contains("fixture redirect"),
+            "{error}"
+        );
+        assert_eq!(
+            received.load(Ordering::SeqCst),
+            1,
+            "redirect forwarded custom credentials"
+        );
+        source.abort();
+        target.abort();
+    }
+    #[tokio::test]
+    async fn plugin_mcp_http_reconnects_and_reconciles() {
+        for initial_status in [405, 503, 200] {
+            let fixture = Fixture {
+                ready: Arc::new(AtomicBool::new(false)),
+                connected: Arc::new(AtomicBool::new(false)),
+                changes: broadcast::channel(8).0,
+            };
+            let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = connections.clone();
+            let ready = fixture.ready.clone();
+            let fail_list = Arc::new(AtomicBool::new(true));
+            let app = Router::new()
+                .route(
+                    "/mcp",
+                    post(
+                        move |State(fixture): State<Fixture>, Json(request): Json<Value>| {
+                            let fail_list = fail_list.clone();
+                            async move {
+                                use axum::response::IntoResponse;
+                                if request["method"] == "tools/list"
+                                    && fixture.ready.load(Ordering::SeqCst)
+                                    && fail_list.swap(false, Ordering::SeqCst)
+                                {
+                                    return (
+                                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                        "fixture restarting",
+                                    )
+                                        .into_response();
+                                }
+                                handle(State(fixture), Json(request)).await
+                            }
+                        },
+                    )
+                    .get(move || {
+                        let count = count.clone();
+                        let ready = ready.clone();
+                        async move {
+                            use axum::response::IntoResponse;
+                            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                                (
+                                    axum::http::StatusCode::from_u16(initial_status).unwrap(),
+                                    [("content-type", "text/event-stream")],
+                                    ": first stream ended\n\n",
+                                )
+                                    .into_response()
+                            } else {
+                                ready.store(true, Ordering::SeqCst);
+                                // No list_changed event: the reconnect itself must reconcile.
+                                ([("content-type", "text/event-stream")], ": reconnected\n\n")
+                                    .into_response()
+                            }
+                        }
+                    }),
+                )
+                .with_state(fixture);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let registry = crate::mcp::registry::McpRegistry::new();
+            registry.register_plugin_server::<tauri::Wry>(None, "demo", "http".into(), serde_json::from_value(json!({"id":"http","name":"HTTP fixture","toolPrefix":"httpfixture","scope":"all","transport":"http","url":url})).unwrap()).await.unwrap();
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+                while registry
+                    .list_tools_for_server("plugin:demo:http")
+                    .await
+                    .len()
+                    != 2
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            registry.shutdown_all().await;
+            task.abort();
+            assert!(
+                observed.is_ok(),
+                "no reconciliation after status {initial_status}; GET count {}",
+                connections.load(Ordering::SeqCst)
+            );
+        }
+    }
+    #[tokio::test]
     async fn plugin_mcp_http_pagination_and_live_notification() {
         let fixture = Fixture {
             ready: Arc::new(AtomicBool::new(false)),
@@ -447,10 +643,21 @@ mod live_tests {
 
     #[test]
     fn plugin_mcp_loopback_host_classification() {
-        for url in ["http://127.0.0.1/mcp", "https://127.9.8.7/mcp", "http://[::1]/mcp", "http://localhost/mcp", "http://localhost./mcp", "http://app.localhost/mcp"] {
+        for url in [
+            "http://127.0.0.1/mcp",
+            "https://127.9.8.7/mcp",
+            "http://[::1]/mcp",
+            "http://localhost/mcp",
+            "http://localhost./mcp",
+            "http://app.localhost/mcp",
+        ] {
             assert!(loopback_url(url), "{url}");
         }
-        for url in ["https://example.com/mcp", "http://localhost.example/mcp", "http://192.168.1.1/mcp"] {
+        for url in [
+            "https://example.com/mcp",
+            "http://localhost.example/mcp",
+            "http://192.168.1.1/mcp",
+        ] {
             assert!(!loopback_url(url), "{url}");
         }
     }
@@ -467,54 +674,121 @@ mod live_tests {
             assert!(status.success());
             return;
         }
-        use axum::{body::Bytes, extract::State, http::{HeaderMap, StatusCode}, response::IntoResponse, Json, Router};
+        use axum::{
+            body::Bytes,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            Json, Router,
+        };
         use std::sync::{Arc, Mutex};
-        async fn peer(State(auth): State<Arc<Mutex<Vec<String>>>>, headers: HeaderMap, body: Bytes) -> axum::response::Response {
-            auth.lock().unwrap().push(headers.get("authorization").and_then(|h|h.to_str().ok()).unwrap_or("").into());
+        async fn peer(
+            State(auth): State<Arc<Mutex<Vec<String>>>>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> axum::response::Response {
+            auth.lock().unwrap().push(
+                headers
+                    .get("authorization")
+                    .and_then(|h| h.to_str().ok())
+                    .unwrap_or("")
+                    .into(),
+            );
             if body.is_empty() {
                 return ([("content-type", "text/event-stream")], "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n").into_response();
             }
             let request: Value = serde_json::from_slice(&body).unwrap();
-            if request.get("id").is_none() { return StatusCode::ACCEPTED.into_response(); }
+            if request.get("id").is_none() {
+                return StatusCode::ACCEPTED.into_response();
+            }
             let result = if request["method"] == "initialize" {
                 json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"proxy-fixture","version":"1"}})
-            } else { json!({"tools":[]}) };
+            } else {
+                json!({"tools":[]})
+            };
             Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result})).into_response()
         }
         async fn server(auth: Arc<Mutex<Vec<String>>>) -> (String, tokio::task::JoinHandle<()>) {
             let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", socket.local_addr().unwrap());
             let app = Router::new().fallback(peer).with_state(auth);
-            let task = tokio::spawn(async move { axum::serve(socket, app).await.unwrap(); });
+            let task = tokio::spawn(async move {
+                axum::serve(socket, app).await.unwrap();
+            });
             (url, task)
         }
         let proxied = Arc::new(Mutex::new(Vec::new()));
         let local = Arc::new(Mutex::new(Vec::new()));
         let (proxy, proxy_task) = server(proxied.clone()).await;
         let (target, target_task) = server(local.clone()).await;
-        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] { std::env::set_var(key, &proxy); }
-        for key in ["NO_PROXY", "no_proxy"] { std::env::remove_var(key); }
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            std::env::set_var(key, &proxy);
+        }
+        for key in ["NO_PROXY", "no_proxy"] {
+            std::env::remove_var(key);
+        }
 
         // Confirm the original default-client behavior in this same harness.
-        reqwest::Client::new().get(format!("{target}/mcp")).header("authorization", "Bearer loopback-test").send().await.unwrap();
+        reqwest::Client::new()
+            .get(format!("{target}/mcp"))
+            .header("authorization", "Bearer loopback-test")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(*proxied.lock().unwrap(), vec!["Bearer loopback-test"]);
         proxied.lock().unwrap().clear();
 
         let config = |url: String, token: &str| McpServerConfig {
-            id:"proxy-fixture".into(),name:"Proxy fixture".into(),sources:vec![super::super::McpConfigSource::Plugin],command:url,args:vec![],env:Default::default(),disabled:false,transport:super::super::McpTransport::Http,
-            raw:json!({"headers":{"Authorization":format!("Bearer {token}")}}),
+            id: "proxy-fixture".into(),
+            name: "Proxy fixture".into(),
+            sources: vec![super::super::McpConfigSource::Plugin],
+            command: url,
+            args: vec![],
+            env: Default::default(),
+            disabled: false,
+            transport: super::super::McpTransport::Http,
+            raw: json!({"headers":{"Authorization":format!("Bearer {token}")}}),
         };
-        let client = HttpMcpClient::connect(&config(format!("{target}/mcp"), "loopback-test")).await.unwrap();
+        let client = HttpMcpClient::connect(&config(format!("{target}/mcp"), "loopback-test"))
+            .await
+            .unwrap();
         client.request("tools/list", json!({})).await.unwrap();
         let mut notifications = client.notifications();
-        client.listen_notifications().await;
-        assert_eq!(notifications.try_recv().unwrap().method, "notifications/tools/list_changed");
-        assert!(proxied.lock().unwrap().is_empty(), "loopback credentials reached proxy");
-        assert_eq!(local.lock().unwrap().len(), 4);
-        assert!(local.lock().unwrap().iter().all(|auth| auth == "Bearer loopback-test"));
+        tokio::select! {
+            _ = client.listen_notifications() => panic!("notification listener ended"),
+            event = notifications.recv() => assert_eq!(event.unwrap().method, "notifications/tools/list_changed"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => panic!("GET did not reconcile"),
+        }
 
-        HttpMcpClient::connect(&config("http://remote-mcp.invalid/mcp".into(), "remote-test")).await.unwrap();
-        assert_eq!(*proxied.lock().unwrap(), vec!["Bearer remote-test", "Bearer remote-test"]);
-        proxy_task.abort(); target_task.abort();
+        assert!(
+            proxied.lock().unwrap().is_empty(),
+            "loopback credentials reached proxy"
+        );
+        assert_eq!(local.lock().unwrap().len(), 4);
+        assert!(local
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|auth| auth == "Bearer loopback-test"));
+
+        HttpMcpClient::connect(&config(
+            "http://remote-mcp.invalid/mcp".into(),
+            "remote-test",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            *proxied.lock().unwrap(),
+            vec!["Bearer remote-test", "Bearer remote-test"]
+        );
+        proxy_task.abort();
+        target_task.abort();
     }
 }
