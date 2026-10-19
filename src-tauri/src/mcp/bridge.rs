@@ -15,6 +15,7 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYP
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use super::gateway::{BRIDGE_TOKEN_ENV, BRIDGE_URL_ENV};
 
@@ -28,6 +29,10 @@ struct Upstream {
     /// `Mcp-Session-Id` the server assigned at `initialize`, if any.
     session: Arc<Mutex<Option<HeaderValue>>>,
     out: mpsc::UnboundedSender<String>,
+    /// In-flight requests and the event-stream listener. Each holds a sender
+    /// to stdout, so they are cancelled when the agent hangs up; otherwise the
+    /// writer, and with it the process, would outlive the agent.
+    tasks: Arc<Mutex<JoinSet<()>>>,
 }
 
 pub async fn run() -> Result<(), String> {
@@ -53,11 +58,17 @@ pub async fn run() -> Result<(), String> {
         }
     });
     let upstream = Upstream {
-        client: reqwest::Client::new(),
+        // The gateway is on loopback; an ambient HTTP(S)_PROXY must not carry
+        // its requests, or the chat's bearer token, anywhere else.
+        client: reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|error| format!("HTTP client: {error}"))?,
         url,
         authorization,
         session: Arc::default(),
         out,
+        tasks: Arc::default(),
     };
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
@@ -72,19 +83,24 @@ pub async fn run() -> Result<(), String> {
         match serde_json::from_str::<Value>(&line) {
             // Requests run concurrently, so a slow tool call doesn't hold up
             // the agent's other requests.
-            Ok(message) => {
-                tokio::spawn(upstream.clone().forward(message));
-            }
+            Ok(message) => upstream.spawn(upstream.clone().forward(message)),
             Err(error) => upstream.send(&rpc_error(Value::Null, -32700, format!("parse error: {error}"))),
         }
     }
     // The agent closed stdin: it is done with this server.
+    upstream.tasks.lock().unwrap_or_else(|p| p.into_inner()).abort_all();
     drop(upstream);
     let _ = writer.await;
     Ok(())
 }
 
 impl Upstream {
+    fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(task);
+    }
+
     fn send(&self, message: &Value) {
         let _ = self.out.send(message.to_string());
     }
@@ -132,7 +148,7 @@ impl Upstream {
             }
         }
         if is_initialize {
-            tokio::spawn(self.listen());
+            self.spawn(self.clone().listen());
         }
     }
 
@@ -244,11 +260,12 @@ mod tests {
             .unwrap();
         let (out, mut replies) = mpsc::unbounded_channel();
         let upstream = |token: &str| Upstream {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
             url: connection.url.clone(),
             authorization: HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
             session: Arc::default(),
             out: out.clone(),
+            tasks: Arc::default(),
         };
 
         let chat = upstream(&connection.bearer_token);
