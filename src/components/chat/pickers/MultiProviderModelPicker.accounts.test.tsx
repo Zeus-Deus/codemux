@@ -110,10 +110,12 @@ const renderPicker = () =>
     />,
   );
 
-it("badges the model chip with the chat's account and names it in the tooltip, never the email", async () => {
+it("badges the model chip with the chat's account and names it in the hover reveal, never the email", async () => {
   renderPicker();
   const trigger = screen.getByTestId("multi-provider-model-picker-trigger");
-  await waitFor(() => expect(trigger).toHaveAttribute("title", "gpt-5.4 · Codex · Work"));
+  await waitFor(() =>
+    expect(screen.getByTestId("multi-provider-model-picker-reveal")).toHaveTextContent(/^Work·$/),
+  );
   expect(trigger).toHaveTextContent("W");
   fireEvent.click(trigger);
   await screen.findByTestId("provider-rail-codex-codex-work");

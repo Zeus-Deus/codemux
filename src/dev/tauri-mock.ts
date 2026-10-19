@@ -1867,6 +1867,16 @@ const CURSOR_CAPABILITIES: ProviderChatCapabilities = {
   permission_granularity: "per_turn",
 };
 
+/** OpenCode federates upstream providers; `sub_provider` names the one a
+ * model routes through, which the composer's model pill reveals on hover. */
+const OPENCODE_CAPABILITIES: ProviderChatCapabilities = {
+  ...CURSOR_CAPABILITIES,
+  models: [
+    { ...MOCK_CHAT_MODEL, id: "opencode/mock-flash", label: "Mock-Flash", description: "Fast routed model", sub_provider: "opencode" },
+    { ...MOCK_CHAT_MODEL, id: "openrouter/mock-coder", label: "Mock-Coder", description: "Routed coding model", sub_provider: "openrouter" },
+  ],
+};
+
 /** Grok's ACP catalogue is discovered at runtime. The mock intentionally uses
  * the provider-native `default` sentinel rather than pinning a released Grok
  * model id, while still exercising dynamically advertised effort levels. */
@@ -5022,7 +5032,9 @@ const handlers: Record<string, Handler> = {
           ? CURSOR_CAPABILITIES
           : a.provider === "grok"
             ? GROK_CAPABILITIES
-            : EMPTY_CAPABILITIES), supports_steering: a.provider === "claude" || a.provider === "codex" || a.provider === "opencode" }),
+            : a.provider === "opencode"
+              ? OPENCODE_CAPABILITIES
+              : EMPTY_CAPABILITIES), supports_steering: a.provider === "claude" || a.provider === "codex" || a.provider === "opencode" }),
   // Provider commands mirror only surfaces our adapters can execute.
   // Codex actions route to app-server; OpenCode commands use its command API.
   list_chat_slash_commands: (a) =>

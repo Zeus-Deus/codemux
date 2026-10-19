@@ -3,7 +3,7 @@ import { ChatGptConnection } from "@/components/auth/chatgpt-connection";
 import { CustomAcpModels } from "./CustomAcpModels";
 import { selectedAcpCatalog, useCustomAcp } from "@/stores/custom-acp-store";
 import { HermesProfileModels } from "./HermesProfileModels";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { ChevronDown, Star } from "lucide-react";
 
 import {
@@ -52,7 +52,6 @@ import type {
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import {
-  CONTEXT_ROW_HIDE_SECONDARY,
   CONTEXT_ROW_POPOVER,
   CONTEXT_ROW_TRIGGER,
   FOOTER_TRIGGER,
@@ -219,8 +218,8 @@ interface Props {
    *  `/model` slash command fires. `0` / `undefined` means "no
    *  request yet"; any increment pops the picker open. */
   openSignal?: number;
-  /** Narrow composer: drop the sub-provider prefix and show only the
-   *  model's leaf name. */
+  /** Narrow composer: show only the model's leaf name, without a
+   *  path or brand prefix. */
   leafLabel?: boolean;
   /** Tight composer: only the provider mark; the model name moves to the
    *  tooltip and accessible name. */
@@ -551,77 +550,136 @@ export function MultiProviderModelPicker({
     return "Select model";
   }, [capsForCurrentProvider, model, resolvedModel, provider, hermesModelLabel, acpCatalog]);
 
-  const triggerSubtitle = resolvedModel?.sub_provider ?? null;
-
-  // The active model's resolved-version blurb, surfaced only in the
-  // trigger's tooltip so the pill itself stays compact. Combines the
-  // visible label with the description (e.g.
-  // "Opus · Opus 4.8 with 1M context · Best for everyday, complex tasks").
-  const triggerTitle = useMemo(() => {
+  // The pill rests on the provider mark and model name. Hovering or
+  // focusing it slides in the upstream provider an OpenCode model routes
+  // through and the account ("openrouter · Work · GLM-5.3-Flash").
+  const triggerReveal = [
+    resolvedModel?.sub_provider,
+    currentAccount ? accountName(currentAccount) : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  // Any pill without that reveal (icon-only, narrow, or a model with
+  // nothing to reveal) gets a tooltip naming the model over
+  // a second line with the provider, account, and resolved-version blurb.
+  const triggerDetails = useMemo(() => {
+    const via = resolvedModel?.sub_provider ? `via ${resolvedModel.sub_provider}` : null;
     // Signed in more than once: name the account, never its email.
-    if (currentAccount) {
-      return `${triggerLabel} · ${providerDisplayLabel(provider)} · ${accountName(currentAccount)}`;
-    }
-    const description = resolvedModel?.description ?? null;
-    return description ? `${triggerLabel} · ${description}` : triggerLabel;
-  }, [resolvedModel, triggerLabel, currentAccount, provider]);
+    const tail = currentAccount
+      ? [providerDisplayLabel(provider), accountName(currentAccount)]
+      : [resolvedModel?.description ?? null];
+    return [via, ...tail].filter(Boolean).join(" · ");
+  }, [resolvedModel, currentAccount, provider]);
+  const triggerTitle = triggerDetails ? `${triggerLabel} · ${triggerDetails}` : triggerLabel;
+  // Held closed while the picker is open so it never sits over the popup.
+  const [tooltipOpen, setTooltipOpen] = useState(false);
+  const showReveal = !iconOnly && !leafLabel && triggerReveal !== "";
+  // The reveal's natural width. The pill grows left by exactly this and
+  // pulls its left margin in by the same amount, so its layout footprint
+  // never changes: the footer and context-row fit ladders don't re-fit
+  // under the pointer, and the pill opens over the free space beside it.
+  const revealRef = useRef<HTMLSpanElement | null>(null);
+  const [revealWidth, setRevealWidth] = useState(0);
+  useLayoutEffect(() => {
+    setRevealWidth(showReveal ? (revealRef.current?.scrollWidth ?? 0) : 0);
+  }, [showReveal, triggerReveal]);
 
   return (
     <Popover open={open} onOpenChange={(v) => !disabled && setOpen(v)}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          disabled={disabled}
-          data-testid="multi-provider-model-picker-trigger"
-          title={triggerTitle}
-          // Composer footer control: quiet ghost text (shared
-          // FOOTER_TRIGGER recipe), the leading ProviderLogo standing
-          // in for a tinted dot. Hairline pipes between footer
-          // controls — not per-pill borders — carry the separation.
-          className={
-            inContextRow
-              ? cn(CONTEXT_ROW_TRIGGER, "shrink")
-              : cn(
-                  FOOTER_TRIGGER,
-                  iconOnly ? FOOTER_TRIGGER_ICON_ONLY : "min-w-[60px] shrink",
-                )
-          }
-          aria-label={iconOnly ? `Model: ${triggerLabel}` : undefined}
-        >
-          {currentAccount ? (
-            <span className="relative mr-1 inline-flex shrink-0">
-              <ProviderLogo provider={provider} className="size-3.5 shrink-0" />
-              <AccountBadge account={currentAccount} current />
-            </span>
-          ) : (
-            <ProviderLogo provider={provider} className="size-3.5 shrink-0" />
-          )}
-          {!iconOnly && (
-            <>
-              <span className="max-w-[180px] truncate">
-                {leafLabel ? (
-                  leafModelName(triggerLabel, sessionProviderLabel(provider))
-                ) : triggerSubtitle ? (
+      <TooltipProvider delayDuration={250}>
+        <Tooltip open={!showReveal && tooltipOpen && !open} onOpenChange={setTooltipOpen}>
+          {/* Popover outside the tooltip: Radix spreads incoming props
+              after its own `data-state`, so the outer trigger's state is the
+              one the button keeps, and the reveal and open styling key on
+              the popover's. */}
+          <PopoverTrigger asChild>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                disabled={disabled}
+                data-testid="multi-provider-model-picker-trigger"
+                // Composer footer control: quiet ghost text (shared
+                // FOOTER_TRIGGER recipe), the leading ProviderLogo standing
+                // in for a tinted dot. Hairline pipes between footer
+                // controls — not per-pill borders — carry the separation.
+                className={cn(
+                  "group/model",
+                  inContextRow
+                    ? cn(CONTEXT_ROW_TRIGGER, "shrink")
+                    : cn(
+                        FOOTER_TRIGGER,
+                        iconOnly ? FOOTER_TRIGGER_ICON_ONLY : "min-w-[60px] shrink",
+                      ),
+                  showReveal && [
+                    "relative z-10 transition-[color,background-color,margin] duration-150 ease-out motion-reduce:transition-none",
+                    "hover:-ml-(--model-reveal-w) focus-visible:-ml-(--model-reveal-w) data-[state=open]:-ml-(--model-reveal-w)",
+                    // Opaque, so the open pill covers what it overlaps: the
+                    // hover tint over the surface the pill sits on.
+                    inContextRow
+                      ? "hover:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_20%,var(--background)))] focus-visible:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_20%,var(--background)))]"
+                      : "hover:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_40%,var(--background)))] focus-visible:bg-[color-mix(in_oklab,var(--foreground)_6%,color-mix(in_oklab,var(--muted)_40%,var(--background)))]",
+                  ],
+                )}
+                style={
+                  showReveal
+                    ? ({ "--model-reveal-w": `${revealWidth}px` } as CSSProperties)
+                    : undefined
+                }
+                aria-label={iconOnly ? `Model: ${triggerLabel}` : undefined}
+              >
+                {currentAccount ? (
+                  <span className="relative mr-1 inline-flex shrink-0">
+                    <ProviderLogo provider={provider} className="size-3.5 shrink-0" />
+                    <AccountBadge account={currentAccount} current />
+                  </span>
+                ) : (
+                  <ProviderLogo provider={provider} className="size-3.5 shrink-0" />
+                )}
+                {!iconOnly && (
                   <>
-                    <span className={cn(inContextRow && CONTEXT_ROW_HIDE_SECONDARY)}>
-                      <span className="opacity-70">{triggerSubtitle}</span>
-                      <span aria-hidden className="mx-1 opacity-40">
-                        ·
+                    <span className="flex min-w-0 items-center">
+                      {showReveal && (
+                        <span
+                          ref={revealRef}
+                          data-testid="multi-provider-model-picker-reveal"
+                          className={cn(
+                            "inline-flex w-0 shrink-0 overflow-hidden whitespace-nowrap opacity-0 transition-[width,opacity] duration-150 ease-out motion-reduce:transition-none",
+                            "group-hover/model:w-(--model-reveal-w) group-hover/model:opacity-70",
+                            "group-focus-visible/model:w-(--model-reveal-w) group-focus-visible/model:opacity-70",
+                            "group-data-[state=open]/model:w-(--model-reveal-w) group-data-[state=open]/model:opacity-70",
+                          )}
+                        >
+                          {triggerReveal}
+                          <span aria-hidden className="mx-1 opacity-60">
+                            ·
+                          </span>
+                        </span>
+                      )}
+                      <span className="max-w-[180px] truncate">
+                        {leafLabel
+                          ? leafModelName(triggerLabel, sessionProviderLabel(provider))
+                          : triggerLabel}
                       </span>
                     </span>
-                    <span>{triggerLabel}</span>
+                    {!inContextRow && (
+                      <ChevronDown className="size-3 shrink-0 opacity-50" />
+                    )}
                   </>
-                ) : (
-                  triggerLabel
                 )}
-              </span>
-              {!inContextRow && (
-                <ChevronDown className="size-3 shrink-0 opacity-50" />
-              )}
-            </>
-          )}
-        </button>
-      </PopoverTrigger>
+              </button>
+            </TooltipTrigger>
+          </PopoverTrigger>
+          <TooltipContent
+            side="top"
+            sideOffset={6}
+            aria-label={triggerTitle}
+            className="flex-col items-start gap-0.5"
+          >
+            <span>{triggerLabel}</span>
+            {triggerDetails && <span className="opacity-70">{triggerDetails}</span>}
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
       <PopoverContent
         // Compact popup: 400px wide (48px provider rail + fluid list),
         // 384px tall — a scannable column instead of a wide panel.
