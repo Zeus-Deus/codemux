@@ -529,6 +529,9 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                tauri::async_runtime::block_on(
+                    app.state::<plugins::host::PluginHostState>().shutdown(),
+                );
                 // Closing sessions cancel their queues; keep the saved copy.
                 commands::queued_turns::mark_exiting();
                 // Chats still running resume on the next launch.
@@ -716,6 +719,7 @@ fn build_core_app<R: tauri::Runtime>(
         // it here is mandatory — without `.manage()` the first
         // `state()` call panics with "state() called before manage()".
         .manage(mcp::registry::McpRegistry::default())
+        .manage(plugins::host::PluginHostState::default())
         .manage(skills::watcher::SkillsWatcherState::new())
         .manage(skills::inventory::SkillInventoryService::new())
         .manage(database::init_database().unwrap_or_else(|e| {
@@ -792,6 +796,7 @@ fn build_core_app<R: tauri::Runtime>(
                     let app = webview.app_handle().clone();
                     let registry = app.state::<mcp::registry::McpRegistry>().inner().clone();
                     registry.invalidate_plugin_page();
+                    app.state::<plugins::host::PluginHostState>().invalidate_page(registry.plugin_page_epoch());
                     tauri::async_runtime::spawn(async move { registry.clear_stale_plugin_servers(Some(&app)).await; });
                 }
                 return;
@@ -2689,6 +2694,12 @@ fn build_core_app<R: tauri::Runtime>(
             plugins::commands::plugins_startup_checkpoint,
             plugins::commands::plugins_resume,
             plugins::commands::plugins_set_event_tap,
+            plugins::host::plugins_host_acquire,
+            plugins::host::plugins_host_release,
+            plugins::host::plugins_process_run,
+            plugins::host::plugins_process_which,
+            plugins::host::plugins_os_info,
+            plugins::host::plugins_fs,
             plugins::mcp::plugins_mcp_register,
             plugins::mcp::plugins_mcp_unregister,
             plugins::mcp::plugins_mcp_list_tools,

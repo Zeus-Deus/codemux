@@ -347,3 +347,110 @@ schemas cannot add them later.
 Plugin stdio servers on Linux and macOS use a 2 MiB limit per JSON-RPC frame,
 including image results. Windows and macOS shutdown behavior remains untested
 live.
+
+## Local processes, project files and plugin data
+
+These typed desktop APIs are bound to the plugin incarnation. Plugins already
+run with full authority; this is the supported, bounded route for CLI checks and
+project detection. The web remote refuses these commands.
+
+```ts
+const executable = await ctx.host.process.which("unity"); // absolute path or null
+const result = await ctx.host.process.run({
+  command: "unity",
+  args: ["status", "--project-path", projectPath, "--json"],
+  cwd: projectPath,                  // absolute local path
+  workspaceId,                      // optional; refuses remote/closed workspaces
+  env: { MY_OPTION: "value", OLD_OPTION: null },
+  timeoutMs: 30_000,
+  maxOutputBytes: 1024 * 1024,
+});
+// { code: number | null, stdout, stderr, timedOut, truncated, cancelled }
+```
+
+`run` passes argv directly, without a shell. `command` resolves on PATH (including
+Windows PATHEXT), or names an executable path. Children inherit the app's
+environment, with the app's usual AppImage environment cleanup; `env` overrides
+values, and `null` removes a key. Windows batch files (`.cmd`/`.bat`) are refused
+by `run`, because launching them would invoke a shell. Call the program's `.exe`
+or its interpreter directly instead; `which` can still locate batch files.
+Without `cwd`, the child uses the app’s current directory, not a workspace path.
+Inputs allow up to 256 arguments (16 KiB each, 1 MiB combined) and 128 environment
+overrides (16 KiB per value, 64 KiB combined).
+
+The default timeout is 30 seconds (maximum 10 minutes). The combined stdout and
+stderr cap defaults to 1 MiB (maximum 8 MiB); excess bytes are drained and discarded,
+with `truncated: true`. Timeout or plugin disposal kills the owned process group
+on Linux and macOS, then waits for the child to exit. Windows currently kills the
+direct child only. A child that deliberately starts a separate session, such as
+an Editor launched by a CLI, remains independent. Inherited output pipes get at
+most 100 ms to drain after the launcher exits; collected output is retained and
+`truncated` signals that a pipe stayed open. Linux lifecycle tests cover a
+normal grandchild and a detached child. Windows and macOS have not been tested live.
+
+`workspaceId` is optional on `run` and every filesystem call. If supplied, it
+must name an open, local workspace. If omitted, the operation runs locally even
+when the selected workspace is remote. **Filesystem paths and `cwd` must be absolute and refer to this machine.** These APIs do not read files or launch programs over SSH.
+
+```ts
+await ctx.host.fs.exists(projectPath, { workspaceId });
+const entries = await ctx.host.fs.listDir(projectPath, { workspaceId });
+// [{ name, kind: "file" | "directory" | "symlink" | "other" }]
+const text = await ctx.host.fs.readText(absolutePath, { maxBytes: 1024 * 1024, workspaceId });
+```
+
+`readText` reads UTF-8 regular files and refuses files larger than `maxBytes`
+(default 1 MiB, maximum 8 MiB). `listDir` refuses more than 10,000 entries.
+
+For CLI policies and manifests, the only supported write route is plugin-owned data:
+
+```ts
+const dir = await ctx.host.fs.dataDir();
+const policyPath = await ctx.host.fs.writeDataFile("policy.json", JSON.stringify(policy));
+await ctx.host.fs.removeDataFile("policy.json");
+```
+
+Files live under `<app data>/plugin-data/<pluginId>/`, separate from installed
+code. `name` is one segment: ASCII letters, digits, dots, underscores or dashes,
+at most 128 bytes, no leading dot, no `..`, and no Windows device names. Links
+are refused. Writes are atomic, capped at 1 MiB, and use owner-only directory
+and file permissions on Unix. Data is retained on disable, reload, update **and
+uninstall**, matching existing `ctx.storage` retention. Reinstalling the same
+plugin id can reuse it. `removeDataFile` deletes only that plugin's named file.
+
+`ctx.host.workspace.list()` returns the open workspaces as `{ id, name, path,
+remote }[]`. `ctx.host.workspace.onListChange(fn)` notifies when that list
+changes and unsubscribes on disposal. Use it to prune workspace registrations;
+`current()` and `subscribe()` still describe the selected workspace.
+
+For install locations that a running app's PATH does not yet include, use
+`await ctx.host.os.info()`:
+
+```ts
+// Exact Rust OS/architecture spellings, not Node's "darwin"/"arm64".
+{
+  platform: "linux" | "windows" | "macos",
+  arch: "x86_64" | "aarch64",
+  homeDir: string | null,
+  configDir: string | null,
+  dataDir: string | null,
+  localDataDir: string | null,
+}
+```
+
+These are `std::env::consts::OS` / `ARCH` on supported desktop targets;
+`info()` refuses other targets rather than returning an undocumented value.
+`configDir` uses `$XDG_CONFIG_HOME` (default `~/.config`) on Linux,
+`~/Library/Application Support` on macOS, and roaming AppData on Windows.
+Directories use native `dirs` resolution: Windows profile, roaming AppData and
+local AppData; Linux XDG data home (default `~/.local/share`); macOS
+`~/Library/Application Support` for both data directories. No general environment
+reader is exposed. `dataDir` here is the OS directory, whereas `fs.dataDir()` is
+the plugin's private directory beneath the app's data directory.
+
+On Linux the GUI inherits its launcher's PATH; it does not import a login shell's
+PATH. A desktop session may omit `~/.local/bin`, so an integration can fall back
+to `homeDir/.local/bin` when `which` misses a newly installed CLI. On Windows,
+`which` accepts non-directory reparse points, including zero-byte App Execution
+Aliases, and `run` passes that path through to CreateProcess. Classification and
+PATHEXT lookup have unit coverage; Windows execution remains untested live.

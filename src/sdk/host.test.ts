@@ -46,6 +46,38 @@ vi.mock("@/lib/themes", () => ({
   THEME_ROLE_VARIABLES: {},
 }));
 
+const workspaces = vi.hoisted(() => {
+  const listeners = new Set<() => void>();
+  const state = {
+    appState: {
+      workspaces: [] as {
+        workspace_id: string;
+        title: string;
+        cwd: string;
+        host_id?: number;
+        remote_cwd?: string;
+      }[],
+    },
+  };
+  return {
+    state,
+    listeners,
+    notify: () => {
+      for (const fn of [...listeners]) fn();
+    },
+  };
+});
+vi.mock("@/stores/app-store", () => ({
+  selectActiveWorkspaceId: () => null,
+  useAppStore: {
+    getState: () => workspaces.state,
+    subscribe: (fn: () => void) => {
+      workspaces.listeners.add(fn);
+      return () => workspaces.listeners.delete(fn);
+    },
+  },
+}));
+
 import { activatePlugin, resetActivationForTests, unloadPlugin } from "@/contrib/activation";
 import { resetLifetimeForTests } from "@/contrib/lifetime";
 import { resetPluginsStoreForTests } from "@/contrib/plugins-store";
@@ -180,5 +212,47 @@ describe("host reduced motion", () => {
     expect(host.reducedMotion()).toBe(false);
     const off = host.onReducedMotionChange(() => {});
     off();
+  });
+});
+
+describe("host.workspace list", () => {
+  it("lists local and remote paths and only notifies on list changes, until unload", () => {
+    workspaces.state.appState.workspaces = [
+      { workspace_id: "local", title: "Project", cwd: "/project" },
+      {
+        workspace_id: "ssh",
+        title: "Remote",
+        cwd: "/mirror",
+        remote_cwd: "/remote/project",
+        host_id: 42,
+      },
+    ];
+    const callback = vi.fn();
+    activatePlugin(
+      {
+        id: "demo",
+        register(ctx) {
+          ctx.host.workspace.onListChange(callback);
+        },
+      },
+      record,
+    );
+    expect(host.workspace.list()).toEqual([
+      { id: "local", name: "Project", path: "/project", remote: false },
+      { id: "ssh", name: "Remote", path: "/remote/project", remote: true },
+    ]);
+    workspaces.notify();
+    expect(callback).not.toHaveBeenCalled();
+    workspaces.state.appState.workspaces =
+      workspaces.state.appState.workspaces.slice(0, 1);
+    workspaces.notify();
+    expect(callback).toHaveBeenCalledWith([
+      { id: "local", name: "Project", path: "/project", remote: false },
+    ]);
+    unloadPlugin("demo");
+    expect(workspaces.listeners.size).toBe(0);
+    workspaces.state.appState.workspaces = [];
+    workspaces.notify();
+    expect(callback).toHaveBeenCalledOnce();
   });
 });
