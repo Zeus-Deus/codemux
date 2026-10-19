@@ -18,9 +18,12 @@
 //!
 //! An account switch (`provider_accounts::switch_thread`) is the
 //! same-provider counterpart. Both serialize on the per-thread dispatch
-//! gate, an account switch is refused while a provider switch is in
-//! flight, and the new provider's start resolves its own account (the
-//! frontend's account pick runs inside `agentChatStartSession` for both).
+//! gate. An account switch cancels the gate only while no provider switch
+//! runs ([`unless_switching`]), and under the dispatch lock it is refused if
+//! a provider switch is running or the chat has moved to another provider
+//! since it looked ([`refuse_stale_send`]). The new provider's start
+//! resolves its own account (the frontend's account pick runs inside
+//! `agentChatStartSession` for both).
 
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
@@ -92,6 +95,17 @@ pub(crate) fn refuse_while_switching(thread_id: &str) -> Result<(), String> {
         return Err("This chat is switching providers. Try again once it's done.".into());
     }
     Ok(())
+}
+
+/// Run `f` unless `thread_id` is switching providers, atomically with a
+/// switch starting (both hold the same lock), so an account switch can't
+/// cancel the thread's native gate under a provider switch.
+pub(crate) fn unless_switching<T>(thread_id: &str, f: impl FnOnce() -> T) -> Result<T, String> {
+    let switching = switching().lock().unwrap();
+    if switching.contains(thread_id) {
+        return Err("This chat is switching providers. Try again once it's done.".into());
+    }
+    Ok(f())
 }
 
 /// Refuse a send that would reach the wrong provider: one arriving while
@@ -554,6 +568,11 @@ mod tests {
         assert!(SwitchMark::claim("t").is_err(), "one switch at a time");
         assert!(refuse_while_switching("t").is_err());
         assert!(refuse_while_switching("other").is_ok());
+        let mut ran = false;
+        assert!(unless_switching("t", || ran = true).is_err());
+        assert!(!ran, "nothing runs under a switch");
+        assert!(unless_switching("other", || ran = true).is_ok());
+        assert!(ran);
         assert_eq!(refuse_stale_send(&db, ProviderKind::Codex, "t").unwrap_err(), SWITCHING);
         drop(mark);
         assert!(refuse_stale_send(&db, ProviderKind::Codex, "t").is_ok());
