@@ -63,7 +63,8 @@ pub struct PrWatchRecord {
     /// Automatic fix attempts (failing checks or a conflict) allowed before
     /// watching stops.
     pub max_attempts: u32,
-    /// Fix attempts spent since checks were last all green.
+    /// Fix attempts spent since checks were last all green on a branch that
+    /// merges cleanly.
     pub attempts: u32,
     /// Comment-only wakes since the head last moved.
     pub comment_streak: u32,
