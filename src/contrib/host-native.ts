@@ -2,6 +2,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Owner } from "./lifetime";
 import { pluginPageEpoch } from "./mcp";
+import { randomUUID } from "@/lib/uuid";
 
 export interface PluginLocalContext {
   /** Optional open workspace to validate. Omit for machine-global operations.
@@ -57,7 +58,7 @@ async function ownerAuth(owner: Owner | null): Promise<Auth> {
     pending = (async () => {
       const pageEpoch = await pluginPageEpoch();
       if (owner.ended) throw new Error("Plugin has been disposed");
-      const auth = { pluginId: owner.pluginId, token: crypto.randomUUID() };
+      const auth = { pluginId: owner.pluginId, token: randomUUID() };
       await invoke<void>("plugins_host_acquire", { ...auth, pageEpoch });
       let stopped: Promise<void> | undefined;
       const stop = () =>

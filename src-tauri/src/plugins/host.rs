@@ -138,8 +138,17 @@ impl PluginHostState {
     pub async fn shutdown(&self) {
         self.invalidate_page(u64::MAX);
         let owners = self.retired.lock().unwrap().clone();
-        for owner in owners {
-            owner.wait_idle().await;
+        // A blocking filesystem operation on a dead mount cannot be cancelled.
+        // Cancel children immediately, but bound the overall app-exit wait.
+        if tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for owner in owners {
+                owner.wait_idle().await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            log::warn!("Plugin host shutdown timed out waiting for blocking calls");
         }
     }
 }
@@ -260,6 +269,16 @@ mod tests {
         assert!(host.begin("demo", "two").is_err());
         assert!(host.acquire(0, "demo", "late").is_err());
         host.acquire(1, "demo", "fresh").unwrap();
+    }
+    #[tokio::test]
+    async fn plugin_host_shutdown_is_bounded_when_a_filesystem_call_is_stuck() {
+        let host = PluginHostState::default();
+        host.acquire(0, "demo", "one").unwrap();
+        let permit = host.begin("demo", "one").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(4), host.shutdown())
+            .await
+            .expect("app exit must not wait forever for a blocking filesystem call");
+        assert!(*permit.cancellation().borrow());
     }
 }
 

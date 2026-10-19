@@ -104,7 +104,40 @@ fn data_dir(app_data: &Path, plugin: &str) -> Result<PathBuf, String> {
     if canonical.parent() != Some(base.as_path()) {
         return Err("Plugin data path escapes its directory".into());
     }
+    sweep_stale_temps(&canonical)?;
     Ok(canonical)
+}
+fn sweep_stale_temps(dir: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix(".tmp")) else {
+            continue;
+        };
+        // tempfile's default writer name is .tmp plus six alphanumeric chars.
+        if suffix.len() != 6 || !suffix.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let meta = match fs::symlink_metadata(entry.path()) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if meta.is_file()
+            && meta
+                .modified()
+                .ok()
+                .and_then(|time| time.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(86400))
+        {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+    Ok(())
 }
 fn data_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
     data_name(name)?;
@@ -213,6 +246,35 @@ pub(super) fn execute(plugin: &str, operation: FsOperation) -> Result<Value, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plugin_host_data_acquire_sweeps_only_stale_writer_temps() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = data_dir(root.path(), "demo").unwrap();
+        let stale = dir.join(".tmpABC123");
+        let recent = dir.join(".tmpNEW123");
+        let named = dir.join("policy.json");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+        for path in [&stale, &recent, &named] {
+            fs::write(path, "fixture").unwrap();
+        }
+        for path in [&stale, &named] {
+            fs::File::open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&named, dir.join(".tmpLNK123")).unwrap();
+        assert_eq!(data_dir(root.path(), "demo").unwrap(), dir);
+        assert!(!stale.exists());
+        assert!(recent.exists());
+        assert!(named.exists());
+        #[cfg(unix)]
+        assert!(fs::symlink_metadata(dir.join(".tmpLNK123"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
     #[test]
     fn plugin_host_data_files_are_bounded_private_and_retained_outside_code() {
         let root = tempfile::tempdir().unwrap();

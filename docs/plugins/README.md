@@ -379,6 +379,7 @@ by `run`, including names with trailing dots or spaces, because launching them
 would invoke a shell. Call the wrapped `.exe` (for example, `node.exe` with the
 script) instead; `which` can still locate batch files. Do not pass untrusted
 arguments to `cmd.exe /c`: its shell quoting differs from normal argv. Windows
+`run` accepts `.exe` and `.com` programs, including `.exe` App Execution Aliases;
 children use `CREATE_NO_WINDOW` to avoid a console flash.
 Without `cwd`, the child uses the app’s current directory, not a workspace path.
 Inputs allow up to 256 arguments (16 KiB each, 1 MiB combined) and 128 environment

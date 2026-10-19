@@ -42,6 +42,7 @@ pub struct RunResult {
     pub stderr: String,
     pub timed_out: bool,
     pub truncated: bool,
+    pub pipes_held_open: bool,
     pub cancelled: bool,
 }
 
@@ -89,17 +90,12 @@ fn resolve(
     } else {
         paths
             .into_iter()
-            .map(|dir| {
-                if dir.is_absolute() {
-                    dir.join(command)
-                } else {
-                    cwd.join(dir).join(command)
-                }
-            })
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(command))
             .collect()
     };
     for base in bases {
-        let mut candidates = vec![base.clone()];
+        let mut candidates = Vec::new();
         if windows && base.extension().is_none() {
             candidates.extend(
                 extensions
@@ -111,6 +107,8 @@ fn resolve(
                     })
                     .map(|ext| PathBuf::from(format!("{}{ext}", base.to_string_lossy()))),
             );
+        } else {
+            candidates.push(base);
         }
         for path in candidates {
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
@@ -163,12 +161,24 @@ fn executable(command: &str, cwd: &Path, env: &HashMap<String, Option<String>>) 
 }
 
 fn validate_program(program: &Path, windows: bool) -> Result<(), String> {
-    if windows
-        && program
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
-    {
-        return Err("Windows batch files (.cmd/.bat) can't run without a shell; call the program's .exe or its interpreter directly.".into());
+    if !windows {
+        return Ok(());
+    }
+    // Win32 normalises these suffixes before interpreting the file name.
+    let name = program
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .trim_end_matches(['.', ' ']);
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat") {
+        return Err("Windows batch files (.cmd/.bat) can't run without a shell; call the wrapped .exe (for example node.exe with the script) instead.".into());
+    }
+    if !extension.eq_ignore_ascii_case("exe") && !extension.eq_ignore_ascii_case("com") {
+        return Err("Windows process.run requires an .exe or .com program; call the script's wrapped executable directly.".into());
     }
     Ok(())
 }
@@ -189,9 +199,14 @@ impl Process {
         if let Some(group) = self.group {
             // Check ownership before signalling. WNOWAIT leaves the leader
             // unreaped, so neither its PID nor process-group id can be reused.
-            if let Err(error) = observe_leader(group) {
+            let observed = observe_leader(group);
+            if observed
+                .as_ref()
+                .is_err_and(|e| e.raw_os_error() == Some(libc::ECHILD))
+            {
+                // ECHILD proves ownership was lost: this PID may be reused.
                 self.group = None;
-                return Err(error.to_string());
+                return Err(observed.unwrap_err().to_string());
             }
             if unsafe { libc::kill(-(group as i32), libc::SIGKILL) } != 0 {
                 let error = std::io::Error::last_os_error();
@@ -199,7 +214,8 @@ impl Process {
                     return Err(error.to_string());
                 }
             }
-            return Ok(());
+            // Other observation errors must not skip the kill attempt.
+            return observed.map(|_| ()).map_err(|e| e.to_string());
         }
         self.child.start_kill().map_err(|e| e.to_string())
     }
@@ -254,17 +270,27 @@ async fn cancelled(rx: &mut watch::Receiver<bool>) {
 struct Captures {
     out: tokio::task::JoinHandle<()>,
     err: tokio::task::JoinHandle<()>,
+    stdout: SharedOutput,
+    stderr: SharedOutput,
 }
 impl Drop for Captures {
     fn drop(&mut self) {
-        self.out.abort();
-        self.err.abort();
+        // Detached children can inherit the pipes. Keep draining until EOF,
+        // including on errors, without retaining output or a plugin permit.
+        self.stdout.lock().unwrap().take();
+        self.stderr.lock().unwrap().take();
     }
 }
+#[derive(Default)]
+struct Captured {
+    bytes: Vec<u8>,
+    capped: bool,
+}
+type SharedOutput = Arc<Mutex<Option<Captured>>>;
 
 async fn capture<R: AsyncRead + Unpin>(
     mut pipe: R,
-    result: Arc<Mutex<Vec<u8>>>,
+    result: SharedOutput,
     remaining: Arc<AtomicUsize>,
     truncated: Arc<AtomicBool>,
 ) {
@@ -278,30 +304,39 @@ async fn capture<R: AsyncRead + Unpin>(
                 break;
             }
         };
+        let mut result = result.lock().unwrap();
+        let Some(result) = result.as_mut() else {
+            continue;
+        };
         let before = remaining
             .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                 Some(left.saturating_sub(count))
             })
             .unwrap();
         let take = count.min(before);
-        result.lock().unwrap().extend_from_slice(&buffer[..take]);
+        result.bytes.extend_from_slice(&buffer[..take]);
         if take < count {
+            result.capped = true;
             truncated.store(true, Ordering::Release);
         }
     }
 }
-fn output(bytes: Vec<u8>, truncated: &AtomicBool) -> String {
-    let max = bytes.len();
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    if text.len() > max {
-        let mut end = max;
-        while !text.is_char_boundary(end) {
-            end -= 1;
+fn output(mut bytes: Vec<u8>, capped: bool) -> String {
+    if capped {
+        // Only a sequence cut by the raw-byte cap is omitted. Complete invalid
+        // bytes still expand to replacement characters without losing a tail.
+        let mut offset = 0;
+        while let Err(error) = std::str::from_utf8(&bytes[offset..]) {
+            offset += error.valid_up_to();
+            if let Some(count) = error.error_len() {
+                offset += count;
+            } else {
+                bytes.truncate(offset);
+                break;
+            }
         }
-        text.truncate(end);
-        truncated.store(true, Ordering::Release);
     }
-    text
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 pub(super) async fn run(input: RunInput, permit: RunPermit) -> Result<RunResult, String> {
@@ -352,6 +387,7 @@ pub(super) async fn run(input: RunInput, permit: RunPermit) -> Result<RunResult,
             stderr: String::new(),
             timed_out: false,
             truncated: false,
+            pipes_held_open: false,
             cancelled: true,
         });
     }
@@ -373,6 +409,8 @@ pub(super) async fn run(input: RunInput, permit: RunPermit) -> Result<RunResult,
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     command.process_group(0);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     let child = command.spawn().map_err(|e| e.to_string())?;
     let mut process = Process {
         group: child
@@ -384,8 +422,8 @@ pub(super) async fn run(input: RunInput, permit: RunPermit) -> Result<RunResult,
     let truncated = Arc::new(AtomicBool::new(false));
     let stdout = process.child.stdout.take().ok_or("Missing stdout pipe")?;
     let stderr = process.child.stderr.take().ok_or("Missing stderr pipe")?;
-    let stdout_bytes = Arc::new(Mutex::new(Vec::new()));
-    let stderr_bytes = Arc::new(Mutex::new(Vec::new()));
+    let stdout_bytes = Arc::new(Mutex::new(Some(Captured::default())));
+    let stderr_bytes = Arc::new(Mutex::new(Some(Captured::default())));
     let out = tokio::spawn(capture(
         stdout,
         stdout_bytes.clone(),
@@ -398,7 +436,12 @@ pub(super) async fn run(input: RunInput, permit: RunPermit) -> Result<RunResult,
         remaining,
         truncated.clone(),
     ));
-    let mut captures = Captures { out, err };
+    let mut captures = Captures {
+        out,
+        err,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    };
     enum End {
         Exited,
         Cancelled,
@@ -408,40 +451,43 @@ pub(super) async fn run(input: RunInput, permit: RunPermit) -> Result<RunResult,
     let ended = tokio::select! { biased; _=cancelled(&mut cancel)=>End::Cancelled,_=tokio::time::sleep(Duration::from_millis(timeout))=>End::TimedOut,result=leader_exited(process.group.unwrap())=>{result?;End::Exited} };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let ended = tokio::select! { biased; _=cancelled(&mut cancel)=>End::Cancelled,_=tokio::time::sleep(Duration::from_millis(timeout))=>End::TimedOut,result=process.child.wait()=>{result.map_err(|e|e.to_string())?;End::Exited} };
-    // Reap only after signalling the still-owned Unix group. A setsid child
-    // has deliberately left that group and remains independent.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    process.kill()?;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if !matches!(ended, End::Exited) {
         process.kill()?;
     }
-    let status = process.child.wait().await;
-    process.group = None;
-    let status = status.map_err(|e| e.to_string())?;
-    let collected = tokio::time::timeout(Duration::from_millis(100), async {
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let collected = tokio::time::timeout_at(drain_deadline, async {
         tokio::join!(&mut captures.out, &mut captures.err)
     })
     .await;
+    let pipes_held_open = collected.is_err();
     match collected {
         Ok((out, err)) => {
             out.map_err(|e| e.to_string())?;
             err.map_err(|e| e.to_string())?;
         }
-        Err(_) => {
-            truncated.store(true, Ordering::Release);
-        }
+        Err(_) => {}
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if matches!(ended, End::Exited) {
+        // Keep the exited leader unreaped, reserving its group ID while a
+        // daemon-style child has the drain window to create its own session.
+        tokio::time::sleep_until(drain_deadline).await;
+        process.kill()?;
+    }
+    let status = process.child.wait().await;
+    process.group = None;
+    let status = status.map_err(|e| e.to_string())?;
+    let stdout = captures.stdout.lock().unwrap().take().unwrap_or_default();
+    let stderr = captures.stderr.lock().unwrap().take().unwrap_or_default();
     drop(captures);
-    let stdout = stdout_bytes.lock().unwrap().clone();
-    let stderr = stderr_bytes.lock().unwrap().clone();
     Ok(RunResult {
         code: status.code(),
-        stdout: output(stdout, &truncated),
-        stderr: output(stderr, &truncated),
+        stdout: output(stdout.bytes, stdout.capped),
+        stderr: output(stderr.bytes, stderr.capped),
         timed_out: matches!(ended, End::TimedOut),
         cancelled: matches!(ended, End::Cancelled),
         truncated: truncated.load(Ordering::Acquire),
+        pipes_held_open,
     })
 }
 
@@ -534,15 +580,22 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("tool"), "#!/bin/sh").unwrap();
         std::fs::write(root.path().join("tool.EXE"), "fixture").unwrap();
-        assert_eq!(resolve("tool", [root.path().into()], root.path(), ".EXE;.CMD", true), Some(root.path().join("tool.EXE")));
+        assert_eq!(
+            resolve("tool", [root.path().into()], root.path(), ".EXE;.CMD", true),
+            Some(root.path().join("tool.EXE"))
+        );
     }
     #[test]
     fn plugin_host_lossy_utf8_preserves_valid_tail_without_false_truncation() {
-        let truncated = AtomicBool::new(false);
         let mut bytes = vec![0xff; 10];
         bytes.extend_from_slice(b"abc");
-        assert_eq!(output(bytes, &truncated), format!("{}abc", "\u{fffd}".repeat(10)));
-        assert!(!truncated.load(Ordering::Acquire));
+        assert_eq!(
+            output(bytes, false),
+            format!("{}abc", "\u{fffd}".repeat(10))
+        );
+        assert_eq!(output(vec![b'a', 0xe2, 0x98], true), "a");
+        assert_eq!(output(vec![0xff, b'a', 0xe2], true), "\u{fffd}a");
+        assert_eq!(output(vec![b'a', 0xe2], false), "a\u{fffd}");
     }
     #[cfg(unix)]
     #[test]
@@ -556,8 +609,22 @@ mod tests {
         assert!(resolve("fresh-cli", [local.clone()], root.path(), "", false).is_none());
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
         for windows in [false, true] {
-            assert!(resolve("fresh-cli", [PathBuf::new(), PathBuf::from(".local/bin")], &local, "", windows).is_none());
-            assert!(resolve("fresh-cli", [PathBuf::from(".local/bin")], root.path(), "", windows).is_none());
+            assert!(resolve(
+                "fresh-cli",
+                [PathBuf::new(), PathBuf::from(".local/bin")],
+                &local,
+                "",
+                windows
+            )
+            .is_none());
+            assert!(resolve(
+                "fresh-cli",
+                [PathBuf::from(".local/bin")],
+                root.path(),
+                "",
+                windows
+            )
+            .is_none());
         }
         assert!(resolve(
             "fresh-cli",
@@ -603,6 +670,12 @@ mod tests {
         let result = run(request, permit(&host)).await.unwrap();
         assert_eq!(result.stdout.len() + result.stderr.len(), 1024);
         assert!(result.truncated);
+        let result = run(input("invalid-utf8", &[]), permit(&host))
+            .await
+            .unwrap();
+        assert_eq!(result.stdout, format!("{}abc", "\u{fffd}".repeat(10)));
+        assert!(!result.truncated);
+        assert!(!result.pipes_held_open);
         let mut request = input("tree", &[root.path().join("timeout").to_str().unwrap()]);
         request.timeout_ms = Some(150);
         let result = run(request, permit(&host)).await.unwrap();
@@ -660,7 +733,8 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
         assert_eq!(result.code, Some(0));
         assert!(result.stdout.contains("launched detached child"));
-        assert!(result.truncated);
+        assert!(result.pipes_held_open);
+        assert!(!result.truncated);
         wait_for(&heartbeat).await;
         let before = std::fs::metadata(&heartbeat).unwrap().len();
         host.release("demo", "test").await;
@@ -681,10 +755,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let heartbeat = root.path().join("daemon");
         let host = PluginHostState::default();
-        let result = run(input("daemon", &[heartbeat.to_str().unwrap()]), permit(&host)).await.unwrap();
+        let result = run(
+            input("daemon", &[heartbeat.to_str().unwrap()]),
+            permit(&host),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.code, Some(0));
         wait_for(&heartbeat).await;
-        let pid: i32 = std::fs::read_to_string(heartbeat.with_extension("pid")).unwrap().parse().unwrap();
-        unsafe { libc::kill(pid, libc::SIGKILL); }
+        let pid: i32 = std::fs::read_to_string(heartbeat.with_extension("pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
     }
 }
