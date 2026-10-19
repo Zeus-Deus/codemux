@@ -698,3 +698,40 @@ async fn a_fresh_conversation_while_reopening_sends_nothing() {
     assert!(h.sent("rr-fresh-early").is_empty());
     assert_eq!(h.db().list_queued_turns("rr-fresh-early").len(), 1);
 }
+
+fn subagent(thread: &str, status: codemux_lib::agent_provider::SubagentStatus) -> ProviderRuntimeEvent {
+    ProviderRuntimeEvent::SubagentUpdated {
+        thread_id: ThreadId(thread.into()),
+        subagent: codemux_lib::agent_provider::SubagentSnapshot {
+            subagent_id: "sub-1".into(),
+            status,
+            ..Default::default()
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_that_yields_to_its_subagents_stays_resumable() {
+    use codemux_lib::agent_provider::SubagentStatus;
+    let h = harness().await;
+    h.chat("rr-yield");
+    h.saved("rr-yield", "q-1", "saved");
+    h.running("rr-yield", "turn-1");
+    resume_after_restart_for_test(&h.handle(), "launch-2").await;
+    h.running("rr-yield", "turn-resume");
+    h.provider.set_turn_active("rr-yield", true);
+    forward_event(&h.handle(), subagent("rr-yield", SubagentStatus::Running));
+    // The provider yields while its subagent works: the run goes on.
+    h.provider.set_turn_active("rr-yield", false);
+    h.completed("rr-yield", TurnStatus::Success);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(h.db().get_restart_turn("rr-yield").is_some(), "a quit now must still resume it");
+    assert_eq!(h.sent("rr-yield").len(), 1, "the saved queue waits for the real end");
+
+    // The subagent finishes and the provider ends the turn for real.
+    forward_event(&h.handle(), subagent("rr-yield", SubagentStatus::Completed));
+    h.completed("rr-yield", TurnStatus::Success);
+    let sent = wait_for_sends(&h, "rr-yield", 2).await;
+    assert_eq!(&sent[1..], ["saved"]);
+    assert!(h.db().get_restart_turn("rr-yield").is_none());
+}

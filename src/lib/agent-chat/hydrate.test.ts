@@ -312,6 +312,27 @@ describe("replayPayloads", () => {
       expect(status(merged, "tu-2")).toBe("running");
     });
 
+    it("keeps a live parent call running past a child's approval request", () => {
+      const state = replayPayloads(
+        [
+          user("run the tests"),
+          toolUse("turn-1", "tu-1"),
+          event({
+            type: "request_opened",
+            thread_id: "t",
+            turn_id: "child-turn",
+            request_id: "req-1",
+            request_kind: "command",
+            payload: {},
+            tool_use_id: null,
+            subagent_id: "child-1",
+          } as ProviderRuntimeEvent),
+        ],
+        { runLive: true },
+      );
+      expect(status(state, "tu-1")).toBe("running");
+    });
+
     it("leaves a finished call alone", () => {
       const state = replayPayloads([
         user("run the tests"),

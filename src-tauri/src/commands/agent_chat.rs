@@ -7547,7 +7547,6 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         };
         super::queued_turns::on_event(&db, &event, queued);
     }
-    super::restart_resume::on_event(app, &event);
 
     // A queued follow-up turn just dispatched — NOW persist its
     // user-message envelope, at real turn order (it was intentionally
@@ -7745,6 +7744,9 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         }
     }
     super::delegation::observe(app, &event, persisted_id);
+    // After the subagent tracker saw the event, so a turn end that only
+    // yields to delegated work reads as such.
+    super::restart_resume::on_event(app, &event);
 
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are

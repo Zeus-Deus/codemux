@@ -38,7 +38,9 @@ use crate::database::restart_resumes::RestartResumeRecord;
 use crate::database::DatabaseStore;
 use crate::state::{AppStateStore, PaneStatus};
 
-use super::agent_chat::{lookup_provider, send_turn_with_origin, ProviderRegistry, TurnOrigin};
+use super::agent_chat::{
+    lookup_provider, send_turn_with_origin, ProviderRegistry, SubagentTracker, TurnOrigin,
+};
 use super::usage_resume::{activity_lock, now_ms, queued_turn, thread_busy};
 
 /// Settings key gating the resume. Absent or anything but `"false"` means
@@ -146,6 +148,17 @@ pub(crate) fn on_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEv
             }
             SessionStatus::Starting => return,
         },
+        // A provider can end its turn while work it delegated still runs
+        // (Claude yields to wait on its subagents): the run goes on, so it
+        // stays resumable and a resumed one has not finished yet. The real
+        // end is a later turn end, or a `Ready` once the work is done.
+        ProviderRuntimeEvent::TurnCompleted { thread_id, .. }
+            if app
+                .try_state::<SubagentTracker>()
+                .is_some_and(|tracker| tracker.delegated_work_holding_turn(&thread_id.0)) =>
+        {
+            return;
+        }
         ProviderRuntimeEvent::TurnCompleted { thread_id, status, .. } => {
             let result = db.clear_restart_turn(&thread_id.0).map(drop);
             let drain = {
@@ -228,8 +241,15 @@ fn settle_if_idle<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId) {
             return;
         }
         let db: State<'_, DatabaseStore> = app.state();
-        if let Err(error) = db.clear_restart_turn_if(&thread_id.0, &row.turn_id) {
-            eprintln!("[codemux::restart_resume] {error}");
+        match db.clear_restart_turn_if(&thread_id.0, &row.turn_id) {
+            // The run ended without a turn end of its own, so a resumed
+            // chat's saved queue stays manual rather than going out after
+            // some later turn.
+            Ok(true) => {
+                live().resuming.remove(&thread_id.0);
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("[codemux::restart_resume] {error}"),
         }
     });
 }

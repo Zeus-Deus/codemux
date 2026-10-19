@@ -445,10 +445,23 @@ function finalizeReplay(
  * `unconfirmed` — the call started, and whether it finished is unknown.
  *
  * With no run live, every such call is cut off. With one live, a call is
- * cut off only once the provider has produced output for a different turn
- * after it. User bubbles prove nothing here: a steered message joins the
- * running turn, and an optimistic one isn't confirmed yet.
+ * cut off only once the provider has produced its own output for a
+ * different turn after it. User bubbles prove nothing here (a steered
+ * message joins the running turn, an optimistic one isn't confirmed yet),
+ * and neither do requests or cards, which can carry a child's turn.
  */
+function isParentOutput(m: ChatViewItem): m is Extract<
+  ChatViewItem,
+  { kind: "assistant_message" | "reasoning" | "tool_call" | "turn_ended" }
+> {
+  return (
+    m.kind === "assistant_message" ||
+    m.kind === "reasoning" ||
+    m.kind === "tool_call" ||
+    m.kind === "turn_ended"
+  );
+}
+
 function settleCutOffToolCalls(
   messages: ChatViewItem[],
   runLive: boolean,
@@ -467,9 +480,7 @@ function settleCutOffToolCalls(
         next[i] = { ...m, status: "unconfirmed", completed_at: settledAt };
       }
     }
-    if (m.kind !== "user_message" && "turn_id" in m && typeof m.turn_id === "string" && m.turn_id) {
-      laterTurns.add(m.turn_id);
-    }
+    if (isParentOutput(m) && m.turn_id) laterTurns.add(m.turn_id);
   }
   return next;
 }
