@@ -64,6 +64,8 @@ it("owns header, dimensions and live status while the plugin supplies only the b
   show();
   expect(screen.getByRole("dialog", { name: "Unity preview" })).toBeInTheDocument();
   expect(screen.getByText("Unity")).toBeInTheDocument();
+  expect(screen.getByText("Unity")).not.toHaveClass("border", "font-mono");
+  expect(screen.getByText("Unity")).toHaveClass("font-medium");
   expect(latest.workspaceId).toBe("ws-1");
   expect(latest.size).toEqual(DEFAULT_PEEK_SIZE);
   act(() => latest.onStatusChange("live", "Editor connected"));

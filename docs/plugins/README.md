@@ -146,7 +146,10 @@ Register `PEEK_AREA` to supply a preview body. The shared shell owns the title,
 status dot, close button, resize handle, placement and entrance/exit motion.
 It uses the browser peek's persisted size, readable minimum and 60% window
 clamp, and honors both app and OS reduced motion. One browser or plugin peek
-can be open at a time. Workspace switches close it, including while Settings
+can be open at a time. When title-bar actions are present, the peek moves below
+the title-bar band with a gap; without them, the browser's position is unchanged.
+Plugin titles are plain header text; only the browser keeps its URL field.
+Workspace switches close it, including while Settings
 is open; removing the contribution dismisses its body immediately.
 Peeks display over the workspace. Settings and utility pages temporarily hide
 the viewer; their title-bar actions remain mounted.

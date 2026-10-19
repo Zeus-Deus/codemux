@@ -3,6 +3,7 @@ import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 
 import { PanelHeader } from "@/components/ui/panel-header";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { useTitlebarActionsWidth } from "@/contrib/react/titlebar-actions";
 import { selectReduceMotion, useSettingsStore } from "@/stores/settings-store";
 import { clampPeekSize, useBrowserPeekStore, type PeekSize, type PeekStatusKind } from "@/stores/browser-peek-store";
 import { PeekStatus } from "./PeekStatus";
@@ -11,6 +12,7 @@ export interface PeekContent {
   id: string;
   workspaceId: string;
   title: string;
+  titlePresentation?: "text" | "url";
   ariaLabel: string;
   icon?: ReactNode;
   status: PeekStatusKind;
@@ -37,6 +39,7 @@ export function PeekShell({ content, workspaceId, allowExit = true }: {
   const panelRef = useRef<HTMLDivElement>(null);
   const resizeCleanup = useRef<(() => void) | null>(null);
   const appReducedMotion = useSettingsStore(selectReduceMotion);
+  const titlebarActionsWidth = useTitlebarActionsWidth();
   const lastShown = useRef<PeekContent | null>(null);
   if (content) lastShown.current = content;
   else if (lastShown.current?.workspaceId !== workspaceId || !allowExit || lastShown.current?.available?.() === false) lastShown.current = null;
@@ -122,7 +125,12 @@ export function PeekShell({ content, workspaceId, allowExit = true }: {
   };
   return (
     <div ref={panelRef} role="dialog" aria-label={shown.ariaLabel} data-state={open ? "open" : "closed"}
-      style={{ "--peek-w": `${size.width}px`, "--peek-h": `${size.height}px` } as CSSProperties}
+      style={{
+        "--peek-w": `${size.width}px`, "--peek-h": `${size.height}px`,
+        // Clear the title-bar band when it carries plugin actions. Without
+        // them, retain the browser's existing inset exactly.
+        top: titlebarActionsWidth > 0 ? "calc(2.5rem + 8px)" : undefined,
+      } as CSSProperties}
       className={cn(
         "absolute right-3.5 top-3.5 z-30 flex h-(--peek-h) w-(--peek-w) flex-col overflow-hidden",
         "rounded-lg border border-border bg-popover shadow-2xl",
@@ -132,7 +140,9 @@ export function PeekShell({ content, workspaceId, allowExit = true }: {
       <PanelHeader>
         <PeekStatus status={shown.status} label={shown.statusLabel} />
         {shown.icon}
-        <span className="min-w-0 flex-1 truncate rounded-md border border-border px-2 py-1 font-mono text-label text-muted-foreground">{shown.title}</span>
+        <span className={cn("min-w-0 flex-1 truncate text-label", shown.titlePresentation === "url"
+          ? "rounded-md border border-border px-2 py-1 font-mono text-muted-foreground"
+          : "font-medium text-foreground")}>{shown.title}</span>
         {shown.dock && <Tooltip>
           <TooltipTrigger asChild>
             <button type="button" onClick={shown.dock} aria-label="Open in side panel"

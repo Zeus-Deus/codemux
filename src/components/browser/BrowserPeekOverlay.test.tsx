@@ -173,6 +173,7 @@ describe("BrowserPeekOverlay", () => {
     renderOverlay();
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(screen.getByText("https://example.com/dashboard")).toBeInTheDocument();
+    expect(screen.getByText("https://example.com/dashboard")).toHaveClass("border", "font-mono");
     const stub = screen.getByTestId("browser-pane-stub");
     expect(stub.dataset.browserId).toBe("ws-abc123");
     expect(stub.dataset.workspaceId).toBe("ws-1");

@@ -38,6 +38,7 @@ function BrowserPeek() {
     id: "browser",
     workspaceId,
     title: session.current_url ?? "about:blank",
+    titlePresentation: "url",
     ariaLabel: "Background browser preview",
     status: status === "live" || status === "error" ? status : "connecting",
     statusLabel: status === "error" ? "Disconnected" : undefined,
