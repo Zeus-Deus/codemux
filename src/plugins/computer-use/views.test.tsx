@@ -23,7 +23,7 @@ async function activeController() {
       run: async ({ args }) => ({ code: 0, stdout: args?.[0] === "--version" ? "cua-driver 0.21.0" : JSON.stringify(healthy), stderr: "", timedOut: false, truncated: false, pipesHeldOpen: false, cancelled: false }),
     },
     os: { info: async () => ({ platform: "linux", arch: "x86_64", homeDir: "/home/demo", configDir: null, dataDir: null, localDataDir: null }) },
-    fs: { writeDataFile: async (name) => `/demo/${name}`, removeDataFile: async () => {} },
+    fs: { dataDir: async () => "/demo", listDir: async () => [], writeDataFile: async (name) => `/demo/${name}`, removeDataFile: async () => {} },
     registerMcpServer: async (options) => async () => { if (options.scope !== "plugin") await exit; },
     mcp: {
       callTool: async (_id, tool) => ({ content: [], ...(tool === "list_windows" ? { structuredContent: { windows: [{ pid: 42, window_id: 123, title: "Counter", app_name: "Counter" }] } } : {}) }),

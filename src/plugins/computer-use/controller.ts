@@ -10,7 +10,7 @@ import {
 export interface ComputerUseServices {
   process: Host["process"];
   os: Host["os"];
-  fs: Pick<Host["fs"], "writeDataFile" | "removeDataFile">;
+  fs: Pick<Host["fs"], "dataDir" | "listDir" | "writeDataFile" | "removeDataFile">;
   mcp: Pick<Host["mcp"], "callTool" | "getStatus" | "onStatus" | "onActivity">;
   registerMcpServer: PluginContext["registerMcpServer"];
 }
@@ -45,6 +45,11 @@ interface Resource {
 
 class Cancelled extends Error {}
 
+const driverFile = /^cua-(?:discovery|view|control)-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.(?:yaml|json)$/;
+// Incarnations can overlap during reload. Keep pending writes and registrations
+// protected until their disposer confirms exit; a new page revokes old owners.
+const liveFiles = new Set<string>();
+
 export class ComputerUseController {
   private state: ComputerUseState = {
     workspace: null, optedIn: false, executable: null, version: null, doctor: null,
@@ -60,6 +65,25 @@ export class ComputerUseController {
   private disposed = false;
 
   constructor(private readonly services: ComputerUseServices) {}
+
+  sweepStaleFiles(): Promise<void> {
+    this.operation = this.operation.then(() => this.sweepFiles()).catch((error: unknown) => {
+      if (!this.disposed) console.warn("[computer-use] Could not sweep stale driver files", error);
+    });
+    return this.operation;
+  }
+
+  private async sweepFiles(): Promise<void> {
+    if (this.disposed) return;
+    const directory = await this.services.fs.dataDir();
+    const entries = await this.services.fs.listDir(directory);
+    for (const entry of entries) {
+      if (this.disposed) return;
+      if (entry.kind !== "file" || !driverFile.test(entry.name) || liveFiles.has(entry.name)) continue;
+      await this.services.fs.removeDataFile(entry.name);
+      console.info("[computer-use] Removed stale driver file", entry.name);
+    }
+  }
 
   getState = () => this.state;
   subscribe = (fn: () => void) => {
@@ -173,8 +197,11 @@ export class ComputerUseController {
     target?: WindowTarget,
   ): Promise<Resource> {
     const { workspace, executable } = this.authorized();
+    await this.sweepFiles();
+    this.check(signal);
     const id = `cua-${kind}-${randomUUID()}`;
     const names = [`${id}.yaml`, `${id}.json`];
+    for (const name of names) liveFiles.add(name);
     let resource: Resource | null = null;
     try {
       const policy = await this.services.fs.writeDataFile(names[0], files.policy);
@@ -212,7 +239,10 @@ export class ComputerUseController {
       throw new Error("cua-driver did not become ready.");
     } catch (error) {
       if (resource) await this.release(resource);
-      else await Promise.all(names.map((name) => this.services.fs.removeDataFile(name).catch(() => {})));
+      else {
+        for (const name of names) liveFiles.delete(name);
+        await Promise.all(names.map((name) => this.services.fs.removeDataFile(name).catch(() => {})));
+      }
       throw error;
     }
   }
@@ -299,6 +329,7 @@ export class ComputerUseController {
   private release(resource: Resource): Promise<void> {
     resource.stopping ??= (async () => {
       await resource.stop();
+      for (const name of resource.files) liveFiles.delete(name);
       for (const unsubscribe of resource.unsubscribe) unsubscribe();
       this.resources.delete(resource);
       if (this.view === resource) this.view = null;

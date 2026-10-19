@@ -7,6 +7,7 @@ export default definePlugin({
   register(ctx) {
     const peek = ctx.host.peek;
     const controller = new ComputerUseController({ ...ctx.host, registerMcpServer: ctx.registerMcpServer });
+    void controller.sweepStaleFiles();
     const synchronizeWorkspace = () => {
       const workspace = ctx.host.workspace.current();
       const before = controller.getState();

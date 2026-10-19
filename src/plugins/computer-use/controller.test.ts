@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { PluginMcpActivity, PluginMcpCallResult, PluginMcpServer, PluginOsInfo } from "@codemux/sdk";
+import type { PluginDirectoryEntry, PluginMcpActivity, PluginMcpCallResult, PluginMcpServer, PluginOsInfo } from "@codemux/sdk";
 import { ComputerUseController, type ComputerUseServices } from "./controller";
 
 function deferred() {
@@ -16,6 +16,7 @@ function fakeDesktop() {
     stopped: boolean;
   }[] = [];
   const removed: string[] = [];
+  const files = new Map<string, PluginDirectoryEntry["kind"]>();
   let stopGate: Promise<void> | undefined;
   let registerGate: Promise<void> | undefined;
   let snapshotGate: Promise<void> | undefined;
@@ -34,8 +35,10 @@ function fakeDesktop() {
     },
     os: { info: async () => ({ platform: "linux", arch: "x86_64", homeDir: "/home/demo", configDir: null, dataDir: null, localDataDir: null }) },
     fs: {
-      writeDataFile: async (name) => `/plugin-data/${name}`,
-      removeDataFile: async (name) => { removed.push(name); },
+      dataDir: async () => "/plugin-data/computer-use",
+      listDir: async () => [...files].map(([name, kind]) => ({ name, kind })),
+      writeDataFile: async (name) => { files.set(name, "file"); return `/plugin-data/computer-use/${name}`; },
+      removeDataFile: async (name) => { removed.push(name); files.delete(name); },
     },
     registerMcpServer: async (options) => {
       const row = { options, calls: [], stopped: false };
@@ -65,7 +68,7 @@ function fakeDesktop() {
     },
   };
   return {
-    services, registrations, removed,
+    services, registrations, removed, files,
     holdStop: (gate: Promise<void>) => { stopGate = gate; },
     holdRegistration: (gate: Promise<void>) => { registerGate = gate; },
     holdSnapshot: (gate: Promise<void>) => { snapshotGate = gate; },
@@ -82,6 +85,89 @@ async function chooseWindow(controller: ComputerUseController) {
 }
 
 describe("computer-use lifecycle", () => {
+  it("sweeps and logs only its exact regular policy/manifest filenames in its own data directory", async () => {
+    const fake = fakeDesktop();
+    const uuid = "00000000-0000-4000-8000-000000000001";
+    const stale = ["discovery", "view", "control"].flatMap((kind) => ["yaml", "json"].map((ext) => `cua-${kind}-${uuid}.${ext}`));
+    for (const name of stale) fake.files.set(name, "file");
+    const untouched: [string, PluginDirectoryEntry["kind"]][] = [
+      ["notes.json", "file"], [`other-plugin-${uuid}.yaml`, "file"],
+      ["cua-control-invalid.json", "file"], [`cua-control-${uuid}.json.bak`, "file"],
+      [`../cua-control-${uuid}.json`, "file"],
+      ["cua-control-00000000-0000-4000-8000-000000000002.json", "symlink"],
+      ["cua-view-00000000-0000-4000-8000-000000000003.yaml", "directory"],
+      ["cua-discovery-00000000-0000-4000-8000-000000000004.json", "other"],
+    ];
+    for (const [name, kind] of untouched) fake.files.set(name, kind);
+    const list = vi.spyOn(fake.services.fs, "listDir");
+    const log = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      const controller = new ComputerUseController(fake.services);
+      await controller.sweepStaleFiles();
+      expect(list).toHaveBeenCalledExactlyOnceWith("/plugin-data/computer-use");
+      expect(fake.removed).toEqual(stale);
+      expect([...fake.files]).toEqual(untouched);
+      expect(log.mock.calls).toEqual(stale.map((name) => ["[computer-use] Removed stale driver file", name]));
+      expect(fake.registrations).toHaveLength(0);
+      await controller.dispose();
+    } finally { log.mockRestore(); }
+  });
+
+  it("preserves another incarnation's pending, live and stopping registrations until confirmed exit", async () => {
+    const fake = fakeDesktop();
+    const first = new ComputerUseController(fake.services);
+    const next = new ComputerUseController(fake.services);
+    const target = await chooseWindow(first);
+    fake.removed.length = 0;
+    const registering = deferred();
+    fake.holdRegistration(registering.promise);
+    const enabling = first.enable(target);
+    await vi.waitFor(() => expect(fake.registrations.some((row) => row.options.scope !== "plugin")).toBe(true));
+    const names = [...fake.files.keys()];
+    expect(names).toHaveLength(4);
+    await next.sweepStaleFiles();
+    expect(fake.removed).toEqual([]);
+    registering.resolve();
+    await enabling;
+    await next.sweepStaleFiles();
+    expect(fake.removed).toEqual([]);
+    const stopping = deferred();
+    fake.holdStop(stopping.promise);
+    const stopped = first.stop();
+    await vi.waitFor(() => expect(fake.registrations.find((row) => row.options.id.startsWith("cua-view-"))?.stopped).toBe(true));
+    const controlNames = names.filter((name) => name.startsWith("cua-control-"));
+    await next.sweepStaleFiles();
+    expect(controlNames.every((name) => fake.files.has(name))).toBe(true);
+    expect(fake.removed.some((name) => controlNames.includes(name))).toBe(false);
+    stopping.resolve();
+    await stopped;
+    expect(fake.files.size).toBe(0);
+    await Promise.all([first.dispose(), next.dispose()]);
+  });
+
+  it("cleans files left when an ended owner could stop children but could not remove data files", async () => {
+    const fake = fakeDesktop();
+    const first = new ComputerUseController(fake.services);
+    await first.enable(await chooseWindow(first));
+    const names = [...fake.files.keys()];
+    const remove = fake.services.fs.removeDataFile;
+    fake.services.fs.removeDataFile = async () => { throw new Error("Plugin host owner is no longer active"); };
+    await first.dispose();
+    expect(fake.registrations.every((row) => row.stopped)).toBe(true);
+    expect([...fake.files.keys()]).toEqual(names);
+    fake.services.fs.removeDataFile = remove;
+    fake.removed.length = 0;
+    const log = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      const next = new ComputerUseController(fake.services);
+      await next.sweepStaleFiles();
+      expect(fake.removed).toEqual(names);
+      expect(fake.files.size).toBe(0);
+      expect(log).toHaveBeenCalledTimes(4);
+      await next.dispose();
+    } finally { log.mockRestore(); }
+  });
+
   it.each<{
     platform: PluginOsInfo["platform"];
     homeDir: string | null;
