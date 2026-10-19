@@ -18,7 +18,10 @@ use axum::{Json, Router};
 use rand::distributions::{Alphanumeric, DistString};
 use serde_json::{json, Value};
 
+use sha2::{Digest, Sha256};
+
 use super::registry::McpRegistry;
+use super::runtime::McpTool;
 use super::McpConfigSource;
 
 /// Sources OpenCode loads itself, mirroring the native-source exclusions the
@@ -54,6 +57,50 @@ pub struct GatewayCaller {
     /// Config sources the agent already loads itself, hidden from its
     /// `tools/list` so it doesn't see every such tool twice.
     pub native_sources: Vec<McpConfigSource>,
+    /// Present tool names without `__`. Grok 1.0.52 admits a tool only when
+    /// `<server>__<tool>` has exactly one `__` (`grok mcp doctor`), and
+    /// registry names such as `mcp__docs__search` already contain it.
+    pub flat_tool_names: bool,
+}
+
+/// `name` with every run of characters outside `[A-Za-z0-9-]` folded to one
+/// `_`, never leading, so it can follow `server__` without forming `___`.
+fn flat_tool_name(name: &str) -> String {
+    let mut flat = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            flat.push(ch);
+        } else if !flat.is_empty() && !flat.ends_with('_') {
+            flat.push('_');
+        }
+    }
+    flat
+}
+
+/// The names a caller sees for `tools`, in order. Flattened names that
+/// collide get a hash of the original appended, so each stays unique and
+/// stable while the tool list is unchanged.
+fn presented_names(tools: &[McpTool], flat: bool) -> Vec<String> {
+    if !flat {
+        return tools.iter().map(|tool| tool.prefixed_name.clone()).collect();
+    }
+    let names: Vec<String> = tools.iter().map(|tool| flat_tool_name(&tool.prefixed_name)).collect();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for name in &names {
+        *counts.entry(name.as_str()).or_default() += 1;
+    }
+    names
+        .iter()
+        .zip(tools)
+        .map(|(name, tool)| {
+            if counts[name.as_str()] == 1 {
+                return name.clone();
+            }
+            let digest = Sha256::digest(tool.prefixed_name.as_bytes());
+            let suffix: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+            format!("{}_{suffix}", name.trim_end_matches('_'))
+        })
+        .collect()
 }
 
 /// Per-chat tokens. A chat keeps its token for the life of this process:
@@ -284,16 +331,14 @@ async fn handle_post(
         }
         "ping" => rpc_result(id, json!({})).into_response(),
         "tools/list" => {
-            let mut tools = state
-                .registry
-                .list_tools_for_workspace(&caller.native_sources, workspace_id)
-                .await;
-            tools.extend(super::registry::plugin_bridge_tools());
+            let tools = caller_tools(&state, &caller).await;
+            let names = presented_names(&tools, caller.flat_tool_names);
             let data: Vec<Value> = tools
                 .into_iter()
-                .map(|tool| {
+                .zip(names)
+                .map(|(tool, name)| {
                     json!({
-                        "name": tool.prefixed_name,
+                        "name": name,
                         "description": tool.description,
                         "inputSchema": tool.input_schema,
                     })
@@ -302,9 +347,21 @@ async fn handle_post(
             rpc_result(id, json!({ "tools": data })).into_response()
         }
         "tools/call" => {
-            let Some(name) = params.get("name").and_then(Value::as_str) else {
+            let Some(requested) = params.get("name").and_then(Value::as_str) else {
                 return rpc_error(id, -32602, "tools/call requires params.name").into_response();
             };
+            // Map a presented name back to the registry's.
+            let resolved = if caller.flat_tool_names {
+                let tools = caller_tools(&state, &caller).await;
+                presented_names(&tools, true)
+                    .into_iter()
+                    .zip(tools)
+                    .find(|(name, _)| name == requested)
+                    .map(|(_, tool)| tool.prefixed_name)
+            } else {
+                None
+            };
+            let name = resolved.as_deref().unwrap_or(requested);
             let arguments = params
                 .get("arguments")
                 .cloned()
@@ -338,6 +395,17 @@ async fn handle_post(
     }
 }
 
+/// Every tool the caller may list or call: its workspace's registry tools
+/// minus the sources its agent loads itself, plus the plugin bridge tools.
+async fn caller_tools(state: &GatewayState, caller: &GatewayCaller) -> Vec<McpTool> {
+    let mut tools = state
+        .registry
+        .list_tools_for_workspace(&caller.native_sources, caller.workspace_id.as_deref())
+        .await;
+    tools.extend(super::registry::plugin_bridge_tools());
+    tools
+}
+
 fn supported_protocol_version(requested: &str) -> &str {
     match requested {
         "2024-11-05" | "2025-03-26" | "2025-06-18" | "2025-11-25" | "2026-07-28" => requested,
@@ -356,6 +424,7 @@ fn authenticate(headers: &HeaderMap, state: &GatewayState) -> Option<GatewayCall
         return Some(GatewayCaller {
             workspace_id: None,
             native_sources: OPENCODE_NATIVE_SOURCES.to_vec(),
+            flat_tool_names: false,
         });
     }
     let grants = state.grants.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -538,6 +607,7 @@ mod tests {
             GatewayCaller {
                 workspace_id: Some("ws-1".into()),
                 native_sources: vec![McpConfigSource::CursorUser],
+                flat_tool_names: false,
             },
         );
         let hermes = runtime.chat_connection("thread-hermes", GatewayCaller::default());
@@ -565,6 +635,7 @@ mod tests {
         let caller = GatewayCaller {
             workspace_id: Some("ws-2".into()),
             native_sources: vec![McpConfigSource::ClaudeUser],
+            flat_tool_names: false,
         };
         let second = runtime.chat_connection("thread", caller.clone());
         assert_eq!(first, second);
@@ -631,7 +702,7 @@ mod tests {
             runtime
                 .chat_connection(
                     key,
-                    GatewayCaller { workspace_id: Some(workspace.into()), native_sources: vec![] },
+                    GatewayCaller { workspace_id: Some(workspace.into()), native_sources: vec![], flat_tool_names: false },
                 )
                 .bearer_token
         };
@@ -660,6 +731,86 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["result"]["isError"], true, "{value}");
+    }
+
+    fn tool(prefixed_name: &str) -> McpTool {
+        McpTool {
+            name: "raw".into(),
+            prefixed_name: prefixed_name.into(),
+            description: None,
+            input_schema: json!({}),
+            server_id: "s".into(),
+        }
+    }
+
+    #[test]
+    fn flat_names_have_no_double_underscore_or_leading_underscore() {
+        assert_eq!(flat_tool_name("mcp__fakeuser__fake_echo"), "mcp_fakeuser_fake_echo");
+        assert_eq!(flat_tool_name("unity__manage_gameobject"), "unity_manage_gameobject");
+        assert_eq!(flat_tool_name("__a.b:c___d-e"), "a_b_c_d-e");
+        assert_eq!(flat_tool_name("codemux_list_plugin_tools"), "codemux_list_plugin_tools");
+    }
+
+    #[test]
+    fn colliding_flat_names_stay_unique() {
+        let tools = [tool("mcp__a__b_c"), tool("mcp__a_b__c"), tool("mcp__z__y")];
+        let names = presented_names(&tools, true);
+        assert_eq!(names[2], "mcp_z_y");
+        assert_ne!(names[0], names[1]);
+        assert!(names[0].starts_with("mcp_a_b_c_") && names[1].starts_with("mcp_a_b_c_"), "{names:?}");
+        assert!(names.iter().all(|name| !name.contains("__")), "{names:?}");
+        assert_eq!(names, presented_names(&tools, true), "stable across calls");
+        assert_eq!(presented_names(&tools, false)[0], "mcp__a__b_c");
+    }
+
+    #[tokio::test]
+    async fn a_flat_caller_lists_and_calls_by_flat_name() {
+        let registry = McpRegistry::new();
+        registry
+            .insert_running_server_for_test("shared", vec![McpConfigSource::CodemuxUser])
+            .await;
+        let runtime = start_gateway(registry.clone()).await.unwrap();
+        let state = GatewayState {
+            registry,
+            bearer_token: Arc::from(runtime.connection().bearer_token.as_str()),
+            grants: runtime.grants.clone(),
+        };
+        let token = runtime
+            .chat_connection(
+                "grok-thread",
+                GatewayCaller { flat_tool_names: true, ..Default::default() },
+            )
+            .bearer_token;
+        let (_, value) = tools_list_with_token(state.clone(), &token).await;
+        let names: Vec<&str> = value["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["mcp_shared_tool", "codemux_list_plugin_tools", "codemux_call_plugin_tool"]
+        );
+        let response = router(state)
+            .oneshot(
+                Request::post("/mcp")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(
+                        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                               "params": {"name": "mcp_shared_tool", "arguments": {}}})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        // Resolved to the registry tool: the test server has no transport,
+        // where an unresolved name would be an unknown tool.
+        let text = value["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("'shared' has no live transport"), "{value}");
     }
 
     #[tokio::test]

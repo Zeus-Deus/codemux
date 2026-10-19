@@ -2362,6 +2362,7 @@ async fn attach_mcp_gateway_scoped(
                     crate::mcp::gateway::GatewayCaller {
                         workspace_id: Some(workspace_id.to_string()),
                         native_sources: crate::mcp::gateway::OPENCODE_NATIVE_SOURCES.to_vec(),
+                        flat_tool_names: false,
                     },
                 )
                 .await

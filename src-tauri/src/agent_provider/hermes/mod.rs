@@ -1047,6 +1047,7 @@ impl AgentProvider for HermesProvider {
             crate::mcp::gateway::GatewayCaller {
                 workspace_id: input.workspace_id.clone().or_else(|| binding.workspace_id.clone()),
                 native_sources: Vec::new(),
+                flat_tool_names: false,
             },
             &mcp_server_name(&input.thread_id.0),
             crate::agent_provider::acp::mcp::Transport::Http,

@@ -111,6 +111,7 @@ mod tests {
         let caller = GatewayCaller {
             workspace_id: Some("ws".into()),
             native_sources: CURSOR_NATIVE_SOURCES.to_vec(),
+            flat_tool_names: false,
         };
         let http =
             session_mcp_servers(Some(&registry), "t1", caller.clone(), SERVER_NAME, Transport::Http)

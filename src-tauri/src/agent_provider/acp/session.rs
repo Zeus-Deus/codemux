@@ -602,6 +602,7 @@ impl AcpSession {
                 crate::mcp::gateway::GatewayCaller {
                     workspace_id: spawn.workspace_id.clone(),
                     native_sources: dialect.native_mcp_sources().to_vec(),
+                    flat_tool_names: dialect.is_grok(),
                 },
                 super::mcp::SERVER_NAME,
                 super::mcp::Transport::negotiated(&initialized),

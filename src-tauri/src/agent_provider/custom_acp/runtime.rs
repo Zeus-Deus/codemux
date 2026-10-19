@@ -591,7 +591,7 @@ impl Session {
                 Some(workspace_id) => crate::agent_provider::acp::mcp::session_mcp_servers(
                     inner.mcp_registry.as_ref(),
                     &session.thread.0,
-                    crate::mcp::gateway::GatewayCaller { workspace_id, native_sources: Vec::new() },
+                    crate::mcp::gateway::GatewayCaller { workspace_id, ..Default::default() },
                     crate::agent_provider::acp::mcp::SERVER_NAME,
                     crate::agent_provider::acp::mcp::Transport::negotiated(&initialized),
                 )
