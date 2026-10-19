@@ -138,7 +138,7 @@ The SDK also exports the app's UI kit, so plugins look native: `Button`,
 `Popover*`, `Tooltip*`, `DropdownMenu*`, `Badge`, `Tabs*`, `ScrollArea`,
 `Separator`, `Kbd`, `Spinner` and `cn`. It also exports lucide icons as `icons`,
 zustand's `create`, React Query's `useQuery`, `useMutation` and
-`useQueryClient`, and `definePlugin` for typed plugins. The current export list
+`useQueryClient`, `randomUUID` for UUID creation, and `definePlugin` for typed plugins. The current export list
 is `src/sdk/index.ts`.
 
 ## Floating previews and compact status
