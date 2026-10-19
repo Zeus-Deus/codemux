@@ -8443,6 +8443,19 @@ impl SubagentTracker {
             .is_some_and(ThreadSubagentState::review_pending)
     }
 
+    /// Whether agent work that the thread's settled parent turn delegated
+    /// may still be running. Unlike [`Self::delegated_work_holding_turn`],
+    /// the stall watchdog doesn't end it: silence is not death, and a fork
+    /// or provider switch would copy or stop the conversation under that
+    /// work. A terminal snapshot, a Stop, the next turn or session teardown
+    /// does.
+    pub fn delegated_work_live(&self, thread_id: &str) -> bool {
+        let threads = self.threads.lock().expect("subagent tracker poisoned");
+        threads
+            .get(thread_id)
+            .is_some_and(|state| state.turn_settled && state.has_agents())
+    }
+
     /// Drop `thread_id`'s watch-loop tasks and report the status the pane
     /// should settle to, backing `agent_chat_stop_monitoring`.
     ///
@@ -8513,7 +8526,7 @@ impl SubagentTracker {
     ///
     /// Mutating under the same lock releases the mutex before the caller
     /// touches `AppStateStore`, so the two locks are never held together.
-    fn take_overdue_reviews(&self, now: SystemTime, threshold: Duration) -> Vec<String> {
+    pub(crate) fn take_overdue_reviews(&self, now: SystemTime, threshold: Duration) -> Vec<String> {
         let mut threads = self.threads.lock().expect("subagent tracker poisoned");
         let mut overdue = Vec::new();
         for (thread_id, state) in threads.iter_mut() {
