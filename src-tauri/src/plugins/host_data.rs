@@ -187,6 +187,56 @@ fn external_path(path: &Path) -> String {
     // CLI arguments when the ordinary absolute spelling is safely equivalent.
     dunce::simplified(path).to_string_lossy().into_owned()
 }
+
+#[cfg(any(windows, test))]
+fn persist_with_retry(
+    mut temp: tempfile::NamedTempFile,
+    path: &Path,
+    budget: std::time::Duration,
+    mut persist: impl FnMut(tempfile::NamedTempFile, &Path) -> Result<fs::File, tempfile::PersistError>,
+) -> Result<(), String> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + budget;
+    let mut delay = Duration::from_millis(10);
+    loop {
+        match persist(temp, path) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                // Windows ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION.
+                if !matches!(error.error.raw_os_error(), Some(5 | 32)) {
+                    return Err(error.to_string());
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    // Dropping PersistError also removes its owned temp file.
+                    return Err(format!(
+                        "Cannot replace plugin data file: the file is open in another program or access is denied; close it or check permissions and try again ({})",
+                        error.error
+                    ));
+                }
+                temp = error.file;
+                std::thread::sleep(delay.min(remaining));
+                delay = (delay * 2).min(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+fn persist_data_file(temp: tempfile::NamedTempFile, path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        persist_with_retry(
+            temp,
+            path,
+            std::time::Duration::from_secs(1),
+            |file, path| file.persist(path),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        temp.persist(path).map(|_| ()).map_err(|e| e.to_string())
+    }
+}
 fn execute_at(app_data: &Path, plugin: &str, operation: FsOperation) -> Result<Value, String> {
     match operation {
         FsOperation::Exists { path } => Ok(json!(absolute_path(&path)?
@@ -229,7 +279,7 @@ fn execute_at(app_data: &Path, plugin: &str, operation: FsOperation) -> Result<V
             // Persist renames the temporary file over the destination atomically.
             // It never opens the destination, so a link cannot redirect the write.
             data_path(&dir, &name)?;
-            temp.persist(&path).map_err(|e| e.to_string())?;
+            persist_data_file(temp, &path)?;
             Ok(json!(external_path(&path)))
         }
         FsOperation::RemoveDataFile { name } => {
@@ -344,6 +394,7 @@ mod tests {
         .unwrap();
         assert!(!path.exists());
     }
+    #[cfg(unix)]
     #[test]
     fn plugin_host_data_atomic_replace_preserves_an_open_reader() {
         let root = tempfile::tempdir().unwrap();
@@ -361,8 +412,7 @@ mod tests {
         let original = "old policy\n".repeat(1024);
         let replacement = "new policy\n".repeat(1024);
         let path = PathBuf::from(write(&original).as_str().unwrap());
-        // Rust's Windows default sharing includes FILE_SHARE_DELETE, so an
-        // existing reader can retain the old file while the name is replaced.
+        // Unix readers keep the old inode when its directory entry is replaced.
         let mut reader = fs::File::open(&path).unwrap();
         assert_eq!(
             write(&replacement).as_str().unwrap(),
@@ -374,6 +424,137 @@ mod tests {
         assert_eq!(old_contents, original);
         drop(reader);
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+    #[test]
+    fn plugin_host_data_windows_persist_retry_is_bounded_and_cleans_temps() {
+        use std::time::{Duration, Instant};
+        let root = tempfile::tempdir().unwrap();
+        for code in [5, 32] {
+            let temp = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+            let temp_path = temp.path().to_owned();
+            let started = Instant::now();
+            let mut attempts = 0;
+            let error = persist_with_retry(
+                temp,
+                &root.path().join("policy.json"),
+                Duration::from_millis(60),
+                |file, _| {
+                    attempts += 1;
+                    Err(tempfile::PersistError {
+                        error: std::io::Error::from_raw_os_error(code),
+                        file,
+                    })
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains("open in another program"));
+            assert!(error.contains("try again"));
+            assert!(started.elapsed() >= Duration::from_millis(60));
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!((2..=5).contains(&attempts));
+            assert!(!temp_path.exists());
+        }
+    }
+    #[test]
+    fn plugin_host_data_windows_persist_retries_only_sharing_or_access_errors() {
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("policy.json");
+        let mut temp = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+        temp.write_all(b"policy").unwrap();
+        let mut attempts = 0;
+        persist_with_retry(temp, &path, Duration::from_secs(1), |file, path| {
+            attempts += 1;
+            if attempts <= 2 {
+                return Err(tempfile::PersistError {
+                    error: std::io::Error::from_raw_os_error(if attempts == 1 { 5 } else { 32 }),
+                    file,
+                });
+            }
+            file.persist(path)
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "policy");
+
+        let temp = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+        let temp_path = temp.path().to_owned();
+        let mut attempts = 0;
+        persist_with_retry(temp, &path, Duration::from_secs(1), |file, _| {
+            attempts += 1;
+            Err(tempfile::PersistError {
+                error: std::io::Error::from_raw_os_error(123),
+                file,
+            })
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(!temp_path.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "policy");
+    }
+    #[cfg(windows)]
+    fn open_without_share_delete(path: &Path) -> fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(path)
+            .unwrap()
+    }
+    #[cfg(windows)]
+    #[test]
+    fn plugin_host_data_windows_blocked_reader_returns_clear_error_and_cleans_temp() {
+        use std::time::{Duration, Instant};
+        let root = tempfile::tempdir().unwrap();
+        let dir = data_dir(root.path(), "demo").unwrap();
+        let path = dir.join("policy.json");
+        fs::write(&path, "old").unwrap();
+        let reader = open_without_share_delete(&path);
+        let start = Instant::now();
+        let error = execute_at(
+            root.path(),
+            "demo",
+            FsOperation::WriteDataFile {
+                name: "policy.json".into(),
+                contents: "new".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("open in another program"));
+        assert!(error.contains("try again"));
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        drop(reader);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn plugin_host_data_windows_replaces_after_reader_closes_within_retry_window() {
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let dir = data_dir(root.path(), "demo").unwrap();
+        let path = dir.join("policy.json");
+        fs::write(&path, "old").unwrap();
+        let reader = open_without_share_delete(&path);
+        let app_data = root.path().to_owned();
+        let writer = std::thread::spawn(move || {
+            execute_at(
+                &app_data,
+                "demo",
+                FsOperation::WriteDataFile {
+                    name: "policy.json".into(),
+                    contents: "new".into(),
+                },
+            )
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!writer.is_finished());
+        drop(reader);
+        writer.join().unwrap().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
     }
     #[cfg(windows)]
     #[test]

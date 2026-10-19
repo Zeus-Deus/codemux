@@ -439,6 +439,10 @@ are refused. Writes are atomic, capped at 1 MiB, and use owner-only directory
 and file permissions on Unix. Data is retained on disable, reload, update **and
 uninstall**, matching existing `ctx.storage` retention. Reinstalling the same
 plugin id can reuse it. `removeDataFile` deletes only that plugin's named file.
+On Windows, another program's open handle can prevent replacement. Sharing or
+access failures retry with short backoff for up to one second, then return an
+error asking you to close the file or check permissions and try again. A failed
+write removes its temporary file and leaves the previous data file intact.
 Acquiring the data directory sweeps abandoned writer temp files older than one
 day, without following links; recent writes and named data files are retained.
 Returned Windows paths use ordinary absolute spelling when safely equivalent;
