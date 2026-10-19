@@ -398,10 +398,24 @@ async fn dispatch_resume<R: Runtime>(
         let last = db.latest_agent_chat_user_message_text(&thread_id.0, AUTOMATIC_RESUME_PREFIX);
         build_usage_resume_text(last.as_deref())
     };
-    let input = queued_turn(thread_id.clone(), text);
+    let mut input = queued_turn(thread_id.clone(), text);
+    input.permission_mode_override = resume_mode(app, provider, thread_id);
     send_turn_with_origin(app.clone(), provider, input, TurnOrigin::UsageResume)
         .await
         .map(|_| ())
+}
+
+/// The mode an automatic continuation runs in: for Codex, the one the chat's
+/// latest message named, since its Plan pill is per turn and does not survive
+/// a restart. `None` lets the provider keep its own.
+pub(super) fn resume_mode<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: &ThreadId,
+) -> Option<String> {
+    (provider == ProviderKind::Codex)
+        .then(|| app.state::<DatabaseStore>().agent_chat_turn_mode(&thread_id.0))
+        .flatten()
 }
 
 /// A plain queued turn whose full text is persisted as the user message

@@ -114,6 +114,12 @@ pub async fn agent_chat_answer_question<R: Runtime>(
         QuestionAction::Answer { permission_mode_override, .. } => permission_mode_override.clone(),
         _ => None,
     };
+    if let (ProviderKind::Codex, Some(mode)) = (provider_kind, &permission_mode_override) {
+        // As for a send: an answer can start the turn a restart interrupts.
+        if let Err(error) = db.set_agent_chat_turn_mode(&thread_id.0, mode) {
+            eprintln!("[codemux::agent_chat] {error}");
+        }
+    }
     let (submission_id, answers, reconcile) = match action {
         QuestionAction::Dismiss | QuestionAction::Reopen => {
             let next = match (&action, &previous) {

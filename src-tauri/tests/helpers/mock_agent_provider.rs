@@ -82,6 +82,8 @@ pub struct MockAgentProvider {
     /// on what the command layer actually handed the provider (workspace
     /// id, env overlay, resume cursor) rather than only that it was called.
     start_inputs: Arc<Mutex<Vec<StartSessionInput>>>,
+    /// The `permission_mode_override` of every `send_turn`, in order.
+    send_modes: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl MockAgentProvider {
@@ -101,7 +103,14 @@ impl MockAgentProvider {
             active_turns: Mutex::new(HashSet::new()),
             send_error: Mutex::new(None),
             start_inputs: Arc::new(Mutex::new(Vec::new())),
+            send_modes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// The mode each `send_turn` named, in order.
+    #[allow(dead_code)]
+    pub fn send_modes(&self) -> Vec<Option<String>> {
+        self.send_modes.lock().unwrap().clone()
     }
 
     /// Snapshot of every `start_session` input received so far.
@@ -245,6 +254,10 @@ impl AgentProvider for MockAgentProvider {
         if let Some(checkpoint) = checkpoint.as_ref() {
             checkpoint.prepare().await;
         }
+        self.send_modes
+            .lock()
+            .unwrap()
+            .push(input.permission_mode_override.clone());
         self.calls
             .push(MockCall::SendTurn(input.thread_id.clone(), input.text));
         if let Some(checkpoint) = checkpoint.as_ref() {

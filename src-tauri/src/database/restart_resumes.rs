@@ -25,6 +25,14 @@ pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
             started_at_ms INTEGER NOT NULL,
             quit_at_ms INTEGER
         );
+        -- The mode a chat's last message named, for a provider that takes it
+        -- per turn (Codex's Plan pill). An automatic continuation after a
+        -- restart runs in it, since the pill does not survive the restart.
+        CREATE TABLE IF NOT EXISTS agent_chat_turn_modes (
+            thread_id TEXT PRIMARY KEY
+                REFERENCES agent_chat_sessions(thread_id) ON DELETE CASCADE,
+            mode TEXT NOT NULL
+        );
         "#,
     )
     .map_err(|e| format!("Failed to create restart resume schema: {e}"))
@@ -58,6 +66,34 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RestartResumeRecor
 const COLUMNS: &str = "thread_id, turn_id, epoch, waiting, chain, started_at_ms, quit_at_ms";
 
 impl DatabaseStore {
+    /// Remember the mode the thread's latest message named. A thread without
+    /// a session row has nothing to resume, so nothing is written.
+    pub fn set_agent_chat_turn_mode(&self, thread_id: &str, mode: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_chat_turn_modes (thread_id, mode)
+             SELECT ?1, ?2
+             WHERE EXISTS (SELECT 1 FROM agent_chat_sessions WHERE thread_id = ?1)
+             ON CONFLICT(thread_id) DO UPDATE SET mode = excluded.mode",
+            params![thread_id, mode],
+        )
+        .map(drop)
+        .map_err(|e| format!("Failed to record turn mode: {e}"))
+    }
+
+    /// The mode the thread's latest message named, if any was recorded.
+    pub fn agent_chat_turn_mode(&self, thread_id: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT mode FROM agent_chat_turn_modes WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     /// Record that `turn_id` is running on a thread. The same turn reported
     /// again keeps what it is waiting on. A thread without a session row
     /// (a side chat) has nothing to resume, so nothing is written.
@@ -251,6 +287,18 @@ mod tests {
         // Waiting on a thread with no running turn records nothing.
         db.set_restart_turn_waiting("t", "req-3", true).unwrap();
         assert!(db.get_restart_turn("t").is_none());
+    }
+
+    #[test]
+    fn a_threads_turn_mode_is_kept_until_its_session_goes() {
+        let db = db_with(&["t"]);
+        assert_eq!(db.agent_chat_turn_mode("t"), None);
+        db.set_agent_chat_turn_mode("t", "plan").unwrap();
+        db.set_agent_chat_turn_mode("t", "danger-full-access").unwrap();
+        assert_eq!(db.agent_chat_turn_mode("t").as_deref(), Some("danger-full-access"));
+        // A side chat has no session row to resume.
+        db.set_agent_chat_turn_mode("side-chat", "plan").unwrap();
+        assert_eq!(db.agent_chat_turn_mode("side-chat"), None);
     }
 
     #[test]

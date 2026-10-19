@@ -575,6 +575,29 @@ async fn the_drain_skips_a_saved_turn_that_was_already_sent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_codex_chat_interrupted_in_plan_resumes_in_plan() {
+    let h = harness().await;
+    h.chat("rr-plan");
+    // The Plan pill rides on each Codex message; it does not survive a restart.
+    let planned = SendTurnCommandInput {
+        permission_mode_override: Some("plan".into()),
+        ..typed("rr-plan", "plan the migration")
+    };
+    agent_chat_send_turn(h.handle(), ProviderKind::Codex, planned)
+        .await
+        .unwrap();
+    h.provider.set_turn_active("rr-plan", false);
+    h.running("rr-plan", "turn-1");
+    on_exit(&h.handle());
+
+    let decisions = resume_after_restart_for_test(&h.handle(), "launch-2").await;
+    assert_eq!(decision(&decisions, "rr-plan"), Some(ResumeDecision::Resume));
+    let modes = h.provider.send_modes();
+    assert_eq!(modes.len(), 2);
+    assert_eq!(modes[1].as_deref(), Some("plan"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_chat_the_user_takes_over_during_the_launch_pass_is_left_alone() {
     let h = harness().await;
     h.chat("rr-take-a");

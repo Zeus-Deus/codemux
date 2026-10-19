@@ -3402,6 +3402,16 @@ async fn send_turn_internal<R: Runtime>(
     feature_flag_on(&observability)?;
     let hermes_gate = matches!(provider, ProviderKind::Hermes | ProviderKind::Acp).then(|| hermes_send_gate(&input.thread_id.0));
     let send_generation = hermes_gate.as_ref().map(|gate| gate.cancelled.load(Ordering::SeqCst));
+    if provider == ProviderKind::Codex {
+        if let Some(mode) = &input.permission_mode_override {
+            // Codex takes the Plan pill per turn and the pill does not survive
+            // a restart; an automatic continuation reuses the mode kept here.
+            let db: State<'_, DatabaseStore> = app.state();
+            if let Err(error) = db.set_agent_chat_turn_mode(&input.thread_id.0, mode) {
+                eprintln!("[codemux::agent_chat] {error}");
+            }
+        }
+    }
     if origin == TurnOrigin::User {
         crate::delegation::app::user_activity(&app, &input.thread_id.0, false)?;
         let db: State<'_, DatabaseStore> = app.state();

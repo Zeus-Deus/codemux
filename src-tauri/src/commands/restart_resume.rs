@@ -43,7 +43,7 @@ use crate::state::{AppStateStore, PaneStatus};
 use super::agent_chat::{
     lookup_provider, send_turn_with_origin, ProviderRegistry, SubagentTracker, TurnOrigin,
 };
-use super::usage_resume::{activity_lock, now_ms, queued_turn, thread_busy};
+use super::usage_resume::{activity_lock, now_ms, queued_turn, resume_mode, thread_busy};
 
 /// Settings key gating the resume. Absent or anything but `"false"` means
 /// enabled — the feature defaults ON. Off leaves the manual Continue.
@@ -574,7 +574,8 @@ async fn dispatch<R: Runtime>(
         abandon();
         return Err("the app is quitting".into());
     }
-    let input = queued_turn(thread_id, resume_note(row.quit_at_ms.is_some()));
+    let mut input = queued_turn(thread_id.clone(), resume_note(row.quit_at_ms.is_some()));
+    input.permission_mode_override = resume_mode(app, provider, &thread_id);
     let result = send_turn_with_origin(app.clone(), provider, input, TurnOrigin::RestartResume).await;
     if result.is_err() {
         abandon();
