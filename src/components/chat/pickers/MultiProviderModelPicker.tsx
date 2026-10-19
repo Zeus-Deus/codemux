@@ -773,6 +773,16 @@ export function MultiProviderModelPicker({
             </Command>}
           </div>
         </div>
+        {/* A switch to another provider says so above the account it
+            lands on. */}
+        {switchHint && (
+          <div
+            data-testid="provider-switch-hint"
+            className="border-t px-3 py-1.5 text-label text-muted-foreground"
+          >
+            {switchHint}
+          </div>
+        )}
         {(() => {
           const view = accountView(railKey);
           return view ? <AccountFooter view={view} onManage={() => setOpen(false)} /> : null;
@@ -783,14 +793,6 @@ export function MultiProviderModelPicker({
             disabled internal filtering with `shouldFilter={false}`.
             The `selectedKey` data attr is a smoke surface for tests. */}
         <span className="sr-only" data-active-key={selectedKey} />
-        {switchHint && (
-          <div
-            data-testid="provider-switch-hint"
-            className="border-t px-3 py-1.5 text-label text-muted-foreground"
-          >
-            {switchHint}
-          </div>
-        )}
       </PopoverContent>
     </Popover>
   );

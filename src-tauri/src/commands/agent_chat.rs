@@ -5757,6 +5757,9 @@ pub(crate) async fn restart_session_holding_gate<R: Runtime, T>(
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0).lock_owned().await;
     super::usage_resume::cancel_for_stopped_thread(app, &thread_id.0);
     let _native_guard = gate.dispatch.clone().lock_owned().await;
+    // A provider switch in flight would see the provider it is leaving
+    // restarted under it.
+    super::provider_switch::refuse_while_switching(&thread_id.0)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     match impl_.stop_session(thread_id.clone()).await {

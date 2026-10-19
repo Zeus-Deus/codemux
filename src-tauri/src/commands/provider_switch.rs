@@ -16,9 +16,11 @@
 //! are refused meanwhile ([`refuse_stale_send`], [`refuse_while_switching`]):
 //! none can run on the old provider, revive it, or change what was read.
 //!
-//! An account switch (provider accounts) is the same-provider counterpart:
-//! it serializes on the same per-thread dispatch gate, so the two never
-//! interleave, and the new provider's start resolves its own account.
+//! An account switch (`provider_accounts::switch_thread`) is the
+//! same-provider counterpart. Both serialize on the per-thread dispatch
+//! gate, an account switch is refused while a provider switch is in
+//! flight, and the new provider's start resolves its own account (the
+//! frontend's account pick runs inside `agentChatStartSession` for both).
 
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
