@@ -483,6 +483,7 @@ pub fn translate_notification_with(
             request_id,
             tool_name,
             tool_input,
+            plugin_bridge_target,
             tool_use_id,
             kind,
         } => {
@@ -496,7 +497,7 @@ pub fn translate_notification_with(
                 } else {
                     kind
                 },
-                payload: tool_input,
+                payload: if plugin_bridge_target {serde_json::json!({"plugin_bridge_target":true,"tool_name":tool_name,"tool_input":tool_input})} else {tool_input},
                 tool_use_id,
                 // Claude's `request-opened` notification does not yet
                 // carry the spawning `parent_tool_use_id`, so a subagent's
@@ -3028,12 +3029,35 @@ mod tests {
     }
 
     #[test]
+    fn plugin_mcp_claude_bridge_permission_payload_keeps_target_identity() {
+        let note = SidecarNotification::from_method_params(
+            "request-opened",
+            json!({"threadId":"t","requestId":"r","toolName":"mcp__codemux__fixture__x","toolInput":{"value":7},"pluginBridgeTarget":true,"toolUseId":"outer-bridge-call","kind":"other"}),
+        );
+        let events = translate_notification(&tid(), note);
+        let ProviderRuntimeEvent::RequestOpened {
+            payload,
+            tool_use_id,
+            ..
+        } = &events[0]
+        else {
+            panic!("approval expected");
+        };
+        assert_eq!(
+            payload,
+            &json!({"plugin_bridge_target":true,"tool_name":"mcp__codemux__fixture__x","tool_input":{"value":7}})
+        );
+        assert_eq!(tool_use_id.as_deref(), Some("outer-bridge-call"));
+    }
+
+    #[test]
     fn notification_request_opened_with_kind_passes_through() {
         let n = SidecarNotification::RequestOpened {
             thread_id: "t".into(),
             request_id: "r-1".into(),
             tool_name: "Bash".into(),
             tool_input: json!({"command": "ls"}),
+            plugin_bridge_target: false,
             tool_use_id: Some("tu-abc".into()),
             kind: "command".into(),
         };
@@ -3063,6 +3087,7 @@ mod tests {
             request_id: "r-2".into(),
             tool_name: "Read".into(),
             tool_input: json!({"path": "/a"}),
+            plugin_bridge_target: false,
             tool_use_id: None,
             kind: String::new(),
         };

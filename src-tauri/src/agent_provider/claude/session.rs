@@ -2333,16 +2333,24 @@ async fn collect_shared_tools_for_claude(
     caller: &crate::mcp::registry::HostCaller,
 ) -> Vec<crate::mcp::runtime::McpTool> {
     let mut tools = registry
-        .list_tools_for_workspace(&[
-            crate::mcp::McpConfigSource::ClaudeUser,
-            crate::mcp::McpConfigSource::ClaudeLocal,
-            crate::mcp::McpConfigSource::ClaudeProject,
-        ], caller.workspace_id.as_deref())
+        .list_tools_for_workspace(
+            &[
+                crate::mcp::McpConfigSource::ClaudeUser,
+                crate::mcp::McpConfigSource::ClaudeLocal,
+                crate::mcp::McpConfigSource::ClaudeProject,
+            ],
+            caller.workspace_id.as_deref(),
+        )
         .await;
     tools.extend(registry.host_tools(caller));
     // These stay callable while native catalog replacement waits for a safe
     // turn boundary (for example, an Editor connecting during this turn).
-    tools.extend(crate::mcp::registry::plugin_bridge_tools());
+    if registry
+        .has_visible_plugin_servers(caller.workspace_id.as_deref())
+        .await
+    {
+        tools.extend(crate::mcp::registry::plugin_bridge_tools());
+    }
     tools
 }
 
@@ -2827,13 +2835,31 @@ mod tests {
 
     #[tokio::test]
     async fn plugin_mcp_claude_payload_has_guidance_and_hides_private_servers() {
-        for scope in ["all","plugin"] {
-            let registry=crate::mcp::registry::test_support::plugin_fixture(scope).await;
-            let tools=collect_mcp_tools(Some(&registry),&test_caller()).await;
-            if scope=="plugin" {assert!(!tools.iter().any(|tool|tool.server_id.starts_with("plugin:")));}
-            else {let tool=tools.iter().find(|t|t.name=="new_tool").unwrap();assert_eq!(tool.description.as_deref(),Some("Use structured tools first.\n\nAlways use background delivery."));}
+        for scope in ["all", "plugin"] {
+            let registry = crate::mcp::registry::test_support::plugin_fixture(scope).await;
+            let tools = collect_mcp_tools(Some(&registry), &test_caller()).await;
+            if scope == "plugin" {
+                assert!(!tools
+                    .iter()
+                    .any(|tool| tool.server_id.starts_with("plugin:")));
+            } else {
+                let tool = tools.iter().find(|t| t.name == "new_tool").unwrap();
+                assert_eq!(
+                    tool.description.as_deref(),
+                    Some("Use structured tools first.\n\nAlways use background delivery.")
+                );
+            }
             registry.shutdown_all().await;
         }
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_claude_has_no_bridge_without_a_visible_plugin_server() {
+        let registry = crate::mcp::registry::McpRegistry::new();
+        let tools = collect_mcp_tools(Some(&registry), &test_caller()).await;
+        assert!(!tools
+            .iter()
+            .any(|tool| tool.server_id == "codemux-plugin-bridge"));
     }
 
     #[tokio::test]
@@ -2841,23 +2867,48 @@ mod tests {
         for scope in ["all", "plugin"] {
             let registry = crate::mcp::registry::test_support::plugin_fixture(scope).await;
             let tools = collect_mcp_tools(Some(&registry), &test_caller()).await;
-            assert!(tools.iter().any(|tool| tool.prefixed_name == "codemux_list_plugin_tools"));
+            assert_eq!(
+                tools
+                    .iter()
+                    .any(|tool| tool.prefixed_name == "codemux_list_plugin_tools"),
+                scope == "all"
+            );
             let (list, failure) = run_mcp_tool_call(
-                Some(&registry), &test_caller(), Some("ws-42"),
-                "codemux_list_plugin_tools", json!({}), None,
+                Some(&registry),
+                &test_caller(),
+                Some("ws-42"),
+                "codemux_list_plugin_tools",
+                json!({}),
+                None,
                 &["fixture__new_tool".into()],
-            ).await;
+            )
+            .await;
             assert!(failure.is_none());
             if scope == "all" {
-                assert!(list["structuredContent"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "fixture__new_tool" && tool["directlyCallable"] == true));
-            } else { assert_eq!(list["structuredContent"]["tools"], json!([])); }
+                assert!(list["structuredContent"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "fixture__new_tool"
+                        && tool["directlyCallable"] == true));
+            } else {
+                assert_eq!(list["structuredContent"]["tools"], json!([]));
+            }
             let (result, _) = run_mcp_tool_call(
-                Some(&registry), &test_caller(), Some("ws-42"),
-                "codemux_call_plugin_tool", json!({"name":"fixture__new_tool","arguments":{}}),
-                None, &[],
-            ).await;
-            if scope == "all" { assert_eq!(result["content"][0]["text"], "ORCHID-742"); }
-            else { assert_eq!(result["isError"], true); }
+                Some(&registry),
+                &test_caller(),
+                Some("ws-42"),
+                "codemux_call_plugin_tool",
+                json!({"name":"fixture__new_tool","arguments":{}}),
+                None,
+                &[],
+            )
+            .await;
+            if scope == "all" {
+                assert_eq!(result["content"][0]["text"], "ORCHID-742");
+            } else {
+                assert_eq!(result["isError"], true);
+            }
             registry.shutdown_all().await;
         }
         let names = plugin_direct_tool_names(&json!({"directPluginTools":vec!["x"; 700]}));
@@ -2869,7 +2920,12 @@ mod tests {
         let (_server, registry, call) =
             crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
         let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
-        assert_eq!(collect_mcp_tools(local.as_ref(), &test_caller()).await.len(), 3);
+        assert_eq!(
+            collect_mcp_tools(local.as_ref(), &test_caller())
+                .await
+                .len(),
+            3
+        );
         let (payload, failure) = run_mcp_tool_call(
             local.as_ref(),
             &test_caller(),

@@ -41,6 +41,7 @@ import {
   type PermissionsEmitter,
 } from "./permissions.ts";
 import { logger } from "./logger.ts";
+import { createPluginPermissions } from "./plugin-permissions.ts";
 
 /** User-facing event channel. The RPC dispatcher implements this by
  *  writing a JSON-RPC notification line to stdout. */
@@ -152,6 +153,13 @@ export function resetQueryFactoryForTests(): void {
  *  land in single-digit milliseconds; the ceiling only guards against
  *  a hung subprocess. */
 let interruptExitTimeoutMs = 2000;
+let mcpRefreshTimeoutMs = 5000;
+export function setMcpRefreshTimeoutForTests(ms: number): void {
+  mcpRefreshTimeoutMs = ms;
+}
+export function resetMcpRefreshTimeoutForTests(): void {
+  mcpRefreshTimeoutMs = 5000;
+}
 
 /** Lower the interrupt-exit timeout so tests don't wait on the real
  *  ceiling. Mirrors the `setQueryFactoryForTests` DI seam. */
@@ -362,6 +370,12 @@ export class ClaudeSession {
   /** The `canUseTool` bridge, retained so a rebuilt query reuses the
    *  same closure over `pendingApprovals` and the emitter. */
   private readonly canUseTool: CanUseTool;
+  private readonly pluginPermissionHook: ReturnType<
+    typeof createPluginPermissions
+  >["hook"];
+  private readonly resetPluginSessionRules: ReturnType<
+    typeof createPluginPermissions
+  >["resetSessionRules"];
   /** True while `interrupt()` is in flight, so `consumeMessages` knows
    *  an iterator exit is expected and stays silent instead of firing
    *  `session-ended`. */
@@ -434,7 +448,7 @@ export class ClaudeSession {
     this.promptQueue = new AsyncPromptQueue<SDKUserMessage>();
     this.pendingApprovals = new Map();
 
-    this.canUseTool = makeCanUseTool(
+    const normalCanUseTool = makeCanUseTool(
       input.threadId,
       emit,
       this.pendingApprovals,
@@ -447,7 +461,42 @@ export class ClaudeSession {
         onBypassDowngradeDetected: () => this.restoreBypassOnce(),
       },
     );
+    const bridgeCanUseTool = makeCanUseTool(
+      input.threadId,
+      {
+        notification: (method, params) =>
+          emit.notification(
+            method,
+            method === "request-opened" &&
+              typeof params === "object" &&
+              params !== null
+              ? { ...params, pluginBridgeTarget: true }
+              : params,
+          ),
+      },
+      this.pendingApprovals,
+    );
+    const permissions = createPluginPermissions({
+      threadId: input.threadId,
+      getQuery: () => this.query,
+      getMode: () => this.startInput.permissionMode,
+      extraArgs: input.extraArgs ?? {},
+      canUseTool: normalCanUseTool,
+      canUseTarget: bridgeCanUseTool,
+    });
+    this.canUseTool = permissions.canUseTool;
+    this.pluginPermissionHook = permissions.hook;
+    this.resetPluginSessionRules = permissions.resetSessionRules;
     const options = buildQueryOptions(input, this.canUseTool);
+    if (!input.managed)
+      options.hooks = {
+        PreToolUse: [
+          {
+            matcher: "^mcp__codemux__codemux_call_plugin_tool$",
+            hooks: [this.pluginPermissionHook],
+          },
+        ],
+      };
     options.abortController = this.queryAbort;
 
     this.query = queryFactory({
@@ -506,7 +555,6 @@ export class ClaudeSession {
         this.emitSpecialCases(message);
         if (message.type === "result" && !parentToolUseId && this.pendingSteers.size === 0 && this.promptQueue.isEmpty()) {
           this.mcpTurnActive = false;
-          this.acceptsSteers = false;
           // Deliver the result before starting control RPCs. A stalled
           // refresh must not stall the message iterator or the visible turn.
           void this.flushMcpTools();
@@ -723,6 +771,7 @@ export class ClaudeSession {
       }
     }
     await this.flushMcpTools();
+    this.ensureLiveQuery();
     this.mcpTurnActive = true;
     const msg = this.buildUserMessage(input.text, input.images);
     // The CLI echoes a prompt's uuid in `user_message_uuids` only when the
@@ -749,6 +798,10 @@ export class ClaudeSession {
     if (this.interrupting || this.queryDead || !this.acceptsSteers) {
       throw new Error("no running turn to steer");
     }
+    await this.flushMcpTools();
+    if (this.closed || this.interrupting || !this.acceptsSteers)
+      throw new Error("no running turn to steer");
+    this.ensureLiveQuery();
     const msg = this.buildUserMessage(input.text, input.images);
     msg.priority = "next";
     msg.uuid = input.uuid as NonNullable<SDKUserMessage["uuid"]>;
@@ -936,7 +989,12 @@ export class ClaudeSession {
     }
 
     this.queryDead = false;
+    this.mcpTurnActive = false;
+    // The replacement starts with the latest snapshot, so no control swap
+    // is needed before its first prompt initializes the CLI.
+    this.pendingMcpTools = null;
     this.pendingSteers.clear();
+    this.resetPluginSessionRules();
     // A rebuilt query is a fresh CLI boot that may or may not be
     // downgraded on its own; give it a fresh restore attempt.
     this.bypassRestoreAttempted = false;
@@ -951,6 +1009,15 @@ export class ClaudeSession {
       rebuildInput.resume = opts.resume;
     }
     const options = buildQueryOptions(rebuildInput, this.canUseTool);
+    if (!rebuildInput.managed)
+      options.hooks = {
+        PreToolUse: [
+          {
+            matcher: "^mcp__codemux__codemux_call_plugin_tool$",
+            hooks: [this.pluginPermissionHook],
+          },
+        ],
+      };
     this.queryAbort = new AbortController();
     options.abortController = this.queryAbort;
     this.query = queryFactory({ prompt: this.promptQueue, options });
@@ -975,18 +1042,56 @@ export class ClaudeSession {
       while (this.pendingMcpTools && !this.closed && !this.queryDead && !this.mcpTurnActive) {
         const tools = this.pendingMcpTools;
         this.pendingMcpTools = null;
+        const query = this.query;
+        const queryAbort = this.queryAbort;
         try {
           // The SDK retains an in-process instance when its name stays
           // present. Explicit removal connects the replacement catalog.
-          await this.query.setMcpServers({});
-          const result = await this.query.setMcpServers(
-            tools.length > 0 ? { codemux: buildCodemuxMcpServer(tools) } : {},
-          );
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          let result;
+          try {
+            result = await Promise.race([
+              (async () => {
+                await query.setMcpServers({});
+                if (this.closed || this.query !== query || this.queryDead)
+                  throw new Error("MCP refresh query retired");
+                return query.setMcpServers(
+                  tools.length > 0
+                    ? { codemux: buildCodemuxMcpServer(tools) }
+                    : {},
+                );
+              })(),
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(() => {
+                  this.retiredQueries.add(query);
+                  if (this.query === query) this.queryDead = true;
+                  try {
+                    queryAbort.abort();
+                    query.close();
+                  } catch (error) {
+                    logger.warn("closing timed-out MCP query failed", {
+                      threadId: this.threadId,
+                      err: String(error),
+                    });
+                  } finally {
+                    reject(
+                      new Error(
+                        "MCP refresh timed out; query will resume with the pending catalog",
+                      ),
+                    );
+                  }
+                }, mcpRefreshTimeoutMs);
+              }),
+            ]);
+          } finally {
+            if (timer !== undefined) clearTimeout(timer);
+          }
           if (Object.keys(result.errors ?? {}).length > 0) {
             throw new Error(`MCP refresh failed: ${JSON.stringify(result.errors)}`);
           }
         } catch (err) {
-          this.pendingMcpTools ??= tools;
+          // A Stop may already have rebuilt with a newer snapshot.
+          if (this.query === query) this.pendingMcpTools ??= tools;
           logger.warn("setMcpServers failed", {
             threadId: this.threadId,
             toolCount: tools.length,
