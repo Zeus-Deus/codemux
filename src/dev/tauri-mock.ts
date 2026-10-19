@@ -116,6 +116,7 @@ import {
   mockSetUsagePriceOverride,
   mockWebRemotePairing,
   mockWebRemoteSessions,
+  mockPushDevices,
   richChatTurnEnvelopes,
   monitoringEnvelopes,
   usageLimitEnvelopes,
@@ -8311,6 +8312,7 @@ const handlers: Record<string, Handler> = {
 
   // ── Provider accounts ──
   ...createProviderAccountsMock().handlers,
+  web_remote_push_devices: () => mockPushDevices(),
 };
 
 let mockStaleWorktrees: StaleWorktree[] = [

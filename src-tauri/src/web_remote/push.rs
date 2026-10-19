@@ -86,7 +86,7 @@ fn write_store(store: &Store) -> Result<(), String> {
         .map_err(|_| "Cannot save push configuration")?;
     std::fs::rename(temp, path).map_err(|_| "Cannot save push configuration".into())
 }
-fn active_session<R: Runtime>(app: &AppHandle<R>, session: &str) -> bool {
+pub(super) fn active_session<R: Runtime>(app: &AppHandle<R>, session: &str) -> bool {
     app.state::<DatabaseStore>()
         .web_remote_get_session(session)
         .is_some_and(|s| s.approved && !s.revoked)
@@ -126,6 +126,9 @@ pub async fn invoke<R: Runtime>(
 ) -> Result<Value, String> {
     if !active_session(app, session) {
         return Err("Remote session is no longer approved".into());
+    }
+    if cmd.starts_with("web_push_native_") {
+        return super::native_push::invoke(app, session, cmd, args).await;
     }
     if cmd == "web_push_test" {
         let subscriber = {
@@ -380,6 +383,25 @@ fn agent_event<R: Runtime>(app: &AppHandle<R>, source: &str, category: &'static 
         return;
     }
     let payload = json!({"category":category, "title": match category {"attention" => "Codemux needs you", "failure" => "Agent failed", _ => "Ready for review"}, "body":workspace.title.chars().take(160).collect::<String>(), "workspace_id":workspace.workspace_id.0, "pane_id":pane, "tag":format!("codemux-{}-{source}-{category}", workspace.workspace_id.0)});
+    if let Some(kind) = super::native_push::Kind::from_web_category(category) {
+        super::native_push::deliver(
+            app,
+            super::native_push::Notice {
+                kind,
+                title: payload["title"].as_str().unwrap_or_default().into(),
+                body: payload["body"].as_str().unwrap_or_default().into(),
+                collapse_key: payload["tag"].as_str().unwrap_or_default().into(),
+                data: [
+                    ("workspaceId", workspace.workspace_id.0.as_str()),
+                    ("paneId", pane.as_str()),
+                    ("source", source),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            },
+        );
+    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let subscribers = {

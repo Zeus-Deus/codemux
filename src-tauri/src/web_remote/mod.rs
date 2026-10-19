@@ -36,6 +36,7 @@ pub mod dispatch;
 pub mod endpoints;
 pub mod events;
 pub mod iroh;
+pub mod native_push;
 mod policy;
 pub(crate) mod push;
 pub mod proxy;

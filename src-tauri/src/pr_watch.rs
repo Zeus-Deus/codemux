@@ -828,6 +828,7 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
                 client_nonce: Some(wake_nonce(&next, &evaluation.delivered)),
                 delivery: crate::agent_provider::types::MessageDelivery::Queue,
             };
+            let mut refunded = false;
             if let Err((error, reached)) =
                 send_turn_reporting_dispatch(app.clone(), provider, input, TurnOrigin::PrWatch).await
             {
@@ -842,6 +843,7 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
                     &[]
                 } else {
                     refund_wake(&mut next, watch, report);
+                    refunded = true;
                     &evaluation.delivered
                 };
                 // Past the commit point nothing may return `Err`: the
@@ -852,8 +854,16 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
                     Err(error) => eprintln!("[codemux::pr-watch] {error}"),
                 }
             }
+            // A refunded wake is retried with the same events next pass, and
+            // the phone hears about it then, once.
+            if !refunded {
+                crate::web_remote::native_push::pr_event(app, &next, &summary(report));
+            }
         }
-        Decision::Exhausted => notify_stopped(app, &next),
+        Decision::Exhausted => {
+            notify_stopped(app, &next);
+            crate::web_remote::native_push::pr_event(app, &next, "Stopped watching: the fix attempts ran out");
+        }
         Decision::Quiet | Decision::Ended => {}
     }
     // Every committed pass moves `last_checked_at_ms`, which the UI shows.

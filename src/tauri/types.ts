@@ -1972,3 +1972,17 @@ export interface ChatForkOrigin {
   /** The fork's last copied transcript row; later rows are its own. */
   boundary_message_id: number | null;
 }
+
+/** A paired phone-app session registered for push through the relay
+ *  (`web_remote_push_devices`). The relay key never leaves the backend. */
+export interface MobilePushDevice {
+  session_id: string;
+  relay_url: string;
+  device_id: string;
+  platform: "ios" | "android";
+  label: string | null;
+  /** JSON object of category → enabled (attention, complete, failure, pr). */
+  categories: string;
+  created_at_ms: number;
+  updated_at_ms: number;
+}

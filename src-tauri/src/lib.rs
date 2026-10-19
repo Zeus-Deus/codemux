@@ -3168,6 +3168,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::provider_account_open_sign_in,
             commands::provider_account_thread,
             commands::provider_account_switch_thread,
+            // Phone-app sessions registered for push through the relay.
+            web_remote::native_push::web_remote_push_devices,
         ])
 }
 

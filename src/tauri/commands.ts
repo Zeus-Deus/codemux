@@ -4014,3 +4014,9 @@ export const providerAccountThread = (
 /** Move a started chat to another account, keeping its conversation. */
 export const providerAccountSwitchThread = (threadId: string, accountId: string) =>
   invoke<AccountSwitchOutcome>("provider_account_switch_thread", { threadId, accountId });
+
+// ── Phone-app push ──
+
+/** Paired sessions running the Codemux phone app with relay push on. */
+export const webRemotePushDevices = () =>
+  invoke<import("./types").MobilePushDevice[]>("web_remote_push_devices");
