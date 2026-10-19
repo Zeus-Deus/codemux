@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { PluginMcpActivity, PluginMcpCallResult } from "@codemux/sdk";
-import type { DesktopAdapter, DriverConnection, DriverOptions } from "./adapter";
+import type { DesktopAdapter, DriverConnection, DriverOptions, OsInfo } from "./adapter";
 import { ComputerUseController } from "./controller";
 
 function deferred() {
@@ -23,6 +23,7 @@ function fakeDesktop() {
   let snapshotGate: Promise<void> | undefined;
   const desktop: DesktopAdapter = {
     which: async () => "/demo/cua-driver",
+    osInfo: async () => ({ platform: "linux", arch: "x86_64", homeDir: "/home/demo", configDir: null, dataDir: null, localDataDir: null }),
     run: async ({ args }) => ({
       code: 0, stdout: args?.[0] === "--version" ? "cua-driver 0.21.0\n" : '{"ok":true,"probes":[]}',
       stderr: "", timedOut: false, truncated: false, cancelled: false,
@@ -77,6 +78,71 @@ async function chooseWindow(controller: ComputerUseController) {
 }
 
 describe("computer-use lifecycle", () => {
+  it.each<{
+    platform: OsInfo["platform"];
+    homeDir: string | null;
+    localDataDir: string | null;
+    expected: string;
+    requested?: string;
+  }>([
+    { platform: "linux", homeDir: "/home/Demo User/", localDataDir: null, expected: "/home/Demo User/.local/bin/cua-driver" },
+    { platform: "linux", homeDir: "/home/demo", localDataDir: null, expected: "/home/demo/.local/bin/cua-driver", requested: "cua-driver" },
+    { platform: "windows", homeDir: null, localDataDir: "C:\\Users\\Demo User\\AppData\\Local\\", expected: "C:\\Users\\Demo User\\AppData\\Local\\Programs\\Cua\\cua-driver\\bin\\cua-driver.exe" },
+    { platform: "macos", homeDir: null, localDataDir: null, expected: "/Applications/CuaDriver.app/Contents/MacOS/cua-driver" },
+    { platform: "macos", homeDir: "/Users/demo", localDataDir: null, expected: "/Users/demo/.local/bin/cua-driver" },
+  ])("finds a standard $platform installation outside PATH", async ({ platform, homeDir, localDataDir, expected, requested }) => {
+    const fake = fakeDesktop();
+    fake.desktop.which = vi.fn(async (command) => command === expected ? expected : null);
+    fake.desktop.osInfo = async () => ({ platform, arch: "x86_64", homeDir, configDir: null, dataDir: null, localDataDir });
+    const run = vi.spyOn(fake.desktop, "run");
+    const controller = new ComputerUseController(fake.desktop);
+    await controller.detect(requested);
+    expect(fake.desktop.which).toHaveBeenNthCalledWith(1, "cua-driver");
+    expect(controller.getState().error).toBeNull();
+    expect(controller.getState().executable).toBe(expected);
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({ command: expected, args: ["--version"] }));
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({ command: expected, args: ["doctor", "--json"] }));
+    await controller.dispose();
+  });
+
+  it.each([undefined, "/chosen/cua-driver"])("keeps PATH or custom executable precedence (%s)", async (command) => {
+    const fake = fakeDesktop();
+    fake.desktop.which = vi.fn(async () => "/resolved/cua-driver");
+    const directories = vi.spyOn(fake.desktop, "osInfo");
+    const controller = new ComputerUseController(fake.desktop);
+    await controller.detect(command);
+    expect(fake.desktop.which).toHaveBeenCalledExactlyOnceWith(command ?? "cua-driver");
+    expect(directories).not.toHaveBeenCalled();
+    expect(controller.getState().executable).toBe("/resolved/cua-driver");
+    await controller.dispose();
+  });
+
+  it("does not silently replace a missing custom executable", async () => {
+    const fake = fakeDesktop();
+    fake.desktop.which = vi.fn(async () => null);
+    const directories = vi.spyOn(fake.desktop, "osInfo");
+    const run = vi.spyOn(fake.desktop, "run");
+    const controller = new ComputerUseController(fake.desktop);
+    await controller.detect("/missing/cua-driver");
+    expect(directories).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(controller.getState().error).toContain("No executable was found at /missing/cua-driver");
+    await controller.dispose();
+  });
+
+  it("handles unavailable home directories without constructing a relative fallback", async () => {
+    const fake = fakeDesktop();
+    fake.desktop.which = vi.fn(async () => null);
+    fake.desktop.osInfo = async () => ({ platform: "linux", arch: "aarch64", homeDir: null, configDir: null, dataDir: null, localDataDir: null });
+    const run = vi.spyOn(fake.desktop, "run");
+    const controller = new ComputerUseController(fake.desktop);
+    await controller.detect();
+    expect(fake.desktop.which).toHaveBeenCalledExactlyOnceWith("cua-driver");
+    expect(run).not.toHaveBeenCalled();
+    expect(controller.getState().error).toContain("Install it or enter its executable path");
+    await controller.dispose();
+  });
+
   it("never registers tools without workspace opt-in", async () => {
     const fake = fakeDesktop();
     const controller = new ComputerUseController(fake.desktop);

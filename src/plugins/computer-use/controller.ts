@@ -90,14 +90,40 @@ export class ComputerUseController {
     return this.stop();
   }
 
+  private async findExecutable(command: string | undefined, signal: AbortSignal): Promise<string> {
+    const requested = command?.trim();
+    const found = await this.desktop.which(requested || "cua-driver");
+    this.check(signal);
+    if (found) return found;
+    if (requested && requested !== "cua-driver") throw new Error(`No executable was found at ${requested}. Check the path, then try again.`);
+    const os = await this.desktop.osInfo();
+    this.check(signal);
+    const userBin = os.homeDir ? `${os.homeDir.replace(/\/+$/, "")}/.local/bin/cua-driver` : null;
+    const candidates: string[] = [];
+    if (os.platform === "windows" && os.localDataDir) {
+      candidates.push(`${os.localDataDir.replace(/[\\/]+$/, "")}\\Programs\\Cua\\cua-driver\\bin\\cua-driver.exe`);
+    } else if (os.platform === "macos") {
+      candidates.push("/Applications/CuaDriver.app/Contents/MacOS/cua-driver");
+      if (userBin) candidates.push(userBin);
+    } else if (os.platform === "linux" && userBin) {
+      candidates.push(userBin);
+    }
+    for (const candidate of candidates) {
+      const executable = await this.desktop.which(candidate);
+      this.check(signal);
+      if (executable) return executable;
+    }
+    throw new Error("cua-driver was not found. Install it or enter its executable path, then check again.");
+  }
+
   detect(command?: string): Promise<void> {
     return this.schedule(async (signal) => {
       await this.releaseAll();
       this.check(signal);
       this.update({ phase: "detecting", error: null, executable: null, version: null, doctor: null });
-      const executable = command?.trim() || await this.desktop.which("cua-driver");
+      const executable = await this.findExecutable(command, signal);
       this.check(signal);
-      if (!executable) throw new Error("cua-driver was not found. Install it, then check again.");
+      this.update({ executable });
       const versionResult = await this.desktop.run({
         command: executable, args: ["--version"], timeoutMs: 5_000, maxOutputBytes: 16_384,
         workspaceId: this.state.workspace?.id, env: { CUA_DRIVER_EMBEDDED: "1" },

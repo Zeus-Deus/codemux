@@ -14,6 +14,13 @@ Codemux does not run the installer or grant operating-system permissions. This
 plugin currently requires version **0.21.0**, whose policy and exact-window
 manifest were evaluated. A different version needs another compatibility check.
 Doctor warnings remain visible even when the driver's overall result is `ok`.
+The installation diagnostics show the resolved executable path. Detection checks
+PATH first, then the standard installation locations: `~/.local/bin/cua-driver`
+on Linux, `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin\cua-driver.exe` on Windows,
+and `/Applications/CuaDriver.app/Contents/MacOS/cua-driver` followed by
+`~/.local/bin/cua-driver` on macOS. The [macOS installer](https://github.com/trycua/cua/blob/70db98d1bcd92890d778f4978e0eb107a4b66c1b/libs/cua-driver/scripts/_install-rust.sh#L933)
+links the user-bin path into that application bundle. An explicit custom path
+takes precedence; Codemux does not change PATH or run an installer.
 
 The title-bar indicator shows when control is enabled and when an agent is
 calling its tools. The **Computer** chip beside the chat's browser status opens

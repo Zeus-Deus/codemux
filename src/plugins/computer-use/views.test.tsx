@@ -4,7 +4,7 @@ import { act, cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { DesktopAdapter, PeekAdapter } from "./adapter";
 import { ComputerUseController } from "./controller";
-import { ComputerChatChip, ComputerIndicator, DoctorDiagnostics } from "./views";
+import { ComputerChatChip, ComputerIndicator, ComputerSettings, DoctorDiagnostics } from "./views";
 
 vi.mock("@/lib/toast", () => ({ toast: { error: vi.fn(), info: vi.fn(), success: vi.fn(), warning: vi.fn() } }));
 vi.mock("@/tauri/commands", () => ({ dbDeleteSetting: vi.fn(async () => {}) }));
@@ -18,6 +18,7 @@ async function activeController() {
   const exit = new Promise<void>((resolve) => { release = resolve; });
   const desktop: DesktopAdapter = {
     which: async () => "/demo/cua-driver",
+    osInfo: async () => ({ platform: "linux", arch: "x86_64", homeDir: "/home/demo", configDir: null, dataDir: null, localDataDir: null }),
     run: async ({ args }) => ({ code: 0, stdout: args?.[0] === "--version" ? "cua-driver 0.21.0" : JSON.stringify(healthy), stderr: "", timedOut: false, truncated: false, cancelled: false }),
     writeDataFile: async (name) => `/demo/${name}`, removeDataFile: async () => {},
     register: async (options) => ({
@@ -40,6 +41,15 @@ async function activeController() {
 }
 
 describe("computer-use status controls", () => {
+  it("shows the resolved executable in the installation diagnostics", async () => {
+    const { controller, peek, release } = await activeController();
+    render(<ComputerSettings controller={controller} peek={peek} initialCommand="" onCommand={() => {}} onOptIn={() => {}} />);
+    expect(screen.getByLabelText("Resolved cua-driver executable")).toBeVisible();
+    expect(screen.getByLabelText("Resolved cua-driver executable")).toHaveTextContent("/demo/cua-driver");
+    release();
+    await controller.dispose();
+  });
+
   it("keeps healthy diagnostics collapsed and warnings immediately visible", () => {
     const { rerender, container } = render(<DoctorDiagnostics report={healthy} />);
     expect(screen.getByText("Driver ready")).toBeVisible();

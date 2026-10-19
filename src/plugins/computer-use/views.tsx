@@ -73,6 +73,9 @@ export function ComputerSettings({ controller, peek, initialCommand, onCommand, 
         <Notice>
           Requires cua-driver 0.21.0. <a href={INSTALL_URL} target="_blank" rel="noreferrer" style={{ color: color("primary"), textDecoration: "underline" }}>Official installation guide</a>
         </Notice>
+        {state.executable && <p style={{ ...muted, margin: 0, overflowWrap: "anywhere" }}>
+          Executable: <code aria-label="Resolved cua-driver executable">{state.executable}</code>
+        </p>}
         {state.doctor && <DoctorDiagnostics report={state.doctor} />}
       </section>
       <section style={section} aria-label="Workspace access">

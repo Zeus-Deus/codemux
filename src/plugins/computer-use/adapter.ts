@@ -48,6 +48,15 @@ export interface ProcessResult {
   cancelled: boolean;
 }
 
+export interface OsInfo {
+  platform: "linux" | "windows" | "macos";
+  arch: "x86_64" | "aarch64";
+  homeDir: string | null;
+  configDir: string | null;
+  dataDir: string | null;
+  localDataDir: string | null;
+}
+
 export interface DriverOptions {
   id: string;
   name: string;
@@ -71,6 +80,7 @@ export interface DriverConnection {
 
 export interface DesktopAdapter {
   which(command: string): Promise<string | null>;
+  osInfo(): Promise<OsInfo>;
   run(options: ProcessOptions): Promise<ProcessResult>;
   writeDataFile(name: string, contents: string): Promise<string>;
   removeDataFile(name: string): Promise<void>;
@@ -107,19 +117,37 @@ export function desktopAdapter(ctx: PluginContext): DesktopAdapter | null {
   if (!record(value) || !record(value.host)) return null;
   const process = value.host.process;
   const fs = value.host.fs;
+  const os = value.host.os;
   if (
     !record(process) || typeof process.which !== "function" || typeof process.run !== "function" ||
-    !record(fs) || typeof fs.writeDataFile !== "function" || typeof fs.removeDataFile !== "function"
+    !record(fs) || typeof fs.writeDataFile !== "function" || typeof fs.removeDataFile !== "function" ||
+    !record(os) || typeof os.info !== "function"
   ) return null;
   const which = process.which.bind(process);
   const run = process.run.bind(process);
   const write = fs.writeDataFile.bind(fs);
   const remove = fs.removeDataFile.bind(fs);
+  const info = os.info.bind(os);
   return {
     async which(command) {
       const result: unknown = await which(command);
       if (result !== null && typeof result !== "string") throw new Error("Invalid executable lookup response.");
       return result;
+    },
+    async osInfo() {
+      const result: unknown = await info();
+      if (!record(result) || (result.platform !== "linux" && result.platform !== "windows" && result.platform !== "macos") ||
+        (result.arch !== "x86_64" && result.arch !== "aarch64") ||
+        (result.homeDir !== null && typeof result.homeDir !== "string") ||
+        (result.configDir !== null && typeof result.configDir !== "string") ||
+        (result.dataDir !== null && typeof result.dataDir !== "string") ||
+        (result.localDataDir !== null && typeof result.localDataDir !== "string")) {
+        throw new Error("Could not read the local installation directories.");
+      }
+      return {
+        platform: result.platform, arch: result.arch, homeDir: result.homeDir, configDir: result.configDir,
+        dataDir: result.dataDir, localDataDir: result.localDataDir,
+      };
     },
     async run(options) {
       const result: unknown = await run(options);
