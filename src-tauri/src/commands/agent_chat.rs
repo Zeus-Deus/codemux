@@ -8065,7 +8065,13 @@ impl ThreadSubagentState {
     /// actually takes. The manual (`codemux monitor start`) half does not
     /// go through this tracker at all.
     fn is_clear(&self) -> bool {
-        self.tasks.is_empty() && self.stopped_monitors.is_empty() && self.live_agents.is_empty()
+        self.pane_clear() && self.live_agents.is_empty()
+    }
+
+    /// Whether the pane side remembers nothing, leaving at most the
+    /// fork/switch hold in [`Self::live_agents`].
+    fn pane_clear(&self) -> bool {
+        self.tasks.is_empty() && self.stopped_monitors.is_empty()
     }
 
     /// Whether any live task is real agent work, i.e. still blocking the
@@ -8359,9 +8365,7 @@ impl SubagentTracker {
         } else {
             state.review_owed_since = None;
         }
-        if state.is_clear() {
-            threads.remove(thread_id);
-        }
+        prune(&mut threads, thread_id);
         status
     }
 
@@ -8378,15 +8382,10 @@ impl SubagentTracker {
     /// boundary rather than a session/pane teardown.
     pub fn begin_turn(&self, thread_id: &str) {
         let mut threads = self.threads.lock().expect("subagent tracker poisoned");
-        let should_remove = if let Some(state) = threads.get_mut(thread_id) {
+        if let Some(state) = threads.get_mut(thread_id) {
             state.begin_turn();
-            state.is_clear()
-        } else {
-            false
-        };
-        if should_remove {
-            threads.remove(thread_id);
         }
+        prune(&mut threads, thread_id);
     }
 
     /// Release `thread_id`'s delegated-work hold after an explicit interrupt,
@@ -8405,9 +8404,7 @@ impl SubagentTracker {
             return;
         };
         state.interrupted();
-        if state.is_clear() {
-            threads.remove(thread_id);
-        }
+        prune(&mut threads, thread_id);
     }
 
     /// Whether real delegated agent work is still holding `thread_id`'s run
@@ -8513,9 +8510,7 @@ impl SubagentTracker {
         } else {
             None
         };
-        if state.is_clear() {
-            threads.remove(thread_id);
-        }
+        prune(&mut threads, thread_id);
         status
     }
 
@@ -8560,7 +8555,10 @@ impl SubagentTracker {
         // A thread force-settled with nothing left tracked has no tombstone
         // left to carry, so it is dropped like any other clear entry rather
         // than lingering in the map.
-        threads.retain(|_, state| !state.is_clear());
+        let ids: Vec<String> = threads.keys().cloned().collect();
+        for id in ids {
+            prune(&mut threads, &id);
+        }
         overdue
     }
 
@@ -8644,6 +8642,22 @@ impl SubagentTracker {
 /// `SessionConfigured` and the `Starting` / `Ready` lifecycle phases map
 /// to `None`: a freshly-started session with no turn is idle, exactly
 /// like a freshly-spawned terminal shows no status until its first hook.
+/// Drop `thread_id`'s entry once it remembers nothing. Once only the
+/// fork/switch hold ([`ThreadSubagentState::live_agents`]) is left, forget
+/// the pane side as dropping the entry would, so a late snapshot for a held
+/// child moves the dot exactly as it would on a fresh entry.
+fn prune(threads: &mut HashMap<String, ThreadSubagentState>, thread_id: &str) {
+    let Some(state) = threads.get_mut(thread_id) else {
+        return;
+    };
+    if state.is_clear() {
+        threads.remove(thread_id);
+    } else if state.pane_clear() {
+        let live_agents = std::mem::take(&mut state.live_agents);
+        *state = ThreadSubagentState { live_agents, ..Default::default() };
+    }
+}
+
 fn map_event_to_pane_status(
     event: &ProviderRuntimeEvent,
     state: &mut ThreadSubagentState,
@@ -12834,6 +12848,25 @@ mod tests {
             Some(PaneStatus::Review),
             "and the pane falls to the settled status when it ends"
         );
+        assert_eq!(tracker.tracked_thread_count(), 0);
+    }
+
+    // A child that outlives its parent's turn holds forks and switches
+    // through the user's follow-up, but its late snapshots move the dot
+    // exactly as they would on a fresh entry: no second Review.
+    #[test]
+    fn a_held_childs_late_snapshots_after_a_follow_up_move_nothing() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), now);
+        assert_eq!(tracker.decide("t", &turn_completed(), now), Some(PaneStatus::Working));
+        tracker.begin_turn("t");
+        assert_eq!(tracker.decide("t", &turn_completed(), now), Some(PaneStatus::Review));
+        assert!(tracker.delegated_work_live("t"), "the follow-up didn't end the child");
+        assert_eq!(tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), now), None);
+        assert!(!tracker.delegated_work_holding_turn("t"));
+        assert_eq!(tracker.decide("t", &subagent_event("s1", SubagentStatus::Completed), now), None);
+        assert!(!tracker.delegated_work_live("t"));
         assert_eq!(tracker.tracked_thread_count(), 0);
     }
 
