@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { McpServerRuntime, McpTool } from "@/tauri/commands";
 import { useMcpStore } from "@/stores/mcp-store";
+import { randomUUID } from "@/lib/uuid";
 import { type Owner } from "./lifetime";
 
 export type PluginMcpScope = "all" | "plugin" | { workspaceIds: string[] };
@@ -73,7 +74,7 @@ export async function registerMcpServer(owner: Owner, server: PluginMcpServer): 
   // that arrive before Settings or the first chat has mounted.
   await useMcpStore.getState().syncToBackend();
   if (owner.ended) throw new Error("Plugin has been disposed");
-  const token = crypto.randomUUID();
+  const token = randomUUID();
   const epoch = await pluginPageEpoch();
   if (owner.ended) throw new Error("Plugin has been disposed");
   await invoke("plugins_mcp_register", { pluginId: owner.pluginId, token, pageEpoch: epoch, server });

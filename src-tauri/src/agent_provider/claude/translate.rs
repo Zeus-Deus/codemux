@@ -488,6 +488,13 @@ pub fn translate_notification_with(
             kind,
         } => {
             let turn_id = extract_turn_id(&tool_input);
+            // Only bridge approvals add target metadata. Native and remote
+            // approvals retain their original input without an envelope.
+            let tool_input = if plugin_bridge_target {
+                serde_json::json!({"plugin_bridge_target":true,"tool_name":tool_name,"tool_input":tool_input})
+            } else {
+                tool_input
+            };
             vec![ProviderRuntimeEvent::RequestOpened {
                 thread_id: thread_id.clone(),
                 turn_id,
@@ -497,7 +504,7 @@ pub fn translate_notification_with(
                 } else {
                     kind
                 },
-                payload: if plugin_bridge_target {serde_json::json!({"plugin_bridge_target":true,"tool_name":tool_name,"tool_input":tool_input})} else {tool_input},
+                payload: tool_input,
                 tool_use_id,
                 // Claude's `request-opened` notification does not yet
                 // carry the spawning `parent_tool_use_id`, so a subagent's
@@ -3048,6 +3055,43 @@ mod tests {
             &json!({"plugin_bridge_target":true,"tool_name":"mcp__codemux__fixture__x","tool_input":{"value":7}})
         );
         assert_eq!(tool_use_id.as_deref(), Some("outer-bridge-call"));
+    }
+
+    #[test]
+    fn plugin_mcp_non_bridge_approval_preserves_raw_input_and_native_identity() {
+        let raw = json!({
+            "text": "Original\r\nCRLF\nLF\rCR λ雪",
+            "input": {"text": "nested\r\nbytes", "flag": false, "value": null},
+            "tool_input": ["Array\r\nbytes"],
+            "plugin_bridge_target": true,
+        });
+        let original_bytes = serde_json::to_vec(&raw).unwrap();
+        for (tool, kind) in [
+            ("WebSearch", "other"),
+            ("Bash", "command"),
+            ("Edit", "file-change"),
+            ("Read", "file-read"),
+        ] {
+            let note = SidecarNotification::from_method_params(
+                "request-opened",
+                json!({"threadId":"child-1", "requestId":"native-request", "toolName":tool, "toolInput":raw, "toolUseId":"opaque-native-call", "kind":kind}),
+            );
+            let events = translate_notification(&tid(), note);
+            let ProviderRuntimeEvent::RequestOpened {
+                payload,
+                request_id,
+                request_kind,
+                tool_use_id,
+                ..
+            } = &events[0]
+            else {
+                panic!("approval expected");
+            };
+            assert_eq!(serde_json::to_vec(payload).unwrap(), original_bytes);
+            assert_eq!(request_id.0, "native-request");
+            assert_eq!(request_kind, kind);
+            assert_eq!(tool_use_id.as_deref(), Some("opaque-native-call"));
+        }
     }
 
     #[test]
