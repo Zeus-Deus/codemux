@@ -700,10 +700,14 @@ async fn a_fresh_conversation_while_reopening_sends_nothing() {
 }
 
 fn subagent(thread: &str, status: codemux_lib::agent_provider::SubagentStatus) -> ProviderRuntimeEvent {
+    child(thread, "sub-1", status)
+}
+
+fn child(thread: &str, id: &str, status: codemux_lib::agent_provider::SubagentStatus) -> ProviderRuntimeEvent {
     ProviderRuntimeEvent::SubagentUpdated {
         thread_id: ThreadId(thread.into()),
         subagent: codemux_lib::agent_provider::SubagentSnapshot {
-            subagent_id: "sub-1".into(),
+            subagent_id: id.into(),
             status,
             ..Default::default()
         },
@@ -810,4 +814,61 @@ async fn a_message_steered_into_a_resumed_turn_resets_the_cap() {
     assert_eq!(h.db().get_restart_turn("rr-steer-cap").unwrap().chain, 0);
     let decisions = resume_after_restart_for_test(&h.handle(), "launch-4").await;
     assert_eq!(decision(&decisions, "rr-steer-cap"), Some(ResumeDecision::Resume));
+}
+
+/// Yield with one child (`sub-1`) or two (`sub-1`, `sub-2`) still running.
+fn yield_to_children(h: &Harness, thread: &str, children: &[&str]) {
+    use codemux_lib::agent_provider::SubagentStatus;
+    h.running(thread, "turn-1");
+    h.provider.set_turn_active(thread, true);
+    for id in children {
+        forward_event(&h.handle(), child(thread, id, SubagentStatus::Running));
+    }
+    h.provider.set_turn_active(thread, false);
+    h.completed(thread, TurnStatus::Success);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_that_picks_itself_back_up_after_its_children_stays_resumable() {
+    use codemux_lib::agent_provider::{CompletedItem, SubagentStatus};
+    let h = harness().await;
+    h.chat("rr-continue");
+    yield_to_children(&h, "rr-continue", &["sub-1"]);
+    forward_event(&h.handle(), subagent("rr-continue", SubagentStatus::Completed));
+    // The provider continues the run without reporting a new turn.
+    forward_event(
+        &h.handle(),
+        ProviderRuntimeEvent::ItemCompleted {
+            thread_id: ThreadId("rr-continue".into()),
+            turn_id: TurnId("turn-1".into()),
+            item: CompletedItem::AssistantText { text: "Both checks passed; merging.".into() },
+            subagent_id: None,
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(h.db().get_restart_turn("rr-continue").is_some(), "the run is still live");
+    // Its own turn end settles it.
+    h.completed("rr-continue", TurnStatus::Success);
+    assert!(h.db().get_restart_turn("rr-continue").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_the_last_child_to_finish_starts_the_settle_clock() {
+    use codemux_lib::agent_provider::SubagentStatus;
+    let h = harness().await;
+    h.chat("rr-two-children");
+    yield_to_children(&h, "rr-two-children", &["sub-1", "sub-2"]);
+    forward_event(&h.handle(), child("rr-two-children", "sub-1", SubagentStatus::Completed));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    forward_event(&h.handle(), child("rr-two-children", "sub-2", SubagentStatus::Completed));
+    // The first child's clock ran out at 200 ms; the second's has not.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(h.db().get_restart_turn("rr-two-children").is_some());
+    for _ in 0..100 {
+        if h.db().get_restart_turn("rr-two-children").is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(h.db().get_restart_turn("rr-two-children").is_none());
 }

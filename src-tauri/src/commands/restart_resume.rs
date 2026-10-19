@@ -103,7 +103,10 @@ struct Live {
     /// being resumed.
     lost: HashSet<String>,
     /// Threads whose turn ended while delegated work still held the run.
-    yielded: HashSet<String>,
+    /// `Some(generation)` once that work started finishing: a settle is
+    /// pending, and only the one for the latest generation may act.
+    yielded: HashMap<String, Option<u64>>,
+    next_yield: u64,
     /// Chats the launch pass has taken but not decided yet. The user acting
     /// on one first (a send, a Stop) takes it out of the pass.
     candidates: HashSet<String>,
@@ -177,7 +180,7 @@ pub(crate) fn on_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEv
                 .is_some_and(|tracker| tracker.delegated_work_holding_turn(&thread_id.0)) =>
         {
             let mut live = live();
-            live.yielded.insert(thread_id.0.clone());
+            live.yielded.insert(thread_id.0.clone(), None);
             // A failed resumed turn disarms the saved queue now, whatever
             // its subagents do next.
             if !matches!(status, TurnStatus::Success) {
@@ -187,19 +190,40 @@ pub(crate) fn on_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEv
         }
         // The delegated work behind a yielded run finished. The provider may
         // pick its turn back up, or the run is over with no turn end of its
-        // own; give it a moment, then settle the row if nothing runs.
+        // own. Wait out a quiet moment after the last such finish, then
+        // settle the row if nothing runs.
         ProviderRuntimeEvent::SubagentUpdated { thread_id, subagent }
             if !matches!(subagent.status, SubagentStatus::Pending | SubagentStatus::Running) =>
         {
-            if live().yielded.contains(&thread_id.0) {
+            let generation = {
+                let mut live = live();
+                live.next_yield += 1;
+                let generation = live.next_yield;
+                live.yielded
+                    .get_mut(&thread_id.0)
+                    .map(|pending| *pending = Some(generation))
+                    .map(|()| generation)
+            };
+            if let Some(generation) = generation {
                 let app = app.clone();
                 let thread_id = thread_id.clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(YIELD_SETTLE_GRACE).await;
-                    if live().yielded.contains(&thread_id.0) {
+                    if live().yielded.get(&thread_id.0) == Some(&Some(generation)) {
                         settle_if_idle(&app, &thread_id);
                     }
                 });
+            }
+            return;
+        }
+        // The parent's own output after its delegated work started finishing:
+        // the provider picked the run back up (Claude can continue without
+        // reporting a new turn). Its own turn end settles it now.
+        ProviderRuntimeEvent::ContentDelta { thread_id, subagent_id: None, .. }
+        | ProviderRuntimeEvent::ItemCompleted { thread_id, subagent_id: None, .. } => {
+            let mut live = live();
+            if matches!(live.yielded.get(&thread_id.0), Some(Some(_))) {
+                live.yielded.remove(&thread_id.0);
             }
             return;
         }
