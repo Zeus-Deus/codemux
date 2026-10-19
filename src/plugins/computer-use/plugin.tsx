@@ -1,7 +1,7 @@
-import { APP_OVERLAY_AREA, definePlugin, icons } from "@codemux/sdk";
+import { TITLEBAR_ACTIONS_AREA, definePlugin, icons } from "@codemux/sdk";
 import { desktopAdapter, peekAdapter, type PeekBodyProps } from "./adapter";
 import { ComputerUseController } from "./controller";
-import { ComputerIndicator, ComputerPreview, ComputerSettings, UnavailableSettings } from "./views";
+import { ComputerChatChip, ComputerIndicator, ComputerPreview, ComputerSettings, UnavailableSettings } from "./views";
 
 export default definePlugin({
   id: "computer-use",
@@ -30,8 +30,13 @@ export default definePlugin({
       render: (props: PeekBodyProps) => <ComputerPreview {...props} controller={controller} />,
     });
     ctx.register({
-      id: "stop", area: APP_OVERLAY_AREA,
+      id: "stop", area: TITLEBAR_ACTIONS_AREA,
       render: () => <ComputerIndicator controller={controller} peek={peek} />,
+    });
+    ctx.register({
+      id: "status", area: peek.composerStatusArea,
+      render: ({ workspaceId }: { workspaceId: string | null; threadId: string | null }) =>
+        <ComputerChatChip controller={controller} peek={peek} workspaceId={workspaceId} />,
     });
     ctx.registerSettingsPage({
       title: "Computer use",

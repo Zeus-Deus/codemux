@@ -1,5 +1,6 @@
 import type { PluginContext, PluginMcpActivity, PluginMcpCallResult, PluginMcpStatus } from "@codemux/sdk";
 import * as sdk from "@codemux/sdk";
+import { createElement, type ComponentType, type ReactNode } from "react";
 
 export type PeekStatus = "live" | "connecting" | "stale" | "error";
 export interface PeekBodyProps {
@@ -11,8 +12,21 @@ export interface PeekBodyProps {
 
 export interface PeekAdapter {
   area: string;
+  composerStatusArea: string;
   open(workspaceId: string): boolean;
   close(): void;
+  chip(props: { label: string; icon?: ComponentType<{ className?: string }>; status: PeekStatus }): ReactNode;
+}
+
+interface PeekChipProps {
+  peekId: string;
+  label: string;
+  icon?: ComponentType<{ className?: string }>;
+  status: PeekStatus;
+}
+
+function isPeekChip(value: unknown): value is ComponentType<PeekChipProps> {
+  return typeof value === "function";
 }
 
 export interface ProcessOptions {
@@ -70,7 +84,9 @@ function record(value: unknown): value is Record<string, unknown> {
 export function peekAdapter(ctx: PluginContext): PeekAdapter | null {
   const exports: unknown = sdk;
   const host: unknown = ctx.host;
-  if (!record(exports) || typeof exports.PEEK_AREA !== "string" || !record(host) || !record(host.peek)) return null;
+  if (!record(exports) || typeof exports.PEEK_AREA !== "string" || typeof exports.COMPOSER_STATUS_AREA !== "string" ||
+    !isPeekChip(exports.PeekChip) || !record(host) || !record(host.peek)) return null;
+  const Chip = exports.PeekChip;
   const peek = host.peek;
   if (typeof peek.open !== "function" || typeof peek.close !== "function") return null;
   const open = peek.open.bind(peek);
@@ -78,8 +94,10 @@ export function peekAdapter(ctx: PluginContext): PeekAdapter | null {
   const id = `${ctx.id}:live`;
   return {
     area: exports.PEEK_AREA,
+    composerStatusArea: exports.COMPOSER_STATUS_AREA,
     open: (workspaceId) => open(id, { workspaceId }) === true,
     close: () => { close(id); },
+    chip: (props) => createElement(Chip, { ...props, peekId: id }),
   };
 }
 

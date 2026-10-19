@@ -86,7 +86,7 @@ export class ComputerUseController {
 
   setWorkspace(workspace: Workspace | null, optedIn: boolean): Promise<void> {
     if (this.state.workspace?.id === workspace?.id && this.state.workspace?.local === workspace?.local && this.state.optedIn === optedIn) return Promise.resolve();
-    this.update({ workspace, optedIn, windows: [], target: null, frame: null });
+    this.update({ workspace, optedIn, windows: [], frame: null });
     return this.stop();
   }
 

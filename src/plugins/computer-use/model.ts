@@ -19,6 +19,12 @@ export interface DoctorReport {
   probes: DoctorProbe[];
 }
 
+export function isLinuxWayland(report: DoctorReport | null): boolean {
+  return report !== null &&
+    report.probes.some((probe) => probe.label === "binary" && /\blinux\b/i.test(probe.message)) &&
+    report.probes.some((probe) => probe.label === "display server" && /wayland/i.test(probe.message));
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

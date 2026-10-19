@@ -1,9 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { connectionFailure, controlFiles, parseDoctor, parseVersion, readFrame, readWindows } from "./model";
+import { connectionFailure, controlFiles, isLinuxWayland, parseDoctor, parseVersion, readFrame, readWindows } from "./model";
 
 const target = { pid: 42, windowId: 123, title: "Demo", appName: "Demo App" };
 
 describe("computer-use driver results", () => {
+  it("limits Wayland-specific copy to positively identified Linux Wayland sessions", () => {
+    const report = (binary: string, display: string) => ({ ok: true, probes: [
+      { label: "binary", status: "ok" as const, message: binary },
+      { label: "display server", status: "ok" as const, message: display },
+    ] });
+    expect(isLinuxWayland(report("cua-driver 0.21.0 (x86_64-linux)", "Wayland+XWayland (WAYLAND_DISPLAY=wayland-1, DISPLAY=:0)"))).toBe(true);
+    expect(isLinuxWayland(report("cua-driver 0.21.0 (x86_64-linux)", "X11 (DISPLAY=:0)"))).toBe(false);
+    expect(isLinuxWayland(report("cua-driver 0.21.0 (aarch64-macos)", "WindowServer"))).toBe(false);
+    expect(isLinuxWayland(report("cua-driver 0.21.0 (x86_64-windows)", "Win32"))).toBe(false);
+    expect(isLinuxWayland(null)).toBe(false);
+  });
   it("keeps a doctor warning even when the driver's overall ok flag is true", () => {
     const probes = [{ label: "X11 connection", status: "warn", message: "no top-level windows returned" }];
     expect(parseDoctor(JSON.stringify({ ok: true, probes }))).toEqual({ ok: true, probes });

@@ -2,7 +2,7 @@ import { useEffect, useState, useSyncExternalStore, type CSSProperties, type Rea
 import { Badge, Button, icons, Input, Switch, host } from "@codemux/sdk";
 import type { PeekAdapter, PeekBodyProps } from "./adapter";
 import { ComputerUseController } from "./controller";
-import { INSTALL_URL } from "./model";
+import { INSTALL_URL, isLinuxWayland, type DoctorProbe, type DoctorReport } from "./model";
 
 const color = (role: Parameters<typeof host.theme.cssVar>[0]) => `var(${host.theme.cssVar(role)})`;
 const muted: CSSProperties = { color: color("mutedForeground"), fontSize: 13, lineHeight: 1.6 };
@@ -15,6 +15,30 @@ function useComputer(controller: ComputerUseController) {
 
 function Notice({ children }: { children: ReactNode }) {
   return <p role="status" style={{ ...muted, margin: 0, overflowWrap: "anywhere" }}>{children}</p>;
+}
+
+function DiagnosticIcon({ status }: { status: DoctorProbe["status"] }) {
+  if (status === "ok") return <icons.CheckCircle2 className="size-4 shrink-0 text-status-open" aria-label="Passed" />;
+  if (status === "warn") return <icons.TriangleAlert className="size-4 shrink-0 text-warning" aria-label="Warning" />;
+  return <icons.CircleAlert className="size-4 shrink-0 text-destructive" aria-label="Error" />;
+}
+
+export function DoctorDiagnostics({ report }: { report: DoctorReport }) {
+  const healthy = report.ok && report.probes.length > 0 && report.probes.every((probe) => probe.status === "ok");
+  const probes = <div style={{ display: "grid", gap: 12 }}>
+    {report.probes.map((probe, i) => <div key={`${probe.label}-${i}`} style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+      <span style={{ paddingTop: 2 }}><DiagnosticIcon status={probe.status} /></span>
+      <div style={{ minWidth: 0 }}><span>{probe.label}</span><p style={{ ...muted, margin: "2px 0 0", overflowWrap: "anywhere" }}>{probe.message}</p>
+        {probe.detail && <pre style={{ ...muted, margin: "4px 0 0", whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{probe.detail}</pre>}
+      </div>
+    </div>)}
+  </div>;
+  return <div aria-label="Driver diagnostics">
+    {healthy ? <>
+      <div style={{ ...row, gap: 8 }}><DiagnosticIcon status="ok" /><span>Driver ready</span></div>
+      <details style={{ ...muted, marginTop: 8 }}><summary style={{ cursor: "pointer" }}>Details</summary><div style={{ paddingTop: 12 }}>{probes}</div></details>
+    </> : probes}
+  </div>;
 }
 
 export function ComputerSettings({ controller, peek, initialCommand, onCommand, onOptIn }: {
@@ -49,16 +73,7 @@ export function ComputerSettings({ controller, peek, initialCommand, onCommand, 
         <Notice>
           Requires cua-driver 0.21.0. <a href={INSTALL_URL} target="_blank" rel="noreferrer" style={{ color: color("primary"), textDecoration: "underline" }}>Official installation guide</a>
         </Notice>
-        {state.doctor && <div style={{ display: "grid", gap: 10 }} aria-label="Driver diagnostics">
-          {state.doctor.probes.map((probe, i) => (
-            <div key={`${probe.label}-${i}`} style={{ display: "flex", gap: 10, alignItems: "baseline" }}>
-              <Badge variant="outline">{probe.status}</Badge>
-              <div><span>{probe.label}</span><p style={{ ...muted, margin: "2px 0 0" }}>{probe.message}</p>
-                {probe.detail && <details style={muted}><summary>Details</summary><pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{probe.detail}</pre></details>}
-              </div>
-            </div>
-          ))}
-        </div>}
+        {state.doctor && <DoctorDiagnostics report={state.doctor} />}
       </section>
       <section style={section} aria-label="Workspace access">
         <div style={{ ...row, justifyContent: "space-between", flexWrap: "nowrap" }}>
@@ -92,7 +107,9 @@ export function ComputerSettings({ controller, peek, initialCommand, onCommand, 
             <Button size="sm" variant="outline" disabled={state.phase !== "active"}
               onClick={() => { if (state.workspace) peek.open(state.workspace.id); }}><icons.Monitor />Live view</Button>
           </div>}
-          <Notice>Only background click, type and scroll are allowed. Actions an application refuses stay blocked. Linux XWayland capture works; native Wayland capture may be unavailable.</Notice>
+          <Notice>Only background click, type and scroll are allowed. Actions an application refuses stay blocked.
+            {isLinuxWayland(state.doctor) && " Linux XWayland capture works; native Wayland capture may be unavailable."}
+          </Notice>
         </>}
       </section>
       {state.error && <div role="alert" style={{ padding: "16px 0", color: "var(--destructive)", fontSize: 13, overflowWrap: "anywhere" }}>{state.error}</div>}
@@ -104,21 +121,32 @@ export function ComputerIndicator({ controller, peek }: { controller: ComputerUs
   const state = useComputer(controller);
   if (!state.target && state.phase !== "stopping") return null;
   const stopping = state.phase === "stopping";
-  const label = stopping ? "Stopping computer use…" : state.phase === "error" ? "Computer use needs attention" : state.activeCalls ? "Agent is controlling the computer" : state.phase === "starting" ? "Connecting computer use…" : "Computer use enabled";
+  const name = state.target?.appName || state.target?.title || "window";
+  const label = stopping ? "Stopping…" : state.phase === "error" ? "Computer use needs attention" : state.activeCalls ? `Controlling ${name}` : state.phase === "starting" ? "Connecting…" : `Computer · ${name}`;
   return <div data-computer-use="indicator" role="status" style={{
-    position: "fixed", bottom: 20, left: "50%", transform: "translateX(-50%)", zIndex: 100,
-    display: "flex", alignItems: "center", gap: 12, padding: "8px 10px 8px 14px", maxWidth: "calc(100vw - 32px)",
-    border: `1px solid ${color("border")}`, borderRadius: 12, background: color("background"), color: color("foreground"),
-    boxShadow: "0 6px 24px #0003", pointerEvents: "auto",
-  }}>
-    <icons.Monitor size={16} style={{ flexShrink: 0 }} />
-    <div style={{ minWidth: 0, fontSize: 12 }}><strong>{label}</strong>
-      {state.target && <div style={{ ...muted, fontSize: 11, maxWidth: 260, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{state.target.title || state.target.appName}</div>}
-    </div>
-    <Button size="icon-sm" variant="ghost" aria-label="Open computer-use live view" disabled={state.phase !== "active"}
-      onClick={() => { if (state.workspace) peek.open(state.workspace.id); }}><icons.Eye /></Button>
-    <Button size="sm" variant="destructive" disabled={stopping} onClick={() => { void controller.stop(); }}><icons.Square />Stop</Button>
+    display: "inline-flex", alignItems: "center", gap: 2, padding: 1, maxWidth: "min(320px, 60vw)", height: 26,
+    border: `1px solid ${color("border")}`, borderRadius: 8, color: color("foreground"),
+  }} onPointerDown={(event) => event.stopPropagation()}>
+    <Button size="xs" variant="ghost" aria-label={`View computer use${state.target ? ` in ${state.target.title || name}` : ""}`}
+      title={label} disabled={state.phase !== "active"} style={{ minWidth: 0, maxWidth: 230 }}
+      onClick={() => { if (state.workspace) peek.open(state.workspace.id); }}>
+      <span aria-hidden style={{ width: 6, height: 6, borderRadius: "50%", flexShrink: 0 }}
+        className={state.phase === "error" ? "bg-warning" : state.activeCalls ? "bg-destructive" : "bg-muted-foreground"} />
+      <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
+    </Button>
+    <Button size="xs" variant="destructive" aria-label="Stop computer use" disabled={stopping} onClick={() => { void controller.stop(); }}>Stop</Button>
   </div>;
+}
+
+export function ComputerChatChip({ controller, peek, workspaceId }: {
+  controller: ComputerUseController; peek: PeekAdapter; workspaceId: string | null;
+}) {
+  const state = useComputer(controller);
+  if (!state.target || state.workspace?.id !== workspaceId) return null;
+  return peek.chip({
+    label: "Computer", icon: icons.Monitor,
+    status: state.phase === "error" ? "error" : state.phase === "stopping" ? "stale" : state.phase === "starting" ? "connecting" : "live",
+  });
 }
 
 export function ComputerPreview({ controller, workspaceId, onStatusChange }: { controller: ComputerUseController } & PeekBodyProps) {

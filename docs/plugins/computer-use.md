@@ -15,8 +15,9 @@ plugin currently requires version **0.21.0**, whose policy and exact-window
 manifest were evaluated. A different version needs another compatibility check.
 Doctor warnings remain visible even when the driver's overall result is `ok`.
 
-The persistent indicator shows when control is enabled and when an agent is
-calling its tools. **Stop** unregisters Codemux's direct input child using
+The title-bar indicator shows when control is enabled and when an agent is
+calling its tools. The **Computer** chip beside the chat's browser status opens
+the live view. **Stop** unregisters Codemux's direct input child using
 immediate shutdown and waits for confirmed exit. It also closes the read-only
 capture child. The indicator stays pending if shutdown cannot be confirmed.
 The plugin never starts, stops, revokes, or reuses an existing driver daemon.
