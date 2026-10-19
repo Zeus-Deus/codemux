@@ -883,6 +883,33 @@ async fn a_resumed_turn_that_fails_while_its_subagents_run_keeps_the_queue_manua
     assert_eq!(h.db().list_queued_turns("rr-yield-fail").len(), 1);
 }
 
+/// A late failed end of an older turn, while the resumed turn's subagents
+/// hold the run, leaves the resumed turn its row and its drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_failed_end_while_subagents_run_leaves_the_resumed_turn_its_drain() {
+    use codemux_lib::agent_provider::SubagentStatus;
+    let h = harness().await;
+    h.chat("rr-late-yield");
+    h.saved("rr-late-yield", "q-1", "saved");
+    h.running("rr-late-yield", "turn-1");
+    resume_after_restart_for_test(&h.handle(), "launch-2").await;
+    h.running("rr-late-yield", "turn-resume");
+    h.provider.set_turn_active("rr-late-yield", true);
+    forward_event(&h.handle(), subagent("rr-late-yield", SubagentStatus::Running));
+    h.provider.set_turn_active("rr-late-yield", false);
+    h.completed(
+        "rr-late-yield",
+        "turn-1",
+        TurnStatus::Error { subtype: "interrupted".into(), message: "cut off".into() },
+    );
+    let row = h.db().get_restart_turn("rr-late-yield").map(|row| row.turn_id);
+    assert_eq!(row.as_deref(), Some("turn-resume"));
+    forward_event(&h.handle(), subagent("rr-late-yield", SubagentStatus::Completed));
+    h.completed("rr-late-yield", "turn-resume", TurnStatus::Success);
+    let sent = wait_for_sends(&h, "rr-late-yield", 2).await;
+    assert_eq!(&sent[1..], ["saved"]);
+}
+
 #[tokio::test]
 async fn a_message_steered_into_a_resumed_turn_resets_the_cap() {
     let h = harness().await;
