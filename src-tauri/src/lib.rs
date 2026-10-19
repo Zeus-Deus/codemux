@@ -3178,6 +3178,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::queued_turns::agent_chat_move_queued_turn,
             commands::queued_turns::agent_chat_cancel_saved_queued_turn,
             commands::queued_turns::agent_chat_send_saved_queued_turn,
+            // Switch a chat to another provider in place.
+            commands::provider_switch::agent_chat_switch_provider,
         ])
 }
 

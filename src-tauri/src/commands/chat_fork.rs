@@ -103,6 +103,7 @@ async fn plan_fork<R: Runtime>(
     // Hold the source still before reading it: no send, restart or handoff
     // can change it between these checks and the transcript copy.
     let dispatch = fork_dispatch_guard(app, source_thread_id).await;
+    super::provider_switch::refuse_while_switching(source_thread_id)?;
     let db: State<'_, DatabaseStore> = app.state();
     let source = db
         .get_agent_chat_session(source_thread_id)
@@ -220,7 +221,7 @@ const BUSY: &str = "Wait for the current turn and any queued messages to finish,
 /// behind can't dispatch and must not block forks forever. `turn_active`
 /// and `runtime_status` read session state only, never the outbound lock,
 /// so they are safe under the timeline guard.
-async fn source_busy(
+pub(crate) async fn source_busy(
     live: &dyn AgentProvider,
     session_live: bool,
     db: &DatabaseStore,
@@ -306,6 +307,9 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
     })?;
     // The fork resumes on the account that holds its native session.
     db.copy_provider_account_bindings(&plan.source.thread_id, &thread_id)?;
+    // A source that switched providers may still owe its session the
+    // conversation from before the switch; so does the fork.
+    super::provider_switch::carry_into_fork(&db, &plan.source.thread_id, &thread_id);
     // Still holding the source: a revert or delete waiting on it would
     // remove the images this copies.
     copy_inherited_images(images).await;

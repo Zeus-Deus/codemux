@@ -91,6 +91,13 @@ function sameItem(a: ChatViewItem, b: ChatViewItem): boolean {
       return b.kind === "workflow_run" && a.workflowId === b.workflowId;
     case "runtime_notice":
       return b.kind === "runtime_notice" && a.message === b.message;
+    case "provider_switch":
+      return (
+        b.kind === "provider_switch" &&
+        a.fromProvider === b.fromProvider &&
+        a.toProvider === b.toProvider &&
+        a.toModel === b.toModel
+      );
     default:
       return false;
   }

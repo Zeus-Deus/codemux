@@ -9,6 +9,7 @@ pub mod custom_acp;
 pub mod provider_accounts;
 pub(crate) mod local_sessions;
 pub mod chat_fork;
+pub mod provider_switch;
 mod delegation;
 pub mod pr_watch;
 pub mod turn_diffs;
@@ -1179,6 +1180,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     provider_accounts::create_schema(conn)?;
     mobile_push::create_schema(conn)?;
     queued_turns::create_schema(conn)?;
+    provider_switch::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new

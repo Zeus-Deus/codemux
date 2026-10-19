@@ -28,6 +28,7 @@ import {
 } from "@/components/ui/tooltip";
 import { sessionProviderLabel } from "@/lib/agent-chat/session-mentions";
 import { fallbackModelLabel } from "@/lib/agent-chat/capability-defaults";
+import { useSwitchHint } from "@/lib/agent-chat/provider-switch";
 import { cn } from "@/lib/utils";
 import {
   pickerFavoriteKey,
@@ -276,6 +277,7 @@ export function MultiProviderModelPicker({
   // own rail entry, so the kind alone doesn't identify the selection.
   const [railAcpAgentId, setRailAcpAgentId] = useState<string | null>(activeAcpAgentId);
   const [query, setQuery] = useState("");
+  const switchHint = useSwitchHint(hermesThreadId, provider, railKey);
 
   // A provider signed in more than once shows each account as its own
   // rail entry; the chat's account rides on the trigger's logo.
@@ -771,6 +773,16 @@ export function MultiProviderModelPicker({
             </Command>}
           </div>
         </div>
+        {/* A switch to another provider says so above the account it
+            lands on. */}
+        {switchHint && (
+          <div
+            data-testid="provider-switch-hint"
+            className="border-t px-3 py-1.5 text-label text-muted-foreground"
+          >
+            {switchHint}
+          </div>
+        )}
         {(() => {
           const view = accountView(railKey);
           return view ? <AccountFooter view={view} onManage={() => setOpen(false)} /> : null;

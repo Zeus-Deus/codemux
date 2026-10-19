@@ -2275,6 +2275,7 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
     }
 
     let _timeline_guard = turn_checkpoint_lock_for(&thread_id).lock_owned().await;
+    super::provider_switch::refuse_while_switching(&thread_id)?;
     if provider.turn_active(&ThreadId(thread_id.clone())).await {
         return Err("Wait for the active turn to finish before reverting.".to_string());
     }
@@ -3433,6 +3434,7 @@ async fn send_turn_internal<R: Runtime>(
         &native_gate,
         native_generation,
     )?;
+    super::provider_switch::refuse_stale_send(&app.state(), provider, &input.thread_id.0)?;
     if origin == TurnOrigin::User {
         // A previously claimed resume may have hit another limit while this
         // user send waited for its dispatch to finish.
@@ -3567,6 +3569,14 @@ async fn send_turn_internal<R: Runtime>(
         provider,
         &skill_invocations,
     )?;
+    let switch_nonce = input.client_nonce.clone().unwrap_or_default();
+    let (rendered_text, switch_seed) = super::provider_switch::seed_turn(
+        &db,
+        &thread_id_for_persist,
+        provider,
+        &switch_nonce,
+        rendered_text,
+    );
     // A non-checkpointed turn makes every older provider-relative target
     // unsafe. Serialize that invalidation with checkpoint commit/revert so a
     // settings or provider switch cannot race a turn currently being
@@ -3723,6 +3733,7 @@ async fn send_turn_internal<R: Runtime>(
     }
     drop(dispatch_guard);
     let result = sent.map_err(provider_err)?;
+    super::provider_switch::seed_delivered(&db, &thread_id_for_persist, provider, &switch_nonce, switch_seed);
     if let Some(queued_id) = &result.queued_id {
         // Do not acknowledge queued acceptance without durable evidence.
         // The event bridge may lag, or dispatch/cancellation may beat this ACK.
@@ -5740,12 +5751,17 @@ pub(crate) async fn restart_session_holding_gate<R: Runtime, T>(
     between: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
     let gate = native_thread_gate(app, &thread_id.0);
-    gate.cancel();
+    // Never cancel under a provider switch: it would invalidate the start
+    // that switch is about to make.
+    super::provider_switch::unless_switching(&thread_id.0, || gate.cancel())?;
     let generation = gate.generation();
     // Same lock order as `agent_chat_stop_session_guarded`.
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0).lock_owned().await;
     super::usage_resume::cancel_for_stopped_thread(app, &thread_id.0);
     let _native_guard = gate.dispatch.clone().lock_owned().await;
+    // A provider switch that began meanwhile, or finished while this waited,
+    // would see the provider it left restarted on the new one's session.
+    super::provider_switch::refuse_stale_send(&app.state(), provider, &thread_id.0)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     match impl_.stop_session(thread_id.clone()).await {
@@ -6373,6 +6389,18 @@ pub async fn agent_chat_get_session_context(
     if record.workspace_id != workspace_id {
         return Err("conversation_outside_workspace".to_string());
     }
+    session_context(&db, record, utility_selection).await
+}
+
+/// The handoff behind [`agent_chat_get_session_context`], for a source row
+/// the caller has already scoped. Also seeds an in-place provider switch
+/// (`commands::provider_switch`).
+pub(crate) async fn session_context(
+    db: &DatabaseStore,
+    record: AgentChatSessionRecord,
+    utility_selection: Option<UtilityModelSelection>,
+) -> Result<AgentChatSessionContext, String> {
+    let thread_id = record.thread_id.clone();
     // Read the revision BEFORE the messages. A message appended between the
     // two reads then leaves the summary keyed to the older revision, which is
     // a harmless cache miss on the next attach; reading it after would stamp
@@ -8685,7 +8713,8 @@ fn map_event_to_pane_status(
         // A usage-limit notice rides alongside the turn's own settlement,
         // which already moves the dot; the resume schedule is not liveness.
         | ProviderRuntimeEvent::UsageLimitReached { .. }
-        | ProviderRuntimeEvent::UsageResumeCancelled { .. } => None,
+        | ProviderRuntimeEvent::UsageResumeCancelled { .. }
+        | ProviderRuntimeEvent::ProviderSwitched { .. } => None,
         // A workflow launching/completing doesn't itself imply a pane
         // status transition — the subagents it spawns and the turn it
         // runs within already drive `Working`/`Review` via their own
@@ -9234,6 +9263,8 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
             // restart, and never resurrects a cancelled one.
             | ProviderRuntimeEvent::UsageLimitReached { .. }
             | ProviderRuntimeEvent::UsageResumeCancelled { .. }
+            // The switch divider marks where the provider changed.
+            | ProviderRuntimeEvent::ProviderSwitched { .. }
     )
     // NOTE: `UserMessage` is deliberately NOT persisted here either — it is
     // MINTED from a row `persist_user_message` has already written, and
@@ -9390,7 +9421,8 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::PlanUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::RunStalled { thread_id, .. }
         | ProviderRuntimeEvent::UsageLimitReached { thread_id, .. }
-        | ProviderRuntimeEvent::UsageResumeCancelled { thread_id, .. } => Some(thread_id.clone()),
+        | ProviderRuntimeEvent::UsageResumeCancelled { thread_id, .. }
+        | ProviderRuntimeEvent::ProviderSwitched { thread_id, .. } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
     }
 }

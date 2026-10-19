@@ -1785,6 +1785,7 @@ export const agentChatStartSession = async (
   provider: AgentChatProviderKind,
   input: AgentChatStartSessionInput,
   expectedThread: string | null = null,
+  switchFrom: ProviderSwitchFrom | null = null,
 ) => {
   let acpStartEpoch: number | undefined;
   if (provider === "hermes") {
@@ -1808,7 +1809,9 @@ export const agentChatStartSession = async (
     input = { ...input, permission_mode: null, extra: { ...(input.extra && typeof input.extra === "object" && !Array.isArray(input.extra) ? input.extra : {}), acp_agent_id: agentId } };
     acpStartEpoch = acpLifecycleEpoch(input.thread_id);
   }
-  const threadId = await invoke<string>("agent_chat_start_session", { paneId, provider, input, expectedThread });
+  const threadId = switchFrom
+    ? await invoke<string>("agent_chat_switch_provider", { paneId, fromProvider: switchFrom.provider, provider, input, utilitySelection: switchFrom.utilitySelection })
+    : await invoke<string>("agent_chat_start_session", { paneId, provider, input, expectedThread });
   if (provider === "acp") {
     const { useCustomAcp } = await import("@/stores/custom-acp-store");
     const binding = await useCustomAcp.getState().restore(threadId);
@@ -4074,3 +4077,22 @@ export const agentChatSendSavedQueuedTurn = (
     queuedId,
     delivery,
   });
+/** The provider a chat is leaving, for {@link agentChatSwitchProvider}. */
+export interface ProviderSwitchFrom {
+  provider: AgentChatProviderKind;
+  /** Summarizes the conversation for the new provider; `null` sends the
+   *  budgeted transcript instead. */
+  utilitySelection: UtilityModelSelection | null;
+}
+
+/** Move the chat on `paneId` (thread `input.thread_id`) to `provider` in
+ *  place. The transcript stays, the new provider starts fresh, and the
+ *  conversation so far reaches it on its first turn. Refused while a turn
+ *  runs or messages are queued. Resolves to the thread the new session runs
+ *  on. On failure the old provider may be stopped; the caller restarts it. */
+export const agentChatSwitchProvider = (
+  paneId: string,
+  from: ProviderSwitchFrom,
+  provider: AgentChatProviderKind,
+  input: AgentChatStartSessionInput,
+) => agentChatStartSession(paneId, provider, input, input.thread_id, from);

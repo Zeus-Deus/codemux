@@ -658,6 +658,20 @@ export type ProviderRuntimeEvent =
       type: "usage_resume_cancelled";
       thread_id: string;
       reason?: UsageResumeBlockedReason | null;
+    }
+  // The chat moved to another provider in place. Persisted, so the
+  // transcript keeps the divider where the switch happened.
+  | {
+      type: "provider_switched";
+      thread_id: string;
+      from_provider: AgentChatProviderKind;
+      from_model?: string | null;
+      to_provider: AgentChatProviderKind;
+      to_model?: string | null;
+      /** `summary`, `direct` (transcript), `none` (nothing said yet), or
+       *  `failed` (the handoff couldn't be saved). */
+      handoff_kind: string;
+      truncated?: boolean;
     };
 
 /** Canonical provider event payload as delivered to the frontend —

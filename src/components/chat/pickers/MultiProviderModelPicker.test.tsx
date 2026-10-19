@@ -34,6 +34,7 @@ import {
 import { usePickerFavorites } from "@/stores/picker-favorites-store";
 import { useCustomAcp } from "@/stores/custom-acp-store";
 import { useSettingsStore } from "@/stores/settings-store";
+import { useAgentChatStore } from "@/stores/agent-chat-store";
 
 import { MultiProviderModelPicker } from "./MultiProviderModelPicker";
 
@@ -348,6 +349,31 @@ describe("MultiProviderModelPicker — provider rail", () => {
     expect(screen.getByTestId("provider-rail-cursor")).toBeInTheDocument();
     expect(screen.getByTestId("provider-rail-grok")).toBeInTheDocument();
     expect(screen.getByTestId("provider-rail-opencode")).toBeInTheDocument();
+  });
+
+  it("says a started chat carries its context to another provider", async () => {
+    const user = userEvent.setup();
+    useAgentChatStore.setState({
+      threads: {
+        started: { inputDraft: "", messages: [{ kind: "user_message", id: "u1", seq: 1, text: "Fix it" }] },
+      } as unknown as ReturnType<typeof useAgentChatStore.getState>["threads"],
+    });
+    renderPicker({ hermesThreadId: "started" });
+    await openPicker(user);
+    expect(screen.queryByTestId("provider-switch-hint")).not.toBeInTheDocument();
+    await user.click(screen.getByTestId("provider-rail-codex"));
+    expect(screen.getByTestId("provider-switch-hint")).toHaveTextContent(
+      "Continues this chat in Codex. The conversation so far carries over.",
+    );
+    useAgentChatStore.setState({ threads: {} });
+  });
+
+  it("shows no switch note before a chat has started", async () => {
+    const user = userEvent.setup();
+    renderPicker({ hermesThreadId: "fresh" });
+    await openPicker(user);
+    await user.click(screen.getByTestId("provider-rail-codex"));
+    expect(screen.queryByTestId("provider-switch-hint")).not.toBeInTheDocument();
   });
 
   it("hides custom agents until one is configured", async () => {
