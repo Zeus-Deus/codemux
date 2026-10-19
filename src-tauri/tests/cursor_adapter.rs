@@ -456,7 +456,7 @@ async fn cursor_chat_receives_the_codemux_mcp_gateway() {
     let authorization = servers[0]["headers"][0]["value"].as_str().unwrap();
     assert!(url.starts_with("http://127.0.0.1:"), "{url}");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let list = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
     let response = client
         .post(url)
@@ -475,4 +475,110 @@ async fn cursor_chat_receives_the_codemux_mcp_gateway() {
         .stop_session(ThreadId(thread_id.into()))
         .await
         .expect("stop fixture session");
+}
+
+/// The `mcpServers` the fake agent saw on its latest `session/new` or
+/// `session/load`, read back through a `mcp-servers` turn.
+async fn mcp_servers_seen(
+    provider: &CursorAgentProvider,
+    events: &mut codemux_lib::agent_provider::ProviderEventStream,
+    thread_id: &str,
+) -> serde_json::Value {
+    provider
+        .send_turn(fixture_turn(thread_id, "mcp-servers"))
+        .await
+        .expect("send turn");
+    let text = timeout(Duration::from_secs(20), async {
+        let mut assistant_text = None;
+        while let Some(event) = events.next().await {
+            match event {
+                ProviderRuntimeEvent::ItemCompleted {
+                    item: CompletedItem::AssistantText { text },
+                    ..
+                } => assistant_text = Some(text),
+                ProviderRuntimeEvent::TurnCompleted { .. } => return assistant_text,
+                _ => {}
+            }
+        }
+        panic!("event stream closed before turn completion");
+    })
+    .await
+    .expect("turn timed out")
+    .expect("assistant text item");
+    serde_json::from_str(&text).expect("mcpServers JSON")
+}
+
+async fn listed_tool_names(servers: &serde_json::Value) -> Vec<String> {
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(servers[0]["url"].as_str().unwrap())
+        .header("authorization", servers[0]["headers"][0]["value"].as_str().unwrap())
+        .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = response.json().await.unwrap();
+    body["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A reopened chat keeps its token but acts for its current workspace: a
+/// plugin server scoped to the old workspace disappears from its tools.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopened_cursor_chat_takes_its_new_workspace() {
+    let registry = codemux_lib::mcp::registry::McpRegistry::new();
+    let server: codemux_lib::mcp::registry::PluginMcpServer = serde_json::from_value(serde_json::json!({
+        "id": "fixture", "name": "Fixture", "toolPrefix": "fixture",
+        "scope": {"workspaceIds": ["ws-a"]},
+        "transport": "stdio", "command": "python3",
+        "args": [format!("{}/tests/fixtures/plugin_mcp.py", env!("CARGO_MANIFEST_DIR"))],
+    }))
+    .unwrap();
+    registry
+        .register_plugin_server_for_page::<tauri::Wry>(
+            None,
+            registry.plugin_page_epoch(),
+            "demo",
+            "token-1".into(),
+            server,
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while registry.list_tools_for_workspace(&[], Some("ws-a")).await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("fixture tools load");
+
+    let provider = CursorAgentProvider::new(CursorProviderConfig {
+        binary: PathBuf::from(env!("CARGO_BIN_EXE_fake_cursor_acp")),
+        event_channel_capacity: 1024,
+        mcp_registry: Some(registry),
+    });
+    let mut events = provider.event_stream();
+    let thread_id = "cursor-rebind";
+
+    let mut input = fixture_start_input(thread_id);
+    input.workspace_id = Some("ws-a".into());
+    provider.start_session(input).await.expect("start in ws-a");
+    let in_a = mcp_servers_seen(&provider, &mut events, thread_id).await;
+    assert!(listed_tool_names(&in_a).await.iter().any(|name| name == "fixture__echo"));
+    provider.stop_session(ThreadId(thread_id.into())).await.expect("stop");
+
+    let mut input = fixture_start_input(thread_id);
+    input.workspace_id = Some("ws-b".into());
+    provider.start_session(input).await.expect("reopen in ws-b");
+    let in_b = mcp_servers_seen(&provider, &mut events, thread_id).await;
+    assert_eq!(in_a[0]["headers"], in_b[0]["headers"], "same chat, same token");
+    let names = listed_tool_names(&in_b).await;
+    assert!(!names.iter().any(|name| name.starts_with("fixture__")), "{names:?}");
+    provider.stop_session(ThreadId(thread_id.into())).await.expect("stop");
 }

@@ -120,6 +120,30 @@ pub struct AcpSpawnConfig {
     pub workspace_id: Option<String>,
 }
 
+/// The `mcpServers` for a Cursor or Grok session. A session on a device gets
+/// none of this computer's tools.
+async fn acp_mcp_servers(
+    dialect: AcpDialect,
+    registry: Option<&crate::mcp::registry::McpRegistry>,
+    remote: Option<&crate::agent_provider::types::RemoteSpawnTarget>,
+    thread_id: &str,
+    workspace_id: Option<String>,
+    initialized: &Value,
+) -> Value {
+    super::mcp::session_mcp_servers(
+        crate::agent_provider::local_tool_registry(registry, remote).as_ref(),
+        thread_id,
+        crate::mcp::gateway::GatewayCaller {
+            workspace_id,
+            native_sources: dialect.native_mcp_sources().to_vec(),
+            flat_tool_names: dialect.is_grok(),
+        },
+        super::mcp::SERVER_NAME,
+        super::mcp::Transport::negotiated(initialized),
+    )
+    .await
+}
+
 #[derive(Debug)]
 struct XAiPromptCompletion {
     prompt_id: String,
@@ -591,21 +615,13 @@ impl AcpSession {
                 });
             }
 
-            // A session on a device gets none of this computer's tools.
-            let mcp_servers = super::mcp::session_mcp_servers(
-                crate::agent_provider::local_tool_registry(
-                    spawn.mcp_registry.as_ref(),
-                    remote.as_ref(),
-                )
-                .as_ref(),
+            let mcp_servers = acp_mcp_servers(
+                dialect,
+                spawn.mcp_registry.as_ref(),
+                remote.as_ref(),
                 &thread_id.0,
-                crate::mcp::gateway::GatewayCaller {
-                    workspace_id: spawn.workspace_id.clone(),
-                    native_sources: dialect.native_mcp_sources().to_vec(),
-                    flat_tool_names: dialect.is_grok(),
-                },
-                super::mcp::SERVER_NAME,
-                super::mcp::Transport::negotiated(&initialized),
+                spawn.workspace_id.clone(),
+                &initialized,
             )
             .await;
             let new_session_params = || {
@@ -4762,5 +4778,28 @@ mod tests {
             }),
             json!({"outcome": {"outcome": "rejected", "reason": "Revise it"}})
         );
+    }
+}
+
+#[cfg(test)]
+mod mcp_delivery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn device_sessions_get_no_gateway_but_local_ones_do() {
+        let registry = crate::mcp::registry::McpRegistry::new();
+        let initialized = json!({"agentCapabilities": {"mcpCapabilities": {"http": true}}});
+        let device = crate::agent_provider::types::RemoteSpawnTarget {
+            host_id: 7,
+            ssh_target: "dev@box".into(),
+            host_name: "box".into(),
+        };
+        for dialect in [AcpDialect::Cursor, AcpDialect::Grok] {
+            let remote = acp_mcp_servers(dialect, Some(&registry), Some(&device), "t", None, &initialized).await;
+            assert_eq!(remote, json!([]), "{dialect:?} on a device");
+            let local = acp_mcp_servers(dialect, Some(&registry), None, "t", None, &initialized).await;
+            assert_eq!(local.as_array().map(Vec::len), Some(1), "{dialect:?} locally: {local}");
+            assert_eq!(local[0]["type"], "http");
+        }
     }
 }
