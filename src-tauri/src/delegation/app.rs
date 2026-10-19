@@ -328,6 +328,13 @@ pub fn parent_for_pane<R: Runtime>(app: &AppHandle<R>, pane: &str) -> Result<Par
     }
     Ok(parent)
 }
+/// The pane names a thread whose session row does not exist yet.
+fn bound_before_persisted<R: Runtime>(app: &AppHandle<R>, pane: &str) -> Result<bool, String> {
+    let Some((_, thread)) = app.state::<AppStateStore>().agent_chat_pane_thread(pane) else {
+        return Ok(false);
+    };
+    Ok(!app.state::<DatabaseStore>().has_agent_chat_session(&thread)?)
+}
 pub fn parent_for_thread<R: Runtime>(app: &AppHandle<R>, thread: &str) -> Result<Parent, String> {
     with_parent_admission(app, thread, |parent, _host| Ok(parent.clone()))
 }
@@ -526,7 +533,15 @@ async fn invoke_open<R: Runtime>(app: &AppHandle<R>, cmd: &str, args: Value) -> 
         store.cache_host(id, &info)?;
         return value(info);
     }
-    let parent = parent_for_pane(app, &string(&args, "paneId")?)?;
+    let pane = string(&args, "paneId")?;
+    // A new chat's pane is bound before its session is persisted, and only a
+    // persisted parent can admit tasks, so that window has nothing to list.
+    // Answering empty keeps every chat's mount-time read from reporting an
+    // error to users who never delegate; mutations below still fail closed.
+    if cmd == "delegation_list" && bound_before_persisted(app, &pane)? {
+        return value(Vec::<LocalTask>::new());
+    }
+    let parent = parent_for_pane(app, &pane)?;
     let _notice = if matches!(cmd,"delegation_list"|"delegation_read"|"delegation_grants") {None} else {Some(MutationNotice::new(app,&parent)?)};
     let result = match cmd {
         "delegation_grants" => value(store.grants(&parent.workspace_id)?),

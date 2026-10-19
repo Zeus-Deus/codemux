@@ -4649,6 +4649,22 @@ impl DatabaseStore {
     pub fn get_agent_chat_session(&self, thread_id: &str) -> Option<AgentChatSessionRecord> {
         agent_chat_session(&self.conn.lock().unwrap(), thread_id)
     }
+
+    /// Whether a session row exists. Unlike `get_agent_chat_session`, a
+    /// query failure is an error rather than an absent row.
+    pub fn has_agent_chat_session(&self, thread_id: &str) -> Result<bool, String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT 1 FROM agent_chat_sessions WHERE thread_id = ?1",
+                [thread_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(|e| format!("Failed to read agent_chat_session: {e}"))
+    }
 }
 
 // ── Agent Chat Messages ──
