@@ -2826,6 +2826,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             );
           }
           setSessionLaunchMode(newId, nextMode);
+          if (provider === "opencode") {
+            // The stop reset OpenCode to its build agent; keep the pill honest.
+            setStoreMode(newId, "default");
+            setStoreModePriorPermissionMode(newId, null);
+          }
           void useProviderHealth.getState().noteProviderSuccess(provider);
         } catch (err) {
           updates.onFailure?.();
@@ -2847,6 +2852,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       cwd,
       pane.pane_id,
       setSessionLaunchMode,
+      setStoreMode,
+      setStoreModePriorPermissionMode,
     ],
   );
 
@@ -3146,6 +3153,21 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         currentSlice.modePriorPermissionMode ??
         providerDefaultPermissionMode ??
         DEFAULT_THREAD_PERMISSION_MODE;
+      if (provider === "opencode") {
+        // OpenCode switches back to its build agent live; a restart would
+        // interrupt work and drop queued turns.
+        try {
+          await agentChatSetPermissionMode(provider, threadId, restore);
+        } catch (err) {
+          toast.failure("Couldn't leave Plan mode", err);
+          return;
+        }
+        setSessionLaunchMode(threadId, restore);
+        setStorePermissionMode(threadId, restore);
+        setStoreMode(threadId, "default");
+        setStoreModePriorPermissionMode(threadId, null);
+        return;
+      }
       // Snap the slice for immediate UI feedback (picker reappears,
       // pill drops). The restart sets sessionLaunchMode itself.
       setStorePermissionMode(threadId, restore);
@@ -3171,8 +3193,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStoreModePriorPermissionMode(threadId, null);
   }, [
     threadId,
+    provider,
     grokConfigurationBusy,
     setStorePermissionMode,
+    setSessionLaunchMode,
     setStoreMode,
     setStoreModePriorPermissionMode,
     restartSessionWith,
@@ -3642,6 +3666,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             // Nothing changed: the old provider is still running.
             toast.error("Can't switch providers yet", { description: refusal });
             return;
+          }
+          if (oldProvider === "opencode") {
+            // The stop reset OpenCode to its build agent; keep the pill honest.
+            setStoreMode(oldThreadId, "default");
+            setStoreModePriorPermissionMode(oldThreadId, null);
           }
           // The old DB row and pane binding are unchanged until the new
           // provider starts successfully. Best-effort rebuild the stopped

@@ -175,6 +175,18 @@ pub struct OpenCodeSession {
     /// session's initial effort; the send path uses it when no per-turn
     /// effort override is supplied.
     pub current_variant: Mutex<Option<String>>,
+    /// OpenCode primary agent selected by the Plan pill: `plan` while it is
+    /// on, `build` once it is turned off, `None` to leave a fresh session on
+    /// its default. A resumed native session starts at `build`: it keeps its
+    /// last agent, and a Plan pill does not survive the rebuild unless the
+    /// provider re-seeds it.
+    pub agent: Mutex<Option<&'static str>>,
+    /// Native agent last acknowledged by `POST /agent`; `None` when unknown
+    /// (fresh or resumed sessions), so the first selection is always sent.
+    applied_agent: Mutex<Option<&'static str>>,
+    /// A native switch queued OpenCode's mode reminder (a steer) that the
+    /// next prompt should be batched with.
+    reminder_pending: AtomicBool,
     server_handle: OpenCodeServerHandle,
     http: reqwest::Client,
     /// Routing context shared with the SSE listener — the listener
@@ -500,6 +512,9 @@ impl OpenCodeSession {
             provider_session_id,
             current_model: Mutex::new(initial_model),
             current_variant: Mutex::new(initial_variant),
+            agent: Mutex::new((native_v2 && did_resume).then_some("build")),
+            applied_agent: Mutex::new(None),
+            reminder_pending: AtomicBool::new(false),
             server_handle,
             http,
             event_ctx,
@@ -1025,6 +1040,148 @@ impl OpenCodeSession {
         Ok(())
     }
 
+    async fn apply_native_agent(&self, agent: &str) -> Result<(), ProviderError> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/api/session/{}/agent",
+                self.server_handle.base_url.trim_end_matches('/'),
+                urlencoding::encode(&self.provider_session_id.0)
+            ))
+            .basic_auth("opencode", Some(&self.server_handle.server_password))
+            .json(&serde_json::json!({ "agent": agent }))
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| ProviderError::RpcError {
+                message: format!("agent_send_failed: {e}"),
+            })?;
+        if !response.status().is_success() {
+            return Err(ProviderError::RpcError {
+                message: format!("agent_http_status_{}", response.status().as_u16()),
+            });
+        }
+        Ok(())
+    }
+
+    /// Select the agent for the next turn. Native sessions switch now, so
+    /// OpenCode's mode reminder is queued before the user's next prompt, the
+    /// way its own agent switch works; a running turn continues in it.
+    pub async fn select_agent(&self, agent: &'static str) -> Result<(), ProviderError> {
+        self.until_closed(async {
+            self.ensure_open()?;
+            let _outbound = self.outbound.lock().await;
+            // A rejected switch must leave the previous selection in force.
+            if self.server_handle.api == super::api::OpenCodeApi::V2 {
+                self.switch_native_agent(agent).await?;
+            }
+            *self.agent.lock().await = Some(agent);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Switch the native agent unless it is already applied. Returns whether
+    /// OpenCode will queue a Plan mode reminder for the switch.
+    async fn switch_native_agent(&self, agent: &'static str) -> Result<bool, ProviderError> {
+        let mut previous = *self.applied_agent.lock().await;
+        let unknown = previous.is_none();
+        if unknown {
+            // A resumed session keeps whatever agent it last ran; leaving a
+            // native Plan queues a reminder too.
+            previous = self.native_agent().await;
+        }
+        if previous == Some(agent) {
+            *self.applied_agent.lock().await = Some(agent);
+            return Ok(false);
+        }
+        if unknown && agent == "plan" {
+            // OpenCode 2.0 starts a directory's Plan reminder listener lazily
+            // and drops the switch that wakes it. Listing the directory's
+            // agents starts it first.
+            self.load_native_agents().await;
+        }
+        self.apply_native_agent(agent).await?;
+        self.ensure_open()?;
+        *self.applied_agent.lock().await = Some(agent);
+        let reminder = agent == "plan" || previous == Some("plan");
+        // A running turn takes the reminder at its next step.
+        if reminder && !self.turn_active().await {
+            self.reminder_pending.store(true, Ordering::Relaxed);
+        }
+        Ok(reminder)
+    }
+
+    /// The session's current native agent from its latest agent switch.
+    /// `None` when unknown, never switched (its default agent) or custom.
+    async fn native_agent(&self) -> Option<&'static str> {
+        let response = self
+            .http
+            .get(format!(
+                "{}/api/session/{}/message?type=agent-switched&order=desc&limit=1",
+                self.server_handle.base_url.trim_end_matches('/'),
+                urlencoding::encode(&self.provider_session_id.0)
+            ))
+            .basic_auth("opencode", Some(&self.server_handle.server_password))
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .ok()
+            .filter(|response| response.status().is_success())?;
+        let page: serde_json::Value = response.json().await.ok()?;
+        match page["data"][0]["agent"].as_str()? {
+            "plan" => Some("plan"),
+            "build" => Some("build"),
+            _ => None,
+        }
+    }
+
+    /// Best-effort: the directory comes from the client's default header.
+    async fn load_native_agents(&self) {
+        let _ = self
+            .http
+            .get(format!(
+                "{}/api/agent",
+                self.server_handle.base_url.trim_end_matches('/')
+            ))
+            .basic_auth("opencode", Some(&self.server_handle.server_password))
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await;
+    }
+
+    /// Best-effort, bounded wait for the reminder an agent switch queues
+    /// asynchronously; a prompt that overtakes it gets a second step that
+    /// answers the late reminder alone. On timeout the prompt still goes out.
+    async fn wait_for_native_reminder(&self) {
+        let url = format!(
+            "{}/api/session/{}/inbox",
+            self.server_handle.base_url.trim_end_matches('/'),
+            urlencoding::encode(&self.provider_session_id.0)
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            let inbox = self
+                .http
+                .get(&url)
+                .basic_auth("opencode", Some(&self.server_handle.server_password))
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await;
+            let Ok(inbox) = inbox else { return };
+            let Ok(inbox) = inbox.json::<serde_json::Value>().await else {
+                return;
+            };
+            let queued = inbox["data"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["type"] == "synthetic"));
+            if queued {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// Whether the SSE listener has declared this session's server
     /// unreachable (reconnect budget exhausted). A dead session is
     /// treated as absent by the provider so the next send auto-resumes.
@@ -1134,9 +1291,11 @@ impl OpenCodeSession {
                 message: "OpenCode /compact accepts no arguments or images.".into(),
             });
         }
-        let prompt =
+        let mut prompt =
             build_prompt_async_request(text.clone(), model.as_deref(), variant.as_deref(), &images)
                 .map_err(|err| ProviderError::ValidationError { message: err })?;
+        let agent = *self.agent.lock().await;
+        prompt.agent = agent.map(str::to_string);
         let native_v2 = self.server_handle.api == super::api::OpenCodeApi::V2;
         let (endpoint, body) = if native_v2 {
             if let Some(checkpoint) = &checkpoint {
@@ -1156,6 +1315,24 @@ impl OpenCodeSession {
                 *self.current_model.lock().await = Some(selected_model.clone());
                 *self.current_variant.lock().await = selected_variant.map(str::to_string);
                 self.refresh_model_context(selected_model).await;
+            }
+            // Normally applied when selected; this catches a rebuilt or
+            // resumed session. Compaction is agent-agnostic.
+            if let Some(agent) = agent.filter(|_| !steer && !matches!(native, Some(("compact", _))))
+            {
+                self.switch_native_agent(agent).await?;
+            }
+            // OpenCode runs pending steers before queued prompts, so a queued
+            // prompt after a switch would first get a reply to the mode
+            // reminder alone. Steering it batches both into one step. A
+            // command's own execution takes the reminder instead.
+            let reminder_pending =
+                !steer && self.reminder_pending.swap(false, Ordering::Relaxed) && native.is_none();
+            if reminder_pending {
+                // OpenCode queues it asynchronously; a prompt sent right after
+                // the toggle can still overtake it.
+                self.wait_for_native_reminder().await;
+                self.ensure_open()?;
             }
             let files: Vec<_> = prompt
                 .parts
@@ -1192,7 +1369,7 @@ impl OpenCodeSession {
                     ("command", body)
                 }
                 None => {
-                    let mut body = super::v2::prompt_body(&text, files, steer);
+                    let mut body = super::v2::prompt_body(&text, files, steer || reminder_pending);
                     body["id"] = serde_json::json!(format!("msg_codemux_{}", Uuid::new_v4()));
                     body["resume"] = serde_json::json!(false);
                     ("prompt", body)
@@ -1237,6 +1414,9 @@ impl OpenCodeSession {
                     }
                     if let Some(variant) = prompt.variant.as_ref() {
                         body["variant"] = serde_json::json!(variant);
+                    }
+                    if let Some(agent) = agent {
+                        body["agent"] = serde_json::json!(agent);
                     }
                     ("command", body)
                 }
@@ -1351,7 +1531,7 @@ impl OpenCodeSession {
         }
         if native_v2 {
             return self
-                .post_native_admission(endpoint, body, turn_id)
+                .post_native_admission(endpoint, body, turn_id, steer)
                 .await
                 .map(Some);
         }
@@ -1526,6 +1706,8 @@ impl OpenCodeSession {
         endpoint: &'static str,
         mut body: serde_json::Value,
         turn_id: TurnId,
+        // Wire delivery can be `steer` for a new turn (see `reminder_pending`).
+        steered: bool,
     ) -> Result<TurnId, ProviderError> {
         let peer = self.native_peer();
         let closing = self.closing.subscribe();
@@ -1550,7 +1732,6 @@ impl OpenCodeSession {
         let router = self.router.clone();
         let root_session = self.provider_session_id.0.clone();
         let expected_turn = turn_id.clone();
-        let steered = body["delivery"] == "steer";
         let dead = self.dead.clone();
         let close = self.closing.clone();
         tokio::spawn(async move {
@@ -2830,6 +3011,100 @@ pub(crate) mod tests {
         let _ = session.shutdown().await;
     }
 
+    /// Developer smoke test: Plan and back on a free OpenCode 2 model, each in
+    /// one turn. Needs network access to OpenCode's free model endpoint.
+    /// OpenCode can still miss a reminder while it loads plugins on a cold
+    /// server; it then answers that reminder too, inside the same turn.
+    #[tokio::test]
+    #[ignore]
+    async fn live_opencode_plan_mode_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = broadcast::channel(4096);
+        // The manager owns the server process; keep it alive for the test.
+        let manager = Arc::new(OpenCodeServerManager::new());
+        let session = OpenCodeSession::start(
+            manager.clone(),
+            None,
+            ThreadId("live-plan-smoke".into()),
+            Some("opencode/deepseek-v4.1-flash-free".into()),
+            None,
+            None,
+            tx,
+            None,
+            Some(directory.path().to_path_buf()),
+        )
+        .await
+        .expect("OpenCode session should start");
+        for (agent, word) in [("plan", "one"), ("build", "two")] {
+            // Send right after toggling: the reminder is queued asynchronously.
+            session.select_agent(agent).await.unwrap();
+            let turn = session
+                .send_turn(
+                    format!("Reply with just the word {word}."),
+                    vec![],
+                    None,
+                    None,
+                )
+                .await
+                .expect("turn should be admitted");
+            let mut texts = Vec::new();
+            loop {
+                let event = tokio::time::timeout(std::time::Duration::from_secs(120), rx.recv())
+                    .await
+                    .expect("turn should finish")
+                    .unwrap();
+                match event {
+                    ProviderRuntimeEvent::ItemCompleted {
+                        turn_id,
+                        item: crate::agent_provider::CompletedItem::AssistantText { text },
+                        ..
+                    } => texts.push((turn_id, text)),
+                    ProviderRuntimeEvent::TurnCompleted {
+                        turn_id, status, ..
+                    } => {
+                        assert_eq!(turn_id, turn, "the reminder must not settle a turn");
+                        assert!(
+                            matches!(status, crate::agent_provider::TurnStatus::Success),
+                            "{status:?}"
+                        );
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(texts.iter().all(|(id, _)| id == &turn), "{texts:?}");
+            assert!(texts[0].1.to_lowercase().contains(word), "{texts:?}");
+        }
+        let base = session
+            .server_handle
+            .base_url
+            .trim_end_matches('/')
+            .to_string();
+        let messages: serde_json::Value = reqwest::Client::new()
+            .get(format!(
+                "{base}/api/session/{}/message",
+                session.provider_session_id.0
+            ))
+            .basic_auth("opencode", Some(&session.server_handle.server_password))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mut agents: Vec<_> = messages["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .filter(|m| m["type"] == "assistant")
+            .map(|m| m["agent"].as_str().unwrap_or_default().to_string())
+            .collect();
+        agents.dedup();
+        assert_eq!(agents, ["plan", "build"], "{messages}");
+        let _ = session.shutdown().await;
+    }
+
     /// Developer smoke test against the installed OpenCode binary. Ignored in
     /// CI because OpenCode is an optional external provider.
     #[tokio::test]
@@ -2944,6 +3219,9 @@ pub(crate) mod tests {
             provider_session_id: provider_session_id.clone(),
             current_model: Mutex::new(Some("openai/gpt-5".into())),
             current_variant: Mutex::new(None),
+            agent: Mutex::new(None),
+            applied_agent: Mutex::new(None),
+            reminder_pending: AtomicBool::new(false),
             server_handle: handle,
             http,
             event_ctx,
@@ -3189,6 +3467,285 @@ pub(crate) mod tests {
         assert!(session.set_model("p/bad".into()).await.is_err());
         reject.assert_async().await;
         assert_eq!(session.current_model.lock().await.as_deref(), Some("p/m"));
+    }
+
+    #[tokio::test]
+    async fn native_agent_switch_precedes_prompt_and_steers_it_into_the_reminder_step() {
+        let mut server = Server::new_async().await;
+        // The first Plan switch loads the directory's agents (see warm-up).
+        let warm = server
+            .mock("GET", "/api/agent")
+            .with_status(200)
+            .with_body(r#"{"data":[]}"#)
+            .create_async()
+            .await;
+        let _inbox = server
+            .mock("GET", "/api/session/s/inbox")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"r","type":"synthetic","delivery":"steer"}]}"#)
+            .create_async()
+            .await;
+        let agent = server
+            .mock("POST", "/api/session/s/agent")
+            .match_body(mockito::Matcher::Json(serde_json::json!({"agent":"plan"})))
+            .with_status(204)
+            .create_async()
+            .await;
+        let prompt = server
+            .mock("POST", "/api/session/s/prompt")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"text":"hi","delivery":"steer"}),
+            ))
+            .expect(2)
+            .with_status(200)
+            .with_body(r#"{"data":{"id":"u","sessionID":"s","type":"user"}}"#)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        *session.agent.lock().await = Some("plan");
+        session
+            .send_turn("hi".into(), vec![], None, None)
+            .await
+            .unwrap();
+        warm.assert_async().await;
+        agent.assert_async().await;
+        prompt.assert_async().await;
+        assert_eq!(*session.applied_agent.lock().await, Some("plan"));
+        // The steered wire delivery still opens a new Codemux turn.
+        assert!(session.turn_active().await);
+    }
+
+    #[tokio::test]
+    async fn selecting_an_agent_switches_now_and_steers_only_the_next_prompt() {
+        let mut server = Server::new_async().await;
+        let _agents = server
+            .mock("GET", "/api/agent")
+            .with_status(200)
+            .with_body(r#"{"data":[]}"#)
+            .create_async()
+            .await;
+        let agent = server
+            .mock("POST", "/api/session/s/agent")
+            .match_body(mockito::Matcher::Json(serde_json::json!({"agent":"plan"})))
+            .with_status(204)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        session.select_agent("plan").await.unwrap();
+        agent.assert_async().await;
+        // An immediate send still waits for the asynchronous reminder.
+        let inbox = server
+            .mock("GET", "/api/session/s/inbox")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"r","type":"synthetic","delivery":"steer"}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let steered = server
+            .mock("POST", "/api/session/s/prompt")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"delivery":"steer"}),
+            ))
+            .expect(2)
+            .with_status(200)
+            .with_body(r#"{"data":{"id":"u","sessionID":"s","type":"user"}}"#)
+            .create_async()
+            .await;
+        session
+            .send_turn("hi".into(), vec![], None, None)
+            .await
+            .unwrap();
+        steered.assert_async().await;
+        inbox.assert_async().await;
+        assert!(!session.reminder_pending.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn resumed_native_plan_is_left_with_a_batched_reminder() {
+        let mut server = Server::new_async().await;
+        let _current = server
+            .mock("GET", "/api/session/s/message")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "type".into(),
+                "agent-switched".into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"m","type":"agent-switched","agent":"plan"}]}"#)
+            .create_async()
+            .await;
+        let build = server
+            .mock("POST", "/api/session/s/agent")
+            .match_body(mockito::Matcher::Json(serde_json::json!({"agent":"build"})))
+            .with_status(204)
+            .create_async()
+            .await;
+        let _inbox = server
+            .mock("GET", "/api/session/s/inbox")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"r","type":"synthetic","delivery":"steer"}]}"#)
+            .create_async()
+            .await;
+        let steered = server
+            .mock("POST", "/api/session/s/prompt")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"delivery":"steer"}),
+            ))
+            .expect(2)
+            .with_status(200)
+            .with_body(r#"{"data":{"id":"u","sessionID":"s","type":"user"}}"#)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        // A resumed session's first turn reconciles to build.
+        *session.agent.lock().await = Some("build");
+        session
+            .send_turn("hi".into(), vec![], None, None)
+            .await
+            .unwrap();
+        build.assert_async().await;
+        steered.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn native_agent_already_selected_is_not_switched() {
+        let mut server = Server::new_async().await;
+        let _current = server
+            .mock("GET", "/api/session/s/message")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"m","type":"agent-switched","agent":"build"}]}"#)
+            .create_async()
+            .await;
+        let agent = server
+            .mock("POST", "/api/session/s/agent")
+            .expect(0)
+            .create_async()
+            .await;
+        let queued = server
+            .mock("POST", "/api/session/s/prompt")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"delivery":"queue"}),
+            ))
+            .expect(2)
+            .with_status(200)
+            .with_body(r#"{"data":{"id":"u","sessionID":"s","type":"user"}}"#)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        *session.agent.lock().await = Some("build");
+        session
+            .send_turn("hi".into(), vec![], None, None)
+            .await
+            .unwrap();
+        agent.assert_async().await;
+        queued.assert_async().await;
+        assert_eq!(*session.applied_agent.lock().await, Some("build"));
+    }
+
+    #[tokio::test]
+    async fn rejected_agent_selection_keeps_the_previous_one() {
+        let mut server = Server::new_async().await;
+        let _reject = server
+            .mock("POST", "/api/session/s/agent")
+            .with_status(400)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        *session.agent.lock().await = Some("plan");
+        *session.applied_agent.lock().await = Some("plan");
+        assert!(session.select_agent("build").await.is_err());
+        // Leaving Plan failed, so the next turn must not run with build.
+        assert_eq!(*session.agent.lock().await, Some("plan"));
+    }
+
+    #[tokio::test]
+    async fn native_applied_agent_is_not_switched_again_and_failed_switch_blocks_prompt() {
+        let mut server = Server::new_async().await;
+        let agent = server
+            .mock("POST", "/api/session/s/agent")
+            .with_status(400)
+            .create_async()
+            .await;
+        let prompt = server
+            .mock("POST", "/api/session/s/prompt")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"delivery":"queue"}),
+            ))
+            .expect(2)
+            .with_status(200)
+            .with_body(r#"{"data":{"id":"u","sessionID":"s","type":"user"}}"#)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        *session.agent.lock().await = Some("build");
+        assert!(session
+            .send_turn("hi".into(), vec![], None, None)
+            .await
+            .is_err());
+        assert_eq!(*session.applied_agent.lock().await, None);
+        *session.applied_agent.lock().await = Some("build");
+        session
+            .send_turn("hi".into(), vec![], None, None)
+            .await
+            .unwrap();
+        agent.assert_async().await;
+        prompt.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_prompt_carries_the_selected_agent() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"agent":"plan"}),
+            ))
+            .with_status(204)
+            .create_async()
+            .await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        *session.agent.lock().await = Some("plan");
+        session
+            .send_turn("hi".into(), vec![], None, None)
+            .await
+            .unwrap();
+        mock.assert_async().await;
     }
 
     #[derive(Debug)]
