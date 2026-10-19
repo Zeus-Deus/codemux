@@ -386,7 +386,16 @@ async fn starts_session_and_reports_ready() {
         .unwrap();
     assert_eq!(session.thread_id.0, "t-ready");
     assert!(matches!(session.status, SessionStatus::Ready));
-    assert_eq!(session.resume_cursor, Some(json!({"threadId": "c-1"})));
+    assert_eq!(
+        session.resume_cursor,
+        Some(json!({
+            "threadId": "c-1",
+            "pluginTools": {
+                "directNames": [],
+                "catalogKey": codemux_lib::mcp::registry::plugin_catalog_key(&[])
+            }
+        }))
+    );
 
     let events = handle.await.unwrap();
     assert!(events
@@ -2975,4 +2984,33 @@ async fn runtime_status_is_busy_while_a_turn_start_is_in_flight() {
     assert!(provider.runtime_status(&id).await.unwrap().busy);
     assert!(provider.runtime_status(&ThreadId("nope".into())).await.is_none());
     provider.stop_session(id).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_accepts_legacy_cursors_and_preserves_plugin_snapshots() {
+    let empty = json!({
+        "directNames": [],
+        "catalogKey": codemux_lib::mcp::registry::plugin_catalog_key(&[])
+    });
+    let saved = json!({"directNames":["fixture__original"],"catalogKey":"previously-announced"});
+    for (index, (cursor, expected)) in [
+        (json!({"threadId":"c-1"}), empty.clone()),
+        (json!({"resume":"c-1"}), empty),
+        (json!({"threadId":"c-1","pluginTools":saved}), saved),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let provider = provider_with_fixture();
+        let thread_id = format!("cursor-compatible-{index}");
+        let mut input = start_input(&thread_id);
+        input.resume_cursor = Some(cursor);
+        let session = start_session_resilient(&provider, input).await.unwrap();
+        assert!(matches!(session.status, SessionStatus::Ready));
+        assert_eq!(
+            session.resume_cursor,
+            Some(json!({"threadId":"c-1","pluginTools":expected}))
+        );
+        provider.stop_session(ThreadId(thread_id)).await.unwrap();
+    }
 }

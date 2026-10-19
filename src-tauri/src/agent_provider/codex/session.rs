@@ -1631,6 +1631,8 @@ impl CodexSession {
     }
 
     pub async fn resume_cursor(&self) -> Value {
+        // A known-empty snapshot still matters: plugins added while the app is
+        // closed need a reminder after resume, rather than being treated as seen.
         json!({"threadId":self.provider_session_id.0,"pluginTools":PluginToolSnapshot {
             direct_names:self.direct_tool_names.clone(),catalog_key:self.plugin_catalog_seen.lock().await.clone(),
         }})
@@ -3264,6 +3266,10 @@ mod tests {
 
     #[test]
     fn resume_cursor_accepts_native_and_persisted_shapes() {
+        assert_eq!(
+            codex_thread_id_from_resume_cursor(&json!({"threadId":"native-thread","pluginTools":{"directNames":[],"catalogKey":"known-empty"}})),
+            Some("native-thread".into())
+        );
         assert_eq!(
             codex_thread_id_from_resume_cursor(&json!({"threadId": "native-thread"})),
             Some("native-thread".into())
