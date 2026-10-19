@@ -441,6 +441,9 @@ uninstall**, matching existing `ctx.storage` retention. Reinstalling the same
 plugin id can reuse it. `removeDataFile` deletes only that plugin's named file.
 Acquiring the data directory sweeps abandoned writer temp files older than one
 day, without following links; recent writes and named data files are retained.
+Returned Windows paths use ordinary absolute spelling when safely equivalent;
+paths that require Windows verbatim syntax retain it. Containment checks always
+use canonical paths internally.
 
 `ctx.host.workspace.list()` returns the open workspaces as `{ id, name, path,
 remote }[]`. `ctx.host.workspace.onListChange(fn)` notifies when that list

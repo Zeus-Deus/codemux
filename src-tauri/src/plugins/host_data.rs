@@ -182,6 +182,11 @@ fn read_text(path: &Path, max: Option<usize>) -> Result<String, String> {
     }
     String::from_utf8(bytes).map_err(|_| "File is not UTF-8 text".into())
 }
+fn external_path(path: &Path) -> String {
+    // Keep canonical paths for containment, but avoid Windows verbatim paths in
+    // CLI arguments when the ordinary absolute spelling is safely equivalent.
+    dunce::simplified(path).to_string_lossy().into_owned()
+}
 fn execute_at(app_data: &Path, plugin: &str, operation: FsOperation) -> Result<Value, String> {
     match operation {
         FsOperation::Exists { path } => Ok(json!(absolute_path(&path)?
@@ -203,7 +208,7 @@ fn execute_at(app_data: &Path, plugin: &str, operation: FsOperation) -> Result<V
         FsOperation::ReadText { path, max_bytes } => {
             Ok(json!(read_text(&absolute_path(&path)?, max_bytes)?))
         }
-        FsOperation::DataDir => Ok(json!(data_dir(app_data, plugin)?.to_string_lossy())),
+        FsOperation::DataDir => Ok(json!(external_path(&data_dir(app_data, plugin)?))),
         FsOperation::WriteDataFile { name, contents } => {
             if contents.len() > MAX_DATA_BYTES {
                 return Err("Data file exceeds 1 MiB".into());
@@ -225,7 +230,7 @@ fn execute_at(app_data: &Path, plugin: &str, operation: FsOperation) -> Result<V
             // It never opens the destination, so a link cannot redirect the write.
             data_path(&dir, &name)?;
             temp.persist(&path).map_err(|e| e.to_string())?;
-            Ok(json!(path.to_string_lossy()))
+            Ok(json!(external_path(&path)))
         }
         FsOperation::RemoveDataFile { name } => {
             let path = data_path(&data_dir(app_data, plugin)?, &name)?;
@@ -258,7 +263,10 @@ mod tests {
             fs::write(path, "fixture").unwrap();
         }
         for path in [&stale, &named] {
-            fs::File::open(path)
+            // Windows requires write-attributes access for SetFileTime.
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
                 .unwrap()
                 .set_times(fs::FileTimes::new().set_modified(old))
                 .unwrap();
@@ -289,7 +297,17 @@ mod tests {
             )
         };
         let path = PathBuf::from(write("one").unwrap().as_str().unwrap());
-        assert!(path.starts_with(root.path().join("plugin-data/demo")));
+        let expected_dir = fs::canonicalize(root.path().join("plugin-data").join("demo")).unwrap();
+        assert_eq!(
+            fs::canonicalize(&path).unwrap().parent(),
+            Some(expected_dir.as_path())
+        );
+        let exported_dir = execute_at(root.path(), "demo", FsOperation::DataDir).unwrap();
+        assert_eq!(
+            Path::new(exported_dir.as_str().unwrap()),
+            path.parent().unwrap()
+        );
+        assert!(path.is_absolute());
         write("two").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "two");
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
@@ -325,6 +343,50 @@ mod tests {
         )
         .unwrap();
         assert!(!path.exists());
+    }
+    #[test]
+    fn plugin_host_data_atomic_replace_preserves_an_open_reader() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |contents: &str| {
+            execute_at(
+                root.path(),
+                "demo",
+                FsOperation::WriteDataFile {
+                    name: "policy.json".into(),
+                    contents: contents.into(),
+                },
+            )
+            .unwrap()
+        };
+        let original = "old policy\n".repeat(1024);
+        let replacement = "new policy\n".repeat(1024);
+        let path = PathBuf::from(write(&original).as_str().unwrap());
+        // Rust's Windows default sharing includes FILE_SHARE_DELETE, so an
+        // existing reader can retain the old file while the name is replaced.
+        let mut reader = fs::File::open(&path).unwrap();
+        assert_eq!(
+            write(&replacement).as_str().unwrap(),
+            path.to_str().unwrap()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), replacement);
+        let mut old_contents = String::new();
+        reader.read_to_string(&mut old_contents).unwrap();
+        assert_eq!(old_contents, original);
+        drop(reader);
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn plugin_host_data_exports_ordinary_windows_paths_only_when_equivalent() {
+        assert_eq!(
+            external_path(Path::new(
+                r"\\?\C:\Users\Runner\plugin-data\demo\policy.json"
+            )),
+            r"C:\Users\Runner\plugin-data\demo\policy.json"
+        );
+        for path in [r"\\?\C:\data\CON", r"\\?\C:\data\trailing."] {
+            assert_eq!(external_path(Path::new(path)), path);
+        }
     }
     #[cfg(unix)]
     #[test]
