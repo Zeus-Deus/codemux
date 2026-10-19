@@ -1905,7 +1905,7 @@ fn codemux_mcp_entry() -> Value {
 /// inside a transient mount for a raw AppImage launch; the wrapper named by
 /// `$APPIMAGE` survives after the desktop process exits and accepts the same
 /// `mcp` argument.
-fn codemux_mcp_command() -> String {
+pub(crate) fn codemux_mcp_command() -> String {
     std::env::var_os("APPIMAGE")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)

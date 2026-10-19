@@ -55,6 +55,7 @@ fn fixture_provider_with_commands() -> (CursorAgentProvider, Arc<AcpSlashCommand
         CursorProviderConfig {
             binary: PathBuf::from(env!("CARGO_BIN_EXE_fake_cursor_acp")),
             event_channel_capacity: 1024,
+            mcp_registry: None,
         },
         Arc::clone(&commands),
     );
@@ -407,4 +408,71 @@ async fn cursor_real_session_resumes_across_fast_tier_changes() {
         .stop_session(ThreadId(thread_id))
         .await
         .expect("stop final Cursor session");
+}
+
+/// A local chat receives Codemux's MCP gateway as one HTTP server whose
+/// token, unique to the chat, the gateway accepts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_chat_receives_the_codemux_mcp_gateway() {
+    let provider = CursorAgentProvider::new(CursorProviderConfig {
+        binary: PathBuf::from(env!("CARGO_BIN_EXE_fake_cursor_acp")),
+        event_channel_capacity: 1024,
+        mcp_registry: Some(codemux_lib::mcp::registry::McpRegistry::new()),
+    });
+    let mut events = provider.event_stream();
+    let thread_id = "cursor-mcp-gateway";
+    let mut input = fixture_start_input(thread_id);
+    input.workspace_id = Some("ws-1".into());
+    provider.start_session(input).await.expect("start fixture session");
+    provider
+        .send_turn(fixture_turn(thread_id, "mcp-servers"))
+        .await
+        .expect("send turn");
+    let text = timeout(Duration::from_secs(20), async {
+        let mut assistant_text = None;
+        while let Some(event) = events.next().await {
+            match event {
+                ProviderRuntimeEvent::ItemCompleted {
+                    item: CompletedItem::AssistantText { text },
+                    ..
+                } => assistant_text = Some(text),
+                ProviderRuntimeEvent::TurnCompleted { .. } => return assistant_text,
+                _ => {}
+            }
+        }
+        panic!("event stream closed before turn completion");
+    })
+    .await
+    .expect("turn timed out")
+    .expect("assistant text item");
+
+    let servers: serde_json::Value = serde_json::from_str(&text).expect("mcpServers JSON");
+    let servers = servers.as_array().expect("mcpServers array");
+    assert_eq!(servers.len(), 1, "{text}");
+    assert_eq!(servers[0]["type"], "http");
+    assert_eq!(servers[0]["name"], "codemux");
+    assert_eq!(servers[0]["headers"][0]["name"], "Authorization");
+    let url = servers[0]["url"].as_str().unwrap();
+    let authorization = servers[0]["headers"][0]["value"].as_str().unwrap();
+    assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+
+    let client = reqwest::Client::new();
+    let list = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let response = client
+        .post(url)
+        .header("authorization", authorization)
+        .json(&list)
+        .send()
+        .await
+        .expect("gateway reachable");
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["result"]["tools"].is_array(), "{body}");
+    let anonymous = client.post(url).json(&list).send().await.unwrap();
+    assert_eq!(anonymous.status(), 401);
+
+    provider
+        .stop_session(ThreadId(thread_id.into()))
+        .await
+        .expect("stop fixture session");
 }

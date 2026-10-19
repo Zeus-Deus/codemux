@@ -95,6 +95,14 @@ impl AcpDialect {
     fn is_grok(self) -> bool {
         self == Self::Grok
     }
+
+    /// Registry sources this agent already loads from its own config.
+    fn native_mcp_sources(self) -> &'static [crate::mcp::McpConfigSource] {
+        match self {
+            Self::Cursor => super::mcp::CURSOR_NATIVE_SOURCES,
+            Self::Grok => super::mcp::GROK_NATIVE_SOURCES,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +114,10 @@ pub struct AcpSpawnConfig {
     pub slash_command_cache: Arc<AcpSlashCommandCache>,
     /// Device to run the agent on over SSH; `None` runs it here.
     pub remote: Option<crate::agent_provider::types::RemoteSpawnTarget>,
+    /// Registry the chat's MCP tools come from. Ignored for a device.
+    pub mcp_registry: Option<crate::mcp::registry::McpRegistry>,
+    /// Workspace that owns the chat, for workspace-scoped Codemux tools.
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -579,8 +591,24 @@ impl AcpSession {
                 });
             }
 
+            // A session on a device gets none of this computer's tools.
+            let mcp_servers = super::mcp::session_mcp_servers(
+                crate::agent_provider::local_tool_registry(
+                    spawn.mcp_registry.as_ref(),
+                    remote.as_ref(),
+                )
+                .as_ref(),
+                &thread_id.0,
+                crate::mcp::gateway::GatewayCaller {
+                    workspace_id: spawn.workspace_id.clone(),
+                    native_sources: dialect.native_mcp_sources().to_vec(),
+                },
+                super::mcp::SERVER_NAME,
+                super::mcp::Transport::negotiated(&initialized),
+            )
+            .await;
             let new_session_params = || {
-                let mut params = json!({ "cwd": cwd.clone(), "mcpServers": [] });
+                let mut params = json!({ "cwd": cwd.clone(), "mcpServers": mcp_servers.clone() });
                 if dialect.is_grok() {
                     let mut meta = json!({
                         "yoloMode": permission_mode

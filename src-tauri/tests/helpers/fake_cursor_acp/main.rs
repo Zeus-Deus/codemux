@@ -5,12 +5,14 @@
 //! lifecycle without an installed, authenticated Cursor CLI.
 //!
 //! Methods understood:
-//!   - `initialize` / `authenticate` → empty result.
+//!   - `initialize` → advertises HTTP MCP servers, like cursor-agent
+//!     2026.10.14. `authenticate` → empty result.
 //!   - `session/new`  → `{sessionId, configOptions}`, followed by the
 //!     `available_commands_update` the real CLI pushes once a session
 //!     exists. Entries carry only a name and description — this path has
 //!     no argument hints.
 //!   - `session/load` → empty result (ACP omits the id on purpose).
+//!   - `session/new` and `session/load` remember their `mcpServers`.
 //!   - `session/set_config_option` → echoes the config options back.
 //!   - `session/prompt` → behavior is chosen by the prompt text:
 //!       * `chunks:<n>` streams `<n>` `agent_message_chunk` updates
@@ -25,6 +27,7 @@
 //!         `session/cancel` notification arrives, and then with
 //!         `stopReason: cancelled`. A client that never delivers the
 //!         cancel hangs, which is exactly what makes it a test of Stop.
+//!       * `mcp-servers` answers with the remembered `mcpServers` as JSON.
 //!       * anything else answers with a single chunk and `end_turn`.
 //!   - `session/cancel` (notification) → completes a held turn, else
 //!     ignored.
@@ -135,6 +138,7 @@ fn main() {
     // Id of a `session/prompt` deliberately left unanswered until a
     // `session/cancel` arrives.
     let mut held_prompt: Option<Value> = None;
+    let mut mcp_servers = Value::Null;
 
     loop {
         line.clear();
@@ -160,8 +164,20 @@ fn main() {
         let id = message.get("id").cloned();
         let params = message.get("params").cloned().unwrap_or(Value::Null);
 
+        if matches!(method, "session/new" | "session/load") {
+            mcp_servers = params.get("mcpServers").cloned().unwrap_or(Value::Null);
+        }
         match method {
-            "initialize" | "authenticate" | "session/load" => {
+            "initialize" => {
+                if let Some(id) = id {
+                    write_line(&json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"agentCapabilities": {"mcpCapabilities": {"http": true, "sse": true}}}
+                    }));
+                }
+            }
+            "authenticate" | "session/load" => {
                 if let Some(id) = id {
                     write_line(&json!({"jsonrpc": "2.0", "id": id, "result": {}}));
                 }
@@ -220,6 +236,8 @@ fn main() {
                             ]
                         }
                     }));
+                } else if text.contains("mcp-servers") {
+                    write_line(&chunk(&session_id, &mcp_servers.to_string()));
                 } else {
                     let count = requested_chunk_count(&text).unwrap_or(1);
                     for index in 0..count {

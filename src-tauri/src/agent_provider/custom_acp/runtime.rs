@@ -221,6 +221,7 @@ struct Inner {
     store: Arc<dyn AcpStore>,
     events: broadcast::Sender<ProviderRuntimeEvent>,
     catalogs: broadcast::Sender<AcpCatalogChanged>,
+    mcp_registry: Option<crate::mcp::registry::McpRegistry>,
 }
 pub struct GenericAcpProvider {
     inner: Arc<Inner>,
@@ -292,6 +293,12 @@ mod parsing_tests {
 }
 impl GenericAcpProvider {
     pub fn new(store: Arc<dyn AcpStore>) -> Self {
+        Self::new_with_mcp_registry(store, None)
+    }
+    pub fn new_with_mcp_registry(
+        store: Arc<dyn AcpStore>,
+        mcp_registry: Option<crate::mcp::registry::McpRegistry>,
+    ) -> Self {
         let (events, _) = broadcast::channel(2048);
         let (catalogs, _) = broadcast::channel(128);
         Self {
@@ -301,6 +308,7 @@ impl GenericAcpProvider {
                 store,
                 events,
                 catalogs,
+                mcp_registry,
             }),
         }
     }
@@ -348,6 +356,7 @@ impl GenericAcpProvider {
             None,
             None,
             false,
+            None,
         )
         .await?;
         let catalog = session.binding.lock().await.catalog.clone();
@@ -483,6 +492,9 @@ impl Session {
         model: Option<String>,
         effort: Option<String>,
         durable: bool,
+        // Workspace of a chat that gets Codemux's MCP tools; `None` for a
+        // probe, which only reads the catalog.
+        tool_workspace: Option<Option<String>>,
     ) -> Result<Arc<Self>, ProviderError> {
         if !cwd.is_absolute() || !cwd.is_dir() || cwd.to_str().is_none() {
             return Err(invalid(
@@ -575,7 +587,18 @@ impl Session {
             let (native,intent,legacy_model)={let b=session.binding.lock().await;
                 let legacy=if b.session_id.is_some() && semantic_option(&b.catalog.config_options,"model").is_none() && !b.catalog.capabilities.models.is_empty() {b.catalog.current_model.clone()} else {None};
                 (b.session_id.clone(),b.config_values.clone(),legacy)};
-            let mut params=json!({"cwd":cwd,"mcpServers":[]});
+            let mcp_servers = match tool_workspace {
+                Some(workspace_id) => crate::agent_provider::acp::mcp::session_mcp_servers(
+                    inner.mcp_registry.as_ref(),
+                    &session.thread.0,
+                    crate::mcp::gateway::GatewayCaller { workspace_id, native_sources: Vec::new() },
+                    crate::agent_provider::acp::mcp::SERVER_NAME,
+                    crate::agent_provider::acp::mcp::Transport::negotiated(&initialized),
+                )
+                .await,
+                None => json!([]),
+            };
+            let mut params=json!({"cwd":cwd,"mcpServers":mcp_servers});
             let method=if let Some(native)=&native {params["sessionId"]=json!(native);caps.resume_method().map_err(invalid)?} else {"session/new"};
             let (response,sequence)=session.request_ordered(method,params).await?;
             // Pumps are running before new/load/resume. Active=None suppresses replay.
@@ -2017,6 +2040,7 @@ impl AgentProvider for GenericAcpProvider {
             input.model,
             input.effort,
             true,
+            Some(input.workspace_id),
         )
         .await?;
         let snapshot = session.snapshot().await;

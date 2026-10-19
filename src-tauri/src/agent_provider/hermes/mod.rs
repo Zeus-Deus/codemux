@@ -139,6 +139,8 @@ struct Pending {
 struct Chat {
     binding: Mutex<Binding>,
     runtime: Arc<Runtime>,
+    /// ACP `mcpServers` sent on every `session/new` and `session/load`.
+    mcp_servers: Value,
     state: Mutex<ChatState>,
     finished: Notify,
 }
@@ -201,12 +203,28 @@ struct Inner {
     runtime_starts: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     store: Arc<dyn BindingStore>,
     events: broadcast::Sender<ProviderRuntimeEvent>,
+    mcp_registry: Option<crate::mcp::registry::McpRegistry>,
+}
+/// Gateway server name for one chat. A Hermes process serves every chat on
+/// its profile and keeps ACP MCP servers by name, reusing a connected one, so a
+/// shared name would send every chat's calls with the first chat's token.
+fn mcp_server_name(thread_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(thread_id.as_bytes());
+    let suffix: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("{}_{suffix}", crate::agent_provider::acp::mcp::SERVER_NAME)
 }
 pub struct HermesProvider {
     inner: Arc<Inner>,
 }
 impl HermesProvider {
     pub fn new(store: Arc<dyn BindingStore>) -> Self {
+        Self::new_with_mcp_registry(store, None)
+    }
+    pub fn new_with_mcp_registry(
+        store: Arc<dyn BindingStore>,
+        mcp_registry: Option<crate::mcp::registry::McpRegistry>,
+    ) -> Self {
         let (events, _) = broadcast::channel(2048);
         Self {
             inner: Arc::new(Inner {
@@ -217,6 +235,7 @@ impl HermesProvider {
                 runtime_starts: Mutex::new(HashMap::new()),
                 store,
                 events,
+                mcp_registry,
             }),
         }
     }
@@ -727,7 +746,7 @@ impl Inner {
                 // for provenance once history exists, suppressing its native replay.
                 if chat.binding.lock().await.current_native_id.is_none() && text(&response,"stopReason") != Some("cancelled") {
                     chat.state.lock().await.replaying=true;
-                    let metadata=runtime.child.request("session/load",json!({"sessionId":binding.acp_session_id,"cwd":binding.cwd,"mcpServers":[]})).await.map_err(rpc)?;
+                    let metadata=runtime.child.request("session/load",json!({"sessionId":binding.acp_session_id,"cwd":binding.cwd,"mcpServers":chat.mcp_servers})).await.map_err(rpc)?;
                     let (tx,rx)=oneshot::channel();let _=runtime.barrier.send(tx);let _=rx.await;
                     chat.state.lock().await.replaying=false;
                     let mut b=chat.binding.lock().await;
@@ -966,7 +985,7 @@ impl AgentProvider for HermesProvider {
                 schema_version: 1,
                 profile,
                 thread_id: input.thread_id.0.clone(),
-                workspace_id: input.workspace_id,
+                workspace_id: input.workspace_id.clone(),
                 cwd: input
                     .cwd
                     .canonicalize()
@@ -1021,6 +1040,18 @@ impl AgentProvider for HermesProvider {
             } else {
                 None
             };
+        // Hermes 0.21.5 advertises no `mcpCapabilities` but takes HTTP servers.
+        let mcp_servers = crate::agent_provider::acp::mcp::session_mcp_servers(
+            self.inner.mcp_registry.as_ref(),
+            &input.thread_id.0,
+            crate::mcp::gateway::GatewayCaller {
+                workspace_id: input.workspace_id.clone().or_else(|| binding.workspace_id.clone()),
+                native_sources: Vec::new(),
+            },
+            &mcp_server_name(&input.thread_id.0),
+            crate::agent_provider::acp::mcp::Transport::Http,
+        )
+        .await;
         // Initialization has no worktree access. Commit the hold only immediately
         // before new/load can access it. Recheck after waiting on the profile gate:
         // deletion may have completed while initialization/another chat was busy.
@@ -1035,13 +1066,13 @@ impl AgentProvider for HermesProvider {
                 .child
                 .request(
                     "session/load",
-                    json!({"sessionId":id,"cwd":binding.cwd,"mcpServers":[]}),
+                    json!({"sessionId":id,"cwd":binding.cwd,"mcpServers":mcp_servers}),
                 )
                 .await
         } else {
             runtime
                 .child
-                .request("session/new", json!({"cwd":binding.cwd,"mcpServers":[]}))
+                .request("session/new", json!({"cwd":binding.cwd,"mcpServers":mcp_servers}))
                 .await
         }
         .map_err(rpc)?;
@@ -1088,7 +1119,7 @@ impl AgentProvider for HermesProvider {
                 .child
                 .request(
                     "session/load",
-                    json!({"sessionId":binding.acp_session_id,"cwd":binding.cwd,"mcpServers":[]}),
+                    json!({"sessionId":binding.acp_session_id,"cwd":binding.cwd,"mcpServers":mcp_servers}),
                 )
                 .await
                 .map_err(rpc)?;
@@ -1131,7 +1162,7 @@ impl AgentProvider for HermesProvider {
                 .child
                 .request(
                     "session/load",
-                    json!({"sessionId":binding.acp_session_id,"cwd":binding.cwd,"mcpServers":[]}),
+                    json!({"sessionId":binding.acp_session_id,"cwd":binding.cwd,"mcpServers":mcp_servers}),
                 )
                 .await
                 .map_err(rpc)?;
@@ -1165,6 +1196,7 @@ impl AgentProvider for HermesProvider {
         let chat = Arc::new(Chat {
             binding: Mutex::new(binding),
             runtime: runtime.clone(),
+            mcp_servers,
             state: Mutex::new(ChatState {
                 models,
                 modes,
@@ -1492,7 +1524,7 @@ impl AgentProvider for HermesProvider {
             .child
             .request(
                 "session/load",
-                json!({"sessionId":b.acp_session_id,"cwd":b.cwd,"mcpServers":[]}),
+                json!({"sessionId":b.acp_session_id,"cwd":b.cwd,"mcpServers":chat.mcp_servers}),
             )
             .await;
         // Release binding before the router barrier (provenance updates take that lock).
@@ -1549,7 +1581,7 @@ impl AgentProvider for HermesProvider {
             .child
             .request(
                 "session/load",
-                json!({"sessionId":b.acp_session_id,"cwd":b.cwd,"mcpServers":[]}),
+                json!({"sessionId":b.acp_session_id,"cwd":b.cwd,"mcpServers":chat.mcp_servers}),
             )
             .await;
         let (tx, rx) = oneshot::channel();

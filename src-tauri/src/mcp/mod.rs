@@ -6,6 +6,7 @@
 // the results in the read-only Settings UI. No spawn or runtime here —
 // Stage 2 will wire `JsonRpcChild` against the discovered specs.
 
+pub mod bridge;
 pub mod codemux_self;
 pub mod gateway;
 pub mod http_client;
