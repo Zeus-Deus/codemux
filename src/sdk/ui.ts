@@ -46,4 +46,6 @@ export { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
 export { Separator } from "@/components/ui/separator";
 export { Kbd } from "@/components/ui/kbd";
 export { Spinner } from "@/components/ui/spinner";
+export { PeekChip } from "@/components/peek/PeekChip";
+export { PeekStatus } from "@/components/peek/PeekStatus";
 export { cn } from "@/lib/utils";

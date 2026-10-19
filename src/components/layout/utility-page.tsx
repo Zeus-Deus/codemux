@@ -6,6 +6,7 @@ import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useTitlebarOverlay } from "@/hooks/use-gui-chrome";
 import { WINDOW_CONTROLS_RESERVE } from "@/lib/titlebar-geometry";
 import { WindowChrome } from "./window-chrome";
+import { useTitlebarActionsWidth } from "@/contrib/react/titlebar-actions";
 
 /**
  * True when a utility page has the whole window to itself: on mobile, and
@@ -36,6 +37,7 @@ interface UtilityPageProps {
 export function UtilityPage({ title, backLabel, onBack, actions, children }: UtilityPageProps) {
   const standalone = useContext(UtilityPageStandaloneContext);
   const overlay = useTitlebarOverlay();
+  const pluginWidth = useTitlebarActionsWidth();
 
   if (standalone) {
     return (
@@ -71,7 +73,7 @@ export function UtilityPage({ title, backLabel, onBack, actions, children }: Uti
       <header
         data-tauri-drag-region
         className="flex h-10 shrink-0 items-center gap-3 pl-5"
-        style={{ paddingRight: rightReserve }}
+        style={{ paddingRight: rightReserve + (overlay ? pluginWidth : 0) }}
       >
         <h1
           data-tauri-drag-region

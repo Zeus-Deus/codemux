@@ -10,6 +10,8 @@ export const PALETTE_AREA = "palette.commands";
 export const KEYBINDS_AREA = "keybinds";
 /** title, data: { icon? }, render({ workspaceId }). Opened from the right panel "+" menu or host.openRightPane(id). */
 export const RIGHT_PANEL_AREA = "rightPanel.panes";
+/** title, data: PeekData, render(PeekRenderProps). A body inside the shared floating peek shell. */
+export const PEEK_AREA = "peek";
 /** title, render(). A full page; opened with host.openPage(id). */
 export const PAGES_AREA = "pages";
 /** Via ctx.registerSettingsPage({ title, render }). */
@@ -20,6 +22,8 @@ export const APPEARANCE_EXTRA_AREA = "appearance.extra";
 export const COMPOSER_ACTIONS_AREA = "composer.actions";
 /** render({ workspaceId, threadId }). Above the composer footer. */
 export const COMPOSER_ACCESSORY_AREA = "composer.accessory";
+/** render({ workspaceId, threadId }). Inline chips inside the existing composer status cluster. */
+export const COMPOSER_STATUS_AREA = "composer.status";
 /** render({ workspaceId, threadId }). Below the composer card. */
 export const COMPOSER_FOOTER_AREA = "composer.footer";
 /** render(). Title bar action island. Stop pointerdown propagation on controls. */
