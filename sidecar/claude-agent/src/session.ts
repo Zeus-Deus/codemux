@@ -491,9 +491,11 @@ export class ClaudeSession {
           this.recoverFromStaleResume();
           break;
         }
-        if (message.type === "result") {
-          this.mcpTurnActive = false;
-          await this.flushMcpTools();
+        const parentToolUseId = "parent_tool_use_id" in message ? message.parent_tool_use_id : null;
+        // A steer may already be running as a separate CLI turn when the
+        // previous result arrives. Subagent results are not turn boundaries.
+        if ((message.type === "assistant" || message.type === "stream_event") && !parentToolUseId) {
+          this.mcpTurnActive = true;
         }
         this.observeSdkSessionId(message);
         this.settleSteers(message);
@@ -502,6 +504,13 @@ export class ClaudeSession {
           message,
         });
         this.emitSpecialCases(message);
+        if (message.type === "result" && !parentToolUseId && this.pendingSteers.size === 0 && this.promptQueue.isEmpty()) {
+          this.mcpTurnActive = false;
+          this.acceptsSteers = false;
+          // Deliver the result before starting control RPCs. A stalled
+          // refresh must not stall the message iterator or the visible turn.
+          void this.flushMcpTools();
+        }
       }
       // A Stop retired this query; `retireForStop` reports the outcome.
       if (this.retiredQueries.has(query)) return;
@@ -743,8 +752,9 @@ export class ClaudeSession {
     const msg = this.buildUserMessage(input.text, input.images);
     msg.priority = "next";
     msg.uuid = input.uuid as NonNullable<SDKUserMessage["uuid"]>;
-    this.promptQueue.push(msg);
+    this.mcpTurnActive = true;
     this.pendingSteers.add(input.uuid);
+    this.promptQueue.push(msg);
   }
 
   /** Forget steers a top-level `result` reports as consumed. */

@@ -1330,3 +1330,56 @@ test("MCP replacement waits for result, coalesces changes and preserves session 
   expect(fake.capturedPrompts.map(x=>x.message.content)).toEqual(["run the long tool"]);
   await session.close();
 });
+
+
+test("MCP review: pending steer owns the next CLI turn until its result", async () => {
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  await session.sendTurn({ text: "first" });
+  await session.steerTurn({ text: "late guidance", uuid: "late-steer" });
+  await session.updateMcpTools([{ name: "new", prefixedName: "fixture__new", description: "new", inputSchema: { type: "object" }, serverId: "fixture" }]);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  fake.emit(mkSuccessResult());
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(events.filter(event => event.method === "sdk-message")).toHaveLength(1);
+  expect(fake.setMcpServersCalls).toEqual([]);
+  fake.emit({ ...mkSuccessResult(), parent_tool_use_id: "subagent", user_message_uuids: ["late-steer"] } as unknown as SDKMessage);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(fake.setMcpServersCalls).toEqual([]);
+  fake.emit({ ...mkSuccessResult(), user_message_uuids: ["late-steer"] } as unknown as SDKMessage);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(fake.setMcpServersCalls).toEqual([[], ["codemux"]]);
+  await session.close();
+});
+
+test("MCP review: control refresh cannot hold the result notification", async () => {
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  await session.sendTurn({ text: "first" });
+  await session.updateMcpTools([]);
+  let release!: () => void;
+  fake.setMcpServers = () => new Promise(resolve => { release = () => resolve({ added: [], removed: [], errors: {} }); });
+  fake.emit(mkSuccessResult());
+  await new Promise(resolve => setTimeout(resolve, 0));
+  try {
+    expect(events.some(event => event.method === "sdk-message")).toBe(true);
+  } finally {
+    release();
+    fake.setMcpServers = async () => ({ added: [], removed: [], errors: {} });
+    await session.close();
+  }
+});
+
+test("MCP review: a subagent result does not end the enclosing turn", async () => {
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  await session.sendTurn({ text: "first" });
+  await session.updateMcpTools([]);
+  fake.emit({ ...mkSuccessResult(), parent_tool_use_id: "subagent" } as unknown as SDKMessage);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(fake.setMcpServersCalls).toEqual([]);
+  fake.emit(mkSuccessResult());
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(fake.setMcpServersCalls).toEqual([[], []]);
+  await session.close();
+});

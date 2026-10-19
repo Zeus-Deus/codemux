@@ -31,6 +31,11 @@ export class AsyncPromptQueue<T> implements AsyncIterable<T> {
     this.queue.push(value);
   }
 
+  /** Prompts not yet handed to the SDK. */
+  isEmpty(): boolean {
+    return this.queue.length === 0;
+  }
+
   /** Signal end-of-stream. After `close()` any pending reader receives
    *  `{done: true}`; further `push()` throws. */
   close(): void {
