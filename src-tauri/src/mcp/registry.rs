@@ -624,7 +624,21 @@ impl McpRegistry {
                 }
             }
             let _stream_guard = StreamGuard(stream_task.take());
+            let mut reconcile_now = child.is_some();
             loop {
+                // Stdio needs an immediate race-closing fetch. HTTP reconciles
+                // only after a real GET stream opens or a session is renewed.
+                if !reconcile_now {
+                    loop {
+                        match notifications.recv().await {
+                            Ok(n) if n.method == "notifications/tools/list_changed" => break,
+                            Ok(_) => {}
+                            Err(broadcast::error::RecvError::Lagged(_)) => break,
+                            Err(broadcast::error::RecvError::Closed) => return,
+                        }
+                    }
+                }
+                reconcile_now = false;
                 let result = if let Some(c) = child.as_ref() {
                     super::runtime::list_stdio_tools(c, &config)
                         .await
@@ -680,14 +694,6 @@ impl McpRegistry {
                     McpServerRuntime::from_handle(h)
                 };
                 emit_status_with_bus(app.as_ref(), &registry.status_tx, &row);
-                loop {
-                    match notifications.recv().await {
-                        Ok(n) if n.method == "notifications/tools/list_changed" => break,
-                        Ok(_) => {}
-                        Err(broadcast::error::RecvError::Lagged(_)) => break,
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    }
-                }
             }
         });
         let mut inner = self.inner.lock().await;
@@ -1956,6 +1962,12 @@ mod tests {
         use mockito::Matcher;
 
         let mut server = mockito::Server::new_async().await;
+        let no_events = server
+            .mock("GET", "/mcp")
+            .with_status(405)
+            .expect(1)
+            .create_async()
+            .await;
         let initialize = server
             .mock("POST", "/mcp")
             .match_body(Matcher::PartialJson(serde_json::json!({
@@ -2046,10 +2058,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["content"][0]["text"], "hi");
+        // Cover the old 100/200 ms retry windows as well as the initial list.
+        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+        reg.shutdown_all().await;
         initialize.assert_async().await;
         initialized.assert_async().await;
         list.assert_async().await;
         call.assert_async().await;
+        no_events.assert_async().await;
     }
 
     /// Developer smoke test against the user's real cross-provider config.

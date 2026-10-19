@@ -6,18 +6,28 @@ use crate::json_rpc_child::Notification;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, Mutex};
+use std::time::Duration;
+use tokio::sync::{broadcast, watch, Mutex};
 
 use super::McpServerConfig;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+#[derive(Clone, Debug, Default)]
+struct HttpSession {
+    id: Option<String>,
+    generation: u64,
+    needs_initialization: bool,
+}
 
 #[derive(Debug)]
 pub struct HttpMcpClient {
     http: reqwest::Client,
     url: String,
     headers: HeaderMap,
-    session_id: Mutex<Option<String>>,
+    session: Mutex<HttpSession>,
+    initialize_lock: Mutex<()>,
+    session_changed: watch::Sender<u64>,
     next_id: AtomicU64,
     notifications: broadcast::Sender<Notification>,
 }
@@ -37,33 +47,16 @@ impl HttpMcpClient {
                 .map_err(|error| format!("build HTTP client: {error}"))?,
             url: config.command.clone(),
             headers,
-            session_id: Mutex::new(None),
+            session: Mutex::new(HttpSession {
+                needs_initialization: true,
+                ..Default::default()
+            }),
+            initialize_lock: Mutex::new(()),
+            session_changed: watch::channel(0).0,
             next_id: AtomicU64::new(1),
             notifications: broadcast::channel(256).0,
         };
-        let initialized = client
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "codemux",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                }),
-            )
-            .await?;
-        if initialized
-            .get("protocolVersion")
-            .and_then(Value::as_str)
-            .is_none()
-        {
-            return Err("initialize response omitted protocolVersion".into());
-        }
-        client
-            .notify("notifications/initialized", json!({}))
-            .await?;
+        client.ensure_session(None).await?;
         Ok(client)
     }
 
@@ -71,29 +64,80 @@ impl HttpMcpClient {
         self.notifications.subscribe()
     }
 
-    /// Streamable HTTP GET is optional. Retry even a 405: a restarted
-    /// server may gain notification support, and finite streams need renewal.
+    /// GET/SSE is optional. Only reconnect after a real SSE stream opened,
+    /// except that a session-bearing 404 always requires a fresh handshake.
     pub async fn listen_notifications(&self) {
-        let mut backoff = std::time::Duration::from_millis(100);
+        let mut backoff = Duration::from_millis(100);
+        let mut opened = false;
+        let mut renewed = false;
+        let mut changes = self.session_changed.subscribe();
         loop {
+            // A failed renewal stays pending. Never fall back to sessionless
+            // GETs (a stateful server correctly rejects those with 400).
+            let needs_initialization = self.session.lock().await.needs_initialization;
+            if needs_initialization {
+                if self.ensure_session(None).await.is_err() {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    continue;
+                }
+            }
+            changes.borrow_and_update();
+            let session = self.session.lock().await.clone();
             let mut request = self
                 .http
                 .get(&self.url)
                 .headers(self.headers.clone())
                 .header(ACCEPT, "text/event-stream")
                 .header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
-            if let Some(id) = self.session_id.lock().await.clone() {
+            if let Some(id) = &session.id {
                 request = request.header("mcp-session-id", id);
             }
-            if let Ok(response) = request.send().await {
-                if response.status().is_success() {
+            // Only bound connection/headers, not the lifetime of a healthy SSE.
+            let response = tokio::select! {
+                response = tokio::time::timeout(Duration::from_secs(5), request.send()) => response.ok().and_then(Result::ok),
+                _ = changes.changed() => continue,
+            };
+            if let Some(response) = response {
+                let status = response.status();
+                if matches!(status.as_u16(), 405 | 501) {
+                    return;
+                }
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    // One renewal per disconnected episode; a persistent 404
+                    // must not create an initialize/list polling loop.
+                    if renewed || (!opened && session.id.is_none()) {
+                        return;
+                    }
+                    renewed = true;
+                    let _ = self.ensure_session(Some(&session)).await;
+                } else if status.is_success()
+                    && response
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v| {
+                            v.split(';')
+                                .next()
+                                .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
+                        })
+                {
+                    opened = true;
+                    renewed = false;
                     let connected_at = std::time::Instant::now();
-                    // Reconcile after reconnect even if changes occurred while
-                    // disconnected and the server sends no fresh notification.
+                    // Covers changes missed while disconnected, including the
+                    // initial gap between tools/list and the first GET stream.
                     self.emit_notification(&json!({"method":"notifications/tools/list_changed"}));
                     let mut stream = response.bytes_stream();
                     let mut decoder = SseDecoder::default();
-                    while let Some(Ok(bytes)) = stream.next().await {
+                    loop {
+                        let next = tokio::select! {
+                            next = stream.next() => next,
+                            _ = changes.changed() => break,
+                        };
+                        let Some(Ok(bytes)) = next else {
+                            break;
+                        };
                         let Ok(messages) = decoder.push(&bytes) else {
                             break;
                         };
@@ -101,21 +145,91 @@ impl HttpMcpClient {
                             self.emit_notification(&value);
                         }
                     }
-                    if connected_at.elapsed() >= std::time::Duration::from_secs(5) {
-                        backoff = std::time::Duration::from_millis(100);
+                    if connected_at.elapsed() >= Duration::from_secs(5) {
+                        backoff = Duration::from_millis(100);
                     }
-                } else if response.status() == reqwest::StatusCode::NOT_FOUND {
-                    // An expired server-side session needs a new initialize.
-                    *self.session_id.lock().await = None;
-                    if self.request("initialize", json!({"protocolVersion":MCP_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"codemux","version":env!("CARGO_PKG_VERSION")}})).await.is_ok() {
-                        let _ = self.notify("notifications/initialized", json!({})).await;
-                    }
+                } else if status.is_success() || !opened {
+                    return;
                 }
+            } else if !opened {
+                return;
             }
             tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+            backoff = (backoff * 2).min(Duration::from_secs(30));
         }
     }
+
+    /// Coalesce expiry reports from concurrent GET/POST requests. Retain the
+    /// pending state until BOTH initialize and initialized have succeeded.
+    async fn ensure_session(&self, expired: Option<&HttpSession>) -> Result<(), String> {
+        let _initializing = self.initialize_lock.lock().await;
+        {
+            let mut session = self.session.lock().await;
+            if expired.is_some_and(|old| old.generation == session.generation)
+                && !session.needs_initialization
+            {
+                session.id = None;
+                session.needs_initialization = true;
+                session.generation += 1;
+                self.session_changed.send_replace(session.generation);
+            }
+            if !session.needs_initialization {
+                return Ok(());
+            }
+        }
+        let renewing = self.session.lock().await.generation > 0;
+        let mut error = String::new();
+        for attempt in 0..4 {
+            let handshake = async {
+                let message = json!({"jsonrpc":"2.0","id":self.next_id.fetch_add(1, Ordering::Relaxed),"method":"initialize","params":{"protocolVersion":MCP_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"codemux","version":env!("CARGO_PKG_VERSION")}}});
+                let response = self.send_post(&message, None).await?;
+                let id = response
+                    .headers()
+                    .get("mcp-session-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let result = self.read_response(&message, response).await?;
+                if result.get("error").is_some()
+                    || result["result"]["protocolVersion"].as_str().is_none()
+                {
+                    return Err(
+                        "initialize response omitted protocolVersion or returned an error".into(),
+                    );
+                }
+                let message =
+                    json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}});
+                let response = self.send_post(&message, id.as_deref()).await?;
+                let result = self.read_response(&message, response).await?;
+                if let Some(error) = result.get("error") {
+                    return Err(format!("initialized: {error}"));
+                }
+                Ok::<_, String>(id)
+            };
+            match tokio::time::timeout(Duration::from_secs(5), handshake).await {
+                Ok(Ok(id)) => {
+                    let mut session = self.session.lock().await;
+                    session.id = id;
+                    session.needs_initialization = false;
+                    session.generation += 1;
+                    self.session_changed.send_replace(session.generation);
+                    drop(session);
+                    if renewing {
+                        self.emit_notification(
+                            &json!({"method":"notifications/tools/list_changed"}),
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(Err(reason)) => error = reason,
+                Err(_) => error = "initialize handshake timed out".into(),
+            }
+            if attempt < 3 {
+                tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
+            }
+        }
+        Err(format!("MCP session initialization is pending: {error}"))
+    }
+
     fn emit_notification(&self, value: &Value) {
         if value.get("id").is_none() {
             if let Some(method) = value.get("method").and_then(Value::as_str) {
@@ -146,14 +260,24 @@ impl HttpMcpClient {
             .ok_or_else(|| format!("{method}: response omitted result"))
     }
 
-    async fn notify(&self, method: &str, params: Value) -> Result<(), String> {
-        let _ = self
-            .post(json!({ "jsonrpc": "2.0", "method": method, "params": params }))
-            .await?;
-        Ok(())
+    async fn post(&self, message: Value) -> Result<Value, String> {
+        self.ensure_session(None).await?;
+        let session = self.session.lock().await.clone();
+        let mut response = self.send_post(&message, session.id.as_deref()).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND && session.id.is_some() {
+            self.ensure_session(Some(&session)).await?;
+            let session = self.session.lock().await.clone();
+            // Retry only an expired-session 404, never an ambiguous tool error.
+            response = self.send_post(&message, session.id.as_deref()).await?;
+        }
+        self.read_response(&message, response).await
     }
 
-    async fn post(&self, message: Value) -> Result<Value, String> {
+    async fn send_post(
+        &self,
+        message: &Value,
+        session_id: Option<&str>,
+    ) -> Result<reqwest::Response, String> {
         let is_initialize = message.get("method").and_then(Value::as_str) == Some("initialize");
         let mut request = self
             .http
@@ -161,25 +285,25 @@ impl HttpMcpClient {
             .headers(self.headers.clone())
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json, text/event-stream")
-            .json(&message);
+            .json(message);
         if !is_initialize {
             request = request.header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
         }
-        if let Some(session_id) = self.session_id.lock().await.clone() {
-            request = request.header("mcp-session-id", session_id);
+        if let Some(id) = session_id {
+            request = request.header("mcp-session-id", id);
         }
-        let response = request
+        request
             .send()
             .await
-            .map_err(|error| format!("HTTP request failed: {error}"))?;
+            .map_err(|error| format!("HTTP request failed: {error}"))
+    }
+
+    async fn read_response(
+        &self,
+        message: &Value,
+        response: reqwest::Response,
+    ) -> Result<Value, String> {
         let status = response.status();
-        if let Some(session_id) = response
-            .headers()
-            .get("mcp-session-id")
-            .and_then(|value| value.to_str().ok())
-        {
-            *self.session_id.lock().await = Some(session_id.to_string());
-        }
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
@@ -506,8 +630,287 @@ mod live_tests {
         target.abort();
     }
     #[tokio::test]
+    async fn plugin_mcp_http_without_an_event_stream_stops_without_reconciliation() {
+        for status in [404, 405, 501, 503, 200] {
+            let fixture = Fixture {
+                ready: Arc::new(AtomicBool::new(false)),
+                connected: Arc::new(AtomicBool::new(false)),
+                changes: broadcast::channel(8).0,
+            };
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = requests.clone();
+            let app = Router::new()
+                .route(
+                    "/mcp",
+                    post(handle).get(move || {
+                        let count = count.clone();
+                        async move {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            (
+                                axum::http::StatusCode::from_u16(status).unwrap(),
+                                [("content-type", "application/json")],
+                                "{}",
+                            )
+                        }
+                    }),
+                )
+                .with_state(fixture);
+            let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = McpServerConfig {
+                id: "no-events".into(),
+                name: "No events".into(),
+                sources: vec![],
+                command: format!("http://{}/mcp", socket.local_addr().unwrap()),
+                args: vec![],
+                env: Default::default(),
+                disabled: false,
+                transport: super::super::McpTransport::Http,
+                raw: json!({}),
+            };
+            let server = tokio::spawn(async move {
+                axum::serve(socket, app).await.unwrap();
+            });
+            let client = HttpMcpClient::connect(&config).await.unwrap();
+            let mut notifications = client.notifications();
+            let stopped = tokio::time::timeout(
+                std::time::Duration::from_millis(450),
+                client.listen_notifications(),
+            )
+            .await;
+            server.abort();
+            assert!(
+                stopped.is_ok(),
+                "GET {status} kept retrying ({} requests)",
+                requests.load(Ordering::SeqCst)
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "GET {status}");
+            assert!(
+                notifications.try_recv().is_err(),
+                "GET {status} reconciled without SSE"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_http_failed_session_renewal_retries_the_handshake() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let requests = log.clone();
+        let initializes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = initializes.clone();
+        let app = Router::new().route("/mcp", post(move |headers: HeaderMap, Json(request): Json<Value>| {
+            let log = requests.clone(); let count = count.clone();
+            async move {
+                let session = headers.get("mcp-session-id").and_then(|v|v.to_str().ok()).unwrap_or("none");
+                let method = request["method"].as_str().unwrap();
+                log.lock().unwrap().push(format!("{method}:{session}"));
+                if method == "initialize" {
+                    let attempt = count.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 1 { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
+                    return ([("mcp-session-id", if attempt == 0 {"old"} else {"new"})], Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":"2025-06-18","capabilities":{}}}))).into_response();
+                }
+                if request.get("id").is_none() { return StatusCode::ACCEPTED.into_response(); }
+                Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"tools":[]}})).into_response()
+            }
+        }).get({ let log=log.clone(); move |headers:HeaderMap| { let log=log.clone(); async move {
+            let session=headers.get("mcp-session-id").and_then(|v|v.to_str().ok()).unwrap_or("none");
+            log.lock().unwrap().push(format!("GET:{session}"));
+            match session {
+                "old" => StatusCode::NOT_FOUND.into_response(),
+                "new" => ([("content-type","text/event-stream")], axum::body::Body::from_stream(futures_util::stream::pending::<Result<axum::body::Bytes,std::io::Error>>())).into_response(),
+                _ => StatusCode::BAD_REQUEST.into_response(),
+            }
+        }}}));
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = McpServerConfig {
+            id: "renew".into(),
+            name: "renew".into(),
+            sources: vec![],
+            command: format!("http://{}/mcp", socket.local_addr().unwrap()),
+            args: vec![],
+            env: Default::default(),
+            disabled: false,
+            transport: super::super::McpTransport::Http,
+            raw: json!({}),
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(socket, app).await.unwrap();
+        });
+        let client = Arc::new(HttpMcpClient::connect(&config).await.unwrap());
+        let listening = client.clone();
+        let listener = tokio::spawn(async move {
+            listening.listen_notifications().await;
+        });
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if log.lock().unwrap().iter().any(|s| s == "GET:new") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        listener.abort();
+        server.abort();
+        assert!(
+            recovered.is_ok(),
+            "recovery requests: {:?}",
+            log.lock().unwrap()
+        );
+        let actual = log.lock().unwrap().clone();
+        assert_eq!(
+            actual,
+            vec![
+                "initialize:none",
+                "notifications/initialized:old",
+                "GET:old",
+                "initialize:none",
+                "initialize:none",
+                "notifications/initialized:new",
+                "GET:new"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_http_stops_after_unsupported_or_persistent_expiry() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        // Even after a valid stream, 405/501 permanently disable GET. An
+        // expired session gets one renewal, never an initialize/list loop.
+        for status in [404, 405, 501] {
+            let initializes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = initializes.clone();
+            let requests = gets.clone();
+            let app = Router::new().route("/mcp", post(move |headers:HeaderMap, Json(message):Json<Value>| {
+                let count=count.clone(); async move {
+                    if message["method"] == "initialize" {
+                        assert!(headers.get("mcp-session-id").is_none());
+                        let generation=count.fetch_add(1, Ordering::SeqCst);
+                        return ([("mcp-session-id",generation.to_string())],Json(json!({"jsonrpc":"2.0","id":message["id"],"result":{"protocolVersion":"2025-06-18"}}))).into_response();
+                    }
+                    StatusCode::ACCEPTED.into_response()
+                }
+            }).get(move || { let requests=requests.clone(); async move {
+                if requests.fetch_add(1,Ordering::SeqCst)==0 {
+                    ([("content-type","text/event-stream")],": opened\n\n").into_response()
+                } else { StatusCode::from_u16(status).unwrap().into_response() }
+            }}));
+            let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = McpServerConfig {
+                id: "expiry".into(),
+                name: "expiry".into(),
+                sources: vec![],
+                command: format!("http://{}/mcp", socket.local_addr().unwrap()),
+                args: vec![],
+                env: Default::default(),
+                disabled: false,
+                transport: super::super::McpTransport::Http,
+                raw: json!({}),
+            };
+            let server = tokio::spawn(async move {
+                axum::serve(socket, app).await.unwrap();
+            });
+            let client = HttpMcpClient::connect(&config).await.unwrap();
+            let stopped =
+                tokio::time::timeout(Duration::from_secs(2), client.listen_notifications()).await;
+            server.abort();
+            assert!(stopped.is_ok(), "GET {status} kept retrying");
+            assert_eq!(
+                gets.load(Ordering::SeqCst),
+                if status == 404 { 3 } else { 2 }
+            );
+            assert_eq!(
+                initializes.load(Ordering::SeqCst),
+                if status == 404 { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_http_post_expiry_renews_and_retries_once() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        for fail_initialized in [false, true] {
+            let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let requests = log.clone();
+            let initializes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = initializes.clone();
+            let app=Router::new().route("/mcp",post(move |headers:HeaderMap,Json(message):Json<Value>| {
+                let log=requests.clone();let count=count.clone();async move {
+                    let session=headers.get("mcp-session-id").and_then(|v|v.to_str().ok()).unwrap_or("none");
+                    let method=message["method"].as_str().unwrap();
+                    log.lock().unwrap().push(format!("{method}:{session}"));
+                    if method=="initialize" {
+                        assert_eq!(session,"none");
+                        let generation=count.fetch_add(1,Ordering::SeqCst);
+                        return ([("mcp-session-id",generation.to_string())],Json(json!({"jsonrpc":"2.0","id":message["id"],"result":{"protocolVersion":"2025-06-18"}}))).into_response();
+                    }
+                    if method=="notifications/initialized" {
+                        return if fail_initialized && session=="1" {StatusCode::SERVICE_UNAVAILABLE} else {StatusCode::ACCEPTED}.into_response();
+                    }
+                    if session=="none" {return StatusCode::BAD_REQUEST.into_response();}
+                    if session=="0" {return StatusCode::NOT_FOUND.into_response();}
+                    Json(json!({"jsonrpc":"2.0","id":message["id"],"result":{"tools":[]}})).into_response()
+                }
+            }));
+            let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = McpServerConfig {
+                id: "post-expiry".into(),
+                name: "post-expiry".into(),
+                sources: vec![],
+                command: format!("http://{}/mcp", socket.local_addr().unwrap()),
+                args: vec![],
+                env: Default::default(),
+                disabled: false,
+                transport: super::super::McpTransport::Http,
+                raw: json!({}),
+            };
+            let server = tokio::spawn(async move {
+                axum::serve(socket, app).await.unwrap();
+            });
+            let client = HttpMcpClient::connect(&config).await.unwrap();
+            let mut notifications = client.notifications();
+            assert_eq!(
+                client.request("tools/list", json!({})).await.unwrap(),
+                json!({"tools":[]})
+            );
+            assert_eq!(
+                notifications.try_recv().unwrap().method,
+                "notifications/tools/list_changed"
+            );
+            let mut expected = vec![
+                "initialize:none",
+                "notifications/initialized:0",
+                "tools/list:0",
+                "initialize:none",
+                "notifications/initialized:1",
+            ];
+            if fail_initialized {
+                expected.extend([
+                    "initialize:none",
+                    "notifications/initialized:2",
+                    "tools/list:2",
+                ]);
+            } else {
+                expected.push("tools/list:1");
+            }
+            assert_eq!(*log.lock().unwrap(), expected);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn plugin_mcp_http_reconnects_and_reconciles() {
-        for initial_status in [405, 503, 200] {
+        for reconnect_status in [503, 502, 200] {
             let fixture = Fixture {
                 ready: Arc::new(AtomicBool::new(false)),
                 connected: Arc::new(AtomicBool::new(false)),
@@ -544,9 +947,15 @@ mod live_tests {
                         let ready = ready.clone();
                         async move {
                             use axum::response::IntoResponse;
-                            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                            let connection = count.fetch_add(1, Ordering::SeqCst);
+                            if connection <= 1 {
                                 (
-                                    axum::http::StatusCode::from_u16(initial_status).unwrap(),
+                                    axum::http::StatusCode::from_u16(if connection == 0 {
+                                        200
+                                    } else {
+                                        reconnect_status
+                                    })
+                                    .unwrap(),
                                     [("content-type", "text/event-stream")],
                                     ": first stream ended\n\n",
                                 )
@@ -583,7 +992,7 @@ mod live_tests {
             task.abort();
             assert!(
                 observed.is_ok(),
-                "no reconciliation after status {initial_status}; GET count {}",
+                "no reconciliation after status {reconnect_status}; GET count {}",
                 connections.load(Ordering::SeqCst)
             );
         }
@@ -653,8 +1062,13 @@ mod live_tests {
                     let events = events.clone();
                     async move {
                         match count.fetch_add(1, Ordering::SeqCst) {
-                            0..=2 => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                            3 => {
+                            0 => (
+                                [("content-type", "text/event-stream")],
+                                ": initial stream ended\n\n",
+                            )
+                                .into_response(),
+                            1..=3 => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                            4 => {
                                 let stream = futures_util::stream::iter([Ok::<
                                     _,
                                     std::convert::Infallible,
