@@ -3035,6 +3035,7 @@ pub(crate) mod tests {
             tx,
             None,
             Some(directory.path().to_path_buf()),
+            None,
         )
         .await
         .expect("OpenCode session should start");
