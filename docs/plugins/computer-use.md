@@ -56,6 +56,9 @@ Missing or refused capture shows a no-image state.
   Native Wayland capture was refused with `surface_identity_unproven` on the
   same host. Background scroll was refused in the isolated X11 fixture; support
   depends on the application and platform.
+- The GTK fixture's background actions sometimes reported `effect: "unverifiable"`;
+  typing also suggested a foreground retry even when text appeared. Verify
+  uncertain results with a fresh window image. Foreground retries remain blocked.
 - macOS and Windows have not been tested with this plugin. Only direct mode is
   supported. Permission setups that require a daemon identity, and Windows
   SSH/autostart daemon workflows, are not supported by this integration.
@@ -72,6 +75,11 @@ a long typing call with immediate Stop. The child and its stdio wrapper had
 exited when Stop returned, the input count stayed unchanged for another second,
 the in-flight call failed, and a subsequent call was denied. No keys or buttons
 remained held in that test.
+
+The real title-bar Stop was also measured during a Claude background-click task
+on the Hyprland GTK fixture. Both input and capture children had exited when
+the indicator disappeared, 134 ms after the click. The fixture count stayed
+unchanged from the Stop request through completion and another second.
 
 The direct child also stopped typing when terminated in the isolated driver probe,
 but terminating a held drag left the button down. A fresh process could not
