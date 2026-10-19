@@ -39,12 +39,11 @@ use crate::utility_ai::UtilityModelSelection;
 use super::agent_chat::{
     agent_chat_start_session, agent_chat_stop_session, feature_flag_on, fork_dispatch_guard,
     fork_timeline_guard, forward_event, lookup_provider, session_context,
-    AgentChatSessionContext, ProviderRegistry, AGENT_CHAT_TURN_CHECKPOINTS_INVALIDATED_EVENT,
+    AgentChatSessionContext, ProviderRegistry, SubagentTracker,
+    AGENT_CHAT_TURN_CHECKPOINTS_INVALIDATED_EVENT,
 };
 use super::chat_fork::source_busy;
 
-const BUSY: &str =
-    "Wait for the current turn and any queued messages to finish, then switch providers.";
 /// Prefixes an error returned before anything changed: the old provider
 /// still runs, so the caller must not restart it.
 const REFUSED: &str = "provider_switch_refused: ";
@@ -305,8 +304,9 @@ async fn plan_switch<R: Runtime>(
     // hold the session's outbound lock while it waits for the timeline.
     let session_live = live.has_session(&ThreadId(thread_id.to_string())).await;
     let timeline = fork_timeline_guard(thread_id).await;
-    if source_busy(&*live, session_live, &db, thread_id).await? {
-        return Err(BUSY.into());
+    let subagents: State<'_, SubagentTracker> = app.state();
+    if let Some(busy) = source_busy(&*live, session_live, &db, &subagents, thread_id).await? {
+        return Err(busy.refusal("switch providers"));
     }
     let from_model = record.model.clone();
     let context = match session_context(&db, record, utility_selection).await {
