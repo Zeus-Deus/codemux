@@ -122,12 +122,12 @@ impl Harness {
         );
     }
 
-    fn completed(&self, thread: &str, status: TurnStatus) {
+    fn completed(&self, thread: &str, turn: &str, status: TurnStatus) {
         forward_event(
             &self.handle(),
             ProviderRuntimeEvent::TurnCompleted {
                 thread_id: ThreadId(thread.into()),
-                turn_id: TurnId("t".into()),
+                turn_id: TurnId(turn.into()),
                 status,
                 usage: None,
             },
@@ -233,10 +233,42 @@ async fn a_settled_turn_leaves_nothing_to_resume() {
     let h = harness().await;
     h.chat("rr-settled");
     h.running("rr-settled", "turn-1");
-    h.completed("rr-settled", TurnStatus::Success);
+    h.completed("rr-settled", "turn-1", TurnStatus::Success);
     let decisions = resume_after_restart_for_test(&h.handle(), "launch-2").await;
     assert_eq!(decision(&decisions, "rr-settled"), None);
     assert!(h.sent("rr-settled").is_empty());
+}
+
+/// A turn's end can arrive after the next turn started: Claude clears its
+/// turn before it publishes the end, so a send can start the next one in
+/// between. The late end leaves the newer turn resumable.
+#[tokio::test]
+async fn a_late_end_of_an_older_turn_keeps_the_newer_turn_resumable() {
+    let h = harness().await;
+    h.chat("rr-late");
+    h.running("rr-late", "turn-old");
+    h.running("rr-late", "turn-new");
+    h.completed("rr-late", "turn-old", TurnStatus::Success);
+    let row = h.db().get_restart_turn("rr-late").map(|row| row.turn_id);
+    assert_eq!(row.as_deref(), Some("turn-new"));
+    on_exit(&h.handle());
+    let decisions = resume_after_restart_for_test(&h.handle(), "launch-2").await;
+    assert_eq!(decision(&decisions, "rr-late"), Some(ResumeDecision::Resume));
+    // Its own end settles it.
+    h.running("rr-late", "turn-next");
+    h.completed("rr-late", "turn-next", TurnStatus::Success);
+    assert!(h.db().get_restart_turn("rr-late").is_none());
+}
+
+/// Providers that can't name a turn end it with an empty id: that end
+/// still settles whatever turn is recorded.
+#[tokio::test]
+async fn an_end_without_a_turn_id_still_settles() {
+    let h = harness().await;
+    h.chat("rr-anonymous");
+    h.running("rr-anonymous", "turn-1");
+    h.completed("rr-anonymous", "", TurnStatus::Success);
+    assert!(h.db().get_restart_turn("rr-anonymous").is_none());
 }
 
 #[tokio::test]
@@ -400,12 +432,42 @@ async fn the_saved_queue_drains_in_order_after_the_resumed_turn() {
     assert_eq!(h.sent("rr-drain").len(), 1);
 
     h.running("rr-drain", "turn-resume");
-    h.completed("rr-drain", TurnStatus::Success);
+    h.completed("rr-drain", "turn-resume", TurnStatus::Success);
     let sent = wait_for_sends(&h, "rr-drain", 4).await;
     assert_eq!(sent.len(), 4, "{sent:?}");
     assert!(sent[0].starts_with(RESTART_RESUME_NOTE_PREFIX));
     assert_eq!(&sent[1..], ["first saved", "second saved", "third saved"]);
+    // Each row goes once its send returns, just after the provider saw it.
+    for _ in 0..200 {
+        if h.db().list_queued_turns("rr-drain").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert!(h.db().list_queued_turns("rr-drain").is_empty());
+}
+
+/// A late end of the turn before the resumed one neither sends the saved
+/// queue early nor disarms it: the resumed turn's own end does that.
+#[tokio::test]
+async fn a_late_end_of_an_older_turn_leaves_the_resumed_turn_its_drain() {
+    let h = harness().await;
+    h.chat("rr-late-drain");
+    h.saved("rr-late-drain", "q-1", "saved");
+    h.running("rr-late-drain", "turn-1");
+    resume_after_restart_for_test(&h.handle(), "launch-2").await;
+    h.running("rr-late-drain", "turn-resume");
+    h.completed(
+        "rr-late-drain",
+        "turn-1",
+        TurnStatus::Error { subtype: "interrupted".into(), message: "cut off".into() },
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(h.sent("rr-late-drain").len(), 1, "nothing drains while the resumed turn runs");
+    assert!(h.db().get_restart_turn("rr-late-drain").is_some());
+    h.completed("rr-late-drain", "turn-resume", TurnStatus::Success);
+    let sent = wait_for_sends(&h, "rr-late-drain", 2).await;
+    assert_eq!(&sent[1..], ["saved"]);
 }
 
 #[tokio::test]
@@ -417,6 +479,7 @@ async fn a_failed_resumed_turn_keeps_the_saved_queue_manual() {
     resume_after_restart_for_test(&h.handle(), "launch-2").await;
     h.completed(
         "rr-failed",
+        "turn-resume",
         TurnStatus::Error {
             subtype: "interrupted".into(),
             message: "turn interrupted".into(),
@@ -436,7 +499,7 @@ async fn an_idle_chat_keeps_its_saved_queue_manual() {
     assert_eq!(decision(&decisions, "rr-idle"), None);
     // A later turn of its own finishing does not send the saved row.
     h.running("rr-idle", "turn-1");
-    h.completed("rr-idle", TurnStatus::Success);
+    h.completed("rr-idle", "turn-1", TurnStatus::Success);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(h.sent("rr-idle").is_empty());
     assert_eq!(h.db().list_queued_turns("rr-idle").len(), 1);
@@ -524,7 +587,7 @@ async fn a_stop_during_the_drain_keeps_the_rest_saved() {
     // Hold the first saved send, then Stop while it is in flight.
     let (entered, release) = h.provider.hold_next_send();
     h.running("rr-drain-stop", "turn-resume");
-    h.completed("rr-drain-stop", TurnStatus::Success);
+    h.completed("rr-drain-stop", "turn-resume", TurnStatus::Success);
     tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
     let stop = tokio::spawn(agent_chat_interrupt_turn(
         h.handle(),
@@ -568,7 +631,7 @@ async fn the_drain_skips_a_saved_turn_that_was_already_sent() {
     h.running("rr-drain-dup", "turn-1");
     resume_after_restart_for_test(&h.handle(), "launch-2").await;
     h.running("rr-drain-dup", "turn-resume");
-    h.completed("rr-drain-dup", TurnStatus::Success);
+    h.completed("rr-drain-dup", "turn-resume", TurnStatus::Success);
     let sent = wait_for_sends(&h, "rr-drain-dup", 2).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(&h.sent("rr-drain-dup")[1..], ["not yet"], "{sent:?}");
@@ -686,7 +749,7 @@ async fn a_resume_that_fell_back_to_a_fresh_conversation_keeps_the_queue_manual(
             resume_cursor: serde_json::Value::Null,
         },
     );
-    h.completed("rr-fresh", TurnStatus::Success);
+    h.completed("rr-fresh", "turn-resume", TurnStatus::Success);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(h.sent("rr-fresh").len(), 1);
     assert_eq!(h.db().list_queued_turns("rr-fresh").len(), 1);
@@ -750,14 +813,14 @@ async fn a_turn_that_yields_to_its_subagents_stays_resumable() {
     forward_event(&h.handle(), subagent("rr-yield", SubagentStatus::Running));
     // The provider yields while its subagent works: the run goes on.
     h.provider.set_turn_active("rr-yield", false);
-    h.completed("rr-yield", TurnStatus::Success);
+    h.completed("rr-yield", "turn-resume", TurnStatus::Success);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(h.db().get_restart_turn("rr-yield").is_some(), "a quit now must still resume it");
     assert_eq!(h.sent("rr-yield").len(), 1, "the saved queue waits for the real end");
 
     // The subagent finishes and the provider ends the turn for real.
     forward_event(&h.handle(), subagent("rr-yield", SubagentStatus::Completed));
-    h.completed("rr-yield", TurnStatus::Success);
+    h.completed("rr-yield", "turn-resume", TurnStatus::Success);
     let sent = wait_for_sends(&h, "rr-yield", 2).await;
     assert_eq!(&sent[1..], ["saved"]);
     assert!(h.db().get_restart_turn("rr-yield").is_none());
@@ -772,7 +835,7 @@ async fn a_yielded_run_whose_subagents_finish_settles() {
     h.provider.set_turn_active("rr-yield-end", true);
     forward_event(&h.handle(), subagent("rr-yield-end", SubagentStatus::Running));
     h.provider.set_turn_active("rr-yield-end", false);
-    h.completed("rr-yield-end", TurnStatus::Success);
+    h.completed("rr-yield-end", "turn-1", TurnStatus::Success);
     // `Ready` while the child still works: the run is not over yet.
     forward_event(
         &h.handle(),
@@ -808,12 +871,13 @@ async fn a_resumed_turn_that_fails_while_its_subagents_run_keeps_the_queue_manua
     h.provider.set_turn_active("rr-yield-fail", false);
     h.completed(
         "rr-yield-fail",
+        "turn-resume",
         TurnStatus::Error { subtype: "error".into(), message: "boom".into() },
     );
     // A later turn of the user's own finishes fine.
     h.running("rr-yield-fail", "turn-user");
     forward_event(&h.handle(), subagent("rr-yield-fail", SubagentStatus::Completed));
-    h.completed("rr-yield-fail", TurnStatus::Success);
+    h.completed("rr-yield-fail", "turn-user", TurnStatus::Success);
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(h.sent("rr-yield-fail").len(), 1);
     assert_eq!(h.db().list_queued_turns("rr-yield-fail").len(), 1);
@@ -848,7 +912,7 @@ fn yield_to_children(h: &Harness, thread: &str, children: &[&str]) {
         forward_event(&h.handle(), child(thread, id, SubagentStatus::Running));
     }
     h.provider.set_turn_active(thread, false);
-    h.completed(thread, TurnStatus::Success);
+    h.completed(thread, "turn-1", TurnStatus::Success);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -871,7 +935,7 @@ async fn a_run_that_picks_itself_back_up_after_its_children_stays_resumable() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(h.db().get_restart_turn("rr-continue").is_some(), "the run is still live");
     // Its own turn end settles it.
-    h.completed("rr-continue", TurnStatus::Success);
+    h.completed("rr-continue", "turn-1", TurnStatus::Success);
     assert!(h.db().get_restart_turn("rr-continue").is_none());
 }
 
