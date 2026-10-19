@@ -220,7 +220,10 @@ fn seed_text(
     context: &AgentChatSessionContext,
 ) -> String {
     let source = match from_model {
-        Some(model) if !model.trim().is_empty() => format!("{} ({model})", provider_label(from)),
+        // "default" is an alias, not a model anyone would recognize.
+        Some(model) if !model.trim().is_empty() && model != "default" => {
+            format!("{} ({model})", provider_label(from))
+        }
         _ => provider_label(from).to_string(),
     };
     let format = if context.handoff_kind == "summary" {
@@ -444,6 +447,8 @@ mod tests {
         assert!(seed.contains("Older middle turns were left out"));
         assert!(seed.contains("conversation_id `t`"));
         assert!(seed.ends_with("Done, tests pass.\n</codemux-provider-handoff>"));
+        let aliased = seed_text(ProviderKind::Claude, Some("default"), "t", &context("direct", false));
+        assert!(aliased.contains("from Claude. "), "an alias is not named as a model");
         let summary = seed_text(ProviderKind::Codex, None, "t", &context("summary", false));
         assert!(summary.contains("from Codex. "));
         assert!(summary.contains("a summary of the conversation so far"));

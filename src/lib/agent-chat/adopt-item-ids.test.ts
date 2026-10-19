@@ -4,6 +4,7 @@ import { adoptItemIds } from "./adopt-item-ids";
 import type {
   AssistantMessageItem,
   ChatViewItem,
+  ProviderSwitchItem,
   SubagentRunItem,
   SubagentView,
   ToolCallItem,
@@ -54,8 +55,29 @@ function run(id: string, subagents: SubagentView[]): SubagentRunItem {
 }
 
 const ids = (items: readonly ChatViewItem[]) => items.map((item) => item.id);
+function switched(id: string, toProvider: ProviderSwitchItem["toProvider"]): ProviderSwitchItem {
+  return {
+    kind: "provider_switch",
+    id,
+    seq: seq++,
+    fromProvider: "claude",
+    fromModel: null,
+    toProvider,
+    toModel: null,
+    handoffKind: "summary",
+    truncated: false,
+  };
+}
 
 describe("adoptItemIds", () => {
+  it("matches a provider switch divider, so the rows above it keep their keys", () => {
+    const previous = [user("p1", "hi"), switched("p2", "codex"), user("p3", "go on")];
+    const next = [user("n1", "hi"), switched("n2", "codex"), user("n3", "go on")];
+    expect(ids(adoptItemIds(previous, next))).toEqual(["p1", "p2", "p3"]);
+    const other = [user("n1", "hi"), switched("n2", "opencode"), user("n3", "go on")];
+    expect(ids(adoptItemIds(previous, other))).toEqual(["n1", "n2", "p3"]);
+  });
+
   it("carries the previous ids onto the matching suffix and leaves the new prefix alone", () => {
     const previous = [user("p1", "hi"), assistant("p2", "hello"), tool("p3", "tu-1")];
     const next = [
