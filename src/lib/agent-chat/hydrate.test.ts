@@ -333,6 +333,135 @@ describe("replayPayloads", () => {
       expect(status(state, "tu-1")).toBe("running");
     });
 
+    it("keeps a stopped turn's call settled while the next turn is live", () => {
+      const state = replayPayloads(
+        [
+          user("run the tests"),
+          toolUse("turn-1", "tu-1"),
+          event({
+            type: "turn_completed",
+            thread_id: "t",
+            turn_id: "turn-1",
+            status: { kind: "error", subtype: "interrupted", message: "turn interrupted" },
+            usage: null,
+          }),
+          user("run only the unit tests"),
+        ],
+        { runLive: true },
+      );
+      expect(status(state, "tu-1")).toBe("unconfirmed");
+    });
+
+    it("keeps the next turn finished when a stopped call's late result replays", () => {
+      const state = replayPayloads([
+        user("run the tests"),
+        toolUse("turn-1", "tu-1"),
+        event({
+          type: "turn_completed",
+          thread_id: "t",
+          turn_id: "turn-1",
+          status: { kind: "error", subtype: "interrupted", message: "turn interrupted" },
+          usage: null,
+        }),
+        user("run only the unit tests"),
+        event({
+          type: "item_completed",
+          thread_id: "t",
+          turn_id: "turn-2",
+          item: { kind: "assistant_text", text: "Done." },
+        }),
+        event({
+          type: "turn_completed",
+          thread_id: "t",
+          turn_id: "turn-2",
+          status: { kind: "success" },
+          usage: null,
+        }),
+        event({
+          type: "item_completed",
+          thread_id: "t",
+          turn_id: "turn-1",
+          item: { kind: "tool_result", tool_use_id: "tu-1", content: "ok", is_error: false },
+        }),
+      ]);
+      expect(status(state, "tu-1")).toBe("done");
+      expect(state.messages.some((m) => m.kind === "turn_ended" && m.interim)).toBe(false);
+    });
+
+    it("reopens on resumed output replayed after a leaked spawn result", () => {
+      const state = replayPayloads(
+        [
+          user("start the report"),
+          event({
+            type: "subagent_updated",
+            thread_id: "t",
+            subagent: { subagent_id: "spawn-1", status: "running", background_task: true },
+          } as ProviderRuntimeEvent),
+          event({
+            type: "turn_completed",
+            thread_id: "t",
+            turn_id: "turn-1",
+            status: { kind: "success" },
+            usage: null,
+          }),
+          event({
+            type: "item_completed",
+            thread_id: "t",
+            turn_id: "turn-1",
+            item: { kind: "tool_result", tool_use_id: "spawn-1", content: "launched", is_error: false },
+          }),
+          event({
+            type: "item_completed",
+            thread_id: "t",
+            turn_id: "turn-1",
+            item: { kind: "assistant_text", text: "The task reported back." },
+          }),
+        ],
+        { runLive: true },
+      );
+      expect(state.messages.some((m) => m.kind === "turn_ended" && m.interim)).toBe(true);
+    });
+
+    it("reopens on resumed output merged in a tail after a leaked spawn result", () => {
+      const slice = replayPayloads(
+        [
+          user("start the report"),
+          event({
+            type: "subagent_updated",
+            thread_id: "t",
+            subagent: { subagent_id: "spawn-1", status: "running", background_task: true },
+          } as ProviderRuntimeEvent),
+          event({
+            type: "turn_completed",
+            thread_id: "t",
+            turn_id: "turn-1",
+            status: { kind: "success" },
+            usage: null,
+          }),
+        ],
+        { runLive: true },
+      );
+      const merged = applyReplayTail(
+        slice,
+        parseReplayPayloads([
+          event({
+            type: "item_completed",
+            thread_id: "t",
+            turn_id: "turn-1",
+            item: { kind: "tool_result", tool_use_id: "spawn-1", content: "launched", is_error: false },
+          }),
+          event({
+            type: "item_completed",
+            thread_id: "t",
+            turn_id: "turn-1",
+            item: { kind: "assistant_text", text: "The task reported back." },
+          }),
+        ]),
+        { runLive: true, previousUnsettled: slice.turnUnsettled, provider: "claude" },
+      );
+      expect(merged.messages.some((m) => m.kind === "turn_ended" && m.interim)).toBe(true);
+    });
+
     it("leaves a finished call alone", () => {
       const state = replayPayloads([
         user("run the tests"),

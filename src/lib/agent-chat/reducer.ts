@@ -1052,38 +1052,56 @@ function trailingTurnEndIndex(messages: ChatViewItem[]): number {
   return -1;
 }
 
-/** Parent-scoped output just landed. If the most recent boundary of the
- *  current prompt is a successful `turn_ended` with no output after it, the
- *  provider had only yielded to wait on background work and has now resumed
- *  the SAME turn — flag that boundary `interim` so the transcript stops
- *  presenting the turn as finished. Output already past the marker means it
- *  was reopened when that output arrived. `interim` reports whether the
- *  trailing boundary is interim after the call (newly or already), so
- *  callers can flip `streaming` back on even when nothing changed — a cold
- *  hydrate during the wait lands with `streaming: false`. */
-/** Mark tool calls of other turns still `running` as `unconfirmed` once
- *  parent output for `turnId` arrives: a turn's calls never outlive it, so
- *  one left running belongs to a run that died (a quit or crash cut it
- *  off). Scans back only to the last turn end; anything before it was
- *  settled already. Same-ref when nothing changed. */
-function settleCutOffToolCalls(
+/** Mark tool calls still `running` as `unconfirmed` when `cutOff` says
+ *  no result will come for them. Scans back only to the last turn end,
+ *  since anything before it was settled already, unless `wholeTranscript`
+ *  is set. Same-ref when nothing changed. */
+function settleRunningToolCalls(
   messages: ChatViewItem[],
-  turnId: string | null | undefined,
+  cutOff: (call: ToolCallItem) => boolean,
   now: Clock,
+  wholeTranscript = false,
 ): ChatViewItem[] {
-  if (!turnId) return messages;
   let next = messages;
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
-    if (m.kind === "turn_ended") break;
-    if (m.kind === "tool_call" && m.status === "running" && m.turn_id && m.turn_id !== turnId) {
+    if (m.kind === "turn_ended" && !wholeTranscript) break;
+    if (m.kind === "tool_call" && m.status === "running" && cutOff(m)) {
       next = replaceItem(next, i, { ...m, status: "unconfirmed", completed_at: now() });
     }
   }
   return next;
 }
 
-function reopenInterimTurnEnd(messages: ChatViewItem[]): {
+/** Settle tool calls of other turns once parent output for `turnId`
+ *  arrives: a turn's calls never outlive it, so one left running belongs
+ *  to a run that died (a quit or crash cut it off). */
+function settleCutOffToolCalls(
+  messages: ChatViewItem[],
+  turnId: string | null | undefined,
+  now: Clock,
+): ChatViewItem[] {
+  if (!turnId) return messages;
+  return settleRunningToolCalls(
+    messages,
+    (call) => !!call.turn_id && call.turn_id !== turnId,
+    now,
+  );
+}
+
+/** Parent-scoped output just landed. If the most recent boundary of the
+ *  current prompt is a successful `turn_ended` with no output after it, the
+ *  provider had only yielded to wait on background work and has now resumed
+ *  the SAME turn — flag that boundary `interim` (unless `reopen` is false)
+ *  so the transcript stops presenting the turn as finished. Output already past the marker means it
+ *  was reopened when that output arrived. `interim` reports whether the
+ *  trailing boundary is interim after the call (newly or already), so
+ *  callers can flip `streaming` back on even when nothing changed — a cold
+ *  hydrate during the wait lands with `streaming: false`. */
+function reopenInterimTurnEnd(
+  messages: ChatViewItem[],
+  reopen = true,
+): {
   messages: ChatViewItem[];
   interim: boolean;
 } {
@@ -1091,7 +1109,7 @@ function reopenInterimTurnEnd(messages: ChatViewItem[]): {
   if (i < 0) return { messages, interim: false };
   const item = messages[i] as TurnEndedItem;
   if (item.interim) return { messages, interim: true };
-  if (item.status.kind !== "success") return { messages, interim: false };
+  if (item.status.kind !== "success" || !reopen) return { messages, interim: false };
   return {
     messages: replaceItem(messages, i, { ...item, interim: true }),
     interim: true,
@@ -1781,7 +1799,13 @@ function applyEventInner(
       }
       // Parent output after a successful boundary means the provider had
       // only yielded to wait on background work: the turn is live again.
-      const reopened = reopenInterimTurnEnd(state.messages);
+      // Except a result for a call already on record: it can be a stopped
+      // call's process reporting late. It updates that row in place, so the
+      // boundary stays trailing and real output after it still reopens.
+      const lateResult =
+        item.kind === "tool_result" &&
+        transcriptIndex(state.messages).toolUseIds.has(item.tool_use_id);
+      const reopened = reopenInterimTurnEnd(state.messages, !lateResult);
       const ctx = applyCompletedItemToList(
         { messages: reopened.messages, nextSeq: state.nextSeq },
         item,
@@ -1790,7 +1814,11 @@ function applyEventInner(
       );
       // Output for this turn means any call another turn left running was
       // cut off (the app or session died under it): no result will come.
-      let messages = settleCutOffToolCalls(ctx.messages, event.turn_id, now);
+      // A late result is not such output, for the same reason as above.
+      let messages =
+        item.kind === "tool_result"
+          ? ctx.messages
+          : settleCutOffToolCalls(ctx.messages, event.turn_id, now);
       // A parent-scoped `tool_result` for a spawning tool settles any
       // subagent the adapter's demux lost track of (issue #153): normally
       // the Claude adapter suppresses the spawn tool_result and emits a
@@ -1878,6 +1906,16 @@ function applyEventInner(
         // has no other terminal signal coming (the sidecar tears the
         // session down) — stop it here so it doesn't spin forever.
         messages = stopRunningWorkflows(messages);
+        // Its running tool calls end with it (a Stop, a crash, a failure),
+        // and the provider may never report their result, so settle them
+        // rather than leave a spinner. A late result still overwrites the
+        // row. A known turn's calls are found past any boundary another
+        // turn's completion left after them; an empty turn id (a Stop that
+        // raced the turn's own end) means the current turn.
+        const endedTurn = event.turn_id;
+        messages = endedTurn
+          ? settleRunningToolCalls(messages, (call) => call.turn_id === endedTurn, now, true)
+          : settleRunningToolCalls(messages, () => true, now);
         // A synthetic child-exit completion (provider watchdog) marks the
         // run as interrupted so the transcript shows the "Run interrupted"
         // divider and the composer offers a Continue chip. A user-initiated
