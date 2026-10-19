@@ -58,7 +58,7 @@ fn switching() -> &'static Mutex<HashSet<String>> {
 }
 
 /// Marks a thread as switching until dropped.
-struct SwitchMark(String);
+pub(crate) struct SwitchMark(String);
 
 impl SwitchMark {
     fn claim(thread_id: &str) -> Result<Self, String> {
@@ -81,6 +81,20 @@ fn slug(provider: ProviderKind) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_default()
+}
+
+/// Hold `thread_id` still for removing an account: no provider switch can
+/// start or run on it until the mark drops, so the provider it runs on can't
+/// change between removal checking it and stopping that provider's session.
+/// Sends are refused meanwhile, as during a switch. Waits for a switch in
+/// flight to end: it may be landing on the account being removed.
+pub(crate) async fn hold_still(thread_id: &str) -> SwitchMark {
+    loop {
+        if let Ok(mark) = SwitchMark::claim(thread_id) {
+            return mark;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Refuse what would change or copy the chat mid-switch: a turn revert
@@ -601,6 +615,19 @@ mod tests {
         assert_eq!(refuse_stale_send(&db, ProviderKind::Codex, "t").unwrap_err(), SWITCHING);
         drop(mark);
         assert!(refuse_stale_send(&db, ProviderKind::Codex, "t").is_ok());
+    }
+
+    #[tokio::test]
+    async fn holding_a_chat_still_waits_for_its_switch_and_blocks_the_next() {
+        let switch = SwitchMark::claim("still-t").unwrap();
+        let held = tokio::spawn(hold_still("still-t"));
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert!(!held.is_finished(), "a switch in flight keeps it");
+        drop(switch);
+        let still = held.await.unwrap();
+        assert!(SwitchMark::claim("still-t").is_err(), "no switch starts while held");
+        drop(still);
+        assert!(SwitchMark::claim("still-t").is_ok());
     }
 
     #[test]

@@ -2975,7 +2975,16 @@ async fn ensure_live_session_locked<R: Runtime>(
         }
         None => (None, None),
     };
-    let env = crate::provider_accounts::rebuild_env(app, provider_kind, &thread_id.0, env, device.is_some());
+    let rebuild = crate::provider_accounts::rebuild_env(
+        app,
+        provider_kind,
+        &thread_id.0,
+        Some(pane_workspace.as_deref().unwrap_or(&record.workspace_id)),
+        record.sdk_session_id.as_deref(),
+        env,
+        device.is_some(),
+    );
+    let env = rebuild.env;
 
     // Build the resume cursor from the persisted id, but for Claude run a
     // preflight: if the CLI's on-disk session JSONL is confirmed gone,
@@ -2983,7 +2992,7 @@ async fn ensure_live_session_locked<R: Runtime>(
     // dead id. Best-effort clear the column so no later rebuild reuses it.
     // Codex / OpenCode carry their own cursor shapes and are untouched, and
     // a device's session files aren't on this computer to check.
-    let resume_cursor = match record.sdk_session_id.as_ref() {
+    let resume_cursor = match rebuild.native.as_ref() {
         Some(id)
             if provider_kind == ProviderKind::Claude
                 && device.is_none()
