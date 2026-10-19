@@ -1061,6 +1061,28 @@ function trailingTurnEndIndex(messages: ChatViewItem[]): number {
  *  trailing boundary is interim after the call (newly or already), so
  *  callers can flip `streaming` back on even when nothing changed — a cold
  *  hydrate during the wait lands with `streaming: false`. */
+/** Mark tool calls of other turns still `running` as `unconfirmed` once
+ *  parent output for `turnId` arrives: a turn's calls never outlive it, so
+ *  one left running belongs to a run that died (a quit or crash cut it
+ *  off). Scans back only to the last turn end; anything before it was
+ *  settled already. Same-ref when nothing changed. */
+function settleCutOffToolCalls(
+  messages: ChatViewItem[],
+  turnId: string | null | undefined,
+  now: Clock,
+): ChatViewItem[] {
+  if (!turnId) return messages;
+  let next = messages;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.kind === "turn_ended") break;
+    if (m.kind === "tool_call" && m.status === "running" && m.turn_id && m.turn_id !== turnId) {
+      next = replaceItem(next, i, { ...m, status: "unconfirmed", completed_at: now() });
+    }
+  }
+  return next;
+}
+
 function reopenInterimTurnEnd(messages: ChatViewItem[]): {
   messages: ChatViewItem[];
   interim: boolean;
@@ -1766,7 +1788,9 @@ function applyEventInner(
         event.turn_id,
         now,
       );
-      let messages = ctx.messages;
+      // Output for this turn means any call another turn left running was
+      // cut off (the app or session died under it): no result will come.
+      let messages = settleCutOffToolCalls(ctx.messages, event.turn_id, now);
       // A parent-scoped `tool_result` for a spawning tool settles any
       // subagent the adapter's demux lost track of (issue #153): normally
       // the Claude adapter suppresses the spawn tool_result and emits a

@@ -71,6 +71,12 @@ const SCHEDULER_TICK: Duration = Duration::from_secs(15);
 pub const USAGE_RESUME_NOTE_PREFIX: &str =
     "[Resumed automatically after a provider usage limit reset";
 
+/// What every automatic resume note starts with, this one and the restart
+/// resume's ([`super::restart_resume::RESTART_RESUME_NOTE_PREFIX`]). The
+/// resume text skips user rows starting with it, so it quotes the user's
+/// own request rather than an earlier note.
+pub const AUTOMATIC_RESUME_PREFIX: &str = "[Resumed automatically after ";
+
 const USAGE_RESUME_NOTE: &str = "[Resumed automatically after a provider usage limit reset. \
 Some of the work may already be complete — check the current state before redoing anything, \
 then finish the task. The interrupted request was:]";
@@ -354,6 +360,7 @@ pub(super) fn arm_usage_limit_event<R: Runtime>(
 /// the attempt count. No event — the frontend clears its countdown on the
 /// new user message itself.
 pub(super) fn forget_on_user_activity(db: &DatabaseStore, thread_id: &str) {
+    super::restart_resume::on_user_activity(db, thread_id);
     if let Err(error) = db.delete_agent_chat_usage_resume(thread_id) {
         eprintln!("[codemux::usage_resume] failed to clear resume for thread={thread_id}: {error}");
     }
@@ -388,7 +395,7 @@ async fn dispatch_resume<R: Runtime>(
 ) -> Result<(), String> {
     let text = {
         let db: State<'_, DatabaseStore> = app.state();
-        let last = db.latest_agent_chat_user_message_text(&thread_id.0, USAGE_RESUME_NOTE_PREFIX);
+        let last = db.latest_agent_chat_user_message_text(&thread_id.0, AUTOMATIC_RESUME_PREFIX);
         build_usage_resume_text(last.as_deref())
     };
     let input = queued_turn(thread_id.clone(), text);
@@ -456,7 +463,9 @@ fn emit_dispatch_failed<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId, ge
 }
 
 /// Stopping or closing a thread has no new user message to clear its UI.
+/// It also drops the thread's restart resume, if any.
 pub(super) fn cancel_for_stopped_thread<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
+    super::restart_resume::forget_stopped_thread(app, thread_id);
     let db: State<'_, DatabaseStore> = app.state();
     match db.delete_agent_chat_usage_resume(thread_id) {
         Ok(true) => emit_cancelled(app, &ThreadId(thread_id.to_owned()), UsageResumeBlockedReason::Cancelled),

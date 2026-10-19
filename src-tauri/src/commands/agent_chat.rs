@@ -3296,6 +3296,10 @@ pub enum TurnOrigin {
     /// activity: it must not start a delegation round or forget a pending
     /// usage resume, and it always queues behind a busy turn.
     PrWatch,
+    /// The resume of a turn the app stopped mid-flight
+    /// (`commands::restart_resume`). Not user activity, so it never resets
+    /// the cap on resumes in a row. The caller holds the activity lock.
+    RestartResume,
 }
 
 /// The one send path behind [`agent_chat_send_turn`] and the usage-limit
@@ -7740,6 +7744,9 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         }
     }
     super::delegation::observe(app, &event, persisted_id);
+    // After the subagent tracker saw the event, so a turn end that only
+    // yields to delegated work reads as such.
+    super::restart_resume::on_event(app, &event);
 
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are

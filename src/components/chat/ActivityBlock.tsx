@@ -215,7 +215,7 @@ function StepIcon({
   }
   if (step.kind !== "reasoning" && step.status === "unconfirmed") {
     return (
-      <TraceIcon title="Hermes did not report a completion result">
+      <TraceIcon title="No completion result was reported">
         <HelpCircle />
       </TraceIcon>
     );

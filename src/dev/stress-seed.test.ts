@@ -27,7 +27,7 @@ afterEach(() => {
 /** How many hand-written workspaces the dev mock seeds. The stress presets
  *  fill up to a fixed total, so this is also what the generated count is
  *  derived from — adding a curated workspace means changing this one number. */
-const CURATED_WORKSPACES = 30;
+const CURATED_WORKSPACES = 31;
 
 describe("dev mock seed — stress fixture scaling", () => {
   it("leaves the curated seed untouched when no fixture is selected", async () => {

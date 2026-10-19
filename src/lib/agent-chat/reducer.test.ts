@@ -3303,3 +3303,32 @@ describe("context compaction activity", () => {
     }).compacting).toBe(false);
   });
 });
+
+describe("tool calls a dead run cut off", () => {
+  const toolUse = (turn: string, id: string): ProviderRuntimeEvent => ({
+    type: "item_completed",
+    thread_id: "t1",
+    turn_id: turn,
+    item: { kind: "tool_use", tool_use_id: id, tool_name: "Bash", input: { command: "make" } },
+  });
+  const text = (turn: string): ProviderRuntimeEvent => ({
+    type: "item_completed",
+    thread_id: "t1",
+    turn_id: turn,
+    item: { kind: "assistant_text", text: "Checking the state first." },
+  });
+  const status = (state: ChatThreadState, id: string) =>
+    state.messages.find((m): m is ToolCallItem => m.kind === "tool_call" && m.tool_use_id === id)?.status;
+
+  it("settles the cut-off turn's running call once the resumed turn speaks", () => {
+    const state = runEvents([toolUse("turn-1", "tu-1"), text("turn-2"), toolUse("turn-2", "tu-2")]);
+    expect(status(state, "tu-1")).toBe("unconfirmed");
+    expect(status(state, "tu-2")).toBe("running");
+  });
+
+  it("leaves a call running while its own turn keeps producing output", () => {
+    const state = runEvents([toolUse("turn-1", "tu-1"), text("turn-1"), toolUse("turn-1", "tu-2")]);
+    expect(status(state, "tu-1")).toBe("running");
+    expect(status(state, "tu-2")).toBe("running");
+  });
+});

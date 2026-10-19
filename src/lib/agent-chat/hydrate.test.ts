@@ -9,7 +9,7 @@ import {
   replayPayloads,
   replayTimed,
 } from "./hydrate";
-import { applyEvent, createEmptyThreadState } from "./reducer";
+import { appendUserMessage, applyEvent, createEmptyThreadState } from "./reducer";
 import {
   findSubagentView,
   runningSubagentEntries,
@@ -224,6 +224,127 @@ describe("replayPayloads", () => {
       tool_use_id: "tu-1",
       status: "done",
       result_content: "file contents",
+    });
+  });
+
+  describe("tool calls a dead run left running", () => {
+    const toolUse = (turn: string, id: string) =>
+      event({
+        type: "item_completed",
+        thread_id: "t",
+        turn_id: turn,
+        item: { kind: "tool_use", tool_name: "Bash", input: { command: "npm test" }, tool_use_id: id },
+      });
+    const status = (state: ChatThreadState, id: string) => {
+      const call = state.messages.find((m) => m.kind === "tool_call" && m.tool_use_id === id);
+      return call?.kind === "tool_call" ? call.status : undefined;
+    };
+
+    it("settles a call cut off by a crash or quit as unconfirmed, not running", () => {
+      const state = replayPayloads([user("run the tests"), toolUse("turn-1", "tu-1")]);
+      expect(status(state, "tu-1")).toBe("unconfirmed");
+      expect(state.interrupted).toBe(true);
+    });
+
+    it("settles the cut-off turn's call when the resumed turn is the live one", () => {
+      const state = replayPayloads(
+        [
+          user("run the tests"),
+          toolUse("turn-1", "tu-1"),
+          user("[Resumed automatically after an app restart. Check the state first.]"),
+          toolUse("turn-2", "tu-2"),
+        ],
+        { runLive: true },
+      );
+      expect(status(state, "tu-1")).toBe("unconfirmed");
+      // The resumed turn is still executing its own call.
+      expect(status(state, "tu-2")).toBe("running");
+    });
+
+    it("keeps a live turn's call running across a message steered into it", () => {
+      const state = replayPayloads(
+        [
+          user("run the tests"),
+          toolUse("turn-1", "tu-1"),
+          JSON.stringify({
+            type: "user_message",
+            thread_id: "t",
+            text: "use the fast config",
+            client_nonce: "steer-1",
+            steered_turn_id: "turn-1",
+          }),
+        ],
+        { runLive: true },
+      );
+      expect(status(state, "tu-1")).toBe("running");
+    });
+
+    it("keeps a live turn's call running past an optimistic bubble", () => {
+      // The composer appends the bubble before the backend confirms it was
+      // queued or steered; a warm merge in that window must not settle.
+      const slice = appendUserMessage(
+        replayPayloads([user("run the tests"), toolUse("turn-1", "tu-1")], { runLive: true }),
+        "also lint",
+      );
+      const merged = applyReplayTail(slice, parseReplayPayloads([]), {
+        runLive: true,
+        previousUnsettled: slice.turnUnsettled,
+        provider: "claude",
+      });
+      expect(status(merged, "tu-1")).toBe("running");
+    });
+
+    it("settles a cut-off turn's call on a live tail merge too", () => {
+      const slice = replayPayloads([user("run the tests"), toolUse("turn-1", "tu-1")], {
+        runLive: true,
+      });
+      expect(status(slice, "tu-1")).toBe("running");
+      // The app restarted; the resumed turn is live when the pane merges its tail.
+      const merged = applyReplayTail(
+        slice,
+        parseReplayPayloads([
+          user("[Resumed automatically after an app restart.]"),
+          toolUse("turn-2", "tu-2"),
+        ]),
+        { runLive: true, previousUnsettled: slice.turnUnsettled, provider: "claude" },
+      );
+      expect(status(merged, "tu-1")).toBe("unconfirmed");
+      expect(status(merged, "tu-2")).toBe("running");
+    });
+
+    it("keeps a live parent call running past a child's approval request", () => {
+      const state = replayPayloads(
+        [
+          user("run the tests"),
+          toolUse("turn-1", "tu-1"),
+          event({
+            type: "request_opened",
+            thread_id: "t",
+            turn_id: "child-turn",
+            request_id: "req-1",
+            request_kind: "command",
+            payload: {},
+            tool_use_id: null,
+            subagent_id: "child-1",
+          } as ProviderRuntimeEvent),
+        ],
+        { runLive: true },
+      );
+      expect(status(state, "tu-1")).toBe("running");
+    });
+
+    it("leaves a finished call alone", () => {
+      const state = replayPayloads([
+        user("run the tests"),
+        toolUse("turn-1", "tu-1"),
+        event({
+          type: "item_completed",
+          thread_id: "t",
+          turn_id: "turn-1",
+          item: { kind: "tool_result", tool_use_id: "tu-1", content: "ok", is_error: false },
+        }),
+      ]);
+      expect(status(state, "tu-1")).toBe("done");
     });
   });
 

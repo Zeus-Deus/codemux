@@ -78,6 +78,7 @@ import {
   MOCK_WEB_REMOTE_PORT,
   MOCK_MONITORING_THREAD_ID,
   MOCK_USAGE_LIMIT_THREAD_ID,
+  MOCK_RESTART_RESUME_THREAD_ID,
   MOCK_SUGGESTED_TASKS_THREAD_ID,
   MOCK_SUGGESTED_CHILD_THREAD_ID,
   MOCK_WORKFLOW_APPROVAL_THREAD_ID,
@@ -120,6 +121,7 @@ import {
   richChatTurnEnvelopes,
   monitoringEnvelopes,
   usageLimitEnvelopes,
+  restartResumeEnvelopes,
   suggestedTasksEnvelopes,
   suggestedTasksFollowUpRows,
   subagentTurnEnvelopes,
@@ -2515,6 +2517,9 @@ const WORKFLOW_THREAD_BUILDERS: Record<string, () => unknown[]> = {
   // composer strip's usage row and the transcript record are reachable.
   [MOCK_USAGE_LIMIT_THREAD_ID]: () =>
     usageLimitEnvelopes(MOCK_USAGE_LIMIT_THREAD_ID),
+  // A run the app quit mid-turn, resumed on its own at the next launch.
+  [MOCK_RESTART_RESUME_THREAD_ID]: () =>
+    restartResumeEnvelopes(MOCK_RESTART_RESUME_THREAD_ID),
   // A finished turn whose agent called `suggest_tasks`, with one task
   // started (working in its own worktree), so the suggestions card shows.
   [MOCK_SUGGESTED_TASKS_THREAD_ID]: () =>
@@ -2563,6 +2568,11 @@ const WORKFLOW_THREAD_WORKSPACE: Record<
     workspaceId: "ws-codemux-usage-limit",
     cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/demo-usage-limit`,
     title: "Port the importer",
+  },
+  [MOCK_RESTART_RESUME_THREAD_ID]: {
+    workspaceId: "ws-codemux-restart-resume",
+    cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/demo-restart-resume`,
+    title: "Split the settings page",
   },
   [MOCK_SUGGESTED_TASKS_THREAD_ID]: {
     workspaceId: "ws-codemux-suggested-tasks",

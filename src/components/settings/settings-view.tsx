@@ -71,6 +71,7 @@ import {
   SETTINGS_DEFAULTS,
   selectSidebarShowGitStats,
   selectAutoResumeUsageLimit,
+  selectAutoResumeAfterRestart,
   selectCrossProviderDelegation,
   selectOrbMatchActivity,
   selectNewChatCheckout,
@@ -1408,6 +1409,7 @@ export function SettingsView() {
   );
   const orbMatchActivity = useSettingsStore(selectOrbMatchActivity);
   const autoResumeUsageLimit = useSettingsStore(selectAutoResumeUsageLimit);
+  const autoResumeAfterRestart = useSettingsStore(selectAutoResumeAfterRestart);
   const crossProviderDelegation = useSettingsStore(selectCrossProviderDelegation);
   const newChatCheckout = useSettingsStore(selectNewChatCheckout);
   const diffLayout = useSettingsStore(selectDiffLayoutPreference);
@@ -2470,6 +2472,22 @@ export function SettingsView() {
                         onCheckedChange={(checked) =>
                           storeSet(
                             "agents.auto_resume_usage_limit",
+                            checked ? "true" : "false",
+                          )
+                        }
+                      />
+                    </SettingRow>
+                    <Separator />
+                    <SettingRow
+                      label="Auto-resume agents after restart"
+                      description="When Codemux quits or crashes mid-run, Claude and Codex chats continue on the next launch. They check the current state first. Chats waiting on you are flagged instead."
+                      scope="device"
+                    >
+                      <Switch
+                        checked={autoResumeAfterRestart}
+                        onCheckedChange={(checked) =>
+                          storeSet(
+                            "agents.auto_resume_after_restart",
                             checked ? "true" : "false",
                           )
                         }
