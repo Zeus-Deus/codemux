@@ -7,7 +7,7 @@ export interface PeekBodyProps {
   workspaceId: string;
   size: { width: number; height: number };
   close(): void;
-  onStatusChange(status: PeekStatus): void;
+  onStatusChange(status: PeekStatus, label?: string): void;
 }
 
 export interface PeekAdapter {
@@ -22,7 +22,7 @@ interface PeekChipProps {
   peekId: string;
   label: string;
   icon?: ComponentType<{ className?: string }>;
-  status: PeekStatus;
+  status?: PeekStatus;
 }
 
 function isPeekChip(value: unknown): value is ComponentType<PeekChipProps> {
