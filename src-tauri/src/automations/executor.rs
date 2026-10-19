@@ -366,6 +366,13 @@ pub async fn execute_run<RT: tauri::Runtime>(
     with_db(&handle, |db| apply_outcome(db, run.id, &outcome));
 }
 
+/// A webhook delivery that started a run, as reported to the sender.
+pub struct DispatchedWebhook {
+    pub run_id: i64,
+    /// Placeholders that had no value in the request.
+    pub missing: Vec<String>,
+}
+
 /// Webhook entry point for the HTTP route: validate the request with
 /// `webhook::accept_delivery`, then announce and execute the run in the
 /// background, like a scheduled fire. Returns once the run is recorded, so
@@ -375,7 +382,7 @@ pub fn dispatch_webhook<RT: tauri::Runtime>(
     webhook_id: &str,
     token: &str,
     request: &super::webhook::WebhookRequest,
-) -> Result<AutomationRunRecord, super::webhook::DeliveryRejection> {
+) -> Result<DispatchedWebhook, super::webhook::DeliveryRejection> {
     use tauri::Emitter;
 
     let accepted = with_db(handle, |db| {
@@ -384,13 +391,16 @@ pub fn dispatch_webhook<RT: tauri::Runtime>(
     if let Err(error) = handle.emit("automations://fire", &accepted.run) {
         eprintln!("[codemux::automations] failed to emit fire event: {error}");
     }
-    let run = accepted.run.clone();
+    let dispatched = DispatchedWebhook {
+        run_id: accepted.run.id,
+        missing: accepted.missing,
+    };
     tauri::async_runtime::spawn(execute_run(
         handle.clone(),
         accepted.automation,
         accepted.run,
     ));
-    Ok(run)
+    Ok(dispatched)
 }
 
 /// Fallible body of `execute_run`. On success returns the worktree path

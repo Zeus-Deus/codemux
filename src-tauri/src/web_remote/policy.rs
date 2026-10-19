@@ -454,6 +454,14 @@ mod tests {
             "hosts_ssh_config_hosts",
             "plugin:shell|execute",
             "future_command",
+            // Webhook URL tokens, signing setup and the secret store stay on
+            // the desktop: a paired browser never reads or enters them.
+            "automations_webhook_credentials",
+            "automations_rotate_webhook_token",
+            "automations_set_webhook_signature",
+            "secrets_store",
+            "secrets_list",
+            "secrets_delete",
         ] {
             assert!(!allowed(cmd), "{cmd}");
         }

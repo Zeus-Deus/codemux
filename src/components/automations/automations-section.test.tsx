@@ -155,4 +155,18 @@ describe("automation agent defaults", () => {
     expect(agentTrigger()).toHaveTextContent("Codex");
     expect(screen.getByTestId("automation-agent-readiness")).toHaveAttribute("data-readiness", "ready");
   });
+
+  it("a webhook trigger drops the schedule and pins the run to this machine", async () => {
+    const { claude, codex, user } = await openForm();
+    await settle(claude, codex);
+    expect(screen.getByText("Schedule")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("radio", { name: "On a webhook" }));
+
+    expect(screen.getByRole("radio", { name: "On a webhook" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByText("Schedule")).not.toBeInTheDocument();
+    expect(screen.queryByText("Timezone")).not.toBeInTheDocument();
+    expect(screen.getByText(/Webhooks arrive at this machine/)).toBeInTheDocument();
+    expect(screen.getByText(/\{\{body\.path\}\}/)).toBeInTheDocument();
+  });
 });

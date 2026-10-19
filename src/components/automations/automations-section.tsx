@@ -41,6 +41,7 @@ import {
   hostsList,
   type AutomationInput,
   type AutomationRunView,
+  type AutomationTrigger,
   type AutomationView,
   type HostView,
   type RepoAccessResult,
@@ -55,6 +56,7 @@ import {
   agentBlocked,
   preferredAutomationAgent,
 } from "./agent-readiness";
+import { WEBHOOK_PLACEHOLDERS, WebhookPanel } from "./webhook-panel";
 
 /** A project currently open in the Codemux sidebar — the source for
  *  the project picker. */
@@ -164,6 +166,13 @@ function describeSchedule(schedule: string): string {
   return `Weekly on ${day} at ${time}`;
 }
 
+/** One-line description of what starts an automation's runs. */
+function describeTrigger(automation: AutomationView): string {
+  return automation.trigger_type === "webhook"
+    ? "On webhook"
+    : describeSchedule(automation.schedule);
+}
+
 function byNameInsensitive(a: AutomationView, b: AutomationView): number {
   return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
 }
@@ -178,6 +187,8 @@ const browserTimezone = (): string => {
 
 /** Draft state for the create/edit form. */
 interface FormDraft {
+  /** Fixed once the automation exists. */
+  trigger: AutomationTrigger;
   name: string;
   prompt: string;
   agent: string;
@@ -199,6 +210,7 @@ interface FormDraft {
 
 function emptyDraft(): FormDraft {
   return {
+    trigger: "schedule",
     name: "",
     prompt: "",
     agent: "claude",
@@ -217,6 +229,7 @@ function emptyDraft(): FormDraft {
 function draftFromAutomation(a: AutomationView): FormDraft {
   const parsed = parseSchedule(a.schedule);
   return {
+    trigger: a.trigger_type,
     name: a.name,
     prompt: a.prompt,
     agent: a.agent,
@@ -226,23 +239,28 @@ function draftFromAutomation(a: AutomationView): FormDraft {
     retentionLimit: a.retention_limit,
     builder: parsed ?? { frequency: "DAILY", hour: 9, minute: 0, weekday: "MO" },
     rawSchedule: a.schedule,
-    rawMode: parsed === null,
+    rawMode: a.trigger_type === "schedule" && parsed === null,
     projectCustom: false,
     agentPicked: true,
   };
 }
 
 function draftToInput(draft: FormDraft): AutomationInput {
-  const schedule = draft.rawMode
-    ? draft.rawSchedule.trim()
-    : composeSchedule({ ...draft.builder, timezone: draft.timezone });
+  const webhook = draft.trigger === "webhook";
+  const schedule = webhook
+    ? ""
+    : draft.rawMode
+      ? draft.rawSchedule.trim()
+      : composeSchedule({ ...draft.builder, timezone: draft.timezone });
   return {
+    trigger_type: draft.trigger,
     name: draft.name.trim(),
     prompt: draft.prompt,
     agent: draft.agent,
     schedule,
     timezone: draft.timezone.trim(),
-    host_id: draft.hostId,
+    // Webhook requests arrive at this machine, so the run happens here too.
+    host_id: webhook ? null : draft.hostId,
     project_path: draft.projectPath.trim() || null,
     retention_limit: draft.retentionLimit,
   };
@@ -419,8 +437,8 @@ export function AutomationsSection() {
             </h3>
             <p className="text-body leading-relaxed text-muted-foreground/80">
               Run an agent on a schedule — triage issues each morning,
-              sweep stale branches nightly, post a weekly summary. It runs
-              on the host you choose, even with your laptop closed.
+              sweep stale branches nightly, post a weekly summary — or when
+              a webhook arrives, like a new GitHub issue.
             </p>
           </div>
           <Button
@@ -512,7 +530,7 @@ export function AutomationsSection() {
                       )}
                     </span>
                     <span className="mt-0.5 block truncate text-label text-muted-foreground/55">
-                      {describeSchedule(automation.schedule)}
+                      {describeTrigger(automation)}
                     </span>
                   </span>
                 </button>
@@ -573,6 +591,11 @@ export function AutomationsSection() {
             onEdit={() => startEdit(selected)}
             onToggleEnabled={() => void handleToggleEnabled(selected)}
             onDelete={() => void handleDelete(selected)}
+            onChanged={(updated) =>
+              setAutomations((prev) =>
+                prev.map((a) => (a.id === updated.id ? updated : a)),
+              )
+            }
           />
         )}
       </div>
@@ -589,6 +612,7 @@ function AutomationDetail({
   onEdit,
   onToggleEnabled,
   onDelete,
+  onChanged,
 }: {
   automation: AutomationView;
   hosts: HostView[];
@@ -596,7 +620,9 @@ function AutomationDetail({
   onEdit: () => void;
   onToggleEnabled: () => void;
   onDelete: () => void;
+  onChanged: (updated: AutomationView) => void;
 }) {
+  const webhook = automation.trigger_type === "webhook";
   const hostLabel =
     automation.host_id === null
       ? "This machine"
@@ -630,7 +656,7 @@ function AutomationDetail({
           )}
         </div>
         <p className="text-body-sm text-muted-foreground/85">
-          {describeSchedule(automation.schedule)} · {agentLabel} · {hostLabel}
+          {describeTrigger(automation)} · {agentLabel} · {hostLabel}
         </p>
       </div>
 
@@ -640,10 +666,16 @@ function AutomationDetail({
         projectRemote={automation.project_remote}
       />
 
-      <div className="grid grid-cols-2 gap-3">
-        <FactCard label="Next run" value={formatStamp(automation.next_run_at)} />
-        <FactCard label="Last run" value={formatStamp(automation.last_run_at)} />
-      </div>
+      {webhook ? (
+        // Keyed so a slow load or rotation for one automation can never land
+        // in another's panel.
+        <WebhookPanel key={automation.id} automation={automation} onChanged={onChanged} />
+      ) : (
+        <div className="grid grid-cols-2 gap-3">
+          <FactCard label="Next run" value={formatStamp(automation.next_run_at)} />
+          <FactCard label="Last run" value={formatStamp(automation.last_run_at)} />
+        </div>
+      )}
 
       <div className="space-y-1.5">
         <Eyebrow>
@@ -771,7 +803,7 @@ function RunHistory({ automationId }: { automationId: number }) {
         <p className="py-2 text-body-sm text-muted-foreground/70">Loading…</p>
       ) : runs.length === 0 ? (
         <p className="rounded-lg border border-dashed border-border/60 px-3 py-3 text-body-sm text-muted-foreground/70">
-          No runs yet. The next fire will appear here.
+          No runs yet. Each run will appear here.
         </p>
       ) : (
         <ul className="overflow-hidden rounded-lg border border-border/60 divide-y divide-border/40">
@@ -797,6 +829,11 @@ function RunHistory({ automationId }: { automationId: number }) {
                   {run.branch}
                 </span>
               ) : null}
+              {run.trigger_type === "webhook" && (
+                <span className="shrink-0 text-caption uppercase tracking-wide text-muted-foreground/60">
+                  webhook
+                </span>
+              )}
               <span
                 className={cn(
                   "ml-auto shrink-0 rounded-sm px-1.5 py-0.5 text-caption font-medium uppercase tracking-wide",
@@ -846,7 +883,8 @@ function AutomationForm({
     draft.prompt.trim() !== "" &&
     draft.projectPath.trim() !== "";
 
-  const local = draft.hostId === null;
+  const webhook = draft.trigger === "webhook";
+  const local = webhook || draft.hostId === null;
   const agentHealth = useProbedProviderHealth(AUTOMATION_PROVIDERS, local);
   const preferredAgent =
     local && !draft.agentPicked ? preferredAutomationAgent(agentHealth) : null;
@@ -869,6 +907,45 @@ function AutomationForm({
         {creating ? "New automation" : "Edit automation"}
       </h3>
 
+      <Field
+        label="Starts"
+        hint={
+          creating
+            ? undefined
+            : "The trigger is fixed once an automation exists."
+        }
+      >
+        <div
+          role="radiogroup"
+          aria-label="What starts a run"
+          className="inline-flex rounded-md border border-border/60 bg-muted/30 p-0.5"
+        >
+          {(
+            [
+              ["schedule", "On a schedule"],
+              ["webhook", "On a webhook"],
+            ] as const
+          ).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              role="radio"
+              aria-checked={draft.trigger === value}
+              disabled={!creating}
+              onClick={() => patch({ trigger: value })}
+              className={cn(
+                "rounded-sm px-3 py-1 text-body-sm transition-colors duration-150 disabled:cursor-not-allowed",
+                draft.trigger === value
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground disabled:hover:text-muted-foreground",
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </Field>
+
       <Field label="Name">
         <Input
           value={draft.name}
@@ -879,11 +956,22 @@ function AutomationForm({
         />
       </Field>
 
-      <Field label="Prompt" hint="What the agent does on every run.">
+      <Field
+        label="Prompt"
+        hint={
+          webhook
+            ? `What the agent does on every request. Read the request with ${WEBHOOK_PLACEHOLDERS.join(", ")}.`
+            : "What the agent does on every run."
+        }
+      >
         <Textarea
           value={draft.prompt}
           onChange={(e) => patch({ prompt: e.target.value })}
-          placeholder="Review newly opened issues and add labels…"
+          placeholder={
+            webhook
+              ? "Triage issue #{{body.issue.number}}: {{body.issue.title}}"
+              : "Review newly opened issues and add labels…"
+          }
           className="min-h-24 text-body"
         />
       </Field>
@@ -909,9 +997,13 @@ function AutomationForm({
           </Select>
         </Field>
 
-        <Field label="Host">
+        <Field
+          label="Host"
+          hint={webhook ? "Webhooks arrive at this machine, so they run here." : undefined}
+        >
           <Select
-            value={draft.hostId === null ? "local" : String(draft.hostId)}
+            disabled={webhook}
+            value={webhook || draft.hostId === null ? "local" : String(draft.hostId)}
             onValueChange={(v) =>
               patch({ hostId: v === "local" ? null : Number(v) })
             }
@@ -938,21 +1030,25 @@ function AutomationForm({
       />
 
       <RepoAccessRow
-        hostId={draft.hostId}
+        hostId={webhook ? null : draft.hostId}
         projectPath={draft.projectPath || null}
         projectRemote={null}
       />
 
-      <ScheduleField draft={draft} patch={patch} patchBuilder={patchBuilder} />
+      {!webhook && (
+        <ScheduleField draft={draft} patch={patch} patchBuilder={patchBuilder} />
+      )}
 
       <div className="grid grid-cols-2 gap-4">
-        <Field label="Timezone">
-          <Input
-            value={draft.timezone}
-            onChange={(e) => patch({ timezone: e.target.value })}
-            className="h-9 text-body font-mono"
-          />
-        </Field>
+        {!webhook && (
+          <Field label="Timezone">
+            <Input
+              value={draft.timezone}
+              onChange={(e) => patch({ timezone: e.target.value })}
+              className="h-9 text-body font-mono"
+            />
+          </Field>
+        )}
         <Field label="Keep last N runs" hint="Older run worktrees are pruned.">
           <Input
             type="number"

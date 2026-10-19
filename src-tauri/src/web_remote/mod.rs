@@ -1056,7 +1056,12 @@ async fn bind_listeners<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) ->
     }
 
     for (listener, mut shutdown_rx) in servers {
-        let router = server::router(app.clone());
+        // Webhook intake reads this listener's own shutdown flag, so a
+        // delivery still uploading when the listener is stopped or replaced
+        // never starts a run.
+        let router = server::router(app.clone()).layer(axum::Extension(
+            crate::automations::webhook_http::ListenerLife(shutdown_rx.clone()),
+        ));
         tokio::spawn(async move {
             let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
             let result = axum::serve(listener, service)

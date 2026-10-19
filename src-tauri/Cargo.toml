@@ -120,6 +120,9 @@ rrule = "0.14"
 # tokio-tungstenite + sha1 + base64 (all already in the tree).
 axum = { version = "0.7", features = ["ws"] }
 tower = "0.5"
+# Tells an over-limit webhook body apart from other read errors; already in
+# the tree via axum.
+http-body-util = "0.1"
 # HTTP response compression for the web-remote server's JSON APIs and embedded
 # frontend bundle (`CompressionLayer`, gzip only — images and other
 # already-compressed types are excluded by tower-http's default predicate).
