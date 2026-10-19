@@ -735,3 +735,79 @@ async fn a_turn_that_yields_to_its_subagents_stays_resumable() {
     assert_eq!(&sent[1..], ["saved"]);
     assert!(h.db().get_restart_turn("rr-yield").is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_yielded_run_whose_subagents_finish_settles() {
+    use codemux_lib::agent_provider::SubagentStatus;
+    let h = harness().await;
+    h.chat("rr-yield-end");
+    h.running("rr-yield-end", "turn-1");
+    h.provider.set_turn_active("rr-yield-end", true);
+    forward_event(&h.handle(), subagent("rr-yield-end", SubagentStatus::Running));
+    h.provider.set_turn_active("rr-yield-end", false);
+    h.completed("rr-yield-end", TurnStatus::Success);
+    // `Ready` while the child still works: the run is not over yet.
+    forward_event(
+        &h.handle(),
+        ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: ThreadId("rr-yield-end".into()),
+            status: SessionStatus::Ready,
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(h.db().get_restart_turn("rr-yield-end").is_some());
+    // The child finishes and the parent never takes another turn.
+    forward_event(&h.handle(), subagent("rr-yield-end", SubagentStatus::Completed));
+    for _ in 0..100 {
+        if h.db().get_restart_turn("rr-yield-end").is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(h.db().get_restart_turn("rr-yield-end").is_none(), "an idle chat must not resume");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_turn_that_fails_while_its_subagents_run_keeps_the_queue_manual() {
+    use codemux_lib::agent_provider::SubagentStatus;
+    let h = harness().await;
+    h.chat("rr-yield-fail");
+    h.saved("rr-yield-fail", "q-1", "saved");
+    h.running("rr-yield-fail", "turn-1");
+    resume_after_restart_for_test(&h.handle(), "launch-2").await;
+    h.running("rr-yield-fail", "turn-resume");
+    h.provider.set_turn_active("rr-yield-fail", true);
+    forward_event(&h.handle(), subagent("rr-yield-fail", SubagentStatus::Running));
+    h.provider.set_turn_active("rr-yield-fail", false);
+    h.completed(
+        "rr-yield-fail",
+        TurnStatus::Error { subtype: "error".into(), message: "boom".into() },
+    );
+    // A later turn of the user's own finishes fine.
+    h.running("rr-yield-fail", "turn-user");
+    forward_event(&h.handle(), subagent("rr-yield-fail", SubagentStatus::Completed));
+    h.completed("rr-yield-fail", TurnStatus::Success);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(h.sent("rr-yield-fail").len(), 1);
+    assert_eq!(h.db().list_queued_turns("rr-yield-fail").len(), 1);
+}
+
+#[tokio::test]
+async fn a_message_steered_into_a_resumed_turn_resets_the_cap() {
+    let h = harness().await;
+    h.chat("rr-steer-cap");
+    h.running("rr-steer-cap", "turn-1");
+    for launch in ["launch-2", "launch-3"] {
+        resume_after_restart_for_test(&h.handle(), launch).await;
+        h.running("rr-steer-cap", &format!("turn-{launch}"));
+        h.provider.set_turn_active("rr-steer-cap", false);
+    }
+    assert_eq!(h.db().get_restart_turn("rr-steer-cap").unwrap().chain, 2);
+    // The user writes into the running turn; no new turn starts.
+    let mut steer = typed("rr-steer-cap", "also check the docs");
+    steer.delivery = MessageDelivery::Steer;
+    let _ = agent_chat_send_turn(h.handle(), ProviderKind::Codex, steer).await;
+    assert_eq!(h.db().get_restart_turn("rr-steer-cap").unwrap().chain, 0);
+    let decisions = resume_after_restart_for_test(&h.handle(), "launch-4").await;
+    assert_eq!(decision(&decisions, "rr-steer-cap"), Some(ResumeDecision::Resume));
+}

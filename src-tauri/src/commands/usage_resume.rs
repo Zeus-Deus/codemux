@@ -360,7 +360,7 @@ pub(super) fn arm_usage_limit_event<R: Runtime>(
 /// the attempt count. No event — the frontend clears its countdown on the
 /// new user message itself.
 pub(super) fn forget_on_user_activity(db: &DatabaseStore, thread_id: &str) {
-    super::restart_resume::on_user_activity(thread_id);
+    super::restart_resume::on_user_activity(db, thread_id);
     if let Err(error) = db.delete_agent_chat_usage_resume(thread_id) {
         eprintln!("[codemux::usage_resume] failed to clear resume for thread={thread_id}: {error}");
     }

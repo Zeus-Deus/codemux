@@ -33,7 +33,9 @@ use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::agent_provider::types::MessageDelivery;
-use crate::agent_provider::{ProviderKind, ProviderRuntimeEvent, SessionStatus, ThreadId, TurnStatus};
+use crate::agent_provider::{
+    ProviderKind, ProviderRuntimeEvent, SessionStatus, SubagentStatus, ThreadId, TurnStatus,
+};
 use crate::database::restart_resumes::RestartResumeRecord;
 use crate::database::DatabaseStore;
 use crate::state::{AppStateStore, PaneStatus};
@@ -54,6 +56,13 @@ pub const RESTART_RESUME_NOTE_PREFIX: &str = "[Resumed automatically after an ap
 
 /// Automatic resumes allowed in a row before the user's next message.
 pub const MAX_RESUMES_IN_A_ROW: i64 = 2;
+
+/// How long a yielded run whose delegated work finished may take to pick
+/// its own turn back up before it counts as over.
+#[cfg(not(feature = "test-fixtures"))]
+const YIELD_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(feature = "test-fixtures")]
+const YIELD_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// The turn sent to a resumed chat. `graceful` says whether the app quit
 /// or stopped unexpectedly.
@@ -93,6 +102,8 @@ struct Live {
     /// Threads whose provider started a fresh conversation while they were
     /// being resumed.
     lost: HashSet<String>,
+    /// Threads whose turn ended while delegated work still held the run.
+    yielded: HashSet<String>,
     /// Chats the launch pass has taken but not decided yet. The user acting
     /// on one first (a send, a Stop) takes it out of the pass.
     candidates: HashSet<String>,
@@ -125,7 +136,11 @@ pub(crate) fn on_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEv
     let result = match event {
         ProviderRuntimeEvent::SessionStateChanged { thread_id, status } => match status {
             SessionStatus::Running { active_turn } => {
-                let chain = live().chain.get(&thread_id.0).copied().unwrap_or(0);
+                let chain = {
+                    let mut live = live();
+                    live.yielded.remove(&thread_id.0);
+                    live.chain.get(&thread_id.0).copied().unwrap_or(0)
+                };
                 db.mark_restart_turn_running(
                     &thread_id.0,
                     &active_turn.0,
@@ -136,6 +151,10 @@ pub(crate) fn on_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEv
             }
             SessionStatus::WaitingApproval { request_id } => waiting(thread_id, &request_id.0, true),
             SessionStatus::Closed | SessionStatus::Error { .. } => {
+                // The resumed run failed: its saved queue stays manual.
+                let mut live = live();
+                live.resuming.remove(&thread_id.0);
+                live.yielded.remove(&thread_id.0);
                 db.clear_restart_turn(&thread_id.0).map(drop)
             }
             // `Ready` alone is no end: a session can report it while its
@@ -152,14 +171,40 @@ pub(crate) fn on_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEv
         // (Claude yields to wait on its subagents): the run goes on, so it
         // stays resumable and a resumed one has not finished yet. The real
         // end is a later turn end, or a `Ready` once the work is done.
-        ProviderRuntimeEvent::TurnCompleted { thread_id, .. }
+        ProviderRuntimeEvent::TurnCompleted { thread_id, status, .. }
             if app
                 .try_state::<SubagentTracker>()
                 .is_some_and(|tracker| tracker.delegated_work_holding_turn(&thread_id.0)) =>
         {
+            let mut live = live();
+            live.yielded.insert(thread_id.0.clone());
+            // A failed resumed turn disarms the saved queue now, whatever
+            // its subagents do next.
+            if !matches!(status, TurnStatus::Success) {
+                live.resuming.remove(&thread_id.0);
+            }
+            return;
+        }
+        // The delegated work behind a yielded run finished. The provider may
+        // pick its turn back up, or the run is over with no turn end of its
+        // own; give it a moment, then settle the row if nothing runs.
+        ProviderRuntimeEvent::SubagentUpdated { thread_id, subagent }
+            if !matches!(subagent.status, SubagentStatus::Pending | SubagentStatus::Running) =>
+        {
+            if live().yielded.contains(&thread_id.0) {
+                let app = app.clone();
+                let thread_id = thread_id.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(YIELD_SETTLE_GRACE).await;
+                    if live().yielded.contains(&thread_id.0) {
+                        settle_if_idle(&app, &thread_id);
+                    }
+                });
+            }
             return;
         }
         ProviderRuntimeEvent::TurnCompleted { thread_id, status, .. } => {
+            live().yielded.remove(&thread_id.0);
             let result = db.clear_restart_turn(&thread_id.0).map(drop);
             let drain = {
                 let mut live = live();
@@ -246,7 +291,9 @@ fn settle_if_idle<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId) {
             // chat's saved queue stays manual rather than going out after
             // some later turn.
             Ok(true) => {
-                live().resuming.remove(&thread_id.0);
+                let mut live = live();
+                live.resuming.remove(&thread_id.0);
+                live.yielded.remove(&thread_id.0);
             }
             Ok(false) => {}
             Err(error) => eprintln!("[codemux::restart_resume] {error}"),
@@ -254,12 +301,18 @@ fn settle_if_idle<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId) {
     });
 }
 
-/// The user sent a message: automatic resumes start counting again, and a
-/// chat still waiting for the launch pass is the user's now.
-pub(super) fn on_user_activity(thread_id: &str) {
-    let mut live = live();
-    live.chain.remove(thread_id);
-    live.candidates.remove(thread_id);
+/// The user sent a message: automatic resumes start counting again (also
+/// for a running turn the message was steered into), and a chat still
+/// waiting for the launch pass is the user's now.
+pub(super) fn on_user_activity(db: &DatabaseStore, thread_id: &str) {
+    {
+        let mut live = live();
+        live.chain.remove(thread_id);
+        live.candidates.remove(thread_id);
+    }
+    if let Err(error) = db.reset_restart_turn_chain(thread_id) {
+        eprintln!("[codemux::restart_resume] {error}");
+    }
 }
 
 /// The user stopped or closed the chat: nothing to resume, and its saved
@@ -272,6 +325,7 @@ pub(super) fn forget_stopped_thread<R: Runtime>(app: &AppHandle<R>, thread_id: &
         let mut live = live();
         live.resuming.remove(thread_id);
         live.lost.remove(thread_id);
+        live.yielded.remove(thread_id);
         live.chain.remove(thread_id);
         live.candidates.remove(thread_id);
         live.draining.remove(thread_id);

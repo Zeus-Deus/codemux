@@ -153,6 +153,18 @@ impl DatabaseStore {
             .map_err(|e| format!("Failed to commit waiting update: {e}"))
     }
 
+    /// The user wrote to the thread: its running turn no longer follows
+    /// automatic resumes only.
+    pub fn reset_restart_turn_chain(&self, thread_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_chat_restart_resumes SET chain = 0 WHERE thread_id = ?1 AND chain != 0",
+            params![thread_id],
+        )
+        .map(drop)
+        .map_err(|e| format!("Failed to reset resume count: {e}"))
+    }
+
     /// Stamp this run's running turns as stopped by a normal quit.
     pub fn stamp_restart_turns_quit(&self, epoch: &str, now_ms: i64) -> Result<usize, String> {
         let conn = self.conn.lock().unwrap();
