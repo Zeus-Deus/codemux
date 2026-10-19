@@ -302,6 +302,19 @@ struct PluginToolSnapshot {
     catalog_key: String,
 }
 
+impl PluginToolSnapshot {
+    fn fallback(resumed: bool, tools: &[DynamicToolSpec], catalog: &[crate::mcp::runtime::McpTool]) -> Self {
+        Self {
+            // A resumed rollout owns its original schemas, which may differ
+            // from today's registry. Unknown is safer than claiming direct calls.
+            direct_names: if resumed { Vec::new() } else {
+                tools.iter().map(|DynamicToolSpec::Function { name, .. }| registry_tool_name(name)).collect()
+            },
+            catalog_key: crate::mcp::registry::plugin_catalog_key(catalog),
+        }
+    }
+}
+
 /// Handle for a live Codex session.
 pub(crate) struct CodexSession {
     /// Runtime-owned thread identifier.
@@ -791,10 +804,10 @@ impl CodexSession {
             .filter(|cursor| codex_thread_id_from_resume_cursor(cursor).as_deref() == Some(&codex_thread_id))
             .and_then(|cursor| cursor.get("pluginTools"))
             .and_then(|value| serde_json::from_value::<PluginToolSnapshot>(value.clone()).ok());
-        let plugin_snapshot = saved_plugin_state.unwrap_or_else(|| PluginToolSnapshot {
-            direct_names: dynamic_tools.as_deref().unwrap_or_default().iter().map(|DynamicToolSpec::Function { name, .. }| registry_tool_name(name)).collect(),
-            catalog_key: crate::mcp::registry::plugin_catalog_key(&initial_plugin_catalog),
-        });
+        let plugin_snapshot = saved_plugin_state.unwrap_or_else(|| PluginToolSnapshot::fallback(
+            resume_cursor.as_ref().and_then(codex_thread_id_from_resume_cursor).as_deref() == Some(&codex_thread_id),
+            dynamic_tools.as_deref().unwrap_or_default(), &initial_plugin_catalog,
+        ));
 
         // --- assemble session handle ----------------------------------------
         let mut demux=CodexSubagentDemux::new(codex_thread_id.clone());demux.set_recorded_usage_baseline(recorded_usage_baseline.unwrap_or_default());
@@ -3493,6 +3506,13 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("aren't available to this thread"));
+    }
+
+    #[test]
+    fn plugin_mcp_old_resume_does_not_claim_current_tools_are_direct() {
+        let tools = vec![DynamicToolSpec::Function { name: "fixture__late".into(), description: "late".into(), input_schema: json!({}), defer_loading: None }];
+        assert!(PluginToolSnapshot::fallback(true, &tools, &[]).direct_names.is_empty());
+        assert_eq!(PluginToolSnapshot::fallback(false, &tools, &[]).direct_names, vec!["fixture__late"]);
     }
 
     #[test]

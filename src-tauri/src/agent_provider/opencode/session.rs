@@ -2348,11 +2348,11 @@ async fn attach_mcp_gateway_scoped(
     server: &OpenCodeServerHandle,
     registry: &McpRegistry,
     directory: Option<&std::path::Path>,
-    workspace_id: Option<&str>,
+    _workspace_id: Option<&str>,
 ) -> Result<(), ProviderError> {
     let connection =
         registry
-            .gateway_connection_for_workspace(if server.api == super::api::OpenCodeApi::V2 { workspace_id } else { None })
+            .gateway_connection()
             .await
             .map_err(|message| ProviderError::ProcessError {
                 message: "failed to start Codemux MCP gateway".into(),
@@ -3309,7 +3309,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn v2_gateway_registration_is_scoped_and_verified_connected() {
+    async fn v2_gateway_registration_has_no_workspace_identity_and_verifies_connection() {
         let mut server = Server::new_async().await;
         let directory = tempfile::tempdir().unwrap();
         let query = mockito::Matcher::UrlEncoded(
@@ -3319,9 +3319,10 @@ pub(crate) mod tests {
         let put = server
             .mock("PUT", "/api/experimental/mcp/codemux")
             .match_query(query.clone())
-            .match_body(mockito::Matcher::PartialJson(
-                serde_json::json!({"config":{"type":"remote","disabled":false,"oauth":false}}),
-            ))
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJson(serde_json::json!({"config":{"type":"remote","disabled":false,"oauth":false}})),
+                mockito::Matcher::Regex(r#""url":"http://127\.0\.0\.1:[0-9]+/mcp""#.into()),
+            ]))
             .with_status(204)
             .create_async()
             .await;

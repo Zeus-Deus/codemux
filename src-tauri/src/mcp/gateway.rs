@@ -28,9 +28,9 @@ use super::McpConfigSource;
 /// ever attaches, the gateway will need per-consumer identity (a token or path
 /// per consumer) instead of this fixed list.
 ///
-/// A directory-scoped OpenCode registration carries an app-supplied
-/// workspaceId in its gateway URL, binding both discovery and calls. Legacy
-/// clients without caller context receive only globally visible plugin tools.
+/// OpenCode's MCP configuration is shared by directory. Until the gateway
+/// carries unambiguous caller identity, it receives only globally visible
+/// plugin tools.
 const GATEWAY_NATIVE_SOURCES: [McpConfigSource; 2] = [
     McpConfigSource::OpenCodeUser,
     McpConfigSource::OpenCodeProject,
@@ -125,8 +125,6 @@ async fn method_not_allowed() -> StatusCode {
 #[serde(rename_all = "camelCase")]
 struct GatewayQuery {
     workspace_id: Option<String>,
-    #[serde(default)]
-    plugin_only: bool,
 }
 
 async fn handle_events(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
@@ -220,7 +218,6 @@ async fn handle_post(
             tools.extend(super::registry::plugin_bridge_tools());
             let data: Vec<Value> = tools
                 .into_iter()
-                .filter(|tool| !query.plugin_only || tool.server_id.starts_with("plugin:"))
                 .map(|tool| {
                     json!({
                         "name": tool.prefixed_name,
@@ -244,16 +241,6 @@ async fn handle_post(
             // calling session's workspace. Absent for OpenCode (see the
             // module note on `GATEWAY_NATIVE_SOURCES`).
             let workspace_id = query.workspace_id.as_deref();
-            if query.plugin_only
-                && !state
-                    .registry
-                    .list_tools_for_workspace(&[], workspace_id)
-                    .await
-                    .iter()
-                    .any(|tool| tool.server_id.starts_with("plugin:") && tool.prefixed_name == name)
-            {
-                return rpc_error(id, -32602, "Unknown plugin MCP tool").into_response();
-            }
             let bridge = state
                 .registry
                 .call_plugin_bridge(name, arguments.clone(), workspace_id, &[])
@@ -436,6 +423,23 @@ mod tests {
         let response = router(state()).oneshot(foreign).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
+    #[tokio::test]
+    async fn plugin_mcp_gateway_never_exposes_plugin_only_scope() {
+        let registry = super::super::registry::test_support::plugin_fixture("plugin").await;
+        let app = router(GatewayState { registry: registry.clone(), bearer_token: Arc::from("test-token") });
+        let response = app.clone().oneshot(request(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["result"]["tools"].as_array().unwrap().iter().all(|tool| !tool["name"].as_str().unwrap().starts_with("fixture__")));
+        for params in [json!({"name":"fixture__new_tool","arguments":{}}), json!({"name":"codemux_call_plugin_tool","arguments":{"name":"fixture__new_tool","arguments":{}}})] {
+            let response = app.clone().oneshot(request(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":params}))).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert!(value.get("error").is_some() || value["result"]["isError"] == true);
+        }
+        registry.shutdown_all().await;
+    }
+
     #[tokio::test]
     async fn plugin_mcp_gateway_emits_list_changed() {
         use futures_util::StreamExt;
