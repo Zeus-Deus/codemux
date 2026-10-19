@@ -142,7 +142,7 @@ function OutboundMcpSection({ projectRoot }: Props) {
     <div>
       <SectionHeader
         title="MCP Servers"
-        description="Model Context Protocol servers expose tools to your agent. Servers spawn lazily on first chat session start; toggle a row off to stop it. Codemux's own MCP is always on."
+        description="Model Context Protocol servers expose tools to your agent. Configured servers start when needed; plugin servers start when their plugin registers them. Toggle a row off to stop it. Codemux's own MCP is always on."
         action={
           <Button
             variant="outline"
