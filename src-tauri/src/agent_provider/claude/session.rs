@@ -2340,6 +2340,9 @@ async fn collect_shared_tools_for_claude(
         ], caller.workspace_id.as_deref())
         .await;
     tools.extend(registry.host_tools(caller));
+    // These stay callable while native catalog replacement waits for a safe
+    // turn boundary (for example, an Editor connecting during this turn).
+    tools.extend(crate::mcp::registry::plugin_bridge_tools());
     tools
 }
 
@@ -2397,6 +2400,7 @@ async fn handle_mcp_tool_call(
         &prefixed_name,
         arguments,
         Some(actor),
+        &plugin_direct_tool_names(&params),
     )
     .await;
     if let Some(message) = failure {
@@ -2409,6 +2413,21 @@ async fn handle_mcp_tool_call(
     let _ = session.sidecar.respond(req.id, Ok(payload)).await;
 }
 
+/// Sidecar-supplied snapshot metadata, never model arguments. It only labels
+/// discovery results; visibility and dispatch still use the registry scope.
+fn plugin_direct_tool_names(params: &Value) -> Vec<String> {
+    params
+        .get("directPluginTools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(512)
+        .filter_map(Value::as_str)
+        .filter(|name| name.len() <= 64)
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Run one `mcp-tool-call` and build the tool result for the SDK, plus the
 /// dispatch failure worth a runtime warning, if any.
 async fn run_mcp_tool_call(
@@ -2418,6 +2437,7 @@ async fn run_mcp_tool_call(
     prefixed_name: &str,
     arguments: Value,
     actor: Option<crate::delegation::app::NativeActor>,
+    direct_tools: &[String],
 ) -> (Value, Option<String>) {
     // No registry: a session on a device (which must not reach this
     // computer's tools whatever name it sends), or a provider built without
@@ -2430,7 +2450,17 @@ async fn run_mcp_tool_call(
         );
     };
 
-    // Host tools first. The caller carries the LIVE permission mode, so a
+    if let Some(result) = registry
+        .call_plugin_bridge(prefixed_name, arguments.clone(), workspace_id, direct_tools)
+        .await
+    {
+        return match result {
+            Ok(payload) => (payload, None),
+            Err(error) => (tool_result_text(error.clone(), true), Some(error)),
+        };
+    }
+
+    // Host tools precede child dispatch. The caller carries the LIVE permission mode, so a
     // Plan/Ask pill flipped after the session started is honoured.
     if let Some(result) = registry.host_call(caller, prefixed_name, &arguments) {
         return (result, None);
@@ -2800,10 +2830,38 @@ mod tests {
         for scope in ["all","plugin"] {
             let registry=crate::mcp::registry::test_support::plugin_fixture(scope).await;
             let tools=collect_mcp_tools(Some(&registry),&test_caller()).await;
-            if scope=="plugin" {assert!(tools.is_empty());}
+            if scope=="plugin" {assert!(!tools.iter().any(|tool|tool.server_id.starts_with("plugin:")));}
             else {let tool=tools.iter().find(|t|t.name=="new_tool").unwrap();assert_eq!(tool.description.as_deref(),Some("Use structured tools first.\n\nAlways use background delivery."));}
             registry.shutdown_all().await;
         }
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_claude_bridge_lists_and_calls_live_tools_with_scope() {
+        for scope in ["all", "plugin"] {
+            let registry = crate::mcp::registry::test_support::plugin_fixture(scope).await;
+            let tools = collect_mcp_tools(Some(&registry), &test_caller()).await;
+            assert!(tools.iter().any(|tool| tool.prefixed_name == "codemux_list_plugin_tools"));
+            let (list, failure) = run_mcp_tool_call(
+                Some(&registry), &test_caller(), Some("ws-42"),
+                "codemux_list_plugin_tools", json!({}), None,
+                &["fixture__new_tool".into()],
+            ).await;
+            assert!(failure.is_none());
+            if scope == "all" {
+                assert!(list["structuredContent"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "fixture__new_tool" && tool["directlyCallable"] == true));
+            } else { assert_eq!(list["structuredContent"]["tools"], json!([])); }
+            let (result, _) = run_mcp_tool_call(
+                Some(&registry), &test_caller(), Some("ws-42"),
+                "codemux_call_plugin_tool", json!({"name":"fixture__new_tool","arguments":{}}),
+                None, &[],
+            ).await;
+            if scope == "all" { assert_eq!(result["content"][0]["text"], "ORCHID-742"); }
+            else { assert_eq!(result["isError"], true); }
+            registry.shutdown_all().await;
+        }
+        let names = plugin_direct_tool_names(&json!({"directPluginTools":vec!["x"; 700]}));
+        assert_eq!(names.len(), 512);
     }
 
     #[tokio::test]
@@ -2811,7 +2869,7 @@ mod tests {
         let (_server, registry, call) =
             crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
         let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
-        assert_eq!(collect_mcp_tools(local.as_ref(), &test_caller()).await.len(), 1);
+        assert_eq!(collect_mcp_tools(local.as_ref(), &test_caller()).await.len(), 3);
         let (payload, failure) = run_mcp_tool_call(
             local.as_ref(),
             &test_caller(),
@@ -2819,6 +2877,7 @@ mod tests {
             "mcp__codemux-remote__echo",
             json!({"text": "hi"}),
             None,
+            &[],
         )
         .await;
         assert_eq!(payload["content"][0]["text"], "routed");
@@ -2849,6 +2908,7 @@ mod tests {
             "mcp__codemux-remote__echo",
             json!({"text": "hi"}),
             None,
+            &[],
         )
         .await;
         assert_eq!(payload["isError"], true);

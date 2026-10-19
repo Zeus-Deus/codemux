@@ -248,6 +248,39 @@ describe("buildCodemuxMcpServer", () => {
     await expect(promise).rejects.toThrow(/child crashed/);
   });
 
+  test("live catalog call carries a bounded snapshot of native plugin tools", async () => {
+    const pluginTools: RegisteredMcpTool[] = Array.from({ length: 700 }, (_, index) => ({
+      name: `t${index}`, prefixedName: `fixture__t${index}`, description: "fixture",
+      inputSchema: { type: "object" }, serverId: "plugin:fixture:editor",
+    }));
+    const server = buildCodemuxMcpServer([...pluginTools, {
+      name: "codemux_list_plugin_tools", prefixedName: "codemux_list_plugin_tools",
+      description: "live list", inputSchema: { type: "object" }, serverId: "codemux-plugin-bridge",
+    }]);
+    let names: string[] = [];
+    setMcpBridgeWriter(line => {
+      const request = JSON.parse(line);
+      names = request.params.directPluginTools;
+      queueMicrotask(() => dispatchResponse({ jsonrpc: "2.0", id: request.id, result: { content: [] } }));
+    });
+    let complete!: () => void;
+    const completed = new Promise<void>(resolve => { complete = resolve; });
+    const transport: Parameters<typeof server.instance.connect>[0] = {
+      start: async () => {}, close: async () => {},
+      send: async message => { if ("id" in message && message.id === 2) complete(); },
+    };
+    await server.instance.connect(transport);
+    transport.onmessage!({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1" } } });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    transport.onmessage!({ jsonrpc: "2.0", method: "notifications/initialized" });
+    transport.onmessage!({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "codemux_list_plugin_tools", arguments: {} } });
+    await completed;
+    expect(names).toHaveLength(512);
+    expect(names[0]).toBe("fixture__t0");
+    expect(names.at(-1)).toBe("fixture__t511");
+    await server.instance.close();
+  });
+
   test("empty tool list still produces a valid server config", () => {
     const server = buildCodemuxMcpServer([]);
     expect(server.type).toBe("sdk");

@@ -78,8 +78,9 @@ export function setMcpBridgeWriter(fn: (line: string) => void): void {
 export function buildCodemuxMcpServer(
   tools: RegisteredMcpTool[],
 ): McpSdkServerConfigWithInstance {
+  const directPluginTools = tools.filter(tool => tool.serverId.startsWith("plugin:")).map(tool => tool.prefixedName).slice(0, 512);
   const sdkTools: Array<SdkMcpToolDefinition> = tools.map((t) =>
-    toolToSdkDefinition(t),
+    toolToSdkDefinition(t, directPluginTools),
   );
 
   return createSdkMcpServer({
@@ -91,6 +92,7 @@ export function buildCodemuxMcpServer(
 
 function toolToSdkDefinition(
   tool: RegisteredMcpTool,
+  directPluginTools: string[],
 ): SdkMcpToolDefinition {
   const inputSchema = jsonSchemaToZodShape(tool.inputSchema);
   // Cast through `unknown`: the SDK's `SdkMcpToolDefinition<Schema>`
@@ -106,7 +108,10 @@ function toolToSdkDefinition(
     try {
       const result = await sendUpstreamRequest(
         METHOD_MCP_TOOL_CALL,
-        { name: tool.prefixedName, arguments: args ?? {} },
+        {
+          name: tool.prefixedName, arguments: args ?? {},
+          ...(tool.prefixedName === "codemux_list_plugin_tools" ? { directPluginTools } : {}),
+        },
         writeLine,
       );
       return normalizeToolResult(result);

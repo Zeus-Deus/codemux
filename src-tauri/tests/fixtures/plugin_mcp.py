@@ -12,6 +12,7 @@ from pathlib import Path
 parser = argparse.ArgumentParser()
 parser.add_argument("--state")
 parser.add_argument("--empty", action="store_true")
+parser.add_argument("--start-editor", action="store_true")
 parser.add_argument("--loop-cursor", action="store_true")
 parser.add_argument("--init-delay", type=float, default=0)
 parser.add_argument("--slow-seconds", type=float, default=120)
@@ -32,6 +33,8 @@ if args.effects:
                 time.sleep(0.01)
     threading.Thread(target=effects, daemon=True).start()
 lock = threading.Lock()
+editor_start = threading.Lock()
+editor_started = False
 
 
 def send(message):
@@ -71,14 +74,28 @@ def handle(message):
         names = [] if state() == "empty" else ["echo", "image", "slow", "new_tool"]
         if state() == "extended":
             names.append("after_call")
+        if args.start_editor:
+            names.insert(0, "start_editor")
         offset = int(params.get("cursor", "0"))
-        result = {"tools": [{"name": name, "description": "Return the fixture's secret verification word." if name == "new_tool" else "Local fixture " + name, "inputSchema": {"type": "object", "properties": {}, "additionalProperties": True}} for name in names[offset:offset + 2]]}
+        result = {"tools": [{"name": name, "description": "Return the fixture's secret verification word." if name == "new_tool" else "Start the test Editor; its integration tools appear about two seconds later." if name == "start_editor" else "Local fixture " + name, "inputSchema": {"type": "object", "properties": {"seconds": {"type": "number", "minimum": 0, "maximum": 120}} if name == "slow" else {}, "additionalProperties": True}} for name in names[offset:offset + 2]]}
         if offset + 2 < len(names):
             result["nextCursor"] = "0" if args.loop_cursor else str(offset + 2)
     elif method == "tools/call":
+        global editor_started
         name = params.get("name")
+        if name == "start_editor":
+            with editor_start:
+                if not editor_started:
+                    editor_started = True
+                    def connect_editor():
+                        time.sleep(2)
+                        if args.state:
+                            Path(args.state).write_text("ready")
+                    threading.Thread(target=connect_editor, daemon=True).start()
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"content": [{"type": "text", "text": "Editor starting. New integration tools will appear in about two seconds; discover them when connected."}]}})
+            return
         if name == "slow":
-            time.sleep(params.get("arguments", {}).get("seconds", args.slow_seconds))
+            time.sleep(float(params.get("arguments", {}).get("seconds", args.slow_seconds)))
         if name == "image":
             result = {"content": [{"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jfsoAAAAASUVORK5CYII="}], "structuredContent": {"intact": True}}
         else:
