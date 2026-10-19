@@ -13,12 +13,26 @@ use super::McpServerConfig;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(super) const NOTIFICATION_STREAM_ERROR: &str = "codemux/notification_stream_error";
+pub(super) const NOTIFICATION_STREAM_OPENED: &str = "codemux/notification_stream_opened";
 const INITIAL_GET_ATTEMPTS: usize = 6;
 
-pub(super) struct CatalogRefresh<'a>(&'a HttpMcpClient);
+pub(super) struct CatalogRefresh<'a> {
+    client: &'a HttpMcpClient,
+    succeeded: bool,
+}
+impl CatalogRefresh<'_> {
+    pub(super) fn complete(&mut self) {
+        self.succeeded = true;
+    }
+}
 impl Drop for CatalogRefresh<'_> {
     fn drop(&mut self) {
-        self.0
+        if self.succeeded {
+            self.client
+                .catalog_refresh_renewed
+                .store(false, Ordering::Release);
+        }
+        self.client
             .catalog_refresh_active
             .store(false, Ordering::Release);
     }
@@ -42,7 +56,6 @@ pub struct HttpMcpClient {
     next_id: AtomicU64,
     catalog_refresh_active: AtomicBool,
     catalog_refresh_renewed: AtomicBool,
-    skip_reconnect_reconcile: AtomicBool,
     notifications: broadcast::Sender<Notification>,
 }
 
@@ -70,7 +83,6 @@ impl HttpMcpClient {
             next_id: AtomicU64::new(1),
             catalog_refresh_active: AtomicBool::new(false),
             catalog_refresh_renewed: AtomicBool::new(false),
-            skip_reconnect_reconcile: AtomicBool::new(false),
             notifications: broadcast::channel(256).0,
         };
         client.ensure_session(None, false).await?;
@@ -81,12 +93,17 @@ impl HttpMcpClient {
         self.notifications.subscribe()
     }
 
-    /// The registry serializes each paginated refresh. Renewal is limited to
-    /// once for that whole fetch, and cannot enqueue another fetch itself.
-    pub(super) fn begin_catalog_refresh(&self) -> CatalogRefresh<'_> {
-        self.catalog_refresh_renewed.store(false, Ordering::Release);
+    /// Renewal is limited across all pages and automatic reconnect refreshes
+    /// of a failed episode. A real change or a successful fetch starts anew.
+    pub(super) fn begin_catalog_refresh(&self, new_change: bool) -> CatalogRefresh<'_> {
+        if new_change {
+            self.catalog_refresh_renewed.store(false, Ordering::Release);
+        }
         self.catalog_refresh_active.store(true, Ordering::Release);
-        CatalogRefresh(self)
+        CatalogRefresh {
+            client: self,
+            succeeded: false,
+        }
     }
 
     fn reserve_catalog_renewal(&self) -> Result<(), String> {
@@ -188,18 +205,12 @@ impl HttpMcpClient {
                                 .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
                         })
                 {
-                    let was_opened = opened;
                     opened = true;
                     renewed = false;
                     let connected_at = std::time::Instant::now();
-                    let coalesced = self.skip_reconnect_reconcile.swap(false, Ordering::AcqRel);
-                    // The initial GET still closes the discovery race. A stream
-                    // reopened because of renewal shares that renewal's refresh.
-                    if !was_opened || !coalesced {
-                        self.emit_notification(
-                            &json!({"method":"notifications/tools/list_changed"}),
-                        );
-                    }
+                    // Always close the missed-notification gap, but reopening
+                    // is not a new server change that resets expiry recovery.
+                    self.emit_notification(&json!({"method":NOTIFICATION_STREAM_OPENED}));
                     let mut stream = response.bytes_stream();
                     let mut decoder = SseDecoder::default();
                     loop {
@@ -305,9 +316,6 @@ impl HttpMcpClient {
                     session.id = id;
                     session.needs_initialization = false;
                     session.generation += 1;
-                    if renewing {
-                        self.skip_reconnect_reconcile.store(true, Ordering::Release);
-                    }
                     self.session_changed.send_replace(session.generation);
                     drop(session);
                     if renewing && notify_catalog {
@@ -1155,6 +1163,8 @@ mod live_tests {
             let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let initializes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let fail = Arc::new(AtomicBool::new(false));
+            let recovery = Arc::new(AtomicBool::new(false));
+            let recovering = recovery.clone();
             let (list_count, init_count, broken) =
                 (lists.clone(), initializes.clone(), fail.clone());
             let app = Router::new()
@@ -1167,6 +1177,7 @@ mod live_tests {
                         let lists = list_count.clone();
                         let initializes = init_count.clone();
                         let fail = broken.clone();
+                        let recovery = recovering.clone();
                         async move {
                             if request["method"] == "initialize" {
                                 assert!(headers.get("mcp-session-id").is_none());
@@ -1181,7 +1192,10 @@ mod live_tests {
                             if request["method"] == "tools/list" {
                                 lists.fetch_add(1, Ordering::SeqCst);
                                 if fail.load(Ordering::SeqCst) {
-                                    if paginated && headers.get("mcp-session-id").unwrap() != "0"
+                                    if recovery.load(Ordering::SeqCst) && headers.get("mcp-session-id").unwrap() != "1" {
+                                        return handle(State(state), Json(request)).await;
+                                    }
+                                    if !recovery.load(Ordering::SeqCst) && paginated && headers.get("mcp-session-id").unwrap() != "0"
                                         && request["params"]["cursor"].is_null()
                                     {
                                         return Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"tools":[],"nextCursor":"second"}})).into_response();
@@ -1220,24 +1234,149 @@ mod live_tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let count = lists.load(Ordering::SeqCst);
             let status = registry.plugin_status("plugin:demo:loop").await.unwrap();
+            let recovery_initializations = initializes.load(Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let settled = lists.load(Ordering::SeqCst);
+            // A genuine server change grants a new recovery episode. The
+            // current session expires once more, then the new catalog works.
+            recovery.store(true, Ordering::SeqCst);
+            fixture.ready.store(true, Ordering::SeqCst);
+            fixture.changes.send(()).unwrap();
+            let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+                while registry
+                    .list_tools_for_server("plugin:demo:loop")
+                    .await
+                    .len()
+                    != 2
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
             registry.shutdown_all().await;
             server.abort();
             assert!(
-                count <= before + if paginated { 3 } else { 2 },
+                count <= before + if paginated { 5 } else { 3 },
                 "renewal fed its own reconciliation: {} lists and {} initializations",
                 count,
                 initializes.load(Ordering::SeqCst)
             );
             assert_eq!(
-                initializes.load(Ordering::SeqCst),
-                2,
-                "more than one renewal in a paginated refresh"
+                recovery_initializations, 2,
+                "more than one renewal in an automatic recovery episode"
             );
+            assert_eq!(
+                count, settled,
+                "catalog recovery kept polling after its error"
+            );
+            assert!(recovered.is_ok(), "a real change did not restart recovery");
+            assert_eq!(initializes.load(Ordering::SeqCst), 3);
             assert!(
                 matches!(status.status,super::super::runtime::McpServerStatus::Errored{ref message} if message.contains("restart")),
                 "{status:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_http_renewed_silent_stream_reconciles_disconnected_changes() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let fixture = Fixture {
+            ready: Arc::new(AtomicBool::new(false)),
+            connected: Arc::new(AtomicBool::new(false)),
+            changes: broadcast::channel(8).0,
+        };
+        let initializes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let renewed_gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed_get = Arc::new(AtomicBool::new(false));
+        let reopen = Arc::new(tokio::sync::Notify::new());
+        let init_count = initializes.clone();
+        let (old_gets, new_gets, failed, permit) = (
+            first_gets.clone(),
+            renewed_gets.clone(),
+            failed_get.clone(),
+            reopen.clone(),
+        );
+        let app = Router::new().route("/mcp", post(move |State(state):State<Fixture>, headers:HeaderMap, Json(request):Json<Value>| {
+            let count=init_count.clone();
+            async move {
+                if request["method"]=="initialize" {
+                    let session=count.fetch_add(1,Ordering::SeqCst).to_string();
+                    let mut response=handle(State(state),Json(request)).await;
+                    response.headers_mut().insert("mcp-session-id",session.parse().unwrap());
+                    return response;
+                }
+                if request["method"]=="tools/list" && headers.get("mcp-session-id").unwrap()=="1" && !state.ready.load(Ordering::SeqCst) {
+                    return Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"tools":[{"name":"before","inputSchema":{"type":"object"}}]}})).into_response();
+                }
+                handle(State(state),Json(request)).await
+            }
+        }).get(move |State(state):State<Fixture>, headers:HeaderMap| {
+            let (old_gets,new_gets,failed,permit)=(old_gets.clone(),new_gets.clone(),failed.clone(),permit.clone());
+            async move {
+                if headers.get("mcp-session-id").unwrap()=="0" {
+                    return if old_gets.fetch_add(1,Ordering::SeqCst)==0 {
+                        ([("content-type","text/event-stream")],": first stream\n\n").into_response()
+                    } else {StatusCode::NOT_FOUND.into_response()};
+                }
+                if new_gets.fetch_add(1,Ordering::SeqCst)==0 {
+                    failed.store(true,Ordering::SeqCst);
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                permit.notified().await;
+                state.connected.store(true,Ordering::SeqCst);
+                // No notification is sent: the only discovery opportunity is
+                // reconciliation after this replacement stream opens.
+                Sse::new(futures_util::stream::pending::<Result<Event,std::convert::Infallible>>()).into_response()
+            }
+        })).with_state(fixture.clone());
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", socket.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(socket, app).await.unwrap();
+        });
+        let registry = McpRegistry::new();
+        registry.register_plugin_server::<tauri::Wry>(None,"demo","token".into(),serde_json::from_value(json!({"id":"gap","name":"Reconnect gap","toolPrefix":"gap","scope":"all","transport":"http","url":url})).unwrap()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !failed_get.load(Ordering::SeqCst)
+                || registry
+                    .list_tools_for_server("plugin:demo:gap")
+                    .await
+                    .len()
+                    != 1
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // The renewal-time catalog is already installed, and GET has failed.
+        // Add tools in that disconnected interval before opening a silent SSE.
+        fixture.ready.store(true, Ordering::SeqCst);
+        reopen.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            while registry
+                .list_tools_for_server("plugin:demo:gap")
+                .await
+                .len()
+                != 2
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let count = registry
+            .list_tools_for_server("plugin:demo:gap")
+            .await
+            .len();
+        registry.shutdown_all().await;
+        server.abort();
+        assert!(result.is_ok(),"silent renewed stream hid tools added after renewal fetch: {count} tools, {} initializations, {} renewed GETs, opened {}",initializes.load(Ordering::SeqCst),renewed_gets.load(Ordering::SeqCst),fixture.connected.load(Ordering::SeqCst));
+        assert_eq!(initializes.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1611,7 +1750,7 @@ mod live_tests {
         let mut notifications = client.notifications();
         tokio::select! {
             _ = client.listen_notifications() => panic!("notification listener ended"),
-            event = notifications.recv() => assert_eq!(event.unwrap().method, "notifications/tools/list_changed"),
+            event = notifications.recv() => assert_eq!(event.unwrap().method, NOTIFICATION_STREAM_OPENED),
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => panic!("GET did not reconcile"),
         }
 

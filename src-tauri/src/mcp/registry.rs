@@ -627,12 +627,20 @@ impl McpRegistry {
             let mut reconcile_now = child.is_some();
             loop {
                 let mut stream_error = None;
+                let mut new_catalog_change = true;
                 // Stdio needs an immediate race-closing fetch. HTTP reconciles
                 // only after a real GET stream opens or a session is renewed.
                 if !reconcile_now {
                     loop {
                         match notifications.recv().await {
                             Ok(n) if n.method == "notifications/tools/list_changed" => break,
+                            Ok(n)
+                                if remote.is_some()
+                                    && n.method == super::http_client::NOTIFICATION_STREAM_OPENED =>
+                            {
+                                new_catalog_change = false;
+                                break;
+                            }
                             Ok(n)
                                 if remote.is_some()
                                     && n.method == super::http_client::NOTIFICATION_STREAM_ERROR =>
@@ -660,8 +668,12 @@ impl McpRegistry {
                         .await
                         .map_err(|e| e.to_string())
                 } else if let Some(r) = remote.as_ref() {
-                    let _refresh = r.begin_catalog_refresh();
-                    super::runtime::list_http_tools(r, &config).await
+                    let mut refresh = r.begin_catalog_refresh(new_catalog_change);
+                    let result = super::runtime::list_http_tools(r, &config).await;
+                    if result.is_ok() {
+                        refresh.complete();
+                    }
+                    result
                 } else {
                     return;
                 };
