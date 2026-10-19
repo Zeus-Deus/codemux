@@ -8029,6 +8029,15 @@ struct ThreadSubagentState {
     /// entry alive until then,
     /// which is the price of the guarantee.
     stopped_monitors: std::collections::BTreeSet<String>,
+    /// Agent-class ids whose work may still run, kept across turn
+    /// boundaries. [`Self::begin_turn`] drops agent entries from
+    /// [`Self::tasks`] so a missed terminal snapshot can't suppress the
+    /// next `Review`, but a child that outlives its parent's turn keeps
+    /// working through the user's follow-up. Forks and provider switches
+    /// must not copy or stop the conversation under it, so this set only
+    /// shrinks on the id's terminal snapshot, a Stop, or teardown (see
+    /// [`SubagentTracker::delegated_work_live`]).
+    live_agents: std::collections::BTreeSet<String>,
 }
 
 impl ThreadSubagentState {
@@ -8056,7 +8065,7 @@ impl ThreadSubagentState {
     /// actually takes. The manual (`codemux monitor start`) half does not
     /// go through this tracker at all.
     fn is_clear(&self) -> bool {
-        self.tasks.is_empty() && self.stopped_monitors.is_empty()
+        self.tasks.is_empty() && self.stopped_monitors.is_empty() && self.live_agents.is_empty()
     }
 
     /// Whether any live task is real agent work, i.e. still blocking the
@@ -8100,9 +8109,15 @@ impl ThreadSubagentState {
             SnapshotClass::Unreported => self.tasks.get(id).copied().unwrap_or(TaskClass::Agent),
             SnapshotClass::Untracked => {
                 self.tasks.remove(id);
+                self.live_agents.remove(id);
                 return false;
             }
         };
+        if class == TaskClass::Agent {
+            self.live_agents.insert(id.to_string());
+        } else {
+            self.live_agents.remove(id);
+        }
         if class == TaskClass::Monitor && self.stopped_monitors.contains(id) {
             // The user stopped this watch loop; a surviving detached task's
             // later ticks must not resurrect the badge.
@@ -8119,6 +8134,7 @@ impl ThreadSubagentState {
     /// Drop `id` from tracking, whatever class it held.
     fn untrack(&mut self, id: &str) {
         self.tasks.remove(id);
+        self.live_agents.remove(id);
     }
 
     /// Start a new parent turn without forgetting confirmed live monitors.
@@ -8129,6 +8145,7 @@ impl ThreadSubagentState {
     /// not guarantee another progress snapshot merely because the user sent a
     /// follow-up. Retaining only monitor-class entries keeps the badge truthful
     /// without reviving the stale-agent bug this reset originally fixed.
+    /// [`Self::live_agents`] is kept: the work may outlive the turn.
     fn begin_turn(&mut self) {
         self.tasks.retain(|_, class| *class == TaskClass::Monitor);
         self.turn_settled = false;
@@ -8158,12 +8175,14 @@ impl ThreadSubagentState {
     /// blocklist is retained for the same reason.
     fn interrupted(&mut self) {
         self.tasks.retain(|_, class| *class == TaskClass::Monitor);
+        self.live_agents.clear();
         self.review_owed_since = None;
     }
 
     /// Forget everything (session close / error or explicit pane teardown).
     fn reset(&mut self) {
         self.tasks.clear();
+        self.live_agents.clear();
         self.turn_settled = false;
         self.forced_settled = false;
         self.review_owed_since = None;
@@ -8443,16 +8462,18 @@ impl SubagentTracker {
             .is_some_and(ThreadSubagentState::review_pending)
     }
 
-    /// Whether agent work the thread delegated may still be running.
-    /// Unlike [`Self::delegated_work_holding_turn`], neither the parent's
-    /// turn end nor the stall watchdog is consulted: a provider clears its
-    /// turn before that end reaches the app, and silence is not death,
-    /// while a fork or provider switch would copy or stop the conversation
-    /// under that work. A terminal snapshot, a Stop, the next turn or
-    /// session teardown ends it.
+    /// Whether agent work the thread delegated may still be running, for
+    /// forks and provider switches, which would copy or stop the
+    /// conversation under it. Unlike [`Self::delegated_work_holding_turn`]
+    /// it ignores the parent's turn end (a provider clears its turn before
+    /// that end reaches the app), the stall watchdog (silence is not death)
+    /// and the next turn (a child can outlive its parent's turn). Only the
+    /// work's terminal snapshot, a Stop, or teardown ends it.
     pub fn delegated_work_live(&self, thread_id: &str) -> bool {
         let threads = self.threads.lock().expect("subagent tracker poisoned");
-        threads.get(thread_id).is_some_and(ThreadSubagentState::has_agents)
+        threads
+            .get(thread_id)
+            .is_some_and(|state| !state.live_agents.is_empty())
     }
 
     /// Drop `thread_id`'s watch-loop tasks and report the status the pane
@@ -13605,6 +13626,10 @@ mod tests {
             Some(PaneStatus::Review),
             "turn 2 settles through the ordinary path"
         );
+        // s1 never ended, so forks and switches still wait for it, until
+        // its late terminal snapshot drops the entry.
+        assert!(tracker.delegated_work_live("t"));
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Completed), settled_at);
         assert_eq!(tracker.tracked_thread_count(), 0);
     }
 
@@ -13710,9 +13735,10 @@ mod tests {
             Some(PaneStatus::Working)
         );
         assert!(
-            st.is_clear(),
+            st.tasks.is_empty() && !st.review_pending(),
             "new turn resets both running and review_pending"
         );
+        assert!(st.live_agents.contains("bg"), "forks and switches still wait for it");
 
         // Turn 2 finishes with nothing tracked → Review fires normally.
         assert_eq!(
@@ -13830,9 +13856,9 @@ mod tests {
         let mut st = ThreadSubagentState::default();
         map_event_to_pane_status(&subagent_event("bg", SubagentStatus::Running), &mut st);
         map_event_to_pane_status(&turn_completed(), &mut st);
-        // New turn resets tracking.
+        // New turn resets tracking; only the fork/switch hold remains.
         map_event_to_pane_status(&session_running(), &mut st);
-        assert!(st.is_clear());
+        assert!(st.tasks.is_empty() && st.live_agents.contains("bg"));
 
         // The old subagent's terminal snapshot finally arrives — no-op.
         assert_eq!(

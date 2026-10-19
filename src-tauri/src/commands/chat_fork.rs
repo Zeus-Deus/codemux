@@ -643,6 +643,41 @@ mod tests {
         assert_eq!(stops(&provider), 0);
     }
 
+    /// A child outlives its parent's turn: the user's follow-up runs and
+    /// ends while it keeps working, so forks and switches still wait for
+    /// it. A Stop releases them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subagent_still_blocks_fork_and_switch_after_a_follow_up_turn() {
+        const THREAD: &str = "follow-up-parent";
+        let (app, provider, root) = parent_waiting_on_subagent(THREAD).await;
+        let thread_id = ThreadId(THREAD.into());
+        let follow_up = TurnId("follow-up".into());
+        forward_event(app.handle(), ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: thread_id.clone(),
+            status: crate::agent_provider::SessionStatus::Running { active_turn: follow_up.clone() },
+        });
+        forward_event(app.handle(), ProviderRuntimeEvent::TurnCompleted {
+            thread_id,
+            turn_id: follow_up,
+            status: TurnStatus::Success,
+            usage: None,
+        });
+        let refused = agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await;
+        assert_eq!(refused.unwrap_err(), "Wait for the chat's subagents to finish, then fork the chat.");
+        let switched = super::super::provider_switch::agent_chat_switch_provider(
+            app.handle().clone(),
+            "pane".into(),
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            start_input(THREAD, root.path()),
+            None,
+        );
+        assert!(switched.await.unwrap_err().starts_with("provider_switch_refused: Wait for the chat's subagents"));
+        assert_eq!(stops(&provider), 0);
+        app.state::<SubagentTracker>().settle_interrupted_turn(THREAD);
+        agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await.unwrap();
+    }
+
     /// The stall watchdog settles the pane of a subagent silent for ten
     /// minutes, but can't tell it's dead: forks and switches keep waiting.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
