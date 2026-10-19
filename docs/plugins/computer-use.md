@@ -48,6 +48,12 @@ Missing or refused capture shows a no-image state.
 - macOS and Windows have not been tested with this plugin. Only direct mode is
   supported. Permission setups that require a daemon identity, and Windows
   SSH/autostart daemon workflows, are not supported by this integration.
+- The Windows 0.21.0 [installer](https://github.com/trycua/cua/blob/70db98d1bcd92890d778f4978e0eb107a4b66c1b/libs/cua-driver/scripts/install.ps1#L112)
+  exposes `cua-driver.exe` through directory junctions under
+  `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin`. Both x64 and ARM64
+  [release archives](https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.21.0)
+  were checksum-checked and contain native PE executables. They require no
+  `.cmd` or `.bat` launcher.
 - cua-driver's optional perception components are not bundled or enabled.
 
 On Linux, an isolated X11 test through the real plugin MCP registry interrupted
