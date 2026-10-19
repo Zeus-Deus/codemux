@@ -50,7 +50,13 @@ Missing or refused capture shows a no-image state.
   SSH/autostart daemon workflows, are not supported by this integration.
 - cua-driver's optional perception components are not bundled or enabled.
 
-The direct child stopped typing when terminated in the isolated driver probe,
+On Linux, an isolated X11 test through the real plugin MCP registry interrupted
+a long typing call with immediate Stop. The child and its stdio wrapper had
+exited when Stop returned, the input count stayed unchanged for another second,
+the in-flight call failed, and a subsequent call was denied. No keys or buttons
+remained held in that test.
+
+The direct child also stopped typing when terminated in the isolated driver probe,
 but terminating a held drag left the button down. A fresh process could not
 release that runtime's held state. That is why hold/drag tools and modifier
 chords remain unavailable. The daemon probe also showed input continuing after

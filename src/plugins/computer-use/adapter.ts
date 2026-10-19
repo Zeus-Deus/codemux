@@ -33,7 +33,7 @@ export interface ProcessOptions {
   command: string;
   args?: string[];
   cwd?: string;
-  env?: Record<string, string>;
+  env?: Record<string, string | null>;
   timeoutMs?: number;
   maxOutputBytes?: number;
   workspaceId?: string;
@@ -101,17 +101,15 @@ export function peekAdapter(ctx: PluginContext): PeekAdapter | null {
   };
 }
 
-// Keep the pending desktop/file and plugin-only MCP APIs at one checked boundary.
+// Keep the pending desktop/file APIs at one checked boundary.
 export function desktopAdapter(ctx: PluginContext): DesktopAdapter | null {
   const value: unknown = ctx;
   if (!record(value) || !record(value.host)) return null;
   const process = value.host.process;
   const fs = value.host.fs;
-  const register = value.registerMcpServer;
   if (
     !record(process) || typeof process.which !== "function" || typeof process.run !== "function" ||
-    !record(fs) || typeof fs.writeDataFile !== "function" || typeof fs.removeDataFile !== "function" ||
-    typeof register !== "function"
+    !record(fs) || typeof fs.writeDataFile !== "function" || typeof fs.removeDataFile !== "function"
   ) return null;
   const which = process.which.bind(process);
   const run = process.run.bind(process);
@@ -143,8 +141,7 @@ export function desktopAdapter(ctx: PluginContext): DesktopAdapter | null {
     },
     async removeDataFile(name) { await remove(name); },
     async register(options) {
-      const dispose: unknown = await register.call(ctx, options);
-      if (typeof dispose !== "function") throw new Error("The driver registration returned no Stop control.");
+      const dispose = await ctx.registerMcpServer(options);
       let stopping: Promise<void> | undefined;
       return {
         call: (tool, args) => ctx.host.mcp.callTool(options.id, tool, args),
@@ -152,13 +149,7 @@ export function desktopAdapter(ctx: PluginContext): DesktopAdapter | null {
         onStatus: (fn) => ctx.host.mcp.onStatus(options.id, fn),
         onActivity: (fn) => ctx.host.mcp.onActivity(options.id, fn),
         stop() {
-          stopping ??= (async () => {
-            const receipt: unknown = dispose();
-            if (!record(receipt) || typeof receipt.then !== "function") {
-              throw new Error("This build cannot confirm that computer input has stopped.");
-            }
-            await receipt;
-          })();
+          stopping ??= dispose();
           return stopping;
         },
       };
