@@ -109,6 +109,8 @@ export async function queryPermissionSettings(
   return query.getSettings();
 }
 export interface PluginBridgeGuard {
+  /** Includes native calls through the shared server, not only bridge calls. */
+  beginCall: () => () => void;
   authorizeCall: (args: unknown, extra: unknown) => Promise<void>;
   filterList: (result: unknown) => Promise<unknown>;
 }
@@ -137,9 +139,28 @@ export function createPluginPermissions(input: {
   extraArgs?: Record<string, string | null>;
   canUseTool: CanUseTool;
   canUseTarget: CanUseTool;
+  onIdle?: () => void;
 }) {
   let logged = false;
   let generation = 0;
+  let active = 0;
+  const changed = () => queueMicrotask(() => input.onIdle?.());
+  const beginCall = () => {
+    const started = generation;
+    active++;
+    let ended = false;
+    return () => {
+      if (ended) return;
+      ended = true;
+      // The SDK forwards a handler's result in promise continuations. Keep
+      // the server busy through those continuations so a control RPC cannot
+      // remove it ahead of its response (covered against the installed SDK).
+      setTimeout(() => {
+        if (generation === started) active--;
+        changed();
+      }, 0);
+    };
+  };
   const sessionRules: Rules = { allow: [], deny: [], ask: [] };
   // The real CLI forwards this call ID in MCP's claudecode/toolUseId meta.
   // No ticket or arguments are added to the model-facing tool schema.
@@ -152,8 +173,27 @@ export function createPluginPermissions(input: {
       mode: string | undefined;
       expires: number;
       promptPending: boolean;
+      timer?: ReturnType<typeof setTimeout>;
+      removeAbortListener?: () => void;
     }
   >();
+  const cancelCall = (id: string) => {
+    const ticket = tickets.get(id);
+    if (!ticket) return;
+    clearTimeout(ticket.timer);
+    ticket.removeAbortListener?.();
+    tickets.delete(id);
+    changed();
+  };
+  const armExpiry = (id: string) => {
+    const ticket = tickets.get(id);
+    if (!ticket) return;
+    clearTimeout(ticket.timer);
+    ticket.timer = setTimeout(() => {
+      if (tickets.get(id) === ticket && !ticket.promptPending) changed();
+    }, 10 * 60_000);
+    ticket.timer.unref();
+  };
   const issue = (
     id: string,
     call: unknown,
@@ -161,14 +201,16 @@ export function createPluginPermissions(input: {
     mode: string | undefined,
   ) => {
     for (const [id, ticket] of tickets)
-      if (!ticket.promptPending && ticket.expires < Date.now()) tickets.delete(id);
+      if (!ticket.promptPending && ticket.expires < Date.now()) cancelCall(id);
     if (tickets.size >= 128) {
-      const evictable = [...tickets].find(([, ticket]) => !ticket.promptPending);
+      const evictable = [...tickets].find(
+        ([, ticket]) => !ticket.promptPending,
+      );
       if (!evictable)
         throw new PluginPermissionError(
           "Too many plugin tool approvals are pending; finish one and try again.",
         );
-      tickets.delete(evictable[0]);
+      cancelCall(evictable[0]);
     }
     tickets.set(id, {
       hash: fingerprint(call),
@@ -178,6 +220,7 @@ export function createPluginPermissions(input: {
       expires: Date.now() + 10 * 60_000,
       promptPending: false,
     });
+    armExpiry(id);
   };
   const ticketFor = (id: string, call: unknown) => {
     const ticket = tickets.get(id);
@@ -283,7 +326,7 @@ export function createPluginPermissions(input: {
       reason: `Permission required for ${call.name}.`,
     };
   };
-  const hook: HookCallback = async (event, _toolUseId, _options) => {
+  const checkHook: HookCallback = async (event, _toolUseId, options) => {
     if (event.hook_event_name !== "PreToolUse" || event.tool_name !== BRIDGE)
       return {};
     const call = target(event.tool_input);
@@ -291,7 +334,7 @@ export function createPluginPermissions(input: {
     let decision: Behavior = "deny";
     let reason =
       "Invalid plugin bridge target or arguments; list plugin tools again.";
-    tickets.delete(event.tool_use_id);
+    cancelCall(event.tool_use_id);
     try {
       if (call) {
         const mode = event.permission_mode ?? input.getMode();
@@ -299,7 +342,11 @@ export function createPluginPermissions(input: {
         decision = outcome.decision;
         reason = outcome.reason;
         if (decision !== "deny") {
-          if (!event.tool_use_id || generation !== started)
+          if (
+            !event.tool_use_id ||
+            generation !== started ||
+            options.signal.aborted
+          )
             throw new PluginPermissionError(NO_CHECK);
           issue(event.tool_use_id, call, decision === "allow", mode);
         }
@@ -316,7 +363,7 @@ export function createPluginPermissions(input: {
       },
     };
   };
-  const canUseTool: CanUseTool = async (name, args, options) => {
+  const checkCanUseTool: CanUseTool = async (name, args, options) => {
     if (name !== BRIDGE) {
       const started = generation;
       const result = await input.canUseTool(name, args, options);
@@ -337,7 +384,7 @@ export function createPluginPermissions(input: {
         tickets.get(options.toolUseID)?.mode,
       );
       if (outcome.decision === "deny") {
-        tickets.delete(options.toolUseID);
+        cancelCall(options.toolUseID);
         return { behavior: "deny", message: outcome.reason };
       }
       const ticket = ticketFor(options.toolUseID, call);
@@ -365,7 +412,7 @@ export function createPluginPermissions(input: {
         ],
       });
       if (result.behavior !== "allow") {
-        tickets.delete(options.toolUseID);
+        cancelCall(options.toolUseID);
         return result;
       }
       // Stop/rebuild invalidates an outstanding approval's old ticket too.
@@ -380,6 +427,7 @@ export function createPluginPermissions(input: {
       ticket.approved = true;
       ticket.promptPending = false;
       ticket.expires = Date.now() + 10 * 60_000;
+      armExpiry(options.toolUseID);
       const updates = result.updatedPermissions?.map((update) =>
         "rules" in update
           ? {
@@ -398,7 +446,7 @@ export function createPluginPermissions(input: {
         ...(updates === undefined ? {} : { updatedPermissions: updates }),
       };
     } catch (error) {
-      tickets.delete(options.toolUseID);
+      cancelCall(options.toolUseID);
       return {
         behavior: "deny",
         message: error instanceof Error ? error.message : String(error),
@@ -418,7 +466,7 @@ export function createPluginPermissions(input: {
       throw new PluginPermissionError(NO_CHECK);
     const started = generation;
     const ticket = ticketFor(id, call);
-    tickets.delete(id); // A ticket is consumed once, even on a failed dispatch.
+    cancelCall(id); // A ticket is consumed once, even on a failed dispatch.
     if (!ticket.ready) throw new PluginPermissionError(NO_CHECK);
     const outcome = await evaluate(call, ticket.mode);
     if (generation !== started) throw new PluginPermissionError(NO_CHECK);
@@ -455,7 +503,8 @@ export function createPluginPermissions(input: {
   };
   const clearTickets = () => {
     generation++;
-    tickets.clear();
+    active = 0;
+    for (const id of tickets.keys()) cancelCall(id);
   };
   // Session rules belong to one CLI process, just like native grants.
   const resetSessionRules = () => {
@@ -464,7 +513,41 @@ export function createPluginPermissions(input: {
     sessionRules.ask = [];
     clearTickets();
   };
+  const hook: HookCallback = async (...args) => {
+    const done = beginCall();
+    const [event, , options] = args;
+    const id =
+      event.hook_event_name === "PreToolUse" ? event.tool_use_id : undefined;
+    const abort = () => {
+      if (id) cancelCall(id);
+    };
+    if (id) options.signal.addEventListener("abort", abort, { once: true });
+    try {
+      return await checkHook(...args);
+    } finally {
+      const remove = () => options.signal.removeEventListener("abort", abort);
+      const ticket = id ? tickets.get(id) : undefined;
+      if (ticket) ticket.removeAbortListener = remove;
+      else remove();
+      done();
+    }
+  };
+  const canUseTool: CanUseTool = async (...args) => {
+    const done = beginCall();
+    try {
+      return await checkCanUseTool(...args);
+    } finally {
+      done();
+    }
+  };
   return {
+    beginCall,
+    isBusy: () =>
+      active > 0 ||
+      [...tickets.values()].some(
+        (ticket) => ticket.promptPending || ticket.expires >= Date.now(),
+      ),
+    cancelCall,
     hook,
     canUseTool,
     authorizeCall,

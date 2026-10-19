@@ -15,6 +15,9 @@ import {
   setQueryFactoryForTests,
   type SessionStartInput,
 } from "../src/session.ts";
+import { callSdk } from "./sdk-mcp-client.ts";
+import { setMcpBridgeWriter } from "../src/mcp-bridge.ts";
+import { dispatchResponse, _resetUpstreamRpcForTests } from "../src/upstream-rpc.ts";
 import { asQuery, FakeQuery } from "./fake-query.ts";
 import { buildMethods, _resetSessionsForTests } from "../src/methods/index.ts";
 
@@ -1634,4 +1637,239 @@ test("MCP round 3: query rebuild forgets CLI session-only target permissions", a
     hookSpecificOutput: { permissionDecision: "ask" },
   });
   await session.close();
+});
+
+test("background bridge approval survives the parent result and defers the catalog swap", async () => {
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(
+    minimalInput({
+      mcpTools: [
+        {
+          name: "codemux_call_plugin_tool",
+          prefixedName: "codemux_call_plugin_tool",
+          description: "call",
+          serverId: "codemux-plugin-bridge",
+          inputSchema: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              arguments: { type: "object" },
+            },
+            required: ["name"],
+          },
+        },
+      ],
+    }),
+    emit,
+  );
+  const query = fake;
+  const options = query.capturedOptions!;
+  const hook = options.hooks!.PreToolUse![0]!.hooks[0]!;
+  const bridge = "mcp__codemux__codemux_call_plugin_tool";
+  const args = { name: "fixture__x", arguments: { value: 7 } };
+  const signal = new AbortController().signal;
+  // FakeQuery exposes the same undocumented contract pinned against the SDK.
+  Object.assign(query, {
+    getSettings: async () => ({ effective: { permissions: {} } }),
+  });
+  await session.sendTurn({ text: "start background work" });
+  await hook(
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: bridge,
+      tool_input: args,
+      tool_use_id: "background-call",
+      session_id: "s",
+      transcript_path: "/fixture",
+      cwd: "/fixture",
+    },
+    "background-call",
+    { signal },
+  );
+  const approval = options.canUseTool!(bridge, args, {
+    signal,
+    toolUseID: "background-call",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await session.updateMcpTools([]);
+  query.emit(mkSuccessResult());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const swapsBeforeApproval = [...query.setMcpServersCalls];
+  const request = events.find((event) => event.method === "request-opened")!
+    .params as { requestId: string };
+  session.respondToRequest(request.requestId, { behavior: "allow" });
+  const decision = await approval;
+  try {
+    expect(decision.behavior).toBe("allow");
+    expect(swapsBeforeApproval).toEqual([]);
+    // Approval does not create a gap where a replacement can retire the server
+    // before the SDK dispatches the approved background call.
+    expect(query.setMcpServersCalls).toEqual([]);
+    const server = options.mcpServers!.codemux!;
+    if (!("instance" in server)) throw new Error("expected an SDK MCP server");
+    let complete!: () => void;
+    let dispatched!: () => void;
+    const started = new Promise<void>((resolve) => {
+      dispatched = resolve;
+    });
+    setMcpBridgeWriter((line) => {
+      const request = JSON.parse(line);
+      complete = () =>
+        dispatchResponse({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { content: [{ type: "text", text: "BACKGROUND-COMPLETED" }] },
+        });
+      dispatched();
+    });
+    const call = callSdk(
+      server,
+      "codemux_call_plugin_tool",
+      args,
+      "background-call",
+      () => {
+        expect(query.setMcpServersCalls).toEqual([]);
+      },
+    );
+    await started;
+    expect(query.setMcpServersCalls).toEqual([]);
+    complete();
+    expect(await call).toMatchObject({
+      result: { content: [{ text: "BACKGROUND-COMPLETED" }] },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(query.setMcpServersCalls).toEqual([[], []]);
+  } finally {
+    _resetUpstreamRpcForTests();
+    await session.close();
+  }
+});
+
+test("background task lifetime and a slow permission hook both defer native refresh", async () => {
+  const session = new ClaudeSession(
+    minimalInput({ permissionMode: "bypassPermissions" }),
+    recordingEmitter().emit,
+  );
+  const query = fake;
+  const options = query.capturedOptions!;
+  let settings!: (value: unknown) => void;
+  Object.assign(query, {
+    getSettings: () =>
+      new Promise((resolve) => {
+        settings = resolve;
+      }),
+  });
+  await session.sendTurn({ text: "start background task" });
+  const hook = options.hooks!.PreToolUse![0]!.hooks[0]!;
+  const checking = hook(
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "mcp__codemux__codemux_call_plugin_tool",
+      tool_input: { name: "fixture__x" },
+      tool_use_id: "checking",
+      session_id: "s",
+      transcript_path: "/fixture",
+      cwd: "/fixture",
+    },
+    "checking",
+    { signal: new AbortController().signal },
+  );
+  await session.updateMcpTools([]);
+  query.emit(mkSuccessResult());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(query.setMcpServersCalls).toEqual([]);
+  settings({ effective: { permissions: {} } });
+  expect(await checking).toMatchObject({
+    hookSpecificOutput: { permissionDecision: "allow" },
+  });
+  query.emit({
+    type: "system",
+    subtype: "task_started",
+    task_id: "background",
+    task_type: "local_agent",
+  } as SDKMessage);
+  // A tool error/cancellation clears this call's ticket, not other tasks'.
+  query.emit({
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "checking",
+          content: "cancelled",
+          is_error: true,
+        },
+      ],
+    },
+  } as SDKMessage);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(query.setMcpServersCalls).toEqual([]);
+  query.emit({
+    type: "system",
+    subtype: "task_notification",
+    task_id: "background",
+    status: "completed",
+  } as SDKMessage);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(query.setMcpServersCalls).toEqual([[], []]);
+  await session.close();
+});
+
+test("a background native MCP result is delivered before its server can be replaced", async () => {
+  const tool = {
+    name: "echo",
+    prefixedName: "fixture__echo",
+    serverId: "fixture",
+    description: "echo",
+    inputSchema: { type: "object" },
+  };
+  const session = new ClaudeSession(
+    minimalInput({ mcpTools: [tool] }),
+    recordingEmitter().emit,
+  );
+  const query = fake;
+  const server = query.capturedOptions!.mcpServers!.codemux!;
+  if (!("instance" in server)) throw new Error("expected SDK MCP server");
+  let finish!: () => void;
+  let dispatched!: () => void;
+  const started = new Promise<void>((resolve) => {
+    dispatched = resolve;
+  });
+  setMcpBridgeWriter((line) => {
+    const request = JSON.parse(line);
+    finish = () =>
+      dispatchResponse({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { content: [{ type: "text", text: "NATIVE-COMPLETED" }] },
+      });
+    dispatched();
+  });
+  await session.sendTurn({ text: "background native tool" });
+  const call = callSdk(
+    server,
+    tool.prefixedName,
+    {},
+    "native-background",
+    () => {
+      expect(query.setMcpServersCalls).toEqual([]);
+    },
+  );
+  try {
+    await started;
+    await session.updateMcpTools([]);
+    query.emit(mkSuccessResult());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(query.setMcpServersCalls).toEqual([]);
+    finish();
+    expect(await call).toMatchObject({
+      result: { content: [{ text: "NATIVE-COMPLETED" }] },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(query.setMcpServersCalls).toEqual([[], []]);
+  } finally {
+    _resetUpstreamRpcForTests();
+    await session.close();
+  }
 });

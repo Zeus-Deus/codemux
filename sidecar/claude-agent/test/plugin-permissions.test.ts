@@ -439,3 +439,37 @@ test("pinned SDK 0.2.114 getSettings control contract (review this test on SDK b
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a cancelled permission hook cannot leave a ticket or block catalog refresh", async () => {
+  let settings!: (value: unknown) => void;
+  const gate = createPluginPermissions({
+    threadId: "cancelled-hook",
+    getQuery: () => ({
+      getSettings: () =>
+        new Promise((resolve) => {
+          settings = resolve;
+        }),
+    }),
+    getMode: () => "bypassPermissions",
+    canUseTool: async () => ({ behavior: "allow" }),
+    canUseTarget: async () => ({ behavior: "allow" }),
+  });
+  const controller = new AbortController();
+  const check = gate.hook(hookInput("x"), "call", {
+    signal: controller.signal,
+  });
+  expect(gate.isBusy()).toBe(true);
+  controller.abort();
+  settings({ effective: { permissions: {} } });
+  expect(await check).toMatchObject({
+    hookSpecificOutput: { permissionDecision: "deny" },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(gate.isBusy()).toBe(false);
+  await expect(
+    gate.authorizeCall(
+      { name: "fixture__x", arguments: { value: 7 } },
+      { _meta: { "claudecode/toolUseId": "call" } },
+    ),
+  ).rejects.toThrow("permission check");
+});

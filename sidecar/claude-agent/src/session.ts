@@ -445,6 +445,7 @@ export class ClaudeSession {
    *  Stop must not reach the turn the CLI runs next. */
   private acceptsSteers = false;
   private mcpTurnActive = false;
+  private readonly backgroundTasks = new Set<string>();
   private pendingMcpTools: RegisteredMcpTool[] | null = null;
   private mcpRefreshTask: Promise<void> | null = null;
 
@@ -504,6 +505,9 @@ export class ClaudeSession {
       extraArgs: input.extraArgs ?? {},
       canUseTool: normalCanUseTool,
       canUseTarget: bridgeCanUseTool,
+      onIdle: () => {
+        void this.flushMcpTools();
+      },
     });
     this.canUseTool = permissions.canUseTool;
     this.pluginPermissionHook = permissions.hook;
@@ -562,12 +566,29 @@ export class ClaudeSession {
           this.recoverFromStaleResume();
           break;
         }
-        const parentToolUseId = "parent_tool_use_id" in message ? message.parent_tool_use_id : null;
+        const parentToolUseId =
+          "parent_tool_use_id" in message ? message.parent_tool_use_id : null;
         // A steer may already be running as a separate CLI turn when the
         // previous result arrives. Subagent results are not turn boundaries.
-        if ((message.type === "assistant" || message.type === "stream_event") && !parentToolUseId) {
+        if (
+          (message.type === "assistant" || message.type === "stream_event") &&
+          !parentToolUseId
+        ) {
           this.mcpTurnActive = true;
         }
+        if (message.type === "system" && message.subtype === "task_started")
+          this.backgroundTasks.add(message.task_id);
+        if (
+          message.type === "system" &&
+          message.subtype === "task_notification"
+        ) {
+          this.backgroundTasks.delete(message.task_id);
+          void this.flushMcpTools();
+        }
+        if (message.type === "user" && Array.isArray(message.message?.content))
+          for (const block of message.message.content)
+            if (block.type === "tool_result")
+              this.pluginBridgeGuard.cancelCall(block.tool_use_id);
         this.observeSdkSessionId(message);
         this.settleSteers(message);
         this.emitter.notification("sdk-message", {
@@ -575,9 +596,13 @@ export class ClaudeSession {
           message,
         });
         this.emitSpecialCases(message);
-        if (message.type === "result" && !parentToolUseId && this.pendingSteers.size === 0 && this.promptQueue.isEmpty()) {
+        if (
+          message.type === "result" &&
+          !parentToolUseId &&
+          this.pendingSteers.size === 0 &&
+          this.promptQueue.isEmpty()
+        ) {
           this.mcpTurnActive = false;
-          this.pluginBridgeGuard.clearTickets();
           // Deliver the result before starting control RPCs. A stalled
           // refresh must not stall the message iterator or the visible turn.
           void this.flushMcpTools();
@@ -1022,6 +1047,7 @@ export class ClaudeSession {
 
     this.queryDead = false;
     this.mcpTurnActive = false;
+    this.backgroundTasks.clear();
     // The replacement starts with the latest snapshot, so no control swap
     // is needed before its first prompt initializes the CLI.
     this.pendingMcpTools = null;
@@ -1080,11 +1106,34 @@ export class ClaudeSession {
     if (!this.mcpTurnActive) await this.flushMcpTools();
   }
 
+  private mcpBackgroundBusy(): boolean {
+    return (
+      this.backgroundTasks.size > 0 ||
+      this.pendingApprovals.size > 0 ||
+      this.pluginBridgeGuard.isBusy()
+    );
+  }
+
   private async flushMcpTools(): Promise<void> {
     if (this.mcpRefreshTask) return this.mcpRefreshTask;
-    if (this.closed || this.queryDead || this.mcpTurnActive || !this.pendingMcpTools) return;
+    if (
+      this.closed ||
+      this.queryDead ||
+      this.interrupting ||
+      this.mcpTurnActive ||
+      this.mcpBackgroundBusy() ||
+      !this.pendingMcpTools
+    )
+      return;
     this.mcpRefreshTask = (async () => {
-      while (this.pendingMcpTools && !this.closed && !this.queryDead && !this.mcpTurnActive) {
+      while (
+        this.pendingMcpTools &&
+        !this.closed &&
+        !this.queryDead &&
+        !this.interrupting &&
+        !this.mcpTurnActive &&
+        !this.mcpBackgroundBusy()
+      ) {
         const tools = this.pendingMcpTools;
         this.pendingMcpTools = null;
         const query = this.query;
@@ -1137,7 +1186,9 @@ export class ClaudeSession {
             if (timer !== undefined) clearTimeout(timer);
           }
           if (Object.keys(result.errors ?? {}).length > 0) {
-            throw new Error(`MCP refresh failed: ${JSON.stringify(result.errors)}`);
+            throw new Error(
+              `MCP refresh failed: ${JSON.stringify(result.errors)}`,
+            );
           }
         } catch (err) {
           // A Stop may already have rebuilt with a newer snapshot.
@@ -1151,7 +1202,11 @@ export class ClaudeSession {
         }
       }
     })();
-    try { await this.mcpRefreshTask; } finally { this.mcpRefreshTask = null; }
+    try {
+      await this.mcpRefreshTask;
+    } finally {
+      this.mcpRefreshTask = null;
+    }
   }
 
   /** Swap the session's default model. `undefined` reverts to the

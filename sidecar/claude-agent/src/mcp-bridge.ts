@@ -112,6 +112,7 @@ function toolToSdkDefinition(
     args: Record<string, unknown>,
     extra: unknown,
   ): Promise<unknown> => {
+    const done = guard?.beginCall();
     try {
       if (tool.prefixedName === "codemux_call_plugin_tool") {
         if (!guard)
@@ -149,6 +150,8 @@ function toolToSdkDefinition(
         ],
         isError: true,
       };
+    } finally {
+      done?.();
     }
   }) as unknown as SdkMcpToolDefinition["handler"];
   return {

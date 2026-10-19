@@ -32,52 +32,7 @@ import {
 import { z } from "zod";
 import { createPluginPermissions } from "../src/plugin-permissions.ts";
 
-async function callSdk(
-  server: ReturnType<typeof buildCodemuxMcpServer>,
-  name: string,
-  args: Record<string, unknown>,
-  toolUseId = "call",
-) {
-  let finish!: (value: unknown) => void;
-  const result = new Promise<unknown>((resolve) => {
-    finish = resolve;
-  });
-  const transport: Parameters<typeof server.instance.connect>[0] = {
-    start: async () => {},
-    close: async () => {},
-    send: async (message) => {
-      if ("id" in message && message.id === 2) finish(message);
-    },
-  };
-  await server.instance.connect(transport);
-  transport.onmessage!({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "initialize",
-    params: {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: { name: "test", version: "1" },
-    },
-  });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  transport.onmessage!({ jsonrpc: "2.0", method: "notifications/initialized" });
-  transport.onmessage!({
-    jsonrpc: "2.0",
-    id: 2,
-    method: "tools/call",
-    params: {
-      name,
-      arguments: args,
-      _meta: { "claudecode/toolUseId": toolUseId },
-    },
-  });
-  try {
-    return await result;
-  } finally {
-    await server.instance.close();
-  }
-}
+import { callSdk } from "./sdk-mcp-client.ts";
 const bridgeTool: RegisteredMcpTool = {
   name: "codemux_call_plugin_tool",
   prefixedName: "codemux_call_plugin_tool",
