@@ -95,6 +95,11 @@ pub struct OpenCodeAgentProvider {
     /// re-broadcast — which is why this in-memory map is sufficient and
     /// no durable per-message baseline is needed.
     usage_states: Arc<RwLock<HashMap<String, Arc<Mutex<OpenCodeUsageState>>>>>,
+    /// Primary agent chosen per thread by `set_permission_mode`. Kept here,
+    /// not only on the session, so a session rebuilt after its listener died
+    /// stays in Plan mode. An explicit stop (restart, provider switch)
+    /// forgets it, as the frontend drops the pill then too.
+    agents: RwLock<HashMap<ThreadId, &'static str>>,
 }
 
 impl OpenCodeAgentProvider {
@@ -108,6 +113,7 @@ impl OpenCodeAgentProvider {
             event_tx,
             mcp_registry: config.mcp_registry,
             usage_states: Arc::new(RwLock::new(HashMap::new())),
+            agents: RwLock::new(HashMap::new()),
         }
     }
 
@@ -160,9 +166,9 @@ impl AgentProvider for OpenCodeAgentProvider {
             // `prompt_async` call, so the model swap is effectively
             // zero-cost.
             supports_mid_session_model_change: true,
-            // No first-class permission-mode RPC today; the provider
-            // ignores `set_permission_mode` calls.
-            supports_mid_session_permission_change: false,
+            // `set_permission_mode` switches the session between OpenCode's
+            // `plan` and `build` agents.
+            supports_mid_session_permission_change: true,
             // `permission.asked` events do block the turn waiting for
             // the user — a `POST /permissions/{id}` resumes it.
             supports_synchronous_tool_approval: true,
@@ -270,6 +276,12 @@ impl AgentProvider for OpenCodeAgentProvider {
             Some(input.cwd.clone()),
         )
         .await?;
+        // Seed before registering: no turn can reach the session until then.
+        // The launch permission mode is not consulted: it is the thread's
+        // durable mode, and the Plan pill is deliberately never durable.
+        if let Some(agent) = self.agents.read().await.get(&thread_id).copied() {
+            *session.agent.lock().await = Some(agent);
+        }
         let provider_session_id = session.provider_session_id.clone();
         // Register under the id the session actually adopted — which is the
         // resumed id when readoption succeeded, and a fresh one when it
@@ -414,22 +426,35 @@ impl AgentProvider for OpenCodeAgentProvider {
 
     async fn set_permission_mode(
         &self,
-        _thread_id: ThreadId,
-        _mode: String,
+        thread_id: ThreadId,
+        mode: String,
     ) -> Result<(), ProviderError> {
-        // OpenCode has per-session permission rules baked in at
-        // session-create time — there is no live "swap mode" RPC.
-        // Surface ValidationError so the UI knows not to render the
-        // control rather than silently swallowing the call.
-        Err(ProviderError::ValidationError {
-            message: "OpenCode does not support runtime permission-mode changes".into(),
-        })
+        // Plan mode is OpenCode's read-only `plan` agent. OpenCode has no
+        // other chat permission modes, so any other value (the Plan pill
+        // restores the thread's prior mode, often another provider's token)
+        // means its default `build` agent.
+        if self.managed_sessions.read().await.contains_key(&thread_id) {
+            return Err(ProviderError::ValidationError {
+                message: "OpenCode workflow sessions keep their configured agent".into(),
+            });
+        }
+        let agent = if mode == "plan" { "plan" } else { "build" };
+        let session = self.lookup(&thread_id).await;
+        if let Ok(session) = &session {
+            session.select_agent(agent).await?;
+        }
+        // A cold thread still records it for the session it starts next.
+        self.agents.write().await.insert(thread_id, agent);
+        session.map(|_| ())
     }
 
     async fn stop_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
         if self.managed_sessions.read().await.contains_key(&thread_id) {
             return self.stop_managed_session(thread_id).await;
         }
+        // The Plan pill does not outlive the session (e.g. a provider switch
+        // away and back), including for a thread with no live session.
+        self.agents.write().await.remove(&thread_id);
         let session = self
             .sessions
             .read()
@@ -623,7 +648,7 @@ mod tests {
         );
         let caps = provider.capabilities();
         assert!(caps.supports_mid_session_model_change);
-        assert!(!caps.supports_mid_session_permission_change);
+        assert!(caps.supports_mid_session_permission_change);
         assert!(caps.supports_synchronous_tool_approval);
         assert!(caps.supports_interrupt);
         assert!(caps.supports_session_resume);
@@ -657,16 +682,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_permission_mode_returns_validation_error() {
+    async fn set_permission_mode_selects_the_agent_for_the_next_session() {
         let provider = OpenCodeAgentProvider::new(
             Arc::new(OpenCodeServerManager::new()),
             OpenCodeProviderConfig::default(),
         );
+        let thread = ThreadId("t1".into());
+        // A cold thread still records the choice for the session it starts.
         let err = provider
-            .set_permission_mode(ThreadId("t1".into()), "bypass".into())
+            .set_permission_mode(thread.clone(), "plan".into())
             .await
-            .expect_err("must fail");
-        assert!(matches!(err, ProviderError::ValidationError { .. }));
+            .expect_err("no live session");
+        assert!(matches!(err, ProviderError::SessionNotFound { .. }));
+        assert_eq!(provider.agents.read().await.get(&thread), Some(&"plan"));
+        // The Plan pill restores the prior mode, often a foreign token.
+        let _ = provider
+            .set_permission_mode(thread.clone(), "bypassPermissions".into())
+            .await;
+        assert_eq!(provider.agents.read().await.get(&thread), Some(&"build"));
+        // Stopping forgets it even without a live session (provider switch).
+        let _ = provider.stop_session(thread.clone()).await;
+        assert_eq!(provider.agents.read().await.get(&thread), None);
     }
 
     #[test]

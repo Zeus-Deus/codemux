@@ -5328,11 +5328,13 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
             permission_mode: AgentChatSessionConfig::set(mode), ..Default::default()
         });
     }
-    // Persist first so the value survives a restart / next auto-resume.
     if let Some(state) = app.try_state::<NativeControlState>() {
         state.mark_worker_mode_uncertain(&thread_id.0);
     }
-    {
+    // Persist only a mode the provider accepted (or a cold thread will launch
+    // with), so it survives a restart / next auto-resume. A rejected mode
+    // must not become the thread's durable configuration.
+    let persist = || {
         let db: State<'_, DatabaseStore> = app.state();
         let config = AgentChatSessionConfig {
             permission_mode: AgentChatSessionConfig::set(mode.clone()),
@@ -5341,12 +5343,13 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
         if let Err(error) = db.update_agent_chat_session_config(&thread_id.0, &config) {
             eprintln!("[codemux::agent_chat] failed to persist permission_mode config: {error}");
         }
-    }
+    };
     match impl_
         .set_permission_mode(thread_id.clone(), mode.clone())
         .await
     {
         Ok(()) => {
+            persist();
             record_native_worker_mode(&app, &thread_id.0, provider, Some(mode));
             if provider == ProviderKind::Claude {
                 // Full-access host tools follow Claude's live permission mode.
@@ -5357,6 +5360,7 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
             Ok(())
         }
         Err(ProviderError::SessionNotFound { .. }) => {
+            persist();
             if let Some(state) = app.try_state::<NativeControlState>() {
                 state.clear_worker(&thread_id.0);
             }

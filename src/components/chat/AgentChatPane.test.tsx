@@ -4010,6 +4010,34 @@ describe("AgentChatPane provider handoff", () => {
       container.querySelector('[data-testid="composer"]'),
     ).toHaveAttribute("data-provider", "claude");
   });
+
+  it("drops OpenCode's Plan pill when a failed switch rebuilds it in build", async () => {
+    vi.mocked(agentChatSwitchProvider).mockRejectedValueOnce(
+      new Error("codex unavailable"),
+    );
+    setModeMock.mockClear();
+    currentSliceOverrides = {
+      "thread-x": {
+        ...currentSliceOverrides["thread-x"],
+        mode: "plan",
+        modePriorPermissionMode: "bypassPermissions",
+      },
+    };
+    const { container } = render(
+      <AgentChatPane pane={{ ...pane, provider: "opencode" }} />,
+    );
+    await act(async () => {});
+
+    fireEvent.click(
+      container.querySelector('[data-testid="provider-model-change"]')!,
+    );
+
+    await waitFor(() =>
+      expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(1),
+    );
+    expect(vi.mocked(agentChatStartSession).mock.calls[0][1]).toBe("opencode");
+    expect(setModeMock).toHaveBeenCalledWith("thread-x", "default");
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────
@@ -4105,6 +4133,60 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     expect(startInput.permission_mode).toBe("default");
     expect(setPermissionModeMock).toHaveBeenCalledWith("thread-x", "default");
     expect(setModeMock).toHaveBeenCalledWith("thread-x", "default");
+  });
+
+  it("OpenCode enters and leaves Plan through the live setter, never a restart", async () => {
+    const { container } = render(
+      <AgentChatPane pane={{ ...pane, provider: "opencode" }} />,
+    );
+    await act(async () => {});
+    (
+      container.querySelector(
+        '[data-testid="mode-activate-plan"]',
+      ) as HTMLButtonElement
+    ).click();
+    await waitFor(() =>
+      expect(agentChatSetPermissionMode).toHaveBeenCalledWith(
+        "opencode",
+        "thread-x",
+        "plan",
+      ),
+    );
+    await waitFor(() =>
+      expect(setModeMock).toHaveBeenCalledWith("thread-x", "plan"),
+    );
+
+    cleanup();
+    vi.mocked(agentChatSetPermissionMode).mockClear();
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "plan",
+        modePriorPermissionMode: "bypassPermissions",
+        permissionMode: "plan",
+        sessionLaunchMode: "plan",
+      },
+    };
+    const removed = render(
+      <AgentChatPane pane={{ ...pane, provider: "opencode" }} />,
+    );
+    await act(async () => {});
+    (
+      removed.container.querySelector(
+        '[data-testid="mode-remove"]',
+      ) as HTMLButtonElement
+    ).click();
+    await waitFor(() =>
+      expect(agentChatSetPermissionMode).toHaveBeenCalledWith(
+        "opencode",
+        "thread-x",
+        "bypassPermissions",
+      ),
+    );
+    await waitFor(() =>
+      expect(setModeMock).toHaveBeenCalledWith("thread-x", "default"),
+    );
+    expect(agentChatStopSession).not.toHaveBeenCalled();
+    expect(agentChatStartSession).not.toHaveBeenCalled();
   });
 
   it("activating Debug pill flips slice.mode without an SDK setPermissionMode call", async () => {
