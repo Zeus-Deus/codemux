@@ -26,6 +26,10 @@ import { z } from "zod";
 
 import { logger } from "./logger.ts";
 import { sendUpstreamRequest } from "./upstream-rpc.ts";
+import {
+  PluginPermissionError,
+  type PluginBridgeGuard,
+} from "./plugin-permissions.ts";
 
 /** Method name on the Rust side that handles tool dispatch. Mirrored
  *  in `src-tauri/src/agent_provider/claude/session.rs::METHOD_MCP_TOOL_CALL`. */
@@ -77,10 +81,11 @@ export function setMcpBridgeWriter(fn: (line: string) => void): void {
  */
 export function buildCodemuxMcpServer(
   tools: RegisteredMcpTool[],
+  guard?: PluginBridgeGuard,
 ): McpSdkServerConfigWithInstance {
   const directPluginTools = tools.filter(tool => tool.serverId.startsWith("plugin:")).map(tool => tool.prefixedName).slice(0, 512);
   const sdkTools: Array<SdkMcpToolDefinition> = tools.map((t) =>
-    toolToSdkDefinition(t, directPluginTools),
+    toolToSdkDefinition(t, directPluginTools, guard),
   );
 
   return createSdkMcpServer({
@@ -93,6 +98,7 @@ export function buildCodemuxMcpServer(
 function toolToSdkDefinition(
   tool: RegisteredMcpTool,
   directPluginTools: string[],
+  guard?: PluginBridgeGuard,
 ): SdkMcpToolDefinition {
   const inputSchema = jsonSchemaToZodShape(tool.inputSchema);
   // Cast through `unknown`: the SDK's `SdkMcpToolDefinition<Schema>`
@@ -104,8 +110,16 @@ function toolToSdkDefinition(
   // the type so the assignment compiles.
   const handler = (async (
     args: Record<string, unknown>,
+    extra: unknown,
   ): Promise<unknown> => {
     try {
+      if (tool.prefixedName === "codemux_call_plugin_tool") {
+        if (!guard)
+          throw new PluginPermissionError(
+            "Codemux couldn't verify Claude's permission check for this plugin tool; call the tool directly.",
+          );
+        await guard.authorizeCall(args, extra);
+      }
       const result = await sendUpstreamRequest(
         METHOD_MCP_TOOL_CALL,
         {
@@ -114,13 +128,21 @@ function toolToSdkDefinition(
         },
         writeLine,
       );
+      if (tool.prefixedName === "codemux_list_plugin_tools") {
+        if (!guard)
+          throw new PluginPermissionError(
+            "Codemux couldn't read Claude's permission rules for plugin tools; call the tool directly.",
+          );
+        return normalizeToolResult(await guard.filterList(result));
+      }
       return normalizeToolResult(result);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      logger.warn("mcp tool call failed", {
-        tool: tool.prefixedName,
-        err: message,
-      });
+      if (!(err instanceof PluginPermissionError))
+        logger.warn("mcp tool call failed", {
+          tool: tool.prefixedName,
+          err: message,
+        });
       return {
         content: [
           { type: "text" as const, text: `Tool call failed: ${message}` },

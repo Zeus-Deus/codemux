@@ -220,6 +220,7 @@ const AUTO_ALLOWED_HOST_TOOLS = new Set(["mcp__codemux__suggest_tasks"]);
 function buildQueryOptions(
   input: SessionStartInput,
   canUseTool: CanUseTool,
+  pluginGuard?: ReturnType<typeof createPluginPermissions>,
 ): Options {
   const opts: Partial<Options> = {
     // Always.
@@ -271,7 +272,12 @@ function buildQueryOptions(
     opts.allowDangerouslySkipPermissions =
       input.allowDangerouslySkipPermissions ?? true;
   }
-  const flagSettings = { ...(input.settings ?? {}) };
+  // A clean CLI omits effective.permissions unless a layer supplies it.
+  // An empty flag layer preserves project/user rules (real CLI probe).
+  const flagSettings: Record<string, unknown> = {
+    permissions: {},
+    ...(input.settings ?? {}),
+  };
   if (input.fastMode !== undefined) {
     flagSettings.fastMode = input.fastMode;
     flagSettings.fastModePerSessionOptIn = true;
@@ -300,10 +306,16 @@ function buildQueryOptions(
   // user-installed MCP's tools surface to this Claude session via a
   // single virtual server. Tool calls are dispatched back to Rust
   // via the `mcp-tool-call` upstream RPC; see `mcp-bridge.ts`.
-  const mcpTools = input.mcpTools ?? [];
+  const mcpTools = (input.mcpTools ?? []).filter(
+    (tool) =>
+      !input.managed ||
+      !["codemux_call_plugin_tool", "codemux_list_plugin_tools"].includes(
+        tool.prefixedName,
+      ),
+  );
   if (mcpTools.length > 0) {
     opts.mcpServers = {
-      codemux: buildCodemuxMcpServer(mcpTools),
+      codemux: buildCodemuxMcpServer(mcpTools, pluginGuard),
     };
     // Host tools that only show something to the user and change nothing
     // run without an approval prompt in every mode (Supervised, Plan):
@@ -376,6 +388,9 @@ export class ClaudeSession {
   private readonly resetPluginSessionRules: ReturnType<
     typeof createPluginPermissions
   >["resetSessionRules"];
+  private readonly pluginBridgeGuard: ReturnType<
+    typeof createPluginPermissions
+  >;
   /** True while `interrupt()` is in flight, so `consumeMessages` knows
    *  an iterator exit is expected and stays silent instead of firing
    *  `session-ended`. */
@@ -443,7 +458,13 @@ export class ClaudeSession {
     this.startInput = { ...input };
     this.currentQueryModel = input.model;
     if (input.mcpTools) {
-      this.startInput.mcpTools = [...input.mcpTools];
+      this.startInput.mcpTools = input.mcpTools.filter(
+        (tool) =>
+          !input.managed ||
+          !["codemux_call_plugin_tool", "codemux_list_plugin_tools"].includes(
+            tool.prefixedName,
+          ),
+      );
     }
     this.promptQueue = new AsyncPromptQueue<SDKUserMessage>();
     this.pendingApprovals = new Map();
@@ -487,7 +508,8 @@ export class ClaudeSession {
     this.canUseTool = permissions.canUseTool;
     this.pluginPermissionHook = permissions.hook;
     this.resetPluginSessionRules = permissions.resetSessionRules;
-    const options = buildQueryOptions(input, this.canUseTool);
+    this.pluginBridgeGuard = permissions;
+    const options = buildQueryOptions(input, this.canUseTool, permissions);
     if (!input.managed)
       options.hooks = {
         PreToolUse: [
@@ -555,6 +577,7 @@ export class ClaudeSession {
         this.emitSpecialCases(message);
         if (message.type === "result" && !parentToolUseId && this.pendingSteers.size === 0 && this.promptQueue.isEmpty()) {
           this.mcpTurnActive = false;
+          this.pluginBridgeGuard.clearTickets();
           // Deliver the result before starting control RPCs. A stalled
           // refresh must not stall the message iterator or the visible turn.
           void this.flushMcpTools();
@@ -753,7 +776,9 @@ export class ClaudeSession {
     }
     // If a prior interrupt killed the query, transparently rebuild a
     // resumed one before enqueuing this turn.
-    this.ensureLiveQuery();
+    this.ensureLiveQuery(input.modelOverride);
+    await this.flushMcpTools();
+    this.ensureLiveQuery(input.modelOverride);
     // If a per-turn model override was supplied, apply it before the
     // turn is dispatched. The SDK applies `setModel` to subsequent
     // messages, not retroactively, which matches what we want.
@@ -770,8 +795,6 @@ export class ClaudeSession {
         });
       }
     }
-    await this.flushMcpTools();
-    this.ensureLiveQuery();
     this.mcpTurnActive = true;
     const msg = this.buildUserMessage(input.text, input.images);
     // The CLI echoes a prompt's uuid in `user_message_uuids` only when the
@@ -908,6 +931,8 @@ export class ClaudeSession {
    *  the stale-resume self-heal. */
   compactIdle(): { started: boolean; reason?: string } {
     if (this.closed) return { started: false, reason: "closed" };
+    if (this.mcpRefreshTask || this.pendingMcpTools)
+      return { started: false, reason: "mcp_refresh" };
     if (this.queryDead) return { started: false, reason: "query_dead" };
     this.lastUserMessage = null;
     this.mcpTurnActive = true;
@@ -927,6 +952,7 @@ export class ClaudeSession {
   async interrupt(): Promise<void> {
     if (this.closed || this.queryDead) return;
     this.acceptsSteers = false;
+    this.pluginBridgeGuard.clearTickets();
     if (this.pendingSteers.size > 0) return this.retireForStop();
     this.interrupting = true;
     try {
@@ -960,7 +986,7 @@ export class ClaudeSession {
    *  issues a fresh session id which `observeSdkSessionId` re-emits so
    *  the host updates its resume cursor. Mirrors the reference impl's
    *  `ensureSessionForThread`. */
-  private ensureLiveQuery(): void {
+  private ensureLiveQuery(modelOverride?: string): void {
     if (!this.queryDead || this.closed) return;
 
     const resume = this.sdkSessionId ?? this.startInput.resume;
@@ -968,7 +994,10 @@ export class ClaudeSession {
     // the observed id so `observeSdkSessionId` re-emits it.
     this.sdkSessionId = null;
 
-    this.rebuildQuery({ resume });
+    this.rebuildQuery({
+      resume,
+      ...(modelOverride === undefined ? {} : { modelOverride }),
+    });
   }
 
   /** Tear down the current query and stand up a replacement with the
@@ -977,7 +1006,10 @@ export class ClaudeSession {
    *  interrupt) and the stale-resume self-heal (`resume: undefined`, a
    *  fresh session). Callers own resume-cursor bookkeeping
    *  (`sdkSessionId`, `startInput.resume`) before calling. */
-  private rebuildQuery(opts: { resume: string | undefined }): void {
+  private rebuildQuery(opts: {
+    resume: string | undefined;
+    modelOverride?: string;
+  }): void {
     // Best-effort reap of the dead subprocess.
     try {
       this.query.close();
@@ -1002,13 +1034,19 @@ export class ClaudeSession {
     // Drop the explicit `sessionId` — that uuid named the ORIGINAL
     // fresh session; the rebuild resumes (or starts fresh) instead.
     const rebuildInput: SessionStartInput = { ...this.startInput };
+    if (opts.modelOverride !== undefined)
+      rebuildInput.model = opts.modelOverride;
     delete rebuildInput.sessionId;
     if (opts.resume === undefined) {
       delete rebuildInput.resume;
     } else {
       rebuildInput.resume = opts.resume;
     }
-    const options = buildQueryOptions(rebuildInput, this.canUseTool);
+    const options = buildQueryOptions(
+      rebuildInput,
+      this.canUseTool,
+      this.pluginBridgeGuard,
+    );
     if (!rebuildInput.managed)
       options.hooks = {
         PreToolUse: [
@@ -1030,6 +1068,13 @@ export class ClaudeSession {
    * next send both flush, coalescing changes to the latest catalog. */
   async updateMcpTools(tools: RegisteredMcpTool[]): Promise<void> {
     if (this.closed) return;
+    if (this.startInput.managed)
+      tools = tools.filter(
+        (tool) =>
+          !["codemux_call_plugin_tool", "codemux_list_plugin_tools"].includes(
+            tool.prefixedName,
+          ),
+      );
     this.startInput.mcpTools = tools;
     this.pendingMcpTools = tools;
     if (!this.mcpTurnActive) await this.flushMcpTools();
@@ -1057,7 +1102,12 @@ export class ClaudeSession {
                   throw new Error("MCP refresh query retired");
                 return query.setMcpServers(
                   tools.length > 0
-                    ? { codemux: buildCodemuxMcpServer(tools) }
+                    ? {
+                        codemux: buildCodemuxMcpServer(
+                          tools,
+                          this.pluginBridgeGuard,
+                        ),
+                      }
                     : {},
                 );
               })(),
@@ -1236,6 +1286,7 @@ export class ClaudeSession {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.pluginBridgeGuard.clearTickets();
 
     // Reject any pending tool approvals so they don't dangle.
     for (const [, resolver] of this.pendingApprovals) {

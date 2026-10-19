@@ -325,6 +325,7 @@ test("fast mode is scoped to the current session and wins over raw settings", ()
     emit,
   );
   expect(fake.capturedOptions?.settings).toEqual({
+    permissions: {},
     fastMode: true,
     fastModePerSessionOptIn: true,
     theme: "dark",
@@ -865,8 +866,8 @@ test("effort option is passed through opaquely even for future values", () => {
     emit,
   );
   expect((fake.capturedOptions as { effort?: string })?.effort).toBe("xhigh");
-  // A plain xhigh selection is exactly that — no workflow setting.
-  expect(fake.capturedOptions?.settings).toBeUndefined();
+  // A plain xhigh selection adds no workflow setting.
+  expect(fake.capturedOptions?.settings).toEqual({ permissions: {} });
   void session;
 });
 
@@ -876,7 +877,10 @@ test("ultracode normalizes to xhigh effort plus the ultracode setting", () => {
   const { emit } = recordingEmitter();
   new ClaudeSession(minimalInput({ effort: "ultracode" }), emit);
   expect((fake.capturedOptions as { effort?: string })?.effort).toBe("xhigh");
-  expect(fake.capturedOptions?.settings).toEqual({ ultracode: true });
+  expect(fake.capturedOptions?.settings).toEqual({
+    permissions: {},
+    ultracode: true,
+  });
 });
 
 test("ultracode composes with fast mode and caller-supplied settings", () => {
@@ -891,6 +895,7 @@ test("ultracode composes with fast mode and caller-supplied settings", () => {
   );
   expect((fake.capturedOptions as { effort?: string })?.effort).toBe("xhigh");
   expect(fake.capturedOptions?.settings).toEqual({
+    permissions: {},
     theme: "dark",
     fastMode: true,
     fastModePerSessionOptIn: true,
@@ -1513,6 +1518,71 @@ test("MCP round 3: an old swap timeout cannot retire the replacement query", asy
     release?.();
     await session.close();
   }
+});
+
+test("MCP round 4: a turn model override applies to the query after a swap timeout", async () => {
+  setMcpRefreshTimeoutForTests(20);
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(
+    minimalInput({ model: "session-default" }),
+    emit,
+  );
+  await session.sendTurn({ text: "first" });
+  await session.updateMcpTools([]);
+  fake.setMcpServers = () => new Promise(() => {});
+  fake.emit(mkSuccessResult());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await session.sendTurn({ text: "next", modelOverride: "turn-override" });
+  expect(fake.capturedOptions?.model).toBe("turn-override");
+  fake.emit(mkAssistant("rebuilt-session"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(events).toContainEqual({
+    method: "sdk-session-id",
+    params: { threadId: "t-1", sessionId: "rebuilt-session" },
+  });
+  await session.close();
+});
+
+test("MCP round 4: idle compaction does not overlap a pending swap", async () => {
+  const session = new ClaudeSession(minimalInput(), recordingEmitter().emit);
+  let release!: () => void;
+  fake.setMcpServers = () =>
+    new Promise((resolve) => {
+      release = () => resolve({ added: [], removed: [], errors: {} });
+    });
+  const refresh = session.updateMcpTools([]);
+  try {
+    expect(session.compactIdle()).toEqual({
+      started: false,
+      reason: "mcp_refresh",
+    });
+    expect(fake.capturedPrompts).toEqual([]);
+  } finally {
+    fake.setMcpServers = async () => ({ added: [], removed: [], errors: {} });
+    release();
+    await refresh;
+    await session.close();
+  }
+});
+
+test("MCP round 4: managed sessions exclude plugin bridge names", async () => {
+  const bridgeNames = ["codemux_call_plugin_tool", "codemux_list_plugin_tools"];
+  const session = new ClaudeSession(
+    minimalInput({
+      managed: true,
+      mcpTools: bridgeNames.map((name) => ({
+        name,
+        prefixedName: name,
+        serverId: "codemux-plugin-bridge",
+        description: name,
+        inputSchema: { type: "object" },
+      })),
+    }),
+    recordingEmitter().emit,
+  );
+  expect(fake.capturedOptions?.mcpServers).toBeUndefined();
+  expect(fake.capturedOptions?.allowedTools).toEqual([]);
+  await session.close();
 });
 
 test("MCP round 3: query rebuild forgets CLI session-only target permissions", async () => {

@@ -807,7 +807,7 @@ impl ClaudeSession {
             Ok(ack) if ack.get("started").and_then(Value::as_bool) == Some(true) => None,
             Ok(ack) => Some(match ack.get("reason").and_then(Value::as_str) {
                 Some("closed") => Refusal::Closed,
-                Some("query_dead") => Refusal::NotReady,
+                Some("query_dead" | "mcp_refresh") => Refusal::NotReady,
                 _ => Refusal::Failed,
             }),
             // The sidecar never ran the method: nothing was queued.

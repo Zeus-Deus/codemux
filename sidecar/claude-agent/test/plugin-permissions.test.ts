@@ -68,6 +68,110 @@ const decision = async (
   return "hookSpecificOutput" in result ? result.hookSpecificOutput : undefined;
 };
 describe("Claude plugin bridge permissions", () => {
+  test("round 4: missing permissions fails closed even in bypass", async () => {
+    const { gate, settings } = setup("bypassPermissions");
+    settings({ effective: {} });
+    expect(await decision(gate, "x")).toMatchObject({
+      permissionDecision: "deny",
+    });
+  });
+  test("round 4: canUseTool denies a target rule without prompting", async () => {
+    const { gate, calls } = setup("default", { deny: [target("x")] });
+    const result = await gate.canUseTool(
+      bridge,
+      { name: "fixture__x", arguments: {} },
+      { toolUseID: "call", signal: new AbortController().signal },
+    );
+    expect(result.behavior).toBe("deny");
+    expect(calls).toEqual([]);
+  });
+  test("round 4: handler tickets bind exact call ID and arguments, once only", async () => {
+    const { gate } = setup("bypassPermissions");
+    const args = { name: "fixture__x", arguments: { value: 7 } };
+    const extra = { _meta: { "claudecode/toolUseId": "call" } };
+    await expect(gate.authorizeCall(args, extra)).rejects.toThrow(
+      "permission check",
+    );
+    await decision(gate, "x");
+    await expect(
+      gate.authorizeCall(args, { _meta: { "claudecode/toolUseId": "other" } }),
+    ).rejects.toThrow("permission check");
+    await expect(
+      gate.authorizeCall({ ...args, arguments: { value: 8 } }, extra),
+    ).rejects.toThrow("permission check");
+    await expect(gate.authorizeCall(args, extra)).resolves.toBeUndefined();
+    await expect(gate.authorizeCall(args, extra)).rejects.toThrow(
+      "permission check",
+    );
+  });
+  test("round 4: a hook still reading settings cannot authorize after Stop", async () => {
+    let finish!: (value: unknown) => void;
+    const pending = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const gate = createPluginPermissions({
+      threadId: "fixture",
+      getQuery: () => ({ getSettings: () => pending }),
+      getMode: () => "bypassPermissions",
+      canUseTool: async () => ({ behavior: "allow" }),
+      canUseTarget: async () => ({ behavior: "allow" }),
+    });
+    const check = gate.hook(hookInput("x"), "call", {
+      signal: new AbortController().signal,
+    });
+    gate.clearTickets();
+    finish({ effective: { permissions: {} } });
+    expect(await check).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+  });
+  test("round 4: an ask ticket cannot execute before the target is approved", async () => {
+    const { gate } = setup();
+    await decision(gate, "x");
+    await expect(
+      gate.authorizeCall(
+        { name: "fixture__x", arguments: { value: 7 } },
+        { _meta: { "claudecode/toolUseId": "call" } },
+      ),
+    ).rejects.toThrow("permission check");
+  });
+  test("round 4: omitted arguments mean an empty object on every permission path", async () => {
+    const { gate } = setup("bypassPermissions");
+    const event = hookInput("x");
+    event.tool_input = { name: "fixture__x" };
+    expect(
+      await gate.hook(event, "call", { signal: new AbortController().signal }),
+    ).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+    await expect(
+      gate.authorizeCall(
+        { name: "fixture__x" },
+        { _meta: { "claudecode/toolUseId": "call" } },
+      ),
+    ).resolves.toBeUndefined();
+  });
+  test("round 4: the hook's actual mode wins over the app's earlier mode", async () => {
+    const { gate } = setup("bypassPermissions");
+    const result = await gate.hook(
+      { ...hookInput("x"), permission_mode: "plan" },
+      "call",
+      { signal: new AbortController().signal },
+    );
+    expect(result).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "ask" },
+    });
+  });
+  test("round 4: catalog filtering removes denied names from text and structured data", async () => {
+    const { gate } = setup("default", { deny: [target("x")] });
+    const data = { tools: [{ name: "fixture__x" }, { name: "fixture__y" }] };
+    const result = await gate.filterList({
+      content: [{ type: "text", text: JSON.stringify(data) }],
+      structuredContent: data,
+    });
+    expect(result).toMatchObject({
+      structuredContent: { tools: [{ name: "fixture__y" }] },
+    });
+    expect(JSON.stringify(result)).not.toContain("fixture__x");
+  });
   test("native deny wins over bridge and target allows, even in full access", async () => {
     for (const mode of ["default", "plan", "bypassPermissions"]) {
       const { gate } = setup(mode, {
@@ -101,6 +205,7 @@ describe("Claude plugin bridge permissions", () => {
       updatedInput: { value: 99 },
       updatedPermissions: updates,
     });
+    await decision(gate, "x");
     const result = await gate.canUseTool(
       bridge,
       { name: "fixture__x", arguments: { value: 7 } },
@@ -133,7 +238,7 @@ describe("Claude plugin bridge permissions", () => {
     });
     expect(
       await decision(setup("plan", { allow: [target("x")] }).gate, "x"),
-    ).toMatchObject({ permissionDecision: "allow" });
+    ).toMatchObject({ permissionDecision: "ask" });
     expect(await decision(setup("dontAsk").gate, "x")).toMatchObject({
       permissionDecision: "deny",
     });

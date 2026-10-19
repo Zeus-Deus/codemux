@@ -289,8 +289,10 @@ use them when an Editor or another integration connects during the current turn,
 while its newly added tools are absent from ToolSearch. Native refresh remains
 available at the next safe boundary. Claude receives the two catalog tools only
 when a plugin registration is visible to that workspace, even if its tool list
-is still empty. A first plugin loaded during a turn becomes available at the
-next safe boundary. A hung refresh times out after five seconds; the next turn
+is still empty. Register the MCP server before its external app connects, even when the server
+initially advertises zero tools. This puts the bridge in place for same-turn
+flows. A first plugin loaded during a turn becomes available at the next safe
+boundary. A hung refresh times out after five seconds; the next turn
 resumes the conversation with the pending catalog. The list marks tools already in this
 session's native snapshot with `directlyCallable`. Plugins loaded
 after a chat starts use those same paths. OpenCode chats see only globally scoped plugin tools in this PR; workspace scoping for OpenCode follows in the gateway-identity PR.
@@ -312,10 +314,19 @@ See [`examples/mcp-tools/`](./examples/mcp-tools/) for a worked plugin.
 
 Claude bridge approvals use the target tool's native name and arguments. A deny
 rule on that name also denies bridge calls; an allow for X does not allow Y.
+Denied targets are omitted from the Claude list tool. The in-process call handler
+requires a one-shot permission ticket for the exact call and arguments. If bare
+mode, policy or workspace trust skips the hook, bridge calls fail closed with
+a clear message to use the native tool or enable hooks. Bridge permission checks
+accept at most 1 MiB of JSON input. Managed workflow
+sessions exclude these two plugin tools.
 The guard reads the CLI's effective permission rules through the installed SDK's
 `getSettings()` control method. This runtime method is pinned by a compatibility
 test; if it is unavailable or its response changes, calls fail closed with a
-visible explanation to call the tool directly or update Codemux. Managed-only
+visible explanation to call the tool directly or update Codemux, including when
+the permission object is absent. An empty session settings layer keeps that
+object present on a clean CLI without replacing existing user/project rules.
+The hook uses the CLI-reported current permission mode. Managed-only
 permission state that the settings view cannot expose also fails closed.
 
 Codex's registry tools, both native `dynamicTools` and bridge calls, use the
