@@ -360,20 +360,26 @@ const result = await ctx.host.process.run({
   command: "unity",
   args: ["status", "--project-path", projectPath, "--json"],
   cwd: projectPath,                  // absolute local path
-  workspaceId,                      // optional; refuses remote/closed workspaces
+  workspaceId,                      // optional locality check only
   env: { MY_OPTION: "value", OLD_OPTION: null },
   timeoutMs: 30_000,
   maxOutputBytes: 1024 * 1024,
 });
-// { code: number | null, stdout, stderr, timedOut, truncated, cancelled }
+// { code: number | null, stdout, stderr, timedOut, truncated, pipesHeldOpen, cancelled }
 ```
 
 `run` passes argv directly, without a shell. `command` resolves on PATH (including
-Windows PATHEXT), or names an executable path. Children inherit the app's
+Windows PATHEXT), or names an executable path. Empty and relative PATH entries
+are ignored; a repository's files cannot become PATH candidates through `cwd`.
+On Windows an extensionless command uses PATHEXT, skipping extensionless shell
+shims. Children inherit the app's
 environment, with the app's usual AppImage environment cleanup; `env` overrides
 values, and `null` removes a key. Windows batch files (`.cmd`/`.bat`) are refused
-by `run`, because launching them would invoke a shell. Call the program's `.exe`
-or its interpreter directly instead; `which` can still locate batch files.
+by `run`, including names with trailing dots or spaces, because launching them
+would invoke a shell. Call the wrapped `.exe` (for example, `node.exe` with the
+script) instead; `which` can still locate batch files. Do not pass untrusted
+arguments to `cmd.exe /c`: its shell quoting differs from normal argv. Windows
+children use `CREATE_NO_WINDOW` to avoid a console flash.
 Without `cwd`, the child uses the app’s current directory, not a workspace path.
 Inputs allow up to 256 arguments (16 KiB each, 1 MiB combined) and 128 environment
 overrides (16 KiB per value, 64 KiB combined).
@@ -381,16 +387,24 @@ overrides (16 KiB per value, 64 KiB combined).
 The default timeout is 30 seconds (maximum 10 minutes). The combined stdout and
 stderr cap defaults to 1 MiB (maximum 8 MiB); excess bytes are drained and discarded,
 with `truncated: true`. Timeout or plugin disposal kills the owned process group
-on Linux and macOS, then waits for the child to exit. Windows currently kills the
+on Linux and macOS, then waits for the child to exit. On normal launcher exit,
+the host gives descendants 100 ms to detach, then kills any still in its group
+before reaping the launcher. Windows currently kills the
 direct child only. A child that deliberately starts a separate session, such as
 an Editor launched by a CLI, remains independent. Inherited output pipes get at
-most 100 ms to drain after the launcher exits; collected output is retained and
-`truncated` signals that a pipe stayed open. Linux lifecycle tests cover a
-normal grandchild and a detached child. Windows and macOS have not been tested live.
+most 100 ms to collect after the launcher exits; `pipesHeldOpen` signals that a
+pipe stayed open. The host keeps reading and discarding until EOF so an Editor's
+later log writes do not hit a closed pipe. `truncated` reports the output cap or
+a pipe read failure, independently of `pipesHeldOpen`. The cap counts raw bytes;
+invalid UTF-8 is replaced without dropping valid text. Linux lifecycle tests
+cover a normal grandchild, delayed detachment and detached stdout writes.
+Windows and macOS have not been tested live.
 
 `workspaceId` is optional on `run` and every filesystem call. If supplied, it
 must name an open, local workspace. If omitted, the operation runs locally even
-when the selected workspace is remote. **Filesystem paths and `cwd` must be absolute and refer to this machine.** These APIs do not read files or launch programs over SSH.
+when the selected workspace is remote. The id validates locality only: it does
+not select, change or check a path against the workspace directory.
+**Filesystem paths and `cwd` must be absolute and refer to this machine.** These APIs do not read files or launch programs over SSH.
 
 ```ts
 await ctx.host.fs.exists(projectPath, { workspaceId });
@@ -417,6 +431,8 @@ are refused. Writes are atomic, capped at 1 MiB, and use owner-only directory
 and file permissions on Unix. Data is retained on disable, reload, update **and
 uninstall**, matching existing `ctx.storage` retention. Reinstalling the same
 plugin id can reuse it. `removeDataFile` deletes only that plugin's named file.
+Acquiring the data directory sweeps abandoned writer temp files older than one
+day, without following links; recent writes and named data files are retained.
 
 `ctx.host.workspace.list()` returns the open workspaces as `{ id, name, path,
 remote }[]`. `ctx.host.workspace.onListChange(fn)` notifies when that list

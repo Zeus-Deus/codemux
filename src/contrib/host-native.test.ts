@@ -12,6 +12,15 @@ beforeEach(() => {
   mocks.invoke.mockResolvedValue(undefined);
 });
 describe("plugin native host", () => {
+  it("retries an acquire after a transient failure", async () => {
+    mocks.invoke.mockRejectedValueOnce(new Error("transient acquire failure"));
+    const owner = new Owner("demo");
+    const host = createNativeHost(() => owner);
+    await expect(host.process.which("unity")).rejects.toThrow("transient");
+    await expect(host.process.which("unity")).resolves.toBeUndefined();
+    expect(mocks.invoke.mock.calls.filter(([name]) => name === "plugins_host_acquire")).toHaveLength(2);
+    owner.end();
+  });
   it("acquires once with the document epoch and releases once on unload", async () => {
     const owner = new Owner("demo");
     const host = createNativeHost(() => owner);

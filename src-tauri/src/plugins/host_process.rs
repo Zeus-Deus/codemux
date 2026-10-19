@@ -525,6 +525,24 @@ mod tests {
         assert!(validate_program(Path::new("tool.CMD"), true).is_err());
         assert!(validate_program(Path::new("tool.bat"), true).is_err());
         assert!(validate_program(Path::new("tool.exe"), true).is_ok());
+        for name in ["tool.cmd.", "tool.BAT ", "tool.cmd. "] {
+            assert!(validate_program(Path::new(name), true).is_err(), "{name}");
+        }
+    }
+    #[test]
+    fn plugin_host_windows_pathext_wins_over_extensionless_shims() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("tool"), "#!/bin/sh").unwrap();
+        std::fs::write(root.path().join("tool.EXE"), "fixture").unwrap();
+        assert_eq!(resolve("tool", [root.path().into()], root.path(), ".EXE;.CMD", true), Some(root.path().join("tool.EXE")));
+    }
+    #[test]
+    fn plugin_host_lossy_utf8_preserves_valid_tail_without_false_truncation() {
+        let truncated = AtomicBool::new(false);
+        let mut bytes = vec![0xff; 10];
+        bytes.extend_from_slice(b"abc");
+        assert_eq!(output(bytes, &truncated), format!("{}abc", "\u{fffd}".repeat(10)));
+        assert!(!truncated.load(Ordering::Acquire));
     }
     #[cfg(unix)]
     #[test]
@@ -537,6 +555,10 @@ mod tests {
         std::fs::write(&tool, "fixture").unwrap();
         assert!(resolve("fresh-cli", [local.clone()], root.path(), "", false).is_none());
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for windows in [false, true] {
+            assert!(resolve("fresh-cli", [PathBuf::new(), PathBuf::from(".local/bin")], &local, "", windows).is_none());
+            assert!(resolve("fresh-cli", [PathBuf::from(".local/bin")], root.path(), "", windows).is_none());
+        }
         assert!(resolve(
             "fresh-cli",
             [root.path().join("usr/bin")],
@@ -652,5 +674,17 @@ mod tests {
         unsafe {
             libc::kill(pid as i32, libc::SIGKILL);
         }
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn plugin_host_normal_exit_gives_a_forked_child_time_to_detach() {
+        let root = tempfile::tempdir().unwrap();
+        let heartbeat = root.path().join("daemon");
+        let host = PluginHostState::default();
+        let result = run(input("daemon", &[heartbeat.to_str().unwrap()]), permit(&host)).await.unwrap();
+        assert_eq!(result.code, Some(0));
+        wait_for(&heartbeat).await;
+        let pid: i32 = std::fs::read_to_string(heartbeat.with_extension("pid")).unwrap().parse().unwrap();
+        unsafe { libc::kill(pid, libc::SIGKILL); }
     }
 }

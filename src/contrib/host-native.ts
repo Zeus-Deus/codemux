@@ -24,7 +24,11 @@ export interface PluginProcessResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** Captured raw output exceeded maxOutputBytes (or a pipe read failed). */
   truncated: boolean;
+  /** A descendant kept an inherited pipe open beyond the 100 ms drain window.
+   * The host continues draining it without retaining more output. */
+  pipesHeldOpen: boolean;
   cancelled: boolean;
 }
 export interface PluginDirectoryEntry {
@@ -75,7 +79,14 @@ async function ownerAuth(owner: Owner | null): Promise<Auth> {
     })();
     owners.set(owner, pending);
   }
-  const auth = await pending;
+  let auth: Auth;
+  try {
+    auth = await pending;
+  } catch (error) {
+    // Retry transient native failures without clearing a newer acquisition.
+    if (owners.get(owner) === pending) owners.delete(owner);
+    throw error;
+  }
   if (owner.ended) throw new Error("Plugin has been disposed");
   return auth;
 }
