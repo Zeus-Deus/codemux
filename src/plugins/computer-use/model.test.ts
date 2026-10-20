@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { connectionFailure, controlFiles, isLinuxWayland, parseDoctor, parseVersion, readFrame, readWindows } from "./model";
+import { connectionFailure, controlFiles, discoveryFiles, isLinuxWayland, parseDoctor, parseVersion, readFrame, readWindows } from "./model";
 
 const target = { pid: 42, windowId: 123, title: "Demo", appName: "Demo App" };
 
@@ -58,9 +58,12 @@ describe("computer-use policy and resource boundaries", () => {
     const policy = JSON.parse(files.policy);
     const manifest = JSON.parse(files.manifest);
     const admitted = [...policy.allow.tools, ...policy.allow.rules.map((rule: { tool: string }) => rule.tool)];
-    for (const tool of ["drag", "mouse_button_down", "mouse_button_up", "mouse_drag", "parallel_mouse_drag", "replay_trajectory", "press_key", "hotkey", "page", "browser_pointer", "clipboard_read", "launch_app", "set_config"]) {
-      expect(admitted).not.toContain(tool);
-    }
+    expect(admitted.sort()).toEqual(["click", "get_window_state", "scroll", "type_text"]);
+    expect(policy.allow.tools).toEqual(["get_window_state"]);
+    expect(policy.allow.rules.map((rule: { tool: string }) => rule.tool).sort()).toEqual(["click", "scroll", "type_text"]);
+    expect(JSON.parse(discoveryFiles().policy).allow.tools).toEqual(["list_windows", "get_screen_size"]);
+    expect(manifest.expires_after).toBe("10m");
+    expect(manifest.idle_timeout).toBe("10m");
     for (const rule of policy.allow.rules) {
       expect(rule.constraints.pid.allowed).toEqual([42]);
       expect(rule.constraints.window_id.allowed).toEqual([123]);

@@ -89,18 +89,18 @@ export function readWindows(result: unknown): WindowTarget[] {
   });
 }
 
-export const OBSERVATION_TOOLS = [
-  "list_windows", "get_window_state", "get_screen_size", "get_config",
-  "start_session", "get_session", "list_sessions", "end_session",
-] as const;
+export const OBSERVATION_TOOLS = ["get_window_state"] as const;
 export const INPUT_TOOLS = ["click", "type_text", "scroll"] as const;
+export const CONTROL_TOOLS = [...OBSERVATION_TOOLS, ...INPUT_TOOLS] as const;
+export const DISCOVERY_TOOLS = ["list_windows", "get_screen_size"] as const;
+export const CONTROL_LIFETIME_MS = 10 * 60 * 1000;
 
 export function discoveryFiles(): { policy: string; manifest: string } {
-  const tools = ["list_windows", "get_screen_size", "get_config"];
+  const tools = DISCOVERY_TOOLS;
   return {
     policy: JSON.stringify({ allow: { tools } }),
     manifest: JSON.stringify({
-      version: 3, expires_after: "1h", idle_timeout: "10m",
+      version: 3, expires_after: "10m", idle_timeout: "10m",
       allow: { tools }, resources: { desktop: { display: true } },
     }),
   };
@@ -109,7 +109,7 @@ export function discoveryFiles(): { policy: string; manifest: string } {
 export function viewFiles(target: WindowTarget): { policy: string; manifest: string } {
   validateTarget(target);
   const manifest = {
-    version: 3, expires_after: "1h", idle_timeout: "10m",
+    version: 3, expires_after: "10m", idle_timeout: "10m",
     allow: { tools: ["get_window_state"] },
     resources: { desktop: { windows: [{ pid: target.pid, window_id: target.windowId }], display: false } },
   };
@@ -117,7 +117,7 @@ export function viewFiles(target: WindowTarget): { policy: string; manifest: str
 }
 
 export function controlInstructions(target: WindowTarget): string {
-  return `Use structured browser/Unity tools first. Only target pid ${target.pid}, window_id ${target.windowId}. ` +
+  return `Prefer structured tools (browser tools, app-specific plugin tools) before computer use. Only target pid ${target.pid}, window_id ${target.windowId}. ` +
     'Input requires pid, window_id and delivery_mode:"background"; click also requires modifier:[]. ' +
     'Use fresh element tokens. Do not retry refused actions in the foreground or capture the full desktop.';
 }
@@ -141,7 +141,7 @@ export function controlFiles(target: WindowTarget): { policy: string; manifest: 
   };
   const manifest = {
     version: 3,
-    expires_after: "1h",
+    expires_after: "10m",
     idle_timeout: "10m",
     allow: { tools: [...OBSERVATION_TOOLS, ...INPUT_TOOLS] },
     resources: {

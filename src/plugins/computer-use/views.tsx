@@ -113,6 +113,7 @@ export function ComputerSettings({ controller, peek, showWorkspace, initialComma
           {state.phase === "active" && <Notice>
             Using Claude? Send a new message after enabling this window. Tools refresh between turns.
           </Notice>}
+          {state.expiresAt !== null && <Notice>Control automatically stops at {new Date(state.expiresAt).toLocaleTimeString()}. Choose the window again to continue.</Notice>}
           <Notice>Only background click, type and scroll are allowed. Actions an application refuses stay blocked.
             {isLinuxWayland(state.doctor) && " Linux XWayland capture works; native Wayland capture may be unavailable."}
           </Notice>
@@ -129,7 +130,7 @@ export function ComputerIndicator({ controller, peek, showWorkspace }: { control
   const stopping = state.phase === "stopping";
   const name = state.target?.appName || state.target?.title || "window";
   const label = stopping ? "Stopping…" : state.phase === "error" ? "Computer use needs attention" : state.activeCalls ? `Controlling ${name}` : state.phase === "starting" ? "Connecting…" : `Computer · ${name}`;
-  return <div data-computer-use="indicator" role="status" style={{
+  return <div data-computer-use="indicator" style={{
     display: "inline-flex", alignItems: "center", gap: 2, padding: 1, maxWidth: "min(320px, 60vw)", height: 26,
     border: `1px solid ${color("border")}`, borderRadius: 8, color: color("foreground"),
   }} onPointerDown={(event) => event.stopPropagation()}>
@@ -138,7 +139,7 @@ export function ComputerIndicator({ controller, peek, showWorkspace }: { control
       onClick={() => { if (state.workspace && showWorkspace()) peek.open("computer-use:live", { workspaceId: state.workspace.id }); }}>
       <span aria-hidden style={{ width: 6, height: 6, borderRadius: "50%", flexShrink: 0 }}
         className={state.phase === "error" ? "bg-warning" : state.activeCalls ? "bg-destructive" : "bg-muted-foreground"} />
-      <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
+      <span aria-live="polite" aria-atomic="true" style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
     </Button>
     <Button size="xs" variant="destructive" aria-label="Stop computer use" disabled={stopping} onClick={() => { void controller.stop(); }}>Stop</Button>
   </div>;
@@ -167,13 +168,13 @@ export function ComputerPreview({ controller, workspaceId, onStatusChange }: { c
   return <div data-computer-use="preview" style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column", minHeight: 0, background: color("background") }}>
     <div style={{ ...row, flexWrap: "nowrap", justifyContent: "space-between", padding: "8px 12px", borderBottom: `1px solid ${color("border")}` }}>
       <span style={{ ...muted, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>{state.target?.title || "Selected window"}</span>
-      <Button size="sm" variant="destructive" disabled={!active} onClick={() => { void controller.stop(); }}><icons.Square />Stop</Button>
+      <Button size="sm" variant="destructive" aria-label="Stop computer use in live view" disabled={!state.target || state.phase === "stopping"} onClick={() => { void controller.stop(); }}><icons.Square />Stop</Button>
     </div>
     <div style={{ flex: 1, minHeight: 0, display: "grid", placeItems: "center", overflow: "hidden" }}>
       {active && state.frame?.kind === "image"
         ? <img src={state.frame.url} alt="Live view of the chosen application window" draggable={false} style={{ width: "100%", height: "100%", objectFit: "contain", minHeight: 0 }} />
         : <div style={{ padding: 28, textAlign: "center", maxWidth: 480 }}><icons.MonitorOff size={24} style={{ margin: "0 auto 12px", color: color("mutedForeground") }} />
-          <strong>{!active ? "Computer use is stopped" : "No window image"}</strong>
+          <strong>{state.phase === "expired" ? "Computer use expired" : !active ? "Computer use is stopped" : "No window image"}</strong>
           <p style={muted}>{!active ? "Choose and enable an application window in Computer use settings." : state.frame?.kind === "unavailable" ? state.frame.message : "Waiting for the driver…"}</p>
         </div>}
     </div>

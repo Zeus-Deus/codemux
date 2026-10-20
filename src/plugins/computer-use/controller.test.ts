@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import type { PluginDirectoryEntry, PluginMcpActivity, PluginMcpCallResult, PluginMcpServer, PluginOsInfo } from "@codemux/sdk";
+import type { PluginDirectoryEntry, PluginMcpActivity, PluginMcpCallResult, PluginMcpServer, PluginMcpStatus, PluginOsInfo } from "@codemux/sdk";
 import { ComputerUseController, type ComputerUseServices } from "./controller";
+import { CONTROL_LIFETIME_MS, CONTROL_TOOLS, DISCOVERY_TOOLS } from "./model";
 
 function deferred() {
   let resolve = () => {};
@@ -12,10 +13,13 @@ function fakeDesktop() {
   const registrations: {
     options: PluginMcpServer;
     activity?: (event: PluginMcpActivity) => void;
+    status?: (status: PluginMcpStatus | null) => void;
+    stopCalls: number;
     calls: string[];
     stopped: boolean;
   }[] = [];
   const removed: string[] = [];
+  const written = new Map<string, string>();
   const files = new Map<string, PluginDirectoryEntry["kind"]>();
   let stopGate: Promise<void> | undefined;
   let registerGate: Promise<void> | undefined;
@@ -37,19 +41,21 @@ function fakeDesktop() {
     fs: {
       dataDir: async () => "/plugin-data/computer-use",
       listDir: async () => [...files].map(([name, kind]) => ({ name, kind })),
-      writeDataFile: async (name) => { files.set(name, "file"); return `/plugin-data/computer-use/${name}`; },
+      writeDataFile: async (name, contents) => { files.set(name, "file"); written.set(name, contents); return `/plugin-data/computer-use/${name}`; },
       removeDataFile: async (name) => { removed.push(name); files.delete(name); },
     },
     registerMcpServer: async (options) => {
-      const row = { options, calls: [], stopped: false };
+      const row = { options, calls: [], stopped: false, stopCalls: 0 };
       registrations.push(row);
       if (options.scope !== "plugin") await registerGate;
       return async () => {
+        row.stopCalls++;
         if (options.scope !== "plugin") await stopGate;
         row.stopped = true;
       };
     },
     mcp: {
+      listTools: async (id) => (id.startsWith("cua-control-") ? CONTROL_TOOLS : id.startsWith("cua-view-") ? ["get_window_state"] : DISCOVERY_TOOLS).map((name) => ({ name, prefixedName: `computer-use__${name}`, description: null, inputSchema: {}, serverId: id })),
       callTool: async (id, tool): Promise<PluginMcpCallResult> => {
         rowFor(id).calls.push(tool);
         if (tool === "list_windows") return { content: [], structuredContent: { windows: [
@@ -63,13 +69,13 @@ function fakeDesktop() {
         id, name: rowFor(id).options.name, status: { kind: "running", toolCount: 3 },
         toolsCount: 3, errorMessage: null, stderrTail: null, startedAtMs: 0,
       }),
-      onStatus: () => () => {},
+      onStatus: (id, fn) => { const row = rowFor(id); row.status = fn; return () => { row.status = undefined; }; },
       onActivity: (id, fn) => { const row = rowFor(id); row.activity = fn; return () => { row.activity = undefined; }; },
     },
   };
   return {
-    services, registrations, removed, files,
-    holdStop: (gate: Promise<void>) => { stopGate = gate; },
+    services, registrations, removed, files, written,
+    holdStop: (gate?: Promise<void>) => { stopGate = gate; },
     holdRegistration: (gate: Promise<void>) => { registerGate = gate; },
     holdSnapshot: (gate: Promise<void>) => { snapshotGate = gate; },
   };
@@ -166,6 +172,160 @@ describe("computer-use lifecycle", () => {
       expect(log).toHaveBeenCalledTimes(4);
       await next.dispose();
     } finally { log.mockRestore(); }
+  });
+
+  it.each(["probe", "control"])("fails closed when the %s child exposes an extra tool", async (stage) => {
+    const fake = fakeDesktop();
+    const controller = new ComputerUseController(fake.services);
+    const target = await chooseWindow(controller);
+    const list = fake.services.mcp.listTools;
+    fake.services.mcp.listTools = async (id) => {
+      const tools = await list(id);
+      const bad = id.startsWith("cua-control-") && (stage === "probe" ? id.endsWith("-probe") : !id.endsWith("-probe"));
+      return bad ? [...tools, { name: "press_key", prefixedName: "computer-use__press_key", description: null, inputSchema: {}, serverId: id }] : tools;
+    };
+    await controller.enable(target);
+    expect(controller.getState().phase).toBe("error");
+    expect(controller.getState().error).toContain("unexpected tools: press_key");
+    expect(fake.registrations.every((row) => row.stopped)).toBe(true);
+    expect(fake.registrations.filter((row) => row.options.scope !== "plugin")).toHaveLength(stage === "probe" ? 0 : 1);
+    expect(fake.files.size).toBe(0);
+    await controller.dispose();
+  });
+
+  it("probes the exact private files before exposing the control child and pins its environment", async () => {
+    const fake = fakeDesktop();
+    const register = fake.services.registerMcpServer;
+    fake.services.registerMcpServer = async (options) => {
+      if (options.scope !== "plugin") expect(fake.registrations.filter((row) => row.options.id.endsWith("-probe")).every((row) => row.stopped)).toBe(true);
+      return register(options);
+    };
+    const controller = new ComputerUseController(fake.services);
+    await controller.enable(await chooseWindow(controller));
+    const control = fake.registrations.find((row) => row.options.scope !== "plugin")?.options;
+    const probe = fake.registrations.find((row) => row.options.id.endsWith("-probe"))?.options;
+    if (!control || control.transport !== "stdio" || !probe || probe.transport !== "stdio") throw new Error("Missing direct registrations");
+    expect(probe.scope).toBe("plugin");
+    expect(control.env).toEqual({
+      CUA_DRIVER_PERMISSION_MODE: "bounded", CUA_DRIVER_CAPABILITY_MANIFEST_APPROVED: "1",
+      CUA_DRIVER_POLICY_FILE: `/plugin-data/computer-use/${control.id}.yaml`,
+      CUA_DRIVER_CAPABILITY_MANIFEST_FILE: `/plugin-data/computer-use/${control.id}.json`,
+      CUA_DRIVER_RS_TELEMETRY_ENABLED: "0", CUA_DRIVER_EMBEDDED: "1",
+    });
+    expect(probe.env).toEqual(control.env);
+    expect(fake.written.has(`${control.id}.yaml`)).toBe(true);
+    expect(fake.written.has(`${control.id}.json`)).toBe(true);
+    expect(JSON.parse(fake.written.get(`${control.id}.json`) ?? "{}").allow.tools).toEqual(["get_window_state", "click", "type_text", "scroll"]);
+    await controller.dispose();
+  });
+
+  it.each(["yaml", "json"])("never exposes control if its %s file cannot be written", async (extension) => {
+    const fake = fakeDesktop();
+    const controller = new ComputerUseController(fake.services);
+    const target = await chooseWindow(controller);
+    const write = fake.services.fs.writeDataFile;
+    fake.services.fs.writeDataFile = async (name, contents) => {
+      if (name.startsWith("cua-control-") && name.endsWith(`.${extension}`)) throw new Error("Write failed");
+      return write(name, contents);
+    };
+    await controller.enable(target);
+    expect(controller.getState().error).toBe("Write failed");
+    expect(fake.registrations.some((row) => row.options.scope !== "plugin")).toBe(false);
+    expect(fake.registrations.every((row) => row.stopped)).toBe(true);
+    expect(fake.files.size).toBe(0);
+    await controller.dispose();
+  });
+
+  it.each(["workspace", "opt-in"])("stops active input when %s changes", async (change) => {
+    const fake = fakeDesktop();
+    const controller = new ComputerUseController(fake.services);
+    await controller.enable(await chooseWindow(controller));
+    await controller.setWorkspace({ id: change === "workspace" ? "workspace-b" : "workspace-a", title: "Demo", local: true }, change !== "opt-in");
+    expect(fake.registrations.every((row) => row.stopped)).toBe(true);
+    expect(controller.getState().target).toBeNull();
+    expect(controller.getState().windows).toEqual([]);
+    await controller.dispose();
+  });
+
+  it.each(["stopped", "errored"] as const)("handles the control status %s", async (kind) => {
+    const fake = fakeDesktop();
+    const controller = new ComputerUseController(fake.services);
+    await controller.enable(await chooseWindow(controller));
+    const control = fake.registrations.find((row) => row.options.scope !== "plugin");
+    if (!control) throw new Error("Missing control");
+    const status = kind === "errored" ? { kind, message: "Driver failed" } : { kind };
+    control.status?.({ id: control.options.id, name: "Computer use", status, toolsCount: 0, errorMessage: null, stderrTail: null, startedAtMs: 0 });
+    if (kind === "stopped") {
+      await vi.waitFor(() => expect(controller.getState().phase).toBe("idle"));
+      expect(fake.registrations.every((row) => row.stopped)).toBe(true);
+    } else {
+      expect(controller.getState().phase).toBe("error");
+      expect(controller.getState().error).toBe("Driver failed");
+      expect(controller.getState().target).not.toBeNull();
+    }
+    await controller.dispose();
+  });
+
+  it("releases the old input before re-choosing and registering new input", async () => {
+    const fake = fakeDesktop();
+    const controller = new ComputerUseController(fake.services);
+    await controller.enable(await chooseWindow(controller));
+    const old = fake.registrations.find((row) => row.options.scope !== "plugin");
+    const register = fake.services.registerMcpServer;
+    fake.services.registerMcpServer = async (options) => {
+      expect(old?.stopped).toBe(true);
+      return register(options);
+    };
+    await controller.discover();
+    await controller.enable(controller.getState().windows[0]);
+    expect(controller.getState().phase).toBe("active");
+    expect(fake.registrations.filter((row) => row.options.scope !== "plugin")).toHaveLength(2);
+    await controller.dispose();
+  });
+
+  it("does not flash Stopping when an idle workspace is first selected or switched", async () => {
+    const fake = fakeDesktop();
+    const controller = new ComputerUseController(fake.services);
+    const phases: string[] = [];
+    controller.subscribe(() => phases.push(controller.getState().phase));
+    await controller.setWorkspace({ id: "a", title: "A", local: true }, false);
+    await controller.setWorkspace({ id: "b", title: "B", local: true }, false);
+    expect(phases).not.toContain("stopping");
+    await controller.dispose();
+  });
+
+  it("stops at the ten-minute UI deadline and requires another window selection", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = fakeDesktop();
+      const controller = new ComputerUseController(fake.services);
+      const target = await chooseWindow(controller);
+      const now = Date.now();
+      await controller.enable(target);
+      expect(controller.getState().expiresAt).toBe(now + CONTROL_LIFETIME_MS);
+      await vi.advanceTimersByTimeAsync(CONTROL_LIFETIME_MS);
+      expect(controller.getState().phase).toBe("expired");
+      expect(controller.getState().target).toBeNull();
+      expect(controller.getState().windows).toEqual([]);
+      expect(fake.registrations.every((row) => row.stopped)).toBe(true);
+      await controller.enable(target);
+      expect(controller.getState().error).toContain("choose a current window");
+      await controller.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("disables telemetry for both diagnostics and rejects a nonzero doctor exit", async () => {
+    const fake = fakeDesktop();
+    const run = fake.services.process.run;
+    fake.services.process.run = vi.fn(async (options) => ({ ...await run(options), code: options.args?.[0] === "doctor" ? 1 : 0 }));
+    const controller = new ComputerUseController(fake.services);
+    await controller.detect();
+    expect(fake.services.process.run).toHaveBeenCalledTimes(2);
+    for (const [options] of vi.mocked(fake.services.process.run).mock.calls) expect(options.env?.CUA_DRIVER_RS_TELEMETRY_ENABLED).toBe("0");
+    expect(controller.getState().doctor?.ok).toBe(false);
+    expect(controller.getState().error).toContain("doctor exited with code 1");
+    expect(controller.getState().phase).toBe("error");
+    await controller.dispose();
   });
 
   it.each<{
@@ -297,7 +457,7 @@ describe("computer-use lifecycle", () => {
     const view = fake.registrations.find((row) => row.options.id.startsWith("cua-view-"));
     expect(control?.options.scope).toEqual({ workspaceIds: ["workspace-a"] });
     expect(control?.options.transport === "stdio" ? control.options.args : undefined).toEqual(["mcp", "--direct", "--no-overlay"]);
-    expect(control?.options.toolDescriptions?.click.append).toContain("structured browser/Unity tools first");
+    expect(control?.options.toolDescriptions?.click.append).toContain("structured tools (browser tools, app-specific plugin tools)");
     expect(control?.options.shutdown).toBe("immediate");
     await controller.refreshPreview();
     expect(view?.calls).toEqual(["get_window_state", "get_window_state"]);
@@ -378,6 +538,15 @@ describe("computer-use lifecycle", () => {
     expect(controller.getState().error).toBe("Could not confirm child exit");
     expect(controller.getState().target?.windowId).toBe(123);
     expect(fake.registrations.find((row) => row.options.scope !== "plugin")?.stopped).toBe(false);
-    await expect(controller.dispose()).rejects.toThrow("Could not confirm child exit");
+    const control = fake.registrations.find((row) => row.options.scope !== "plugin");
+    const attempts = control?.stopCalls ?? 0;
+    fake.holdStop();
+    await controller.stop();
+    expect(control?.stopCalls).toBe(attempts + 1);
+    expect(control?.stopped).toBe(true);
+    expect(controller.getState().phase).toBe("idle");
+    expect(controller.getState().windows).toEqual([]);
+    expect(controller.getState().target).toBeNull();
+    await controller.dispose();
   });
 });

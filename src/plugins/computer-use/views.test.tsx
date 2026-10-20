@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { PEEK_AREA, type Host } from "@codemux/sdk";
 import { registry } from "@/contrib/registry";
 import { ComputerUseController, type ComputerUseServices } from "./controller";
-import { ComputerChatChip, ComputerIndicator, ComputerSettings, DoctorDiagnostics } from "./views";
+import { ComputerChatChip, ComputerIndicator, ComputerPreview, ComputerSettings, DoctorDiagnostics } from "./views";
 
 vi.mock("@/lib/toast", () => ({ toast: { error: vi.fn(), info: vi.fn(), success: vi.fn(), warning: vi.fn() } }));
 vi.mock("@/tauri/commands", () => ({ dbDeleteSetting: vi.fn(async () => {}) }));
@@ -26,6 +26,7 @@ async function activeController() {
     fs: { dataDir: async () => "/demo", listDir: async () => [], writeDataFile: async (name) => `/demo/${name}`, removeDataFile: async () => {} },
     registerMcpServer: async (options) => async () => { if (options.scope !== "plugin") await exit; },
     mcp: {
+      listTools: async (id) => (id.startsWith("cua-discovery-") ? ["list_windows", "get_screen_size"] : id.startsWith("cua-view-") ? ["get_window_state"] : ["get_window_state", "click", "type_text", "scroll"]).map((name) => ({ name, prefixedName: name, description: null, inputSchema: {}, serverId: id })),
       callTool: async (_id, tool) => ({ content: [], ...(tool === "list_windows" ? { structuredContent: { windows: [{ pid: 42, window_id: 123, title: "Counter", app_name: "Counter" }] } } : {}) }),
       getStatus: async (id) => ({ id, name: "Computer use", status: { kind: "running", toolCount: 1 }, toolsCount: 1, errorMessage: null, stderrTail: null, startedAtMs: 0 }),
       onStatus: () => () => {}, onActivity: () => () => {},
@@ -97,6 +98,30 @@ describe("computer-use status controls", () => {
     expect(screen.getByRole("button", { name: "Stop computer use" })).toBeDisabled();
     await act(async () => { release(); await controller.stop(); });
     expect(screen.queryByRole("button", { name: "Stop computer use" })).toBeNull();
+    await controller.dispose();
+  });
+
+  it.each(["starting", "error", "stopping"] as const)("keeps live-view Stop available in %s unless shutdown is pending", async (phase) => {
+    const { controller, release } = await activeController();
+    const state = { ...controller.getState(), phase };
+    vi.spyOn(controller, "getState").mockReturnValue(state);
+    render(<ComputerPreview controller={controller} workspaceId="demo" size={{ width: 400, height: 300 }} close={() => {}} onStatusChange={() => {}} />);
+    const button = screen.getByRole("button", { name: "Stop computer use in live view" });
+    if (phase === "stopping") expect(button).toBeDisabled();
+    else expect(button).toBeEnabled();
+    release();
+    await controller.dispose();
+  });
+
+  it("announces only the state text instead of wrapping the Stop buttons in a live region", async () => {
+    const { controller, peek, release } = await activeController();
+    const { container } = render(<ComputerIndicator controller={controller} peek={peek} showWorkspace={() => true} />);
+    expect(container.querySelector('[data-computer-use="indicator"]')).not.toHaveAttribute("role");
+    const live = container.querySelector('[aria-live="polite"]');
+    expect(live).toHaveTextContent("Computer · Counter");
+    expect(live?.querySelector("button")).toBeNull();
+    expect(screen.getByRole("button", { name: "Stop computer use" }).closest('[aria-live]')).toBeNull();
+    release();
     await controller.dispose();
   });
 

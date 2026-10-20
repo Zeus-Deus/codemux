@@ -1,17 +1,21 @@
 # Computer use
 
 Computer use is an optional Official plugin. It starts off. Use a structured
-bridge, such as browser tools or Unity tools, whenever one is available.
+tool, such as browser tools or app-specific plugin tools, whenever one is available.
 
 Enable **Computer use** in Settings → Plugins, then open its settings. Check the
 installation, allow access in the current local workspace, choose an application
 window, and select **Enable for this window**. The workspace choice is saved on
 this device. The selected window and active control are never restored after a
-restart. Switching workspaces stops control.
+restart. Switching workspaces stops control. Control expires after ten minutes; the UI
+shows the deadline, stops the children, and requires another window selection.
+The UI deadline starts before child startup, so it precedes the driver’s
+ten-minute lifetime and idle limits.
 
 After enabling a window, send a new message in Claude. A turn already in
 progress may not have the newly enabled tools; Claude refreshes them between
-turns.
+turns. In Codex, enabled computer-use calls have no per-tool approval and run
+unprompted in the opted-in workspace.
 
 Install cua-driver yourself using the [official installation guide](https://cua.ai/docs/cua-driver/quickstart).
 Codemux does not run the installer or grant operating-system permissions. This
@@ -41,7 +45,10 @@ Missing or refused capture shows a no-image state.
 ## Scope and limits
 
 - Agent tools are registered only for the opted-in workspace and selected PID
-  and native window ID. The manifest denies full-display capture.
+  and native window ID. Control exposes only `get_window_state`, `click`,
+  `type_text` and `scroll`. Window discovery is plugin-only, for the user’s
+  window picker; agents cannot list other windows or read driver/session config.
+  The manifest denies full-display capture.
 - Click, type and scroll require explicit background delivery. Refused actions
   do not fall back to foreground input.
 - Hold, drag, replay, key chords, clipboard, application launching and driver
@@ -49,7 +56,11 @@ Missing or refused capture shows a no-image state.
   restricted to an empty list.
 - A driver policy filters `tools/list`; a separate capability manifest limits
   resources. Both files are private to this plugin and regenerated for each
-  child. Driver configuration is read on child startup.
+  child. A plugin-only probe verifies the actual tool roster with the exact
+  same files before control is exposed; the control child is checked again.
+  Any extra tool stops startup and disposes the children. Driver configuration
+  is read on child startup. Stale files from an ended page are swept on plugin
+  registration and before startup; pending/live registrations keep their files.
 - Remote/SSH workspaces cannot control this computer.
 - Capture and semantic background click/type worked for the owned XWayland GTK
   fixture on Hyprland with plain `DISPLAY=:0`. Capture showed only that window.
