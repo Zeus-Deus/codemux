@@ -166,7 +166,12 @@ export const ToolCallCard = memo(function ToolCallCard({
     isError,
   });
 
-  const launchedThread = displayItem.tool_name.split("__").pop() === "thread_launch" && item.status === "done" ? launchedChatId(item.result_content) : null;
+  const launchToolName = displayItem.tool_name.startsWith("mcp__codemux__")
+    ? displayItem.tool_name.slice("mcp__codemux__".length)
+    : displayItem.tool_name;
+  const launchedThread = launchToolName === "thread_launch" && item.status === "done"
+    ? launchedChatId(item.result_content)
+    : null;
   const hasResultBody = hasRenderableContent(item.result_content);
   const inputText = hasRenderableInput(displayItem.input)
     ? safeStringify(displayItem.input)

@@ -785,6 +785,11 @@ it("plugin bridge approval displays and allows the target tool, not the bridge",
 });
 
 describe("native chat launch result", () => {
+  it("keeps another MCP server\'s launch result as an ordinary tool card", () => {
+    render(<ToolCallCard item={makeTool({tool_name:"mcp__other__thread_launch",status:"done",result_content:JSON.stringify({thread_id:"foreign-chat"})})} approval={null} onDecide={vi.fn()} />);
+    expect(screen.queryByRole("button", {name:"Open chat"})).not.toBeInTheDocument();
+  });
+
   it.each(["thread_launch", "mcp__codemux__thread_launch"])("opens a chat from %s through app navigation", (toolName) => {
     openChat.mockClear();
     render(<ToolCallCard item={makeTool({tool_name:toolName,status:"done",input:{title:"Parser review"},result_content:[{type:"text",text:JSON.stringify({state:"accepted",thread_id:"launched-chat"})}]})} approval={null} onDecide={vi.fn()} />);
