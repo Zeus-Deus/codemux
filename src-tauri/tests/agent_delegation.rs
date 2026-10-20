@@ -1670,7 +1670,7 @@ mod delegation {
         assert_eq!(
             h.call(FULL, args("codex", "Add slugify helper"))
                 .unwrap_err(),
-            "Cross-provider delegation is off (Settings → Agent)."
+            "Cross-provider delegation is off (Settings → Agents → Models & behavior)."
         );
     }
 

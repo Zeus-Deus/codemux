@@ -762,11 +762,10 @@ impl Journal {
             .transpose()
     }
 
+    #[cfg(test)]
     pub(crate) fn claim_delivery(&self, id: &str) -> Result<Option<String>, String> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         let mut task = read_task(&tx, id)?;
         if task.cancel_requested || task.wake_error.as_deref() == Some("disposed_by_stop") || task.wake_state != WakeState::Pending {
             return Ok(None);
@@ -802,19 +801,19 @@ impl Journal {
         let mut conn=self.conn.lock().unwrap();let tx=conn.transaction().map_err(|e|e.to_string())?;
         let mut task=read_task(&tx,id)?;
         if task.cancel_requested || task.wake_error.as_deref() == Some("disposed_by_stop") {return Err("Task cancelled".into());}
-        if matches!(task.wake_state, WakeState::Held | WakeState::Suppressed | WakeState::Delivered) {
+        let prior:Option<(String,String)>=tx.query_row("SELECT attempt,state FROM delivery_outcomes WHERE task=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+        if !(task.wake_state == WakeState::Pending || (task.wake_state == WakeState::Held && prior.as_ref().is_some_and(|(_, state)| state == "before_send"))) {
             return Err("Result is held or already delivered; explicit release is required".into());
         }
-        let prior:Option<(String,String)>=tx.query_row("SELECT attempt,state FROM delivery_outcomes WHERE task=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
         let attempt=match prior {
-            Some((_,state)) if matches!(state.as_str(),"accepted"|"unknown")=>return Err("SSH acceptance may have occurred; automatic resend held".into()),
-            Some((attempt,_)) if !attempt.is_empty()=>attempt,
+            Some((_,state)) if !matches!(state.as_str(),"before_send"|"not_attempted")=>return Err("SSH acceptance may have occurred; automatic resend held".into()),
             _=>format!("task-result:ssh:{id}:1"),
         };
         tx.execute("INSERT INTO delivery_outcomes(task,attempt,state) VALUES (?1,?2,'before_send') ON CONFLICT(task) DO UPDATE SET attempt=excluded.attempt,state='before_send'",params![id,attempt]).map_err(|e|e.to_string())?;
         task.wake_state=WakeState::Delivering;tx.execute("UPDATE tasks SET data=?2 WHERE id=?1",params![id,encode(&task)?]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e|e.to_string())?;Ok(attempt)
     }
+    #[cfg(test)]
     pub(crate) fn delivery_attempt(&self, id: &str) -> Result<String, String> {
         self.conn
             .lock()
@@ -855,7 +854,6 @@ impl Journal {
             .map_err(|e| e.to_string())?;
         if state.as_deref().is_some_and(|s| !matches!(s, "before_send" | "not_attempted"))
             || task.cancel_requested
-            || task.wake_error.as_deref() == Some("disposed_by_stop")
             || matches!(
                 task.wake_state,
                 WakeState::Delivered | WakeState::Delivering
@@ -898,8 +896,7 @@ impl Journal {
                         continue;
                     }
                 };
-            if !stopped && task.wake_state == WakeState::Delivering && outcome == DeliveryOutcome::BeforeSend
-                && matches!(outcome, DeliveryOutcome::NotAttempted | DeliveryOutcome::BeforeSend) {
+            if !stopped && task.wake_state == WakeState::Delivering && outcome == DeliveryOutcome::BeforeSend {
                 self.update(&task.id, |t| { t.wake_state = WakeState::Pending; t.wake_error = None; })?;
                 continue;
             }

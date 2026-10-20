@@ -1768,6 +1768,7 @@ impl Session {
             .await;
             let mut transport_failed = false;
             let mut dispatch_refused = false;
+            let mut prompt_responded = false;
             let result = if control.is_none() || !self.turn_admitted(&turn).await {
                 if let Some(checkpoint) = &input.turn_checkpoint {
                     checkpoint.abort().await;
@@ -1837,12 +1838,13 @@ impl Session {
                     tokio::select! {
                         biased;
                         response=&mut request=>break match response {
-                            Ok((value, _))=>Ok(value),
+                            Ok((value, _))=>{ prompt_responded = true; Ok(value) },
                             Err(RpcChildError::CancelledBeforeWrite)=>{
                                 if let Some(checkpoint) = &input.turn_checkpoint { checkpoint.abort().await; }
                                 Ok(json!({"stopReason":"cancelled"}))
                             },
                             Err(e)=>{
+                                prompt_responded = matches!(&e,RpcChildError::RpcError(_));
                                 transport_failed = !matches!(e,RpcChildError::RpcError(_)) || !self.child.is_alive();
                                 Err(if self.child.is_alive() { rpc_error("session/prompt",&e) } else { protocol("ACP prompt transport failed") })
                             }
@@ -1863,6 +1865,15 @@ impl Session {
                 }
                 }
             };
+            if let Some(checkpoint) = &input.turn_checkpoint {
+                if prompt_responded {
+                    checkpoint.accepted(&turn).await;
+                } else if result.is_err() {
+                    // A terminal transport failure has no native acceptance
+                    // evidence, including cancellation whose reply never arrived.
+                    checkpoint.abort().await;
+                }
+            }
             drop(control);
             // Cancelled or misconfigured before its prompt: the rest of a held
             // queue stays held.

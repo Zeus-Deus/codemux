@@ -33,6 +33,7 @@ use super::slash_commands::{is_available_commands_update, AcpSlashCommandCache};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const PROMPT_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 /// After Grok's durable `turn_completed` lifecycle update, keep waiting for
 /// the authoritative standard prompt response through a normal RPC watchdog
 /// window. Grok can still be uploading traces/session state after the terminal
@@ -1114,7 +1115,7 @@ impl AcpSession {
         }
 
         if let Some(checkpoint) = &input.turn_checkpoint {
-            if let Err(error) = checkpoint.authorize_dispatch() { Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await; return Err(PrepareTurnError::Rejected(error)); }
+            if let Err(error) = checkpoint.verify_dispatch() { Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await; return Err(PrepareTurnError::Rejected(error)); }
         }
         let turn_id = TurnId(self.opaque_id("turn"));
         {
@@ -1176,9 +1177,10 @@ impl AcpSession {
             // `interrupt` writes, so the request cannot slip past.
             let interrupted_before_send = self.state.lock().await.take_interrupt(generation);
             let response = if interrupted_before_send {
+                if let Some(checkpoint) = &checkpoint { checkpoint.abort().await; }
                 Ok(json!({ "stopReason": "cancelled" }))
             } else {
-                self.send_prompt(&prompt, generation, checkpoint.as_ref()).await
+                self.send_prompt(&turn_id, &prompt, generation, checkpoint.as_ref()).await
             };
             let mut next = self.finish_turn(turn_id, response, generation).await;
             loop {
@@ -1310,7 +1312,7 @@ impl AcpSession {
     /// and that mutex is FIFO so the cancel queues behind the prompt and
     /// still reaches the child second. `session/cancel` is a notification
     /// with no reply, so repeating it is harmless.
-    async fn send_prompt(&self, prompt: &[Value], generation: u64, checkpoint: Option<&Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>) -> Result<Value, RpcChildError> {
+    async fn send_prompt(&self, turn: &TurnId, prompt: &[Value], generation: u64, checkpoint: Option<&Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>) -> Result<Value, RpcChildError> {
         let prompt_id = self.dialect.is_grok().then(|| self.opaque_id("prompt"));
         let fallback_rx = if let Some(prompt_id) = prompt_id.as_ref() {
             let (tx, rx) = oneshot::channel();
@@ -1334,67 +1336,76 @@ impl AcpSession {
             });
         }
         if let Some(checkpoint) = checkpoint {
-            checkpoint.authorize_dispatch().map_err(|error| RpcChildError::RpcError(RpcError {code:-32001,message:error.to_string(),data:None}))?;
-        }
-        let request = self
-            .child
-            .request_with_timeout("session/prompt", params, PROMPT_TIMEOUT);
-        let fallback = async move {
-            match fallback_rx {
-                Some(rx) => rx.await.ok(),
-                None => std::future::pending::<Option<Value>>().await,
+            if let Err(error) = checkpoint.authorize_dispatch() {
+                checkpoint.abort().await;
+                return Err(RpcChildError::RpcError(RpcError {code:-32001,message:error.to_string(),data:None}));
             }
-        };
-        let completion =
-            prefer_standard_prompt_response(request, fallback, XAI_TERMINAL_RESPONSE_GRACE);
-        tokio::pin!(completion);
-        loop {
-            tokio::select! {
-                biased;
-                response = &mut completion => {
-                    self.clear_xai_prompt_completion(prompt_id.as_deref()).await;
-                    return response;
-                },
-                () = self.interrupt_notify.notified() => {
-                    if !self.state.lock().await.take_interrupt(generation) {
-                        continue;
-                    }
-                    // Hand the cancel to a detached task instead of
-                    // awaiting it here. A child's stdin is a blocking-pool
-                    // wrapper on Windows, whose `flush` yields at least
-                    // once, so the pinned prompt future can be parked
-                    // *inside* `write_line` while still holding the
-                    // transport's writer mutex. Awaiting the cancel in this
-                    // branch body would then block on that same mutex —
-                    // and `select!` does not poll the prompt arm that owns
-                    // it while a branch body is awaiting, so the turn
-                    // deadlocks and the Stop is swallowed. Spawning keeps
-                    // the loop polling the prompt so its write can finish
-                    // and release the lock; the cancel queues behind it on
-                    // the FIFO mutex, preserving the order described above.
-                    let child = Arc::clone(&self.child);
-                    let session_id = self.provider_session_id.0.clone();
-                    let event_tx = self.event_tx.clone();
-                    let thread_id = self.thread_id.clone();
-                    let provider_label = self.dialect.label();
-                    tokio::spawn(async move {
-                        if let Err(error) = child
-                            .notify("session/cancel", json!({ "sessionId": session_id }))
-                            .await
-                        {
-                            let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
-                                thread_id: Some(thread_id),
-                                message: format!(
-                                    "Could not cancel the {} turn: {error}",
-                                    provider_label
-                                ),
-                                original_payload: None,
-                            });
+        }
+        let mut cancellation_expired = false;
+        let response = {
+            let request = self.child.request_with_timeout("session/prompt", params, PROMPT_TIMEOUT);
+            let fallback = async move {
+                match fallback_rx {
+                    Some(rx) => rx.await.ok(),
+                    None => std::future::pending::<Option<Value>>().await,
+                }
+            };
+            let completion = prefer_standard_prompt_response(request, fallback, XAI_TERMINAL_RESPONSE_GRACE);
+            tokio::pin!(completion);
+            let cancel_at = tokio::time::sleep(PROMPT_TIMEOUT);
+            tokio::pin!(cancel_at);
+            let mut cancelling = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    response = &mut completion => break response,
+                    () = self.interrupt_notify.notified() => {
+                        if !self.state.lock().await.take_interrupt(generation) { continue; }
+                        if !cancelling {
+                            cancelling = true;
+                            cancel_at.as_mut().reset(tokio::time::Instant::now() + PROMPT_CANCEL_TIMEOUT);
                         }
-                    });
+                        // Keep polling the prompt while cancel waits for the
+                        // same FIFO writer, including a partial request frame.
+                        let child = Arc::clone(&self.child);
+                        let session_id = self.provider_session_id.0.clone();
+                        let event_tx = self.event_tx.clone();
+                        let thread_id = self.thread_id.clone();
+                        let provider_label = self.dialect.label();
+                        tokio::spawn(async move {
+                            if let Err(error) = child
+                                .notify("session/cancel", json!({ "sessionId": session_id }))
+                                .await
+                            {
+                                let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                                    thread_id: Some(thread_id),
+                                    message: format!(
+                                        "Could not cancel the {} turn: {error}",
+                                        provider_label
+                                    ),
+                                    original_payload: None,
+                                });
+                            }
+                        });
+                    }
+                    () = &mut cancel_at, if cancelling => {
+                        cancellation_expired = true;
+                        break Err(RpcChildError::Timeout {method:"session/prompt cancellation".into(),elapsed:PROMPT_CANCEL_TIMEOUT});
+                    }
                 }
             }
+        };
+        if let Some(checkpoint) = checkpoint {
+            if matches!(&response, Ok(_) | Err(RpcChildError::RpcError(_))) {
+                checkpoint.accepted(turn).await;
+            } else {
+                checkpoint.abort().await;
+            }
         }
+        self.clear_xai_prompt_completion(prompt_id.as_deref()).await;
+        // Drop the unanswered request before shutting down its transport.
+        if cancellation_expired { let _ = self.child.shutdown().await; }
+        response
     }
 
     async fn clear_xai_prompt_completion(&self, prompt_id: Option<&str>) {

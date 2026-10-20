@@ -9,7 +9,7 @@ import { useFeatureFlags } from "@/stores/feature-flags";
 import { toast } from "@/lib/toast";
 
 /**
- * Settings → Interface. Home of the Agent Chat GUI master toggle —
+ * Settings → Agents → Chat interface. Home of the Agent Chat GUI master toggle —
  * formerly the "Beta Features" section, promoted to a regular setting
  * now that the GUI is the default interface.
  *
@@ -67,7 +67,7 @@ export function InterfaceSection() {
   return (
     <div>
       <SectionHeader
-        title="Interface"
+        title="Chat interface"
         description="Choose how Codemux presents agent sessions."
       />
 

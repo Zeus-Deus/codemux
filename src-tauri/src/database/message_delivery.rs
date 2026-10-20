@@ -145,6 +145,29 @@ fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord> {
 }
 const COLUMNS: &str = "id,thread_id,message_id,payload,epoch,generation,attempt_id,state,principal,operation_id,queued_id,turn_id,result,error,attempted,dispatch_payload,attempt_count,origin_notified,hold_reason";
 
+/// Called inside the session merge transaction, before deleting aliases.
+pub(super) fn move_to_thread(conn: &Connection, merged: &[String], survivor: &str) -> Result<(), String> {
+    for source in merged {
+        conn.execute("INSERT INTO agent_thread_delivery_state(thread_id,generation,stopped)
+            SELECT ?2,generation,stopped FROM agent_thread_delivery_state WHERE thread_id=?1
+            ON CONFLICT(thread_id) DO UPDATE SET generation=MAX(generation,excluded.generation),stopped=MAX(stopped,excluded.stopped)",params![source,survivor]).map_err(|e|e.to_string())?;
+        conn.execute("UPDATE agent_message_deliveries SET thread_id=?2,
+            payload=json_set(payload,'$.input.thread_id',?2),
+            dispatch_payload=CASE WHEN dispatch_payload IS NULL THEN NULL ELSE json_set(dispatch_payload,'$.input.thread_id',?2) END
+            WHERE thread_id=?1",params![source,survivor]).map_err(|e|e.to_string())?;
+        conn.execute("UPDATE agent_message_delivery_results SET target_thread_id=?2 WHERE target_thread_id=?1",params![source,survivor]).map_err(|e|e.to_string())?;
+        conn.execute("UPDATE agent_control_operations SET thread_id=?2,
+            admitted_payload=CASE WHEN admitted_payload IS NULL THEN NULL ELSE json_set(admitted_payload,'$.input.thread_id',?2) END,
+            result=CASE WHEN result IS NULL THEN NULL ELSE json_set(result,'$.thread_id',?2) END
+            WHERE thread_id=?1 AND delivery_id IS NOT NULL",params![source,survivor]).map_err(|e|e.to_string())?;
+        conn.execute("DELETE FROM agent_thread_delivery_state WHERE thread_id=?1",[source]).map_err(|e|e.to_string())?;
+    }
+    // Both aliases now share the survivor's Stop fence. Existing held and
+    // disposed states remain authoritative; merging never rearms them.
+    conn.execute("UPDATE agent_message_deliveries SET generation=COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1),0) WHERE thread_id=?1 AND attempted=0",[survivor]).map_err(|e|e.to_string())?;
+    Ok(())
+}
+
 /// Optional outside-controller receipt, admitted atomically with its effect.
 pub struct DeliveryOperation<'a> {
     pub principal: &'a str,
@@ -253,11 +276,55 @@ impl DatabaseStore {
         if n==0 { return Err("Delivery may already have reached the provider; automatic replay is held".into()); }
         Ok(())
     }
+    /// Only the explicit remote-result action calls this, after checking the
+    /// delegation ledger and live authority. Stop never automatically rearms it.
+    pub(crate) fn rearm_remote_result_delivery(&self, thread: &str, task: &str) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let canonical = format!("ssh:{task}");
+        let record: Option<String> = tx.query_row("SELECT record FROM agent_delegation_tasks WHERE task_id=?1 AND parent_thread_id=?2", params![canonical, thread], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        let mut record = record.map(|data| serde_json::from_str::<super::delegation_tasks::TaskRecord>(&data).map_err(|e| e.to_string())).transpose()?;
+        if record.as_ref().is_some_and(|record| matches!(record.completion_delivery.as_str(), "acknowledged" | "disposed_by_close" | "held_unknown" | "delivered")) {
+            return Err("Remote result was acknowledged, closed or may already have reached the provider".into());
+        }
+        let delivery = record.as_ref().and_then(|record| record.delivery_id.clone()).unwrap_or_else(|| format!("task-result:{canonical}:1"));
+        let message = format!("delegation:{task}");
+        let row = tx.query_row(&format!("SELECT {COLUMNS} FROM agent_message_deliveries WHERE thread_id=?1 AND (id=?2 OR message_id=?3)"), params![thread,delivery,message], read).optional().map_err(|e|e.to_string())?;
+        if let Some(row) = row {
+            let stopped = row.hold_reason.as_deref() == Some("stop") || record.as_ref().is_some_and(|record| record.completion_delivery == "disposed_by_stop");
+            if row.attempted || row.queued_id.is_some() || row.payload["origin"] != "remote_delegation"
+                || !matches!(row.state.as_str(), "pending" | "held" | "rejected" | "cancelled")
+                || (row.state == "cancelled" && !stopped)
+            {
+                return Err("Remote result may already have reached the provider or no longer owns this delivery".into());
+            }
+            tx.execute("UPDATE agent_message_deliveries SET state='pending',dispatch_owned=0,attempt_count=0,retry_at=NULL,error=NULL,hold_reason=NULL,attention_acknowledged=0,
+                generation=COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?2),0),updated_at=datetime('now') WHERE id=?1",params![row.id,thread]).map_err(|e|e.to_string())?;
+        }
+        if let Some(record) = &mut record {
+            record.completion_delivery = "pending".into();
+            record.admission_generation = Some(tx.query_row("SELECT COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1),0)", [thread], |r| r.get(0)).map_err(|e| e.to_string())?);
+            tx.execute("UPDATE agent_delegation_tasks SET record=?2 WHERE task_id=?1", params![canonical, serde_json::to_string(record).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e|e.to_string())
+    }
+
     pub fn stop_message_deliveries(&self, thread: &str) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         stop_in_transaction(&tx, thread)?;
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// New human instructions supersede only definite-no-send resume intent.
+    /// Completed task reports retain their independent delivery ownership.
+    pub fn dispose_superseded_resume_deliveries(&self, thread: &str) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e|e.to_string())?;
+        tx.execute("UPDATE agent_message_deliveries SET state='cancelled',dispatch_owned=0,retry_at=NULL,hold_reason='superseded',error='Resume superseded by newer human activity'
+            WHERE thread_id=?1 AND attempted=0 AND state IN ('pending','preparing','queued','submitting','held','rejected') AND json_extract(payload,'$.origin') IN ('usage_resume','restart_resume')",[thread]).map_err(|e|e.to_string())?;
+        retire_automatic_queues(&tx,Some(thread))?;
+        tx.commit().map_err(|e|e.to_string())
     }
 
     pub fn is_disposed_delivery_queue(&self, thread: &str, queued: &str) -> Result<bool, String> {
@@ -368,7 +435,7 @@ impl DatabaseStore {
         tx.execute("UPDATE agent_message_deliveries SET dispatch_owned=0,hold_reason=CASE WHEN ?2='held' OR (state='held' AND ?2='queued') THEN COALESCE(hold_reason,'recovery') ELSE NULL END,state=CASE WHEN state='held' AND ?2='queued' THEN state ELSE ?2 END,result=COALESCE(?3,result),error=CASE WHEN state='held' AND ?2='queued' THEN error ELSE ?4 END,
             queued_id=COALESCE(json_extract(?3,'$.queued_id'),queued_id),turn_id=COALESCE(json_extract(?3,'$.turn_id'),turn_id),
             retry_at=CASE WHEN ?2='pending' THEN datetime('now','+' || MIN(300,5 * (1 << MIN(attempt_count,6))) || ' seconds') ELSE NULL END,updated_at=datetime('now')
-            WHERE id=?1 AND state<>'cancelled' AND (state<>'accepted' OR ?2='accepted') AND ((state='held' AND ?2='queued') OR ?2 IN ('held','held_unknown','cancelled','accepted','submitting','rejected') OR (state NOT IN ('held','held_unknown','rejected') AND (state<>'accepted' OR ?2='accepted') AND NOT (state='pending' AND error IS NOT NULL AND ?2 IN ('accepted','submitting'))))",params![id,state,result.map(Value::to_string),error]).map_err(|e|e.to_string())?;
+            WHERE id=?1 AND state<>'cancelled' AND (state<>'accepted' OR ?2='accepted') AND NOT (?2='submitting' AND state IN ('pending','held','held_unknown','rejected')) AND ((state='held' AND ?2='queued') OR ?2 IN ('held','held_unknown','cancelled','accepted','submitting','rejected') OR (state NOT IN ('held','held_unknown','rejected') AND (state<>'accepted' OR ?2='accepted') AND NOT (state='pending' AND error IS NOT NULL AND ?2 IN ('accepted','submitting'))))",params![id,state,result.map(Value::to_string),error]).map_err(|e|e.to_string())?;
         tx.execute("UPDATE agent_control_operations SET
             state=CASE (SELECT state FROM agent_message_deliveries WHERE id=?1) WHEN 'accepted' THEN 'succeeded' WHEN 'queued' THEN 'succeeded' WHEN 'submitting' THEN 'succeeded' WHEN 'held_unknown' THEN 'needs_attention' WHEN 'held' THEN 'needs_attention' WHEN 'cancelled' THEN 'failed' WHEN 'rejected' THEN 'failed' ELSE 'accepted' END,
             dispatch_disposition=(SELECT state FROM agent_message_deliveries WHERE id=?1),
@@ -378,6 +445,20 @@ impl DatabaseStore {
             params![id]).map_err(|e|e.to_string())?;
         tx.execute("UPDATE agent_delegation_tasks SET record=json_set(record,'$.completion_delivery',CASE (SELECT state FROM agent_message_deliveries WHERE id=?1) WHEN 'accepted' THEN 'delivered' ELSE (SELECT state FROM agent_message_deliveries WHERE id=?1) END,'$.delivered_at',CASE WHEN (SELECT state FROM agent_message_deliveries WHERE id=?1)='accepted' THEN COALESCE(json_extract(record,'$.delivered_at'),CAST(unixepoch('subsec')*1000 AS INTEGER)) ELSE json_extract(record,'$.delivered_at') END) WHERE task_id IN (SELECT task_id FROM agent_message_delivery_results WHERE delivery_id=?1) AND json_extract(record,'$.completion_delivery') NOT IN ('acknowledged','disposed_by_stop','disposed_by_close')",[id]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
+    }
+    pub fn accept_message_delivery_prompt(&self, id: &str, turn: &str) -> Result<(), String> {
+        {
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction().map_err(|e|e.to_string())?;
+            tx.execute("INSERT INTO agent_chat_messages(thread_id,payload) SELECT thread_id,json_object('type','native_prompt_accepted','delivery_id',id,'turn_id',?2) FROM agent_message_deliveries WHERE id=?1 AND attempted=1",params![id,turn]).map_err(|e|e.to_string())?;
+            tx.execute("UPDATE agent_message_deliveries SET turn_id=?2 WHERE id=?1 AND attempted=1",params![id,turn]).map_err(|e|e.to_string())?;
+            tx.commit().map_err(|e|e.to_string())?;
+        }
+        let row = self.message_delivery(id)?.ok_or("delivery_not_found")?;
+        if row.attempted {
+            self.finish_message_delivery(id,"accepted",Some(&serde_json::json!({"turn_id":turn,"queued_id":null,"steered":false})),None)?;
+        }
+        Ok(())
     }
     pub fn confirm_message_delivery_turn(&self, thread: &str, turn: &str) -> Result<(), String> {
         let ids: Vec<String> = {
@@ -423,9 +504,11 @@ impl DatabaseStore {
             AND json_extract(c.payload,'$.user_message_id')=m.id
             WHERE m.thread_id=agent_message_deliveries.thread_id AND m.message_id=agent_message_deliveries.message_id LIMIT 1))
             WHERE state IN ('submitting','held_unknown')",[]).map_err(|e|e.to_string())?;
-        conn.execute("UPDATE agent_message_deliveries SET state='accepted',error=NULL WHERE state IN ('submitting','held_unknown') AND EXISTS (
+        conn.execute("UPDATE agent_message_deliveries SET state='accepted',error=NULL WHERE state IN ('submitting','held_unknown') AND attempted=1 AND EXISTS (
             SELECT 1 FROM agent_chat_messages m WHERE m.thread_id=agent_message_deliveries.thread_id
-            AND json_extract(m.payload,'$.type')='turn_completed' AND json_extract(m.payload,'$.turn_id')=agent_message_deliveries.turn_id)",[]).map_err(|e|e.to_string())?;
+            AND json_extract(m.payload,'$.turn_id')=agent_message_deliveries.turn_id
+            AND ((json_extract(m.payload,'$.type')='native_prompt_accepted' AND json_extract(m.payload,'$.delivery_id')=agent_message_deliveries.id)
+                OR (json_extract(agent_message_deliveries.payload,'$.provider') IN ('claude','codex','opencode') AND json_extract(m.payload,'$.type')='turn_completed')))",[]).map_err(|e|e.to_string())?;
         // For native ACK adapters the correlated envelope is written after
         // actual acceptance. ACP worker ACKs alone remain ambiguous.
         conn.execute("UPDATE agent_message_deliveries SET state='accepted',error=NULL WHERE state IN ('submitting','held_unknown')
@@ -560,13 +643,82 @@ mod tests {
             id,
             "receiver",
             id,
-            &json!({"origin":"controller","text":"review"}),
+            &json!({"origin":"controller","provider":"claude","text":"review"}),
             "epoch-a",
             0,
             None,
             false,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn review_r1_saved_delivery_replays_after_session_merge() {
+        for release_queue in [false, true] {
+            let db = super::super::init_test_database();
+            for thread in ["source", "survivor"] { db.upsert_agent_chat_session(thread,"ws",None,"claude").unwrap(); }
+            let payload = json!({"origin":"controller","provider":"claude","input":{"thread_id":"source","text":"saved"},"provenance":{"message_id":"message"}});
+            db.admit_message_delivery("delivery","source","message",&payload,"old",0,None,true).unwrap();
+            db.finish_message_delivery("delivery","queued",Some(&json!({"queued_id":"saved"})),None).unwrap();
+            db.conn.lock().unwrap().execute("INSERT INTO agent_chat_queued_turns(thread_id,queued_id,position,text,epoch,provenance) VALUES ('source','saved',0,'saved','old',?1)",[json!({"delivery_id":"delivery","message_id":"message"}).to_string()]).unwrap();
+            db.merge_reopened_agent_chat_session("source","survivor").unwrap();
+            db.recover_message_deliveries("new").unwrap();
+            db.rearm_saved_message_delivery("delivery","survivor","saved",release_queue).unwrap();
+            let moved = db.message_delivery("delivery").unwrap().unwrap();
+            assert_eq!(moved.thread_id,"survivor");
+            assert_eq!(moved.payload["input"]["thread_id"],"survivor");
+        }
+    }
+
+    #[test]
+    fn review_r1_recovery_ignores_synthetic_completion_without_prompt_evidence() {
+        let db = super::super::init_test_database();
+        db.upsert_agent_chat_session("receiver","ws",None,"acp").unwrap();
+        db.admit_message_delivery("unsent","receiver","unsent",&json!({"origin":"controller","provider":"acp"}),"old",0,None,true).unwrap();
+        db.finish_message_delivery("unsent","submitting",Some(&json!({"turn_id":"worker"})),None).unwrap();
+        db.append_agent_chat_message("receiver",&json!({"type":"turn_completed","turn_id":"worker","status":{"kind":"error","subtype":"acp_error"}}).to_string()).unwrap();
+        db.recover_message_deliveries("new").unwrap();
+        let row = db.message_delivery("unsent").unwrap().unwrap();
+        assert_eq!(row.state,"pending");
+        assert!(!row.attempted);
+    }
+
+    #[test]
+    fn review_r1_recovery_requires_native_prompt_response_for_deferred_adapters() {
+        for accepted in [false,true] {
+            let db=super::super::init_test_database();
+            db.upsert_agent_chat_session("receiver","ws",None,"acp").unwrap();
+            db.admit_message_delivery("message","receiver","message",&json!({"origin":"controller","provider":"acp"}),"old",0,None,true).unwrap();
+            db.message_delivery_submitting("message").unwrap();
+            db.finish_message_delivery("message","submitting",Some(&json!({"turn_id":"turn"})),None).unwrap();
+            db.append_agent_chat_message("receiver",&json!({"type":"turn_completed","turn_id":"turn","status":{"kind":"error","subtype":"acp_error"}}).to_string()).unwrap();
+            if accepted {
+                db.accept_message_delivery_prompt("message","turn").unwrap();
+                // Recover the durable response marker after an interrupted ACK update.
+                db.conn.lock().unwrap().execute("UPDATE agent_message_deliveries SET state='submitting' WHERE id='message'",[]).unwrap();
+            }
+            db.recover_message_deliveries("new").unwrap();
+            assert_eq!(db.message_delivery("message").unwrap().unwrap().state,if accepted {"accepted"} else {"held_unknown"});
+        }
+    }
+
+    #[test]
+    fn review_r1_merge_moves_stop_fence_dispatch_target_and_result_ownership() {
+        let db=super::super::init_test_database();
+        for thread in ["source","survivor"] { db.upsert_agent_chat_session(thread,"ws",None,"claude").unwrap(); }
+        let payload=json!({"origin":"delegation","provider":"claude","input":{"thread_id":"source","text":"result"},"provenance":{"notification":{"source":{"kind":"delegated_task","task_ids":["task"]},"outcome":"completed"}}});
+        db.admit_message_delivery("result","source","result",&payload,"old",0,Some(DeliveryOperation {principal:"test",key:"result",hash:"hash",workspace:"ws"}),true).unwrap();
+        db.conn.lock().unwrap().execute("UPDATE agent_message_deliveries SET dispatch_payload=payload WHERE id='result'",[]).unwrap();
+        db.stop_message_deliveries("source").unwrap();
+        db.merge_reopened_agent_chat_session("source","survivor").unwrap();
+        let row=db.message_delivery("result").unwrap().unwrap();
+        assert_eq!(row.state,"cancelled"); assert_eq!(row.hold_reason.as_deref(),Some("stop"));
+        assert_eq!(row.dispatch_payload.unwrap()["input"]["thread_id"],"survivor");
+        assert_eq!(db.delivery_generation("survivor").unwrap().0,1);
+        let conn=db.conn.lock().unwrap();
+        assert_eq!(conn.query_row("SELECT target_thread_id FROM agent_message_delivery_results WHERE delivery_id='result'",[],|r|r.get::<_,String>(0)).unwrap(),"survivor");
+        let operation:(String,String)=conn.query_row("SELECT thread_id,json_extract(admitted_payload,'$.input.thread_id') FROM agent_control_operations WHERE delivery_id='result'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(operation,("survivor".into(),"survivor".into()));
     }
     #[test]
     fn orchestration_message_migration_preserves_legacy_human_unknown() {

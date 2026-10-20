@@ -89,7 +89,7 @@ async fn chatgpt_runtime_renews_idle_child_and_resumes_queued_turn() {
     let binary = fixture_binary(dir.path());
     let (tx, _) = broadcast::channel(128);
     let session = CodexSession::spawn_and_initialize(
-        ThreadId("t".into()),
+        ThreadId("managed-runtime-renew-queue".into()),
         dir.path().into(),
         Some("fixture-model".into()),
         Some("read-only".into()),

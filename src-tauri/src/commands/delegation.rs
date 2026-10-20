@@ -1066,7 +1066,7 @@ fn delegate_with_call<R: Runtime>(
     let wait_until = (arguments["mode"] == "wait").then(|| now_ms() + arguments["wait_ms"].as_u64().unwrap_or(20_000).min(20_000) as i64);
 
     if !setting_on(&db) {
-        return Err("Cross-provider delegation is off (Settings → Agent).".into());
+        return Err("Cross-provider delegation is off (Settings → Agents → Models & behavior).".into());
     }
     if state.is_running_child(parent) {
         return Err("A delegated task cannot delegate further.".into());

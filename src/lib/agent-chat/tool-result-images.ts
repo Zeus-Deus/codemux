@@ -1,3 +1,5 @@
+import { lazyToolResultStub } from "./lazy-tool-result";
+
 /**
  * Pull renderable images out of a tool-result `content` payload.
  *
@@ -16,12 +18,13 @@
  *   3. OpenCode native file block:
  *        { type: "file", uri: "data:image/png;base64,…", mime: "image/png" }
  *
- * The backend forwards these blocks through verbatim (tool-result
- * content is opaque JSON), so the data is already client-side — the
- * transcript renderers just never turned it into an `<img>`. This
- * helper is the single place that normalises both shapes into a
- * webview-loadable `src`, so the tool bodies can render a thumbnail
- * instead of dumping base64 text.
+ *   4. Codex native MCP / dynamic output blocks:
+ *        { type: "image", data: "<b64>", mimeType: "image/png" }
+ *        { type: "inputImage", imageUrl: "data:image/png;base64,…" }
+ *
+ * Full provider content is opaque JSON. Oversized results can instead carry
+ * lazy image handles; `LazyToolResultImages` resolves those independently of
+ * the full body. This helper normalizes loaded blocks to image sources.
  */
 
 export interface ToolResultImage {
@@ -65,6 +68,13 @@ function imageFromEntry(entry: unknown): ToolResultImage | null {
     return safe ? { src: safe } : null;
   }
 
+  // Codex dynamic tool output uses inputImage even in a result envelope.
+  if (entry.type === "inputImage") {
+    const url = str(entry.imageUrl);
+    const safe = url && safeImageSrc(url);
+    return safe ? { src: safe } : null;
+  }
+
   if (entry.type === "file") {
     const mediaType = str(entry.mime);
     const uri = str(entry.uri);
@@ -76,6 +86,14 @@ function imageFromEntry(entry: unknown): ToolResultImage | null {
   if (entry.type !== "image") return null;
 
   const source = entry.source;
+  // Native MCP image blocks carry their MIME type beside the base64 data.
+  if (source === undefined) {
+    const data = str(entry.data);
+    const mediaType = str(entry.mimeType);
+    return data && mediaType && /^image\//i.test(mediaType)
+      ? { src: `data:${mediaType};base64,${data}`, mediaType }
+      : null;
+  }
   if (!isRecord(source)) return null;
 
   if (source.type === "base64") {
@@ -114,17 +132,77 @@ export function isRenderableImageBlock(entry: unknown): boolean {
  * a non-empty result as "render a thumbnail grid".
  */
 export function extractToolResultImages(content: unknown): ToolResultImage[] {
-  if (!Array.isArray(content)) return [];
   const out: ToolResultImage[] = [];
-  for (const entry of content) {
+  visitImageContent(content, (entry) => {
     const image = imageFromEntry(entry);
     if (image) out.push(image);
-  }
+  });
   return out;
 }
 
-/** Cheap presence check without building the `src` strings. */
+/** Provider envelopes wrap blocks under these result containers. Never scan
+ *  arbitrary arguments or metadata for things that merely look like images. */
+function visitImageContent(
+  content: unknown,
+  visit: (entry: unknown, pointer: string) => void,
+  pointer = "",
+) {
+  if (isRenderableImageBlock(content)) {
+    visit(content, pointer);
+  } else if (Array.isArray(content)) {
+    content.forEach((entry, index) =>
+      visitImageContent(entry, visit, `${pointer}/${index}`),
+    );
+  } else if (isRecord(content)) {
+    for (const key of ["result", "content", "contentItems"]) {
+      if (key in content) visitImageContent(content[key], visit, `${pointer}/${key}`);
+    }
+  }
+}
+
+/** Mirrors the Rust wire projection for the browser mock. */
+export function toolResultImagePointers(
+  content: unknown,
+): { pointer: string; src?: string }[] {
+  const pointers: { pointer: string; src?: string }[] = [];
+  visitImageContent(content, (entry, pointer) => {
+    const image = imageFromEntry(entry);
+    if (!image) return;
+    const src = image.src;
+    const match = /^data:image\/(?:png|jpe?g|gif|webp);base64,([^]*)$/i.exec(src);
+    const materializable = match &&
+      match[1].length <= Math.ceil(25 * 1024 * 1024 / 3) * 4;
+    pointers.push(
+      src.length <= 32 * 1024 || !materializable ? { pointer, src } : { pointer },
+    );
+  });
+  return pointers;
+}
+
+/** Render projection only: the store and full-result copy retain every byte. */
+export function withoutToolResultImages(content: unknown): unknown {
+  if (isRenderableImageBlock(content)) return null;
+  if (Array.isArray(content)) {
+    return content
+      .filter((entry) => !isRenderableImageBlock(entry))
+      .map(withoutToolResultImages);
+  }
+  if (isRecord(content)) {
+    const out = { ...content };
+    for (const key of ["result", "content", "contentItems"]) {
+      if (key in out) out[key] = withoutToolResultImages(out[key]);
+    }
+    return out;
+  }
+  return content;
+}
+
+/** Presence check includes lazy image metadata so disclosure/turn folding stays
+ *  identical before and after loading the full result. */
 export function hasToolResultImages(content: unknown): boolean {
-  if (!Array.isArray(content)) return false;
-  return content.some((entry) => imageFromEntry(entry) !== null);
+  const stub = lazyToolResultStub(content);
+  if (stub) return stub.has_images;
+  let found = false;
+  visitImageContent(content, () => { found = true; });
+  return found;
 }

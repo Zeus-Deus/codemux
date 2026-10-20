@@ -9,6 +9,22 @@ import { ToolCallBody } from "./ToolCallBodies";
 
 afterEach(cleanup);
 
+it.each([
+  { type: "dynamicToolCall", contentItems: [{ type: "inputImage", imageUrl: "data:image/png;base64,AAAA" }] },
+  { type: "mcpToolCall", result: { content: [{ type: "image", data: "AAAA", mimeType: "image/png" }] } },
+])("renders native output once without image JSON: $type", (content) => {
+  const item: ToolCallItem = {
+    kind: "tool_call", id: "native", seq: 1, tool_use_id: "native",
+    tool_name: content.type, input: {}, status: "done",
+    result_content: content, approval_request_id: null,
+  };
+  const { container } = render(<ToolCallBody item={item} />);
+  expect(screen.getAllByRole("img")).toHaveLength(1);
+  expect(container.textContent).not.toContain("imageUrl");
+  expect(container.textContent).not.toContain("mimeType");
+  expect(container.textContent).not.toContain("AAAA");
+});
+
 it("renders a native image result as a thumbnail and lightbox without dumping its data URI", async () => {
   const fixture: { data: { content: unknown[] } } =
     JSON.parse(nativeImageResultRaw);

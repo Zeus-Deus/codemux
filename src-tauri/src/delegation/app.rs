@@ -239,7 +239,7 @@ pub fn guard_wake<R: Runtime>(
     let store = journal(app)?;
     let task = store.task(id)?;
     let canonical=app.state::<DatabaseStore>().delegation_task(&format!("ssh:{id}"))?;
-    if task.parent_thread_id != thread || task.cancel_requested || canonical.as_ref().is_some_and(|t|matches!(t.completion_delivery.as_str(),"disposed_by_stop"|"acknowledged")) {
+    if task.parent_thread_id != thread || task.cancel_requested || canonical.as_ref().is_some_and(|t|matches!(t.completion_delivery.as_str(),"disposed_by_stop"|"disposed_by_close"|"acknowledged")) {
         return Err("Delegation delivery was stopped or acknowledged".into());
     }
     let parent = parent_for_thread(app, thread)?;
@@ -261,9 +261,18 @@ impl<R: Runtime> Drop for WakeDispatch<R> {
         let _ = self.store.finish_delivery(&self.id, &self.attempt);
         if self.store.delivery_outcome(&self.id).ok() == Some(DeliveryOutcome::BeforeSend) {
             if let Some(db) = self.app.try_state::<DatabaseStore>() {
-                let _ = db.confirm_message_delivery_before_send(&format!("task-result:ssh:{}:1",self.id));
+                let delivery = format!("task-result:ssh:{}:1", self.id);
+                if db.message_delivery(&delivery).ok().flatten().is_some_and(|row| row.attempted) {
+                    let _ = db.confirm_message_delivery_before_send(&delivery);
+                }
             }
         }
+        let _ = self.store.update(&self.id, |task| {
+            if task.wake_state == WakeState::Delivering {
+                task.wake_state = WakeState::Held;
+                task.wake_error = Some("Result dispatch ended before acceptance was confirmed".into());
+            }
+        });
     }
 }
 impl<R: Runtime> std::fmt::Debug for WakeDispatch<R> {
@@ -811,9 +820,9 @@ async fn invoke_open<R: Runtime>(app: &AppHandle<R>, cmd: &str, args: Value) -> 
                 return Err("This result is not available for explicit delivery".into());
             }
             store.explicit_delivery(&id)?;
-            if let Some(record)=app.state::<DatabaseStore>().delegation_task(&format!("ssh:{id}"))? {
-                if record.delivery_id.is_some() {app.state::<DatabaseStore>().retry_delegation_delivery(&record.task_id)?;}
-                else {app.state::<DatabaseStore>().update_delegation_task(&record.task_id,|t|t.completion_delivery="pending".into())?;}
+            if let Err(error) = app.state::<DatabaseStore>().rearm_remote_result_delivery(&parent.thread_id, &id) {
+                store.update(&id, |task| { task.wake_state=WakeState::Held; task.wake_error=Some(error.clone()); })?;
+                return Err(error);
             }
             super::coordinator::wake_open(app, &id).await?;
             value(store.task(&id)?)

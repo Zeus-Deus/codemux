@@ -724,7 +724,7 @@ describe("use-keyboard-shortcuts dispatch — failures are visible", () => {
   it("toasts the backend's reason when the dev command can't run", async () => {
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.mocked(runProjectDevCommand).mockRejectedValueOnce(
-      "No run command configured. Set one in Settings > Projects.",
+      "No run command configured. Set one in Settings → Workspaces → Projects.",
     );
     useAppStore.setState({
       appState: {
@@ -739,7 +739,7 @@ describe("use-keyboard-shortcuts dispatch — failures are visible", () => {
       expect(toast.error).toHaveBeenCalledWith(
         "Couldn't run the dev command",
         expect.objectContaining({
-          description: "No run command configured. Set one in Settings > Projects.",
+          description: "No run command configured. Set one in Settings → Workspaces → Projects.",
         }),
       ),
     );

@@ -630,7 +630,7 @@ impl OpenCodeSession {
         // follows it once it starts.
         let held = input.releases_queue_hold() && self.queue_hold().goes_first();
         if turn_active {
-            let result = self.queue_input(input, None).await;
+            let result = self.queue_input(input, None).await?;
             if held {
                 // Still settling the stopped turn: queue it ahead instead.
                 let mut queue = self.queued.lock().await;
@@ -643,7 +643,12 @@ impl OpenCodeSession {
             return Ok(result);
         }
         if !held && !self.queued.lock().await.is_empty() {
-            return Ok(self.queue_input(input, None).await);
+            let result = self.queue_input(input, None).await?;
+            // Refused items can leave an idle, nonempty queue. No running
+            // turn will emit Ready, so this enqueue must schedule its drain.
+            drop(_outbound);
+            self.drain_queue().await;
+            return Ok(result);
         }
         let was_held = input.releases_queue_hold() && self.queue_hold().take();
         let result = self.dispatch_input(input, false, None).await;
@@ -664,9 +669,10 @@ impl OpenCodeSession {
         &self,
         input: crate::agent_provider::SendTurnInput,
         existing_id: Option<String>,
-    ) -> crate::agent_provider::TurnStartResult {
+    ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
         let is_existing = existing_id.is_some();
         let id = existing_id.unwrap_or_else(|| format!("opencode-queued-{}", Uuid::new_v4()));
+        if let Some(checkpoint) = &input.turn_checkpoint { checkpoint.queued(&id)?; }
         let text = input
             .display_text
             .clone()
@@ -686,11 +692,11 @@ impl OpenCodeSession {
                 text,
             });
         }
-        crate::agent_provider::TurnStartResult {
+        Ok(crate::agent_provider::TurnStartResult {
             turn_id: TurnId(String::new()),
             queued_id: Some(id),
             steered: false,
-        }
+        })
     }
 
     pub async fn steer_turn(
@@ -778,11 +784,11 @@ impl OpenCodeSession {
             }
             Ok(None) => {
                 if let Some(checkpoint) = checkpoint {
-                    checkpoint.abort().await;
+                    checkpoint.defer().await;
                 }
                 // A background execution can resume while model preparation
                 // awaits its ACK. Preserve this input for the next idle turn.
-                Ok(self.queue_input(input, queued_id).await)
+                self.queue_input(input, queued_id).await
             }
             Err(error) => {
                 if let Some(checkpoint) = checkpoint {
@@ -1319,7 +1325,7 @@ impl OpenCodeSession {
         let native_v2 = self.server_handle.api == super::api::OpenCodeApi::V2;
         let (endpoint, body) = if native_v2 {
             if let Some(checkpoint) = &checkpoint {
-                checkpoint.authorize_dispatch()?;
+                checkpoint.verify_dispatch()?;
             }
             let selected_variant = variant.as_deref().filter(|v| !v.is_empty());
             if model != *self.current_model.lock().await
@@ -2621,6 +2627,97 @@ pub(crate) mod tests {
             turn_checkpoint: None,
             dispatch_guard: None,
         }
+    }
+
+    fn journal_checkpoint() -> (tauri::App<tauri::test::MockRuntime>, Arc<dyn crate::agent_provider::TurnDispatchCheckpoint>) {
+        use tauri::Manager;
+        let app = tauri::test::mock_app();
+        let db = crate::database::DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("t1", "ws", None, "opencode").unwrap();
+        db.admit_message_delivery("review-r1", "t1", "review-r1", &serde_json::json!({"origin":"controller","provider":"opencode"}), "epoch", 0, None, true).unwrap();
+        app.manage(db);
+        let checkpoint = Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {
+            app: app.handle().clone(), id: "review-r1".into(), thread: "t1".into(),
+            provider: crate::agent_provider::ProviderKind::OpenCode, inner: None,
+            release_queue: false, admitted_generation: 0, resumed_ids: vec![],
+        });
+        (app, checkpoint)
+    }
+
+    #[tokio::test]
+    async fn review_r1_blocked_queue_does_not_strand_later_idle_human_send() {
+        use tauri::Manager;
+        let mut server = Server::new_async().await;
+        let post = server.mock("POST", "/session/sess_1/prompt_async")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"parts":[{"type":"text","text":"Human"}]})))
+            .with_status(204).expect(1).create_async().await;
+        let (session, _, mut events) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (app, checkpoint) = journal_checkpoint();
+        let mut input = delivery_input("Refused controller");
+        input.turn_checkpoint = Some(checkpoint);
+        session.event_ctx.lock().await.turn_active = true;
+        let blocked = session.enqueue_or_send(input).await.unwrap().queued_id.unwrap();
+        app.state::<crate::database::DatabaseStore>().refuse_message_delivery("review-r1", "grant_revoked").unwrap();
+        session.event_ctx.lock().await.turn_active = false;
+        session.drain_queue().await;
+        session.enqueue_or_send(delivery_input("Human")).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if matches!(events.recv().await.unwrap(), ProviderRuntimeEvent::SessionStateChanged {status: SessionStatus::Running {..}, ..}) { break; }
+            }
+        }).await.expect("an idle enqueue must start selectable work without another Ready event");
+        assert_eq!(session.queued.lock().await.front().unwrap().0, blocked);
+        post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn review_r2_idle_drain_records_human_queue_before_preparation_failure() {
+        use tauri::Manager;
+        let mut server = Server::new_async().await;
+        let rejected_model = server.mock("POST", "/api/session/s/model")
+            .with_status(400).expect(1).create_async().await;
+        let (session, _, _) = mock_session_api(server.url(), "pw".into(), "s", super::super::api::OpenCodeApi::V2).await;
+        let (app, blocked_checkpoint) = journal_checkpoint();
+        let db = app.state::<crate::database::DatabaseStore>();
+        let mut blocked = delivery_input("Refused controller");
+        blocked.turn_checkpoint = Some(blocked_checkpoint);
+        session.event_ctx.lock().await.turn_active = true;
+        session.enqueue_or_send(blocked).await.unwrap();
+        db.refuse_message_delivery("review-r1", "grant_revoked").unwrap();
+        session.event_ctx.lock().await.turn_active = false;
+        db.admit_message_delivery("human", "t1", "human", &serde_json::json!({"origin":"user","provider":"opencode"}), "epoch", 0, None, true).unwrap();
+        let mut human = delivery_input("Human");
+        human.model_override = Some("p/m".into());
+        human.turn_checkpoint = Some(Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {
+            app:app.handle().clone(),id:"human".into(),thread:"t1".into(),provider:crate::agent_provider::ProviderKind::OpenCode,
+            inner:None,release_queue:true,admitted_generation:0,resumed_ids:vec![],
+        }));
+        let result = session.enqueue_or_send(human).await.unwrap();
+        let queued = result.queued_id.unwrap();
+        // This is the command's late queue ACK, after the synchronous drain failed.
+        db.finish_message_delivery("human", "queued", Some(&serde_json::json!({"queued_id":queued})), None).unwrap();
+        let row = db.message_delivery("human").unwrap().unwrap();
+        assert_eq!(row.state, "held", "a queued preparation refusal must remain manually repairable");
+        assert_eq!(row.queued_id.as_deref(), Some(queued.as_str()));
+        assert!(!row.attempted);
+        assert!(session.queued.lock().await.iter().any(|(id,_)| id == &queued));
+        rejected_model.assert_async().await;
+        rejected_model.remove_async().await;
+        let model = server.mock("POST", "/api/session/s/model").with_status(204).expect(1).create_async().await;
+        // V2 stages the input, then resumes that same native identity.
+        let prompt = server.mock("POST", "/api/session/s/prompt")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"text":"Human","resume":false})))
+            .with_status(200).with_body("{}").expect(1).create_async().await;
+        let resume = server.mock("POST", "/api/session/s/prompt")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({"text":"Human","resume":true})))
+            .with_status(200).with_body("{}").expect(1).create_async().await;
+        db.rearm_promoted_message_delivery("t1", &queued).unwrap();
+        session.send_queued_now(&queued, false).await.unwrap();
+        assert!(db.message_delivery("human").unwrap().unwrap().attempted);
+        assert!(!session.queued.lock().await.iter().any(|(id,_)| id == &queued));
+        model.assert_async().await;
+        prompt.assert_async().await;
+        resume.assert_async().await;
     }
 
     #[tokio::test]
@@ -5555,6 +5652,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn native_background_resume_keeps_prompt_queued_after_pending_model_ack() {
+        use tauri::Manager;
+        let (app, checkpoint) = journal_checkpoint();
         let mut server = Server::new_async().await;
         let _teardown = native_idle_responses(&mut server, "s").await;
         let (seen, mut received) = tokio::sync::mpsc::unbounded_channel();
@@ -5598,6 +5697,7 @@ pub(crate) mod tests {
         session.event_ctx.lock().await.turn_active = true;
         let mut input = delivery_input("waiting input");
         input.model_override = Some("p/m".into());
+        input.turn_checkpoint = Some(checkpoint.clone());
         let queued = session
             .enqueue_or_send(input)
             .await
@@ -5610,6 +5710,8 @@ pub(crate) mod tests {
             async move { session.drain_queue().await }
         });
         received.recv().await.unwrap();
+        assert!(!app.state::<crate::database::DatabaseStore>().message_delivery("review-r1").unwrap().unwrap().attempted,
+            "model preparation is not a prompt submission attempt");
         let peer = SsePeer {
             api: super::super::api::OpenCodeApi::V2,
             ready: tokio::sync::watch::channel(true).0,
@@ -5642,6 +5744,7 @@ pub(crate) mod tests {
         let callback_turn = session.event_ctx.lock().await.turn_id.clone();
         release.send(()).unwrap();
         draining.await.unwrap();
+        assert_eq!(checkpoint.queued_delivery_state(), crate::agent_provider::types::QueuedDeliveryState::Ready);
         assert_eq!(session.event_ctx.lock().await.turn_id, callback_turn);
         assert!(session.turn_active().await);
         assert_eq!(session.queued.lock().await.front().unwrap().0, queued);

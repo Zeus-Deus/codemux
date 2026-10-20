@@ -394,7 +394,7 @@ describe("RunButton — panel variant", () => {
     await waitFor(() => expect(caret).toHaveFocus());
   });
 
-  it("More settings opens Settings > Projects", async () => {
+  it("More settings opens Settings → Workspaces → Projects", async () => {
     renderPanelRunButton();
     await flushPromises();
     await userEvent.click(screen.getByText("Set run command"));

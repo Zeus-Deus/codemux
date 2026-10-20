@@ -39,6 +39,9 @@ for line in sys.stdin:
   else:out({'id':id,'result':{'configOptions':options()}})
  elif method=='session/prompt':
   text=' '.join(b.get('text','') for b in p.get('prompt',[]))
+  if text=='review-r2-exit-prompt':sys.exit(7)
+  if text=='review-r2-unanswered-prompt':
+   (rig/'prompt-ready').write_text('ready');continue
   if 'review-hold' in text or 'review-approval' in text or 'fr1-hold' in text:
    if 'fr1-hold' in text:
     mode=text.split()[-1];(rig/'fr1-peer-pid').write_text(str(os.getpid()))

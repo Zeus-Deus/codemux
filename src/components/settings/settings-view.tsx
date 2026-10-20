@@ -164,7 +164,19 @@ import { CSS } from "@dnd-kit/utilities";
 import { Blocks, GripVertical, Star } from "lucide-react";
 import { usePluginsStore } from "@/contrib/plugins-store";
 
-import { buildNavGroups, isSettingsSectionAvailable, type Section } from "@/lib/settings-sections";
+import {
+  buildSettingsPages,
+  settingsPageFor,
+  type Section,
+  type SettingsSectionItem,
+} from "@/lib/settings-sections";
+import {
+  SIDEBAR_WIDTH_DEFAULT,
+  SIDEBAR_WIDTH_MAX,
+  SIDEBAR_WIDTH_MIN,
+  clampSidebarWidth,
+} from "@/components/ui/sidebar";
+import { resizeKeyAction } from "@/lib/resize-keys";
 import { SettingsFooterPin } from "./settings-footer-pin";
 
 /** Sections that render in the wide content column instead of the
@@ -194,6 +206,7 @@ import {
   SegmentedControl,
   SettingsCard,
   SettingRow,
+  StackedSections,
   SubsectionHeader,
 } from "./settings-primitives";
 import { SettingsSyncIndicator } from "./settings-sync-indicator";
@@ -332,6 +345,110 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
       />
       <span className="truncate">{label}</span>
     </button>
+  );
+}
+
+/** The seam on the nav's right edge. Dragging it, or arrow keys while it is
+ *  focused, resizes the nav — and with it the app sidebar, which shares the
+ *  width. A double click restores the default. */
+function SettingsNavResizer({
+  navRef,
+  width,
+  onWidthChange,
+}: {
+  navRef: React.RefObject<HTMLElement | null>;
+  width: number;
+  onWidthChange: (width: number) => void;
+}) {
+  const [dragging, setDragging] = useState(false);
+  const onPointerDown = (e: React.PointerEvent) => {
+    const nav = navRef.current;
+    if (!nav) return;
+    e.preventDefault();
+    setDragging(true);
+    const left = nav.getBoundingClientRect().left;
+    let next = width;
+    let frame = 0;
+    // Track the cursor on the element itself and commit once on release, so
+    // a drag re-renders Settings once rather than on every move.
+    const onMove = (ev: PointerEvent) => {
+      next = clampSidebarWidth(Math.round(ev.clientX - left));
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        nav.style.width = `${next}px`;
+      });
+    };
+    const onUp = () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      setDragging(false);
+      onWidthChange(next);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    const action = resizeKeyAction(e, "vertical");
+    if (!action) return;
+    e.preventDefault();
+    onWidthChange(
+      clampSidebarWidth(
+        action.kind === "min" ? SIDEBAR_WIDTH_MIN : action.kind === "max" ? SIDEBAR_WIDTH_MAX : width + action.px,
+      ),
+    );
+  };
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize settings navigation"
+      aria-valuenow={width}
+      aria-valuemin={SIDEBAR_WIDTH_MIN}
+      aria-valuemax={SIDEBAR_WIDTH_MAX}
+      tabIndex={0}
+      data-dragging={dragging || undefined}
+      onPointerDown={onPointerDown}
+      onKeyDown={onKeyDown}
+      onDoubleClick={() => onWidthChange(SIDEBAR_WIDTH_DEFAULT)}
+      className="absolute inset-y-0 -right-0.5 z-20 w-1 cursor-col-resize bg-transparent transition-colors duration-100 outline-none hover:bg-foreground/20 focus-visible:bg-ring/60 data-[dragging]:bg-foreground/30"
+    />
+  );
+}
+
+/** The sections of a stacked page, beside it while there is room. The
+ *  section being read is marked; choosing one scrolls to it. */
+function OnThisPage({
+  sections,
+  current,
+  onSelect,
+}: {
+  sections: SettingsSectionItem[];
+  current: Section | null;
+  onSelect: (section: Section, index: number) => void;
+}) {
+  return (
+    <nav
+      aria-label="On this page"
+      className="sticky top-8 mt-1 hidden w-40 shrink-0 border-l border-hairline @min-[60rem]:block"
+    >
+      {sections.map((item, index) => (
+        <button
+          key={item.id}
+          type="button"
+          aria-current={current === item.id ? "location" : undefined}
+          onClick={() => onSelect(item.id, index)}
+          className={cn(
+            "-ml-px block w-full truncate border-l-2 py-1 pl-3 text-left text-body-sm transition-colors duration-150 outline-none focus-visible:text-foreground",
+            current === item.id
+              ? "border-accent-ember text-foreground"
+              : "border-transparent text-muted-foreground/80 hover:text-foreground",
+          )}
+        >
+          {item.label}
+        </button>
+      ))}
+    </nav>
   );
 }
 
@@ -1385,8 +1502,21 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
   );
 }
 
+/** How far below the top of the content a section's heading counts as the
+ *  one being read. */
+const SECTION_SPY_OFFSET = 120;
+/** Room left above a section heading scrolled to the top. */
+const SECTION_SCROLL_MARGIN = 24;
+
+function viewportOf(scrollArea: HTMLElement | null): HTMLElement | null {
+  return scrollArea?.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]') ?? null;
+}
+
 export function SettingsView() {
   const mobile = useMobileLayout();
+  const navRef = useRef<HTMLElement>(null);
+  const navWidth = clampSidebarWidth(useUIStore((s) => s.sidebarWidth));
+  const setNavWidth = useUIStore((s) => s.setSidebarWidth);
   const setShowSettings = useUIStore((s) => s.setShowSettings);
   const commandPaletteOpen = useUIStore((s) => s.showCommandPalette);
   const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
@@ -1450,66 +1580,141 @@ export function SettingsView() {
   const { confirm, dialog: confirmDialog } = useConfirm();
 
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
-  // Plugin settings pages get their own nav group, absent without any.
+  const pages = useMemo(() => buildSettingsPages(enableAgentChat), [enableAgentChat]);
+  // Plugin settings pages get their own nav rows, absent without any.
   const pluginSettingsPages = usePluginSettingsPages();
   const pluginRecords = usePluginsStore((s) => s.records);
-  const navGroups = useMemo(() => {
-    const groups = buildNavGroups(enableAgentChat);
-    if (pluginSettingsPages.size === 0) return groups;
-    return [
-      ...groups,
-      {
-        label: "PLUGIN SETTINGS",
-        items: [...pluginSettingsPages.keys()].map((pluginId) => ({
-          id: `plugin:${pluginId}` as Section,
-          label: pluginRecords[pluginId]?.name ?? pluginId,
-          icon: Blocks,
-        })),
-      },
-    ];
-  }, [enableAgentChat, pluginSettingsPages, pluginRecords]);
+  const pluginNavItems = useMemo(
+    () =>
+      [...pluginSettingsPages.keys()].map((pluginId) => ({
+        id: `plugin:${pluginId}`,
+        label: pluginRecords[pluginId]?.name ?? pluginId,
+      })),
+    [pluginSettingsPages, pluginRecords],
+  );
   const settingsNavigationVersion = useUIStore((s) => s.settingsNavigationVersion);
-  const [activeSection, setActiveSection] = useState<string>(settingsSection ?? "account");
+  // The open page: a SettingsPageId, `plugin:<id>`, or — for a section the
+  // flags hide — that section's id, which matches no page and shows the
+  // unavailable notice.
+  const pageIdFor = useCallback(
+    (section: string) => settingsPageFor(section, enableAgentChat)?.id ?? section,
+    [enableAgentChat],
+  );
+  const [activePage, setActivePage] = useState<string>(() => pageIdFor(settingsSection ?? "account"));
+  // Search and links name a section; its page opens scrolled to it, and to
+  // `anchor` (a row label) within it when given.
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [revealRequest, setRevealRequest] = useState<{ section: string; anchor: string | null } | null>(null);
+  // Takes any id a caller may hold: a hidden section opens the unavailable
+  // notice, and `plugin:<id>` opens that plugin's page.
+  const openSection = useCallback(
+    (section: string, anchor: string | null = null) => {
+      setActivePage(pageIdFor(section));
+      setRevealRequest({ section, anchor });
+    },
+    [pageIdFor],
+  );
   // Honor repeated requests too, even after local navigation within Settings.
   useEffect(() => {
-    if (settingsSection !== null) setActiveSection(settingsSection);
-  }, [settingsSection, settingsNavigationVersion]);
-  const pluginSettingsId = activeSection.startsWith("plugin:") ? activeSection.slice("plugin:".length) : null;
-  const sectionAvailable = pluginSettingsId
-    ? pluginSettingsPages.has(pluginSettingsId)
-    : isSettingsSectionAvailable(activeSection, enableAgentChat);
+    if (settingsSection !== null) openSection(settingsSection);
+  }, [settingsSection, settingsNavigationVersion, openSection]);
+  const pluginSettingsId = activePage.startsWith("plugin:") ? activePage.slice("plugin:".length) : null;
+  const page = pages.find((p) => p.id === activePage);
+  const pageAvailable = pluginSettingsId ? pluginSettingsPages.has(pluginSettingsId) : page !== undefined;
+  const pageSections = useMemo(() => page?.sections.map((item) => item.id) ?? [], [page]);
   const contentScrollRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     // Repeated Settings requests should scroll to the top while preserving
     // local editor state, including unsaved preset fields in the sheet.
-    const viewport = contentScrollRef.current?.querySelector<HTMLElement>(
-      '[data-slot="scroll-area-viewport"]',
-    );
+    const viewport = viewportOf(contentScrollRef.current);
     if (viewport) {
       viewport.scrollTop = 0;
       viewport.scrollLeft = 0;
     }
-  }, [activeSection, settingsNavigationVersion]);
+  }, [activePage, settingsNavigationVersion]);
+
+  // The section in view, for the "On this page" list and the footer pin.
+  const [currentSection, setCurrentSection] = useState<Section | null>(null);
+  // A jump marks its target even where the scroll lands it lower than a
+  // reader's position would (a row centred by search, a short last
+  // section), until the reader scrolls on their own.
+  const heldSection = useRef<Section | null>(null);
+  const holdSection = useCallback((section: Section) => {
+    heldSection.current = section;
+    setCurrentSection(section);
+  }, []);
+  useEffect(() => {
+    heldSection.current = null;
+    setCurrentSection(pageSections[0] ?? null);
+    const scrollArea = contentScrollRef.current;
+    const viewport = viewportOf(scrollArea);
+    if (!scrollArea || !viewport || pageSections.length < 2) return;
+    let frame = 0;
+    const release = () => {
+      heldSection.current = null;
+    };
+    const update = () => {
+      if (heldSection.current) return;
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        // A jump may have landed between the scroll and this frame.
+        if (heldSection.current) return;
+        const top = viewport.getBoundingClientRect().top;
+        let current = pageSections[0];
+        for (const id of pageSections) {
+          const el = viewport.querySelector(`[data-settings-section="${id}"]`);
+          if (el && el.getBoundingClientRect().top - top <= SECTION_SPY_OFFSET) current = id;
+        }
+        // The last sections may be too short to reach the top.
+        if (viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 4) {
+          current = pageSections[pageSections.length - 1];
+        }
+        setCurrentSection(current);
+      });
+    };
+    // Reader input lands on the whole scroll area: the scrollbar is the
+    // viewport's sibling, so a thumb drag never reaches the viewport.
+    const input = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
+    viewport.addEventListener("scroll", update, { passive: true });
+    for (const type of input) scrollArea.addEventListener(type, release, { passive: true });
+    return () => {
+      cancelAnimationFrame(frame);
+      viewport.removeEventListener("scroll", update);
+      for (const type of input) scrollArea.removeEventListener(type, release);
+    };
+  }, [pageSections]);
+
+  const scrollToSection = useCallback((section: string, behavior: ScrollBehavior) => {
+    const viewport = viewportOf(contentScrollRef.current);
+    const el = viewport?.querySelector(`[data-settings-section="${section}"]`);
+    if (!viewport || !el) return;
+    viewport.scrollTo?.({
+      top: viewport.scrollTop + el.getBoundingClientRect().top - viewport.getBoundingClientRect().top - SECTION_SCROLL_MARGIN,
+      behavior,
+    });
+  }, []);
 
   // Settings search: a result opens its page, then lights the row it named.
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const contentRef = useRef<HTMLDivElement>(null);
-  const [revealRequest, setRevealRequest] = useState<{ anchor: string | null } | null>(null);
-  const navigateToSearchResult = useCallback((result: SettingsSearchResult) => {
-    setActiveSection(result.section);
-    setRevealRequest({ anchor: result.anchor });
-  }, []);
+  const navigateToSearchResult = useCallback(
+    (result: SettingsSearchResult) => openSection(result.section, result.anchor),
+    [openSection],
+  );
   useEffect(() => {
     if (!revealRequest) return;
     // After paint, so the destination page is the one being searched.
     const frame = requestAnimationFrame(() => {
       const root = contentRef.current;
       if (!root) return;
-      if (revealRequest.anchor && revealSettingsAnchor(root, revealRequest.anchor)) return;
-      root.scrollIntoView?.({ block: "start" });
+      const section = root.querySelector<HTMLElement>(`[data-settings-section="${revealRequest.section}"]`);
+      if (section) holdSection(revealRequest.section as Section);
+      if (revealRequest.anchor && revealSettingsAnchor(section ?? root, revealRequest.anchor)) return;
+      // A page's first section opens at the top, so the page title shows.
+      if (section?.dataset.settingsSectionIndex === "0") viewportOf(contentScrollRef.current)?.scrollTo?.({ top: 0 });
+      else scrollToSection(revealRequest.section, "auto");
     });
     return () => cancelAnimationFrame(frame);
-  }, [revealRequest]);
+  }, [revealRequest, scrollToSection, holdSection]);
 
   // Ctrl+F anywhere, or "/" outside a text field, jumps to the search field.
   const commandPaletteOpenRef = useRef(commandPaletteOpen);
@@ -1643,7 +1848,7 @@ export function SettingsView() {
     setHasIncludeFile(false);
     setSavedVisible(false);
     if (savedTimer.current) clearTimeout(savedTimer.current);
-    if (activeSection !== "projects" || !scriptsRoot) return;
+    if (!pageSections.includes("projects") || !scriptsRoot) return;
     // A slow answer for the previously chosen project must not land in
     // the form after the user picked another one.
     let stale = false;
@@ -1677,7 +1882,7 @@ export function SettingsView() {
       ++scriptsGeneration.current;
       ++scriptSaveGeneration.current;
     };
-  }, [activeSection, scriptsRoot]);
+  }, [pageSections, scriptsRoot]);
 
   const saveProjectSettings = (field: ProjectField) => {
     const owner = savedScripts.current;
@@ -1770,9 +1975,9 @@ export function SettingsView() {
     // observes the flag still set.
     if (!useUIStore.getState().pendingPresetCreate) return;
     useUIStore.getState().clearPendingPresetCreate();
-    setActiveSection("presets");
+    openSection("presets");
     handleNewPreset();
-  }, [pendingPresetCreate, handleNewPreset]);
+  }, [pendingPresetCreate, handleNewPreset, openSection]);
 
   useEffect(() => {
     if (
@@ -1786,10 +1991,9 @@ export function SettingsView() {
     }
   }, [defaultEditor, editors, updateSyncedSetting]);
 
-  const renderSection = () => {
-    if (pluginSettingsId) return <PluginSettingsPageView pluginId={pluginSettingsId} />;
-    switch (activeSection) {
-      case "plugins": return <PluginsSettings onOpenSettings={(id) => setActiveSection(`plugin:${id}`)} />;
+  const renderSection = (section: Section) => {
+    switch (section) {
+      case "plugins": return <PluginsSettings onOpenSettings={(id) => setActivePage(`plugin:${id}`)} />;
       case "account":
         return (
           <div>
@@ -2116,7 +2320,7 @@ export function SettingsView() {
                   variant="ghost"
                   size="sm"
                   className="text-muted-foreground"
-                  onClick={() => setActiveSection("appearance")}
+                  onClick={() => openSection("appearance")}
                 >
                   Open Appearance
                 </Button>
@@ -2413,9 +2617,9 @@ export function SettingsView() {
         return (
           <div>
             <SectionHeader
-              title="Agent"
+              title="Models & behavior"
               description={<>How chats start and behave. Set up agents and accounts in{" "}
-                <button type="button" className="text-foreground underline-offset-4 hover:underline" onClick={() => setActiveSection("providers")}>Providers</button>.</>}
+                <button type="button" className="text-foreground underline-offset-4 hover:underline" onClick={() => openSection("providers")}>Providers</button>.</>}
             />
             {/* Chat drafts are an Agent Chat surface; the CLI interface
                 launches agents from presets instead. */}
@@ -2926,13 +3130,34 @@ export function SettingsView() {
     }
   };
 
-  // Resolve the human-readable label for the active nav row so the
-  // header can show "Settings › Section" — a quiet breadcrumb that
-  // tells the user where they are without taking visual weight away
-  // from the actual content.
-  const activeLabel = navGroups
-    .flatMap((g) => g.items)
-    .find((i) => i.id === activeSection)?.label ?? null;
+  const wide = pageSections.some((id) => WIDE_SECTIONS.has(id));
+  const split = pageSections.some((id) => SPLIT_SECTIONS.has(id));
+  const stacked = !pluginSettingsId && page !== undefined && page.sections.length > 1;
+  const jumpToSection = (section: Section, index: number) => {
+    const behavior: ScrollBehavior = reduceMotion ? "auto" : "smooth";
+    holdSection(section);
+    if (index === 0) viewportOf(contentScrollRef.current)?.scrollTo?.({ top: 0, behavior });
+    else scrollToSection(section, behavior);
+  };
+
+  const renderPage = () => {
+    if (pluginSettingsId) return <PluginSettingsPageView pluginId={pluginSettingsId} />;
+    if (!page) return null;
+    const sections = page.sections.map((item, index) => (
+      <section key={item.id} data-settings-section={item.id} data-settings-section-index={index}>
+        {renderSection(item.id)}
+      </section>
+    ));
+    if (!stacked) return sections;
+    return (
+      <>
+        <SectionHeader title={page.label} description={page.description} className="mb-10" />
+        <StackedSections>
+          <div className="space-y-14">{sections}</div>
+        </StackedSections>
+      </>
+    );
+  };
 
   return (
     <div className="relative flex h-screen flex-col bg-background">
@@ -2940,10 +3165,11 @@ export function SettingsView() {
       {/* Header. `WindowChrome` is an absolute 28px drag-region strip
           with z-50 that overlays the top of the page; if header content
           sits in y=0..28 the drag region eats its clicks. We give the
-          header `pt-7` (= 28px) so the back button and breadcrumb are
+          header `pt-7` (= 28px) so the back button and title are
           rendered ENTIRELY below the drag strip and their full hit area
           stays clickable. The remaining `pb-2` keeps the bar visually
-          tight without growing the chrome unnecessarily. */}
+          tight without growing the chrome unnecessarily. The page title
+          says where you are, so the header carries no breadcrumb. */}
       <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 pt-7 pb-2">
         <Button
           variant="ghost"
@@ -2954,82 +3180,110 @@ export function SettingsView() {
         >
           <ArrowLeft className="size-4" />
         </Button>
-        <div className="flex items-center gap-2 text-body-lg">
-          <span className="font-semibold tracking-tight text-foreground">Settings</span>
-          {activeLabel && !mobile && (
-            <>
-              <span className="text-muted-foreground/40">/</span>
-              <span className="font-semibold text-muted-foreground">{activeLabel}</span>
-            </>
-          )}
-        </div>
+        <span className="text-body-lg font-semibold tracking-tight text-foreground">Settings</span>
         <div className="ml-2">
           <SettingsSyncIndicator />
         </div>
-        {sectionAvailable && !pluginSettingsId && !mobile && <SettingsFooterPin section={activeSection as Section} />}
+        {/* On a stacked page, the pin follows the section being read. */}
+        {pageAvailable && !pluginSettingsId && !mobile && currentSection && (
+          <SettingsFooterPin section={currentSection} />
+        )}
       </div>
 
       {/* Body */}
       <div className={cn("flex flex-1 min-h-0", mobile && "flex-col")}>
-        {/* Left nav — refined-minimal pill rows matching the new
-            sidebar aesthetic: inset margins, soft muted hover, calm
-            type hierarchy. Group separation is whitespace alone (no
-            dividers) so the nav reads as one continuous list. Mono
-            group captions echo the design system's metadata voice. */}
-        {mobile && <select aria-label="Settings section" className="mobile-pane-picker" value={activeSection} onChange={e => setActiveSection(e.target.value as Section)}>{navGroups.map(group => <optgroup key={group.label} label={group.label}>{group.items.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</optgroup>)}</select>}
+        {mobile && (
+          <select
+            aria-label="Settings page"
+            className="mobile-pane-picker"
+            value={activePage}
+            onChange={(e) => setActivePage(e.target.value)}
+          >
+            {pages.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+            {pluginNavItems.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+          </select>
+        )}
+        {/* Left nav: one quiet row per page, no group captions, so the
+            whole list reads at a glance. It shares the app sidebar's
+            width, so opening Settings doesn't shift the content edge, and
+            resizing either one resizes both. */}
         {!mobile && (
-          <nav className="flex w-60 shrink-0 flex-col border-r border-border bg-background pt-4">
+          <nav
+            ref={navRef}
+            style={{ width: navWidth }}
+            className="relative flex shrink-0 flex-col border-r border-border bg-background pt-4"
+          >
             <SettingsNavSearch
               agentChatEnabled={enableAgentChat}
               signedIn={!!authUser}
-              activeSection={activeSection}
+              activePage={activePage}
               inputRef={searchInputRef}
               onNavigate={navigateToSearchResult}
             >
-              <div className="space-y-5">
-                {navGroups.map((group) => (
-                  <div key={group.label}>
-                    <Eyebrow className="px-4 pb-1.5">
-                      {group.label}
-                    </Eyebrow>
-                    <div className="space-y-px px-3">
-                      {group.items.map((item) => (
-                        <SettingsNavItem
-                          key={item.id}
-                          icon={item.icon}
-                          label={item.label}
-                          active={activeSection === item.id}
-                          onClick={() => setActiveSection(item.id)}
-                        />
-                      ))}
-                    </div>
-                  </div>
+              <div className="space-y-px px-3">
+                {pages.map((item) => (
+                  <SettingsNavItem
+                    key={item.id}
+                    icon={item.icon}
+                    label={item.label}
+                    active={activePage === item.id}
+                    onClick={() => setActivePage(item.id)}
+                  />
                 ))}
               </div>
+              {pluginNavItems.length > 0 && (
+                <div className="mx-3 mt-3 space-y-px border-t border-hairline pt-3">
+                  {pluginNavItems.map((item) => (
+                    <SettingsNavItem
+                      key={item.id}
+                      icon={Blocks}
+                      label={item.label}
+                      active={activePage === item.id}
+                      onClick={() => setActivePage(item.id)}
+                    />
+                  ))}
+                </div>
+              )}
             </SettingsNavSearch>
+            <SettingsNavResizer navRef={navRef} width={navWidth} onWidthChange={setNavWidth} />
           </nav>
         )}
 
         {/* Content */}
         <ScrollArea ref={contentScrollRef} className="flex-1 bg-card">
-          <div
-            ref={contentRef}
-            className={cn(
-              "animate-in fade-in-0 slide-in-from-bottom-1 duration-150 motion-reduce:animate-none",
-              mobile ? "mx-auto min-w-0 px-4 pt-5 pb-20" : "mx-auto px-11 pt-8 pb-20",
-              WIDE_SECTIONS.has(activeSection as Section)
-                ? "max-w-[1400px]"
-                : SPLIT_SECTIONS.has(activeSection as Section) ? "max-w-5xl" : "max-w-3xl",
-            )}
-          >
-            {sectionAvailable ? renderSection() : (
-              <div role="status">
-                <SectionHeader
-                  title="Settings section unavailable"
-                  description="This section is hidden or no longer available. Choose a section from Settings."
-                />
-              </div>
-            )}
+          {/* The container query shows "On this page" only where it fits
+              beside the reading measure. */}
+          <div className="@container">
+            <div
+              ref={contentRef}
+              className={cn(
+                "animate-in fade-in-0 slide-in-from-bottom-1 duration-150 motion-reduce:animate-none",
+                mobile ? "mx-auto min-w-0 px-4 pt-5 pb-20" : "mx-auto px-11 pt-8 pb-20",
+                wide
+                  ? "max-w-[1400px]"
+                  : split
+                    ? "max-w-5xl"
+                    : stacked && !mobile
+                      ? "max-w-3xl @min-[60rem]:flex @min-[60rem]:max-w-[61rem] @min-[60rem]:items-start @min-[60rem]:gap-12"
+                      : "max-w-3xl",
+              )}
+            >
+              {pageAvailable ? (
+                <>
+                  <div className="min-w-0 flex-1">{renderPage()}</div>
+                  {stacked && !mobile && page && (
+                    <OnThisPage sections={page.sections} current={currentSection} onSelect={jumpToSection} />
+                  )}
+                </>
+              ) : (
+                <div role="status">
+                  <SectionHeader
+                    title="Settings section unavailable"
+                    description="This section is hidden or no longer available. Choose a section from Settings."
+                  />
+                </div>
+              )}
+            </div>
           </div>
         </ScrollArea>
       </div>

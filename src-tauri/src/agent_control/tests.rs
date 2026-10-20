@@ -37,6 +37,139 @@ async fn fixture() -> (tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_prov
     (app, provider, root, workspace)
 }
 
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn review_r1_human_activity_disposes_unsent_resumes_but_keeps_task_results() {
+    let (app,provider,_root,workspace)=fixture().await;
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"r1-resume-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let launched=settle_operation(&app,&receipt).await;
+    let thread=launched["thread_id"].as_str().unwrap();
+    let db=app.state::<crate::database::DatabaseStore>();
+    let mut snapshots=vec![];
+    for (id,origin) in [("stale-usage","usage_resume"),("stale-restart","restart_resume"),("task-result","delegation")] {
+        let payload=json!({"provider":"claude","origin":origin,"input":{"thread_id":thread,"text":id,"client_nonce":id},"provenance":{"created_by":"system","creation_source":"codemux"},"caller":null});
+        db.admit_message_delivery(id,thread,id,&payload,"old",0,None,false).unwrap();
+        snapshots.push(db.message_delivery(id).unwrap().unwrap());
+    }
+    crate::commands::agent_chat::send_desktop_turn(app.handle().clone(),crate::agent_provider::ProviderKind::Claude,serde_json::from_value(json!({"thread_id":thread,"text":"new task","client_nonce":"new-human-task"})).unwrap()).await.unwrap();
+    for id in ["stale-usage","stale-restart"] { assert_eq!(db.message_delivery(id).unwrap().unwrap().state,"cancelled"); }
+    assert_eq!(db.message_delivery("task-result").unwrap().unwrap().state,"pending");
+    for row in snapshots { super::delivery::dispatch(app.handle(),row).await; }
+    let sends:Vec<_>=provider.calls.snapshot().into_iter().filter_map(|call|match call {mock_agent_provider::MockCall::SendTurn(_,text)=>Some(text),_=>None}).collect();
+    assert_eq!(sends,vec!["new task","task-result"]);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn review_r1_merged_saved_queue_sends_with_original_delivery_identity() {
+    use crate::agent_provider::{message::*,types::MessageDelivery,ProviderKind,ThreadId};
+    for restart_replay in [false,true] {
+        let (app,provider,_root,workspace)=fixture().await;
+        let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"r1-merge-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+        let launched=settle_operation(&app,&receipt).await;
+        let survivor=launched["thread_id"].as_str().unwrap();
+        let db=app.state::<crate::database::DatabaseStore>();
+        db.upsert_agent_chat_session("merge-source",&workspace,None,"claude").unwrap();
+        let provenance=MessageProvenance {message_id:Some("merge-message".into()),delivery_id:Some("merge-delivery".into()),origin:Some(crate::commands::agent_chat::TurnOrigin::Controller),..Default::default()};
+        db.admit_message_delivery("merge-delivery","merge-source","merge-message",&json!({"provider":"claude","origin":"controller","input":{"thread_id":"merge-source","text":"saved task"},"provenance":provenance,"caller":null}),"old",0,None,true).unwrap();
+        db.finish_message_delivery("merge-delivery","queued",Some(&json!({"queued_id":"merge-queue"})),None).unwrap();
+        db.insert_queued_turn(&crate::database::queued_turns::QueuedTurnRecord {thread_id:"merge-source".into(),queued_id:"merge-queue".into(),position:0,text:"saved task".into(),prompt:None,provenance,skill_ids:vec![],skill_text:None,include_plugins:false,images:vec![],client_nonce:Some("merge-message".into()),model_override:None,effort_override:None,permission_mode_override:None,epoch:"old".into()}).unwrap();
+        db.merge_reopened_agent_chat_session("merge-source",survivor).unwrap();
+        if restart_replay { db.recover_message_deliveries("new").unwrap(); }
+        crate::commands::queued_turns::send_saved_queued_turn(app.handle().clone(),ProviderKind::Claude,ThreadId(survivor.into()),"merge-queue".into(),MessageDelivery::Queue,!restart_replay).await.unwrap();
+        assert!(db.get_queued_turn(survivor,"merge-queue").is_none());
+        let row=db.message_delivery("merge-delivery").unwrap().unwrap();
+        assert_eq!(row.state,"accepted"); assert_eq!(row.message_id,"merge-message");
+        assert_eq!(provider.calls.snapshot().into_iter().filter(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(..))).count(),1);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn review_r2_cursor_unanswered_prompts_settle_without_native_acceptance() {
+    use crate::agent_provider::{AgentProvider,ProviderKind,ProviderRuntimeEvent,SendTurnInput,ThreadId};
+    use futures_util::StreamExt;
+    use std::os::unix::fs::PermissionsExt;
+    for interrupt in [false,true] {
+        let root=tempfile::tempdir().unwrap();
+        let binary=root.path().join("peer.py");
+        std::fs::write(&binary,include_str!("../../tests/helpers/agent_control_acp_peer.py")).unwrap();
+        std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let provider=crate::agent_provider::cursor::CursorAgentProvider::new(crate::agent_provider::cursor::CursorProviderConfig {binary,event_channel_capacity:64,mcp_registry:None});
+        let thread=ThreadId(format!("review-r2-cursor-{interrupt}"));
+        provider.start_session(serde_json::from_value(json!({"thread_id":thread,"cwd":root.path(),"permission_mode":"ask","additional_directories":[],"env":{"CODEMUX_AGENT_CONTROL_FIXTURE_ROOT":root.path()}})).unwrap()).await.unwrap();
+        let app=tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(crate::commands::agent_chat::SubagentTracker::default());
+    app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+        app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+        let db=app.state::<crate::database::DatabaseStore>();
+        db.upsert_agent_chat_session(&thread.0,"workspace",None,"cursor").unwrap();
+        db.admit_message_delivery("unanswered",&thread.0,"unanswered",&json!({"origin":"controller","provider":"cursor"}),"epoch",0,None,true).unwrap();
+        let mut input:SendTurnInput=serde_json::from_value(json!({"thread_id":thread,"text":if interrupt {"review-r2-unanswered-prompt"} else {"review-r2-exit-prompt"}})).unwrap();
+        input.turn_checkpoint=Some(Arc::new(super::delivery::DeliveryCheckpoint {app:app.handle().clone(),id:"unanswered".into(),thread:thread.0.clone(),provider:ProviderKind::Cursor,inner:None,release_queue:false,admitted_generation:0,resumed_ids:vec![]}));
+        let mut events=provider.event_stream();
+        let sent=provider.send_turn(input).await.unwrap();
+        if interrupt {
+            tokio::time::timeout(std::time::Duration::from_secs(3),async {
+                while !root.path().join("prompt-ready").exists() {tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+            }).await.unwrap();
+            provider.interrupt_turn(thread.clone(),Some(sent.turn_id)).await.unwrap();
+        }
+        let completed=tokio::time::timeout(std::time::Duration::from_secs(8),async {
+            while !matches!(events.next().await,Some(ProviderRuntimeEvent::TurnCompleted {..})) {}
+        }).await;
+        provider.stop_session(thread.clone()).await.unwrap();
+        assert!(completed.is_ok(),"an unanswered interrupted prompt must have a cancellation deadline");
+        let row=db.message_delivery("unanswered").unwrap().unwrap();
+        assert!(row.attempted);
+        assert_eq!(row.state,"held_unknown");
+        assert_eq!(db.thread_message_delivery_attention(&thread.0).unwrap().len(),1);
+        assert!(!db.has_inflight_message_deliveries(&thread.0).unwrap());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn review_r1_acp_local_rpc_refusal_is_not_native_acceptance() {
+    use crate::agent_provider::{AgentProvider,ProviderKind,ProviderRuntimeEvent,SendTurnInput,ThreadId,TurnDispatchCheckpoint};
+    use futures_util::StreamExt;
+    use std::{os::unix::fs::PermissionsExt,sync::atomic::{AtomicBool,AtomicUsize,Ordering}};
+    #[derive(Debug,Default)]
+    struct Refusal { calls:AtomicUsize, accepted:AtomicBool }
+    #[async_trait::async_trait]
+    impl TurnDispatchCheckpoint for Refusal {
+        fn authorize_dispatch(&self)->Result<(),crate::agent_provider::ProviderError> {
+            if self.calls.fetch_add(1,Ordering::SeqCst)==0 {Ok(())}
+            else {Err(crate::agent_provider::ProviderError::ValidationError {message:"refused at final prompt boundary".into()})}
+        }
+        async fn accepted(&self,_:&crate::agent_provider::TurnId) { self.accepted.store(true,Ordering::SeqCst); }
+        async fn prepare(&self) {}
+        async fn commit(&self) {}
+        async fn abort(&self) {}
+    }
+    let root=tempfile::tempdir().unwrap();
+    let binary=root.path().join("peer.py");
+    std::fs::write(&binary,include_str!("../../tests/helpers/agent_control_acp_peer.py")).unwrap();
+    std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let rig=root.path().join("rig");std::fs::create_dir(&rig).unwrap();
+    let provider=crate::agent_provider::cursor::CursorAgentProvider::new(crate::agent_provider::cursor::CursorProviderConfig {binary,event_channel_capacity:64,mcp_registry:None});
+    let thread=ThreadId("review-r1-local-rpc-refusal".into());
+    provider.start_session(serde_json::from_value(json!({"thread_id":thread,"cwd":root.path(),"permission_mode":"ask","additional_directories":[],"env":{"CODEMUX_AGENT_CONTROL_FIXTURE_ROOT":rig}})).unwrap()).await.unwrap();
+    let checkpoint=Arc::new(Refusal::default());
+    let mut input:SendTurnInput=serde_json::from_value(json!({"thread_id":thread,"text":"must not prompt"})).unwrap();
+    input.turn_checkpoint=Some(checkpoint.clone());
+    let mut events=provider.event_stream();
+    provider.send_turn(input).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3),async {
+        while !matches!(events.next().await,Some(ProviderRuntimeEvent::TurnCompleted {..})) {}
+    }).await.unwrap();
+    let wire=std::fs::read_to_string(rig.join("peer-wire.jsonl")).unwrap();
+    provider.stop_session(thread).await.unwrap();
+    assert_eq!(checkpoint.calls.load(Ordering::SeqCst),2);
+    assert!(!checkpoint.accepted.load(Ordering::SeqCst));
+    assert!(!wire.contains("session/prompt"));
+    assert_eq!(provider.kind(),ProviderKind::Cursor);
+}
+
 // Capture the actual native Channel serializer, never a hand-built DTO.
 fn mario_channel(app: &tauri::AppHandle<tauri::test::MockRuntime>, thread: &str) -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
     let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
@@ -238,6 +371,7 @@ struct MarioQueueCheckpoint {
 #[async_trait::async_trait]
 impl crate::agent_provider::types::TurnDispatchCheckpoint for MarioQueueCheckpoint {
     fn authorize_dispatch(&self) -> Result<(), crate::agent_provider::ProviderError> { self.inner.authorize_dispatch() }
+    async fn accepted(&self, turn: &crate::agent_provider::TurnId) { self.inner.accepted(turn).await; }
     async fn prepare(&self) {
         self.inner.prepare().await;
         self.gate.entered.notify_one();

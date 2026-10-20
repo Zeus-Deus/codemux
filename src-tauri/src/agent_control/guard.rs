@@ -162,6 +162,7 @@ impl<R: Runtime> crate::agent_provider::types::TurnDispatchCheckpoint for Guarde
     async fn prepare(&self) { if let Some(inner) = &self.inner { inner.prepare().await; } }
     async fn commit(&self) { if let Some(inner) = &self.inner { inner.commit().await; } }
     async fn abort(&self) { if let Some(inner) = &self.inner { inner.abort().await; } }
+    async fn accepted(&self, turn: &crate::agent_provider::TurnId) { if let Some(inner) = &self.inner { inner.accepted(turn).await; } }
 }
 
 fn binding_cwd<'a>(

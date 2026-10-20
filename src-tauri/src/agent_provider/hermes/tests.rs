@@ -1080,6 +1080,77 @@ fn hermes_offline_free_model_change_fails_without_mutating_binding() {
     assert!(provider.validate_intent("thread", Some("opencode-free:mimo-v2.5-free"), None).is_ok());
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn review_r2_hermes_child_exit_settles_delivery_attention() {
+    use tauri::Manager;
+    use std::os::unix::fs::PermissionsExt;
+    let peer=tempfile::tempdir().unwrap();
+    let binary=peer.path().join("exit-peer.py");
+    std::fs::write(&binary,"#!/usr/bin/env python3\nimport sys\nsys.stdin.readline()\nsys.exit(7)\n").unwrap();
+    std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_root,provider,runtime,_chat,task)=review_pump_fixture_with_binary(Some(binary)).await;
+    let app=tauri::test::mock_app();
+    app.manage(crate::database::init_test_database());
+    app.manage(crate::commands::agent_chat::SubagentTracker::default());
+    app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+    app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_session("thread","workspace",None,"hermes").unwrap();
+    db.admit_message_delivery("unanswered","thread","unanswered",&json!({"origin":"controller","provider":"hermes"}),"epoch",0,None,true).unwrap();
+    runtime.queue.lock().await.running=true;
+    let mut input=turn("thread","unanswered prompt");
+    input.turn_checkpoint=Some(Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {app:app.handle().clone(),id:"unanswered".into(),thread:"thread".into(),provider:ProviderKind::Hermes,inner:None,release_queue:false,admitted_generation:0,resumed_ids:vec![]}));
+    provider.send_turn(input).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3),provider.inner.clone().pump(runtime.clone())).await.unwrap();
+    let row=db.message_delivery("unanswered").unwrap().unwrap();
+    runtime.child.shutdown().await.unwrap();task.abort();let _=task.await;
+    assert!(row.attempted);
+    assert_eq!(row.state,"held_unknown");
+    assert_eq!(db.thread_message_delivery_attention("thread").unwrap().len(),1);
+    assert!(!db.has_inflight_message_deliveries("thread").unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn review_r2_hermes_cancellation_timeout_settles_delivery_attention() {
+    use tauri::Manager;
+    use std::os::unix::fs::PermissionsExt;
+    let peer=tempfile::tempdir().unwrap();
+    let binary=peer.path().join("unanswered-peer.py");
+    std::fs::write(&binary,"#!/usr/bin/env python3\nimport sys,pathlib\nsys.stdin.readline()\npathlib.Path(__file__).with_suffix('.ready').write_text('ready')\nfor line in sys.stdin: pass\n").unwrap();
+    std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_root,provider,runtime,chat,task)=review_pump_fixture_with_binary(Some(binary.clone())).await;
+    let app=tauri::test::mock_app();
+    app.manage(crate::database::init_test_database());
+    app.manage(crate::commands::agent_chat::SubagentTracker::default());
+    app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+    app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_session("thread","workspace",None,"hermes").unwrap();
+    db.admit_message_delivery("unanswered","thread","unanswered",&json!({"origin":"controller","provider":"hermes"}),"epoch",0,None,true).unwrap();
+    runtime.queue.lock().await.running=true;
+    let mut input=turn("thread","unanswered prompt");
+    input.turn_checkpoint=Some(Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {app:app.handle().clone(),id:"unanswered".into(),thread:"thread".into(),provider:ProviderKind::Hermes,inner:None,release_queue:false,admitted_generation:0,resumed_ids:vec![]}));
+    provider.send_turn(input).await.unwrap();
+    let pump=tokio::spawn({let inner=provider.inner.clone();let runtime=runtime.clone();async move {inner.pump(runtime).await}});
+    tokio::time::timeout(Duration::from_secs(3),async {
+        while !binary.with_extension("ready").exists() {tokio::time::sleep(Duration::from_millis(5)).await;}
+    }).await.unwrap();
+    let active=chat.state.lock().await.active.clone();
+    let interrupted=provider.interrupt_turn(ThreadId("thread".into()),active).await;
+    // Inspect before teardown can settle the unanswered prompt itself.
+    let row=db.message_delivery("unanswered").unwrap().unwrap();
+    let attention=db.thread_message_delivery_attention("thread").unwrap();
+    runtime.child.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3),pump).await.unwrap().unwrap();
+    task.abort();let _=task.await;
+    assert!(interrupted.unwrap_err().to_string().contains("cancellation has not completed"));
+    assert!(row.attempted);
+    assert_eq!(row.state,"held_unknown");
+    assert_eq!(attention.len(),1);
+}
+
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn orchestration_message_hermes_failed_human_release_preserves_stop_hold() {
     let (_root,provider,runtime,_chat,task)=review_pump_fixture().await;

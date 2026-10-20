@@ -597,7 +597,7 @@ function NoDevices(props: {
       <div style={titleStyle}>No devices yet</div>
       <div style={subtitleStyle}>
         None of your desktops are set up for remote access. On a desktop running
-        Codemux, open <strong>Settings → Remote Access</strong> and turn on
+        Codemux, open <strong>Settings → Connections → Remote Access</strong> and turn on
         relay mode, then refresh this page.
       </div>
       {props.error && (

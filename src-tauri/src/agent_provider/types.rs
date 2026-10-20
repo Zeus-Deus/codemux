@@ -102,6 +102,9 @@ pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
     /// Plain Git snapshots have no caller; the native owner wraps controlled
     /// inputs with a live authority check regardless of checkpoint settings.
     fn authorize_dispatch(&self) -> Result<(), super::ProviderError> { Ok(()) }
+    /// Check authority before asynchronous preparation without recording a
+    /// submission attempt. The adapter still authorizes at the wire boundary.
+    fn verify_dispatch(&self) -> Result<(), super::ProviderError> { self.authorize_dispatch() }
     /// Check a human queue promotion before it can interrupt another turn.
     /// This must not record a provider submission.
     fn authorize_queue_promotion(&self) -> Result<(), super::ProviderError> {
@@ -116,9 +119,16 @@ pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
     /// Only an explicit human action releases the provider queue hold.
     fn releases_queue_hold(&self) -> bool { true }
     fn queued_delivery_state(&self) -> QueuedDeliveryState { QueuedDeliveryState::Ready }
+    /// Persist queue ownership before an adapter can select the input.
+    fn queued(&self, _queued_id: &str) -> Result<(), super::ProviderError> { Ok(()) }
     async fn prepare(&self);
     async fn commit(&self);
     async fn abort(&self);
+    /// Normal scheduling deferral: roll back preparation, retaining delivery.
+    async fn defer(&self) { self.abort().await; }
+    /// A native prompt response proves admission; local worker lifecycle
+    /// completion alone does not. Deferred adapters report this explicitly.
+    async fn accepted(&self, _turn: &TurnId) {}
 }
 
 #[async_trait]

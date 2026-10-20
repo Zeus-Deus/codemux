@@ -241,7 +241,7 @@ impl std::error::Error for RpcChildError {
     }
 }
 
-type PendingResult = Result<(Value, u64), RpcError>;
+type PendingResult = Result<(Value, u64), RpcChildError>;
 
 /// Internal pending-request bookkeeping.
 #[derive(Default)]
@@ -804,13 +804,9 @@ impl JsonRpcChild {
                     .map(|mut m| m.drain())
                     .unwrap_or_default();
                 for tx in pending_list {
-                    let _ = tx.send(Err(RpcError {
-                        code: -32000,
-                        message: format!(
-                            "child process exited (code={:?}); stderr: {}",
-                            code, tail_snapshot
-                        ),
-                        data: None,
+                    let _ = tx.send(Err(RpcChildError::ChildExited {
+                        code,
+                        stderr_tail: tail_snapshot.clone(),
                     }));
                 }
                 // Reference the sender in this closure so it is actually
@@ -914,7 +910,7 @@ impl JsonRpcChild {
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(err))) => Err(RpcChildError::RpcError(err)),
+            Ok(Ok(Err(err))) => Err(err),
             Ok(Err(_canceled)) => Err(self.exit_or_shutdown()),
             Err(_elapsed) => {
                 if let Ok(mut map) = self.pending.lock() {
@@ -973,7 +969,7 @@ impl JsonRpcChild {
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(Ok((result, _)))) => Ok(result),
-            Ok(Ok(Err(err))) => Err(RpcChildError::RpcError(err)),
+            Ok(Ok(Err(err))) => Err(err),
             Ok(Err(_canceled)) => Err(self.exit_or_shutdown()),
             Err(_elapsed) => {
                 if let Ok(mut map) = self.pending.lock() {
@@ -1569,12 +1565,12 @@ async fn route_incoming_line(
             };
             let outcome: PendingResult = if let Some(err_val) = obj.get("error") {
                 match serde_json::from_value::<RpcError>(err_val.clone()) {
-                    Ok(err) => Err(err),
-                    Err(_) => Err(RpcError {
+                    Ok(err) => Err(RpcChildError::RpcError(err)),
+                    Err(_) => Err(RpcChildError::RpcError(RpcError {
                         code: -32000,
                         message: format!("unparseable error payload: {err_val}"),
                         data: None,
-                    }),
+                    })),
                 }
             } else {
                 Ok((obj.get("result").cloned().unwrap_or(Value::Null), sequence))
