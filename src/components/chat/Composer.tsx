@@ -122,7 +122,7 @@ import { HooksManager } from "./HooksManager";
 import { ProviderCommandsDialog } from "./ProviderCommandsDialog";
 import { useUIStore } from "@/stores/ui-store";
 import { ComposerCommandMenu } from "./ComposerCommandMenu";
-import { ComposerFooter, ComposerSettings } from "./ComposerFooter";
+import { ComposerFooter } from "./ComposerFooter";
 import { ModePill, type ActivePillMode } from "./pickers/ModePill";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
@@ -263,11 +263,6 @@ interface Props {
    *  (the default) renders nothing — existing non-draft call sites are
    *  unaffected. */
   belowComposerSlot?: React.ReactNode;
-  /** Context row under the composer that hosts the model, effort and
-   *  access pickers. Receives them as `settings`; the controls row then
-   *  drops them. Takes precedence over `belowComposerSlot`. Omit it to
-   *  keep the pickers in the controls row. */
-  renderContextRow?: (settings: React.ReactNode) => React.ReactNode;
   /** Shared strip docked ABOVE the composer pill (`ComposerStrip`):
    *  subagents, monitoring, queued messages, session errors. Detached from
    *  the card in every state; its bottom seam tucks under the pill, which
@@ -543,7 +538,6 @@ export function Composer({
   showStopButton = true,
   zone1Override,
   belowComposerSlot,
-  renderContextRow,
   stripSlot,
   onSteerNextQueued,
   onEditLastQueued,
@@ -2943,7 +2937,6 @@ export function Composer({
     busy,
     delivery.delivery,
     streaming && draft.trim().length > 0,
-    !!renderContextRow,
     tasks ? `${tasks.completed}/${tasks.total}` : "",
     // The ring appearing adds width inside the gap without resizing it,
     // so no observer would notice.
@@ -3214,7 +3207,8 @@ export function Composer({
 
   return (
     <div className={cn(CHAT_COLUMN_OUTER, "pb-3")}>
-      <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
+      {/* `data-composer-dock`: the floating browser peek keeps clear of it. */}
+      <div data-composer-dock className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
         {zone1Override !== null && zone1Override !== undefined ? (
           <div className="pb-1">{zone1Override}</div>
         ) : zone1Override === undefined && cwd ? (
@@ -3362,7 +3356,7 @@ export function Composer({
               footerNote={attachPopupFooter}
               submode={attachSubmode}
               headerSlot={
-                footerLadder.configInMenu && !renderContextRow && provider !== "acp" && attachSubmode === "main" ? (
+                footerLadder.configInMenu && provider !== "acp" && attachSubmode === "main" ? (
                   <>
                     <ReasoningPicker
                       model={activeModel}
@@ -3921,44 +3915,13 @@ export function Composer({
             effortIconOnly={footerLadder.effortIconOnly}
             accessIconOnly={footerLadder.accessIconOnly}
             configInMenu={footerLadder.configInMenu}
-            settingsInContextRow={!!renderContextRow}
           />
         </div>
         {/* No gap here — the scope strip / context strip attaches
             flush to the card's bottom edge so it reads as a layer
             sliding out from beneath the card. Slot content owns any
             spacing it needs below itself. */}
-        {renderContextRow
-          ? renderContextRow(
-              <ComposerSettings
-                hermesThreadId={threadId}
-                hermesProjectPath={cwd}
-                customAgentsAllowed={customAgentsAllowed}
-                provider={provider}
-                model={model}
-                permissionMode={permissionMode}
-                effort={effort}
-                contextWindow={contextWindow}
-                serviceTier={serviceTier}
-                activeModel={activeModel}
-                effortLabelMap={effortLabelMap}
-                permissionModes={permissionModes}
-                ultrathinkInBodyText={ultrathinkInBodyText}
-                showProviderPicker={showProviderPicker}
-                mode={mode}
-                onProviderModelChange={onProviderModelChange}
-                onModelChange={onModelChange}
-                onPermissionModeChange={onPermissionModeChange}
-                onEffortChange={onEffortChange}
-                onContextWindowChange={onContextWindowChange}
-                onServiceTierChange={onServiceTierChange}
-                configurationDisabled={!configurationEnabled}
-                modelPickerOpenSignal={modelPickerOpenSignal}
-                permissionPickerOpenSignal={permissionPickerOpenSignal}
-                placement="context-row"
-              />,
-            )
-          : (belowComposerSlot ?? null)}
+        {belowComposerSlot ?? null}
         <Slot area={COMPOSER_FOOTER_AREA} props={{ workspaceId, threadId }} variant="block" />
       </div>
       {provider === "codex" && <HooksManager open={hooksOpen} onOpenChange={setHooksOpen} cwd={cwd ?? null} threadId={threadId ?? null} />}

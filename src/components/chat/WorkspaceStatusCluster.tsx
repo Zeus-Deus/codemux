@@ -37,9 +37,9 @@ import {
 } from "@/lib/source-control";
 
 /**
- * Context Row status cluster (design: `.design-import/Context Row.dc.html`)
- * — the passive git/PR status from the retired full-width workspace
- * context bar, relocated to sit RIGHT of the composer's scope row. Renders:
+ * Compact git/PR status cluster for the phone shell's workspace context
+ * line. (The desktop chat used to show it under the composer; it now keeps
+ * this state in the title bar's Workspace details card.) Renders:
  *
  *  - the GUI-mode background-browser indicator (the same sky-tinted
  *    "Browser" pill shown compactly in terminal headers — shared
@@ -51,20 +51,14 @@ import {
  *    the hosting product,
  *  - a linked-issue chip (Issue #N) that opens the issue detail
  *    popover upward — the same `IssueDetailPopover` (chip variant) the
- *    old bar rendered, so a thread's linked issue stays visible on the
- *    Context Row,
+ *    old bar rendered, so a thread's linked issue stays visible,
  *  - a "workspace details" button that opens a compact popover with
  *    the full picture (branch, base — the PR target, else the branch
  *    the worktree was created from — behind, ahead, uncommitted diff,
  *    PR, issue, device) plus quick view / sync actions.
  *
- * Self-contained: reads the active workspace directly. This only ever
- * renders from inside an `AgentChatPane`, and `PaneContainer` only
- * ever mounts panes for the currently active workspace — so
- * `useActiveWorkspace()` always resolves to the pane's own workspace.
- * (That mount context also makes the `enableAgentChat`
- * browser-indicator gate implicit here: a disabled flag renders a
- * placeholder instead of the pane.)
+ * Self-contained: reads the active workspace directly, which is the one
+ * the phone shell is showing.
  *
  * Renders nothing when there is no active workspace, or there is
  * neither a git branch, a no-git affordance, a background browser
