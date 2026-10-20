@@ -764,6 +764,18 @@ export interface PrWatchChangedPayload {
   watch: import("./types").PrWatchStatus | null;
 }
 
+/** Chats were merged into `survivor` (a chat reopened from history): its
+ *  lineage, watch and other per-chat state may have moved onto it. */
+export interface AgentChatSessionsMergedPayload {
+  survivor: string;
+  merged: string[];
+}
+
+export const onAgentChatSessionsMerged = (
+  cb: EventCallback<AgentChatSessionsMergedPayload>,
+): Promise<UnlistenFn> =>
+  listen<AgentChatSessionsMergedPayload>("agent-chat-sessions-merged", (e) => cb(e.payload));
+
 /** A chat's pull-request watch changed: armed, swept, woke, stopped. */
 export const onPrWatchChanged = (
   cb: EventCallback<PrWatchChangedPayload>,

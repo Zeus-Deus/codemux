@@ -32,6 +32,7 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::agent_provider::side_chat::provider_label;
 use crate::agent_provider::{ProviderKind, ProviderRuntimeEvent, StartSessionInput, ThreadId};
+use crate::database::provider_switch::{history_ref, retarget_seed};
 use crate::database::DatabaseStore;
 use crate::observability::ObservabilityStore;
 use crate::utility_ai::UtilityModelSelection;
@@ -206,18 +207,6 @@ pub(crate) fn carry_into_fork(db: &DatabaseStore, source: &str, fork: &str) {
     }
 }
 
-/// `seed` with its history pointer moved from `source` to `fork`. Only the
-/// header Codemux wrote is touched, never the conversation in the body.
-fn retarget_seed(seed: &str, source: &str, fork: &str) -> String {
-    let (header, body) = seed.split_once("\n\n").unwrap_or((seed, ""));
-    let header = header.replacen(&history_ref(source), &history_ref(fork), 1);
-    if body.is_empty() {
-        header
-    } else {
-        format!("{header}\n\n{body}")
-    }
-}
-
 /// Tells a forked session where its own full history lives.
 fn fork_correction(fork: &str) -> String {
     format!(
@@ -239,11 +228,6 @@ pub(crate) fn seed_delivered(
             eprintln!("[codemux::provider_switch] {error}");
         }
     }
-}
-
-/// How a seed names the chat whose full history it points at.
-fn history_ref(thread_id: &str) -> String {
-    format!("conversation_id `{thread_id}`")
 }
 
 /// The handoff block the new provider reads before the user's next message.
@@ -540,6 +524,32 @@ mod tests {
         let (path, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n1", "/tmp/x is broken".into());
         assert_eq!(path, "SEED\n\n/tmp/x is broken");
         assert!(seed.is_some());
+    }
+
+    #[test]
+    fn a_reopened_chat_tells_its_provider_where_the_history_went() {
+        // The handoff was answered under "t"; reopening the chat from history
+        // merges it into "t2" and deletes "t", which the provider's handoff
+        // still names. The next turn carries a short correction, once.
+        let db = store();
+        db.put_provider_switch_seed("t", "codex", "SEED conversation_id `t`", 0).unwrap();
+        let (_, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n1", "go".into());
+        seed_delivered(&db, "t", ProviderKind::Codex, "n1", seed);
+        user_message(&db, "n1");
+        db.append_agent_chat_message("t", r#"{"type":"item_completed"}"#).unwrap();
+        db.upsert_agent_chat_session("t2", "ws", Some("/repo"), "codex").unwrap();
+        db.merge_reopened_agent_chat_session("t", "t2").unwrap();
+
+        let (text, seed) = seed_turn(&db, "t2", ProviderKind::Codex, "n2", "next".into());
+        assert!(text.contains("reopened under a new id"), "{text}");
+        assert!(text.contains(&history_ref("t2")) && !text.contains(&history_ref("t")));
+        assert!(text.ends_with("\n\nnext"));
+        seed_delivered(&db, "t2", ProviderKind::Codex, "n2", seed);
+        let reply = serde_json::json!({"type": "user_message", "text": "next", "client_nonce": "n2"});
+        db.append_agent_chat_message("t2", &reply.to_string()).unwrap();
+        db.append_agent_chat_message("t2", r#"{"type":"item_completed"}"#).unwrap();
+        let (after, none) = seed_turn(&db, "t2", ProviderKind::Codex, "n3", "more".into());
+        assert_eq!((after.as_str(), none), ("more", None));
     }
 
     #[test]

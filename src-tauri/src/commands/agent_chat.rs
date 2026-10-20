@@ -1151,6 +1151,14 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
         fast_mode: Some(input.fast_mode),
         service_tier: input.service_tier.clone(),
     };
+    // A history pick names the persisted chat it reopens under this fresh
+    // thread id; that chat is merged into this one once the session runs.
+    let reopened_from = input
+        .extra
+        .get(crate::provider_accounts::FROM_THREAD_EXTRA_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|from| *from != input.thread_id.0)
+        .map(str::to_string);
     // A restart of an existing durable CodeMux thread must not depend solely
     // on the frontend's in-memory cursor. That slice can be cold after sleep,
     // remount, or event-stream recovery even though the authoritative session
@@ -1586,6 +1594,13 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
             // The row now exists. Project the latest acknowledged binding,
             // including updates accepted while startup was completing.
             db.project_acp_binding(&session.thread_id.0)?;
+        }
+        // Fold the reopened chat into this thread now rather than waiting
+        // for a matching provider session id: Codex reports its id only at
+        // start (and one that never finished a turn resumes under a new
+        // id), and Claude's arrives after the first prompt was sent.
+        if let Some(from) = reopened_from {
+            merge_reopened_chat(&app, &db, &state, provider, &from, &session.thread_id.0).await;
         }
         if persisted {
             // The pane may have read its task list while the row was missing
@@ -2254,6 +2269,38 @@ fn delete_orphaned_chat_images(removed_payloads: &[String], retained_payloads: &
                 }
             }
             Err(error) => eprintln!("[codemux::agent_chat] skipped reverted image {path}: {error}"),
+        }
+    }
+}
+
+/// Delete `thread_id`'s images: its own folder, and the images its
+/// transcript points at elsewhere (a chat reopened from history keeps the
+/// merged-away thread's images where they were). Only while the chat
+/// exists: a stale delete of a thread a reopen merged away must not take
+/// the folder the survivor now uses.
+fn delete_chat_images_in(root: &std::path::Path, db: &DatabaseStore, thread_id: &str) {
+    if !db.has_agent_chat_session(thread_id).unwrap_or(false) {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(root.join(thread_id));
+    delete_referenced_chat_images_in(root, &db.list_agent_chat_messages(thread_id));
+}
+
+fn delete_referenced_chat_images_in(root: &std::path::Path, payloads: &[String]) {
+    let Ok(canon_root) = root.canonicalize() else {
+        return;
+    };
+    let paths = payloads
+        .iter()
+        .flat_map(|payload| chat_image_paths_in_payload(payload))
+        .collect::<std::collections::HashSet<_>>();
+    for path in paths {
+        if let Ok(resolved) = resolve_within(root, &path) {
+            let _ = std::fs::remove_file(&resolved);
+            if let Some(dir) = resolved.parent().filter(|dir| *dir != canon_root) {
+                // Fails, harmlessly, while the folder still holds files.
+                let _ = std::fs::remove_dir(dir);
+            }
         }
     }
 }
@@ -6592,6 +6639,14 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
     select: Option<bool>,
 ) -> Result<OpenAgentChatSearchResult, String> {
     feature_flag_on(&observability)?;
+    // Binding a new pane holds the chat's dispatch lock from reading it
+    // through the bind, so a history reopen can't merge it away in between
+    // (`merge_reopened_chat`). A chat already open in a pane is never
+    // merged, so focusing it doesn't wait behind a session that is starting.
+    let dispatch_guard = match state.agent_chat_pane_id_for_thread(&thread_id) {
+        Some(_) => None,
+        None => Some(native_thread_gate(&app, &thread_id).dispatch.clone().lock_owned().await),
+    };
     let record = db
         .get_agent_chat_session(&thread_id)
         .ok_or_else(|| format!("conversation_not_found: {thread_id}"))?;
@@ -6621,6 +6676,7 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
             .0;
         pane_id.0
     };
+    drop(dispatch_guard);
 
     // Pane activation selects the workspace/surface, while tab activation is
     // a separate state field. Resolve both from one immutable snapshot and
@@ -6750,12 +6806,12 @@ pub async fn agent_chat_delete_session<R: Runtime>(
                 .map_err(|e| e.to_string())?;
         }
     }
-    // Best-effort: drop the thread's on-disk image directory alongside the
-    // DB rows. The messages cascade via FK, but the image files live
-    // outside SQLite, so nothing else would ever reclaim them. A failure
-    // here (missing dir is the common case) must not fail the delete.
-    if let Some(dir) = chat_images_dir(&thread_id) {
-        let _ = std::fs::remove_dir_all(&dir);
+    // Best-effort: drop the chat's images alongside the DB rows. The
+    // messages cascade via FK, but the image files live outside SQLite, so
+    // nothing else would ever reclaim them. A failure here (missing dir is
+    // the common case) must not fail the delete.
+    if let Some(root) = chat_images_root() {
+        delete_chat_images_in(&root, &db, &thread_id);
     }
     // SQLite cascades remove checkpoint bookkeeping, but Git refs live
     // outside the database and would otherwise retain snapshot objects
@@ -6807,11 +6863,125 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     Ok(())
 }
 
-fn cleanup_collapsed_session_resources(cleanup: crate::database::AgentChatSessionCleanup) {
-    for thread_id in &cleanup.thread_ids {
-        if let Some(dir) = chat_images_dir(thread_id) {
-            let _ = std::fs::remove_dir_all(dir);
+/// Resume creates a fresh DB row (new thread_id) carrying the same
+/// sdk_session_id as the original. Collapse the duplicates so the dropdown
+/// doesn't grow unboundedly, but only while the rows that would go are idle,
+/// as for a reopen ([`merge_reopened_chat`]): open in no pane, not
+/// dispatching (their dispatch locks are held, without waiting, through the
+/// collapse), with no live session and no pull-request wake on its way.
+async fn collapse_resumed_duplicates<R: Runtime>(app: &AppHandle<R>, sdk_session_id: &str) {
+    let db = app.state::<DatabaseStore>();
+    let state = app.state::<AppStateStore>();
+    let registry = app.state::<ProviderRegistry>();
+    // Rows checked idle, whose dispatch locks are held until the collapse is
+    // done. The collapse merges away no other row, so one that joins the
+    // group meanwhile is left alone.
+    let mut cleared = std::collections::HashSet::new();
+    let mut held = Vec::new();
+    for (thread, provider) in db.agent_chat_threads_for_sdk_session(sdk_session_id) {
+        let gate = native_thread_gate(app, &thread);
+        let Ok(guard) = gate.dispatch.clone().try_lock_owned() else {
+            continue;
+        };
+        let live = match serde_json::from_value::<ProviderKind>(serde_json::json!(provider)) {
+            Ok(kind) => match lookup_provider(&registry, kind).await {
+                Ok(provider) => provider.has_session(&ThreadId(thread.clone())).await,
+                Err(_) => true,
+            },
+            Err(_) => false,
+        };
+        if !live && state.agent_chat_pane_id_for_thread(&thread).is_none() {
+            cleared.insert(thread);
+            held.push(guard);
         }
+    }
+    let collapsed = crate::pr_watch::unless_any_waking(|waking| {
+        cleared.retain(|thread| !waking.contains(thread));
+        db.collapse_duplicate_agent_chat_sessions_if_cleared(sdk_session_id, &cleared)
+    });
+    drop(held);
+    match collapsed {
+        Ok(cleanup) => agent_chat_sessions_merged(app, &db, cleanup),
+        Err(error) => eprintln!("[codemux::agent_chat] failed to collapse duplicates: {error}"),
+    }
+}
+
+/// Merge the chat a history pick reopened (`from`) into the thread that now
+/// runs it. The old chat must be idle: open in no pane, and with no live
+/// session (a pull-request wake can resume a closed chat headless). Its
+/// dispatch lock is held, without waiting, from that check through the
+/// merge, so nothing can resume it in between; a busy chat is left alone.
+async fn merge_reopened_chat<R: Runtime>(
+    app: &AppHandle<R>,
+    db: &DatabaseStore,
+    state: &AppStateStore,
+    provider: ProviderKind,
+    from: &str,
+    into: &str,
+) {
+    if state.agent_chat_pane_id_for_thread(from).is_some() {
+        return;
+    }
+    let gate = native_thread_gate(app, from);
+    let Ok(_from_guard) = gate.dispatch.clone().try_lock_owned() else {
+        return;
+    };
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let live = match lookup_provider(&registry, provider).await {
+        Ok(provider) => provider.has_session(&ThreadId(from.to_string())).await,
+        Err(_) => true,
+    };
+    if live || state.agent_chat_pane_id_for_thread(from).is_some() {
+        return;
+    }
+    // A pull-request wake already committed for the old chat is about to
+    // send to it; merging now would lose that wake.
+    match crate::pr_watch::unless_waking(from, || db.merge_reopened_agent_chat_session(from, into)) {
+        None => {}
+        Some(Ok(cleanup)) => agent_chat_sessions_merged(app, db, cleanup),
+        Some(Err(error)) => eprintln!("[codemux::agent_chat] failed to merge the reopened chat: {error}"),
+    }
+}
+
+/// Chats were merged into a survivor (a history reopen): payload
+/// `{ survivor, merged }`. A pane already bound to the survivor re-reads
+/// state that has no change event of its own, such as fork lineage.
+pub const AGENT_CHAT_SESSIONS_MERGED_EVENT: &str = "agent-chat-sessions-merged";
+
+/// Chats were merged into `cleanup.survivor`: adopt queued images, drop
+/// what the merged-away rows owned outside SQLite, and have the survivor's
+/// pane re-read the per-chat state that moved onto it.
+fn agent_chat_sessions_merged<R: Runtime>(
+    app: &AppHandle<R>,
+    db: &DatabaseStore,
+    cleanup: crate::database::AgentChatSessionCleanup,
+) {
+    super::queued_turns::after_sessions_merged(app, db, chat_images_dir);
+    if !cleanup.thread_ids.is_empty() {
+        let survivor = cleanup.survivor.clone();
+        let _ = app.emit(
+            AGENT_CHAT_SESSIONS_MERGED_EVENT,
+            serde_json::json!({ "survivor": survivor, "merged": cleanup.thread_ids }),
+        );
+        if let Ok(Some(watch)) = db.get_pr_watch(&survivor) {
+            crate::pr_watch::emit_changed(app, &survivor, Some(watch));
+        }
+        if !db.list_follow_up_tasks(&survivor).is_empty() {
+            super::follow_ups::emit_changed(app, &survivor);
+        }
+        // A reopened follow-up task: its parent's card now links the survivor.
+        if let Some(task) = db.get_follow_up_task(&survivor) {
+            super::follow_ups::emit_changed(app, &task.parent_thread_id);
+        }
+    }
+    cleanup_collapsed_session_resources(cleanup)
+}
+
+fn cleanup_collapsed_session_resources(cleanup: crate::database::AgentChatSessionCleanup) {
+    // A merged-away thread's image folder stays: the survivor's transcript
+    // now points at the files in it. Deleting the survivor removes them
+    // ([`agent_chat_delete_session`]).
+    for thread_id in &cleanup.thread_ids {
         forget_turn_checkpoint_lock(thread_id);
         let repos = cleanup.repo_paths.iter().filter(|(id, _)| id == thread_id);
         let repos = repos.map(|(_, repo)| repo.clone()).collect::<Vec<_>>();
@@ -7529,18 +7699,11 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             if let Err(error) = db.set_agent_chat_sdk_session_id(&thread_id.0, &sdk_session_id) {
                 eprintln!("[codemux::agent_chat] failed to persist sdk_session_id: {error}");
             }
-            // Resume creates a fresh DB row (new thread_id) carrying the
-            // same sdk_session_id as the original. Collapse the
-            // duplicates so the dropdown doesn't grow unboundedly.
-            match db.collapse_duplicate_agent_chat_sessions(&sdk_session_id) {
-                Ok(cleanup) => {
-                    super::queued_turns::after_sessions_merged(app, &db, chat_images_dir);
-                    cleanup_collapsed_session_resources(cleanup)
-                }
-                Err(error) => {
-                    eprintln!("[codemux::agent_chat] failed to collapse duplicates: {error}");
-                }
-            }
+            let app = app.clone();
+            let sdk_session_id = sdk_session_id.clone();
+            tauri::async_runtime::spawn(async move {
+                collapse_resumed_duplicates(&app, &sdk_session_id).await;
+            });
         } else if resume_cursor.is_null() {
             // A JSON-null cursor is the stale-session recovery signal (the
             // sidecar rebuilt a fresh query because the persisted id's
@@ -9679,6 +9842,7 @@ mod tests {
             thread_ids: vec![thread_id.to_string()],
             repo_paths: vec![(thread_id.to_string(), repo.to_string_lossy().to_string())],
             checkpoint_refs: vec![(repo.to_string_lossy().to_string(), checkpoint_ref.clone())],
+            ..Default::default()
         });
 
         for ref_name in [checkpoint_ref, safety_ref, failed_safety_ref] {
@@ -9766,6 +9930,94 @@ mod tests {
         )
         .is_empty());
         assert!(chat_image_paths_in_payload("not json").is_empty());
+    }
+
+    #[test]
+    fn a_fork_of_a_reopened_chat_owns_copies_of_its_images() {
+        // A reopened as B: B's transcript points at A's folder. Forking B
+        // into C copies that image into C's folder, so deleting either chat
+        // leaves the other's images intact.
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("a");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("img.png"), b"png").unwrap();
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("b", "ws", Some("/repo"), "claude").unwrap();
+        let message = serde_json::json!({
+            "type": "user_message", "thread_id": "b", "text": "look",
+            "images": [{"path": old.join("img.png"), "media_type": "image/png"}],
+        });
+        db.append_agent_chat_message("b", &message.to_string()).unwrap();
+        let source = db.get_agent_chat_session("b").unwrap();
+        let fork_dir = root.path().join("c");
+        let roots = vec![root.path().to_path_buf()];
+        let images = db
+            .create_agent_chat_fork(&crate::database::chat_fork::NewChatFork {
+                thread_id: "c",
+                source: &source,
+                sdk_session_id: "native-c",
+                workspace_id: "ws",
+                cwd: "/repo",
+                title: "fork",
+                cut_before: None,
+                image_dirs: Some((roots.as_slice(), &fork_dir)),
+            })
+            .unwrap();
+        for (from, to) in images {
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(from, to).unwrap();
+        }
+
+        delete_referenced_chat_images_in(root.path(), &db.list_agent_chat_messages("b"));
+        assert!(!old.join("img.png").exists());
+        assert!(fork_dir.join("img.png").exists(), "the fork has its own copy");
+        delete_referenced_chat_images_in(root.path(), &db.list_agent_chat_messages("c"));
+        assert!(!fork_dir.exists());
+    }
+
+    #[test]
+    fn deleting_a_merged_away_thread_keeps_the_survivors_images() {
+        // "old" was reopened as "new": its row is gone, its folder now holds
+        // images "new" points at. A stale delete of "old" leaves them.
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("a.png"), b"png").unwrap();
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("new", "ws", Some("/repo"), "claude").unwrap();
+        let message = serde_json::json!({"type": "user_message", "images": [{"path": old.join("a.png")}]});
+        db.append_agent_chat_message("new", &message.to_string()).unwrap();
+
+        delete_chat_images_in(root.path(), &db, "old");
+        assert!(old.join("a.png").exists());
+        delete_chat_images_in(root.path(), &db, "new");
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn deleting_a_chat_deletes_the_images_its_transcript_points_at() {
+        // A chat reopened from history points at images in the merged-away
+        // thread's folder; deleting it removes them and the emptied folder.
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old-thread");
+        let other = root.path().join("other-thread");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        for file in [old.join("a.png"), other.join("b.png")] {
+            std::fs::write(file, b"png").unwrap();
+        }
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let user = |path: &std::path::Path| {
+            serde_json::json!({"type": "user_message", "images": [{"path": path}]}).to_string()
+        };
+        delete_referenced_chat_images_in(
+            root.path(),
+            &[user(&old.join("a.png")), user(outside.path())],
+        );
+        assert!(!old.exists(), "the emptied folder goes too");
+        assert!(other.join("b.png").exists(), "another chat's image stays");
+        assert!(outside.path().exists(), "nothing outside the image root is touched");
+        assert!(root.path().exists());
     }
 
     #[test]
@@ -11202,6 +11454,60 @@ mod tests {
             .unwrap();
         assert_eq!(provider.stopped.lock().unwrap().len(), 1);
         assert_eq!(provider.started_on.lock().unwrap().len(), 1);
+    }
+
+    /// A history pick merges the chat it reopened only while that chat is
+    /// idle: not running a session (a PR wake can resume it headless) and
+    /// not mid-dispatch.
+    #[tokio::test]
+    async fn a_reopened_chat_merges_only_while_it_is_idle() {
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app("reopened", None, provider.clone()).await;
+        let handle = app.handle().clone();
+        let db = app.state::<DatabaseStore>();
+        let state = app.state::<AppStateStore>();
+        db.upsert_agent_chat_session("old", &workspace, Some("/tmp"), "codex").unwrap();
+        let merge = || merge_reopened_chat(&handle, &db, &state, ProviderKind::Codex, "old", "reopened");
+
+        provider.live.lock().unwrap().insert("old".into());
+        merge().await;
+        assert!(db.get_agent_chat_session("old").is_some(), "its session still runs");
+        provider.live.lock().unwrap().clear();
+
+        let gate = native_thread_gate(&handle, "old");
+        let busy = gate.dispatch.clone().lock_owned().await;
+        merge().await;
+        assert!(db.get_agent_chat_session("old").is_some(), "something is dispatching to it");
+        drop(busy);
+
+        let waking = crate::pr_watch::tests_claim_waking("old");
+        merge().await;
+        assert!(db.get_agent_chat_session("old").is_some(), "a committed PR wake is on its way");
+        drop(waking);
+
+        // The collapse a matching provider session id triggers holds back
+        // the same way. "reopened" reports the id a second later, so it is
+        // the newest row: the survivor.
+        db.set_agent_chat_sdk_session_id("old", "native-1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        db.set_agent_chat_sdk_session_id("reopened", "native-1").unwrap();
+        provider.live.lock().unwrap().insert("old".into());
+        collapse_resumed_duplicates(&handle, "native-1").await;
+        assert!(db.get_agent_chat_session("old").is_some(), "its session still runs");
+        provider.live.lock().unwrap().clear();
+        let busy = gate.dispatch.clone().lock_owned().await;
+        collapse_resumed_duplicates(&handle, "native-1").await;
+        assert!(db.get_agent_chat_session("old").is_some(), "something is dispatching to it");
+        drop(busy);
+        let waking = crate::pr_watch::tests_claim_waking("old");
+        collapse_resumed_duplicates(&handle, "native-1").await;
+        assert!(db.get_agent_chat_session("old").is_some(), "a committed PR wake is on its way");
+        drop(waking);
+        // The survivor's own pane and session don't hold it back.
+        provider.live.lock().unwrap().insert("reopened".into());
+        collapse_resumed_duplicates(&handle, "native-1").await;
+        assert!(db.get_agent_chat_session("old").is_none());
+        assert!(db.get_agent_chat_session("reopened").is_some());
     }
 
     /// Push / pull stop the workspace's live chats before copying it.

@@ -17,6 +17,215 @@ pub mod mobile_push;
 pub mod queued_turns;
 pub mod restart_resumes;
 
+/// Merge every session row matching `group` (an `agent_chat_sessions`
+/// predicate over `?1 = key`) into `survivor` (`?2`), which must match it
+/// too: identity, config, transcript and per-chat state move onto the
+/// survivor, then the other rows are deleted. Returns what the caller must
+/// clean up outside SQLite once the transaction commits.
+fn merge_agent_chat_session_rows(
+    tx: &rusqlite::Transaction<'_>,
+    group: &str,
+    key: &str,
+    survivor: &str,
+) -> Result<AgentChatSessionCleanup, String> {
+    // Capture every external resource owned by rows that the FK cascade is
+    // about to remove. Git refs and chat images live outside SQLite, so the
+    // caller must delete them after this transaction commits.
+    let removed_sessions = {
+        let mut statement = tx
+            .prepare(
+                &format!("SELECT thread_id, cwd FROM agent_chat_sessions
+                 WHERE {group} AND thread_id != ?2"),
+            )
+            .map_err(|e| format!("Failed to prepare duplicate-session cleanup: {e}"))?;
+        let sessions = statement
+            .query_map(params![key, survivor], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| format!("Failed to read duplicate-session cleanup: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect duplicate-session cleanup: {e}"))?;
+        sessions
+    };
+    let mut cleanup = AgentChatSessionCleanup {
+        survivor: survivor.to_string(),
+        thread_ids: removed_sessions
+            .iter()
+            .map(|(thread_id, _)| thread_id.clone())
+            .collect(),
+        ..AgentChatSessionCleanup::default()
+    };
+    let mut repo_paths = removed_sessions
+        .iter()
+        .filter_map(|(thread_id, cwd)| {
+            cwd.as_ref().map(|cwd| (thread_id.clone(), cwd.clone()))
+        })
+        .collect::<HashSet<_>>();
+    let mut checkpoint_refs = HashSet::new();
+    for (thread_id, _) in &removed_sessions {
+        let mut turn_statement = tx
+            .prepare(
+                "SELECT repo_path, ref_name FROM agent_chat_turn_checkpoints
+                 WHERE thread_id = ?1",
+            )
+            .map_err(|e| format!("Failed to prepare turn-checkpoint cleanup: {e}"))?;
+        let turn_refs = turn_statement
+            .query_map(params![thread_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Failed to read turn-checkpoint cleanup: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect turn-checkpoint cleanup: {e}"))?;
+        for (repo_path, ref_name) in turn_refs {
+            repo_paths.insert((thread_id.clone(), repo_path.clone()));
+            checkpoint_refs.insert((repo_path, ref_name));
+        }
+        let legacy_ref = tx
+            .query_row(
+                "SELECT repo_path, ref_name FROM agent_chat_checkpoints
+                 WHERE thread_id = ?1",
+                params![thread_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to read run-checkpoint cleanup: {e}"))?;
+        if let Some((repo_path, ref_name)) = legacy_ref {
+            repo_paths.insert((thread_id.clone(), repo_path.clone()));
+            checkpoint_refs.insert((repo_path, ref_name));
+        }
+    }
+    cleanup.repo_paths = repo_paths.into_iter().collect();
+    cleanup.checkpoint_refs = checkpoint_refs.into_iter().collect();
+    cleanup.thread_ids.sort();
+    cleanup.repo_paths.sort();
+    cleanup.checkpoint_refs.sort();
+    // Merge identity + config fields onto the survivor: keep the
+    // earliest created_at, and carry forward any non-null title /
+    // per-thread config (model / effort / context_window /
+    // permission_mode / fast_mode) across the whole set. For a resume the
+    // survivor is the freshly minted thread whose config columns are still
+    // NULL — so
+    // without this backfill the user's persisted per-thread model /
+    // effort / context / permission-mode / speed selection would be lost
+    // when the original row is DELETEd below. Each config column
+    // prefers the survivor's own non-null value, then the
+    // most-recently-active non-null value across the group.
+    // `sdk_session_id` is backfilled the same way: a reopened Claude chat
+    // learns its own only on its first turn, and history lists only rows
+    // that have one.
+    tx.execute(
+        &format!("UPDATE agent_chat_sessions
+             SET created_at = COALESCE(
+                 (SELECT MIN(created_at) FROM agent_chat_sessions
+                  WHERE {group}),
+                 created_at
+             ),
+             sdk_session_id = COALESCE(
+                 sdk_session_id,
+                 (SELECT sdk_session_id FROM agent_chat_sessions
+                  WHERE {group} AND sdk_session_id IS NOT NULL
+                  ORDER BY last_active_at DESC LIMIT 1)
+             ),
+             title = COALESCE(
+                 title,
+                 (SELECT title FROM agent_chat_sessions
+                  WHERE {group} AND title IS NOT NULL
+                  ORDER BY last_active_at DESC LIMIT 1)
+             ),
+             model = COALESCE(
+                 model,
+                 (SELECT model FROM agent_chat_sessions
+                  WHERE {group} AND model IS NOT NULL
+                  ORDER BY last_active_at DESC LIMIT 1)
+             ),
+             effort = COALESCE(
+                 effort,
+                 (SELECT effort FROM agent_chat_sessions
+                  WHERE {group} AND effort IS NOT NULL
+                  ORDER BY last_active_at DESC LIMIT 1)
+             ),
+             context_window = COALESCE(
+                 context_window,
+                 (SELECT context_window FROM agent_chat_sessions
+                  WHERE {group} AND context_window IS NOT NULL
+                  ORDER BY last_active_at DESC LIMIT 1)
+             ),
+             permission_mode = COALESCE(
+                 permission_mode,
+                 (SELECT permission_mode FROM agent_chat_sessions
+                  WHERE {group} AND permission_mode IS NOT NULL
+                  ORDER BY last_active_at DESC LIMIT 1)
+             ),
+             service_tier = COALESCE(
+                 service_tier,
+                 CASE WHEN fast_mode IS NOT NULL
+                      THEN CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END END,
+                 (SELECT COALESCE(service_tier,
+                     CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
+                  FROM agent_chat_sessions
+                  WHERE {group} AND (service_tier IS NOT NULL OR fast_mode IS NOT NULL)
+                  ORDER BY last_active_at DESC LIMIT 1)
+             ),
+             fast_mode = COALESCE(
+                 fast_mode,
+                 (SELECT fast_mode FROM agent_chat_sessions
+                  WHERE {group} AND fast_mode IS NOT NULL
+                  ORDER BY last_active_at DESC LIMIT 1),
+                 0
+             )
+         WHERE thread_id = ?2"),
+        params![key, survivor],
+    )
+    .map_err(|e| format!("Failed to merge duplicate sessions: {e}"))?;
+    // Move persisted messages from the non-survivors onto the
+    // survivor BEFORE the DELETE — otherwise ON DELETE CASCADE
+    // wipes the transcript history of the prior thread_ids whose
+    // messages we want to keep visible after resume.
+    tx.execute(
+        &format!("UPDATE agent_chat_messages
+         SET thread_id = ?2
+         WHERE thread_id IN (
+             SELECT thread_id FROM agent_chat_sessions
+             WHERE {group} AND thread_id != ?2
+         )"),
+        params![key, survivor],
+    )
+    .map_err(|e| format!("Failed to migrate duplicate session messages: {e}"))?;
+    turn_diffs::move_to_thread(
+        tx,
+        &format!("thread_id IN (
+             SELECT thread_id FROM agent_chat_sessions
+             WHERE {group} AND thread_id != ?2
+         )"),
+        params![key, survivor],
+    )?;
+    queued_turns::move_to_thread(
+        tx,
+        &format!("thread_id IN (
+             SELECT thread_id FROM agent_chat_sessions
+             WHERE {group} AND thread_id != ?2
+         )"),
+        params![key, survivor],
+    )?;
+    // Per-chat feature state with no transcript of its own: a pending
+    // provider-switch handoff, a pull-request watch, fork lineage, and
+    // the follow-up tasks a chat started. Rows keyed to a merged-away
+    // thread would cascade away or be swept as orphans.
+    let merged = &cleanup.thread_ids;
+    provider_switch::move_to_thread(tx, merged, survivor)?;
+    pr_watch::move_to_thread(tx, merged, survivor)?;
+    chat_fork::move_to_thread(tx, merged, survivor)?;
+    follow_ups::move_to_thread(tx, merged, survivor)?;
+    // Delete the non-survivors.
+    tx.execute(
+        &format!("DELETE FROM agent_chat_sessions
+         WHERE {group} AND thread_id != ?2"),
+        params![key, survivor],
+    )
+    .map_err(|e| format!("Failed to drop duplicate sessions: {e}"))?;
+    Ok(cleanup)
+}
+
 fn agent_chat_session(conn: &Connection, thread_id: &str) -> Option<AgentChatSessionRecord> {
         conn.query_row(
             "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id), COALESCE(service_tier, CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
@@ -357,6 +566,9 @@ pub struct AgentChatTurnRevertOutcome {
 /// refs that SQLite cannot cascade-delete itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentChatSessionCleanup {
+    /// The row the others were merged into.
+    pub survivor: String,
+    /// The merged-away rows, now deleted.
     pub thread_ids: Vec<String>,
     /// `(thread_id, repo_path)` pairs that may own a pre-restore safety ref.
     pub repo_paths: Vec<(String, String)>,
@@ -4446,6 +4658,40 @@ impl DatabaseStore {
         &self,
         sdk_session_id: &str,
     ) -> Result<AgentChatSessionCleanup, String> {
+        self.collapse_agent_chat_sessions(sdk_session_id, None)
+    }
+
+    /// `(thread_id, provider)` of every chat on native session `sdk_session_id`.
+    pub fn agent_chat_threads_for_sdk_session(&self, sdk_session_id: &str) -> Vec<(String, String)> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut statement) = conn.prepare(
+            "SELECT thread_id, provider FROM agent_chat_sessions WHERE sdk_session_id = ?1",
+        ) else {
+            return Vec::new();
+        };
+        statement
+            .query_map(params![sdk_session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .and_then(|rows| rows.collect())
+            .unwrap_or_default()
+    }
+
+    /// [`Self::collapse_duplicate_agent_chat_sessions`], only if every row
+    /// it would merge away is in `cleared` (checked idle by the caller);
+    /// otherwise nothing changes. A row that joined the group since the
+    /// caller looked is never in it.
+    pub fn collapse_duplicate_agent_chat_sessions_if_cleared(
+        &self,
+        sdk_session_id: &str,
+        cleared: &HashSet<String>,
+    ) -> Result<AgentChatSessionCleanup, String> {
+        self.collapse_agent_chat_sessions(sdk_session_id, Some(cleared))
+    }
+
+    fn collapse_agent_chat_sessions(
+        &self,
+        sdk_session_id: &str,
+        cleared: Option<&HashSet<String>>,
+    ) -> Result<AgentChatSessionCleanup, String> {
         let mut conn = self.conn.lock().unwrap();
         let transaction = conn
             .transaction()
@@ -4463,186 +4709,72 @@ impl DatabaseStore {
         let Some(survivor) = survivor else {
             return Ok(AgentChatSessionCleanup::default());
         };
-
-        // Capture every external resource owned by rows that the FK cascade is
-        // about to remove. Git refs and chat images live outside SQLite, so the
-        // caller must delete them after this transaction commits.
-        let removed_sessions = {
+        if let Some(cleared) = cleared {
             let mut statement = transaction
                 .prepare(
-                    "SELECT thread_id, cwd FROM agent_chat_sessions
+                    "SELECT thread_id FROM agent_chat_sessions
                      WHERE sdk_session_id = ?1 AND thread_id != ?2",
                 )
-                .map_err(|e| format!("Failed to prepare duplicate-session cleanup: {e}"))?;
-            let sessions = statement
-                .query_map(params![sdk_session_id, survivor], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                })
-                .map_err(|e| format!("Failed to read duplicate-session cleanup: {e}"))?
+                .map_err(|e| format!("Failed to read duplicate sessions: {e}"))?;
+            let merged = statement
+                .query_map(params![sdk_session_id, survivor], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("Failed to read duplicate sessions: {e}"))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to collect duplicate-session cleanup: {e}"))?;
-            sessions
-        };
-        let mut cleanup = AgentChatSessionCleanup {
-            thread_ids: removed_sessions
-                .iter()
-                .map(|(thread_id, _)| thread_id.clone())
-                .collect(),
-            ..AgentChatSessionCleanup::default()
-        };
-        let mut repo_paths = removed_sessions
-            .iter()
-            .filter_map(|(thread_id, cwd)| {
-                cwd.as_ref().map(|cwd| (thread_id.clone(), cwd.clone()))
-            })
-            .collect::<HashSet<_>>();
-        let mut checkpoint_refs = HashSet::new();
-        for (thread_id, _) in &removed_sessions {
-            let mut turn_statement = transaction
-                .prepare(
-                    "SELECT repo_path, ref_name FROM agent_chat_turn_checkpoints
-                     WHERE thread_id = ?1",
-                )
-                .map_err(|e| format!("Failed to prepare turn-checkpoint cleanup: {e}"))?;
-            let turn_refs = turn_statement
-                .query_map(params![thread_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|e| format!("Failed to read turn-checkpoint cleanup: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to collect turn-checkpoint cleanup: {e}"))?;
-            for (repo_path, ref_name) in turn_refs {
-                repo_paths.insert((thread_id.clone(), repo_path.clone()));
-                checkpoint_refs.insert((repo_path, ref_name));
-            }
-            let legacy_ref = transaction
-                .query_row(
-                    "SELECT repo_path, ref_name FROM agent_chat_checkpoints
-                     WHERE thread_id = ?1",
-                    params![thread_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()
-                .map_err(|e| format!("Failed to read run-checkpoint cleanup: {e}"))?;
-            if let Some((repo_path, ref_name)) = legacy_ref {
-                repo_paths.insert((thread_id.clone(), repo_path.clone()));
-                checkpoint_refs.insert((repo_path, ref_name));
+                .map_err(|e| format!("Failed to read duplicate sessions: {e}"))?;
+            if merged.iter().any(|thread| !cleared.contains(thread)) {
+                return Ok(AgentChatSessionCleanup::default());
             }
         }
-        cleanup.repo_paths = repo_paths.into_iter().collect();
-        cleanup.checkpoint_refs = checkpoint_refs.into_iter().collect();
-        cleanup.thread_ids.sort();
-        cleanup.repo_paths.sort();
-        cleanup.checkpoint_refs.sort();
-        // Merge identity + config fields onto the survivor: keep the
-        // earliest created_at, and carry forward any non-null title /
-        // per-thread config (model / effort / context_window /
-        // permission_mode / fast_mode) across the whole set. The survivor is the
-        // most-recently-active row — for a resume that's the freshly
-        // minted thread whose config columns are still NULL — so
-        // without this backfill the user's persisted per-thread model /
-        // effort / context / permission-mode / speed selection would be lost
-        // when the original row is DELETEd below. Each config column
-        // prefers the survivor's own non-null value, then the
-        // most-recently-active non-null value across the group.
-        transaction.execute(
-            "UPDATE agent_chat_sessions
-                 SET created_at = COALESCE(
-                     (SELECT MIN(created_at) FROM agent_chat_sessions
-                      WHERE sdk_session_id = ?1),
-                     created_at
-                 ),
-                 title = COALESCE(
-                     title,
-                     (SELECT title FROM agent_chat_sessions
-                      WHERE sdk_session_id = ?1 AND title IS NOT NULL
-                      ORDER BY last_active_at DESC LIMIT 1)
-                 ),
-                 model = COALESCE(
-                     model,
-                     (SELECT model FROM agent_chat_sessions
-                      WHERE sdk_session_id = ?1 AND model IS NOT NULL
-                      ORDER BY last_active_at DESC LIMIT 1)
-                 ),
-                 effort = COALESCE(
-                     effort,
-                     (SELECT effort FROM agent_chat_sessions
-                      WHERE sdk_session_id = ?1 AND effort IS NOT NULL
-                      ORDER BY last_active_at DESC LIMIT 1)
-                 ),
-                 context_window = COALESCE(
-                     context_window,
-                     (SELECT context_window FROM agent_chat_sessions
-                      WHERE sdk_session_id = ?1 AND context_window IS NOT NULL
-                      ORDER BY last_active_at DESC LIMIT 1)
-                 ),
-                 permission_mode = COALESCE(
-                     permission_mode,
-                     (SELECT permission_mode FROM agent_chat_sessions
-                      WHERE sdk_session_id = ?1 AND permission_mode IS NOT NULL
-                      ORDER BY last_active_at DESC LIMIT 1)
-                 ),
-                 service_tier = COALESCE(
-                     service_tier,
-                     CASE WHEN fast_mode IS NOT NULL
-                          THEN CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END END,
-                     (SELECT COALESCE(service_tier,
-                         CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
-                      FROM agent_chat_sessions
-                      WHERE sdk_session_id = ?1 AND (service_tier IS NOT NULL OR fast_mode IS NOT NULL)
-                      ORDER BY last_active_at DESC LIMIT 1)
-                 ),
-                 fast_mode = COALESCE(
-                     fast_mode,
-                     (SELECT fast_mode FROM agent_chat_sessions
-                      WHERE sdk_session_id = ?1 AND fast_mode IS NOT NULL
-                      ORDER BY last_active_at DESC LIMIT 1),
-                     0
-                 )
-             WHERE thread_id = ?2",
-            params![sdk_session_id, survivor],
-        )
-        .map_err(|e| format!("Failed to merge duplicate sessions: {e}"))?;
-        // Move persisted messages from the non-survivors onto the
-        // survivor BEFORE the DELETE — otherwise ON DELETE CASCADE
-        // wipes the transcript history of the prior thread_ids whose
-        // messages we want to keep visible after resume.
-        transaction.execute(
-            "UPDATE agent_chat_messages
-             SET thread_id = ?2
-             WHERE thread_id IN (
-                 SELECT thread_id FROM agent_chat_sessions
-                 WHERE sdk_session_id = ?1 AND thread_id != ?2
-             )",
-            params![sdk_session_id, survivor],
-        )
-        .map_err(|e| format!("Failed to migrate duplicate session messages: {e}"))?;
-        turn_diffs::move_to_thread(
+        let cleanup = merge_agent_chat_session_rows(
             &transaction,
-            "thread_id IN (
-                 SELECT thread_id FROM agent_chat_sessions
-                 WHERE sdk_session_id = ?1 AND thread_id != ?2
-             )",
-            params![sdk_session_id, survivor],
+            "sdk_session_id = ?1",
+            sdk_session_id,
+            &survivor,
         )?;
-        queued_turns::move_to_thread(
-            &transaction,
-            "thread_id IN (
-                 SELECT thread_id FROM agent_chat_sessions
-                 WHERE sdk_session_id = ?1 AND thread_id != ?2
-             )",
-            params![sdk_session_id, survivor],
-        )?;
-        // Delete the non-survivors.
-        transaction.execute(
-            "DELETE FROM agent_chat_sessions
-             WHERE sdk_session_id = ?1 AND thread_id != ?2",
-            params![sdk_session_id, survivor],
-        )
-        .map_err(|e| format!("Failed to drop duplicate sessions: {e}"))?;
         transaction
             .commit()
             .map_err(|e| format!("Failed to commit duplicate-session merge: {e}"))?;
+        Ok(cleanup)
+    }
+
+    /// Merge `from` into `into`: a chat reopened from history runs under a
+    /// fresh thread id, and the provider can't always tell the two apart by
+    /// session id (Codex reports its id only at start, and one that never
+    /// finished a turn resumes under a new id). Same merge as
+    /// [`Self::collapse_duplicate_agent_chat_sessions`], with `into` as the
+    /// survivor. A no-op unless both rows exist and run the same provider.
+    pub fn merge_reopened_agent_chat_session(
+        &self,
+        from: &str,
+        into: &str,
+    ) -> Result<AgentChatSessionCleanup, String> {
+        if from == into {
+            return Ok(AgentChatSessionCleanup::default());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start reopened-session merge: {e}"))?;
+        let same_chat: bool = transaction
+            .query_row(
+                "SELECT COUNT(DISTINCT provider) = 1 AND COUNT(*) = 2 FROM agent_chat_sessions
+                 WHERE thread_id IN (?1, ?2)",
+                params![from, into],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to read reopened-session merge: {e}"))?;
+        if !same_chat {
+            return Ok(AgentChatSessionCleanup::default());
+        }
+        let cleanup = merge_agent_chat_session_rows(
+            &transaction,
+            "thread_id IN (?1, ?2)",
+            from,
+            into,
+        )?;
+        transaction
+            .commit()
+            .map_err(|e| format!("Failed to commit reopened-session merge: {e}"))?;
         Ok(cleanup)
     }
 
@@ -7831,6 +7963,82 @@ mod tests {
         assert_eq!(survivor.context_window.as_deref(), Some("1m"));
         assert_eq!(survivor.permission_mode.as_deref(), Some("acceptEdits"));
         assert!(survivor.fast_mode);
+    }
+
+    #[test]
+    fn a_reopened_chat_is_merged_even_when_its_session_id_changed() {
+        // Codex resumes a chat that never finished a turn under a new native
+        // id, and a reopened Claude row has no id until its first turn. The
+        // reopen still names the chat it continues.
+        let db = init_test_database();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, title, model, created_at, last_active_at)
+                 VALUES ('codex-old', 'native-old', 'ws', 'codex', 'Original', 'gpt', '2025-01-01', '2025-01-01'),
+                        ('codex-new', 'native-new', 'ws', 'codex', NULL, NULL, '2025-03-01', '2025-03-01'),
+                        ('claude-old', 'sdk-1', 'ws', 'claude', 'Claude chat', NULL, '2025-01-01', '2025-01-01'),
+                        ('claude-new', NULL, 'ws', 'claude', NULL, NULL, '2025-03-01', '2025-03-01'),
+                        ('other', 'sdk-2', 'ws', 'claude', 'Other', NULL, '2025-01-01', '2025-01-01')",
+            )
+            .unwrap();
+        }
+        db.append_agent_chat_message("codex-old", r#"{"type":"user_message","text":"hi"}"#)
+            .unwrap();
+
+        let cleanup = db.merge_reopened_agent_chat_session("codex-old", "codex-new").unwrap();
+        assert_eq!((cleanup.survivor.as_str(), cleanup.thread_ids.clone()), ("codex-new", vec!["codex-old".to_string()]));
+        assert!(db.get_agent_chat_session("codex-old").is_none());
+        let codex = db.get_agent_chat_session("codex-new").unwrap();
+        assert_eq!(codex.sdk_session_id.as_deref(), Some("native-new"), "the session that runs now");
+        assert_eq!((codex.title.as_deref(), codex.model.as_deref()), (Some("Original"), Some("gpt")));
+        assert_eq!(codex.created_at, "2025-01-01");
+        assert_eq!(db.list_agent_chat_messages("codex-new").len(), 1);
+
+        db.merge_reopened_agent_chat_session("claude-old", "claude-new").unwrap();
+        let claude = db.get_agent_chat_session("claude-new").unwrap();
+        assert_eq!(claude.sdk_session_id.as_deref(), Some("sdk-1"), "still listed in history");
+
+        // Another provider's chat, or one that is gone, is never merged.
+        assert!(db.merge_reopened_agent_chat_session("codex-new", "claude-new").unwrap().thread_ids.is_empty());
+        assert!(db.merge_reopened_agent_chat_session("missing", "other").unwrap().thread_ids.is_empty());
+        assert!(db.get_agent_chat_session("codex-new").is_some());
+    }
+
+    #[test]
+    fn a_collapse_merges_away_only_rows_cleared_by_the_caller() {
+        let db = init_test_database();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('old', 'sdk-1', 'ws', 'claude', '2025-01-01', '2025-01-01'),
+                        ('new', 'sdk-1', 'ws', 'claude', '2025-03-01', '2025-03-01')",
+            )
+            .unwrap();
+        let cleared = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<HashSet<_>>();
+        // The survivor needn't be cleared (it isn't deleted); "old" must be.
+        let skipped = db.collapse_duplicate_agent_chat_sessions_if_cleared("sdk-1", &cleared(&["new"])).unwrap();
+        assert!(skipped.thread_ids.is_empty());
+        assert!(db.get_agent_chat_session("old").is_some());
+        // A row that joined the group after the caller looked wasn't cleared.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('late', 'sdk-1', 'ws', 'claude', '2025-02-01', '2025-02-01')",
+            )
+            .unwrap();
+        let skipped = db.collapse_duplicate_agent_chat_sessions_if_cleared("sdk-1", &cleared(&["old"])).unwrap();
+        assert!(skipped.thread_ids.is_empty());
+        assert!(db.get_agent_chat_session("late").is_some());
+        let merged = db.collapse_duplicate_agent_chat_sessions_if_cleared("sdk-1", &cleared(&["old", "late"])).unwrap();
+        assert_eq!(merged.thread_ids, vec!["late".to_string(), "old".to_string()]);
     }
 
     #[test]
