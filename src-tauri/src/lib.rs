@@ -1416,6 +1416,7 @@ fn build_core_app<R: tauri::Runtime>(
                             mcp::registry::CompositeHostTools(vec![
                                 std::sync::Arc::new(commands::delegation::DelegationHost::new(registry_handle.clone())),
                                 std::sync::Arc::new(commands::workspace_launch::WorkspaceLaunchHost::new(registry_handle.clone())),
+                                std::sync::Arc::new(commands::pr_watch::PrWatchHost::new(registry_handle.clone())),
                             ]),
                         ));
 

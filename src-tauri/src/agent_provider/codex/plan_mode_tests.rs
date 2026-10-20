@@ -290,3 +290,117 @@ async fn a_server_that_reports_no_mode_resumes_in_the_recorded_one() {
         let _ = provider.stop_session(thread).await;
     }
 }
+
+/// The permission mode a host tool called from turn `turn` sees.
+async fn host_call_mode(provider: &CodexAgentProvider, thread: &ThreadId, turn: Option<&str>) -> Option<String> {
+    let session = provider.sessions.read().await.get(thread).cloned().unwrap();
+    session.host_caller_for_call(turn).permission_mode
+}
+
+#[tokio::test]
+async fn host_tools_called_from_a_plan_turn_see_plan_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = CodexAgentProvider::new(CodexProviderConfig {
+        codex_binary: fixture_binary(dir.path()),
+        ..Default::default()
+    });
+    let thread = ThreadId("plan-host-tools".into());
+    provider.start_session(start_input(dir.path(), &thread)).await.unwrap();
+
+    send(&provider, &thread, Some("plan")).await;
+    assert_eq!(host_call_mode(&provider, &thread, Some("turn-1")).await.as_deref(), Some("plan"));
+    // Naming the next turn's mode leaves the started turn's alone.
+    let session = provider.sessions.read().await.get(&thread).cloned().unwrap();
+    session.select_collaboration_mode(Some("danger-full-access"));
+    assert_eq!(host_call_mode(&provider, &thread, Some("turn-1")).await.as_deref(), Some("plan"));
+
+    send(&provider, &thread, Some("danger-full-access")).await;
+    assert_eq!(host_call_mode(&provider, &thread, Some("turn-2")).await.as_deref(), Some("danger-full-access"));
+    // A call from the Plan turn that arrives after it was replaced keeps Plan.
+    assert_eq!(host_call_mode(&provider, &thread, Some("turn-1")).await.as_deref(), Some("plan"));
+    // A turn this session did not start (or forgot) may be in Plan.
+    assert_eq!(host_call_mode(&provider, &thread, Some("turn-9")).await.as_deref(), Some("plan"));
+    let _ = provider.stop_session(thread).await;
+}
+
+#[tokio::test]
+async fn a_resumed_thread_calls_host_tools_in_its_resumed_mode() {
+    for (server, recorded, expected) in [
+        ("older-server", "plan", "plan"),
+        ("reports-plan", "default", "plan"),
+        ("reports-default", "plan", "danger-full-access"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(server), "").unwrap();
+        let provider = CodexAgentProvider::new(CodexProviderConfig {
+            codex_binary: fixture_binary(dir.path()),
+            ..Default::default()
+        });
+        let thread = ThreadId("resumed-host-tools".into());
+        let mut input = start_input(dir.path(), &thread);
+        input.resume_cursor = Some(json!({"threadId": "fixture-thread"}));
+        input.extra = json!({ "turnMode": recorded });
+        provider.start_session(input).await.unwrap();
+        // Its continuation names no mode, so it runs in the resumed one.
+        send(&provider, &thread, None).await;
+        assert_eq!(host_call_mode(&provider, &thread, Some("turn-1")).await.as_deref(), Some(expected), "{server}");
+        let _ = provider.stop_session(thread).await;
+    }
+}
+
+#[test]
+fn turn_modes_answer_plan_whenever_a_turns_mode_is_uncertain() {
+    let mut modes = TurnModes::default();
+    // A confirmed turn keeps its own mode after later turns start.
+    let plan = modes.begin(Some(true));
+    modes.confirm("t1", plan);
+    let plan = modes.begin(Some(false));
+    // An unknown id during a pending start may be a late call from a turn
+    // whose start was never confirmed.
+    assert!(modes.is_plan(Some("unknown")));
+    modes.confirm("t2", plan);
+    assert!(modes.is_plan(Some("t1")));
+    assert!(!modes.is_plan(Some("t2")));
+    // Idle, an unknown turn (a review, a failed start, a forgotten one) is Plan.
+    assert!(modes.is_plan(Some("unknown")) && modes.is_plan(None));
+
+    // A start that names no mode keeps the thread's.
+    assert!(!modes.begin(None));
+    assert!(modes.is_plan(Some("pending")), "unconfirmed, so not trusted yet");
+    modes.confirm("t3", false);
+    assert!(!modes.is_plan(Some("t3")));
+
+    // A rejected Default start leaves an inherited Plan alone, so a later
+    // start that names no mode is still Plan.
+    let mut modes = TurnModes { inherited: true, ..Default::default() };
+    modes.begin(Some(false));
+    modes.fail();
+    assert!(modes.begin(None));
+    modes.confirm("t4", true);
+    assert!(modes.is_plan(Some("t4")));
+
+    // A Plan start whose answer was lost may have run: the thread counts as
+    // Plan until a start is confirmed.
+    let mut modes = TurnModes::default();
+    modes.begin(Some(true));
+    modes.fail();
+    assert!(modes.begin(None));
+    modes.fail();
+    let plan = modes.begin(Some(false));
+    assert!(modes.is_plan(Some("lost-plan-turn")));
+    modes.confirm("t5", plan);
+    assert!(!modes.is_plan(Some("t5")));
+    assert!(modes.is_plan(Some("lost-plan-turn")));
+    // ...and while yet another Default start is pending.
+    modes.begin(Some(false));
+    assert!(modes.is_plan(Some("lost-plan-turn")));
+
+    // Old turns are forgotten, and then read as Plan.
+    let mut modes = TurnModes::default();
+    for turn in 0..=RECENT_TURN_MODES {
+        let plan = modes.begin(Some(false));
+        modes.confirm(&format!("t{turn}"), plan);
+    }
+    assert!(modes.is_plan(Some("t0")));
+    assert!(!modes.is_plan(Some(&format!("t{RECENT_TURN_MODES}"))));
+}

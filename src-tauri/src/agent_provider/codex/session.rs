@@ -88,6 +88,59 @@ When `request_user_input_async` is available, use it for clarification questions
 In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, ask the user directly with a concise plain-text question. Never write a multiple choice question as a textual assistant message.
 </collaboration_mode>"#;
 
+/// Started turns whose mode [`TurnModes`] remembers.
+const RECENT_TURN_MODES: usize = 64;
+
+/// Which turns run in Plan, for host tools called from them. Codex takes
+/// Plan per turn and keeps the thread's mode when a turn names none. Where
+/// the mode is uncertain (a start that failed, a turn Codemux did not start or
+/// no longer remembers) it answers Plan: a refused tool is recoverable, a
+/// Plan turn acting with full access is not.
+#[derive(Debug, Default)]
+struct TurnModes {
+    /// The thread's mode as of its last confirmed start (or resume).
+    inherited: bool,
+    /// The mode of a start not yet answered.
+    pending: Option<bool>,
+    /// Confirmed starts, oldest first.
+    turns: VecDeque<(String, bool)>,
+}
+
+impl TurnModes {
+    /// A start is about to be sent; `requested` is the mode it names, if any.
+    fn begin(&mut self, requested: Option<bool>) -> bool {
+        let plan = requested.unwrap_or(self.inherited);
+        self.pending = Some(plan);
+        plan
+    }
+
+    fn confirm(&mut self, turn_id: &str, plan: bool) {
+        self.pending = None;
+        self.inherited = plan;
+        self.turns.push_back((turn_id.to_string(), plan));
+        while self.turns.len() > RECENT_TURN_MODES {
+            self.turns.pop_front();
+        }
+    }
+
+    /// The start failed. Codex may still have applied it, so a Plan request
+    /// leaves the thread counted as Plan; a rejected one changes nothing else.
+    fn fail(&mut self) {
+        if let Some(plan) = self.pending.take() {
+            self.inherited |= plan;
+        }
+    }
+
+    /// Only a confirmed non-Plan turn is not Plan. An unknown id may be a
+    /// pending start's turn calling before its response was read, but just
+    /// as well a late call from a turn whose start was never confirmed.
+    fn is_plan(&self, turn_id: Option<&str>) -> bool {
+        turn_id
+            .and_then(|turn| self.turns.iter().rev().find(|(id, _)| id == turn))
+            .map_or(true, |(_, plan)| *plan)
+    }
+}
+
 fn runtime_collaboration_mode(
     model: Option<&str>,
     effort: Option<&str>,
@@ -383,7 +436,8 @@ pub(crate) struct CodexSession {
     managed: Option<Arc<crate::agent_provider::managed::ManagedSession>>,
     /// This session as a host-tool caller. Its permission mode is the one
     /// the session started with: Codex cannot change mode mid-session, and
-    /// the host tools it lists are fixed at `thread/start`.
+    /// the host tools it lists are fixed at `thread/start`. Calls go through
+    /// [`Self::host_caller_for_call`], which adds the turn's Plan mode.
     host_caller: crate::mcp::registry::HostCaller,
     /// Codemux instructions for the tools listed at `thread/start`, added to
     /// every turn's developer instructions.
@@ -392,6 +446,10 @@ pub(crate) struct CodexSession {
     /// instead of `default`. Set by each composer send (see
     /// [`Self::select_collaboration_mode`]); the sandbox is untouched.
     plan_mode: AtomicBool,
+    /// Which turns run in Plan, for host tools called from them (see
+    /// [`Self::host_caller_for_call`]); `plan_mode` can already name the next
+    /// turn's mode while one runs.
+    turn_modes: std::sync::Mutex<TurnModes>,
     /// Whether Codex reported the resumed thread's mode. When it did not
     /// (older servers), the provider seeds the mode Codemux recorded.
     mode_reported: bool,
@@ -876,6 +934,10 @@ impl CodexSession {
             // composer send names one, so restart auto-resume, and answers
             // given right after a rebuild, keep an interrupted Plan task in Plan.
             plan_mode: AtomicBool::new(resumed_plan.unwrap_or(false)),
+            turn_modes: std::sync::Mutex::new(TurnModes {
+                inherited: resumed_plan.unwrap_or(false),
+                ..Default::default()
+            }),
             mode_reported: resumed_plan.is_some(),
         });
 
@@ -1616,6 +1678,9 @@ impl CodexSession {
         // The turn this starts runs in this mode. Reported before the request,
         // so an uncertain response still records it; turns start only when
         // none is running, so one that fails to start leaves nothing to resume.
+        // Without an override (no model to name one) Codex keeps the
+        // thread's mode, and so does this.
+        let plan_turn = self.turn_modes().begin(selected_mode.as_deref().map(|mode| mode == "plan"));
         if let Some(mode) = selected_mode {
             let _ = self.event_tx().send(ProviderRuntimeEvent::TurnModeSelected {
                 thread_id: self.thread_id.clone(),
@@ -1642,6 +1707,7 @@ impl CodexSession {
         let mut state = self.state.lock().await;
         let pending = state.pending_turn_start.take().unwrap_or_default();
         let parsed = parsed.map_err(|error| {
+            self.turn_modes().fail();
             self.native_authority.finish_pending(generation);
             error
         })?;
@@ -1652,6 +1718,7 @@ impl CodexSession {
             });
         }
         let turn_id = TurnId(parsed.turn.id);
+        self.turn_modes().confirm(&turn_id.0, plan_turn);
         if pending.completed_turns.contains(&turn_id) || pending.failed {
             self.native_authority.finish_pending(generation);
         }
@@ -1689,11 +1756,27 @@ impl CodexSession {
         self.dead.load(Ordering::Relaxed)
     }
 
+    fn turn_modes(&self) -> std::sync::MutexGuard<'_, TurnModes> {
+        self.turn_modes.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// This session as the caller of a host tool from turn `turn_id`: like a
+    /// Claude chat's live mode, a Plan turn reads as `plan`, whatever sandbox
+    /// the session started with (see [`TurnModes::is_plan`]).
+    fn host_caller_for_call(&self, turn_id: Option<&str>) -> crate::mcp::registry::HostCaller {
+        let mut caller = self.host_caller.clone();
+        if self.turn_modes().is_plan(turn_id) {
+            caller.permission_mode = Some("plan".into());
+        }
+        caller
+    }
+
     /// Seed the mode Codemux recorded for this thread's last turn, unless
     /// Codex reported one when the thread was resumed (that one is the truth).
     pub(crate) fn seed_recorded_mode(&self, mode: &str) {
         if !self.mode_reported {
             self.plan_mode.store(mode == "plan", Ordering::SeqCst);
+            self.turn_modes().inherited = mode == "plan";
         }
     }
 
@@ -2748,10 +2831,11 @@ fn spawn_incoming_requests_task(
                         if let Some(actor) = &actor {
                             let _ = actor.permit.wait_ready().await;
                         }
+                        let host_caller = session.host_caller_for_call(params.get("turnId").and_then(Value::as_str));
                         let result = handle_dynamic_tool_call_native(
                             mcp_registry.as_ref(),
                             session.workspace_id.as_deref(),
-                            Some((&session.host_caller, session.provider_session_id.0.as_str())),
+                            Some((&host_caller, session.provider_session_id.0.as_str())),
                             params, actor, &session.direct_tool_names,
                         )
                         .await;
