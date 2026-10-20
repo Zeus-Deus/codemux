@@ -59,7 +59,7 @@ chmod 700 "$ROOT/runtime"
 chmod 444 "$ROOT/empty/file"; chmod 555 "$ROOT/empty/dir"
 # A fresh id per start: down.sh only signals processes that carry it.
 RUN_ID="$(cat /proc/sys/kernel/random/uuid)"
-SERVE_PID="" SERVE_START="" PORT="" BASE_URL="" PAIR_URL="" WORKSPACE_ID=""
+SERVE_PID="" SERVE_START="" INIT_PID="" INIT_START="" PORT="" BASE_URL="" PAIR_URL="" WORKSPACE_ID=""
 
 # Shutdown metadata, written as soon as a sandbox exists so down.sh (and the
 # failure trap below) can always stop it.
@@ -73,6 +73,8 @@ SIDECAR='$SIDECAR'
 RUN_ID='$RUN_ID'
 SERVE_PID='$SERVE_PID'
 SERVE_START='$SERVE_START'
+INIT_PID='$INIT_PID'
+INIT_START='$INIT_START'
 PORT='$PORT'
 BASE_URL='$BASE_URL'
 PAIR_URL='$PAIR_URL'
@@ -138,8 +140,10 @@ if [ ! -d "$ROOT/repo/.git" ]; then
     -c user.email=orch-live@example.invalid commit -q -m "chore: seed"
 fi
 
-# down.sh compares the real ~/.claude against this.
+# down.sh compares the real ~/.claude, and which credential files exist,
+# against these.
 claude_real_snapshot >"$ROOT/claude-real.snapshot"
+record_real_credentials
 
 # ── Pre-flight ───────────────────────────────────────────────────────────
 preflight_log="$ROOT/logs/preflight.log"
@@ -228,17 +232,7 @@ port_candidates() {
 
 launch_serve() { # $1=port
   # cwd = the seed repo, so the instance's default workspace is the repo.
-  local -a bwrap_args sandbox_envs
-  mapfile -t bwrap_args < <(SANDBOX_CWD="$ROOT/repo" sandbox_args)
-  mapfile -t sandbox_envs < <(sandbox_env)
-  # setsid: off the caller's terminal. --unshare-pid: the sandbox's init
-  # waits for every process inside before it exits. ORCH_LIVE_RUN_ID on
-  # bwrap itself lets down.sh recognise it.
-  ORCH_LIVE_RUN_ID="$RUN_ID" setsid bwrap "${bwrap_args[@]}" -- /usr/bin/env -i "${sandbox_envs[@]}" \
-    "$BIN" serve --scope loopback --port "$1" \
-    >>"$ROOT/logs/serve.log" 2>&1 </dev/null &
-  SERVE_PID=$!
-  SERVE_START="$(proc_start "$SERVE_PID" || true)"
+  SANDBOX_CWD="$ROOT/repo" launch_sandbox "$ROOT/logs/serve.log" "$BIN" serve --scope loopback --port "$1"
   PORT="$1"
   BASE_URL="http://127.0.0.1:$PORT"
   write_env
@@ -249,7 +243,8 @@ serve_ready() {
   local status serve
   for _ in $(seq 1 120); do
     cmx status '{}' >/dev/null 2>&1 && break
-    kill -0 "$SERVE_PID" 2>/dev/null || { echo "serve exited"; return 1; }
+    # bwrap's outer process exits with serve.
+    proc_running "$SERVE_PID" || { echo "serve exited"; return 1; }
     sleep 0.5
   done
   cmx status '{}' >/dev/null 2>&1 || { echo "control socket never came up"; return 1; }
@@ -276,10 +271,10 @@ for candidate in $(port_candidates); do
   log_offset="$(stat -c %s "$ROOT/logs/serve.log" 2>/dev/null || echo 0)"
   launch_serve "$candidate"
   if why="$(serve_ready)"; then UP=1; break; fi
-  kill -0 "$SERVE_PID" 2>/dev/null || why="serve exited ($why)"
+  proc_running "$SERVE_PID" || why="serve exited ($why)"
   note "serve on port $candidate: $why"
   stop_sandbox graceful || fail "could not stop the failed sandbox (pid $SERVE_PID)"
-  SERVE_PID="" SERVE_START=""
+  SERVE_PID="" SERVE_START="" INIT_PID="" INIT_START=""
   write_env
   # Only a lost port race is worth another port.
   case "$why" in "bind failed"*|"port $candidate is not held"*) continue ;; esac
@@ -288,7 +283,7 @@ for candidate in $(port_candidates); do
   fail "serve did not come up (see $ROOT/logs/serve.log)"
 done
 [ "$UP" = 1 ] || fail "serve could not bind any candidate port"
-pass "serve up (sandbox pid $SERVE_PID, port $PORT)"
+pass "serve up (sandbox init pid $INIT_PID, port $PORT)"
 
 # ── Workspace + pairing ─────────────────────────────────────────────────────
 WORKSPACE_ID="$(cmx get_app_state '{}' | jq -r --arg p "$ROOT/repo" \

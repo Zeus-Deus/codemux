@@ -170,6 +170,38 @@ in_sandbox() {
   bwrap "${args[@]}" -- /usr/bin/env -i "${envs[@]}" "$@"
 }
 
+# Start a command in the sandbox in the background, off the caller's terminal.
+# $1=log file, $2…=command. Sets SERVE_PID/SERVE_START, bwrap's outer
+# process, which exits as soon as the command does, and INIT_PID/INIT_START,
+# the PID namespace's init (bwrap's --info-fd "child-pid"). The init keeps
+# reaping orphans and only exits once every process in the namespace has
+# exited on its own (so namespace teardown never kills a live provider); it is
+# what "the sandbox is running" means and what stop_sandbox waits for.
+# ORCH_LIVE_RUN_ID on bwrap itself marks both for down.sh.
+launch_sandbox() {
+  local log="$1" info="$ROOT/logs/sandbox-info.json" i
+  shift
+  local -a bwrap_args sandbox_envs
+  mapfile -t bwrap_args < <(sandbox_args)
+  mapfile -t sandbox_envs < <(sandbox_env)
+  mkdir -p "$ROOT/logs"
+  : >"$info"
+  ORCH_LIVE_RUN_ID="$RUN_ID" setsid bwrap --info-fd 3 "${bwrap_args[@]}" -- /usr/bin/env -i "${sandbox_envs[@]}" \
+    "$@" >>"$log" 2>&1 </dev/null 3>"$info" &
+  SERVE_PID=$!
+  SERVE_START="$(proc_start "$SERVE_PID" || true)"
+  INIT_PID="" INIT_START=""
+  # bwrap writes the info before it runs the command; it never comes if
+  # bwrap fails during setup.
+  for i in $(seq 1 40); do
+    INIT_PID="$(jq -r '."child-pid" // empty' "$info" 2>/dev/null || true)"
+    [ -n "$INIT_PID" ] && break
+    proc_running "$SERVE_PID" || { INIT_PID="$(jq -r '."child-pid" // empty' "$info" 2>/dev/null || true)"; break; }
+    python3 -c 'import time; time.sleep(0.25)'
+  done
+  [ -z "$INIT_PID" ] || INIT_START="$(proc_start "$INIT_PID" || true)"
+}
+
 # Every live descendant of a PID, children first-level then deeper. Walks
 # /proc/<pid>/task/*/children, so it only ever names processes we started.
 descendants() {
@@ -194,19 +226,37 @@ proc_start() {
   echo "${20}"
 }
 
-# Whether a PID carries this run's ORCH_LIVE_RUN_ID in its environment.
-has_run_marker() {
-  [ -n "${RUN_ID:-}" ] || return 1
-  tr '\0' '\n' 2>/dev/null <"/proc/$1/environ" | grep -qxF "ORCH_LIVE_RUN_ID=$RUN_ID"
+# Whether a PID names a running process (exists and is not a zombie).
+proc_running() {
+  local stat
+  [ -n "${1:-}" ] || return 1
+  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  case "${stat##*) }" in Z*|X*) return 1 ;; esac
 }
 
-# The sandbox this root started, still alive and still the same process: the
-# recorded PID with the recorded start time and the run marker. Prints why
-# not on stderr.
+# Whether a PID carries this run's ORCH_LIVE_RUN_ID in its environment. No
+# pipe: under pipefail, `grep -q` exiting early can SIGPIPE the writer and
+# turn a match into a spurious "not ours", which made a running sandbox look
+# stopped.
+has_run_marker() {
+  [ -n "${RUN_ID:-}" ] || return 1
+  grep -qzxF "ORCH_LIVE_RUN_ID=$RUN_ID" "/proc/$1/environ" 2>/dev/null
+}
+
+# The process that stands for the sandbox: its PID namespace's init, or
+# bwrap's outer process if bwrap never reported one (it failed during setup).
+sandbox_pid() { echo "${INIT_PID:-${SERVE_PID:-}}"; }
+
+# The sandbox this root started is still running: sandbox_pid is still the
+# same process (recorded start time, not a zombie) and carries the run
+# marker. Prints why not on stderr if the PID now names another process.
 sandbox_alive() {
-  [ -n "${SERVE_PID:-}" ] && kill -0 "$SERVE_PID" 2>/dev/null || return 1
-  if [ "$(proc_start "$SERVE_PID")" != "${SERVE_START:-}" ] || ! has_run_marker "$SERVE_PID"; then
-    echo "pid $SERVE_PID is alive but is not the sandbox this root started (start time or run marker differ)" >&2
+  local pid start
+  pid="$(sandbox_pid)"
+  if [ -n "${INIT_PID:-}" ]; then start="${INIT_START:-}"; else start="${SERVE_START:-}"; fi
+  proc_running "$pid" || return 1
+  if [ "$(proc_start "$pid")" != "$start" ] || ! has_run_marker "$pid"; then
+    echo "pid $pid is alive but is not the sandbox this root started (start time or run marker differ)" >&2
     return 2
   fi
 }
@@ -214,7 +264,7 @@ sandbox_alive() {
 # The `codemux serve` process inside the sandbox (host PID), or empty.
 serve_process() {
   local child
-  for child in $(descendants "$SERVE_PID"); do
+  for child in $(descendants "$(sandbox_pid)"); do
     if [ "$(readlink -f "/proc/$child/exe" 2>/dev/null)" = "$BIN" ] && has_run_marker "$child"; then
       echo "$child"
       return
@@ -222,10 +272,10 @@ serve_process() {
   done
 }
 
-wait_gone() { # $1=pid $2=seconds
+wait_sandbox_gone() { # $1=seconds
   local i
-  for i in $(seq 1 $(($2 * 4))); do
-    kill -0 "$1" 2>/dev/null || return 0
+  for i in $(seq 1 $(($1 * 4))); do
+    sandbox_alive 2>/dev/null || return 0
     python3 -c 'import time; time.sleep(0.25)'
   done
   return 1
@@ -234,13 +284,16 @@ wait_gone() { # $1=pid $2=seconds
 # Stop the sandbox. $1=graceful|hard. Graceful: SIGTERM serve, the same path
 # as quitting the app. Hard (crash simulation): SIGKILL the serve process
 # alone. Either way provider CLIs are then left to exit on their own (stdin
-# EOF once serve is gone) and only get SIGTERM if they linger. Nothing else is
-# ever SIGKILLed: Codex rewrites auth.json in place, and a kill mid-refresh
-# would leave the user's real credentials truncated. Returns non-zero, with
-# the survivors listed, if the sandbox outlives all of that.
+# EOF once serve is gone) and only get SIGTERM if they linger past
+# ORCH_LIVE_STOP_GRACE seconds (default 30). Nothing else is ever SIGKILLed:
+# Codex rewrites auth.json in place, and a kill mid-refresh would leave the
+# user's real credentials truncated. The sandbox counts as stopped only once
+# its PID namespace's init has exited, i.e. every process inside is gone.
+# Returns non-zero, with the survivors listed, if it outlives all of that.
 stop_sandbox() {
-  local mode="$1" serve child survivors
-  sandbox_alive || { [ $? = 2 ] && return 1; note "serve not running (pid ${SERVE_PID:-none})"; return 0; }
+  local mode="$1" grace="${ORCH_LIVE_STOP_GRACE:-30}" pid serve child
+  sandbox_alive || { [ $? = 2 ] && return 1; note "sandbox not running (pid $(sandbox_pid))"; return 0; }
+  pid="$(sandbox_pid)"
   serve="$(serve_process)"
   if [ -n "$serve" ]; then
     if [ "$mode" = hard ]; then
@@ -250,17 +303,14 @@ stop_sandbox() {
       kill -TERM "$serve" 2>/dev/null || true
     fi
   fi
-  if wait_gone "$SERVE_PID" 30; then return 0; fi
-  survivors="$(descendants "$SERVE_PID" | tac)"
-  note "sandbox still running 30 s after serve stopped; SIGTERM to its remaining processes"
-  for child in $survivors; do
-    # The sandbox's own init exits by itself once its children are gone.
-    [ "$(readlink -f "/proc/$child/exe" 2>/dev/null)" = "$(readlink -f "$(command -v bwrap)")" ] && continue
+  if wait_sandbox_gone "$grace"; then return 0; fi
+  note "sandbox still running $grace s after serve stopped; SIGTERM to its remaining processes"
+  for child in $(descendants "$pid" | tac); do
     kill -TERM "$child" 2>/dev/null || true
   done
-  wait_gone "$SERVE_PID" 15 && return 0
-  echo "FAIL: sandbox pid $SERVE_PID survived; still running (not SIGKILLed on purpose):" >&2
-  for child in $(descendants "$SERVE_PID"); do
+  wait_sandbox_gone $((grace / 2 > 1 ? grace / 2 : 1)) && return 0
+  echo "FAIL: sandbox (init pid $pid) survived; still running (not SIGKILLed on purpose):" >&2
+  for child in $(descendants "$pid"); do
     echo "  $child $(readlink -f "/proc/$child/exe" 2>/dev/null)" >&2
   done
   return 1
@@ -280,20 +330,42 @@ claude_real_snapshot() {
   done | LC_ALL=C sort
 }
 
-# Fails loudly if the real credential files are not intact JSON objects, or
-# if the real ~/.claude gained an entry (or lost or changed a symlink) since
-# up.sh, other than Claude's own credential entries. Never restores anything.
+# The user's real provider credential files down.sh checks.
+real_credential_files() {
+  printf '%s\n' "$HOME/.codex/auth.json" "$HOME/.claude/.credentials.json"
+}
+
+# up.sh records which of them exist, so down.sh can tell a file that was
+# never there (skipped) from one that vanished during the run (a failure).
+record_real_credentials() {
+  local file
+  real_credential_files | while IFS= read -r file; do
+    if [ -e "$file" ]; then printf '%s\n' "$file"; fi
+  done >"$ROOT/credentials.present"
+}
+
+# Fails loudly if a real credential file that existed at up.sh is missing or
+# is not an intact JSON object, or if the real ~/.claude gained an entry (or
+# lost or changed a symlink) since up.sh, other than Claude's own credential
+# entries. Never restores anything.
 check_real_credentials() {
   local rc=0 snap_rc=0 file before after line
-  for file in "$HOME/.codex/auth.json" "$HOME/.claude/.credentials.json"; do
-    [ -e "$file" ] || continue
+  [ -f "$ROOT/credentials.present" ] || note "$ROOT/credentials.present missing; cannot tell whether a credential file vanished"
+  while IFS= read -r file; do
+    if [ ! -e "$file" ]; then
+      if grep -qxF "$file" "$ROOT/credentials.present" 2>/dev/null; then
+        echo "FAIL: $file existed when up.sh ran and is gone now — the user's real login may be broken; do NOT restore it from a copy, re-login instead" >&2
+        rc=1
+      fi
+      continue
+    fi
     if [ -s "$file" ] && jq -e 'type == "object" and length > 0' "$file" >/dev/null 2>&1; then
       pass "$file is intact (non-empty JSON object)"
     else
       echo "FAIL: $file is empty or not valid JSON — the user's real login may be broken; do NOT restore it from a copy, re-login instead" >&2
       rc=1
     fi
-  done
+  done < <(real_credential_files)
   before="$ROOT/claude-real.snapshot"
   if [ -f "$before" ]; then
     after="$(claude_real_snapshot)"

@@ -13,6 +13,7 @@ assert.sh           read-only sqlite + `codemux json conversation_read` helpers
 run.mjs             run scenarios/*.mjs → <root>/report.md, report.json, shots/
 lib.sh              shared env, sandbox, stop and credential-check helpers
 isolation-check.sh  runs inside the sandbox during up.sh; asserts what must be out of reach
+tests/              harness self-tests (no providers, no build): teardown-test.sh
 ```
 
 ## Run it
@@ -137,7 +138,9 @@ unknown or empty values are an error). Run only the scenarios you need.
   - **Codex** rewrites `auth.json` in place, so only that file is bound into
     an otherwise private `~/.codex`.
   - `down.sh` checks that both real files are still non-empty JSON objects
-    and fails loudly if not. It never restores them: re-login instead.
+    and fails loudly if not, or if a file that existed when `up.sh` ran
+    (recorded in `<root>/credentials.present`) is gone. It never restores
+    them: re-login instead.
   - Hermes is not wired yet. It writes `auth.json` with temp + replace, so it
     needs the Claude treatment (its storage dir bound, everything else in it
     covered). Add that before any Hermes scenario.
@@ -167,7 +170,14 @@ unknown or empty values are an error). Run only the scenarios you need.
   stops serve (SIGTERM; with `--hard`, SIGKILL to the serve process alone),
   lets provider CLIs exit on stdin EOF, sends SIGTERM to anything still
   running after 30 s, and otherwise fails and leaves the survivors for a
-  human. (Codemux's own provider shutdown is out of the harness's hands.)
+  human. It waits on the sandbox's PID-namespace init (bwrap's `--info-fd`
+  `child-pid`), not bwrap's outer process: the outer process exits as soon
+  as serve does, while the init keeps reaping orphaned provider processes
+  and exits only once all of them have exited on their own, so namespace
+  teardown never kills a live provider. (Codemux's own provider shutdown is
+  out of the harness's hands.) `tests/teardown-test.sh` checks this, and the
+  credential checks, with a stand-in serve and a fake HOME; it needs only
+  bwrap, jq and python3.
 - **Isolation.** The sandbox mounts the host read-only and gives the run
   private `/dev`, `/proc` (own PID namespace), `/tmp`, `/var/tmp`, `/dev/shm`
   and `/run` (only systemd-resolved's directory is re-exposed when
