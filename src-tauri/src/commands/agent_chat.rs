@@ -3045,6 +3045,11 @@ async fn ensure_live_session_locked<R: Runtime>(
     if let Some(control) = control {
         control.verify_mode(permission_mode.as_deref())?;
     }
+    // Codex reports a resumed thread's collaboration mode on newer servers;
+    // for older ones, hand it the mode recorded for the thread's last turn.
+    let recorded_turn_mode = (provider_kind == ProviderKind::Codex)
+        .then(|| app.state::<DatabaseStore>().agent_chat_turn_mode(&thread_id.0))
+        .flatten();
     let build_input = |resume_cursor: Option<serde_json::Value>| StartSessionInput {
         thread_id: thread_id.clone(),
         cwd: cwd.clone(),
@@ -3062,7 +3067,9 @@ async fn ensure_live_session_locked<R: Runtime>(
         env: env.clone(),
         workspace_id: workspace_id.clone(),
         remote: remote.clone(),
-        extra: serde_json::Value::Null,
+        extra: recorded_turn_mode
+            .as_ref()
+            .map_or(serde_json::Value::Null, |mode| serde_json::json!({ "turnMode": mode })),
         recorded_usage_baseline: None,
     };
 
@@ -7396,6 +7403,17 @@ fn saturating_usage_i64(value: u64) -> i64 {
 /// UUID carried by `ResumeCursorUpdated` so the history dropdown can
 /// resume this session after a restart.
 pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeEvent) {
+    // Codex takes the Plan pill per turn and the pill does not survive a
+    // restart: remember the mode each started turn runs in, so a session
+    // rebuilt on a server that does not report it resumes in it too.
+    // Internal bookkeeping, so it reaches neither plugins nor the UI.
+    if let ProviderRuntimeEvent::TurnModeSelected { thread_id, mode } = &event {
+        let db: State<'_, DatabaseStore> = app.state();
+        if let Err(error) = db.set_agent_chat_turn_mode(&thread_id.0, mode) {
+            eprintln!("[codemux::agent_chat] {error}");
+        }
+        return;
+    }
     // Plugin chat tap: every event, before anything below can swallow it
     // (usage and plan-quota events return early). One atomic load when off.
     crate::plugins::tap::emit(app, &event);
@@ -7429,17 +7447,6 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                 return;
             }
         }
-    }
-
-    // Codex takes the Plan pill per turn and the pill does not survive a
-    // restart: remember the mode each started turn runs in, so its automatic
-    // continuation (see `usage_resume::resume_mode`) runs in it too.
-    if let ProviderRuntimeEvent::TurnModeSelected { thread_id, mode } = &event {
-        let db: State<'_, DatabaseStore> = app.state();
-        if let Err(error) = db.set_agent_chat_turn_mode(&thread_id.0, mode) {
-            eprintln!("[codemux::agent_chat] {error}");
-        }
-        return;
     }
 
     // Plan quota is provider-scoped level state, not transcript or

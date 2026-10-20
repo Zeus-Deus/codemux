@@ -592,7 +592,9 @@ async fn a_codex_chat_interrupted_in_plan_resumes_in_plan() {
 
     let decisions = resume_after_restart_for_test(&h.handle(), "launch-2").await;
     assert_eq!(decision(&decisions, "rr-plan"), Some(ResumeDecision::Resume));
-    assert_eq!(h.provider.send_modes(), [Some("plan".to_string())]);
+    // The reopened session gets it, for servers that do not report it.
+    let starts = h.provider.start_inputs();
+    assert_eq!(starts[0].extra, serde_json::json!({ "turnMode": "plan" }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

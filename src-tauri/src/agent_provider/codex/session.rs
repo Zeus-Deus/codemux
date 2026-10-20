@@ -369,6 +369,9 @@ pub(crate) struct CodexSession {
     /// instead of `default`. Set by each composer send (see
     /// [`Self::select_collaboration_mode`]); the sandbox is untouched.
     plan_mode: AtomicBool,
+    /// Whether Codex reported the resumed thread's mode. When it did not
+    /// (older servers), the provider seeds the mode Codemux recorded.
+    mode_reported: bool,
 }
 
 impl CodexSession {
@@ -833,7 +836,8 @@ impl CodexSession {
             // A resumed thread continues in its last turn's mode until a
             // composer send names one, so restart auto-resume, and answers
             // given right after a rebuild, keep an interrupted Plan task in Plan.
-            plan_mode: AtomicBool::new(resumed_plan),
+            plan_mode: AtomicBool::new(resumed_plan.unwrap_or(false)),
+            mode_reported: resumed_plan.is_some(),
         });
 
         // Emit SessionConfigured up front so subscribers see the thread
@@ -1621,6 +1625,14 @@ impl CodexSession {
     /// treated as absent by the provider so the next send auto-resumes.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
+    }
+
+    /// Seed the mode Codemux recorded for this thread's last turn, unless
+    /// Codex reported one when the thread was resumed (that one is the truth).
+    pub(crate) fn seed_recorded_mode(&self, mode: &str) {
+        if !self.mode_reported {
+            self.plan_mode.store(mode == "plan", Ordering::SeqCst);
+        }
     }
 
     /// Composer sends carry the Plan pill as `permission_mode_override`

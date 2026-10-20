@@ -242,12 +242,13 @@ impl ThreadStartResponse {
     }
 
     /// Whether the thread's last turn ran in Codex's `plan` collaboration
-    /// mode, as reported when it is resumed.
-    pub fn plan_mode(&self) -> bool {
-        matches!(
-            self,
-            Self::Nested { collaboration_mode: Some(mode), .. } if mode.mode == "plan"
-        )
+    /// mode, as reported when it is resumed. `None` when the server does not
+    /// say (fresh threads, and older servers).
+    pub fn plan_mode(&self) -> Option<bool> {
+        match self {
+            Self::Nested { collaboration_mode: Some(mode), .. } => Some(mode.mode == "plan"),
+            _ => None,
+        }
     }
 }
 
