@@ -277,11 +277,11 @@ impl ClaudeSession {
             uuid: uuid.to_owned(),
             images: encode_images(&input.images),
         };
-        let Err(error) = self
-            .sidecar
-            .request(METHOD_STEER_TURN, serde_json::to_value(&params).unwrap())
-            .await
-        else {
+        let response = match input.turn_checkpoint.as_ref().map(|checkpoint| checkpoint.authorize_dispatch()).transpose() {
+            Ok(_) => self.sidecar.request(METHOD_STEER_TURN, serde_json::to_value(&params).unwrap()).await,
+            Err(error) => Err(RpcChildError::RpcError(crate::json_rpc_child::RpcError {code:-32001,message:error.to_string(),data:None})),
+        };
+        let Err(error) = response else {
             return Ok(());
         };
         {

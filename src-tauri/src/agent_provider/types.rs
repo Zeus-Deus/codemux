@@ -49,6 +49,7 @@ impl ProviderKind {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageDelivery {
+    Auto,
     #[default]
     Queue,
     Steer,
@@ -80,6 +81,18 @@ pub struct ProviderCapabilities {
     pub supports_conversation_rollback: bool,
 }
 
+/// A durable queue item may be held by Stop or disposed before its adapter
+/// notices. Neither condition is a provider dispatch failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuedDeliveryState {
+    Ready,
+    /// Stop holds the whole queue until a human action.
+    Held,
+    /// This item needs attention; unrelated queued items may proceed.
+    Blocked,
+    Disposed,
+}
+
 /// Lifecycle hook executed at the provider's actual dispatch boundary.
 /// Provider queues call this immediately before an accepted turn so queued
 /// prompts capture the state at dispatch, not when they were typed.
@@ -89,9 +102,33 @@ pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
     /// Plain Git snapshots have no caller; the native owner wraps controlled
     /// inputs with a live authority check regardless of checkpoint settings.
     fn authorize_dispatch(&self) -> Result<(), super::ProviderError> { Ok(()) }
+    /// Check authority before asynchronous preparation without recording a
+    /// submission attempt. The adapter still authorizes at the wire boundary.
+    fn verify_dispatch(&self) -> Result<(), super::ProviderError> { self.authorize_dispatch() }
+    /// Check a human queue promotion before it can interrupt another turn.
+    /// This must not record a provider submission.
+    fn authorize_queue_promotion(&self) -> Result<(), super::ProviderError> {
+        match self.queued_delivery_state() {
+            QueuedDeliveryState::Ready => Ok(()),
+            _ => Err(super::ProviderError::ValidationError { message: "Queued message is still held or disposed; inspect its delivery error before sending.".into() }),
+        }
+    }
+    /// A durable human release may advance only the Stop fence of an
+    /// already queued input. Other authority checks remain live.
+    fn authorize_rearmed_dispatch(&self, _released_stops: u64) -> Result<(), super::ProviderError> { self.authorize_dispatch() }
+    /// Only an explicit human action releases the provider queue hold.
+    fn releases_queue_hold(&self) -> bool { true }
+    fn queued_delivery_state(&self) -> QueuedDeliveryState { QueuedDeliveryState::Ready }
+    /// Persist queue ownership before an adapter can select the input.
+    fn queued(&self, _queued_id: &str) -> Result<(), super::ProviderError> { Ok(()) }
     async fn prepare(&self);
     async fn commit(&self);
     async fn abort(&self);
+    /// Normal scheduling deferral: roll back preparation, retaining delivery.
+    async fn defer(&self) { self.abort().await; }
+    /// A native prompt response proves admission; local worker lifecycle
+    /// completion alone does not. Deferred adapters report this explicitly.
+    async fn accepted(&self, _turn: &TurnId) {}
 }
 
 #[async_trait]
@@ -321,6 +358,18 @@ pub struct SendTurnInput {
     /// In-process only. Never a serialized IPC capability.
     #[serde(skip)]
     pub dispatch_guard: Option<Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard>>,
+}
+
+impl SendTurnInput {
+    pub(crate) fn releases_queue_hold(&self) -> bool {
+        self.turn_checkpoint.as_ref().is_none_or(|c| c.releases_queue_hold())
+    }
+    pub(crate) fn authorize_queue_promotion(&self) -> Result<(), super::ProviderError> {
+        self.turn_checkpoint.as_ref().map_or(Ok(()), |c|c.authorize_queue_promotion())
+    }
+    pub(crate) fn queued_delivery_state(&self) -> QueuedDeliveryState {
+        self.turn_checkpoint.as_ref().map_or(QueuedDeliveryState::Ready, |c| c.queued_delivery_state())
+    }
 }
 
 // ---------------------------------------------------------------------------

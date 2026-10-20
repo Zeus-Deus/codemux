@@ -1,3 +1,4 @@
+import { DeliveryAttention } from "./DeliveryAttention";
 import { SERVICE_TIER_FALLBACK_PREFIX } from "@/lib/agent-chat/runtime-notice";
 import { resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
@@ -4471,6 +4472,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         <ProviderStatusNotice provider={provider} workspaceId={paneWorkspaceId} />
       )}
       {conversationWritable && <ProviderUpdateNotice provider={provider} threadId={threadId} remote={providerUpdatesRemote} />}
+      {threadId && <DeliveryAttention key={threadId} threadId={threadId} />}
       {transcriptMessages.length === 0 && !hydrating ? (
         <ChatHomeLanding composer={composerEl} workspaceId={paneWorkspaceId} />
       ) : (

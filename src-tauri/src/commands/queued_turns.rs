@@ -31,7 +31,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use super::agent_chat::{
-    feature_flag_on, forward_event, lookup_provider, provider_err, send_turn_with_origin,
+    feature_flag_on, forward_event, lookup_provider, provider_err,
     ChatImageRef, ProviderRegistry, SendTurnCommandInput, TurnOrigin,
 };
 use crate::agent_provider::queue_edit;
@@ -74,6 +74,7 @@ pub(crate) struct Replay {
 
 /// What `forward_event` hands over for a `TurnQueued`.
 pub(crate) struct Queued<'a> {
+    pub provenance: Option<&'a crate::agent_provider::message::MessageProvenance>,
     pub images: Vec<QueuedTurnImage>,
     pub client_nonce: Option<&'a str>,
     pub replay: Option<&'a Replay>,
@@ -93,14 +94,19 @@ fn mirror(db: &DatabaseStore, event: &ProviderRuntimeEvent, queued: Option<Queue
             queued_id,
             client_nonce,
             text,
+            provenance,
         } => {
             let queued = queued.unwrap_or(Queued {
                 images: Vec::new(),
                 client_nonce: None,
                 replay: None,
+                provenance: None,
             });
             let replay = queued.replay;
+            let mut provenance = queued.provenance.cloned().unwrap_or_else(||provenance.clone());
+            provenance.input_intent = crate::agent_provider::message::InputIntent::QueuedTurn;
             db.insert_queued_turn(&QueuedTurnRecord {
+                provenance,
                 thread_id: thread_id.0.clone(),
                 queued_id: queued_id.clone(),
                 position: 0,
@@ -123,10 +129,8 @@ fn mirror(db: &DatabaseStore, event: &ProviderRuntimeEvent, queued: Option<Queue
             queued_id,
             ..
         } => db.delete_queued_turn(&thread_id.0, queued_id).map(drop),
-        ProviderRuntimeEvent::QueuedTurnCancelled {
-            thread_id,
-            queued_id,
-        } => {
+        ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, queued_id }
+        | ProviderRuntimeEvent::QueuedTurnDisposed { thread_id, queued_id } => {
             if exiting {
                 return;
             }
@@ -291,6 +295,8 @@ fn nonce(row: &QueuedTurnRecord) -> String {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueuedTurnView {
+    #[serde(flatten)]
+    pub provenance: crate::agent_provider::message::MessageProvenance,
     pub queued_id: String,
     pub text: String,
     /// Queued before this app run; see the module docs.
@@ -325,6 +331,7 @@ pub async fn agent_chat_list_queued_turns<R: Runtime>(
             queued_id: row.queued_id,
             text: row.text,
             images: row.images,
+            provenance: row.provenance,
         })
         .collect())
 }
@@ -463,6 +470,13 @@ pub async fn agent_chat_send_saved_queued_turn<R: Runtime>(
     queued_id: String,
     delivery: MessageDelivery,
 ) -> Result<TurnStartResult, String> {
+    send_saved_queued_turn(app, provider, thread_id, queued_id, delivery, true).await
+}
+
+pub(crate) async fn send_saved_queued_turn<R: Runtime>(
+    app: AppHandle<R>, provider: ProviderKind, thread_id: ThreadId,
+    queued_id: String, delivery: MessageDelivery, release_queue: bool,
+) -> Result<TurnStartResult, String> {
     let db: State<'_, DatabaseStore> = app.state();
     // Claim first, then read: a send that finished meanwhile has removed
     // or replaced the row.
@@ -473,6 +487,7 @@ pub async fn agent_chat_send_saved_queued_turn<R: Runtime>(
         return Err("This message is no longer saved.".into());
     };
     let input = SendTurnCommandInput {
+        input_source: None,
         delivery,
         thread_id: thread_id.clone(),
         text: row.prompt.clone().unwrap_or_else(|| row.text.clone()),
@@ -493,7 +508,40 @@ pub async fn agent_chat_send_saved_queued_turn<R: Runtime>(
         permission_mode_override: row.permission_mode_override.clone(),
         client_nonce: Some(nonce(&row)),
     };
-    let result = send_turn_with_origin(app.clone(), provider, input, TurnOrigin::User).await?;
+    let mut context = crate::agent_control::delivery::SendContext::new(if row.provenance.created_by == crate::agent_provider::message::CreatedBy::User && row.provenance.creation_source != crate::agent_provider::message::CreationSource::Mcp {TurnOrigin::User} else {TurnOrigin::Controller});
+    context.origin = row.provenance.origin.unwrap_or(context.origin);
+    context.provenance = row.provenance.clone();
+    context.provenance.input_intent = crate::agent_provider::message::InputIntent::QueuedTurn;
+    context.delivery_id = context.provenance.delivery_id.clone();
+    if let Some(id) = &context.delivery_id {
+        let record = db.message_delivery(id)?.ok_or("Saved message delivery is missing")?;
+        let payload: crate::agent_control::delivery::DeliveryPayload = serde_json::from_value(record.payload).map_err(|e|e.to_string())?;
+        context.control = payload.caller.map(|caller| crate::agent_control::NativeControlGuard {
+            caller, workspace_id: db.get_agent_chat_session(&thread_id.0).map(|r|r.workspace_id).unwrap_or_default(),
+            thread_id: thread_id.0.clone(), provider, admission: None,
+        }.retain_admission(&app));
+        if let Some(control) = &context.control {
+            if let Err(error) = control.verify(&app) {
+                db.refuse_message_delivery(id,&error)?;
+                return Err(error);
+            }
+        }
+        db.rearm_saved_message_delivery(id,&thread_id.0,&queued_id,release_queue)?;
+        context.claimed=true;
+    } else {
+        // Legacy saved messages have no delivery journal row, but their old
+        // native queue admission must still retire before replay.
+        db.control_record_queue_event(&ProviderRuntimeEvent::QueuedTurnCancelled {thread_id:thread_id.clone(),queued_id:queued_id.clone()})?;
+    }
+    context.release_queue = release_queue;
+    let result = match super::agent_chat::send_turn_with_context(app.clone(), provider, input, context).await {
+        Ok(result) => result,
+        Err(error) => {
+            let message = row.provenance.message_id.clone().unwrap_or_else(|| nonce(&row));
+            db.retain_saved_message_delivery(&thread_id.0, &queued_id, &message)?;
+            return Err(error);
+        }
+    };
     // Accepted. A started or steered turn is already in the transcript, so
     // the row can go. A queued one is now a live turn: save it under its new
     // id in the same step that drops this row, before the claim is released,
@@ -543,12 +591,14 @@ mod tests {
             ..Default::default()
         };
         let event = ProviderRuntimeEvent::TurnQueued {
+            provenance: Default::default(),
             thread_id: t(),
             queued_id: id.into(),
             client_nonce: Some(format!("nonce-{id}")),
             text: text.into(),
         };
         let stash = Queued {
+            provenance: None,
             images: Vec::new(),
             client_nonce: None,
             replay: Some(&replay),
@@ -608,6 +658,7 @@ mod tests {
         let db = crate::database::init_test_database();
         db.upsert_agent_chat_session("t", "w", None, "claude").unwrap();
         let mut row = QueuedTurnRecord {
+            provenance: Default::default(),
             thread_id: "t".into(),
             queued_id: "old".into(),
             position: 0,
@@ -660,6 +711,7 @@ mod tests {
         std::fs::write(&old, b"png").unwrap();
         let image = QueuedTurnImage { path: old.to_string_lossy().into_owned(), media_type: "image/png".into() };
         db.insert_queued_turn(&QueuedTurnRecord {
+            provenance: Default::default(),
             thread_id: "new".into(),
             queued_id: "q".into(),
             position: 0,

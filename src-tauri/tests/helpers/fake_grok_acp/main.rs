@@ -203,12 +203,26 @@ fn handle_prompt(id: Value, params: &Value) {
                 "usage": {
                     "inputTokens": 800,
                     "outputTokens": 80,
+                    "numTurns": 3,
+                    "apiDurationMs": 321,
                     "costUsdTicks": 9_000_000_000_i64
                 }
             },
             "_meta": {"totalTokens": 88}
         }),
     );
+    if prompt_text(params).contains("omitted-standard") {
+        // Ordered after the terminal: lets the test interrupt during the
+        // standard-response grace, after the adapter has received evidence.
+        notification(
+            "_x.ai/session_notification",
+            json!({
+                "sessionId": SESSION_ID,
+                "update": {"sessionUpdate": "auto_compact_completed"}
+            }),
+        );
+        return;
+    }
     thread::sleep(Duration::from_millis(25));
 
     response(

@@ -1951,8 +1951,19 @@ interface MockMessageRow {
 const mockFullPayloadById = new Map<number, string>();
 const mockThreadRowCache = new Map<string, MockMessageRow[]>();
 
+const mockDeliveryAcknowledged = new Set<string>();
+
 /** The raw persisted payloads a thread would hold. */
 function mockThreadPayloads(threadId: string): string[] {
+  if (new URLSearchParams(window.location.search).get("mockScenario") === "message-provenance" && threadId === MOCK_CHAT_THREAD_ID) {
+    return [
+      {message_id:"provenance-agent",created_by:"agent",creation_source:"provider",sender_thread_id:MOCK_SECOND_CHAT_THREAD_ID,sender_title:"Parser review",input_intent:"turn_start",text:"Review the parser changes and run the focused checks."},
+      {message_id:"provenance-system",created_by:"system",creation_source:"codemux",input_intent:"turn_start",text:"The watched pull request has new review comments."},
+      {message_id:"provenance-queue",created_by:"agent",creation_source:"mcp",sender_title:"Previous review agent",input_intent:"queued_turn",text:"Also check the Unicode boundary cases."},
+      {message_id:"provenance-steer",created_by:"user",creation_source:"desktop",input_intent:"steer",text:"Keep the fix focused on message delivery.",steered_turn_id:"provenance-turn"},
+      {text:'[Codemux: delegated task results]\n<task provider="codex" title="Legacy parser review" status="completed">\n<report>Focused parser checks passed. The result remains available after restart.</report>\n</task>'},
+    ].flatMap((message) => [JSON.stringify({type:"user_message",thread_id:threadId,...message}),JSON.stringify({type:"turn_completed",thread_id:threadId,turn_id:"provenance-turn",status:{kind:"success"},usage:null})]);
+  }
   const imported = mockImportedPayloads.get(threadId);
   if (imported) return imported;
   const forked = mockForkPayloads.get(threadId);
@@ -5588,16 +5599,18 @@ const handlers: Record<string, Handler> = {
     const threadId = String(a.threadId ?? "");
     const location = findChatPaneLocation(threadId);
     if (!location) throw new Error(`not_found: mock chat session ${threadId}`);
-    location.workspace.active_surface_id = location.surface.surface_id;
-    location.surface.active_pane_id = location.paneId;
     const tab = location.workspace.tabs.find(
       (candidate) => candidate.surface_id === location.surface.surface_id,
     );
-    if (tab) location.workspace.active_tab_id = tab.tab_id;
-    appState = {
-      ...appState,
-      active_workspace_id: location.workspace.workspace_id,
-    };
+    // Keep the old snapshot intact so selectors can observe sender navigation
+    // when it stays inside the current workspace.
+    replaceWorkspace(location.workspace.workspace_id, (workspace) => ({
+      active_surface_id: location.surface.surface_id,
+      active_tab_id: tab?.tab_id ?? workspace.active_tab_id,
+      surfaces: workspace.surfaces.map((surface) => surface.surface_id === location.surface.surface_id
+        ? { ...surface, active_pane_id: location.paneId } : surface),
+    }));
+    appState = { ...appState, active_workspace_id: location.workspace.workspace_id };
     emitAppState();
     return {
       pane_id: location.paneId,
@@ -5632,14 +5645,14 @@ const handlers: Record<string, Handler> = {
         permission_mode: provider === "codex" ? "danger-full-access" : "bypassPermissions",
       };
     }
-    if (threadId === MOCK_CHAT_THREAD_ID) {
+    if (threadId === MOCK_CHAT_THREAD_ID || threadId === MOCK_SECOND_CHAT_THREAD_ID) {
       return {
-        thread_id: MOCK_CHAT_THREAD_ID,
-        sdk_session_id: "sdk-mock-chat",
+        thread_id: threadId,
+        sdk_session_id: threadId === MOCK_SECOND_CHAT_THREAD_ID ? "sdk-mock-chat-second" : "sdk-mock-chat",
         workspace_id: "ws-codemux-chat",
         cwd: `${MOCK_HOME_DIR}/projects/codemux`,
         provider: "codex",
-        title: "agent-chat-demo",
+        title: threadId === MOCK_SECOND_CHAT_THREAD_ID ? "Parser review" : "agent-chat-demo",
         created_at: new Date().toISOString(),
         last_active_at: new Date().toISOString(),
         model: "gpt-5.4",
@@ -5826,7 +5839,7 @@ const handlers: Record<string, Handler> = {
     if (input.delivery === "steer" && chatActiveTurns.has(threadId)) {
       if (a.provider !== "claude" && a.provider !== "codex" && a.provider !== "opencode") throw new Error("Safe steering is unavailable for this provider.");
       const turnId = chatActiveTurns.get(threadId)!;
-      emitChatEvent(threadId, { type: "user_message", thread_id: threadId, text: input.display_text ?? input.text, client_nonce: input.client_nonce ?? undefined, steered_turn_id: turnId });
+      emitChatEvent(threadId, { type: "user_message", thread_id: threadId, text: input.display_text ?? input.text, client_nonce: input.client_nonce ?? undefined, steered_turn_id: turnId, input_intent:"steer",message_id:input.client_nonce ?? undefined,created_by:"user",creation_source:"desktop" });
       return { turn_id: turnId, queued_id: null, steered: true };
     }
     // Queue-while-busy, mirroring the real provider: a send during an
@@ -8394,6 +8407,11 @@ const handlers: Record<string, Handler> = {
     };
   },
   agent_chat_fork_origin: (a) => mockForkOrigins.get(a.threadId as string) ?? null,
+  agent_chat_delivery_attention: (a) => new URLSearchParams(window.location.search).get("mockScenario") === "message-provenance" && a.threadId === MOCK_CHAT_THREAD_ID
+    ? [{id:"mock-unknown-delivery",message_id:"mock-unknown",state:"held_unknown",reason:"Provider acceptance could not be confirmed after restart. Automatic resend is held.",display_text:"Review the parser changes.",can_retry:false},
+       {id:"mock-retry-delivery",message_id:"mock-retry",state:"rejected",reason:"The provider was unavailable before the message was sent.",display_text:"Check the Unicode boundaries.",can_retry:true}].filter(row => !mockDeliveryAcknowledged.has(row.id)) : [],
+  agent_chat_acknowledge_delivery: (a) => { mockDeliveryAcknowledged.add(a.deliveryId as string); return null; },
+  agent_chat_retry_delivery: (a) => { mockDeliveryAcknowledged.add(a.deliveryId as string); return null; },
   agent_chat_list_queued_turns: (a) => {
     const threadId = a.threadId as string;
     const view = (saved: boolean) => (e: MockQueuedTurn) => ({

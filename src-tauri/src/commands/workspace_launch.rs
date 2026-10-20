@@ -292,6 +292,7 @@ async fn start<R: Runtime>(
     let title = input.title.clone();
     let outcome: Result<(), String> = async {
         let control = ControlCaller {
+            created_by: crate::agent_provider::message::CreatedBy::Agent,
             principal: format!("thread:{}", caller.thread_id),
             access: ControlAccess::FullAccess,
             grant_id: None,

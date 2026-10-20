@@ -36,7 +36,7 @@ use crate::database::DatabaseStore;
 use crate::observability::ObservabilityStore;
 
 use super::agent_chat::{
-    feature_flag_on, forward_event, lookup_provider, send_turn_with_origin, ProviderRegistry,
+    feature_flag_on, forward_event, lookup_provider, ProviderRegistry,
     SendTurnCommandInput, SubagentTracker, TurnOrigin,
 };
 
@@ -360,6 +360,9 @@ pub(super) fn arm_usage_limit_event<R: Runtime>(
 /// the attempt count. No event — the frontend clears its countdown on the
 /// new user message itself.
 pub(super) fn forget_on_user_activity(db: &DatabaseStore, thread_id: &str) {
+    if let Err(error) = db.dispose_superseded_resume_deliveries(thread_id) {
+        log::error!("Failed to dispose superseded resumes for {thread_id}: {error}");
+    }
     super::restart_resume::on_user_activity(db, thread_id);
     if let Err(error) = db.delete_agent_chat_usage_resume(thread_id) {
         eprintln!("[codemux::usage_resume] failed to clear resume for thread={thread_id}: {error}");
@@ -392,6 +395,7 @@ async fn dispatch_resume<R: Runtime>(
     app: &AppHandle<R>,
     provider: ProviderKind,
     thread_id: &ThreadId,
+    release_queue: bool,
 ) -> Result<(), String> {
     let text = {
         let db: State<'_, DatabaseStore> = app.state();
@@ -399,7 +403,9 @@ async fn dispatch_resume<R: Runtime>(
         build_usage_resume_text(last.as_deref())
     };
     let input = queued_turn(thread_id.clone(), text);
-    send_turn_with_origin(app.clone(), provider, input, TurnOrigin::UsageResume)
+    let mut context = crate::agent_control::delivery::SendContext::new(TurnOrigin::UsageResume);
+    context.release_queue = release_queue;
+    super::agent_chat::send_turn_with_context(app.clone(), provider, input, context)
         .await
         .map(|_| ())
 }
@@ -408,6 +414,7 @@ async fn dispatch_resume<R: Runtime>(
 /// (`display_text: None`), so the transcript shows exactly what was sent.
 pub(super) fn queued_turn(thread_id: ThreadId, text: String) -> SendTurnCommandInput {
     SendTurnCommandInput {
+        input_source: None,
         thread_id,
         text,
         display_text: None,
@@ -548,7 +555,7 @@ async fn fire_due_resumes<R: Runtime>(app: &AppHandle<R>) {
             row.attempts + 1
         );
         let generation = notice_generation(&row.thread_id);
-        if let Err(error) = dispatch_resume(app, provider, &thread_id).await {
+        if let Err(error) = dispatch_resume(app, provider, &thread_id, false).await {
             eprintln!(
                 "[codemux::usage_resume] automatic resume failed for thread={}: {error}",
                 row.thread_id
@@ -607,7 +614,7 @@ pub async fn agent_chat_resume_after_usage_limit<R: Runtime>(
     }
     let generation = notice_generation(&thread_id.0);
     emit_cancelled(&app, &thread_id, UsageResumeBlockedReason::Cancelled);
-    let result = dispatch_resume(&app, provider, &thread_id).await;
+    let result = dispatch_resume(&app, provider, &thread_id, true).await;
     if result.is_err() {
         // The schedule is already gone; say why nothing will happen next.
         emit_dispatch_failed(&app, &thread_id, generation);

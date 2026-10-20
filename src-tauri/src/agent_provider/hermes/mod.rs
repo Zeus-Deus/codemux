@@ -147,6 +147,7 @@ struct Chat {
 #[derive(Default)]
 struct ChatState {
     active: Option<TurnId>,
+    active_checkpoint: Option<Arc<dyn crate::agent_provider::TurnDispatchCheckpoint>>,
     cancelled: bool,
     cancel_epoch: u64,
     replaying: bool,
@@ -180,6 +181,7 @@ impl crate::agent_provider::queue_edit::QueueEntry for Job {
 struct Queue {
     jobs: VecDeque<Job>,
     running: bool,
+    holds: HashMap<ThreadId, crate::agent_provider::queue_hold::QueueHold>,
 }
 struct Runtime {
     #[cfg(test)]
@@ -681,7 +683,9 @@ impl Inner {
             let _guard = runtime.operation.lock().await;
             let job = {
                 let mut queue = runtime.queue.lock().await;
-                match queue.jobs.pop_front() {
+                let queue = &mut *queue;
+                let next = queue.jobs.iter().position(|job| queue.holds.entry(job.input.thread_id.clone()).or_default().can_select(&job.id, job.input.queued_delivery_state()));
+                match next.and_then(|i|queue.jobs.remove(i)) {
                     Some(j) => j,
                     None => {
                         queue.running = false;
@@ -689,7 +693,7 @@ impl Inner {
                     }
                 }
             };
-            let chat = &job.chat;
+            let chat = job.chat.clone();
             let thread = job.input.thread_id.clone();
             let turn = TurnId(Uuid::new_v4().to_string());
             let mut dispatched = false;
@@ -697,6 +701,14 @@ impl Inner {
             {
                 let mut state = chat.state.lock().await;
                 if state.cancel_epoch != job.cancel_epoch {
+                    if job.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Held {
+                        let epoch = state.cancel_epoch;
+                        drop(state);
+                        let mut queue = runtime.queue.lock().await;
+                        queue.holds.entry(thread.clone()).or_default().hold();
+                        queue.jobs.push_front(Job { cancel_epoch: epoch, ..job });
+                        continue;
+                    }
                     self.emit(ProviderRuntimeEvent::QueuedTurnCancelled {
                         thread_id: thread.clone(),
                         queued_id: job.id.clone(),
@@ -704,9 +716,16 @@ impl Inner {
                     continue;
                 }
                 state.active = Some(turn.clone());
+                state.active_checkpoint = job.input.turn_checkpoint.clone();
                 state.cancelled = false;
             }
+            let mut prompt_responded = false;
+            let mut checkpoint_aborted = false;
             let result = async {
+                if job.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Disposed {
+                    rejected = true;
+                    return Err(invalid("Disposed queued delivery"));
+                }
                 let binding = chat.binding.lock().await.clone();
                 binding.profile.validate().map_err(invalid)?;
                 binding.validate_cwd().map_err(invalid)?;
@@ -717,12 +736,13 @@ impl Inner {
                 }
                 if let Some(checkpoint) = job.input.turn_checkpoint.as_ref() { checkpoint.prepare().await; }
                 if chat.state.lock().await.cancelled {
-                    if let Some(checkpoint) = job.input.turn_checkpoint.as_ref() { checkpoint.abort().await; }
+                    if let Some(checkpoint) = job.input.turn_checkpoint.as_ref() { checkpoint.abort().await; checkpoint_aborted = true; }
+                    rejected = job.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Held;
                     return Err(invalid("Hermes turn cancelled before dispatch"));
                 }
                 if let Some(checkpoint) = job.input.turn_checkpoint.as_ref() {
-                    if let Err(error) = checkpoint.authorize_dispatch() {
-                        checkpoint.abort().await;
+                    if let Err(error) = checkpoint.verify_dispatch() {
+                        checkpoint.abort().await; checkpoint_aborted = true;
                         rejected = true;
                         return Err(error);
                     }
@@ -731,15 +751,21 @@ impl Inner {
                 // Commit may await: authority must still hold at transport dispatch.
                 if let Some(checkpoint) = job.input.turn_checkpoint.as_ref() {
                     if let Err(error) = checkpoint.authorize_dispatch() {
-                        checkpoint.abort().await;
+                        checkpoint.abort().await; checkpoint_aborted = true;
                         rejected = true;
                         return Err(error);
                     }
                 }
                 dispatched = true;
+                runtime.queue.lock().await.holds.entry(thread.clone()).or_default().settle(&job.id,true);
                 self.emit(ProviderRuntimeEvent::QueuedTurnDispatched {thread_id:thread.clone(),queued_id:job.id.clone(),turn_id:turn.clone(),text:job.input.display_text.clone().unwrap_or_else(||job.input.text.clone()),steered:false});
                 self.emit(ProviderRuntimeEvent::SessionStateChanged {thread_id:thread.clone(),status:SessionStatus::Running {active_turn:turn.clone()}});
-                let response = runtime.child.request_with_timeout("session/prompt",json!({"sessionId":binding.acp_session_id,"prompt":[{"type":"text","text":job.input.text}]}),Duration::from_secs(24*60*60)).await.map_err(rpc)?;
+                let response = runtime.child.request_with_timeout("session/prompt",json!({"sessionId":binding.acp_session_id,"prompt":[{"type":"text","text":job.input.text}]}),Duration::from_secs(24*60*60)).await;
+                prompt_responded = matches!(&response, Ok(_) | Err(crate::json_rpc_child::RpcChildError::RpcError(_)));
+                if prompt_responded {
+                    if let Some(checkpoint) = &job.input.turn_checkpoint { checkpoint.accepted(&turn).await; }
+                }
+                let response = response.map_err(rpc)?;
                 let (tx,rx) = oneshot::channel(); let _=runtime.barrier.send(tx); let _=rx.await;
                 if text(&response,"stopReason") == Some("cancelled") { chat.state.lock().await.cancelled=true; }
                 // Empty new sessions are ephemeral upstream. Ask the official load endpoint
@@ -757,11 +783,33 @@ impl Inner {
                 if response.get("stopReason").and_then(Value::as_str).is_none() { return Err(invalid("unsupported: Hermes prompt returned no stop reason")); }
                 Ok::<(),ProviderError>(())
             }.await;
+            if result.is_err() && !prompt_responded && !checkpoint_aborted {
+                if let Some(checkpoint) = &job.input.turn_checkpoint { checkpoint.abort().await; }
+            }
+            if !dispatched {
+                runtime.queue.lock().await.holds.entry(thread.clone()).or_default().settle(&job.id,false);
+            }
             let mut state = chat.state.lock().await;
+            state.active_checkpoint = None;
             if rejected {
                 // No prompt was written. Reject only this input, leaving real
                 // runtime errors intact and the profile pump free to continue.
                 state.active = None;
+                if job.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Held {
+                    let epoch = state.cancel_epoch;
+                    drop(state);
+                    let mut queue = runtime.queue.lock().await;
+                    queue.holds.entry(thread.clone()).or_default().hold();
+                    queue.jobs.push_front(Job { cancel_epoch: epoch, ..job });
+                    chat.finished.notify_waiters();
+                    continue;
+                }
+                if job.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Blocked {
+                    drop(state);
+                    runtime.queue.lock().await.jobs.push_front(job);
+                    chat.finished.notify_waiters();
+                    continue;
+                }
                 self.emit(ProviderRuntimeEvent::QueuedTurnCancelled {
                     thread_id: thread.clone(), queued_id: job.id.clone(),
                 });
@@ -1266,8 +1314,12 @@ impl AgentProvider for HermesProvider {
         let id = Uuid::new_v4().to_string();
         let runtime = chat.runtime.clone();
         let mut queue = runtime.queue.lock().await;
+        let hold = queue.holds.entry(input.thread_id.clone()).or_default();
+        let release = input.releases_queue_hold() && hold.goes_first();
+        if release { hold.release_with(&id); }
         let idle = chat.state.lock().await.active.is_none();
         self.inner.emit(ProviderRuntimeEvent::TurnQueued {
+            provenance: Default::default(),
             thread_id: input.thread_id.clone(),
             queued_id: id.clone(),
             client_nonce: input.client_nonce.clone(),
@@ -1276,17 +1328,14 @@ impl AgentProvider for HermesProvider {
                 .clone()
                 .unwrap_or_else(|| input.text.clone()),
         });
-        queue.jobs.push_back(Job {
-            id: id.clone(),
-            cancel_epoch,
-            chat,
-            input,
-        });
+        let job = Job { id: id.clone(), cancel_epoch, chat, input };
+        if release { queue.jobs.push_front(job); }
+        else { queue.jobs.push_back(job); }
         // A profile-wide queue can hold a chat with no active turn of its own.
         // Clear the composer's optimistic streaming state until actual dispatch.
         if idle {
             self.inner.emit(ProviderRuntimeEvent::SessionStateChanged {
-                thread_id: ThreadId(queue.jobs.back().unwrap().input.thread_id.0.clone()),
+                thread_id: if release { queue.jobs.front().unwrap().input.thread_id.clone() } else { queue.jobs.back().unwrap().input.thread_id.clone() },
                 status: SessionStatus::Ready,
             });
         }
@@ -1321,6 +1370,25 @@ impl AgentProvider for HermesProvider {
         } else {
             Ok(false)
         }
+    }
+    async fn send_queued_turn_now(&self, thread_id: ThreadId, queued_id: String) -> Result<(), ProviderError> {
+        let chat = self.chat(&thread_id).await?;
+        let runtime = chat.runtime.clone();
+        let active = chat.state.lock().await.active.clone();
+        {
+            let mut queue = runtime.queue.lock().await;
+            let Some(index) = queue.jobs.iter().position(|job|job.id == queued_id && job.input.thread_id == thread_id) else { return Ok(()) };
+            queue.jobs[index].input.authorize_queue_promotion()?;
+            let job = queue.jobs.remove(index).unwrap();
+            queue.jobs.push_front(job);
+            queue.holds.entry(thread_id.clone()).or_default().release_with(&queued_id);
+            if !queue.running {
+                queue.running = true;
+                tokio::spawn(self.inner.clone().pump(runtime.clone()));
+            }
+        }
+        if let Some(active) = active { self.interrupt_turn(thread_id, Some(active)).await?; }
+        Ok(())
     }
     /// The queue is profile-wide; edits and moves stay within this chat.
     async fn edit_queued_turn(
@@ -1359,23 +1427,16 @@ impl AgentProvider for HermesProvider {
             return session.interrupt().await;
         }
         let chat = self.chat(&thread_id).await?;
-        if turn_id.is_none() {
-            let mut queue = chat.runtime.queue.lock().await;
-            queue.jobs.retain(|job| {
-                if job.input.thread_id != thread_id {
-                    return true;
-                }
-                self.inner.emit(ProviderRuntimeEvent::QueuedTurnCancelled {
-                    thread_id: thread_id.clone(),
-                    queued_id: job.id.clone(),
-                });
-                false
-            });
-        }
+        let mut queue = chat.runtime.queue.lock().await;
         let mut s = chat.state.lock().await;
         if turn_id.is_none() {
+            queue.holds.entry(thread_id.clone()).or_default().hold();
             s.cancel_epoch += 1;
+            for job in queue.jobs.iter_mut().filter(|job|job.input.thread_id == thread_id) {
+                job.cancel_epoch = s.cancel_epoch;
+            }
         }
+        drop(queue);
         if s.active.is_none() {
             self.inner.emit(ProviderRuntimeEvent::SessionStateChanged {
                 thread_id,
@@ -1386,6 +1447,8 @@ impl AgentProvider for HermesProvider {
         if turn_id.is_some_and(|id| Some(id) != s.active) {
             return Ok(());
         }
+        let interrupted_turn = s.active.clone();
+        let checkpoint = s.active_checkpoint.clone();
         s.cancelled = true;
         for (id, p) in s.pending.drain() {
             let _ = chat
@@ -1401,22 +1464,24 @@ impl AgentProvider for HermesProvider {
         }
         let sid = chat.binding.lock().await.acp_session_id.clone();
         drop(s);
-        chat.runtime
-            .child
-            .notify("session/cancel", json!({"sessionId":sid}))
-            .await
-            .map_err(rpc)?;
-        tokio::time::timeout(Duration::from_secs(30), async {
+        if let Err(error) = chat.runtime.child.notify("session/cancel", json!({"sessionId":sid})).await {
+            if let Some(checkpoint) = checkpoint { checkpoint.abort().await; }
+            return Err(rpc(error));
+        }
+        let settled = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let notified = chat.finished.notified();
-                if chat.state.lock().await.active.is_none() {
+                if chat.state.lock().await.active != interrupted_turn {
                     break;
                 }
                 notified.await;
             }
         })
-        .await
-        .map_err(|_| {
+        .await;
+        if settled.is_err() {
+            if let Some(checkpoint) = checkpoint { checkpoint.abort().await; }
+        }
+        settled.map_err(|_| {
             invalid("Hermes cancellation has not completed; workspace cleanup remains pending")
         })?;
         Ok(())

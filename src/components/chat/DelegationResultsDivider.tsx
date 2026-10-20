@@ -1,6 +1,7 @@
 import { ChevronDown, Inbox } from "lucide-react";
 import { useMemo, useState } from "react";
 
+import type { MessageNotification } from "@/tauri/events";
 import { parseWake, wakeSummary } from "@/lib/agent-chat/delegation";
 import { cn } from "@/lib/utils";
 
@@ -14,9 +15,14 @@ import { ProviderLogo } from "./provider-logo";
  * received, which can run to tens of thousands of characters, so it opens
  * into a bounded, scrolling block rather than a wall of centered prose.
  */
-export function DelegationResultsDivider({ text }: { text: string }) {
+export function DelegationResultsDivider({ text, notification }: { text: string; notification?: MessageNotification }) {
   const [open, setOpen] = useState(false);
-  const summary = useMemo(() => wakeSummary(parseWake(text)), [text]);
+  const taskNames = (notification?.tasks ?? (notification ? [] : parseWake(text))).map(task => task.title).filter(Boolean).join(", ");
+  const summary = useMemo(() => {
+    const tasks = notification?.tasks?.map(task => ({...task,status:notification.outcome,model:null,effort:null,thread:null}));
+    const result = wakeSummary(tasks ?? (notification ? [] : parseWake(text)));
+    return notification ? {...result,outcome:notification.outcome,failed:notification.outcome === "failed"} : result;
+  }, [text, notification]);
   return (
     <div data-testid="delegation-results-divider">
       <button
@@ -44,6 +50,7 @@ export function DelegationResultsDivider({ text }: { text: string }) {
           <span className="truncate">
             Delegated results
             {summary.names ? ` · ${summary.names}` : null}
+            {taskNames ? ` · ${taskNames}` : null}
             {summary.outcome ? (
               <span
                 data-testid="delegation-results-outcome"

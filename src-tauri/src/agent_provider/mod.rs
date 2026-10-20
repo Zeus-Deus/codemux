@@ -4,6 +4,7 @@
 //! integration (Claude Code, Codex, …). It is currently scaffolding — no
 //! user-visible behaviour is wired to it yet.
 
+pub mod message;
 pub mod acp;
 pub mod claude;
 pub mod codex;

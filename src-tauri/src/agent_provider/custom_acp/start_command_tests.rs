@@ -4,6 +4,101 @@ use crate::{commands::agent_chat::{agent_chat_start_session,ensure_live_session,
 use futures_util::StreamExt;
 use tauri::Manager;
 struct Fixture { dir: tempfile::TempDir, app: tauri::App<tauri::test::MockRuntime>, provider: Arc<GenericAcpProvider>, agent: String, thread: ThreadId, pane: String }
+
+#[tokio::test]
+async fn review_r1_delayed_configuration_failure_never_confirms_prompt_acceptance() {
+    let f = Fixture::new("review-r1-delayed-reject-model").await;
+    f.start(None, None).await.unwrap();
+    let mut events = f.provider.event_stream();
+    let sent = f.command_send(json!({"thread_id":f.thread.0,"text":"unsent instruction","model_override":"vendor:model [1m]","client_nonce":"review-r1-unsent"})).await.unwrap();
+    wait_marker(&f.dir.path().join("wire.jsonl.ready")).await;
+    std::fs::write(f.dir.path().join("wire.jsonl.release"), b"release").unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(ProviderRuntimeEvent::TurnCompleted {turn_id, ..}) = events.next().await {
+                if turn_id == sent.turn_id { break; }
+            }
+        }
+    }).await.unwrap();
+    let db = f.app.state::<DatabaseStore>();
+    // Exercise live confirmation even if the event bridge is still catching up.
+    crate::commands::agent_chat::forward_event(f.app.handle(), ProviderRuntimeEvent::TurnCompleted {
+        thread_id:f.thread.clone(), turn_id:sent.turn_id.clone(), status:TurnStatus::Error {subtype:"acp_error".into(),message:"pre-prompt configuration failed".into()}, usage:None,
+    });
+    let row = db.message_delivery_for_message(&f.thread.0, "review-r1-unsent").unwrap().unwrap();
+    assert!(!row.attempted, "an in-process worker ACK is not a prompt attempt: {row:?}");
+    assert_eq!(row.state, "rejected");
+    db.recover_message_deliveries("review-r1-restart").unwrap();
+    assert_eq!(db.message_delivery(&row.id).unwrap().unwrap().state, "rejected");
+    let wire = std::fs::read_to_string(f.dir.path().join("wire.jsonl")).unwrap();
+    assert!(wire.contains("session/set_config_option"));
+    assert!(!wire.contains("session/prompt"));
+    f.provider.stop_session(f.thread.clone()).await.unwrap();
+}
+// Exercise asynchronous worker settlement with the common delivery journal.
+async fn unanswered_controller_prompt(mode: &str, interrupt: bool) {
+    let f = Fixture::new(mode).await;
+    f.start(None, None).await.unwrap();
+    f.app.manage(crate::commands::agent_chat::SubagentTracker::default());
+    f.app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+    f.app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+    let mut events = f.provider.event_stream();
+    let sent = crate::commands::agent_chat::send_turn_with_origin(
+        f.app.handle().clone(), ProviderKind::Acp,
+        serde_json::from_value(json!({"thread_id":f.thread.0,"text":"controller instruction","client_nonce":"review-r2-unanswered"})).unwrap(),
+        crate::commands::agent_chat::TurnOrigin::Controller,
+    ).await.unwrap();
+    wait_marker(&f.dir.path().join("wire.jsonl.ready")).await;
+    if interrupt {
+        f.provider.interrupt_turn(f.thread.clone(), Some(sent.turn_id)).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(9), async {
+        loop {
+            if matches!(events.next().await, Some(ProviderRuntimeEvent::SessionStateChanged {status:SessionStatus::Error {..},..})) { break; }
+        }
+    }).await.expect("terminal transport failure must settle in process");
+    let db = f.app.state::<DatabaseStore>();
+    let row = db.message_delivery_for_message(&f.thread.0, "review-r2-unanswered").unwrap().unwrap();
+    let attention = db.thread_message_delivery_attention(&f.thread.0).unwrap();
+    let wire = std::fs::read_to_string(f.dir.path().join("wire.jsonl")).unwrap();
+    f.provider.stop_session(f.thread.clone()).await.unwrap();
+    assert!(row.attempted);
+    assert!(!db.has_inflight_message_deliveries(&f.thread.0).unwrap());
+    assert_eq!(row.state, "held_unknown", "unanswered prompt has no native acceptance evidence");
+    assert!(attention.iter().any(|entry| entry.id == row.id));
+    assert!(db.pending_message_deliveries().unwrap().iter().all(|entry| entry.id != row.id));
+    assert_eq!(wire.lines().filter(|line| line.contains("session/prompt")).count(), 1);
+    if interrupt { assert!(wire.contains("session/cancel")); }
+    db.recover_message_deliveries("review-r2-restart").unwrap();
+    assert_eq!(db.message_delivery(&row.id).unwrap().unwrap().state, "held_unknown");
+}
+
+#[tokio::test]
+async fn review_r2_child_exit_without_prompt_reply_is_held_unknown() {
+    unanswered_controller_prompt("review-r2-exit-prompt", false).await;
+}
+
+#[tokio::test]
+async fn review_r2_interrupted_unanswered_prompt_settles_journal_and_attention() {
+    unanswered_controller_prompt("review-r2-unanswered-prompt", true).await;
+}
+
+#[tokio::test]
+async fn review_r2_correlated_native_error_remains_acceptance_evidence() {
+    let f=Fixture::new("review-r2-native-error").await;
+    f.start(None,None).await.unwrap();
+    let mut events=f.provider.event_stream();
+    f.command_send(json!({"thread_id":f.thread.0,"text":"native rejection","client_nonce":"native-error"})).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3),async {
+        while !matches!(events.next().await,Some(ProviderRuntimeEvent::TurnCompleted {..})) {}
+    }).await.unwrap();
+    let db=f.app.state::<DatabaseStore>();
+    assert_eq!(db.message_delivery_for_message(&f.thread.0,"native-error").unwrap().unwrap().state,"accepted");
+    db.recover_message_deliveries("native-error-restart").unwrap();
+    assert_eq!(db.message_delivery_for_message(&f.thread.0,"native-error").unwrap().unwrap().state,"accepted");
+    f.provider.stop_session(f.thread.clone()).await.unwrap();
+}
+
 impl Fixture {
     async fn new(mode: &str) -> Self {
         let dir=tempfile::tempdir().unwrap();
@@ -32,7 +127,7 @@ impl Fixture {
             self.app.manage(crate::commands::agent_chat::RunActivityTracker::default());
             self.app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
         }
-        crate::commands::agent_chat::agent_chat_send_turn(self.app.handle().clone(), ProviderKind::Acp, serde_json::from_value(input).unwrap()).await
+        crate::commands::agent_chat::send_desktop_turn(self.app.handle().clone(), ProviderKind::Acp, serde_json::from_value(input).unwrap()).await
     }
     fn row(&self) -> crate::database::AgentChatSessionRecord { self.app.state::<DatabaseStore>().get_agent_chat_session(&self.thread.0).unwrap() }
 }
@@ -508,8 +603,9 @@ async fn held_queue_survives_failed_config(send: HeldSend) {
     let mut completed = 0;
     tokio::time::timeout(Duration::from_secs(4), async { while failing_turn.is_none() || completed < 2 {
         let event = events.next().await.unwrap();
-        if let ProviderRuntimeEvent::TurnCompleted { .. } = &event {
+        if let ProviderRuntimeEvent::TurnCompleted { turn_id, .. } = &event {
             completed += 1;
+            if completed == 2 { failing_turn = Some(turn_id.clone()); }
             if completed == 1 {
                 match send {
                     HeldSend::IdleSendNow => f.provider.send_queued_turn_now(f.thread.clone(), q1.clone().unwrap()).await.unwrap(),
@@ -1227,4 +1323,103 @@ async fn rereview_automatic_resume_ignores_legacy_stale_generic_row() {
     let _=f.provider.stop_session(f.thread.clone()).await;
     assert!(matches!(resumed,Ok(Ok(()))),"auto-resume must not replay stale generic overrides: {resumed:?}");
     assert_eq!(catalog.current_model.as_deref(),Some("vendor:model [1m]"));
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_custom_acp_stop_machine_send_retains_controller_queue_until_human() {
+    let f=Fixture::new("dynamic-review5-queue").await;
+    f.start(None,None).await.unwrap();
+    f.command_send(json!({"thread_id":f.thread.0,"text":"first held prompt"})).await.unwrap();
+    wait_marker(&f.dir.path().join("wire.jsonl.ready")).await;
+    let input=|text:&str|serde_json::from_value(json!({"thread_id":f.thread.0,"text":text,"client_nonce":text,"delivery":"queue"})).unwrap();
+    let b=crate::commands::agent_chat::send_turn_with_context(f.app.handle().clone(),ProviderKind::Acp,input("controller B"),crate::agent_control::delivery::SendContext::controller(&crate::agent_control::ControlCaller::trusted())).await.unwrap().queued_id.unwrap();
+    let db=f.app.state::<DatabaseStore>();
+    db.stop_message_deliveries(&f.thread.0).unwrap();
+    f.provider.interrupt_turn(f.thread.clone(),None).await.unwrap();
+    std::fs::write(f.dir.path().join("wire.jsonl.release"),b"release").unwrap();
+    let session=f.provider.session(&f.thread).await.unwrap();
+    let idle=|| async { tokio::time::timeout(Duration::from_secs(4),async { while session.state.lock().await.active.is_some() { tokio::time::sleep(Duration::from_millis(5)).await; } }).await.unwrap(); };
+    idle().await;
+    crate::commands::agent_chat::send_turn_with_context(f.app.handle().clone(),ProviderKind::Acp,input("machine C"),crate::agent_control::delivery::SendContext::controller(&crate::agent_control::ControlCaller::trusted())).await.unwrap();
+    idle().await;
+    assert!(session.state.lock().await.queued.iter().any(|q|q.id==b),"machine send must not pop and lose B");
+    assert!(!db.message_delivery_for_message(&f.thread.0,"controller B").unwrap().unwrap().attempted);
+    let wire=std::fs::read_to_string(f.dir.path().join("wire.jsonl")).unwrap();
+    assert!(!wire.lines().any(|l|l.contains("session/prompt") && l.contains("controller B")));
+    f.command_send(json!({"thread_id":f.thread.0,"text":"human D"})).await.unwrap();
+    idle().await;
+    f.provider.stop_session(f.thread.clone()).await.unwrap();
+    let wire=std::fs::read_to_string(f.dir.path().join("wire.jsonl")).unwrap();
+    let prompts:Vec<Value>=wire.lines().filter_map(|l|serde_json::from_str::<Value>(l).ok()).filter(|v|v["method"]=="session/prompt").collect();
+    let texts:Vec<_>=prompts.iter().map(|v|v["params"]["prompt"][0]["text"].as_str().unwrap()).collect();
+    assert_eq!(texts,vec!["first held prompt","machine C","human D","controller B"]);
+}
+
+#[derive(Debug,Default)]
+struct RefusedQueueItem(std::sync::atomic::AtomicBool);
+#[async_trait]
+impl TurnDispatchCheckpoint for RefusedQueueItem {
+    fn authorize_dispatch(&self)->Result<(),ProviderError> { self.0.store(true,Ordering::SeqCst);Err(invalid("grant_revoked: synthetic queued client")) }
+    fn queued_delivery_state(&self)->crate::agent_provider::types::QueuedDeliveryState {
+        if self.0.load(Ordering::SeqCst) { crate::agent_provider::types::QueuedDeliveryState::Blocked }
+        else { crate::agent_provider::types::QueuedDeliveryState::Ready }
+    }
+    async fn prepare(&self){}
+    async fn commit(&self){}
+    async fn abort(&self){}
+}
+#[derive(Debug)]
+struct DisposedQueueItem;
+#[async_trait]
+impl TurnDispatchCheckpoint for DisposedQueueItem {
+    fn queued_delivery_state(&self)->crate::agent_provider::types::QueuedDeliveryState { crate::agent_provider::types::QueuedDeliveryState::Disposed }
+    async fn prepare(&self){}
+    async fn commit(&self){}
+    async fn abort(&self){}
+}
+#[tokio::test]
+async fn orchestration_message_custom_acp_refused_item_stays_queued_and_later_item_dispatches() {
+    let f=Fixture::new("dynamic-review5-queue").await;f.start(None,None).await.unwrap();
+    let mut events=f.provider.event_stream();
+    f.provider.send_turn(serde_json::from_value(json!({"thread_id":f.thread.0,"text":"first held prompt"})).unwrap()).await.unwrap();
+    wait_marker(&f.dir.path().join("wire.jsonl.ready")).await;
+    let mut refused:SendTurnInput=serde_json::from_value(json!({"thread_id":f.thread.0,"text":"refused B"})).unwrap();
+    refused.turn_checkpoint=Some(Arc::new(RefusedQueueItem::default()));
+    let b=f.provider.send_turn(refused).await.unwrap().queued_id.unwrap();
+    let mut disposed:SendTurnInput=serde_json::from_value(json!({"thread_id":f.thread.0,"text":"disposed wake"})).unwrap();
+    disposed.turn_checkpoint=Some(Arc::new(DisposedQueueItem));
+    let disposed=f.provider.send_turn(disposed).await.unwrap().queued_id.unwrap();
+    let d=f.provider.send_turn(serde_json::from_value(json!({"thread_id":f.thread.0,"text":"allowed D"})).unwrap()).await.unwrap().queued_id.unwrap();
+    std::fs::write(f.dir.path().join("wire.jsonl.release"),b"release").unwrap();
+    let mut seen=vec![];
+    tokio::time::timeout(Duration::from_secs(4),async {loop {
+        let e=events.next().await.unwrap();let done=matches!(&e,ProviderRuntimeEvent::QueuedTurnDispatched {queued_id,..} if queued_id==&d);
+        seen.push(e);if done {break;}
+    }}).await.unwrap();
+    assert!(!seen.iter().any(|e|matches!(e,ProviderRuntimeEvent::QueuedTurnDispatched {queued_id,..} if queued_id==&b)));
+    assert!(f.provider.session(&f.thread).await.unwrap().state.lock().await.queued.iter().any(|q|q.id==b));
+    assert!(seen.iter().any(|e|matches!(e,ProviderRuntimeEvent::QueuedTurnCancelled {queued_id,..} if queued_id==&disposed)));
+    assert_eq!(seen.iter().filter(|e|matches!(e,ProviderRuntimeEvent::SessionStateChanged {status:SessionStatus::Running {..},..})).count(),2,"only the first and allowed prompts may emit Running");
+    assert_eq!(seen.iter().filter(|e|matches!(e,ProviderRuntimeEvent::TurnCompleted {..})).count(),1,"refused B never started a turn");
+    f.provider.stop_session(f.thread.clone()).await.unwrap();
+}
+
+#[tokio::test]
+async fn orchestration_message_custom_acp_promotes_refused_item_after_rearm() {
+    let f=Fixture::new("dynamic-review5-queue").await;f.start(None,None).await.unwrap();
+    f.command_send(json!({"thread_id":f.thread.0,"text":"first held prompt"})).await.unwrap();
+    wait_marker(&f.dir.path().join("wire.jsonl.ready")).await;
+    let b=f.command_send(json!({"thread_id":f.thread.0,"text":"refused B","client_nonce":"B"})).await.unwrap().queued_id.unwrap();
+    let db=f.app.state::<DatabaseStore>();
+    let id=db.message_delivery_for_message(&f.thread.0,"B").unwrap().unwrap().id;
+    db.refuse_message_delivery(&id,"grant_revoked").unwrap();
+    let mut events=f.provider.event_stream();
+    crate::commands::agent_chat::agent_chat_send_queued_turn_now(f.app.handle().clone(),ProviderKind::Acp,f.thread.clone(),b.clone(),None).await.unwrap();
+    std::fs::write(f.dir.path().join("wire.jsonl.release"),b"release").unwrap();
+    tokio::time::timeout(Duration::from_secs(4),async {loop {
+        if matches!(events.next().await,Some(ProviderRuntimeEvent::QueuedTurnDispatched {queued_id,..}) if queued_id==b) {break;}
+    }}).await.unwrap();
+    f.provider.stop_session(f.thread.clone()).await.unwrap();
+    let wire=std::fs::read_to_string(f.dir.path().join("wire.jsonl")).unwrap();
+    assert_eq!(wire.lines().filter(|l|l.contains("session/prompt")&&l.contains("refused B")).count(),1);
 }

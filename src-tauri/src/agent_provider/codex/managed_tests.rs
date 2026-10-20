@@ -80,7 +80,7 @@ async fn chatgpt_runtime_renews_idle_child_and_resumes_queued_turn() {
     let binary = fixture_binary(dir.path());
     let (tx, _) = broadcast::channel(128);
     let session = CodexSession::spawn_and_initialize(
-        ThreadId("t".into()),
+        ThreadId("managed-runtime-renew-queue".into()),
         dir.path().into(),
         Some("fixture-model".into()),
         Some("read-only".into()),
@@ -963,4 +963,32 @@ async fn chatgpt_workflow_uses_owned_grant_and_containment_through_renewal() {
     assert!(!captured.iter().any(|entry| entry["rpc"] == "account/read"));
     assert!(!dir.path().join("auth-called").exists());
     assert!(session.runtime_lease.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn orchestration_message_codex_machine_send_keeps_provider_hold_and_held_input() {
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _) = broadcast::channel(128);
+    let session = CodexSession::spawn_and_initialize(
+        ThreadId("held".into()), root.path().into(), None, None, None, "default".into(), None, None, None,
+        CodexSpawnConfig {codex_binary:fixture_binary(root.path()),chatgpt_owner:None,codex_home:None,remote:None,
+            client_info:ClientInfo {name:"fixture".into(),title:"fixture".into(),version:"fixture".into()},mcp_registry:None},tx,None,
+    ).await.unwrap();
+    let mut input=super::tests::queued("machine").input;
+    input.turn_checkpoint=Some(Arc::new(crate::agent_provider::queue_hold::TestCheckpoint {release:false,held:Default::default()}));
+    session.hold_queue().await;
+    session.enqueue_or_send(input).await.unwrap();
+    assert!(session.state.lock().await.queue_hold.is_held());
+    let mut queued=super::tests::queued("held-message");
+    queued.input.turn_checkpoint=Some(Arc::new(crate::agent_provider::queue_hold::TestCheckpoint {release:true,held:true.into()}));
+    {
+        let mut state=session.state.lock().await;
+        state.active_turn=None;state.status=SessionStatus::Ready;
+        // Exercise a stale drain even if its provider hold was lost.
+        state.queue_hold=Default::default();state.queued_turns.push_back(queued);
+    }
+    session.drain_queue().await;
+    assert_eq!(session.state.lock().await.queued_turns.len(),1);
+    assert_eq!(wire(root.path()).iter().filter(|v|v["rpc"]=="turn/start").count(),1);
+    session.shutdown().await.unwrap();
 }

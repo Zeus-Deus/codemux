@@ -42,18 +42,27 @@ impl QueueHold {
     }
 
     /// Whether a drain may dispatch the queue's `front` item. An empty queue
-    /// has nothing to hold, so the hold clears.
+    /// retains the hold until an explicit human release.
     pub fn admits(&mut self, front: Option<&str>) -> bool {
         if !self.held {
             return true;
         }
         match front {
-            None => {
-                self.held = false;
-                self.release = None;
-                false
-            }
+            None => false,
             Some(id) => self.release.as_deref() == Some(id),
+        }
+    }
+
+    /// Shared drain policy for every adapter. Stop retains the queue, a
+    /// refused item stays visible without blocking later work, and disposed
+    /// wakes can be retired even while the queue is held.
+    pub fn can_select(&mut self, id: &str, state: super::types::QueuedDeliveryState) -> bool {
+        use super::types::QueuedDeliveryState::*;
+        match state {
+            Held => { self.hold(); false }
+            Blocked => false,
+            Disposed => true,
+            Ready => self.admits(Some(id)),
         }
     }
 
@@ -153,11 +162,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_queue_clears_the_hold() {
+    fn orchestration_message_empty_queue_retains_stop_hold() {
         let mut hold = QueueHold::default();
         hold.hold();
         assert!(!hold.admits(None));
-        assert!(!hold.is_held());
+        assert!(hold.is_held());
     }
 
     #[test]
@@ -242,6 +251,25 @@ mod tests {
     }
 
     #[test]
+    fn orchestration_message_drain_policy_skips_refused_items_without_releasing_stop() {
+        use crate::agent_provider::types::QueuedDeliveryState::*;
+        let mut hold=QueueHold::default();
+        assert!(!hold.can_select("revoked",Blocked));
+        assert!(hold.can_select("next",Ready));
+        hold.hold();
+        assert!(!hold.can_select("revoked",Blocked));
+        assert!(!hold.can_select("next",Ready));
+        assert!(hold.can_select("disposed",Disposed));
+        hold.release_with("human");
+        assert!(hold.can_select("human",Ready));
+        hold.settle("human",false);
+        assert!(!hold.can_select("next",Ready));
+        hold.release_with("human-2");
+        hold.settle("human-2",true);
+        assert!(hold.can_select("next",Ready));
+    }
+
+    #[test]
     fn stop_during_a_taken_hold_drops_the_release() {
         let mut hold = QueueHold::default();
         hold.hold();
@@ -251,4 +279,23 @@ mod tests {
         hold.settle_take(was_held, false);
         assert!(!hold.admits(Some("m")));
     }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestCheckpoint {
+    pub release: bool,
+    pub held: std::sync::atomic::AtomicBool,
+}
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::agent_provider::TurnDispatchCheckpoint for TestCheckpoint {
+    fn releases_queue_hold(&self) -> bool { self.release }
+    fn queued_delivery_state(&self) -> crate::agent_provider::types::QueuedDeliveryState {
+        if self.held.load(std::sync::atomic::Ordering::SeqCst) { crate::agent_provider::types::QueuedDeliveryState::Held }
+        else { crate::agent_provider::types::QueuedDeliveryState::Ready }
+    }
+    async fn prepare(&self) {}
+    async fn commit(&self) {}
+    async fn abort(&self) {}
 }

@@ -1,3 +1,4 @@
+import { messageAttribution, messageProvenance } from "@/lib/agent-chat/message-provenance";
 /**
  * The follow-up queue, shown as a list in the composer's top chin.
  *
@@ -498,6 +499,7 @@ export function QueuedTurnsList({
                   <span className="min-w-0 flex-1 truncate text-body-sm text-foreground/80">{preview}</span>
                 </TooltipTrigger>
                 <TooltipContent side="top" className="max-w-96 whitespace-pre-wrap break-words">
+                  {messageAttribution(item) && <div className="mb-1 text-caption text-muted-foreground">{messageAttribution(item) === "agent" ? "Sent by another agent" : messageAttribution(item) === "automation" ? "Sent by automation" : "Sent by Codemux"}{item.sender_title ? ` · ${item.sender_title}` : ""}</div>}
                   {item.text}
                 </TooltipContent>
               </Tooltip>
@@ -564,13 +566,13 @@ export function QueuedTurnsList({
                       ) : null}
                       <button
                         type="button"
-                        aria-label="Interrupt and send queued message"
-                        title="Stop current work and send this message"
+                        aria-label={streaming ? "Interrupt and send queued message" : "Send queued message now"}
+                        title={streaming ? "Stop current work and send this message" : "Send now"}
                         onClick={() => onInterrupt(queuedId)}
                         className={ACTION}
                       >
                         <CornerDownLeft className="size-3" aria-hidden />
-                        Interrupt
+                        {streaming ? "Interrupt" : "Send now"}
                       </button>
                     </>
                   )}
@@ -646,11 +648,13 @@ export function reconcileQueuedTurns(
       if (item.kind !== "user_message") continue;
       const savedChanged = !!item.queued?.saved !== row.saved;
       const imagesMissing = row.images.length > 0 && (item.images?.length ?? 0) !== row.images.length;
-      if (savedChanged || imagesMissing) {
+      if (savedChanged || imagesMissing || row.message_id !== item.message_id) {
         next = {
           ...next,
           messages: replaceTranscriptItem(next.messages, index, {
             ...item,
+            ...messageProvenance(row),
+            input_intent: "queued_turn",
             queued: { queuedId: row.queued_id, ...(row.saved ? { saved: true } : {}) },
             ...(imagesMissing ? { images: imagesOf(row) } : {}),
           }),
@@ -662,6 +666,7 @@ export function reconcileQueuedTurns(
       continue;
     }
     next = applyEvent(next, {
+      ...messageProvenance(row),
       type: "turn_queued",
       thread_id: threadId,
       queued_id: row.queued_id,

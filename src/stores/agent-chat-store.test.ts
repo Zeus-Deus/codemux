@@ -82,6 +82,17 @@ describe("agent-chat-store", () => {
       });
     }
 
+    it("disposes automatic wakes without restoring agent text to the composer", () => {
+      const store = useAgentChatStore.getState();
+      store.ensureThread("disposed");
+      store.setInputDraft("disposed", "human draft");
+      queue("disposed", "wake", "automatic wake text");
+      store.applyEvent("disposed", { type: "queued_turn_disposed", thread_id: "disposed", queued_id: "wake" });
+      const slice = useAgentChatStore.getState().threads.disposed;
+      expect(slice.inputDraft).toBe("human draft");
+      expect(slice.messages.some(m => m.kind === "user_message" && m.queued)).toBe(false);
+    });
+
     it("returns their text to the composer in queue order", () => {
       resetStore();
       const store = useAgentChatStore.getState();

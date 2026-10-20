@@ -3479,3 +3479,87 @@ async fn steer_refuses_slash_commands_and_old_sidecars() {
     );
     f.provider.stop_session(f.thread).await.ok();
 }
+
+#[derive(Debug)]
+struct MachineQueueCheckpoint;
+#[async_trait::async_trait]
+impl codemux_lib::agent_provider::TurnDispatchCheckpoint for MachineQueueCheckpoint {
+    fn releases_queue_hold(&self) -> bool { false }
+    async fn prepare(&self) {}
+    async fn commit(&self) {}
+    async fn abort(&self) {}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn orchestration_message_claude_machine_send_preserves_stop_queue_hold() {
+    let provider=provider_with_fake().await;
+    let thread=ThreadId("machine-held-queue".into());
+    provider.start_session(start_input(&thread.0)).await.unwrap();
+    let mut events=provider.event_stream();
+    provider.send_turn(turn_input(&thread.0,"first")).await.unwrap();
+    let held=provider.send_turn(turn_input(&thread.0,"held-B")).await.unwrap().queued_id.unwrap();
+    provider.interrupt_turn(thread.clone(),None).await.unwrap();
+    let mut machine=turn_input(&thread.0,"machine-C");
+    machine.turn_checkpoint=Some(Arc::new(MachineQueueCheckpoint));
+    let started=provider.send_turn(machine).await.unwrap();
+    assert!(started.queued_id.is_none());
+    // A selected-turn interrupt is not another Stop. Its completion would
+    // drain B if the machine send had taken the existing provider hold.
+    provider.interrupt_turn(thread.clone(),Some(started.turn_id)).await.unwrap();
+    let observed=timeout(Duration::from_millis(500),async {
+        while let Some(event)=events.next().await {
+            if matches!(event,ProviderRuntimeEvent::QueuedTurnDispatched {ref queued_id,..}|ProviderRuntimeEvent::QueuedTurnCancelled {ref queued_id,..} if queued_id==&held) { return event; }
+        }
+        panic!("event stream closed");
+    }).await;
+    assert!(observed.is_err(),"held B must stay queued: {observed:?}");
+    provider.send_queued_turn_now(thread.clone(),held).await.unwrap();
+    provider.stop_session(thread).await.unwrap();
+}
+
+#[derive(Debug)]
+struct PromotionAuthority(std::sync::atomic::AtomicBool);
+#[async_trait::async_trait]
+impl codemux_lib::agent_provider::TurnDispatchCheckpoint for PromotionAuthority {
+    fn queued_delivery_state(&self) -> codemux_lib::agent_provider::types::QueuedDeliveryState {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) { codemux_lib::agent_provider::types::QueuedDeliveryState::Blocked }
+        else { codemux_lib::agent_provider::types::QueuedDeliveryState::Ready }
+    }
+    fn authorize_dispatch(&self) -> Result<(),ProviderError> {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) { Err(ProviderError::ValidationError {message:"grant_revoked".into()}) } else { Ok(()) }
+    }
+    async fn prepare(&self) {}
+    async fn commit(&self) {}
+    async fn abort(&self) {}
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_claude_blocked_promotion_cannot_interrupt_for_another_message() {
+    let provider=provider_with_fake().await;
+    let thread=ThreadId("refused-send-now".into());
+    provider.start_session(start_input(&thread.0)).await.unwrap();
+    let running=provider.send_turn(turn_input(&thread.0,"running C")).await.unwrap();
+    let authority=Arc::new(PromotionAuthority(std::sync::atomic::AtomicBool::new(true)));
+    let mut b=turn_input(&thread.0,"refused B");b.turn_checkpoint=Some(authority.clone());
+    let b=provider.send_turn(b).await.unwrap().queued_id.unwrap();
+    let d=provider.send_turn(turn_input(&thread.0,"queued D")).await.unwrap().queued_id.unwrap();
+    let mut events=provider.event_stream();
+    let denied=provider.send_queued_turn_now(thread.clone(),b.clone()).await;
+    assert!(matches!(&denied,Err(ProviderError::ValidationError {message}) if message.contains("held")),"{denied:?}");
+    assert!(provider.turn_active(&thread).await,"running C must not be interrupted for D");
+    assert!(timeout(Duration::from_millis(250),async { while let Some(e)=events.next().await {
+        if matches!(e,ProviderRuntimeEvent::TurnCompleted {ref turn_id,..} if turn_id==&running.turn_id) || matches!(e,ProviderRuntimeEvent::QueuedTurnDispatched {ref queued_id,..} if queued_id==&d) { return; }
+    }}).await.is_err());
+    authority.0.store(false,std::sync::atomic::Ordering::SeqCst);
+    provider.send_queued_turn_now(thread.clone(),b.clone()).await.unwrap();
+    let mut dispatched=vec![];
+    timeout(Duration::from_secs(3),async { while let Some(e)=events.next().await {
+        if let ProviderRuntimeEvent::QueuedTurnDispatched {queued_id,..}=e { dispatched.push(queued_id);break; }
+    }}).await.unwrap();
+    assert_eq!(dispatched,vec![b.clone()]);
+    provider.send_queued_turn_now(thread.clone(),b).await.unwrap();
+    assert!(timeout(Duration::from_millis(250),async { while let Some(e)=events.next().await {
+        if matches!(e,ProviderRuntimeEvent::QueuedTurnDispatched {..}) { return; }
+    }}).await.is_err(),"idempotent promotion must not send B twice or interrupt it for D");
+    provider.stop_session(thread).await.unwrap();
+}

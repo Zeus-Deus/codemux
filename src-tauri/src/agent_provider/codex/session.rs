@@ -1036,7 +1036,7 @@ impl CodexSession {
                 };
                 // Sent by hand while a Stop settles: it goes first and
                 // releases the held queue behind it once it starts.
-                let first = state.queue_hold.goes_first();
+                let first = queued.input.releases_queue_hold() && state.queue_hold.goes_first();
                 if first {
                     state.queued_turns.push_front(queued);
                     state.queue_hold.release_with(&queued_id);
@@ -1046,6 +1046,7 @@ impl CodexSession {
                 let order = first.then(|| crate::agent_provider::queue_edit::reordered(&state.queued_turns, &self.thread_id));
                 drop(state);
                 let _ = self.event_tx().send(ProviderRuntimeEvent::TurnQueued {
+                    provenance: Default::default(),
                     thread_id: self.thread_id.clone(),
                     queued_id: queued_id.clone(),
                     client_nonce,
@@ -1057,7 +1058,7 @@ impl CodexSession {
                 return Ok(SendOutcome::Queued(queued_id));
             }
             // A message sent by hand goes first; the held queue follows it.
-            (state.queue_hold.take(), InFlightSend::enter(&self.dispatching))
+            (input.releases_queue_hold() && state.queue_hold.take(), InFlightSend::enter(&self.dispatching))
         };
         let checkpoint = input.turn_checkpoint.clone();
         if let Some(checkpoint) = checkpoint.as_ref() {
@@ -1111,7 +1112,7 @@ impl CodexSession {
     ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
         let result = {
             let _outbound = self.outbound.lock().await;
-            let was_held = self.state.lock().await.queue_hold.take();
+            let was_held = input.releases_queue_hold() && self.state.lock().await.queue_hold.take();
             let result = self.deliver_steer(input).await;
             restore_hold_unless_started(&self.state, was_held, &result).await;
             result
@@ -1257,6 +1258,7 @@ impl CodexSession {
                 .find(|q| q.queued_id == queued_id)
                 .map(|q| q.input.clone());
             let Some(input) = input else { return Ok(()) };
+            input.authorize_queue_promotion()?;
             let text = input
                 .display_text
                 .clone()
@@ -1305,22 +1307,25 @@ impl CodexSession {
                 if !idle {
                     return;
                 }
-                let front = state.queued_turns.front().map(|q| q.queued_id.clone());
-                if !state.queue_hold.admits(front.as_deref()) {
-                    return;
-                }
-                state
-                    .queued_turns
-                    .pop_front()
+                let state = &mut *state;
+                let next = state.queued_turns.iter().position(|q| state.queue_hold.can_select(&q.queued_id, q.input.queued_delivery_state()));
+                next.and_then(|i| state.queued_turns.remove(i))
                     .map(|queued| (queued, InFlightSend::enter(&self.dispatching)))
             };
             let Some((queued, _dispatching)) = next else { return };
+            let retained_input = queued.input.clone();
             let text = queued
                 .input
                 .display_text
                 .clone()
                 .unwrap_or_else(|| queued.input.text.clone());
             let checkpoint = queued.input.turn_checkpoint.clone();
+            if retained_input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Disposed {
+
+                log::debug!("Disposed queued wake {}", queued.queued_id);
+                let _ = self.event_tx().send(ProviderRuntimeEvent::QueuedTurnCancelled { thread_id: self.thread_id.clone(), queued_id: queued.queued_id });
+                continue;
+            }
             if let Some(checkpoint) = checkpoint.as_ref() {
                 checkpoint.prepare().await;
             }
@@ -1361,6 +1366,24 @@ impl CodexSession {
                         checkpoint.abort().await;
                     }
                     self.state.lock().await.queue_hold.settle(&queued.queued_id, false);
+                    match retained_input.queued_delivery_state() {
+                        crate::agent_provider::types::QueuedDeliveryState::Held => {
+                            let mut state = self.state.lock().await;
+                            state.queued_turns.push_front(QueuedTurn { queued_id: queued.queued_id, input: retained_input });
+                            state.queue_hold.hold();
+                            return;
+                        }
+                        crate::agent_provider::types::QueuedDeliveryState::Blocked => {
+                            self.state.lock().await.queued_turns.push_front(QueuedTurn { queued_id: queued.queued_id, input: retained_input });
+                            continue;
+                        }
+                        crate::agent_provider::types::QueuedDeliveryState::Disposed => {
+                            log::debug!("Disposed queued wake {}", queued.queued_id);
+                            let _ = self.event_tx().send(ProviderRuntimeEvent::QueuedTurnCancelled { thread_id: self.thread_id.clone(), queued_id: queued.queued_id });
+                            continue;
+                        }
+                        crate::agent_provider::types::QueuedDeliveryState::Ready => {}
+                    }
                     let _ = self.event_tx().send(ProviderRuntimeEvent::RuntimeWarning {
                         thread_id: Some(self.thread_id.clone()),
                         message: format!(
@@ -1436,6 +1459,7 @@ impl CodexSession {
         let outbound = self.outbound.lock().await;
         let (has_active_turn, original_index, previous_release) = {
             let mut state = self.state.lock().await;
+            if let Some(q) = state.queued_turns.iter().find(|q|q.queued_id == queued_id) { q.input.authorize_queue_promotion()?; }
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
                 Some(idx) => {
                     let previous = state.queue_hold.release_with(queued_id);

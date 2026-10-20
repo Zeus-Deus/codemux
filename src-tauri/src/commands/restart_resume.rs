@@ -706,12 +706,13 @@ async fn drain_saved_queue<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId,
             );
             return;
         }
-        let sent = super::queued_turns::agent_chat_send_saved_queued_turn(
+        let sent = super::queued_turns::send_saved_queued_turn(
             app.clone(),
             provider,
             thread_id.clone(),
             queued_id.clone(),
             MessageDelivery::Queue,
+            false,
         )
         .await;
         if let Err(error) = sent {
@@ -719,10 +720,29 @@ async fn drain_saved_queue<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId,
                 "[codemux::restart_resume] saved turn {queued_id} on thread={} stays saved: {error}",
                 thread_id.0
             );
-            break;
+            // A refused caller owns only its own saved message. Keep that
+            // row visible and let unrelated saved work behind it proceed.
+            let db = app.state::<DatabaseStore>();
+            let blocked_item = db.get_queued_turn(&thread_id.0,&queued_id)
+                .and_then(|row|row.provenance.delivery_id)
+                .and_then(|id|db.message_delivery(&id).ok().flatten())
+                .is_some_and(|row|row.state == "held" && !row.attempted && row.hold_reason.as_deref() == Some("refused"));
+            if !blocked_item { break; }
         }
     }
     finish();
+}
+
+#[cfg(test)]
+pub(crate) async fn test_drain_saved_queue<R: Runtime>(app: &AppHandle<R>, thread: &ThreadId) {
+    let token = {
+        let mut state = live();
+        state.next_drain += 1;
+        let token = state.next_drain;
+        state.draining.insert(thread.0.clone(),token);
+        token
+    };
+    drain_saved_queue(app,thread,token).await;
 }
 
 /// Resume the chats the last run left running. Called once from app setup,

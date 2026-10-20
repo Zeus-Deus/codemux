@@ -425,7 +425,10 @@ async fn usage_resume_manual_dispatch_rejects_overlap_and_preserves_a_new_limit(
     let handle = app.handle().clone();
     let db: State<'_, DatabaseStore> = handle.state();
     let thread = "usage-resume-overlap";
-    db.upsert_agent_chat_session(thread, "ws", None, "claude")
+    let state = handle.state::<AppStateStore>();
+    let workspace = state.snapshot().active_workspace_id.0;
+    bind_chat_pane(&state, &workspace, thread);
+    db.upsert_agent_chat_session(thread, &workspace, None, "claude")
         .unwrap();
     db.upsert_agent_chat_usage_resume(thread, "claude", Some(1_000))
         .unwrap();
@@ -561,7 +564,10 @@ async fn usage_resume_manual_dispatch_failure_keeps_a_newer_limit() {
     let handle = app.handle().clone();
     let db: State<'_, DatabaseStore> = handle.state();
     let thread = "usage-resume-failure-new-limit";
-    db.upsert_agent_chat_session(thread, "ws", None, "claude")
+    let state = handle.state::<AppStateStore>();
+    let workspace = state.snapshot().active_workspace_id.0;
+    bind_chat_pane(&state, &workspace, thread);
+    db.upsert_agent_chat_session(thread, &workspace, None, "claude")
         .unwrap();
     let channels: State<'_, AgentChatChannelRegistry> = handle.state();
     let (channel, captured) = capture_channel();

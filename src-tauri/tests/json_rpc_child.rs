@@ -206,7 +206,7 @@ os._exit(0)
     drop(parent);
     assert!(matches!(shutdowns, Ok((Ok(()), Ok(()), Ok(())))), "asymmetric fd={retained_fd} strict={strict}: watchdog must complete without double-poll panic: {shutdowns:?}");
     assert!(reaped, "owned parent must actually be reaped");
-    assert!(matches!(settled, Ok(Err(RpcChildError::RpcError(_)))), "unanswered pending request must fail at the owned drain boundary: {settled:?}");
+    assert!(matches!(settled, Ok(Err(RpcChildError::ChildExited { .. }))), "unanswered pending request must fail at the owned drain boundary: {settled:?}");
     assert!(matches!(closed, Ok(None)), "callback channel must be closed: {closed:?}");
     assert!(done.is_ok());
     assert!(late.is_err(), "no descendant bytes may route after the drain boundary: {late:?}");
@@ -441,20 +441,6 @@ async fn child_exit_fails_pending() {
 
     let outcome = slow.await.expect("join");
     match outcome {
-        Err(RpcChildError::RpcError(err)) => {
-            // The watchdog synthesises an RpcError wrapping the exit info
-            // when it cancels pending requests.
-            assert!(
-                err.message.contains("exited"),
-                "message should mention exit: {}",
-                err.message
-            );
-            assert!(
-                err.message.contains("farewell-diagnostic"),
-                "message should include stderr tail: {}",
-                err.message
-            );
-        }
         Err(RpcChildError::ChildExited { code, stderr_tail }) => {
             assert_eq!(code, Some(7));
             assert!(stderr_tail.contains("farewell-diagnostic"));

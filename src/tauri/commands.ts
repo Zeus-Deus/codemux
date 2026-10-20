@@ -1,3 +1,4 @@
+import type { MessageProvenance } from "./events";
 import { containsPane, projectRemotePanes, rememberRemotePane } from "@/remote/pane-selection";
 import type { MessageDelivery } from "@/lib/agent-chat/message-delivery";
 import { invoke, Channel } from "@tauri-apps/api/core";
@@ -1700,6 +1701,7 @@ export interface AgentChatStartSessionInput {
 }
 
 export interface AgentChatSendTurnInput {
+  input_source?: "desktop" | "web" | "phone";
   delivery?: MessageDelivery;
   thread_id: string;
   text: string;
@@ -1829,7 +1831,10 @@ export const agentChatStartSession = async (
 export const agentChatSendTurn = (
   provider: AgentChatProviderKind,
   input: AgentChatSendTurnInput,
-) => invoke<TurnStartResult>("agent_chat_send_turn", { provider, input });
+) => invoke<TurnStartResult>("agent_chat_send_turn", {
+  provider,
+  input: { ...input, input_source: isRemoteClient() && window.matchMedia("(max-width: 767px)").matches ? "phone" : undefined },
+});
 
 /** Stage a pasted/attached image's raw bytes to a backend staging file,
  *  moving the (potentially multi-MB) upload off the send path. The bytes
@@ -4034,7 +4039,7 @@ export const webRemotePushDevices = () =>
 // for the user. See src-tauri/src/commands/queued_turns.rs.
 
 /** One queued turn, in dispatch order. */
-export interface QueuedTurnView {
+export interface QueuedTurnView extends MessageProvenance {
   queued_id: string;
   text: string;
   /** Queued before this app run; no provider holds it. */
@@ -4100,3 +4105,18 @@ export const agentChatSwitchProvider = (
   provider: AgentChatProviderKind,
   input: AgentChatStartSessionInput,
 ) => agentChatStartSession(paneId, provider, input, input.thread_id, from);
+
+export interface MessageDeliveryAttention {
+  id: string;
+  message_id: string;
+  state: string;
+  reason: string | null;
+  display_text: string | null;
+  can_retry: boolean;
+}
+export const agentChatDeliveryAttention = (threadId: string) =>
+  invoke<MessageDeliveryAttention[]>("agent_chat_delivery_attention", {threadId});
+export const agentChatAcknowledgeDelivery = (threadId: string, deliveryId: string) =>
+  invoke<void>("agent_chat_acknowledge_delivery", {threadId, deliveryId});
+export const agentChatRetryDelivery = (threadId: string, deliveryId: string) =>
+  invoke<void>("agent_chat_retry_delivery", {threadId, deliveryId});

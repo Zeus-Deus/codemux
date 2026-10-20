@@ -1,3 +1,4 @@
+import { isDelegationResultsMessage } from "@/lib/agent-chat/message-provenance";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { useContributions } from "@/contrib/react/use-contributions";
 import { TOOL_RENDERER_AREA } from "@/sdk/areas";
@@ -37,7 +38,6 @@ import {
   type ChatViewItem,
   type PermissionRequestItem,
 } from "@/lib/agent-chat/types";
-import { isDelegationResultsText } from "@/lib/agent-chat/delegation";
 import { isRestartResumeText } from "@/lib/agent-chat/restart-resume";
 import {
   isAutoResumeText,
@@ -1943,9 +1943,9 @@ function ItemRow({
   if (
     item.kind === "user_message" &&
     !item.queued &&
-    isDelegationResultsText(item.text)
+    isDelegationResultsMessage(item)
   ) {
-    return <DelegationResultsDivider text={item.text} />;
+    return <DelegationResultsDivider text={item.text} notification={item.notification} />;
   }
 
   if (item.kind === "provider_switch") {

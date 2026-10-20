@@ -1,3 +1,4 @@
+import { messageProvenance } from "./message-provenance";
 import type { ProviderRuntimeEvent } from "@/tauri/events";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
@@ -239,7 +240,9 @@ export function stampSearchSourceId<T extends ChatThreadState>(
       const item = next.messages[i];
       if (
         item.kind === "user_message" &&
-        (event.client_nonce
+        (event.message_id
+          ? item.message_id === event.message_id
+          : event.client_nonce
           ? item.clientNonce === event.client_nonce
           : item.text === event.text &&
             (i >= previous.messages.length || previous.messages[i] !== item))
@@ -598,6 +601,8 @@ function parsePayload(raw: string): ReplayPayload | null {
     const nonce = (value as { client_nonce?: unknown }).client_nonce;
     const steeredTurnId = (value as { steered_turn_id?: unknown }).steered_turn_id;
     return {
+      ...messageProvenance(value as UserMessageEnvelope),
+      input_intent: !(value as UserMessageEnvelope).input_intent && typeof steeredTurnId === "string" && steeredTurnId ? "steer" : messageProvenance(value as UserMessageEnvelope).input_intent,
       type: "user_message",
       thread_id: (value as { thread_id?: string }).thread_id ?? "",
       text,

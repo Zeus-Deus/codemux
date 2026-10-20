@@ -1,4 +1,5 @@
 import type {
+  MessageProvenance,
   QuestionResolution,
   RetainedReplyImage,
   UserQuestionSet,
@@ -68,7 +69,7 @@ export interface UserMessageImage {
  * an existing item (appending delta text, attaching tool result,
  * resolving a permission request) MUST preserve the original `seq`.
  */
-export interface UserMessageItem {
+export interface UserMessageItem extends MessageProvenance {
   /** Input accepted inside an existing provider turn is not a new boundary. */
   inflight?: boolean;
   in_reply_to?: string;

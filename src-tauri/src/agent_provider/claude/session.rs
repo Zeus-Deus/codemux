@@ -1125,7 +1125,7 @@ impl ClaudeSession {
                 };
                 // Sent by hand while a Stop settles: it goes first and
                 // releases the held queue behind it once it starts.
-                let first = state.queue_hold.goes_first();
+                let first = queued.input.releases_queue_hold() && state.queue_hold.goes_first();
                 if first {
                     state.queued_turns.push_front(queued);
                     state.queue_hold.release_with(&queued_id);
@@ -1133,6 +1133,7 @@ impl ClaudeSession {
                     state.queued_turns.push_back(queued);
                 }
                 let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
+                    provenance: Default::default(),
                     thread_id: self.thread_id.clone(),
                     queued_id: queued_id.clone(),
                     client_nonce,
@@ -1148,7 +1149,7 @@ impl ClaudeSession {
             // A message sent by hand goes first; the held queue follows it.
             // Reserve dispatch so a drain cannot start a queued turn before
             // this one becomes active.
-            let was_held = state.queue_hold.take();
+            let was_held = input.releases_queue_hold() && state.queue_hold.take();
             if was_held {
                 state.dispatching = true;
             }
@@ -1217,11 +1218,9 @@ impl ClaudeSession {
                 if !idle {
                     return;
                 }
-                let front = state.queued_turns.front().map(|q| q.queued_id.clone());
-                if !state.queue_hold.admits(front.as_deref()) {
-                    return;
-                }
-                match state.queued_turns.pop_front() {
+                let state = &mut *state;
+                let next = state.queued_turns.iter().position(|q| state.queue_hold.can_select(&q.queued_id, q.input.queued_delivery_state()));
+                match next.and_then(|i| state.queued_turns.remove(i)) {
                     Some(queued) => {
                         state.dispatching = true;
                         Some(queued)
@@ -1230,12 +1229,19 @@ impl ClaudeSession {
                 }
             };
             let Some(queued) = next else { return };
+            let retained_input = queued.input.clone();
             let text = queued
                 .input
                 .display_text
                 .clone()
                 .unwrap_or_else(|| queued.input.text.clone());
             let checkpoint = queued.input.turn_checkpoint.clone();
+            if retained_input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Disposed {
+                self.state.lock().await.dispatching = false;
+                log::debug!("Disposed queued wake {}", queued.queued_id);
+                let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled { thread_id: self.thread_id.clone(), queued_id: queued.queued_id });
+                continue;
+            }
             if let Some(checkpoint) = checkpoint.as_ref() {
                 checkpoint.prepare().await;
             }
@@ -1277,6 +1283,24 @@ impl ClaudeSession {
                         let mut state = self.state.lock().await;
                         state.dispatching = false;
                         state.queue_hold.settle(&queued.queued_id, false);
+                    }
+                    match retained_input.queued_delivery_state() {
+                        crate::agent_provider::types::QueuedDeliveryState::Held => {
+                            let mut state = self.state.lock().await;
+                            state.queued_turns.push_front(QueuedTurn { queued_id: queued.queued_id, input: retained_input });
+                            state.queue_hold.hold();
+                            return;
+                        }
+                        crate::agent_provider::types::QueuedDeliveryState::Blocked => {
+                            self.state.lock().await.queued_turns.push_front(QueuedTurn { queued_id: queued.queued_id, input: retained_input });
+                            continue;
+                        }
+                        crate::agent_provider::types::QueuedDeliveryState::Disposed => {
+                            log::debug!("Disposed queued wake {}", queued.queued_id);
+                            let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled { thread_id: self.thread_id.clone(), queued_id: queued.queued_id });
+                            continue;
+                        }
+                        crate::agent_provider::types::QueuedDeliveryState::Ready => {}
                     }
                     // Don't wedge the queue: surface the failure, cancel
                     // this item, and try the next one.
@@ -1366,6 +1390,7 @@ impl ClaudeSession {
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
         let (has_active_turn, original_index, previous_release) = {
             let mut state = self.state.lock().await;
+            if let Some(q) = state.queued_turns.iter().find(|q|q.queued_id == queued_id) { q.input.authorize_queue_promotion()?; }
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
                 // `turn_busy`, not `active_turn`: an SDK-initiated turn
                 // parked on a question has no `active_turn`, and draining

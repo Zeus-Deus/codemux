@@ -150,9 +150,19 @@ impl<R: Runtime> crate::agent_provider::types::TurnDispatchCheckpoint for Guarde
         if let Some(inner) = &self.inner { inner.authorize_dispatch()?; }
         Ok(())
     }
+    fn authorize_rearmed_dispatch(&self, released_stops: u64) -> Result<(), crate::agent_provider::ProviderError> {
+        let mut control = self.control.clone();
+        if let Some((_, generation)) = &mut control.admission {
+            *generation = generation.checked_add(released_stops).ok_or_else(||crate::agent_provider::ProviderError::ValidationError {message:"Delivery Stop generation overflow".into()})?;
+        }
+        control.verify(&self.app).map_err(|message|crate::agent_provider::ProviderError::ValidationError {message})?;
+        if let Some(inner) = &self.inner { inner.authorize_rearmed_dispatch(released_stops)?; }
+        Ok(())
+    }
     async fn prepare(&self) { if let Some(inner) = &self.inner { inner.prepare().await; } }
     async fn commit(&self) { if let Some(inner) = &self.inner { inner.commit().await; } }
     async fn abort(&self) { if let Some(inner) = &self.inner { inner.abort().await; } }
+    async fn accepted(&self, turn: &crate::agent_provider::TurnId) { if let Some(inner) = &self.inner { inner.accepted(turn).await; } }
 }
 
 fn binding_cwd<'a>(

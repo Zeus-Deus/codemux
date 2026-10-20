@@ -132,6 +132,7 @@ async fn contract_manual_deliver_shutdown_owns_native_effect_and_caller_drop() {
 async fn final_dispatch_unsupported_parent_fails_before_provider_or_app_side_effects() {
     let app = tauri::test::mock_app();
     let input = crate::commands::agent_chat::SendTurnCommandInput {
+        input_source: None,
         thread_id: ThreadId("unsupported-parent".into()),
         text: "must not dispatch".into(),
         display_text: None,
@@ -312,6 +313,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
         app.manage(journal.clone());
         app.manage(crate::commands::agent_chat::ProviderRegistry::new());
         app.manage(crate::commands::agent_chat::SubagentTracker::default());
+        app.manage(crate::commands::agent_chat::RunActivityTracker::default());
         app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
         app.manage(crate::observability::ObservabilityStore::default());
         let provider: Arc<dyn AgentProvider> = if kind == ProviderKind::Codex {
@@ -455,6 +457,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
                 let t = thread.clone();
                 user_sending = Some(tokio::spawn(async move {
                     let input = crate::commands::agent_chat::SendTurnCommandInput {
+                        input_source: None,
                         thread_id: ThreadId(t),
                         text: "normal user wins".into(),
                         display_text: None,
@@ -499,6 +502,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
             _ => unreachable!(),
         }
         let mut settled_without_io_wake = true;
+        let mut dispatch_result = None;
         if action.starts_with("pending") {
             if action=="pending-rebind" {write_gate.as_ref().unwrap().release();}
             settled_without_io_wake = tokio::time::timeout(Duration::from_secs(2), &mut sending)
@@ -517,7 +521,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
             } else {
                 checkpoint.release.notify_one();
             }
-            if action == "owner-drop" { let _ = sending.await; } else { sending.await.unwrap().unwrap(); }
+            if action == "owner-drop" { let _ = sending.await; } else { dispatch_result = Some(sending.await.unwrap()); }
         }
         if let Some(closing) = owner_closing { if owner_waited { closing.await.unwrap().unwrap(); } }
         crate::json_rpc_child::TEST_WRITE_GATES
@@ -558,6 +562,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
             None
         };
         if action.starts_with("presentation") {
+            dispatch_result.unwrap().unwrap();
             let db = app.state::<crate::database::DatabaseStore>();
             let delivered = persisted_user_message(&db, &thread, &format!("delegation:{}", task.id));
             let delivered_state = journal.task(&task.id).unwrap().wake_state;
@@ -570,6 +575,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
             let user_sent = crate::commands::agent_chat::send_turn_with_origin(
                 app.handle().clone(), kind,
                 crate::commands::agent_chat::SendTurnCommandInput {
+                    input_source: None,
                     thread_id: ThreadId(thread.clone()), text: user_prose.into(), display_text: None,
                     skill_ids: vec![], skill_text: None, include_plugins: false, images: vec![],
                     model_override: None, effort_override: None, permission_mode_override: None,
@@ -650,6 +656,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
         assert!(settled_without_io_wake,"Stop/user activity did not wake a Pending first-byte dispatch; adapter stayed wedged without IO readiness");
         if action.starts_with("target-") {
             let positive = matches!(action, "target-cosmetic" | "target-unchanged");
+            assert_eq!(dispatch_result.unwrap().is_ok(), positive, "{kind:?}/{action}: caller must observe target refusal");
             let outcome: String = journal.conn.lock().unwrap().query_row(
                 "SELECT state FROM delivery_outcomes WHERE task=?1", [&task.id], |r| r.get(0),
             ).unwrap();
@@ -659,6 +666,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
             return;
         }
         if action.starts_with("owner") {
+            if let Some(result) = dispatch_result { result.unwrap(); }
             assert!(owner_waited, "desktop/maintenance native effect escaped shutdown ownership");
             assert!(owner_postclose_rejected, "desktop Deliver admitted work after shutdown");
             assert_eq!(coordinator.owner_counts(), (0, 0, false));
@@ -667,6 +675,9 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
             return;
         }
         if let Some(explicit) = explicit {
+            if let Some(result) = dispatch_result {
+                assert_eq!(result.is_err(), matches!(action,"unknown"|"empty"), "{kind:?}/{action}: caller must observe missing native acceptance");
+            }
             assert!(
                 explicit.is_err(),
                 "hidden {action} allowed explicit resend: {explicit:?}"
@@ -711,6 +722,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
                 assert!(ready && !active && !authority_live, "empty native acknowledgement created phantom turn/authority");
             }
         } else {
+            if let Some(result) = dispatch_result { assert!(result.is_err(), "{kind:?}/{action}: dispatch refusal was hidden"); }
             assert_eq!(
                 count,
                 usize::from(action == "user"),

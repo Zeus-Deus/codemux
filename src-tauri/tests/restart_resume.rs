@@ -22,7 +22,7 @@ use codemux_lib::agent_provider::{
 };
 use codemux_lib::agent_provider::types::MessageDelivery;
 use codemux_lib::commands::agent_chat::{
-    agent_chat_interrupt_turn, agent_chat_send_turn, forward_event, AgentChatChannelRegistry,
+    agent_chat_interrupt_turn, send_turn_with_origin, TurnOrigin, forward_event, AgentChatChannelRegistry,
     GrokUsageLedgerBridge, ProviderRegistry, RunActivityTracker, SendTurnCommandInput,
     SubagentTracker,
 };
@@ -154,6 +154,7 @@ impl Harness {
                 position: 0,
                 text: text.into(),
                 prompt: None,
+                provenance: Default::default(),
                 skill_ids: Vec::new(),
                 skill_text: None,
                 include_plugins: true,
@@ -561,6 +562,7 @@ async fn a_claude_chat_resumes_only_while_its_conversation_file_exists() {
 
 fn typed(thread: &str, text: &str) -> SendTurnCommandInput {
     SendTurnCommandInput {
+        input_source: None,
         delivery: MessageDelivery::Queue,
         thread_id: ThreadId(thread.into()),
         text: text.into(),
@@ -601,14 +603,23 @@ async fn a_stop_during_the_drain_keeps_the_rest_saved() {
     stop.await.unwrap().unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let sent = h.sent("rr-drain-stop");
-    assert_eq!(&sent[1..], ["first saved"], "{sent:?}");
+    assert!(sent[1..].is_empty(), "Stop before submission must hold the selected saved input: {sent:?}");
     let left: Vec<_> = h
         .db()
         .list_queued_turns("rr-drain-stop")
         .into_iter()
         .map(|row| row.queued_id)
         .collect();
-    assert_eq!(left, ["q-2"]);
+    assert_eq!(left, ["q-1", "q-2"]);
+    let held = h.db().message_delivery_for_message("rr-drain-stop", "nonce-q-1").unwrap().unwrap();
+    assert_eq!(held.state, "held");
+    assert_eq!(held.hold_reason.as_deref(), Some("stop"));
+    assert!(!held.attempted);
+    codemux_lib::commands::queued_turns::agent_chat_send_saved_queued_turn(
+        h.handle(), ProviderKind::Codex, ThreadId("rr-drain-stop".into()), "q-1".into(), MessageDelivery::Queue,
+    ).await.unwrap();
+    assert_eq!(&h.sent("rr-drain-stop")[1..], ["first saved"]);
+    assert_eq!(h.db().list_queued_turns("rr-drain-stop").iter().map(|row| row.queued_id.as_str()).collect::<Vec<_>>(), ["q-2"]);
 }
 
 #[tokio::test]
@@ -675,7 +686,7 @@ async fn a_chat_the_user_takes_over_during_the_launch_pass_is_left_alone() {
         async move { resume_after_restart_for_test(&handle, "launch-2").await }
     });
     tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
-    agent_chat_send_turn(h.handle(), ProviderKind::Codex, typed("rr-take-b", "do this instead"))
+    send_turn_with_origin(h.handle(), ProviderKind::Codex, typed("rr-take-b", "do this instead"), TurnOrigin::User)
         .await
         .unwrap();
     // B's own turn finished before the pass reached it.
@@ -947,7 +958,7 @@ async fn a_message_steered_into_a_resumed_turn_resets_the_cap() {
     // The user writes into the running turn; no new turn starts.
     let mut steer = typed("rr-steer-cap", "also check the docs");
     steer.delivery = MessageDelivery::Steer;
-    let _ = agent_chat_send_turn(h.handle(), ProviderKind::Codex, steer).await;
+    let _ = send_turn_with_origin(h.handle(), ProviderKind::Codex, steer, TurnOrigin::User).await;
     assert_eq!(h.db().get_restart_turn("rr-steer-cap").unwrap().chain, 0);
     let decisions = resume_after_restart_for_test(&h.handle(), "launch-4").await;
     assert_eq!(decision(&decisions, "rr-steer-cap"), Some(ResumeDecision::Resume));

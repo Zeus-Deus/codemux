@@ -57,7 +57,7 @@ use crate::state::AppStateStore;
 
 use super::agent_chat::{
     agent_chat_interrupt_turn, agent_chat_start_session, fallback_permission_mode, forward_event,
-    resolve_start_permission_mode, send_turn_with_origin, thread_id_for_event, ProviderRegistry,
+    resolve_start_permission_mode, send_turn_with_context, thread_id_for_event, ProviderRegistry,
     TurnOrigin,
 };
 use super::usage_resume::{self, now_ms, queued_turn};
@@ -65,8 +65,7 @@ use super::usage_resume::{self, now_ms, queued_turn};
 /// Settings key for the off switch. Absent or anything but `"false"` means
 /// enabled — the tool only acts when the user asks for another agent.
 pub const DELEGATION_SETTING_KEY: &str = "agents.cross_provider_delegation";
-/// First line of every results message. The frontend renders turns that
-/// start with it as a divider, so changing it breaks that.
+/// Agent-facing header. Presentation uses structured notification metadata.
 pub const DELEGATION_RESULTS_PREFIX: &str = "[Codemux: delegated task results]";
 /// Marks a parent's card row as a delegated task (`delegate:<child thread>`).
 pub const DELEGATED_ROW_PREFIX: &str = "delegate:";
@@ -1302,8 +1301,15 @@ pub(crate) async fn run_starter<R: Runtime>(
             } else {
                 WORKTREE_CHILD_FOOTER
             };
-            let turn = queued_turn(ThreadId(child.clone()), format!("{}{footer}", task.brief));
-            send_turn_with_origin(app.clone(), provider, turn, TurnOrigin::Delegation)
+            let mut turn = queued_turn(ThreadId(child.clone()), format!("{}{footer}", task.brief));
+            turn.display_text = Some(task.brief.clone());
+            turn.client_nonce = Some(format!("delegated-task:{child}"));
+            let mut context = crate::agent_control::delivery::SendContext::new(TurnOrigin::Delegation);
+            context.provenance.created_by = crate::agent_provider::message::CreatedBy::Agent;
+            context.provenance.creation_source = crate::agent_provider::message::CreationSource::Provider;
+            context.provenance.sender_thread_id = Some(task.parent.clone());
+            context.provenance.sender_title = app.state::<DatabaseStore>().get_agent_chat_title(&task.parent);
+            send_turn_with_context(app.clone(), provider, turn, context)
                 .await
                 .err()
                 .map(|error| {
@@ -1713,16 +1719,73 @@ pub async fn deliver<R: Runtime>(app: &AppHandle<R>, parent: &str) {
     let Some((posted, text)) = state.take_report(parent) else {
         return;
     };
-    let turn = queued_turn(thread.clone(), text);
-    let sent = send_turn_with_origin(app.clone(), provider, turn, TurnOrigin::Delegation).await;
-    let exhausted = state.record_send(parent, &posted, sent.is_ok());
+    let (display, failed, tasks) = {
+        let inner = state.lock();
+        let mut reports = Vec::new();
+        let mut tasks = Vec::new();
+        let mut failed = false;
+        for id in &posted {
+            if let Some(task) = inner.tasks.get(id) {
+                let body = match &task.phase {
+                    Phase::Completed(report) => report.clone(),
+                    Phase::Failed(report) => {
+                        failed = true;
+                        report.clone()
+                    }
+                    Phase::Stopped(reason) => reason.note().into(),
+                    _ => continue,
+                };
+                tasks.push(crate::agent_provider::message::NotificationTask { provider:provider_id(task.provider).into(),title:task.title.clone() });
+                reports.push(format!("{}\n{}", task.title, body));
+            }
+        }
+        (reports.join("\n\n"), failed, tasks)
+    };
+    let mut ids = posted.clone();
+    ids.sort();
+    use sha2::{Digest, Sha256};
+    let message_id = format!(
+        "delegated-results:{:x}",
+        Sha256::digest(ids.join("\n").as_bytes())
+    );
+    let mut turn = queued_turn(thread.clone(), text);
+    turn.client_nonce = Some(message_id.clone());
+    turn.display_text = Some(display.clone());
+    let mut context = crate::agent_control::delivery::SendContext::new(TurnOrigin::Delegation);
+    context.provenance.notification = Some(crate::agent_provider::message::MessageNotification {
+        source: crate::agent_provider::message::NotificationSource {
+            kind: crate::agent_provider::message::NotificationKind::DelegatedTask,
+            task_ids: ids,
+            child_thread_id: if posted.len() == 1 {
+                posted.first().cloned()
+            } else {
+                None
+            },
+        },
+        outcome: if failed {
+            crate::agent_provider::message::NotificationOutcome::Failed
+        } else {
+            crate::agent_provider::message::NotificationOutcome::Completed
+        },
+        summary: display.lines().next().unwrap_or("Delegated results").into(),
+        tasks,
+    });
+    let sent = send_turn_with_context(app.clone(), provider, turn, context).await;
+    // Once admitted, the persisted delivery owns retries and uncertainty. The
+    // old report sweep must never re-coalesce these results into another send.
+    let admitted = db
+        .message_delivery_for_message(parent, &message_id)
+        .ok()
+        .flatten()
+        .is_some();
+    let exhausted = state.record_send(parent, &posted, sent.is_ok() || admitted);
     if let (Err(error), true) = (sent, exhausted) {
         forward_event(
             app,
             ProviderRuntimeEvent::RuntimeWarning {
                 thread_id: Some(thread),
                 message: format!(
-                    "Codemux could not post the delegated task results here ({}). It will try again after your next message.",
+                    "Codemux could not post the delegated task results here ({}). Inspect message delivery attention before retrying.",
                     readable_error(&error)
                 ),
                 original_payload: None,
@@ -2329,4 +2392,11 @@ mod tests {
         assert!(!state.has_report("parent"));
         assert_eq!(state.lock().tasks.len(), 2);
     }
+    #[test]
+    fn orchestration_message_child_footer_retains_existing_policy() {
+        for footer in [CHILD_FOOTER,WORKTREE_CHILD_FOOTER] {
+            assert!(footer.contains("Work on your own: do not ask questions or wait for input"));
+        }
+    }
+
 }

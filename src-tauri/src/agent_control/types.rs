@@ -8,8 +8,10 @@ pub enum ControlAccess {
     FullAccess,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlCaller {
+    #[serde(default)]
+    pub created_by: crate::agent_provider::message::CreatedBy,
     pub principal: String,
     pub access: ControlAccess,
     pub grant_id: Option<String>,
@@ -18,13 +20,13 @@ pub struct ControlCaller {
 impl ControlCaller {
     /// Local socket access already confers application control authority.
     pub fn trusted() -> Self {
-        Self { principal: "local".into(), access: ControlAccess::FullAccess, grant_id: None }
+        Self { created_by: crate::agent_provider::message::CreatedBy::User, principal: "local".into(), access: ControlAccess::FullAccess, grant_id: None }
     }
 
     /// Receipt ownership is the authenticated registration, while every action
     /// remains bound to the particular (replaceable/revocable) grant.
     pub fn outside(client_id: String, grant_id: String, access: ControlAccess) -> Self {
-        Self { principal: format!("mcp-client:{client_id}"), access, grant_id: Some(grant_id) }
+        Self { created_by: crate::agent_provider::message::CreatedBy::User, principal: format!("mcp-client:{client_id}"), access, grant_id: Some(grant_id) }
     }
 }
 

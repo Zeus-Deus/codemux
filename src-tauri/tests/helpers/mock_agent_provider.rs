@@ -78,6 +78,7 @@ pub struct MockAgentProvider {
     /// runs turns itself, so tests set this to stand in for one.
     active_turns: Mutex<HashSet<ThreadId>>,
     send_error: Mutex<Option<ProviderError>>,
+    send_error_after_accept: Mutex<Option<ProviderError>>,
     /// Every `StartSessionInput` received, in order, so tests can assert
     /// on what the command layer actually handed the provider (workspace
     /// id, env overlay, resume cursor) rather than only that it was called.
@@ -100,6 +101,7 @@ impl MockAgentProvider {
             start_gate: Mutex::new(None),
             active_turns: Mutex::new(HashSet::new()),
             send_error: Mutex::new(None),
+            send_error_after_accept: Mutex::new(None),
             start_inputs: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -160,6 +162,10 @@ impl MockAgentProvider {
     #[allow(dead_code)]
     pub fn fail_next_send(&self, error: ProviderError) {
         *self.send_error.lock().unwrap() = Some(error);
+    }
+
+    pub fn fail_next_send_after_accept(&self,error:ProviderError) {
+        *self.send_error_after_accept.lock().unwrap()=Some(error);
     }
 
     /// Convenience: emit a runtime event via the broadcaster, the
@@ -244,11 +250,30 @@ impl AgentProvider for MockAgentProvider {
         let checkpoint = input.turn_checkpoint.clone();
         if let Some(checkpoint) = checkpoint.as_ref() {
             checkpoint.prepare().await;
+            if let Err(error) = checkpoint.authorize_dispatch() {
+                checkpoint.abort().await;
+                return Err(error);
+            }
+        }
+        if let Some(guard) = &input.dispatch_guard {
+            let mut wire = Vec::new();
+            let poll=guard.poll_first(&mut || std::task::Poll::Ready(std::io::Write::write(&mut wire,b"prompt")))
+                .map_err(|message|ProviderError::ValidationError {message})?;
+            assert!(matches!(poll,std::task::Poll::Ready(Ok(_))));
+            guard.accepted().map_err(|message|ProviderError::ValidationError {message})?;
         }
         self.calls
             .push(MockCall::SendTurn(input.thread_id.clone(), input.text));
+        let after_accept = self.send_error_after_accept.lock().unwrap().take();
+        if let Some(error) = after_accept {
+            if let Some(checkpoint) = checkpoint.as_ref() { checkpoint.abort().await; }
+            return Err(error);
+        }
         if let Some(checkpoint) = checkpoint.as_ref() {
             checkpoint.commit().await;
+            if matches!(self.kind,ProviderKind::Cursor|ProviderKind::Grok|ProviderKind::Hermes|ProviderKind::Acp) {
+                checkpoint.accepted(&TurnId("mock-turn".into())).await;
+            }
         }
         Ok(TurnStartResult {
             steered: false,

@@ -71,6 +71,7 @@ pub struct QueuedTurnImage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedTurnRecord {
+    pub provenance: crate::agent_provider::message::MessageProvenance,
     pub thread_id: String,
     pub queued_id: String,
     pub position: i64,
@@ -92,11 +93,12 @@ pub struct QueuedTurnRecord {
 
 const COLUMNS: &str = "thread_id, queued_id, position, text, prompt, images, client_nonce,
      model_override, effort_override, permission_mode_override, epoch, skill_ids, skill_text,
-     include_plugins";
+     include_plugins, provenance";
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedTurnRecord> {
     let images: String = row.get(5)?;
     Ok(QueuedTurnRecord {
+        provenance: serde_json::from_str(&row.get::<_,String>(14)?).unwrap_or_default(),
         thread_id: row.get(0)?,
         queued_id: row.get(1)?,
         position: row.get(2)?,
@@ -120,7 +122,7 @@ fn insert(conn: &Connection, row: &QueuedTurnRecord) -> Result<bool, String> {
     conn.execute(
         &format!(
             "INSERT OR IGNORE INTO agent_chat_queued_turns ({COLUMNS})
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
              WHERE EXISTS (SELECT 1 FROM agent_chat_sessions WHERE thread_id = ?1)"
         ),
         params![
@@ -138,6 +140,7 @@ fn insert(conn: &Connection, row: &QueuedTurnRecord) -> Result<bool, String> {
             skill_ids,
             row.skill_text,
             row.include_plugins,
+            serde_json::to_string(&row.provenance).map_err(|e|e.to_string())?,
         ],
     )
     .map(|changed| changed > 0)
@@ -278,14 +281,15 @@ impl DatabaseStore {
         Ok(row)
     }
 
-    /// Whether a user turn with this nonce reached the transcript, which
-    /// means a saved turn carrying it was already sent.
+    /// Whether acceptance evidence confirms this logical message was sent.
+    /// Legacy envelopes predate the ledger and retain their historical meaning.
     pub fn queued_turn_was_sent(&self, thread_id: &str, client_nonce: &str) -> bool {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT 1 FROM agent_chat_messages
-             WHERE thread_id = ?1 AND json_extract(payload, '$.type') = 'user_message'
-               AND json_extract(payload, '$.client_nonce') = ?2
+            "SELECT 1 FROM agent_chat_messages m
+             WHERE thread_id = ?1 AND json_extract(m.payload, '$.type') = 'user_message'
+               AND json_extract(m.payload, '$.client_nonce') = ?2
+               AND (json_extract(m.payload,'$.delivery_id') IS NULL OR EXISTS (SELECT 1 FROM agent_message_deliveries d WHERE d.id=json_extract(m.payload,'$.delivery_id') AND d.state='accepted'))
              LIMIT 1",
             params![thread_id, client_nonce],
             |_| Ok(()),
@@ -304,14 +308,22 @@ impl DatabaseStore {
         text: &str,
         prompt: Option<&str>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx=conn.transaction().map_err(|e|e.to_string())?;
+        let changed=tx.execute(
             "UPDATE agent_chat_queued_turns SET text = ?3, prompt = ?4
              WHERE thread_id = ?1 AND queued_id = ?2",
             params![thread_id, queued_id, text, prompt],
-        )
-        .map(|changed| changed > 0)
-        .map_err(|e| format!("Failed to edit queued turn: {e}"))
+        ).map_err(|e|format!("Failed to edit queued turn: {e}"))?;
+        if changed>0 {
+            // Keep immutable admission evidence and the current editable queue
+            // input separately. A definite-no-send retry must use the edit.
+            tx.execute("UPDATE agent_message_deliveries SET dispatch_payload=json_set(COALESCE(dispatch_payload,payload),'$.input.text',COALESCE(?4,?3),'$.input.display_text',?3)
+                WHERE id=(SELECT json_extract(provenance,'$.delivery_id') FROM agent_chat_queued_turns WHERE thread_id=?1 AND queued_id=?2) AND attempted=0 AND state IN ('pending','preparing','queued')",
+                params![thread_id,queued_id,text,prompt]).map_err(|e|e.to_string())?;
+        }
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(changed>0)
     }
 
     /// Point a row's images at their new files.
@@ -389,6 +401,12 @@ mod tests {
 
     fn row(thread: &str, id: &str, epoch: &str) -> QueuedTurnRecord {
         QueuedTurnRecord {
+            provenance: crate::agent_provider::message::MessageProvenance {
+                message_id:Some(format!("message-{id}")),created_by:crate::agent_provider::message::CreatedBy::Agent,
+                creation_source:crate::agent_provider::message::CreationSource::Provider,
+                sender_thread_id:Some("sender".into()),sender_title:Some("Review agent".into()),
+                input_intent:crate::agent_provider::message::InputIntent::QueuedTurn,..Default::default()
+            },
             thread_id: thread.into(),
             queued_id: id.into(),
             position: 0,
@@ -414,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_turns_round_trip_in_order() {
+    fn orchestration_message_provenance_survives_queue_edit_and_saved_replay() {
         let db = init_test_database();
         db.upsert_agent_chat_session("t", "w", None, "claude").unwrap();
         for id in ["a", "b", "c"] {
@@ -434,6 +452,7 @@ mod tests {
 
         assert!(db.update_queued_turn_text("t", "b", "new", Some("<mode/>\n\nnew")).unwrap());
         assert_eq!(db.get_queued_turn("t", "b").unwrap().text, "new");
+        assert_eq!(db.get_queued_turn("t", "b").unwrap().provenance,row("t","b","e1").provenance);
 
         let taken = db.take_queued_turn("t", "b").unwrap().unwrap();
         assert_eq!(db.take_queued_turn("t", "b").unwrap(), None);
@@ -449,6 +468,7 @@ mod tests {
         let resent = QueuedTurnRecord { queued_id: "b2".into(), ..row("t", "b", "e2") };
         assert!(db.insert_queued_turn(&resent).unwrap());
         assert_eq!(ids(&db, "t"), ["a", "b2"]);
+        assert_eq!(db.get_queued_turn("t","b2").unwrap().provenance,row("t","b","e1").provenance);
         // A resend replaces the saved row it came from, whatever its nonce.
         let moved = QueuedTurnRecord { queued_id: "a2".into(), client_nonce: None, ..row("t", "a", "e2") };
         assert!(db.replace_queued_turn(Some("a"), &moved).unwrap());

@@ -161,11 +161,8 @@ impl State {
     /// The next queued turn to dispatch, unless a user Stop holds the queue.
     /// A released item settles in the worker, once its prompt is admitted.
     fn next_queued(&mut self) -> Option<Queued> {
-        let front = self.queued.front().map(|queued| queued.id.as_str());
-        if !self.queue_hold.admits(front) {
-            return None;
-        }
-        self.queued.pop_front()
+        let next = self.queued.iter().position(|q| self.queue_hold.can_select(&q.id, q.input.queued_delivery_state()));
+        next.and_then(|i|self.queued.remove(i))
     }
 }
 /// What a turn owes a Stop-held queue, settled when its prompt is admitted
@@ -1661,6 +1658,7 @@ impl Session {
             }
             let id = format!("acp-queued-{}", Uuid::new_v4());
             self.emit(ProviderRuntimeEvent::TurnQueued {
+                provenance: Default::default(),
                 thread_id: self.thread.clone(),
                 queued_id: id.clone(),
                 client_nonce: input.client_nonce.clone(),
@@ -1669,13 +1667,14 @@ impl Session {
                     .clone()
                     .unwrap_or_else(|| input.text.clone()),
             });
+            let releases_hold = input.releases_queue_hold();
             let queued = Queued {
                 id: id.clone(),
                 input,
             };
             // Sent by hand while a Stop settles: it goes first and releases
             // the held queue behind it once it starts.
-            if s.queue_hold.goes_first() {
+            if releases_hold && s.queue_hold.goes_first() {
                 s.queued.push_front(queued);
                 s.queue_hold.release_with(&id);
                 self.emit(crate::agent_provider::queue_edit::reordered(&s.queued, &self.thread));
@@ -1693,7 +1692,7 @@ impl Session {
         s.interrupted = false;
         // A message sent by hand goes first; the held queue follows it once
         // its prompt is admitted.
-        let claim = s.queue_hold.take().then_some(HoldClaim::Taken);
+        let claim = (input.releases_queue_hold() && s.queue_hold.take()).then_some(HoldClaim::Taken);
         drop(s);
         let session = self.clone();
         let worker_turn = turn.clone();
@@ -1736,7 +1735,9 @@ impl Session {
         mut claim: Option<HoldClaim>,
     ) {
         loop {
-            if self.turn_admitted(&turn).await {
+            let queued_id = match &claim { Some(HoldClaim::Release(id)) => Some(id.clone()), _ => None };
+            let disposed = input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Disposed;
+            if !disposed && self.turn_admitted(&turn).await {
                 if let Some(checkpoint) = &input.turn_checkpoint {
                     checkpoint.prepare().await;
                 }
@@ -1751,6 +1752,7 @@ impl Session {
                 control = self.control.lock() => Some(control),
             };
             let configured = async {
+                if disposed { return Err(invalid("Disposed queued delivery")); }
                 self.check_override_owner(Some(&turn)).await?;
                 self.validate_turn(&input).await?;
                 if let Some(model) = input.model_override.clone() {
@@ -1765,6 +1767,8 @@ impl Session {
             }
             .await;
             let mut transport_failed = false;
+            let mut dispatch_refused = false;
+            let mut prompt_responded = false;
             let result = if control.is_none() || !self.turn_admitted(&turn).await {
                 if let Some(checkpoint) = &input.turn_checkpoint {
                     checkpoint.abort().await;
@@ -1776,13 +1780,6 @@ impl Session {
                 }
                 Err(protocol("ACP turn configuration could not be applied"))
             } else {
-                if let Some(claim) = claim.take() {
-                    claim.settle(&mut self.state.lock().await.queue_hold, true);
-                }
-                self.status(SessionStatus::Running {
-                    active_turn: turn.clone(),
-                })
-                .await;
                 if self.turn_admitted(&turn).await {
                     if let Some(checkpoint) = &input.turn_checkpoint {
                         checkpoint.commit().await;
@@ -1806,11 +1803,28 @@ impl Session {
                     json!({"sessionId":native,"prompt":prompt}),
                     Duration::from_secs(24 * 60 * 60),
                     || async {
-                        let allowed = self.turn_admitted(&turn).await;
+                        let allowed = self.turn_admitted(&turn).await
+                            && input.turn_checkpoint.as_ref().is_none_or(|checkpoint| match checkpoint.authorize_dispatch() {
+                                Ok(()) => true,
+                                Err(_) => { dispatch_refused = true; false }
+                            });
                         // Set only under the acquired writer, on successful
                         // exact-turn admission. A revoked unsent prompt needs
                         // neither a frame nor a session/cancel notification.
-                        if allowed { admitted.store(true, Ordering::SeqCst); }
+                        if allowed {
+                            self.status(SessionStatus::Running { active_turn: turn.clone() }).await;
+                            if !self.turn_admitted(&turn).await { return false; }
+                            admitted.store(true, Ordering::SeqCst);
+                            if let Some(id) = &queued_id {
+                                self.emit(ProviderRuntimeEvent::QueuedTurnDispatched {
+                                    steered:false,thread_id:self.thread.clone(),queued_id:id.clone(),turn_id:turn.clone(),
+                                    text:input.display_text.clone().unwrap_or_else(||input.text.clone()),
+                                });
+                            }
+                            if let Some(claim) = claim.take() {
+                                claim.settle(&mut self.state.lock().await.queue_hold, true);
+                            }
+                        }
                         allowed
                     },
                 );
@@ -1824,12 +1838,13 @@ impl Session {
                     tokio::select! {
                         biased;
                         response=&mut request=>break match response {
-                            Ok((value, _))=>Ok(value),
+                            Ok((value, _))=>{ prompt_responded = true; Ok(value) },
                             Err(RpcChildError::CancelledBeforeWrite)=>{
                                 if let Some(checkpoint) = &input.turn_checkpoint { checkpoint.abort().await; }
                                 Ok(json!({"stopReason":"cancelled"}))
                             },
                             Err(e)=>{
+                                prompt_responded = matches!(&e,RpcChildError::RpcError(_));
                                 transport_failed = !matches!(e,RpcChildError::RpcError(_)) || !self.child.is_alive();
                                 Err(if self.child.is_alive() { rpc_error("session/prompt",&e) } else { protocol("ACP prompt transport failed") })
                             }
@@ -1850,11 +1865,33 @@ impl Session {
                 }
                 }
             };
+            if let Some(checkpoint) = &input.turn_checkpoint {
+                if prompt_responded {
+                    checkpoint.accepted(&turn).await;
+                } else if result.is_err() {
+                    // A terminal transport failure has no native acceptance
+                    // evidence, including cancellation whose reply never arrived.
+                    checkpoint.abort().await;
+                }
+            }
             drop(control);
             // Cancelled or misconfigured before its prompt: the rest of a held
             // queue stays held.
             if let Some(claim) = claim.take() {
-                claim.settle(&mut self.state.lock().await.queue_hold, false);
+                let mut state = self.state.lock().await;
+                claim.settle(&mut state.queue_hold, false);
+                if let Some(id) = &queued_id {
+                    match input.queued_delivery_state() {
+                        crate::agent_provider::types::QueuedDeliveryState::Held => {
+                            state.queue_hold.hold();
+                            state.queued.push_front(Queued {id:id.clone(),input:input.clone()});
+                        }
+                        crate::agent_provider::types::QueuedDeliveryState::Blocked => {
+                            state.queued.push_front(Queued {id:id.clone(),input:input.clone()});
+                        }
+                        _ => self.emit(ProviderRuntimeEvent::QueuedTurnCancelled {thread_id:self.thread.clone(),queued_id:id.clone()}),
+                    }
+                }
             }
             // The pinned request is now dropped; teardown cannot deadlock on
             // the stdin writer mutex held by an unpolled request future.
@@ -1904,12 +1941,14 @@ impl Session {
                     message: "ACP prompt or turn configuration failed".into(),
                 },
             };
-            self.emit(ProviderRuntimeEvent::TurnCompleted {
-                thread_id: self.thread.clone(),
-                turn_id: turn.clone(),
-                status,
-                usage: None,
-            });
+            if !disposed && !dispatch_refused {
+                self.emit(ProviderRuntimeEvent::TurnCompleted {
+                    thread_id: self.thread.clone(),
+                    turn_id: turn.clone(),
+                    status,
+                    usage: None,
+                });
+            }
             state.active = None;
             state.interrupted = false;
             if !self.child.is_alive() {
@@ -1922,21 +1961,18 @@ impl Session {
                 thread_id: self.thread.clone(),
                 status: SessionStatus::Ready,
             });
-            let next = state.next_queued();
+            let next = loop {
+                let next = state.next_queued();
+                match next {
+                    Some(q) if q.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Disposed => {
+                        self.emit(ProviderRuntimeEvent::QueuedTurnCancelled {thread_id:self.thread.clone(),queued_id:q.id});
+                    }
+                    next => break next,
+                }
+            };
             if let Some(queued) = next {
                 turn = TurnId(format!("acp-turn-{}", Uuid::new_v4()));
                 state.active = Some(turn.clone());
-                self.emit(ProviderRuntimeEvent::QueuedTurnDispatched {
-                    steered: false,
-                    thread_id: self.thread.clone(),
-                    queued_id: queued.id.clone(),
-                    turn_id: turn.clone(),
-                    text: queued
-                        .input
-                        .display_text
-                        .clone()
-                        .unwrap_or_else(|| queued.input.text.clone()),
-                });
                 input = queued.input;
                 claim = Some(HoldClaim::Release(queued.id));
                 drop(state);
@@ -2180,6 +2216,7 @@ impl AgentProvider for GenericAcpProvider {
         let Some(index) = s.queued.iter().position(|q| q.id == id) else {
             return Ok(());
         };
+        s.queued[index].input.authorize_queue_promotion()?;
         let queued = s.queued.remove(index).unwrap();
         if s.active.is_some() {
             // The promoted item goes through a held queue; the hold lifts
@@ -2200,17 +2237,6 @@ impl AgentProvider for GenericAcpProvider {
         let turn = TurnId(format!("acp-turn-{}", Uuid::new_v4()));
         s.active = Some(turn.clone());
         s.interrupted = false;
-        session.emit(ProviderRuntimeEvent::QueuedTurnDispatched {
-            steered: false,
-            thread_id: thread,
-            queued_id: queued.id,
-            turn_id: turn.clone(),
-            text: queued
-                .input
-                .display_text
-                .clone()
-                .unwrap_or_else(|| queued.input.text.clone()),
-        });
         drop(s);
         tokio::spawn(session.clone().worker(turn, queued.input, Some(HoldClaim::Release(id))));
         Ok(())

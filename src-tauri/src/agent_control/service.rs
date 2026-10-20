@@ -329,12 +329,23 @@ pub(crate) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -
     let pending: Vec<_> = observed.as_ref().map(|view|view.pending_approvals.iter().map(|request|
         json!({"request_id":request.outside_handle,"turn_id":request.turn_id,"request_kind":request.request_kind})
     ).collect()).unwrap_or_default();
-    let queued = observed.as_ref().map(|view|view.queued_ids.clone()).unwrap_or_default();
+    let inactive = app.state::<DatabaseStore>().inactive_delivery_queue_ids(&target.thread_id)?;
+    let queued: Vec<_> = observed.as_ref().map(|view|view.queued_ids.clone()).unwrap_or_default().into_iter().filter(|id| !inactive.contains(id)).collect();
     let uncertain_queued = app.state::<DatabaseStore>().control_unresolved_queued_ids(&target.thread_id)?
-        .into_iter().filter(|id| !runtime_live || !queued.contains(id)).collect::<Vec<_>>();
-    let busy = active || !pending.is_empty() || !queued.is_empty() || !uncertain_queued.is_empty()
+        .into_iter().filter(|id| !inactive.contains(id) && (!runtime_live || !queued.contains(id))).collect::<Vec<_>>();
+    let deliveries: Vec<_> = app.state::<DatabaseStore>().thread_message_delivery_attention(&target.thread_id)?.into_iter().map(|row|json!({
+        "delivery_id":row.id,"message_id":row.message_id,"state":row.state,"reason":row.error,
+        "display_text":row.payload["input"]["display_text"].as_str().or_else(||row.payload["input"]["text"].as_str()),
+    })).collect();
+    let inflight = app.state::<DatabaseStore>().has_inflight_message_deliveries(&target.thread_id)?;
+    let busy = inflight || active || !pending.is_empty() || !queued.is_empty() || !uncertain_queued.is_empty()
         || observed.as_ref().is_some_and(|view|matches!(view.phase.as_str(),"starting"|"running"|"waiting_approval"));
+    let historical_error = !active && observed.as_ref().is_none_or(|view| view.phase == "unknown")
+        && terminal.is_some_and(|event| super::state::turn_outcome(event["status"]["kind"].as_str(), event["status"]["subtype"].as_str()).0 == "error");
     let phase = if !pending.is_empty() { "waiting_approval" }
+    else if let Some(view) = observed.as_ref().filter(|view| matches!(view.phase.as_str(), "closed" | "error")) { view.phase.as_str() }
+    else if historical_error { "error" }
+    else if !deliveries.is_empty() { "needs_attention" }
     else if !uncertain_queued.is_empty() && !active && queued.is_empty() { "needs_attention" }
     else if let Some(view) = observed.as_ref().filter(|view|view.phase != "unknown") { view.phase.as_str() }
     else if active { "running" } else if let Some(event) = terminal {
@@ -342,7 +353,7 @@ pub(crate) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -
     } else if runtime_live { "ready" } else { "unknown" };
     let last_turn = observed.as_ref().and_then(|view|view.last_turn.clone()).or_else(||terminal.map(|event|
         json!({"type":"turn_completed","turn_id":event["turn_id"],"status":{"kind":super::state::turn_outcome(event["status"]["kind"].as_str(), event["status"]["subtype"].as_str()).1}})));
-    let settled = !busy && matches!(phase,"completed"|"interrupted"|"error") && last_turn.is_some();
+    let settled = !busy && matches!(phase,"completed"|"interrupted"|"error"|"closed"|"ready"|"needs_attention");
     // Historical identity is correlation only, never a restored live owner.
     let turn_id = observed.as_ref().and_then(|view|view.turn_id.clone()).or_else(||latest.as_ref().and_then(|event|event["turn_id"].as_str().filter(|turn| !turn.is_empty()).map(str::to_owned)));
     Ok(json!({
@@ -350,44 +361,134 @@ pub(crate) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -
         "pane_id":app.state::<AppStateStore>().agent_chat_pane_id_for_thread(&record.thread_id),
         "runtime_live":runtime_live,"phase":phase,"settled":settled,
         "turn_id":turn_id,"pending_approvals":pending,"queued_ids":queued,"uncertain_queued_ids":uncertain_queued,"last_turn":last_turn,
-        "imported_snapshot":record.imported_from.is_some(),
+        "imported_snapshot":record.imported_from.is_some(),"deliveries_needing_attention":deliveries,
     }))
 }
 
-pub(crate) async fn thread_send<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
-    #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+pub(crate) async fn thread_send<R: Runtime>(
+    app: &AppHandle<R>,
+    caller: &ControlCaller,
+    args: Value,
+) -> Result<Value, ControlError> {
+    #[derive(Deserialize, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
     struct Args {
-        workspace_id: String, thread_id: String, client_request_id: String, message: String,
-        #[serde(default)] delivery: crate::agent_provider::types::MessageDelivery,
+        workspace_id: String,
+        thread_id: String,
+        client_request_id: String,
+        message: String,
+        #[serde(default = "auto_delivery")]
+        delivery: crate::agent_provider::types::MessageDelivery,
     }
-    let input: Args = parse(args.clone())?;
+    fn auto_delivery() -> crate::agent_provider::types::MessageDelivery {
+        crate::agent_provider::types::MessageDelivery::Auto
+    }
+    let input: Args = parse(args)?;
+    let args = serde_json::to_value(&input)
+        .map_err(|e| ControlError::new("invalid_arguments", e.to_string()))?;
     identifier(&input.client_request_id, "client_request_id", 128)?;
     if input.message.trim().is_empty() || input.message.len() > 65536 {
-        return Err(ControlError::new("invalid_arguments", "message must contain text and fit in 65536 bytes"));
+        return Err(ControlError::new(
+            "invalid_arguments",
+            "message must contain text and fit in 65536 bytes",
+        ));
     }
-    let target = Target { workspace_id: input.workspace_id.clone(), thread_id: input.thread_id.clone() };
-    if let Some(receipt) = retry_receipt(app, caller, "thread_send", &args)? { return Ok(receipt); }
+    if let Some(receipt) = retry_receipt(app, caller, "thread_send", &args)? {
+        return Ok(receipt);
+    }
+    let target = Target {
+        workspace_id: input.workspace_id.clone(),
+        thread_id: input.thread_id.clone(),
+    };
+    authorize(app, caller)?;
     let (record, provider) = resolve_thread(app, &target, true)?;
+    if record.imported_from.is_some() {
+        return Err(ControlError::new(
+            "imported_snapshot_read_only",
+            "Imported threads are read-only snapshots",
+        ));
+    }
     permission_ceiling(caller, provider, record.permission_mode.as_deref())?;
-    let admission = admit_mutation(app, caller, "thread_send", &args, &target)?;
-    let receipt = serde_json::to_value(&admission.receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
-    if !admission.newly_admitted { return Ok(receipt); }
-    let owned_app = app.clone();
-    let owned_caller = caller.clone();
-    let control = NativeControlGuard { caller:caller.clone(),workspace_id:target.workspace_id.clone(),thread_id:target.thread_id.clone(),provider,admission:None }.retain_admission(app);
-    spawn_operation(app, caller, admission.receipt, async move {
-        authorize(&owned_app,&owned_caller)?;
-        let (record, current_provider) = resolve_thread(&owned_app, &target, true)?;
-        if provider != current_provider { return Err(ControlError::new("stale_thread_binding", "The thread changed provider after admission")); }
-        permission_ceiling(&owned_caller,current_provider,record.permission_mode.as_deref())?;
-        let command: SendTurnCommandInput = serde_json::from_value(json!({
-            "thread_id":input.thread_id,"text":input.message,"delivery":input.delivery,
-            "model_override":null,"client_nonce":input.client_request_id,
-        })).map_err(|e|ControlError::new("invalid_arguments",e.to_string()))?;
-        let turn = agent_chat::send_turn_with_control(owned_app.clone(), provider, command, Some(control)).await?;
-        Ok(json!({"workspace_id":target.workspace_id,"thread_id":target.thread_id,"accepted_as":if turn.queued_id.is_some() {"queued"} else if turn.steered {"steered"} else {"dispatched"},"turn":turn}))
-    });
-    Ok(receipt)
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut context = super::delivery::SendContext::controller(caller);
+    context.provenance.message_id = Some(id.clone());
+    let control = NativeControlGuard { caller:caller.clone(),workspace_id:input.workspace_id.clone(),thread_id:input.thread_id.clone(),provider,admission:None }.retain_admission(app);
+    let command: SendTurnCommandInput = serde_json::from_value(json!({
+        "thread_id":input.thread_id,"text":input.message,"delivery":input.delivery,
+        "model_override":null,"client_nonce":input.client_request_id,
+    }))
+    .map_err(|e| ControlError::new("invalid_arguments", e.to_string()))?;
+    let payload = serde_json::to_value(super::delivery::DeliveryPayload {
+        provider,
+        input: command,
+        origin: context.origin,
+        provenance: context.provenance,
+        caller: Some(caller.clone()),
+        pr_watch: None,
+    })
+    .map_err(|e| ControlError::new("invalid_arguments", e.to_string()))?;
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&args)
+                .map_err(|e| ControlError::new("invalid_arguments", e.to_string()))?
+        )
+    );
+    let epoch = app.state::<NativeControlState>().epoch.clone();
+    let db = app.state::<DatabaseStore>();
+    let generation = db.delivery_generation(&input.thread_id)?.0;
+    let (id, new) = db
+        .admit_message_delivery(
+            &id,
+            &input.thread_id,
+            &id,
+            &payload,
+            &epoch,
+            generation,
+            Some(crate::database::message_delivery::DeliveryOperation {
+                principal: &caller.principal,
+                key: &input.client_request_id,
+                hash: &hash,
+                workspace: &input.workspace_id,
+            }),
+            true,
+        )
+        .map_err(|e| {
+            ControlError::new(
+                if e.starts_with("request_key_conflict") {
+                    "request_key_conflict"
+                } else {
+                    "operation_admission_failed"
+                },
+                e,
+            )
+        })?;
+    let receipt = db
+        .control_operation(&caller.principal, &id, &epoch)?
+        .ok_or_else(|| ControlError::new("operation_not_found", "Missing admitted receipt"))?;
+    if new {
+        let owned = app.clone();
+        let row = db
+            .message_delivery(&id)?
+            .ok_or_else(|| ControlError::new("delivery_not_found", "Missing admitted delivery"))?;
+        #[cfg(test)]
+        let barrier = app
+            .state::<NativeControlState>()
+            .fixture_operation_barrier
+            .lock()
+            .unwrap()
+            .take();
+        tauri::async_runtime::spawn(async move {
+            #[cfg(test)]
+            if let Some(barrier) = barrier {
+                barrier.acquire().await.unwrap().forget();
+            }
+            super::delivery::dispatch_admitted(&owned, row, Some(control)).await;
+        });
+        super::delivery::notify();
+    }
+    serde_json::to_value(receipt)
+        .map_err(|e| ControlError::new("serialization_failed", e.to_string()))
 }
 
 fn retry_receipt<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, tool: &str, args: &Value) -> Result<Option<Value>, ControlError> {
@@ -476,6 +577,14 @@ pub(crate) async fn thread_interrupt<R: Runtime>(app: &AppHandle<R>, caller: &Co
     let implementation = app.state::<ProviderRegistry>().get(provider).await
         .ok_or_else(||ControlError::new("provider_not_configured","The selected provider is not configured in CodeMux"))?;
     if !implementation.capabilities().supports_interrupt { return Err(ControlError::new("unsupported_operation","This provider does not support interruption")); }
+    // Capture the selected run at admission. A delayed operation must not
+    // interrupt a newer run that started while its receipt was pending.
+    let mut selected = input.turn_id.clone().or_else(|| app.state::<NativeControlState>().thread_runtime(&target.thread_id).and_then(|view| view.turn_id));
+    if selected.is_none() {
+        selected = implementation.list_sessions().await.map_err(|e|ControlError::from(e.to_string()))?.into_iter()
+            .find(|session|session.thread_id.0 == target.thread_id)
+            .and_then(|session| match session.status {crate::agent_provider::SessionStatus::Running {active_turn} => Some(active_turn.0), _ => None});
+    }
     let admission = admit_mutation(app,caller,"thread_interrupt",&args,&target)?;
     let receipt = serde_json::to_value(&admission.receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
     if !admission.newly_admitted { return Ok(receipt); }
@@ -487,7 +596,7 @@ pub(crate) async fn thread_interrupt<R: Runtime>(app: &AppHandle<R>, caller: &Co
         if provider != current_provider { return Err(ControlError::new("stale_thread_binding","The thread changed provider after admission")); }
         permission_ceiling(&owned_caller,provider,record.permission_mode.as_deref())?;
         let control = NativeControlGuard { caller:owned_caller.clone(),workspace_id:target.workspace_id.clone(),thread_id:target.thread_id.clone(),provider,admission:None };
-        let reached = agent_chat::agent_chat_interrupt_turn_guarded(owned_app.clone(),provider,ThreadId(target.thread_id.clone()),input.turn_id.clone().map(crate::agent_provider::TurnId),Some(control)).await?;
+        let reached = if let Some(selected) = selected { agent_chat::agent_chat_interrupt_turn_guarded(owned_app.clone(),provider,ThreadId(target.thread_id.clone()),Some(crate::agent_provider::TurnId(selected)),Some(control)).await? } else { false };
         Ok(json!({"workspace_id":target.workspace_id,"thread_id":target.thread_id,"reached_provider":reached,"requested_turn_id":input.turn_id}))
     });
     Ok(receipt)
@@ -513,6 +622,9 @@ pub(crate) async fn thread_stop<R: Runtime>(app: &AppHandle<R>, caller: &Control
         if provider != current_provider { return Err(ControlError::new("stale_thread_binding","The thread changed provider after admission")); }
         permission_ceiling(&owned_caller,provider,record.permission_mode.as_deref())?;
         let control = NativeControlGuard { caller:owned_caller.clone(),workspace_id:target.workspace_id.clone(),thread_id:target.thread_id.clone(),provider,admission:None };
+        // The controller's explicit Stop is durable. Session restart and
+        // provider replacement use the session owner without this Stop fence.
+        owned_app.state::<DatabaseStore>().stop_message_deliveries(&target.thread_id)?;
         agent_chat::agent_chat_stop_session_guarded(owned_app.clone(),provider,ThreadId(target.thread_id.clone()),Some(control)).await?;
         Ok(json!({"workspace_id":target.workspace_id,"thread_id":target.thread_id,"stopped":true}))
     });

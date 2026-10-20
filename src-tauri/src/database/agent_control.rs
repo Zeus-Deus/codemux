@@ -1,4 +1,4 @@
-//! Durable admission receipts. Request payloads are hashed, not stored.
+//! Durable control receipts and message/run correlations.
 use super::DatabaseStore;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,8 @@ pub struct OperationReceipt {
     pub thread_id: Option<String>,
     pub result: Option<Value>,
     pub error: Option<Value>,
+    pub delivery_id: Option<String>,
+    pub dispatch_disposition: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -82,7 +84,7 @@ impl DatabaseStore {
             ProviderRuntimeEvent::TurnQueued {thread_id,queued_id,..} => self.control_record_queue_admission(&thread_id.0,queued_id),
             ProviderRuntimeEvent::QueuedTurnDispatched {thread_id,queued_id,turn_id,steered,..} =>
                 self.control_record_queue_transition(&thread_id.0,queued_id,"dispatched",Some(&turn_id.0),*steered),
-            ProviderRuntimeEvent::QueuedTurnCancelled {thread_id,queued_id} =>
+            ProviderRuntimeEvent::QueuedTurnCancelled {thread_id,queued_id} | ProviderRuntimeEvent::QueuedTurnDisposed {thread_id,queued_id} =>
                 self.control_record_queue_transition(&thread_id.0,queued_id,"cancelled",None,false),
             _ => Ok(()),
         }
@@ -99,6 +101,9 @@ impl DatabaseStore {
                    WHERE d.thread_id=a.thread_id AND json_extract(d.payload,'$.type')='native_queue_control'
                      AND json_extract(d.payload,'$.queued_id')=json_extract(a.payload,'$.queued_id')
                      AND json_extract(d.payload,'$.disposition') IN ('dispatched','cancelled'))
+               AND NOT EXISTS (SELECT 1 FROM agent_message_deliveries m
+                   WHERE m.thread_id=a.thread_id AND m.queued_id=json_extract(a.payload,'$.queued_id')
+                     AND (m.state<>'queued' OR m.generation<>COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=m.thread_id),0)))
              ORDER BY a.id ASC",
         ).map_err(|e|e.to_string())?;
         let rows = statement.query_map(params![thread], |row|row.get(0)).map_err(|e|e.to_string())?;
@@ -139,9 +144,13 @@ impl DatabaseStore {
     pub(crate) fn control_append_user_message(&self, thread: &str, payload: &str, turn: &str, steered: bool) -> Result<Option<i64>, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e|e.to_string())?;
+        let identity: Value = serde_json::from_str(payload).map_err(|e|e.to_string())?;
+        let existing: Option<i64> = tx.query_row("SELECT id FROM agent_chat_messages WHERE thread_id=?1 AND message_id=?2",
+            params![thread,identity["message_id"].as_str()],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        let row = if let Some(row) = existing { row } else {
         match tx.execute(
-            "INSERT INTO agent_chat_messages (thread_id,payload,created_at)
-             VALUES (?1,?2,strftime('%Y-%m-%d %H:%M:%f','now'))",
+            "INSERT INTO agent_chat_messages (thread_id,payload,created_at,message_id,created_by,creation_source,sender_thread_id,sender_title,input_intent,notification)
+             VALUES (?1,?2,strftime('%Y-%m-%d %H:%M:%f','now'),json_extract(?2,'$.message_id'),COALESCE(json_extract(?2,'$.created_by'),'user'),COALESCE(json_extract(?2,'$.creation_source'),'unknown'),json_extract(?2,'$.sender_thread_id'),json_extract(?2,'$.sender_title'),COALESCE(json_extract(?2,'$.input_intent'),'turn_start'),json_extract(?2,'$.notification'))",
             params![thread,payload],
         ) {
             Ok(_) => {},
@@ -149,14 +158,17 @@ impl DatabaseStore {
                 if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY => return Ok(None),
             Err(e) => return Err(e.to_string()),
         }
-        let row = tx.last_insert_rowid();
+        tx.last_insert_rowid()
+        };
         if !turn.is_empty() {
             let identity = serde_json::json!({"type":"native_user_control","thread_id":thread,
                 "user_message_id":row,"turn_id":turn,"steered":steered});
             tx.execute(
                 "INSERT INTO agent_chat_messages (thread_id,payload,created_at)
-                 VALUES (?1,?2,strftime('%Y-%m-%d %H:%M:%f','now'))",
-                params![thread,identity.to_string()],
+                 SELECT ?1,?2,strftime('%Y-%m-%d %H:%M:%f','now') WHERE NOT EXISTS (
+                    SELECT 1 FROM agent_chat_messages WHERE thread_id=?1 AND json_extract(payload,'$.type')='native_user_control'
+                    AND json_extract(payload,'$.user_message_id')=?3 AND json_extract(payload,'$.turn_id')=?4)",
+                params![thread,identity.to_string(),row,turn],
             ).map_err(|e|format!("user_turn_journal_failed: {e}"))?;
         }
         tx.commit().map_err(|e|e.to_string())?;
@@ -263,11 +275,11 @@ impl DatabaseStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE agent_control_operations SET state='needs_attention', updated_at=datetime('now')
-             WHERE principal=?1 AND id=?2 AND epoch<>?3 AND state IN ('accepted','running')",
+             WHERE principal=?1 AND id=?2 AND epoch<>?3 AND state IN ('accepted','running') AND delivery_id IS NULL",
             params![principal, id, epoch],
         ).map_err(|e| e.to_string())?;
         conn.query_row(
-            "SELECT id, tool, state, workspace_id, thread_id, result, error, created_at, updated_at
+            "SELECT id, tool, state, workspace_id, thread_id, result, error, created_at, updated_at, delivery_id, dispatch_disposition
              FROM agent_control_operations WHERE principal=?1 AND id=?2",
             params![principal,id], |row| {
                 let result: Option<String> = row.get(5)?;
@@ -278,6 +290,7 @@ impl DatabaseStore {
                     result: result.and_then(|v| serde_json::from_str(&v).ok()),
                     error: error.and_then(|v| serde_json::from_str(&v).ok()),
                     created_at: row.get(7)?, updated_at: row.get(8)?,
+                    delivery_id: row.get(9)?, dispatch_disposition: row.get(10)?,
                 })
             },
         ).optional().map_err(|e|e.to_string())

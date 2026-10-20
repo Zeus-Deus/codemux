@@ -44,7 +44,7 @@ async fn review_l3_native_stop_wakes_cold_hermes_profile_operation_wait() {
     let held_by_a = runtime.operation.lock().await;
     let handle = app.handle().clone();
     let send = tokio::spawn(async move {
-        agent_chat::agent_chat_send_turn(handle,ProviderKind::Hermes,
+        agent_chat::send_desktop_turn(handle,ProviderKind::Hermes,
             serde_json::from_value(json!({"thread_id":"cold-hermes-b","text":"Never dispatch","model_override":null})).unwrap()).await
     });
     tokio::time::timeout(Duration::from_secs(2),runtime.fixture_start_wait.notified()).await.unwrap();
@@ -83,9 +83,12 @@ impl crate::agent_provider::types::TurnDispatchCheckpoint for ReviewDispatchAuth
 }
 
 async fn review_pump_fixture() -> (tempfile::TempDir, HermesProvider, Arc<Runtime>, Arc<Chat>, tokio::task::JoinHandle<()>) {
+    review_pump_fixture_with_binary(None).await
+}
+async fn review_pump_fixture_with_binary(binary: Option<std::path::PathBuf>) -> (tempfile::TempDir, HermesProvider, Arc<Runtime>, Arc<Chat>, tokio::task::JoinHandle<()>) {
     let root = tempfile::tempdir().unwrap();
     // Launch only the compiled synthetic ACP peer, never the official Hermes CLI.
-    let binary = std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from)
+    let binary = binary.or_else(||std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from))
         .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
     assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
     std::fs::write(root.path().join("config.yaml"), "model: {provider: custom}\n").unwrap();
@@ -171,9 +174,15 @@ async fn review_r2_transport_failure_remains_chat_fatal_and_cancels_followup() {
     runtime.child.shutdown().await.unwrap(); task.abort(); let _=task.await;
 }
 
+// The peer is a Python script made executable with Unix permissions.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_r2_interrupt_cancels_real_prompt_and_queue_but_allows_fresh_native_work() {
-    let (_root, provider, runtime, _chat, task) = review_pump_fixture().await;
+async fn orchestration_message_hermes_stop_holds_queue_but_allows_fresh_native_work() {
+    use std::os::unix::fs::PermissionsExt;
+    let peer=tempfile::tempdir().unwrap();let binary=peer.path().join("peer.py");
+    std::fs::write(&binary,include_str!("../../../tests/helpers/agent_control_acp_peer.py")).unwrap();
+    std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_root, provider, runtime, _chat, task) = review_pump_fixture_with_binary(Some(binary)).await;
     let mut rx=provider.inner.events.subscribe();
     runtime.queue.lock().await.running=true;
     provider.send_turn(turn("thread", "review-hold")).await.unwrap();
@@ -186,7 +195,8 @@ async fn review_r2_interrupt_cancels_real_prompt_and_queue_but_allows_fresh_nati
     provider.interrupt_turn(ThreadId("thread".into()), None).await.unwrap();
     tokio::time::timeout(Duration::from_secs(3), pump).await.unwrap().unwrap();
     let mut cancelled=vec![]; while let Ok(e)=rx.try_recv() { cancelled.push(e); }
-    assert!(cancelled.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnCancelled {queued_id, ..} if queued_id == &q2)));
+    assert!(!cancelled.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnCancelled {queued_id, ..} if queued_id == &q2)));
+    assert!(runtime.queue.lock().await.jobs.iter().any(|job|job.id == q2));
     assert!(!cancelled.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnDispatched {queued_id, ..} if queued_id == &q2)));
     assert!(cancelled.iter().any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted {status:TurnStatus::Error {subtype, ..}, ..} if subtype == "cancelled")));
     assert!(provider.has_session(&ThreadId("thread".into())).await);
@@ -1068,4 +1078,134 @@ fn hermes_offline_free_model_change_fails_without_mutating_binding() {
     assert_eq!(retained.resolved_model, binding.resolved_model);
     assert_eq!(retained.acp_session_id, binding.acp_session_id);
     assert!(provider.validate_intent("thread", Some("opencode-free:mimo-v2.5-free"), None).is_ok());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn review_r2_hermes_child_exit_settles_delivery_attention() {
+    use tauri::Manager;
+    use std::os::unix::fs::PermissionsExt;
+    let peer=tempfile::tempdir().unwrap();
+    let binary=peer.path().join("exit-peer.py");
+    std::fs::write(&binary,"#!/usr/bin/env python3\nimport sys\nsys.stdin.readline()\nsys.exit(7)\n").unwrap();
+    std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_root,provider,runtime,_chat,task)=review_pump_fixture_with_binary(Some(binary)).await;
+    let app=tauri::test::mock_app();
+    app.manage(crate::database::init_test_database());
+    app.manage(crate::commands::agent_chat::SubagentTracker::default());
+    app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+    app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_session("thread","workspace",None,"hermes").unwrap();
+    db.admit_message_delivery("unanswered","thread","unanswered",&json!({"origin":"controller","provider":"hermes"}),"epoch",0,None,true).unwrap();
+    runtime.queue.lock().await.running=true;
+    let mut input=turn("thread","unanswered prompt");
+    input.turn_checkpoint=Some(Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {app:app.handle().clone(),id:"unanswered".into(),thread:"thread".into(),provider:ProviderKind::Hermes,inner:None,release_queue:false,admitted_generation:0,resumed_ids:vec![]}));
+    provider.send_turn(input).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3),provider.inner.clone().pump(runtime.clone())).await.unwrap();
+    let row=db.message_delivery("unanswered").unwrap().unwrap();
+    runtime.child.shutdown().await.unwrap();task.abort();let _=task.await;
+    assert!(row.attempted);
+    assert_eq!(row.state,"held_unknown");
+    assert_eq!(db.thread_message_delivery_attention("thread").unwrap().len(),1);
+    assert!(!db.has_inflight_message_deliveries("thread").unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn review_r2_hermes_cancellation_timeout_settles_delivery_attention() {
+    use tauri::Manager;
+    use std::os::unix::fs::PermissionsExt;
+    let peer=tempfile::tempdir().unwrap();
+    let binary=peer.path().join("unanswered-peer.py");
+    std::fs::write(&binary,"#!/usr/bin/env python3\nimport sys,pathlib\nsys.stdin.readline()\npathlib.Path(__file__).with_suffix('.ready').write_text('ready')\nfor line in sys.stdin: pass\n").unwrap();
+    std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_root,provider,runtime,chat,task)=review_pump_fixture_with_binary(Some(binary.clone())).await;
+    let app=tauri::test::mock_app();
+    app.manage(crate::database::init_test_database());
+    app.manage(crate::commands::agent_chat::SubagentTracker::default());
+    app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+    app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_session("thread","workspace",None,"hermes").unwrap();
+    db.admit_message_delivery("unanswered","thread","unanswered",&json!({"origin":"controller","provider":"hermes"}),"epoch",0,None,true).unwrap();
+    runtime.queue.lock().await.running=true;
+    let mut input=turn("thread","unanswered prompt");
+    input.turn_checkpoint=Some(Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {app:app.handle().clone(),id:"unanswered".into(),thread:"thread".into(),provider:ProviderKind::Hermes,inner:None,release_queue:false,admitted_generation:0,resumed_ids:vec![]}));
+    provider.send_turn(input).await.unwrap();
+    let pump=tokio::spawn({let inner=provider.inner.clone();let runtime=runtime.clone();async move {inner.pump(runtime).await}});
+    tokio::time::timeout(Duration::from_secs(3),async {
+        while !binary.with_extension("ready").exists() {tokio::time::sleep(Duration::from_millis(5)).await;}
+    }).await.unwrap();
+    let active=chat.state.lock().await.active.clone();
+    let interrupted=provider.interrupt_turn(ThreadId("thread".into()),active).await;
+    // Inspect before teardown can settle the unanswered prompt itself.
+    let row=db.message_delivery("unanswered").unwrap().unwrap();
+    let attention=db.thread_message_delivery_attention("thread").unwrap();
+    runtime.child.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3),pump).await.unwrap().unwrap();
+    task.abort();let _=task.await;
+    assert!(interrupted.unwrap_err().to_string().contains("cancellation has not completed"));
+    assert!(row.attempted);
+    assert_eq!(row.state,"held_unknown");
+    assert_eq!(attention.len(),1);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_hermes_failed_human_release_preserves_stop_hold() {
+    let (_root,provider,runtime,_chat,task)=review_pump_fixture().await;
+    let mut events=provider.inner.events.subscribe();
+    runtime.queue.lock().await.running=true;
+    provider.interrupt_turn(ThreadId("thread".into()),None).await.unwrap();
+    let mut machine=turn("thread","held B");
+    machine.turn_checkpoint=Some(Arc::new(crate::agent_provider::queue_hold::TestCheckpoint {release:false,held:Default::default()}));
+    let b=provider.send_turn(machine).await.unwrap().queued_id.unwrap();
+    let revoked=Arc::new(ReviewDispatchAuthority::default());revoked.revoked.store(true,std::sync::atomic::Ordering::SeqCst);
+    let mut human=turn("thread","failed human C");human.turn_checkpoint=Some(revoked);
+    let c=provider.send_turn(human).await.unwrap().queued_id.unwrap();
+    tokio::time::timeout(Duration::from_secs(3),provider.inner.clone().pump(runtime.clone())).await.unwrap();
+    assert!(runtime.queue.lock().await.jobs.iter().any(|j|j.id==b));
+    let mut seen=vec![];while let Ok(e)=events.try_recv(){seen.push(e);}
+    assert!(seen.iter().any(|e|matches!(e,ProviderRuntimeEvent::QueuedTurnCancelled {queued_id,..} if queued_id==&c)));
+    assert!(!seen.iter().any(|e|matches!(e,ProviderRuntimeEvent::QueuedTurnDispatched {queued_id,..} if queued_id==&b)));
+    runtime.child.shutdown().await.unwrap();task.abort();let _=task.await;
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_hermes_failed_release_reholds_durable_rows_before_next_pump() {
+    use tauri::Manager;
+    let (_root,provider,runtime,_chat,task)=review_pump_fixture().await;
+    let app=tauri::test::mock_app();app.manage(crate::database::init_test_database());
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_session("thread","workspace",None,"hermes").unwrap();
+    runtime.queue.lock().await.running=true;
+    provider.interrupt_turn(ThreadId("thread".into()),None).await.unwrap();
+    db.admit_message_delivery("B","thread","B",&json!({"origin":"controller"}),"epoch",0,None,true).unwrap();
+    let mut b=turn("thread","held B");
+    b.turn_checkpoint=Some(Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {
+        app:app.handle().clone(),id:"B".into(),thread:"thread".into(),provider:ProviderKind::Hermes,inner:None,
+        release_queue:false,admitted_generation:0,resumed_ids:vec![],
+    }));
+    let b=provider.send_turn(b).await.unwrap().queued_id.unwrap();
+    db.finish_message_delivery("B","queued",Some(&json!({"queued_id":b})),None).unwrap();
+    db.stop_message_deliveries("thread").unwrap();
+    let resumed_ids=db.resume_message_delivery_thread("thread").unwrap();
+    db.admit_message_delivery("D","thread","D",&json!({"origin":"user"}),"epoch",1,None,true).unwrap();
+    let revoked=Arc::new(ReviewDispatchAuthority::default());revoked.revoked.store(true,std::sync::atomic::Ordering::SeqCst);
+    let mut d=turn("thread","failed D");
+    d.turn_checkpoint=Some(Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {
+        app:app.handle().clone(),id:"D".into(),thread:"thread".into(),provider:ProviderKind::Hermes,inner:Some(revoked),
+        release_queue:true,admitted_generation:1,resumed_ids,
+    }));
+    let d=provider.send_turn(d).await.unwrap().queued_id.unwrap();
+    db.finish_message_delivery("D","queued",Some(&json!({"queued_id":d})),None).unwrap();
+    tokio::time::timeout(Duration::from_secs(3),provider.inner.clone().pump(runtime.clone())).await.unwrap();
+    let row=db.message_delivery("B").unwrap().unwrap();
+    assert_eq!(row.state,"held");assert_eq!(row.hold_reason.as_deref(),Some("stop"));assert!(!row.attempted);
+    let mut machine=turn("thread","fresh machine C");
+    machine.turn_checkpoint=Some(Arc::new(crate::agent_provider::queue_hold::TestCheckpoint {release:false,held:Default::default()}));
+    provider.send_turn(machine).await.unwrap();
+    assert!(runtime.queue.lock().await.jobs.iter().any(|job|job.id==b));
+    assert!(!db.message_delivery("B").unwrap().unwrap().attempted);
+    runtime.child.shutdown().await.unwrap();task.abort();let _=task.await;
 }

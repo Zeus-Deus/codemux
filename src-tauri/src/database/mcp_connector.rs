@@ -583,7 +583,7 @@ mod tests {
                 conn.query_row("SELECT MAX(version) FROM schema_version", [], |r| r
                     .get::<_, u32>(0))
                     .unwrap(),
-                20
+                super::super::SCHEMA_VERSION
             );
             assert_eq!(
                 conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, u32>(0))

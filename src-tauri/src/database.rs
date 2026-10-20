@@ -1,6 +1,7 @@
 pub mod async_questions;
 pub mod automation_triggers;
 pub mod agent_control;
+pub mod message_delivery;
 pub mod mcp_connector;
 pub mod delegated_tasks;
 pub mod follow_ups;
@@ -216,6 +217,7 @@ fn merge_agent_chat_session_rows(
     pr_watch::move_to_thread(tx, merged, survivor)?;
     chat_fork::move_to_thread(tx, merged, survivor)?;
     follow_ups::move_to_thread(tx, merged, survivor)?;
+    message_delivery::move_to_thread(tx, merged, survivor)?;
     // Delete the non-survivors.
     tx.execute(
         &format!("DELETE FROM agent_chat_sessions
@@ -261,7 +263,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 20;
+const SCHEMA_VERSION: u32 = 22;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -1403,6 +1405,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     provider_accounts::create_schema(conn)?;
     mobile_push::create_schema(conn)?;
     queued_turns::create_schema(conn)?;
+    message_delivery::migrate(conn)?;
     provider_switch::create_schema(conn)?;
     restart_resumes::create_schema(conn)?;
 

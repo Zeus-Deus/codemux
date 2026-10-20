@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -33,6 +33,7 @@ use super::slash_commands::{is_available_commands_update, AcpSlashCommandCache};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const PROMPT_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 /// After Grok's durable `turn_completed` lifecycle update, keep waiting for
 /// the authoritative standard prompt response through a normal RPC watchdog
 /// window. Grok can still be uploading traces/session state after the terminal
@@ -147,7 +148,7 @@ async fn acp_mcp_servers(
 #[derive(Debug)]
 struct XAiPromptCompletion {
     prompt_id: String,
-    tx: oneshot::Sender<Value>,
+    tx: watch::Sender<Option<Value>>,
     announced: Option<Value>,
 }
 
@@ -360,11 +361,8 @@ impl AcpSessionState {
 
     /// The next queued turn to dispatch, unless a user Stop holds the queue.
     fn next_queued(&mut self) -> Option<QueuedTurn> {
-        let front = self.queued.front().map(|queued| queued.id.as_str());
-        if !self.queue_hold.admits(front) {
-            return None;
-        }
-        self.queued.pop_front()
+        let next = self.queued.iter().position(|q| self.queue_hold.can_select(&q.id, q.input.queued_delivery_state()));
+        next.and_then(|i|self.queued.remove(i))
     }
 
     /// Release the prompt slot. Drops any Stop still aimed at the
@@ -910,7 +908,7 @@ impl AcpSession {
             };
             // Sent by hand while a Stop settles: it goes first and releases
             // the held queue behind it once it starts.
-            let first = state.queue_hold.goes_first();
+            let first = input.releases_queue_hold() && state.queue_hold.goes_first();
             if first {
                 state.queued.push_front(queued);
                 state.queue_hold.release_with(&queued_id);
@@ -918,6 +916,7 @@ impl AcpSession {
                 state.queued.push_back(queued);
             }
             let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
+                provenance: Default::default(),
                 thread_id: self.thread_id.clone(),
                 queued_id: queued_id.clone(),
                 client_nonce: input.client_nonce,
@@ -935,7 +934,7 @@ impl AcpSession {
         state.active_turn = Some(self.dispatching_turn_id());
         let generation = state.claim_turn();
         // A message sent by hand goes first; the held queue follows it.
-        let was_held = state.queue_hold.take();
+        let was_held = input.releases_queue_hold() && state.queue_hold.take();
         drop(state);
         let outcome = match self.dispatch_turn(input, None, generation).await {
             Ok(turn_id) => Ok(SendOutcome::Started(turn_id)),
@@ -1057,10 +1056,6 @@ impl AcpSession {
         }
         if let Some(checkpoint) = &input.turn_checkpoint {
             checkpoint.prepare().await;
-            if let Err(error) = checkpoint.authorize_dispatch() {
-                Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await;
-                return Err(PrepareTurnError::Rejected(error));
-            }
         }
         let configured = async {
             if self.dialect.is_grok() {
@@ -1120,7 +1115,7 @@ impl AcpSession {
         }
 
         if let Some(checkpoint) = &input.turn_checkpoint {
-            if let Err(error) = checkpoint.authorize_dispatch() { Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await; return Err(PrepareTurnError::Rejected(error)); }
+            if let Err(error) = checkpoint.verify_dispatch() { Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await; return Err(PrepareTurnError::Rejected(error)); }
         }
         let turn_id = TurnId(self.opaque_id("turn"));
         {
@@ -1182,9 +1177,10 @@ impl AcpSession {
             // `interrupt` writes, so the request cannot slip past.
             let interrupted_before_send = self.state.lock().await.take_interrupt(generation);
             let response = if interrupted_before_send {
+                if let Some(checkpoint) = &checkpoint { checkpoint.abort().await; }
                 Ok(json!({ "stopReason": "cancelled" }))
             } else {
-                self.send_prompt(&prompt, generation, checkpoint.as_ref()).await
+                self.send_prompt(&turn_id, &prompt, generation, checkpoint.as_ref()).await
             };
             let mut next = self.finish_turn(turn_id, response, generation).await;
             loop {
@@ -1195,8 +1191,16 @@ impl AcpSession {
             #[cfg(test)]
             selected_prepare_test_schedule(&self.thread_id).await;
             checkpoint = queued.input.turn_checkpoint.clone();
+            if queued.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Disposed {
+                self.cancel_selected_queued(&queued.id).await;
+                let mut state = self.state.lock().await;
+                state.release_turn();
+                state.status = SessionStatus::Ready;
+                next = state.next_queued().map(|queued| self.claim_queued_turn(&mut state, queued));
+                continue;
+            }
             match self
-                .prepare_turn(queued.input, queued.dispatch.clone())
+                .prepare_turn(queued.input.clone(), queued.dispatch.clone())
                 .await
             {
                 Ok((next_turn_id, next_prompt)) => {
@@ -1204,6 +1208,26 @@ impl AcpSession {
                     turn_id = next_turn_id;
                     prompt = next_prompt;
                     break;
+                }
+                Err(PrepareTurnError::Rejected(_)) if queued.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Held => {
+                    // Stop can land after selection but before authorization.
+                    // Retain the input and saved ID without a cancellation event.
+                    let mut state = self.state.lock().await;
+                    state.selected_queued.take();
+                    state.release_turn();
+                    state.status = SessionStatus::Ready;
+                    state.queue_hold.hold();
+                    state.queued.push_front(QueuedTurn { dispatch: None, ..queued });
+                    return;
+                }
+                Err(PrepareTurnError::Rejected(_)) if queued.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Blocked => {
+                    let mut state = self.state.lock().await;
+                    state.selected_queued.take();
+                    state.queue_hold.settle(&queued.id, false);
+                    state.release_turn();
+                    state.status = SessionStatus::Ready;
+                    state.queued.push_front(QueuedTurn { dispatch: None, ..queued });
+                    next = state.next_queued().map(|queued| self.claim_queued_turn(&mut state, queued));
                 }
                 Err(PrepareTurnError::Rejected(_)) => {
                     self.cancel_selected_queued(&queued.id).await;
@@ -1288,10 +1312,10 @@ impl AcpSession {
     /// and that mutex is FIFO so the cancel queues behind the prompt and
     /// still reaches the child second. `session/cancel` is a notification
     /// with no reply, so repeating it is harmless.
-    async fn send_prompt(&self, prompt: &[Value], generation: u64, checkpoint: Option<&Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>) -> Result<Value, RpcChildError> {
+    async fn send_prompt(&self, turn: &TurnId, prompt: &[Value], generation: u64, checkpoint: Option<&Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>) -> Result<Value, RpcChildError> {
         let prompt_id = self.dialect.is_grok().then(|| self.opaque_id("prompt"));
         let fallback_rx = if let Some(prompt_id) = prompt_id.as_ref() {
-            let (tx, rx) = oneshot::channel();
+            let (tx, rx) = watch::channel(None);
             *self.xai_prompt_completion.lock().await = Some(XAiPromptCompletion {
                 prompt_id: prompt_id.clone(),
                 tx,
@@ -1312,67 +1336,90 @@ impl AcpSession {
             });
         }
         if let Some(checkpoint) = checkpoint {
-            checkpoint.authorize_dispatch().map_err(|error| RpcChildError::RpcError(RpcError {code:-32001,message:error.to_string(),data:None}))?;
-        }
-        let request = self
-            .child
-            .request_with_timeout("session/prompt", params, PROMPT_TIMEOUT);
-        let fallback = async move {
-            match fallback_rx {
-                Some(rx) => rx.await.ok(),
-                None => std::future::pending::<Option<Value>>().await,
+            if let Err(error) = checkpoint.authorize_dispatch() {
+                checkpoint.abort().await;
+                return Err(RpcChildError::RpcError(RpcError {code:-32001,message:error.to_string(),data:None}));
             }
-        };
-        let completion =
-            prefer_standard_prompt_response(request, fallback, XAI_TERMINAL_RESPONSE_GRACE);
-        tokio::pin!(completion);
-        loop {
-            tokio::select! {
-                biased;
-                response = &mut completion => {
-                    self.clear_xai_prompt_completion(prompt_id.as_deref()).await;
-                    return response;
-                },
-                () = self.interrupt_notify.notified() => {
-                    if !self.state.lock().await.take_interrupt(generation) {
-                        continue;
-                    }
-                    // Hand the cancel to a detached task instead of
-                    // awaiting it here. A child's stdin is a blocking-pool
-                    // wrapper on Windows, whose `flush` yields at least
-                    // once, so the pinned prompt future can be parked
-                    // *inside* `write_line` while still holding the
-                    // transport's writer mutex. Awaiting the cancel in this
-                    // branch body would then block on that same mutex —
-                    // and `select!` does not poll the prompt arm that owns
-                    // it while a branch body is awaiting, so the turn
-                    // deadlocks and the Stop is swallowed. Spawning keeps
-                    // the loop polling the prompt so its write can finish
-                    // and release the lock; the cancel queues behind it on
-                    // the FIFO mutex, preserving the order described above.
-                    let child = Arc::clone(&self.child);
-                    let session_id = self.provider_session_id.0.clone();
-                    let event_tx = self.event_tx.clone();
-                    let thread_id = self.thread_id.clone();
-                    let provider_label = self.dialect.label();
-                    tokio::spawn(async move {
-                        if let Err(error) = child
-                            .notify("session/cancel", json!({ "sessionId": session_id }))
-                            .await
-                        {
-                            let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
-                                thread_id: Some(thread_id),
-                                message: format!(
-                                    "Could not cancel the {} turn: {error}",
-                                    provider_label
-                                ),
-                                original_payload: None,
-                            });
+        }
+        let mut cancellation_expired = false;
+        let response = {
+            let request = self.child.request_with_timeout("session/prompt", params, PROMPT_TIMEOUT);
+            // Keep a receiver outside the response arbiter: cancellation may
+            // end its grace after the durable terminal has already arrived.
+            let fallback = {
+                let fallback_rx = fallback_rx.clone();
+                async move {
+                    match fallback_rx {
+                        Some(mut rx) => {
+                            let completion = rx.wait_for(|value| value.is_some()).await;
+                            completion.ok().and_then(|value| value.clone())
                         }
-                    });
+                        None => std::future::pending::<Option<Value>>().await,
+                    }
+                }
+            };
+            let completion = prefer_standard_prompt_response(request, fallback, XAI_TERMINAL_RESPONSE_GRACE);
+            tokio::pin!(completion);
+            let cancel_at = tokio::time::sleep(PROMPT_TIMEOUT);
+            tokio::pin!(cancel_at);
+            let mut cancelling = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    response = &mut completion => break response,
+                    () = self.interrupt_notify.notified() => {
+                        if !self.state.lock().await.take_interrupt(generation) { continue; }
+                        if !cancelling {
+                            cancelling = true;
+                            cancel_at.as_mut().reset(tokio::time::Instant::now() + PROMPT_CANCEL_TIMEOUT);
+                        }
+                        // Keep polling the prompt while cancel waits for the
+                        // same FIFO writer, including a partial request frame.
+                        let child = Arc::clone(&self.child);
+                        let session_id = self.provider_session_id.0.clone();
+                        let event_tx = self.event_tx.clone();
+                        let thread_id = self.thread_id.clone();
+                        let provider_label = self.dialect.label();
+                        tokio::spawn(async move {
+                            if let Err(error) = child
+                                .notify("session/cancel", json!({ "sessionId": session_id }))
+                                .await
+                            {
+                                let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                                    thread_id: Some(thread_id),
+                                    message: format!(
+                                        "Could not cancel the {} turn: {error}",
+                                        provider_label
+                                    ),
+                                    original_payload: None,
+                                });
+                            }
+                        });
+                    }
+                    () = &mut cancel_at, if cancelling => {
+                        if let Some(completion) = fallback_rx.as_ref().and_then(|rx| rx.borrow().clone()) {
+                            // Correlated durable completion proves acceptance
+                            // even when the standard response was omitted.
+                            break Ok(completion);
+                        }
+                        cancellation_expired = true;
+                        break Err(RpcChildError::Timeout {method:"session/prompt cancellation".into(),elapsed:PROMPT_CANCEL_TIMEOUT});
+                    }
                 }
             }
+        };
+        if let Some(checkpoint) = checkpoint {
+            if matches!(&response, Ok(_) | Err(RpcChildError::RpcError(_))) {
+                checkpoint.accepted(turn).await;
+            } else {
+                checkpoint.abort().await;
+            }
         }
+        self.clear_xai_prompt_completion(prompt_id.as_deref()).await;
+        // The request is dropped before bounded shutdown. A durable terminal
+        // leaves the child usable and does not require transport teardown.
+        if cancellation_expired { let _ = self.child.shutdown().await; }
+        response
     }
 
     async fn clear_xai_prompt_completion(&self, prompt_id: Option<&str>) {
@@ -1428,7 +1475,7 @@ impl AcpSession {
         let Some(entry) = pending.take() else {
             return;
         };
-        let _ = entry.tx.send(completion);
+        let _ = entry.tx.send(Some(completion));
     }
 
     /// xAI extension envelopes carry the live context occupancy separately
@@ -1649,6 +1696,7 @@ impl AcpSession {
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
         let (ready_to_dispatch, should_interrupt, was_held) = {
             let mut state = self.state.lock().await;
+            if let Some(q) = state.queued.iter().find(|q|q.id == queued_id) { q.input.authorize_queue_promotion()?; }
             let queued = state
                 .queued
                 .iter()
@@ -3062,8 +3110,8 @@ fn xai_terminal_completion(
 /// current Grok builds can emit their durable lifecycle event while the
 /// standard RPC response is still being finalized. Keeping this arbitration
 /// independent from the subprocess makes the ordering contract directly
-/// testable and leaves [`AcpSession::send_prompt`] responsible only for Stop
-/// forwarding.
+/// testable and leaves [`AcpSession::send_prompt`] responsible for cancellation
+/// and acceptance settlement.
 async fn prefer_standard_prompt_response<R, F>(
     request: R,
     fallback: F,

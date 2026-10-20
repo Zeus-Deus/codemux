@@ -484,6 +484,7 @@ vi.mock("@/tauri/events", async (importOriginal) => ({
   // Pure payload helper the pane applies to every live event.
   withRetainedImages: (await importOriginal<typeof import("@/tauri/events")>())
     .withRetainedImages,
+  onAgentChatDeliveryChanged: vi.fn().mockResolvedValue(() => {}),
   onAgentChatSessionsMerged: vi.fn().mockResolvedValue(() => {}),
   onAgentChatTurnCheckpoint: vi.fn().mockResolvedValue(() => {}),
   onAgentChatTurnCheckpointReverted: vi.fn().mockResolvedValue(() => {}),
@@ -492,6 +493,9 @@ vi.mock("@/tauri/events", async (importOriginal) => ({
 }));
 
 vi.mock("@/tauri/commands", () => ({
+  agentChatDeliveryAttention: vi.fn().mockResolvedValue([]),
+  agentChatAcknowledgeDelivery: vi.fn().mockResolvedValue(undefined),
+  agentChatRetryDelivery: vi.fn().mockResolvedValue(undefined),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   // Provider health is probed only on picker intent or start/send failure.
