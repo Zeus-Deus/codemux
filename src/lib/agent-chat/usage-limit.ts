@@ -26,7 +26,7 @@ export const COARSE_TICK_MS = 15_000;
  *  read after the reset still holds. Never names a button: the same note
  *  sits beside "Try now" before the reset and "Resume" after it. */
 const BLOCKED_REASON_TEXT: Record<UsageResumeBlockedReason, string> = {
-  disabled: "Automatic resume was turned off in Settings → Agent.",
+  disabled: "Automatic resume was turned off in Settings → Agents.",
   unknown_reset: "No reset time was reported.",
   reset_passed: "The reported reset time had already passed.",
   reset_too_far: "The reset was more than 26 hours away.",

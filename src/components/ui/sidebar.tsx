@@ -799,6 +799,10 @@ export {
   SidebarProvider,
   SidebarRail,
   SidebarSeparator,
+  SIDEBAR_WIDTH_DEFAULT,
+  SIDEBAR_WIDTH_MAX,
+  SIDEBAR_WIDTH_MIN,
+  clampSidebarWidth,
   SidebarTrigger,
   useSidebar,
 }

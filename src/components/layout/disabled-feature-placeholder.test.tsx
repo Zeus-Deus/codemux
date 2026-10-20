@@ -33,7 +33,7 @@ describe("DisabledFeaturePlaceholder", () => {
     expect(screen.getByText("Custom suspension reason.")).toBeInTheDocument();
   });
 
-  it("CTA opens Settings → Interface", async () => {
+  it("CTA opens Settings → Agents", async () => {
     const user = userEvent.setup();
     const setShowSettings = vi.fn();
     useUIStore.setState({ setShowSettings } as unknown as Parameters<typeof useUIStore.setState>[0]);

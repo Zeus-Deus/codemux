@@ -51,7 +51,7 @@ export function useWorktreeIncludeToast() {
 
       const fileNames = payload.copied.map((f) => basename(f)).join(", ");
       toast.info(
-        `Copied default files (${fileNames}) to worktree. Customize in Settings > Projects or add a .codemuxinclude file.`,
+        `Copied default files (${fileNames}) to worktree. Customize in Settings → Workspaces → Projects or add a .codemuxinclude file.`,
         { duration: 8000 },
       );
 

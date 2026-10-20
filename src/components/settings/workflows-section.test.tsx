@@ -30,7 +30,7 @@ beforeEach(() => {
 });
 afterEach(() => cleanup());
 
-describe("Settings → Workflows", () => {
+describe("Settings → Agents → Workflows", () => {
   it("defaults to same-provider runs and saves a switch to mixing providers", () => {
     mount();
     const same = screen.getByRole("radio", { name: /Same provider as the chat/ });

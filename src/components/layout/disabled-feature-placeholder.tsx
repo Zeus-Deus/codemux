@@ -19,7 +19,7 @@ interface DisabledFeaturePlaceholderProps {
  * chat-only pane kind) when the Agent Chat GUI toggle is off but
  * the persisted layout still references that pane kind. Hides the
  * pane chrome instead of crashing on mount, and offers a CTA that
- * jumps the user straight to Settings → Interface so they can
+ * jumps the user straight to Settings → Agents → Chat interface so they can
  * flip it back on if they meant to.
  *
  * Data preservation contract: this component renders, but does not
@@ -29,7 +29,7 @@ interface DisabledFeaturePlaceholderProps {
  */
 export function DisabledFeaturePlaceholder({
   feature,
-  description = "This pane needs the Agent Chat GUI, which is turned off. Your data is preserved — turn it back on in Settings → Interface to use this pane again.",
+  description = "This pane needs the Agent Chat GUI, which is turned off. Your data is preserved — turn it back on in Settings → Agents to use this pane again.",
 }: DisabledFeaturePlaceholderProps) {
   const setShowSettings = useUIStore((s) => s.setShowSettings);
 
@@ -55,7 +55,7 @@ export function DisabledFeaturePlaceholder({
           onClick={openSettings}
           className="border-warning/30 hover:bg-warning/10 hover:text-warning"
         >
-          Open Settings → Interface
+          Open Settings → Agents
         </Button>
       </div>
     </div>

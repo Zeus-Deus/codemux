@@ -1,10 +1,10 @@
 import { isRemoteClient } from "@/components/remote/is-remote-client";
-import { buildNavGroups, type Section } from "./settings-sections";
+import { settingsSectionsFor, type Section } from "./settings-sections";
 
 /**
  * The searchable index behind the Settings search field.
  *
- * Settings renders one section at a time, so the rows of every other page are
+ * Settings renders one page at a time, so the rows of every other page are
  * not in the DOM to be searched. This list stands in for them: one entry per
  * row or subsection a person might look for, keyed by the text the page shows.
  * That label is also how navigation finds the row to scroll to, so it must
@@ -33,8 +33,9 @@ const SECTION_KEYWORDS: Partial<Record<Section, string>> = {
   shortcuts: "keyboard keybinds keybindings hotkeys bindings",
   workflows: "orchestration parallel agents subagents /workflow planner",
   providers: "agents claude codex cursor grok opencode hermes acp accounts chatgpt sign in install",
-  agent: "ai models defaults behaviour",
-  interface: "agent chat gui classic cli mode",
+  // Each section's former page name still finds it.
+  agent: "agent ai models defaults behaviour",
+  interface: "interface agent chat gui classic cli mode",
   permissions: "allow deny ask tool rules approvals",
   skills: "skill sync import export",
   mcp: "model context protocol servers tools",
@@ -214,7 +215,7 @@ export function searchSettings(
   const remote = isRemoteClient();
 
   const groups: SettingsSearchGroup[] = [];
-  for (const item of buildNavGroups(agentChatEnabled).flatMap((g) => g.items)) {
+  for (const item of settingsSectionsFor(agentChatEnabled)) {
     const sectionKeywords = SECTION_KEYWORDS[item.id] ?? "";
     const sectionText = `${item.label} ${sectionKeywords}`.toLowerCase();
     const pageMatches = needles.every((n) => sectionText.includes(n));
@@ -275,7 +276,7 @@ export function settingsPagesForQuery(
   const rest = typed.replace(/^settings?(\s+|$)/, "");
   if (rest !== typed) {
     return rest === ""
-      ? buildNavGroups(agentChatEnabled).flatMap((g) => g.items.map((i) => i.id))
+      ? settingsSectionsFor(agentChatEnabled).map((i) => i.id)
       : searchSettings(rest, agentChatEnabled, signedIn).map((g) => g.section);
   }
   if (typed.length < 2) return [];

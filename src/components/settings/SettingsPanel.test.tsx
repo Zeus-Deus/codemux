@@ -16,6 +16,7 @@ beforeAll(() => {
 // ── Mocks ──
 
 const mockSetShowSettings = vi.fn();
+const mockSetSidebarWidth = vi.fn();
 let requestedSection: string | null = null;
 let navigationVersion = 0;
 const mockSignOut = vi.fn();
@@ -40,6 +41,8 @@ vi.mock("@/stores/ui-store", () => ({
   useUIStore: (sel: (s: Record<string, unknown>) => unknown) =>
     sel({
       setShowSettings: mockSetShowSettings,
+      sidebarWidth: 288,
+      setSidebarWidth: mockSetSidebarWidth,
       settingsSection: requestedSection,
       settingsNavigationVersion: navigationVersion,
     }),
@@ -158,6 +161,8 @@ vi.mock("@/stores/synced-settings-store", () => ({
   selectNotificationSoundEnabled: () => true,
   selectDesktopNotificationsEnabled: () => true,
   selectKeyboardShortcuts: () => ({}),
+  // Source Control shares the Git page.
+  selectOpenPrLinksInBrowser: () => false,
 }));
 
 vi.mock("@/tauri/commands", () => ({
@@ -202,6 +207,10 @@ vi.mock("@/tauri/commands", () => ({
   // Updates section: no devices, so only this computer is checked.
   hostsList: vi.fn().mockResolvedValue([]),
   getLocalDeviceName: vi.fn().mockResolvedValue("this-computer"),
+  // Sections that share a page with the ones above.
+  discoverSourceControl: vi.fn().mockResolvedValue([]),
+  listToolPermissions: vi.fn().mockResolvedValue([]),
+  removeToolPermission: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
@@ -278,22 +287,50 @@ describe("SettingsPanel", () => {
     vi.clearAllMocks();
   });
 
-  it("renders nav with all section groups", () => {
-    render(<SettingsView />);
-
-    // Group headers
-    for (const group of ["PERSONAL", "AGENTS", "WORKSPACES", "TOOLS", "SYSTEM"]) {
-      expect(screen.getByText(group)).toBeInTheDocument();
+  it("lists one nav row per page, without group captions", () => {
+    const view = render(<SettingsView />);
+    const nav = view.container.querySelector("nav") as HTMLElement;
+    const rows = within(nav).getAllByRole("button").map((row) => row.textContent);
+    expect(rows).toEqual([
+      "General", "Appearance", "Agents", "Providers", "Usage", "Extensions",
+      "Workspaces", "Tools", "Git", "Connections", "System",
+    ]);
+    for (const caption of ["PERSONAL", "AGENTS", "WORKSPACES", "TOOLS", "SYSTEM"]) {
+      expect(within(nav).queryByText(caption)).toBeNull();
     }
+    view.unmount();
+  });
 
-    // Nav items
-    expect(screen.getByRole("button", { name: /Account/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Appearance/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Notifications/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Shortcuts/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Editor/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Terminal/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Git/i })).toBeInTheDocument();
+  it("stacks a page's sections under the page title, each listed beside it", () => {
+    const view = render(<SettingsView />);
+    fireEvent.click(within(view.container.querySelector("nav")!).getByRole("button", { name: "Agents" }));
+    expect(view.getByRole("heading", { level: 2, name: "Agents" })).toBeInTheDocument();
+    const sections = Array.from(
+      view.container.querySelectorAll<HTMLElement>("[data-settings-section]"),
+      (el) => el.dataset.settingsSection,
+    );
+    expect(sections).toEqual(["interface", "agent", "permissions", "workflows"]);
+    for (const name of ["Chat interface", "Models & behavior", "Permissions", "Workflows"]) {
+      expect(view.getByRole("heading", { level: 3, name })).toBeInTheDocument();
+    }
+    const onThisPage = view.getByRole("navigation", { name: "On this page" });
+    expect(within(onThisPage).getAllByRole("button").map((b) => b.textContent)).toEqual([
+      "Chat interface", "Models & behavior", "Permissions", "Workflows",
+    ]);
+    expect(within(onThisPage).getByRole("button", { name: "Chat interface" }))
+      .toHaveAttribute("aria-current", "location");
+    view.unmount();
+  });
+
+  it("resizes the nav with the app sidebar's shared width", () => {
+    const view = render(<SettingsView />);
+    const seam = view.getByRole("separator", { name: "Resize settings navigation" });
+    expect(seam).toHaveAttribute("aria-valuenow", "288");
+    fireEvent.keyDown(seam, { key: "ArrowRight" });
+    expect(mockSetSidebarWidth).toHaveBeenCalledWith(304);
+    fireEvent.keyDown(seam, { key: "Home" });
+    expect(mockSetSidebarWidth).toHaveBeenCalledWith(180);
+    view.unmount();
   });
 
   it("shows Account section by default with user info", () => {
@@ -312,8 +349,8 @@ describe("SettingsPanel", () => {
     fireEvent.click(appearanceButtons[0]);
     expect(screen.getAllByText("Typography").length).toBeGreaterThan(0);
 
-    const terminalButtons = screen.getAllByRole("button", { name: /Terminal/i });
-    fireEvent.click(terminalButtons[0]);
+    const toolsButtons = screen.getAllByRole("button", { name: /Tools/i });
+    fireEvent.click(toolsButtons[0]);
     expect(screen.getAllByText("Cursor style").length).toBeGreaterThan(0);
   });
 
@@ -340,10 +377,10 @@ describe("SettingsPanel", () => {
     expect(wrapper()).not.toHaveClass("max-w-3xl");
 
     // Switching away restores the reading measure.
-    const terminalButtons = within(container).getAllByRole("button", {
-      name: /^Terminal$/i,
+    const toolsButtons = within(container).getAllByRole("button", {
+      name: /^Tools$/i,
     });
-    fireEvent.click(terminalButtons[0]);
+    fireEvent.click(toolsButtons[0]);
     expect(wrapper()).toHaveClass("max-w-3xl");
   });
 
@@ -678,7 +715,7 @@ describe("Settings footer navigation", () => {
     navigationVersion++;
     view.rerender(<SettingsView />);
     expect(view.getByRole("button", { name: "Appearance" })).toHaveAttribute("aria-current", "page");
-    fireEvent.click(view.getByRole("button", { name: "Account" }));
+    fireEvent.click(view.getByRole("button", { name: "General" }));
     navigationVersion++;
     view.rerender(<SettingsView />);
     expect(view.getByRole("button", { name: "Appearance" })).toHaveAttribute("aria-current", "page");
@@ -704,7 +741,7 @@ describe("Settings footer navigation", () => {
     requestedSection = "mcp";
     const view = render(<SettingsView />);
     try {
-      expect(view.getByRole("button", { name: "MCP Servers" })).toHaveAttribute("aria-current", "page");
+      expect(view.getByRole("button", { name: "Extensions" })).toHaveAttribute("aria-current", "page");
       fireEvent.click(await view.findByRole("button", { name: "Revoke" }));
       vi.mocked(commands.agentConnectorStatus).mockResolvedValue({ ...status, clients: [] });
       fireEvent.click(view.getByRole("button", { name: "Revoke access" }));
@@ -745,7 +782,7 @@ describe("Settings footer navigation", () => {
     const viewport = () =>
       view.container.querySelector('[data-slot="scroll-area-viewport"]') as HTMLElement;
     viewport().scrollTop = 600;
-    fireEvent.click(view.getByRole("button", { name: "Terminal" }));
+    fireEvent.click(view.getByRole("button", { name: "Tools" }));
     expect(viewport().scrollTop).toBe(0);
     view.unmount();
   });
@@ -754,7 +791,7 @@ describe("Settings footer navigation", () => {
     const view = render(<SettingsView />);
     const nav = view.container.querySelector("nav") as HTMLElement;
     const scroller = nav.querySelector(".overflow-y-auto");
-    expect(scroller).toContainElement(view.getByRole("button", { name: "Account" }));
+    expect(scroller).toContainElement(within(nav).getByRole("button", { name: "General" }));
     expect(scroller).not.toContainElement(view.getByRole("combobox", { name: "Search settings" }));
     view.unmount();
   });
@@ -904,6 +941,37 @@ describe("Settings footer navigation", () => {
     expect(view.getByRole("button", { name: "Unpin from footer" })).toBeInTheDocument();
     view.unmount();
     requestedSection = null;
+  });
+});
+
+describe("Settings section tracking", () => {
+  it("follows the reader again once they scroll by the scrollbar after a jump", async () => {
+    const { useFooterPinsStore } = await import("@/stores/footer-pins-store");
+    useFooterPinsStore.getState().reset();
+    requestedSection = "terminal";
+    const view = render(<SettingsView />);
+    try {
+      const onThisPage = view.getByRole("navigation", { name: "On this page" });
+      const current = () => within(onThisPage).getByRole("button", { current: "location" });
+      const scrollArea = view.container.querySelector<HTMLElement>('[data-slot="scroll-area"]')!;
+      const viewport = scrollArea.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')!;
+      // The deep link holds Terminal while the scroll it caused settles.
+      await waitFor(() => expect(current()).toHaveTextContent("Terminal"));
+      fireEvent.scroll(viewport);
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      expect(current()).toHaveTextContent("Terminal");
+
+      // A thumb drag starts on the scrollbar, outside the viewport. jsdom
+      // has no layout, so the scroll then reads as the bottom: Browser.
+      fireEvent.pointerDown(scrollArea);
+      fireEvent.scroll(viewport);
+      await waitFor(() => expect(current()).toHaveTextContent("Browser"));
+      fireEvent.click(view.getByRole("button", { name: "Pin to footer" }));
+      expect(useFooterPinsStore.getState().pins.slice(-1)[0]?.id).toBe("codemux.settings.browser");
+    } finally {
+      view.unmount();
+      requestedSection = null;
+    }
   });
 });
 
@@ -1092,7 +1160,8 @@ describe("Settings → Projects", () => {
     const setup = screen.getByPlaceholderText("e.g. npm install");
     expect(setup).toBeDisabled();
     expect(setup).toHaveValue("");
-    expect(screen.getByRole("status")).toHaveTextContent("Loading project scripts");
+    const projects = document.querySelector<HTMLElement>('[data-settings-section="projects"]')!;
+    expect(within(projects).getByRole("status")).toHaveTextContent("Loading project scripts");
     fireEvent.blur(setup);
     expect(commands.setProjectScripts).not.toHaveBeenCalled();
 
@@ -1239,7 +1308,7 @@ describe("Settings search", () => {
     expect(within(results).getByRole("option", { name: /Match the orb to the activity/ }))
       .toHaveAttribute("aria-selected", "true");
     // The nav is replaced while searching.
-    expect(view.queryByRole("button", { name: "Account" })).toBeNull();
+    expect(within(view.container.querySelector("nav")!).queryByRole("button", { name: "General" })).toBeNull();
 
     fireEvent.keyDown(searchField(view), { key: "Enter" });
 
@@ -1258,8 +1327,8 @@ describe("Settings search", () => {
     const view = render(<SettingsView />);
     // jsdom has no layout: the nav shows y 100–500 and the About row sits at
     // y 900–932, below the fold.
-    const scroller = view
-      .getByRole("button", { name: "Account" })
+    const scroller = within(view.container.querySelector("nav")!)
+      .getByRole("button", { name: "General" })
       .closest<HTMLElement>(".overflow-y-auto")!;
     let scrollTop = 0;
     Object.defineProperty(scroller, "scrollTop", {
@@ -1281,7 +1350,7 @@ describe("Settings search", () => {
     fireEvent.change(searchField(view), { target: { value: "diagnostics" } });
     fireEvent.keyDown(searchField(view), { key: "Enter" });
 
-    expect(view.getByRole("button", { name: "About" })).toHaveAttribute("aria-current", "page");
+    expect(view.getByRole("button", { name: "System" })).toHaveAttribute("aria-current", "page");
     // 932 − 500, plus the 12px margin.
     expect(scrollTop).toBe(444);
     rects.mockRestore();

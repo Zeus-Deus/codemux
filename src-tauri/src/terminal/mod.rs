@@ -1691,7 +1691,7 @@ async fn handle_daemon_spawn_failure<R: Runtime>(
         let message = if is_remote {
             format!(
                 "Couldn't reach the remote host: {error}. Try Test Connection in \
-                 Settings → Hosts, or right-click → Pull back."
+                 Settings → Connections → Devices, or right-click → Pull back."
             )
         } else {
             format!(

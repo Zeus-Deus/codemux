@@ -142,12 +142,12 @@ mod on_device {
             .into_iter()
             .find(|h| h.id == host_id)
             .ok_or_else(|| {
-                "That device isn't set up on this computer. Add it in Settings → Devices."
+                "That device isn't set up on this computer. Add it in Settings → Connections → Devices."
                     .to_string()
             })?;
         let device = host.name.as_str();
         validate_ssh_target(&host.ssh_target).map_err(|e| {
-            format!("{device}'s SSH address isn't valid ({e}). Fix it in Settings → Devices.")
+            format!("{device}'s SSH address isn't valid ({e}). Fix it in Settings → Connections → Devices.")
         })?;
 
         ensure_codemux_remote(app, &host).await?;
@@ -239,7 +239,7 @@ mod on_device {
         let set_up_failed = |e: String| {
             format!(
                 "Couldn't set up codemux on {device}: {e}. \
-                 Finish setting up {device} in Settings → Devices."
+                 Finish setting up {device} in Settings → Connections → Devices."
             )
         };
         match probe_host(ProbeOptions::new(&host.ssh_target)).await {

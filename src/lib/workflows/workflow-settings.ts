@@ -184,7 +184,7 @@ export function buildWorkflowRoutes({
 
   if (chat) {
     if (!isWorkflowProvider(chat.provider)) {
-      return { routes, labels, problem: "Workflows can't run on this chat's agent. Switch to Claude or Codex, or choose providers in Settings → Workflows." };
+      return { routes, labels, problem: "Workflows can't run on this chat's agent. Switch to Claude or Codex, or choose providers in Settings → Agents → Workflows." };
     }
     const provider = chat.provider;
     const info = capability(provider);
@@ -213,7 +213,7 @@ export function buildWorkflowRoutes({
     add(provider, model);
   }
   if (routes.length === 0) {
-    return { routes, labels, problem: "No workflow provider is ready. Turn one on in Settings → Workflows." };
+    return { routes, labels, problem: "No workflow provider is ready. Turn one on in Settings → Agents → Workflows." };
   }
   return { routes, labels, problem: null };
 }

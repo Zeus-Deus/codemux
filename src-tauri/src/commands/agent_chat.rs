@@ -2296,6 +2296,89 @@ fn delete_chat_images_in(root: &std::path::Path, db: &DatabaseStore, thread_id: 
     delete_referenced_chat_images_in(root, &db.list_agent_chat_messages(thread_id));
 }
 
+/// Reclaim only this feature's deterministic raster cache files. Durable
+/// references (including retained reply images) always win over eviction.
+fn delete_tool_result_image_cache_in(root: &std::path::Path, db: &DatabaseStore, thread_id: &str) {
+    let mut components = std::path::Path::new(thread_id).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(name)) if name == thread_id)
+        || components.next().is_some()
+    {
+        return;
+    }
+    let dir = root.join(thread_id);
+    // Never traverse a symlink in place of a session folder or cache file.
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|metadata| metadata.is_dir()) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut paths = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some((stem, ext)) = name.rsplit_once('.') else {
+            continue;
+        };
+        let Some((row, digest)) = stem
+            .strip_prefix("tool-")
+            .and_then(|stem| stem.split_once('-'))
+        else {
+            continue;
+        };
+        if !matches!(ext, "png" | "jpg" | "gif" | "webp")
+            || !row
+                .parse::<i64>()
+                .is_ok_and(|id| id > 0 && id.to_string() == row)
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            continue;
+        }
+        paths.push(entry.path());
+    }
+    if !paths.is_empty() {
+        let Ok(retained_payloads) = db.list_agent_chat_image_payloads() else {
+            return;
+        };
+        let retained = retained_payloads
+            .iter()
+            .flat_map(|payload| chat_image_paths_in_payload(payload))
+            .filter_map(|path| resolve_within(root, &path).ok())
+            .collect::<std::collections::HashSet<_>>();
+        for path in paths {
+            if resolve_within(root, &path.to_string_lossy())
+                .is_ok_and(|path| !retained.contains(&path))
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    // Other assets or referenced cache files keep their folder intact.
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// Finish a materialization after a concurrent delete/merge. Cache cleanup
+/// preserves durable references even if the original row has since gone.
+fn finish_tool_result_image_cache(
+    db: &DatabaseStore,
+    thread_id: &str,
+    path: &std::path::Path,
+) -> bool {
+    if !matches!(db.has_agent_chat_session(thread_id), Ok(false)) {
+        return true;
+    }
+    if let Some(root) = path.parent().and_then(std::path::Path::parent) {
+        delete_tool_result_image_cache_in(root, db, thread_id);
+    }
+    false
+}
+
 fn delete_referenced_chat_images_in(root: &std::path::Path, payloads: &[String]) {
     let Ok(canon_root) = root.canonicalize() else {
         return;
@@ -7075,6 +7158,7 @@ pub async fn agent_chat_delete_session<R: Runtime>(
                 .map_err(|e| e.to_string())?;
         }
     }
+    let existed = db.has_agent_chat_session(&thread_id)?;
     // Best-effort: drop the chat's images alongside the DB rows. The
     // messages cascade via FK, but the image files live outside SQLite, so
     // nothing else would ever reclaim them. A failure here (missing dir is
@@ -7120,6 +7204,13 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     }));
     let turn_diff_cleanup = super::turn_diff::thread_cleanup(&db, &thread_id);
     db.delete_agent_chat_session(&thread_id)?;
+    if existed {
+        if let Some(root) = chat_images_root() {
+            // A materializer may have completed between the first image
+            // cleanup and the DB delete. Later writes check ownership too.
+            delete_tool_result_image_cache_in(&root, &db, &thread_id);
+        }
+    }
     super::async_questions::publish_attention(&app);
     // The thread is gone; its dispatch lock can never be contended again.
     forget_turn_checkpoint_lock(&thread_id);
@@ -7229,6 +7320,11 @@ fn agent_chat_sessions_merged<R: Runtime>(
 ) {
     super::queued_turns::after_sessions_merged(app, db, chat_images_dir);
     if !cleanup.thread_ids.is_empty() {
+        if let Some(root) = chat_images_root() {
+            for thread_id in &cleanup.thread_ids {
+                delete_tool_result_image_cache_in(&root, db, thread_id);
+            }
+        }
         let survivor = cleanup.survivor.clone();
         let _ = app.emit(
             AGENT_CHAT_SESSIONS_MERGED_EVENT,
@@ -7459,7 +7555,170 @@ pub async fn agent_chat_get_tool_result(
         .ok_or_else(|| format!("not_found: agent_chat_messages row {row_id}"))
 }
 
-// ── Lazy tool-result shaping (read path only) ─────────────────────────
+/// Resolve just one image from the original result. Images travel separately
+/// over the existing protected asset transport instead of every history read.
+/// Full-result retrieval above remains verbatim, even for malformed images.
+#[derive(Serialize)]
+pub struct ToolResultImageSource {
+    src: String,
+    local: bool,
+}
+
+#[tauri::command]
+pub async fn agent_chat_get_tool_result_image(
+    db: State<'_, DatabaseStore>,
+    row_id: i64,
+    pointer: String,
+    inline: Option<bool>,
+) -> Result<ToolResultImageSource, String> {
+    let (thread_id, payload) = db
+        .get_agent_chat_message_with_thread(row_id)
+        .ok_or_else(|| format!("not_found: agent_chat_messages row {row_id}"))?;
+    let (src, image) = tokio::task::spawn_blocking(move || -> Result<_, String> {
+        let src = tool_result_image_src(&payload, &pointer)?;
+        if ["http://", "https://"].iter().any(|prefix| {
+            src.get(..prefix.len())
+                .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+        }) {
+            return Ok((src, None));
+        }
+        if inline.unwrap_or(false) {
+            if !can_materialize_tool_image(&src) {
+                return Err(
+                    "validation_error: image source exceeds inline transport bounds".into(),
+                );
+            }
+            return Ok((src, None));
+        }
+        // Browsers tolerate whitespace/unpadded base64 and sniffed formats.
+        // Preserve the bounded original source without writing unvalidated bytes.
+        let bytes = match decode_tool_result_image(&src) {
+            Ok(bytes) => bytes,
+            Err(_) if can_materialize_tool_image(&src) => return Ok((src, None)),
+            Err(error) => return Err(error),
+        };
+        use sha2::{Digest, Sha256};
+        let stem = format!("tool-{row_id}-{:x}", Sha256::digest(&bytes));
+        Ok((src, Some((stem, bytes))))
+    })
+    .await
+    .map_err(|error| format!("failed to resolve tool-result image: {error}"))??;
+    let Some((stem, bytes)) = image else {
+        return Ok(ToolResultImageSource { src, local: false });
+    };
+    match write_thread_chat_image(&thread_id, &stem, &bytes).await {
+        Ok((path, _)) if !finish_tool_result_image_cache(&db, &thread_id, &path) => {
+            Ok(ToolResultImageSource { src, local: false })
+        }
+        Ok((path, _)) => Ok(ToolResultImageSource {
+            src: path.to_string_lossy().into_owned(),
+            local: true,
+        }),
+        // This file is a cache; an unwritable cache must not hide evidence.
+        Err(_) => Ok(ToolResultImageSource { src, local: false }),
+    }
+}
+
+fn tool_result_image_src(payload: &str, pointer: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|_| "validation_error: invalid tool-result row".to_string())?;
+    if value["type"] != "item_completed" || value["item"]["kind"] != "tool_result" {
+        return Err("validation_error: row is not a tool result".to_string());
+    }
+    let mut entry = &value["item"]["content"];
+    if !pointer.is_empty() {
+        for token in pointer
+            .strip_prefix('/')
+            .ok_or("validation_error: invalid image pointer")?
+            .split('/')
+        {
+            entry = match entry {
+                serde_json::Value::Array(entries) => {
+                    token.parse::<usize>().ok().and_then(|i| entries.get(i))
+                }
+                serde_json::Value::Object(object)
+                    if ["result", "content", "contentItems"].contains(&token) =>
+                {
+                    object.get(token)
+                }
+                _ => None,
+            }
+            .ok_or("validation_error: invalid image pointer")?;
+        }
+    }
+    if !is_renderable_image_entry(entry) {
+        return Err("validation_error: pointer is not a renderable image block".to_string());
+    }
+    Ok(image_src_from_entry(entry))
+}
+
+fn image_src_from_entry(entry: &serde_json::Value) -> String {
+    let src = match entry["type"].as_str() {
+        Some("file") => entry["uri"].as_str().unwrap().to_string(),
+        Some("inputImage") => entry["imageUrl"].as_str().unwrap().to_string(),
+        Some("image_url") => entry["image_url"]["url"]
+            .as_str()
+            .or_else(|| entry["image_url"].as_str())
+            .unwrap()
+            .to_string(),
+        Some("image") if entry.get("source").is_none() => format!(
+            "data:{};base64,{}",
+            entry["mimeType"].as_str().unwrap(),
+            entry["data"].as_str().unwrap()
+        ),
+        _ if entry["source"]["type"] == "base64" => format!(
+            "data:{};base64,{}",
+            entry["source"]["media_type"]
+                .as_str()
+                .unwrap_or("image/png"),
+            entry["source"]["data"].as_str().unwrap()
+        ),
+        _ => entry["source"]["url"].as_str().unwrap().to_string(),
+    };
+    src.trim().to_string()
+}
+
+fn can_materialize_tool_image(src: &str) -> bool {
+    let Some((header, data)) = src.split_once(',') else {
+        return false;
+    };
+    let header = header.to_ascii_lowercase();
+    let Some(mime) = header
+        .strip_prefix("data:")
+        .and_then(|s| s.strip_suffix(";base64"))
+    else {
+        return false;
+    };
+    validate_chat_image_mime(mime).is_ok()
+        && data.len() <= crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES.div_ceil(3) * 4
+}
+
+fn decode_tool_result_image(src: &str) -> Result<Vec<u8>, String> {
+    let (header, data) = src
+        .split_once(',')
+        .ok_or("validation_error: invalid image data URL")?;
+    let header = header.to_ascii_lowercase();
+    let mime = header
+        .strip_prefix("data:")
+        .and_then(|s| s.strip_suffix(";base64"))
+        .ok_or("validation_error: expected a base64 image data URL")?;
+    validate_chat_image_mime(mime)?;
+    let limit = crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES;
+    if data.len() > limit.div_ceil(3) * 4 {
+        return Err("validation_error: tool-result image exceeds preview limit; load full output for original data".to_string());
+    }
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| "validation_error: invalid image base64".to_string())?;
+    if bytes.len() > limit {
+        return Err("validation_error: tool-result image exceeds preview limit".to_string());
+    }
+    media_type_from_image_bytes(&bytes)?;
+    Ok(bytes)
+}
+
+// ── Lazy tool-result shaping (replay and persisted live events) ────────
 
 /// Serialized `tool_result` content above this size is replaced by a
 /// stub on the cursor read path. A 13 MB thread is mostly collapsed
@@ -7475,14 +7734,8 @@ pub const LAZY_TOOL_RESULT_PREVIEW_BYTES: usize = 2 * 1024;
 /// distinguishable from a genuine tool-result body.
 pub const LAZY_TOOL_RESULT_KEY: &str = "__codemux_lazy_tool_result";
 
-/// Replace an oversized `tool_result` body with a metadata stub.
-///
-/// Returns the payload unchanged unless ALL of the following hold: the
-/// envelope is an `item_completed` carrying a `tool_result`, its
-/// `content` serializes to more than [`LAZY_TOOL_RESULT_THRESHOLD_BYTES`],
-/// and the content carries no image block. Image-bearing results are
-/// never stubbed so the thumbnail grid and the auto-expand-on-image
-/// behaviour keep working off the real content.
+/// Shape only the wire copy. Stored provider payloads remain lossless, including
+/// legacy rows; image handles resolve against the original row on demand.
 fn shape_persisted_payload(row_id: i64, payload: &str) -> String {
     // Cheap gate: the stub only ever shrinks a payload that is already
     // bigger than the threshold, so smaller rows skip the parse entirely.
@@ -7504,16 +7757,22 @@ fn shape_persisted_payload(row_id: i64, payload: &str) -> String {
     let Some(content) = item.get("content") else {
         return payload.to_string();
     };
-    if content_has_image_block(content) {
-        return payload.to_string();
-    }
-    let Ok(serialized) = serde_json::to_string(content) else {
+    let Some(stub) = lazy_tool_result_content(row_id, content) else {
         return payload.to_string();
     };
+    item.insert("content".to_string(), stub);
+    serde_json::to_string(&value).unwrap_or_else(|_| payload.to_string())
+}
+
+fn lazy_tool_result_content(row_id: i64, content: &serde_json::Value) -> Option<serde_json::Value> {
+    let serialized = serde_json::to_string(content).ok()?;
     if serialized.len() <= LAZY_TOOL_RESULT_THRESHOLD_BYTES {
-        return payload.to_string();
+        return None;
     }
-    let text = stringify_tool_content(content);
+    let mut preview_content = content.clone();
+    let mut images = Vec::new();
+    collect_tool_result_images(&mut preview_content, "", &mut images);
+    let text = stringify_tool_content(&preview_content);
     let mut stub = serde_json::json!({
         LAZY_TOOL_RESULT_KEY: {
             "row_id": row_id,
@@ -7522,32 +7781,92 @@ fn shape_persisted_payload(row_id: i64, payload: &str) -> String {
             // `split('\n')` (not `lines()`) so the count matches the
             // frontend's `split("\n").length` on the same text.
             "line_count": text.split('\n').count(),
-            "has_images": false,
+            "has_images": !images.is_empty(),
+            "images": images,
         }
     });
     if !crate::agent_provider::codex::tool_outcome::preserve_outcome_in_stub(content, &mut stub) {
-        return payload.to_string();
+        return None;
     }
-    item.insert("content".to_string(), stub);
-    serde_json::to_string(&value).unwrap_or_else(|_| payload.to_string())
+    Some(stub)
 }
 
-/// Mirror of the frontend's `hasToolResultImages`
-/// (`src/lib/agent-chat/tool-result-images.ts`): an entry counts only if
-/// the renderer would actually draw it.
-///
-/// The accept-set has to match, not merely overlap. Too narrow and we stub
-/// a body the thumbnail grid needs; too wide — the old "any `type` starting
-/// with image" test — and a base64 PDF or a sourceless entry bypasses the
-/// stub, which is exactly backwards, since those are the biggest payloads
-/// and nothing renders them.
+/// Only shape live events after a successful durable write. A persistence
+/// failure (including the deleted-session race returning no id) must leave the
+/// full live content available rather than minting an unreachable handle.
+fn shape_live_tool_result(event: &mut ProviderRuntimeEvent, row_id: Option<i64>) {
+    let Some(row_id) = row_id else { return };
+    if let ProviderRuntimeEvent::ItemCompleted {
+        item: crate::agent_provider::CompletedItem::ToolResult { content, .. },
+        ..
+    } = event
+    {
+        // Preserve text-only live delivery and avoid shaping work on that path.
+        if content_has_image_block(content) {
+            if let Some(stub) = lazy_tool_result_content(row_id, content) {
+                *content = stub;
+            }
+        }
+    }
+}
+
 fn content_has_image_block(content: &serde_json::Value) -> bool {
-    let Some(entries) = content.as_array() else {
-        return false;
-    };
-    entries.iter().any(is_renderable_image_entry)
+    if is_renderable_image_entry(content) {
+        return true;
+    }
+    match content {
+        serde_json::Value::Array(entries) => entries.iter().any(content_has_image_block),
+        serde_json::Value::Object(object) => ["result", "content", "contentItems"]
+            .iter()
+            .any(|key| object.get(*key).is_some_and(content_has_image_block)),
+        _ => false,
+    }
 }
 
+/// Walk provider result containers, not arbitrary inputs/arguments. JSON
+/// pointers stay stable across a replay, fork or merge because wire stubs are
+/// regenerated using the destination row id, never stored in the database.
+fn collect_tool_result_images(
+    content: &mut serde_json::Value,
+    pointer: &str,
+    images: &mut Vec<serde_json::Value>,
+) {
+    if is_renderable_image_entry(content) {
+        let src = image_src_from_entry(content);
+        // Keep small sources and formats outside the managed raster transport
+        // directly renderable. Never turn a previously working SVG, AVIF or
+        // parameterized data URL into a permanently failing image handle.
+        if src.len() <= LAZY_TOOL_RESULT_THRESHOLD_BYTES || !can_materialize_tool_image(&src) {
+            images.push(serde_json::json!({ "pointer": pointer, "src": src }));
+        } else {
+            images.push(serde_json::json!({ "pointer": pointer }));
+        }
+        *content = serde_json::Value::Null;
+        return;
+    }
+    match content {
+        serde_json::Value::Array(entries) => {
+            let mut index = 0;
+            entries.retain_mut(|entry| {
+                let is_image = is_renderable_image_entry(entry);
+                collect_tool_result_images(entry, &format!("{pointer}/{index}"), images);
+                index += 1;
+                !is_image
+            });
+        }
+        serde_json::Value::Object(object) => {
+            for key in ["result", "content", "contentItems"] {
+                if let Some(value) = object.get_mut(key) {
+                    collect_tool_result_images(value, &format!("{pointer}/{key}"), images);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Same accepted image blocks as `tool-result-images.ts`. Invalid/non-image
+/// entries remain in the textual preview and can always be loaded in full.
 fn is_renderable_image_entry(entry: &serde_json::Value) -> bool {
     let Some(entry) = entry.as_object() else {
         return false;
@@ -7561,6 +7880,10 @@ fn is_renderable_image_entry(entry: &serde_json::Value) -> bool {
                 None => iu.as_str(),
             })
             .is_some_and(is_safe_image_src),
+        Some("inputImage") => entry
+            .get("imageUrl")
+            .and_then(|url| url.as_str())
+            .is_some_and(is_safe_image_src),
         Some("file") => {
             entry
                 .get("mime")
@@ -7572,6 +7895,16 @@ fn is_renderable_image_entry(entry: &serde_json::Value) -> bool {
                     .is_some_and(is_safe_image_src)
         }
         Some("image") => {
+            if !entry.contains_key("source") {
+                return entry
+                    .get("data")
+                    .and_then(|data| data.as_str())
+                    .is_some_and(|data| !data.is_empty())
+                    && entry
+                        .get("mimeType")
+                        .and_then(|mime| mime.as_str())
+                        .is_some_and(|mime| mime.to_ascii_lowercase().starts_with("image/"));
+            }
             let Some(source) = entry.get("source").and_then(|s| s.as_object()) else {
                 return false;
             };
@@ -7602,8 +7935,11 @@ fn is_renderable_image_entry(entry: &serde_json::Value) -> bool {
 /// Same accept-set as the frontend's `safeImageSrc`: only sources the
 /// webview will load as an image.
 fn is_safe_image_src(raw: &str) -> bool {
-    let url = raw.trim().to_ascii_lowercase();
-    url.starts_with("data:image/") || url.starts_with("http://") || url.starts_with("https://")
+    let url = raw.trim();
+    ["data:image/", "http://", "https://"].iter().any(|prefix| {
+        url.get(..prefix.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+    })
 }
 
 /// Flatten tool-result content to the text the collapsed card would
@@ -8372,6 +8708,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         // forwarded with an empty ThreadId so the frontend at least
         // sees them; a richer global-warning channel is a follow-up.
         .unwrap_or_else(|| ThreadId(String::new()));
+    shape_live_tool_result(&mut event, persisted_id);
     let payload = AgentChatEventPayload {
         thread_id: thread_id.clone(),
         event,
@@ -10688,6 +11025,190 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_image_cache_cleanup_covers_both_delete_write_orders() {
+        let root = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("deleted", "ws", None, "claude")
+            .unwrap();
+        let dir = root.path().join("deleted");
+        let path = dir.join(format!("tool-1-{}.png", "a".repeat(64)));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"cache").unwrap();
+        delete_chat_images_in(root.path(), &db, "deleted");
+        assert!(!dir.exists());
+        // The write finishes after folder cleanup but before the DB delete.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"late cache").unwrap();
+        assert!(finish_tool_result_image_cache(&db, "deleted", &path));
+        db.delete_agent_chat_session("deleted").unwrap();
+        delete_tool_result_image_cache_in(root.path(), &db, "deleted");
+        assert!(
+            !dir.exists(),
+            "the post-delete sweep reclaims the late write"
+        );
+        // Or the write finishes after the DB delete and its final sweep.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"later cache").unwrap();
+        assert!(!finish_tool_result_image_cache(&db, "deleted", &path));
+        assert!(
+            !dir.exists(),
+            "post-write ownership check reclaims this order"
+        );
+    }
+
+    #[test]
+    fn tool_result_image_cache_merge_preserves_all_durable_references_and_other_files() {
+        let root = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::new_in_memory();
+        for thread in ["source", "survivor", "other"] {
+            db.upsert_agent_chat_session(thread, "ws", Some("/repo"), "claude")
+                .unwrap();
+        }
+        let row = db
+            .append_agent_chat_message("source", &tool_result_payload(json!("image")))
+            .unwrap()
+            .unwrap();
+        let dir = root.path().join("source");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = |id, ext| dir.join(format!("tool-{id}-{}.{ext}", "b".repeat(64)));
+        let unused = cache(row, "png");
+        let attachment = cache(row + 1, "jpg");
+        let retained_reply = cache(row + 2, "webp");
+        let foreign_attachment = cache(row + 3, "gif");
+        for path in [&unused, &attachment, &retained_reply, &foreign_attachment] {
+            std::fs::write(path, b"cache").unwrap();
+        }
+        for (thread, payload) in [
+            (
+                "source",
+                json!({"type":"user_message", "images":[{"path":attachment}]}),
+            ),
+            (
+                "source",
+                json!({"type":"item_completed", "item":{"kind":"assistant_text", "retained_images":[{"source":unused, "path":retained_reply}]}}),
+            ),
+            (
+                "other",
+                json!({"type":"user_message", "images":[{"path":foreign_attachment}]}),
+            ),
+        ] {
+            db.append_agent_chat_message(thread, &payload.to_string())
+                .unwrap();
+        }
+        let other_names = [
+            "attachment.png".to_string(),
+            format!("tool-0-{}.png", "b".repeat(64)),
+            format!("tool-01-{}.png", "b".repeat(64)),
+            format!("tool-1-{}.svg", "b".repeat(64)),
+            // A distinct row prevents this malformed name aliasing the valid
+            // lowercase cache file on case-insensitive filesystems.
+            format!("tool-{}-{}.png", row + 20, "B".repeat(64)),
+            "tool-1-short.png".to_string(),
+            ".tool-1-temp.tmp".to_string(),
+        ];
+        for name in &other_names {
+            std::fs::write(dir.join(name), b"preserve").unwrap();
+        }
+        let named_dir = cache(row + 10, "png");
+        std::fs::create_dir(&named_dir).unwrap();
+        db.merge_reopened_agent_chat_session("source", "survivor")
+            .unwrap();
+        delete_tool_result_image_cache_in(root.path(), &db, "source");
+        assert!(!unused.exists());
+        for path in [&attachment, &retained_reply, &foreign_attachment] {
+            assert!(path.exists());
+        }
+        for name in &other_names {
+            assert!(dir.join(name).exists());
+        }
+        assert!(named_dir.is_dir());
+        // A late materializer must also preserve references after its source
+        // session and even its original result row are both gone.
+        db.delete_agent_chat_messages_for_thread("survivor")
+            .unwrap();
+        db.append_agent_chat_message(
+            "survivor",
+            &json!({"type":"item_completed", "item":{"retained_images":[{"path":retained_reply}]}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(&unused, b"late cache").unwrap();
+        assert!(!finish_tool_result_image_cache(&db, "source", &unused));
+        assert!(!unused.exists());
+        assert!(retained_reply.exists());
+        assert!(foreign_attachment.exists());
+        assert!(dir.join("attachment.png").exists());
+        std::fs::write(&unused, b"traversal guard").unwrap();
+        delete_tool_result_image_cache_in(root.path(), &db, "source/../source");
+        assert!(
+            unused.exists(),
+            "a non-plain alias must not sweep the live directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_result_image_cache_cleanup_never_follows_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::new_in_memory();
+        let name = format!("tool-1-{}.png", "c".repeat(64));
+        let target = outside.path().join(&name);
+        std::fs::write(&target, b"preserve").unwrap();
+        let dir = root.path().join("linked");
+        std::os::unix::fs::symlink(outside.path(), &dir).unwrap();
+        delete_tool_result_image_cache_in(root.path(), &db, "linked");
+        assert!(target.exists());
+        let ordinary = root.path().join("ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        let link = ordinary.join(name);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        delete_tool_result_image_cache_in(root.path(), &db, "ordinary");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(target).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn tool_result_image_cache_cleanup_never_evicts_reply_image_copies() {
+        let root = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::new_in_memory();
+        for thread in ["source", "survivor"] {
+            db.upsert_agent_chat_session(thread, "ws", Some("/repo"), "claude")
+                .unwrap();
+        }
+        let dir = root.path().join("source");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join(format!("tool-1-{}.png", "d".repeat(64)));
+        // Reply copies are named `<uuid>.<ext>` (see `reply_images::plan`).
+        // One is recorded on its reply row; the other has landed on disk but
+        // its job has not recorded it yet, so only the name keeps it safe.
+        let recorded = dir.join(format!("{}.png", uuid::Uuid::new_v4()));
+        let in_flight = dir.join(format!("{}.webp", uuid::Uuid::new_v4()));
+        for path in [&cache, &recorded, &in_flight] {
+            std::fs::write(path, b"image").unwrap();
+        }
+        db.append_agent_chat_message(
+            "source",
+            &json!({"type":"item_completed", "item":{"kind":"assistant_text", "text":"[Proof](/tmp/proof.png)",
+                "retained_images":[{"source":"/tmp/proof.png", "path":recorded}]}})
+            .to_string(),
+        )
+        .unwrap();
+        db.merge_reopened_agent_chat_session("source", "survivor")
+            .unwrap();
+        delete_tool_result_image_cache_in(root.path(), &db, "source");
+        assert!(!cache.exists(), "the unreferenced tool-image cache is reclaimed");
+        assert!(recorded.exists(), "a recorded reply copy survives");
+        assert!(in_flight.exists(), "a not-yet-recorded reply copy survives");
+        // A late materializer for the merged-away source sweeps again.
+        std::fs::write(&cache, b"late cache").unwrap();
+        assert!(!finish_tool_result_image_cache(&db, "source", &cache));
+        assert!(!cache.exists());
+        assert!(recorded.exists());
+        assert!(in_flight.exists());
+    }
+
+    #[test]
     fn shape_leaves_small_tool_results_untouched() {
         let payload = tool_result_payload(json!("just a little output"));
         assert_eq!(shape_persisted_payload(7, &payload), payload);
@@ -10771,50 +11292,384 @@ mod tests {
     }
 
     #[test]
-    fn shape_never_stubs_image_bearing_results() {
-        // Image blocks stay verbatim so the thumbnail grid and the
-        // auto-expand-on-image behaviour keep reading real content.
+    fn shape_image_results_keep_handles_and_small_or_unsupported_sources() {
         let data = "A".repeat(LAZY_TOOL_RESULT_THRESHOLD_BYTES + 5_000);
-        let payload = tool_result_payload(json!([
+        let content = json!([
             { "type": "text", "text": "screenshot:" },
             { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": data } },
-        ]));
-        assert_eq!(shape_persisted_payload(9, &payload), payload);
+            { "type": "image_url", "image_url": "https://example.test/image.png" },
+            { "type": "file", "mime": "image/png", "uri": format!("data:image/png;base64,{data}") },
+        ]);
+        let payload = tool_result_payload(content);
+        let shaped = shape_persisted_payload(9, &payload);
+        let stub = stub_of(&shaped).unwrap();
+        assert_eq!(stub["has_images"], true);
+        assert_eq!(stub["images"][0], json!({"pointer":"/1"}));
+        assert_eq!(stub["images"][1]["src"], "https://example.test/image.png");
+        assert_eq!(stub["images"][2], json!({"pointer":"/3"}));
+        assert!(shaped.len() < 1024);
+        assert!(stub["preview"].as_str().unwrap().contains("screenshot:"));
+        assert!(!stub["preview"].as_str().unwrap().contains("AAAA"));
 
-        let url_payload = tool_result_payload(json!([
-            { "type": "image_url", "image_url": { "url": format!("https://example.test/{data}") } },
-        ]));
-        assert_eq!(shape_persisted_payload(9, &url_payload), url_payload);
-
-        // A bare-string `image_url` and a `source: { type: "url" }` are the
-        // frontend's other two accepted shapes.
-        let bare = tool_result_payload(json!([
-            { "type": "image_url", "image_url": format!("https://example.test/{data}") },
-        ]));
-        assert_eq!(shape_persisted_payload(9, &bare), bare);
-        let sourced = tool_result_payload(json!([
-            { "type": "image", "source": { "type": "url", "url": format!("https://example.test/{data}") } },
-        ]));
-        assert_eq!(shape_persisted_payload(9, &sourced), sourced);
-        // Media type absent → the frontend renders it as image/png.
-        let defaulted = tool_result_payload(json!([
-            { "type": "image", "source": { "type": "base64", "data": data } },
-        ]));
-        assert_eq!(shape_persisted_payload(9, &defaulted), defaulted);
+        for source in [
+            format!("data:image/svg+xml;base64,{data}"),
+            format!("data:image/avif;base64,{data}"),
+            format!("data:image/png;charset=utf-8;base64,{data}"),
+            format!("data:image/png,{}", "x".repeat(40_000)),
+        ] {
+            let payload = tool_result_payload(json!([{ "type":"image_url", "image_url":source }]));
+            let stub = stub_of(&shape_persisted_payload(4, &payload)).unwrap();
+            assert_eq!(
+                stub["images"][0]["src"], source,
+                "unsupported transport stays inline"
+            );
+        }
     }
 
     #[test]
-    fn shape_never_stubs_native_image_tool_result_fixture() {
-        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+    fn shape_nested_native_images_and_reader_only_accept_result_image_fields() {
+        let source = format!("data:image/png;base64,{}", "A".repeat(40_000));
+        for (content, pointer) in [
+            (
+                json!({"type":"mcpToolCall", "id":"tu-1", "status":"completed", "result":{"content":[{"type":"image", "data":"A".repeat(40_000), "mimeType":"image/png"}]}}),
+                "/result/content/0",
+            ),
+            (
+                json!({"type":"dynamicToolCall", "id":"tu-1", "status":"completed", "contentItems":[{"type":"inputImage", "imageUrl":source}]}),
+                "/contentItems/0",
+            ),
+        ] {
+            let payload = tool_result_payload(content);
+            let stub = stub_of(&shape_persisted_payload(8, &payload)).unwrap();
+            assert_eq!(stub["images"][0]["pointer"], pointer);
+            assert_eq!(tool_result_image_src(&payload, pointer).unwrap(), source);
+            assert!(tool_result_image_src(&payload, &format!("{pointer}/source")).is_err());
+            assert!(tool_result_image_src(&payload, "/input/image").is_err());
+            assert!(tool_result_image_src(&payload, "/../../etc/passwd").is_err());
+        }
+        let nonimage =
+            tool_result_payload(json!({"input":{"type":"image_url", "image_url":source}}));
+        assert!(tool_result_image_src(&nonimage, "/input").is_err());
+        assert!(tool_result_image_src("{}", "").is_err());
+        assert!(tool_result_image_src("malformed", "").is_err());
+        for block in [
+            json!({"type":"inputImage", "imageUrl":"file:///private.png"}),
+            json!({"type":"inputImage", "imageUrl":42}),
+            json!({"type":"image", "data":"AAAA", "mimeType":"application/pdf"}),
+            json!({"type":"image", "data":"", "mimeType":"image/png"}),
+            json!({"type":"image", "source":null, "data":"AAAA", "mimeType":"image/png"}),
+        ] {
+            assert!(!is_renderable_image_entry(&block));
+            assert!(tool_result_image_src(&tool_result_payload(json!([block])), "/0").is_err());
+        }
+        let svg = format!("data:image/svg+xml;base64,{}", "A".repeat(40_000));
+        let payload = tool_result_payload(
+            json!({"type":"mcpToolCall", "id":"tu-1", "status":"completed", "result":{"content":[{"type":"image", "data":"A".repeat(40_000), "mimeType":"image/svg+xml"}]}}),
+        );
+        assert_eq!(
+            stub_of(&shape_persisted_payload(8, &payload)).unwrap()["images"][0]["src"],
+            svg
+        );
+        assert_eq!(
+            tool_result_image_src(&payload, "/result/content/0").unwrap(),
+            svg
+        );
+        assert!(tool_result_image_src(
+            &tool_result_payload(json!([{"type":"file","mime":"application/pdf","uri":source}])),
+            "/0"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn shape_live_requires_durable_row_and_matches_replay() {
+        let payload = tool_result_payload(
+            json!([{ "type":"image", "source":{"type":"base64", "data":"A".repeat(40_000)} }]),
+        );
+        let original: ProviderRuntimeEvent = serde_json::from_str(&payload).unwrap();
+        let text_payload = tool_result_payload(json!(big_text(40_000)));
+        let mut text_event: ProviderRuntimeEvent = serde_json::from_str(&text_payload).unwrap();
+        let original_text = serde_json::to_value(&text_event).unwrap();
+        shape_live_tool_result(&mut text_event, Some(18));
+        assert_eq!(serde_json::to_value(text_event).unwrap(), original_text);
+        let mut failed_write = original.clone();
+        shape_live_tool_result(&mut failed_write, None);
+        assert_eq!(
+            serde_json::to_value(&failed_write).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        let mut event = original;
+        shape_live_tool_result(&mut event, Some(17));
+        let shaped: serde_json::Value =
+            serde_json::from_str(&shape_persisted_payload(17, &payload)).unwrap();
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["item"]["content"],
+            shaped["item"]["content"]
+        );
+    }
+
+    #[test]
+    fn tool_result_image_outcomes_survive_live_and_replay() {
+        for (native, expected) in [
+            (
+                json!({"type":"mcpToolCall", "id":"tu-1", "status":"failed", "result":{"content":[]}}),
+                "error",
+            ),
+            (
+                json!({"type":"mcpToolCall", "id":"tu-1", "status":"future", "result":{"content":[]}}),
+                "unconfirmed",
+            ),
+            (
+                json!({"type":"dynamicToolCall", "id":"tu-1", "status":"completed", "success":false, "contentItems":[]}),
+                "error",
+            ),
+            (
+                json!({"type":"dynamicToolCall", "id":"tu-1", "status":"future", "contentItems":[]}),
+                "unconfirmed",
+            ),
+        ] {
+            let mut native = native;
+            if native["type"] == "mcpToolCall" {
+                native["result"]["content"] =
+                    json!([{ "type":"image", "data":"A".repeat(40_000), "mimeType":"image/png" }]);
+            } else {
+                native["contentItems"] = json!([{ "type":"inputImage", "imageUrl":format!("data:image/png;base64,{}", "A".repeat(40_000)) }]);
+            }
+            let payload = tool_result_payload(native.clone());
+            let shaped: serde_json::Value =
+                serde_json::from_str(&shape_persisted_payload(7, &payload)).unwrap();
+            let mut live: ProviderRuntimeEvent = serde_json::from_str(&payload).unwrap();
+            shape_live_tool_result(&mut live, Some(7));
+            for content in [
+                shaped["item"]["content"].clone(),
+                serde_json::to_value(live).unwrap()["item"]["content"].clone(),
+            ] {
+                assert_eq!(content[LAZY_TOOL_RESULT_KEY]["has_images"], true);
+                assert_eq!(
+                    content["__codemux_codex_tool_outcome"],
+                    json!({"tool_use_id":"tu-1", "status":expected})
+                );
+            }
+            for bad_id in [serde_json::Value::Null, json!("x".repeat(257))] {
+                native["id"] = bad_id;
+                let payload = tool_result_payload(native.clone());
+                assert_eq!(shape_persisted_payload(7, &payload), payload);
+                let mut live: ProviderRuntimeEvent = serde_json::from_str(&payload).unwrap();
+                let original = serde_json::to_value(&live).unwrap();
+                shape_live_tool_result(&mut live, Some(7));
+                assert_eq!(serde_json::to_value(live).unwrap(), original);
+            }
+        }
+    }
+
+    fn synthetic_tool_image_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 512, 512);
+            encoder.set_color(png::ColorType::Rgb);
+            let mut writer = encoder.write_header().unwrap();
+            let mut seed = 7_u32;
+            let pixels: Vec<u8> = (0..512 * 512 * 3)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (seed >> 24) as u8
+                })
+                .collect();
+            writer.write_image_data(&pixels).unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn shape_screenshot_transcript_measures_actual_serialized_reduction() {
+        use base64::Engine as _;
+        let bytes = synthetic_tool_image_bytes();
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let payload = tool_result_payload(json!([
+            {"type":"text", "text":"Synthetic screenshot evidence"},
+            {"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":data}},
+        ]));
+        let rows: Vec<_> = (1..=12).map(|id| (id, payload.clone(), 0)).collect();
+        let before = serde_json::to_vec(
+            &rows
+                .iter()
+                .map(|(id, payload, created_at_ms)| AgentChatMessageRow {
+                    id: *id,
+                    payload: payload.clone(),
+                    created_at_ms: *created_at_ms,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .len();
+        let after = serde_json::to_vec(&shape_rows(rows)).unwrap().len();
+        let src = tool_result_image_src(&payload, "/1").unwrap();
+        assert_eq!(decode_tool_result_image(&src).unwrap(), bytes);
+        eprintln!("synthetic screenshot transcript: 12 valid 512x512 PNG results; serialized replay {before} -> {after} bytes; original image {} bytes", bytes.len());
+        assert!(after < before / 1000);
+    }
+
+    #[tokio::test]
+    async fn tool_result_image_command_materializes_owned_bytes_and_recovers_cache() {
+        use base64::Engine as _;
+        let persisted = tempfile::tempdir().unwrap();
+        let database_path = persisted.path().join("tool-images.db");
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::test_file(&database_path));
+        let db: State<'_, DatabaseStore> = app.state();
+        let owner = format!("tool-image-test-{}", uuid::Uuid::new_v4());
+        struct OwnImageDir(std::path::PathBuf);
+        impl Drop for OwnImageDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        // This guard owns only the UUID directory minted by this test, and
+        // also removes it if an assertion unwinds before normal cleanup.
+        let _owned_dir = OwnImageDir(chat_images_dir(&owner).unwrap());
+        db.upsert_agent_chat_session(&owner, "ws", None, "claude")
+            .unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../src/lib/agent-chat/__fixtures__/opencode-native-image-tool-result.json"
         ))
         .unwrap();
-        fixture["data"]["content"][1]["uri"] = json!(format!(
+        let mut content = fixture["data"]["content"].clone();
+        content[1]["uri"] = json!(format!(
             "data:image/png;base64,{}",
-            "A".repeat(LAZY_TOOL_RESULT_THRESHOLD_BYTES + 5_000)
+            base64::engine::general_purpose::STANDARD.encode(synthetic_tool_image_bytes())
         ));
-        let payload = tool_result_payload(fixture["data"]["content"].clone());
-        assert_eq!(shape_persisted_payload(9, &payload), payload);
+        let payload = tool_result_payload(content);
+        let row_id = db
+            .append_agent_chat_message(&owner, &payload)
+            .unwrap()
+            .unwrap();
+        let source = tool_result_image_src(&payload, "/1").unwrap();
+        let original = decode_tool_result_image(&source).unwrap();
+        let resolved = agent_chat_get_tool_result_image(db.clone(), row_id, "/1".into(), None)
+            .await
+            .unwrap();
+        assert!(resolved.local);
+        let path = std::path::PathBuf::from(&resolved.src);
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), owner.as_str());
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), original);
+        let inline = agent_chat_get_tool_result_image(db.clone(), row_id, "/1".into(), Some(true))
+            .await
+            .unwrap();
+        assert!(!inline.local);
+        assert_eq!(inline.src, source);
+        assert_eq!(db.get_agent_chat_message(row_id).unwrap(), payload);
+        assert!(
+            agent_chat_get_tool_result_image(db.clone(), row_id, "/1/uri".into(), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            agent_chat_get_tool_result_image(db.clone(), row_id + 1, "/1".into(), None)
+                .await
+                .is_err()
+        );
+        // Only this test's generated cache file is removed. The unchanged row
+        // rematerializes it after a restart or an absent image cache.
+        tokio::fs::remove_file(&path).await.unwrap();
+        let again = agent_chat_get_tool_result_image(db, row_id, "/1".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(again.src, resolved.src);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), original);
+        tokio::fs::remove_file(&path).await.unwrap();
+        tokio::fs::remove_dir(path.parent().unwrap()).await.unwrap();
+        // The browser's base64 decoder accepts whitespace and omitted padding.
+        // Keep that image-only source accessible without writing unvalidated bytes.
+        let tolerated = source
+            .replace("base64,", "base64,\n")
+            .trim_end_matches('=')
+            .to_string();
+        let db: State<'_, DatabaseStore> = app.state();
+        let tolerant_payload =
+            tool_result_payload(json!([{ "type":"image_url", "image_url":tolerated }]));
+        let row = db
+            .append_agent_chat_message(&owner, &tolerant_payload)
+            .unwrap()
+            .unwrap();
+        let fallback = agent_chat_get_tool_result_image(db, row, "/0".into(), None)
+            .await
+            .unwrap();
+        assert!(!fallback.local);
+        assert_eq!(fallback.src, tolerated);
+        let db: State<'_, DatabaseStore> = app.state();
+        for (native, pointer) in [
+            (
+                json!({"type":"mcpToolCall", "id":"tu-1", "status":"failed", "result":{"content":[{"type":"image", "data":base64::engine::general_purpose::STANDARD.encode(&original), "mimeType":"image/png"}]}}),
+                "/result/content/0",
+            ),
+            (
+                json!({"type":"dynamicToolCall", "id":"tu-1", "status":"future", "contentItems":[{"type":"inputImage", "imageUrl":source}]}),
+                "/contentItems/0",
+            ),
+        ] {
+            let full = tool_result_payload(native);
+            let row = db
+                .append_agent_chat_message(&owner, &full)
+                .unwrap()
+                .unwrap();
+            let shaped = stub_of(&shape_persisted_payload(row, &full)).unwrap();
+            assert_eq!(shaped["images"][0]["pointer"], pointer);
+            let image = agent_chat_get_tool_result_image(db.clone(), row, pointer.into(), None)
+                .await
+                .unwrap();
+            assert!(image.local);
+            assert_eq!(tokio::fs::read(&image.src).await.unwrap(), original);
+            assert_eq!(
+                agent_chat_get_tool_result(db.clone(), row).await.unwrap(),
+                full
+            );
+            let inline =
+                agent_chat_get_tool_result_image(db.clone(), row, pointer.into(), Some(true))
+                    .await
+                    .unwrap();
+            assert_eq!(inline.src, source);
+            assert!(!inline.local);
+        }
+        drop(app);
+        let reopened = tauri::test::mock_app();
+        reopened.manage(DatabaseStore::test_file(&database_path));
+        let db: State<'_, DatabaseStore> = reopened.state();
+        let row = db.list_agent_chat_messages_after(&owner, None).unwrap()[0].clone();
+        let replayed = shape_rows(vec![row]);
+        assert!(stub_of(&replayed[0].payload).unwrap()["has_images"]
+            .as_bool()
+            .unwrap());
+        assert_eq!(
+            agent_chat_get_tool_result(db.clone(), row_id)
+                .await
+                .unwrap(),
+            payload
+        );
+        let image = agent_chat_get_tool_result_image(db, row_id, "/1".into(), None)
+            .await
+            .unwrap();
+        assert!(image.local);
+        assert_eq!(image.src, resolved.src);
+        assert_eq!(tokio::fs::read(image.src).await.unwrap(), original);
+    }
+
+    #[test]
+    fn tool_result_image_decode_rejects_malformed_nonimage_and_oversized_data() {
+        for src in [
+            "data:text/plain;base64,AAAA",
+            "data:image/png;base64,???",
+            "data:image/png;base64,AAAA",
+            "file:///etc/passwd",
+            "data:image/png,abc",
+        ] {
+            assert!(decode_tool_result_image(src).is_err(), "{src}");
+        }
+        let oversized = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES.div_ceil(3) * 4 + 4)
+        );
+        assert!(!can_materialize_tool_image(&oversized));
+        assert!(decode_tool_result_image(&oversized).is_err());
     }
 
     #[test]
