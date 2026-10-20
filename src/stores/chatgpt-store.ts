@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import {
   getChatGptStatus, startChatGptLogin, cancelChatGptLogin, disconnectChatGpt,
-  acknowledgeChatGptWelcome, getLocalWorkbench, setLocalWorkbench,
+  acknowledgeChatGptWelcome, getLocalWorkbench, setLocalWorkbench, getE2eLocalRemote,
   type ChatGptStatus,
 } from "@/tauri/chatgpt";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
@@ -82,7 +82,15 @@ export const useChatGptStore = create<ChatGptStore>((set, get) => ({
   subscriptionError: null, localMode: false, cloudLogin: false,
   bootstrap: () => {
     if (bootstrapFlight) return bootstrapFlight;
-    if (isRemoteClient()) { set({ ready: true }); return Promise.resolve(); }
+    if (isRemoteClient()) {
+      // A paired browser has no local-mode preference of its own; only a
+      // debug host running the live test harness lets it skip sign-in.
+      const flight = getE2eLocalRemote().catch(() => false).then((localMode) => {
+        set({ localMode: localMode === true, ready: true });
+      }).finally(() => { if (bootstrapFlight === flight) bootstrapFlight = null; });
+      bootstrapFlight = flight;
+      return flight;
+    }
     const requestPreferenceEpoch = preferenceEpoch;
     set({ loading: true });
     const flight = Promise.all([get().refresh(), getLocalWorkbench()])

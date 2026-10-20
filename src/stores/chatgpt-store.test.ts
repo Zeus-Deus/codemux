@@ -6,10 +6,10 @@ import { useAuthStore } from "./auth-store";
 import type { ChatGptStatus } from "@/tauri/chatgpt";
 import type { ProviderChatCapabilities } from "@/tauri/types";
 
-const rpc = vi.hoisted(() => ({ get: vi.fn(), start: vi.fn(), cancel: vi.fn(), disconnect: vi.fn(), acknowledge: vi.fn(), getLocal: vi.fn(), setLocal: vi.fn(), catalog: vi.fn() }));
+const rpc = vi.hoisted(() => ({ get: vi.fn(), start: vi.fn(), cancel: vi.fn(), disconnect: vi.fn(), acknowledge: vi.fn(), getLocal: vi.fn(), setLocal: vi.fn(), e2eLocal: vi.fn(), catalog: vi.fn() }));
 vi.mock("@/tauri/chatgpt", () => ({ getChatGptStatus: rpc.get, startChatGptLogin: rpc.start,
   cancelChatGptLogin: rpc.cancel, disconnectChatGpt: rpc.disconnect, acknowledgeChatGptWelcome: rpc.acknowledge,
-  getLocalWorkbench: rpc.getLocal, setLocalWorkbench: rpc.setLocal }));
+  getLocalWorkbench: rpc.getLocal, setLocalWorkbench: rpc.setLocal, getE2eLocalRemote: rpc.e2eLocal }));
 vi.mock("@/tauri/commands", () => ({ agentChatProviderHealth: vi.fn().mockResolvedValue({ provider: "codex", installed: true, status: "ready", message: null, version: null }), listChatProviderCapabilities: rpc.catalog }));
 const disconnected: ChatGptStatus = { phase: "disconnected", attemptId: null, email: null, error: null,
   profiles: [], activeProfileId: null, welcomePending: false, installed: true };
@@ -19,7 +19,7 @@ const caps: ProviderChatCapabilities = { models: [], effort_granularity: "per_tu
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((done) => { resolve = done; }); return { promise, resolve }; }
 beforeEach(() => {
   vi.clearAllMocks();
-  rpc.get.mockResolvedValue(disconnected); rpc.getLocal.mockResolvedValue(false);
+  rpc.get.mockResolvedValue(disconnected); rpc.getLocal.mockResolvedValue(false); rpc.e2eLocal.mockResolvedValue(false);
   rpc.cancel.mockResolvedValue(disconnected); rpc.start.mockResolvedValue(pending);
   rpc.disconnect.mockResolvedValue(disconnected); rpc.setLocal.mockResolvedValue(undefined);
   rpc.catalog.mockResolvedValue(caps);
@@ -28,6 +28,32 @@ beforeEach(() => {
   (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = false;
 });
 afterEach(() => { (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = false; });
+describe("paired browser local mode", () => {
+  const remote = () => { (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true; };
+
+  it("enters local mode only when the host enables the live test harness", async () => {
+    remote();
+    rpc.e2eLocal.mockResolvedValue(true);
+    await useChatGptStore.getState().bootstrap();
+    expect(useChatGptStore.getState()).toMatchObject({ localMode: true, ready: true });
+    expect(rpc.getLocal).not.toHaveBeenCalled();
+    expect(rpc.get).not.toHaveBeenCalled();
+  });
+
+  it("stays at sign-in when the host does not enable it", async () => {
+    remote();
+    await useChatGptStore.getState().bootstrap();
+    expect(useChatGptStore.getState()).toMatchObject({ localMode: false, ready: true });
+  });
+
+  it("stays at sign-in when an older host lacks the command", async () => {
+    remote();
+    rpc.e2eLocal.mockRejectedValue(new Error("command not allowed"));
+    await useChatGptStore.getState().bootstrap();
+    expect(useChatGptStore.getState()).toMatchObject({ localMode: false, ready: true });
+  });
+});
+
 describe("ChatGPT connection ownership", () => {
   it("invalidates Codex metadata without dropping another provider's catalog", async () => {
     useChatGptStore.setState({ status: connected });
