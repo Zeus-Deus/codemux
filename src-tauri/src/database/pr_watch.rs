@@ -38,7 +38,46 @@ pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
             PRIMARY KEY (thread_id, event_key)
         );",
     )
-    .map_err(|e| format!("Failed to create PR watch tables: {e}"))
+    .map_err(|e| format!("Failed to create PR watch tables: {e}"))?;
+    // Additive: tolerate the column an earlier start already added.
+    if let Err(e) = conn.execute(
+        "ALTER TABLE pr_watches ADD COLUMN wake_on_green INTEGER NOT NULL DEFAULT 0",
+        [],
+    ) {
+        if !e.to_string().contains("duplicate column name") {
+            return Err(format!("Failed to migrate PR watch tables: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// Why a watch ended when its pull request was merged or closed (`state`
+/// as GitHub reports it).
+pub(crate) fn finished_reason(state: &str) -> String {
+    format!("{FINISHED_PREFIX}{}", state.to_ascii_lowercase())
+}
+
+const FINISHED_PREFIX: &str = "Pull request was ";
+
+/// Whether `watch` ended because its pull request was merged or closed, so
+/// it can never wake again.
+fn is_finished(watch: &PrWatchRecord) -> bool {
+    watch.status == PR_WATCH_ENDED
+        && watch.stop_reason.as_deref().is_some_and(|reason| reason.starts_with(FINISHED_PREFIX))
+}
+
+/// What [`DatabaseStore::start_pr_watch_for_agent`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentWatchStart {
+    /// Watching now: a new watch, or a stopped one continuing where it
+    /// stopped.
+    Started(PrWatchRecord),
+    /// Already watching this pull request; nothing was reset.
+    AlreadyWatching(PrWatchRecord),
+    /// The fix attempts ran out. Only the user re-arms it.
+    Exhausted(PrWatchRecord),
+    /// The chat's watch is on another pull request that can still change.
+    OtherPullRequest(PrWatchRecord),
 }
 
 /// `active` sweeps; `exhausted` and `ended` are kept so the UI can say why
@@ -81,6 +120,9 @@ pub struct PrWatchRecord {
     pub last_wake_summary: Option<String>,
     pub last_error: Option<String>,
     pub stop_reason: Option<String>,
+    /// Also wake once per head when every check passes and it merges
+    /// cleanly. Set when the chat's agent started the watch.
+    pub wake_on_green: bool,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -88,7 +130,7 @@ pub struct PrWatchRecord {
 const SELECT_COLUMNS: &str = "thread_id, workspace_id, pr_number, pr_url, status, generation,
     max_attempts, attempts, comment_streak, head_sha, baselined, failure_pending_since_ms,
     last_checked_at_ms, last_wake_at_ms, last_wake_summary, last_error, stop_reason,
-    created_at_ms, updated_at_ms";
+    created_at_ms, updated_at_ms, wake_on_green";
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PrWatchRecord> {
     Ok(PrWatchRecord {
@@ -111,6 +153,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PrWatchRecord> {
         stop_reason: row.get(16)?,
         created_at_ms: row.get(17)?,
         updated_at_ms: row.get(18)?,
+        wake_on_green: row.get::<_, i64>(19)? != 0,
     })
 }
 
@@ -162,6 +205,72 @@ pub(super) fn move_to_thread(conn: &Connection, merged: &[String], survivor: &st
     Ok(())
 }
 
+/// Random, not a counter: unwatch deletes the row, and a counter restarting
+/// at 1 would let a sweep that read the old watch pass the generation check
+/// against the new one.
+fn fresh_generation(existing: Option<&PrWatchRecord>) -> i64 {
+    loop {
+        let token = uuid::Uuid::new_v4().as_u64_pair().0 as i64;
+        if existing.map_or(true, |w| w.generation != token) {
+            break token;
+        }
+    }
+}
+
+/// Write a new or re-armed watch inside `tx`: counters, errors and the stop
+/// reason reset. Events already told about stay seen unless the chat now
+/// watches a different pull request.
+#[allow(clippy::too_many_arguments)]
+fn arm(
+    tx: &rusqlite::Transaction<'_>,
+    existing: Option<&PrWatchRecord>,
+    thread_id: &str,
+    workspace_id: &str,
+    pr_number: u32,
+    pr_url: Option<&str>,
+    max_attempts: u32,
+    wake_on_green: bool,
+    now_ms: i64,
+) -> Result<PrWatchRecord, String> {
+    let same_pr = existing.is_some_and(|w| w.pr_number == pr_number && w.pr_url.as_deref() == pr_url);
+    if !same_pr {
+        tx.execute("DELETE FROM pr_watch_seen WHERE thread_id = ?1", params![thread_id])
+            .map_err(|e| format!("Failed to reset PR watch history: {e}"))?;
+    }
+    let generation = fresh_generation(existing);
+    let created_at_ms = existing.map_or(now_ms, |w| w.created_at_ms);
+    // A different pull request starts from nothing; the same one keeps
+    // its baseline and head so re-arming does not replay history.
+    let (head_sha, baselined) = match existing.filter(|_| same_pr) {
+        Some(w) => (w.head_sha.clone(), w.baselined),
+        None => (None, false),
+    };
+    tx.execute(
+        "INSERT OR REPLACE INTO pr_watches
+             (thread_id, workspace_id, pr_number, pr_url, status, generation, max_attempts,
+              attempts, comment_streak, head_sha, baselined, failure_pending_since_ms,
+              last_checked_at_ms, last_wake_at_ms, last_wake_summary, last_error, stop_reason,
+              created_at_ms, updated_at_ms, wake_on_green)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL, ?10, ?11, ?12)",
+        params![
+            thread_id,
+            workspace_id,
+            pr_number,
+            pr_url,
+            PR_WATCH_ACTIVE,
+            generation,
+            max_attempts,
+            head_sha,
+            baselined as i64,
+            created_at_ms,
+            now_ms,
+            wake_on_green as i64
+        ],
+    )
+    .map_err(|e| format!("Failed to save PR watch: {e}"))?;
+    pr_watch(tx, thread_id)?.ok_or_else(|| "PR watch vanished while arming".to_string())
+}
+
 impl DatabaseStore {
     /// Start watching, or re-arm an existing watch: counters, errors and the
     /// stop reason reset. Events already told about stay seen unless the
@@ -180,52 +289,98 @@ impl DatabaseStore {
             .transaction()
             .map_err(|e| format!("Failed to open PR watch transaction: {e}"))?;
         let existing = pr_watch(&tx, thread_id)?;
-        let same_pr = existing
-            .as_ref()
-            .is_some_and(|w| w.pr_number == pr_number && w.pr_url.as_deref() == pr_url);
-        if !same_pr {
-            tx.execute("DELETE FROM pr_watch_seen WHERE thread_id = ?1", params![thread_id])
-                .map_err(|e| format!("Failed to reset PR watch history: {e}"))?;
-        }
-        // Random, not a counter: unwatch deletes the row, and a counter
-        // restarting at 1 would let a sweep that read the old watch pass
-        // the generation check against the new one.
-        let generation = loop {
-            let token = uuid::Uuid::new_v4().as_u64_pair().0 as i64;
-            if existing.as_ref().map_or(true, |w| w.generation != token) {
-                break token;
+        let record = arm(&tx, existing.as_ref(), thread_id, workspace_id, pr_number, pr_url, max_attempts, false, now_ms)?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit PR watch: {e}"))?;
+        Ok(record)
+    }
+
+    /// The chat's own agent asks to watch `pr_number`. Unlike
+    /// [`Self::arm_pr_watch`] (the user's re-arm) this never resets spent fix
+    /// attempts or forgets told events: a watch on the same pull request is
+    /// left alone or continued where it stopped, an exhausted one stays
+    /// stopped, and another pull request replaces the watch only once that
+    /// one was merged or closed. Decided and written in one transaction, so a
+    /// sweep or an unwatch cannot slip in between.
+    pub fn start_pr_watch_for_agent(
+        &self,
+        thread_id: &str,
+        workspace_id: &str,
+        pr_number: u32,
+        pr_url: &str,
+        now_ms: i64,
+    ) -> Result<AgentWatchStart, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to open PR watch transaction: {e}"))?;
+        let existing = pr_watch(&tx, thread_id)?;
+        let outcome = match existing {
+            Some(watch) if watch.status == PR_WATCH_EXHAUSTED => AgentWatchStart::Exhausted(watch),
+            Some(watch) if watch.pr_number == pr_number && watch.pr_url.as_deref() == Some(pr_url) => {
+                if watch.status == PR_WATCH_ACTIVE {
+                    // The generation stays: a sweep in flight still commits.
+                    tx.execute(
+                        "UPDATE pr_watches SET wake_on_green = 1 WHERE thread_id = ?1",
+                        params![thread_id],
+                    )
+                    .map_err(|e| format!("Failed to update PR watch: {e}"))?;
+                    AgentWatchStart::AlreadyWatching(pr_watch(&tx, thread_id)?.ok_or("PR watch vanished")?)
+                } else {
+                    tx.execute(
+                        "UPDATE pr_watches SET status = ?2, generation = ?3, stop_reason = NULL,
+                             last_error = NULL, wake_on_green = 1, updated_at_ms = ?4
+                         WHERE thread_id = ?1",
+                        params![thread_id, PR_WATCH_ACTIVE, fresh_generation(Some(&watch)), now_ms],
+                    )
+                    .map_err(|e| format!("Failed to resume PR watch: {e}"))?;
+                    AgentWatchStart::Started(pr_watch(&tx, thread_id)?.ok_or("PR watch vanished")?)
+                }
             }
-        };
-        let created_at_ms = existing.as_ref().map_or(now_ms, |w| w.created_at_ms);
-        // A different pull request starts from nothing; the same one keeps
-        // its baseline and head so re-arming does not replay history.
-        let (head_sha, baselined) = match existing.as_ref().filter(|_| same_pr) {
-            Some(w) => (w.head_sha.clone(), w.baselined),
-            None => (None, false),
-        };
-        tx.execute(
-            "INSERT OR REPLACE INTO pr_watches
-                 (thread_id, workspace_id, pr_number, pr_url, status, generation, max_attempts,
-                  attempts, comment_streak, head_sha, baselined, failure_pending_since_ms,
-                  last_checked_at_ms, last_wake_at_ms, last_wake_summary, last_error, stop_reason,
-                  created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL, ?10, ?11)",
-            params![
+            Some(watch) if !is_finished(&watch) => AgentWatchStart::OtherPullRequest(watch),
+            existing => AgentWatchStart::Started(arm(
+                &tx,
+                existing.as_ref(),
                 thread_id,
                 workspace_id,
                 pr_number,
-                pr_url,
-                PR_WATCH_ACTIVE,
-                generation,
-                max_attempts,
-                head_sha,
-                baselined as i64,
-                created_at_ms,
-                now_ms
-            ],
+                Some(pr_url),
+                crate::pr_watch::DEFAULT_MAX_ATTEMPTS,
+                true,
+                now_ms,
+            )?),
+        };
+        tx.commit()
+            .map_err(|e| format!("Failed to commit PR watch: {e}"))?;
+        Ok(outcome)
+    }
+
+    /// The chat's own agent stops its active watch. Unlike an unwatch the
+    /// record stays, with its spent attempts and told events, so a later
+    /// [`Self::start_pr_watch_for_agent`] continues instead of starting
+    /// over. The new generation keeps a sweep in flight from committing or
+    /// waking. `None` when the chat had no active watch.
+    pub fn end_pr_watch_for_agent(
+        &self,
+        thread_id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<Option<PrWatchRecord>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to open PR watch transaction: {e}"))?;
+        let Some(watch) = pr_watch(&tx, thread_id)?.filter(|w| w.status == PR_WATCH_ACTIVE) else {
+            return Ok(None);
+        };
+        tx.execute(
+            "UPDATE pr_watches SET status = ?2, generation = ?3, stop_reason = ?4,
+                 failure_pending_since_ms = NULL, updated_at_ms = ?5
+             WHERE thread_id = ?1",
+            params![thread_id, PR_WATCH_ENDED, fresh_generation(Some(&watch)), reason, now_ms],
         )
-        .map_err(|e| format!("Failed to save PR watch: {e}"))?;
-        let record = pr_watch(&tx, thread_id)?.ok_or("PR watch vanished while arming")?;
+        .map_err(|e| format!("Failed to stop PR watch: {e}"))?;
+        let record = pr_watch(&tx, thread_id)?;
         tx.commit()
             .map_err(|e| format!("Failed to commit PR watch: {e}"))?;
         Ok(record)
