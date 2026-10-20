@@ -42,6 +42,7 @@ use super::protocol::{
     ThreadStartedParams, ThreadTokenUsageUpdatedParams, TokenUsageBreakdown, TurnCompletedParams,
     TurnStartedParams,
 };
+use super::tool_outcome::{native_tool_outcome, ToolOutcome};
 
 /// Per-session subagent demux state.
 ///
@@ -1507,25 +1508,33 @@ fn translate_item_completed(
         }
         // Tool-style items emit a result with the final payload.
         "commandExecution" => {
-            let aggregated = env
-                .item
-                .get("aggregatedOutput")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let exit_code = env.item.get("exitCode").and_then(|v| v.as_i64());
-            let is_error = exit_code.map(|c| c != 0).unwrap_or(false);
+            let outcome = native_tool_outcome(&env.item).unwrap_or(ToolOutcome::Unconfirmed);
+            let content = if outcome == ToolOutcome::Unconfirmed {
+                // A false error flag alone cannot express an unknown outcome.
+                // Retain the native evidence so the reducer shows unconfirmed.
+                env.item
+            } else {
+                Value::String(
+                    env.item
+                        .get("aggregatedOutput")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            };
             vec![ProviderRuntimeEvent::ItemCompleted {
                 subagent_id: None,
                 thread_id: thread_id.clone(),
                 turn_id,
                 item: CompletedItem::ToolResult {
                     tool_use_id: item_id,
-                    content: serde_json::Value::String(aggregated.to_string()),
-                    is_error,
+                    content,
+                    is_error: outcome == ToolOutcome::Error,
                 },
             }]
         }
         "fileChange" | "mcpToolCall" | "dynamicToolCall" | "webSearch" => {
+            let is_error = native_tool_outcome(&env.item) == Some(ToolOutcome::Error);
             vec![ProviderRuntimeEvent::ItemCompleted {
                 subagent_id: None,
                 thread_id: thread_id.clone(),
@@ -1533,7 +1542,7 @@ fn translate_item_completed(
                 item: CompletedItem::ToolResult {
                     tool_use_id: item_id,
                     content: env.item,
-                    is_error: false,
+                    is_error,
                 },
             }]
         }
@@ -2027,6 +2036,93 @@ mod tests {
             },
             _ => panic!("wrong event"),
         }
+    }
+
+    #[test]
+    fn codex_tool_outcomes_native_failures_are_errors() {
+        // Statuses/fields from `codex-cli 0.162.1 app-server generate-ts --experimental`.
+        for item in [
+            json!({"type": "dynamicToolCall", "id": "dynamic", "status": "failed", "success": false}),
+            json!({"type": "mcpToolCall", "id": "mcp", "status": "failed", "error": {"message": "connection failed"}}),
+            json!({"type": "fileChange", "id": "patch", "status": "failed", "changes": []}),
+            json!({"type": "commandExecution", "id": "command", "status": "failed", "exitCode": null}),
+            json!({"type": "commandExecution", "id": "declined", "status": "declined", "exitCode": null}),
+        ] {
+            let events = translate_notification(
+                &tid(),
+                NotificationMessage::from_raw(
+                    "item/completed",
+                    json!({
+                        "threadId": "c1", "turnId": "t1", "item": item,
+                    }),
+                ),
+            );
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [ProviderRuntimeEvent::ItemCompleted {
+                        item: CompletedItem::ToolResult { is_error: true, .. },
+                        ..
+                    }]
+                ),
+                "native failure became a successful result: {item}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_tool_outcomes_preserve_native_evidence() {
+        let cases: Value = serde_json::from_str(include_str!("fixtures/tool-outcomes.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            let native = &case["item"];
+            let events = translate_notification(
+                &tid(),
+                NotificationMessage::from_raw(
+                    "item/completed",
+                    json!({"threadId": "c1", "turnId": "t1", "item": native}),
+                ),
+            );
+            let [ProviderRuntimeEvent::ItemCompleted {
+                item:
+                    CompletedItem::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    },
+                ..
+            }] = events.as_slice()
+            else {
+                panic!("{}: {events:?}", case["name"])
+            };
+            assert_eq!(tool_use_id, native["id"].as_str().unwrap());
+            assert_eq!(*is_error, case["outcome"] == "error", "{}", case["name"]);
+            if native["type"] == "commandExecution" && case["outcome"] != "unconfirmed" {
+                assert_eq!(content, &native["aggregatedOutput"]);
+            } else {
+                assert_eq!(
+                    content, native,
+                    "raw evidence must survive: {}",
+                    case["name"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_tool_outcomes_do_not_invent_web_search_statuses() {
+        let native = json!({"type": "webSearch", "id": "search", "query": "example", "action": null});
+        let events = translate_notification(
+            &tid(),
+            NotificationMessage::from_raw(
+                "item/completed",
+                json!({"threadId": "c1", "turnId": "t1", "item": native}),
+            ),
+        );
+        assert!(
+            matches!(events.as_slice(), [ProviderRuntimeEvent::ItemCompleted {
+            item: CompletedItem::ToolResult { is_error: false, content, .. }, ..
+        }] if content == &native)
+        );
     }
 
     #[test]
