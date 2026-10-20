@@ -18,6 +18,10 @@ import { lazyToolResultStub } from "./lazy-tool-result";
  *   3. OpenCode native file block:
  *        { type: "file", uri: "data:image/png;base64,…", mime: "image/png" }
  *
+ *   4. Codex native MCP / dynamic output blocks:
+ *        { type: "image", data: "<b64>", mimeType: "image/png" }
+ *        { type: "inputImage", imageUrl: "data:image/png;base64,…" }
+ *
  * Full provider content is opaque JSON. Oversized results can instead carry
  * lazy image handles; `LazyToolResultImages` resolves those independently of
  * the full body. This helper normalizes loaded blocks to image sources.
@@ -64,6 +68,13 @@ function imageFromEntry(entry: unknown): ToolResultImage | null {
     return safe ? { src: safe } : null;
   }
 
+  // Codex dynamic tool output uses inputImage even in a result envelope.
+  if (entry.type === "inputImage") {
+    const url = str(entry.imageUrl);
+    const safe = url && safeImageSrc(url);
+    return safe ? { src: safe } : null;
+  }
+
   if (entry.type === "file") {
     const mediaType = str(entry.mime);
     const uri = str(entry.uri);
@@ -75,6 +86,14 @@ function imageFromEntry(entry: unknown): ToolResultImage | null {
   if (entry.type !== "image") return null;
 
   const source = entry.source;
+  // Native MCP image blocks carry their MIME type beside the base64 data.
+  if (source === undefined) {
+    const data = str(entry.data);
+    const mediaType = str(entry.mimeType);
+    return data && mediaType && /^image\//i.test(mediaType)
+      ? { src: `data:${mediaType};base64,${data}`, mediaType }
+      : null;
+  }
   if (!isRecord(source)) return null;
 
   if (source.type === "base64") {

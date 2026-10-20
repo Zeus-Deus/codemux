@@ -48,7 +48,7 @@ export function ToolResultImages({ images, onImageError }: {
         }}
         title="Tool result image"
       >
-        {lightboxImage ? <LightboxImage key={lightboxImage.src} image={lightboxImage} onImageError={onImageError} /> : null}
+        {lightboxImage ? <LightboxImage key={`${lightboxImage.src.slice(0, 48)}-${lightboxIndex}`} image={lightboxImage} onImageError={onImageError} /> : null}
       </ImageLightbox>
     </div>
   );
@@ -232,9 +232,11 @@ function LazyToolResultImage({ stub, pointer }: { stub: LazyToolResultStub; poin
   const [failed, setFailed] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const mounted = useRef(false);
+  const activeRequest = useRef<ImageRequest | null>(null);
   useEffect(() => {
     mounted.current = true;
     const request = imageRequest(stub, pointer);
+    activeRequest.current = request;
     request.users += 1;
     if (request.idleTimer) clearTimeout(request.idleTimer);
     request.idleTimer = undefined;
@@ -247,16 +249,18 @@ function LazyToolResultImage({ stub, pointer }: { stub: LazyToolResultStub; poin
     request.promise.then((value) => {
       if (mounted.current) setSource(request.blob ? { src: request.blob.src, local: false } : value);
     }).catch(() => { if (mounted.current) setFailed(true); });
-    return () => { mounted.current = false; releaseImage(request); };
+    return () => { mounted.current = false; activeRequest.current = null; releaseImage(request); };
   }, [stub, pointer, attempt]);
 
   const readFallback = () => {
     if (!source?.local) return;
-    const request = imageRequest(stub, pointer);
+    const request = activeRequest.current;
+    if (!request) return;
     inlineImage(stub, pointer, request).then((value) => {
       if (mounted.current) setSource(value);
     }).catch(() => {
-      imageRequests.get(stub)?.delete(pointer);
+      const cache = imageRequests.get(stub);
+      if (cache?.get(pointer) === request) cache.delete(pointer);
       if (mounted.current) setFailed(true);
     });
   };

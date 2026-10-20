@@ -1501,6 +1501,13 @@ fn conversation_fts_query(query: &str) -> Option<String> {
 }
 
 impl DatabaseStore {
+    #[cfg(test)]
+    pub(crate) fn test_file(path: &std::path::Path) -> Self {
+        let conn = open_connection(path).unwrap();
+        create_schema(&conn).unwrap();
+        Self { conn: Mutex::new(conn) }
+    }
+
     /// Create an in-memory database (fallback if file DB fails, and for tests).
     pub fn new_in_memory() -> Self {
         let conn = Connection::open_in_memory().expect("Failed to open in-memory database");

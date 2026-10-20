@@ -2,6 +2,8 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { LAZY_TOOL_RESULT_KEY } from "@/lib/agent-chat/lazy-tool-result";
+import { applyEvent, createEmptyThreadState } from "@/lib/agent-chat/reducer";
+import type { ProviderRuntimeEvent } from "@/tauri/events";
 import { replayPayloads } from "@/lib/agent-chat/hydrate";
 import type { AgentChatMessageRow } from "@/tauri/commands";
 
@@ -155,6 +157,35 @@ describe("dev mock stub preview parity with the Rust shaper", () => {
     expect(previewBytes).toBeLessThanOrEqual(2 * 1024);
     // Right up against the cap, not arbitrarily short.
     expect(previewBytes).toBeGreaterThan(2 * 1024 - 4);
+  });
+
+  it("preserves native failed and unknown image outcomes in live/replay stubs and full output", async () => {
+    const { mockShapePayload } = await import("./tauri-mock");
+    for (const [status, expected] of [["failed", "error"], ["future", "unconfirmed"]]) {
+      const data = "A".repeat(40_000);
+      const src = `data:image/png;base64,${data}`;
+      for (const [native, pointer] of [
+        [{ type: "mcpToolCall", id: "tu-1", status, result: { content: [
+          { type: "image", data, mimeType: "image/png" },
+        ] } }, "/result/content/0"],
+        [{ type: "dynamicToolCall", id: "tu-1", status, contentItems: [
+          { type: "inputImage", imageUrl: src },
+        ] }, "/contentItems/0"],
+      ] as const) {
+        const payload = toolResult(native);
+        const shaped = mockShapePayload(901, payload);
+        const event: ProviderRuntimeEvent = JSON.parse(shaped);
+        const live = applyEvent(createEmptyThreadState(), event);
+        const replay = replayPayloads([shaped]);
+        for (const state of [live, replay]) {
+          expect(state.messages.find((item) => item.kind === "tool_call")?.status).toBe(expected);
+        }
+        expect(JSON.parse(shaped).item.content[LAZY_TOOL_RESULT_KEY]).toMatchObject({ has_images: true, images: [{ pointer }] });
+        expect(await invoke("agent_chat_get_tool_result_image", { rowId: 901, pointer })).toEqual({ src, local: false });
+        expect(await invoke("agent_chat_get_tool_result", { rowId: 901 })).toBe(payload);
+        expect(mockShapePayload(902, toolResult({ ...native, id: "x".repeat(257) }))).toBe(toolResult({ ...native, id: "x".repeat(257) }));
+      }
+    }
   });
 
   it("stubs image bodies with handles and keeps the original accessible", async () => {

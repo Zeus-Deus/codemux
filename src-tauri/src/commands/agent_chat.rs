@@ -7249,17 +7249,22 @@ pub async fn agent_chat_get_tool_result_image(
     pointer: String,
     inline: Option<bool>,
 ) -> Result<ToolResultImageSource, String> {
-    let (thread_id, payload) = db.get_agent_chat_message_with_thread(row_id)
+    let (thread_id, payload) = db
+        .get_agent_chat_message_with_thread(row_id)
         .ok_or_else(|| format!("not_found: agent_chat_messages row {row_id}"))?;
     let (src, image) = tokio::task::spawn_blocking(move || -> Result<_, String> {
         let src = tool_result_image_src(&payload, &pointer)?;
-        if ["http://", "https://"].iter().any(|prefix|
-            src.get(..prefix.len()).is_some_and(|value| value.eq_ignore_ascii_case(prefix))) {
+        if ["http://", "https://"].iter().any(|prefix| {
+            src.get(..prefix.len())
+                .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+        }) {
             return Ok((src, None));
         }
         if inline.unwrap_or(false) {
             if !can_materialize_tool_image(&src) {
-                return Err("validation_error: image source exceeds inline transport bounds".into());
+                return Err(
+                    "validation_error: image source exceeds inline transport bounds".into(),
+                );
             }
             return Ok((src, None));
         }
@@ -7273,13 +7278,25 @@ pub async fn agent_chat_get_tool_result_image(
         use sha2::{Digest, Sha256};
         let stem = format!("tool-{row_id}-{:x}", Sha256::digest(&bytes));
         Ok((src, Some((stem, bytes))))
-    }).await.map_err(|error| format!("failed to resolve tool-result image: {error}"))??;
+    })
+    .await
+    .map_err(|error| format!("failed to resolve tool-result image: {error}"))??;
     let Some((stem, bytes)) = image else {
         return Ok(ToolResultImageSource { src, local: false });
     };
     match write_thread_chat_image(&thread_id, &stem, &bytes).await {
+        Ok((path, _)) if matches!(db.has_agent_chat_session(&thread_id), Ok(false)) => {
+            // A delete may have removed the session while the cache write was
+            // in flight. Reclaim only this image and its now-empty directory.
+            let _ = tokio::fs::remove_file(&path).await;
+            if let Some(dir) = path.parent() {
+                let _ = tokio::fs::remove_dir(dir).await;
+            }
+            Ok(ToolResultImageSource { src, local: false })
+        }
         Ok((path, _)) => Ok(ToolResultImageSource {
-            src: path.to_string_lossy().into_owned(), local: true,
+            src: path.to_string_lossy().into_owned(),
+            local: true,
         }),
         // This file is a cache; an unwritable cache must not hide evidence.
         Err(_) => Ok(ToolResultImageSource { src, local: false }),
@@ -7322,11 +7339,17 @@ fn tool_result_image_src(payload: &str, pointer: &str) -> Result<String, String>
 fn image_src_from_entry(entry: &serde_json::Value) -> String {
     let src = match entry["type"].as_str() {
         Some("file") => entry["uri"].as_str().unwrap().to_string(),
+        Some("inputImage") => entry["imageUrl"].as_str().unwrap().to_string(),
         Some("image_url") => entry["image_url"]["url"]
             .as_str()
             .or_else(|| entry["image_url"].as_str())
             .unwrap()
             .to_string(),
+        Some("image") if entry.get("source").is_none() => format!(
+            "data:{};base64,{}",
+            entry["mimeType"].as_str().unwrap(),
+            entry["data"].as_str().unwrap()
+        ),
         _ if entry["source"]["type"] == "base64" => format!(
             "data:{};base64,{}",
             entry["source"]["media_type"]
@@ -7541,6 +7564,10 @@ fn is_renderable_image_entry(entry: &serde_json::Value) -> bool {
                 None => iu.as_str(),
             })
             .is_some_and(is_safe_image_src),
+        Some("inputImage") => entry
+            .get("imageUrl")
+            .and_then(|url| url.as_str())
+            .is_some_and(is_safe_image_src),
         Some("file") => {
             entry
                 .get("mime")
@@ -7552,6 +7579,16 @@ fn is_renderable_image_entry(entry: &serde_json::Value) -> bool {
                     .is_some_and(is_safe_image_src)
         }
         Some("image") => {
+            if !entry.contains_key("source") {
+                return entry
+                    .get("data")
+                    .and_then(|data| data.as_str())
+                    .is_some_and(|data| !data.is_empty())
+                    && entry
+                        .get("mimeType")
+                        .and_then(|mime| mime.as_str())
+                        .is_some_and(|mime| mime.to_ascii_lowercase().starts_with("image/"));
+            }
             let Some(source) = entry.get("source").and_then(|s| s.as_object()) else {
                 return false;
             };
@@ -7584,7 +7621,8 @@ fn is_renderable_image_entry(entry: &serde_json::Value) -> bool {
 fn is_safe_image_src(raw: &str) -> bool {
     let url = raw.trim();
     ["data:image/", "http://", "https://"].iter().any(|prefix| {
-        url.get(..prefix.len()).is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+        url.get(..prefix.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
     })
 }
 
@@ -10703,11 +10741,11 @@ mod tests {
         let source = format!("data:image/png;base64,{}", "A".repeat(40_000));
         for (content, pointer) in [
             (
-                json!({"type":"mcpToolCall", "result":{"content":[{"type":"image_url", "image_url":source}]}}),
+                json!({"type":"mcpToolCall", "id":"tu-1", "status":"completed", "result":{"content":[{"type":"image", "data":"A".repeat(40_000), "mimeType":"image/png"}]}}),
                 "/result/content/0",
             ),
             (
-                json!({"type":"dynamicToolCall", "contentItems":[{"type":"file", "mime":"image/png", "uri":source}]}),
+                json!({"type":"dynamicToolCall", "id":"tu-1", "status":"completed", "contentItems":[{"type":"inputImage", "imageUrl":source}]}),
                 "/contentItems/0",
             ),
         ] {
@@ -10724,6 +10762,28 @@ mod tests {
         assert!(tool_result_image_src(&nonimage, "/input").is_err());
         assert!(tool_result_image_src("{}", "").is_err());
         assert!(tool_result_image_src("malformed", "").is_err());
+        for block in [
+            json!({"type":"inputImage", "imageUrl":"file:///private.png"}),
+            json!({"type":"inputImage", "imageUrl":42}),
+            json!({"type":"image", "data":"AAAA", "mimeType":"application/pdf"}),
+            json!({"type":"image", "data":"", "mimeType":"image/png"}),
+            json!({"type":"image", "source":null, "data":"AAAA", "mimeType":"image/png"}),
+        ] {
+            assert!(!is_renderable_image_entry(&block));
+            assert!(tool_result_image_src(&tool_result_payload(json!([block])), "/0").is_err());
+        }
+        let svg = format!("data:image/svg+xml;base64,{}", "A".repeat(40_000));
+        let payload = tool_result_payload(
+            json!({"type":"mcpToolCall", "id":"tu-1", "status":"completed", "result":{"content":[{"type":"image", "data":"A".repeat(40_000), "mimeType":"image/svg+xml"}]}}),
+        );
+        assert_eq!(
+            stub_of(&shape_persisted_payload(8, &payload)).unwrap()["images"][0]["src"],
+            svg
+        );
+        assert_eq!(
+            tool_result_image_src(&payload, "/result/content/0").unwrap(),
+            svg
+        );
         assert!(tool_result_image_src(
             &tool_result_payload(json!([{"type":"file","mime":"application/pdf","uri":source}])),
             "/0"
@@ -10759,8 +10819,60 @@ mod tests {
     }
 
     #[test]
-    fn shape_screenshot_transcript_measures_actual_serialized_reduction() {
-        use base64::Engine as _;
+    fn tool_result_image_outcomes_survive_live_and_replay() {
+        for (native, expected) in [
+            (
+                json!({"type":"mcpToolCall", "id":"tu-1", "status":"failed", "result":{"content":[]}}),
+                "error",
+            ),
+            (
+                json!({"type":"mcpToolCall", "id":"tu-1", "status":"future", "result":{"content":[]}}),
+                "unconfirmed",
+            ),
+            (
+                json!({"type":"dynamicToolCall", "id":"tu-1", "status":"completed", "success":false, "contentItems":[]}),
+                "error",
+            ),
+            (
+                json!({"type":"dynamicToolCall", "id":"tu-1", "status":"future", "contentItems":[]}),
+                "unconfirmed",
+            ),
+        ] {
+            let mut native = native;
+            if native["type"] == "mcpToolCall" {
+                native["result"]["content"] =
+                    json!([{ "type":"image", "data":"A".repeat(40_000), "mimeType":"image/png" }]);
+            } else {
+                native["contentItems"] = json!([{ "type":"inputImage", "imageUrl":format!("data:image/png;base64,{}", "A".repeat(40_000)) }]);
+            }
+            let payload = tool_result_payload(native.clone());
+            let shaped: serde_json::Value =
+                serde_json::from_str(&shape_persisted_payload(7, &payload)).unwrap();
+            let mut live: ProviderRuntimeEvent = serde_json::from_str(&payload).unwrap();
+            shape_live_tool_result(&mut live, Some(7));
+            for content in [
+                shaped["item"]["content"].clone(),
+                serde_json::to_value(live).unwrap()["item"]["content"].clone(),
+            ] {
+                assert_eq!(content[LAZY_TOOL_RESULT_KEY]["has_images"], true);
+                assert_eq!(
+                    content["__codemux_codex_tool_outcome"],
+                    json!({"tool_use_id":"tu-1", "status":expected})
+                );
+            }
+            for bad_id in [serde_json::Value::Null, json!("x".repeat(257))] {
+                native["id"] = bad_id;
+                let payload = tool_result_payload(native.clone());
+                assert_eq!(shape_persisted_payload(7, &payload), payload);
+                let mut live: ProviderRuntimeEvent = serde_json::from_str(&payload).unwrap();
+                let original = serde_json::to_value(&live).unwrap();
+                shape_live_tool_result(&mut live, Some(7));
+                assert_eq!(serde_json::to_value(live).unwrap(), original);
+            }
+        }
+    }
+
+    fn synthetic_tool_image_bytes() -> Vec<u8> {
         let mut bytes = Vec::new();
         {
             let mut encoder = png::Encoder::new(&mut bytes, 512, 512);
@@ -10775,6 +10887,13 @@ mod tests {
                 .collect();
             writer.write_image_data(&pixels).unwrap();
         }
+        bytes
+    }
+
+    #[test]
+    fn shape_screenshot_transcript_measures_actual_serialized_reduction() {
+        use base64::Engine as _;
+        let bytes = synthetic_tool_image_bytes();
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let payload = tool_result_payload(json!([
             {"type":"text", "text":"Synthetic screenshot evidence"},
@@ -10802,13 +10921,18 @@ mod tests {
 
     #[tokio::test]
     async fn tool_result_image_command_materializes_owned_bytes_and_recovers_cache() {
+        use base64::Engine as _;
+        let persisted = tempfile::tempdir().unwrap();
+        let database_path = persisted.path().join("tool-images.db");
         let app = tauri::test::mock_app();
-        app.manage(DatabaseStore::new_in_memory());
+        app.manage(DatabaseStore::test_file(&database_path));
         let db: State<'_, DatabaseStore> = app.state();
         let owner = format!("tool-image-test-{}", uuid::Uuid::new_v4());
         struct OwnImageDir(std::path::PathBuf);
         impl Drop for OwnImageDir {
-            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
         // This guard owns only the UUID directory minted by this test, and
         // also removes it if an assertion unwinds before normal cleanup.
@@ -10819,7 +10943,11 @@ mod tests {
             "../../../src/lib/agent-chat/__fixtures__/opencode-native-image-tool-result.json"
         ))
         .unwrap();
-        let content = fixture["data"]["content"].clone();
+        let mut content = fixture["data"]["content"].clone();
+        content[1]["uri"] = json!(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(synthetic_tool_image_bytes())
+        ));
         let payload = tool_result_payload(content);
         let row_id = db
             .append_agent_chat_message(&owner, &payload)
@@ -10834,7 +10962,9 @@ mod tests {
         let path = std::path::PathBuf::from(&resolved.src);
         assert_eq!(path.parent().unwrap().file_name().unwrap(), owner.as_str());
         assert_eq!(tokio::fs::read(&path).await.unwrap(), original);
-        let inline = agent_chat_get_tool_result_image(db.clone(), row_id, "/1".into(), Some(true)).await.unwrap();
+        let inline = agent_chat_get_tool_result_image(db.clone(), row_id, "/1".into(), Some(true))
+            .await
+            .unwrap();
         assert!(!inline.local);
         assert_eq!(inline.src, source);
         assert_eq!(db.get_agent_chat_message(row_id).unwrap(), payload);
@@ -10876,6 +11006,61 @@ mod tests {
             .unwrap();
         assert!(!fallback.local);
         assert_eq!(fallback.src, tolerated);
+        let db: State<'_, DatabaseStore> = app.state();
+        for (native, pointer) in [
+            (
+                json!({"type":"mcpToolCall", "id":"tu-1", "status":"failed", "result":{"content":[{"type":"image", "data":base64::engine::general_purpose::STANDARD.encode(&original), "mimeType":"image/png"}]}}),
+                "/result/content/0",
+            ),
+            (
+                json!({"type":"dynamicToolCall", "id":"tu-1", "status":"future", "contentItems":[{"type":"inputImage", "imageUrl":source}]}),
+                "/contentItems/0",
+            ),
+        ] {
+            let full = tool_result_payload(native);
+            let row = db
+                .append_agent_chat_message(&owner, &full)
+                .unwrap()
+                .unwrap();
+            let shaped = stub_of(&shape_persisted_payload(row, &full)).unwrap();
+            assert_eq!(shaped["images"][0]["pointer"], pointer);
+            let image = agent_chat_get_tool_result_image(db.clone(), row, pointer.into(), None)
+                .await
+                .unwrap();
+            assert!(image.local);
+            assert_eq!(tokio::fs::read(&image.src).await.unwrap(), original);
+            assert_eq!(
+                agent_chat_get_tool_result(db.clone(), row).await.unwrap(),
+                full
+            );
+            let inline =
+                agent_chat_get_tool_result_image(db.clone(), row, pointer.into(), Some(true))
+                    .await
+                    .unwrap();
+            assert_eq!(inline.src, source);
+            assert!(!inline.local);
+        }
+        drop(app);
+        let reopened = tauri::test::mock_app();
+        reopened.manage(DatabaseStore::test_file(&database_path));
+        let db: State<'_, DatabaseStore> = reopened.state();
+        let row = db.list_agent_chat_messages_after(&owner, None).unwrap()[0].clone();
+        let replayed = shape_rows(vec![row]);
+        assert!(stub_of(&replayed[0].payload).unwrap()["has_images"]
+            .as_bool()
+            .unwrap());
+        assert_eq!(
+            agent_chat_get_tool_result(db.clone(), row_id)
+                .await
+                .unwrap(),
+            payload
+        );
+        let image = agent_chat_get_tool_result_image(db, row_id, "/1".into(), None)
+            .await
+            .unwrap();
+        assert!(image.local);
+        assert_eq!(image.src, resolved.src);
+        assert_eq!(tokio::fs::read(image.src).await.unwrap(), original);
     }
 
     #[test]

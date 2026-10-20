@@ -47,6 +47,7 @@ import { randomUUID } from "@/lib/uuid";
  * falls through to a logged, shape-safe default.
  */
 import { workspaceLaunchScenario, streamWorkspaceLaunch, type MockWorkspaceLaunch } from "./workspace-launch-mock";
+import { toolResultStatus } from "@/lib/agent-chat/codex-tool-outcome";
 import { extractToolResultImages, toolResultImagePointers, withoutToolResultImages } from "@/lib/agent-chat/tool-result-images";
 import { createAgentConnectorMock } from "./agent-connector-mock";
 import { workflowMockHandlers } from "./workflow-mock";
@@ -2036,9 +2037,20 @@ export function mockShapePayload(rowId: number, payload: string): string {
   const serialized = JSON.stringify(content);
   if (serialized.length <= MOCK_LAZY_TOOL_RESULT_THRESHOLD_BYTES)
     return payload;
+  const native = typeof content === "object" && content !== null && !Array.isArray(content)
+    ? content as Record<string, unknown> : null;
+  const isNative = native != null && ["commandExecution", "fileChange", "dynamicToolCall", "mcpToolCall"].includes(String(native.type));
+  if (isNative && (typeof native.id !== "string" || new TextEncoder().encode(native.id).length > 256)) return payload;
+  const outcome = isNative && typeof native.id === "string" ? {
+    __codemux_codex_tool_outcome: {
+      tool_use_id: native.id,
+      status: toolResultStatus({ kind: "tool_result", tool_use_id: native.id, content, is_error: false }),
+    },
+  } : {};
   mockFullPayloadById.set(rowId, payload);
   const text = mockStringifyToolContent(images.length ? withoutToolResultImages(content) : content);
   item.content = {
+    ...outcome,
     __codemux_lazy_tool_result: {
       row_id: rowId,
       bytes: serialized.length,

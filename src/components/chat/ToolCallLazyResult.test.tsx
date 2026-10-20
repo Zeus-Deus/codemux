@@ -198,6 +198,32 @@ describe("lazy tool-result body", () => {
     expect(URL.revokeObjectURL).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps mounted ownership when a sibling fallback failure invalidates the cache", async () => {
+    vi.mocked(agentChatGetToolResultImage)
+      .mockResolvedValueOnce({ src: "/managed/shared.png", local: true })
+      .mockRejectedValueOnce(new Error("temporary hosted failure"))
+      .mockResolvedValueOnce({ src: "data:image/png;base64,AQID", local: false });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ blob: async () => new Blob(["image"]) }));
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => "blob:shared-race") });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+    const item = imageStub();
+    const first = render(<ToolCallBody item={item} />);
+    const second = render(<ToolCallBody item={item} />);
+    await waitFor(() => expect(screen.getAllByRole("img")).toHaveLength(2));
+    fireEvent.error(screen.getAllByRole("img")[0]);
+    await screen.findByRole("button", { name: "Image preview unavailable — retry" });
+    fireEvent.error(screen.getByRole("img"));
+    await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "blob:shared-race"));
+    expect(agentChatGetToolResultImage).toHaveBeenCalledTimes(3);
+    vi.useFakeTimers();
+    first.unmount();
+    vi.advanceTimersByTime(60_000);
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+    second.unmount();
+    vi.advanceTimersByTime(60_000);
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:shared-race");
+  });
+
   it("bounds idle Blob entries and never evicts a mounted image", async () => {
     vi.mocked(agentChatGetToolResultImage).mockImplementation(async (rowId, _pointer, inline) =>
       inline ? { src: "data:image/png;base64,AQID", local: false } : { src: `/managed/${rowId}.png`, local: true });
