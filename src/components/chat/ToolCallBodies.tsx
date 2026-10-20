@@ -396,14 +396,10 @@ function NativeFileChangeBody({ changes }: { changes: NativeFileChange[] }) {
             <div className="select-text font-mono text-body-sm text-foreground">
               <ToolSourcePath path={change.path} />
             </div>
-          ) : change.kind === "update" ? (
-            <DiffView filename={change.path} patch={change.diff} copyText={change.diff} />
           ) : (
             <DiffView
               filename={change.path}
-              // The file's final newline is not a line of its own.
-              oldText={change.kind === "delete" ? change.diff.replace(/\r?\n$/, "") : ""}
-              newText={change.kind === "add" ? change.diff.replace(/\r?\n$/, "") : ""}
+              patch={change.kind === "update" ? change.diff : wholeFilePatch(change)}
               copyText={change.diff}
             />
           )}
@@ -411,6 +407,16 @@ function NativeFileChangeBody({ changes }: { changes: NativeFileChange[] }) {
       ))}
     </div>
   );
+}
+
+/** An added or deleted file arrives as its whole content. As a one-hunk
+ *  patch every line, even a lone empty one, renders as its own row; the
+ *  final newline ends the last line rather than starting another. */
+function wholeFilePatch(change: NativeFileChange): string {
+  const lines = change.diff.replace(/\r?\n$/, "").split(/\r?\n/);
+  const sign = change.kind === "add" ? "+" : "-";
+  const range = change.kind === "add" ? `-0,0 +1,${lines.length}` : `-1,${lines.length} +0,0`;
+  return [`@@ ${range} @@`, ...lines.map((line) => sign + line)].join("\n");
 }
 
 /** A Codex MCP or dynamic tool call: its arguments, then its result blocks

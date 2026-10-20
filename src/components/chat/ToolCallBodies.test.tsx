@@ -620,6 +620,31 @@ describe("Codex native items", () => {
     expect(screen.queryByText(/"changes"/)).not.toBeInTheDocument();
   });
 
+  it("counts whole-file adds and deletes line for line, LF or CRLF", () => {
+    const counts = (kind: "add" | "delete", diff: string) => {
+      cleanup();
+      const { container } = render(
+        <ToolCallBody
+          item={makeTool({
+            tool_name: "fileChange",
+            input: { type: "fileChange", id: "c", changes: [{ path: "/repo/f.txt", kind: { type: kind }, diff }] },
+          })}
+        />,
+        { wrapper: TooltipProvider },
+      );
+      const rows = container.querySelectorAll(kind === "add" ? ".text-status-open.flex" : ".text-status-attention.flex");
+      const header = container.querySelector(".font-mono.text-label")?.textContent ?? "";
+      return { rows: rows.length, header };
+    };
+    expect(counts("add", "\n")).toEqual({ rows: 1, header: "+1 −0" });
+    expect(counts("add", "\r\n")).toEqual({ rows: 1, header: "+1 −0" });
+    expect(counts("add", "a\r\nb\r\n")).toEqual({ rows: 2, header: "+2 −0" });
+    expect(counts("add", "a\nb")).toEqual({ rows: 2, header: "+2 −0" });
+    expect(counts("delete", "\n")).toEqual({ rows: 1, header: "+0 −1" });
+    expect(counts("delete", "x\r\n\r\n")).toEqual({ rows: 2, header: "+0 −2" });
+    expect(screen.queryByText(/\r/)).not.toBeInTheDocument();
+  });
+
   it("shows an MCP call's arguments and result text, not its envelope", () => {
     const input = {
       type: "mcpToolCall",
