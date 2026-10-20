@@ -96,7 +96,7 @@ import {
 } from "@/stores/provider-health-store";
 import { Composer } from "./Composer";
 import { UserMessage } from "./UserMessage";
-import type { ActivePillMode } from "./pickers/ModePill";
+import type { ActivePillMode } from "./pickers/ModeTab";
 import { ProjectScopePopover } from "./pickers/ProjectScopePopover";
 import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
 import { cn } from "@/lib/utils";
@@ -1491,6 +1491,16 @@ function DraftChatSurfaceInner({
       // hides Composer's own zone-1 slot rather than falling back to a
       // plain cwd string.
       zone1Override={null}
+      // The landing's one-time Full access explanation docks on the card's
+      // top edge, beneath the mode tab.
+      stripSlot={
+        pending ? null : (
+          <FullAccessNotice
+            permissionMode={draft.permissionMode}
+            permissionModes={permissionModes}
+          />
+        )
+      }
       belowComposerSlot={belowComposerSlot}
       mode={normalizedMode}
       stagedAttachments={stagedAttachments}
@@ -1589,12 +1599,6 @@ function DraftChatSurfaceInner({
           <ChatHomeLanding
             composer={composerEl}
             agents={threadHostId === null ? landingAgents : undefined}
-            notice={
-              <FullAccessNotice
-                permissionMode={draft.permissionMode}
-                permissionModes={permissionModes}
-              />
-            }
             onProjectOpened={handleProjectOpened}
             projectName={scopeProjectPath ? basename(scopeProjectPath) : null}
             projectPicker={(trigger) => (

@@ -45,10 +45,10 @@ interface KindConfig {
   icon: LucideIcon;
   /** Named tint, surfaced on the chip as `data-tint`. */
   tint: ChipTint;
-  /** Tailwind classes — bg + text. 15% opacity fill matches ModePill
-   *  per the chat-ui chip token. Note: chat-ui skill technically
-   *  reserves accent for the app shell only, but ModePill set the
-   *  in-pane precedent and AttachmentChip mirrors it. */
+  /** Tailwind classes — bg + text. 15% opacity fill matches the mode
+   *  tab (`MODE_CONFIG`) per the chat-ui chip token. Note: chat-ui skill
+   *  technically reserves accent for the app shell only, but the mode
+   *  colors set the in-pane precedent and AttachmentChip mirrors it. */
   className: string;
 }
 
@@ -220,8 +220,7 @@ interface AttachmentChipProps {
 }
 
 /** Compact chip rendered in the strip above the composer textarea
- *  when an attachment is staged. Mirrors the ModePill chip shape and
- *  removal affordance.
+ *  when an attachment is staged: a tinted chip with an × to remove it.
  *
  *  Stage 1 only exercises `kind: "file"` end-to-end — the other kinds
  *  render via the same component so Stages 2–6 can flip their flows

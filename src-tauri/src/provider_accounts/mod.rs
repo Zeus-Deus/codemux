@@ -243,6 +243,28 @@ impl Removed {
         (!stale).then_some(native)
     }
 
+    /// A history reopen continues `from` as `to`, and merges `from`'s row
+    /// into `to`'s, native id included: `to` refuses whatever `from` would,
+    /// whether or not the start still offers a cursor (Claude's preflight
+    /// may have dropped it). A refused id still on `from`'s row is cleared,
+    /// as a removal clears the ids it takes, so the merge can't carry it
+    /// onto `to`'s row, where it would outlive this in-memory record.
+    fn inherit(&mut self, db: &DatabaseStore, provider: ProviderKind, from: &str, to: &str) {
+        let stored = db.get_agent_chat_session(from).and_then(|record| record.sdk_session_id);
+        if let Some(native) = stored.clone().filter(|_| self.orphaned(db, provider, from)) {
+            self.refuse(from, native);
+        }
+        let refused: Vec<String> = self.natives.get(from).into_iter().flatten().cloned().collect();
+        if stored.is_some_and(|native| refused.contains(&native)) {
+            if let Err(error) = db.clear_agent_chat_sdk_session_id(from) {
+                eprintln!("[codemux::provider_accounts] clearing {from}'s removed session: {error}");
+            }
+        }
+        for native in refused {
+            self.refuse(to, native);
+        }
+    }
+
     /// Whether a start's `cursor` resumes a session that left with a removed
     /// account.
     fn refuses_cursor(&mut self, db: &DatabaseStore, provider: ProviderKind, thread_id: &str, cursor: &serde_json::Value) -> bool {
@@ -256,6 +278,33 @@ impl Removed {
             .get(thread_id)
             .is_some_and(|stale| stale.iter().any(|id| cursor_mentions(cursor, id)))
     }
+}
+
+/// Store the native id a session reported for `thread_id` (at start or by
+/// event), unless it left with a removed account (see [`Removed`]): the chat
+/// lost its binding to a removal and hasn't bound again, or that very id was
+/// refused. Such an id is never stored, so it can't outlive the in-memory
+/// record of the removal. Decided and written under the removal lock, so a
+/// removal lands wholly before (the id is refused) or after (it clears the
+/// id). Returns whether the id was stored.
+pub fn store_reported_native(db: &DatabaseStore, thread_id: &str, native: &str) -> Result<bool, String> {
+    let mut removed = removed();
+    let removed = removed.get_or_insert_with(Default::default);
+    let provider = db
+        .get_agent_chat_session(thread_id)
+        .and_then(|record| serde_json::from_value::<ProviderKind>(serde_json::json!(record.provider)).ok())
+        .filter(|provider| supports(*provider));
+    if let Some(provider) = provider {
+        if removed.orphaned(db, provider, thread_id) {
+            removed.refuse(thread_id, native.to_string());
+            return Ok(false);
+        }
+        if removed.natives.get(thread_id).is_some_and(|ids| ids.contains(native)) {
+            return Ok(false);
+        }
+    }
+    db.set_agent_chat_sdk_session_id(thread_id, native)?;
+    Ok(true)
 }
 
 /// Delete an account with its defaults and bindings, and remember what its
@@ -368,9 +417,12 @@ fn start_resolution(
         return resolve(db, provider, Some(&input.thread_id.0), None, has_history);
     }
     // Reopening another persisted chat: its account has the transcript, and
-    // stays the chat's account even if a stale cursor was dropped.
+    // stays the chat's account even if a stale cursor was dropped. Without
+    // one (a removal took it), it resolves like a new chat, unless it still
+    // offers native history, which predates accounts and lives with the
+    // CLI's own sign-in (as [`rebuild_env`] does).
     if let Some(from) = extra(FROM_THREAD_EXTRA_KEY) {
-        return resolve(db, provider, Some(&from), None, true);
+        return resolve(db, provider, Some(&from), None, has_history);
     }
     resolve(db, provider, None, explicit.as_deref(), has_history)
 }
@@ -381,10 +433,32 @@ fn prepare_start_with(
     input: &mut StartSessionInput,
 ) -> Result<(), String> {
     let mut removed = removed();
+    let removed = removed.get_or_insert_with(Default::default);
+    let thread_id = input.thread_id.0.clone();
+    // A history pick resumes another chat's session under this thread: that
+    // chat may be the one a removal unbound.
+    let from = input
+        .extra
+        .get(FROM_THREAD_EXTRA_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|from| *from != thread_id)
+        .map(str::to_string);
+    if let Some(from) = from.as_deref() {
+        removed.inherit(db, provider, from, &thread_id);
+    }
     let refused = input.resume_cursor.as_ref().is_some_and(|cursor| {
-        removed
-            .get_or_insert_with(Default::default)
-            .refuses_cursor(db, provider, &input.thread_id.0, cursor)
+        let refused_here = removed.refuses_cursor(db, provider, &thread_id, cursor);
+        let refused_from = from
+            .as_deref()
+            .is_some_and(|from| removed.refuses_cursor(db, provider, from, cursor));
+        if refused_from {
+            // The reopen merges the old chat into this thread, native id
+            // included; this thread mustn't resume it later either.
+            if let Some(native) = crate::commands::agent_chat::extract_sdk_session_id(cursor) {
+                removed.refuse(&thread_id, native);
+            }
+        }
+        refused_here || refused_from
     });
     if refused {
         input.resume_cursor = None;
@@ -911,6 +985,66 @@ mod tests {
         db.upsert_agent_chat_session("rm-legacy", "ws", Some("/repo"), "claude").unwrap();
         assert_eq!(rebuilt(&app, "rm-legacy", "native-2"), (None, Some("native-2".into())));
         assert_eq!(db.provider_account_binding("rm-legacy", "claude").unwrap().as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn reopening_a_chat_whose_account_was_removed_starts_fresh_on_the_next_default() {
+        let db = db_with(&[("ro-work", "codex"), ("ro-personal", "codex")]);
+        db.set_provider_account_default("", "codex", Some("ro-personal")).unwrap();
+        db.upsert_agent_chat_session("ro-old", "ws", Some("/repo"), "codex").unwrap();
+        db.set_agent_chat_sdk_session_id("ro-old", "native-1").unwrap();
+        db.set_provider_account_binding("ro-old", "codex", "ro-work").unwrap();
+        delete_account(&db, "ro-work").unwrap();
+        let app = app_with(db);
+        let db = app.state::<DatabaseStore>();
+
+        // The history pick offers the old chat's cursor under a fresh thread.
+        let mut start = input("ro-new", true, serde_json::json!({ FROM_THREAD_EXTRA_KEY: "ro-old" }));
+        prepare_start(app.handle(), ProviderKind::Codex, &mut start, false);
+        assert_eq!(start.resume_cursor, None, "the removed account's session is not resumed");
+        assert_eq!(db.provider_account_binding("ro-new", "codex").unwrap().as_deref(), Some("ro-personal"));
+        let account = start.env.as_ref().and_then(|env| env.get(SESSION_ACCOUNT_ENV)).cloned();
+        assert_eq!(account.as_deref(), Some("ro-personal"));
+        // The reopen merges the old row in, its native id included: a later
+        // rebuild of the reopened chat doesn't resume that session either.
+        let rebuild = rebuild_env(app.handle(), ProviderKind::Codex, "ro-new", Some("native-1"), None, false);
+        assert_eq!(rebuild.native, None);
+
+        // Claude's start preflight may already have dropped the cursor (the
+        // session file isn't in the CLI home): the reopened chat still won't
+        // resume the removed session the merge copies onto it.
+        let app2 = app_with(db_with(&[("rp-work", "claude"), ("rp-personal", "claude")]));
+        let db2 = app2.state::<DatabaseStore>();
+        db2.set_provider_account_default("", "claude", Some("rp-personal")).unwrap();
+        db2.upsert_agent_chat_session("rp-old", "ws", Some("/repo"), "claude").unwrap();
+        db2.set_provider_account_binding("rp-old", "claude", "rp-work").unwrap();
+        delete_account(&db2, "rp-work").unwrap();
+        // A first turn's id reported after the removal.
+        db2.set_agent_chat_sdk_session_id("rp-old", "late-native").unwrap();
+        let mut preflighted = input("rp-new", false, serde_json::json!({ FROM_THREAD_EXTRA_KEY: "rp-old" }));
+        prepare_start(app2.handle(), ProviderKind::Claude, &mut preflighted, false);
+        assert_eq!(db2.provider_account_binding("rp-new", "claude").unwrap().as_deref(), Some("rp-personal"));
+        let rebuild = rebuild_env(app2.handle(), ProviderKind::Claude, "rp-new", Some("late-native"), None, false);
+        assert_eq!(rebuild.native, None);
+        // Nor does the id outlive this process: it is off the old row, so
+        // the reopen merge doesn't copy it onto the reopened chat's. The old
+        // session reporting it again late isn't stored either.
+        assert!(!store_reported_native(&db2, "rp-old", "late-native").unwrap());
+        assert_eq!(db2.get_agent_chat_session("rp-old").unwrap().sdk_session_id, None);
+        db2.upsert_agent_chat_session("rp-new", "ws", Some("/repo"), "claude").unwrap();
+        assert!(!store_reported_native(&db2, "rp-new", "late-native").unwrap());
+        db2.merge_reopened_agent_chat_session("rp-old", "rp-new").unwrap();
+        assert_eq!(db2.get_agent_chat_session("rp-new").unwrap().sdk_session_id, None);
+        // The reopened chat's own session is stored as usual.
+        assert!(store_reported_native(&db2, "rp-new", "fresh-native").unwrap());
+        assert_eq!(db2.get_agent_chat_session("rp-new").unwrap().sdk_session_id.as_deref(), Some("fresh-native"));
+
+        // A chat from before accounts still resumes on the CLI's own sign-in.
+        db.upsert_agent_chat_session("ro-legacy", "ws", Some("/repo"), "codex").unwrap();
+        let mut legacy = input("ro-legacy-new", true, serde_json::json!({ FROM_THREAD_EXTRA_KEY: "ro-legacy" }));
+        prepare_start(app.handle(), ProviderKind::Codex, &mut legacy, false);
+        assert!(legacy.resume_cursor.is_some());
+        assert_eq!(db.provider_account_binding("ro-legacy-new", "codex").unwrap().as_deref(), Some("default"));
     }
 
     #[test]
