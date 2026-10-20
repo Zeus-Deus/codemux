@@ -7,9 +7,11 @@
 //! chat-image folder, recorded on the reply as `retained_images` so live and
 //! replayed transcripts show the copy and fall back to the original path.
 //!
-//! The event bridge only scans the text and names the destinations; the
-//! copies run afterwards on a background task, which then writes the
-//! destinations that actually landed back onto the reply's row.
+//! The event bridge only scans the text and names the destinations, and
+//! stores the reply together with a copy job. The copies run afterwards on a
+//! background task, which records the destinations that actually landed on
+//! the reply's row and retires the job. A job a quit cut short resumes on
+//! the next launch; a fork inherits the jobs of replies it copies.
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime};
@@ -62,69 +64,115 @@ pub(super) fn plan(thread_id: &str, text: &str) -> Vec<RetainedReplyImage> {
         .collect()
 }
 
-/// Copy the planned images in the background, then record the copies that
-/// landed on row `row_id`. A reply whose row is gone by then (session
-/// deleted, turn reverted) gets its copies removed instead. A merge keeps
-/// row ids, so a merged reply still finds its row.
-pub(super) fn spawn_copies<R: Runtime>(
-    app: &AppHandle<R>,
-    row_id: i64,
-    thread_id: String,
-    planned: Vec<RetainedReplyImage>,
-) {
+/// Copy reply `row_id`'s planned images in the background, then record the
+/// copies that landed on its row and retire its job. Each run copies only
+/// what is still missing, so a resumed or repeated job is harmless; one row
+/// never runs twice at once.
+pub(super) fn spawn_copies<R: Runtime>(app: &AppHandle<R>, row_id: i64) {
+    if !in_flight().lock().unwrap().insert(row_id) {
+        return;
+    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let kept = copy_planned(&thread_id, planned).await;
-        let db = app.state::<DatabaseStore>();
-        match db.set_agent_chat_message_retained_images(row_id, &kept) {
-            Ok(true) => {}
-            Ok(false) => remove_copies(&kept),
-            Err(error) => {
-                eprintln!("[codemux::reply_images] couldn't record kept images: {error}")
-            }
-        }
+        retain_row(&app, row_id).await;
+        in_flight().lock().unwrap().remove(&row_id);
     });
 }
 
-async fn copy_planned(
-    thread_id: &str,
-    planned: Vec<RetainedReplyImage>,
-) -> Vec<RetainedReplyImage> {
+/// Resume every reply whose copies were not recorded yet: those cut short
+/// by a quit, and a fork's inherited replies that were still copying.
+pub fn resume_pending<R: Runtime>(app: &AppHandle<R>) {
+    let Some(db) = app.try_state::<DatabaseStore>() else {
+        return;
+    };
+    for row_id in db.list_reply_image_jobs() {
+        spawn_copies(app, row_id);
+    }
+}
+
+fn in_flight() -> &'static std::sync::Mutex<std::collections::HashSet<i64>> {
+    static ROWS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i64>>> =
+        std::sync::OnceLock::new();
+    ROWS.get_or_init(Default::default)
+}
+
+async fn retain_row<R: Runtime>(app: &AppHandle<R>, row_id: i64) {
+    let db = app.state::<DatabaseStore>();
+    // A row that is gone took its job with it.
+    let Some(payload) = db.get_agent_chat_message_payload(row_id) else {
+        return;
+    };
+    let planned = planned_in_payload(&payload);
     let Ok(_permit) = COPY_PERMITS.acquire().await else {
-        return Vec::new();
+        return;
+    };
+    let Some(root) = chat_images_root() else {
+        return;
     };
     let mut budget = MAX_RETAINED_BYTES_PER_REPLY;
     let mut kept = Vec::new();
     for image in planned {
-        match copy_one(thread_id, &image, &mut budget).await {
-            Ok(path) => kept.push(RetainedReplyImage { path, ..image }),
+        match keep_one(&root, &image, &mut budget).await {
+            Ok(()) => kept.push(image),
             Err(error) => eprintln!(
                 "[codemux::reply_images] not keeping {}: {error}",
                 image.source
             ),
         }
     }
-    kept
+    match db.finish_reply_image_job(row_id, &kept) {
+        Ok(true) => {}
+        Ok(false) => remove_copies(&kept),
+        // The job stays queued for the next launch.
+        Err(error) => eprintln!("[codemux::reply_images] couldn't record kept images: {error}"),
+    }
 }
 
-async fn copy_one(
-    thread_id: &str,
+/// The copies a stored reply names.
+fn planned_in_payload(payload: &str) -> Vec<RetainedReplyImage> {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| value.pointer("/item/retained_images").cloned())
+        .and_then(|images| serde_json::from_value(images).ok())
+        .unwrap_or_default()
+}
+
+/// Make sure `image.path` holds a copy of `image.source`. The destination
+/// comes from a stored row, so it must be exactly
+/// `<root>/<folder>/<stem>.<ext>`; the copy lands at that path or not at
+/// all, so a live reply and the stored row always name the same file.
+async fn keep_one(
+    root: &std::path::Path,
     image: &RetainedReplyImage,
     budget: &mut usize,
-) -> Result<String, String> {
-    let stem = std::path::Path::new(&image.path)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| "planned copy has no file name".to_string())?;
-    let bytes = read_bounded_local_image(&image.source).await?.bytes;
-    if bytes.len() > *budget {
+) -> Result<(), String> {
+    let (folder, stem, extension) =
+        copy_target(root, &image.path).ok_or_else(|| "not a chat-image copy path".to_string())?;
+    if tokio::fs::try_exists(&image.path).await.unwrap_or(false) {
+        return Ok(());
+    }
+    let read = read_bounded_local_image(&image.source).await?;
+    if chat_image_extension(&read.media_type) != extension {
+        return Err(format!("its content is {}, not .{extension}", read.media_type));
+    }
+    if read.bytes.len() > *budget {
         return Err("this reply's image budget is spent".to_string());
     }
-    *budget -= bytes.len();
-    // The stored name follows the content: a mislabelled file lands under
-    // its real extension, and the row records that path.
-    let (path, _) = write_thread_chat_image(thread_id, stem, &bytes).await?;
-    Ok(path.to_string_lossy().into_owned())
+    *budget -= read.bytes.len();
+    write_thread_chat_image(&folder, &stem, &read.bytes).await?;
+    Ok(())
+}
+
+/// Split a planned copy path into its chat-image folder, file stem and
+/// extension, or `None` when it is not a plain file directly inside a
+/// folder of `root`.
+fn copy_target(root: &std::path::Path, path: &str) -> Option<(String, String, String)> {
+    let path = std::path::Path::new(path);
+    let folder = path.parent()?.file_name()?.to_str()?;
+    let stem = path.file_stem()?.to_str()?;
+    let extension = path.extension()?.to_str()?;
+    let expected = root.join(folder).join(format!("{stem}.{extension}"));
+    (expected == path).then(|| (folder.to_string(), stem.to_string(), extension.to_string()))
 }
 
 fn remove_copies(kept: &[RetainedReplyImage]) {
@@ -392,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn the_row_records_only_copies_that_landed() {
+    fn a_reply_job_records_only_copies_that_landed_and_dies_with_its_row() {
         let db = DatabaseStore::new_in_memory();
         db.upsert_agent_chat_session("t", "ws", Some("/repo"), "claude").unwrap();
         let planned = |path: &str| RetainedReplyImage {
@@ -402,23 +450,54 @@ mod tests {
         let payload = serde_json::json!({
             "type": "item_completed", "thread_id": "t", "turn_id": "u",
             "item": {"kind": "assistant_text", "text": "[a](/tmp/a.png)",
-                     "retained_images": [planned("/img/t/k.png")]},
+                     "retained_images": [planned("/img/t/k.png"), planned("/img/t/l.png")]},
         });
-        let row = db.append_agent_chat_message("t", &payload.to_string()).unwrap().unwrap();
+        let row = db
+            .append_agent_chat_reply_with_image_job("t", &payload.to_string())
+            .unwrap()
+            .unwrap();
+        // The row and its job commit together; a restart finds the job.
+        assert_eq!(db.list_reply_image_jobs(), vec![row]);
+        let stored = db.get_agent_chat_message_payload(row).unwrap();
+        assert_eq!(planned_in_payload(&stored).len(), 2);
+
+        // One copy landed: the row names only it, and the job is retired.
+        assert!(db.finish_reply_image_job(row, &[planned("/img/t/l.png")]).unwrap());
         let item = |db: &DatabaseStore| {
             let rows = db.list_agent_chat_messages("t");
             serde_json::from_str::<serde_json::Value>(&rows[0]).unwrap()["item"].clone()
         };
-
-        // A copy that landed under its real extension replaces the plan.
-        assert!(db.set_agent_chat_message_retained_images(row, &[planned("/img/t/k.jpg")]).unwrap());
-        assert_eq!(item(&db)["retained_images"][0]["path"], "/img/t/k.jpg");
-        // None landed: the reply claims no copy at all.
-        assert!(db.set_agent_chat_message_retained_images::<RetainedReplyImage>(row, &[]).unwrap());
+        assert_eq!(item(&db)["retained_images"], serde_json::json!([planned("/img/t/l.png")]));
+        assert!(db.list_reply_image_jobs().is_empty());
+        // None landed: the reply claims no copy at all, its text untouched.
+        assert!(db.finish_reply_image_job::<RetainedReplyImage>(row, &[]).unwrap());
         assert!(item(&db).get("retained_images").is_none());
         assert_eq!(item(&db)["text"], "[a](/tmp/a.png)");
-        // The row is gone: the caller learns the copies are unowned.
-        assert!(!db.set_agent_chat_message_retained_images::<RetainedReplyImage>(row + 1, &[]).unwrap());
+
+        // A deleted session takes a pending job with it, and a late finish
+        // learns its copies are unowned.
+        let again = db
+            .append_agent_chat_reply_with_image_job("t", &payload.to_string())
+            .unwrap()
+            .unwrap();
+        db.delete_agent_chat_session("t").unwrap();
+        assert!(db.list_reply_image_jobs().is_empty());
+        assert!(db.get_agent_chat_message_payload(again).is_none());
+        assert!(!db.finish_reply_image_job::<RetainedReplyImage>(again, &[]).unwrap());
+    }
+
+    #[test]
+    fn copies_land_only_at_plain_paths_inside_the_root() {
+        let root = std::path::Path::new("/cfg/images");
+        assert_eq!(
+            copy_target(root, "/cfg/images/t1/k.png"),
+            Some(("t1".into(), "k".into(), "png".into()))
+        );
+        assert_eq!(copy_target(root, "/cfg/images/k.png"), None, "no thread folder");
+        assert_eq!(copy_target(root, "/cfg/images/t1/sub/k.png"), None);
+        assert_eq!(copy_target(root, "/cfg/images/../t1/k.png"), None);
+        assert_eq!(copy_target(root, "/elsewhere/t1/k.png"), None);
+        assert_eq!(copy_target(root, "/cfg/images/t1/k"), None, "no extension");
     }
 
     #[test]

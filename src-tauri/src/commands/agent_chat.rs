@@ -7975,16 +7975,16 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                 let planned = plan_reply_images(app, &event);
                 if let Ok(payload) = persisted_event_payload(&event, &planned) {
                     let db: State<'_, DatabaseStore> = app.state();
-                    match db.append_agent_chat_message(&thread_id.0, &payload) {
+                    let appended = if planned.is_empty() {
+                        db.append_agent_chat_message(&thread_id.0, &payload)
+                    } else {
+                        db.append_agent_chat_reply_with_image_job(&thread_id.0, &payload)
+                    };
+                    match appended {
                         Ok(row_id) => {
                             persisted_id = row_id;
                             if let (Some(row_id), false) = (row_id, planned.is_empty()) {
-                                super::reply_images::spawn_copies(
-                                    app,
-                                    row_id,
-                                    thread_id.0.clone(),
-                                    planned.clone(),
-                                );
+                                super::reply_images::spawn_copies(app, row_id);
                                 retained_images = planned;
                             }
                         }

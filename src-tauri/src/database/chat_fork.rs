@@ -280,6 +280,16 @@ impl DatabaseStore {
             )
             .map_err(|e| format!("Failed to copy the transcript: {e}"))?;
             let copied = tx.last_insert_rowid();
+            // A reply still copying its linked images: the fork's copy names
+            // destinations in the fork's folder that the source's job never
+            // writes, so the fork gets a job of its own.
+            tx.execute(
+                "INSERT INTO agent_chat_reply_image_jobs (row_id)
+                 SELECT ?2 WHERE EXISTS
+                     (SELECT 1 FROM agent_chat_reply_image_jobs WHERE row_id = ?1)",
+                params![id, copied],
+            )
+            .map_err(|e| format!("Failed to copy a pending image job: {e}"))?;
             copied_ids.insert(id, copied);
             boundary = Some(copied);
         }
@@ -472,6 +482,42 @@ mod tests {
             images,
             vec![(PathBuf::from("/img/src/k.png"), PathBuf::from("/img/fork/k.png"))]
         );
+    }
+
+    #[test]
+    fn a_fork_inherits_the_copy_jobs_of_replies_still_copying() {
+        let db = store_with_source();
+        let reply = |path: &str| {
+            serde_json::json!({"type":"item_completed","thread_id":"src","turn_id":"u",
+                "item":{"kind":"assistant_text","text":"[a](/tmp/a.png)",
+                        "retained_images":[{"source":"/tmp/a.png","path":path}]}})
+            .to_string()
+        };
+        let done = db.append_agent_chat_message("src", &reply("/img/src/done.png")).unwrap().unwrap();
+        let pending = db
+            .append_agent_chat_reply_with_image_job("src", &reply("/img/src/pending.png"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.list_reply_image_jobs(), vec![pending]);
+        let source = db.get_agent_chat_session("src").unwrap();
+        let roots = vec![PathBuf::from("/img")];
+        db.create_agent_chat_fork(&NewChatFork {
+            thread_id: "fork",
+            source: &source,
+            sdk_session_id: "native-fork",
+            workspace_id: "ws",
+            cwd: "/repo",
+            title: "fork",
+            cut_before: None,
+            image_dirs: Some((roots.as_slice(), Path::new("/img/fork"))),
+        })
+        .unwrap();
+
+        let jobs = db.list_reply_image_jobs();
+        assert_eq!(jobs.len(), 2, "only the pending reply's copy gets a job");
+        let forked = db.get_agent_chat_message_payload(jobs[1]).unwrap();
+        assert!(forked.contains("/img/fork/pending.png"), "{forked}");
+        assert!(jobs[1] > done);
     }
 
     #[test]

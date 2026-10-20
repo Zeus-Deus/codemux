@@ -724,6 +724,16 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_thread
             ON agent_chat_messages(thread_id, id ASC);
 
+        -- Replies whose linked local images are still being copied into the
+        -- conversation (see commands::reply_images). Written with the reply's
+        -- row, removed once its copies are recorded, so a copy cut short by a
+        -- quit resumes on the next launch. Cascade keeps a job from outliving
+        -- its row.
+        CREATE TABLE IF NOT EXISTS agent_chat_reply_image_jobs (
+            row_id INTEGER PRIMARY KEY
+                REFERENCES agent_chat_messages(id) ON DELETE CASCADE
+        );
+
         -- Numeric affinity matches the row-id comparison, including legacy
         -- numeric JSON strings. Accept JSON5 TEXT like json_extract while
         -- excluding malformed input from this derived index.
@@ -4867,26 +4877,93 @@ impl DatabaseStore {
         }
     }
 
-    /// Record the image copies that landed for the assistant reply in row
-    /// `id` (see `commands::reply_images`), dropping the entry when none did.
-    /// `Ok(false)` means the row no longer exists, so the copies are unowned.
-    pub fn set_agent_chat_message_retained_images<T: serde::Serialize>(
+    /// [`Self::append_agent_chat_message`] for an assistant reply whose
+    /// linked images still need copying: the row and its copy job commit
+    /// together, so no reply can name copies nothing will make.
+    pub fn append_agent_chat_reply_with_image_job(
+        &self,
+        thread_id: &str,
+        payload_json: &str,
+    ) -> Result<Option<i64>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        match tx.execute(
+            "INSERT INTO agent_chat_messages (thread_id, payload, created_at)
+             VALUES (?1, ?2, strftime('%Y-%m-%d %H:%M:%f', 'now'))",
+            params![thread_id, payload_json],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
+            {
+                // The session was deleted; see `append_agent_chat_message`.
+                return Ok(None);
+            }
+            Err(e) => return Err(format!("Failed to append agent_chat_message: {e}")),
+        }
+        let row_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO agent_chat_reply_image_jobs (row_id) VALUES (?1)",
+            params![row_id],
+        )
+        .map_err(|e| format!("Failed to queue reply image copies: {e}"))?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(Some(row_id))
+    }
+
+    /// Rows whose reply image copies have not been recorded yet.
+    pub fn list_reply_image_jobs(&self) -> Vec<i64> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) =
+            conn.prepare("SELECT row_id FROM agent_chat_reply_image_jobs ORDER BY row_id")
+        else {
+            return Vec::new();
+        };
+        stmt.query_map([], |row| row.get(0))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// The stored payload of one message row, if it still exists.
+    pub fn get_agent_chat_message_payload(&self, id: i64) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT payload FROM agent_chat_messages WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    /// Record the image copies that landed for the reply in row `id` (see
+    /// `commands::reply_images`), dropping the entry when none did, and
+    /// retire its copy job. `Ok(false)` means the row no longer exists, so
+    /// the copies are unowned.
+    pub fn finish_reply_image_job<T: serde::Serialize>(
         &self,
         id: i64,
         images: &[T],
     ) -> Result<bool, String> {
         let images = serde_json::to_string(images).map_err(|e| e.to_string())?;
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE agent_chat_messages
-             SET payload = CASE json_array_length(?2)
-                 WHEN 0 THEN json_remove(payload, '$.item.retained_images')
-                 ELSE json_set(payload, '$.item.retained_images', json(?2)) END
-             WHERE id = ?1 AND json_valid(payload)",
-            params![id, images],
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let changed = tx
+            .execute(
+                "UPDATE agent_chat_messages
+                 SET payload = CASE json_array_length(?2)
+                     WHEN 0 THEN json_remove(payload, '$.item.retained_images')
+                     ELSE json_set(payload, '$.item.retained_images', json(?2)) END
+                 WHERE id = ?1 AND json_valid(payload)",
+                params![id, images],
+            )
+            .map_err(|e| format!("Failed to record retained reply images: {e}"))?;
+        tx.execute(
+            "DELETE FROM agent_chat_reply_image_jobs WHERE row_id = ?1",
+            params![id],
         )
-        .map(|changed| changed > 0)
-        .map_err(|e| format!("Failed to record retained reply images: {e}"))
+        .map_err(|e| format!("Failed to retire the reply image job: {e}"))?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed > 0)
     }
 
     /// Return every persisted message for a thread, ordered by
