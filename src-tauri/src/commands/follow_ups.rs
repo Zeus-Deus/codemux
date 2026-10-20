@@ -1674,10 +1674,10 @@ pub(crate) mod tests {
                 .map(|tool| tool.name)
                 .collect::<Vec<_>>()
         };
-        // Codex outside Full access gets suggestions but not delegation.
+        // Discovery is independent of start mode; dispatch enforces ceilings.
         assert_eq!(
             names(&caller(ProviderKind::Codex, Some("workspace-write"))),
-            vec!["suggest_tasks"]
+            vec!["delegate_task", "task_status", "task_cancel", "suggest_tasks"]
         );
         assert_eq!(
             names(&caller(ProviderKind::Claude, Some("plan"))),
@@ -1705,13 +1705,14 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(refused["isError"], true);
 
-        // A running child is neither offered nor served the tool.
+        // Running children may delegate within shared budgets, but suggestions
+        // for a user-started worktree are still neither offered nor served.
         let state = app.state::<DelegationState>();
         state.reserve_worktree(
             "parent",
             Task::new("grandparent", ProviderKind::Codex, "t", "b", 0),
         );
-        assert!(names(&claude).is_empty());
+        assert_eq!(names(&claude), vec!["delegate_task", "task_status", "task_cancel"]);
         let refused = host
             .call(
                 &claude,
