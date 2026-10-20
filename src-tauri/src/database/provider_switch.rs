@@ -46,10 +46,37 @@ pub(crate) fn retarget_seed(seed: &str, from: &str, to: &str) -> String {
     }
 }
 
+/// See [`DatabaseStore::agent_chat_turn_answered_after`].
+fn turn_answered_after(conn: &Connection, thread_id: &str, nonce: &str, after_id: i64) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_chat_messages u
+            WHERE u.thread_id = ?1 AND u.id > ?3 AND json_valid(u.payload)
+              AND json_extract(u.payload, '$.type') = 'user_message'
+              AND json_extract(u.payload, '$.client_nonce') = ?2
+              AND EXISTS(SELECT 1 FROM agent_chat_messages r
+                  WHERE r.thread_id = u.thread_id AND r.id > u.id AND json_valid(r.payload)
+                    AND json_extract(r.payload, '$.type') = 'item_completed'))",
+        params![thread_id, nonce, after_id],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
+}
+
+/// Tells a provider that already has a handoff where the chat's full
+/// history lives now that a history reopen gave the chat a new id.
+fn reopen_correction(thread_id: &str) -> String {
+    format!(
+        "<codemux-provider-handoff>\nThis chat was reopened under a new id. Its complete conversation is now under {}: use that with `conversation_search` and `conversation_read`, not the conversation an earlier handoff named.\n</codemux-provider-handoff>",
+        history_ref(thread_id)
+    )
+}
+
 /// A history reopen merges `merged` into `survivor`
-/// (`merge_agent_chat_session_rows`). Unless the survivor has a seed of its
-/// own, it takes the newest of theirs as it stood, delivery state included,
-/// with its history pointer moved to the survivor: the merged ids are gone.
+/// (`merge_agent_chat_session_rows`, after the transcript moved). Unless the
+/// survivor has a seed of its own, it takes the newest of theirs: as it
+/// stood, history pointer moved to the survivor, while the provider hasn't
+/// answered it; once it has, a short correction naming the survivor
+/// instead, which the next turn carries. The merged ids are gone.
 pub(super) fn move_to_thread(conn: &Connection, merged: &[String], survivor: &str) -> Result<(), String> {
     let read_error = |e: rusqlite::Error| format!("Failed to read the provider switch context: {e}");
     let own: bool = conn
@@ -77,14 +104,30 @@ pub(super) fn move_to_thread(conn: &Connection, merged: &[String], survivor: &st
             newest = Some(seed);
         }
     }
-    let Some((from, provider, content, anchor_id, sent_nonce, created_at)) = newest else {
+    let Some((from, provider, mut content, mut anchor_id, mut sent_nonce, created_at)) = newest else {
         return Ok(());
     };
+    let answered = sent_nonce
+        .as_deref()
+        .is_some_and(|sent| turn_answered_after(conn, survivor, sent, anchor_id));
+    if answered {
+        content = reopen_correction(survivor);
+        anchor_id = conn
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM agent_chat_messages WHERE thread_id = ?1",
+                params![survivor],
+                |row| row.get(0),
+            )
+            .map_err(read_error)?;
+        sent_nonce = None;
+    } else {
+        content = retarget_seed(&content, from, survivor);
+    }
     conn.execute(
         "INSERT INTO agent_chat_provider_switch_seeds
             (thread_id, provider, content, anchor_id, sent_nonce, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![survivor, provider, retarget_seed(&content, from, survivor), anchor_id, sent_nonce, created_at],
+        params![survivor, provider, content, anchor_id, sent_nonce, created_at],
     )
     .map(|_| ())
     .map_err(|e| format!("Failed to keep the provider switch context: {e}"))
@@ -173,21 +216,7 @@ impl DatabaseStore {
     /// item follows it. A turn stopped or rejected before the provider took
     /// it leaves no reply behind.
     pub fn agent_chat_turn_answered_after(&self, thread_id: &str, nonce: &str, after_id: i64) -> bool {
-        self.conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM agent_chat_messages u
-                    WHERE u.thread_id = ?1 AND u.id > ?3 AND json_valid(u.payload)
-                      AND json_extract(u.payload, '$.type') = 'user_message'
-                      AND json_extract(u.payload, '$.client_nonce') = ?2
-                      AND EXISTS(SELECT 1 FROM agent_chat_messages r
-                          WHERE r.thread_id = u.thread_id AND r.id > u.id AND json_valid(r.payload)
-                            AND json_extract(r.payload, '$.type') = 'item_completed'))",
-                params![thread_id, nonce, after_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false)
+        turn_answered_after(&self.conn.lock().unwrap(), thread_id, nonce, after_id)
     }
 
     /// A thread's seed and the provider it is for.

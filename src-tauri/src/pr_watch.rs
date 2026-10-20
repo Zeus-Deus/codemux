@@ -805,8 +805,12 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
         }
         _ => HashMap::new(),
     };
+    // From before the commit until the wake is delivered or refunded, a
+    // history reopen leaves the chat where it is (`unless_waking`).
+    let _waking = matches!(evaluation.decision, Decision::Wake(_)).then(|| Waking::claim(&watch.thread_id));
     // The write is the commit point: if the watch was re-armed or removed
-    // while we fetched, nothing is recorded and nobody is woken.
+    // (or moved by a history reopen) while we fetched, nothing is recorded
+    // and nobody is woken.
     if !db.save_pr_watch_progress(&evaluation.next, &evaluation.mark_seen, now)? {
         return Ok(());
     }
@@ -869,6 +873,47 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
     // Every committed pass moves `last_checked_at_ms`, which the UI shows.
     emit_changed(app, &watch.thread_id, Some(next));
     Ok(())
+}
+
+/// Chats with a wake between its commit (events marked seen, attempt
+/// spent) and its delivery or refund, which both name the chat's thread.
+fn waking() -> std::sync::MutexGuard<'static, HashSet<String>> {
+    static WAKING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    WAKING
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Marks a chat as being woken until dropped.
+struct Waking(String);
+
+impl Waking {
+    fn claim(thread_id: &str) -> Self {
+        waking().insert(thread_id.to_string());
+        Self(thread_id.to_string())
+    }
+}
+
+impl Drop for Waking {
+    fn drop(&mut self) {
+        waking().remove(&self.0);
+    }
+}
+
+/// Run `f` (a history reopen merging `thread_id` away) unless a wake for
+/// the chat is in flight, atomically with a wake claiming it: either the
+/// wake's commit finds its watch moved and wakes nobody, or the chat stays.
+pub(crate) fn unless_waking<T>(thread_id: &str, f: impl FnOnce() -> T) -> Option<T> {
+    let waking = waking();
+    (!waking.contains(thread_id)).then(f)
+}
+
+/// A wake in flight for `thread_id` until the result drops, for tests of
+/// callers of [`unless_waking`].
+#[cfg(test)]
+pub(crate) fn tests_claim_waking(thread_id: &str) -> impl Drop {
+    Waking::claim(thread_id)
 }
 
 /// Undo what [`evaluate`] spent on a wake that never reached the chat.

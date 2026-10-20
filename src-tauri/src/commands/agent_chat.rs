@@ -6862,9 +6862,12 @@ async fn merge_reopened_chat<R: Runtime>(
     if live || state.agent_chat_pane_id_for_thread(from).is_some() {
         return;
     }
-    match db.merge_reopened_agent_chat_session(from, into) {
-        Ok(cleanup) => agent_chat_sessions_merged(app, db, cleanup),
-        Err(error) => eprintln!("[codemux::agent_chat] failed to merge the reopened chat: {error}"),
+    // A pull-request wake already committed for the old chat is about to
+    // send to it; merging now would lose that wake.
+    match crate::pr_watch::unless_waking(from, || db.merge_reopened_agent_chat_session(from, into)) {
+        None => {}
+        Some(Ok(cleanup)) => agent_chat_sessions_merged(app, db, cleanup),
+        Some(Err(error)) => eprintln!("[codemux::agent_chat] failed to merge the reopened chat: {error}"),
     }
 }
 
@@ -11375,6 +11378,11 @@ mod tests {
         merge().await;
         assert!(db.get_agent_chat_session("old").is_some(), "something is dispatching to it");
         drop(busy);
+
+        let waking = crate::pr_watch::tests_claim_waking("old");
+        merge().await;
+        assert!(db.get_agent_chat_session("old").is_some(), "a committed PR wake is on its way");
+        drop(waking);
 
         merge().await;
         assert!(db.get_agent_chat_session("old").is_none());

@@ -513,6 +513,32 @@ mod tests {
     }
 
     #[test]
+    fn a_reopened_chat_tells_its_provider_where_the_history_went() {
+        // The handoff was answered under "t"; reopening the chat from history
+        // merges it into "t2" and deletes "t", which the provider's handoff
+        // still names. The next turn carries a short correction, once.
+        let db = store();
+        db.put_provider_switch_seed("t", "codex", "SEED conversation_id `t`", 0).unwrap();
+        let (_, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n1", "go".into());
+        seed_delivered(&db, "t", ProviderKind::Codex, "n1", seed);
+        user_message(&db, "n1");
+        db.append_agent_chat_message("t", r#"{"type":"item_completed"}"#).unwrap();
+        db.upsert_agent_chat_session("t2", "ws", Some("/repo"), "codex").unwrap();
+        db.merge_reopened_agent_chat_session("t", "t2").unwrap();
+
+        let (text, seed) = seed_turn(&db, "t2", ProviderKind::Codex, "n2", "next".into());
+        assert!(text.contains("reopened under a new id"), "{text}");
+        assert!(text.contains(&history_ref("t2")) && !text.contains(&history_ref("t")));
+        assert!(text.ends_with("\n\nnext"));
+        seed_delivered(&db, "t2", ProviderKind::Codex, "n2", seed);
+        let reply = serde_json::json!({"type": "user_message", "text": "next", "client_nonce": "n2"});
+        db.append_agent_chat_message("t2", &reply.to_string()).unwrap();
+        db.append_agent_chat_message("t2", r#"{"type":"item_completed"}"#).unwrap();
+        let (after, none) = seed_turn(&db, "t2", ProviderKind::Codex, "n3", "more".into());
+        assert_eq!((after.as_str(), none), ("more", None));
+    }
+
+    #[test]
     fn a_reverted_seeded_turn_hands_the_seed_to_the_next_one() {
         let db = store();
         db.put_provider_switch_seed("t", "codex", "SEED", 0).unwrap();
