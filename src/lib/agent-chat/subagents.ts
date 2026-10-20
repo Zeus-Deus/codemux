@@ -1,3 +1,4 @@
+import { isDelegationResultsMessage } from "@/lib/agent-chat/message-provenance";
 import type { SubagentSnapshot, SubagentStatus } from "@/tauri/events";
 
 import {
@@ -953,7 +954,7 @@ export function subagentWaves(messages: ChatViewItem[]): SubagentWave[] {
     if (item.kind === "user_message") {
       if (item.queued || item.inflight) continue;
       // The results turn reads as the trail and divider name it.
-      const line = item.notification?.source.kind === "delegated_task"
+      const line = isDelegationResultsMessage(item)
         ? "Delegated results"
         : firstLine(item.text);
       prompt = line.length > 0 ? line : null;

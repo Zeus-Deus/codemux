@@ -4101,3 +4101,18 @@ export const agentChatSwitchProvider = (
   provider: AgentChatProviderKind,
   input: AgentChatStartSessionInput,
 ) => agentChatStartSession(paneId, provider, input, input.thread_id, from);
+
+export interface MessageDeliveryAttention {
+  id: string;
+  message_id: string;
+  state: string;
+  reason: string | null;
+  display_text: string | null;
+  can_retry: boolean;
+}
+export const agentChatDeliveryAttention = (threadId: string) =>
+  invoke<MessageDeliveryAttention[]>("agent_chat_delivery_attention", {threadId});
+export const agentChatAcknowledgeDelivery = (threadId: string, deliveryId: string) =>
+  invoke<void>("agent_chat_acknowledge_delivery", {threadId, deliveryId});
+export const agentChatRetryDelivery = (threadId: string, deliveryId: string) =>
+  invoke<void>("agent_chat_retry_delivery", {threadId, deliveryId});

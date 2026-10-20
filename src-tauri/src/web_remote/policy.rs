@@ -114,6 +114,9 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "agent_chat_list_turn_checkpoints"
             | "agent_chat_get_turn_diff"
             // The editable, saved follow-up queue; the same reach as send/cancel.
+            | "agent_chat_delivery_attention"
+            | "agent_chat_acknowledge_delivery"
+            | "agent_chat_retry_delivery"
             | "agent_chat_list_queued_turns"
             | "agent_chat_edit_queued_turn"
             | "agent_chat_move_queued_turn"

@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use crate::agent_provider::{ProviderKind, ThreadId};
-use crate::commands::agent_chat::{send_turn_reporting_dispatch, SendTurnCommandInput, TurnOrigin};
+use crate::commands::agent_chat::{SendTurnCommandInput, TurnOrigin};
 use crate::database::pr_watch::{PrWatchRecord, PR_WATCH_ENDED, PR_WATCH_EXHAUSTED};
 use crate::database::DatabaseStore;
 
@@ -607,6 +607,8 @@ pub(crate) fn render_wake(
 fn wake_nonce(watch: &PrWatchRecord, mark_seen: &[String]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(watch.generation.to_le_bytes());
+    hasher.update(watch.attempts.to_le_bytes());
+    hasher.update(watch.comment_streak.to_le_bytes());
     for key in mark_seen {
         hasher.update(key.as_bytes());
         hasher.update([0]);
@@ -866,9 +868,11 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
                 client_nonce: Some(wake_nonce(&next, &evaluation.delivered)),
                 delivery: crate::agent_provider::types::MessageDelivery::Queue,
             };
+            let mut context = crate::agent_control::delivery::SendContext::new(TurnOrigin::PrWatch);
+            context.pr_watch = Some(crate::agent_control::delivery::PrWatchDelivery {generation:next.generation,event_keys:evaluation.delivered.clone()});
             let mut refunded = false;
-            if let Err((error, reached)) =
-                send_turn_reporting_dispatch(app.clone(), provider, input, TurnOrigin::PrWatch).await
+            if let Err(error) =
+                crate::commands::agent_chat::send_turn_with_context(app.clone(), provider, input, context).await
             {
                 next.last_error = Some(format!("Could not wake the chat: {error}"));
                 // A send rejected before the provider was asked (no session,
@@ -881,7 +885,7 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
                 // first attempt failed before bytes. Never coalesce those
                 // same events into another wake while it is pending/held.
                 let admitted=db.message_delivery_for_message(&next.thread_id,&wake_nonce(&next,&evaluation.delivered)).ok().flatten().is_some();
-                let unmark: &[String] = if reached || admitted {
+                let unmark: &[String] = if admitted {
                     &[]
                 } else {
                     refund_wake(&mut next, watch, report);
@@ -1424,7 +1428,7 @@ mod tests {
         assert!(!eval.delivered.is_empty());
         // The retry carries the same events, so the same nonce.
         let again = evaluate(&next, &view("h1", vec![], vec![check("ci", CheckState::Failure, 1)]), &HashSet::new(), 6);
-        assert_eq!(wake_nonce(&next, &again.delivered), wake_nonce(&eval.next, &eval.delivered));
+        assert_eq!(wake_nonce(&again.next, &again.delivered), wake_nonce(&eval.next, &eval.delivered));
     }
 
     #[test]
@@ -1486,4 +1490,15 @@ mod tests {
         assert_eq!(a, wake_nonce(&w, &["check:x".into()]));
         assert_ne!(a, wake_nonce(&w, &["check:y".into()]));
     }
+    #[test]
+    fn orchestration_message_pr_watch_rescheduled_attempt_has_distinct_nonce_and_keeps_budget() {
+        let before=watch();
+        let seen=HashSet::new();
+        let view=view("h1",vec![],vec![check("ci",CheckState::Failure,1)]);
+        let first=evaluate(&before,&view,&seen,5);
+        let second=evaluate(&first.next,&view,&seen,10000000);
+        assert_eq!(second.next.attempts,2);
+        assert_ne!(wake_nonce(&first.next,&first.delivered),wake_nonce(&second.next,&second.delivered));
+    }
+
 }

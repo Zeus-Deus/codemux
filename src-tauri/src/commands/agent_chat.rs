@@ -3443,6 +3443,15 @@ async fn send_turn_context_reporting<R: Runtime>(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     input.client_nonce.get_or_insert_with(|| message_id.clone());
     context.provenance.message_id = Some(message_id.clone());
+    // The remote journal owns immutable result identity. Reuse the first
+    // admitted rendering if later journal metadata changes during a retry.
+    if context.origin == TurnOrigin::RemoteDelegation {
+        if let Some(row) = db.message_delivery_for_message(&input.thread_id.0, &message_id)? {
+            let admitted: DeliveryPayload = serde_json::from_value(row.payload).map_err(|e|e.to_string())?;
+            input = admitted.input;
+            context.provenance = admitted.provenance;
+        }
+    }
     let generation = context
         .generation
         .unwrap_or(db.delivery_generation(&input.thread_id.0)?.0);
@@ -3460,6 +3469,7 @@ async fn send_turn_context_reporting<R: Runtime>(
             origin: context.origin,
             provenance: context.provenance.clone(),
             caller: context.control.as_ref().map(|c| c.caller.clone()),
+            pr_watch: context.pr_watch.clone(),
         })
         .map_err(|e| e.to_string())?;
         let (id, new) = db.admit_message_delivery(
@@ -3473,6 +3483,7 @@ async fn send_turn_context_reporting<R: Runtime>(
             true,
         )?;
         context.claimed = new;
+        if new { crate::agent_control::delivery::notify(); }
         id
     };
     context.delivery_id = Some(id.clone());
@@ -3491,6 +3502,7 @@ async fn send_turn_context_reporting<R: Runtime>(
                 .unwrap_or_else(|| "message already admitted".into())
         ));
     }
+    let machine = !context.is_human();
     let result = send_turn_internal(app.clone(), provider, input.clone(), context, reached).await;
     match &result {
         Ok(result) => {
@@ -3499,7 +3511,7 @@ async fn send_turn_context_reporting<R: Runtime>(
             let completed = deferred
                 && db
                     .control_turn_outcome(&input.thread_id.0, &result.turn_id.0)?
-                    .is_some_and(|event| event["status"]["kind"] == "success");
+                    .is_some();
             let disposition = if result.queued_id.is_some() {
                 "queued"
             } else if deferred && !completed {
@@ -3522,7 +3534,7 @@ async fn send_turn_context_reporting<R: Runtime>(
                 .message_delivery(&id)?
                 .map(|r| r.state)
                 .unwrap_or_default();
-            if state == "held" {
+            if machine && state == "held" {
                 crate::agent_control::delivery::warn_held(&app, &input.thread_id.0, error);
             }
             if !matches!(state.as_str(), "held" | "cancelled" | "held_unknown" | "rejected") {
@@ -3639,7 +3651,6 @@ async fn send_turn_internal<R: Runtime>(
         let unbound=app.try_state::<AppStateStore>().is_some_and(|state|state.agent_chat_pane_id_for_thread(&input.thread_id.0).is_none());
         let reason=if record.is_none(){Some("Missing conversation")} else if record.as_ref().is_some_and(|r|r.imported_from.is_some()) {Some("Imported conversation is read-only")} else if unbound {Some("Thread is unbound; reopen the chat to inspect delivery")} else {None};
         if let Some(reason)=reason {
-            if let Some(id)=&context.delivery_id {db.finish_message_delivery(id,"held",None,Some(reason))?;}
             return Err(reason.into());
         }
     }
@@ -3665,9 +3676,6 @@ async fn send_turn_internal<R: Runtime>(
     )
     .await;
     if let Err(error)=restored {
-        if !human {
-            if let Some(id)=&context.delivery_id {db.finish_message_delivery(id,"held",None,Some(&format!("Could not restore the original conversation: {error}")))?;}
-        }
         return Err(error);
     }
     verify_native_control(
@@ -3692,8 +3700,11 @@ async fn send_turn_internal<R: Runtime>(
     if input.client_nonce.as_deref().is_none_or(str::is_empty) {
         input.client_nonce = Some(uuid::Uuid::new_v4().to_string());
     }
+    let active = impl_.turn_active(&input.thread_id).await;
+    if input.delivery == MessageDelivery::Steer && !active {
+        input.delivery = MessageDelivery::Queue;
+    }
     if input.delivery == MessageDelivery::Auto {
-        let active = impl_.turn_active(&input.thread_id).await;
         let view = app.state::<NativeControlState>().thread_runtime(&input.thread_id.0);
         let runtime = impl_.runtime_status(&input.thread_id).await;
         let ready = runtime.as_ref().is_some_and(|r| r.status == "running" && !r.compacting);
@@ -3844,7 +3855,7 @@ async fn send_turn_internal<R: Runtime>(
         .or(turn_checkpoint);
     let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = Some(Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {
         app:app.clone(),id:context.delivery_id.clone().unwrap(),thread:input.thread_id.0.clone(),provider,
-        generation:context.generation.unwrap_or_default(),inner:turn_checkpoint,
+        inner:turn_checkpoint,
     }));
     let mut provenance = context.provenance.clone();
     let provider_input = SendTurnInput {
@@ -4140,6 +4151,7 @@ pub async fn agent_chat_send_queued_turn_now<R: Runtime>(
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     gate.verify(generation)?;
+    app.state::<DatabaseStore>().resume_message_delivery_thread(&thread_id.0)?;
     use crate::agent_provider::types::MessageDelivery;
     match delivery.unwrap_or(MessageDelivery::Interrupt) {
         MessageDelivery::Steer => impl_.steer_queued_turn(thread_id, queued_id).await,
@@ -4841,7 +4853,7 @@ pub async fn agent_chat_prime_mcp<R: Runtime>(app: AppHandle<R>) -> Result<(), S
 }
 
 /// What a QUEUED send stashes for its deferred envelope write.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PendingQueuedTurn {
     provenance: crate::agent_provider::message::MessageProvenance,
     /// On-disk image records minted at enqueue time.
@@ -7265,6 +7277,26 @@ pub async fn agent_chat_list_messages(
     Ok(db.list_agent_chat_messages(&thread_id))
 }
 
+/// Snapshot read on mount and delivery transitions, including startup recovery.
+#[tauri::command]
+pub async fn agent_chat_delivery_attention(db: State<'_, DatabaseStore>, thread_id: String) -> Result<Vec<serde_json::Value>, String> {
+    Ok(db.thread_message_delivery_attention(&thread_id)?.into_iter().map(|row| serde_json::json!({
+        "id":row.id,"message_id":row.message_id,"state":row.state,"reason":row.error,
+        "display_text":row.payload["input"]["display_text"].as_str().or_else(||row.payload["input"]["text"].as_str()),
+        "can_retry":!row.attempted,
+    })).collect())
+}
+#[tauri::command]
+pub async fn agent_chat_acknowledge_delivery(db: State<'_, DatabaseStore>, thread_id: String, delivery_id: String) -> Result<(), String> {
+    db.acknowledge_message_delivery(&thread_id, &delivery_id)
+}
+#[tauri::command]
+pub async fn agent_chat_retry_delivery(db: State<'_, DatabaseStore>, thread_id: String, delivery_id: String) -> Result<(), String> {
+    db.retry_message_delivery(&thread_id, &delivery_id)?;
+    crate::agent_control::delivery::notify();
+    Ok(())
+}
+
 /// One persisted row, tagged with its durable `agent_chat_messages.id`.
 ///
 /// The id is the frontend's resume cursor: it records the highest id it
@@ -7804,6 +7836,18 @@ fn saturating_usage_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn queued_event_pending(thread: &str, nonce: &str, queued_id: &str) -> Option<PendingQueuedTurn> {
+    pending_send_images().lock().unwrap().get(&(thread.into(),nonce.into())).cloned()
+        .or_else(|| pending_queued_images().lock().unwrap().get(queued_id).cloned())
+}
+
+fn delivery_transition(event: &ProviderRuntimeEvent) -> bool {
+    matches!(event, ProviderRuntimeEvent::TurnCompleted {..} | ProviderRuntimeEvent::TurnQueued {..}
+        | ProviderRuntimeEvent::QueuedTurnDispatched {..} | ProviderRuntimeEvent::QueuedTurnCancelled {..}
+        | ProviderRuntimeEvent::SessionConfigured {..} | ProviderRuntimeEvent::ResumeCursorUpdated {..}
+        | ProviderRuntimeEvent::SessionStateChanged {..})
+}
+
 /// Forward a single provider event to the frontend.
 ///
 /// Routing:
@@ -7821,8 +7865,8 @@ fn saturating_usage_i64(value: u64) -> i64 {
 /// UUID carried by `ResumeCursorUpdated` so the history dropdown can
 /// resume this session after a restart.
 pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeEvent) {
-    crate::agent_control::delivery::notify();
-    if let ProviderRuntimeEvent::TurnCompleted {thread_id,turn_id,status:crate::agent_provider::TurnStatus::Success,..}=&event {
+    if delivery_transition(&event) { crate::agent_control::delivery::notify(); }
+    if let ProviderRuntimeEvent::TurnCompleted {thread_id,turn_id,..}=&event {
         let _=app.state::<DatabaseStore>().confirm_message_delivery_turn(&thread_id.0,&turn_id.0);
     }
     // Codex takes the Plan pill per turn and the pill does not survive a
@@ -7958,9 +8002,11 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     }
     // Queue events contain prompt text for LIVE rendering only. Persist a
     // control-only ID/disposition journal instead of replayable actor events.
-    if let ProviderRuntimeEvent::TurnQueued { thread_id, client_nonce: Some(nonce), provenance, .. } = &mut event {
-        if let Some(pending) = pending_send_images().lock().unwrap().get(&(thread_id.0.clone(),nonce.clone())) {
-            *provenance = pending.provenance.clone();
+    if let ProviderRuntimeEvent::TurnQueued { thread_id, client_nonce: Some(nonce), queued_id, provenance, .. } = &mut event {
+        // The RPC ACK can move the entry before the provider event arrives.
+        let pending = queued_event_pending(&thread_id.0,nonce,queued_id);
+        if let Some(pending) = pending {
+            *provenance = pending.provenance;
             provenance.input_intent = crate::agent_provider::message::InputIntent::QueuedTurn;
         }
     }
@@ -14752,4 +14798,22 @@ mod tests {
         };
         assert!(!should_persist_event(&e));
     }
+    #[test]
+    fn orchestration_message_stream_deltas_do_not_wake_delivery_worker() {
+        let thread_id=ThreadId("delta".into());
+        assert!(!delivery_transition(&ProviderRuntimeEvent::ContentDelta {thread_id:thread_id.clone(),turn_id:TurnId("turn".into()),delta:crate::agent_provider::ContentDelta::Text {text:"chunk".into()},subagent_id:None}));
+        assert!(delivery_transition(&ProviderRuntimeEvent::TurnCompleted {thread_id:thread_id.clone(),turn_id:TurnId("turn".into()),status:crate::agent_provider::TurnStatus::Success,usage:None}));
+        assert!(delivery_transition(&ProviderRuntimeEvent::SessionStateChanged {thread_id,status:crate::agent_provider::SessionStatus::Ready}));
+    }
+
+    #[test]
+    fn orchestration_message_late_turn_queued_recovers_provenance_from_rpc_ack_map() {
+        let thread="late-queued-event";
+        pending_queued_images().lock().unwrap().insert("late-queue".into(),PendingQueuedTurn {provenance:crate::agent_provider::message::MessageProvenance {created_by:crate::agent_provider::message::CreatedBy::Agent,sender_title:Some("Reviewer".into()),..Default::default()},..Default::default()});
+        let recovered=queued_event_pending(thread,"late-nonce","late-queue").unwrap();
+        assert_eq!(recovered.provenance.created_by,crate::agent_provider::message::CreatedBy::Agent);
+        assert_eq!(recovered.provenance.sender_title.as_deref(),Some("Reviewer"));
+        pending_queued_images().lock().unwrap().remove("late-queue");
+    }
+
 }

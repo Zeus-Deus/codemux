@@ -47,7 +47,7 @@ fn mutation() -> Value {
 pub fn native_tools() -> Vec<ToolDefinition> {
     let mut send = mutation();
     send["message"] = json!({"type": "string", "minLength": 1, "maxLength": 65536});
-    send["delivery"] = json!({"type": "string", "enum": ["auto", "queue", "steer", "interrupt"], "default": "queue"});
+    send["delivery"] = json!({"type": "string", "enum": ["auto", "queue", "steer", "interrupt"], "default": "auto"});
     let mut read = target();
     read["cursor"] = json!({"type": "integer", "minimum": 0});
     read["limit"] = json!({"type": "integer", "minimum": 1, "maximum": 100, "default": 20});
@@ -120,4 +120,13 @@ pub fn is_native_tool(name: &str) -> bool {
 
 pub fn is_read_only(name: &str) -> bool {
     matches!(name, "workspace_list" | "agent_capabilities" | "thread_list" | "thread_read" | "thread_status" | "thread_wait" | "operation_status")
+}
+
+#[cfg(test)]
+mod delivery_default_tests {
+    #[test]
+    fn orchestration_message_send_schema_defaults_to_auto() {
+        let tool=super::native_tools().into_iter().find(|tool|tool.name=="thread_send").unwrap();
+        assert_eq!(tool.input_schema["properties"]["delivery"]["default"],"auto");
+    }
 }

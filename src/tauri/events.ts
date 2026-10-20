@@ -426,6 +426,7 @@ export type QuestionResolution =
     };
 
 export interface MessageNotification {
+  tasks?: { provider: string; title: string }[];
   source: {
     kind: "delegated_task" | "remote_task" | "subagent" | "automation" | "system";
     task_ids: string[];

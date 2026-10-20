@@ -250,11 +250,18 @@ impl AgentProvider for MockAgentProvider {
         let checkpoint = input.turn_checkpoint.clone();
         if let Some(checkpoint) = checkpoint.as_ref() {
             checkpoint.prepare().await;
-            checkpoint.authorize_dispatch()?;
+            if let Err(error) = checkpoint.authorize_dispatch() {
+                checkpoint.abort().await;
+                return Err(error);
+            }
         }
         self.calls
             .push(MockCall::SendTurn(input.thread_id.clone(), input.text));
-        if let Some(error)=self.send_error_after_accept.lock().unwrap().take() { return Err(error); }
+        let after_accept = self.send_error_after_accept.lock().unwrap().take();
+        if let Some(error) = after_accept {
+            if let Some(checkpoint) = checkpoint.as_ref() { checkpoint.abort().await; }
+            return Err(error);
+        }
         if let Some(checkpoint) = checkpoint.as_ref() {
             checkpoint.commit().await;
         }

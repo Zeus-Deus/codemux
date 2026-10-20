@@ -1000,7 +1000,7 @@ describe("subagentWaves — spawn-wave grouping for the pane", () => {
     const waves = subagentWaves([
       user("u1", 0, "have codex implement it, then review it"),
       card("c1", 1, [sub("delegate:t1")]),
-      { ...user("u2", 2, "[Codemux: delegated task results]\n<task id=\"t1\">"), notification: {source:{kind:"delegated_task",task_ids:["task"]},outcome:"completed",summary:"Delegated results"} },
+      { ...user("u2", 2, "[Codemux: delegated task results]\n<task id=\"t1\">") },
       card("c2", 3, [sub("delegate:t2")]),
     ]);
     expect(subagentHistoryGroups(waves).map((g) => [g.promptId, g.prompt])).toEqual([

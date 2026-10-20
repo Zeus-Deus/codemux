@@ -1058,10 +1058,6 @@ impl AcpSession {
         }
         if let Some(checkpoint) = &input.turn_checkpoint {
             checkpoint.prepare().await;
-            if let Err(error) = checkpoint.authorize_dispatch() {
-                Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await;
-                return Err(PrepareTurnError::Rejected(error));
-            }
         }
         let configured = async {
             if self.dialect.is_grok() {

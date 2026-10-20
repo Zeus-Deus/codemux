@@ -1448,7 +1448,7 @@ describe("MessageList usage limit", () => {
       '[Codemux: delegated task results]\nCodemux posted this message, not the user.\n\n<task provider="codex" status="completed" title="Add slugify helper" duration="6m 12s" thread="c1">\n<report>Done.</report>\n</task>';
     renderList([userTurn, { kind: "user_message", id: "um-2", seq: 1, text }]);
     expect(screen.getByTestId("delegation-results-divider")).toHaveTextContent(
-      "Delegated results · Codex · completed",
+      "Delegated results · Codex · Add slugify helper · completed",
     );
     expect(screen.queryByText(/Codemux posted this message/)).toBeNull();
   });

@@ -262,7 +262,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 21;
+const SCHEMA_VERSION: u32 = 22;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,

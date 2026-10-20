@@ -18,6 +18,7 @@ pub struct SendContext {
     pub generation: Option<u64>,
     /// An already-admitted worker owns this claim, rather than claiming again.
     pub claimed: bool,
+    pub(crate) pr_watch: Option<PrWatchDelivery>,
 }
 impl SendContext {
     pub fn new(origin: TurnOrigin) -> Self {
@@ -42,6 +43,7 @@ impl SendContext {
             delivery_id: None,
             generation: None,
             claimed: false,
+            pr_watch: None,
         }
     }
     pub fn controller(caller: &ControlCaller) -> Self {
@@ -56,12 +58,20 @@ impl SendContext {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct PrWatchDelivery {
+    pub generation: i64,
+    pub event_keys: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct DeliveryPayload {
     pub provider: ProviderKind,
     pub input: SendTurnCommandInput,
     pub origin: TurnOrigin,
     pub provenance: MessageProvenance,
     pub caller: Option<ControlCaller>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pr_watch: Option<PrWatchDelivery>,
 }
 
 pub(crate) fn select_delivery(
@@ -101,24 +111,12 @@ fn wake() -> &'static tokio::sync::Notify {
 /// repair sweep cover lost notifications. Claiming is a SQLite compare-and-set.
 pub(crate) fn spawn<R: Runtime>(app: AppHandle<R>) {
     let epoch = app.state::<NativeControlState>().epoch.clone();
-    match app
-        .state::<DatabaseStore>()
-        .recover_message_deliveries(&epoch)
-    {
-        Ok(()) => {
-            if let Ok(rows) = app
-                .state::<DatabaseStore>()
-                .message_delivery_recovery_attention()
-            {
-                for (thread, error) in rows {
-                    warn_held(&app, &thread, &error);
-                }
-            }
-        }
-        Err(error) => log::error!("Delivery recovery failed: {error}"),
+    if let Err(error) = app.state::<DatabaseStore>().recover_message_deliveries(&epoch) {
+        log::error!("Delivery recovery failed: {error}");
     }
     tauri::async_runtime::spawn(async move {
         loop {
+            let _ = app.state::<DatabaseStore>().reconcile_pr_watch_deliveries();
             let rows = app.state::<DatabaseStore>().pending_message_deliveries();
             match rows {
                 Ok(rows) => {
@@ -177,8 +175,9 @@ pub(crate) async fn dispatch<R: Runtime>(
     });
     if let Some(control) = &control {
         if let Err(error) = control.verify(app) {
-            let _ = db.finish_message_delivery(&row.id, "held", None, Some(&error));
-            warn_held(app, &row.thread_id, &error);
+            if db.fail_message_delivery(&row.id, &error).ok().as_deref() == Some("rejected") {
+                warn_held(app, &row.thread_id, &error);
+            }
             return;
         }
     }
@@ -198,6 +197,7 @@ pub(crate) async fn dispatch<R: Runtime>(
         delivery_id: Some(row.id.clone()),
         generation: Some(row.generation),
         claimed: true,
+        pr_watch: payload.pr_watch,
     };
     if let Err(error) =
         agent_chat::send_turn_with_context(app.clone(), payload.provider, payload.input, context)
@@ -212,7 +212,6 @@ pub(crate) struct DeliveryCheckpoint<R: Runtime> {
     pub id: String,
     pub thread: String,
     pub provider: ProviderKind,
-    pub generation: u64,
     pub inner: Option<Arc<dyn TurnDispatchCheckpoint>>,
 }
 impl<R: Runtime> std::fmt::Debug for DeliveryCheckpoint<R> {
@@ -244,13 +243,12 @@ impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
         if !valid {
             let message =
                 "Delivery held: target was deleted, archived, unbound or changed provider";
-            let _ = db.finish_message_delivery(&self.id, "held", None, Some(message));
+            let _ = db.fail_message_delivery(&self.id, message);
             return Err(crate::agent_provider::ProviderError::ValidationError {
                 message: message.into(),
             });
         }
-        db.verify_delivery_generation(&self.thread, self.generation)
-            .and_then(|_| db.message_delivery_submitting(&self.id))
+        db.message_delivery_submitting(&self.id)
             .map_err(|message| crate::agent_provider::ProviderError::ValidationError { message })
     }
     async fn prepare(&self) {
@@ -283,6 +281,7 @@ impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
 }
 
 pub(crate) fn warn_held<R: Runtime>(app: &AppHandle<R>, thread: &str, error: &str) {
+    if app.state::<DatabaseStore>().thread_message_delivery_attention(thread).is_ok_and(|rows| rows.is_empty()) { return; }
     agent_chat::forward_event(
         app,
         crate::agent_provider::ProviderRuntimeEvent::RuntimeWarning {

@@ -1,3 +1,4 @@
+import { isDelegationResultsText } from "./delegation";
 import type { MessageProvenance } from "@/tauri/events";
 
 /** Only structured metadata identifies a sender; prompt text is never evidence. */
@@ -15,7 +16,7 @@ export function messageProvenance(value: MessageProvenance): MessageProvenance {
     sender_thread_id: string(value.sender_thread_id),
     sender_title: string(value.sender_title),
     input_intent: value.input_intent && ["turn_start","queued_turn","steer","promoted_queued_to_steer"].includes(value.input_intent) ? value.input_intent : "turn_start",
-    notification: validNotification ? {source:{kind:notification.source.kind,task_ids:notification.source.task_ids,child_thread_id:string(notification.source.child_thread_id)},outcome:notification.outcome,summary:notification.summary} : undefined,
+    notification: validNotification ? {source:{kind:notification.source.kind,task_ids:notification.source.task_ids,child_thread_id:string(notification.source.child_thread_id)},outcome:notification.outcome,summary:notification.summary,tasks:Array.isArray(notification.tasks) ? notification.tasks.filter((task) => task && typeof task.provider === "string" && typeof task.title === "string") : undefined} : undefined,
     automation_id: string(value.automation_id),
     automation_run_id: string(value.automation_run_id),
     delivery_id: string(value.delivery_id),
@@ -27,4 +28,13 @@ export function messageAttribution(item: MessageProvenance): "agent" | "codemux"
   if (item.created_by === "system" || (item.created_by === "agent" && item.creation_source === "codemux")) return "codemux";
   if (item.created_by === "agent") return "agent";
   return null;
+}
+
+/** Legacy compatibility affects presentation only, never sender attribution. */
+export function isDelegationResultsMessage(item: MessageProvenance & {text: string}): boolean {
+  return item.notification?.source.kind === "delegated_task" || (
+    !item.message_id && (!item.creation_source || item.creation_source === "unknown")
+    && (!item.created_by || item.created_by === "user") && !item.notification
+    && isDelegationResultsText(item.text)
+  );
 }

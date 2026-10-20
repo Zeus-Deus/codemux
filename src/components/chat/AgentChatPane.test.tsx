@@ -492,6 +492,9 @@ vi.mock("@/tauri/events", async (importOriginal) => ({
 }));
 
 vi.mock("@/tauri/commands", () => ({
+  agentChatDeliveryAttention: vi.fn().mockResolvedValue([]),
+  agentChatAcknowledgeDelivery: vi.fn().mockResolvedValue(undefined),
+  agentChatRetryDelivery: vi.fn().mockResolvedValue(undefined),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   // Provider health is probed only on picker intent or start/send failure.

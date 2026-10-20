@@ -23,4 +23,20 @@ describe("DelegationResultsDivider",()=>{
     expect(getByTestId("delegation-results-text").textContent).toBe(text);
     expect(getByTestId("delegation-results-text").className).toContain("max-h-[320px]");
   });
+  it("keeps legacy provider logos and names while folding large reports",()=>{
+    const text='[Codemux: delegated task results]\n<task provider="codex" title="Parser review" status="completed">\n<report>Done</report>\n</task>';
+    const {getByRole,queryByTestId,container}=render(<DelegationResultsDivider text={text}/>);
+    expect(getByRole("button")).toHaveTextContent("Codex");
+    expect(container.querySelector("svg")).not.toBeNull();
+    expect(queryByTestId("delegation-results-text")).toBeNull();
+    fireEvent.click(getByRole("button"));
+    expect(getByRole("button")).toHaveAttribute("aria-expanded","true");
+  });
+  it("preserves structured provider logos and task names",()=>{
+    const {getByRole,container}=render(<DelegationResultsDivider text="Parser review\nDone" notification={{...notification,tasks:[{provider:"codex",title:"Parser review"}]}}/>);
+    expect(getByRole("button")).toHaveTextContent("Codex");
+    expect(getByRole("button")).toHaveTextContent("Parser review");
+    expect(container.querySelector("svg")).not.toBeNull();
+  });
+
 });

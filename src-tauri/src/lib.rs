@@ -3219,6 +3219,9 @@ fn build_core_app<R: tauri::Runtime>(
             // Phone-app sessions registered for push through the relay.
             web_remote::native_push::web_remote_push_devices,
             // Editable follow-up queue, saved across restarts.
+            commands::agent_chat::agent_chat_delivery_attention,
+            commands::agent_chat::agent_chat_acknowledge_delivery,
+            commands::agent_chat::agent_chat_retry_delivery,
             commands::queued_turns::agent_chat_list_queued_turns,
             commands::queued_turns::agent_chat_edit_queued_turn,
             commands::queued_turns::agent_chat_move_queued_turn,

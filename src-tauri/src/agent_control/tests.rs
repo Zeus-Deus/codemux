@@ -1200,3 +1200,195 @@ async fn orchestration_message_only_interactive_sources_reset_human_activity() {
         assert_eq!(row["created_by"],"user");assert_eq!(row["creation_source"],source);
     }
 }
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_stop_queue_release_rearms_retained_checkpoint() {
+    use crate::agent_provider::{ProviderKind, ThreadId, TurnDispatchCheckpoint};
+    for send_now in [false,true] {
+        let (app,_provider,_root,workspace)=fixture().await;
+        let launched=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"release-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+        let launched=settle_operation(&app,&launched).await;
+        let thread=launched["thread_id"].as_str().unwrap();
+        let db=app.state::<crate::database::DatabaseStore>();
+        db.admit_message_delivery("queued-b",thread,"b",&json!({"origin":"user"}),"epoch",0,None,true).unwrap();
+        db.finish_message_delivery("queued-b","queued",Some(&json!({"queued_id":"b"})),None).unwrap();
+        let checkpoint=super::delivery::DeliveryCheckpoint {app:app.handle().clone(),id:"queued-b".into(),thread:thread.into(),provider:ProviderKind::Claude,inner:None};
+        db.stop_message_deliveries(thread).unwrap();
+        assert!(checkpoint.authorize_dispatch().is_err());
+        if send_now {
+            // The mock has no queue implementation; the command must still
+            // re-arm before handing control to the provider's release path.
+            let _=crate::commands::agent_chat::agent_chat_send_queued_turn_now(app.handle().clone(),ProviderKind::Claude,ThreadId(thread.into()),"b".into(),None).await;
+        } else {
+            crate::commands::agent_chat::agent_chat_send_turn(app.handle().clone(),ProviderKind::Claude,serde_json::from_value(json!({"thread_id":thread,"text":"C","client_nonce":"c"})).unwrap()).await.unwrap();
+        }
+        checkpoint.authorize_dispatch().unwrap();
+        db.finish_message_delivery("queued-b","accepted",Some(&json!({"turn_id":"b-run"})),None).unwrap();
+        assert_eq!(db.message_delivery("queued-b").unwrap().unwrap().state,"accepted");
+    }
+}
+
+#[tokio::test]
+async fn orchestration_message_held_queue_and_unknown_delivery_do_not_prevent_wait_settling() {
+    use crate::agent_provider::{ProviderRuntimeEvent,ThreadId,TurnId,TurnStatus};
+    let (app,_provider,_root,workspace)=fixture().await;
+    let thread="held-settled";
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_session(thread,&workspace,None,"claude").unwrap();
+    db.admit_message_delivery("unknown",thread,"unknown",&json!({"origin":"controller"}),"epoch",0,None,true).unwrap();
+    db.message_delivery_submitting("unknown").unwrap();db.fail_message_delivery("unknown","ACK lost").unwrap();
+    db.admit_message_delivery("human",thread,"human",&json!({"origin":"user"}),"epoch",0,None,true).unwrap();
+    db.finish_message_delivery("human","queued",Some(&json!({"queued_id":"held-b"})),None).unwrap();
+    crate::commands::agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::TurnQueued {thread_id:ThreadId(thread.into()),queued_id:"held-b".into(),client_nonce:None,text:"B".into(),provenance:Default::default()});
+    db.stop_message_deliveries(thread).unwrap();
+    crate::commands::agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::TurnCompleted {thread_id:ThreadId(thread.into()),turn_id:TurnId("a".into()),status:TurnStatus::Error {subtype:"interrupted".into(),message:"Stopped".into()},usage:None});
+    let result=execute(app.handle(),&ControlCaller::trusted(),"thread_wait",json!({"workspace_id":workspace,"thread_id":thread,"timeout_ms":1})).await.unwrap();
+    assert_eq!(result["settled"],true,"{result}");
+    assert_eq!(result["status"]["phase"],"needs_attention");
+    assert_eq!(result["status"]["deliveries_needing_attention"].as_array().unwrap().len(),1);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_controller_interrupt_selects_current_run_without_stop_fence() {
+    use crate::agent_provider::{ProviderRuntimeEvent,ThreadId,TurnId,SessionStatus};
+    let (app,provider,_root,workspace)=fixture().await;
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"interrupt-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let launched=settle_operation(&app,&receipt).await; let thread=launched["thread_id"].as_str().unwrap();
+    crate::commands::agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::SessionStateChanged {thread_id:ThreadId(thread.into()),status:SessionStatus::Running {active_turn:TurnId("selected".into())}});
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.admit_message_delivery("pending",thread,"pending",&json!({"origin":"controller"}),"epoch",0,None,false).unwrap();
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_interrupt",json!({"workspace_id":workspace,"thread_id":thread,"client_request_id":"interrupt"})).await.unwrap();
+    assert_eq!(settle_operation(&app,&receipt).await["state"],"succeeded");
+    assert_eq!(db.delivery_generation(thread).unwrap().0,0);
+    assert_eq!(db.message_delivery("pending").unwrap().unwrap().state,"pending");
+    assert!(provider.calls.snapshot().iter().any(|call|matches!(call,mock_agent_provider::MockCall::InterruptTurn(_,Some(turn)) if turn.0=="selected")));
+    db.stop_message_deliveries(thread).unwrap();
+    let input=serde_json::from_value(json!({"thread_id":thread,"text":"Resume","client_nonce":"new-resume"})).unwrap();
+    crate::commands::agent_chat::send_turn_with_origin(app.handle().clone(),crate::agent_provider::ProviderKind::Claude,input,crate::commands::agent_chat::TurnOrigin::UsageResume).await.unwrap();
+}
+
+#[tokio::test]
+async fn orchestration_message_controller_checks_authority_and_binding_before_admission() {
+    let (app,_provider,_root,workspace)=fixture().await;
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_session("unbound",&workspace,None,"claude").unwrap();
+    let args=json!({"workspace_id":workspace,"thread_id":"unbound","client_request_id":"must-not-admit","message":"brief"});
+    let error=execute(app.handle(),&ControlCaller::trusted(),"thread_send",args.clone()).await.unwrap_err();
+    assert_eq!(error.code,"thread_not_bound");
+    // Calling the service itself exercises its own pre-admission guard.
+    app.manage(crate::mcp_connector::McpConnectorState::default());
+    app.manage(crate::web_remote::WebRemoteState::default());
+    let caller=ControlCaller::outside("revoked-client".into(),"missing-grant".into(),ControlAccess::FullAccess);
+    assert!(super::service::thread_send(app.handle(),&caller,args).await.is_err());
+    assert!(db.pending_message_deliveries().unwrap().is_empty());
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_idle_nonsteering_provider_starts_but_busy_steer_is_rejected() {
+    use crate::agent_provider::{AgentProvider,ProviderKind};
+    let (app,claude,_root,workspace)=fixture().await;
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"idle-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let launched=settle_operation(&app,&receipt).await; let thread=launched["thread_id"].as_str().unwrap();
+    let provider=Arc::new(mock_agent_provider::MockAgentProvider::new(ProviderKind::Cursor));
+    provider.start_session(claude.start_inputs()[0].clone()).await.unwrap();
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_cursor(provider.clone()).await;
+    app.state::<crate::database::DatabaseStore>().upsert_agent_chat_session(thread,&workspace,None,"cursor").unwrap();
+    for busy in [false,true] {
+        provider.set_turn_active(thread,busy);
+        let result=crate::commands::agent_chat::agent_chat_send_turn(app.handle().clone(),ProviderKind::Cursor,serde_json::from_value(json!({"thread_id":thread,"text":"brief","delivery":"steer","client_nonce":format!("steer-{busy}")})).unwrap()).await;
+        assert_eq!(result.is_ok(),!busy,"{result:?}");
+    }
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_remote_result_retry_uses_first_admitted_payload() {
+    let (app,provider,_root,workspace)=fixture().await;
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"remote-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let launched=settle_operation(&app,&receipt).await; let thread=launched["thread_id"].as_str().unwrap();
+    provider.fail_next_send(crate::agent_provider::ProviderError::ValidationError {message:"before bytes".into()});
+    // Exercise canonical retry rendering at intake. The actual remote journal
+    // guard is separately covered by delegation integration tests.
+    let make=|text:&str|serde_json::from_value(json!({"thread_id":thread,"text":text,"client_nonce":"delegation:remote-id"})).unwrap();
+    let mut context=super::delivery::SendContext::new(crate::commands::agent_chat::TurnOrigin::RemoteDelegation);
+    // A missing remote journal task rejects before send but after admission.
+    let _=crate::commands::agent_chat::send_turn_with_context(app.handle().clone(),crate::agent_provider::ProviderKind::Claude,make("first rendering"),context.clone()).await;
+    context.provenance.sender_title=Some("later mutable title".into());
+    let error=crate::commands::agent_chat::send_turn_with_context(app.handle().clone(),crate::agent_provider::ProviderKind::Claude,make("changed rendering"),context).await.unwrap_err();
+    assert!(!error.contains("message_identity_conflict"),"{error}");
+    let row=app.state::<crate::database::DatabaseStore>().message_delivery_for_message(thread,"delegation:remote-id").unwrap().unwrap();
+    assert_eq!(row.payload["input"]["text"],"first rendering");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_real_acp_configuration_failure_is_definitely_before_send() {
+    use crate::agent_provider::{AgentProvider,ProviderKind,StartSessionInput,ThreadId};
+    use std::os::unix::fs::PermissionsExt;
+    let peer_root=tempfile::tempdir().unwrap(); let binary=peer_root.path().join("peer.py");
+    std::fs::write(&binary,include_str!("../../tests/helpers/agent_control_acp_peer.py")).unwrap();
+    std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let rig=peer_root.path().join("rig");std::fs::create_dir(&rig).unwrap();
+    let provider=Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(crate::agent_provider::cursor::CursorProviderConfig {binary,event_channel_capacity:128,mcp_registry:None}));
+    let thread="pre-config-failure";
+    let (app,root,_workspace,pane)=super::guard_tests::fixture(provider.clone(),thread).await;
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_cursor(provider.clone()).await;
+    crate::commands::agent_chat::agent_chat_start_session(app.handle().clone(),pane,ProviderKind::Cursor,StartSessionInput {
+        thread_id:ThreadId(thread.into()),cwd:root.path().canonicalize().unwrap(),model:None,resume_cursor:None,fresh_session:true,permission_mode:Some("ask".into()),effort:None,context_window:None,fast_mode:false,service_tier:None,additional_directories:vec![],env:Some(std::collections::HashMap::from([("CODEMUX_AGENT_CONTROL_FIXTURE_ROOT".into(),rig.to_string_lossy().into_owned())])),workspace_id:None,remote:None,extra:serde_json::Value::Null,recorded_usage_baseline:None,
+    },Some(thread.into())).await.unwrap();
+    let result=crate::commands::agent_chat::agent_chat_send_turn(app.handle().clone(),ProviderKind::Cursor,serde_json::from_value(json!({"thread_id":thread,"text":"must not dispatch","model_override":"review-fatal","client_nonce":"config-failure"})).unwrap()).await;
+    assert!(result.is_err(),"{result:?}");
+    let db=app.state::<crate::database::DatabaseStore>();
+    let row=db.message_delivery_for_message(thread,"config-failure").unwrap().unwrap();
+    assert!(!row.attempted,"configuration failure must precede dispatch authorization");
+    assert_eq!(row.state,"rejected");assert!(db.thread_message_delivery_attention(thread).unwrap().is_empty());
+    let wire=std::fs::read_to_string(rig.join("peer-wire.jsonl")).unwrap();
+    assert!(wire.contains("session/set_config_option"));assert!(!wire.contains("session/prompt"));
+    provider.stop_session(ThreadId(thread.into())).await.unwrap();
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_unbound_controller_delivery_retries_when_pane_is_rebound() {
+    use crate::agent_provider::ProviderKind;
+    let (app,provider,root,workspace)=fixture().await;
+    let launch=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"rebind-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let launched=settle_operation(&app,&launch).await; let thread=launched["thread_id"].as_str().unwrap();
+    let state=app.state::<crate::state::AppStateStore>();
+    let pane=state.agent_chat_pane_id_for_thread(thread).unwrap();
+    let db=app.state::<crate::database::DatabaseStore>();
+    let context=super::delivery::SendContext::controller(&ControlCaller::trusted());
+    let payload=serde_json::to_value(super::delivery::DeliveryPayload {provider:ProviderKind::Claude,input:serde_json::from_value(json!({"thread_id":thread,"text":"retry after reopen","client_nonce":"rebind-message"})).unwrap(),origin:context.origin,provenance:context.provenance,caller:Some(ControlCaller::trusted()),pr_watch:None}).unwrap();
+    db.admit_message_delivery("rebind",thread,"rebind-message",&payload,"epoch",0,None,false).unwrap();
+    state.close_pane(&pane).unwrap();
+    super::delivery::dispatch(app.handle(),db.message_delivery("rebind").unwrap().unwrap()).await;
+    let pending=db.message_delivery("rebind").unwrap().unwrap();
+    assert_eq!(pending.state,"pending"); assert!(!pending.attempted);
+    state.create_agent_chat_pane(&workspace,Some(ProviderKind::Claude),Some(root.path().to_string_lossy().into_owned()),None,Some(thread.into())).unwrap();
+    super::delivery::dispatch(app.handle(),pending).await;
+    assert_eq!(db.message_delivery("rebind").unwrap().unwrap().state,"accepted");
+    assert_eq!(provider.calls.snapshot().iter().filter(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(_, _))).count(),1);
+}
+
+#[tokio::test]
+async fn orchestration_message_mock_adapter_aborts_checkpoint_on_rejection_and_lost_ack() {
+    use crate::agent_provider::{AgentProvider,ProviderError,ProviderKind,SendTurnInput,TurnDispatchCheckpoint};
+    #[derive(Debug)]
+    struct Checkpoint { reject:bool, aborts:std::sync::atomic::AtomicUsize }
+    #[async_trait::async_trait]
+    impl TurnDispatchCheckpoint for Checkpoint {
+        fn authorize_dispatch(&self)->Result<(),ProviderError> {
+            if self.reject { Err(ProviderError::ValidationError {message:"authorization rejected".into()}) } else { Ok(()) }
+        }
+        async fn prepare(&self) {}
+        async fn commit(&self) {}
+        async fn abort(&self) {self.aborts.fetch_add(1,std::sync::atomic::Ordering::SeqCst);}
+    }
+    for reject in [false,true] {
+        let provider=mock_agent_provider::MockAgentProvider::new(ProviderKind::Claude);
+        let checkpoint=Arc::new(Checkpoint {reject,aborts:Default::default()});
+        let mut input:SendTurnInput=serde_json::from_value(json!({"thread_id":"thread","text":"brief","model_override":null})).unwrap();
+        input.turn_checkpoint=Some(checkpoint.clone());
+        if !reject {provider.fail_next_send_after_accept(ProviderError::RpcError {message:"ACK lost".into()});}
+        assert!(provider.send_turn(input).await.is_err());
+        assert_eq!(checkpoint.aborts.load(std::sync::atomic::Ordering::SeqCst),1);
+    }
+}

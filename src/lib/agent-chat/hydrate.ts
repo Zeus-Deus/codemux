@@ -602,6 +602,7 @@ function parsePayload(raw: string): ReplayPayload | null {
     const steeredTurnId = (value as { steered_turn_id?: unknown }).steered_turn_id;
     return {
       ...messageProvenance(value as UserMessageEnvelope),
+      input_intent: !(value as UserMessageEnvelope).input_intent && typeof steeredTurnId === "string" && steeredTurnId ? "steer" : messageProvenance(value as UserMessageEnvelope).input_intent,
       type: "user_message",
       thread_id: (value as { thread_id?: string }).thread_id ?? "",
       text,

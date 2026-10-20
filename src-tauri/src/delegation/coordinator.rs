@@ -436,7 +436,7 @@ pub(super) async fn wake_open<R: Runtime>(handle: &AppHandle<R>, id: &str) -> Re
         outcome:match remote.status {crate::remote_task_protocol::TaskStatus::Completed => crate::agent_provider::message::NotificationOutcome::Completed,
             crate::remote_task_protocol::TaskStatus::Failed => crate::agent_provider::message::NotificationOutcome::Failed,
             crate::remote_task_protocol::TaskStatus::Cancelled => crate::agent_provider::message::NotificationOutcome::Cancelled,
-            _ => crate::agent_provider::message::NotificationOutcome::Unknown},summary:display_text,
+            _ => crate::agent_provider::message::NotificationOutcome::Unknown},summary:display_text,tasks:vec![],
     });
     let sent = send_turn_with_context(
         handle.clone(), parent.provider, input, context,

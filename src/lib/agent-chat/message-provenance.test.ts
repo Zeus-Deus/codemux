@@ -4,7 +4,7 @@ import { applyEvent, appendUserMessage, createEmptyThreadState } from "./reducer
 import { applyReplayTail, replayPayloads } from "./hydrate";
 import type { UserMessageItem } from "./types";
 import { editQueuedTurn } from "./queue-edits";
-import { messageAttribution } from "./message-provenance";
+import { isDelegationResultsMessage, messageAttribution } from "./message-provenance";
 
 const message = {
   type:"user_message",thread_id:"receiver",text:"Review this change.",message_id:"stable-message",
@@ -53,5 +53,19 @@ describe("message provenance", () => {
     const state = replayPayloads([JSON.stringify({...message,text:"Task finished.",agent_text:"agent-only wake header <task>private framing</task>",notification:{source:{kind:"delegated_task",task_ids:["task"]},outcome:"completed",summary:"Task finished."}})]);
     expect(state.messages[0]).toMatchObject({text:"Task finished.",notification:{source:{task_ids:["task"]}}});
     expect(JSON.stringify(state.messages)).not.toContain("agent-only");
+  });
+});
+
+describe("legacy presentation",()=>{
+  it("recognizes legacy result dividers without inferring attribution",()=>{
+    const state=replayPayloads([JSON.stringify({type:"user_message",thread_id:"t",text:'[Codemux: delegated task results]\n<task provider="codex" title="Parser review" status="completed">'})]);
+    const item=state.messages[0] as UserMessageItem;
+    expect(isDelegationResultsMessage(item)).toBe(true);
+    expect(messageAttribution(item)).toBeNull();
+    expect(isDelegationResultsMessage({...item,message_id:"new-human-message",creation_source:"desktop"})).toBe(false);
+  });
+  it("hydrates legacy steered_turn_id as steer intent",()=>{
+    const state=replayPayloads([JSON.stringify({type:"user_message",thread_id:"t",text:"Follow up",steered_turn_id:"running"})]);
+    expect(state.messages[0]).toMatchObject({input_intent:"steer"});
   });
 });

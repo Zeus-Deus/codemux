@@ -1950,6 +1950,8 @@ interface MockMessageRow {
 const mockFullPayloadById = new Map<number, string>();
 const mockThreadRowCache = new Map<string, MockMessageRow[]>();
 
+const mockDeliveryAcknowledged = new Set<string>();
+
 /** The raw persisted payloads a thread would hold. */
 function mockThreadPayloads(threadId: string): string[] {
   if (new URLSearchParams(window.location.search).get("mockScenario") === "message-provenance" && threadId === MOCK_CHAT_THREAD_ID) {
@@ -1958,6 +1960,7 @@ function mockThreadPayloads(threadId: string): string[] {
       {message_id:"provenance-system",created_by:"system",creation_source:"codemux",input_intent:"turn_start",text:"The watched pull request has new review comments."},
       {message_id:"provenance-queue",created_by:"agent",creation_source:"mcp",sender_title:"Previous review agent",input_intent:"queued_turn",text:"Also check the Unicode boundary cases."},
       {message_id:"provenance-steer",created_by:"user",creation_source:"desktop",input_intent:"steer",text:"Keep the fix focused on message delivery.",steered_turn_id:"provenance-turn"},
+      {text:'[Codemux: delegated task results]\n<task provider="codex" title="Legacy parser review" status="completed">\n<report>Focused parser checks passed. The result remains available after restart.</report>\n</task>'},
     ].flatMap((message) => [JSON.stringify({type:"user_message",thread_id:threadId,...message}),JSON.stringify({type:"turn_completed",thread_id:threadId,turn_id:"provenance-turn",status:{kind:"success"},usage:null})]);
   }
   const imported = mockImportedPayloads.get(threadId);
@@ -8377,6 +8380,11 @@ const handlers: Record<string, Handler> = {
     };
   },
   agent_chat_fork_origin: (a) => mockForkOrigins.get(a.threadId as string) ?? null,
+  agent_chat_delivery_attention: (a) => new URLSearchParams(window.location.search).get("mockScenario") === "message-provenance" && a.threadId === MOCK_CHAT_THREAD_ID
+    ? [{id:"mock-unknown-delivery",message_id:"mock-unknown",state:"held_unknown",reason:"Provider acceptance could not be confirmed after restart. Automatic resend is held.",display_text:"Review the parser changes.",can_retry:false},
+       {id:"mock-retry-delivery",message_id:"mock-retry",state:"rejected",reason:"The provider was unavailable before the message was sent.",display_text:"Check the Unicode boundaries.",can_retry:true}].filter(row => !mockDeliveryAcknowledged.has(row.id)) : [],
+  agent_chat_acknowledge_delivery: (a) => { mockDeliveryAcknowledged.add(a.deliveryId as string); return null; },
+  agent_chat_retry_delivery: (a) => { mockDeliveryAcknowledged.add(a.deliveryId as string); return null; },
   agent_chat_list_queued_turns: (a) => {
     const threadId = a.threadId as string;
     const view = (saved: boolean) => (e: MockQueuedTurn) => ({

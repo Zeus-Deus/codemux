@@ -1,3 +1,4 @@
+import { isDelegationResultsMessage } from "@/lib/agent-chat/message-provenance";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { useContributions } from "@/contrib/react/use-contributions";
 import { TOOL_RENDERER_AREA } from "@/sdk/areas";
@@ -1942,7 +1943,7 @@ function ItemRow({
   if (
     item.kind === "user_message" &&
     !item.queued &&
-    item.notification?.source.kind === "delegated_task"
+    isDelegationResultsMessage(item)
   ) {
     return <DelegationResultsDivider text={item.text} notification={item.notification} />;
   }

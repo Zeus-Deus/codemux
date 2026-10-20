@@ -98,9 +98,9 @@ pub(super) const CANDIDATES: [ProviderKind; 5] = [
 const STOPPED_MEANWHILE: &str = "This chat was stopped before the task started.";
 
 /// Appended to the task as the child's first message. Visible in its tab.
-const CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: another coding agent handed you this task and will read your final message. Work independently. Ask a question when missing information blocks the task; otherwise choose a safe option and explain it. End with a short report: what you changed (files), how you checked it, and anything left undone.";
+const CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: another coding agent handed you this task and will read your final message. Work on your own: do not ask questions or wait for input; if something is unclear, pick the safest reasonable option and say so. End with a short report: what you changed (files), how you checked it, and anything left undone.";
 /// The footer for a started suggested task, which runs on its own branch.
-pub(crate) const WORKTREE_CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: the user started this task from another chat's suggestions; that chat will read your final message. You are in your own git worktree on a new branch made from that chat's latest commit (its uncommitted edits are not here). Work independently. Ask a question when missing information blocks the task; otherwise choose a safe option and explain it. When done, COMMIT all of your work on this branch (do not push, do not switch branches) so it can be merged back; leave nothing uncommitted. End with a short report: what you changed (files), the commit(s), how you checked it, and anything left undone.";
+pub(crate) const WORKTREE_CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: the user started this task from another chat's suggestions; that chat will read your final message. You are in your own git worktree on a new branch made from that chat's latest commit (its uncommitted edits are not here). Work on your own: do not ask questions or wait for input; if something is unclear, pick the safest reasonable option and say so. When done, COMMIT all of your work on this branch (do not push, do not switch branches) so it can be merged back; leave nothing uncommitted. End with a short report: what you changed (files), the commit(s), how you checked it, and anything left undone.";
 
 const TOOL_DESCRIPTION: &str = "Hand one task to another coding agent installed in Codemux, such as Codex or Claude. It runs as its own chat in a background tab of this workspace, in the same folder, with full access, and its final report is posted back here automatically. Use it when the user asks for another agent, or wants an implementation or independent review by a different vendor. For helpers on your own provider, use your built-in subagent tool; use workspace_launch for separate top-level workspaces whose results do not come back here. Call it only from the main conversation, never from a subagent.
 
@@ -1719,9 +1719,10 @@ pub async fn deliver<R: Runtime>(app: &AppHandle<R>, parent: &str) {
     let Some((posted, text)) = state.take_report(parent) else {
         return;
     };
-    let (display, failed) = {
+    let (display, failed, tasks) = {
         let inner = state.lock();
         let mut reports = Vec::new();
+        let mut tasks = Vec::new();
         let mut failed = false;
         for id in &posted {
             if let Some(task) = inner.tasks.get(id) {
@@ -1734,10 +1735,11 @@ pub async fn deliver<R: Runtime>(app: &AppHandle<R>, parent: &str) {
                     Phase::Stopped(reason) => reason.note().into(),
                     _ => continue,
                 };
+                tasks.push(crate::agent_provider::message::NotificationTask { provider:provider_id(task.provider).into(),title:task.title.clone() });
                 reports.push(format!("{}\n{}", task.title, body));
             }
         }
-        (reports.join("\n\n"), failed)
+        (reports.join("\n\n"), failed, tasks)
     };
     let mut ids = posted.clone();
     ids.sort();
@@ -1766,6 +1768,7 @@ pub async fn deliver<R: Runtime>(app: &AppHandle<R>, parent: &str) {
             crate::agent_provider::message::NotificationOutcome::Completed
         },
         summary: display.lines().next().unwrap_or("Delegated results").into(),
+        tasks,
     });
     let sent = send_turn_with_context(app.clone(), provider, turn, context).await;
     // Once admitted, the persisted delivery owns retries and uncertainty. The
@@ -2389,4 +2392,11 @@ mod tests {
         assert!(!state.has_report("parent"));
         assert_eq!(state.lock().tasks.len(), 2);
     }
+    #[test]
+    fn orchestration_message_child_footer_retains_existing_policy() {
+        for footer in [CHILD_FOOTER,WORKTREE_CHILD_FOOTER] {
+            assert!(footer.contains("Work on your own: do not ask questions or wait for input"));
+        }
+    }
+
 }

@@ -60,10 +60,17 @@ pub struct NotificationSource {
     pub child_thread_id: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationTask {
+    pub provider: String,
+    pub title: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageNotification {
     pub source: NotificationSource,
     pub outcome: NotificationOutcome,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<NotificationTask>,
 }
 
 /// Missing legacy metadata means human input from an unknown source. Text is
