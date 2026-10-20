@@ -53,7 +53,7 @@ describe("InterfaceSection", () => {
   it("renders headline + toggle description without any Beta framing", () => {
     render(<InterfaceSection />);
 
-    expect(screen.getByText("Interface")).toBeInTheDocument();
+    expect(screen.getByText("Chat interface")).toBeInTheDocument();
     expect(screen.getByText("Agent Chat GUI")).toBeInTheDocument();
     // The GUI is a promoted default, not a preview surface.
     expect(screen.queryByText(/beta/i)).toBeNull();

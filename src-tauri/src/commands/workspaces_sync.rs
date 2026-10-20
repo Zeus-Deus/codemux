@@ -374,7 +374,7 @@ pub async fn workspace_open_on_host<R: tauri::Runtime>(
             format!(
                 "host_not_configured: The host this workspace lives on \
                  (host_server_id={host_server_id}) is not configured on this \
-                 device. Add it in Settings → Hosts, then try again."
+                 device. Add it in Settings → Connections → Devices, then try again."
             )
         })?;
 
@@ -854,7 +854,7 @@ pub async fn workspaces_adopt_synced<R: tauri::Runtime>(
                 format!(
                     "host_not_configured: The host this workspace lives on \
                      (host_server_id={host_server_id}) is not configured on \
-                     this device yet. Add it in Settings → Devices."
+                     this device yet. Add it in Settings → Connections → Devices."
                 )
             })?;
 
@@ -1123,7 +1123,7 @@ async fn adopt_worktree_via_repo_rsync<R: tauri::Runtime>(
                 format!(
                     "host_not_configured: The host this workspace lives on \
                      (host_server_id={host_server_id}) is not configured on \
-                     this device yet. Add it in Settings → Devices."
+                     this device yet. Add it in Settings → Connections → Devices."
                 )
             })?;
 

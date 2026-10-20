@@ -10,7 +10,9 @@
 import {
   Children,
   cloneElement,
+  createContext,
   isValidElement,
+  useContext,
   useId,
   useRef,
   type KeyboardEvent,
@@ -28,10 +30,20 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 
-/** The title of a whole settings page. Every section renders this one
- *  heading so the title keeps its size and weight as you move between
- *  sections. `action` holds page-level buttons or a master toggle; `icon`
- *  sits before the title. */
+/** Whether a section's `SectionHeader` titles the whole page, or one of
+ *  several sections stacked under a page title. */
+const SectionHeadingLevel = createContext<"page" | "section">("page");
+
+/** Renders a page's stacked sections with section-sized headings. */
+export function StackedSections({ children }: { children: React.ReactNode }) {
+  return <SectionHeadingLevel.Provider value="section">{children}</SectionHeadingLevel.Provider>;
+}
+
+/** The title of a settings section. Every section renders this one
+ *  heading: alone on its page it is the page title, and stacked under a
+ *  page title (inside `StackedSections`) it steps down a level. `action`
+ *  holds section-level buttons or a master toggle; `icon` sits before the
+ *  title. */
 export function SectionHeader({
   title,
   description,
@@ -45,15 +57,29 @@ export function SectionHeader({
   icon?: React.ReactNode;
   className?: string;
 }) {
+  const stacked = useContext(SectionHeadingLevel) === "section";
+  const Heading = stacked ? "h3" : "h2";
   return (
-    <div className={cn("mb-7 flex items-start justify-between gap-4", className)}>
+    <div className={cn("flex items-start justify-between gap-4", stacked ? "mb-5" : "mb-7", className)}>
       <div className="min-w-0">
         <div className="flex items-center gap-2">
           {icon}
-          <h2 className="text-title font-bold tracking-tight text-foreground">{title}</h2>
+          <Heading
+            className={cn(
+              "tracking-tight text-foreground",
+              stacked ? "text-[1.0625rem] leading-snug font-semibold" : "text-title font-bold",
+            )}
+          >
+            {title}
+          </Heading>
         </div>
         {description && (
-          <p className="mt-1.5 max-w-prose text-body-lg leading-relaxed text-muted-foreground/80">
+          <p
+            className={cn(
+              "max-w-prose leading-relaxed text-muted-foreground/80",
+              stacked ? "mt-1 text-body" : "mt-1.5 text-body-lg",
+            )}
+          >
             {description}
           </p>
         )}

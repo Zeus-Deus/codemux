@@ -948,10 +948,10 @@ describe("command palette — settings pages", () => {
   it("updates row-based page matches when Agent Chat or sign-in state changes", () => {
     const view = renderPalette();
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "checkpoint" } });
-    expect(screen.getByText("Settings · Agent")).toBeInTheDocument();
+    expect(screen.getByText("Settings · Models & behavior")).toBeInTheDocument();
 
     act(() => useFeatureFlags.setState({ enableAgentChat: false }));
-    expect(screen.queryByText("Settings · Agent")).not.toBeInTheDocument();
+    expect(screen.queryByText("Settings · Models & behavior")).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "skills sync" } });
     expect(screen.queryByText("Settings · Account")).not.toBeInTheDocument();
 

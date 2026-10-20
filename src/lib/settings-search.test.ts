@@ -36,7 +36,7 @@ describe("searchSettings", () => {
   });
 
   it("finds a row by a synonym its label does not contain", () => {
-    expect(labels("checkpoint")).toEqual(["Agent › Per-turn revert checkpoints"]);
+    expect(labels("checkpoint")).toEqual(["Models & behavior › Per-turn revert checkpoints"]);
   });
 
   it("names the synonym that matched when the label shows no match", () => {

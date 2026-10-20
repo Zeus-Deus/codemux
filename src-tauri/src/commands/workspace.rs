@@ -3138,7 +3138,7 @@ pub fn run_project_dev_command<R: tauri::Runtime>(
     let run_cmd = config
         .and_then(|c| c.run)
         .ok_or_else(|| {
-            "No run command configured. Set one in Settings > Projects.".to_string()
+            "No run command configured. Set one in Settings → Workspaces → Projects.".to_string()
         })?;
 
     // Check if a "Workspace Run" tab already exists for this workspace

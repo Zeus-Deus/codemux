@@ -27,7 +27,7 @@ it.each(['empty-hosts', 'incompatible-helper'] as const)('guides %s recovery to 
     await screen.findByRole('alert');
     expect(screen.getByRole('button', { name: 'Refresh receiver' })).toBeEnabled();
   }
-  await screen.findByText(/Settings → Devices/);
+  await screen.findByText(/Settings → Connections → Devices/);
   expect(screen.queryByText(/Settings → Hosts/)).not.toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Run on host' })).toBeDisabled();
   expect(native.invoke.mock.calls.some(([command]) => command === 'delegation_authorize' || command === 'delegate_task')).toBe(false);

@@ -146,7 +146,7 @@ import { Eyebrow } from "@/components/ui/eyebrow";
 import { Spinner } from "@/components/ui/spinner";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useAuthStore } from "@/stores/auth-store";
-import { buildNavGroups } from "@/lib/settings-sections";
+import { settingsSectionsFor } from "@/lib/settings-sections";
 import { settingsPagesForQuery } from "@/lib/settings-search";
 import { KeyHint } from "@/components/ui/key-hint";
 import { formatKeyCombo } from "@/components/ui/menu-chrome";
@@ -918,7 +918,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   const signedIn = useAuthStore((s) => s.user !== null);
   const settingsRows = useMemo<CommandRow[]>(() => {
     if (prsOnly || query.pathMode) return [];
-    const pages = buildNavGroups(enableAgentChat).flatMap((group) => group.items);
+    const pages = settingsSectionsFor(enableAgentChat);
     return settingsPagesForQuery(query.needle, enableAgentChat, signedIn).flatMap((id) => {
       const page = pages.find((item) => item.id === id);
       if (!page) return [];

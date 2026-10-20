@@ -1091,7 +1091,7 @@ fn delegate<R: Runtime>(
     let parent = caller.thread_id.as_str();
 
     if !setting_on(&db) {
-        return Err("Cross-provider delegation is off (Settings → Agent).".into());
+        return Err("Cross-provider delegation is off (Settings → Agents → Models & behavior).".into());
     }
     if state.is_running_child(parent) {
         return Err("A delegated task cannot delegate further.".into());

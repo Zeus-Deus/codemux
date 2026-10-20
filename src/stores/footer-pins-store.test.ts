@@ -6,7 +6,7 @@ import {
   validateFooterPins,
 } from "./footer-pins-store";
 import { FOOTER_ACTIONS, isFooterActionAvailable } from "@/lib/footer-actions";
-import { buildNavGroups } from "@/lib/settings-sections";
+import { settingsSectionsFor } from "@/lib/settings-sections";
 
 beforeEach(() => {
   localStorage.clear();
@@ -98,9 +98,7 @@ describe("footer preferences", () => {
           action.section && isFooterActionAvailable(action, enabled, false),
       ).map((action) => action.section);
       expect(offered).toEqual(
-        buildNavGroups(enabled).flatMap((group) =>
-          group.items.map((item) => item.id),
-        ),
+        settingsSectionsFor(enabled).map((item) => item.id),
       );
     }
   });

@@ -27,7 +27,7 @@ describe("usageResumeExplanation", () => {
   });
 
   it.each([
-    ["disabled", "Settings → Agent"],
+    ["disabled", "Settings → Agents"],
     ["attempts_exhausted", "Two automatic resumes"],
     ["reset_too_far", "more than 26 hours"],
     ["cancelled", "cancelled"],
