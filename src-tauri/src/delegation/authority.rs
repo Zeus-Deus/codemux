@@ -171,10 +171,11 @@ impl NativeAuthority {
         self.changed.notify_waiters();
         state.generation
     }
-    /// A provider-owned steer continuation inherits the original Stop fence.
+    /// A failed Stop can leave already-delivered guidance running. Track that
+    /// lifecycle with the original Stop fence without re-arming native tools.
     pub fn begin_continuation(&self) -> Option<u64> {
         let mut state = self.state.lock().unwrap();
-        if !state.live || !state.tools_live { return None; }
+        if !state.live { return None; }
         state.generation += 1;
         state.turn = None;
         state.pending = true;
@@ -407,6 +408,10 @@ mod tests {
         assert!(owner.bind(continuation,"continuation"));
         assert_eq!(owner.capture().identity().unwrap().stop_generation,7);
         owner.invalidate();
+        let stopped_continuation = owner.begin_continuation().unwrap();
+        assert!(owner.bind(stopped_continuation,"after-failed-stop"));
+        assert!(owner.capture().identity().is_err());
+        owner.revoke();
         assert!(owner.begin_continuation().is_none());
     }
 
