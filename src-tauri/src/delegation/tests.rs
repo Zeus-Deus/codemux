@@ -182,7 +182,7 @@ fn final_dispatch_legacy_held_delivery_is_unknown_after_recovery() {
 
 #[test]
 fn ngi3_legacy_missing_outcomes_remain_unknown_without_replay_or_backfill() {
-    for wake in [WakeState::Held, WakeState::Suppressed, WakeState::Delivering] {
+    for wake in [WakeState::Held, WakeState::Delivering] {
         let dir = tempfile::TempDir::new().unwrap();
         let journal = Journal::open(dir.path()).unwrap();
         let (parent, grant, input) = fixture();
@@ -737,8 +737,38 @@ fn delegation_delivery_human_messages_before_during_after_remote_completion_do_n
 }
 
 #[test]
-fn delegation_delivery_legacy_suppressed_without_witness_is_held_unknown() {
-    let dir=tempfile::tempdir().unwrap();let store=Journal::open(dir.path()).unwrap();let (parent,grant,input)=fixture();store.put_grant(&parent.workspace_id,&grant).unwrap();let task=store.admit(&parent,&grant,"checkout",&input).unwrap();
-    store.update(&task.id,|t|t.wake_state=WakeState::Suppressed).unwrap();store.conn.lock().unwrap().execute("DELETE FROM delivery_outcomes WHERE task=?1",[&task.id]).unwrap();drop(store);
-    let store=Journal::open(dir.path()).unwrap();store.recover_deliveries().unwrap();assert_eq!(store.delivery_outcome(&task.id).unwrap(),DeliveryOutcome::Unknown);assert_eq!(store.task(&task.id).unwrap().wake_state,WakeState::Suppressed);
+fn delegation_delivery_legacy_suppression_recovers_only_without_stop_or_claim_evidence() {
+    for (outcome, stop, expected) in [
+        (None, false, WakeState::Pending),
+        (Some("before_send"), true, WakeState::Suppressed),
+        (None, true, WakeState::Suppressed),
+        (Some("unknown"), false, WakeState::Suppressed),
+        (Some("in_flight"), false, WakeState::Suppressed),
+    ] {
+        let dir = tempfile::tempdir().unwrap(); let store = Journal::open(dir.path()).unwrap();
+        let (parent, grant, input) = fixture(); store.put_grant(&parent.workspace_id, &grant).unwrap();
+        let task = store.admit(&parent, &grant, "checkout", &input).unwrap();
+        store.apply_remote(&task.id, &remote(&task, TaskStatus::Completed)).unwrap();
+        store.update(&task.id, |t| { t.wake_state = WakeState::Suppressed; t.wake_error = Some(if stop {"disposed_by_stop"} else {"Parent user activity superseded automatic result delivery"}.into()); }).unwrap();
+        store.conn.lock().unwrap().execute("DELETE FROM delivery_outcomes WHERE task=?1", [&task.id]).unwrap();
+        if let Some(outcome) = outcome {
+            store.conn.lock().unwrap().execute("INSERT INTO delivery_outcomes VALUES (?1,'old-attempt',?2)", rusqlite::params![task.id, outcome]).unwrap();
+        }
+        drop(store);
+        let store = Journal::open(dir.path()).unwrap(); store.recover_deliveries().unwrap();
+        assert_eq!(store.task(&task.id).unwrap().wake_state, expected, "{outcome:?}/{stop}");
+        if expected == WakeState::Pending { assert!(store.claim_outbox_delivery(&task.id).is_ok()); }
+        else if !stop { assert!(store.claim_outbox_delivery(&task.id).is_err()); }
+    }
+}
+
+#[test]
+fn delegation_delivery_legacy_stop_evidence_disposes_before_send_result() {
+    let dir = tempfile::tempdir().unwrap(); let store = Journal::open(dir.path()).unwrap();
+    let (parent, grant, input) = fixture(); store.put_grant(&parent.workspace_id, &grant).unwrap();
+    let task = store.admit(&parent, &grant, "checkout", &input).unwrap();
+    store.apply_remote(&task.id, &remote(&task, TaskStatus::Completed)).unwrap();
+    store.update(&task.id, |t| { t.wake_state = WakeState::Suppressed; t.wake_error = Some("Parent user activity superseded automatic result delivery".into()); }).unwrap();
+    store.recover_deliveries_with_stop_evidence(|_| Ok(true)).unwrap();
+    assert_eq!(store.task(&task.id).unwrap().wake_error.as_deref(), Some("disposed_by_stop"));
 }

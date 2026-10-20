@@ -1,3 +1,4 @@
+import { isDelegationResultsMessage } from "@/lib/agent-chat/message-provenance";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { useContributions } from "@/contrib/react/use-contributions";
 import { TOOL_RENDERER_AREA } from "@/sdk/areas";
@@ -1938,6 +1939,10 @@ function ItemRow({
   // Same for the resume of a run the app stopped mid-turn.
   if (item.kind === "user_message" && !item.queued && isRestartResumeText(item.text)) {
     return <AutoResumedTurnDivider text={item.text} label="Resumed after restart" />;
+  }
+
+  if (item.kind === "user_message" && !item.queued && !item.notification && isDelegationResultsMessage(item)) {
+    return <div data-testid="legacy-delegation-result-row" className="px-2 py-1.5 text-caption text-muted-foreground">Delegated results</div>;
   }
 
   // Likewise the round of delegated-task reports Codemux posts back.

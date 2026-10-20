@@ -5022,6 +5022,21 @@ pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
     turn_id: Option<TurnId>,
     control: Option<NativeControlGuard>,
 ) -> Result<bool, String> {
+    interrupt_turn_inner(app, provider, thread_id, turn_id, control, true).await
+}
+
+/// Lifecycle callers have already persisted cancellation, or are only closing
+/// a tab. Do not turn their provider interrupt into a second recursive Stop.
+pub(crate) async fn interrupt_stopped_thread<R: Runtime>(
+    app: AppHandle<R>, provider: ProviderKind, thread_id: ThreadId,
+) -> Result<bool, String> {
+    interrupt_turn_inner(app, provider, thread_id, None, None, false).await
+}
+
+async fn interrupt_turn_inner<R: Runtime>(
+    app: AppHandle<R>, provider: ProviderKind, thread_id: ThreadId,
+    turn_id: Option<TurnId>, control: Option<NativeControlGuard>, recursive_stop: bool,
+) -> Result<bool, String> {
     if let Some(control) = &control {
         control.verify_target(provider, &thread_id.0)?;
         control.verify(&app)?;
@@ -5032,13 +5047,17 @@ pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
     // A selected interrupt applies only to an already-running turn. The
     // provider must first match that identity; it is not a blanket Stop of
     // newer admitted sends, usage resumes or delegated tasks.
-    if turn_id.is_none() {
+    if turn_id.is_none() && recursive_stop {
         crate::delegation::app::user_activity(&app, &thread_id.0, true)?;
         native_gate.cancel();
         app.state::<DatabaseStore>().stop_message_deliveries(&thread_id.0)?;
         // Before the lock: a delegated child's starter holds it while it starts,
         // and the task must read Stopped at once rather than after the start.
         super::delegation::on_thread_stopped(&app, &thread_id.0, super::delegation::StopKind::Stop);
+        super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
+    }
+    if turn_id.is_none() && !recursive_stop {
+        native_gate.cancel();
         super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
     }
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
@@ -6063,7 +6082,7 @@ pub async fn agent_chat_stop_session_guarded<R: Runtime>(
     feature_flag_on(&observability)?;
     let native_gate = native_thread_gate(&app, &thread_id.0);
     native_gate.cancel();
-    crate::delegation::app::user_activity(&app, &thread_id.0, true)?;
+    crate::delegation::app::user_activity(&app, &thread_id.0, false)?;
     // A restart in place: a delegated child's task stops quietly, a
     // parent's tasks keep running (New Chat / history pick rebinds the
     // pane afterwards, and that rebind is what stops them).

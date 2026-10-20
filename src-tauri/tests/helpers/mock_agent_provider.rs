@@ -73,6 +73,7 @@ pub struct MockAgentProvider {
     fast_mode_error: Mutex<Option<ProviderError>>,
     start_error: Mutex<Option<ProviderError>>,
     send_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    accepted_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     start_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Threads `turn_active` reports as running a turn. The mock never
     /// runs turns itself, so tests set this to stand in for one.
@@ -99,6 +100,7 @@ impl MockAgentProvider {
             start_error: Mutex::new(None),
             send_gate: Mutex::new(None),
             start_gate: Mutex::new(None),
+            accepted_gate: Mutex::new(None),
             active_turns: Mutex::new(HashSet::new()),
             send_error: Mutex::new(None),
             send_error_after_accept: Mutex::new(None),
@@ -136,6 +138,15 @@ impl MockAgentProvider {
         let release = Arc::new(tokio::sync::Notify::new());
         *self.start_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
         (entered, release)
+    }
+
+    /// Barrier after the provider has accepted the request, before its ACK.
+    #[allow(dead_code)]
+    pub fn hold_next_ack(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.accepted_gate.lock().unwrap() = Some((accepted.clone(), release.clone()));
+        (accepted, release)
     }
 
     /// Report a turn in flight (or not) on `thread` from `turn_active`.
@@ -258,6 +269,11 @@ impl AgentProvider for MockAgentProvider {
         }
         self.calls
             .push(MockCall::SendTurn(input.thread_id.clone(), input.text));
+        let accepted_gate = self.accepted_gate.lock().unwrap().take();
+        if let Some((accepted, release)) = accepted_gate {
+            accepted.notify_one();
+            release.notified().await;
+        }
         let after_accept = self.send_error_after_accept.lock().unwrap().take();
         if let Some(error) = after_accept {
             if let Some(checkpoint) = checkpoint.as_ref() {

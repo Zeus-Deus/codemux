@@ -827,9 +827,17 @@ fn parent_cwd(
     )
 }
 
-/// Start suggestion `index` of the `suggest_tasks` call `tool_call_id` as
-/// its own workspace + worktree branched from the parent's HEAD, running
-/// `provider`.
+/// Admission can lose the race with Stop while git preparation runs. Release
+/// the suggestion claim so the next explicit Start can try again.
+fn admit_follow_up_intent(db: &DatabaseStore, row: &FollowUpTaskRow, intent: &crate::database::delegation_tasks::TaskRecord) -> Result<(), String> {
+    if let Err(error) = db.admit_delegation_task(intent, None, &json!({"suggestion":row.tool_call_id,"index":row.index,"child":row.child_thread_id})) {
+        db.delete_follow_up_task(&row.child_thread_id)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Start a persisted suggestion in its own worktree from the parent's HEAD.
 #[tauri::command]
 pub async fn follow_up_start<R: Runtime>(
     app: AppHandle<R>,
@@ -843,6 +851,7 @@ pub async fn follow_up_start<R: Runtime>(
     let db = app.state::<DatabaseStore>();
     let app_state = app.state::<AppStateStore>();
     let parent = parent_thread_id.as_str();
+    let admission_generation = db.delivery_generation(parent)?.0;
     let provider = parse_provider(&provider)
         .filter(|kind| CANDIDATES.contains(kind))
         .ok_or_else(|| format!("Codemux cannot start a task with \"{provider}\"."))?;
@@ -933,7 +942,11 @@ pub async fn follow_up_start<R: Runtime>(
     // worktree child even before its workspace or provider session exists.
     let mut intent=crate::database::delegation_tasks::TaskRecord::new(format!("local:{}",uuid::Uuid::new_v4()),parent.into(),Some(child.clone()),provider_id(provider).into(),suggestion.title.clone(),suggestion.task.clone(),row.created_at_ms);
     intent.parent_title=db.get_agent_chat_title(parent);intent.workspace_id=workspace.workspace_id.0.clone();intent.cwd=repo_path.display().to_string();intent.isolation="worktree".into();intent.preparation_state="preparing".into();intent.tool_call_id=Some(row.tool_call_id.clone());
-    db.admit_delegation_task(&intent,None,&json!({"suggestion":row.tool_call_id,"index":row.index,"child":child}))?;
+    intent.admission_generation = Some(admission_generation);
+    if let Err(error) = admit_follow_up_intent(&db, &row, &intent) {
+        emit_changed(&app, parent);
+        return Err(error);
+    }
 
     let created = super::workspace::create_worktree_workspace_impl_with_selection(
         app.clone(),
@@ -1111,7 +1124,7 @@ pub async fn follow_up_merge_all<R: Runtime>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tempfile::TempDir;
 
@@ -1235,6 +1248,28 @@ mod tests {
     }
 
     // ── git, in a temp repo with isolated HOME and config ──
+
+    pub(crate) fn task_row(child: &str, parent: &str) -> FollowUpTaskRow {
+        FollowUpTaskRow { child_thread_id:child.into(), parent_thread_id:parent.into(), tool_call_id:format!("suggest-{child}"), index:0, workspace_id:String::new(), parent_workspace_id:"workspace".into(), repo_path:String::new(), worktree_path:String::new(), branch:format!("task-{child}"), base_sha:"a".repeat(40), provider:"codex".into(), title:"Review".into(), outcome:"running".into(), additions:None, deletions:None, commits:None, uncommitted:None, merged:false, created_at_ms:1 }
+    }
+
+    #[test]
+    fn delegation_delivery_suggested_start_after_stop_and_failed_admission_releases_claim() {
+        let db = DatabaseStore::new_in_memory();
+        let row = task_row("child", "parent");
+        let mut task = crate::database::delegation_tasks::TaskRecord::new("suggested".into(), "parent".into(), Some("child".into()), "codex".into(), "Review".into(), "Brief".into(), 1);
+        task.admission_generation = Some(db.delivery_generation("parent").unwrap().0);
+        db.insert_follow_up_task(&row).unwrap();
+        db.stop_message_deliveries("parent").unwrap();
+        db.stop_delegation_tree("parent").unwrap();
+        assert!(admit_follow_up_intent(&db, &row, &task).is_err());
+        assert!(db.get_follow_up_task("child").is_none());
+        db.insert_follow_up_task(&row).unwrap();
+        task.admission_generation = Some(db.delivery_generation("parent").unwrap().0);
+        admit_follow_up_intent(&db, &row, &task).unwrap();
+        assert!(db.get_follow_up_task("child").is_some());
+        assert!(db.delegation_task("suggested").unwrap().is_some());
+    }
 
     fn repo() -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();

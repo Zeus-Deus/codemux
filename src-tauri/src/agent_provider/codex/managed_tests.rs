@@ -51,6 +51,8 @@ for line in sys.stdin:
    while not (root/'queued-response-release').exists(): time.sleep(.01)
  else: result={}
  output({'id':m['id'],'result':result})
+ if method=='turn/start' and (root/'host-tool').exists():
+  output({'id':9876,'method':'item/tool/call','params':{'threadId':'fixture-thread','turnId':'turn-1','callId':'waiting-delegate','namespace':None,'tool':'codemux_mcp__codemux__delegate_task','arguments':{'mode':'wait'}}})
  if method=='turn/start' and (root/'close-stdout-live').exists():
   os.close(1);time.sleep(30)
  if method=='turn/start' and os.environ.get('ACCESS_TOKEN')=='synthetic-runtime-a': threading.Thread(target=finish,daemon=True).start()
@@ -990,5 +992,37 @@ async fn orchestration_message_codex_machine_send_keeps_provider_hold_and_held_i
     session.drain_queue().await;
     assert_eq!(session.state.lock().await.queued_turns.len(),1);
     assert_eq!(wire(root.path()).iter().filter(|v|v["rpc"]=="turn/start").count(),1);
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn delegation_delivery_codex_stop_aborts_waiting_dynamic_host_call() {
+    struct WaitingHost { entered: Arc<tokio::sync::Notify>, dropped: Arc<std::sync::atomic::AtomicBool> }
+    struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Dropped { fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::SeqCst); } }
+    impl crate::mcp::registry::HostTools for WaitingHost {
+        fn tools_for(&self, _caller: &crate::mcp::registry::HostCaller) -> Vec<crate::mcp::runtime::McpTool> {
+            vec![crate::mcp::runtime::McpTool {name:"delegate_task".into(),prefixed_name:"mcp__codemux__delegate_task".into(),description:None,input_schema:json!({}),server_id:"host".into()}]
+        }
+        fn call(&self, _: &crate::mcp::registry::HostCaller, _: &str, _: &Value) -> Option<Value> { None }
+        fn call_async<'a>(&'a self, _: &'a crate::mcp::registry::HostCaller, _: &'a str, _: &'a Value, _: Option<&'a str>, _: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output=Option<Value>> + Send + 'a>> {
+            Box::pin(async move { let _lease = Dropped(self.dropped.clone()); self.entered.notify_one(); std::future::pending().await })
+        }
+    }
+    let root = tempfile::tempdir().unwrap(); std::fs::write(root.path().join("host-tool"), "yes").unwrap();
+    let host = Arc::new(WaitingHost {entered:Default::default(),dropped:Default::default()});
+    let registry = McpRegistry::new(); registry.set_host_tools(host.clone());
+    let (tx, _) = broadcast::channel(128);
+    let session = CodexSession::spawn_and_initialize(
+        ThreadId("waiting-host".into()), root.path().into(), None, Some("danger-full-access".into()), None, "default".into(), None, None, None,
+        CodexSpawnConfig {codex_binary:fixture_binary(root.path()),chatgpt_owner:None,codex_home:None,remote:None,
+            client_info:ClientInfo {name:"fixture".into(),title:"fixture".into(),version:"fixture".into()},mcp_registry:Some(registry)},tx,None,
+    ).await.unwrap();
+    session.enqueue_or_send(super::tests::queued("first").input).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), host.entered.notified()).await.unwrap();
+    session.interrupt_turn(None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !host.dropped.load(std::sync::atomic::Ordering::SeqCst) { tokio::task::yield_now().await; }
+    }).await.expect("Stop must drop the waiting host call and release its wait lease");
     session.shutdown().await.unwrap();
 }

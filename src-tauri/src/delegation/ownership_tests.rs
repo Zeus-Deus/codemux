@@ -625,3 +625,32 @@ fn new_chat_list_is_empty_until_its_session_is_persisted() {
     app.state::<DatabaseStore>().upsert_agent_chat_session("new-chat",&ws,Some("/synthetic/parent"),"codex").unwrap();
     assert_eq!(list().unwrap(),serde_json::json!([]));
 }
+
+#[test]
+fn delegation_delivery_ssh_queued_result_survives_restart_before_provider_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, store, task, _, _, _) = setup(dir.path(), "queued-parent");
+    store.apply_remote(&task.id, &tests::remote(&task, crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
+    let canonical = canonical::ingest(app.handle(), &store, &store.task(&task.id).unwrap()).unwrap();
+    let db = app.state::<DatabaseStore>();
+    let delivery = db.delegation_task(&canonical).unwrap().unwrap().delivery_id.unwrap();
+    assert!(db.claim_message_delivery(&delivery).unwrap());
+    // Building the input happens before the busy-parent queue decision.
+    let queued_guard = app::dispatch_guard(app.handle(), &task.parent_thread_id, Some(&format!("delegation:{}", task.id))).unwrap();
+    db.finish_message_delivery(&delivery, "queued", Some(&serde_json::json!({"queued_id":"old-queue","turn_id":"","steered":false})), None).unwrap();
+    let recovered = journal::Journal::open(dir.path()).unwrap();
+    recovered.recover_deliveries().unwrap();
+    db.recover_message_deliveries("new-process").unwrap();
+    assert_eq!(db.message_delivery(&delivery).unwrap().unwrap().state, "pending");
+    assert_eq!(recovered.delivery_outcome(&task.id).unwrap(), DeliveryOutcome::BeforeSend);
+    assert!(!db.message_delivery(&delivery).unwrap().unwrap().attempted);
+    // The same stable result can now acquire its first real write.
+    let guard = app::dispatch_guard(app.handle(), &task.parent_thread_id, Some(&format!("delegation:{}", task.id))).unwrap();
+    let mut writes = 0;
+    assert!(guard.poll_first(&mut || { writes += 1; std::task::Poll::Ready(Ok(1)) }).unwrap().is_ready());
+    guard.accepted().unwrap();
+    assert_eq!(writes, 1);
+    assert_eq!(recovered.delivery_outcome(&task.id).unwrap(), DeliveryOutcome::Accepted);
+    drop(queued_guard);
+    assert_eq!(recovered.delivery_outcome(&task.id).unwrap(), DeliveryOutcome::Accepted);
+}

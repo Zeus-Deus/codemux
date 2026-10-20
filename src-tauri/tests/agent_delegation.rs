@@ -810,7 +810,7 @@ mod delegation {
     }
 
     #[tokio::test]
-    async fn closing_a_child_waits_for_confirmation_then_reports_to_parent() {
+    async fn closing_a_child_reports_tab_close_wording_to_parent() {
         let h = Harness::new().await;
         let child = h
             .delegate_and_dispatch(args("codex", "Review parser"))
@@ -828,6 +828,9 @@ mod delegation {
                     .contains(&MockCall::StopSession(ThreadId(child.clone())))
         );
         h.deliver().await;
+        let record = h.db().delegation_task_for_child(&child).unwrap().unwrap();
+        assert_eq!(record.result.as_ref().unwrap().text, "The user closed its tab. Partial changes may be in the working tree.");
+        assert_ne!(record.completion_delivery, "disposed_by_stop");
         assert!(h
             .db()
             .delegation_task_for_child(&child)
@@ -1803,11 +1806,11 @@ async fn delegation_delivery_ready(h: &Harness, child: &str) {
 }
 
 #[tokio::test]
-async fn delegation_delivery_real_mock_barrier_holds_ambiguous_ack_and_keeps_one_result() {
+async fn delegation_delivery_ambiguous_provider_ack_barrier_holds_without_resubmit() {
     let h = Harness::new().await;
     let child = h.delegate(args("codex", "Review parser"));
     delegation_delivery_ready(&h, &child).await;
-    let (entered, release) = h.claude.hold_next_send();
+    let (entered, release) = h.claude.hold_next_ack();
     h.claude
         .fail_next_send_after_accept(ProviderError::ValidationError {
             message: "ACK lost".into(),
@@ -1826,6 +1829,7 @@ async fn delegation_delivery_real_mock_barrier_holds_ambiguous_ack_and_keeps_one
                 h.db().delegation_tasks(Some(&h.parent))
             )
         });
+    assert_eq!(h.sent(ProviderKind::Claude, &h.parent).len(), 1, "provider accepted before ACK barrier");
     let task = h.db().delegation_task_for_child(&child).unwrap().unwrap();
     assert_eq!(task.result.as_ref().unwrap().text, "Final stable report");
     assert!(task.delivery_id.is_some());
@@ -2171,4 +2175,57 @@ async fn delegation_delivery_parent_stop_targets_later_run_current_provider() {
     );
     assert_eq!(task.result.unwrap().text, "Original immutable result");
     assert_eq!(task.completion_delivery, "disposed_by_stop");
+}
+
+#[tokio::test]
+async fn delegation_delivery_wait_result_inside_window_has_no_automatic_delivery() {
+    let h = Harness::new().await;
+    let caller = h.caller(FULL);
+    let input = json!({"provider":"codex","title":"Wait review","task":TASK,"mode":"wait","wait_ms":20000,"client_request_id":"wait-inside"});
+    let mut waiting = h.host.call_async(&caller, DELEGATE_TOOL, &input, Some("wait-call"), None);
+    assert!(futures_util::poll!(&mut waiting).is_pending());
+    let task = h.db().delegation_tasks(Some(&h.parent)).unwrap().pop().unwrap();
+    let child = task.child_thread_id.unwrap();
+    delegation_delivery_ready(&h, &child).await;
+    h.child_reports(&child, "Inside wait window");
+    h.settle(&child).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap();
+    let receipt: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(receipt["result"]["text"], "Inside wait window");
+    h.deliver().await;
+    assert!(h.wakes().is_empty());
+    assert_eq!(h.db().delegation_task(&task.task_id).unwrap().unwrap().completion_delivery, "acknowledged");
+}
+
+#[tokio::test]
+async fn delegation_delivery_machine_turn_can_delegate_after_stop_without_human_release() {
+    let h = Harness::new().await;
+    agent_chat_interrupt_turn(h.handle.clone(), ProviderKind::Claude, ThreadId(h.parent.clone()), None).await.unwrap();
+    let child = h.delegate_and_dispatch(args("codex", "New machine delegation")).await;
+    h.child_reports(&child, "Fresh task result"); h.settle(&child).await;
+    h.wait_for_wakes(1).await;
+    assert_ne!(h.db().delegation_task_for_child(&child).unwrap().unwrap().completion_delivery, "disposed_by_stop");
+}
+
+#[tokio::test]
+async fn delegation_delivery_agent_cancel_has_distinct_result_wording() {
+    let h = Harness::new().await;
+    let child = h.delegate_and_dispatch(args("codex", "Cancel review")).await;
+    let task = h.db().delegation_task_for_child(&child).unwrap().unwrap();
+    h.host.call(&h.caller(FULL), "mcp__codemux__task_cancel", &json!({"task_id":task.task_id})).unwrap();
+    wait_for("agent cancellation result", || h.db().delegation_task(&task.task_id).unwrap().unwrap().result.is_some()).await;
+    let text = h.db().delegation_task(&task.task_id).unwrap().unwrap().result.unwrap().text;
+    assert!(text.contains("parent agent cancelled"), "{text}");
+    assert!(!text.contains("user stopped"));
+}
+
+#[tokio::test]
+async fn delegation_delivery_wait_uses_one_deadline_including_admission_work() {
+    let h = Harness::with_install_check(|_| { std::thread::sleep(Duration::from_millis(80)); true }).await;
+    let input = json!({"provider":"codex","title":"Bounded wait","task":TASK,"mode":"wait","wait_ms":20});
+    let before = now_ms();
+    let receipt = h.call(FULL, input).unwrap();
+    let task = h.db().delegation_task(receipt["task_id"].as_str().unwrap()).unwrap().unwrap();
+    assert!(task.wait_until.unwrap() <= before + 20, "admission must not extend the wait budget");
+    assert_eq!(receipt["wait_until"].as_i64(), task.wait_until);
 }

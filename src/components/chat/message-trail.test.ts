@@ -101,7 +101,7 @@ describe("buildTrailEntries", () => {
     const entries = buildTrailEntries(
       buildTranscriptSlots([
         userMsg(0, "have Codex do it"),
-        { ...userMsg(1, results), notification: {source:{kind:"delegated_task",task_ids:["task"]},outcome:"completed",summary:"Add slugify helper"} },
+        { ...userMsg(1, results) },
         assistantMsg(2, "Codex added slugify."),
       ]),
     );

@@ -149,7 +149,7 @@ impl Journal {
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if state.as_deref() != Some("in_flight") {
+        if !matches!(state.as_deref(), Some("in_flight" | "before_send")) {
             return Err("Result delivery attempt is not admissible".into());
         }
         // Commit Unknown BEFORE a syscall can accept any bytes. A crash in
@@ -163,8 +163,8 @@ impl Journal {
         let poll = write();
         if poll.is_pending() {
             conn.execute(
-                "UPDATE delivery_outcomes SET state='in_flight' WHERE task=?1 AND attempt=?2",
-                params![id, attempt],
+                "UPDATE delivery_outcomes SET state=?3 WHERE task=?1 AND attempt=?2",
+                params![id, attempt, state],
             )
             .map_err(|e| e.to_string())?;
         }
@@ -743,7 +743,7 @@ impl Journal {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         let mut task = read_task(&tx, id)?;
-        if task.cancel_requested || task.wake_state != WakeState::Pending {
+        if task.cancel_requested || task.wake_error.as_deref() == Some("disposed_by_stop") || task.wake_state != WakeState::Pending {
             return Ok(None);
         }
         let prior: Option<String> = tx
@@ -776,14 +776,14 @@ impl Journal {
     pub(crate) fn claim_outbox_delivery(&self,id:&str)->Result<String,String> {
         let mut conn=self.conn.lock().unwrap();let tx=conn.transaction().map_err(|e|e.to_string())?;
         let mut task=read_task(&tx,id)?;
-        if task.cancel_requested {return Err("Task cancelled".into());}
+        if task.cancel_requested || task.wake_error.as_deref() == Some("disposed_by_stop") {return Err("Task cancelled".into());}
         let prior:Option<(String,String)>=tx.query_row("SELECT attempt,state FROM delivery_outcomes WHERE task=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
         let attempt=match prior {
             Some((_,state)) if matches!(state.as_str(),"accepted"|"unknown")=>return Err("SSH acceptance may have occurred; automatic resend held".into()),
             Some((attempt,_)) if !attempt.is_empty()=>attempt,
             _=>format!("task-result:ssh:{id}:1"),
         };
-        tx.execute("INSERT INTO delivery_outcomes(task,attempt,state) VALUES (?1,?2,'in_flight') ON CONFLICT(task) DO UPDATE SET attempt=excluded.attempt,state='in_flight'",params![id,attempt]).map_err(|e|e.to_string())?;
+        tx.execute("INSERT INTO delivery_outcomes(task,attempt,state) VALUES (?1,?2,'before_send') ON CONFLICT(task) DO UPDATE SET attempt=excluded.attempt,state='before_send'",params![id,attempt]).map_err(|e|e.to_string())?;
         task.wake_state=WakeState::Delivering;tx.execute("UPDATE tasks SET data=?2 WHERE id=?1",params![id,encode(&task)?]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e|e.to_string())?;Ok(attempt)
     }
@@ -827,6 +827,7 @@ impl Journal {
             .map_err(|e| e.to_string())?;
         if state.as_deref().is_some_and(|s| !matches!(s, "before_send" | "not_attempted"))
             || task.cancel_requested
+            || task.wake_error.as_deref() == Some("disposed_by_stop")
             || matches!(
                 task.wake_state,
                 WakeState::Delivered | WakeState::Delivering
@@ -847,6 +848,9 @@ impl Journal {
         tx.commit().map_err(|e| e.to_string())
     }
     pub fn recover_deliveries(&self) -> Result<(), String> {
+        self.recover_deliveries_with_stop_evidence(|_| Ok(false))
+    }
+    pub(crate) fn recover_deliveries_with_stop_evidence(&self, stopped_after: impl Fn(&LocalTask) -> Result<bool, String>) -> Result<(), String> {
         self.conn
             .lock()
             .unwrap()
@@ -856,8 +860,17 @@ impl Journal {
             )
             .map_err(|e| e.to_string())?;
         for task in self.tasks()? {
-            if task.wake_state==WakeState::Suppressed && !task.cancel_requested && self.conn.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM delivery_outcomes WHERE task=?1 AND state IN ('not_attempted','before_send'))",[&task.id],|r|r.get::<_,bool>(0)).map_err(|e|e.to_string())? {
-                self.update(&task.id,|t|{t.wake_state=WakeState::Pending;t.wake_error=None;})?;
+            let outcome = self.delivery_outcome(&task.id)?;
+            let stopped = task.cancel_requested || task.wake_error.as_deref() == Some("disposed_by_stop")
+                || task.wake_state == WakeState::Suppressed && stopped_after(&task)?;
+            if !stopped && (task.wake_state == WakeState::Suppressed
+                || task.wake_state == WakeState::Delivering && outcome == DeliveryOutcome::BeforeSend)
+                && matches!(outcome, DeliveryOutcome::NotAttempted | DeliveryOutcome::BeforeSend) {
+                self.update(&task.id, |t| { t.wake_state = WakeState::Pending; t.wake_error = None; })?;
+                continue;
+            }
+            if stopped {
+                self.update(&task.id, |t| { t.wake_state = WakeState::Suppressed; t.wake_error = Some("disposed_by_stop".into()); })?;
                 continue;
             }
             if matches!(

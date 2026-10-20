@@ -29,7 +29,11 @@ export function messageAttribution(item: MessageProvenance): "agent" | "codemux"
   return null;
 }
 
-/** Result presentation requires persisted notification metadata. */
+/** Legacy text changes presentation only; attribution still requires metadata. */
 export function isDelegationResultsMessage(item: MessageProvenance & {text: string}): boolean {
-  return item.notification?.source.kind === "delegated_task";
+  return item.notification?.source.kind === "delegated_task" || (
+    !item.message_id && (!item.creation_source || item.creation_source === "unknown")
+    && (!item.created_by || item.created_by === "user") && !item.notification
+    && item.text.startsWith("[Codemux: delegated task results]")
+  );
 }

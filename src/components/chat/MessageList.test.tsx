@@ -1453,6 +1453,13 @@ describe("MessageList usage limit", () => {
     expect(screen.queryByText(/Codemux posted this message/)).toBeNull();
   });
 
+  it("compacts legacy results without disclosing agent framing or inventing attribution", () => {
+    const text = '[Codemux: delegated task results]\nCodemux posted this message, not the user.\n<task provider="codex"><brief>private brief</brief><report>raw report</report></task>';
+    renderList([userTurn, { kind: "user_message", id: "legacy", seq: 1, text }]);
+    expect(screen.getByTestId("legacy-delegation-result-row")).toHaveTextContent("Delegated results");
+    expect(screen.queryByText(/Codemux posted|private brief|raw report|Sent by Codemux/)).toBeNull();
+  });
+
   it("renders a delegate_task call as the delegation card, not a tool row", () => {
     const delegateCall: ToolCallItem = {
       kind: "tool_call",

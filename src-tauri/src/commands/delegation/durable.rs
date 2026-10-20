@@ -141,6 +141,7 @@ pub(super) fn publish_finished<R: Runtime>(app: &AppHandle<R>, child: &str) -> R
     }
     let text = match &task.phase {
         Phase::Completed(text) | Phase::Failed(text) => text.clone(),
+        Phase::Stopped(_) if record.preparation_state == "not_started" => "Task was admitted but never started before restart. Delegate again with a fresh key to start it.".into(),
         Phase::Stopped(reason) => reason.note().into(),
         _ => return Ok(()),
     };
@@ -179,7 +180,7 @@ fn persist_result<R: Runtime>(
                 t.status = result.status.clone();
                 t.work_state = WorkState::ResultAvailable;
                 t.completed_at = if result.status == TaskStatus::Interrupted
-                    && t.preparation_state == "interrupted_on_restart"
+                    && matches!(t.preparation_state.as_str(), "interrupted_on_restart" | "not_started")
                 {
                     None
                 } else {
@@ -190,7 +191,7 @@ fn persist_result<R: Runtime>(
                 t.progress = Some(error);
                 if !matches!(
                     t.completion_delivery.as_str(),
-                    "disposed_by_stop" | "acknowledged"
+                    "disposed_by_stop" | "disposed_by_close" | "acknowledged"
                 ) {
                     t.completion_delivery = "held".into();
                 }
@@ -279,7 +280,7 @@ pub(crate) fn restoration_held<R: Runtime>(app: &AppHandle<R>, child: &str, reas
 pub(super) fn task_receipt(record: &TaskRecord) -> Value {
     json!({"task_id":record.task_id,"child_thread_id":record.child_thread_id,"status":record.status,"result":record.result,
         "started":{"task_id":record.task_id,"child_thread_id":record.child_thread_id,"thread":record.child_thread_id,"title":record.title,"provider":record.provider,"model":record.model,"effort":record.effort},
-        "note":"This task is durable. Each finished result is delivered independently. For another round use a fresh delegation key and a complete brief."})
+        "wait_until":record.wait_until,"preparation_state":record.preparation_state,"note":"This task is durable. Each finished result is delivered independently. For another round use a fresh delegation key and a complete brief."})
 }
 pub(super) fn task_tool(name: &str) -> McpTool {
     McpTool {name:name.into(),prefixed_name:prefix_tool_name("codemux",name),description:Some(if name=="task_status" {"Read a directly owned task and its complete immutable terminal result. Returning that complete result acknowledges automatic delivery. Uses task_id, not child_thread_id."}else{"Cancel a directly owned task and its descendants, retaining any published result and disposing automatic delivery. Uses task_id, not child_thread_id."}.into()),input_schema:json!({"type":"object","properties":{"task_id":{"type":"string"},"cursor":{"type":"integer","minimum":0}},"required":["task_id"],"additionalProperties":false}),server_id:"codemux-host".into()}
@@ -308,9 +309,13 @@ pub(crate) fn local_task_call<R: Runtime>(
         ) {
             let owned = app.clone();
             let child = child.clone();
+            if let Some(state) = app.try_state::<DelegationState>() {
+                state.update(app, &child, |task| task.stop_reason = Some(StopReason::AgentCancellation));
+            }
+            db.stop_message_deliveries(&child)?;
             on_thread_stopped(app, &child, StopKind::Stop);
             tauri::async_runtime::spawn(async move {
-                let _ = agent_chat_interrupt_turn(owned, provider, ThreadId(child), None).await;
+                let _ = super::super::agent_chat::interrupt_stopped_thread(owned, provider, ThreadId(child)).await;
             });
         }
         Ok(Some(
@@ -406,15 +411,25 @@ pub(super) fn recover_tasks<R: Runtime>(app: &AppHandle<R>) -> Result<(), String
             task.phase = match result.status {
                 TaskStatus::Completed => Phase::Completed(result.text.clone()),
                 TaskStatus::Failed => Phase::Failed(result.text.clone()),
-                TaskStatus::Cancelled if result.text == StopReason::User.note() => {
-                    Phase::Stopped(StopReason::User)
-                }
-                TaskStatus::Cancelled if result.text == StopReason::Parent.note() => {
-                    Phase::Stopped(StopReason::Parent)
-                }
+                TaskStatus::Cancelled => Phase::Stopped(
+                    [StopReason::User, StopReason::AgentCancellation, StopReason::TabClosed, StopReason::WorkspaceClosed, StopReason::Parent]
+                        .into_iter().find(|reason| result.text == reason.note()).unwrap_or(StopReason::AppClosed)
+                ),
                 _ => Phase::Stopped(StopReason::AppClosed),
             };
             task.finished_at_ms = record.completed_at;
+        } else if record.preparation_state == "admitted" && record.original_child_run_id.is_none() {
+            // There is no provider dispatch intent to reconcile. Make the
+            // same-key receipt explicit, without waking the parent for work
+            // that never began.
+            task.phase = Phase::Stopped(StopReason::AppClosed);
+            task.finished_at_ms = None;
+            db.update_delegation_task(&record.task_id, |r| {
+                r.preparation_state = "not_started".into();
+                r.status = TaskStatus::Interrupted;
+                r.progress = Some("Task was admitted but never started before restart".into());
+                r.completion_delivery = "held".into();
+            })?;
         } else {
             // Reconcile the exact durable child run; a later run cannot replace
             // the original published result. No terminal event means interrupted.
@@ -505,12 +520,22 @@ pub(super) struct WaitLease<R: Runtime> {
     pub app: AppHandle<R>,
     pub task_id: String,
 }
+impl<R: Runtime> WaitLease<R> {
+    pub fn acquire(app: AppHandle<R>, task_id: String) -> Self {
+        *app.state::<DelegationState>().lock().wait_leases.entry(task_id.clone()).or_default() += 1;
+        Self { app, task_id }
+    }
+}
 impl<R: Runtime> Drop for WaitLease<R> {
     fn drop(&mut self) {
-        let _ = self
-            .app
-            .state::<DatabaseStore>()
-            .release_delegation_wait(&self.task_id);
+        let state = self.app.state::<DelegationState>();
+        let mut inner = state.lock();
+        if let Some(count) = inner.wait_leases.get_mut(&self.task_id) {
+            *count -= 1;
+            if *count > 0 { return; }
+            inner.wait_leases.remove(&self.task_id);
+            let _ = self.app.state::<DatabaseStore>().release_delegation_wait(&self.task_id);
+        }
         notify();
     }
 }
@@ -573,6 +598,85 @@ pub(crate) fn stop_confirmed<R: Runtime>(app: &AppHandle<R>, child: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegation_delivery_close_preserves_worktrees_and_records_workspace_close_wording() {
+        let app = tauri::test::mock_app(); let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("parent", "workspace", None, "codex").unwrap();
+        let row = super::super::super::follow_ups::tests::task_row("child", "parent");
+        db.insert_follow_up_task(&row).unwrap();
+        let mut live = Task::new("parent", ProviderKind::Codex, "Review", "Brief", 1);
+        live.phase = Phase::Running;
+        live.placement = Placement::Worktree(super::super::super::follow_ups::placement_of(&row));
+        let record = record_of("child", &live);
+        db.admit_delegation_task(&record, None, &json!({})).unwrap();
+        app.manage(db); app.manage(DelegationState::default());
+        app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+        app.manage(crate::commands::agent_chat::GrokUsageLedgerBridge::default());
+        app.manage(crate::commands::agent_chat::SubagentTracker::default());
+        app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+        app.manage(crate::commands::agent_chat::ProviderRegistry::new());
+        app.manage(crate::observability::ObservabilityStore::default());
+        app.manage(AppStateStore::default());
+        app.state::<DelegationState>().reserve_worktree("child", live);
+        on_thread_stopped(app.handle(), "parent", StopKind::Close);
+        let db = app.state::<DatabaseStore>();
+        assert_eq!(db.delegation_task(&record.task_id).unwrap().unwrap().completion_delivery, "pending");
+        assert!(db.delegation_task(&record.task_id).unwrap().unwrap().result.is_none());
+        assert_eq!(db.delivery_generation("parent").unwrap(), (0, false));
+        on_thread_stopped(app.handle(), "child", StopKind::Close);
+        let closed = db.delegation_task(&record.task_id).unwrap().unwrap();
+        assert_eq!(closed.result.unwrap().text, StopReason::WorkspaceClosed.note());
+        assert_ne!(closed.completion_delivery, "disposed_by_stop");
+        assert_eq!(db.get_follow_up_task("child").unwrap().outcome, "stopped");
+    }
+
+    #[test]
+    fn delegation_delivery_wait_lease_releases_only_after_last_waiter() {
+        let app = tauri::test::mock_app();
+        let db = DatabaseStore::new_in_memory();
+        let mut task = TaskRecord::new("wait".into(), "parent".into(), Some("child".into()), "codex".into(), "Review".into(), "Brief".into(), 1);
+        task.wait_until = Some(now_ms() + 20_000);
+        db.admit_delegation_task(&task, None, &json!({})).unwrap();
+        app.manage(db); app.manage(DelegationState::default());
+        app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+        app.manage(crate::commands::agent_chat::GrokUsageLedgerBridge::default());
+        app.manage(crate::commands::agent_chat::SubagentTracker::default());
+        app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+        app.manage(crate::commands::agent_chat::ProviderRegistry::new());
+        app.manage(crate::observability::ObservabilityStore::default());
+        app.manage(AppStateStore::default());
+        let first = WaitLease::acquire(app.handle().clone(), "wait".into());
+        let second = WaitLease::acquire(app.handle().clone(), "wait".into());
+        drop(second);
+        assert!(app.state::<DatabaseStore>().delegation_task("wait").unwrap().unwrap().wait_until.is_some());
+        drop(first);
+        assert!(app.state::<DatabaseStore>().delegation_task("wait").unwrap().unwrap().wait_until.is_none());
+    }
+
+    #[test]
+    fn delegation_delivery_recovery_reports_never_started_without_auto_wake() {
+        let app = tauri::test::mock_app();
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("parent", "workspace", None, "codex").unwrap();
+        let record = TaskRecord::new("admitted".into(), "parent".into(), Some("child".into()), "codex".into(), "Review".into(), "Brief".into(), 1);
+        db.admit_delegation_task(&record, Some("same-key"), &json!({})).unwrap();
+        app.manage(db); app.manage(DelegationState::default());
+        app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+        app.manage(crate::commands::agent_chat::GrokUsageLedgerBridge::default());
+        app.manage(crate::commands::agent_chat::SubagentTracker::default());
+        app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+        app.manage(crate::commands::agent_chat::ProviderRegistry::new());
+        app.manage(crate::observability::ObservabilityStore::default());
+        app.manage(AppStateStore::default());
+        recover_tasks(app.handle()).unwrap();
+        let db = app.state::<DatabaseStore>();
+        let retry = db.delegation_retry("parent", "same-key", &json!({})).unwrap().unwrap();
+        assert_eq!(retry.preparation_state, "not_started");
+        assert!(retry.result.unwrap().text.contains("never started"));
+        assert!(retry.delivery_id.is_none());
+        assert!(db.pending_message_deliveries().unwrap().is_empty());
+    }
 
     #[test]
     fn delegation_delivery_failed_restoration_is_interrupted_with_original_identity() {

@@ -113,6 +113,7 @@ impl NativeAuthority {
         let mut state = self.state.lock().unwrap();
         state.activity += 1;
         state.tools_live = false;
+        for job in state.callbacks.drain(..) { job.abort(); }
         state.dispatch_wakers.retain(|w| w.strong_count() > 0);
         for waker in state.dispatch_wakers.iter().filter_map(Weak::upgrade) {
             waker.wake();
@@ -165,7 +166,7 @@ impl NativeAuthority {
     pub fn track(&self, job: AbortHandle) {
         let mut state = self.state.lock().unwrap();
         state.callbacks.retain(|job| !job.is_finished());
-        if state.live {
+        if state.live && state.tools_live {
             state.callbacks.push(job);
         } else {
             job.abort();

@@ -23,7 +23,7 @@ use crate::mcp::runtime::{prefix_tool_name, McpTool};
 use crate::state::AppStateStore;
 
 use super::agent_chat::{
-    agent_chat_interrupt_turn, agent_chat_start_session, fallback_permission_mode, forward_event,
+    agent_chat_start_session, fallback_permission_mode, forward_event,
     resolve_start_permission_mode, send_turn_with_context, thread_id_for_event, TurnOrigin,
 };
 use super::usage_resume::{self, now_ms, queued_turn};
@@ -95,6 +95,7 @@ pub enum StopKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StopReason {
     User,
+    AgentCancellation,
     TabClosed,
     /// A worktree task's workspace was closed or archived.
     WorkspaceClosed,
@@ -107,6 +108,7 @@ impl StopReason {
     fn note(self) -> &'static str {
         match self {
             Self::User => "The user stopped this task. Partial changes may be in the working tree.",
+            Self::AgentCancellation => "The parent agent cancelled this task. Partial changes may be in the working tree.",
             Self::TabClosed => {
                 "The user closed its tab. Partial changes may be in the working tree."
             }
@@ -397,6 +399,7 @@ struct ParentState {
 struct Inner {
     /// Keyed by child thread id.
     tasks: HashMap<String, Task>,
+    wait_leases: HashMap<String, usize>,
     parents: HashMap<String, ParentState>,
 }
 
@@ -890,14 +893,9 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                     if args["mode"] == "wait" {
                         let already_terminal = receipt["result"].is_object();
                         let id = receipt["task_id"].as_str().unwrap_or_default().to_string();
-                        let _lease = WaitLease {
-                            app: self.app.clone(),
-                            task_id: id.clone(),
-                        };
-                        let deadline = tokio::time::Instant::now()
-                            + Duration::from_millis(
-                                args["wait_ms"].as_u64().unwrap_or(20_000).min(20_000),
-                            );
+                        let _lease = WaitLease::acquire(self.app.clone(), id.clone());
+                        let remaining = receipt["wait_until"].as_i64().unwrap_or_else(now_ms).saturating_sub(now_ms()).max(0) as u64;
+                        let deadline = tokio::time::Instant::now() + Duration::from_millis(remaining);
                         loop {
                             // Register before reading to avoid losing a completion.
                             let notified = task_changes().notified();
@@ -1058,6 +1056,8 @@ fn delegate_with_call<R: Runtime>(
     let state = app.try_state::<DelegationState>().ok_or_else(unavailable)?;
     let app_state = app.try_state::<AppStateStore>().ok_or_else(unavailable)?;
     let parent = caller.thread_id.as_str();
+    let admission_generation = db.delivery_generation(parent)?.0;
+    let wait_until = (arguments["mode"] == "wait").then(|| now_ms() + arguments["wait_ms"].as_u64().unwrap_or(20_000).min(20_000) as i64);
 
     if !setting_on(&db) {
         return Err("Cross-provider delegation is off (Settings → Agent).".into());
@@ -1152,9 +1152,8 @@ fn delegate_with_call<R: Runtime>(
     });
     record.parent_title = db.get_agent_chat_title(parent);
     record.permission_mode = fallback_permission_mode(provider).map(str::to_string);
-    if args.mode.as_deref() == Some("wait") {
-        record.wait_until = Some(now_ms() + args.wait_ms.unwrap_or(20_000).min(20_000) as i64);
-    }
+    record.admission_generation = Some(admission_generation);
+    record.wait_until = wait_until;
     let (record, new) =
         db.admit_delegation_task(&record, args.client_request_id.as_deref(), &payload)?;
     if !new {
@@ -1539,10 +1538,14 @@ pub(crate) fn on_request_answered<R: Runtime>(
     }
 }
 
-/// Persist recursive Stop/Close disposition before waiting on providers.
+/// Persist recursive Stop disposition before waiting on providers.
 /// Session restart and process exit preserve task ownership and delivery.
 pub fn on_thread_stopped<R: Runtime>(app: &AppHandle<R>, thread_id: &str, kind: StopKind) {
     if kind == StopKind::Restart || super::queued_turns::exiting() {
+        return;
+    }
+    if kind == StopKind::Close {
+        close_tasks(app, thread_id);
         return;
     }
     let Some(db) = app.try_state::<DatabaseStore>() else {
@@ -1597,7 +1600,7 @@ pub fn on_thread_stopped<R: Runtime>(app: &AppHandle<R>, thread_id: &str, kind: 
         };
         let owned = app.clone();
         tauri::async_runtime::spawn(async move {
-            match agent_chat_interrupt_turn(owned.clone(), provider, ThreadId(child.clone()), None)
+            match super::agent_chat::interrupt_stopped_thread(owned.clone(), provider, ThreadId(child.clone()))
                 .await
             {
                 Ok(_) => {
@@ -1614,6 +1617,29 @@ pub fn on_thread_stopped<R: Runtime>(app: &AppHandle<R>, thread_id: &str, kind: 
                 }
             }
         });
+    }
+}
+
+/// Closing a parent retains independent worktree work. Only its direct tab
+/// children follow the old tab lifecycle; they do not recursively Stop a tree.
+fn close_tasks<R: Runtime>(app: &AppHandle<R>, thread: &str) {
+    let Some(state) = app.try_state::<DelegationState>() else { return; };
+    let reason = if state.task_matches(thread, |task| !task.placement.is_tab()) {
+        StopReason::WorkspaceClosed
+    } else { StopReason::TabClosed };
+    if let Some(parent) = state.finish(app, thread, Phase::Stopped(reason)) {
+        spawn_deliver(app, &parent, Duration::ZERO);
+    }
+    let children: Vec<_> = state.lock().tasks.iter()
+        .filter(|(_, task)| task.parent == thread && task.placement.is_tab())
+        .map(|(child, task)| (child.clone(), task.clone())).collect();
+    for (child, task) in children {
+        if let Some(db) = app.try_state::<DatabaseStore>() {
+            let _ = db.dispose_delegation_task_for_close(thread, &task.task_id);
+        }
+        if task.phase.is_terminal() { continue; }
+        state.finish(app, &child, Phase::Stopped(StopReason::Parent));
+        tauri::async_runtime::spawn(super::agent_chat::interrupt_stopped_thread(app.clone(), task.provider, ThreadId(child)));
     }
 }
 

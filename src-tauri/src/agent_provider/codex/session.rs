@@ -2853,7 +2853,7 @@ fn spawn_incoming_requests_task(
                             })
                         };
                         let owned_session=session.clone();let owned_child=child.clone();let owned_registry=mcp_registry.clone();let owned_events=event_tx.clone();
-                        tokio::spawn(async move {
+                        let job = tokio::spawn(async move {
                             let session=owned_session;let child=owned_child;let mcp_registry=owned_registry;let event_tx=owned_events;
                         if let Some(actor) = &actor {
                             let _ = actor.permit.wait_ready().await;
@@ -2874,6 +2874,7 @@ fn spawn_incoming_requests_task(
                             });
                         }
                         });
+                        session.native_authority.track(job.abort_handle());
                         continue;
                     }
                     let request_id = mint_request_id();

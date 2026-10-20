@@ -40,7 +40,7 @@ pub(super) fn ingest<R: Runtime>(
     record.remote_task_id = Some(task.id.clone());
     record.host = Some(json!({"id":task.target_host_id,"name":task.target_host_name}));
     if db.delegation_task(&id)?.is_none() {
-        record.completion_delivery = if task.cancel_requested {
+        record.completion_delivery = if task.cancel_requested || task.wake_error.as_deref() == Some("disposed_by_stop") {
             "disposed_by_stop"
         } else if task.wake_state == WakeState::Delivered {
             "delivered"
@@ -84,7 +84,7 @@ pub(super) fn ingest<R: Runtime>(
         if record.result.is_none() {
             record.status = status.clone();
         }
-        if task.cancel_requested {
+        if task.cancel_requested || task.wake_error.as_deref() == Some("disposed_by_stop") {
             record.completion_delivery = "disposed_by_stop".into();
         }
         if let Some(remote) = &task.remote {

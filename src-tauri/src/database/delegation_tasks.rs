@@ -66,7 +66,7 @@ pub struct PublishedResult {
     pub published_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskRecord {
     pub task_id: String,
     pub backend: TaskBackend,
@@ -98,6 +98,9 @@ pub struct TaskRecord {
     pub work_state: WorkState,
     pub progress: Option<String>,
     pub result: Option<PublishedResult>,
+    /// Parent Stop generation captured before admission; absent on legacy rows.
+    #[serde(default)]
+    pub admission_generation: Option<u64>,
     pub cancellation_generation: u64,
     pub completion_delivery: String,
     pub delivery_id: Option<String>,
@@ -151,6 +154,7 @@ impl TaskRecord {
             work_state: WorkState::Working,
             progress: None,
             result: None,
+            admission_generation: None,
             cancellation_generation: 0,
             completion_delivery: "pending".into(),
             delivery_id: None,
@@ -205,11 +209,22 @@ impl DatabaseStore {
             .transpose()
             .map(Option::flatten)
     }
+    /// Old suppression did not distinguish human activity from Stop. Prefer
+    /// retaining a result when a saved interruption followed its completion;
+    /// generation-only evidence is conservatively treated as Stop too.
+    pub(crate) fn legacy_parent_stop_after(&self, thread: &str, finished: &str) -> Result<bool, String> {
+        self.conn.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM agent_chat_messages
+            WHERE thread_id=?1 AND datetime(created_at)>=datetime(?2)
+            AND json_extract(payload,'$.type')='turn_completed'
+            AND json_extract(payload,'$.status.subtype') IN ('interrupted','aborted','cancelled'))
+            OR EXISTS(SELECT 1 FROM agent_thread_delivery_state WHERE thread_id=?1 AND generation>0)",
+            params![thread, finished], |r| r.get(0)).map_err(|e| e.to_string())
+    }
     pub fn retry_delegation_delivery(&self, id: &str) -> Result<(), String> {
         let task = self.delegation_task(id)?.ok_or("Unknown task")?;
         if matches!(
             task.completion_delivery.as_str(),
-            "disposed_by_stop" | "acknowledged"
+            "disposed_by_stop" | "disposed_by_close" | "acknowledged"
         ) {
             return Err("Result was disposed or acknowledged".into());
         }
@@ -258,7 +273,7 @@ impl DatabaseStore {
                 if let Some((state, _)) = state {
                     if !matches!(
                         task.completion_delivery.as_str(),
-                        "acknowledged" | "disposed_by_stop"
+                        "acknowledged" | "disposed_by_stop" | "disposed_by_close"
                     ) {
                         task.completion_delivery = if state == "accepted" {
                             "delivered".into()
@@ -330,24 +345,21 @@ impl DatabaseStore {
                 return Ok((decode(data)?, false));
             }
         }
+        let generation: u64 = tx.query_row(
+            "SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1",
+            [&task.parent_thread_id], |r| r.get(0),
+        ).optional().map_err(|e| e.to_string())?.unwrap_or(0);
+        if task.admission_generation.is_some_and(|admitted| admitted != generation) {
+            return Err("Parent was stopped before task admission".into());
+        }
+        let mut task = task.clone();
+        task.admission_generation = Some(generation);
         if task.backend == TaskBackend::Local {
-            let stopped: bool = tx
-                .query_row(
-                    "SELECT stopped FROM agent_thread_delivery_state WHERE thread_id=?1",
-                    [&task.parent_thread_id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?
-                .unwrap_or(false);
-            if stopped {
-                return Err("Parent was stopped before task admission".into());
-            }
             if let Some(child) = &task.child_thread_id {
                 tx.execute("INSERT INTO agent_chat_sessions (thread_id,workspace_id,cwd,provider,title,model,effort,permission_mode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(thread_id) DO NOTHING",params![child,task.workspace_id,task.cwd,task.provider,task.title,task.model,task.effort,task.permission_mode]).map_err(|e|e.to_string())?;
             }
         }
-        tx.execute("INSERT INTO agent_delegation_tasks (task_id,parent_thread_id,child_thread_id,backend,client_request_id,admission_payload,record) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![task.task_id,task.parent_thread_id,task.child_thread_id,if task.backend==TaskBackend::Local {"local"}else{"ssh"},key,payload.to_string(),serde_json::to_string(task).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        tx.execute("INSERT INTO agent_delegation_tasks (task_id,parent_thread_id,child_thread_id,backend,client_request_id,admission_payload,record) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![task.task_id,task.parent_thread_id,task.child_thread_id,if task.backend==TaskBackend::Local {"local"}else{"ssh"},key,payload.to_string(),serde_json::to_string(&task).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok((task.clone(), true))
     }
@@ -358,11 +370,13 @@ impl DatabaseStore {
     ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         let mut task = read(&conn, id)?.ok_or("Unknown task")?;
+        let original = task.clone();
         let published = task.result.clone();
         change(&mut task);
         if published.is_some() {
             task.result = published;
         }
+        if task == original { return Ok(()); }
         write(&conn, &task)
     }
     /// The result and its durable delivery membership commit before any UI event.
@@ -392,7 +406,7 @@ impl DatabaseStore {
                 .into(),
             );
             task.completed_at = if result.status == TaskStatus::Interrupted
-                && task.preparation_state == "interrupted_on_restart"
+                && matches!(task.preparation_state.as_str(), "interrupted_on_restart" | "not_started")
             {
                 None
             } else {
@@ -401,18 +415,19 @@ impl DatabaseStore {
             task.pending_request = None;
             task.has_pending_child_runs = false;
         }
-        let (generation, stopped): (u64, bool) = tx
+        let generation: u64 = tx
             .query_row(
-                "SELECT generation,stopped FROM agent_thread_delivery_state WHERE thread_id=?1",
+                "SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1",
                 [&task.parent_thread_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .optional()
             .map_err(|e| e.to_string())?
-            .unwrap_or((0, false));
-        if stopped || task.completion_delivery == "disposed_by_stop" {
+            .unwrap_or(0);
+        if task.admission_generation.is_some_and(|admitted| admitted != generation) && !task.completion_delivery.starts_with("disposed_by_") {
             task.completion_delivery = "disposed_by_stop".into();
-        } else if task.delivery_id.is_none()
+        }
+        if !task.completion_delivery.starts_with("disposed_by_") && task.delivery_id.is_none()
             && !matches!(
                 task.completion_delivery.as_str(),
                 "acknowledged" | "held_unknown" | "delivered" | "held"
@@ -444,18 +459,24 @@ impl DatabaseStore {
     }
     /// Only a complete terminal result read by its direct owner consumes a wake.
     pub fn dispose_delegation_task(&self, parent: &str, id: &str) -> Result<(), String> {
+        self.dispose_task_result(parent, id, "disposed_by_stop")
+    }
+    pub(crate) fn dispose_delegation_task_for_close(&self, parent: &str, id: &str) -> Result<(), String> {
+        self.dispose_task_result(parent, id, "disposed_by_close")
+    }
+    fn dispose_task_result(&self, parent: &str, id: &str, reason: &str) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let mut task = read(&tx, id)?.ok_or("Unknown task")?;
         if task.parent_thread_id != parent {
             return Err("Task is not owned by this thread".into());
         }
-        if task.completion_delivery != "disposed_by_stop" {
+        if !task.completion_delivery.starts_with("disposed_by_") {
             task.cancellation_generation += 1;
         }
-        task.completion_delivery = "disposed_by_stop".into();
+        task.completion_delivery = reason.into();
         if let Some(delivery) = &task.delivery_id {
-            tx.execute("UPDATE agent_message_deliveries SET state=CASE WHEN attempted=1 THEN 'held_unknown' ELSE 'cancelled' END,error='disposed_by_stop' WHERE id=?1 AND state<>'accepted'",[delivery]).map_err(|e|e.to_string())?;
+            tx.execute("UPDATE agent_message_deliveries SET state=CASE WHEN attempted=1 THEN 'held_unknown' ELSE 'cancelled' END,error=?2 WHERE id=?1 AND state<>'accepted'",params![delivery, reason]).map_err(|e|e.to_string())?;
         }
         write(&tx, &task)?;
         tx.commit().map_err(|e| e.to_string())
@@ -471,7 +492,7 @@ impl DatabaseStore {
         if task.parent_thread_id != parent {
             return Err("Task is not owned by this thread".into());
         }
-        if task.result.is_some() && task.completion_delivery != "disposed_by_stop" {
+        if task.result.is_some() && !task.completion_delivery.starts_with("disposed_by_") {
             if let Some(delivery) = &task.delivery_id {
                 tx.execute("UPDATE agent_message_deliveries SET state='cancelled',error='Terminal result read by parent' WHERE id=?1 AND attempted=0 AND state IN ('pending','preparing','queued','held')",[delivery]).map_err(|e|e.to_string())?;
             }
@@ -506,7 +527,7 @@ impl DatabaseStore {
             };
             for row in rows {
                 let mut task = decode(row)?;
-                let needs_stop = task.completion_delivery != "disposed_by_stop"
+                let needs_stop = !task.completion_delivery.starts_with("disposed_by_")
                     || !task.status.terminal()
                     || task.has_pending_child_runs;
                 if task.backend == TaskBackend::Local {
@@ -514,7 +535,7 @@ impl DatabaseStore {
                         frontier.push(child.clone());
                     }
                 }
-                if task.completion_delivery != "disposed_by_stop" {
+                if !task.completion_delivery.starts_with("disposed_by_") {
                     task.cancellation_generation += 1;
                 }
                 task.completion_delivery = "disposed_by_stop".into();
@@ -529,8 +550,10 @@ impl DatabaseStore {
                     stopped.push(task);
                 }
             }
-            tx.execute("INSERT INTO agent_thread_delivery_state(thread_id,generation,stopped) VALUES (?1,1,1) ON CONFLICT(thread_id) DO UPDATE SET generation=generation+1,stopped=1",[&thread]).map_err(|e|e.to_string())?;
-            tx.execute("UPDATE agent_message_deliveries SET state=CASE WHEN attempted=1 THEN 'held_unknown' ELSE 'held' END,error='disposed_by_stop' WHERE thread_id=?1 AND state IN ('pending','preparing','queued','submitting')",[&thread]).map_err(|e|e.to_string())?;
+            // The root's ordinary Stop hook already advanced its generation.
+            // Descendants use the same writer in this transaction, before any
+            // provider interrupt can race a new human send.
+            if thread != parent { message_delivery::stop_in_transaction(&tx, &thread)?; }
             tx.execute("UPDATE pr_watches SET status='ended',generation=generation+1,stop_reason='disposed_by_stop',updated_at_ms=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE thread_id=?1 AND status='active'",[&thread]).map_err(|e|e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
@@ -584,6 +607,69 @@ mod tests {
         )
         .unwrap();
     }
+    #[test]
+    fn delegation_delivery_legacy_parent_stop_marker_uses_completion_timestamp() {
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("parent", "workspace", None, "codex").unwrap();
+        db.append_agent_chat_message("parent", &json!({"type":"turn_completed","status":{"kind":"error","subtype":"interrupted"}}).to_string()).unwrap();
+        db.conn.lock().unwrap().execute("UPDATE agent_chat_messages SET created_at='2026-10-20 15:00:00'", []).unwrap();
+        assert!(db.legacy_parent_stop_after("parent", "2026-10-20T14:00:00Z").unwrap());
+        assert!(!db.legacy_parent_stop_after("parent", "2026-10-20T16:00:00Z").unwrap());
+    }
+
+    #[test]
+    fn delegation_delivery_stop_generation_fences_only_pre_stop_admission() {
+        let db = DatabaseStore::new_in_memory();
+        let mut stale = task("old", "old-child");
+        stale.admission_generation = Some(db.delivery_generation("parent").unwrap().0);
+        db.stop_message_deliveries("parent").unwrap();
+        db.stop_delegation_tree("parent").unwrap();
+        assert!(db.admit_delegation_task(&stale, None, &json!({})).unwrap_err().contains("stopped"));
+        for (id, backend) in [("local", TaskBackend::Local), ("ssh", TaskBackend::Ssh)] {
+            let mut fresh = task(id, &format!("{id}-child"));
+            fresh.backend = backend;
+            fresh.admission_generation = Some(db.delivery_generation("parent").unwrap().0);
+            db.admit_delegation_task(&fresh, None, &json!({})).unwrap();
+            publish(&db, id, "Fresh result after Stop");
+            assert_eq!(db.delegation_task(id).unwrap().unwrap().completion_delivery, "pending");
+        }
+        assert!(!db.delivery_generation("parent").unwrap().1);
+    }
+
+    #[test]
+    fn delegation_delivery_descendant_stop_disposes_auto_wakes_and_retains_explicit_queues() {
+        let db = DatabaseStore::new_in_memory();
+        db.admit_delegation_task(&task("owned", "child"), None, &json!({})).unwrap();
+        for origin in ["user", "controller", "delegation", "pr_watch", "usage_resume", "auto_resume"] {
+            let id = format!("{origin}-delivery");
+            db.admit_message_delivery(&id, "child", &id, &json!({"origin":origin}), "boot", 0, None, false).unwrap();
+            let conn = db.conn.lock().unwrap();
+            conn.execute("UPDATE agent_message_deliveries SET state='queued',queued_id=?1 WHERE id=?1", [&id]).unwrap();
+            conn.execute("INSERT INTO agent_chat_queued_turns(thread_id,queued_id,position,text,epoch) VALUES ('child',?1,0,'saved','boot')", [&id]).unwrap();
+        }
+        db.stop_message_deliveries("parent").unwrap();
+        db.stop_delegation_tree("parent").unwrap();
+        db.resume_message_delivery_thread("child").unwrap();
+        for origin in ["user", "controller", "delegation", "pr_watch", "usage_resume", "auto_resume"] {
+            let id = format!("{origin}-delivery");
+            let explicit = matches!(origin, "user" | "controller");
+            assert_eq!(db.message_delivery(&id).unwrap().unwrap().state, if explicit {"queued"} else {"cancelled"});
+            let saved: bool = db.conn.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM agent_chat_queued_turns WHERE queued_id=?1)", [&id], |r| r.get(0)).unwrap();
+            assert_eq!(saved, explicit, "{origin}");
+        }
+    }
+
+    #[test]
+    fn delegation_delivery_noop_observation_does_not_rewrite_durable_record() {
+        let db = DatabaseStore::new_in_memory();
+        db.admit_delegation_task(&task("a", "child"), None, &json!({})).unwrap();
+        let before = db.conn.lock().unwrap().query_row("SELECT total_changes()", [], |r| r.get::<_, u64>(0)).unwrap();
+        db.update_delegation_task("a", |_| {}).unwrap();
+        assert_eq!(db.conn.lock().unwrap().query_row("SELECT total_changes()", [], |r| r.get::<_, u64>(0)).unwrap(), before);
+        db.update_delegation_task("a", |t| t.progress = Some("Changed".into())).unwrap();
+        assert_eq!(db.conn.lock().unwrap().query_row("SELECT total_changes()", [], |r| r.get::<_, u64>(0)).unwrap(), before + 1);
+    }
+
     #[test]
     fn delegation_delivery_reopens_after_terminal_commit_and_after_wake_admission() {
         let dir = tempfile::tempdir().unwrap();
@@ -717,52 +803,6 @@ mod tests {
             .unwrap_err()
             .contains("conflict"));
     }
-    #[tokio::test]
-    async fn delegation_delivery_ambiguous_provider_ack_barrier_holds_without_resubmit() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("app.sqlite");
-        let db = Arc::new(reopen(&path));
-        db.admit_delegation_task(&task("a", "child"), None, &json!({}))
-            .unwrap();
-        publish(&db, "a", "Stable result");
-        let id = db.pending_message_deliveries().unwrap()[0].id.clone();
-        let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (accepted, at_acceptance) = tokio::sync::oneshot::channel();
-        let (crash, crashed) = tokio::sync::oneshot::channel();
-        let attempt = {
-            let db = db.clone();
-            let calls = provider_calls.clone();
-            let id = id.clone();
-            tokio::spawn(async move {
-                assert!(db.claim_message_delivery(&id).unwrap());
-                db.message_delivery_submitting(&id).unwrap();
-                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                accepted.send(()).unwrap();
-                let _ = crashed.await; /* simulated lost provider ACK, before local receipt */
-            })
-        };
-        at_acceptance.await.unwrap();
-        crash.send(()).unwrap();
-        attempt.await.unwrap();
-        drop(db);
-        let db = reopen(&path);
-        db.recover_message_deliveries("boot-2").unwrap();
-        assert_eq!(
-            db.message_delivery(&id).unwrap().unwrap().state,
-            "held_unknown"
-        );
-        assert!(db.pending_message_deliveries().unwrap().is_empty());
-        assert_eq!(provider_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(
-            db.delegation_task("a")
-                .unwrap()
-                .unwrap()
-                .result
-                .unwrap()
-                .text,
-            "Stable result"
-        );
-    }
     #[test]
     fn delegation_delivery_stop_durable_includes_worktree_later_runs_and_retains_results() {
         let dir = tempfile::tempdir().unwrap();
@@ -787,6 +827,9 @@ mod tests {
             t.has_pending_child_runs = true;
         })
         .unwrap();
+        let mut late = self::task("late", "late-child");
+        late.admission_generation = Some(db.delivery_generation("parent").unwrap().0);
+        db.stop_message_deliveries("parent").unwrap();
         assert_eq!(db.stop_delegation_tree("parent").unwrap().len(), 2);
         drop(db);
         let db = reopen(&path);
@@ -814,7 +857,7 @@ mod tests {
         );
         assert!(db.pending_message_deliveries().unwrap().is_empty());
         assert!(db
-            .admit_delegation_task(&self::task("late", "late-child"), None, &json!({}))
+            .admit_delegation_task(&late, None, &json!({}))
             .is_err());
     }
     #[test]

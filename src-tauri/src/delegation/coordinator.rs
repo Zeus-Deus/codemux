@@ -298,7 +298,10 @@ pub fn install<R: Runtime>(handle: &AppHandle<R>) -> Result<(), String> {
         .join(crate::APP_DIR_NAME)
         .join("delegation");
     let store = Arc::new(Journal::open(&root)?);
-    store.recover_deliveries()?;
+    store.recover_deliveries_with_stop_evidence(|task| {
+        handle.state::<crate::database::DatabaseStore>().legacy_parent_stop_after(
+            &task.parent_thread_id, task.remote.as_ref().map(|r| r.updated_at.as_str()).unwrap_or(&task.updated_at))
+    })?;
     handle.manage(store.clone());
     handle.manage(Coordinator::new(Arc::new(SshTransport)));
     let callback_handle = handle.clone();
@@ -308,8 +311,15 @@ pub fn install<R: Runtime>(handle: &AppHandle<R>) -> Result<(), String> {
             let handle = callback_handle.clone();
             Box::pin(async move { app::native_call(handle, actor, name, args).await })
         }));
+    restore_tasks(handle, &store)?;
+    handle.state::<Coordinator>().start_maintenance(handle.clone())?;
+    Ok(())
+}
+fn restore_tasks<R: Runtime>(handle: &AppHandle<R>, store: &Journal) -> Result<(), String> {
     for task in store.tasks()? {
-        super::canonical::ingest(handle,&store,&task)?;
+        if let Err(error) = super::canonical::ingest(handle,&store,&task) {
+            log::error!("SSH task {} import failed; journal retained for repair: {error}", task.id);
+        }
         if !task.status.is_terminal()
             || task.connection_error.is_some()
             || store.tail_pending(&task.id)?
@@ -317,9 +327,31 @@ pub fn install<R: Runtime>(handle: &AppHandle<R>) -> Result<(), String> {
             app::start(handle, &task.id);
         }
     }
-    handle.state::<Coordinator>().start_maintenance(handle.clone())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    #[test]
+    fn delegation_delivery_startup_isolates_one_failed_ssh_import() {
+        let app = tauri::test::mock_app();
+        let db = crate::database::DatabaseStore::new_in_memory();
+        let dir = tempfile::tempdir().unwrap(); let store = Journal::open(dir.path()).unwrap();
+        let (parent, grant, mut input) = super::super::tests::fixture();
+        db.upsert_agent_chat_session(&parent.thread_id, &parent.workspace_id, None, "codex").unwrap();
+        app.manage(db); store.put_grant(&parent.workspace_id, &grant).unwrap();
+        let bad = store.admit(&parent, &grant, "checkout", &input).unwrap();
+        input.client_request_id = "good".into();
+        let good = store.admit(&parent, &grant, "checkout", &input).unwrap();
+        for task in [&bad, &good] { store.apply_remote(&task.id, &super::super::tests::remote(task, crate::remote_task_protocol::TaskStatus::Completed)).unwrap(); }
+        store.conn.lock().unwrap().execute_batch(&format!("CREATE TRIGGER fail_one_import BEFORE INSERT ON canonical_result_imports WHEN NEW.task='{}' BEGIN SELECT RAISE(ABORT,'fixture import failure'); END;", bad.id)).unwrap();
+        assert!(super::super::canonical::ingest(app.handle(), &store, &store.task(&bad.id).unwrap()).is_err());
+        restore_tasks(app.handle(), &store).unwrap();
+        assert!(app.state::<crate::database::DatabaseStore>().delegation_task(&format!("ssh:{}", good.id)).unwrap().unwrap().result.is_some());
+    }
+}
+
 pub async fn wake<R: Runtime>(handle: &AppHandle<R>, id: &str) -> Result<(), String> {
     if let Some(coordinator) = handle.try_state::<Coordinator>() {
         let app = handle.clone(); let task_id = id.to_owned();

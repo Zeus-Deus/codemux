@@ -256,10 +256,7 @@ impl DatabaseStore {
     pub fn stop_message_deliveries(&self, thread: &str) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute("INSERT INTO agent_thread_delivery_state (thread_id,generation,stopped) VALUES (?1,1,0) ON CONFLICT(thread_id) DO UPDATE SET generation=generation+1,stopped=0",[thread]).map_err(|e|e.to_string())?;
-        tx.execute("UPDATE agent_message_deliveries SET state=CASE WHEN attempted=1 THEN CASE WHEN json_extract(payload,'$.origin')='user' THEN 'rejected' ELSE 'held_unknown' END WHEN json_extract(payload,'$.origin') IN ('user','controller') THEN 'held' ELSE 'cancelled' END,hold_reason='stop',error='Thread stopped; explicit messages held and automatic wakes disposed' WHERE thread_id=?1 AND state IN ('pending','preparing','queued','submitting')",[thread]).map_err(|e|e.to_string())?;
-        tx.execute("UPDATE agent_control_operations SET state=CASE (SELECT state FROM agent_message_deliveries WHERE id=delivery_id) WHEN 'cancelled' THEN 'failed' WHEN 'rejected' THEN 'failed' ELSE 'needs_attention' END,dispatch_disposition=(SELECT state FROM agent_message_deliveries WHERE id=delivery_id),error=json_object('code','delivery_held','message','Thread stopped') WHERE delivery_id IN (SELECT id FROM agent_message_deliveries WHERE thread_id=?1 AND state IN ('held','held_unknown','cancelled','rejected'))",[thread]).map_err(|e|e.to_string())?;
-        retire_automatic_queues(&tx, Some(thread))?;
+        stop_in_transaction(&tx, thread)?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -379,7 +376,7 @@ impl DatabaseStore {
             error=CASE WHEN (SELECT error FROM agent_message_deliveries WHERE id=?1) IS NULL THEN NULL ELSE json_object('code',(SELECT state FROM agent_message_deliveries WHERE id=?1),'message',(SELECT error FROM agent_message_deliveries WHERE id=?1)) END,
             updated_at=datetime('now') WHERE delivery_id=?1",
             params![id]).map_err(|e|e.to_string())?;
-        tx.execute("UPDATE agent_delegation_tasks SET record=json_set(record,'$.completion_delivery',CASE (SELECT state FROM agent_message_deliveries WHERE id=?1) WHEN 'accepted' THEN 'delivered' ELSE (SELECT state FROM agent_message_deliveries WHERE id=?1) END,'$.delivered_at',CASE WHEN (SELECT state FROM agent_message_deliveries WHERE id=?1)='accepted' THEN COALESCE(json_extract(record,'$.delivered_at'),CAST(unixepoch('subsec')*1000 AS INTEGER)) ELSE json_extract(record,'$.delivered_at') END) WHERE task_id IN (SELECT task_id FROM agent_message_delivery_results WHERE delivery_id=?1) AND json_extract(record,'$.completion_delivery') NOT IN ('acknowledged','disposed_by_stop')",[id]).map_err(|e|e.to_string())?;
+        tx.execute("UPDATE agent_delegation_tasks SET record=json_set(record,'$.completion_delivery',CASE (SELECT state FROM agent_message_deliveries WHERE id=?1) WHEN 'accepted' THEN 'delivered' ELSE (SELECT state FROM agent_message_deliveries WHERE id=?1) END,'$.delivered_at',CASE WHEN (SELECT state FROM agent_message_deliveries WHERE id=?1)='accepted' THEN COALESCE(json_extract(record,'$.delivered_at'),CAST(unixepoch('subsec')*1000 AS INTEGER)) ELSE json_extract(record,'$.delivered_at') END) WHERE task_id IN (SELECT task_id FROM agent_message_delivery_results WHERE delivery_id=?1) AND json_extract(record,'$.completion_delivery') NOT IN ('acknowledged','disposed_by_stop','disposed_by_close')",[id]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
     pub fn confirm_message_delivery_turn(&self, thread: &str, turn: &str) -> Result<(), String> {
@@ -465,6 +462,15 @@ impl DeliveryRecord {
         !self.attempted && !self.origin_notified && self.queued_id.is_none()
             && matches!(self.state.as_str(), "held" | "rejected")
     }
+}
+
+/// The sole Stop writer, shared by recursive task cancellation.
+pub(super) fn stop_in_transaction(conn: &Connection, thread: &str) -> Result<(), String> {
+        conn.execute("INSERT INTO agent_thread_delivery_state (thread_id,generation,stopped) VALUES (?1,1,0) ON CONFLICT(thread_id) DO UPDATE SET generation=generation+1,stopped=0",[thread]).map_err(|e|e.to_string())?;
+        conn.execute("UPDATE agent_message_deliveries SET state=CASE WHEN attempted=1 THEN CASE WHEN json_extract(payload,'$.origin')='user' THEN 'rejected' ELSE 'held_unknown' END WHEN json_extract(payload,'$.origin') IN ('user','controller') THEN 'held' ELSE 'cancelled' END,hold_reason='stop',error='Thread stopped; explicit messages held and automatic wakes disposed' WHERE thread_id=?1 AND state IN ('pending','preparing','queued','submitting')",[thread]).map_err(|e|e.to_string())?;
+        conn.execute("UPDATE agent_control_operations SET state=CASE (SELECT state FROM agent_message_deliveries WHERE id=delivery_id) WHEN 'cancelled' THEN 'failed' WHEN 'rejected' THEN 'failed' ELSE 'needs_attention' END,dispatch_disposition=(SELECT state FROM agent_message_deliveries WHERE id=delivery_id),error=json_object('code','delivery_held','message','Thread stopped') WHERE delivery_id IN (SELECT id FROM agent_message_deliveries WHERE thread_id=?1 AND state IN ('held','held_unknown','cancelled','rejected'))",[thread]).map_err(|e|e.to_string())?;
+        retire_automatic_queues(conn, Some(thread))?;
+        Ok(())
 }
 
 /// Retire only automatic wake queue ownership, atomically with its journal
