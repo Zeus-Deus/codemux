@@ -44,7 +44,7 @@ async fn review_l3_native_stop_wakes_cold_hermes_profile_operation_wait() {
     let held_by_a = runtime.operation.lock().await;
     let handle = app.handle().clone();
     let send = tokio::spawn(async move {
-        agent_chat::agent_chat_send_turn(handle,ProviderKind::Hermes,
+        agent_chat::send_desktop_turn(handle,ProviderKind::Hermes,
             serde_json::from_value(json!({"thread_id":"cold-hermes-b","text":"Never dispatch","model_override":null})).unwrap()).await
     });
     tokio::time::timeout(Duration::from_secs(2),runtime.fixture_start_wait.notified()).await.unwrap();
@@ -83,9 +83,12 @@ impl crate::agent_provider::types::TurnDispatchCheckpoint for ReviewDispatchAuth
 }
 
 async fn review_pump_fixture() -> (tempfile::TempDir, HermesProvider, Arc<Runtime>, Arc<Chat>, tokio::task::JoinHandle<()>) {
+    review_pump_fixture_with_binary(None).await
+}
+async fn review_pump_fixture_with_binary(binary: Option<std::path::PathBuf>) -> (tempfile::TempDir, HermesProvider, Arc<Runtime>, Arc<Chat>, tokio::task::JoinHandle<()>) {
     let root = tempfile::tempdir().unwrap();
     // Launch only the compiled synthetic ACP peer, never the official Hermes CLI.
-    let binary = std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from)
+    let binary = binary.or_else(||std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from))
         .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
     assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
     std::fs::write(root.path().join("config.yaml"), "model: {provider: custom}\n").unwrap();
@@ -172,8 +175,12 @@ async fn review_r2_transport_failure_remains_chat_fatal_and_cancels_followup() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_r2_interrupt_cancels_real_prompt_and_queue_but_allows_fresh_native_work() {
-    let (_root, provider, runtime, _chat, task) = review_pump_fixture().await;
+async fn orchestration_message_hermes_stop_holds_queue_but_allows_fresh_native_work() {
+    use std::os::unix::fs::PermissionsExt;
+    let peer=tempfile::tempdir().unwrap();let binary=peer.path().join("peer.py");
+    std::fs::write(&binary,include_str!("../../../tests/helpers/agent_control_acp_peer.py")).unwrap();
+    std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_root, provider, runtime, _chat, task) = review_pump_fixture_with_binary(Some(binary)).await;
     let mut rx=provider.inner.events.subscribe();
     runtime.queue.lock().await.running=true;
     provider.send_turn(turn("thread", "review-hold")).await.unwrap();
@@ -186,7 +193,8 @@ async fn review_r2_interrupt_cancels_real_prompt_and_queue_but_allows_fresh_nati
     provider.interrupt_turn(ThreadId("thread".into()), None).await.unwrap();
     tokio::time::timeout(Duration::from_secs(3), pump).await.unwrap().unwrap();
     let mut cancelled=vec![]; while let Ok(e)=rx.try_recv() { cancelled.push(e); }
-    assert!(cancelled.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnCancelled {queued_id, ..} if queued_id == &q2)));
+    assert!(!cancelled.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnCancelled {queued_id, ..} if queued_id == &q2)));
+    assert!(runtime.queue.lock().await.jobs.iter().any(|job|job.id == q2));
     assert!(!cancelled.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnDispatched {queued_id, ..} if queued_id == &q2)));
     assert!(cancelled.iter().any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted {status:TurnStatus::Error {subtype, ..}, ..} if subtype == "cancelled")));
     assert!(provider.has_session(&ThreadId("thread".into())).await);

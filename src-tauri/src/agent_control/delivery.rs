@@ -7,7 +7,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 #[derive(Clone)]
 pub struct SendContext {
@@ -18,6 +18,7 @@ pub struct SendContext {
     pub generation: Option<u64>,
     /// An already-admitted worker owns this claim, rather than claiming again.
     pub claimed: bool,
+    pub release_queue: bool,
     pub(crate) pr_watch: Option<PrWatchDelivery>,
 }
 impl SendContext {
@@ -43,6 +44,7 @@ impl SendContext {
             delivery_id: None,
             generation: None,
             claimed: false,
+            release_queue: human,
             pr_watch: None,
         }
     }
@@ -102,6 +104,9 @@ pub(crate) fn deferred_acceptance(provider: ProviderKind) -> bool {
 pub(crate) fn notify() {
     wake().notify_one();
 }
+pub(crate) fn changed<R: Runtime>(app: &AppHandle<R>, thread: &str) {
+    let _ = app.emit("agent_chat_delivery_changed", thread);
+}
 fn wake() -> &'static tokio::sync::Notify {
     static WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
     WAKE.get_or_init(Default::default)
@@ -142,6 +147,7 @@ pub(crate) async fn dispatch<R: Runtime>(
     if !db.claim_message_delivery(&row.id).unwrap_or(false) {
         return;
     }
+    let _changed = DeliveryChange { app, thread: &row.thread_id };
     let row = match db.message_delivery(&row.id) {
         Ok(Some(row)) => row,
         _ => return,
@@ -197,14 +203,24 @@ pub(crate) async fn dispatch<R: Runtime>(
         delivery_id: Some(row.id.clone()),
         generation: Some(row.generation),
         claimed: true,
+        release_queue: false,
         pr_watch: payload.pr_watch,
     };
     if let Err(error) =
         agent_chat::send_turn_with_context(app.clone(), payload.provider, payload.input, context)
             .await
     {
-        log::warn!("Message delivery {}: {error}", row.id);
+        if db.message_delivery(&row.id).ok().flatten().is_some_and(|row|row.state == "cancelled") {
+            log::debug!("Disposed message delivery {}: {error}", row.id);
+        } else {
+            log::warn!("Message delivery {}: {error}", row.id);
+        }
     }
+}
+
+struct DeliveryChange<'a, R: Runtime> { app: &'a AppHandle<R>, thread: &'a str }
+impl<R: Runtime> Drop for DeliveryChange<'_, R> {
+    fn drop(&mut self) { changed(self.app, self.thread); }
 }
 
 pub(crate) struct DeliveryCheckpoint<R: Runtime> {
@@ -213,6 +229,7 @@ pub(crate) struct DeliveryCheckpoint<R: Runtime> {
     pub thread: String,
     pub provider: ProviderKind,
     pub inner: Option<Arc<dyn TurnDispatchCheckpoint>>,
+    pub release_queue: bool,
 }
 impl<R: Runtime> std::fmt::Debug for DeliveryCheckpoint<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -221,6 +238,16 @@ impl<R: Runtime> std::fmt::Debug for DeliveryCheckpoint<R> {
 }
 #[async_trait::async_trait]
 impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
+    fn releases_queue_hold(&self) -> bool { self.release_queue }
+    fn queued_delivery_state(&self) -> crate::agent_provider::types::QueuedDeliveryState {
+        use crate::agent_provider::types::QueuedDeliveryState::*;
+        match self.app.state::<DatabaseStore>().message_delivery(&self.id) {
+            Ok(Some(row)) if row.state == "cancelled" => Disposed,
+            Ok(Some(row)) if row.state == "held" || row.state == "held_unknown" => Held,
+            Ok(Some(_)) => Ready,
+            _ => Held,
+        }
+    }
     fn authorize_dispatch(&self) -> Result<(), crate::agent_provider::ProviderError> {
         if let Some(inner) = &self.inner {
             inner.authorize_dispatch()?;
@@ -281,6 +308,7 @@ impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
 }
 
 pub(crate) fn warn_held<R: Runtime>(app: &AppHandle<R>, thread: &str, error: &str) {
+    changed(app, thread);
     if app.state::<DatabaseStore>().thread_message_delivery_attention(thread).is_ok_and(|rows| rows.is_empty()) { return; }
     agent_chat::forward_event(
         app,

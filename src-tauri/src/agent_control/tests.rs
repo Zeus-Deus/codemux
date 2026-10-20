@@ -330,7 +330,7 @@ async fn mario_r3_queue_boundary(mode: &str) {
         env:Some(std::collections::HashMap::from([("CODEMUX_AGENT_CONTROL_FIXTURE_ROOT".into(),rig.to_string_lossy().into_owned())])),
         workspace_id:None,remote:None,extra:serde_json::Value::Null,recorded_usage_baseline:None,
     }, Some(thread.into())).await.unwrap();
-    let first = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, serde_json::from_value(json!({
+    let first = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, serde_json::from_value(json!({
         "thread_id":thread,"text":"review-hold","delivery":"queue","client_nonce":"mario-parent-nonce",
     })).unwrap()).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -511,7 +511,7 @@ async fn recovery_opencode_boundary(complete_b: bool) {
     let channel = mario_channel(app.handle(),thread);
     let mut stream = provider.event_stream();let bridge_app = app.handle().clone();
     let bridge = tokio::spawn(async move {while let Some(event) = stream.next().await {agent_chat::forward_event(&bridge_app,event);}});
-    let a = agent_chat::agent_chat_send_turn(app.handle().clone(),ProviderKind::OpenCode,serde_json::from_value(json!({"thread_id":thread,"text":"recovery-a","client_nonce":"recovery-a-nonce"})).unwrap()).await.unwrap();
+    let a = agent_chat::send_desktop_turn(app.handle().clone(),ProviderKind::OpenCode,serde_json::from_value(json!({"thread_id":thread,"text":"recovery-a","client_nonce":"recovery-a-nonce"})).unwrap()).await.unwrap();
     assert!(provider.turn_active(&ThreadId(thread.into())).await);
     let receipt = execute(app.handle(),&ControlCaller::trusted(),"thread_send",json!({"workspace_id":workspace,"thread_id":thread,"client_request_id":"recovery-b-nonce","message":"recovery-b","delivery":"queue"})).await.unwrap();
     let accepted = settle_operation(&app,&receipt).await;
@@ -584,7 +584,7 @@ async fn review5479417968_immediate_envelope_and_late_steering_remain_one_comple
     let channel = mario_channel(app.handle(),thread);
     let (entered,release) = provider.hold_next_send();
     let send_app = app.handle().clone();let send_thread=thread.to_string();
-    let send = tokio::spawn(async move {agent_chat::agent_chat_send_turn(send_app,ProviderKind::Claude,serde_json::from_value(json!({"thread_id":send_thread,"text":"immediate visible","client_nonce":"immediate-nonce"})).unwrap()).await.unwrap()});
+    let send = tokio::spawn(async move {agent_chat::send_desktop_turn(send_app,ProviderKind::Claude,serde_json::from_value(json!({"thread_id":send_thread,"text":"immediate visible","client_nonce":"immediate-nonce"})).unwrap()).await.unwrap()});
     tokio::time::timeout(std::time::Duration::from_secs(5),entered.notified()).await.unwrap();
     // Scheduling-only synthetic completion before the mock send's ACK. The
     // real command must still correlate its late visible envelope by ID.
@@ -1194,10 +1194,10 @@ async fn orchestration_message_only_interactive_sources_reset_human_activity() {
     for source in ["desktop","web","phone"] {
         db.upsert_agent_chat_usage_resume(thread,"claude",Some(9999999999999)).unwrap();
         let command=serde_json::from_value(json!({"thread_id":thread,"text":format!("Human {source}"),"client_nonce":format!("human-{source}"),"input_source":source})).unwrap();
-        crate::commands::agent_chat::agent_chat_send_turn(app.handle().clone(),crate::agent_provider::ProviderKind::Claude,command).await.unwrap();
+        crate::commands::agent_chat::send_desktop_turn(app.handle().clone(),crate::agent_provider::ProviderKind::Claude,command).await.unwrap();
         assert!(db.get_agent_chat_usage_resume(thread).is_none());
         let row=db.list_agent_chat_messages(thread).into_iter().filter_map(|p|serde_json::from_str::<serde_json::Value>(&p).ok()).find(|p|p["message_id"]==format!("human-{source}")).unwrap();
-        assert_eq!(row["created_by"],"user");assert_eq!(row["creation_source"],source);
+        assert_eq!(row["created_by"],"user");assert_eq!(row["creation_source"],"desktop","client input_source cannot override desktop IPC");
     }
 }
 
@@ -1212,7 +1212,7 @@ async fn orchestration_message_stop_queue_release_rearms_retained_checkpoint() {
         let db=app.state::<crate::database::DatabaseStore>();
         db.admit_message_delivery("queued-b",thread,"b",&json!({"origin":"user"}),"epoch",0,None,true).unwrap();
         db.finish_message_delivery("queued-b","queued",Some(&json!({"queued_id":"b"})),None).unwrap();
-        let checkpoint=super::delivery::DeliveryCheckpoint {app:app.handle().clone(),id:"queued-b".into(),thread:thread.into(),provider:ProviderKind::Claude,inner:None};
+        let checkpoint=super::delivery::DeliveryCheckpoint {app:app.handle().clone(),id:"queued-b".into(),thread:thread.into(),provider:ProviderKind::Claude,inner:None,release_queue:false};
         db.stop_message_deliveries(thread).unwrap();
         assert!(checkpoint.authorize_dispatch().is_err());
         if send_now {
@@ -1220,7 +1220,7 @@ async fn orchestration_message_stop_queue_release_rearms_retained_checkpoint() {
             // re-arm before handing control to the provider's release path.
             let _=crate::commands::agent_chat::agent_chat_send_queued_turn_now(app.handle().clone(),ProviderKind::Claude,ThreadId(thread.into()),"b".into(),None).await;
         } else {
-            crate::commands::agent_chat::agent_chat_send_turn(app.handle().clone(),ProviderKind::Claude,serde_json::from_value(json!({"thread_id":thread,"text":"C","client_nonce":"c"})).unwrap()).await.unwrap();
+            crate::commands::agent_chat::send_desktop_turn(app.handle().clone(),ProviderKind::Claude,serde_json::from_value(json!({"thread_id":thread,"text":"C","client_nonce":"c"})).unwrap()).await.unwrap();
         }
         checkpoint.authorize_dispatch().unwrap();
         db.finish_message_delivery("queued-b","accepted",Some(&json!({"turn_id":"b-run"})),None).unwrap();
@@ -1295,7 +1295,7 @@ async fn orchestration_message_idle_nonsteering_provider_starts_but_busy_steer_i
     app.state::<crate::database::DatabaseStore>().upsert_agent_chat_session(thread,&workspace,None,"cursor").unwrap();
     for busy in [false,true] {
         provider.set_turn_active(thread,busy);
-        let result=crate::commands::agent_chat::agent_chat_send_turn(app.handle().clone(),ProviderKind::Cursor,serde_json::from_value(json!({"thread_id":thread,"text":"brief","delivery":"steer","client_nonce":format!("steer-{busy}")})).unwrap()).await;
+        let result=crate::commands::agent_chat::send_desktop_turn(app.handle().clone(),ProviderKind::Cursor,serde_json::from_value(json!({"thread_id":thread,"text":"brief","delivery":"steer","client_nonce":format!("steer-{busy}")})).unwrap()).await;
         assert_eq!(result.is_ok(),!busy,"{result:?}");
     }
 }
@@ -1335,7 +1335,7 @@ async fn orchestration_message_real_acp_configuration_failure_is_definitely_befo
     crate::commands::agent_chat::agent_chat_start_session(app.handle().clone(),pane,ProviderKind::Cursor,StartSessionInput {
         thread_id:ThreadId(thread.into()),cwd:root.path().canonicalize().unwrap(),model:None,resume_cursor:None,fresh_session:true,permission_mode:Some("ask".into()),effort:None,context_window:None,fast_mode:false,service_tier:None,additional_directories:vec![],env:Some(std::collections::HashMap::from([("CODEMUX_AGENT_CONTROL_FIXTURE_ROOT".into(),rig.to_string_lossy().into_owned())])),workspace_id:None,remote:None,extra:serde_json::Value::Null,recorded_usage_baseline:None,
     },Some(thread.into())).await.unwrap();
-    let result=crate::commands::agent_chat::agent_chat_send_turn(app.handle().clone(),ProviderKind::Cursor,serde_json::from_value(json!({"thread_id":thread,"text":"must not dispatch","model_override":"review-fatal","client_nonce":"config-failure"})).unwrap()).await;
+    let result=crate::commands::agent_chat::send_desktop_turn(app.handle().clone(),ProviderKind::Cursor,serde_json::from_value(json!({"thread_id":thread,"text":"must not dispatch","model_override":"review-fatal","client_nonce":"config-failure"})).unwrap()).await;
     assert!(result.is_err(),"{result:?}");
     let db=app.state::<crate::database::DatabaseStore>();
     let row=db.message_delivery_for_message(thread,"config-failure").unwrap().unwrap();
@@ -1391,4 +1391,79 @@ async fn orchestration_message_mock_adapter_aborts_checkpoint_on_rejection_and_l
         assert!(provider.send_turn(input).await.is_err());
         assert_eq!(checkpoint.aborts.load(std::sync::atomic::Ordering::SeqCst),1);
     }
+}
+
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_wait_includes_admitted_work_and_retry_backoff() {
+    let (app,_provider,_root,workspace)=fixture().await;
+    let launched=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"wait-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let launched=settle_operation(&app,&launched).await;let thread=launched["thread_id"].as_str().unwrap();
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.admit_message_delivery("admitted",thread,"admitted",&json!({"origin":"controller"}),"epoch",0,None,false).unwrap();
+    for state in ["pending","preparing","pending","submitting"] {
+        if state=="preparing" { assert!(db.claim_message_delivery("admitted").unwrap()); }
+        if state=="pending" && db.message_delivery("admitted").unwrap().unwrap().state=="preparing" { db.fail_message_delivery("admitted","transient pre-send failure").unwrap(); }
+        if state=="submitting" { db.claim_message_delivery("admitted").unwrap();db.message_delivery_submitting("admitted").unwrap(); }
+        let waited=execute(app.handle(),&ControlCaller::trusted(),"thread_wait",json!({"workspace_id":workspace,"thread_id":thread,"timeout_ms":1})).await.unwrap();
+        assert_eq!(waited["settled"],false,"{state}: {waited}");assert_eq!(waited["timed_out"],true);
+    }
+    db.finish_message_delivery("admitted","accepted",None,None).unwrap();
+    let waited=execute(app.handle(),&ControlCaller::trusted(),"thread_wait",json!({"workspace_id":workspace,"thread_id":thread,"timeout_ms":1})).await.unwrap();
+    assert_eq!(waited["settled"],true);
+}
+
+#[tokio::test]
+async fn orchestration_message_disposed_wake_emits_no_warning_or_draft_restoration() {
+    use crate::agent_provider::{ProviderRuntimeEvent,ThreadId};
+    let (app,_provider,_root,workspace)=fixture().await;
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_session("receiver",&workspace,None,"claude").unwrap();
+    let events=mario_channel(app.handle(),"receiver");
+    db.admit_message_delivery("wake","receiver","wake",&json!({"origin":"pr_watch"}),"epoch",0,None,true).unwrap();
+    db.finish_message_delivery("wake","queued",Some(&json!({"queued_id":"wake-queue"})),None).unwrap();
+    db.stop_message_deliveries("receiver").unwrap();
+    crate::commands::agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::QueuedTurnCancelled {thread_id:ThreadId("receiver".into()),queued_id:"wake-queue".into()});
+    let events=events.lock().unwrap();
+    assert!(events.iter().any(|e|e["event"]["type"]=="queued_turn_disposed"));
+    assert!(!events.iter().any(|e|matches!(e["event"]["type"].as_str(),Some("runtime_warning"|"queued_turn_cancelled"))));
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_real_acp_machine_send_cannot_release_stopped_explicit_queue() {
+    use crate::agent_provider::{AgentProvider,ProviderKind,StartSessionInput,ThreadId};
+    use std::os::unix::fs::PermissionsExt;
+    let peer=tempfile::tempdir().unwrap(); let binary=peer.path().join("peer.py");
+    std::fs::write(&binary,include_str!("../../tests/helpers/agent_control_acp_peer.py")).unwrap();
+    std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let rig=peer.path().join("rig");std::fs::create_dir(&rig).unwrap();
+    let provider=Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(crate::agent_provider::cursor::CursorProviderConfig {binary,event_channel_capacity:128,mcp_registry:None}));
+    let thread="acp-held-explicit";
+    let (app,root,_workspace,pane)=super::guard_tests::fixture(provider.clone(),thread).await;
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_cursor(provider.clone()).await;
+    crate::commands::agent_chat::agent_chat_start_session(app.handle().clone(),pane,ProviderKind::Cursor,StartSessionInput {
+        thread_id:ThreadId(thread.into()),cwd:root.path().canonicalize().unwrap(),model:None,resume_cursor:None,fresh_session:true,permission_mode:Some("ask".into()),effort:None,context_window:None,fast_mode:false,service_tier:None,additional_directories:vec![],env:Some(std::collections::HashMap::from([("CODEMUX_AGENT_CONTROL_FIXTURE_ROOT".into(),rig.to_string_lossy().into_owned())])),workspace_id:None,remote:None,extra:serde_json::Value::Null,recorded_usage_baseline:None,
+    },Some(thread.into())).await.unwrap();
+    let send=|text:&str|serde_json::from_value(json!({"thread_id":thread,"text":text,"client_nonce":text,"delivery":"queue"})).unwrap();
+    crate::commands::agent_chat::send_desktop_turn(app.handle().clone(),ProviderKind::Cursor,send("review-hold")).await.unwrap();
+    let b=crate::commands::agent_chat::send_desktop_turn(app.handle().clone(),ProviderKind::Cursor,send("held-B")).await.unwrap();
+    assert!(b.queued_id.is_some());
+    crate::commands::agent_chat::agent_chat_interrupt_turn(app.handle().clone(),ProviderKind::Cursor,ThreadId(thread.into()),None).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3),async {
+        while provider.turn_active(&ThreadId(thread.into())).await { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+    }).await.unwrap();
+    let db=app.state::<crate::database::DatabaseStore>();
+    assert_eq!(db.message_delivery_for_message(thread,"held-B").unwrap().unwrap().state,"held");
+    crate::commands::agent_chat::send_turn_with_context(app.handle().clone(),ProviderKind::Cursor,send("machine-C"),super::delivery::SendContext::controller(&ControlCaller::trusted())).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3),async {
+        while provider.turn_active(&ThreadId(thread.into())).await { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+    }).await.unwrap();
+    let b=db.message_delivery_for_message(thread,"held-B").unwrap().unwrap();
+    assert_eq!(b.state,"held");assert!(!b.attempted);
+    // A fresh human action re-arms B, which is still in the adapter queue.
+    crate::commands::agent_chat::send_desktop_turn(app.handle().clone(),ProviderKind::Cursor,send("human-D")).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3),async {
+        while !db.message_delivery_for_message(thread,"held-B").unwrap().unwrap().attempted { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+    }).await.unwrap();
+    provider.stop_session(ThreadId(thread.into())).await.unwrap();
 }

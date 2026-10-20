@@ -566,13 +566,13 @@ export function QueuedTurnsList({
                       ) : null}
                       <button
                         type="button"
-                        aria-label="Interrupt and send queued message"
-                        title="Stop current work and send this message"
+                        aria-label={streaming ? "Interrupt and send queued message" : "Send queued message now"}
+                        title={streaming ? "Stop current work and send this message" : "Send now"}
                         onClick={() => onInterrupt(queuedId)}
                         className={ACTION}
                       >
                         <CornerDownLeft className="size-3" aria-hidden />
-                        Interrupt
+                        {streaming ? "Interrupt" : "Send now"}
                       </button>
                     </>
                   )}

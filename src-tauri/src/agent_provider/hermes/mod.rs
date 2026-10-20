@@ -180,6 +180,7 @@ impl crate::agent_provider::queue_edit::QueueEntry for Job {
 struct Queue {
     jobs: VecDeque<Job>,
     running: bool,
+    held_threads: std::collections::HashSet<ThreadId>,
 }
 struct Runtime {
     #[cfg(test)]
@@ -681,7 +682,9 @@ impl Inner {
             let _guard = runtime.operation.lock().await;
             let job = {
                 let mut queue = runtime.queue.lock().await;
-                match queue.jobs.pop_front() {
+                let next = queue.jobs.iter().position(|job| !queue.held_threads.contains(&job.input.thread_id)
+                    && job.input.queued_delivery_state() != crate::agent_provider::types::QueuedDeliveryState::Held);
+                match next.and_then(|i|queue.jobs.remove(i)) {
                     Some(j) => j,
                     None => {
                         queue.running = false;
@@ -689,7 +692,7 @@ impl Inner {
                     }
                 }
             };
-            let chat = &job.chat;
+            let chat = job.chat.clone();
             let thread = job.input.thread_id.clone();
             let turn = TurnId(Uuid::new_v4().to_string());
             let mut dispatched = false;
@@ -697,6 +700,14 @@ impl Inner {
             {
                 let mut state = chat.state.lock().await;
                 if state.cancel_epoch != job.cancel_epoch {
+                    if job.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Held {
+                        let epoch = state.cancel_epoch;
+                        drop(state);
+                        let mut queue = runtime.queue.lock().await;
+                        queue.held_threads.insert(thread.clone());
+                        queue.jobs.push_front(Job { cancel_epoch: epoch, ..job });
+                        continue;
+                    }
                     self.emit(ProviderRuntimeEvent::QueuedTurnCancelled {
                         thread_id: thread.clone(),
                         queued_id: job.id.clone(),
@@ -718,6 +729,7 @@ impl Inner {
                 if let Some(checkpoint) = job.input.turn_checkpoint.as_ref() { checkpoint.prepare().await; }
                 if chat.state.lock().await.cancelled {
                     if let Some(checkpoint) = job.input.turn_checkpoint.as_ref() { checkpoint.abort().await; }
+                    rejected = job.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Held;
                     return Err(invalid("Hermes turn cancelled before dispatch"));
                 }
                 if let Some(checkpoint) = job.input.turn_checkpoint.as_ref() {
@@ -762,6 +774,15 @@ impl Inner {
                 // No prompt was written. Reject only this input, leaving real
                 // runtime errors intact and the profile pump free to continue.
                 state.active = None;
+                if job.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Held {
+                    let epoch = state.cancel_epoch;
+                    drop(state);
+                    let mut queue = runtime.queue.lock().await;
+                    queue.held_threads.insert(thread.clone());
+                    queue.jobs.push_front(Job { cancel_epoch: epoch, ..job });
+                    chat.finished.notify_waiters();
+                    continue;
+                }
                 self.emit(ProviderRuntimeEvent::QueuedTurnCancelled {
                     thread_id: thread.clone(), queued_id: job.id.clone(),
                 });
@@ -1266,6 +1287,7 @@ impl AgentProvider for HermesProvider {
         let id = Uuid::new_v4().to_string();
         let runtime = chat.runtime.clone();
         let mut queue = runtime.queue.lock().await;
+        let release = input.releases_queue_hold() && queue.held_threads.remove(&input.thread_id);
         let idle = chat.state.lock().await.active.is_none();
         self.inner.emit(ProviderRuntimeEvent::TurnQueued {
             provenance: Default::default(),
@@ -1277,17 +1299,14 @@ impl AgentProvider for HermesProvider {
                 .clone()
                 .unwrap_or_else(|| input.text.clone()),
         });
-        queue.jobs.push_back(Job {
-            id: id.clone(),
-            cancel_epoch,
-            chat,
-            input,
-        });
+        let job = Job { id: id.clone(), cancel_epoch, chat, input };
+        if release { queue.jobs.push_front(job); }
+        else { queue.jobs.push_back(job); }
         // A profile-wide queue can hold a chat with no active turn of its own.
         // Clear the composer's optimistic streaming state until actual dispatch.
         if idle {
             self.inner.emit(ProviderRuntimeEvent::SessionStateChanged {
-                thread_id: ThreadId(queue.jobs.back().unwrap().input.thread_id.0.clone()),
+                thread_id: if release { queue.jobs.front().unwrap().input.thread_id.clone() } else { queue.jobs.back().unwrap().input.thread_id.clone() },
                 status: SessionStatus::Ready,
             });
         }
@@ -1322,6 +1341,24 @@ impl AgentProvider for HermesProvider {
         } else {
             Ok(false)
         }
+    }
+    async fn send_queued_turn_now(&self, thread_id: ThreadId, queued_id: String) -> Result<(), ProviderError> {
+        let chat = self.chat(&thread_id).await?;
+        let runtime = chat.runtime.clone();
+        let active = chat.state.lock().await.active.clone();
+        {
+            let mut queue = runtime.queue.lock().await;
+            let Some(index) = queue.jobs.iter().position(|job|job.id == queued_id && job.input.thread_id == thread_id) else { return Ok(()) };
+            let job = queue.jobs.remove(index).unwrap();
+            queue.jobs.push_front(job);
+            queue.held_threads.remove(&thread_id);
+            if !queue.running {
+                queue.running = true;
+                tokio::spawn(self.inner.clone().pump(runtime.clone()));
+            }
+        }
+        if let Some(active) = active { self.interrupt_turn(thread_id, Some(active)).await?; }
+        Ok(())
     }
     /// The queue is profile-wide; edits and moves stay within this chat.
     async fn edit_queued_turn(
@@ -1360,23 +1397,16 @@ impl AgentProvider for HermesProvider {
             return session.interrupt().await;
         }
         let chat = self.chat(&thread_id).await?;
-        if turn_id.is_none() {
-            let mut queue = chat.runtime.queue.lock().await;
-            queue.jobs.retain(|job| {
-                if job.input.thread_id != thread_id {
-                    return true;
-                }
-                self.inner.emit(ProviderRuntimeEvent::QueuedTurnCancelled {
-                    thread_id: thread_id.clone(),
-                    queued_id: job.id.clone(),
-                });
-                false
-            });
-        }
+        let mut queue = chat.runtime.queue.lock().await;
         let mut s = chat.state.lock().await;
         if turn_id.is_none() {
+            queue.held_threads.insert(thread_id.clone());
             s.cancel_epoch += 1;
+            for job in queue.jobs.iter_mut().filter(|job|job.input.thread_id == thread_id) {
+                job.cancel_epoch = s.cancel_epoch;
+            }
         }
+        drop(queue);
         if s.active.is_none() {
             self.inner.emit(ProviderRuntimeEvent::SessionStateChanged {
                 thread_id,

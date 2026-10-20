@@ -81,6 +81,11 @@ pub struct ProviderCapabilities {
     pub supports_conversation_rollback: bool,
 }
 
+/// A durable queue item may be held by Stop or disposed before its adapter
+/// notices. Neither condition is a provider dispatch failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuedDeliveryState { Ready, Held, Disposed }
+
 /// Lifecycle hook executed at the provider's actual dispatch boundary.
 /// Provider queues call this immediately before an accepted turn so queued
 /// prompts capture the state at dispatch, not when they were typed.
@@ -90,6 +95,9 @@ pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
     /// Plain Git snapshots have no caller; the native owner wraps controlled
     /// inputs with a live authority check regardless of checkpoint settings.
     fn authorize_dispatch(&self) -> Result<(), super::ProviderError> { Ok(()) }
+    /// Only an explicit human action releases the provider queue hold.
+    fn releases_queue_hold(&self) -> bool { true }
+    fn queued_delivery_state(&self) -> QueuedDeliveryState { QueuedDeliveryState::Ready }
     async fn prepare(&self);
     async fn commit(&self);
     async fn abort(&self);
@@ -322,6 +330,15 @@ pub struct SendTurnInput {
     /// In-process only. Never a serialized IPC capability.
     #[serde(skip)]
     pub dispatch_guard: Option<Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard>>,
+}
+
+impl SendTurnInput {
+    pub(crate) fn releases_queue_hold(&self) -> bool {
+        self.turn_checkpoint.as_ref().is_none_or(|c| c.releases_queue_hold())
+    }
+    pub(crate) fn queued_delivery_state(&self) -> QueuedDeliveryState {
+        self.turn_checkpoint.as_ref().map_or(QueuedDeliveryState::Ready, |c| c.queued_delivery_state())
+    }
 }
 
 // ---------------------------------------------------------------------------

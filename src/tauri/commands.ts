@@ -1833,7 +1833,7 @@ export const agentChatSendTurn = (
   input: AgentChatSendTurnInput,
 ) => invoke<TurnStartResult>("agent_chat_send_turn", {
   provider,
-  input: { ...input, input_source: input.input_source ?? (isRemoteClient() ? (window.matchMedia("(max-width: 767px)").matches ? "phone" : "web") : "desktop") },
+  input: { ...input, input_source: isRemoteClient() && window.matchMedia("(max-width: 767px)").matches ? "phone" : undefined },
 });
 
 /** Stage a pasted/attached image's raw bytes to a backend staging file,

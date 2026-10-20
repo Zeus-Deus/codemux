@@ -360,6 +360,10 @@ impl AcpSessionState {
 
     /// The next queued turn to dispatch, unless a user Stop holds the queue.
     fn next_queued(&mut self) -> Option<QueuedTurn> {
+        if self.queued.front().is_some_and(|q| q.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Held) {
+            self.queue_hold.hold();
+            return None;
+        }
         let front = self.queued.front().map(|queued| queued.id.as_str());
         if !self.queue_hold.admits(front) {
             return None;
@@ -910,7 +914,7 @@ impl AcpSession {
             };
             // Sent by hand while a Stop settles: it goes first and releases
             // the held queue behind it once it starts.
-            let first = state.queue_hold.goes_first();
+            let first = input.releases_queue_hold() && state.queue_hold.goes_first();
             if first {
                 state.queued.push_front(queued);
                 state.queue_hold.release_with(&queued_id);
@@ -936,7 +940,7 @@ impl AcpSession {
         state.active_turn = Some(self.dispatching_turn_id());
         let generation = state.claim_turn();
         // A message sent by hand goes first; the held queue follows it.
-        let was_held = state.queue_hold.take();
+        let was_held = input.releases_queue_hold() && state.queue_hold.take();
         drop(state);
         let outcome = match self.dispatch_turn(input, None, generation).await {
             Ok(turn_id) => Ok(SendOutcome::Started(turn_id)),
@@ -1193,7 +1197,7 @@ impl AcpSession {
             selected_prepare_test_schedule(&self.thread_id).await;
             checkpoint = queued.input.turn_checkpoint.clone();
             match self
-                .prepare_turn(queued.input, queued.dispatch.clone())
+                .prepare_turn(queued.input.clone(), queued.dispatch.clone())
                 .await
             {
                 Ok((next_turn_id, next_prompt)) => {
@@ -1201,6 +1205,17 @@ impl AcpSession {
                     turn_id = next_turn_id;
                     prompt = next_prompt;
                     break;
+                }
+                Err(PrepareTurnError::Rejected(_)) if queued.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Held => {
+                    // Stop can land after selection but before authorization.
+                    // Retain the input and saved ID without a cancellation event.
+                    let mut state = self.state.lock().await;
+                    state.selected_queued.take();
+                    state.release_turn();
+                    state.status = SessionStatus::Ready;
+                    state.queue_hold.hold();
+                    state.queued.push_front(QueuedTurn { dispatch: None, ..queued });
+                    return;
                 }
                 Err(PrepareTurnError::Rejected(_)) => {
                     self.cancel_selected_queued(&queued.id).await;

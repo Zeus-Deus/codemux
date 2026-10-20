@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { agentChatAcknowledgeDelivery, agentChatDeliveryAttention, agentChatRetryDelivery, type MessageDeliveryAttention } from "@/tauri/commands";
+import { onAgentChatDeliveryChanged } from "@/tauri/events";
 import { useTranscriptTopInset } from "./transcript-top-inset";
 import { InlineButton } from "@/components/ui/button";
 
@@ -18,8 +19,11 @@ export function DeliveryAttention({threadId}: {threadId: string}) {
     setRows([]);
     setError(null);
     refresh();
-    const timer = setInterval(refresh, 5000);
-    return () => { alive = false; clearInterval(timer); };
+    let unlisten: (() => void) | undefined;
+    void onAgentChatDeliveryChanged(changedThread => {
+      if (changedThread === threadId) refresh();
+    }).then(stop => { if (alive) { unlisten = stop; refresh(); } else stop(); }).catch(() => {});
+    return () => { alive = false; unlisten?.(); };
   }, [threadId]);
   const act = async (row: MessageDeliveryAttention, retry: boolean) => {
     try {

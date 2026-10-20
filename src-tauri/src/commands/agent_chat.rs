@@ -3349,17 +3349,29 @@ fn render_skill_invocations(
 /// reflects real turn order.
 #[tauri::command]
 pub async fn agent_chat_send_turn<R: Runtime>(
+    request: Request<'_>,
     app: AppHandle<R>,
     provider: ProviderKind,
     input: SendTurnCommandInput,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
+    let source = interactive_creation_source(request.headers().get("x-codemux-input-source").and_then(|v| v.to_str().ok()));
+    let mut context = crate::agent_control::delivery::SendContext::new(TurnOrigin::User);
+    context.provenance.creation_source = source;
+    send_turn_with_context(app, provider, input, context).await
+}
+
+fn interactive_creation_source(transport: Option<&str>) -> crate::agent_provider::message::CreationSource {
     use crate::agent_provider::message::CreationSource;
-    let mut context=crate::agent_control::delivery::SendContext::new(TurnOrigin::User);
-    context.provenance.creation_source=match input.input_source.unwrap_or(CreationSource::Desktop) {
-        source @ (CreationSource::Desktop|CreationSource::Web|CreationSource::Phone)=>source,
-        _=>return Err("Interactive sends require desktop, web or phone provenance".into()),
-    };
-    send_turn_with_context(app,provider,input,context).await
+    match transport {
+        Some("phone") => CreationSource::Phone,
+        Some("web") => CreationSource::Web,
+        _ => CreationSource::Desktop,
+    }
+}
+
+#[cfg(test)]
+pub async fn send_desktop_turn<R: Runtime>(app: AppHandle<R>, provider: ProviderKind, input: SendTurnCommandInput) -> Result<crate::agent_provider::TurnStartResult, String> {
+    send_turn_with_origin(app, provider, input, TurnOrigin::User).await
 }
 
 /// Who initiated a turn going through [`send_turn_with_origin`].
@@ -3544,6 +3556,7 @@ async fn send_turn_context_reporting<R: Runtime>(
             }
         }
     }
+    crate::agent_control::delivery::changed(&app, &input.thread_id.0);
     result
 }
 
@@ -3641,7 +3654,7 @@ async fn send_turn_internal<R: Runtime>(
         native_generation,
     )?;
     let db = app.state::<DatabaseStore>();
-    if human { db.resume_message_delivery_thread(&input.thread_id.0)?; }
+    if context.release_queue { db.resume_message_delivery_thread(&input.thread_id.0)?; }
     if let Err(error) = db.verify_delivery_generation(&input.thread_id.0,context.generation.unwrap_or_default()) {
         if let Some(id) = &context.delivery_id { db.finish_message_delivery(id,"held",None,Some(&error))?; }
         return Err(error);
@@ -3855,7 +3868,7 @@ async fn send_turn_internal<R: Runtime>(
         .or(turn_checkpoint);
     let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = Some(Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {
         app:app.clone(),id:context.delivery_id.clone().unwrap(),thread:input.thread_id.0.clone(),provider,
-        inner:turn_checkpoint,
+        inner:turn_checkpoint, release_queue:context.release_queue,
     }));
     let mut provenance = context.provenance.clone();
     let provider_input = SendTurnInput {
@@ -5045,6 +5058,12 @@ pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
     if let Some(control) = &control {
         control.verify(&app)?;
     }
+    if turn_id.is_none() {
+        for queued_id in app.state::<DatabaseStore>().disposed_delivery_queue_ids(&thread_id.0)? {
+            log::debug!("Disposing automatic queued wake {queued_id} after Stop");
+            impl_.cancel_queued_turn(thread_id.clone(), queued_id).await.map_err(provider_err)?;
+        }
+    }
     let reached = match impl_.interrupt_turn(thread_id.clone(), turn_id).await {
         Ok(()) => true,
         Err(ProviderError::SessionNotFound { .. }) | Err(ProviderError::SessionClosed { .. }) => {
@@ -5054,6 +5073,7 @@ pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
     };
     let tracker: State<'_, SubagentTracker> = app.state();
     tracker.settle_interrupted_turn(&thread_id.0);
+    crate::agent_control::delivery::changed(&app, &thread_id.0);
     Ok(reached)
 }
 
@@ -7283,16 +7303,19 @@ pub async fn agent_chat_delivery_attention(db: State<'_, DatabaseStore>, thread_
     Ok(db.thread_message_delivery_attention(&thread_id)?.into_iter().map(|row| serde_json::json!({
         "id":row.id,"message_id":row.message_id,"state":row.state,"reason":row.error,
         "display_text":row.payload["input"]["display_text"].as_str().or_else(||row.payload["input"]["text"].as_str()),
-        "can_retry":!row.attempted,
+        "can_retry":row.can_retry(),
     })).collect())
 }
 #[tauri::command]
-pub async fn agent_chat_acknowledge_delivery(db: State<'_, DatabaseStore>, thread_id: String, delivery_id: String) -> Result<(), String> {
-    db.acknowledge_message_delivery(&thread_id, &delivery_id)
+pub async fn agent_chat_acknowledge_delivery<R: Runtime>(app: AppHandle<R>, db: State<'_, DatabaseStore>, thread_id: String, delivery_id: String) -> Result<(), String> {
+    db.acknowledge_message_delivery(&thread_id, &delivery_id)?;
+    crate::agent_control::delivery::changed(&app, &thread_id);
+    Ok(())
 }
 #[tauri::command]
-pub async fn agent_chat_retry_delivery(db: State<'_, DatabaseStore>, thread_id: String, delivery_id: String) -> Result<(), String> {
+pub async fn agent_chat_retry_delivery<R: Runtime>(app: AppHandle<R>, db: State<'_, DatabaseStore>, thread_id: String, delivery_id: String) -> Result<(), String> {
     db.retry_message_delivery(&thread_id, &delivery_id)?;
+    crate::agent_control::delivery::changed(&app, &thread_id);
     crate::agent_control::delivery::notify();
     Ok(())
 }
@@ -7843,7 +7866,7 @@ fn queued_event_pending(thread: &str, nonce: &str, queued_id: &str) -> Option<Pe
 
 fn delivery_transition(event: &ProviderRuntimeEvent) -> bool {
     matches!(event, ProviderRuntimeEvent::TurnCompleted {..} | ProviderRuntimeEvent::TurnQueued {..}
-        | ProviderRuntimeEvent::QueuedTurnDispatched {..} | ProviderRuntimeEvent::QueuedTurnCancelled {..}
+        | ProviderRuntimeEvent::QueuedTurnDispatched {..} | ProviderRuntimeEvent::QueuedTurnCancelled {..} | ProviderRuntimeEvent::QueuedTurnDisposed {..}
         | ProviderRuntimeEvent::SessionConfigured {..} | ProviderRuntimeEvent::ResumeCursorUpdated {..}
         | ProviderRuntimeEvent::SessionStateChanged {..})
 }
@@ -7865,7 +7888,13 @@ fn delivery_transition(event: &ProviderRuntimeEvent) -> bool {
 /// UUID carried by `ResumeCursorUpdated` so the history dropdown can
 /// resume this session after a restart.
 pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeEvent) {
-    if delivery_transition(&event) { crate::agent_control::delivery::notify(); }
+    if let ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, queued_id } = &event {
+        if app.state::<DatabaseStore>().disposed_delivery_queue_ids(&thread_id.0).is_ok_and(|ids|ids.contains(queued_id)) {
+            event = ProviderRuntimeEvent::QueuedTurnDisposed { thread_id: thread_id.clone(), queued_id: queued_id.clone() };
+        }
+    }
+    let delivery_changed = delivery_transition(&event);
+    if delivery_changed { crate::agent_control::delivery::notify(); }
     if let ProviderRuntimeEvent::TurnCompleted {thread_id,turn_id,..}=&event {
         let _=app.state::<DatabaseStore>().confirm_message_delivery_turn(&thread_id.0,&turn_id.0);
     }
@@ -8028,7 +8057,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         }
     }
     if matches!(&event, ProviderRuntimeEvent::TurnQueued { .. }
-        | ProviderRuntimeEvent::QueuedTurnDispatched { .. } | ProviderRuntimeEvent::QueuedTurnCancelled { .. }) {
+        | ProviderRuntimeEvent::QueuedTurnDispatched { .. } | ProviderRuntimeEvent::QueuedTurnCancelled { .. } | ProviderRuntimeEvent::QueuedTurnDisposed { .. }) {
         let db: State<'_, DatabaseStore> = app.state();
         if let Err(error) = db.control_record_queue_event(&event) {
             eprintln!("[codemux::agent_chat] failed to persist queue disposition: {error}");
@@ -8051,7 +8080,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         }
     }
     if matches!(&event, ProviderRuntimeEvent::TurnQueued { .. }
-        | ProviderRuntimeEvent::QueuedTurnDispatched { .. } | ProviderRuntimeEvent::QueuedTurnCancelled { .. }
+        | ProviderRuntimeEvent::QueuedTurnDispatched { .. } | ProviderRuntimeEvent::QueuedTurnCancelled { .. } | ProviderRuntimeEvent::QueuedTurnDisposed { .. }
         | ProviderRuntimeEvent::QueuedTurnEdited { .. } | ProviderRuntimeEvent::QueuedTurnsReordered { .. }) {
         let db: State<'_, DatabaseStore> = app.state();
         let pending = pending_queued_images().lock().unwrap();
@@ -8067,6 +8096,22 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             _ => None,
         };
         super::queued_turns::on_event(&db, &event, queued);
+    }
+
+    if let ProviderRuntimeEvent::TurnQueued { thread_id, queued_id, provenance, .. } = &event {
+        if provenance.delivery_id.as_deref().is_some_and(|id|app.state::<DatabaseStore>().message_delivery(id).ok().flatten().is_some_and(|row|row.state=="cancelled")) {
+            let _ = app.state::<DatabaseStore>().finish_message_delivery(provenance.delivery_id.as_deref().unwrap(), "queued", Some(&serde_json::json!({"queued_id":queued_id})), None);
+            let app = app.clone(); let thread_id = thread_id.clone(); let queued_id = queued_id.clone();
+            tauri::async_runtime::spawn(async move {
+                let provider = app.state::<DatabaseStore>().get_agent_chat_session(&thread_id.0)
+                    .and_then(|r|serde_json::from_value::<ProviderKind>(serde_json::json!(r.provider)).ok());
+                if let Some(provider) = provider {
+                    if let Ok(implementation) = lookup_provider(&app.state(), provider).await {
+                        let _ = implementation.cancel_queued_turn(thread_id, queued_id).await;
+                    }
+                }
+            });
+        }
     }
 
     // A queued follow-up turn just dispatched — NOW persist its
@@ -8161,7 +8206,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     // delete the orphaned on-disk copies so a cancelled attachment does not
     // leak a file forever.
     // Quitting keeps them for the saved queue.
-    if let ProviderRuntimeEvent::QueuedTurnCancelled { queued_id, .. } = &event {
+    if let ProviderRuntimeEvent::QueuedTurnCancelled { queued_id, .. } | ProviderRuntimeEvent::QueuedTurnDisposed { queued_id, .. } = &event {
         let orphaned = pending_queued_images().lock().unwrap().remove(queued_id)
             .filter(|_| !super::queued_turns::exiting());
         if let Some(pending) = orphaned {
@@ -8174,6 +8219,11 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             for image in pending.images {
                 let _ = std::fs::remove_file(&image.path);
             }
+        }
+    }
+    if delivery_changed {
+        if let Some(thread) = thread_id_for_event(&event) {
+            crate::agent_control::delivery::changed(app, &thread.0);
         }
     }
     // Usage-limit auto-resume. A notice is armed centrally here (the single
@@ -9355,7 +9405,7 @@ fn map_event_to_pane_status(
         // indicator untouched.
         | ProviderRuntimeEvent::TurnQueued { .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { .. }
-        | ProviderRuntimeEvent::QueuedTurnCancelled { .. }
+        | ProviderRuntimeEvent::QueuedTurnCancelled { .. } | ProviderRuntimeEvent::QueuedTurnDisposed { .. }
         | ProviderRuntimeEvent::QueuedTurnEdited { .. }
         | ProviderRuntimeEvent::QueuedTurnsReordered { .. }
         // A stall is advisory only — the run may well be fine (a long quiet
@@ -10066,6 +10116,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::TurnQueued { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, .. }
+        | ProviderRuntimeEvent::QueuedTurnDisposed { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnEdited { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnsReordered { thread_id, .. }
         | ProviderRuntimeEvent::ContextCompactionChanged { thread_id, .. }

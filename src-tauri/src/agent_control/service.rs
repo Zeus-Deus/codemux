@@ -337,7 +337,8 @@ pub(crate) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -
         "delivery_id":row.id,"message_id":row.message_id,"state":row.state,"reason":row.error,
         "display_text":row.payload["input"]["display_text"].as_str().or_else(||row.payload["input"]["text"].as_str()),
     })).collect();
-    let busy = active || !pending.is_empty() || !queued.is_empty() || !uncertain_queued.is_empty()
+    let inflight = app.state::<DatabaseStore>().has_inflight_message_deliveries(&target.thread_id)?;
+    let busy = inflight || active || !pending.is_empty() || !queued.is_empty() || !uncertain_queued.is_empty()
         || observed.as_ref().is_some_and(|view|matches!(view.phase.as_str(),"starting"|"running"|"waiting_approval"));
     let phase = if !pending.is_empty() { "waiting_approval" }
     else if !deliveries.is_empty() { "needs_attention" }

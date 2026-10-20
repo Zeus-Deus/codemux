@@ -706,12 +706,13 @@ async fn drain_saved_queue<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId,
             );
             return;
         }
-        let sent = super::queued_turns::agent_chat_send_saved_queued_turn(
+        let sent = super::queued_turns::send_saved_queued_turn(
             app.clone(),
             provider,
             thread_id.clone(),
             queued_id.clone(),
             MessageDelivery::Queue,
+            false,
         )
         .await;
         if let Err(error) = sent {

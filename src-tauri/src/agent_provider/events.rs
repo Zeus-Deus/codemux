@@ -737,6 +737,9 @@ pub enum ProviderRuntimeEvent {
         thread_id: ThreadId,
         queued_id: String,
     },
+    /// An automatic wake was disposed by Stop; remove it without restoring
+    /// its agent-facing text to the human composer's draft.
+    QueuedTurnDisposed { thread_id: ThreadId, queued_id: String },
     /// The user edited a queued turn in place. `text` is the new
     /// user-visible text; the item keeps its id, position and attachments.
     QueuedTurnEdited {

@@ -42,17 +42,13 @@ impl QueueHold {
     }
 
     /// Whether a drain may dispatch the queue's `front` item. An empty queue
-    /// has nothing to hold, so the hold clears.
+    /// retains the hold until an explicit human release.
     pub fn admits(&mut self, front: Option<&str>) -> bool {
         if !self.held {
             return true;
         }
         match front {
-            None => {
-                self.held = false;
-                self.release = None;
-                false
-            }
+            None => false,
             Some(id) => self.release.as_deref() == Some(id),
         }
     }
@@ -153,11 +149,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_queue_clears_the_hold() {
+    fn orchestration_message_empty_queue_retains_stop_hold() {
         let mut hold = QueueHold::default();
         hold.hold();
         assert!(!hold.admits(None));
-        assert!(!hold.is_held());
+        assert!(hold.is_held());
     }
 
     #[test]
@@ -251,4 +247,23 @@ mod tests {
         hold.settle_take(was_held, false);
         assert!(!hold.admits(Some("m")));
     }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestCheckpoint {
+    pub release: bool,
+    pub held: std::sync::atomic::AtomicBool,
+}
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::agent_provider::TurnDispatchCheckpoint for TestCheckpoint {
+    fn releases_queue_hold(&self) -> bool { self.release }
+    fn queued_delivery_state(&self) -> crate::agent_provider::types::QueuedDeliveryState {
+        if self.held.load(std::sync::atomic::Ordering::SeqCst) { crate::agent_provider::types::QueuedDeliveryState::Held }
+        else { crate::agent_provider::types::QueuedDeliveryState::Ready }
+    }
+    async fn prepare(&self) {}
+    async fn commit(&self) {}
+    async fn abort(&self) {}
 }

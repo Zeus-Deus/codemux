@@ -248,6 +248,7 @@ impl NativeControlState {
             | ProviderRuntimeEvent::RequestResponseFailed { thread_id, .. }
             | ProviderRuntimeEvent::TurnQueued { thread_id, .. }
             | ProviderRuntimeEvent::QueuedTurnDispatched { thread_id, .. }
+            | ProviderRuntimeEvent::QueuedTurnDisposed { thread_id, .. }
             | ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, .. } => &thread_id.0,
             _ => return,
         };
@@ -451,7 +452,7 @@ impl NativeControlState {
                     .into();
                 }
             }
-            ProviderRuntimeEvent::QueuedTurnCancelled { queued_id, .. } => {
+            ProviderRuntimeEvent::QueuedTurnDisposed { queued_id, .. } | ProviderRuntimeEvent::QueuedTurnCancelled { queued_id, .. } => {
                 entry.view.queued_ids.retain(|id| id != queued_id);
                 remember(&mut entry.retired_queues, queued_id);
             }

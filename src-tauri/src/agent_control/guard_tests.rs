@@ -623,7 +623,7 @@ async fn guarded_send_rechecks_permission_after_activity_wait() {
     let (entered, release) = provider.hold_next_send();
     let handle = app.handle().clone();
     let first = tokio::spawn(async move {
-        agent_chat::agent_chat_send_turn(handle, ProviderKind::Claude, send("permission-wait"))
+        agent_chat::send_desktop_turn(handle, ProviderKind::Claude, send("permission-wait"))
             .await
     });
     entered.notified().await;
@@ -780,7 +780,7 @@ async fn native_permission_changes_wait_for_the_dispatch_owner() {
     let (entered, release) = provider.hold_next_send();
     let handle = app.handle().clone();
     let first = tokio::spawn(async move {
-        agent_chat::agent_chat_send_turn(handle, ProviderKind::Claude, send("mode-lock")).await
+        agent_chat::send_desktop_turn(handle, ProviderKind::Claude, send("mode-lock")).await
     });
     entered.notified().await;
     let permission = agent_chat::agent_chat_set_permission_mode(
@@ -949,7 +949,7 @@ async fn review_s5_native_cursor_override_cannot_mutate_session_mode_behind_witn
     control.provider = ProviderKind::Cursor; control.caller.access = ControlAccess::Supervised;
     control.verify(app.handle()).unwrap();
     let mut turn = send("cursor-override"); turn.permission_mode_override = Some("agent".into());
-    let result = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, turn).await;
+    let result = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, turn).await;
     provider.stop_session(ThreadId("cursor-override".into())).await.unwrap();
     assert!(result.is_err(), "ACP overrides are session-wide: require the native permission setter, not a hidden per-turn mutation: {result:?}");
     assert!(result.unwrap_err().starts_with("unsupported_permission_override:"));
@@ -970,7 +970,7 @@ async fn review_s2_actual_acp_queue_drain_revalidates_native_worker_ceiling() {
     agent_chat::agent_chat_start_session(app.handle().clone(), pane, ProviderKind::Cursor, input, Some("guarded-queue".into())).await.unwrap();
     let mut events = provider.event_stream();
     let mut first = send("guarded-queue"); first.text = "await-cancel".into();
-    let first = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
+    let first = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
     let mut control = guard(&workspace, "guarded-queue"); control.provider=ProviderKind::Cursor; control.caller.access=ControlAccess::Supervised;
     let queued = agent_chat::send_turn_with_control(app.handle().clone(), ProviderKind::Cursor, send("guarded-queue"), Some(control)).await.unwrap();
     let queued_id = queued.queued_id.unwrap();
@@ -1255,14 +1255,14 @@ async fn c1_stop_control(mode: &'static str) {
     });
     let mut stream = provider.event_stream();
     let mut first = send(&thread); first.text = "review-hold".into();
-    agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
+    agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
     let request = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop { if let ProviderRuntimeEvent::RequestOpened {request_id, ..} = stream.next().await.unwrap() { break request_id; } }
     }).await.unwrap();
     let mut ids = vec![];
     if mode == "promote" {
         let mut ahead = send(&thread); ahead.text = "c1-never-dispatch-ahead".into();
-        ids.push(agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, ahead).await.unwrap().queued_id.unwrap());
+        ids.push(agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, ahead).await.unwrap().queued_id.unwrap());
     }
     let mut q2 = send(&thread); q2.text = if mode == "prompt" { "c1-selected review-hold" } else { "c1-selected-controlled" }.into();
     q2.model_override = match mode { "abort" => Some("review-fatal".into()), "config"|"promote"|"queued-cancel" => Some("stop-race-held".into()), _ => None };
@@ -1270,7 +1270,7 @@ async fn c1_stop_control(mode: &'static str) {
     let selected = agent_chat::send_turn_with_control(app.handle().clone(), ProviderKind::Cursor, q2, Some(control)).await.unwrap().queued_id.unwrap();
     ids.push(selected.clone());
     let mut trailing = send(&thread); trailing.text = "c1-never-dispatch-trailing".into();
-    let q3 = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, trailing).await.unwrap().queued_id.unwrap(); ids.push(q3.clone());
+    let q3 = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, trailing).await.unwrap().queued_id.unwrap(); ids.push(q3.clone());
     if mode == "queued-cancel" {
         assert!(provider.cancel_queued_turn(ThreadId(thread.clone()), q3).await.unwrap());
     }
@@ -1385,9 +1385,9 @@ async fn c1_idle_promotion_control(before_prepare: bool) {
         }
     }).await.unwrap();
     let mut input = send(&thread); input.text = "c1-idle-selected".into(); input.model_override = Some("stop-race-held".into());
-    let selected = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, input).await.unwrap().queued_id.unwrap();
+    let selected = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, input).await.unwrap().queued_id.unwrap();
     let mut trailing = send(&thread); trailing.text = "c1-idle-trailing".into();
-    let q3 = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, trailing).await.unwrap().queued_id.unwrap();
+    let q3 = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, trailing).await.unwrap().queued_id.unwrap();
     std::fs::write(rig.join("release-config-reject"), b"release actual held error").unwrap();
     assert!(tokio::time::timeout(std::time::Duration::from_secs(3), first).await.unwrap().unwrap().is_err());
     assert!(!provider.turn_active(&ThreadId(thread.clone())).await, "real failed initial dispatch must release its reservation");
@@ -1449,18 +1449,18 @@ async fn review_fr1_c1_r1_failed_locked_drain_native_stop_preserves_trailing_ids
     });
     let mut stream = provider.event_stream();
     let mut first = send(thread); first.text = "review-hold".into();
-    agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
+    agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
     let request = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop { if let ProviderRuntimeEvent::RequestOpened {request_id, ..} = stream.next().await.unwrap() { break request_id; } }
     }).await.unwrap();
     let mut selected = send(thread);
     selected.text = "r1-never-prompt-selected-q2".into();
     selected.model_override = Some("stop-race-held".into());
-    let q2 = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, selected).await.unwrap().queued_id.unwrap();
+    let q2 = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, selected).await.unwrap().queued_id.unwrap();
     let mut ids = vec![q2.clone()];
     for text in ["r1-never-prompt-trailing-q3", "r1-never-prompt-trailing-q4"] {
         let mut trailing = send(thread); trailing.text = text.into();
-        ids.push(agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, trailing).await.unwrap().queued_id.unwrap());
+        ids.push(agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, trailing).await.unwrap().queued_id.unwrap());
     }
     let admitted = app.state::<NativeControlState>().thread_runtime(thread).unwrap();
     assert!(ids.iter().all(|id| admitted.queued_ids.contains(id)));
@@ -1543,7 +1543,7 @@ async fn review_fr1_c1_stop_during_selected_config_rpc_terminalizes_every_id() {
     });
     let mut events = provider.event_stream();
     let mut first = send(thread); first.text = "review-hold".into();
-    agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
+    agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
     let request = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop { if let ProviderRuntimeEvent::RequestOpened {request_id, ..} = events.next().await.unwrap() { break request_id; } }
     }).await.unwrap();
@@ -1552,9 +1552,9 @@ async fn review_fr1_c1_stop_during_selected_config_rpc_terminalizes_every_id() {
     let mut outside = send(thread); outside.text = "c1-rejected-q1".into();
     let q1 = agent_chat::send_turn_with_control(app.handle().clone(), ProviderKind::Cursor, outside, Some(control)).await.unwrap().queued_id.unwrap();
     let mut native = send(thread); native.text = "c1-selected-q2".into(); native.model_override = Some("stop-race-held".into());
-    let q2 = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, native).await.unwrap().queued_id.unwrap();
+    let q2 = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, native).await.unwrap().queued_id.unwrap();
     let mut trailing = send(thread); trailing.text = "c1-trailing-q3".into();
-    let q3 = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, trailing).await.unwrap().queued_id.unwrap();
+    let q3 = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, trailing).await.unwrap().queued_id.unwrap();
     let admitted = app.state::<NativeControlState>().thread_runtime(thread).unwrap();
     assert!(admitted.queued_ids.contains(&q1) && admitted.queued_ids.contains(&q2) && admitted.queued_ids.contains(&q3));
     app.state::<crate::database::DatabaseStore>().update_agent_chat_session_config(thread,
@@ -1646,7 +1646,7 @@ async fn review_fr1_rejection_case(mode: &str) {
     });
     let mut stream = provider.event_stream();
     let mut first = send(thread); first.text = format!("fr1-hold {mode}");
-    let parent = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
+    let parent = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
     let mut observed = vec![];
     let request = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
@@ -1661,7 +1661,7 @@ async fn review_fr1_rejection_case(mode: &str) {
     let q1 = agent_chat::send_turn_with_control(app.handle().clone(), ProviderKind::Cursor,
         outside, Some(control)).await.unwrap().queued_id.unwrap();
     let mut native = send(thread); native.text = "fr1-native-q2".into();
-    let q2 = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor,
+    let q2 = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor,
         native).await.unwrap().queued_id.unwrap();
     assert!(provider.has_session(&ThreadId(thread.into())).await);
     let admitted = app.state::<NativeControlState>().thread_runtime(thread).unwrap();
@@ -1753,7 +1753,7 @@ async fn review_fr1_rejection_case(mode: &str) {
     assert_eq!(status["settled"], true, "native status must settle without later cleanup: {status}");
     if mode == "interrupt" {
         let mut fresh = send(thread); fresh.text = "fr1-fresh-native".into();
-        let fresh = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, fresh).await.unwrap();
+        let fresh = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, fresh).await.unwrap();
         assert!(fresh.queued_id.is_none());
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
@@ -1777,7 +1777,7 @@ async fn review_r1_denied_guarded_acp_followup_preserves_native_followup() {
     let (app, _root, workspace, provider) = review_acp_fixture(thread).await;
     let mut events = provider.event_stream();
     let mut first = send(thread); first.text = "review-hold".into();
-    agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
+    agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
     let request = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let e = events.next().await.unwrap();
@@ -1790,7 +1790,7 @@ async fn review_r1_denied_guarded_acp_followup_preserves_native_followup() {
     let q1 = agent_chat::send_turn_with_control(app.handle().clone(), ProviderKind::Cursor,
         outside, Some(control)).await.unwrap().queued_id.unwrap();
     let mut native = send(thread); native.text = "native-q2".into();
-    let q2 = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor,
+    let q2 = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor,
         native).await.unwrap().queued_id.unwrap();
     // Revoke only Q1's dispatch authority, without Stop or provider failure.
     app.state::<crate::database::DatabaseStore>().update_agent_chat_session_config(thread,
@@ -1827,14 +1827,14 @@ async fn review_r1_stop_and_real_config_failure_still_cancel_queued_work() {
         let (app, _root, _workspace, provider) = review_acp_fixture(thread).await;
         let mut events = provider.event_stream();
         let mut first = send(thread); first.text="review-hold".into();
-        agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
+        agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
         let request = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop { if let ProviderRuntimeEvent::RequestOpened {request_id, ..} = events.next().await.unwrap() { break request_id; } }
         }).await.unwrap();
         let mut q1_input = send(thread); q1_input.text="q1-control".into();
         if !stop { q1_input.model_override=Some("review-fatal".into()); }
-        let q1 = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, q1_input).await.unwrap().queued_id.unwrap();
-        let q2 = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, send(thread)).await.unwrap().queued_id.unwrap();
+        let q1 = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, q1_input).await.unwrap().queued_id.unwrap();
+        let q2 = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, send(thread)).await.unwrap().queued_id.unwrap();
         if stop {
             agent_chat::agent_chat_stop_session(app.handle().clone(), ProviderKind::Cursor, ThreadId(thread.into())).await.unwrap();
         } else {
@@ -1880,7 +1880,7 @@ async fn review_r3_strict_owner_acp_options_emit_logical_resolution_and_preserve
         let (app, _root, workspace, provider) = review_acp_fixture(&thread).await;
         let mut stream = provider.event_stream();
         let mut input = send(&thread); input.text = if unsupported_first { "review-approval only-always" } else { "review-approval" }.into();
-        agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, input).await.unwrap();
+        agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, input).await.unwrap();
         let mut events = vec![];
         let request = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
@@ -1971,10 +1971,10 @@ async fn stop_cancels_native_send_already_waiting_for_activity() {
     let (entered, release) = provider.hold_next_send();
     let handle = app.handle().clone();
     let first = tokio::spawn(async move {
-        agent_chat::agent_chat_send_turn(handle, ProviderKind::Claude, send("cancel-waiter")).await
+        agent_chat::send_desktop_turn(handle, ProviderKind::Claude, send("cancel-waiter")).await
     });
     entered.notified().await;
-    let second = agent_chat::agent_chat_send_turn(
+    let second = agent_chat::send_desktop_turn(
         app.handle().clone(),
         ProviderKind::Claude,
         send("cancel-waiter"),

@@ -648,7 +648,7 @@ export type ProviderRuntimeEvent =
       text: string;
     }
   | {
-      type: "queued_turn_cancelled";
+      type: "queued_turn_cancelled" | "queued_turn_disposed";
       thread_id: string;
       queued_id: string;
     }
@@ -865,3 +865,7 @@ export const onAgentChatQueuedTurnsChanged = (
   cb: EventCallback<string>,
 ): Promise<UnlistenFn> =>
   listen<string>("agent-chat-queued-turns-changed", (e) => cb(e.payload));
+
+/** Durable attention changes; streaming transcript events do not refresh it. */
+export const onAgentChatDeliveryChanged = (cb: EventCallback<string>): Promise<UnlistenFn> =>
+  listen<string>("agent_chat_delivery_changed", (e) => cb(e.payload));

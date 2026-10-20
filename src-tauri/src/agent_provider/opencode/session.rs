@@ -628,7 +628,7 @@ impl OpenCodeSession {
         let turn_active = self.turn_active().await;
         // A message sent by hand after a Stop goes first; the held queue
         // follows it once it starts.
-        let held = self.queue_hold().goes_first();
+        let held = input.releases_queue_hold() && self.queue_hold().goes_first();
         if turn_active {
             let result = self.queue_input(input, None).await;
             if held {
@@ -645,7 +645,7 @@ impl OpenCodeSession {
         if !held && !self.queued.lock().await.is_empty() {
             return Ok(self.queue_input(input, None).await);
         }
-        let was_held = self.queue_hold().take();
+        let was_held = input.releases_queue_hold() && self.queue_hold().take();
         let result = self.dispatch_input(input, false, None).await;
         self.restore_hold_unless_started(was_held, &result).await;
         result
@@ -698,7 +698,7 @@ impl OpenCodeSession {
         input: crate::agent_provider::SendTurnInput,
     ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
         let _outbound = self.outbound.lock().await;
-        let was_held = self.queue_hold().take();
+        let was_held = input.releases_queue_hold() && self.queue_hold().take();
         let result = self.dispatch_input(input, true, None).await;
         self.restore_hold_unless_started(was_held, &result).await;
         result
@@ -801,6 +801,10 @@ impl OpenCodeSession {
         }
         while !self.turn_active().await {
             let mut queue = self.queued.lock().await;
+            if queue.front().is_some_and(|(_, input)| input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Held) {
+                self.queue_hold().hold();
+                return;
+            }
             let front = queue.front().map(|(id, _)| id.clone());
             if !self.queue_hold().admits(front.as_deref()) {
                 return;
@@ -813,6 +817,7 @@ impl OpenCodeSession {
                 .display_text
                 .clone()
                 .unwrap_or_else(|| input.text.clone());
+            let retained_input = input.clone();
             match self.dispatch_input(input, false, Some(id.clone())).await {
                 Ok(result) if result.queued_id.is_some() => return,
                 Ok(result) => {
@@ -830,6 +835,19 @@ impl OpenCodeSession {
                 }
                 Err(error) => {
                     self.queue_hold().settle(&id, false);
+                    match retained_input.queued_delivery_state() {
+                        crate::agent_provider::types::QueuedDeliveryState::Held => {
+                            self.queued.lock().await.push_front((id, retained_input));
+                            self.queue_hold().hold();
+                            return;
+                        }
+                        crate::agent_provider::types::QueuedDeliveryState::Disposed => {
+                            log::debug!("Disposed queued wake {id}");
+                            let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled { thread_id: self.thread_id.clone(), queued_id: id });
+                            continue;
+                        }
+                        crate::agent_provider::types::QueuedDeliveryState::Ready => {}
+                    }
                     let _ = self.event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                         thread_id: Some(self.thread_id.clone()),
                         message: format!("Queued message failed: {error}"),
@@ -2876,6 +2894,27 @@ pub(crate) mod tests {
         assert_eq!(session.queued.lock().await.len(), 1);
         abort.assert_async().await;
         queued_post.assert_async().await;
+    }
+
+
+    #[tokio::test]
+    async fn orchestration_message_opencode_machine_send_retains_hold_and_held_drain() {
+        let mut server=Server::new_async().await;
+        let post=server.mock("POST","/session/sess_1/prompt_async").with_status(204).expect(1).create_async().await;
+        let (session,_,_)=mock_session(server.url(),"pw".into(),"sess_1").await;
+        session.hold_queue();
+        let mut machine=delivery_input("Machine");
+        machine.turn_checkpoint=Some(Arc::new(crate::agent_provider::queue_hold::TestCheckpoint {release:false,held:Default::default()}));
+        session.enqueue_or_send(machine).await.unwrap();
+        assert!(session.queue_hold().is_held());
+        let mut held=delivery_input("Held");
+        held.turn_checkpoint=Some(Arc::new(crate::agent_provider::queue_hold::TestCheckpoint {release:true,held:true.into()}));
+        session.queued.lock().await.push_back(("held".into(),held));
+        session.event_ctx.lock().await.turn_active=false;
+        *session.queue_hold()=Default::default();
+        session.drain_queue().await;
+        assert_eq!(session.queued.lock().await.len(),1);
+        post.assert_async().await;
     }
 
     fn deferred(id: &str) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {

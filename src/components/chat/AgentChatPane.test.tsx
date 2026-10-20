@@ -484,6 +484,7 @@ vi.mock("@/tauri/events", async (importOriginal) => ({
   // Pure payload helper the pane applies to every live event.
   withRetainedImages: (await importOriginal<typeof import("@/tauri/events")>())
     .withRetainedImages,
+  onAgentChatDeliveryChanged: vi.fn().mockResolvedValue(() => {}),
   onAgentChatSessionsMerged: vi.fn().mockResolvedValue(() => {}),
   onAgentChatTurnCheckpoint: vi.fn().mockResolvedValue(() => {}),
   onAgentChatTurnCheckpointReverted: vi.fn().mockResolvedValue(() => {}),

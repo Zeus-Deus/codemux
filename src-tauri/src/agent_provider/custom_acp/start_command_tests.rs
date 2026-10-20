@@ -32,7 +32,7 @@ impl Fixture {
             self.app.manage(crate::commands::agent_chat::RunActivityTracker::default());
             self.app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
         }
-        crate::commands::agent_chat::agent_chat_send_turn(self.app.handle().clone(), ProviderKind::Acp, serde_json::from_value(input).unwrap()).await
+        crate::commands::agent_chat::send_desktop_turn(self.app.handle().clone(), ProviderKind::Acp, serde_json::from_value(input).unwrap()).await
     }
     fn row(&self) -> crate::database::AgentChatSessionRecord { self.app.state::<DatabaseStore>().get_agent_chat_session(&self.thread.0).unwrap() }
 }

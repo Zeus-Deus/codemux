@@ -84,7 +84,7 @@ impl DatabaseStore {
             ProviderRuntimeEvent::TurnQueued {thread_id,queued_id,..} => self.control_record_queue_admission(&thread_id.0,queued_id),
             ProviderRuntimeEvent::QueuedTurnDispatched {thread_id,queued_id,turn_id,steered,..} =>
                 self.control_record_queue_transition(&thread_id.0,queued_id,"dispatched",Some(&turn_id.0),*steered),
-            ProviderRuntimeEvent::QueuedTurnCancelled {thread_id,queued_id} =>
+            ProviderRuntimeEvent::QueuedTurnCancelled {thread_id,queued_id} | ProviderRuntimeEvent::QueuedTurnDisposed {thread_id,queued_id} =>
                 self.control_record_queue_transition(&thread_id.0,queued_id,"cancelled",None,false),
             _ => Ok(()),
         }
@@ -101,6 +101,9 @@ impl DatabaseStore {
                    WHERE d.thread_id=a.thread_id AND json_extract(d.payload,'$.type')='native_queue_control'
                      AND json_extract(d.payload,'$.queued_id')=json_extract(a.payload,'$.queued_id')
                      AND json_extract(d.payload,'$.disposition') IN ('dispatched','cancelled'))
+               AND NOT EXISTS (SELECT 1 FROM agent_message_deliveries m
+                   WHERE m.thread_id=a.thread_id AND m.queued_id=json_extract(a.payload,'$.queued_id')
+                     AND m.state<>'queued')
              ORDER BY a.id ASC",
         ).map_err(|e|e.to_string())?;
         let rows = statement.query_map(params![thread], |row|row.get(0)).map_err(|e|e.to_string())?;

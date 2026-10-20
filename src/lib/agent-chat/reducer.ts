@@ -2353,6 +2353,7 @@ function applyEventInner(
       };
     }
 
+    case "queued_turn_disposed":
     case "queued_turn_cancelled": {
       // The queued turn was cancelled (by the user, or by session
       // close/error) — remove its greyed bubble.

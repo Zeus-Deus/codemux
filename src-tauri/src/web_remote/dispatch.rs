@@ -335,13 +335,17 @@ pub async fn dispatch_invoke<R: Runtime>(
         }
     };
 
+    let mut headers = tauri::http::HeaderMap::new();
+    if cmd == "agent_chat_send_turn" {
+        headers.insert("x-codemux-input-source", remote_input_source(&args).parse().unwrap());
+    }
     let request = InvokeRequest {
         cmd: cmd.clone(),
         callback: CallbackFn(0),
         error: CallbackFn(1),
         url,
         body: InvokeBody::Json(args),
-        headers: Default::default(),
+        headers,
         invoke_key: app.invoke_key().to_string(),
     };
 
@@ -365,6 +369,12 @@ pub async fn dispatch_invoke<R: Runtime>(
         Err(_) => err_text(id, "web-remote: command dropped without responding"),
     };
     let _ = out.send(frame);
+}
+
+/// A remote connection can identify a phone layout, but cannot impersonate
+/// the desktop transport through its input payload.
+fn remote_input_source(args: &Value) -> &'static str {
+    if args["input"]["input_source"] == "phone" { "phone" } else { "web" }
 }
 
 fn plugin_mcp_command(command: &str, args: &Value) -> bool {
@@ -765,5 +775,17 @@ mod plugins_boundary_tests {
             assert!(frame.contains("REMOTE_UNSUPPORTED"));
             assert!(router.routes.lock().unwrap().is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    #[test]
+    fn orchestration_message_remote_transport_cannot_claim_desktop() {
+        for claimed in ["desktop", "mcp", "web"] {
+            assert_eq!(remote_input_source(&json!({"input":{"input_source":claimed}})), "web");
+        }
+        assert_eq!(remote_input_source(&json!({"input":{"input_source":"phone"}})), "phone");
     }
 }
