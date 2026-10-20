@@ -286,6 +286,17 @@ impl DatabaseStore {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    /// New human instructions supersede only definite-no-send resume intent.
+    /// Completed task reports retain their independent delivery ownership.
+    pub fn dispose_superseded_resume_deliveries(&self, thread: &str) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e|e.to_string())?;
+        tx.execute("UPDATE agent_message_deliveries SET state='cancelled',dispatch_owned=0,retry_at=NULL,hold_reason='superseded',error='Resume superseded by newer human activity'
+            WHERE thread_id=?1 AND attempted=0 AND state IN ('pending','preparing','queued','submitting','held','rejected') AND json_extract(payload,'$.origin') IN ('usage_resume','restart_resume')",[thread]).map_err(|e|e.to_string())?;
+        retire_automatic_queues(&tx,Some(thread))?;
+        tx.commit().map_err(|e|e.to_string())
+    }
+
     pub fn is_disposed_delivery_queue(&self, thread: &str, queued: &str) -> Result<bool, String> {
         self.conn.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM agent_message_deliveries WHERE thread_id=?1 AND queued_id=?2 AND state='cancelled' AND json_extract(payload,'$.origin') NOT IN ('user','controller'))",params![thread,queued],|r|r.get(0)).map_err(|e|e.to_string())
     }

@@ -38,6 +38,27 @@ async fn fixture() -> (tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_prov
 }
 
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn review_r1_human_activity_disposes_unsent_resumes_but_keeps_task_results() {
+    let (app,provider,_root,workspace)=fixture().await;
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"r1-resume-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let launched=settle_operation(&app,&receipt).await;
+    let thread=launched["thread_id"].as_str().unwrap();
+    let db=app.state::<crate::database::DatabaseStore>();
+    let mut snapshots=vec![];
+    for (id,origin) in [("stale-usage","usage_resume"),("stale-restart","restart_resume"),("task-result","delegation")] {
+        let payload=json!({"provider":"claude","origin":origin,"input":{"thread_id":thread,"text":id,"client_nonce":id},"provenance":{"created_by":"system","creation_source":"codemux"},"caller":null});
+        db.admit_message_delivery(id,thread,id,&payload,"old",0,None,false).unwrap();
+        snapshots.push(db.message_delivery(id).unwrap().unwrap());
+    }
+    crate::commands::agent_chat::send_desktop_turn(app.handle().clone(),crate::agent_provider::ProviderKind::Claude,serde_json::from_value(json!({"thread_id":thread,"text":"new task","client_nonce":"new-human-task"})).unwrap()).await.unwrap();
+    for id in ["stale-usage","stale-restart"] { assert_eq!(db.message_delivery(id).unwrap().unwrap().state,"cancelled"); }
+    assert_eq!(db.message_delivery("task-result").unwrap().unwrap().state,"pending");
+    for row in snapshots { super::delivery::dispatch(app.handle(),row).await; }
+    let sends:Vec<_>=provider.calls.snapshot().into_iter().filter_map(|call|match call {mock_agent_provider::MockCall::SendTurn(_,text)=>Some(text),_=>None}).collect();
+    assert_eq!(sends,vec!["new task","task-result"]);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn review_r1_merged_saved_queue_sends_with_original_delivery_identity() {
     use crate::agent_provider::{message::*,types::MessageDelivery,ProviderKind,ThreadId};
     for restart_replay in [false,true] {
