@@ -60,6 +60,7 @@ export function useInboxLifecycle(): void {
   const settled = useSidebarInboxStore((s) => s.settled);
   const snoozed = useSidebarInboxStore((s) => s.snoozed);
   const keepActive = useSidebarInboxStore((s) => s.keepActive);
+  const pinOverrides = useSidebarInboxStore((s) => s.pinOverrides);
   const activity = useSidebarInboxStore((s) => s.activity);
   const prune = useSidebarInboxStore((s) => s.prune);
 
@@ -262,7 +263,7 @@ export function useInboxLifecycle(): void {
     const snoozedSet = new Set(snoozed.map((e) => e.id));
     for (const ws of allWorkspaces) {
       const id = ws.workspace_id;
-      if (ws.pinned_at != null) continue;
+      if (pinOverrides[id] ?? (ws.pinned_at != null)) continue;
       if (settledSet.has(id) || snoozedSet.has(id)) continue;
       if (keepActive[id]) continue;
       const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
@@ -294,6 +295,7 @@ export function useInboxLifecycle(): void {
     settled,
     snoozed,
     keepActive,
+    pinOverrides,
     activity,
     autoSettleDays,
     now,
