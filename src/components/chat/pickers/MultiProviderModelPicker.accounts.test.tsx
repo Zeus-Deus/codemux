@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 
 const { thread, switchThread } = vi.hoisted(() => ({
-  thread: { current: { account_id: "codex-work", bound: false, workspace_id: "ws-1", workspace_default: null as string | null } },
+  thread: { current: { account_id: "codex-work", bound: false } },
   switchThread: vi.fn(async (_threadId: string, accountId: string) => {
     thread.current = { ...thread.current, account_id: accountId };
     return { account_id: accountId, carried: true };
@@ -30,6 +30,7 @@ import type { UsageLimitState } from "@/lib/agent-chat/types";
 import { resetProviderCapabilities, useProviderCapabilities } from "@/stores/provider-capabilities-store";
 import { pickKey, useProviderAccounts } from "@/stores/provider-accounts-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
+import { useUIStore } from "@/stores/ui-store";
 import { MultiProviderModelPicker } from "./MultiProviderModelPicker";
 import { useUsageLimitOccupant } from "../use-composer-strip-occupants";
 import { useThreadAccount } from "../use-thread-account";
@@ -86,7 +87,7 @@ beforeEach(() => {
   vi.mocked(listChatProviderCapabilities).mockReset().mockImplementation(() => new Promise(() => {}));
   resetProviderCapabilities();
   setStreaming(false);
-  thread.current = { account_id: "codex-work", bound: false, workspace_id: "ws-1", workspace_default: null };
+  thread.current = { account_id: "codex-work", bound: false };
   switchThread.mockClear();
   useProviderAccounts.setState({ accounts: ACCOUNTS, defaults: {}, picks: {}, pickerRequest: null });
   useProviderCapabilities.setState({
@@ -130,8 +131,12 @@ it("one rail entry per account; a draft's choice is its pick, and a signed-out a
   fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
   const personal = await screen.findByTestId("provider-rail-codex-default");
   expect(screen.queryByTestId("provider-rail-codex")).toBeNull();
-  expect(screen.getByTestId("provider-rail-codex-codex-side")).toBeDisabled();
-  expect(screen.getByText("This chat starts on the account you pick.")).toBeInTheDocument();
+  const side = screen.getByTestId("provider-rail-codex-codex-side");
+  expect(side).toHaveAttribute("aria-disabled", "true");
+  fireEvent.click(side);
+  expect(useProviderAccounts.getState().picks[pickKey("codex", "t1")]).not.toBe("codex-side");
+  // What picking does is the account header's tooltip, not a footer.
+  expect(screen.getByTestId("provider-account-header")).toHaveTextContent("This chat starts on the account you pick.");
   fireEvent.click(personal);
   expect(useProviderAccounts.getState().picks[pickKey("codex", "t1")]).toBe("default");
   expect(switchThread).not.toHaveBeenCalled();
@@ -142,8 +147,9 @@ it("on a started chat, choosing another account moves it, but not while a turn r
   renderPicker();
   fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
   await screen.findByText("Picking another account moves this chat there and keeps the conversation.");
-  expect(screen.getByRole("menuitemcheckbox", { name: "Use Work for new chats in this workspace" })).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Manage accounts…" })).toBeInTheDocument();
+  // No per-workspace default to set from here any more.
+  expect(screen.queryByRole("menuitemcheckbox")).toBeNull();
+  expect(screen.queryByText(/for new chats in this workspace/)).toBeNull();
   fireEvent.click(screen.getByTestId("provider-rail-codex-default"));
   await waitFor(() => expect(switchThread).toHaveBeenCalledWith("t1", "default"));
 
@@ -153,7 +159,28 @@ it("on a started chat, choosing another account moves it, but not while a turn r
   setStreaming(true);
   renderPicker();
   fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
-  expect(await screen.findByTestId("provider-rail-codex-default")).toBeDisabled();
+  const other = await screen.findByTestId("provider-rail-codex-default");
+  expect(other).toHaveAttribute("aria-disabled", "true");
+  fireEvent.click(other);
+  expect(switchThread).not.toHaveBeenCalled();
+  // The rail entry itself says why.
+  fireEvent.focus(other);
+  expect((await screen.findAllByText("Accounts can be switched once this turn finishes.")).length).toBeGreaterThan(0);
+});
+
+it("the rail's settings button opens Settings → Providers", async () => {
+  const setShowSettings = vi.fn();
+  const original = useUIStore.getState().setShowSettings;
+  useUIStore.setState({ setShowSettings });
+  try {
+    renderPicker();
+    fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
+    fireEvent.click(await screen.findByRole("button", { name: "Manage accounts" }));
+    expect(setShowSettings).toHaveBeenCalledWith(true, "providers");
+    await waitFor(() => expect(screen.queryByTestId("multi-provider-rail")).toBeNull());
+  } finally {
+    useUIStore.setState({ setShowSettings: original });
+  }
 });
 
 it("an extra account lists the models its own sign-in offers", async () => {
@@ -183,7 +210,8 @@ it("a single account adds nothing", async () => {
   expect(screen.queryByTestId("provider-account-badge")).toBeNull();
   fireEvent.click(trigger);
   await screen.findByTestId("provider-rail-codex");
-  expect(screen.queryByTestId("provider-account-footer")).toBeNull();
+  expect(screen.queryByTestId("provider-account-header")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Manage accounts" })).toBeNull();
 });
 
 it("the usage-limit notice offers the switch, and Choose account… opens the picker on that provider", async () => {
@@ -219,4 +247,30 @@ it("a switch made from one view moves every view of the chat", async () => {
     await result.current.strip.choose(ACCOUNTS[0]);
   });
   await waitFor(() => expect(result.current.chip.current?.id).toBe("default"));
+});
+
+it("the model list's fades follow its scroll, also after the picker reopens", async () => {
+  // jsdom has no layout: 300px of rows in a 100px list, scrolled to the top.
+  const overflow = (list: HTMLElement) => {
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 300 });
+    Object.defineProperty(list, "clientHeight", { configurable: true, value: 100 });
+    fireEvent.scroll(list);
+  };
+  renderPicker();
+  const trigger = screen.getByTestId("multi-provider-model-picker-trigger");
+  fireEvent.click(trigger);
+  overflow(await screen.findByTestId("multi-provider-model-list"));
+  expect(screen.getByTestId("multi-provider-model-list-bottom-fade")).toHaveAttribute("data-visible", "true");
+  expect(screen.getByTestId("multi-provider-model-list-top-fade")).toHaveAttribute("data-visible", "false");
+
+  // Closing unmounts the list; the reopened one is a new element.
+  fireEvent.click(trigger);
+  await waitFor(() => expect(screen.queryByTestId("multi-provider-model-list")).toBeNull());
+  fireEvent.click(trigger);
+  const list = await screen.findByTestId("multi-provider-model-list");
+  overflow(list);
+  list.scrollTop = 200;
+  fireEvent.scroll(list);
+  expect(screen.getByTestId("multi-provider-model-list-top-fade")).toHaveAttribute("data-visible", "true");
+  expect(screen.getByTestId("multi-provider-model-list-bottom-fade")).toHaveAttribute("data-visible", "false");
 });

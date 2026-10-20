@@ -1,5 +1,5 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 
@@ -67,4 +67,33 @@ it("updates when content is filtered or resized, and disconnects on unmount", as
   disconnect.mockClear();
   unmount();
   expect(disconnect).toHaveBeenCalledOnce();
+});
+
+function ElementExample({ show, rows }: { show: boolean; rows: string }) {
+  const [node, setNode] = useState<HTMLDivElement | null>(null);
+  const edges = useScrollEdges(node);
+  return (
+    <div>
+      {/* Keyed so each change of rows is a new scroller element. */}
+      {show && <div key={rows} ref={setNode} data-testid="viewport">{rows}</div>}
+      <ScrollEdgeFade edge="top" visible={edges.top} data-testid="top" />
+      <ScrollEdgeFade edge="bottom" visible={edges.bottom} data-testid="bottom" />
+    </div>
+  );
+}
+
+it("follows an element that mounts late or is replaced", () => {
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(100);
+  vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(300);
+  // The caller is mounted before its scroller exists, as in a popover.
+  const { rerender } = render(<ElementExample show={false} rows="a" />);
+  rerender(<ElementExample show rows="a" />);
+  expect(screen.getByTestId("bottom")).toHaveAttribute("data-visible", "true");
+
+  rerender(<ElementExample show rows="b" />);
+  const replaced = screen.getByTestId("viewport");
+  replaced.scrollTop = 200;
+  fireEvent.scroll(replaced);
+  expect(screen.getByTestId("top")).toHaveAttribute("data-visible", "true");
+  expect(screen.getByTestId("bottom")).toHaveAttribute("data-visible", "false");
 });

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { act, cleanup, renderHook } from "@testing-library/react";
 
-type Lookup = { account_id: string; bound: boolean; workspace_id: string | null; workspace_default: string | null };
+type Lookup = { account_id: string; bound: boolean };
 
 const { lookups, switchThread } = vi.hoisted(() => ({
   // Each binding read waits until the test answers it.
@@ -34,7 +34,7 @@ const account = (id: string, label: string | null): ProviderAccount => ({
 const DEFAULT = account("default", null);
 const WORK = account("codex-work", "Work");
 
-const bound = (account_id: string): Lookup => ({ account_id, bound: true, workspace_id: "ws", workspace_default: null });
+const bound = (account_id: string): Lookup => ({ account_id, bound: true });
 
 /** Answer the oldest unanswered read of `threadId`. */
 async function answer(threadId: string, value: Lookup) {
@@ -95,7 +95,7 @@ it("ignores a read begun before a switch that answers after it", async () => {
   expect(result.current.current?.id).toBe("codex-work");
 });
 
-const unbound = (account_id: string): Lookup => ({ account_id, bound: false, workspace_id: null, workspace_default: null });
+const unbound = (account_id: string): Lookup => ({ account_id, bound: false });
 
 function setStreaming(threadId: string, streaming: boolean) {
   useAgentChatStore.getState().ensureThread(threadId);
@@ -161,7 +161,7 @@ it("a second view of a draft never overrides its explicit pick", async () => {
   await answer("draft-b", unbound("default"));
   await act(() => result.current.picker.choose(DEFAULT));
 
-  // The draft moves to a workspace whose default is Work; both views re-read.
+  // The app-wide default changes to Work; both views re-read.
   act(() => result.current.reader.refreshIdentities());
   await answer("draft-b", unbound("codex-work"));
   act(() => result.current.picker.refreshIdentities());

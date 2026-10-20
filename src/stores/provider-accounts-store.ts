@@ -29,8 +29,8 @@ interface ProviderAccountsStore {
    *  over from that provider's default. */
   picks: Record<string, string>;
   /** Picks the app made to match what a draft shows, by `pickKey`, rather
-   *  than ones the user chose: only these follow the draft's target. Shared
-   *  so every view of a draft agrees. */
+   *  than ones the user chose: only these follow the app-wide default.
+   *  Shared so every view of a draft agrees. */
   autoPicks: Record<string, boolean>;
   load: (force?: boolean) => Promise<void>;
   /** Also asks Codex who each home is signed in as (spawns the CLI). */
@@ -38,7 +38,7 @@ interface ProviderAccountsStore {
   add: (provider: AccountProvider, label: string) => Promise<ProviderAccount>;
   rename: (accountId: string, label: string) => Promise<void>;
   remove: (accountId: string) => Promise<void>;
-  setDefault: (provider: AccountProvider, accountId: string | null, workspaceId?: string | null) => Promise<void>;
+  setDefault: (provider: AccountProvider, accountId: string | null) => Promise<void>;
   pick: (provider: AccountProvider, threadId: string, accountId: string, auto?: boolean) => void;
   /** Ask the composer's model picker to open on `provider`'s accounts
    *  (the usage-limit notice's "Choose account…"). */
@@ -85,8 +85,7 @@ export const useProviderAccounts = create<ProviderAccountsStore>((set, get) => (
       picks: Object.fromEntries(Object.entries(s.picks).filter(([, id]) => id !== accountId)),
     }));
   },
-  setDefault: async (provider, accountId, workspaceId = null) =>
-    accept(await providerAccountSetDefault(provider, accountId, workspaceId)),
+  setDefault: async (provider, accountId) => accept(await providerAccountSetDefault(provider, accountId)),
   pick: (provider, threadId, accountId, auto = false) =>
     set((s) => {
       const key = pickKey(provider, threadId);
@@ -135,13 +134,12 @@ export function withAccountPick(
 export async function startsOnSignedInAccount(
   provider: string,
   threadId: string,
-  workspaceId: string | null,
 ): Promise<boolean> {
   if (provider !== "claude" && provider !== "codex") return false;
   try {
     const store = useProviderAccounts.getState();
     await store.load(true);
-    const resolved = await providerAccountThread(threadId, provider, workspaceId);
+    const resolved = await providerAccountThread(threadId, provider);
     const id = (resolved.bound ? null : useProviderAccounts.getState().picks[pickKey(provider, threadId)]) ?? resolved.account_id;
     if (id === DEFAULT_ACCOUNT_ID) return false;
     const find = () => accountsFor(useProviderAccounts.getState().accounts, provider).find((a) => a.id === id);

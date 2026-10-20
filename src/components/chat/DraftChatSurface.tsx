@@ -687,11 +687,7 @@ function DraftChatSurfaceInner({
       // starts on a signed-in extra provider account.
       if (
         blocked?.installed && blocked.login_command
-        && await startsOnSignedInAccount(
-          finalDraft.provider,
-          finalDraft.threadId,
-          finalDraft.target.kind === "existing_workspace" ? finalDraft.target.workspaceId : null,
-        )
+        && await startsOnSignedInAccount(finalDraft.provider, finalDraft.threadId)
       ) blocked = null;
       if (blocked) {
         const reason = (blocked.message ?? "The agent isn't available").replace(

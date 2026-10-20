@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
-import { useChatDraftStore } from "@/stores/chat-draft-store";
 import {
   accountName,
   accountsFor,
@@ -57,7 +56,6 @@ export interface ThreadAccountView {
   busy: boolean;
   /** Pick the account a draft starts on, or move a started chat. */
   choose: (account: ProviderAccount) => Promise<void>;
-  toggleWorkspaceDefault: () => Promise<void>;
   /** Re-read sign-ins; asks the CLIs when an account isn't known signed in. */
   refreshIdentities: () => void;
 }
@@ -82,11 +80,6 @@ export function useThreadAccount(
   const revision = useProviderAccounts((s) =>
     threadId && supported ? (s.bindingRevisions[pickKey(provider, threadId)] ?? 0) : 0,
   );
-  // A draft aimed at an existing workspace resolves that workspace's default.
-  const draftWorkspace = useChatDraftStore((s) => {
-    const target = Object.values(s.draftsById).find((d) => d.threadId === threadId)?.target;
-    return target?.kind === "existing_workspace" ? target.workspaceId : null;
-  });
   // The last answer, keyed by the chat it describes, so a different chat or
   // provider never shows it. `null` is a read that failed.
   const [lookup, setLookup] = useState<{ key: string; thread: ThreadAccount | null } | null>(null);
@@ -109,13 +102,12 @@ export function useThreadAccount(
     const read = ++reads.current;
     const readKey = pickKey(provider, threadId);
     try {
-      const resolved = await providerAccountThread(threadId, provider, draftWorkspace);
+      const resolved = await providerAccountThread(threadId, provider);
       if (read !== reads.current) return;
       setLookup({ key: readKey, thread: resolved });
-      // A draft starts where it is shown, even if it materializes into a
-      // new workspace whose own default would differ: record what is
-      // displayed as the draft's pick. An explicit pick stays; an automatic
-      // one follows the draft's target.
+      // A draft starts where it is shown: record what is displayed as the
+      // draft's pick. An explicit pick stays; an automatic one follows the
+      // app-wide default.
       const store = useProviderAccounts.getState();
       const existing = store.picks[readKey];
       if (!resolved.bound && (!existing || store.autoPicks[readKey])) {
@@ -124,7 +116,7 @@ export function useThreadAccount(
     } catch {
       if (read === reads.current) setLookup({ key: readKey, thread: null });
     }
-  }, [threadId, provider, draftWorkspace]);
+  }, [threadId, provider]);
 
   // A run starting or ending may have bound a draft: its unbound answer is
   // stale until the read below answers.
@@ -183,18 +175,6 @@ export function useThreadAccount(
     }
   };
 
-  const toggleWorkspaceDefault = async () => {
-    if (!thread?.workspace_id || !current || !isAccountProvider(provider)) return;
-    try {
-      await useProviderAccounts
-        .getState()
-        .setDefault(provider, thread.workspace_default === current.id ? null : current.id, thread.workspace_id);
-      await reload();
-    } catch (error) {
-      toast.failure("Couldn't set the workspace default", error);
-    }
-  };
-
   const refreshIdentities = () => {
     // A sign-in may have finished in a terminal since the last read. Ask
     // the CLIs again when an account is not known to be signed in (keyring
@@ -218,7 +198,6 @@ export function useThreadAccount(
     switching,
     busy: streaming,
     choose,
-    toggleWorkspaceDefault,
     refreshIdentities,
   };
 }

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager, Runtime, State};
+use tauri::{AppHandle, Runtime, State};
 
 use crate::agent_provider::ProviderKind;
 use crate::database::provider_accounts::ProviderAccountRow;
@@ -45,8 +45,6 @@ pub struct ThreadAccount {
     /// The chat has started and is pinned to the account; changing it is a
     /// switch rather than a pick for the next start.
     pub bound: bool,
-    pub workspace_id: Option<String>,
-    pub workspace_default: Option<String>,
 }
 
 fn provider_kind(slug: &str) -> Result<ProviderKind, String> {
@@ -283,14 +281,13 @@ pub async fn provider_account_remove<R: Runtime>(
     snapshot(&db)
 }
 
-/// Set the default for new chats, app-wide or for one workspace.
-/// `account_id: None` clears it so the next level applies.
+/// Set the app-wide default for new chats. `account_id: None` clears it,
+/// leaving the CLI's own sign-in.
 #[tauri::command]
 pub async fn provider_account_set_default(
     db: State<'_, DatabaseStore>,
     provider: String,
     account_id: Option<String>,
-    workspace_id: Option<String>,
 ) -> Result<ProviderAccountsState, String> {
     provider_kind(&provider)?;
     if let Some(id) = account_id.as_deref().filter(|id| *id != DEFAULT_ACCOUNT_ID) {
@@ -299,13 +296,9 @@ pub async fn provider_account_set_default(
             return Err("That account belongs to another provider.".into());
         }
     }
-    let scope = workspace_id.as_deref().unwrap_or("");
-    // App-wide, the CLI's own sign-in is what an empty default means.
-    let stored = match (scope, account_id.as_deref()) {
-        ("", Some(DEFAULT_ACCOUNT_ID)) => None,
-        (_, id) => id,
-    };
-    db.set_provider_account_default(scope, &provider, stored)?;
+    // The CLI's own sign-in is what an empty default means.
+    let stored = account_id.as_deref().filter(|id| *id != DEFAULT_ACCOUNT_ID);
+    db.set_provider_account_default("", &provider, stored)?;
     snapshot(&db)
 }
 
@@ -337,49 +330,27 @@ pub fn provider_account_open_sign_in<R: Runtime>(
     Ok(())
 }
 
-/// The workspace a chat lives in: its pane's, else the persisted row's.
-fn thread_workspace<R: Runtime>(app: &AppHandle<R>, db: &DatabaseStore, thread_id: &str) -> Option<String> {
-    let state = app.try_state::<AppStateStore>();
-    state
-        .as_ref()
-        .and_then(|state| state.agent_chat_pane_id_for_thread(thread_id))
-        .and_then(|pane| state.as_ref().and_then(|s| s.workspace_id_for_pane(&pane)))
-        .or_else(|| db.get_agent_chat_session(thread_id).map(|r| r.workspace_id))
-}
-
 /// Which account `thread_id` runs (or would start) on for `provider`.
-/// `workspace_id` is where a draft will start; a chat that already lives
-/// in a workspace uses its own.
 #[tauri::command]
-pub async fn provider_account_thread<R: Runtime>(
-    app: AppHandle<R>,
+pub async fn provider_account_thread(
     db: State<'_, DatabaseStore>,
     thread_id: String,
     provider: String,
-    workspace_id: Option<String>,
 ) -> Result<ThreadAccount, String> {
     let kind = provider_kind(&provider)?;
     let record = db.get_agent_chat_session(&thread_id).filter(|r| r.provider == provider);
-    let workspace_id = thread_workspace(&app, &db, &thread_id).or(workspace_id);
     let resolution = accounts::resolve(
         &db,
         kind,
         Some(&thread_id),
         None,
-        workspace_id.as_deref(),
         record.as_ref().is_some_and(|r| r.sdk_session_id.is_some()),
     )?;
-    let workspace_default = match workspace_id.as_deref() {
-        Some(ws) => db.provider_account_default(ws, &provider)?,
-        None => None,
-    };
     Ok(ThreadAccount {
         account_id: resolution.account_id().to_string(),
         // Any chat that has started runs somewhere: changing it is a switch,
         // even for a chat from before accounts existed (it has no binding).
         bound: record.is_some(),
-        workspace_id,
-        workspace_default,
     })
 }
 
