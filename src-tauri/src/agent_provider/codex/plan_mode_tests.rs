@@ -23,7 +23,8 @@ for line in sys.stdin:
  elif method=='thread/resume':
   result={'thread':{'id':'fixture-thread'},'model':'fixture-model'}
   # Older servers do not report the resumed thread's mode.
-  if not (root/'older-server').exists(): result['collaborationMode']={'mode':'plan','settings':{'model':'fixture-model'}}
+  reported='default' if (root/'reports-default').exists() else 'plan'
+  if not (root/'older-server').exists(): result['collaborationMode']={'mode':reported,'settings':{'model':'fixture-model'}}
  elif method=='thread/read': result={'thread':{'id':'fixture-thread','turns':[]}}
  elif method=='turn/start':
   count+=1;result={'turn':{'id':'turn-'+str(count),'status':'inProgress'}}
@@ -194,16 +195,15 @@ async fn a_resumed_plan_thread_continues_in_plan_until_a_send_names_a_mode() {
 
 #[tokio::test]
 async fn a_server_that_reports_no_mode_resumes_in_the_recorded_one() {
-    for (older, recorded, expected) in [
+    for (server, recorded, expected) in [
         // Older server: the mode Codemux recorded for the last turn.
-        (true, "plan", "plan"),
+        ("older-server", "plan", "plan"),
         // A server that reports the mode is the truth, over a stale record.
-        (false, "default", "plan"),
+        ("reports-plan", "default", "plan"),
+        ("reports-default", "plan", "default"),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        if older {
-            std::fs::write(dir.path().join("older-server"), "").unwrap();
-        }
+        std::fs::write(dir.path().join(server), "").unwrap();
         let provider = CodexAgentProvider::new(CodexProviderConfig {
             codex_binary: fixture_binary(dir.path()),
             ..Default::default()
@@ -220,7 +220,7 @@ async fn a_server_that_reports_no_mode_resumes_in_the_recorded_one() {
             .filter(|(method, _)| method == "turn/start")
             .map(|(_, mode)| mode.unwrap())
             .collect();
-        assert_eq!(modes, [expected], "older={older}");
+        assert_eq!(modes, [expected], "{server}");
         let _ = provider.stop_session(thread).await;
     }
 }
