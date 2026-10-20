@@ -3698,7 +3698,7 @@ describe("Activity drag commits", () => {
   it("opens Wrapping up honestly during preview and transfers keyboard focus after unpinning", async () => {
     const base = Date.now();
     workspaces = [
-      makeWorkspace({ title: "Ready pin", pinned_at: 1, worktree_path: "/wt/a", pr_number: 12, pr_state: "OPEN", last_active_at: base - 600_000, last_visited_at: base - 60_000 }),
+      makeWorkspace({ title: "Ready pin", pinned_at: 1, worktree_path: "/wt/a", pr_number: 12, pr_state: "OPEN", last_active_at: base - 4 * 86_400_000, last_visited_at: base - 60_000 }),
       makeWorkspace({ title: "Already wrapping", worktree_path: "/wt/b", pr_number: 13, pr_state: "OPEN", last_active_at: base - 600_000, last_visited_at: base - 60_000 }),
     ];
     const { container, rerender } = await renderInbox();
@@ -3712,7 +3712,7 @@ describe("Activity drag commits", () => {
     await vi.waitFor(() => expect(document.activeElement).toBe(container.querySelector('[data-inbox-card="ws-1"]')));
     expect(container.querySelector('[data-inbox-drag-list] [data-inbox-card="ws-1"]')).toBeNull();
     expect(setWorkspacePinned).toHaveBeenCalledWith("ws-1", false);
-    expect(useSidebarInboxStore.getState().keepActive["ws-1"]).toBeUndefined();
+    expect(useSidebarInboxStore.getState().keepActive["ws-1"]).toBe("wrapping");
     workspaces = workspaces.map((workspace) => workspace.workspace_id === "ws-1"
       ? { ...workspace, pinned_at: null, pr_state: "MERGED" } : workspace);
     await rerenderInbox(rerender);

@@ -265,7 +265,7 @@ export function useInboxLifecycle(): void {
       const id = ws.workspace_id;
       if (pinOverrides[id] ?? (ws.pinned_at != null)) continue;
       if (settledSet.has(id) || snoozedSet.has(id)) continue;
-      if (keepActive[id]) continue;
+      if (keepActive[id] === true) continue;
       const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
       // Aggregate state: the workspace settles when the *set* is finished,
       // not when its primary happens to merge. Settling a nine-PR stack
@@ -280,7 +280,9 @@ export function useInboxLifecycle(): void {
           status,
           stamp,
           now,
-          autoSettleDays,
+          // Preserve an explicit shelf drop even for old work, while still
+          // applying the merged/closed completion rule above the idle fallback.
+          keepActive[id] === "wrapping" ? null : autoSettleDays,
           prsDescribeThisCheckout(prs, ws.git_branch),
         )
       ) {

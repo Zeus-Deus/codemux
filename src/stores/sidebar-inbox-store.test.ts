@@ -22,6 +22,7 @@ interface PersistedBlob {
   settled: { id: string; at: number; workEndedAt?: number }[];
   snoozed: { id: string; at: number; until: number }[];
   keepActive: string[];
+  keepWrapping: string[];
   activity: Record<string, number>;
 }
 
@@ -561,7 +562,7 @@ describe("inbox drag commits", () => {
   it("clears hidden shelves when dropping into Wrapping up without suppressing its automatic lifecycle", async () => {
     useSidebarInboxStore.setState({ settled: [{ id: "a", at: 1 }], keepActive: { a: true } });
     await useSidebarInboxStore.getState().applyDrop({ ...unpin, destination: "wrapping" }, true);
-    expect(useSidebarInboxStore.getState()).toMatchObject({ settled: [], keepActive: {} });
+    expect(useSidebarInboxStore.getState()).toMatchObject({ settled: [], keepActive: { a: "wrapping" } });
   });
 
   it("restores hidden shelves and their previous keep-active decision if a wrapping drop fails", async () => {
@@ -570,6 +571,33 @@ describe("inbox drag commits", () => {
     mockSetWorkspacePinned.mockRejectedValueOnce(new Error("offline"));
     await expect(useSidebarInboxStore.getState().applyDrop({ ...unpin, destination: "wrapping" }, true)).rejects.toThrow("offline");
     expect(useSidebarInboxStore.getState()).toMatchObject({ settled: [entry], keepActive: { a: true } });
+  });
+
+  it("persists the Wrapping up idle exemption, prunes it, and clears it on real activity", async () => {
+    await useSidebarInboxStore.getState().applyDrop({ ...unpin, destination: "wrapping" }, true);
+    expect(lastPersistedBlob()).toMatchObject({ keepActive: [], keepWrapping: ["a"] });
+    const raw = JSON.stringify(lastPersistedBlob());
+    __resetSidebarInboxStoreForTests();
+    mockDbGetUiState.mockResolvedValue(raw);
+    await useSidebarInboxStore.getState().load();
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({ a: "wrapping" });
+    useSidebarInboxStore.getState().noteActivity("a", 100);
+    useSidebarInboxStore.getState().prune(new Set(["a"]));
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({ a: "wrapping" });
+    // Genuine activity clears even when its timestamp is inside the throttle.
+    useSidebarInboxStore.getState().noteActivity("a", 101, { clearPin: true });
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({});
+    expect(lastPersistedBlob().keepWrapping).toEqual([]);
+    useSidebarInboxStore.setState({ keepActive: { gone: "wrapping" } });
+    useSidebarInboxStore.getState().prune(new Set(["a"]));
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({});
+  });
+
+  it("restores the Wrapping up exemption when a later Active drop is rejected", async () => {
+    useSidebarInboxStore.setState({ keepActive: { a: "wrapping" } });
+    mockSetWorkspacePinned.mockRejectedValueOnce(new Error("offline"));
+    await expect(useSidebarInboxStore.getState().applyDrop(unpin, true)).rejects.toThrow("offline");
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({ a: "wrapping" });
   });
 
   it("lets a later menu action win after an in-flight drop and clears its override", async () => {

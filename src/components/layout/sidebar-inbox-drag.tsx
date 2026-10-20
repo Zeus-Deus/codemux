@@ -548,18 +548,18 @@ export function InboxDragList(props: Props) {
       key={PINNED}
       id={PINNED}
       dragging={Boolean(drag)}
-      target={drag?.to === "pinned"}
+      target={Boolean(drag?.valid && drag.to === "pinned")}
       resting={false}
-      empty={layout?.pinned.length === 0}
+      empty={Boolean(drag?.valid && layout?.pinned.length === 0)}
     />,
     ...props.pinned.map((id, index) => props.renderCard(id, index, true)),
     <Boundary
       key={ACTIVE}
       id={ACTIVE}
       dragging={Boolean(drag)}
-      target={drag?.to === "active"}
+      target={Boolean(drag?.valid && drag.to === "active")}
       resting={props.pinned.length > 0 && props.hasContentBelow}
-      empty={layout?.active.length === 0}
+      empty={Boolean(drag?.valid && layout?.active.length === 0)}
       wrapping={layout?.wrapping}
     />,
     <ActiveLeading key={LEADING}>{props.activeLeading}</ActiveLeading>,
