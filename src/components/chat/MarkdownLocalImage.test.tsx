@@ -224,6 +224,76 @@ describe("MarkdownLocalImage", () => {
       }
     });
 
+    it("reads afresh when the copy is announced during a failing read", async () => {
+      const originalCreateObjectUrl = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+      Object.defineProperty(URL, "createObjectURL", {
+        configurable: true,
+        value: vi.fn(() => "blob:fresh-copy"),
+      });
+      readLocalChatImageMock.mockRejectedValue(new Error("gone"));
+      let rejectCatchUp: (error: Error) => void = () => {};
+      readChatImageMock
+        .mockRejectedValueOnce(new Error("not yet"))
+        .mockImplementationOnce(
+          () => new Promise((_, reject) => { rejectCatchUp = reject; }),
+        )
+        .mockResolvedValue({ bytes: new Uint8Array([137, 80, 78, 71]), media_type: "image/png" });
+      const { container, findByText } = renderKept();
+
+      fireEvent.error(container.querySelector("img")!);
+      await waitFor(() => {
+        expect(container.querySelector("img")).toHaveAttribute("src", "mock-asset:/tmp/proof.png");
+      });
+      fireEvent.error(container.querySelector("img")!);
+      expect(await findByText("Image unavailable")).toBeInTheDocument();
+      await waitFor(() => expect(readChatImageMock).toHaveBeenCalledTimes(2));
+      // The copy lands while the catch-up read is still failing.
+      announceKept?.(["/cfg/images/t/k.png"]);
+      rejectCatchUp(new Error("not yet"));
+
+      await waitFor(() => {
+        expect(container.querySelector("img")).toHaveAttribute("src", "blob:fresh-copy");
+      });
+      expect(readChatImageMock).toHaveBeenCalledTimes(3);
+      if (originalCreateObjectUrl) {
+        Object.defineProperty(URL, "createObjectURL", originalCreateObjectUrl);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+    });
+
+    it("does not revive a kept copy the browser could not decode", async () => {
+      const originalCreateObjectUrl = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+      Object.defineProperty(URL, "createObjectURL", {
+        configurable: true,
+        value: vi.fn(() => "blob:undecodable"),
+      });
+      readChatImageMock.mockResolvedValue({ bytes: new Uint8Array([137, 80]), media_type: "image/png" });
+      readLocalChatImageMock.mockRejectedValue(new Error("gone"));
+      const { container, findByText } = renderKept();
+
+      fireEvent.error(container.querySelector("img")!);
+      await waitFor(() => {
+        expect(container.querySelector("img")).toHaveAttribute("src", "blob:undecodable");
+      });
+      fireEvent.error(container.querySelector("img")!);
+      await waitFor(() => {
+        expect(container.querySelector("img")).toHaveAttribute("src", "mock-asset:/tmp/proof.png");
+      });
+      fireEvent.error(container.querySelector("img")!);
+      expect(await findByText("Image unavailable")).toBeInTheDocument();
+      announceKept?.(["/cfg/images/t/k.png"]);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(container.querySelector("img")).toBeNull();
+      expect(readChatImageMock).toHaveBeenCalledTimes(1);
+      if (originalCreateObjectUrl) {
+        Object.defineProperty(URL, "createObjectURL", originalCreateObjectUrl);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+    });
+
     it("ignores copies kept for other links", () => {
       const { container } = render(
         <RetainedImagesProvider images={kept}>

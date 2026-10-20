@@ -98,6 +98,13 @@ function requestBlobUrl({ path, read }: ImageCandidate): Promise<string> {
   return request;
 }
 
+/** A read that starts after any read already in flight settles, so a copy
+ *  announced mid-read is not judged by that earlier attempt. */
+async function settledBlobUrl(candidate: ImageCandidate): Promise<string> {
+  await blobRequestCache.get(candidate.path)?.catch(() => undefined);
+  return requestBlobUrl(candidate);
+}
+
 function basename(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] ?? path;
@@ -208,13 +215,16 @@ function useLocalImageSource(candidates: readonly ImageCandidate[]) {
 
   // Every source failed, but the kept copy may only have been landing (its
   // background copy can hold the bytes after the original is gone): load it
-  // when the backend records it. The immediate read covers a copy that
-  // landed before this card started waiting.
+  // when the backend records it, and read it once more right away in case
+  // it landed before this card started waiting. A copy that already has a
+  // blob was read in full and failed to decode, so it is never re-read.
+  const caughtUp = useRef<string | null>(null);
   useEffect(() => {
     const kept = candidates[0];
     if (!state.failed || !kept?.kept) return;
     const load = () => {
-      requestBlobUrl(kept)
+      if (blobUrlCache.has(kept.path)) return;
+      settledBlobUrl(kept)
         .then((url) => {
           if (currentKey.current === key) {
             setStored({ key, index: 0, blob: url, failed: false });
@@ -223,7 +233,10 @@ function useLocalImageSource(candidates: readonly ImageCandidate[]) {
         .catch(() => {});
     };
     const stop = whenKeptCopyLands(kept.path, load);
-    load();
+    if (caughtUp.current !== key) {
+      caughtUp.current = key;
+      load();
+    }
     return stop;
   }, [candidates, key, state.failed]);
 
