@@ -756,6 +756,9 @@ impl Journal {
             )
             .optional()
             .map_err(|e| e.to_string())?;
+        if retry_held && task.wake_state == WakeState::Held && prior.is_none() {
+            return Err("Held result has no definite-no-send delivery evidence".into());
+        }
         if prior.as_deref().is_some_and(|s| !matches!(s, "before_send" | "not_attempted")) {
             return Err(
                 "Result was accepted or may have been submitted; explicit resend is forbidden"

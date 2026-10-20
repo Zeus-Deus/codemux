@@ -42,7 +42,7 @@ async fn review_r1_remote_result_outbox_reacquires_before_send_attempt() {
 
 #[test]
 fn review_r1_remote_outbox_retry_rechecks_grant_stop_cancellation_and_uncertainty() {
-    for action in ["grant","stop","cancel","unknown","accepted"] {
+    for action in ["grant","stop","cancel","unknown","accepted","missing"] {
         let root=tempfile::tempdir().unwrap();
         let (app,store,task,_,mut grant,_)=setup(root.path(),&format!("review-r1-remote-{action}"));
         store.apply_remote(&task.id,&tests::remote(&task,crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
@@ -57,10 +57,11 @@ fn review_r1_remote_outbox_retry_rechecks_grant_stop_cancellation_and_uncertaint
             "grant"=>{grant.enabled=false;store.put_grant(&task.parent_workspace_id,&grant).unwrap();},
             "stop"=>store.suppress_parent(&task.parent_thread_id,true).unwrap(),
             "cancel"=>{store.cancel(&task.id).unwrap();},
+            "missing"=>{store.conn.lock().unwrap().execute("DELETE FROM delivery_outcomes WHERE task=?1",[&task.id]).unwrap();},
             _=>{},
         }
         assert!(app::begin_wake_delivery(app.handle(),&task.parent_thread_id,Some(&format!("delegation:{}",task.id))).is_err(),"{action}");
-        assert_eq!(store.delivery_outcome(&task.id).unwrap(),match action {"unknown"=>DeliveryOutcome::Unknown,"accepted"=>DeliveryOutcome::Accepted,_=>DeliveryOutcome::BeforeSend});
+        assert_eq!(store.delivery_outcome(&task.id).unwrap(),match action {"unknown"=>DeliveryOutcome::Unknown,"accepted"=>DeliveryOutcome::Accepted,"missing"=>DeliveryOutcome::NotAttempted,_=>DeliveryOutcome::BeforeSend});
     }
 }
 
