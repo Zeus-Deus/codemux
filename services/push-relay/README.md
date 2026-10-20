@@ -14,7 +14,7 @@ Paths are relative to `basePath`. All JSON responses carry `content-type: applic
 | `POST /v1/devices/:id/notifications` | desktop | `Bearer <sendKey>` | `{title≤120, body≤400, category, collapseKey?≤64, data?, ttlSeconds?}` | `202 {delivered:true}` | 400, 401, 404, 410 `gone` (device deleted), 429 (120/h per device), 502 `upstream_failed`, 503 `platform_unavailable` |
 | `GET /v1/health` | anyone | none | — | `200 {ok, platforms:{ios, android}}` | — |
 
-`category` is one of `approval | input | complete | failure | pr | test`. A category the phone muted (`mutedCategories`, any but `test`) is accepted with `202 {delivered:false}` and not sent, so an opt-out holds while the desktops are out of the phone's reach. `data` is ≤10 string entries (keys `[A-Za-z][A-Za-z0-9_]{0,31}`, values ≤256 chars, FCM-reserved keys rejected); `data.workspaceId` becomes the iOS `thread-id`. `collapseKey` is restricted to `[A-Za-z0-9._:-]` because it becomes an HTTP header.
+`category` is one of `approval | input | complete | failure | pr | test`. A category the phone muted (`mutedCategories`, any but `test`) is accepted with `202 {delivered:false}` and not sent, so an opt-out holds while the desktops are out of the phone's reach. Text limits (`title`, `body`, `data` values) count Unicode code points, the unit the desktop clips by, and title, body and data (with `data.workspaceId` counted twice, as APNs repeats it) must also fit in 3072 UTF-8 bytes. `data` is ≤10 string entries (keys `[A-Za-z][A-Za-z0-9_]{0,31}`, values ≤256 chars, FCM-reserved keys rejected); `data.workspaceId` becomes the iOS `thread-id`. `collapseKey` is restricted to `[A-Za-z0-9._:-]` because it becomes an HTTP header.
 
 ## Mounting (Hono)
 
