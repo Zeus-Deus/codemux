@@ -65,6 +65,16 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RestartResumeRecor
 
 const COLUMNS: &str = "thread_id, turn_id, epoch, waiting, chain, started_at_ms, quit_at_ms";
 
+fn other_turn_recorded(conn: &Connection, thread_id: &str, ended: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM agent_chat_restart_resumes
+             WHERE thread_id = ?1 AND ?2 <> '' AND turn_id <> '' AND turn_id <> ?2)",
+        params![thread_id, ended],
+        |row| row.get(0),
+    )
+    .map_err(|e| format!("Failed to read running turn: {e}"))
+}
+
 impl DatabaseStore {
     /// Remember the mode the thread's latest message named. A thread without
     /// a session row has nothing to resume, so nothing is written.
@@ -135,6 +145,30 @@ impl DatabaseStore {
         )
         .map(|changed| changed > 0)
         .map_err(|e| format!("Failed to clear running turn: {e}"))
+    }
+
+    /// Clear the thread's running turn now that `ended` finished. `false`,
+    /// clearing nothing, when another turn holds the row: a late end of an
+    /// older turn, which must leave the newer one resumable. An empty id on
+    /// either side can't be told apart, so it clears.
+    pub fn end_restart_turn(&self, thread_id: &str, ended: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        if other_turn_recorded(&conn, thread_id, ended)? {
+            return Ok(false);
+        }
+        conn.execute(
+            "DELETE FROM agent_chat_restart_resumes WHERE thread_id = ?1",
+            params![thread_id],
+        )
+        .map(drop)
+        .map_err(|e| format!("Failed to clear running turn: {e}"))?;
+        Ok(true)
+    }
+
+    /// Whether a turn other than `ended` holds the thread's row (see
+    /// [`end_restart_turn`](Self::end_restart_turn)).
+    pub fn restart_turn_is_other(&self, thread_id: &str, ended: &str) -> Result<bool, String> {
+        other_turn_recorded(&self.conn.lock().unwrap(), thread_id, ended)
     }
 
     /// [`clear_restart_turn`](Self::clear_restart_turn), but only while the
@@ -264,6 +298,24 @@ mod tests {
             db.upsert_agent_chat_session(thread, "w", None, "claude").unwrap();
         }
         db
+    }
+
+    #[test]
+    fn a_turn_end_clears_only_its_own_turn() {
+        let db = db_with(&["t"]);
+        db.mark_restart_turn_running("t", "new", "e", 0, 1).unwrap();
+        assert!(db.restart_turn_is_other("t", "old").unwrap());
+        assert!(!db.end_restart_turn("t", "old").unwrap(), "a late end of an older turn");
+        assert_eq!(db.get_restart_turn("t").unwrap().turn_id, "new");
+        assert!(db.end_restart_turn("t", "new").unwrap());
+        assert!(db.get_restart_turn("t").is_none());
+        // An id missing on either side can't be told apart, so it clears.
+        db.mark_restart_turn_running("t", "", "e", 0, 1).unwrap();
+        assert!(db.end_restart_turn("t", "old").unwrap());
+        db.mark_restart_turn_running("t", "new", "e", 0, 1).unwrap();
+        assert!(db.end_restart_turn("t", "").unwrap());
+        assert!(db.end_restart_turn("t", "new").unwrap(), "nothing recorded");
+        assert!(!db.restart_turn_is_other("t", "new").unwrap());
     }
 
     #[test]
