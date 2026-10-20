@@ -379,9 +379,12 @@ pub(crate) fn evaluate(
         let green = !pending
             && view.checks.iter().all(|c| matches!(c.state, CheckState::Success | CheckState::Neutral))
             && view.checks.iter().any(|c| c.state == CheckState::Success);
-        if green {
-            // The fix worked, so the budget refills. Cancelled runs prove
-            // nothing and leave it alone.
+        // Green checks prove the fix worked only once GitHub also reports
+        // the branch as mergeable: an agent pushing green heads that still
+        // conflict would otherwise get a fresh budget for every conflict
+        // wake. A mergeability still being computed waits for the next
+        // pass. Cancelled runs prove nothing and leave the budget alone.
+        if green && view.mergeable == "MERGEABLE" {
             next.attempts = 0;
         }
         let untold: Vec<PrCheck> = view
@@ -1221,6 +1224,36 @@ mod tests {
         let ended = evaluate(&next, &v, &seen, 2);
         assert!(matches!(ended.decision, Decision::Ended));
         assert_eq!(ended.next.status, PR_WATCH_ENDED);
+    }
+
+    #[test]
+    fn green_checks_do_not_refill_the_budget_while_the_conflict_stays() {
+        // An agent that pushes green heads without resolving the conflict
+        // spends one attempt per head, then watching stops.
+        let mut seen = HashSet::new();
+        let mut w = watch();
+        let green = || vec![check("test", CheckState::Success, 1)];
+        for (i, head) in ["h1", "h2", "h3"].into_iter().enumerate() {
+            let mut v = view(head, vec![], green());
+            v.mergeable = "CONFLICTING".into();
+            let eval = evaluate(&w, &v, &seen, i as i64);
+            let Decision::Wake(report) = &eval.decision else { panic!("head {head}: {:?}", eval.decision) };
+            assert!(report.conflict);
+            w = commit(&eval, &mut seen);
+            assert_eq!(w.attempts, i as u32 + 1, "head {head}");
+        }
+        let mut v = view("h4", vec![], green());
+        v.mergeable = "CONFLICTING".into();
+        assert!(matches!(evaluate(&w, &v, &seen, 3).decision, Decision::Exhausted));
+
+        // Still being computed after a push, or not reported: no refill yet.
+        for unknown in ["UNKNOWN", ""] {
+            v.mergeable = unknown.into();
+            assert_eq!(evaluate(&w, &v, &seen, 4).next.attempts, 3, "{unknown:?}");
+        }
+        // Resolved and green: the fix worked, the budget refills.
+        v.mergeable = "MERGEABLE".into();
+        assert_eq!(evaluate(&w, &v, &seen, 5).next.attempts, 0);
     }
 
     #[test]
