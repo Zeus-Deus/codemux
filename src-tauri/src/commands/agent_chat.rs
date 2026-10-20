@@ -7247,36 +7247,41 @@ pub async fn agent_chat_get_tool_result_image(
     db: State<'_, DatabaseStore>,
     row_id: i64,
     pointer: String,
+    inline: Option<bool>,
 ) -> Result<ToolResultImageSource, String> {
-    let (thread_id, payload) = db
-        .get_agent_chat_message_with_thread(row_id)
+    let (thread_id, payload) = db.get_agent_chat_message_with_thread(row_id)
         .ok_or_else(|| format!("not_found: agent_chat_messages row {row_id}"))?;
-    let src = tool_result_image_src(&payload, &pointer)?;
-    if ["http://", "https://"].iter().any(|prefix| {
-        src.get(..prefix.len())
-            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
-    }) {
-        return Ok(ToolResultImageSource { src, local: false });
-    }
-    // Browsers tolerate e.g. whitespace/unpadded base64 or sniffed formats.
-    // Preserve that original image-only source on demand if the bounded
-    // managed-raster decoder cannot accept it; never persist unvalidated bytes.
-    let bytes = match decode_tool_result_image(&src) {
-        Ok(bytes) => bytes,
-        Err(_) if can_materialize_tool_image(&src) => {
-            return Ok(ToolResultImageSource { src, local: false });
+    let (src, image) = tokio::task::spawn_blocking(move || -> Result<_, String> {
+        let src = tool_result_image_src(&payload, &pointer)?;
+        if ["http://", "https://"].iter().any(|prefix|
+            src.get(..prefix.len()).is_some_and(|value| value.eq_ignore_ascii_case(prefix))) {
+            return Ok((src, None));
         }
-        Err(error) => return Err(error),
+        if inline.unwrap_or(false) {
+            if !can_materialize_tool_image(&src) {
+                return Err("validation_error: image source exceeds inline transport bounds".into());
+            }
+            return Ok((src, None));
+        }
+        // Browsers tolerate whitespace/unpadded base64 and sniffed formats.
+        // Preserve the bounded original source without writing unvalidated bytes.
+        let bytes = match decode_tool_result_image(&src) {
+            Ok(bytes) => bytes,
+            Err(_) if can_materialize_tool_image(&src) => return Ok((src, None)),
+            Err(error) => return Err(error),
+        };
+        use sha2::{Digest, Sha256};
+        let stem = format!("tool-{row_id}-{:x}", Sha256::digest(&bytes));
+        Ok((src, Some((stem, bytes))))
+    }).await.map_err(|error| format!("failed to resolve tool-result image: {error}"))??;
+    let Some((stem, bytes)) = image else {
+        return Ok(ToolResultImageSource { src, local: false });
     };
-    use sha2::{Digest, Sha256};
-    let stem = format!("tool-{row_id}-{:x}", Sha256::digest(&bytes));
     match write_thread_chat_image(&thread_id, &stem, &bytes).await {
         Ok((path, _)) => Ok(ToolResultImageSource {
-            src: path.to_string_lossy().into_owned(),
-            local: true,
+            src: path.to_string_lossy().into_owned(), local: true,
         }),
-        // This file is a cache; inability to write it must not hide evidence
-        // already stored durably in the original result.
+        // This file is a cache; an unwritable cache must not hide evidence.
         Err(_) => Ok(ToolResultImageSource { src, local: false }),
     }
 }
@@ -10801,6 +10806,13 @@ mod tests {
         app.manage(DatabaseStore::new_in_memory());
         let db: State<'_, DatabaseStore> = app.state();
         let owner = format!("tool-image-test-{}", uuid::Uuid::new_v4());
+        struct OwnImageDir(std::path::PathBuf);
+        impl Drop for OwnImageDir {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        // This guard owns only the UUID directory minted by this test, and
+        // also removes it if an assertion unwinds before normal cleanup.
+        let _owned_dir = OwnImageDir(chat_images_dir(&owner).unwrap());
         db.upsert_agent_chat_session(&owner, "ws", None, "claude")
             .unwrap();
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -10815,28 +10827,31 @@ mod tests {
             .unwrap();
         let source = tool_result_image_src(&payload, "/1").unwrap();
         let original = decode_tool_result_image(&source).unwrap();
-        let resolved = agent_chat_get_tool_result_image(db.clone(), row_id, "/1".into())
+        let resolved = agent_chat_get_tool_result_image(db.clone(), row_id, "/1".into(), None)
             .await
             .unwrap();
         assert!(resolved.local);
         let path = std::path::PathBuf::from(&resolved.src);
         assert_eq!(path.parent().unwrap().file_name().unwrap(), owner.as_str());
         assert_eq!(tokio::fs::read(&path).await.unwrap(), original);
+        let inline = agent_chat_get_tool_result_image(db.clone(), row_id, "/1".into(), Some(true)).await.unwrap();
+        assert!(!inline.local);
+        assert_eq!(inline.src, source);
         assert_eq!(db.get_agent_chat_message(row_id).unwrap(), payload);
         assert!(
-            agent_chat_get_tool_result_image(db.clone(), row_id, "/1/uri".into())
+            agent_chat_get_tool_result_image(db.clone(), row_id, "/1/uri".into(), None)
                 .await
                 .is_err()
         );
         assert!(
-            agent_chat_get_tool_result_image(db.clone(), row_id + 1, "/1".into())
+            agent_chat_get_tool_result_image(db.clone(), row_id + 1, "/1".into(), None)
                 .await
                 .is_err()
         );
         // Only this test's generated cache file is removed. The unchanged row
         // rematerializes it after a restart or an absent image cache.
         tokio::fs::remove_file(&path).await.unwrap();
-        let again = agent_chat_get_tool_result_image(db, row_id, "/1".into())
+        let again = agent_chat_get_tool_result_image(db, row_id, "/1".into(), None)
             .await
             .unwrap();
         assert_eq!(again.src, resolved.src);
@@ -10856,7 +10871,7 @@ mod tests {
             .append_agent_chat_message(&owner, &tolerant_payload)
             .unwrap()
             .unwrap();
-        let fallback = agent_chat_get_tool_result_image(db, row, "/0".into())
+        let fallback = agent_chat_get_tool_result_image(db, row, "/0".into(), None)
             .await
             .unwrap();
         assert!(!fallback.local);

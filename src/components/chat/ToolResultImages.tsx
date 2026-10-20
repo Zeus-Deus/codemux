@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { agentChatGetToolResultImage, readChatImage } from "@/tauri/commands";
+import { agentChatGetToolResultImage } from "@/tauri/commands";
 import type { LazyToolResultStub } from "@/lib/agent-chat/lazy-tool-result";
 import { ImageOff } from "lucide-react";
 
@@ -17,8 +17,8 @@ import type { ToolResultImage } from "@/lib/agent-chat/tool-result-images";
  * image thumbnail row on the user bubble (`UserMessage.tsx`): a wrapping
  * row of bounded thumbnails, each opening a near-fullscreen lightbox on
  * click. Lazy local sources use the protected asset transport, with the same
- * bounded IPC image reader as user attachments when hosted clients cannot
- * reach that asset URL.
+ * image-only data-URL fallback when hosted clients cannot reach that asset
+ * URL. Its binary Blob cache is bounded by bytes, entries and idle time.
  */
 export function ToolResultImages({ images, onImageError }: {
   images: ToolResultImage[];
@@ -138,10 +138,70 @@ export function LazyToolResultImages({ stub }: { stub: LazyToolResultStub }) {
 }
 
 type ImageSource = Awaited<ReturnType<typeof agentChatGetToolResultImage>>;
-interface ImageRequest { promise: Promise<ImageSource>; value?: ImageSource }
-// Keys have the lifetime of the actual replay stub, so separate devices/DBs
-// cannot collide on a row id. Cache only tiny local paths, never image data.
+interface ImageRequest {
+  promise: Promise<ImageSource>;
+  value?: ImageSource;
+  users: number;
+  blob?: { src: string; bytes: number };
+  inlinePromise?: Promise<ImageSource>;
+  idleTimer?: ReturnType<typeof setTimeout>;
+}
+// Keys live with the actual replay stub: different devices/DBs cannot collide
+// on a row id. Raw base64 is never retained after creating a binary Blob.
 const imageRequests = new WeakMap<LazyToolResultStub, Map<string, ImageRequest>>();
+const idleBlobs = new Map<ImageRequest, true>();
+const MAX_BLOB_BYTES = 32 * 1024 * 1024;
+const MAX_BLOB_ENTRIES = 32;
+const BLOB_IDLE_MS = 60_000;
+let blobBytes = 0;
+
+function evictBlob(request: ImageRequest) {
+  if (!request.blob || request.users > 0) return;
+  URL.revokeObjectURL(request.blob.src);
+  blobBytes -= request.blob.bytes;
+  request.blob = undefined;
+  if (request.idleTimer) clearTimeout(request.idleTimer);
+  request.idleTimer = undefined;
+  idleBlobs.delete(request);
+}
+
+function trimBlobs() {
+  for (const request of idleBlobs.keys()) {
+    if (blobBytes <= MAX_BLOB_BYTES && idleBlobs.size <= MAX_BLOB_ENTRIES) break;
+    evictBlob(request);
+  }
+}
+
+function releaseImage(request: ImageRequest) {
+  request.users -= 1;
+  if (request.users === 0 && request.blob) {
+    request.idleTimer = setTimeout(() => evictBlob(request), BLOB_IDLE_MS);
+    trimBlobs();
+  }
+}
+
+function inlineImage(stub: LazyToolResultStub, pointer: string, request: ImageRequest) {
+  if (request.blob) return Promise.resolve({ src: request.blob.src, local: false });
+  if (!request.inlinePromise) {
+    request.inlinePromise = agentChatGetToolResultImage(stub.row_id, pointer, true)
+      .then(async (source) => {
+        const response = await fetch(source.src);
+        const blob = await response.blob();
+        const src = URL.createObjectURL(blob);
+        request.blob = { src, bytes: blob.size };
+        blobBytes += blob.size;
+        idleBlobs.set(request, true);
+        // A request can finish after its body unmounted. Release its unused
+        // URL on the same idle lifetime rather than leaking it indefinitely.
+        if (request.users === 0) {
+          request.idleTimer = setTimeout(() => evictBlob(request), BLOB_IDLE_MS);
+        }
+        trimBlobs();
+        return { src, local: false };
+      }).finally(() => { request.inlinePromise = undefined; });
+  }
+  return request.inlinePromise;
+}
 
 function imageRequest(stub: LazyToolResultStub, pointer: string): ImageRequest {
   let requests = imageRequests.get(stub);
@@ -153,6 +213,7 @@ function imageRequest(stub: LazyToolResultStub, pointer: string): ImageRequest {
   if (existing) return existing;
   const cache = requests;
   const request: ImageRequest = {
+    users: 0,
     promise: agentChatGetToolResultImage(stub.row_id, pointer).then((source) => {
       if (source.local) request.value = source;
       else cache.delete(pointer);
@@ -164,40 +225,40 @@ function imageRequest(stub: LazyToolResultStub, pointer: string): ImageRequest {
 }
 
 function LazyToolResultImage({ stub, pointer }: { stub: LazyToolResultStub; pointer: string }) {
+  const cached = imageRequests.get(stub)?.get(pointer);
   const [source, setSource] = useState<ImageSource | null>(
-    () => imageRequests.get(stub)?.get(pointer)?.value ?? null,
+    () => cached?.blob ? { src: cached.blob.src, local: false } : cached?.value ?? null,
   );
   const [failed, setFailed] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const mounted = useRef(false);
-  const blobUrl = useRef<string | null>(null);
-  const reading = useRef(false);
   useEffect(() => {
     mounted.current = true;
-    setSource(imageRequests.get(stub)?.get(pointer)?.value ?? null);
+    const request = imageRequest(stub, pointer);
+    request.users += 1;
+    if (request.idleTimer) clearTimeout(request.idleTimer);
+    request.idleTimer = undefined;
+    if (request.blob) {
+      idleBlobs.delete(request);
+      idleBlobs.set(request, true);
+    }
+    setSource(request.blob ? { src: request.blob.src, local: false } : request.value ?? null);
     setFailed(false);
-    imageRequest(stub, pointer).promise.then((value) => {
-      if (mounted.current) setSource(value);
+    request.promise.then((value) => {
+      if (mounted.current) setSource(request.blob ? { src: request.blob.src, local: false } : value);
     }).catch(() => { if (mounted.current) setFailed(true); });
-    return () => {
-      mounted.current = false;
-      if (blobUrl.current) URL.revokeObjectURL(blobUrl.current);
-      blobUrl.current = null;
-    };
+    return () => { mounted.current = false; releaseImage(request); };
   }, [stub, pointer, attempt]);
 
   const readFallback = () => {
-    if (!source?.local || reading.current) return;
-    reading.current = true;
-    readChatImage(source.src).then(({ bytes, media_type }) => {
-      if (!mounted.current) return;
-      const url = URL.createObjectURL(new Blob([bytes], { type: media_type }));
-      blobUrl.current = url;
-      setSource({ src: url, local: false });
+    if (!source?.local) return;
+    const request = imageRequest(stub, pointer);
+    inlineImage(stub, pointer, request).then((value) => {
+      if (mounted.current) setSource(value);
     }).catch(() => {
       imageRequests.get(stub)?.delete(pointer);
       if (mounted.current) setFailed(true);
-    }).finally(() => { reading.current = false; });
+    });
   };
 
   if (source && !failed) {

@@ -18,9 +18,9 @@ vi.mock("@/tauri/commands", () => ({
 vi.mock("@/lib/clipboard", () => ({ copyToClipboard: vi.fn().mockResolvedValue(true) }));
 import { copyToClipboard } from "@/lib/clipboard";
 vi.mock("@tauri-apps/api/core", () => ({ convertFileSrc: (path: string) => `asset:${path}` }));
-import { agentChatGetToolResult, agentChatGetToolResultImage, readChatImage } from "@/tauri/commands";
+import { agentChatGetToolResult, agentChatGetToolResultImage } from "@/tauri/commands";
 
-afterEach(() => cleanup());
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 const ROW_ID = 4242;
 
@@ -68,7 +68,6 @@ describe("lazy tool-result body", () => {
   beforeEach(() => {
     vi.mocked(agentChatGetToolResult).mockReset();
     vi.mocked(agentChatGetToolResultImage).mockReset();
-    vi.mocked(readChatImage).mockReset();
     vi.mocked(copyToClipboard).mockResolvedValue(true);
     useAgentChatStore.setState({ threads: {} });
   });
@@ -139,9 +138,12 @@ describe("lazy tool-result body", () => {
     expect(screen.getByRole("img")).toHaveAttribute("src", "data:image/svg+xml;base64,AAAA");
   });
 
-  it("uses bounded IPC readback when a hosted client cannot reach the image asset, and releases its blob", async () => {
-    vi.mocked(agentChatGetToolResultImage).mockResolvedValue({ src: "/managed/tool.png", local: true });
-    vi.mocked(readChatImage).mockResolvedValue({ bytes: new Uint8Array([1, 2, 3]), media_type: "image/png" });
+  it("reuses a bounded binary cache across hosted remounts and revokes idle URLs", async () => {
+    vi.mocked(agentChatGetToolResultImage)
+      .mockResolvedValueOnce({ src: "/managed/tool.png", local: true })
+      .mockResolvedValueOnce({ src: "data:image/png;base64,AQID", local: false });
+    const fetchMock = vi.fn().mockResolvedValue({ blob: async () => new Blob([new Uint8Array([1, 2, 3])]) });
+    vi.stubGlobal("fetch", fetchMock);
     Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => "blob:tool-image") });
     Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
     const item = imageStub();
@@ -151,13 +153,69 @@ describe("lazy tool-result body", () => {
     await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "blob:tool-image"));
     await userEvent.click(screen.getByRole("button", { name: "Open image" }));
     expect(screen.getByRole("dialog").querySelector("img")).toHaveAttribute("src", "blob:tool-image");
-    expect(readChatImage).toHaveBeenCalledTimes(1);
+    expect(agentChatGetToolResultImage).toHaveBeenLastCalledWith(ROW_ID, "/1", true);
+    expect(fetchMock).toHaveBeenCalledWith("data:image/png;base64,AQID");
     expect(agentChatGetToolResult).not.toHaveBeenCalled();
     view.unmount();
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+    const remount = render(<ToolCallBody item={item} />);
+    expect(screen.getByRole("img")).toHaveAttribute("src", "blob:tool-image");
+    expect(agentChatGetToolResultImage).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    vi.useFakeTimers();
+    remount.unmount();
+    vi.advanceTimersByTime(60_000);
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:tool-image");
-    render(<ToolCallBody item={item} />);
-    await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "asset:/managed/tool.png"));
-    expect(agentChatGetToolResultImage).toHaveBeenCalledTimes(1);
+  });
+
+  it("evicts over-budget compressed bytes only after every mounted owner releases them", async () => {
+    vi.mocked(agentChatGetToolResultImage).mockImplementation(async (rowId, _pointer, inline) =>
+      inline ? { src: "data:image/png;base64,AQID", local: false } : { src: `/managed/${rowId}.png`, local: true });
+    const blob = new Blob([new Uint8Array([1, 2, 3])]);
+    // Two compressed 17 MiB images exceed the aggregate cache budget while
+    // each remains below the backend's 25 MiB image ceiling.
+    Object.defineProperty(blob, "size", { value: 17 * 1024 * 1024 });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ blob: async () => blob }));
+    let nextUrl = 0;
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => `blob:budget-${++nextUrl}`) });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+    const item = imageStub();
+    const first = render(<ToolCallBody item={item} />);
+    const second = render(<ToolCallBody item={item} />);
+    const third = render(<ToolCallBody item={imageStub()} />);
+    await waitFor(() => expect(screen.getAllByRole("img")).toHaveLength(3));
+    for (const image of screen.getAllByRole("img")) fireEvent.error(image);
+    await waitFor(() => expect(screen.getAllByRole("img").every((image) => image.getAttribute("src")?.startsWith("blob:"))).toBe(true));
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+    first.unmount();
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+    second.unmount();
+    expect(URL.revokeObjectURL).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("img")).toHaveAttribute("src", "blob:budget-2");
+    vi.useFakeTimers();
+    third.unmount();
+    vi.advanceTimersByTime(60_000);
+    expect(URL.revokeObjectURL).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds idle Blob entries and never evicts a mounted image", async () => {
+    vi.mocked(agentChatGetToolResultImage).mockImplementation(async (rowId, _pointer, inline) =>
+      inline ? { src: "data:image/png;base64,AQID", local: false } : { src: `/managed/${rowId}.png`, local: true });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ blob: async () => new Blob(["image"]) }));
+    let nextUrl = 0;
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => `blob:entry-${++nextUrl}`) });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+    const items = Array.from({ length: 33 }, () => imageStub());
+    const view = render(<>{items.map((item, index) => <ToolCallBody key={index} item={item} />)}</>);
+    await waitFor(() => expect(screen.getAllByRole("img")).toHaveLength(33));
+    for (const image of screen.getAllByRole("img")) fireEvent.error(image);
+    await waitFor(() => expect(screen.getAllByRole("img").every((image) => image.getAttribute("src")?.startsWith("blob:"))).toBe(true));
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+    vi.useFakeTimers();
+    view.unmount();
+    expect(URL.revokeObjectURL).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(60_000);
+    expect(URL.revokeObjectURL).toHaveBeenCalledTimes(33);
   });
 
   it("retries a failed image request without fetching the entire result", async () => {
