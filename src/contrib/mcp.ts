@@ -85,7 +85,10 @@ export async function registerMcpServer(owner: Owner, server: PluginMcpServer): 
   const stop = () => stopped ??= (async () => {
     await invoke("plugins_mcp_unregister", { pluginId: owner.pluginId, localId: server.id, token });
     if (map.get(server.id) === token) map.delete(server.id);
-  })();
+  })().catch((error) => {
+    stopped = undefined;
+    throw error;
+  });
   const release = owner.track(() => { void stop().catch((error) => console.error(`[plugins] ${owner.pluginId}: MCP cleanup failed`, error)); });
   const dispose = () => { release(); return stop(); };
   if (owner.ended) await dispose();

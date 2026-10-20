@@ -1294,6 +1294,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_mcp_failed_unregister_keeps_ownership_and_retries_to_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = crate::json_rpc_child::install_exit_drain_test_barrier(dir.path());
+        let mut config = server(PluginMcpScope::All("all".into()), vec![]);
+        if let PluginMcpTransport::Stdio { cwd, .. } = &mut config.transport {
+            *cwd = Some(dir.path().display().to_string());
+        }
+        let registry = McpRegistry::new();
+        registry
+            .register_plugin_server::<tauri::Wry>(None, "demo", "one".into(), config)
+            .await
+            .unwrap();
+        wait_count(&registry, 4).await;
+        let id = "plugin:demo:fixture";
+        let child = registry.inner.lock().await.handles[id]
+            .child
+            .clone()
+            .unwrap();
+        let mut events = registry.subscribe_status();
+        // Hold the real reap receipt past shutdown's timeout, then allow the
+        // same retained watchdog to complete before the next unregister.
+        let first = registry
+            .unregister_plugin_server::<tauri::Wry>(None, "demo", "fixture", "one")
+            .await;
+        barrier.release.add_permits(1);
+        let error = first.unwrap_err();
+        assert!(error.contains("shutdown/reap"), "{error}");
+        assert_eq!(
+            registry
+                .owned_plugin_server("demo", "fixture", "one")
+                .await
+                .unwrap(),
+            id
+        );
+        {
+            let inner = registry.inner.lock().await;
+            let handle = &inner.handles[id];
+            assert!(matches!(handle.status, McpServerStatus::Errored { .. }));
+            assert!(Arc::ptr_eq(handle.child.as_ref().unwrap(), &child));
+        }
+        while let Ok(row) = events.try_recv() {
+            assert!(!matches!(row.status, McpServerStatus::Stopped));
+        }
+        registry
+            .unregister_plugin_server::<tauri::Wry>(None, "demo", "fixture", "one")
+            .await
+            .unwrap();
+        let mut statuses = Vec::new();
+        while let Ok(row) = events.try_recv() {
+            statuses.push(row.status);
+        }
+        assert!(matches!(statuses.last(), Some(McpServerStatus::Stopped)));
+        assert!(!child.is_alive());
+        assert!(registry.plugin_configs().await.is_empty());
+        registry
+            .unregister_plugin_server::<tauri::Wry>(None, "demo", "fixture", "one")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn plugin_mcp_startup_dispose_waits_for_child_exit() {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");

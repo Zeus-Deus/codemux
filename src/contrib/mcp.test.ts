@@ -46,6 +46,30 @@ describe("plugin MCP", () => {
     owner.end();
     expect(mocks.invoke.mock.calls.filter(([name]) => name === "plugins_mcp_unregister")).toHaveLength(1);
   });
+  it("retries a rejected native stop and caches only a successful stop", async () => {
+    const owner = new Owner("unity");
+    const dispose = await registerMcpServer(owner, server);
+    const registration = mocks.invoke.mock.calls.find(([name]) => name === "plugins_mcp_register")![1];
+    const failure = new Error("Could not confirm MCP shutdown");
+    let attempts = 0;
+    mocks.invoke.mockImplementation(async (name: string) => {
+      if (name === "plugins_mcp_unregister" && ++attempts === 1) throw failure;
+    });
+    const first = dispose();
+    expect(dispose()).toBe(first);
+    await expect(first).rejects.toBe(failure);
+    await api(owner).getStatus("editor");
+    expect(mocks.invoke).toHaveBeenLastCalledWith("plugins_mcp_status", {
+      pluginId: "unity", localId: "editor", token: registration.token,
+    });
+    const retry = dispose();
+    expect(retry).not.toBe(first);
+    await retry;
+    expect(dispose()).toBe(retry);
+    owner.end();
+    expect(attempts).toBe(2);
+    expect(() => api(owner).getStatus("editor")).toThrow("no longer active");
+  });
   it("tears down when disabled before async registration settles", async () => {
     let finish!: () => void;
     mocks.invoke.mockImplementation((name: string) => name === "plugins_mcp_register" ? new Promise<void>((resolve) => { finish = resolve; }) : Promise.resolve());
