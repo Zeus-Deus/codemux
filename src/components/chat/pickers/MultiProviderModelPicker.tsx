@@ -1089,7 +1089,7 @@ function ProviderRail({
                   onClick={onManageAccounts}
                   data-testid="provider-rail-manage-accounts"
                   aria-label="Manage accounts"
-                  className="flex h-8 w-full items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground focus-visible:bg-muted focus-visible:text-foreground focus-visible:outline-none"
+                  className="flex h-8 w-full items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:bg-surface-2 focus-visible:text-foreground focus-visible:outline-none"
                 >
                   <Settings2 className="size-4" aria-hidden />
                 </button>
