@@ -496,6 +496,7 @@ vi.mock("@/hooks/use-agent-chat-events", () => ({
 }));
 
 vi.mock("@/tauri/events", () => ({
+  onAgentChatSessionsMerged: vi.fn().mockResolvedValue(() => {}),
   onAgentChatTurnCheckpoint: vi.fn().mockResolvedValue(() => {}),
   onAgentChatTurnCheckpointReverted: vi.fn().mockResolvedValue(() => {}),
   onAgentChatTurnCheckpointsInvalidated: vi.fn().mockResolvedValue(() => {}),
