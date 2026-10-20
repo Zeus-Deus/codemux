@@ -32,7 +32,7 @@ use crate::state::AppStateStore;
 
 use super::agent_chat::{
     chat_images_dir_pub, feature_flag_on, fork_dispatch_guard, fork_timeline_guard,
-    lookup_provider, ProviderRegistry,
+    lookup_provider, ProviderRegistry, SubagentTracker,
 };
 use super::side_chat::{codex_initialize, codex_mcp_servers, spawn_claude_sidecar, spawn_codex};
 
@@ -175,8 +175,9 @@ async fn plan_fork<R: Runtime>(
     // own after this point either still runs or has moved the head when
     // `settled_bound` looks again.
     let (_, user_head) = db.agent_chat_fork_heads(source_thread_id);
-    if source_busy(&*live, session_live, &db, source_thread_id).await? {
-        return Err(BUSY.into());
+    let subagents: State<'_, SubagentTracker> = app.state();
+    if let Some(busy) = source_busy(&*live, session_live, &db, &subagents, source_thread_id).await? {
+        return Err(busy.refusal(FORK));
     }
     let cut = match (before_message_id, provider) {
         (None, _) => Cut::Latest,
@@ -211,43 +212,78 @@ async fn plan_fork<R: Runtime>(
     })
 }
 
-const BUSY: &str = "Wait for the current turn and any queued messages to finish, then fork the chat.";
+/// What a fork or provider switch has to wait for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Busy {
+    /// A turn running, a compaction, or queued messages still to send.
+    Turn,
+    /// The parent turn yielded, but subagents it started still work on
+    /// the conversation.
+    Subagents,
+}
 
-/// Whether the source has a turn running, a compaction in progress, or
-/// queued messages still to send.
+impl Busy {
+    /// The refusal, ending in what to do once it's over (`then`).
+    pub(crate) fn refusal(self, then: &str) -> String {
+        match self {
+            Busy::Turn => {
+                format!("Wait for the current turn and any queued messages to finish, then {then}.")
+            }
+            // A subagent cancelled without reporting it would hold forever;
+            // closing the chat clears the hold (see `agent_chat_close_pane`).
+            Busy::Subagents => format!(
+                "Wait for the chat's subagents to finish, then {then}. \
+                 If none are running, close and reopen the chat."
+            ),
+        }
+    }
+}
+
+/// What the source is busy with, if anything.
 /// A queued turn can finish before its dispatch is acknowledged (and its
 /// user message written), so the queue journal counts too, but only while
 /// the provider holds a session (`session_live`): entries a crash left
 /// behind can't dispatch and must not block forks forever. `turn_active`
 /// and `runtime_status` read session state only, never the outbound lock,
-/// so they are safe under the timeline guard.
+/// so they are safe under the timeline guard. A provider can end its turn
+/// while work it delegated still runs (Claude yields to wait on a `Task`),
+/// so the subagent tracker counts as well.
 pub(crate) async fn source_busy(
     live: &dyn AgentProvider,
     session_live: bool,
     db: &DatabaseStore,
+    subagents: &SubagentTracker,
     thread: &str,
-) -> Result<bool, String> {
+) -> Result<Option<Busy>, String> {
     let id = ThreadId(thread.to_string());
-    if live.turn_active(&id).await {
-        return Ok(true);
+    if live.turn_active(&id).await
+        // A plugin-requested compaction is rewriting the native history.
+        || live.runtime_status(&id).await.is_some_and(|status| status.compacting)
+        || (session_live && !db.control_unresolved_queued_ids(thread)?.is_empty())
+    {
+        return Ok(Some(Busy::Turn));
     }
-    // A plugin-requested compaction is rewriting the native history.
-    if live.runtime_status(&id).await.is_some_and(|status| status.compacting) {
-        return Ok(true);
-    }
-    Ok(session_live && !db.control_unresolved_queued_ids(thread)?.is_empty())
+    Ok(subagents.delegated_work_live(thread).then_some(Busy::Subagents))
 }
+
+const FORK: &str = "fork the chat";
 
 /// After the provider forked, confirm the source is still where the plan
 /// saw it and return the transcript bound to copy before. The guards stop
 /// sends and reverts, but a provider starts a queued turn on its own once
 /// the previous one ends; a fork that raced one is refused rather than
 /// pairing the provider's copy with a different transcript.
-async fn settled_bound(plan: &ForkPlan, db: &DatabaseStore) -> Result<Option<i64>, String> {
+async fn settled_bound(
+    plan: &ForkPlan,
+    db: &DatabaseStore,
+    subagents: &SubagentTracker,
+) -> Result<Option<i64>, String> {
     let thread = &plan.source.thread_id;
     let (head, user_head) = db.agent_chat_fork_heads(thread);
-    if user_head != plan.user_head || source_busy(&*plan.live, plan.session_live, db, thread).await? {
-        return Err(format!("The chat started another turn while it was being forked. {BUSY}"));
+    let busy = source_busy(&*plan.live, plan.session_live, db, subagents, thread).await?;
+    if user_head != plan.user_head || busy.is_some() {
+        let busy = busy.unwrap_or(Busy::Turn).refusal(FORK);
+        return Err(format!("The chat started another turn while it was being forked. {busy}"));
     }
     Ok(match plan.cut.before() {
         Some(before) => Some(before),
@@ -289,7 +325,7 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
         _ => fork_codex(&plan).await?,
     };
     let db: State<'_, DatabaseStore> = app.state();
-    let cut_before = settled_bound(&plan, &db).await?;
+    let cut_before = settled_bound(&plan, &db, &app.state()).await?;
     let thread_id = uuid::Uuid::new_v4().to_string();
     let title = fork_title(plan.source.title.as_deref());
     let cwd = plan.target_cwd.to_string_lossy().into_owned();
@@ -445,4 +481,244 @@ async fn codex_fork_in(
         .request_with_timeout("thread/unsubscribe", json!({ "threadId": fork_id }), CLEANUP_TIMEOUT)
         .await;
     Ok(fork_id)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../tests/helpers/mock_agent_provider.rs"]
+mod fork_mock;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_provider::{
+        ProviderRuntimeEvent, StartSessionInput, SubagentSnapshot, SubagentStatus, TurnId, TurnStatus,
+    };
+    use crate::commands::agent_chat::forward_event;
+    use fork_mock::{MockAgentProvider, MockCall};
+
+    const FORK_REFUSED: &str =
+        "Wait for the chat's subagents to finish, then fork the chat. If none are running, close and reopen the chat.";
+
+    fn start_input(thread: &str, cwd: &Path) -> StartSessionInput {
+        StartSessionInput {
+            thread_id: ThreadId(thread.into()),
+            cwd: cwd.into(),
+            model: None,
+            resume_cursor: None,
+            fresh_session: false,
+            permission_mode: Some("default".into()),
+            effort: None,
+            context_window: None,
+            fast_mode: false,
+            service_tier: None,
+            additional_directories: vec![],
+            env: None,
+            workspace_id: None,
+            remote: None,
+            extra: serde_json::Value::Null,
+            recorded_usage_baseline: None,
+        }
+    }
+
+    /// A live Claude chat whose parent turn yielded while a subagent it
+    /// spawned keeps running.
+    async fn parent_waiting_on_subagent(thread: &str) -> (
+        tauri::App<tauri::test::MockRuntime>,
+        Arc<MockAgentProvider>,
+        tempfile::TempDir,
+    ) {
+        let (app, provider, root) = parent_running_subagent(thread).await;
+        // Claude yields to wait on the Task it spawned.
+        forward_event(app.handle(), ProviderRuntimeEvent::TurnCompleted {
+            thread_id: ThreadId(thread.into()),
+            turn_id: TurnId("parent-turn".into()),
+            status: TurnStatus::Success,
+            usage: None,
+        });
+        (app, provider, root)
+    }
+
+    /// A live Claude chat with a running subagent and no turn of its own:
+    /// the provider has cleared it, but its end hasn't been forwarded yet.
+    async fn parent_running_subagent(thread: &str) -> (
+        tauri::App<tauri::test::MockRuntime>,
+        Arc<MockAgentProvider>,
+        tempfile::TempDir,
+    ) {
+        let app = tauri::test::mock_app();
+        let root = tempfile::tempdir().unwrap();
+        let state = AppStateStore::default();
+        let workspace = state.create_empty_workspace_at_path(root.path().to_path_buf()).0;
+        app.manage(state);
+        let db = DatabaseStore::new_in_memory();
+        let cwd = root.path().to_string_lossy().into_owned();
+        db.upsert_agent_chat_session(thread, &workspace, Some(&cwd), "claude").unwrap();
+        db.set_agent_chat_sdk_session_id(thread, "native-parent").unwrap();
+        app.manage(db);
+        let observability = ObservabilityStore::default();
+        let mut flags = observability.feature_flags();
+        flags.enable_agent_chat = true;
+        observability.set_feature_flags(flags);
+        app.manage(observability);
+        app.manage(ProviderRegistry::new());
+        app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+        app.manage(SubagentTracker::default());
+        app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+        app.manage(crate::agent_control::NativeControlState::default());
+        let provider = Arc::new(MockAgentProvider::new(ProviderKind::Claude));
+        app.state::<ProviderRegistry>().set_claude(provider.clone()).await;
+        provider.start_session(start_input(thread, root.path())).await.unwrap();
+        forward_event(app.handle(), ProviderRuntimeEvent::SubagentUpdated {
+            thread_id: ThreadId(thread.into()),
+            subagent: SubagentSnapshot {
+                subagent_id: "child".into(),
+                status: SubagentStatus::Running,
+                ..Default::default()
+            },
+        });
+        (app, provider, root)
+    }
+
+    fn finish_subagent(app: &tauri::App<tauri::test::MockRuntime>, thread: &str) {
+        forward_event(app.handle(), ProviderRuntimeEvent::SubagentUpdated {
+            thread_id: ThreadId(thread.into()),
+            subagent: SubagentSnapshot {
+                subagent_id: "child".into(),
+                status: SubagentStatus::Completed,
+                ..Default::default()
+            },
+        });
+    }
+
+    fn stops(provider: &MockAgentProvider) -> usize {
+        let calls = provider.calls.snapshot();
+        calls.iter().filter(|call| matches!(call, MockCall::StopSession(_))).count()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fork_waits_for_subagents_still_running_after_the_parent_yields() {
+        const THREAD: &str = "fork-parent";
+        let (app, _provider, _root) = parent_waiting_on_subagent(THREAD).await;
+        let turn_active = super::super::agent_chat::agent_chat_turn_active(
+            app.handle().clone(),
+            ProviderKind::Claude,
+            ThreadId(THREAD.into()),
+        );
+        assert!(turn_active.await.unwrap(), "the run is still live");
+        let refused = agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await;
+        assert_eq!(refused.unwrap_err(), FORK_REFUSED);
+        finish_subagent(&app, THREAD);
+        agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_switch_waits_for_subagents_and_leaves_the_source_running() {
+        const THREAD: &str = "switch-parent";
+        let (app, provider, root) = parent_waiting_on_subagent(THREAD).await;
+        let switch = || {
+            super::super::provider_switch::agent_chat_switch_provider(
+                app.handle().clone(),
+                "pane".into(),
+                ProviderKind::Claude,
+                ProviderKind::Codex,
+                start_input(THREAD, root.path()),
+                None,
+            )
+        };
+        assert_eq!(
+            switch().await.unwrap_err(),
+            "provider_switch_refused: Wait for the chat's subagents to finish, then switch providers. \
+             If none are running, close and reopen the chat."
+        );
+        assert_eq!(stops(&provider), 0, "the source session keeps running");
+        finish_subagent(&app, THREAD);
+        // Past the busy check the switch stops the source; no Codex is
+        // registered here, so it fails after that.
+        let error = switch().await.unwrap_err();
+        assert!(!error.starts_with("provider_switch_refused: "), "{error}");
+        assert_eq!(stops(&provider), 1);
+    }
+
+    /// Claude clears its turn before its end reaches the app: in between,
+    /// the provider is idle but the subagent already runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subagent_blocks_fork_and_switch_before_the_parent_turn_end_arrives() {
+        const THREAD: &str = "handoff-parent";
+        let (app, provider, root) = parent_running_subagent(THREAD).await;
+        let refused = agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await;
+        assert_eq!(refused.unwrap_err(), FORK_REFUSED);
+        let switched = super::super::provider_switch::agent_chat_switch_provider(
+            app.handle().clone(),
+            "pane".into(),
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            start_input(THREAD, root.path()),
+            None,
+        );
+        assert!(switched.await.unwrap_err().starts_with("provider_switch_refused: Wait for the chat's subagents"));
+        assert_eq!(stops(&provider), 0);
+    }
+
+    /// A child outlives its parent's turn: the user's follow-up runs and
+    /// ends while it keeps working, so forks and switches still wait for
+    /// it. A Stop releases them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subagent_still_blocks_fork_and_switch_after_a_follow_up_turn() {
+        const THREAD: &str = "follow-up-parent";
+        let (app, provider, root) = parent_waiting_on_subagent(THREAD).await;
+        let thread_id = ThreadId(THREAD.into());
+        let follow_up = TurnId("follow-up".into());
+        forward_event(app.handle(), ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: thread_id.clone(),
+            status: crate::agent_provider::SessionStatus::Running { active_turn: follow_up.clone() },
+        });
+        forward_event(app.handle(), ProviderRuntimeEvent::TurnCompleted {
+            thread_id,
+            turn_id: follow_up,
+            status: TurnStatus::Success,
+            usage: None,
+        });
+        let refused = agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await;
+        assert_eq!(refused.unwrap_err(), FORK_REFUSED);
+        let switched = super::super::provider_switch::agent_chat_switch_provider(
+            app.handle().clone(),
+            "pane".into(),
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            start_input(THREAD, root.path()),
+            None,
+        );
+        assert!(switched.await.unwrap_err().starts_with("provider_switch_refused: Wait for the chat's subagents"));
+        assert_eq!(stops(&provider), 0);
+        app.state::<SubagentTracker>().settle_interrupted_turn(THREAD);
+        agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await.unwrap();
+    }
+
+    /// The stall watchdog settles the pane of a subagent silent for ten
+    /// minutes, but can't tell it's dead: forks and switches keep waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_quiet_subagent_the_watchdog_settled_still_blocks_fork_and_switch() {
+        const THREAD: &str = "quiet-parent";
+        let (app, provider, root) = parent_waiting_on_subagent(THREAD).await;
+        let tracker = app.state::<SubagentTracker>();
+        let later = std::time::SystemTime::now() + Duration::from_secs(3_600);
+        assert_eq!(tracker.take_overdue_reviews(later, Duration::ZERO), [THREAD]);
+        assert!(!tracker.delegated_work_holding_turn(THREAD), "the pane settled");
+        let refused = agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await;
+        assert_eq!(refused.unwrap_err(), FORK_REFUSED);
+        let switched = super::super::provider_switch::agent_chat_switch_provider(
+            app.handle().clone(),
+            "pane".into(),
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            start_input(THREAD, root.path()),
+            None,
+        );
+        assert!(switched.await.unwrap_err().starts_with("provider_switch_refused: Wait for the chat's subagents"));
+        assert_eq!(stops(&provider), 0);
+        // Its late terminal snapshot releases them.
+        finish_subagent(&app, THREAD);
+        agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await.unwrap();
+    }
 }
