@@ -830,6 +830,15 @@ pub enum ProviderRuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_write_ttl: Option<CacheWriteTtl>,
     },
+    /// A turn started in this collaboration mode ("plan" or "default"),
+    /// for a provider that takes the mode per turn (Codex's Plan pill).
+    /// Sent once the provider accepted the turn, in turn order, so the
+    /// command layer can resume an interrupted turn in the mode it ran in.
+    /// Recorded, never fanned out.
+    TurnModeSelected {
+        thread_id: ThreadId,
+        mode: String,
+    },
     /// The provider's plan-quota occupancy changed.
     ///
     /// **Level state, not history.** Like

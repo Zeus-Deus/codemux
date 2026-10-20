@@ -575,6 +575,29 @@ async fn the_drain_skips_a_saved_turn_that_was_already_sent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_codex_chat_interrupted_in_plan_resumes_in_plan() {
+    let h = harness().await;
+    h.chat("rr-plan");
+    // Codex reports the mode each accepted turn runs in; the Plan pill that
+    // chose it does not survive a restart.
+    forward_event(
+        &h.handle(),
+        ProviderRuntimeEvent::TurnModeSelected {
+            thread_id: ThreadId("rr-plan".into()),
+            mode: "plan".into(),
+        },
+    );
+    h.running("rr-plan", "turn-1");
+    on_exit(&h.handle());
+
+    let decisions = resume_after_restart_for_test(&h.handle(), "launch-2").await;
+    assert_eq!(decision(&decisions, "rr-plan"), Some(ResumeDecision::Resume));
+    // The reopened session gets it, for servers that do not report it.
+    let starts = h.provider.start_inputs();
+    assert_eq!(starts[0].extra, serde_json::json!({ "turnMode": "plan" }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_chat_the_user_takes_over_during_the_launch_pass_is_left_alone() {
     let h = harness().await;
     h.chat("rr-take-a");

@@ -52,6 +52,7 @@ import {
 } from "@/lib/agent-chat/event-batcher";
 import { resolveContextWindowTokens } from "@/lib/agent-chat/context-usage";
 import { applyAllPrefixes } from "@/lib/agent-chat/mode-prefix";
+import { codexTurnPermissionOverride } from "@/lib/agent-chat/mode-compatibility";
 import {
   resolveSkillSelection,
   skillsForProvider,
@@ -1998,6 +1999,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         images: imageRefs,
         model_override: null,
         effort_override: plan.effortOverride,
+        permission_mode_override: codexTurnPermissionOverride(
+          provider,
+          mode,
+          permissionMode,
+        ),
         client_nonce: clientNonce,
       };
       try {
@@ -2070,6 +2076,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     provider,
     effort,
     mode,
+    permissionMode,
     cwd,
     skillsRegistry,
     capabilities,
@@ -3029,6 +3036,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const currentSlice = useAgentChatStore.getState().threads[threadId];
       if (!currentSlice) return;
       if (currentSlice.mode === newMode) return;
+      if (provider === "codex" && (newMode === "plan" || newMode === "ask")) {
+        // Codex plans per turn: each send carries the pill (see the send
+        // path), so its session and permission mode stay as they are.
+        setStoreMode(threadId, newMode);
+        return;
+      }
       if (newMode === "plan" || newMode === "ask") {
         const priorMode = currentSlice.permissionMode;
         try {
@@ -3106,7 +3119,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         text: CLEANUP_PROMPT,
         model_override: null,
         effort_override: null,
-        permission_mode_override: null,
+        // Cleanup edits files, so it never runs in a Codex Plan turn.
+        permission_mode_override: codexTurnPermissionOverride(
+          provider,
+          "default",
+          permissionMode,
+        ),
       });
       setStoreHasDebugActivity(threadId, false);
     } catch (err) {
@@ -3115,7 +3133,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       cleanupInFlightRef.current = false;
       setCleanupInFlight(false);
     }
-  }, [threadId, provider, setStoreMode, setStoreHasDebugActivity]);
+  }, [threadId, provider, permissionMode, setStoreMode, setStoreHasDebugActivity]);
 
   /** Open the exit-confirmation dialog and resolve with the user's
    *  pick. Caller awaits the choice and dispatches accordingly. The
@@ -3149,6 +3167,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const currentSlice = useAgentChatStore.getState().threads[threadId];
     if (!currentSlice) return;
     if (currentSlice.mode === "plan" || currentSlice.mode === "ask") {
+      if (provider === "codex") {
+        // The session never left its mode; the next send runs without Plan.
+        setStoreMode(threadId, "default");
+        return;
+      }
       const restore =
         currentSlice.modePriorPermissionMode ??
         providerDefaultPermissionMode ??

@@ -15,8 +15,11 @@ import {
 import type { AsyncQuestionItem } from "@/lib/agent-chat/types";
 import { agentChatAnswerQuestion } from "@/tauri/commands";
 vi.mock("@/tauri/commands", () => ({ agentChatAnswerQuestion: vi.fn() }));
+const { threads } = vi.hoisted(() => ({
+  threads: {} as Record<string, { mode: string; permissionMode: string }>,
+}));
 vi.mock("@/stores/agent-chat-store", () => ({
-  useAgentChatStore: { getState: () => ({ applyEvent: vi.fn() }) },
+  useAgentChatStore: { getState: () => ({ applyEvent: vi.fn(), threads }) },
 }));
 const item = (id = "q1"): AsyncQuestionItem => ({
   kind: "async_question",
@@ -65,6 +68,20 @@ describe("async question panel", () => {
         }),
       ),
     );
+  });
+  it("answers in the composer's mode, so a Plan answer starts a Plan turn", async () => {
+    threads.thread = { mode: "plan", permissionMode: "danger-full-access" };
+    render(<AsyncQuestionPanel threadId="thread" items={[item()]} working />);
+    fireEvent.click(screen.getByText("SQLite"));
+    fireEvent.submit(screen.getByText("SQLite").closest("form")!);
+    await waitFor(() =>
+      expect(agentChatAnswerQuestion).toHaveBeenCalledWith(
+        "thread",
+        "q1",
+        expect.objectContaining({ permission_mode_override: "plan" }),
+      ),
+    );
+    delete threads.thread;
   });
   it("retains typed drafts across remounts and does not steal focus", () => {
     const input = document.createElement("textarea");
