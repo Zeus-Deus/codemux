@@ -1758,6 +1758,34 @@ function RunInterruptedDivider() {
 /** A turn the backend sent on its own: once a usage limit reset, or after
  *  the app restarted mid-run. Same hairline as the session-start marker;
  *  the label discloses the full text. */
+/** Historical wake text is display data, never evidence of its sender. */
+function LegacyDelegationResult({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const body = text.replace(/^\[Codemux: delegated task results\]\s*/, "")
+    .replace(/^Codemux posted this message, not the user\.[^\n]*\s*/, "").trim();
+  const tasks = [...body.matchAll(/<task\b([^>]*)>([\s\S]*?)<\/task>/g)].flatMap((task) => {
+    const report = task[2].match(/<report>([\s\S]*?)<\/report>/);
+
+    const decode = (value: string) => value.replace(/&(amp|lt|gt|quot|apos);/g, (_, entity: string) =>
+      ({ amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" })[entity] ?? entity);
+    return [{ title: decode(task[1].match(/\btitle="([^"]*)"/)?.[1] ?? ""), report: decode(report?.[1] ?? task[2].replace(/<brief>[\s\S]*?<\/brief>/g, "")).trim() }];
+  });
+  return (
+    <div data-testid="legacy-delegation-result-row" className="px-2 py-1.5 text-caption text-muted-foreground">
+      <button type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)} className="inline-flex items-center gap-1.5 rounded-sm hover:text-foreground focus-visible:outline-ring">
+        Delegated results
+        <ChevronDown className={cn("size-3 transition-transform", open && "rotate-180")} aria-hidden />
+      </button>
+      {open && <div data-testid="legacy-delegation-report" className="mt-2 max-h-80 overflow-y-auto select-text whitespace-pre-wrap break-words text-body-sm">
+        {tasks.length ? <ul className="space-y-3">{tasks.map((task, index) => <li key={index}>
+          {task.title && <p className="font-medium text-foreground">{task.title}</p>}
+          <p>{task.report}</p>
+        </li>)}</ul> : body}
+      </div>}
+    </div>
+  );
+}
+
 function AutoResumedTurnDivider({ text, label }: { text: string; label: string }) {
   const [open, setOpen] = useState(false);
   return (
@@ -1942,7 +1970,7 @@ function ItemRow({
   }
 
   if (item.kind === "user_message" && !item.queued && !item.notification && isDelegationResultsMessage(item)) {
-    return <div data-testid="legacy-delegation-result-row" className="px-2 py-1.5 text-caption text-muted-foreground">Delegated results</div>;
+    return <LegacyDelegationResult text={item.text} />;
   }
 
   // Likewise the round of delegated-task reports Codemux posts back.

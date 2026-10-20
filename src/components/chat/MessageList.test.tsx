@@ -1458,6 +1458,31 @@ describe("MessageList usage limit", () => {
     renderList([userTurn, { kind: "user_message", id: "legacy", seq: 1, text }]);
     expect(screen.getByTestId("legacy-delegation-result-row")).toHaveTextContent("Delegated results");
     expect(screen.queryByText(/Codemux posted|private brief|raw report|Sent by Codemux/)).toBeNull();
+    const row = screen.getByTestId("legacy-delegation-result-row");
+    fireEvent.click(screen.getByRole("button", { name: "Delegated results" }));
+    expect(row).toHaveTextContent("raw report");
+    expect(row).not.toHaveTextContent(/Codemux posted|private brief|<task|<report|Sent by Codemux/);
+    expect(row.querySelector('[data-testid="legacy-delegation-report"]')).toHaveClass("max-h-80", "overflow-y-auto");
+    fireEvent.click(screen.getByRole("button", { name: "Delegated results" }));
+    expect(screen.queryByText("raw report")).toBeNull();
+  });
+
+  it("discloses each legacy task report with its saved title and plain fallback text", () => {
+    const text = '[Codemux: delegated task results]\nCodemux posted this message, not the user.\n<task title="Review &amp; test"><report>First report.\nSecond line.</report></task>\n<task title="Build"><report>Build passed.</report></task>';
+    renderList([userTurn, { kind: "user_message", id: "legacy", seq: 1, text }]);
+    fireEvent.click(screen.getByRole("button", { name: "Delegated results" }));
+    const report = screen.getByTestId("legacy-delegation-report");
+    expect(report).toHaveTextContent("Review & test");
+    expect(report).toHaveTextContent("First report. Second line.");
+    expect(report).toHaveTextContent("BuildBuild passed.");
+    expect(report).not.toHaveTextContent(/Codemux posted|<task|Sent by/);
+  });
+
+  it("keeps an unparseable legacy result readable as bounded plain text", () => {
+    renderList([userTurn, { kind: "user_message", id: "legacy", seq: 1, text: '[Codemux: delegated task results]\nAn old plain report\nwith details.' }]);
+    fireEvent.click(screen.getByRole("button", { name: "Delegated results" }));
+    expect(screen.getByTestId("legacy-delegation-report")).toHaveTextContent("An old plain report with details.");
+    expect(screen.getByTestId("legacy-delegation-report")).not.toHaveTextContent("[Codemux:");
   });
 
   it("renders a delegate_task call as the delegation card, not a tool row", () => {
