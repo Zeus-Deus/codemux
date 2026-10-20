@@ -286,12 +286,13 @@ pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES;
-    // Candidates, each list bounded on its own: links the transcript always
+    // Candidates, in order and deduplicated: links the transcript always
     // renders; reference links it may leave as text; and links inside
-    // footnotes, which render only when the footnote is referenced.
-    let mut rendered: Vec<String> = Vec::new();
-    let mut referenced_links: Vec<String> = Vec::new();
-    let mut in_footnotes: Vec<(UniCase<String>, bool, String)> = Vec::new();
+    // footnotes, which render only once the footnote is referenced. Each
+    // holds a part of the reply at most once, so they stay linear in it.
+    let mut rendered = Candidates::default();
+    let mut referenced_links = Candidates::default();
+    let mut in_footnotes: Candidates<(UniCase<String>, bool, String)> = Candidates::default();
     // Footnote labels match like the parser matches them: case-folded.
     let mut referenced = std::collections::HashSet::new();
     let mut footnote: Option<UniCase<String>> = None;
@@ -331,49 +332,28 @@ pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
             continue;
         }
         let renders = matches!(link_type, LinkType::Inline | LinkType::Autolink);
-        // Past a list's bound the scan keeps going, storing nothing more
-        // there, so footnotes referenced late are still seen.
-        let full = match &footnote {
-            Some(_) => in_footnotes.len() == MAX_SCANNED_CANDIDATES,
-            None if renders => rendered.len() == MAX_SCANNED_CANDIDATES,
-            None => referenced_links.len() == MAX_SCANNED_CANDIDATES,
-        };
-        if full {
-            continue;
-        }
         let Some(path) = local_image_path(&dest_url) else {
             continue;
         };
         match &footnote {
-            Some(label) => {
-                let candidate = (label.clone(), renders, path);
-                if !in_footnotes.contains(&candidate) {
-                    in_footnotes.push(candidate);
-                }
-            }
-            None if renders => {
-                if !rendered.contains(&path) {
-                    rendered.push(path);
-                }
-            }
-            None => {
-                if !referenced_links.contains(&path) {
-                    referenced_links.push(path);
-                }
-            }
+            Some(label) => in_footnotes.add((label.clone(), renders, path)),
+            None if renders => rendered.add(path),
+            None => referenced_links.add(path),
         }
     }
     // Links known to render come first; reference links only take slots
     // those leave free, so a speculative copy never displaces a visible one.
     let (noted_rendering, noted_references): (Vec<_>, Vec<_>) = in_footnotes
+        .order
         .into_iter()
         .filter(|(label, _, _)| referenced.contains(label))
         .partition(|(_, renders, _)| *renders);
     let mut sources: Vec<String> = Vec::new();
     let ordered = rendered
+        .order
         .into_iter()
         .chain(noted_rendering.into_iter().map(|(_, _, path)| path))
-        .chain(referenced_links)
+        .chain(referenced_links.order)
         .chain(noted_references.into_iter().map(|(_, _, path)| path));
     for path in ordered {
         if !sources.contains(&path) {
@@ -391,9 +371,26 @@ pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
 const MAX_LINE_MARKERS: usize = 32;
 /// Most leading indentation, in columns, a line keeps for the scan.
 const MAX_LINE_INDENT: usize = 64;
-/// Most distinct candidate links of each kind one scan keeps while
-/// footnotes resolve.
-const MAX_SCANNED_CANDIDATES: usize = 64;
+
+/// Distinct values in the order first seen.
+struct Candidates<T> {
+    order: Vec<T>,
+    seen: std::collections::HashSet<T>,
+}
+
+impl<T> Default for Candidates<T> {
+    fn default() -> Self {
+        Self { order: Vec::new(), seen: std::collections::HashSet::new() }
+    }
+}
+
+impl<T: Clone + Eq + std::hash::Hash> Candidates<T> {
+    fn add(&mut self, value: T) {
+        if self.seen.insert(value.clone()) {
+            self.order.push(value);
+        }
+    }
+}
 
 /// `markdown` with `\n` line endings and every line's leading container
 /// markers and indentation cut to the bounds above.
@@ -410,7 +407,7 @@ const MAX_SCANNED_CANDIDATES: usize = 64;
 fn bounded_for_scan(markdown: &str) -> std::borrow::Cow<'_, str> {
     let within = |line: &str| {
         let prefix = line_prefix(line);
-        prefix.markers.len() <= MAX_LINE_MARKERS && prefix.indent <= MAX_LINE_INDENT
+        prefix.markers <= MAX_LINE_MARKERS && prefix.indent <= MAX_LINE_INDENT
     };
     if !markdown.contains('\r') && markdown_lines(markdown).all(|(line, _)| within(line)) {
         return std::borrow::Cow::Borrowed(markdown);
@@ -420,11 +417,24 @@ fn bounded_for_scan(markdown: &str) -> std::borrow::Cow<'_, str> {
         if within(line) {
             out.push_str(line);
         } else {
+            // Same order as written: indentation and markers interleave, so
+            // a quoted code line stays in its quote. Indentation past the
+            // budget and markers past the limit are left out.
             let prefix = line_prefix(line);
-            out.extend(std::iter::repeat(' ').take(prefix.indent.min(MAX_LINE_INDENT)));
-            for marker in prefix.markers.iter().take(MAX_LINE_MARKERS) {
-                out.push_str(marker);
-                out.push(' ');
+            let mut indent_left = MAX_LINE_INDENT;
+            for part in &prefix.parts {
+                match *part {
+                    PrefixPart::Indent(columns) => {
+                        let kept = columns.min(indent_left);
+                        indent_left -= kept;
+                        out.extend(std::iter::repeat(' ').take(kept));
+                    }
+                    PrefixPart::Marker(marker, ordinal) if ordinal < MAX_LINE_MARKERS => {
+                        out.push_str(marker);
+                        out.push(' ');
+                    }
+                    PrefixPart::Marker(..) => {}
+                }
             }
             out.push_str(&line[prefix.content..]);
         }
@@ -433,6 +443,23 @@ fn bounded_for_scan(markdown: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     std::borrow::Cow::Owned(out)
+}
+
+/// Where the label of a footnote definition ends: the byte offset of the
+/// first unescaped `]` in `label`, if a `:` follows it. A backslash escapes
+/// the next character, as in the parser.
+fn footnote_label_end(label: &str) -> Option<usize> {
+    let mut chars = label.char_indices();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            ']' => return label[at + 1..].starts_with(':').then_some(at),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `markdown`'s lines with their endings, split at `\n`, `\r\n` and a bare
@@ -453,33 +480,46 @@ fn markdown_lines(markdown: &str) -> impl Iterator<Item = (&str, &str)> {
     })
 }
 
-/// A line's leading container markers (`>`, list markers, `[^label]:`), the
-/// indentation around them in columns (a marker's own following space
-/// excluded), and the byte offset where its content starts.
+/// A line's leading container markers (`>`, list markers, `[^label]:`) and
+/// the indentation around them in columns (a marker's own following space
+/// excluded), in order, and the byte offset where its content starts.
 struct LinePrefix<'a> {
-    markers: Vec<&'a str>,
+    parts: Vec<PrefixPart<'a>>,
+    markers: usize,
     indent: usize,
     content: usize,
 }
 
+/// Indentation in columns, or a marker with its position among the line's
+/// markers.
+enum PrefixPart<'a> {
+    Indent(usize),
+    Marker(&'a str, usize),
+}
+
 fn line_prefix(line: &str) -> LinePrefix<'_> {
-    let mut markers = Vec::new();
+    let mut parts = Vec::new();
+    let mut markers = 0;
     let mut indent = 0;
     let mut at = 0;
     loop {
         let rest = &line[at..];
         let trimmed = rest.trim_start_matches([' ', '\t']);
-        indent += rest[..rest.len() - trimmed.len()]
+        let columns = rest[..rest.len() - trimmed.len()]
             .chars()
             .map(|c| if c == '\t' { 4 } else { 1 })
             .sum::<usize>();
+        if columns > 0 {
+            parts.push(PrefixPart::Indent(columns));
+            indent += columns;
+        }
         at = line.len() - trimmed.len();
         let marker = if trimmed.starts_with('>') {
             1
         } else if trimmed.starts_with(['-', '*', '+']) {
             1
         } else if let Some(label) = trimmed.strip_prefix("[^") {
-            label.find("]:").map_or(0, |end| end + 4)
+            footnote_label_end(label).map_or(0, |end| end + 4)
         } else {
             let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
             if (1..=9).contains(&digits) && trimmed[digits..].starts_with(['.', ')']) {
@@ -494,9 +534,10 @@ fn line_prefix(line: &str) -> LinePrefix<'_> {
                 || after.is_empty()
                 || after.starts_with([' ', '\t']));
         if !opens {
-            return LinePrefix { markers, indent, content: at };
+            return LinePrefix { parts, markers, indent, content: at };
         }
-        markers.push(&trimmed[..marker]);
+        parts.push(PrefixPart::Marker(&trimmed[..marker], markers));
+        markers += 1;
         // The one space after a marker belongs to it, not to indentation.
         at += marker + usize::from(after.starts_with([' ', '\t']));
     }
@@ -509,7 +550,7 @@ fn local_image_path(destination: &str) -> Option<String> {
         .get(..5)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"));
     let path = if is_file_url {
-        let url = url::Url::parse(destination).ok()?;
+        let url = url::Url::parse(&normalize_uri(destination)).ok()?;
         if url.scheme() != "file" || url.host_str().is_some_and(|host| host != "localhost") {
             return None;
         }
@@ -523,9 +564,11 @@ fn local_image_path(destination: &str) -> Option<String> {
             path
         }
     } else {
-        // `decodeURI`, which leaves reserved characters encoded; the
-        // transcript keeps a path it cannot decode as written.
-        decode_uri(destination, ";/?:@&=+$,#").unwrap_or_else(|| destination.to_string())
+        // The transcript normalizes the destination, then `decodeURI`s it
+        // (leaving reserved characters encoded), and keeps the normalized
+        // form when that fails.
+        let normalized = normalize_uri(destination);
+        decode_uri(&normalized, ";/?:@&=+$,#").unwrap_or(normalized)
     };
     let bytes = path.as_bytes();
     let absolute = path.starts_with('/')
@@ -539,6 +582,36 @@ fn local_image_path(destination: &str) -> Option<String> {
         .iter()
         .any(|extension| lower.ends_with(extension));
     (absolute && supported).then_some(path)
+}
+
+/// micromark's `normalizeUri`, which the transcript applies to a link before
+/// decoding it: a `%` followed by two ASCII letters or digits stays, other
+/// characters outside its URL-safe ASCII set are percent-encoded as UTF-8.
+fn normalize_uri(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.char_indices();
+    while let Some((at, c)) = chars.next() {
+        let escape = c == '%'
+            && bytes.get(at + 1).is_some_and(u8::is_ascii_alphanumeric)
+            && bytes.get(at + 2).is_some_and(u8::is_ascii_alphanumeric);
+        if escape {
+            out.push_str(&value[at..at + 3]);
+            chars.next();
+            chars.next();
+            continue;
+        }
+        let safe = matches!(c, '!' | '#' | '$' | '&'..=';' | '=' | '?'..='Z' | '_' | 'a'..='z' | '~');
+        if safe {
+            out.push(c);
+        } else {
+            let mut buffer = [0; 4];
+            for byte in c.encode_utf8(&mut buffer).bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    out
 }
 
 /// JavaScript's `decodeURI` (or `decodeURIComponent`, with `keep` empty):
@@ -790,9 +863,17 @@ mod tests {
         assert!(matches!(bounded_for_scan(nested), std::borrow::Cow::Borrowed(_)));
         assert_eq!(local_image_sources(nested), ["/tmp/proof.png"]);
         let prefix = line_prefix("> - 1. [^a]: item");
-        assert_eq!((prefix.markers, prefix.indent), (vec![">", "-", "1.", "[^a]:"], 0));
+        let markers: Vec<_> = prefix
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                PrefixPart::Marker(marker, _) => Some(*marker),
+                PrefixPart::Indent(_) => None,
+            })
+            .collect();
+        assert_eq!((markers, prefix.indent), (vec![">", "-", "1.", "[^a]:"], 0));
         assert_eq!(line_prefix("        - item").indent, 8);
-        assert!(line_prefix("-x *** 1.5").markers.is_empty());
+        assert_eq!(line_prefix("-x *** 1.5").markers, 0);
     }
 
     #[test]
@@ -810,6 +891,26 @@ mod tests {
             "- ".repeat(MAX_LINE_MARKERS + 5)
         );
         assert_eq!(local_image_sources(&indented), ["/tmp/proof.png"]);
+    }
+
+    #[test]
+    fn a_cut_line_keeps_its_markers_where_they_were() {
+        let text = format!(
+            "> ```text\n> {}example\n> ```\n>\n> [Proof](/tmp/proof.png)",
+            " ".repeat(100)
+        );
+        assert_eq!(local_image_sources(&text), ["/tmp/proof.png"]);
+        assert_eq!(
+            bounded_for_scan(&format!("> {}x", " ".repeat(100))),
+            format!("> {}x", " ".repeat(MAX_LINE_INDENT))
+        );
+    }
+
+    #[test]
+    fn unused_footnotes_never_crowd_out_a_used_one() {
+        let unused: String = (0..70).map(|i| format!("> [^u{i}]: [hidden](/tmp/u{i}.png)\n>\n")).collect();
+        let text = format!("> See [^used].\n>\n{unused}> [^used]: [Proof](/tmp/proof.png)");
+        assert_eq!(local_image_sources(&text), ["/tmp/proof.png"]);
     }
 
     #[test]
@@ -834,6 +935,28 @@ mod tests {
             ),
             ["/tmp/a%zz%20b.png", "/tmp/c%2Fd e.png", "/tmp/f%+1.png", "/tmp/i j.png"]
         );
+    }
+
+    #[test]
+    fn paths_are_normalized_before_decoding_like_the_transcript() {
+        assert_eq!(
+            local_image_sources(
+                "[a](</tmp/a%zz b.png>) [b](/tmp/c%%20d.png) [c](/tmp/e%2%20f.png) [d](</tmp/g%zz é.png>)"
+            ),
+            ["/tmp/a%zz%20b.png", "/tmp/c% d.png", "/tmp/e%2 f.png", "/tmp/g%zz%20%C3%A9.png"]
+        );
+        assert_eq!(local_image_sources("[a](<file:///tmp/a.png >)"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_escaped_bracket_does_not_end_a_footnote_label() {
+        assert_eq!(footnote_label_end(r"a\]:b]: x"), Some(5));
+        assert_eq!(footnote_label_end("a] x"), None);
+        let n = 10_000;
+        let text = format!(r"[^a\]:b]: {}x{}[Proof](/tmp/proof.png)", "- ".repeat(n), "\n".repeat(n));
+        let started = std::time::Instant::now();
+        assert_eq!(local_image_sources(&text), ["/tmp/proof.png"]);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 
     #[test]

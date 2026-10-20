@@ -501,6 +501,24 @@ describe("ChatMarkdown local image links", () => {
     ).toEqual(["Open Proof"]);
   });
 
+  it("renders an image after a quoted code block with a deeply indented line", () => {
+    expect(
+      renderedCaptions(
+        "> ```text\n> " + " ".repeat(100) + "example\n> ```\n>\n> [Proof](/tmp/proof.png)",
+      ),
+    ).toEqual(["Open Proof"]);
+  });
+
+  it("renders only the used footnote image among many unused ones", () => {
+    const unused = Array.from(
+      { length: 70 },
+      (_, i) => `> [^u${i}]: [hidden](/tmp/u${i}.png)\n>\n`,
+    ).join("");
+    expect(
+      renderedCaptions(`> See [^used].\n>\n${unused}> [^used]: [Proof](/tmp/proof.png)`),
+    ).toEqual(["Open Proof"]);
+  });
+
   it("reads a bare carriage return as a line ending", () => {
     expect(
       renderedCaptions(" ".repeat(64) + "- x\r\r[Proof](/tmp/proof.png)"),
@@ -526,6 +544,14 @@ describe("ChatMarkdown local image links", () => {
           "[d](file:///tmp/g%FF.png) [e](file:///tmp/h%zz.png) [f](file:///tmp/i%20j.png)",
       ),
     ).toEqual(["/tmp/a%zz%20b.png", "/tmp/c%2Fd e.png", "/tmp/f%+1.png", "/tmp/i j.png"]);
+  });
+
+  it("normalizes a path before decoding it, keeping the normalized form when that fails", () => {
+    expect(
+      renderedPaths(
+        "[a](</tmp/a%zz b.png>) [b](/tmp/c%%20d.png) [c](/tmp/e%2%20f.png) [d](</tmp/g%zz é.png>)",
+      ),
+    ).toEqual(["/tmp/a%zz%20b.png", "/tmp/c% d.png", "/tmp/e%2 f.png", "/tmp/g%zz%20%C3%A9.png"]);
   });
 
   it("keeps a local file reference inert when no workspace root is available", () => {
