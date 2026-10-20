@@ -4,6 +4,37 @@ use crate::{commands::agent_chat::{agent_chat_start_session,ensure_live_session,
 use futures_util::StreamExt;
 use tauri::Manager;
 struct Fixture { dir: tempfile::TempDir, app: tauri::App<tauri::test::MockRuntime>, provider: Arc<GenericAcpProvider>, agent: String, thread: ThreadId, pane: String }
+
+#[tokio::test]
+async fn review_r1_delayed_configuration_failure_never_confirms_prompt_acceptance() {
+    let f = Fixture::new("review-r1-delayed-reject-model").await;
+    f.start(None, None).await.unwrap();
+    let mut events = f.provider.event_stream();
+    let sent = f.command_send(json!({"thread_id":f.thread.0,"text":"unsent instruction","model_override":"vendor:model [1m]","client_nonce":"review-r1-unsent"})).await.unwrap();
+    wait_marker(&f.dir.path().join("wire.jsonl.ready")).await;
+    std::fs::write(f.dir.path().join("wire.jsonl.release"), b"release").unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(ProviderRuntimeEvent::TurnCompleted {turn_id, ..}) = events.next().await {
+                if turn_id == sent.turn_id { break; }
+            }
+        }
+    }).await.unwrap();
+    let db = f.app.state::<DatabaseStore>();
+    // Exercise live confirmation even if the event bridge is still catching up.
+    crate::commands::agent_chat::forward_event(f.app.handle(), ProviderRuntimeEvent::TurnCompleted {
+        thread_id:f.thread.clone(), turn_id:sent.turn_id.clone(), status:TurnStatus::Error {subtype:"acp_error".into(),message:"pre-prompt configuration failed".into()}, usage:None,
+    });
+    let row = db.message_delivery_for_message(&f.thread.0, "review-r1-unsent").unwrap().unwrap();
+    assert!(!row.attempted, "an in-process worker ACK is not a prompt attempt: {row:?}");
+    assert_eq!(row.state, "rejected");
+    db.recover_message_deliveries("review-r1-restart").unwrap();
+    assert_eq!(db.message_delivery(&row.id).unwrap().unwrap().state, "rejected");
+    let wire = std::fs::read_to_string(f.dir.path().join("wire.jsonl")).unwrap();
+    assert!(wire.contains("session/set_config_option"));
+    assert!(!wire.contains("session/prompt"));
+    f.provider.stop_session(f.thread.clone()).await.unwrap();
+}
 impl Fixture {
     async fn new(mode: &str) -> Self {
         let dir=tempfile::tempdir().unwrap();

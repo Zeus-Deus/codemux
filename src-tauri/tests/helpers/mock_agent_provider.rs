@@ -264,6 +264,9 @@ impl AgentProvider for MockAgentProvider {
         }
         if let Some(checkpoint) = checkpoint.as_ref() {
             checkpoint.commit().await;
+            if matches!(self.kind,ProviderKind::Cursor|ProviderKind::Grok|ProviderKind::Hermes|ProviderKind::Acp) {
+                checkpoint.accepted(&TurnId("mock-turn".into())).await;
+            }
         }
         Ok(TurnStartResult {
             steered: false,

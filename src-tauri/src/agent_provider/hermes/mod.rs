@@ -756,7 +756,11 @@ impl Inner {
                 runtime.queue.lock().await.holds.entry(thread.clone()).or_default().settle(&job.id,true);
                 self.emit(ProviderRuntimeEvent::QueuedTurnDispatched {thread_id:thread.clone(),queued_id:job.id.clone(),turn_id:turn.clone(),text:job.input.display_text.clone().unwrap_or_else(||job.input.text.clone()),steered:false});
                 self.emit(ProviderRuntimeEvent::SessionStateChanged {thread_id:thread.clone(),status:SessionStatus::Running {active_turn:turn.clone()}});
-                let response = runtime.child.request_with_timeout("session/prompt",json!({"sessionId":binding.acp_session_id,"prompt":[{"type":"text","text":job.input.text}]}),Duration::from_secs(24*60*60)).await.map_err(rpc)?;
+                let response = runtime.child.request_with_timeout("session/prompt",json!({"sessionId":binding.acp_session_id,"prompt":[{"type":"text","text":job.input.text}]}),Duration::from_secs(24*60*60)).await;
+                if matches!(&response, Ok(_) | Err(crate::json_rpc_child::RpcChildError::RpcError(_))) {
+                    if let Some(checkpoint) = &job.input.turn_checkpoint { checkpoint.accepted(&turn).await; }
+                }
+                let response = response.map_err(rpc)?;
                 let (tx,rx) = oneshot::channel(); let _=runtime.barrier.send(tx); let _=rx.await;
                 if text(&response,"stopReason") == Some("cancelled") { chat.state.lock().await.cancelled=true; }
                 // Empty new sessions are ephemeral upstream. Ask the official load endpoint

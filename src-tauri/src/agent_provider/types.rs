@@ -124,6 +124,9 @@ pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
     async fn abort(&self);
     /// Normal scheduling deferral: roll back preparation, retaining delivery.
     async fn defer(&self) { self.abort().await; }
+    /// A native prompt response proves admission; local worker lifecycle
+    /// completion alone does not. Deferred adapters report this explicitly.
+    async fn accepted(&self, _turn: &TurnId) {}
 }
 
 #[async_trait]

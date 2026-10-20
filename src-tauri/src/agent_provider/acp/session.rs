@@ -1180,6 +1180,9 @@ impl AcpSession {
             } else {
                 self.send_prompt(&prompt, generation, checkpoint.as_ref()).await
             };
+            if !interrupted_before_send && matches!(&response, Ok(_) | Err(RpcChildError::RpcError(_))) {
+                if let Some(checkpoint) = &checkpoint { checkpoint.accepted(&turn_id).await; }
+            }
             let mut next = self.finish_turn(turn_id, response, generation).await;
             loop {
                 let Some((queued, next_generation)) = next else {

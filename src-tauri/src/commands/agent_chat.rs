@@ -3527,20 +3527,13 @@ async fn send_turn_context_reporting<R: Runtime>(
         Ok(result) => {
             let deferred = crate::agent_control::delivery::deferred_acceptance(provider)
                 && result.queued_id.is_none();
-            let completed = deferred
-                && db
-                    .control_turn_outcome(&input.thread_id.0, &result.turn_id.0)?
-                    .is_some();
             let disposition = if result.queued_id.is_some() {
                 "queued"
-            } else if deferred && !completed {
+            } else if deferred {
                 "submitting"
             } else {
                 "accepted"
             };
-            if deferred && !completed {
-                let _ = db.message_delivery_submitting(&id);
-            }
             db.finish_message_delivery(
                 &id,
                 disposition,
@@ -7907,7 +7900,9 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     let delivery_changed = delivery_transition(&event);
     if delivery_changed { crate::agent_control::delivery::notify(); }
     if let ProviderRuntimeEvent::TurnCompleted {thread_id,turn_id,..}=&event {
-        let _=app.state::<DatabaseStore>().confirm_message_delivery_turn(&thread_id.0,&turn_id.0);
+        let db=app.state::<DatabaseStore>();
+        let native_ack=db.get_agent_chat_session(&thread_id.0).is_some_and(|row|matches!(row.provider.as_str(),"claude"|"codex"|"opencode"));
+        if native_ack { let _=db.confirm_message_delivery_turn(&thread_id.0,&turn_id.0); }
     }
     // Codex takes the Plan pill per turn and the pill does not survive a
     // restart: remember the mode each started turn runs in, so a session
@@ -8160,7 +8155,6 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                 let result = serde_json::json!({"turn_id":turn_id,"queued_id":null,"steered":steered});
                 let provider=db.get_agent_chat_session(&thread_id.0).and_then(|row|serde_json::from_value::<ProviderKind>(serde_json::json!(row.provider)).ok());
                 let deferred=provider.is_some_and(crate::agent_control::delivery::deferred_acceptance);
-                if deferred { let _=db.message_delivery_submitting(id); }
                 let _ = db.finish_message_delivery(id,if deferred {"submitting"}else{"accepted"},Some(&result),None);
             }
             let row_id = persist_user_message(

@@ -92,8 +92,8 @@ pub(crate) fn select_delivery(
 }
 
 /// These adapters acknowledge an in-process prompt worker before the native
-/// prompt response. Treat that acknowledgement as possible submission until
-/// exact-turn completion supplies acceptance evidence.
+/// prompt response. The wire boundary records possible submission; only a
+/// native prompt response supplies acceptance evidence.
 pub(crate) fn deferred_acceptance(provider: ProviderKind) -> bool {
     matches!(
         provider,
@@ -319,6 +319,13 @@ impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
     }
     async fn defer(&self) {
         if let Some(inner) = &self.inner { inner.defer().await; }
+    }
+    async fn accepted(&self, turn: &crate::agent_provider::TurnId) {
+        if let Err(error) = self.app.state::<DatabaseStore>().accept_message_delivery_prompt(&self.id, &turn.0) {
+            log::error!("Could not record prompt acceptance: {error}");
+        }
+        if let Some(inner) = &self.inner { inner.accepted(turn).await; }
+        changed(&self.app, &self.thread);
     }
 }
 impl<R: Runtime> DeliveryCheckpoint<R> {

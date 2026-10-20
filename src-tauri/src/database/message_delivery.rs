@@ -418,7 +418,7 @@ impl DatabaseStore {
         tx.execute("UPDATE agent_message_deliveries SET dispatch_owned=0,hold_reason=CASE WHEN ?2='held' OR (state='held' AND ?2='queued') THEN COALESCE(hold_reason,'recovery') ELSE NULL END,state=CASE WHEN state='held' AND ?2='queued' THEN state ELSE ?2 END,result=COALESCE(?3,result),error=CASE WHEN state='held' AND ?2='queued' THEN error ELSE ?4 END,
             queued_id=COALESCE(json_extract(?3,'$.queued_id'),queued_id),turn_id=COALESCE(json_extract(?3,'$.turn_id'),turn_id),
             retry_at=CASE WHEN ?2='pending' THEN datetime('now','+' || MIN(300,5 * (1 << MIN(attempt_count,6))) || ' seconds') ELSE NULL END,updated_at=datetime('now')
-            WHERE id=?1 AND state<>'cancelled' AND (state<>'accepted' OR ?2='accepted') AND ((state='held' AND ?2='queued') OR ?2 IN ('held','held_unknown','cancelled','accepted','submitting','rejected') OR (state NOT IN ('held','held_unknown','rejected') AND (state<>'accepted' OR ?2='accepted') AND NOT (state='pending' AND error IS NOT NULL AND ?2 IN ('accepted','submitting'))))",params![id,state,result.map(Value::to_string),error]).map_err(|e|e.to_string())?;
+            WHERE id=?1 AND state<>'cancelled' AND (state<>'accepted' OR ?2='accepted') AND NOT (?2='submitting' AND state IN ('pending','held','held_unknown','rejected')) AND ((state='held' AND ?2='queued') OR ?2 IN ('held','held_unknown','cancelled','accepted','submitting','rejected') OR (state NOT IN ('held','held_unknown','rejected') AND (state<>'accepted' OR ?2='accepted') AND NOT (state='pending' AND error IS NOT NULL AND ?2 IN ('accepted','submitting'))))",params![id,state,result.map(Value::to_string),error]).map_err(|e|e.to_string())?;
         tx.execute("UPDATE agent_control_operations SET
             state=CASE (SELECT state FROM agent_message_deliveries WHERE id=?1) WHEN 'accepted' THEN 'succeeded' WHEN 'queued' THEN 'succeeded' WHEN 'submitting' THEN 'succeeded' WHEN 'held_unknown' THEN 'needs_attention' WHEN 'held' THEN 'needs_attention' WHEN 'cancelled' THEN 'failed' WHEN 'rejected' THEN 'failed' ELSE 'accepted' END,
             dispatch_disposition=(SELECT state FROM agent_message_deliveries WHERE id=?1),
@@ -427,6 +427,20 @@ impl DatabaseStore {
             updated_at=datetime('now') WHERE delivery_id=?1",
             params![id]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
+    }
+    pub fn accept_message_delivery_prompt(&self, id: &str, turn: &str) -> Result<(), String> {
+        {
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction().map_err(|e|e.to_string())?;
+            tx.execute("INSERT INTO agent_chat_messages(thread_id,payload) SELECT thread_id,json_object('type','native_prompt_accepted','delivery_id',id,'turn_id',?2) FROM agent_message_deliveries WHERE id=?1 AND attempted=1",params![id,turn]).map_err(|e|e.to_string())?;
+            tx.execute("UPDATE agent_message_deliveries SET turn_id=?2 WHERE id=?1 AND attempted=1",params![id,turn]).map_err(|e|e.to_string())?;
+            tx.commit().map_err(|e|e.to_string())?;
+        }
+        let row = self.message_delivery(id)?.ok_or("delivery_not_found")?;
+        if row.attempted {
+            self.finish_message_delivery(id,"accepted",Some(&serde_json::json!({"turn_id":turn,"queued_id":null,"steered":false})),None)?;
+        }
+        Ok(())
     }
     pub fn confirm_message_delivery_turn(&self, thread: &str, turn: &str) -> Result<(), String> {
         let ids: Vec<String> = {
@@ -472,9 +486,11 @@ impl DatabaseStore {
             AND json_extract(c.payload,'$.user_message_id')=m.id
             WHERE m.thread_id=agent_message_deliveries.thread_id AND m.message_id=agent_message_deliveries.message_id LIMIT 1))
             WHERE state IN ('submitting','held_unknown')",[]).map_err(|e|e.to_string())?;
-        conn.execute("UPDATE agent_message_deliveries SET state='accepted',error=NULL WHERE state IN ('submitting','held_unknown') AND EXISTS (
+        conn.execute("UPDATE agent_message_deliveries SET state='accepted',error=NULL WHERE state IN ('submitting','held_unknown') AND attempted=1 AND EXISTS (
             SELECT 1 FROM agent_chat_messages m WHERE m.thread_id=agent_message_deliveries.thread_id
-            AND json_extract(m.payload,'$.type')='turn_completed' AND json_extract(m.payload,'$.turn_id')=agent_message_deliveries.turn_id)",[]).map_err(|e|e.to_string())?;
+            AND json_extract(m.payload,'$.turn_id')=agent_message_deliveries.turn_id
+            AND ((json_extract(m.payload,'$.type')='native_prompt_accepted' AND json_extract(m.payload,'$.delivery_id')=agent_message_deliveries.id)
+                OR (json_extract(agent_message_deliveries.payload,'$.provider') IN ('claude','codex','opencode') AND json_extract(m.payload,'$.type')='turn_completed')))",[]).map_err(|e|e.to_string())?;
         // For native ACK adapters the correlated envelope is written after
         // actual acceptance. ACP worker ACKs alone remain ambiguous.
         conn.execute("UPDATE agent_message_deliveries SET state='accepted',error=NULL WHERE state IN ('submitting','held_unknown')
@@ -537,7 +553,7 @@ mod tests {
             id,
             "receiver",
             id,
-            &json!({"origin":"controller","text":"review"}),
+            &json!({"origin":"controller","provider":"claude","text":"review"}),
             "epoch-a",
             0,
             None,
@@ -545,6 +561,39 @@ mod tests {
         )
         .unwrap();
     }
+
+    #[test]
+    fn review_r1_recovery_ignores_synthetic_completion_without_prompt_evidence() {
+        let db = super::super::init_test_database();
+        db.upsert_agent_chat_session("receiver","ws",None,"acp").unwrap();
+        db.admit_message_delivery("unsent","receiver","unsent",&json!({"origin":"controller","provider":"acp"}),"old",0,None,true).unwrap();
+        db.finish_message_delivery("unsent","submitting",Some(&json!({"turn_id":"worker"})),None).unwrap();
+        db.append_agent_chat_message("receiver",&json!({"type":"turn_completed","turn_id":"worker","status":{"kind":"error","subtype":"acp_error"}}).to_string()).unwrap();
+        db.recover_message_deliveries("new").unwrap();
+        let row = db.message_delivery("unsent").unwrap().unwrap();
+        assert_eq!(row.state,"pending");
+        assert!(!row.attempted);
+    }
+
+    #[test]
+    fn review_r1_recovery_requires_native_prompt_response_for_deferred_adapters() {
+        for accepted in [false,true] {
+            let db=super::super::init_test_database();
+            db.upsert_agent_chat_session("receiver","ws",None,"acp").unwrap();
+            db.admit_message_delivery("message","receiver","message",&json!({"origin":"controller","provider":"acp"}),"old",0,None,true).unwrap();
+            db.message_delivery_submitting("message").unwrap();
+            db.finish_message_delivery("message","submitting",Some(&json!({"turn_id":"turn"})),None).unwrap();
+            db.append_agent_chat_message("receiver",&json!({"type":"turn_completed","turn_id":"turn","status":{"kind":"error","subtype":"acp_error"}}).to_string()).unwrap();
+            if accepted {
+                db.accept_message_delivery_prompt("message","turn").unwrap();
+                // Recover the durable response marker after an interrupted ACK update.
+                db.conn.lock().unwrap().execute("UPDATE agent_message_deliveries SET state='submitting' WHERE id='message'",[]).unwrap();
+            }
+            db.recover_message_deliveries("new").unwrap();
+            assert_eq!(db.message_delivery("message").unwrap().unwrap().state,if accepted {"accepted"} else {"held_unknown"});
+        }
+    }
+
     #[test]
     fn orchestration_message_migration_preserves_legacy_human_unknown() {
         let conn = Connection::open_in_memory().unwrap();

@@ -445,6 +445,15 @@ for line in sys.stdin:
         if mode.startswith("ordered-"):
             ordered_reply(request_id, params["value"] if params["configId"] == "model selector" else selected_model)
             continue
+        if mode == "review-r1-delayed-reject-model" and params["configId"] == "model selector":
+            with open(log_path + ".ready", "w", encoding="utf-8") as ready:
+                ready.write("setter received; prompt has not been written")
+            deadline = time.monotonic() + 10
+            while not os.path.exists(log_path + ".release"):
+                if time.monotonic() > deadline: os._exit(29)
+                time.sleep(0.005)
+            send({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "fixture rejects delayed model"}})
+            continue
         if mode == "reject-model" and params["configId"] == "model selector" and params["value"] == "vendor:model [1m]":
             send({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "fixture rejects model"}})
             continue
