@@ -6607,10 +6607,14 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
     select: Option<bool>,
 ) -> Result<OpenAgentChatSearchResult, String> {
     feature_flag_on(&observability)?;
-    // Held from reading the chat through binding its pane, so a history
-    // reopen can't merge the chat away in between (`merge_reopened_chat`).
-    let gate = native_thread_gate(&app, &thread_id);
-    let dispatch_guard = gate.dispatch.clone().lock_owned().await;
+    // Binding a new pane holds the chat's dispatch lock from reading it
+    // through the bind, so a history reopen can't merge it away in between
+    // (`merge_reopened_chat`). A chat already open in a pane is never
+    // merged, so focusing it doesn't wait behind a session that is starting.
+    let dispatch_guard = match state.agent_chat_pane_id_for_thread(&thread_id) {
+        Some(_) => None,
+        None => Some(native_thread_gate(&app, &thread_id).dispatch.clone().lock_owned().await),
+    };
     let record = db
         .get_agent_chat_session(&thread_id)
         .ok_or_else(|| format!("conversation_not_found: {thread_id}"))?;
