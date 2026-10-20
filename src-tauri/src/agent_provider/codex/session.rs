@@ -1530,6 +1530,7 @@ impl CodexSession {
             self.guidance.as_deref(),
             self.plan_mode.load(Ordering::SeqCst),
         );
+        let selected_mode = collaboration_mode.as_ref().map(|mode| mode.mode.clone());
         let params = TurnStartParams {
             thread_id: codex_thread_id,
             input: input_items,
@@ -1560,6 +1561,15 @@ impl CodexSession {
             state.pending_turn_start = Some(PendingTurnStart::default());
             generation
         };
+        // The turn this starts runs in this mode. Reported before the request,
+        // so an uncertain response still records it; turns start only when
+        // none is running, so one that fails to start leaves nothing to resume.
+        if let Some(mode) = selected_mode {
+            let _ = self.event_tx().send(ProviderRuntimeEvent::TurnModeSelected {
+                thread_id: self.thread_id.clone(),
+                mode,
+            });
+        }
         let child = self.child().await;
         let response = match dispatch_guard.as_deref() {
             Some(guard) => child.request_guarded("turn/start", params_value, guard).await,

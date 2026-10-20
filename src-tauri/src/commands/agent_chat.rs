@@ -3745,11 +3745,6 @@ async fn send_turn_internal<R: Runtime>(
     }
     drop(dispatch_guard);
     let result = sent.map_err(provider_err)?;
-    if provider == ProviderKind::Codex && result.queued_id.is_none() && !result.steered {
-        // The turn this send started runs in the mode it named; queued ones
-        // are recorded when they are dispatched.
-        record_turn_mode(&db, &input.thread_id.0, input.permission_mode_override.as_deref());
-    }
     super::provider_switch::seed_delivered(&db, &thread_id_for_persist, provider, &switch_nonce, switch_seed);
     if let Some(queued_id) = &result.queued_id {
         // Do not acknowledge queued acceptance without durable evidence.
@@ -5290,18 +5285,6 @@ pub async fn agent_chat_set_service_tier<R: Runtime>(
             ..Default::default()
         },
     )
-}
-
-/// Codex takes the Plan pill per turn and the pill does not survive a restart:
-/// remember the mode a started turn runs in, so its automatic continuation
-/// (see `usage_resume::resume_mode`) runs in it too. A turn that names no mode
-/// keeps the previous one, as the session does.
-pub(super) fn record_turn_mode(db: &DatabaseStore, thread_id: &str, mode: Option<&str>) {
-    if let Some(mode) = mode {
-        if let Err(error) = db.set_agent_chat_turn_mode(thread_id, mode) {
-            eprintln!("[codemux::agent_chat] {error}");
-        }
-    }
 }
 
 /// Change a session's permission mode (accept-edits, bypass, plan,
@@ -7448,6 +7431,17 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         }
     }
 
+    // Codex takes the Plan pill per turn and the pill does not survive a
+    // restart: remember the mode each started turn runs in, so its automatic
+    // continuation (see `usage_resume::resume_mode`) runs in it too.
+    if let ProviderRuntimeEvent::TurnModeSelected { thread_id, mode } = &event {
+        let db: State<'_, DatabaseStore> = app.state();
+        if let Err(error) = db.set_agent_chat_turn_mode(&thread_id.0, mode) {
+            eprintln!("[codemux::agent_chat] {error}");
+        }
+        return;
+    }
+
     // Plan quota is provider-scoped level state, not transcript or
     // history: intercept it, update the in-memory store, and return. Like
     // `UsageRecorded` it is never persisted and never fanned out — but
@@ -8764,7 +8758,9 @@ fn map_event_to_pane_status(
         | ProviderRuntimeEvent::ContextUsageUpdated { .. }
         | ProviderRuntimeEvent::UsageRecorded { .. }
         // Plan quota is an account-level reading, not thread liveness.
-        | ProviderRuntimeEvent::PlanUsageUpdated { .. } => None,
+        | ProviderRuntimeEvent::PlanUsageUpdated { .. }
+        // A turn's collaboration mode is bookkeeping for a later resume.
+        | ProviderRuntimeEvent::TurnModeSelected { .. } => None,
         // A fanned-out user turn is an INPUT echo, not provider liveness.
         // `agent_chat_send_turn` already owns the send's status transition
         // (and it runs on the sending client's command, before any of this),
@@ -9455,6 +9451,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::UserMessage { thread_id, .. }
         | ProviderRuntimeEvent::UsageRecorded { thread_id, .. }
         | ProviderRuntimeEvent::PlanUsageUpdated { thread_id, .. }
+        | ProviderRuntimeEvent::TurnModeSelected { thread_id, .. }
         | ProviderRuntimeEvent::RunStalled { thread_id, .. }
         | ProviderRuntimeEvent::UsageLimitReached { thread_id, .. }
         | ProviderRuntimeEvent::UsageResumeCancelled { thread_id, .. }

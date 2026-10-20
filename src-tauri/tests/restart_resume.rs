@@ -578,31 +578,21 @@ async fn the_drain_skips_a_saved_turn_that_was_already_sent() {
 async fn a_codex_chat_interrupted_in_plan_resumes_in_plan() {
     let h = harness().await;
     h.chat("rr-plan");
-    // The Plan pill rides on each Codex message; it does not survive a restart.
-    let planned = SendTurnCommandInput {
-        permission_mode_override: Some("plan".into()),
-        ..typed("rr-plan", "plan the migration")
-    };
-    agent_chat_send_turn(h.handle(), ProviderKind::Codex, planned)
-        .await
-        .unwrap();
-    // A send the provider rejects started no turn, so it changes nothing.
-    h.provider.fail_next_send(codemux_lib::agent_provider::ProviderError::ValidationError {
-        message: "busy".into(),
-    });
-    let rejected = SendTurnCommandInput {
-        permission_mode_override: Some("danger-full-access".into()),
-        ..typed("rr-plan", "never mind")
-    };
-    assert!(agent_chat_send_turn(h.handle(), ProviderKind::Codex, rejected).await.is_err());
-    h.provider.set_turn_active("rr-plan", false);
+    // Codex reports the mode each accepted turn runs in; the Plan pill that
+    // chose it does not survive a restart.
+    forward_event(
+        &h.handle(),
+        ProviderRuntimeEvent::TurnModeSelected {
+            thread_id: ThreadId("rr-plan".into()),
+            mode: "plan".into(),
+        },
+    );
     h.running("rr-plan", "turn-1");
     on_exit(&h.handle());
 
     let decisions = resume_after_restart_for_test(&h.handle(), "launch-2").await;
     assert_eq!(decision(&decisions, "rr-plan"), Some(ResumeDecision::Resume));
-    let modes = h.provider.send_modes();
-    assert_eq!(modes.last().cloned().flatten().as_deref(), Some("plan"));
+    assert_eq!(h.provider.send_modes(), [Some("plan".to_string())]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

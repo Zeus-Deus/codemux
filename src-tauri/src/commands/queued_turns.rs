@@ -121,19 +121,8 @@ fn mirror(db: &DatabaseStore, event: &ProviderRuntimeEvent, queued: Option<Queue
         ProviderRuntimeEvent::QueuedTurnDispatched {
             thread_id,
             queued_id,
-            steered,
             ..
-        } => {
-            // A queued message that starts a turn sets its mode (the Codex
-            // Plan pill it was written under); steered into one, it does not.
-            if !steered {
-                let mode = db
-                    .get_queued_turn(&thread_id.0, queued_id)
-                    .and_then(|row| row.permission_mode_override);
-                super::agent_chat::record_turn_mode(db, &thread_id.0, mode.as_deref());
-            }
-            db.delete_queued_turn(&thread_id.0, queued_id).map(drop)
-        }
+        } => db.delete_queued_turn(&thread_id.0, queued_id).map(drop),
         ProviderRuntimeEvent::QueuedTurnCancelled {
             thread_id,
             queued_id,
@@ -612,44 +601,6 @@ mod tests {
         assert_eq!(ids(&db), ["a", "b"]);
         mirror(&db, &cancelled("a"), None, false);
         assert_eq!(ids(&db), ["b"]);
-    }
-
-    #[test]
-    fn a_queued_message_sets_the_turn_mode_when_it_starts_a_turn() {
-        let db = crate::database::init_test_database();
-        db.upsert_agent_chat_session("t", "w", None, "codex").unwrap();
-        db.set_agent_chat_turn_mode("t", "danger-full-access").unwrap();
-        let plan = |id: &str| {
-            let replay = Replay {
-                permission_mode_override: Some("plan".into()),
-                ..Default::default()
-            };
-            let event = ProviderRuntimeEvent::TurnQueued {
-                thread_id: t(),
-                queued_id: id.into(),
-                client_nonce: None,
-                text: "plan it".into(),
-            };
-            let stash = Queued { images: Vec::new(), client_nonce: None, replay: Some(&replay) };
-            mirror(&db, &event, Some(stash), false);
-        };
-        let dispatched = |id: &str, steered: bool| ProviderRuntimeEvent::QueuedTurnDispatched {
-            steered,
-            thread_id: t(),
-            queued_id: id.into(),
-            turn_id: TurnId("turn".into()),
-            text: "plan it".into(),
-        };
-        // Waiting in the queue, it does not change the running turn's mode.
-        plan("a");
-        assert_eq!(db.agent_chat_turn_mode("t").as_deref(), Some("danger-full-access"));
-        // Steered into the running turn, it still does not.
-        mirror(&db, &dispatched("a", true), None, false);
-        assert_eq!(db.agent_chat_turn_mode("t").as_deref(), Some("danger-full-access"));
-        // Starting its own turn, it does.
-        plan("b");
-        mirror(&db, &dispatched("b", false), None, false);
-        assert_eq!(db.agent_chat_turn_mode("t").as_deref(), Some("plan"));
     }
 
     #[test]

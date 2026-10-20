@@ -116,6 +116,7 @@ async fn the_plan_pill_on_each_send_picks_the_turns_collaboration_mode() {
         ..Default::default()
     });
     let thread = ThreadId("plan".into());
+    let mut events = provider.event_tx.subscribe();
     provider.start_session(start_input(dir.path(), &thread)).await.unwrap();
 
     send(&provider, &thread, Some("plan")).await;
@@ -146,6 +147,15 @@ async fn the_plan_pill_on_each_send_picks_the_turns_collaboration_mode() {
             turn("plan"),
         ]
     );
+    // Each accepted turn reports the mode it runs in, in turn order, so a
+    // restart can resume it in that mode.
+    let mut reported = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let ProviderRuntimeEvent::TurnModeSelected { mode, .. } = event {
+            reported.push(mode);
+        }
+    }
+    assert_eq!(reported, ["plan", "plan", "plan", "default", "plan", "plan"]);
     // Plan is per turn, never a session permission change.
     assert!(provider
         .set_permission_mode(thread.clone(), "plan".into())

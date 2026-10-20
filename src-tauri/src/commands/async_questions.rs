@@ -182,13 +182,9 @@ pub async fn agent_chat_answer_question<R: Runtime>(
                 record.cwd.clone().map(|cwd| Arc::new(GitTurnDispatchCheckpoint::new(app.clone(), thread_id.0.clone(), record.workspace_id, cwd, Some(submission_id.clone()))) as Arc<dyn TurnDispatchCheckpoint>)
             } else { None };
             let checkpoint = super::turn_diff::wrap_dispatch_checkpoint(&app, &thread_id.0, record.cwd, Some(&submission_id), checkpoint);
-            let delivered = provider.answer_question(AnswerQuestionInput { thread_id: thread_id.clone(), question, answers: answers.clone(), submission_id: submission_id.clone(), checkpoint, permission_mode_override: permission_mode_override.clone() }).await;
+            let delivered = provider.answer_question(AnswerQuestionInput { thread_id: thread_id.clone(), question, answers: answers.clone(), submission_id: submission_id.clone(), checkpoint, permission_mode_override }).await;
             if let Ok(QuestionDelivery::NewTurn { turn_id }) = &delivered {
                 super::turn_diff::on_turn_bound(&app, &thread_id.0, Some(&submission_id), &turn_id.0);
-                // An answer that starts a turn sets its mode, as a send does.
-                if provider_kind == ProviderKind::Codex {
-                    super::agent_chat::record_turn_mode(&db, &thread_id.0, permission_mode_override.as_deref());
-                }
             }
             delivered
         }
