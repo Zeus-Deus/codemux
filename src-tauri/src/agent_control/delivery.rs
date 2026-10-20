@@ -234,6 +234,7 @@ pub(crate) struct DeliveryCheckpoint<R: Runtime> {
     pub inner: Option<Arc<dyn TurnDispatchCheckpoint>>,
     pub release_queue: bool,
     pub admitted_generation: u64,
+    pub resumed_ids: Vec<String>,
 }
 impl<R: Runtime> std::fmt::Debug for DeliveryCheckpoint<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -253,13 +254,42 @@ impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
             _ => Held,
         }
     }
+    fn authorize_queue_promotion(&self) -> Result<(), crate::agent_provider::ProviderError> {
+        if self.queued_delivery_state() != crate::agent_provider::types::QueuedDeliveryState::Ready {
+            return Err(crate::agent_provider::ProviderError::ValidationError {message:"Queued message is still held or disposed; inspect its delivery error before sending.".into()});
+        }
+        self.verify_authority()
+    }
     fn authorize_dispatch(&self) -> Result<(), crate::agent_provider::ProviderError> {
+        self.verify_authority()?;
+        self.app.state::<DatabaseStore>().message_delivery_submitting(&self.id)
+            .map_err(|message| crate::agent_provider::ProviderError::ValidationError { message })
+    }
+    async fn prepare(&self) {
+        if let Some(inner) = &self.inner { inner.prepare().await; }
+    }
+    async fn commit(&self) {
+        if let Some(inner) = &self.inner { inner.commit().await; }
+    }
+    async fn abort(&self) {
+        let db = self.app.state::<DatabaseStore>();
+        let _ = db.rehold_message_deliveries(&self.resumed_ids);
+        let reason = "Provider submission failed; inspect acceptance evidence before resending";
+        let already_held = db.message_delivery(&self.id).ok().flatten().is_some_and(|row| row.state == "held_unknown");
+        if db.fail_message_delivery(&self.id, reason).ok().as_deref() == Some("held_unknown") && !already_held {
+            warn_held(&self.app, &self.thread, reason);
+        }
+        if let Some(inner) = &self.inner { inner.abort().await; }
+    }
+}
+impl<R: Runtime> DeliveryCheckpoint<R> {
+    fn verify_authority(&self) -> Result<(), crate::agent_provider::ProviderError> {
         let db = self.app.state::<DatabaseStore>();
         let record = db.message_delivery(&self.id).map_err(|message|crate::agent_provider::ProviderError::ValidationError {message})?;
         let released_stops = record.as_ref().and_then(|row|row.generation.checked_sub(self.admitted_generation)).unwrap_or(0);
         if let Some(inner) = &self.inner {
             if let Err(error) = inner.authorize_rearmed_dispatch(released_stops) {
-                let _ = db.fail_message_delivery(&self.id, &error.to_string());
+                let _ = db.refuse_message_delivery(&self.id, &error.to_string());
                 changed(&self.app, &self.thread);
                 return Err(error);
             }
@@ -286,35 +316,7 @@ impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
                 message: message.into(),
             });
         }
-        db.message_delivery_submitting(&self.id)
-            .map_err(|message| crate::agent_provider::ProviderError::ValidationError { message })
-    }
-    async fn prepare(&self) {
-        if let Some(inner) = &self.inner {
-            inner.prepare().await;
-        }
-    }
-    async fn commit(&self) {
-        if let Some(inner) = &self.inner {
-            inner.commit().await;
-        }
-    }
-    async fn abort(&self) {
-        let db = self.app.state::<DatabaseStore>();
-        let reason = "Provider submission failed; inspect acceptance evidence before resending";
-        let already_held = db
-            .message_delivery(&self.id)
-            .ok()
-            .flatten()
-            .is_some_and(|row| row.state == "held_unknown");
-        if db.fail_message_delivery(&self.id, reason).ok().as_deref() == Some("held_unknown")
-            && !already_held
-        {
-            warn_held(&self.app, &self.thread, reason);
-        }
-        if let Some(inner) = &self.inner {
-            inner.abort().await;
-        }
+        Ok(())
     }
 }
 

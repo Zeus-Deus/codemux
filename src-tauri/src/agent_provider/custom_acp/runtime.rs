@@ -1767,6 +1767,7 @@ impl Session {
             }
             .await;
             let mut transport_failed = false;
+            let mut dispatch_refused = false;
             let result = if control.is_none() || !self.turn_admitted(&turn).await {
                 if let Some(checkpoint) = &input.turn_checkpoint {
                     checkpoint.abort().await;
@@ -1778,10 +1779,6 @@ impl Session {
                 }
                 Err(protocol("ACP turn configuration could not be applied"))
             } else {
-                self.status(SessionStatus::Running {
-                    active_turn: turn.clone(),
-                })
-                .await;
                 if self.turn_admitted(&turn).await {
                     if let Some(checkpoint) = &input.turn_checkpoint {
                         checkpoint.commit().await;
@@ -1806,11 +1803,16 @@ impl Session {
                     Duration::from_secs(24 * 60 * 60),
                     || async {
                         let allowed = self.turn_admitted(&turn).await
-                            && input.turn_checkpoint.as_ref().is_none_or(|checkpoint| checkpoint.authorize_dispatch().is_ok());
+                            && input.turn_checkpoint.as_ref().is_none_or(|checkpoint| match checkpoint.authorize_dispatch() {
+                                Ok(()) => true,
+                                Err(_) => { dispatch_refused = true; false }
+                            });
                         // Set only under the acquired writer, on successful
                         // exact-turn admission. A revoked unsent prompt needs
                         // neither a frame nor a session/cancel notification.
                         if allowed {
+                            self.status(SessionStatus::Running { active_turn: turn.clone() }).await;
+                            if !self.turn_admitted(&turn).await { return false; }
                             admitted.store(true, Ordering::SeqCst);
                             if let Some(id) = &queued_id {
                                 self.emit(ProviderRuntimeEvent::QueuedTurnDispatched {
@@ -1928,12 +1930,14 @@ impl Session {
                     message: "ACP prompt or turn configuration failed".into(),
                 },
             };
-            self.emit(ProviderRuntimeEvent::TurnCompleted {
-                thread_id: self.thread.clone(),
-                turn_id: turn.clone(),
-                status,
-                usage: None,
-            });
+            if !disposed && !dispatch_refused {
+                self.emit(ProviderRuntimeEvent::TurnCompleted {
+                    thread_id: self.thread.clone(),
+                    turn_id: turn.clone(),
+                    status,
+                    usage: None,
+                });
+            }
             state.active = None;
             state.interrupted = false;
             if !self.child.is_alive() {
@@ -1946,7 +1950,15 @@ impl Session {
                 thread_id: self.thread.clone(),
                 status: SessionStatus::Ready,
             });
-            let next = state.next_queued();
+            let next = loop {
+                let next = state.next_queued();
+                match next {
+                    Some(q) if q.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Disposed => {
+                        self.emit(ProviderRuntimeEvent::QueuedTurnCancelled {thread_id:self.thread.clone(),queued_id:q.id});
+                    }
+                    next => break next,
+                }
+            };
             if let Some(queued) = next {
                 turn = TurnId(format!("acp-turn-{}", Uuid::new_v4()));
                 state.active = Some(turn.clone());
@@ -2193,6 +2205,7 @@ impl AgentProvider for GenericAcpProvider {
         let Some(index) = s.queued.iter().position(|q| q.id == id) else {
             return Ok(());
         };
+        s.queued[index].input.authorize_queue_promotion()?;
         let queued = s.queued.remove(index).unwrap();
         if s.active.is_some() {
             // The promoted item goes through a held queue; the hold lifts

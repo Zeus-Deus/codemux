@@ -1273,6 +1273,15 @@ impl TurnDispatchCheckpoint for RefusedQueueItem {
     async fn commit(&self){}
     async fn abort(&self){}
 }
+#[derive(Debug)]
+struct DisposedQueueItem;
+#[async_trait]
+impl TurnDispatchCheckpoint for DisposedQueueItem {
+    fn queued_delivery_state(&self)->crate::agent_provider::types::QueuedDeliveryState { crate::agent_provider::types::QueuedDeliveryState::Disposed }
+    async fn prepare(&self){}
+    async fn commit(&self){}
+    async fn abort(&self){}
+}
 #[tokio::test]
 async fn orchestration_message_custom_acp_refused_item_stays_queued_and_later_item_dispatches() {
     let f=Fixture::new("dynamic-review5-queue").await;f.start(None,None).await.unwrap();
@@ -1282,6 +1291,9 @@ async fn orchestration_message_custom_acp_refused_item_stays_queued_and_later_it
     let mut refused:SendTurnInput=serde_json::from_value(json!({"thread_id":f.thread.0,"text":"refused B"})).unwrap();
     refused.turn_checkpoint=Some(Arc::new(RefusedQueueItem::default()));
     let b=f.provider.send_turn(refused).await.unwrap().queued_id.unwrap();
+    let mut disposed:SendTurnInput=serde_json::from_value(json!({"thread_id":f.thread.0,"text":"disposed wake"})).unwrap();
+    disposed.turn_checkpoint=Some(Arc::new(DisposedQueueItem));
+    let disposed=f.provider.send_turn(disposed).await.unwrap().queued_id.unwrap();
     let d=f.provider.send_turn(serde_json::from_value(json!({"thread_id":f.thread.0,"text":"allowed D"})).unwrap()).await.unwrap().queued_id.unwrap();
     std::fs::write(f.dir.path().join("wire.jsonl.release"),b"release").unwrap();
     let mut seen=vec![];
@@ -1291,5 +1303,28 @@ async fn orchestration_message_custom_acp_refused_item_stays_queued_and_later_it
     }}).await.unwrap();
     assert!(!seen.iter().any(|e|matches!(e,ProviderRuntimeEvent::QueuedTurnDispatched {queued_id,..} if queued_id==&b)));
     assert!(f.provider.session(&f.thread).await.unwrap().state.lock().await.queued.iter().any(|q|q.id==b));
+    assert!(seen.iter().any(|e|matches!(e,ProviderRuntimeEvent::QueuedTurnCancelled {queued_id,..} if queued_id==&disposed)));
+    assert_eq!(seen.iter().filter(|e|matches!(e,ProviderRuntimeEvent::SessionStateChanged {status:SessionStatus::Running {..},..})).count(),2,"only the first and allowed prompts may emit Running");
+    assert_eq!(seen.iter().filter(|e|matches!(e,ProviderRuntimeEvent::TurnCompleted {..})).count(),1,"refused B never started a turn");
     f.provider.stop_session(f.thread.clone()).await.unwrap();
+}
+
+#[tokio::test]
+async fn orchestration_message_custom_acp_promotes_refused_item_after_rearm() {
+    let f=Fixture::new("dynamic-review5-queue").await;f.start(None,None).await.unwrap();
+    f.command_send(json!({"thread_id":f.thread.0,"text":"first held prompt"})).await.unwrap();
+    wait_marker(&f.dir.path().join("wire.jsonl.ready")).await;
+    let b=f.command_send(json!({"thread_id":f.thread.0,"text":"refused B","client_nonce":"B"})).await.unwrap().queued_id.unwrap();
+    let db=f.app.state::<DatabaseStore>();
+    let id=db.message_delivery_for_message(&f.thread.0,"B").unwrap().unwrap().id;
+    db.refuse_message_delivery(&id,"grant_revoked").unwrap();
+    let mut events=f.provider.event_stream();
+    crate::commands::agent_chat::agent_chat_send_queued_turn_now(f.app.handle().clone(),ProviderKind::Acp,f.thread.clone(),b.clone(),None).await.unwrap();
+    std::fs::write(f.dir.path().join("wire.jsonl.release"),b"release").unwrap();
+    tokio::time::timeout(Duration::from_secs(4),async {loop {
+        if matches!(events.next().await,Some(ProviderRuntimeEvent::QueuedTurnDispatched {queued_id,..}) if queued_id==b) {break;}
+    }}).await.unwrap();
+    f.provider.stop_session(f.thread.clone()).await.unwrap();
+    let wire=std::fs::read_to_string(f.dir.path().join("wire.jsonl")).unwrap();
+    assert_eq!(wire.lines().filter(|l|l.contains("session/prompt")&&l.contains("refused B")).count(),1);
 }

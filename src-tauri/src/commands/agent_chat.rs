@@ -3515,7 +3515,9 @@ async fn send_turn_context_reporting<R: Runtime>(
         ));
     }
     let machine = !context.is_human();
-    let result = send_turn_internal(app.clone(), provider, input.clone(), context, reached).await;
+    let mut resumed_ids = Vec::new();
+    let result = send_turn_internal(app.clone(), provider, input.clone(), context, reached, &mut resumed_ids).await;
+    if result.is_err() { db.rehold_message_deliveries(&resumed_ids)?; }
     match &result {
         Ok(result) => {
             let deferred = crate::agent_control::delivery::deferred_acceptance(provider)
@@ -3549,7 +3551,7 @@ async fn send_turn_context_reporting<R: Runtime>(
             if machine && state == "held" {
                 crate::agent_control::delivery::warn_held(&app, &input.thread_id.0, error);
             }
-            if db.fail_message_delivery(&id, error)? == "held_unknown" {
+            if db.fail_message_delivery(&id, error)? == "held_unknown" && state != "held_unknown" {
                 crate::agent_control::delivery::warn_held(&app, &input.thread_id.0, error);
             }
         }
@@ -3564,6 +3566,7 @@ async fn send_turn_internal<R: Runtime>(
     mut input: SendTurnCommandInput,
     context: crate::agent_control::delivery::SendContext,
     dispatch_reached: Option<Arc<std::sync::atomic::AtomicBool>>,
+    resumed_ids: &mut Vec<String>,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
     let origin = context.origin;
     let human = context.is_human();
@@ -3652,11 +3655,11 @@ async fn send_turn_internal<R: Runtime>(
         native_generation,
     )?;
     let db = app.state::<DatabaseStore>();
-    if context.release_queue { db.resume_message_delivery_thread(&input.thread_id.0)?; }
     if let Err(error) = db.verify_delivery_generation(&input.thread_id.0,context.generation.unwrap_or_default()) {
         if let Some(id) = &context.delivery_id { db.finish_message_delivery(id,"held",None,Some(&error))?; }
         return Err(error);
     }
+    if context.release_queue { *resumed_ids = db.resume_message_delivery_thread(&input.thread_id.0)?; }
     if !human {
         let record=db.get_agent_chat_session(&input.thread_id.0);
         let unbound=app.try_state::<AppStateStore>().is_some_and(|state|state.agent_chat_pane_id_for_thread(&input.thread_id.0).is_none());
@@ -3866,7 +3869,7 @@ async fn send_turn_internal<R: Runtime>(
         .or(turn_checkpoint);
     let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = Some(Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {
         app:app.clone(),id:context.delivery_id.clone().unwrap(),thread:input.thread_id.0.clone(),provider,
-        inner:turn_checkpoint, release_queue:context.release_queue, admitted_generation:context.generation.unwrap_or_default(),
+        inner:turn_checkpoint, release_queue:context.release_queue, admitted_generation:context.generation.unwrap_or_default(), resumed_ids:resumed_ids.clone(),
     }));
     let mut provenance = context.provenance.clone();
     let provider_input = SendTurnInput {
@@ -4162,14 +4165,21 @@ pub async fn agent_chat_send_queued_turn_now<R: Runtime>(
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     gate.verify(generation)?;
-    app.state::<DatabaseStore>().resume_message_delivery_thread(&thread_id.0)?;
     use crate::agent_provider::types::MessageDelivery;
-    match delivery.unwrap_or(MessageDelivery::Interrupt) {
+    if !matches!(delivery.unwrap_or(MessageDelivery::Interrupt), MessageDelivery::Interrupt | MessageDelivery::Steer) {
+        return Err("Message is already queued.".into());
+    }
+    let db = app.state::<DatabaseStore>();
+    db.rearm_promoted_message_delivery(&thread_id.0, &queued_id)?;
+    let resumed_ids = db.resume_message_delivery_thread(&thread_id.0)?;
+    let result = match delivery.unwrap_or(MessageDelivery::Interrupt) {
         MessageDelivery::Steer => impl_.steer_queued_turn(thread_id, queued_id).await,
         MessageDelivery::Interrupt => impl_.send_queued_turn_now(thread_id, queued_id).await,
         MessageDelivery::Auto | MessageDelivery::Queue => return Err("Message is already queued.".into()),
     }
-    .map_err(provider_err)
+    .map_err(provider_err);
+    if result.is_err() { db.rehold_message_deliveries(&resumed_ids)?; }
+    result
 }
 
 /// A chat image attachment that has been written to disk for the

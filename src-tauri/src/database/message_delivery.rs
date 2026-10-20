@@ -203,10 +203,34 @@ impl DatabaseStore {
     }
     /// An explicit user release re-arms only provider-owned queued work.
     /// Pending machine wakes disposed by Stop must never walk back in.
-    pub fn resume_message_delivery_thread(&self, thread: &str) -> Result<(), String> {
+    pub fn resume_message_delivery_thread(&self, thread: &str) -> Result<Vec<String>, String> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE agent_message_deliveries SET state=CASE WHEN queued_id IS NOT NULL THEN 'queued' WHEN json_extract(payload,'$.origin')='controller' AND dispatch_owned=0 THEN 'pending' ELSE 'preparing' END,generation=COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1),0),error=NULL,hold_reason=NULL
-            WHERE thread_id=?1 AND state='held' AND COALESCE(hold_reason,'') IN ('stop','') AND attempted=0 AND json_extract(payload,'$.origin') IN ('user','controller')", [thread]).map(drop).map_err(|e|e.to_string())
+        let mut stmt = conn.prepare("UPDATE agent_message_deliveries SET state=CASE WHEN queued_id IS NOT NULL THEN 'queued' WHEN json_extract(payload,'$.origin')='controller' AND dispatch_owned=0 THEN 'pending' WHEN json_extract(payload,'$.origin')='user' AND dispatch_owned=0 THEN 'rejected' ELSE 'preparing' END,generation=COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1),0),error=NULL,hold_reason=NULL
+            WHERE thread_id=?1 AND state='held' AND COALESCE(hold_reason,'') IN ('stop','') AND attempted=0 AND json_extract(payload,'$.origin') IN ('user','controller') RETURNING id").map_err(|e|e.to_string())?;
+        let rows = stmt.query_map([thread], |r|r.get(0)).map_err(|e|e.to_string())?;
+        rows.collect::<Result<_,_>>().map_err(|e|e.to_string())
+    }
+    /// A failed human release restores only the work it resumed, without
+    /// overwriting acceptance or a later Stop.
+    pub fn rehold_message_deliveries(&self, ids: &[String]) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        for id in ids {
+            conn.execute("UPDATE agent_message_deliveries SET state='held',hold_reason='stop',error='Human send failed before releasing the stopped queue' WHERE id=?1 AND state IN ('pending','preparing','queued') AND attempted=0",[id]).map_err(|e|e.to_string())?;
+        }
+        Ok(())
+    }
+    /// A human promotion retries just this definite-no-send queue item.
+    /// Its retained checkpoint still verifies live authority before dispatch.
+    pub fn rearm_promoted_message_delivery(&self, thread: &str, queued: &str) -> Result<(), String> {
+        self.conn.lock().unwrap().execute("UPDATE agent_message_deliveries SET state='queued',hold_reason=NULL,error=NULL,generation=COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1),0) WHERE thread_id=?1 AND queued_id=?2 AND state='held' AND attempted=0 AND hold_reason IN ('refused','recovery')",params![thread,queued]).map(drop).map_err(|e|e.to_string())
+    }
+    pub fn refuse_message_delivery(&self, id: &str, error: &str) -> Result<(), String> {
+        if self.message_delivery(id)?.is_some_and(|row|row.attempted) {
+            self.fail_message_delivery(id,error)?;
+            return Ok(());
+        }
+        self.finish_message_delivery(id,"held",None,Some(error))?;
+        self.conn.lock().unwrap().execute("UPDATE agent_message_deliveries SET hold_reason='refused' WHERE id=?1 AND state='held' AND attempted=0 AND COALESCE(hold_reason,'')<>'stop'",[id]).map(drop).map_err(|e|e.to_string())
     }
     pub fn acknowledge_message_delivery(&self, thread: &str, id: &str) -> Result<(), String> {
         self.conn.lock().unwrap().execute("UPDATE agent_message_deliveries SET attention_acknowledged=1 WHERE thread_id=?1 AND id=?2 AND state IN ('held','held_unknown','rejected')", params![thread,id]).map(drop).map_err(|e|e.to_string())
@@ -382,7 +406,7 @@ impl DatabaseStore {
         if state == "queued" {
             tx.execute("UPDATE agent_message_deliveries SET queued_id=COALESCE(json_extract(?2,'$.queued_id'),queued_id) WHERE id=?1 AND state='cancelled'", params![id,result.map(Value::to_string)]).map_err(|e|e.to_string())?;
         }
-        tx.execute("UPDATE agent_message_deliveries SET dispatch_owned=0,hold_reason=CASE WHEN ?2='held' OR (state='held' AND ?2='queued') THEN COALESCE(hold_reason,'refused') ELSE NULL END,state=CASE WHEN state='held' AND ?2='queued' THEN state ELSE ?2 END,result=COALESCE(?3,result),error=CASE WHEN state='held' AND ?2='queued' THEN error ELSE ?4 END,
+        tx.execute("UPDATE agent_message_deliveries SET dispatch_owned=0,hold_reason=CASE WHEN ?2='held' OR (state='held' AND ?2='queued') THEN COALESCE(hold_reason,'recovery') ELSE NULL END,state=CASE WHEN state='held' AND ?2='queued' THEN state ELSE ?2 END,result=COALESCE(?3,result),error=CASE WHEN state='held' AND ?2='queued' THEN error ELSE ?4 END,
             queued_id=COALESCE(json_extract(?3,'$.queued_id'),queued_id),turn_id=COALESCE(json_extract(?3,'$.turn_id'),turn_id),
             retry_at=CASE WHEN ?2='pending' THEN datetime('now','+' || MIN(300,5 * (1 << MIN(attempt_count,6))) || ' seconds') ELSE NULL END,updated_at=datetime('now')
             WHERE id=?1 AND state<>'cancelled' AND (state<>'accepted' OR ?2='accepted') AND ((state='held' AND ?2='queued') OR ?2 IN ('held','held_unknown','cancelled','accepted','submitting','rejected') OR (state NOT IN ('held','held_unknown','rejected') AND (state<>'accepted' OR ?2='accepted') AND NOT (state='pending' AND error IS NOT NULL AND ?2 IN ('accepted','submitting'))))",params![id,state,result.map(Value::to_string),error]).map_err(|e|e.to_string())?;
@@ -1193,6 +1217,44 @@ mod tests {
         saved(&db,"wake","pr_watch","old-queue");
         db.stop_message_deliveries("receiver").unwrap();
         assert!(db.disposed_delivery_queue_ids("receiver").unwrap().is_empty());
+    }
+
+    #[test]
+    fn orchestration_message_failed_direct_send_stopped_before_dispatch_cannot_become_inflight() {
+        let db=super::super::init_test_database();
+        db.admit_message_delivery("M","receiver","M",&json!({"origin":"user"}),"epoch",0,None,true).unwrap();
+        db.stop_message_deliveries("receiver").unwrap();
+        assert!(db.verify_delivery_generation("receiver",0).is_err());
+        assert_eq!(db.fail_message_delivery("M","stopped before dispatch").unwrap(),"held");
+        db.resume_message_delivery_thread("receiver").unwrap();
+        let row=db.message_delivery("M").unwrap().unwrap();
+        assert_eq!(row.state,"rejected");
+        assert!(!db.has_inflight_message_deliveries("receiver").unwrap());
+        db.recover_message_deliveries("next-epoch").unwrap();
+        assert!(!db.has_inflight_message_deliveries("receiver").unwrap());
+    }
+
+    #[test]
+    fn orchestration_message_promotion_rearms_only_selected_definite_no_send() {
+        let db=super::super::init_test_database();
+        db.upsert_agent_chat_session("receiver","workspace",None,"claude").unwrap();
+        for id in ["B","other","unknown","recovery"] {
+            saved(&db,id,"controller",id);
+            db.finish_message_delivery(id,"held",None,Some("unsent failure")).unwrap();
+        }
+        db.refuse_message_delivery("B","grant_revoked").unwrap();
+        db.refuse_message_delivery("other","grant_revoked").unwrap();
+        db.finish_message_delivery("unknown","held_unknown",None,Some("possible send")).unwrap();
+        db.stop_message_deliveries("receiver").unwrap();
+        db.rearm_promoted_message_delivery("receiver","B").unwrap();
+        let row=db.message_delivery("B").unwrap().unwrap();
+        assert_eq!(row.state,"queued");assert_eq!(row.generation,1);
+        assert!(row.error.is_none() && row.hold_reason.is_none() && !row.attempted);
+        assert_eq!(db.message_delivery("other").unwrap().unwrap().state,"held");
+        db.rearm_promoted_message_delivery("receiver","unknown").unwrap();
+        assert_eq!(db.message_delivery("unknown").unwrap().unwrap().state,"held_unknown");
+        db.rearm_promoted_message_delivery("receiver","recovery").unwrap();
+        assert_eq!(db.message_delivery("recovery").unwrap().unwrap().state,"queued");
     }
 
 }

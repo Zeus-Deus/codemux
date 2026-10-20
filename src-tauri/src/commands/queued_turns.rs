@@ -522,7 +522,7 @@ pub(crate) async fn send_saved_queued_turn<R: Runtime>(
         }.retain_admission(&app));
         if let Some(control) = &context.control {
             if let Err(error) = control.verify(&app) {
-                db.finish_message_delivery(id,"held",None,Some(&error))?;
+                db.refuse_message_delivery(id,&error)?;
                 return Err(error);
             }
         }
@@ -534,7 +534,6 @@ pub(crate) async fn send_saved_queued_turn<R: Runtime>(
         db.control_record_queue_event(&ProviderRuntimeEvent::QueuedTurnCancelled {thread_id:thread_id.clone(),queued_id:queued_id.clone()})?;
     }
     context.release_queue = release_queue;
-    if release_queue { db.resume_message_delivery_thread(&thread_id.0)?; }
     let result = super::agent_chat::send_turn_with_context(app.clone(), provider, input, context).await?;
     // Accepted. A started or steered turn is already in the transcript, so
     // the row can go. A queued one is now a live turn: save it under its new

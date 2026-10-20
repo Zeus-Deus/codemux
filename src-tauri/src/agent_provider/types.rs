@@ -102,6 +102,14 @@ pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
     /// Plain Git snapshots have no caller; the native owner wraps controlled
     /// inputs with a live authority check regardless of checkpoint settings.
     fn authorize_dispatch(&self) -> Result<(), super::ProviderError> { Ok(()) }
+    /// Check a human queue promotion before it can interrupt another turn.
+    /// This must not record a provider submission.
+    fn authorize_queue_promotion(&self) -> Result<(), super::ProviderError> {
+        match self.queued_delivery_state() {
+            QueuedDeliveryState::Ready => Ok(()),
+            _ => Err(super::ProviderError::ValidationError { message: "Queued message is still held or disposed; inspect its delivery error before sending.".into() }),
+        }
+    }
     /// A durable human release may advance only the Stop fence of an
     /// already queued input. Other authority checks remain live.
     fn authorize_rearmed_dispatch(&self, _released_stops: u64) -> Result<(), super::ProviderError> { self.authorize_dispatch() }
@@ -345,6 +353,9 @@ pub struct SendTurnInput {
 impl SendTurnInput {
     pub(crate) fn releases_queue_hold(&self) -> bool {
         self.turn_checkpoint.as_ref().is_none_or(|c| c.releases_queue_hold())
+    }
+    pub(crate) fn authorize_queue_promotion(&self) -> Result<(), super::ProviderError> {
+        self.turn_checkpoint.as_ref().map_or(Ok(()), |c|c.authorize_queue_promotion())
     }
     pub(crate) fn queued_delivery_state(&self) -> QueuedDeliveryState {
         self.turn_checkpoint.as_ref().map_or(QueuedDeliveryState::Ready, |c| c.queued_delivery_state())

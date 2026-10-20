@@ -1365,6 +1365,7 @@ impl AgentProvider for HermesProvider {
         {
             let mut queue = runtime.queue.lock().await;
             let Some(index) = queue.jobs.iter().position(|job|job.id == queued_id && job.input.thread_id == thread_id) else { return Ok(()) };
+            queue.jobs[index].input.authorize_queue_promotion()?;
             let job = queue.jobs.remove(index).unwrap();
             queue.jobs.push_front(job);
             queue.holds.entry(thread_id.clone()).or_default().release_with(&queued_id);

@@ -726,7 +726,7 @@ async fn drain_saved_queue<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId,
             let blocked_item = db.get_queued_turn(&thread_id.0,&queued_id)
                 .and_then(|row|row.provenance.delivery_id)
                 .and_then(|id|db.message_delivery(&id).ok().flatten())
-                .is_some_and(|row|row.state == "held" && !row.attempted && row.hold_reason.as_deref() != Some("stop"));
+                .is_some_and(|row|row.state == "held" && !row.attempted && row.hold_reason.as_deref() == Some("refused"));
             if !blocked_item { break; }
         }
     }

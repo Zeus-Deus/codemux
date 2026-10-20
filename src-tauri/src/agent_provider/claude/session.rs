@@ -1390,6 +1390,7 @@ impl ClaudeSession {
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
         let (has_active_turn, original_index, previous_release) = {
             let mut state = self.state.lock().await;
+            if let Some(q) = state.queued_turns.iter().find(|q|q.queued_id == queued_id) { q.input.authorize_queue_promotion()?; }
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
                 // `turn_busy`, not `active_turn`: an SDK-initiated turn
                 // parked on a question has no `active_turn`, and draining

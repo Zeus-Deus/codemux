@@ -1097,3 +1097,42 @@ async fn orchestration_message_hermes_failed_human_release_preserves_stop_hold()
     assert!(!seen.iter().any(|e|matches!(e,ProviderRuntimeEvent::QueuedTurnDispatched {queued_id,..} if queued_id==&b)));
     runtime.child.shutdown().await.unwrap();task.abort();let _=task.await;
 }
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_hermes_failed_release_reholds_durable_rows_before_next_pump() {
+    use tauri::Manager;
+    let (_root,provider,runtime,_chat,task)=review_pump_fixture().await;
+    let app=tauri::test::mock_app();app.manage(crate::database::init_test_database());
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_session("thread","workspace",None,"hermes").unwrap();
+    runtime.queue.lock().await.running=true;
+    provider.interrupt_turn(ThreadId("thread".into()),None).await.unwrap();
+    db.admit_message_delivery("B","thread","B",&json!({"origin":"controller"}),"epoch",0,None,true).unwrap();
+    let mut b=turn("thread","held B");
+    b.turn_checkpoint=Some(Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {
+        app:app.handle().clone(),id:"B".into(),thread:"thread".into(),provider:ProviderKind::Hermes,inner:None,
+        release_queue:false,admitted_generation:0,resumed_ids:vec![],
+    }));
+    let b=provider.send_turn(b).await.unwrap().queued_id.unwrap();
+    db.finish_message_delivery("B","queued",Some(&json!({"queued_id":b})),None).unwrap();
+    db.stop_message_deliveries("thread").unwrap();
+    let resumed_ids=db.resume_message_delivery_thread("thread").unwrap();
+    db.admit_message_delivery("D","thread","D",&json!({"origin":"user"}),"epoch",1,None,true).unwrap();
+    let revoked=Arc::new(ReviewDispatchAuthority::default());revoked.revoked.store(true,std::sync::atomic::Ordering::SeqCst);
+    let mut d=turn("thread","failed D");
+    d.turn_checkpoint=Some(Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {
+        app:app.handle().clone(),id:"D".into(),thread:"thread".into(),provider:ProviderKind::Hermes,inner:Some(revoked),
+        release_queue:true,admitted_generation:1,resumed_ids,
+    }));
+    let d=provider.send_turn(d).await.unwrap().queued_id.unwrap();
+    db.finish_message_delivery("D","queued",Some(&json!({"queued_id":d})),None).unwrap();
+    tokio::time::timeout(Duration::from_secs(3),provider.inner.clone().pump(runtime.clone())).await.unwrap();
+    let row=db.message_delivery("B").unwrap().unwrap();
+    assert_eq!(row.state,"held");assert_eq!(row.hold_reason.as_deref(),Some("stop"));assert!(!row.attempted);
+    let mut machine=turn("thread","fresh machine C");
+    machine.turn_checkpoint=Some(Arc::new(crate::agent_provider::queue_hold::TestCheckpoint {release:false,held:Default::default()}));
+    provider.send_turn(machine).await.unwrap();
+    assert!(runtime.queue.lock().await.jobs.iter().any(|job|job.id==b));
+    assert!(!db.message_delivery("B").unwrap().unwrap().attempted);
+    runtime.child.shutdown().await.unwrap();task.abort();let _=task.await;
+}

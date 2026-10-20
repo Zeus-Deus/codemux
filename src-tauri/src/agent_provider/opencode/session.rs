@@ -931,6 +931,7 @@ impl OpenCodeSession {
             .find(|(key, _)| key == id)
             .map(|(_, input)| input.clone());
         let Some(input) = input else { return Ok(()) };
+        input.authorize_queue_promotion()?;
         if steer {
             let text = input
                 .display_text

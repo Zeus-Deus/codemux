@@ -1258,6 +1258,7 @@ impl CodexSession {
                 .find(|q| q.queued_id == queued_id)
                 .map(|q| q.input.clone());
             let Some(input) = input else { return Ok(()) };
+            input.authorize_queue_promotion()?;
             let text = input
                 .display_text
                 .clone()
@@ -1458,6 +1459,7 @@ impl CodexSession {
         let outbound = self.outbound.lock().await;
         let (has_active_turn, original_index, previous_release) = {
             let mut state = self.state.lock().await;
+            if let Some(q) = state.queued_turns.iter().find(|q|q.queued_id == queued_id) { q.input.authorize_queue_promotion()?; }
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
                 Some(idx) => {
                     let previous = state.queue_hold.release_with(queued_id);

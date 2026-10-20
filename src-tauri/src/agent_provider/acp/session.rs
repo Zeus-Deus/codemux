@@ -1671,6 +1671,7 @@ impl AcpSession {
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
         let (ready_to_dispatch, should_interrupt, was_held) = {
             let mut state = self.state.lock().await;
+            if let Some(q) = state.queued.iter().find(|q|q.id == queued_id) { q.input.authorize_queue_promotion()?; }
             let queued = state
                 .queued
                 .iter()
