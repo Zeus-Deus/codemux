@@ -2283,6 +2283,7 @@ fn async_answer(thread: &str) -> codemux_lib::agent_provider::AnswerQuestionInpu
         answers: vec!["SQLite".into()],
         submission_id: "answer-1".into(),
         checkpoint: None,
+        permission_mode_override: None,
     }
 }
 

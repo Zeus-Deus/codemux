@@ -2,7 +2,6 @@ import { ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { PermissionModeOption } from "@/tauri/types";
 import { useFullAccessNoticeStore } from "@/stores/full-access-notice-store";
-import { CHAT_COLUMN } from "./chat-column";
 
 /**
  * Provider-native values for "run every tool without asking" (Claude,
@@ -43,33 +42,32 @@ export function FullAccessNotice({
     "Full access";
 
   return (
-    // Same tab language as the scope strip under the composer: inset,
-    // top-rounded, and tucked 18px under the card so the two read as one
-    // piece rather than a separate box with its own border.
-    <div className={CHAT_COLUMN}>
-      <div className="relative z-0 px-5">
-        <div
-          role="note"
-          className="-mb-[18px] flex items-start gap-2 rounded-t-[14px] border border-b-0 border-border/70 bg-muted/20 px-3 pt-2 pb-[26px] text-body-sm text-muted-foreground"
+    // Docked in the composer's strip slot (inside its column). Same tab
+    // language as the scope strip under the composer: inset, top-rounded,
+    // and tucked 18px under the card so the two read as one piece rather
+    // than a separate box with its own border.
+    <div className="relative z-0 px-5">
+      <div
+        role="note"
+        className="-mb-[18px] flex items-start gap-2 rounded-t-[14px] border border-b-0 border-border/70 bg-muted/20 px-3 pt-2 pb-[26px] text-body-sm text-muted-foreground"
+      >
+        <ShieldAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+        <p className="min-w-0 flex-1 leading-relaxed">
+          <span className="text-foreground">
+            New chats start with {label}.
+          </span>{" "}
+          Agents run commands and edit files without asking first.
+          {hasPicker &&
+            ` Change it for this chat from the ${label} menu in the message box.`}
+        </p>
+        <Button
+          variant="ghost"
+          size="xs"
+          className="shrink-0 text-muted-foreground"
+          onClick={dismiss}
         >
-          <ShieldAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
-          <p className="min-w-0 flex-1 leading-relaxed">
-            <span className="text-foreground">
-              New chats start with {label}.
-            </span>{" "}
-            Agents run commands and edit files without asking first.
-            {hasPicker &&
-              ` Change it for this chat from the ${label} menu in the message box.`}
-          </p>
-          <Button
-            variant="ghost"
-            size="xs"
-            className="shrink-0 text-muted-foreground"
-            onClick={dismiss}
-          >
-            Got it
-          </Button>
-        </div>
+          Got it
+        </Button>
       </div>
     </div>
   );

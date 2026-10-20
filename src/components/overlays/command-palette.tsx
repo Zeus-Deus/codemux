@@ -1,4 +1,5 @@
 import { Kbd } from "@/components/ui/kbd";
+import { ScrollEdgeFade, useScrollEdges } from "@/components/ui/scroll-edge-fade";
 import { useContributions } from "@/contrib/react/use-contributions";
 import { PALETTE_AREA } from "@/sdk/areas";
 import type { PaletteCommandData } from "@/sdk/host";
@@ -615,6 +616,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   const prOverview = usePrOverview(query.mode === "prs");
   const prOverviewRows = prOverview.rows;
   const listRef = useRef<HTMLDivElement>(null);
+  const edges = useScrollEdges(listRef);
   // A seeded `theme` query is a deep link from Settings ▸ Appearance, not
   // an ordinary palette search. Remember that distinction after the store's
   // one-shot seed has been consumed so only that entry point puts Themes
@@ -1449,7 +1451,8 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
           ))}
         </CommandPrimitive.List>
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-5 bg-gradient-to-b from-transparent to-popover" />
+        <ScrollEdgeFade edge="top" visible={edges.top} />
+        <ScrollEdgeFade edge="bottom" visible={edges.bottom} />
       </div>
 
       {/* Footer — while a theme is previewing it explains the preview instead

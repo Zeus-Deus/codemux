@@ -134,17 +134,13 @@ interface Props {
   accessIconOnly?: boolean;
   /** Width ladder: effort + access leave the row for the `+` menu. */
   configInMenu?: boolean;
-  /** Model, effort and access render in the context row under the
-   *  composer instead of this row. */
-  settingsInContextRow?: boolean;
 }
 
 /**
  * The composer's single controls row. Identical geometry in the collapsed
  * pill and the expanded card, so nothing moves horizontally when the
  * textarea opens above it: attach pinned left, send pinned right, a
- * flexible gap in between. Model / effort / access sit beside send only when
- * the composer has no context row to host them (`settingsInContextRow`).
+ * flexible gap in between, with model / effort / access beside send.
  */
 export function ComposerFooter({
   hermesThreadId, hermesProjectPath, customAgentsAllowed = true,
@@ -200,7 +196,6 @@ export function ComposerFooter({
   effortIconOnly = false,
   accessIconOnly = false,
   configInMenu = false,
-  settingsInContextRow = false,
 }: Props) {
   const stopTooltip = useStopTooltip();
 
@@ -309,46 +304,42 @@ export function ComposerFooter({
                 </>
               )}
             </button>
-            {!settingsInContextRow && (
-              <span className={FOOTER_SEPARATOR} aria-hidden />
-            )}
+            <span className={FOOTER_SEPARATOR} aria-hidden />
           </>
         )}
 
-        {!settingsInContextRow && (
-          <ComposerSettings
-            hermesThreadId={hermesThreadId}
-            hermesProjectPath={hermesProjectPath}
-            customAgentsAllowed={customAgentsAllowed}
-            provider={provider}
-            model={model}
-            permissionMode={permissionMode}
-            effort={effort}
-            contextWindow={contextWindow}
-            serviceTier={serviceTier}
-            activeModel={activeModel}
-            effortLabelMap={effortLabelMap}
-            permissionModes={permissionModes}
-            ultrathinkInBodyText={ultrathinkInBodyText}
-            showProviderPicker={showProviderPicker}
-            mode={mode}
-            onProviderModelChange={onProviderModelChange}
-            onModelChange={onModelChange}
-            onPermissionModeChange={onPermissionModeChange}
-            onEffortChange={onEffortChange}
-            onContextWindowChange={onContextWindowChange}
-            onServiceTierChange={onServiceTierChange}
-            configurationDisabled={configurationDisabled}
-            modelPickerOpenSignal={modelPickerOpenSignal}
-            permissionPickerOpenSignal={permissionPickerOpenSignal}
-            placement="footer"
-            modelLeafLabel={modelLeafLabel}
-            modelIconOnly={modelIconOnly}
-            effortIconOnly={effortIconOnly}
-            accessIconOnly={accessIconOnly}
-            configInMenu={configInMenu}
-          />
-        )}
+        <ComposerSettings
+          hermesThreadId={hermesThreadId}
+          hermesProjectPath={hermesProjectPath}
+          customAgentsAllowed={customAgentsAllowed}
+          provider={provider}
+          model={model}
+          permissionMode={permissionMode}
+          effort={effort}
+          contextWindow={contextWindow}
+          serviceTier={serviceTier}
+          activeModel={activeModel}
+          effortLabelMap={effortLabelMap}
+          permissionModes={permissionModes}
+          ultrathinkInBodyText={ultrathinkInBodyText}
+          showProviderPicker={showProviderPicker}
+          mode={mode}
+          onProviderModelChange={onProviderModelChange}
+          onModelChange={onModelChange}
+          onPermissionModeChange={onPermissionModeChange}
+          onEffortChange={onEffortChange}
+          onContextWindowChange={onContextWindowChange}
+          onServiceTierChange={onServiceTierChange}
+          configurationDisabled={configurationDisabled}
+          modelPickerOpenSignal={modelPickerOpenSignal}
+          permissionPickerOpenSignal={permissionPickerOpenSignal}
+          placement="footer"
+          modelLeafLabel={modelLeafLabel}
+          modelIconOnly={modelIconOnly}
+          effortIconOnly={effortIconOnly}
+          accessIconOnly={accessIconOnly}
+          configInMenu={configInMenu}
+        />
 
         {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} iconOnly={accessIconOnly} />}
         {streaming && onDeliveryChange && hasDraft ? (

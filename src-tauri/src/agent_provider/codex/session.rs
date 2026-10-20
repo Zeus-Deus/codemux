@@ -92,6 +92,7 @@ fn runtime_collaboration_mode(
     model: Option<&str>,
     effort: Option<&str>,
     guidance: Option<&str>,
+    plan: bool,
 ) -> Option<CollaborationMode> {
     let model = model?.split_whitespace().collect::<Vec<_>>().join(" ");
     if model.is_empty() {
@@ -100,6 +101,18 @@ fn runtime_collaboration_mode(
     let effort = effort
         .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|value| !value.is_empty());
+    if plan {
+        // No instructions selects Codex's built-in Plan mode prompt: plan
+        // without mutating anything, and finish with a `<proposed_plan>`.
+        return Some(CollaborationMode {
+            mode: "plan".into(),
+            settings: CollaborationModeSettings {
+                model,
+                reasoning_effort: effort,
+                developer_instructions: None,
+            },
+        });
+    }
     let effort_text = effort
         .as_deref()
         .map(|value| format!(" with {value} reasoning effort"))
@@ -116,7 +129,7 @@ fn runtime_collaboration_mode(
         settings: CollaborationModeSettings {
             model,
             reasoning_effort: effort,
-            developer_instructions,
+            developer_instructions: Some(developer_instructions),
         },
     })
 }
@@ -375,6 +388,13 @@ pub(crate) struct CodexSession {
     /// Codemux instructions for the tools listed at `thread/start`, added to
     /// every turn's developer instructions.
     guidance: Option<String>,
+    /// The Plan pill: turns start in Codex's `plan` collaboration mode
+    /// instead of `default`. Set by each composer send (see
+    /// [`Self::select_collaboration_mode`]); the sandbox is untouched.
+    plan_mode: AtomicBool,
+    /// Whether Codex reported the resumed thread's mode. When it did not
+    /// (older servers), the provider seeds the mode Codemux recorded.
+    mode_reported: bool,
 }
 
 impl CodexSession {
@@ -795,6 +815,7 @@ impl CodexSession {
             }
         };
         let codex_thread_id = thread.thread_id().to_string();
+        let resumed_plan = thread.plan_mode();
         // A chat that names no model runs on Codex's configured default. Keep
         // the model Codex reports, since each turn's runtime identity and tool
         // guidance ride on collaboration-mode settings, which require one.
@@ -851,6 +872,11 @@ impl CodexSession {
             plugin_registry: mcp_registry.clone().filter(|_| managed.is_none()),
             plugin_catalog_seen: Mutex::new(plugin_snapshot.catalog_key),
             direct_tool_names: plugin_snapshot.direct_names,
+            // A resumed thread continues in its last turn's mode until a
+            // composer send names one, so restart auto-resume, and answers
+            // given right after a rebuild, keep an interrupted Plan task in Plan.
+            plan_mode: AtomicBool::new(resumed_plan.unwrap_or(false)),
+            mode_reported: resumed_plan.is_some(),
         });
 
         // Emit SessionConfigured up front so subscribers see the thread
@@ -975,6 +1001,7 @@ impl CodexSession {
         if let Some(checkpoint) = checkpoint.as_ref() {
             checkpoint.prepare().await;
         }
+        self.select_collaboration_mode(input.permission_mode_override.as_deref());
         let sent = self
             .do_send(
                 input.text,
@@ -1106,6 +1133,7 @@ impl CodexSession {
             if let Some(checkpoint) = checkpoint {
                 checkpoint.prepare().await;
             }
+            self.select_collaboration_mode(input.permission_mode_override.as_deref());
             let sent = if native {
                 self.do_send(
                     input.text.clone(),
@@ -1234,6 +1262,8 @@ impl CodexSession {
             if let Some(checkpoint) = checkpoint.as_ref() {
                 checkpoint.prepare().await;
             }
+            // A queued message runs in the mode it was written in.
+            self.select_collaboration_mode(queued.input.permission_mode_override.as_deref());
             match self
                 .do_send(
                     queued.input.text,
@@ -1542,8 +1572,13 @@ impl CodexSession {
             let key = crate::mcp::registry::plugin_catalog_key(&tools);
             (key != *self.plugin_catalog_seen.lock().await).then(|| (key, crate::mcp::registry::plugin_catalog_notice(&tools)))
         } else { None };
-        let collaboration_mode =
-            runtime_collaboration_mode(model.as_deref(), effort.as_deref(), self.guidance.as_deref());
+        let collaboration_mode = runtime_collaboration_mode(
+            model.as_deref(),
+            effort.as_deref(),
+            self.guidance.as_deref(),
+            self.plan_mode.load(Ordering::SeqCst),
+        );
+        let selected_mode = collaboration_mode.as_ref().map(|mode| mode.mode.clone());
         let mut input_items = input_items;
         if let Some((_,notice)) = &changed_catalog {
             input_items.insert(0, TurnInputItem::Text { text: notice.clone(), text_elements: vec![] });
@@ -1578,6 +1613,15 @@ impl CodexSession {
             state.pending_turn_start = Some(PendingTurnStart::default());
             generation
         };
+        // The turn this starts runs in this mode. Reported before the request,
+        // so an uncertain response still records it; turns start only when
+        // none is running, so one that fails to start leaves nothing to resume.
+        if let Some(mode) = selected_mode {
+            let _ = self.event_tx().send(ProviderRuntimeEvent::TurnModeSelected {
+                thread_id: self.thread_id.clone(),
+                mode,
+            });
+        }
         let child = self.child().await;
         let response = match dispatch_guard.as_deref() {
             Some(guard) => child.request_guarded("turn/start", params_value, guard).await,
@@ -1643,6 +1687,26 @@ impl CodexSession {
     /// treated as absent by the provider so the next send auto-resumes.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
+    }
+
+    /// Seed the mode Codemux recorded for this thread's last turn, unless
+    /// Codex reported one when the thread was resumed (that one is the truth).
+    pub(crate) fn seed_recorded_mode(&self, mode: &str) {
+        if !self.mode_reported {
+            self.plan_mode.store(mode == "plan", Ordering::SeqCst);
+        }
+    }
+
+    /// Composer sends carry the Plan pill as `permission_mode_override`
+    /// ("plan", or the thread's own mode when the pill is off), so the pill
+    /// is the truth for every turn it starts, across restarts and rebuilds;
+    /// question answers carry it too. A send that names no mode (from outside
+    /// the composer) keeps the last one. A started turn keeps its mode: Codex
+    /// cannot change it, so guidance steered into it does too.
+    fn select_collaboration_mode(&self, permission_mode_override: Option<&str>) {
+        if let Some(mode) = permission_mode_override {
+            self.plan_mode.store(mode == "plan", Ordering::SeqCst);
+        }
     }
 
     /// Whether a send is between leaving the queue (or the send button)
@@ -1751,6 +1815,7 @@ impl CodexSession {
                 if let Some(checkpoint) = &input.checkpoint {
                     checkpoint.prepare().await;
                 }
+                self.select_collaboration_mode(input.permission_mode_override.as_deref());
                 let result = self
                     .do_send_with_id(
                         text.clone(),
@@ -3098,6 +3163,10 @@ pub(crate) mod managed_tests;
 #[path = "approval_tests.rs"]
 mod approval_tests;
 
+#[cfg(all(test, unix))]
+#[path = "plan_mode_tests.rs"]
+mod plan_mode_tests;
+
 #[cfg(test)]
 mod in_flight_send_tests {
     use super::InFlightSend;
@@ -3204,15 +3273,29 @@ mod tests {
 
     #[test]
     fn runtime_identity_uses_the_resolved_turn_settings() {
-        let mode = runtime_collaboration_mode(Some("gpt-5.6-sol"), Some("high"), None).unwrap();
+        let mode =
+            runtime_collaboration_mode(Some("gpt-5.6-sol"), Some("high"), None, false).unwrap();
         assert_eq!(mode.mode, "default");
         assert_eq!(mode.settings.model, "gpt-5.6-sol");
         assert_eq!(mode.settings.reasoning_effort.as_deref(), Some("high"));
-        assert!(mode.settings.developer_instructions.ends_with(
+        assert!(mode.settings.developer_instructions.unwrap().ends_with(
             "<runtime_info>In case you're asked: you are running in CodeMux through the Codex harness, as gpt-5.6-sol with high reasoning effort. No need to mention this otherwise.</runtime_info>"
         ));
 
-        assert!(runtime_collaboration_mode(None, Some("high"), None).is_none());
+        assert!(runtime_collaboration_mode(None, Some("high"), None, false).is_none());
+    }
+
+    #[test]
+    fn plan_mode_selects_codex_built_in_plan_instructions() {
+        let mode =
+            runtime_collaboration_mode(Some("gpt-6.1-sol"), Some("high"), Some("guidance"), true)
+                .unwrap();
+        assert_eq!(mode.mode, "plan");
+        assert_eq!(mode.settings.model, "gpt-6.1-sol");
+        assert_eq!(mode.settings.reasoning_effort.as_deref(), Some("high"));
+        // Custom text would replace Codex's Plan prompt, so none is sent.
+        let value = serde_json::to_value(&mode).unwrap();
+        assert_eq!(value["settings"]["developer_instructions"], Value::Null);
     }
 
     #[test]
@@ -3232,8 +3315,9 @@ mod tests {
         assert!(developer_guidance(&[tool("mcp__other__html_render")]).is_none());
 
         let mode =
-            runtime_collaboration_mode(Some("gpt-5.6-sol"), None, guidance.as_deref()).unwrap();
-        let instructions = mode.settings.developer_instructions;
+            runtime_collaboration_mode(Some("gpt-5.6-sol"), None, guidance.as_deref(), false)
+                .unwrap();
+        let instructions = mode.settings.developer_instructions.unwrap();
         assert!(instructions.contains(crate::mcp_server::HTML_RENDER_GUIDANCE));
         assert!(instructions.ends_with("</runtime_info>"), "runtime identity stays last");
     }
@@ -3259,8 +3343,9 @@ mod tests {
         assert!(both.starts_with(crate::mcp_server::HTML_RENDER_GUIDANCE));
         assert!(both.ends_with(suggest));
         assert!(developer_guidance(&[tool("mcp__other__suggest_tasks")]).is_none());
-        let mode = runtime_collaboration_mode(Some("gpt-5.6-sol"), None, Some(&both)).unwrap();
-        assert!(mode.settings.developer_instructions.contains(suggest));
+        let mode =
+            runtime_collaboration_mode(Some("gpt-5.6-sol"), None, Some(&both), false).unwrap();
+        assert!(mode.settings.developer_instructions.unwrap().contains(suggest));
     }
 
     #[test]

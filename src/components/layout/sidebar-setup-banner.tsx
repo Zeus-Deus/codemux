@@ -1,6 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
 import { X } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { selectActiveWorkspaceId, useAppStore, useHomeDir } from "@/stores/app-store";
 import { basename } from "@/lib/path";
@@ -106,21 +105,18 @@ export function SidebarSetupBanner() {
     <div className="shrink-0">
       <div className="px-3 py-2">
         <div className="rounded-md border border-border bg-muted/30 px-3 pt-2.5 pb-3">
-          <div className="flex items-start justify-between mb-1.5">
-            <Badge variant="outline" className="text-micro px-1.5 py-0 h-4 uppercase tracking-wider font-semibold">
-              Setup
-            </Badge>
+          <div className="flex items-center justify-between">
+            <p className="text-label font-semibold text-foreground">Setup scripts</p>
             <Button
               variant="ghost"
               size="icon-xs"
-              className="shrink-0 -mr-1 -mt-0.5 text-muted-foreground hover:text-foreground"
+              className="shrink-0 -mr-1 text-muted-foreground hover:text-foreground"
               onClick={handleDismiss}
               aria-label="Dismiss setup tip"
             >
               <X className="size-3" />
             </Button>
           </div>
-          <p className="text-label font-semibold text-foreground">Setup scripts</p>
           <p className="text-label text-muted-foreground mt-0.5">
             Automate workspace setup for {projectName} with setup scripts
             and <code className="font-mono text-caption bg-muted/50 px-0.5 rounded-sm">.codemuxinclude</code>

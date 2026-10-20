@@ -383,7 +383,12 @@ describe("SidebarProjectsView", () => {
     });
     workspaces = [makeWorkspace({ title: "existing" })];
     await renderView();
-    fireEvent.click(screen.getByRole("button", { name: "New chat in app" }));
+    const toggle = screen.getByRole("button", { name: "app (1)" });
+    const create = screen.getByRole("button", { name: "New chat in app" });
+    expect(create.parentElement).toBe(toggle.parentElement);
+    expect(toggle.querySelector("button")).toBeNull();
+    fireEvent.click(create);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
     await act(async () => {
       await Promise.resolve();
     });

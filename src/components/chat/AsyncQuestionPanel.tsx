@@ -5,6 +5,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
+import { turnPermissionMode } from "@/lib/agent-chat/mode-compatibility";
 import type { AsyncQuestionItem } from "@/lib/agent-chat/types";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
@@ -177,7 +178,21 @@ async function resolveQuestion(
   id: string,
   action: QuestionAction,
 ): Promise<void> {
-  const resolution = await agentChatAnswerQuestion(threadId, id, action);
+  // An answer that starts a new turn runs in the mode it was given in.
+  const slice = useAgentChatStore.getState().threads[threadId];
+  const resolution = await agentChatAnswerQuestion(
+    threadId,
+    id,
+    action.action === "answer"
+      ? {
+          ...action,
+          permission_mode_override: turnPermissionMode(
+            slice?.mode ?? "default",
+            slice?.permissionMode ?? null,
+          ),
+        }
+      : action,
+  );
   useAgentChatStore.getState().applyEvent(threadId, {
     type: "question_resolved",
     thread_id: threadId,

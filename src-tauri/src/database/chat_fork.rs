@@ -5,7 +5,8 @@
 //! forked session as its resume cursor. This table only records lineage, so
 //! the fork can say where it came from. The row cascades with the fork; it
 //! deliberately has no foreign key to the source, which may be deleted
-//! while the fork lives on.
+//! while the fork lives on. Reopening either from history keeps the link
+//! ([`move_to_thread`]).
 use super::*;
 use std::path::Path;
 
@@ -30,6 +31,28 @@ pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
     .map_err(|e| format!("Failed to create chat fork table: {e}"))
 }
 
+/// A history reopen merges `merged` into `survivor`
+/// (`merge_agent_chat_session_rows`): the survivor keeps the lineage of the
+/// fork it continues, unless it has its own, and forks of a merged chat now
+/// come from the survivor.
+pub(super) fn move_to_thread(conn: &Connection, merged: &[String], survivor: &str) -> Result<(), String> {
+    let move_error = |e: rusqlite::Error| format!("Failed to keep the fork's origin: {e}");
+    for thread in merged {
+        conn.execute(
+            "UPDATE OR IGNORE agent_chat_forks SET thread_id = ?2 WHERE thread_id = ?1",
+            params![thread, survivor],
+        )
+        .map_err(move_error)?;
+        conn.execute(
+            "UPDATE agent_chat_forks SET source_thread_id = ?2
+             WHERE source_thread_id = ?1 AND thread_id != ?2",
+            params![thread, survivor],
+        )
+        .map_err(move_error)?;
+    }
+    Ok(())
+}
+
 /// The new thread a fork creates: its session row (copied from the source,
 /// with the forked provider session as its resume cursor) and lineage.
 #[derive(Debug, Clone)]
@@ -42,10 +65,13 @@ pub struct NewChatFork<'a> {
     pub title: &'a str,
     /// Copy only rows before this source row id; `None` copies them all.
     pub cut_before: Option<i64>,
-    /// The source's and the fork's chat-image folders. Inherited images are
-    /// re-pointed into the fork's own folder, so deleting or reverting the
-    /// source can't break them.
-    pub image_dirs: Option<(&'a Path, &'a Path)>,
+    /// The chat-image root, as written and as canonicalized (a resent image
+    /// is stored by its canonical path), and the fork's folder. Inherited
+    /// images anywhere under the root (the source's folder, or that of a
+    /// chat it absorbed by a history reopen) are re-pointed into the fork's
+    /// own folder, so the fork and its source never share a file: deleting
+    /// or reverting either can't break the other.
+    pub image_dirs: Option<(&'a [PathBuf], &'a Path)>,
 }
 
 /// An inherited image the fork's transcript now points at: copy `from` to
@@ -66,12 +92,13 @@ pub struct ChatForkOrigin {
 /// Rewrite one copied transcript row for the fork: the envelope's
 /// `thread_id` names the fork, a user-turn journal row points at the fork's
 /// copy of its user message, and a user message's images inside the
-/// source's image folder move to the fork's (recorded in `images`).
+/// chat-image root move into the fork's folder by file name (unique per
+/// image), recorded in `images`.
 pub(crate) fn rewrite_forked_payload(
     payload: &str,
     fork_thread_id: &str,
     copied_ids: &HashMap<i64, i64>,
-    image_dirs: Option<(&Path, &Path)>,
+    image_dirs: Option<(&[PathBuf], &Path)>,
     images: &mut Vec<ForkedImage>,
 ) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
@@ -89,7 +116,7 @@ pub(crate) fn rewrite_forked_payload(
             object.insert("user_message_id".into(), (*copied).into());
         }
     }
-    if let (Some((source_dir, fork_dir)), Some(list)) = (
+    if let (Some((roots, fork_dir)), Some(list)) = (
         image_dirs,
         object.get_mut("images").and_then(serde_json::Value::as_array_mut),
     ) {
@@ -98,10 +125,16 @@ pub(crate) fn rewrite_forked_payload(
                 continue;
             };
             let from = PathBuf::from(path);
-            let Ok(rest) = from.strip_prefix(source_dir) else {
+            // A transcript row is data: only plain paths under the root move.
+            let inside = roots.iter().any(|root| {
+                from.strip_prefix(root).is_ok_and(|rest| {
+                    rest.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+                })
+            });
+            let (true, Some(name)) = (inside, from.file_name()) else {
                 continue;
             };
-            let to = fork_dir.join(rest);
+            let to = fork_dir.join(name);
             image["path"] = to.to_string_lossy().into_owned().into();
             images.push((from, to));
         }
@@ -386,18 +419,30 @@ mod tests {
     #[test]
     fn rewrite_moves_inherited_images_into_the_forks_folder() {
         let mut images = Vec::new();
+        // `old` belongs to a chat the source absorbed by a history reopen:
+        // its images are the source's now, so they move too, whichever form
+        // of the root (`/real/img` is its canonical path) they were saved by.
+        let roots = vec![PathBuf::from("/real/img"), PathBuf::from("/img")];
         let row = rewrite_forked_payload(
-            r#"{"type":"user_message","text":"look","images":[{"path":"/img/src/a.png","media_type":"image/png"},{"path":"/elsewhere/b.png"}]}"#,
+            r#"{"type":"user_message","text":"look","images":[{"path":"/img/src/a.png","media_type":"image/png"},{"path":"/elsewhere/b.png"},{"path":"/real/img/old/c.png"},{"path":"/img/../etc/d.png"}]}"#,
             "fork",
             &HashMap::new(),
-            Some((Path::new("/img/src"), Path::new("/img/fork"))),
+            Some((roots.as_slice(), Path::new("/img/fork"))),
             &mut images,
         );
         let row: serde_json::Value = serde_json::from_str(&row).unwrap();
-        let moved = Path::new("/img/fork").join("a.png");
-        assert_eq!(row["images"][0]["path"], moved.to_string_lossy().as_ref());
-        assert_eq!(row["images"][1]["path"], "/elsewhere/b.png", "only the source's own folder moves");
-        assert_eq!(images, vec![(PathBuf::from("/img/src/a.png"), PathBuf::from("/img/fork/a.png"))]);
+        let fork = |name: &str| Path::new("/img/fork").join(name);
+        assert_eq!(row["images"][0]["path"], fork("a.png").to_string_lossy().as_ref());
+        assert_eq!(row["images"][1]["path"], "/elsewhere/b.png", "only the chat-image root moves");
+        assert_eq!(row["images"][2]["path"], fork("c.png").to_string_lossy().as_ref());
+        assert_eq!(row["images"][3]["path"], "/img/../etc/d.png", "never a path that leaves the root");
+        assert_eq!(
+            images,
+            vec![
+                (PathBuf::from("/img/src/a.png"), fork("a.png")),
+                (PathBuf::from("/real/img/old/c.png"), fork("c.png")),
+            ]
+        );
     }
 
     #[test]
@@ -528,6 +573,47 @@ mod tests {
         let user = append(&db, serde_json::json!({"type":"user_message","text":"one"}));
         let done = append(&db, serde_json::json!({"type":"turn_completed"}));
         assert_eq!(db.agent_chat_fork_heads("src"), (Some(done), Some(user)));
+    }
+
+    #[test]
+    fn reopening_a_fork_or_its_source_from_history_keeps_the_lineage() {
+        let db = store_with_source();
+        append(&db, serde_json::json!({"type":"user_message","thread_id":"src","text":"one"}));
+        let source = db.get_agent_chat_session("src").unwrap();
+        db.create_agent_chat_fork(&NewChatFork {
+            thread_id: "fork",
+            source: &source,
+            sdk_session_id: "native-fork",
+            workspace_id: "ws",
+            cwd: "/repo",
+            title: "Fix the parser (fork)",
+            cut_before: None,
+            image_dirs: None,
+        })
+        .unwrap();
+        let boundary = db.agent_chat_fork_origin("fork").unwrap().boundary_message_id;
+        db.set_agent_chat_sdk_session_id("src", "native-src").unwrap();
+        // Each is reopened from history under a fresh thread id.
+        for (thread, sdk) in [("src2", "native-src"), ("fork2", "native-fork")] {
+            db.upsert_agent_chat_session(thread, "ws", Some("/repo"), "claude").unwrap();
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE agent_chat_sessions SET sdk_session_id = ?2,
+                         last_active_at = datetime('now', '+1 day') WHERE thread_id = ?1",
+                    params![thread, sdk],
+                )
+                .unwrap();
+            db.collapse_duplicate_agent_chat_sessions(sdk).unwrap();
+        }
+
+        assert!(db.agent_chat_fork_origin("fork").is_none());
+        let origin = db.agent_chat_fork_origin("fork2").unwrap();
+        assert_eq!(origin.source_thread_id, "src2");
+        assert!(origin.source_exists);
+        assert_eq!(origin.source_title.as_deref(), Some("Fix the parser"));
+        assert_eq!(origin.boundary_message_id, boundary);
     }
 
     #[test]

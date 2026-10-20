@@ -122,8 +122,8 @@ import { HooksManager } from "./HooksManager";
 import { ProviderCommandsDialog } from "./ProviderCommandsDialog";
 import { useUIStore } from "@/stores/ui-store";
 import { ComposerCommandMenu } from "./ComposerCommandMenu";
-import { ComposerFooter, ComposerSettings } from "./ComposerFooter";
-import { ModePill, type ActivePillMode } from "./pickers/ModePill";
+import { ComposerFooter } from "./ComposerFooter";
+import { ModeTab, type ActivePillMode } from "./pickers/ModeTab";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
 import { StoreSlashCommandPopup } from "./SlashCommandPopup";
@@ -263,11 +263,6 @@ interface Props {
    *  (the default) renders nothing — existing non-draft call sites are
    *  unaffected. */
   belowComposerSlot?: React.ReactNode;
-  /** Context row under the composer that hosts the model, effort and
-   *  access pickers. Receives them as `settings`; the controls row then
-   *  drops them. Takes precedence over `belowComposerSlot`. Omit it to
-   *  keep the pickers in the controls row. */
-  renderContextRow?: (settings: React.ReactNode) => React.ReactNode;
   /** Shared strip docked ABOVE the composer pill (`ComposerStrip`):
    *  subagents, monitoring, queued messages, session errors. Detached from
    *  the card in every state; its bottom seam tucks under the pill, which
@@ -543,7 +538,6 @@ export function Composer({
   showStopButton = true,
   zone1Override,
   belowComposerSlot,
-  renderContextRow,
   stripSlot,
   onSteerNextQueued,
   onEditLastQueued,
@@ -831,6 +825,9 @@ export function Composer({
   // (state-only activation, same handling as mode picks).
   const [modelPickerOpenSignal, setModelPickerOpenSignal] = useState(0);
   const [permissionPickerOpenSignal, setPermissionPickerOpenSignal] = useState(0);
+  // Whether the footer ladder has moved effort + access into the `+` menu.
+  // Read by `/permissions`, which is defined before the ladder resolves.
+  const configInMenuRef = useRef(false);
   const [hooksOpen, setHooksOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const modelCommand = useMemo(
@@ -1033,7 +1030,18 @@ export function Composer({
         id: "composer:permissions", label: "Permissions", command: "/permissions", icon: Settings,
         description: "Choose this provider's access mode", group: "CHAT",
         disabled: !configurationEnabled || mode !== "default" || !permissionModes?.length,
-        onSelect: () => setPermissionPickerOpenSignal((signal) => signal + 1),
+        onSelect: () => {
+          // A narrow composer keeps the access picker in the `+` menu's
+          // header: open the menu, then the picker once it has mounted.
+          if (configInMenuRef.current) {
+            setAttachOpen(true);
+            setAttachSubmode("main");
+            setAttachQuery("");
+            requestAnimationFrame(() => setPermissionPickerOpenSignal((signal) => signal + 1));
+            return;
+          }
+          setPermissionPickerOpenSignal((signal) => signal + 1);
+        },
       },
       {
         id: "composer:refresh", label: "Refresh commands and skills", command: "/refresh", icon: RotateCw,
@@ -1936,7 +1944,7 @@ export function Composer({
       const mainRows: SlashCommandItem[] = [
         // MODES — design tones (sky / amber / violet) on the icon
         // chips; the lucide icons stay in sync with MODE_CONFIG /
-        // ModePill so the picked mode's pill shows the same glyph.
+        // ModeTab so the picked mode's tab shows the same glyph.
         {
           id: "mode:plan",
           label: "Plan",
@@ -2857,6 +2865,7 @@ export function Composer({
     return () => observer.disconnect();
   }, [fitFooter]);
   const footerLadder = composerFooterLadder(footerFit.level);
+  configInMenuRef.current = footerLadder.configInMenu;
 
   const [focusWithin, setFocusWithin] = useState(false);
   const markPluginComposerFocused = pluginComposer.markFocused;
@@ -2942,7 +2951,6 @@ export function Composer({
     busy,
     delivery.delivery,
     streaming && draft.trim().length > 0,
-    !!renderContextRow,
     tasks ? `${tasks.completed}/${tasks.total}` : "",
     // The ring appearing adds width inside the gap without resizing it,
     // so no observer would notice.
@@ -3213,7 +3221,8 @@ export function Composer({
 
   return (
     <div className={cn(CHAT_COLUMN_OUTER, "pb-3")}>
-      <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
+      {/* `data-composer-dock`: the floating browser peek keeps clear of it. */}
+      <div data-composer-dock className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
         {zone1Override !== null && zone1Override !== undefined ? (
           <div className="pb-1">{zone1Override}</div>
         ) : zone1Override === undefined && cwd ? (
@@ -3221,6 +3230,12 @@ export function Composer({
             {cwd}
           </div>
         ) : null}
+        {/* The active mode's tab rides the top edge of whatever is
+            docked above the card, so the stack reads tab → strip → card. */}
+        <ModeTab
+          mode={mode === "default" ? null : (mode as ActivePillMode)}
+          onRemove={onModeRemove}
+        />
         {stripSlot ?? null}
         <div
           ref={wrapperRef}
@@ -3361,7 +3376,7 @@ export function Composer({
               footerNote={attachPopupFooter}
               submode={attachSubmode}
               headerSlot={
-                footerLadder.configInMenu && !renderContextRow && provider !== "acp" && attachSubmode === "main" ? (
+                footerLadder.configInMenu && provider !== "acp" && attachSubmode === "main" ? (
                   <>
                     <ReasoningPicker
                       model={activeModel}
@@ -3376,6 +3391,7 @@ export function Composer({
                       disabled={!configurationEnabled}
                     />
                     <PermissionModePicker
+                      openSignal={permissionPickerOpenSignal}
                       modes={permissionModes}
                       value={permissionMode}
                       onChange={onPermissionModeChange}
@@ -3432,15 +3448,12 @@ export function Composer({
               {unsupportedAcpImages && <p role="alert" className="px-3 pt-2 text-body-sm text-muted-foreground">This custom agent does not advertise image support. Remove image attachments to send a text prompt.</p>}
               {provider === "acp" && !customAgentsAllowed && <p role="alert" className="px-3 pt-2 text-body-sm text-muted-foreground">Custom agents are local-workspace only. Create a local chat to use this harness.</p>}
               {provider === "acp" && (acp.error || acp.loading || acp.warning) && <p role={acp.error ? "alert" : "status"} className="px-3 pt-2 text-body-sm text-muted-foreground">{acp.error ?? acp.warning ?? "Restoring custom agent identity…"}</p>}
-              {/* Step 8 Stage 3 refactor — strip above textarea hosts
-                  the active mode pill + image attachment chips. File /
-                  folder chips render INSIDE the textarea via the mirror
-                  overlay below; images can't live inline as text so they
-                  stay here. The mode pill moved out of the footer when
-                  the `+ Mode` dropdown was retired in favour of the
-                  unified `+` popup. */}
-              {(mode !== "default" ||
-                pendingCommand !== null ||
+              {/* Strip above the textarea hosts image / PR / session
+                  attachment chips. File / folder chips render INSIDE the
+                  textarea via the mirror overlay below; images can't live
+                  inline as text so they stay here. The active mode is a
+                  tab on the card's top edge (`ModeTab`), not a chip. */}
+              {(pendingCommand !== null ||
                 stagedAttachments.some(
                   (a) =>
                     a.kind === "image" ||
@@ -3492,8 +3505,8 @@ export function Composer({
                     </span>
                   )}
                   {/* Dead-run recovery (issue #154): a one-click chip that
-                      resumes the interrupted run. Amber-tinted, mirroring
-                      ModePill's shape. */}
+                      resumes the interrupted run. Amber-tinted, in the
+                      attachment chips' shape. */}
                   {interrupted && !streaming && !sending && onContinueRun && (
                     <button
                       type="button"
@@ -3504,12 +3517,6 @@ export function Composer({
                       <RotateCw className="size-3" aria-hidden />
                       <span>Continue run</span>
                     </button>
-                  )}
-                  {mode !== "default" && (
-                    <ModePill
-                      mode={mode as ActivePillMode}
-                      onRemove={onModeRemove}
-                    />
                   )}
                   {stagedAttachments
                     .filter(
@@ -3920,44 +3927,13 @@ export function Composer({
             effortIconOnly={footerLadder.effortIconOnly}
             accessIconOnly={footerLadder.accessIconOnly}
             configInMenu={footerLadder.configInMenu}
-            settingsInContextRow={!!renderContextRow}
           />
         </div>
         {/* No gap here — the scope strip / context strip attaches
             flush to the card's bottom edge so it reads as a layer
             sliding out from beneath the card. Slot content owns any
             spacing it needs below itself. */}
-        {renderContextRow
-          ? renderContextRow(
-              <ComposerSettings
-                hermesThreadId={threadId}
-                hermesProjectPath={cwd}
-                customAgentsAllowed={customAgentsAllowed}
-                provider={provider}
-                model={model}
-                permissionMode={permissionMode}
-                effort={effort}
-                contextWindow={contextWindow}
-                serviceTier={serviceTier}
-                activeModel={activeModel}
-                effortLabelMap={effortLabelMap}
-                permissionModes={permissionModes}
-                ultrathinkInBodyText={ultrathinkInBodyText}
-                showProviderPicker={showProviderPicker}
-                mode={mode}
-                onProviderModelChange={onProviderModelChange}
-                onModelChange={onModelChange}
-                onPermissionModeChange={onPermissionModeChange}
-                onEffortChange={onEffortChange}
-                onContextWindowChange={onContextWindowChange}
-                onServiceTierChange={onServiceTierChange}
-                configurationDisabled={!configurationEnabled}
-                modelPickerOpenSignal={modelPickerOpenSignal}
-                permissionPickerOpenSignal={permissionPickerOpenSignal}
-                placement="context-row"
-              />,
-            )
-          : (belowComposerSlot ?? null)}
+        {belowComposerSlot ?? null}
         <Slot area={COMPOSER_FOOTER_AREA} props={{ workspaceId, threadId }} variant="block" />
       </div>
       {provider === "codex" && <HooksManager open={hooksOpen} onOpenChange={setHooksOpen} cwd={cwd ?? null} threadId={threadId ?? null} />}

@@ -82,6 +82,10 @@ pub struct AnswerQuestionInput {
     pub answers: Vec<String>,
     pub submission_id: String,
     pub checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>>,
+    /// The composer mode the answer was given in, as on
+    /// [`super::SendTurnInput::permission_mode_override`]. Codex uses it when
+    /// the answer starts a new turn.
+    pub permission_mode_override: Option<String>,
 }
 
 /// A rejection is known not to have been accepted. Transport failures after

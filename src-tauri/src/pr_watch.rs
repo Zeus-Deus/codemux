@@ -379,9 +379,12 @@ pub(crate) fn evaluate(
         let green = !pending
             && view.checks.iter().all(|c| matches!(c.state, CheckState::Success | CheckState::Neutral))
             && view.checks.iter().any(|c| c.state == CheckState::Success);
-        if green {
-            // The fix worked, so the budget refills. Cancelled runs prove
-            // nothing and leave it alone.
+        // Green checks prove the fix worked only once GitHub also reports
+        // the branch as mergeable: an agent pushing green heads that still
+        // conflict would otherwise get a fresh budget for every conflict
+        // wake. A mergeability still being computed waits for the next
+        // pass. Cancelled runs prove nothing and leave the budget alone.
+        if green && view.mergeable == "MERGEABLE" {
             next.attempts = 0;
         }
         let untold: Vec<PrCheck> = view
@@ -805,8 +808,12 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
         }
         _ => HashMap::new(),
     };
+    // From before the commit until the wake is delivered or refunded, a
+    // history reopen leaves the chat where it is (`unless_waking`).
+    let _waking = matches!(evaluation.decision, Decision::Wake(_)).then(|| Waking::claim(&watch.thread_id));
     // The write is the commit point: if the watch was re-armed or removed
-    // while we fetched, nothing is recorded and nobody is woken.
+    // (or moved by a history reopen) while we fetched, nothing is recorded
+    // and nobody is woken.
     if !db.save_pr_watch_progress(&evaluation.next, &evaluation.mark_seen, now)? {
         return Ok(());
     }
@@ -869,6 +876,53 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
     // Every committed pass moves `last_checked_at_ms`, which the UI shows.
     emit_changed(app, &watch.thread_id, Some(next));
     Ok(())
+}
+
+/// Chats with a wake between its commit (events marked seen, attempt
+/// spent) and its delivery or refund, which both name the chat's thread.
+fn waking() -> std::sync::MutexGuard<'static, HashSet<String>> {
+    static WAKING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    WAKING
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Marks a chat as being woken until dropped.
+struct Waking(String);
+
+impl Waking {
+    fn claim(thread_id: &str) -> Self {
+        waking().insert(thread_id.to_string());
+        Self(thread_id.to_string())
+    }
+}
+
+impl Drop for Waking {
+    fn drop(&mut self) {
+        waking().remove(&self.0);
+    }
+}
+
+/// Run `f` (a history reopen merging `thread_id` away) unless a wake for
+/// the chat is in flight, atomically with a wake claiming it: either the
+/// wake's commit finds its watch moved and wakes nobody, or the chat stays.
+pub(crate) fn unless_waking<T>(thread_id: &str, f: impl FnOnce() -> T) -> Option<T> {
+    let waking = waking();
+    (!waking.contains(thread_id)).then(f)
+}
+
+/// A wake in flight for `thread_id` until the result drops, for tests of
+/// callers of [`unless_waking`].
+#[cfg(test)]
+pub(crate) fn tests_claim_waking(thread_id: &str) -> impl Drop {
+    Waking::claim(thread_id)
+}
+
+/// Run `f` with the chats a wake is in flight for, atomically with a wake
+/// claiming one (see [`unless_waking`]): `f` must leave those chats alone.
+pub(crate) fn unless_any_waking<T>(f: impl FnOnce(&HashSet<String>) -> T) -> T {
+    f(&waking())
 }
 
 /// Undo what [`evaluate`] spent on a wake that never reached the chat.
@@ -1170,6 +1224,36 @@ mod tests {
         let ended = evaluate(&next, &v, &seen, 2);
         assert!(matches!(ended.decision, Decision::Ended));
         assert_eq!(ended.next.status, PR_WATCH_ENDED);
+    }
+
+    #[test]
+    fn green_checks_do_not_refill_the_budget_while_the_conflict_stays() {
+        // An agent that pushes green heads without resolving the conflict
+        // spends one attempt per head, then watching stops.
+        let mut seen = HashSet::new();
+        let mut w = watch();
+        let green = || vec![check("test", CheckState::Success, 1)];
+        for (i, head) in ["h1", "h2", "h3"].into_iter().enumerate() {
+            let mut v = view(head, vec![], green());
+            v.mergeable = "CONFLICTING".into();
+            let eval = evaluate(&w, &v, &seen, i as i64);
+            let Decision::Wake(report) = &eval.decision else { panic!("head {head}: {:?}", eval.decision) };
+            assert!(report.conflict);
+            w = commit(&eval, &mut seen);
+            assert_eq!(w.attempts, i as u32 + 1, "head {head}");
+        }
+        let mut v = view("h4", vec![], green());
+        v.mergeable = "CONFLICTING".into();
+        assert!(matches!(evaluate(&w, &v, &seen, 3).decision, Decision::Exhausted));
+
+        // Still being computed after a push, or not reported: no refill yet.
+        for unknown in ["UNKNOWN", ""] {
+            v.mergeable = unknown.into();
+            assert_eq!(evaluate(&w, &v, &seen, 4).next.attempts, 3, "{unknown:?}");
+        }
+        // Resolved and green: the fix worked, the budget refills.
+        v.mergeable = "MERGEABLE".into();
+        assert_eq!(evaluate(&w, &v, &seen, 5).next.attempts, 0);
     }
 
     #[test]

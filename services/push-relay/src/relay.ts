@@ -317,12 +317,17 @@ function parseMuted(value: unknown): Category[] {
   return [...new Set(value as Category[])];
 }
 
+/** Length in Unicode code points, the unit the desktop clips text by. */
+function codePoints(value: string): number {
+  return [...value].length;
+}
+
 function parseNotification(value: unknown): PushMessage {
   const body = asObject(value);
-  if (typeof body.title !== "string" || body.title === "" || body.title.length > 120) {
+  if (typeof body.title !== "string" || body.title === "" || codePoints(body.title) > 120) {
     throw invalid("title must be a non-empty string of at most 120 characters");
   }
-  if (typeof body.body !== "string" || body.body.length > 400) {
+  if (typeof body.body !== "string" || codePoints(body.body) > 400) {
     throw invalid("body must be a string of at most 400 characters");
   }
   if (!CATEGORIES.includes(body.category as Category)) {
@@ -342,7 +347,7 @@ function parseNotification(value: unknown): PushMessage {
       if (!DATA_KEY_RE.test(key) || RESERVED_DATA_KEYS.has(key) || /^(google|gcm)/i.test(key)) {
         throw invalid(`data key "${key.slice(0, 32)}" is invalid or reserved`);
       }
-      if (typeof val !== "string" || val.length > 256) {
+      if (typeof val !== "string" || codePoints(val) > 256) {
         throw invalid(`data.${key} must be a string of at most 256 characters`);
       }
       data[key] = val;
@@ -363,7 +368,10 @@ function parseNotification(value: unknown): PushMessage {
     ttlSeconds,
   };
   if (body.collapseKey !== undefined) message.collapseKey = body.collapseKey as string;
-  const contentBytes = new TextEncoder().encode(JSON.stringify([message.title, message.body, data])).byteLength;
+  // APNs repeats data.workspaceId as aps.thread-id, so it counts twice.
+  const contentBytes = new TextEncoder().encode(
+    JSON.stringify([message.title, message.body, data, data.workspaceId ?? ""]),
+  ).byteLength;
   if (contentBytes > MAX_CONTENT_BYTES) {
     throw invalid(`title, body and data together exceed ${MAX_CONTENT_BYTES} bytes`);
   }

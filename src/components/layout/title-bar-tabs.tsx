@@ -82,15 +82,51 @@ function tabIcon(tab: TabSnapshot, isChat: boolean): React.ReactNode {
 // rather than five competing boxes stacked over the transcript. Radius is
 // the band-wide control token, shared with the panel toggle and the 28px
 // icon buttons.
+//
+// The close button leads the pill and wears the tab's kind icon, which turns
+// into the × on hover or keyboard focus (and stays a × on touch, where there
+// is no hover). Same footprint either way, so the pill never changes size and
+// keeps no empty slot for a hidden ×. `pl-2` plus the button's 2px inset puts
+// the icon 10px in, matching `pr-2.5`.
 const PILL_BASE = cn(
-  "group/tab flex h-7 shrink-0 items-center gap-1 pl-2.5 pr-1 text-label transition-colors duration-150",
+  "group/tab flex h-7 shrink-0 items-center gap-1 pl-2 pr-2.5 text-label transition-colors duration-150",
   BAND_CONTROL_RADIUS,
 );
 const PILL_ACTIVE = cn(BAND_ACTIVE_FILL, "text-foreground font-semibold");
 const PILL_INACTIVE =
   "font-medium text-muted-foreground hover:bg-muted/40 hover:text-foreground";
+// `order-first`: drawn leading but kept after the label in the DOM, so the
+// label stays the tab's first stop for Tab and for the rename input's
+// refocus, which lands on the pill's first button.
 const CLOSE_BTN =
-  "ml-0.5 rounded-sm p-0.5 text-muted-foreground/70 transition-colors duration-150 hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
+  "group/close order-first flex size-4 shrink-0 items-center justify-center rounded-sm transition-colors duration-150 hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
+const CLOSE_ICON =
+  "shrink-0 opacity-90 group-hover/tab:hidden group-focus-visible/close:hidden pointer-coarse:hidden";
+const CLOSE_X =
+  "hidden size-3 group-hover/tab:block group-focus-visible/close:block pointer-coarse:block";
+
+/** The pill's leading control: the tab's kind icon, a × on reveal. */
+function TabCloseButton({
+  icon,
+  onClose,
+}: {
+  icon: React.ReactNode;
+  onClose: (e: React.MouseEvent) => void;
+}) {
+  return (
+    <button
+      type="button"
+      data-no-drag
+      onClick={onClose}
+      aria-label="Close tab"
+      title="Close tab"
+      className={CLOSE_BTN}
+    >
+      <span className={CLOSE_ICON}>{icon}</span>
+      <X className={CLOSE_X} />
+    </button>
+  );
+}
 
 interface TitleBarTabsProps {
   workspace: WorkspaceSnapshot;
@@ -117,7 +153,7 @@ function useOverflowEdges(scroller: HTMLElement | null, contentKey: string) {
     const observer =
       typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
     observer?.observe(scroller);
-    // Once the island hits its width cap the scroller's own box stops
+    // Once the island runs out of band width the scroller's own box stops
     // changing, so a pill growing or shrinking (a rename, the active chat
     // tab gaining its chevron) is only seen through the pills themselves.
     for (const pill of Array.from(scroller.children)) observer?.observe(pill);
@@ -329,9 +365,6 @@ function TitleBarTab({
     e.stopPropagation();
     close();
   };
-  const icon = (
-    <span className="shrink-0 opacity-90">{tabIcon(tab, isChat)}</span>
-  );
 
   return (
     <TabContextMenu
@@ -350,15 +383,12 @@ function TitleBarTab({
         )}
       >
         {rename.renaming ? (
-          <div className="flex min-w-0 items-center gap-1.5">
-            {icon}
-            <TabTitleInput
-              workspaceId={workspace.workspace_id}
-              tabId={tab.tab_id}
-              title={tab.title}
-              onDone={rename.stop}
-            />
-          </div>
+          <TabTitleInput
+            workspaceId={workspace.workspace_id}
+            tabId={tab.tab_id}
+            title={tab.title}
+            onDone={rename.stop}
+          />
         ) : (
           <button
             type="button"
@@ -368,27 +398,12 @@ function TitleBarTab({
             aria-current={isActive ? "page" : undefined}
             title={tab.title}
           >
-            {icon}
             <span className="max-w-[130px] truncate">{tab.title}</span>
             {tab.kind === "editor" && <EditorDirtyDot tabId={tab.tab_id} />}
             {status && <StatusIndicator status={status} />}
           </button>
         )}
-        <button
-          type="button"
-          data-no-drag
-          onClick={handleClose}
-          aria-label="Close tab"
-          title="Close tab"
-          className={cn(
-            CLOSE_BTN,
-            isActive
-              ? "opacity-70"
-              : "opacity-0 group-hover/tab:opacity-100 focus-visible:opacity-100",
-          )}
-        >
-          <X className="size-3" />
-        </button>
+        <TabCloseButton icon={tabIcon(tab, isChat)} onClose={handleClose} />
       </div>
     </TabContextMenu>
   );
@@ -429,11 +444,6 @@ function ActiveChatTab({
     e.stopPropagation();
     close();
   };
-  const icon = (
-    <span className="shrink-0 opacity-90">
-      <MessageSquare className="size-3" />
-    </span>
-  );
 
   // Rename is reached from the context menu only: a click on the label
   // already opens the session-history dropdown.
@@ -450,15 +460,12 @@ function ActiveChatTab({
         className={cn(PILL_BASE, PILL_ACTIVE, isDragging && "opacity-40")}
       >
         {rename.renaming ? (
-          <div className="flex min-w-0 items-center gap-1.5">
-            {icon}
-            <TabTitleInput
-              workspaceId={workspaceId}
-              tabId={tab.tab_id}
-              title={tab.title}
-              onDone={rename.stop}
-            />
-          </div>
+          <TabTitleInput
+            workspaceId={workspaceId}
+            tabId={tab.tab_id}
+            title={tab.title}
+            onDone={rename.stop}
+          />
         ) : (
           <DropdownMenu open={open} onOpenChange={setOpen}>
             <DropdownMenuTrigger asChild>
@@ -469,7 +476,6 @@ function ActiveChatTab({
                 title={tab.title}
                 data-testid="titlebar-chat-tab-trigger"
               >
-                {icon}
                 <span className="max-w-[130px] truncate">{tab.title}</span>
                 {status && <StatusIndicator status={status} />}
                 <ChevronDown
@@ -504,16 +510,10 @@ function ActiveChatTab({
             </DropdownMenuContent>
           </DropdownMenu>
         )}
-        <button
-          type="button"
-          data-no-drag
-          onClick={handleClose}
-          aria-label="Close tab"
-          title="Close tab"
-          className={cn(CLOSE_BTN, "opacity-70")}
-        >
-          <X className="size-3" />
-        </button>
+        <TabCloseButton
+          icon={<MessageSquare className="size-3" />}
+          onClose={handleClose}
+        />
       </div>
     </TabContextMenu>
   );

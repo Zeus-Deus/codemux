@@ -1,11 +1,12 @@
 import { NativeSelect } from "@/components/ui/native-select";
 import { Checkbox } from "@/components/ui/checkbox";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { FlaskConical } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import { useCustomAcpThread } from "@/hooks/use-custom-acp-thread";
 import { acpCatalogKey, useCustomAcp } from "@/stores/custom-acp-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
+import { ScrollEdgeFade, useScrollEdges } from "@/components/ui/scroll-edge-fade";
 
 /** Models and runtime controls for one custom agent. The picker rail lists
  *  each agent separately; picking a model here binds the chat to `agentId`. */
@@ -26,6 +27,8 @@ export function CustomAcpModels({ agentId, threadId, projectPath, active, model,
   const catalog = fixed ? threadCatalog : agentCatalog;
   const [actionError, setActionError] = useState<string | null>(null);
   const [probing, setProbing] = useState(false);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const edges = useScrollEdges(scrollRef);
   // Thread errors describe the agent the chat uses, not one being browsed.
   const error = fixed || active ? threadError : null;
   const streaming = useAgentChatStore(s => threadId ? s.threads[threadId]?.streaming ?? false : false);
@@ -42,7 +45,7 @@ export function CustomAcpModels({ agentId, threadId, projectPath, active, model,
       useAgentChatStore.getState().setModel(threadId, updated.current_model);
     } catch (e) { setActionError(String(e)); }
   };
-  return <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-3 text-body-sm" data-testid="custom-acp-models">
+  return <div className="relative flex min-h-0 flex-1 flex-col"><div ref={scrollRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-3 text-body-sm" data-testid="custom-acp-models">
     <div className="flex items-center justify-between gap-2"><strong className="truncate">{agent?.name ?? binding?.catalog.agent_name ?? "Custom agent"}</strong><span className="shrink-0 text-label text-muted-foreground">{fixed ? "Fixed for this chat" : "Local ACP"}</span></div>
     {binding && !agent && <p className="text-label text-muted-foreground">This agent was removed from Settings → Providers.</p>}
     {warning && <p role="status" className="rounded-md bg-muted/50 p-2 text-label text-muted-foreground">{warning}</p>}
@@ -59,5 +62,8 @@ export function CustomAcpModels({ agentId, threadId, projectPath, active, model,
     {fixed && catalog?.config_options.filter(option => option.type === "select" || option.type === "boolean").map(option => option.type === "boolean" ? <label key={option.id} className="flex items-center gap-2 border-t border-border/40 pt-2" title={option.description ?? undefined}><Checkbox aria-label={option.name} checked={option.current_value === true} disabled={disabled} onCheckedChange={(checked) => void changeConfig(option.id, (checked === true))} />{option.name}</label> : <label key={option.id} className="border-t border-border/40 pt-2 text-label text-muted-foreground" title={option.description ?? undefined}>{option.name}<NativeSelect aria-label={option.name} value={String(option.current_value)} disabled={disabled} className="mt-1" onChange={e => void changeConfig(option.id, e.target.value)}>{option.options.map((value, i) => <option key={i} value={value.value}>{value.name}</option>)}</NativeSelect></label>)}
     {catalog && <p className="text-label text-muted-foreground">{catalog.supports_resume ? "Resume supported" : "Resume not advertised · restarting this chat may be unavailable"} · {catalog.supports_images ? "Images supported" : "Text only"}</p>}
     <p className="border-t border-border/40 pt-2 text-label text-muted-foreground">Supervised approvals · modes do not grant automatic access. Skills and delegation unavailable. {!fixed && "Additional runtime controls appear after the session starts."}</p>
+  </div>
+    <ScrollEdgeFade edge="top" visible={edges.top} />
+    <ScrollEdgeFade edge="bottom" visible={edges.bottom} />
   </div>;
 }

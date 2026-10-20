@@ -83,6 +83,9 @@ pub struct CodexCapabilityCache {
     inner: Mutex<Option<ProviderChatCapabilities>>,
     generation: std::sync::atomic::AtomicU64,
     key: Mutex<Option<String>>,
+    /// Extra accounts' catalogs by account id, with the login each was read
+    /// under: each account signs in on its own.
+    accounts: Mutex<HashMap<String, (Option<LoginRevision>, ProviderChatCapabilities)>>,
 }
 
 impl CodexCapabilityCache {
@@ -91,7 +94,32 @@ impl CodexCapabilityCache {
             inner: Mutex::new(None),
             generation: std::sync::atomic::AtomicU64::new(0),
             key: Mutex::new(None),
+            accounts: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// An extra account's catalog, harvested from its own home (its own
+    /// sign-in) and cached per account until that home signs in again. A
+    /// login that leaves no file to compare (keyring storage) is asked every
+    /// time, as is any request with `force`.
+    pub async fn get_or_harvest_account(
+        &self,
+        binary_path: &std::path::Path,
+        account_id: &str,
+        home: &std::path::Path,
+        force: bool,
+    ) -> Result<ProviderChatCapabilities, HarvestError> {
+        let login = login_revision(home);
+        if !force {
+            if let Some((read_under, cached)) = self.accounts.lock().await.get(account_id) {
+                if read_under.is_some() && *read_under == login {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+        let fresh = harvest_codex_capabilities(binary_path, Some(home)).await?;
+        self.accounts.lock().await.insert(account_id.to_string(), (login, fresh.clone()));
+        Ok(fresh)
     }
 
     /// Return the cached value if present; otherwise run the live
@@ -135,6 +163,16 @@ impl CodexCapabilityCache {
         *self.key.lock().await=None;
         *guard = None;
     }
+}
+
+/// Which login a Codex home holds: its `auth.json`'s size and mtime, which
+/// a new sign-in rewrites. A keyring sign-in writes no file and reads as
+/// `None`.
+type LoginRevision = (u64, std::time::SystemTime);
+
+fn login_revision(home: &std::path::Path) -> Option<LoginRevision> {
+    let meta = std::fs::metadata(home.join("auth.json")).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
 }
 
 /// Run the live harvest. Spawns a short-lived `codex app-server`,
@@ -536,6 +574,39 @@ mod tests {
             .await
             .expect("cached value returned");
         assert_eq!(result.models.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn extra_accounts_keep_their_own_catalog() {
+        let cache = CodexCapabilityCache::new();
+        *cache.inner.lock().await = Some(build_capabilities(vec![entry("cli", false, vec!["text"])]));
+        let bogus = std::path::Path::new("/no/such/codex");
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // The CLI sign-in's catalog is never served for an extra account:
+        // an uncached account harvests from its own home.
+        assert!(cache.get_or_harvest_account(bogus, "work", home, false).await.is_err());
+        std::fs::write(home.join("auth.json"), "{}").unwrap();
+        cache.accounts.lock().await.insert(
+            "work".into(),
+            (login_revision(home), build_capabilities(vec![entry("work-model", false, vec!["text"])])),
+        );
+        let work = cache.get_or_harvest_account(bogus, "work", home, false).await.unwrap();
+        assert_eq!(work.models[0].id, "work-model");
+        assert!(cache.get_or_harvest_account(bogus, "side", home, false).await.is_err());
+        // A keyring login leaves nothing to compare, so it is asked each time.
+        cache.accounts.lock().await.insert(
+            "keyring".into(),
+            (None, build_capabilities(vec![entry("old-login", false, vec!["text"])])),
+        );
+        let keyring_home = home.join("keyring");
+        std::fs::create_dir_all(&keyring_home).unwrap();
+        assert!(cache.get_or_harvest_account(bogus, "keyring", &keyring_home, false).await.is_err());
+        // A forced refresh asks that account's login again.
+        assert!(cache.get_or_harvest_account(bogus, "work", home, true).await.is_err());
+        // So does signing that home in again (another login, another plan).
+        std::fs::write(home.join("auth.json"), "{\"another\":\"login\"}").unwrap();
+        assert!(cache.get_or_harvest_account(bogus, "work", home, false).await.is_err());
     }
 
     #[tokio::test]

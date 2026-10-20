@@ -7,6 +7,7 @@ const api = vi.hoisted(() => ({
   status: vi.fn(), config: vi.fn(), approve: vi.fn(), deny: vi.fn(), revoke: vi.fn(),
   listen: vi.fn(), copy: vi.fn(), changed: null as (() => void) | null,
   remoteListen: vi.fn(), webRemoteChanged: null as ((event: { payload: unknown }) => void) | null,
+  toastSuccess: vi.fn(), toastError: vi.fn(),
 }));
 vi.mock("@/tauri/commands", () => ({
   agentConnectorStatus: api.status, agentConnectorSetConfig: api.config,
@@ -17,6 +18,7 @@ vi.mock("@/tauri/events", () => ({
 }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: api.remoteListen }));
 vi.mock("@/lib/clipboard", () => ({ copyToClipboard: api.copy, COPY_FAILED_MESSAGE: "Couldn't copy — select and copy manually." }));
+vi.mock("@/lib/toast", () => ({ toast: { success: api.toastSuccess, error: api.toastError } }));
 vi.mock("@/components/remote/is-remote-client", () => ({ isRemoteClient: () => api.remote }));
 
 import { OutsideAssistantsSection } from "./outside-assistants-section";
@@ -137,7 +139,9 @@ it("copies the backend-supplied local STDIO command while HTTP is disabled", asy
   render(<OutsideAssistantsSection />);
   fireEvent.click(await screen.findByRole("button", { name: "Copy local command" }));
   await waitFor(() => expect(api.copy).toHaveBeenCalledWith("/opt/codemux mcp"));
-  expect(await screen.findByText("Copied")).toBeInTheDocument();
+  await waitFor(() => expect(api.toastSuccess).toHaveBeenCalled());
+  // Confirmation lives inside the button; no status row grows the layout.
+  expect(screen.queryByText("Copied")).not.toBeInTheDocument();
 });
 
 it("explains listener-offline and routes to existing Remote Access without starting it", async () => {
@@ -235,20 +239,21 @@ it("keeps an unsaved public origin when only HTTP enablement is changed", async 
 
 it("does not show old clipboard success for a changed setup command", async () => {
   render(<OutsideAssistantsSection />);
+  const copied = () => screen.getByRole("button", { name: "Copy local command" }).querySelector(".text-status-open");
   fireEvent.click(await screen.findByRole("button", { name: "Copy local command" }));
-  expect(await screen.findByText("Copied")).toBeInTheDocument();
+  await waitFor(() => expect(copied()).not.toBeNull());
   api.status.mockResolvedValue(snapshot({ localCommand: "/opt/new-codemux mcp" }));
   await act(async () => api.changed?.());
   expect(screen.getByText("/opt/new-codemux mcp")).toBeInTheDocument();
-  expect(screen.queryByText("Copied")).not.toBeInTheDocument();
+  expect(copied()).toBeNull();
 });
 
 it("reports failed clipboard writes instead of claiming copy success", async () => {
   api.copy.mockResolvedValue(false);
   render(<OutsideAssistantsSection />);
   fireEvent.click(await screen.findByRole("button", { name: "Copy local command" }));
-  expect(await screen.findByText("Couldn't copy — select and copy manually.")).toBeInTheDocument();
-  expect(screen.queryByText("Copied")).not.toBeInTheDocument();
+  await waitFor(() => expect(api.toastError).toHaveBeenCalledWith("Couldn't copy — select and copy manually."));
+  expect(api.toastSuccess).not.toHaveBeenCalled();
 });
 
 it("does not grant a request invalidated by a refresh before React re-renders", async () => {

@@ -1151,6 +1151,14 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
         fast_mode: Some(input.fast_mode),
         service_tier: input.service_tier.clone(),
     };
+    // A history pick names the persisted chat it reopens under this fresh
+    // thread id; that chat is merged into this one once the session runs.
+    let reopened_from = input
+        .extra
+        .get(crate::provider_accounts::FROM_THREAD_EXTRA_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|from| *from != input.thread_id.0)
+        .map(str::to_string);
     // A restart of an existing durable CodeMux thread must not depend solely
     // on the frontend's in-memory cursor. That slice can be cold after sleep,
     // remount, or event-stream recovery even though the authoritative session
@@ -1565,9 +1573,12 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
             .as_ref()
             .and_then(extract_sdk_session_id)
         {
-            if let Err(error) =
-                db.set_agent_chat_sdk_session_id(&session.thread_id.0, &sdk_session_id)
-            {
+            // Not if a removal took the account this session started on.
+            if let Err(error) = crate::provider_accounts::store_reported_native(
+                &db,
+                &session.thread_id.0,
+                &sdk_session_id,
+            ) {
                 eprintln!(
                     "[codemux::agent_chat] failed to persist start-time resume cursor: {error}"
                 );
@@ -1586,6 +1597,13 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
             // The row now exists. Project the latest acknowledged binding,
             // including updates accepted while startup was completing.
             db.project_acp_binding(&session.thread_id.0)?;
+        }
+        // Fold the reopened chat into this thread now rather than waiting
+        // for a matching provider session id: Codex reports its id only at
+        // start (and one that never finished a turn resumes under a new
+        // id), and Claude's arrives after the first prompt was sent.
+        if let Some(from) = reopened_from {
+            merge_reopened_chat(&app, &db, &state, provider, &from, &session.thread_id.0).await;
         }
         if persisted {
             // The pane may have read its task list while the row was missing
@@ -2254,6 +2272,38 @@ fn delete_orphaned_chat_images(removed_payloads: &[String], retained_payloads: &
                 }
             }
             Err(error) => eprintln!("[codemux::agent_chat] skipped reverted image {path}: {error}"),
+        }
+    }
+}
+
+/// Delete `thread_id`'s images: its own folder, and the images its
+/// transcript points at elsewhere (a chat reopened from history keeps the
+/// merged-away thread's images where they were). Only while the chat
+/// exists: a stale delete of a thread a reopen merged away must not take
+/// the folder the survivor now uses.
+fn delete_chat_images_in(root: &std::path::Path, db: &DatabaseStore, thread_id: &str) {
+    if !db.has_agent_chat_session(thread_id).unwrap_or(false) {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(root.join(thread_id));
+    delete_referenced_chat_images_in(root, &db.list_agent_chat_messages(thread_id));
+}
+
+fn delete_referenced_chat_images_in(root: &std::path::Path, payloads: &[String]) {
+    let Ok(canon_root) = root.canonicalize() else {
+        return;
+    };
+    let paths = payloads
+        .iter()
+        .flat_map(|payload| chat_image_paths_in_payload(payload))
+        .collect::<std::collections::HashSet<_>>();
+    for path in paths {
+        if let Ok(resolved) = resolve_within(root, &path) {
+            let _ = std::fs::remove_file(&resolved);
+            if let Some(dir) = resolved.parent().filter(|dir| *dir != canon_root) {
+                // Fails, harmlessly, while the folder still holds files.
+                let _ = std::fs::remove_dir(dir);
+            }
         }
     }
 }
@@ -2975,7 +3025,15 @@ async fn ensure_live_session_locked<R: Runtime>(
         }
         None => (None, None),
     };
-    let env = crate::provider_accounts::rebuild_env(app, provider_kind, &thread_id.0, env, device.is_some());
+    let rebuild = crate::provider_accounts::rebuild_env(
+        app,
+        provider_kind,
+        &thread_id.0,
+        record.sdk_session_id.as_deref(),
+        env,
+        device.is_some(),
+    );
+    let env = rebuild.env;
 
     // Build the resume cursor from the persisted id, but for Claude run a
     // preflight: if the CLI's on-disk session JSONL is confirmed gone,
@@ -2983,7 +3041,7 @@ async fn ensure_live_session_locked<R: Runtime>(
     // dead id. Best-effort clear the column so no later rebuild reuses it.
     // Codex / OpenCode carry their own cursor shapes and are untouched, and
     // a device's session files aren't on this computer to check.
-    let resume_cursor = match record.sdk_session_id.as_ref() {
+    let resume_cursor = match rebuild.native.as_ref() {
         Some(id)
             if provider_kind == ProviderKind::Claude
                 && device.is_none()
@@ -3045,6 +3103,11 @@ async fn ensure_live_session_locked<R: Runtime>(
     if let Some(control) = control {
         control.verify_mode(permission_mode.as_deref())?;
     }
+    // Codex reports a resumed thread's collaboration mode on newer servers;
+    // for older ones, hand it the mode recorded for the thread's last turn.
+    let recorded_turn_mode = (provider_kind == ProviderKind::Codex)
+        .then(|| app.state::<DatabaseStore>().agent_chat_turn_mode(&thread_id.0))
+        .flatten();
     let build_input = |resume_cursor: Option<serde_json::Value>| StartSessionInput {
         thread_id: thread_id.clone(),
         cwd: cwd.clone(),
@@ -3062,7 +3125,9 @@ async fn ensure_live_session_locked<R: Runtime>(
         env: env.clone(),
         workspace_id: workspace_id.clone(),
         remote: remote.clone(),
-        extra: serde_json::Value::Null,
+        extra: recorded_turn_mode
+            .as_ref()
+            .map_or(serde_json::Value::Null, |mode| serde_json::json!({ "turnMode": mode })),
         recorded_usage_baseline: None,
     };
 
@@ -5411,6 +5476,7 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
     force: Option<bool>,
+    account_id: Option<String>,
     codex_cache: tauri::State<
         '_,
         std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>,
@@ -5434,11 +5500,7 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
 ) -> Result<ProviderChatCapabilities, String> {
     // Note: `feature_flag_on(&observability)?;` was deliberately
     // removed when settings began consuming capabilities. See the
-    // function-level comment for the rationale. The `app` handle is
-    // still in the signature because removing it would be a public
-    // API break; downstream consumers may add it back if they grow a
-    // need for app-handle-scoped state.
-    let _ = app;
+    // function-level comment for the rationale.
     let mut capabilities = match provider {
         ProviderKind::Claude => {
             // Cache + cascade: sidecar `list-models` (SDK
@@ -5470,13 +5532,27 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
                 }
                 .to_command_string()
             })?;
-            if force.unwrap_or(false) {
-                codex_cache.invalidate().await;
+            // An extra account signs in on its own: list what that login
+            // offers, never the CLI sign-in's catalog or its auth error.
+            let account = match app.try_state::<DatabaseStore>() {
+                Some(db) => crate::provider_accounts::account_home(&db, provider, account_id.as_deref())?,
+                None => None,
+            };
+            match account {
+                Some((id, home)) => codex_cache
+                    .get_or_harvest_account(&binary_path, &id, &home, force.unwrap_or(false))
+                    .await
+                    .map_err(|err| err.to_command_string()),
+                None => {
+                    if force.unwrap_or(false) {
+                        codex_cache.invalidate().await;
+                    }
+                    codex_cache
+                        .get_or_harvest_owned(&binary_path, &crate::agent_provider::codex::chatgpt::owner())
+                        .await
+                        .map_err(|err| err.to_command_string())
+                }
             }
-            codex_cache
-                .get_or_harvest_owned(&binary_path, &crate::agent_provider::codex::chatgpt::owner())
-                .await
-                .map_err(|err| err.to_command_string())
         }
         ProviderKind::Cursor => {
             let binary_path = which::which("cursor-agent").map_err(|_| {
@@ -6565,6 +6641,14 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
     select: Option<bool>,
 ) -> Result<OpenAgentChatSearchResult, String> {
     feature_flag_on(&observability)?;
+    // Binding a new pane holds the chat's dispatch lock from reading it
+    // through the bind, so a history reopen can't merge it away in between
+    // (`merge_reopened_chat`). A chat already open in a pane is never
+    // merged, so focusing it doesn't wait behind a session that is starting.
+    let dispatch_guard = match state.agent_chat_pane_id_for_thread(&thread_id) {
+        Some(_) => None,
+        None => Some(native_thread_gate(&app, &thread_id).dispatch.clone().lock_owned().await),
+    };
     let record = db
         .get_agent_chat_session(&thread_id)
         .ok_or_else(|| format!("conversation_not_found: {thread_id}"))?;
@@ -6594,6 +6678,7 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
             .0;
         pane_id.0
     };
+    drop(dispatch_guard);
 
     // Pane activation selects the workspace/surface, while tab activation is
     // a separate state field. Resolve both from one immutable snapshot and
@@ -6723,12 +6808,12 @@ pub async fn agent_chat_delete_session<R: Runtime>(
                 .map_err(|e| e.to_string())?;
         }
     }
-    // Best-effort: drop the thread's on-disk image directory alongside the
-    // DB rows. The messages cascade via FK, but the image files live
-    // outside SQLite, so nothing else would ever reclaim them. A failure
-    // here (missing dir is the common case) must not fail the delete.
-    if let Some(dir) = chat_images_dir(&thread_id) {
-        let _ = std::fs::remove_dir_all(&dir);
+    // Best-effort: drop the chat's images alongside the DB rows. The
+    // messages cascade via FK, but the image files live outside SQLite, so
+    // nothing else would ever reclaim them. A failure here (missing dir is
+    // the common case) must not fail the delete.
+    if let Some(root) = chat_images_root() {
+        delete_chat_images_in(&root, &db, &thread_id);
     }
     // SQLite cascades remove checkpoint bookkeeping, but Git refs live
     // outside the database and would otherwise retain snapshot objects
@@ -6780,11 +6865,125 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     Ok(())
 }
 
-fn cleanup_collapsed_session_resources(cleanup: crate::database::AgentChatSessionCleanup) {
-    for thread_id in &cleanup.thread_ids {
-        if let Some(dir) = chat_images_dir(thread_id) {
-            let _ = std::fs::remove_dir_all(dir);
+/// Resume creates a fresh DB row (new thread_id) carrying the same
+/// sdk_session_id as the original. Collapse the duplicates so the dropdown
+/// doesn't grow unboundedly, but only while the rows that would go are idle,
+/// as for a reopen ([`merge_reopened_chat`]): open in no pane, not
+/// dispatching (their dispatch locks are held, without waiting, through the
+/// collapse), with no live session and no pull-request wake on its way.
+async fn collapse_resumed_duplicates<R: Runtime>(app: &AppHandle<R>, sdk_session_id: &str) {
+    let db = app.state::<DatabaseStore>();
+    let state = app.state::<AppStateStore>();
+    let registry = app.state::<ProviderRegistry>();
+    // Rows checked idle, whose dispatch locks are held until the collapse is
+    // done. The collapse merges away no other row, so one that joins the
+    // group meanwhile is left alone.
+    let mut cleared = std::collections::HashSet::new();
+    let mut held = Vec::new();
+    for (thread, provider) in db.agent_chat_threads_for_sdk_session(sdk_session_id) {
+        let gate = native_thread_gate(app, &thread);
+        let Ok(guard) = gate.dispatch.clone().try_lock_owned() else {
+            continue;
+        };
+        let live = match serde_json::from_value::<ProviderKind>(serde_json::json!(provider)) {
+            Ok(kind) => match lookup_provider(&registry, kind).await {
+                Ok(provider) => provider.has_session(&ThreadId(thread.clone())).await,
+                Err(_) => true,
+            },
+            Err(_) => false,
+        };
+        if !live && state.agent_chat_pane_id_for_thread(&thread).is_none() {
+            cleared.insert(thread);
+            held.push(guard);
         }
+    }
+    let collapsed = crate::pr_watch::unless_any_waking(|waking| {
+        cleared.retain(|thread| !waking.contains(thread));
+        db.collapse_duplicate_agent_chat_sessions_if_cleared(sdk_session_id, &cleared)
+    });
+    drop(held);
+    match collapsed {
+        Ok(cleanup) => agent_chat_sessions_merged(app, &db, cleanup),
+        Err(error) => eprintln!("[codemux::agent_chat] failed to collapse duplicates: {error}"),
+    }
+}
+
+/// Merge the chat a history pick reopened (`from`) into the thread that now
+/// runs it. The old chat must be idle: open in no pane, and with no live
+/// session (a pull-request wake can resume a closed chat headless). Its
+/// dispatch lock is held, without waiting, from that check through the
+/// merge, so nothing can resume it in between; a busy chat is left alone.
+async fn merge_reopened_chat<R: Runtime>(
+    app: &AppHandle<R>,
+    db: &DatabaseStore,
+    state: &AppStateStore,
+    provider: ProviderKind,
+    from: &str,
+    into: &str,
+) {
+    if state.agent_chat_pane_id_for_thread(from).is_some() {
+        return;
+    }
+    let gate = native_thread_gate(app, from);
+    let Ok(_from_guard) = gate.dispatch.clone().try_lock_owned() else {
+        return;
+    };
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let live = match lookup_provider(&registry, provider).await {
+        Ok(provider) => provider.has_session(&ThreadId(from.to_string())).await,
+        Err(_) => true,
+    };
+    if live || state.agent_chat_pane_id_for_thread(from).is_some() {
+        return;
+    }
+    // A pull-request wake already committed for the old chat is about to
+    // send to it; merging now would lose that wake.
+    match crate::pr_watch::unless_waking(from, || db.merge_reopened_agent_chat_session(from, into)) {
+        None => {}
+        Some(Ok(cleanup)) => agent_chat_sessions_merged(app, db, cleanup),
+        Some(Err(error)) => eprintln!("[codemux::agent_chat] failed to merge the reopened chat: {error}"),
+    }
+}
+
+/// Chats were merged into a survivor (a history reopen): payload
+/// `{ survivor, merged }`. A pane already bound to the survivor re-reads
+/// state that has no change event of its own, such as fork lineage.
+pub const AGENT_CHAT_SESSIONS_MERGED_EVENT: &str = "agent-chat-sessions-merged";
+
+/// Chats were merged into `cleanup.survivor`: adopt queued images, drop
+/// what the merged-away rows owned outside SQLite, and have the survivor's
+/// pane re-read the per-chat state that moved onto it.
+fn agent_chat_sessions_merged<R: Runtime>(
+    app: &AppHandle<R>,
+    db: &DatabaseStore,
+    cleanup: crate::database::AgentChatSessionCleanup,
+) {
+    super::queued_turns::after_sessions_merged(app, db, chat_images_dir);
+    if !cleanup.thread_ids.is_empty() {
+        let survivor = cleanup.survivor.clone();
+        let _ = app.emit(
+            AGENT_CHAT_SESSIONS_MERGED_EVENT,
+            serde_json::json!({ "survivor": survivor, "merged": cleanup.thread_ids }),
+        );
+        if let Ok(Some(watch)) = db.get_pr_watch(&survivor) {
+            crate::pr_watch::emit_changed(app, &survivor, Some(watch));
+        }
+        if !db.list_follow_up_tasks(&survivor).is_empty() {
+            super::follow_ups::emit_changed(app, &survivor);
+        }
+        // A reopened follow-up task: its parent's card now links the survivor.
+        if let Some(task) = db.get_follow_up_task(&survivor) {
+            super::follow_ups::emit_changed(app, &task.parent_thread_id);
+        }
+    }
+    cleanup_collapsed_session_resources(cleanup)
+}
+
+fn cleanup_collapsed_session_resources(cleanup: crate::database::AgentChatSessionCleanup) {
+    // A merged-away thread's image folder stays: the survivor's transcript
+    // now points at the files in it. Deleting the survivor removes them
+    // ([`agent_chat_delete_session`]).
+    for thread_id in &cleanup.thread_ids {
         forget_turn_checkpoint_lock(thread_id);
         let repos = cleanup.repo_paths.iter().filter(|(id, _)| id == thread_id);
         let repos = repos.map(|(_, repo)| repo.clone()).collect::<Vec<_>>();
@@ -7396,6 +7595,17 @@ fn saturating_usage_i64(value: u64) -> i64 {
 /// UUID carried by `ResumeCursorUpdated` so the history dropdown can
 /// resume this session after a restart.
 pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeEvent) {
+    // Codex takes the Plan pill per turn and the pill does not survive a
+    // restart: remember the mode each started turn runs in, so a session
+    // rebuilt on a server that does not report it resumes in it too.
+    // Internal bookkeeping, so it reaches neither plugins nor the UI.
+    if let ProviderRuntimeEvent::TurnModeSelected { thread_id, mode } = &event {
+        let db: State<'_, DatabaseStore> = app.state();
+        if let Err(error) = db.set_agent_chat_turn_mode(&thread_id.0, mode) {
+            eprintln!("[codemux::agent_chat] {error}");
+        }
+        return;
+    }
     // Plugin chat tap: every event, before anything below can swallow it
     // (usage and plan-quota events return early). One atomic load when off.
     crate::plugins::tap::emit(app, &event);
@@ -7486,23 +7696,22 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         resume_cursor,
     } = &event
     {
-        if let Some(sdk_session_id) = extract_sdk_session_id(resume_cursor) {
-            let db: State<'_, DatabaseStore> = app.state();
-            if let Err(error) = db.set_agent_chat_sdk_session_id(&thread_id.0, &sdk_session_id) {
+        let db: State<'_, DatabaseStore> = app.state();
+        // A session that left with a removed account may still report its id
+        // late; it isn't stored (where it would outlive the removal's
+        // in-memory refusal) and merges nothing.
+        let stored = |native: &str| {
+            crate::provider_accounts::store_reported_native(&db, &thread_id.0, native).unwrap_or_else(|error| {
                 eprintln!("[codemux::agent_chat] failed to persist sdk_session_id: {error}");
-            }
-            // Resume creates a fresh DB row (new thread_id) carrying the
-            // same sdk_session_id as the original. Collapse the
-            // duplicates so the dropdown doesn't grow unboundedly.
-            match db.collapse_duplicate_agent_chat_sessions(&sdk_session_id) {
-                Ok(cleanup) => {
-                    super::queued_turns::after_sessions_merged(app, &db, chat_images_dir);
-                    cleanup_collapsed_session_resources(cleanup)
-                }
-                Err(error) => {
-                    eprintln!("[codemux::agent_chat] failed to collapse duplicates: {error}");
-                }
-            }
+                true
+            })
+        };
+        if let Some(sdk_session_id) = extract_sdk_session_id(resume_cursor).filter(|native| stored(native)) {
+            let app = app.clone();
+            let sdk_session_id = sdk_session_id.clone();
+            tauri::async_runtime::spawn(async move {
+                collapse_resumed_duplicates(&app, &sdk_session_id).await;
+            });
         } else if resume_cursor.is_null() {
             // A JSON-null cursor is the stale-session recovery signal (the
             // sidecar rebuilt a fresh query because the persisted id's
@@ -8029,6 +8238,15 @@ struct ThreadSubagentState {
     /// entry alive until then,
     /// which is the price of the guarantee.
     stopped_monitors: std::collections::BTreeSet<String>,
+    /// Agent-class ids whose work may still run, kept across turn
+    /// boundaries. [`Self::begin_turn`] drops agent entries from
+    /// [`Self::tasks`] so a missed terminal snapshot can't suppress the
+    /// next `Review`, but a child that outlives its parent's turn keeps
+    /// working through the user's follow-up. Forks and provider switches
+    /// must not copy or stop the conversation under it, so this set only
+    /// shrinks on the id's terminal snapshot, a Stop, or teardown (see
+    /// [`SubagentTracker::delegated_work_live`]).
+    live_agents: std::collections::BTreeSet<String>,
 }
 
 impl ThreadSubagentState {
@@ -8056,6 +8274,12 @@ impl ThreadSubagentState {
     /// actually takes. The manual (`codemux monitor start`) half does not
     /// go through this tracker at all.
     fn is_clear(&self) -> bool {
+        self.pane_clear() && self.live_agents.is_empty()
+    }
+
+    /// Whether the pane side remembers nothing, leaving at most the
+    /// fork/switch hold in [`Self::live_agents`].
+    fn pane_clear(&self) -> bool {
         self.tasks.is_empty() && self.stopped_monitors.is_empty()
     }
 
@@ -8100,9 +8324,15 @@ impl ThreadSubagentState {
             SnapshotClass::Unreported => self.tasks.get(id).copied().unwrap_or(TaskClass::Agent),
             SnapshotClass::Untracked => {
                 self.tasks.remove(id);
+                self.live_agents.remove(id);
                 return false;
             }
         };
+        if class == TaskClass::Agent {
+            self.live_agents.insert(id.to_string());
+        } else {
+            self.live_agents.remove(id);
+        }
         if class == TaskClass::Monitor && self.stopped_monitors.contains(id) {
             // The user stopped this watch loop; a surviving detached task's
             // later ticks must not resurrect the badge.
@@ -8119,6 +8349,7 @@ impl ThreadSubagentState {
     /// Drop `id` from tracking, whatever class it held.
     fn untrack(&mut self, id: &str) {
         self.tasks.remove(id);
+        self.live_agents.remove(id);
     }
 
     /// Start a new parent turn without forgetting confirmed live monitors.
@@ -8129,6 +8360,7 @@ impl ThreadSubagentState {
     /// not guarantee another progress snapshot merely because the user sent a
     /// follow-up. Retaining only monitor-class entries keeps the badge truthful
     /// without reviving the stale-agent bug this reset originally fixed.
+    /// [`Self::live_agents`] is kept: the work may outlive the turn.
     fn begin_turn(&mut self) {
         self.tasks.retain(|_, class| *class == TaskClass::Monitor);
         self.turn_settled = false;
@@ -8158,12 +8390,14 @@ impl ThreadSubagentState {
     /// blocklist is retained for the same reason.
     fn interrupted(&mut self) {
         self.tasks.retain(|_, class| *class == TaskClass::Monitor);
+        self.live_agents.clear();
         self.review_owed_since = None;
     }
 
     /// Forget everything (session close / error or explicit pane teardown).
     fn reset(&mut self) {
         self.tasks.clear();
+        self.live_agents.clear();
         self.turn_settled = false;
         self.forced_settled = false;
         self.review_owed_since = None;
@@ -8340,9 +8574,7 @@ impl SubagentTracker {
         } else {
             state.review_owed_since = None;
         }
-        if state.is_clear() {
-            threads.remove(thread_id);
-        }
+        prune(&mut threads, thread_id);
         status
     }
 
@@ -8359,15 +8591,10 @@ impl SubagentTracker {
     /// boundary rather than a session/pane teardown.
     pub fn begin_turn(&self, thread_id: &str) {
         let mut threads = self.threads.lock().expect("subagent tracker poisoned");
-        let should_remove = if let Some(state) = threads.get_mut(thread_id) {
+        if let Some(state) = threads.get_mut(thread_id) {
             state.begin_turn();
-            state.is_clear()
-        } else {
-            false
-        };
-        if should_remove {
-            threads.remove(thread_id);
         }
+        prune(&mut threads, thread_id);
     }
 
     /// Release `thread_id`'s delegated-work hold after an explicit interrupt,
@@ -8386,9 +8613,7 @@ impl SubagentTracker {
             return;
         };
         state.interrupted();
-        if state.is_clear() {
-            threads.remove(thread_id);
-        }
+        prune(&mut threads, thread_id);
     }
 
     /// Whether real delegated agent work is still holding `thread_id`'s run
@@ -8443,6 +8668,20 @@ impl SubagentTracker {
             .is_some_and(ThreadSubagentState::review_pending)
     }
 
+    /// Whether agent work the thread delegated may still be running, for
+    /// forks and provider switches, which would copy or stop the
+    /// conversation under it. Unlike [`Self::delegated_work_holding_turn`]
+    /// it ignores the parent's turn end (a provider clears its turn before
+    /// that end reaches the app), the stall watchdog (silence is not death)
+    /// and the next turn (a child can outlive its parent's turn). Only the
+    /// work's terminal snapshot, a Stop, or teardown ends it.
+    pub fn delegated_work_live(&self, thread_id: &str) -> bool {
+        let threads = self.threads.lock().expect("subagent tracker poisoned");
+        threads
+            .get(thread_id)
+            .is_some_and(|state| !state.live_agents.is_empty())
+    }
+
     /// Drop `thread_id`'s watch-loop tasks and report the status the pane
     /// should settle to, backing `agent_chat_stop_monitoring`.
     ///
@@ -8480,9 +8719,7 @@ impl SubagentTracker {
         } else {
             None
         };
-        if state.is_clear() {
-            threads.remove(thread_id);
-        }
+        prune(&mut threads, thread_id);
         status
     }
 
@@ -8513,7 +8750,7 @@ impl SubagentTracker {
     ///
     /// Mutating under the same lock releases the mutex before the caller
     /// touches `AppStateStore`, so the two locks are never held together.
-    fn take_overdue_reviews(&self, now: SystemTime, threshold: Duration) -> Vec<String> {
+    pub(crate) fn take_overdue_reviews(&self, now: SystemTime, threshold: Duration) -> Vec<String> {
         let mut threads = self.threads.lock().expect("subagent tracker poisoned");
         let mut overdue = Vec::new();
         for (thread_id, state) in threads.iter_mut() {
@@ -8527,7 +8764,10 @@ impl SubagentTracker {
         // A thread force-settled with nothing left tracked has no tombstone
         // left to carry, so it is dropped like any other clear entry rather
         // than lingering in the map.
-        threads.retain(|_, state| !state.is_clear());
+        let ids: Vec<String> = threads.keys().cloned().collect();
+        for id in ids {
+            prune(&mut threads, &id);
+        }
         overdue
     }
 
@@ -8611,6 +8851,22 @@ impl SubagentTracker {
 /// `SessionConfigured` and the `Starting` / `Ready` lifecycle phases map
 /// to `None`: a freshly-started session with no turn is idle, exactly
 /// like a freshly-spawned terminal shows no status until its first hook.
+/// Drop `thread_id`'s entry once it remembers nothing. Once only the
+/// fork/switch hold ([`ThreadSubagentState::live_agents`]) is left, forget
+/// the pane side as dropping the entry would, so a late snapshot for a held
+/// child moves the dot exactly as it would on a fresh entry.
+fn prune(threads: &mut HashMap<String, ThreadSubagentState>, thread_id: &str) {
+    let Some(state) = threads.get_mut(thread_id) else {
+        return;
+    };
+    if state.is_clear() {
+        threads.remove(thread_id);
+    } else if state.pane_clear() {
+        let live_agents = std::mem::take(&mut state.live_agents);
+        *state = ThreadSubagentState { live_agents, ..Default::default() };
+    }
+}
+
 fn map_event_to_pane_status(
     event: &ProviderRuntimeEvent,
     state: &mut ThreadSubagentState,
@@ -8747,7 +9003,9 @@ fn map_event_to_pane_status(
         | ProviderRuntimeEvent::ContextUsageUpdated { .. }
         | ProviderRuntimeEvent::UsageRecorded { .. }
         // Plan quota is an account-level reading, not thread liveness.
-        | ProviderRuntimeEvent::PlanUsageUpdated { .. } => None,
+        | ProviderRuntimeEvent::PlanUsageUpdated { .. }
+        // A turn's collaboration mode is bookkeeping for a later resume.
+        | ProviderRuntimeEvent::TurnModeSelected { .. } => None,
         // A fanned-out user turn is an INPUT echo, not provider liveness.
         // `agent_chat_send_turn` already owns the send's status transition
         // (and it runs on the sending client's command, before any of this),
@@ -9438,6 +9696,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::UserMessage { thread_id, .. }
         | ProviderRuntimeEvent::UsageRecorded { thread_id, .. }
         | ProviderRuntimeEvent::PlanUsageUpdated { thread_id, .. }
+        | ProviderRuntimeEvent::TurnModeSelected { thread_id, .. }
         | ProviderRuntimeEvent::RunStalled { thread_id, .. }
         | ProviderRuntimeEvent::UsageLimitReached { thread_id, .. }
         | ProviderRuntimeEvent::UsageResumeCancelled { thread_id, .. }
@@ -9638,6 +9897,7 @@ mod tests {
             thread_ids: vec![thread_id.to_string()],
             repo_paths: vec![(thread_id.to_string(), repo.to_string_lossy().to_string())],
             checkpoint_refs: vec![(repo.to_string_lossy().to_string(), checkpoint_ref.clone())],
+            ..Default::default()
         });
 
         for ref_name in [checkpoint_ref, safety_ref, failed_safety_ref] {
@@ -9725,6 +9985,94 @@ mod tests {
         )
         .is_empty());
         assert!(chat_image_paths_in_payload("not json").is_empty());
+    }
+
+    #[test]
+    fn a_fork_of_a_reopened_chat_owns_copies_of_its_images() {
+        // A reopened as B: B's transcript points at A's folder. Forking B
+        // into C copies that image into C's folder, so deleting either chat
+        // leaves the other's images intact.
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("a");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("img.png"), b"png").unwrap();
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("b", "ws", Some("/repo"), "claude").unwrap();
+        let message = serde_json::json!({
+            "type": "user_message", "thread_id": "b", "text": "look",
+            "images": [{"path": old.join("img.png"), "media_type": "image/png"}],
+        });
+        db.append_agent_chat_message("b", &message.to_string()).unwrap();
+        let source = db.get_agent_chat_session("b").unwrap();
+        let fork_dir = root.path().join("c");
+        let roots = vec![root.path().to_path_buf()];
+        let images = db
+            .create_agent_chat_fork(&crate::database::chat_fork::NewChatFork {
+                thread_id: "c",
+                source: &source,
+                sdk_session_id: "native-c",
+                workspace_id: "ws",
+                cwd: "/repo",
+                title: "fork",
+                cut_before: None,
+                image_dirs: Some((roots.as_slice(), &fork_dir)),
+            })
+            .unwrap();
+        for (from, to) in images {
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(from, to).unwrap();
+        }
+
+        delete_referenced_chat_images_in(root.path(), &db.list_agent_chat_messages("b"));
+        assert!(!old.join("img.png").exists());
+        assert!(fork_dir.join("img.png").exists(), "the fork has its own copy");
+        delete_referenced_chat_images_in(root.path(), &db.list_agent_chat_messages("c"));
+        assert!(!fork_dir.exists());
+    }
+
+    #[test]
+    fn deleting_a_merged_away_thread_keeps_the_survivors_images() {
+        // "old" was reopened as "new": its row is gone, its folder now holds
+        // images "new" points at. A stale delete of "old" leaves them.
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("a.png"), b"png").unwrap();
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("new", "ws", Some("/repo"), "claude").unwrap();
+        let message = serde_json::json!({"type": "user_message", "images": [{"path": old.join("a.png")}]});
+        db.append_agent_chat_message("new", &message.to_string()).unwrap();
+
+        delete_chat_images_in(root.path(), &db, "old");
+        assert!(old.join("a.png").exists());
+        delete_chat_images_in(root.path(), &db, "new");
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn deleting_a_chat_deletes_the_images_its_transcript_points_at() {
+        // A chat reopened from history points at images in the merged-away
+        // thread's folder; deleting it removes them and the emptied folder.
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old-thread");
+        let other = root.path().join("other-thread");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        for file in [old.join("a.png"), other.join("b.png")] {
+            std::fs::write(file, b"png").unwrap();
+        }
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let user = |path: &std::path::Path| {
+            serde_json::json!({"type": "user_message", "images": [{"path": path}]}).to_string()
+        };
+        delete_referenced_chat_images_in(
+            root.path(),
+            &[user(&old.join("a.png")), user(outside.path())],
+        );
+        assert!(!old.exists(), "the emptied folder goes too");
+        assert!(other.join("b.png").exists(), "another chat's image stays");
+        assert!(outside.path().exists(), "nothing outside the image root is touched");
+        assert!(root.path().exists());
     }
 
     #[test]
@@ -11161,6 +11509,60 @@ mod tests {
             .unwrap();
         assert_eq!(provider.stopped.lock().unwrap().len(), 1);
         assert_eq!(provider.started_on.lock().unwrap().len(), 1);
+    }
+
+    /// A history pick merges the chat it reopened only while that chat is
+    /// idle: not running a session (a PR wake can resume it headless) and
+    /// not mid-dispatch.
+    #[tokio::test]
+    async fn a_reopened_chat_merges_only_while_it_is_idle() {
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app("reopened", None, provider.clone()).await;
+        let handle = app.handle().clone();
+        let db = app.state::<DatabaseStore>();
+        let state = app.state::<AppStateStore>();
+        db.upsert_agent_chat_session("old", &workspace, Some("/tmp"), "codex").unwrap();
+        let merge = || merge_reopened_chat(&handle, &db, &state, ProviderKind::Codex, "old", "reopened");
+
+        provider.live.lock().unwrap().insert("old".into());
+        merge().await;
+        assert!(db.get_agent_chat_session("old").is_some(), "its session still runs");
+        provider.live.lock().unwrap().clear();
+
+        let gate = native_thread_gate(&handle, "old");
+        let busy = gate.dispatch.clone().lock_owned().await;
+        merge().await;
+        assert!(db.get_agent_chat_session("old").is_some(), "something is dispatching to it");
+        drop(busy);
+
+        let waking = crate::pr_watch::tests_claim_waking("old");
+        merge().await;
+        assert!(db.get_agent_chat_session("old").is_some(), "a committed PR wake is on its way");
+        drop(waking);
+
+        // The collapse a matching provider session id triggers holds back
+        // the same way. "reopened" reports the id a second later, so it is
+        // the newest row: the survivor.
+        db.set_agent_chat_sdk_session_id("old", "native-1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        db.set_agent_chat_sdk_session_id("reopened", "native-1").unwrap();
+        provider.live.lock().unwrap().insert("old".into());
+        collapse_resumed_duplicates(&handle, "native-1").await;
+        assert!(db.get_agent_chat_session("old").is_some(), "its session still runs");
+        provider.live.lock().unwrap().clear();
+        let busy = gate.dispatch.clone().lock_owned().await;
+        collapse_resumed_duplicates(&handle, "native-1").await;
+        assert!(db.get_agent_chat_session("old").is_some(), "something is dispatching to it");
+        drop(busy);
+        let waking = crate::pr_watch::tests_claim_waking("old");
+        collapse_resumed_duplicates(&handle, "native-1").await;
+        assert!(db.get_agent_chat_session("old").is_some(), "a committed PR wake is on its way");
+        drop(waking);
+        // The survivor's own pane and session don't hold it back.
+        provider.live.lock().unwrap().insert("reopened".into());
+        collapse_resumed_duplicates(&handle, "native-1").await;
+        assert!(db.get_agent_chat_session("old").is_none());
+        assert!(db.get_agent_chat_session("reopened").is_some());
     }
 
     /// Push / pull stop the workspace's live chats before copying it.
@@ -12804,6 +13206,37 @@ mod tests {
         assert_eq!(tracker.tracked_thread_count(), 0);
     }
 
+    // A child that outlives its parent's turn holds forks and switches
+    // through the user's follow-up, but its late snapshots move the dot
+    // exactly as they would on a fresh entry: no second Review.
+    #[test]
+    fn a_held_childs_late_snapshots_after_a_follow_up_move_nothing() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), now);
+        assert_eq!(tracker.decide("t", &turn_completed(), now), Some(PaneStatus::Working));
+        tracker.begin_turn("t");
+        assert_eq!(tracker.decide("t", &turn_completed(), now), Some(PaneStatus::Review));
+        assert!(tracker.delegated_work_live("t"), "the follow-up didn't end the child");
+        assert_eq!(tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), now), None);
+        assert!(!tracker.delegated_work_holding_turn("t"));
+        assert_eq!(tracker.decide("t", &subagent_event("s1", SubagentStatus::Completed), now), None);
+        assert!(!tracker.delegated_work_live("t"));
+        assert_eq!(tracker.tracked_thread_count(), 0);
+    }
+
+    // Closing the chat is the way out of a hold whose child ended without
+    // reporting it, as the fork/switch refusal says.
+    #[test]
+    fn closing_the_chat_releases_the_fork_switch_hold() {
+        let tracker = SubagentTracker::default();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), SystemTime::now());
+        tracker.begin_turn("t");
+        assert!(tracker.delegated_work_live("t"));
+        tracker.clear_thread("t");
+        assert!(!tracker.delegated_work_live("t"));
+    }
+
     // `agent_chat_turn_active`'s second signal, exercised through the
     // provider-agnostic event vocabulary it actually keys on. Claude hits
     // this on every SDK `result` it emits to yield; Codex hits it whenever a
@@ -13593,6 +14026,10 @@ mod tests {
             Some(PaneStatus::Review),
             "turn 2 settles through the ordinary path"
         );
+        // s1 never ended, so forks and switches still wait for it, until
+        // its late terminal snapshot drops the entry.
+        assert!(tracker.delegated_work_live("t"));
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Completed), settled_at);
         assert_eq!(tracker.tracked_thread_count(), 0);
     }
 
@@ -13698,9 +14135,10 @@ mod tests {
             Some(PaneStatus::Working)
         );
         assert!(
-            st.is_clear(),
+            st.tasks.is_empty() && !st.review_pending(),
             "new turn resets both running and review_pending"
         );
+        assert!(st.live_agents.contains("bg"), "forks and switches still wait for it");
 
         // Turn 2 finishes with nothing tracked → Review fires normally.
         assert_eq!(
@@ -13818,9 +14256,9 @@ mod tests {
         let mut st = ThreadSubagentState::default();
         map_event_to_pane_status(&subagent_event("bg", SubagentStatus::Running), &mut st);
         map_event_to_pane_status(&turn_completed(), &mut st);
-        // New turn resets tracking.
+        // New turn resets tracking; only the fork/switch hold remains.
         map_event_to_pane_status(&session_running(), &mut st);
-        assert!(st.is_clear());
+        assert!(st.tasks.is_empty() && st.live_agents.contains("bg"));
 
         // The old subagent's terminal snapshot finally arrives — no-op.
         assert_eq!(

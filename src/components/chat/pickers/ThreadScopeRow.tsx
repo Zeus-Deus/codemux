@@ -1,15 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import {
-  Check,
-  ChevronDown,
-  Folder,
-  GitBranch,
-  GitFork,
-  Globe,
-  Sparkle,
-} from "lucide-react";
+import { ChevronDown, GitBranch, GitFork, Globe } from "lucide-react";
 
-import { DevicePicker } from "@/components/hosts/device-picker";
 import {
   Command,
   CommandEmpty,
@@ -34,6 +25,7 @@ import { checkIsGitRepo, listBranchesDetailed } from "@/tauri/commands";
 import type { BranchDetail, WorkspaceSnapshot } from "@/tauri/types";
 
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
+import { RunContextControl } from "./RunContextControl";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
 // Module-scoped stable empty array — returning a fresh `[]` literal
@@ -92,7 +84,8 @@ export interface ThreadScopeRowProps {
 /**
  * Thread Scope redesign — the scope strip rendered BELOW the composer
  * (`Composer`'s `belowComposerSlot`, attached flush via `SCOPE_STRIP`):
- * device · checkout on the left, "from ⑂ branch" on the right. With a
+ * one device + checkout control on the left, "⑂ From branch" on the right.
+ * With a
  * device picked, the checkout and branch controls describe what to
  * create on that device (its own checkout of the project's remote); in
  * its current checkout the branch is the device's, so the pill gives way
@@ -194,24 +187,17 @@ export function ThreadScopeRow({
     <div className="rise-in flex w-full flex-col items-center gap-3">
       <div className={SCOPE_STRIP_INSET}>
         <div className={SCOPE_STRIP} data-mobile-draft-scope>
-          <div className="flex min-w-0 items-center gap-0.5">
-            <DevicePicker
+          <div className="flex min-w-0 items-center">
+            <RunContextControl
               hostId={hostId}
-              onSelectHostId={onChangeHostId}
+              onChangeHostId={onChangeHostId}
+              showWorkspace={projectPath !== null && projectIsGit}
+              checkoutMode={checkoutMode}
+              worktreeName={worktreeName}
               disabled={disabled}
+              onChangeCheckoutMode={onChangeCheckoutMode}
+              onChangeWorktreeName={onChangeWorktreeName}
             />
-            {projectPath !== null && projectIsGit && (
-              <>
-                <span className="select-none text-muted-foreground/50">·</span>
-                <CheckoutControl
-                  checkoutMode={checkoutMode}
-                  worktreeName={worktreeName}
-                  disabled={disabled}
-                  onChangeCheckoutMode={onChangeCheckoutMode}
-                  onChangeWorktreeName={onChangeWorktreeName}
-                />
-              </>
-            )}
           </div>
           {projectPath !== null && projectIsGit && (
             <div className="flex shrink-0 items-center gap-1.5">
@@ -232,117 +218,6 @@ export function ThreadScopeRow({
         </div>
       </div>
     </div>
-  );
-}
-
-// ── Checkout control ──
-
-function CheckoutControl({
-  checkoutMode,
-  worktreeName,
-  disabled,
-  onChangeCheckoutMode,
-  onChangeWorktreeName,
-}: {
-  checkoutMode: "current" | "worktree";
-  worktreeName: string;
-  disabled?: boolean;
-  onChangeCheckoutMode: (mode: "current" | "worktree") => void;
-  onChangeWorktreeName: (name: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const isWorktree = checkoutMode === "worktree";
-  const isCurrent = !isWorktree;
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button type="button" disabled={disabled} className={GHOST_BTN}>
-          {isWorktree ? (
-            <GitFork className="size-3 text-muted-foreground" />
-          ) : (
-            <Folder className="size-3 text-muted-foreground" />
-          )}
-          {isWorktree ? "New worktree" : "Current checkout"}
-          <ChevronDown className="size-3 opacity-45" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent
-        className="w-[320px] p-1.5"
-        align="start"
-        side="top"
-        onOpenAutoFocus={focusCmdkOnOpen}
-      >
-        <Eyebrow className="px-2 pb-1 pt-1">
-          Where should the agent work?
-        </Eyebrow>
-        <button
-          type="button"
-          onClick={() => onChangeCheckoutMode("current")}
-          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors duration-150 hover:bg-surface-2"
-        >
-          <Folder className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-          <span className="min-w-0 flex-1">
-            <span className="flex items-center gap-1.5">
-              <span className="text-label font-semibold text-foreground">
-                Current checkout
-              </span>
-              {isCurrent && (
-                <Check className="size-3.5 shrink-0 text-accent-ember" />
-              )}
-            </span>
-            <span className="mt-0.5 block text-label leading-snug text-muted-foreground">
-              Work directly in the project's checked-out branch. No new
-              worktree.
-            </span>
-          </span>
-        </button>
-        <button
-          type="button"
-          onClick={() => onChangeCheckoutMode("worktree")}
-          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors duration-150 hover:bg-surface-2"
-        >
-          <GitFork className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-          <span className="min-w-0 flex-1">
-            <span className="flex items-center gap-1.5">
-              <span className="text-label font-semibold text-foreground">
-                New worktree
-              </span>
-              {isWorktree && (
-                <Check className="size-3.5 shrink-0 text-accent-ember" />
-              )}
-            </span>
-            <span className="mt-0.5 block text-label leading-snug text-muted-foreground">
-              Branch off in an isolated worktree, so the agent can't touch
-              your working copy.
-            </span>
-          </span>
-        </button>
-        {isWorktree && (
-          <div className="px-1 pb-0.5 pt-1">
-            <div className="flex h-8 items-center gap-2 rounded-lg border border-border bg-background px-2.5">
-              <GitFork className="size-3 shrink-0 text-muted-foreground" />
-              <input
-                value={worktreeName}
-                onChange={(e) => onChangeWorktreeName(e.target.value)}
-                onClick={(e) => e.stopPropagation()}
-                onKeyDown={(e) => e.stopPropagation()}
-                placeholder="name — leave empty to auto-name"
-                aria-label="Worktree name"
-                className="flex-1 min-w-0 bg-transparent font-mono text-body-sm text-foreground outline-none placeholder:text-muted-foreground/60"
-              />
-            </div>
-            <div className="mt-1.5 flex items-start gap-1.5 px-0.5 text-label leading-snug text-muted-foreground">
-              <Sparkle className="mt-px size-3 shrink-0 text-status-remote" />
-              <span>
-                Empty → CodeMux names it from your first message, like the
-                CLI does.
-              </span>
-            </div>
-          </div>
-        )}
-      </PopoverContent>
-    </Popover>
   );
 }
 
@@ -508,8 +383,8 @@ function BranchControl({
     <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger asChild>
         <button type="button" disabled={disabled} className={GHOST_BTN}>
-          <span className="font-medium text-muted-foreground">from</span>
           <GitBranch className="size-3 text-muted-foreground" />
+          <span className="font-medium text-muted-foreground">From</span>
           <span className="max-w-[160px] truncate font-mono text-foreground">
             {baseBranch || "…"}
           </span>
