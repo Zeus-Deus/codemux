@@ -475,13 +475,11 @@ mod tests {
             &mut images,
         );
         let row: serde_json::Value = serde_json::from_str(&row).unwrap();
+        let fork_copy = Path::new("/img/fork").join("k.png");
         let kept = &row["item"]["retained_images"][0];
-        assert_eq!(kept["path"], "/img/fork/k.png");
+        assert_eq!(kept["path"], fork_copy.to_string_lossy().as_ref());
         assert_eq!(kept["source"], "/tmp/a.png", "the link the reply wrote stays as written");
-        assert_eq!(
-            images,
-            vec![(PathBuf::from("/img/src/k.png"), PathBuf::from("/img/fork/k.png"))]
-        );
+        assert_eq!(images, vec![(PathBuf::from("/img/src/k.png"), fork_copy)]);
     }
 
     #[test]
@@ -515,9 +513,18 @@ mod tests {
 
         let jobs = db.list_reply_image_jobs(None);
         assert_eq!(jobs.len(), 2, "only the pending reply's copy gets a job");
-        let forked = db.get_agent_chat_message_payload(jobs[1]).unwrap();
-        assert!(forked.contains("/img/fork/pending.png"), "{forked}");
+        assert_eq!(jobs[0], pending);
         assert!(jobs[1] > done);
+        // The fork's job is for its own copy of the pending reply.
+        let forked: serde_json::Value =
+            serde_json::from_str(&db.get_agent_chat_message_payload(jobs[1]).unwrap()).unwrap();
+        assert_eq!(forked["thread_id"], "fork");
+        let kept = &forked["item"]["retained_images"][0];
+        assert_eq!(
+            kept["path"],
+            Path::new("/img/fork").join("pending.png").to_string_lossy().as_ref()
+        );
+        assert_eq!(kept["source"], "/tmp/a.png");
     }
 
     #[test]

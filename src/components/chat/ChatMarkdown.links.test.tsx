@@ -427,6 +427,45 @@ describe("ChatMarkdown local image links", () => {
     ).toBeInTheDocument();
   });
 
+  // Parity cases for the backend's copy planner (`reply_images.rs`): it must
+  // keep exactly the images rendered here.
+  const renderedCaptions = (markdown: string) => {
+    const { container } = render(
+      <TooltipProvider>
+        <ChatMarkdown>{markdown}</ChatMarkdown>
+      </TooltipProvider>,
+    );
+    return [...container.querySelectorAll("[data-chat-local-image] button")].map(
+      (button) => button.getAttribute("aria-label"),
+    );
+  };
+
+  it("renders only the image outside a code block opened in a list item", () => {
+    expect(
+      renderedCaptions(
+        "- ```markdown\n  [Example](/tmp/example.png)\n  ```\n\n[Actual proof](/tmp/actual.png)",
+      ),
+    ).toEqual(["Open Actual proof"]);
+  });
+
+  it("renders links and images whose destination is on its own line", () => {
+    expect(
+      renderedCaptions("[Proof](\n/tmp/proof.png\n) and ![Shot](\n/tmp/shot.png\n)"),
+    ).toEqual(["Open Proof", "Open Shot"]);
+  });
+
+  it("renders autolinks, table cells and headings, but not reference links or raw HTML", () => {
+    expect(
+      renderedCaptions(
+        "Shot: <file:///tmp/auto.png>\n\n" +
+          "| a | b |\n| - | - |\n| [cell](/tmp/cell.png) | x |\n\n" +
+          "# Title [h](/tmp/h.png)\n\n" +
+          "See [the mockup][m].\n\n[m]: /tmp/mockup.png\n\n" +
+          '<a href="/tmp/html.png">h</a>',
+      ),
+    ).toEqual(["Open file:///tmp/auto.png", "Open cell", "Open h"]);
+  });
+
   it("keeps a local file reference inert when no workspace root is available", () => {
     const { container } = render(
       <ChatMarkdown>{"[implementation](/home/me/src/app.tsx)"}</ChatMarkdown>,

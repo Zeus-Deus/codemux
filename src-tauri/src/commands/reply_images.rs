@@ -269,256 +269,40 @@ fn remove_copies(root: &std::path::Path, kept: &[RetainedReplyImage]) {
 }
 
 /// The local image paths `markdown` links to, in order and deduplicated, as
-/// the transcript renders them: inline links and images whose destination
-/// is an absolute path or a local `file:` URL ending in a supported image
-/// extension. Fenced code (also inside block quotes) and code spans are
-/// examples, not links, and are skipped. Mirrors `localImagePath` in
-/// `src/lib/agent-chat/local-image-links.ts`.
+/// the transcript renders them: inline links, images and autolinks whose
+/// destination is an absolute path or a local `file:` URL ending in a
+/// supported image extension. Code is not scanned for links. Reference-style
+/// links are skipped because the transcript leaves them as text (it renders
+/// each block on its own, so a definition never reaches its use). Mirrors
+/// `localImagePath` in `src/lib/agent-chat/local-image-links.ts`.
 pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
+    use pulldown_cmark::{Event, LinkType, Options, Parser, Tag};
+
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
     let mut sources: Vec<String> = Vec::new();
-    // An open fence: its marker, length, and the quote depth it opened at.
-    let mut fence: Option<(char, usize, usize)> = None;
-    for line in markdown.lines() {
-        let (depth, body) = without_quote_markers(line);
-        // A fence ends with the block quote that holds it.
-        if fence.is_some_and(|(_, _, opened)| depth < opened) {
-            fence = None;
-        }
-        let trimmed = body.trim_start_matches(' ');
-        if body.len() - trimmed.len() <= 3 {
-            if let Some(marker) = trimmed.chars().next().filter(|c| *c == '`' || *c == '~') {
-                // Fence markers are ASCII, so the run length is a byte offset.
-                let run = trimmed.chars().take_while(|c| *c == marker).count();
-                if run >= 3 {
-                    match fence {
-                        None => {
-                            fence = Some((marker, run, depth));
-                            continue;
-                        }
-                        Some((open, len, opened))
-                            if open == marker
-                                && run >= len
-                                && opened == depth
-                                && trimmed[run..].trim().is_empty() =>
-                        {
-                            fence = None;
-                            continue;
-                        }
-                        Some(_) => {}
-                    }
-                }
-            }
-        }
-        if fence.is_some() {
+    for event in Parser::new_ext(markdown, options) {
+        let (Event::Start(Tag::Link { link_type, dest_url, .. })
+        | Event::Start(Tag::Image { link_type, dest_url, .. })) = event
+        else {
+            continue;
+        };
+        if !matches!(link_type, LinkType::Inline | LinkType::Autolink) {
             continue;
         }
-        for destination in link_destinations(&without_code_spans(line)) {
-            let Some(path) = local_image_path(&destination) else {
-                continue;
-            };
-            if !sources.contains(&path) {
-                sources.push(path);
-                if sources.len() == MAX_RETAINED_PER_REPLY {
-                    return sources;
-                }
+        let Some(path) = local_image_path(&dest_url) else {
+            continue;
+        };
+        if !sources.contains(&path) {
+            sources.push(path);
+            if sources.len() == MAX_RETAINED_PER_REPLY {
+                break;
             }
         }
     }
     sources
-}
-
-/// `line`'s block-quote depth and its text without the markers
-/// (`> > text` → `(2, "text")`).
-fn without_quote_markers(line: &str) -> (usize, &str) {
-    let mut depth = 0;
-    let mut rest = line;
-    loop {
-        let trimmed = rest.trim_start_matches(' ');
-        if rest.len() - trimmed.len() > 3 {
-            return (depth, rest);
-        }
-        match trimmed.strip_prefix('>') {
-            Some(after) => {
-                depth += 1;
-                rest = after.strip_prefix(' ').unwrap_or(after);
-            }
-            None => return (depth, rest),
-        }
-    }
-}
-
-/// `line` with every closed code span blanked out. Linear: each backtick
-/// run looks ahead only through the later runs of its own length.
-fn without_code_spans(line: &str) -> String {
-    let bytes = line.as_bytes();
-    let mut runs = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'`' {
-            let start = i;
-            while i < bytes.len() && bytes[i] == b'`' {
-                i += 1;
-            }
-            runs.push((start, i));
-        } else {
-            i += 1;
-        }
-    }
-    let mut by_length: HashMap<usize, (Vec<usize>, usize)> = HashMap::new();
-    for (index, (start, end)) in runs.iter().enumerate() {
-        by_length.entry(end - start).or_default().0.push(index);
-    }
-    let mut out = String::with_capacity(line.len());
-    let mut copied = 0;
-    let mut index = 0;
-    while index < runs.len() {
-        let (start, end) = runs[index];
-        let (same, cursor) = by_length.get_mut(&(end - start)).expect("every run is indexed");
-        while *cursor < same.len() && same[*cursor] <= index {
-            *cursor += 1;
-        }
-        match same.get(*cursor) {
-            Some(&close) => {
-                out.push_str(&line[copied..start]);
-                out.push(' ');
-                copied = runs[close].1;
-                index = close + 1;
-            }
-            None => index += 1,
-        }
-    }
-    out.push_str(&line[copied..]);
-    out
-}
-
-/// Destinations of the inline links (`[..](dest)`) and images in `line`.
-/// Only a `](` closing an unescaped `[` counts.
-fn link_destinations(line: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut open = 0usize;
-    let mut chars = line.char_indices().peekable();
-    while let Some((at, c)) = chars.next() {
-        match c {
-            '\\' => {
-                chars.next();
-            }
-            '[' => open += 1,
-            ']' if open > 0 => {
-                open -= 1;
-                if line[at + 1..].starts_with('(') {
-                    let after = line[at + 2..].trim_start_matches([' ', '\t']);
-                    let (destination, consumed) = parse_destination(after);
-                    if let Some(destination) = destination {
-                        found.push(destination);
-                    }
-                    let resume = line.len() - after.len() + consumed;
-                    while chars.peek().is_some_and(|(next, _)| *next < resume) {
-                        chars.next();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    found
-}
-
-/// Parse one link destination, returning it (when well formed, with
-/// backslash escapes and character references resolved) and how many bytes
-/// of `input` it spans. A destination using a named reference this parser
-/// does not know is skipped: the renderer would resolve it to a different
-/// path, so a copy kept under the written one would never be found.
-fn parse_destination(input: &str) -> (Option<String>, usize) {
-    let (destination, consumed) = parse_destination_text(input);
-    (destination.filter(|text| !text.contains(UNRESOLVED_REFERENCE)), consumed)
-}
-
-/// Stands in for a named reference [`character_reference`] cannot resolve.
-const UNRESOLVED_REFERENCE: char = '\u{FFFF}';
-
-fn parse_destination_text(input: &str) -> (Option<String>, usize) {
-    let mut out = String::new();
-    let mut chars = input.char_indices().peekable();
-    let angled = input.starts_with('<');
-    if angled {
-        chars.next();
-    }
-    let mut depth = 0usize;
-    while let Some((at, c)) = chars.next() {
-        match c {
-            '>' if angled => return (Some(out), at + 1),
-            '<' | '\n' if angled => return (None, at),
-            c if !angled && (c.is_ascii_whitespace() || c.is_ascii_control()) => {
-                return (Some(out).filter(|_| depth == 0), at)
-            }
-            '(' if !angled => {
-                depth += 1;
-                out.push(c);
-            }
-            ')' if !angled && depth == 0 => return (Some(out), at),
-            ')' if !angled => {
-                depth -= 1;
-                out.push(c);
-            }
-            '\\' if chars.peek().is_some_and(|(_, next)| next.is_ascii_punctuation()) => {
-                out.push(chars.next().map(|(_, next)| next).unwrap_or('\\'));
-            }
-            '&' => match character_reference(&input[at..]) {
-                Some((decoded, len)) => {
-                    out.push(decoded);
-                    while chars.peek().is_some_and(|(next, _)| *next < at + len) {
-                        chars.next();
-                    }
-                }
-                None if named_reference(&input[at..]) => out.push(UNRESOLVED_REFERENCE),
-                None => out.push('&'),
-            },
-            _ => out.push(c),
-        }
-    }
-    (None, input.len())
-}
-
-/// Decode a character reference at the start of `input` (`&amp;`, `&#38;`,
-/// `&#x26;`), returning the character and the reference's byte length.
-/// Named references beyond the five XML ones stay as written.
-fn character_reference(input: &str) -> Option<(char, usize)> {
-    let end = 1 + input[1..]
-        .char_indices()
-        .take(32)
-        .find(|(_, c)| *c == ';')?
-        .0;
-    let name = &input[1..end];
-    let decoded = match name {
-        "amp" => '&',
-        "lt" => '<',
-        "gt" => '>',
-        "quot" => '"',
-        "apos" => '\'',
-        _ => {
-            let number = name.strip_prefix('#')?;
-            let code = match number.strip_prefix(['x', 'X']) {
-                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-                None => number.parse().ok()?,
-            };
-            char::from_u32(code).filter(|c| *c != '\0')?
-        }
-    };
-    Some((decoded, end + 1))
-}
-
-/// Whether `input` starts with something shaped like a named character
-/// reference (`&copy;`), which the renderer may resolve.
-fn named_reference(input: &str) -> bool {
-    // Bounded like `character_reference`: a run of bare `&`s stays linear.
-    let rest = &input[1..];
-    let Some((end, _)) = rest.char_indices().take(32).find(|(_, c)| *c == ';') else {
-        return false;
-    };
-    let name = &rest[..end];
-    name.len() >= 2
-        && name.starts_with(|c: char| c.is_ascii_alphabetic())
-        && name.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// The native absolute path a Markdown destination names, when it is a
@@ -723,6 +507,33 @@ mod tests {
     }
 
     #[test]
+    fn a_fence_opened_in_a_list_item_hides_only_its_own_lines() {
+        let text = "- ```markdown\n  [Example](/tmp/example.png)\n  ```\n\n[Actual proof](/tmp/actual.png)";
+        assert_eq!(local_image_sources(text), ["/tmp/actual.png"]);
+    }
+
+    #[test]
+    fn destinations_on_their_own_line_count() {
+        assert_eq!(
+            local_image_sources("[Proof](\n/tmp/proof.png\n) and ![Shot](\n/tmp/shot.png\n)"),
+            ["/tmp/proof.png", "/tmp/shot.png"]
+        );
+    }
+
+    #[test]
+    fn rendered_forms_count_and_reference_links_do_not() {
+        let text = "Shot: <file:///tmp/auto.png>\n\n\
+                    | a | b |\n| - | - |\n| [cell](/tmp/cell.png) | x |\n\n\
+                    # Title [h](/tmp/h.png)\n\n\
+                    See [the mockup][m].\n\n[m]: /tmp/mockup.png\n\n\
+                    <a href=\"/tmp/html.png\">h</a>";
+        assert_eq!(
+            local_image_sources(text),
+            ["/tmp/auto.png", "/tmp/cell.png", "/tmp/h.png"]
+        );
+    }
+
+    #[test]
     fn a_quoted_fence_line_does_not_close_an_outer_fence() {
         let text = "~~~\n> ~~~\n[example](/tmp/a.png)\n~~~\n[proof](/tmp/proof.png)";
         assert_eq!(local_image_sources(text), ["/tmp/proof.png"]);
@@ -748,8 +559,7 @@ mod tests {
             local_image_sources(
                 "[a](/tmp/a&amp;b.png) [c](/tmp/c&#x41;.png) [d](/tmp/&copy;.png) [e](/tmp/e&f.png)"
             ),
-            // `&copy;` may resolve to another path when rendered: not kept.
-            ["/tmp/a&b.png", "/tmp/cA.png", "/tmp/e&f.png"]
+            ["/tmp/a&b.png", "/tmp/cA.png", "/tmp/©.png", "/tmp/e&f.png"]
         );
     }
 

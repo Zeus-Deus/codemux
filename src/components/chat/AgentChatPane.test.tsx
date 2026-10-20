@@ -480,7 +480,10 @@ vi.mock("@/hooks/use-agent-chat-events", () => ({
   useAgentChatEvents: vi.fn(),
 }));
 
-vi.mock("@/tauri/events", () => ({
+vi.mock("@/tauri/events", async (importOriginal) => ({
+  // Pure payload helper the pane applies to every live event.
+  withRetainedImages: (await importOriginal<typeof import("@/tauri/events")>())
+    .withRetainedImages,
   onAgentChatSessionsMerged: vi.fn().mockResolvedValue(() => {}),
   onAgentChatTurnCheckpoint: vi.fn().mockResolvedValue(() => {}),
   onAgentChatTurnCheckpointReverted: vi.fn().mockResolvedValue(() => {}),
