@@ -924,7 +924,7 @@ impl CodexSession {
             tasks: Mutex::new(Vec::new()),
             dead: Arc::new(AtomicBool::new(false)),
             workspace_id,
-            native_authority: crate::delegation::authority::NativeAuthority::new(&thread_id.0),
+            native_authority: crate::delegation::authority::NativeAuthority::with_policy(&thread_id.0,crate::agent_provider::ProviderKind::Codex,if resumed_plan==Some(true){Some("plan")}else{permission_mode.as_deref()}),
             managed: managed.clone(),
             host_caller,
             guidance: dynamic_tools.as_deref().and_then(developer_guidance),
@@ -1802,6 +1802,7 @@ impl CodexSession {
         if !self.mode_reported {
             self.plan_mode.store(mode == "plan", Ordering::SeqCst);
             self.turn_modes().inherited = mode == "plan";
+            self.native_authority.set_policy(crate::agent_provider::ProviderKind::Codex,if mode=="plan" {Some("plan")}else{self.host_caller.permission_mode.as_deref()});
         }
     }
 
@@ -1815,6 +1816,7 @@ impl CodexSession {
         if let Some(mode) = permission_mode_override {
             self.plan_mode.store(mode == "plan", Ordering::SeqCst);
         }
+        self.native_authority.set_policy(crate::agent_provider::ProviderKind::Codex,if self.plan_mode.load(Ordering::SeqCst){Some("plan")}else{self.host_caller.permission_mode.as_deref()});
     }
 
     /// Whether a send is between leaving the queue (or the send button)

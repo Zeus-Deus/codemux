@@ -84,6 +84,9 @@ pub(crate) fn authorize<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller) 
         }
         let canonical = super::permissions::Ceiling::for_mode(*provider, record.permission_mode.as_deref())
             .ok_or_else(|| ControlError::new("unsupported_permission_ceiling", "Canonical chat mode is unknown"))?;
+        if let Some(effective)=crate::delegation::authority::NativeAuthority::effective_ceiling(thread_id).map_err(|e|ControlError::new("unsupported_permission_ceiling",e))? {
+            if !effective.permits(*ceiling){return Err(ControlError::new("permission_ceiling","Effective native mode narrowed after admission"));}
+        }
         if !canonical.permits(*ceiling) { return Err(ControlError::new("permission_ceiling", "Calling chat policy was narrowed after admission")); }
         workspace(app, &record.workspace_id, true)?;
         return Ok(());

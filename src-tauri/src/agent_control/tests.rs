@@ -1932,7 +1932,7 @@ async fn native_caller_fixture(mode:&str)->(tauri::App<tauri::test::MockRuntime>
     let receipt=settle_operation(&app,&launched).await;
     assert_eq!(receipt["state"],"succeeded","{receipt}");
     let thread=receipt["thread_id"].as_str().unwrap().to_string();
-    let authority=crate::delegation::authority::NativeAuthority::new(&thread);
+    let authority=crate::delegation::authority::NativeAuthority::with_policy(&thread,crate::agent_provider::ProviderKind::Claude,Some(mode));
     let generation=authority.begin();assert!(authority.bind(generation,"native-run"));
     let actor=crate::delegation::app::NativeActor {thread_id:thread.clone(),provider:crate::agent_provider::ProviderKind::Claude,workspace_id:Some(workspace.clone()),session_id:format!("mock-{thread}"),permission_mode:Some(mode.into()),permit:authority.capture()};
     (app,provider,root,workspace,thread,authority,actor)
@@ -1971,6 +1971,9 @@ async fn native_callers_plan_ceiling_and_dispatch_downgrade(){
     let (app,_,_root,workspace,thread,_authority,actor)=native_caller_fixture("bypassPermissions").await;
     let caller=super::native::qualify(app.handle(),&actor).await.unwrap();
     let guard=NativeControlGuard {caller,workspace_id:workspace,thread_id:thread.clone(),provider:ProviderKind::Claude,admission:None}.retain_admission(app.handle());
+    _authority.set_policy(ProviderKind::Claude,Some("plan"));
+    assert!(guard.verify(app.handle()).unwrap_err().contains("permission_ceiling"),"per-turn downgrade is effective even before the persisted session mode changes");
+    _authority.set_policy(ProviderKind::Claude,Some("bypassPermissions"));
     app.state::<crate::database::DatabaseStore>().update_agent_chat_session_config(&thread,&crate::database::AgentChatSessionConfig{permission_mode:Some(Some("plan".into())),..Default::default()}).unwrap();
     assert!(guard.verify(app.handle()).unwrap_err().contains("permission_ceiling"));
 }

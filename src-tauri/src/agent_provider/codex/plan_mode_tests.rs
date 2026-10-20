@@ -127,11 +127,13 @@ async fn the_plan_pill_on_each_send_picks_the_turns_collaboration_mode() {
     provider.start_session(start_input(dir.path(), &thread)).await.unwrap();
 
     send(&provider, &thread, Some("plan")).await;
+    assert!(crate::delegation::authority::NativeAuthority::effective_ceiling(&thread.0).unwrap().unwrap().plan);
     send(&provider, &thread, Some("plan")).await;
     // A send that names no mode (e.g. a question answer) keeps Plan.
     send(&provider, &thread, None).await;
     // With the pill off the composer names the thread's own mode.
     send(&provider, &thread, Some("danger-full-access")).await;
+    assert!(!crate::delegation::authority::NativeAuthority::effective_ceiling(&thread.0).unwrap().unwrap().plan);
     // A restart or rebuild cannot drop Plan: the next send names it again,
     // and so does an answer that starts a turn.
     provider.stop_session(thread.clone()).await.unwrap();

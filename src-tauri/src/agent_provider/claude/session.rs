@@ -664,7 +664,7 @@ impl ClaudeSession {
                 mcp_registry
             },
             workspace_id: input.workspace_id.clone(),
-            native_authority: crate::delegation::authority::NativeAuthority::new(&thread_id.0),
+            native_authority: crate::delegation::authority::NativeAuthority::with_policy(&thread_id.0,crate::agent_provider::ProviderKind::Claude,input.permission_mode.as_deref()),
             managed_diagnostics: input
                 .extra
                 .get("managedDiagnostics")
@@ -1685,7 +1685,10 @@ impl ClaudeSession {
                 message: "managed workflow tool permissions cannot be relaxed".into(),
             });
         }
-        if self.state.lock().await.permission_mode.as_deref() != Some(&mode) { self.native_authority.invalidate(); }
+        if self.state.lock().await.permission_mode.as_deref() != Some(&mode) {
+            self.native_authority.invalidate();
+            self.native_authority.set_policy(crate::agent_provider::ProviderKind::Claude,Some(&mode));
+        }
         let params = SetPermissionModeParams {
             thread_id: self.thread_id.0.clone(),
             mode: mode.clone(),
