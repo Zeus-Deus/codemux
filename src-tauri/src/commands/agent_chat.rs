@@ -1573,9 +1573,12 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
             .as_ref()
             .and_then(extract_sdk_session_id)
         {
-            if let Err(error) =
-                db.set_agent_chat_sdk_session_id(&session.thread_id.0, &sdk_session_id)
-            {
+            // Not if a removal took the account this session started on.
+            if let Err(error) = crate::provider_accounts::store_reported_native(
+                &db,
+                &session.thread_id.0,
+                &sdk_session_id,
+            ) {
                 eprintln!(
                     "[codemux::agent_chat] failed to persist start-time resume cursor: {error}"
                 );
@@ -7694,11 +7697,17 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         resume_cursor,
     } = &event
     {
-        if let Some(sdk_session_id) = extract_sdk_session_id(resume_cursor) {
-            let db: State<'_, DatabaseStore> = app.state();
-            if let Err(error) = db.set_agent_chat_sdk_session_id(&thread_id.0, &sdk_session_id) {
+        let db: State<'_, DatabaseStore> = app.state();
+        // A session that left with a removed account may still report its id
+        // late; it isn't stored (where it would outlive the removal's
+        // in-memory refusal) and merges nothing.
+        let stored = |native: &str| {
+            crate::provider_accounts::store_reported_native(&db, &thread_id.0, native).unwrap_or_else(|error| {
                 eprintln!("[codemux::agent_chat] failed to persist sdk_session_id: {error}");
-            }
+                true
+            })
+        };
+        if let Some(sdk_session_id) = extract_sdk_session_id(resume_cursor).filter(|native| stored(native)) {
             let app = app.clone();
             let sdk_session_id = sdk_session_id.clone();
             tauri::async_runtime::spawn(async move {
