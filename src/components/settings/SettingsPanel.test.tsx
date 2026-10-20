@@ -944,6 +944,37 @@ describe("Settings footer navigation", () => {
   });
 });
 
+describe("Settings section tracking", () => {
+  it("follows the reader again once they scroll by the scrollbar after a jump", async () => {
+    const { useFooterPinsStore } = await import("@/stores/footer-pins-store");
+    useFooterPinsStore.getState().reset();
+    requestedSection = "terminal";
+    const view = render(<SettingsView />);
+    try {
+      const onThisPage = view.getByRole("navigation", { name: "On this page" });
+      const current = () => within(onThisPage).getByRole("button", { current: "location" });
+      const scrollArea = view.container.querySelector<HTMLElement>('[data-slot="scroll-area"]')!;
+      const viewport = scrollArea.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')!;
+      // The deep link holds Terminal while the scroll it caused settles.
+      await waitFor(() => expect(current()).toHaveTextContent("Terminal"));
+      fireEvent.scroll(viewport);
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      expect(current()).toHaveTextContent("Terminal");
+
+      // A thumb drag starts on the scrollbar, outside the viewport. jsdom
+      // has no layout, so the scroll then reads as the bottom: Browser.
+      fireEvent.pointerDown(scrollArea);
+      fireEvent.scroll(viewport);
+      await waitFor(() => expect(current()).toHaveTextContent("Browser"));
+      fireEvent.click(view.getByRole("button", { name: "Pin to footer" }));
+      expect(useFooterPinsStore.getState().pins.slice(-1)[0]?.id).toBe("codemux.settings.browser");
+    } finally {
+      view.unmount();
+      requestedSection = null;
+    }
+  });
+});
+
 describe("Settings destructive actions", () => {
   beforeEach(() => {
     cleanup();

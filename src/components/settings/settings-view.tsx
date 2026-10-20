@@ -1646,8 +1646,9 @@ export function SettingsView() {
   useEffect(() => {
     heldSection.current = null;
     setCurrentSection(pageSections[0] ?? null);
-    const viewport = viewportOf(contentScrollRef.current);
-    if (!viewport || pageSections.length < 2) return;
+    const scrollArea = contentScrollRef.current;
+    const viewport = viewportOf(scrollArea);
+    if (!scrollArea || !viewport || pageSections.length < 2) return;
     let frame = 0;
     const release = () => {
       heldSection.current = null;
@@ -1671,13 +1672,15 @@ export function SettingsView() {
         setCurrentSection(current);
       });
     };
+    // Reader input lands on the whole scroll area: the scrollbar is the
+    // viewport's sibling, so a thumb drag never reaches the viewport.
     const input = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
     viewport.addEventListener("scroll", update, { passive: true });
-    for (const type of input) viewport.addEventListener(type, release, { passive: true });
+    for (const type of input) scrollArea.addEventListener(type, release, { passive: true });
     return () => {
       cancelAnimationFrame(frame);
       viewport.removeEventListener("scroll", update);
-      for (const type of input) viewport.removeEventListener(type, release);
+      for (const type of input) scrollArea.removeEventListener(type, release);
     };
   }, [pageSections]);
 
