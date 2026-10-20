@@ -498,7 +498,7 @@ mod tests {
             .append_agent_chat_reply_with_image_job("src", &reply("/img/src/pending.png"))
             .unwrap()
             .unwrap();
-        assert_eq!(db.list_reply_image_jobs(), vec![pending]);
+        assert_eq!(db.list_reply_image_jobs(None), vec![pending]);
         let source = db.get_agent_chat_session("src").unwrap();
         let roots = vec![PathBuf::from("/img")];
         db.create_agent_chat_fork(&NewChatFork {
@@ -513,7 +513,7 @@ mod tests {
         })
         .unwrap();
 
-        let jobs = db.list_reply_image_jobs();
+        let jobs = db.list_reply_image_jobs(None);
         assert_eq!(jobs.len(), 2, "only the pending reply's copy gets a job");
         let forked = db.get_agent_chat_message_payload(jobs[1]).unwrap();
         assert!(forked.contains("/img/fork/pending.png"), "{forked}");

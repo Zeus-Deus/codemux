@@ -4187,7 +4187,7 @@ fn media_type_from_image_bytes(bytes: &[u8]) -> Result<String, String> {
 /// name is re-joined onto the canonical parent. Returns an error when the
 /// candidate has no parent/file component, when the parent cannot be
 /// resolved, or when it escapes `root`.
-fn resolve_within(root: &std::path::Path, candidate: &str) -> Result<std::path::PathBuf, String> {
+pub(super) fn resolve_within(root: &std::path::Path, candidate: &str) -> Result<std::path::PathBuf, String> {
     let candidate = std::path::Path::new(candidate);
     let file_name = candidate
         .file_name()
@@ -6875,7 +6875,9 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     // Best-effort: drop the chat's images alongside the DB rows. The
     // messages cascade via FK, but the image files live outside SQLite, so
     // nothing else would ever reclaim them. A failure here (missing dir is
-    // the common case) must not fail the delete.
+    // the common case) must not fail the delete. Reply image copies still
+    // in progress settle first, so none lands after the folder is gone.
+    super::reply_images::abandon_thread(&app, &thread_id).await;
     if let Some(root) = chat_images_root() {
         delete_chat_images_in(&root, &db, &thread_id);
     }

@@ -329,6 +329,9 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
     let thread_id = uuid::Uuid::new_v4().to_string();
     let title = fork_title(plan.source.title.as_deref());
     let cwd = plan.target_cwd.to_string_lossy().into_owned();
+    // Let the source's linked-image copies land first, so the fork copies
+    // them like any other image instead of racing their temp files.
+    super::reply_images::settle_thread(&app, &plan.source.thread_id).await;
     let fork_images = chat_images_dir_pub(&thread_id);
     let image_roots = fork_images
         .as_deref()

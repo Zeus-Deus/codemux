@@ -4911,17 +4911,45 @@ impl DatabaseStore {
         Ok(Some(row_id))
     }
 
-    /// Rows whose reply image copies have not been recorded yet.
-    pub fn list_reply_image_jobs(&self) -> Vec<i64> {
+    /// Rows whose reply image copies have not been recorded yet, in one
+    /// thread or in all of them.
+    pub fn list_reply_image_jobs(&self, thread_id: Option<&str>) -> Vec<i64> {
         let conn = self.conn.lock().unwrap();
-        let Ok(mut stmt) =
-            conn.prepare("SELECT row_id FROM agent_chat_reply_image_jobs ORDER BY row_id")
-        else {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT job.row_id FROM agent_chat_reply_image_jobs job
+             JOIN agent_chat_messages message ON message.id = job.row_id
+             WHERE ?1 IS NULL OR message.thread_id = ?1
+             ORDER BY job.row_id",
+        ) else {
             return Vec::new();
         };
-        stmt.query_map([], |row| row.get(0))
+        stmt.query_map(params![thread_id], |row| row.get(0))
             .map(|rows| rows.filter_map(Result::ok).collect())
             .unwrap_or_default()
+    }
+
+    /// Whether row `id` still waits for its reply image copies.
+    pub fn has_reply_image_job(&self, id: i64) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT 1 FROM agent_chat_reply_image_jobs WHERE row_id = ?1",
+            params![id],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    /// Drop `thread_id`'s pending reply image jobs, returning their rows.
+    pub fn take_reply_image_jobs(&self, thread_id: &str) -> Vec<i64> {
+        let rows = self.list_reply_image_jobs(Some(thread_id));
+        let conn = self.conn.lock().unwrap();
+        for row_id in &rows {
+            let _ = conn.execute(
+                "DELETE FROM agent_chat_reply_image_jobs WHERE row_id = ?1",
+                params![row_id],
+            );
+        }
+        rows
     }
 
     /// The stored payload of one message row, if it still exists.
