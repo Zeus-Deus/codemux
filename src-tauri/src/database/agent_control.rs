@@ -103,7 +103,7 @@ impl DatabaseStore {
                      AND json_extract(d.payload,'$.disposition') IN ('dispatched','cancelled'))
                AND NOT EXISTS (SELECT 1 FROM agent_message_deliveries m
                    WHERE m.thread_id=a.thread_id AND m.queued_id=json_extract(a.payload,'$.queued_id')
-                     AND m.state<>'queued')
+                     AND (m.state<>'queued' OR m.generation<>COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=m.thread_id),0)))
              ORDER BY a.id ASC",
         ).map_err(|e|e.to_string())?;
         let rows = statement.query_map(params![thread], |row|row.get(0)).map_err(|e|e.to_string())?;

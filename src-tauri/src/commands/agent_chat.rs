@@ -3868,7 +3868,7 @@ async fn send_turn_internal<R: Runtime>(
         .or(turn_checkpoint);
     let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = Some(Arc::new(crate::agent_control::delivery::DeliveryCheckpoint {
         app:app.clone(),id:context.delivery_id.clone().unwrap(),thread:input.thread_id.0.clone(),provider,
-        inner:turn_checkpoint, release_queue:context.release_queue,
+        inner:turn_checkpoint, release_queue:context.release_queue, admitted_generation:context.generation.unwrap_or_default(),
     }));
     let mut provenance = context.provenance.clone();
     let provider_input = SendTurnInput {

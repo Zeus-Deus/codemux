@@ -121,7 +121,10 @@ pub(crate) fn spawn<R: Runtime>(app: AppHandle<R>) {
     }
     tauri::async_runtime::spawn(async move {
         loop {
-            let _ = app.state::<DatabaseStore>().reconcile_pr_watch_deliveries();
+            match app.state::<DatabaseStore>().reconcile_pr_watch_deliveries() {
+                Ok(threads) => for thread in threads { changed(&app, &thread); },
+                Err(error) => log::warn!("PR-watch delivery reconciliation failed: {error}"),
+            }
             let rows = app.state::<DatabaseStore>().pending_message_deliveries();
             match rows {
                 Ok(rows) => {
@@ -230,6 +233,7 @@ pub(crate) struct DeliveryCheckpoint<R: Runtime> {
     pub provider: ProviderKind,
     pub inner: Option<Arc<dyn TurnDispatchCheckpoint>>,
     pub release_queue: bool,
+    pub admitted_generation: u64,
 }
 impl<R: Runtime> std::fmt::Debug for DeliveryCheckpoint<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -249,10 +253,12 @@ impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
         }
     }
     fn authorize_dispatch(&self) -> Result<(), crate::agent_provider::ProviderError> {
-        if let Some(inner) = &self.inner {
-            inner.authorize_dispatch()?;
-        }
         let db = self.app.state::<DatabaseStore>();
+        let record = db.message_delivery(&self.id).map_err(|message|crate::agent_provider::ProviderError::ValidationError {message})?;
+        let released_stops = record.as_ref().and_then(|row|row.generation.checked_sub(self.admitted_generation)).unwrap_or(0);
+        if let Some(inner) = &self.inner {
+            inner.authorize_rearmed_dispatch(released_stops)?;
+        }
         let binding = db.get_agent_chat_session(&self.thread);
         let valid = binding.as_ref().is_some_and(|record| {
             record.imported_from.is_none()

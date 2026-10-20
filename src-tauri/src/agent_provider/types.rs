@@ -95,6 +95,9 @@ pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
     /// Plain Git snapshots have no caller; the native owner wraps controlled
     /// inputs with a live authority check regardless of checkpoint settings.
     fn authorize_dispatch(&self) -> Result<(), super::ProviderError> { Ok(()) }
+    /// A durable human release may advance only the Stop fence of an
+    /// already queued input. Other authority checks remain live.
+    fn authorize_rearmed_dispatch(&self, _released_stops: u64) -> Result<(), super::ProviderError> { self.authorize_dispatch() }
     /// Only an explicit human action releases the provider queue hold.
     fn releases_queue_hold(&self) -> bool { true }
     fn queued_delivery_state(&self) -> QueuedDeliveryState { QueuedDeliveryState::Ready }

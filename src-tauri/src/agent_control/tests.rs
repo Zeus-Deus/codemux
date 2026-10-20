@@ -1169,6 +1169,7 @@ async fn orchestration_message_saved_resend_keeps_agent_identity_and_text_split(
     let launched=settle_operation(&app,&receipt).await;let thread=launched["thread_id"].as_str().unwrap();
     let db=app.state::<crate::database::DatabaseStore>();
     db.upsert_agent_chat_usage_resume(thread,"claude",Some(9999999999999)).unwrap();
+    db.control_record_queue_admission(thread,"saved").unwrap();
     db.insert_queued_turn(&crate::database::queued_turns::QueuedTurnRecord {
         provenance:MessageProvenance {message_id:Some("saved-agent-message".into()),created_by:CreatedBy::Agent,creation_source:CreationSource::Provider,
             sender_thread_id:Some("sender".into()),sender_title:Some("Review agent".into()),origin:Some(crate::commands::agent_chat::TurnOrigin::Delegation),..Default::default()},
@@ -1181,6 +1182,7 @@ async fn orchestration_message_saved_resend_keeps_agent_identity_and_text_split(
     assert_eq!(rows.len(),1);assert_eq!(rows[0]["message_id"],"saved-agent-message");assert_eq!(rows[0]["created_by"],"agent");
     assert_eq!(rows[0]["input_intent"],"queued_turn");assert_eq!(rows[0]["text"],"Visible brief");assert_eq!(rows[0]["agent_text"],"Visible brief\nAgent-only footer");
     assert!(db.get_agent_chat_usage_resume(thread).is_some());assert!(db.list_queued_turns(thread).is_empty());
+    assert!(db.control_unresolved_queued_ids(thread).unwrap().is_empty(), "legacy replay must retire its old native queue admission");
     assert!(provider.calls.snapshot().iter().any(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(_,text) if text=="Visible brief\nAgent-only footer")));
 }
 
@@ -1212,7 +1214,7 @@ async fn orchestration_message_stop_queue_release_rearms_retained_checkpoint() {
         let db=app.state::<crate::database::DatabaseStore>();
         db.admit_message_delivery("queued-b",thread,"b",&json!({"origin":"user"}),"epoch",0,None,true).unwrap();
         db.finish_message_delivery("queued-b","queued",Some(&json!({"queued_id":"b"})),None).unwrap();
-        let checkpoint=super::delivery::DeliveryCheckpoint {app:app.handle().clone(),id:"queued-b".into(),thread:thread.into(),provider:ProviderKind::Claude,inner:None,release_queue:false};
+        let checkpoint=super::delivery::DeliveryCheckpoint {app:app.handle().clone(),id:"queued-b".into(),thread:thread.into(),provider:ProviderKind::Claude,inner:None,release_queue:false,admitted_generation:0};
         db.stop_message_deliveries(thread).unwrap();
         assert!(checkpoint.authorize_dispatch().is_err());
         if send_now {
@@ -1466,4 +1468,29 @@ async fn orchestration_message_real_acp_machine_send_cannot_release_stopped_expl
         while !db.message_delivery_for_message(thread,"held-B").unwrap().unwrap().attempted { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
     }).await.unwrap();
     provider.stop_session(ThreadId(thread.into())).await.unwrap();
+}
+
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_controller_queue_release_refreshes_only_stop_fence() {
+    use crate::agent_provider::{ProviderKind,TurnDispatchCheckpoint};
+    let (app,_provider,_root,workspace)=fixture().await;
+    let launched=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"retained-guard-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let launched=settle_operation(&app,&launched).await;let thread=launched["thread_id"].as_str().unwrap();
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.admit_message_delivery("retained-B",thread,"retained-B",&json!({"origin":"controller"}),"epoch",0,None,true).unwrap();
+    db.finish_message_delivery("retained-B","queued",Some(&json!({"queued_id":"B"})),None).unwrap();
+    let control=NativeControlGuard {caller:ControlCaller::trusted(),workspace_id:workspace.clone(),thread_id:thread.into(),provider:ProviderKind::Claude,admission:None}.retain_admission(app.handle());
+    let checkpoint=super::delivery::DeliveryCheckpoint {
+        app:app.handle().clone(),id:"retained-B".into(),thread:thread.into(),provider:ProviderKind::Claude,
+        release_queue:false,admitted_generation:0,inner:Some(Arc::new(super::GuardedTurnCheckpoint {app:app.handle().clone(),control,inner:None})),
+    };
+    let gate=app.state::<NativeControlState>().thread_gate(thread);
+    gate.cancel();db.stop_message_deliveries(thread).unwrap();
+    assert!(checkpoint.authorize_dispatch().is_err());
+    crate::commands::agent_chat::send_desktop_turn(app.handle().clone(),ProviderKind::Claude,serde_json::from_value(json!({"thread_id":thread,"text":"human C","client_nonce":"release-C"})).unwrap()).await.unwrap();
+    checkpoint.authorize_dispatch().unwrap();
+    // A later provider restart/rebind is not a human release of another Stop.
+    gate.cancel();
+    assert!(checkpoint.authorize_dispatch().is_err());
 }

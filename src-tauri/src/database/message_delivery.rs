@@ -201,7 +201,7 @@ impl DatabaseStore {
     /// Pending machine wakes disposed by Stop must never walk back in.
     pub fn resume_message_delivery_thread(&self, thread: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE agent_message_deliveries SET state=CASE WHEN queued_id IS NOT NULL THEN 'queued' WHEN json_extract(payload,'$.origin')='user' THEN 'preparing' ELSE 'pending' END,generation=COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1),0),error=NULL
+        conn.execute("UPDATE agent_message_deliveries SET state=CASE WHEN queued_id IS NOT NULL THEN 'queued' WHEN json_extract(payload,'$.origin')='controller' AND (attempt_count=0 OR retry_at IS NOT NULL) THEN 'pending' ELSE 'preparing' END,generation=COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1),0),error=NULL
             WHERE thread_id=?1 AND state='held' AND attempted=0 AND json_extract(payload,'$.origin') IN ('user','controller')", [thread]).map(drop).map_err(|e|e.to_string())
     }
     pub fn acknowledge_message_delivery(&self, thread: &str, id: &str) -> Result<(), String> {
@@ -322,9 +322,14 @@ impl DatabaseStore {
     }
     /// Hand definite no-send failures back to PR watch atomically. Its spent
     /// attempt stays spent, so rescheduling cannot bypass the watch budget.
-    pub fn reconcile_pr_watch_deliveries(&self) -> Result<(), String> {
+    pub fn reconcile_pr_watch_deliveries(&self) -> Result<Vec<String>, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e|e.to_string())?;
+        let changed_threads = {
+            let mut stmt=tx.prepare("SELECT DISTINCT thread_id FROM agent_message_deliveries WHERE state='rejected' AND attempted=0 AND origin_notified=0 AND json_extract(payload,'$.origin')='pr_watch'").map_err(|e|e.to_string())?;
+            let rows=stmt.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
+            rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?
+        };
         tx.execute("DELETE FROM pr_watch_seen WHERE EXISTS (
             SELECT 1 FROM agent_message_deliveries d JOIN pr_watches w ON w.thread_id=d.thread_id
             JOIN json_each(d.payload,'$.pr_watch.event_keys') k ON k.value=pr_watch_seen.event_key
@@ -334,7 +339,8 @@ impl DatabaseStore {
             SELECT 1 FROM agent_message_deliveries d WHERE d.thread_id=pr_watches.thread_id AND d.state='rejected' AND d.attempted=0 AND d.origin_notified=0
             AND json_extract(d.payload,'$.origin')='pr_watch' AND pr_watches.generation=json_extract(d.payload,'$.pr_watch.generation'))",[]).map_err(|e|e.to_string())?;
         tx.execute("UPDATE agent_message_deliveries SET origin_notified=1 WHERE state='rejected' AND attempted=0 AND json_extract(payload,'$.origin')='pr_watch'",[]).map_err(|e|e.to_string())?;
-        tx.commit().map_err(|e|e.to_string())
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(changed_threads)
     }
     pub fn pending_message_deliveries(&self) -> Result<Vec<DeliveryRecord>, String> {
         let conn = self.conn.lock().unwrap();
@@ -1012,11 +1018,14 @@ mod tests {
 
     #[test]
     fn orchestration_message_stop_before_queue_ack_preserves_manual_release() {
-        for release_first in [false,true] {
+        for (origin,release_first) in ["user","controller"].into_iter().flat_map(|origin|[false,true].map(|release|(origin,release))) {
             let db=super::super::init_test_database();
-            db.admit_message_delivery("b","receiver","b",&json!({"origin":"user"}),"epoch",0,None,true).unwrap();
+            db.admit_message_delivery("b","receiver","b",&json!({"origin":origin}),"epoch",0,None,true).unwrap();
             db.stop_message_deliveries("receiver").unwrap();
-            if release_first { db.resume_message_delivery_thread("receiver").unwrap(); }
+            if release_first {
+                db.resume_message_delivery_thread("receiver").unwrap();
+                assert!(db.pending_message_deliveries().unwrap().is_empty(), "an in-flight queue ACK still owns this message");
+            }
             db.finish_message_delivery("b","queued",Some(&json!({"queued_id":"b-queue"})),None).unwrap();
             if !release_first {
                 assert_eq!(db.message_delivery("b").unwrap().unwrap().state,"held");
@@ -1123,7 +1132,8 @@ mod tests {
         db.admit_message_delivery("wake","receiver","wake",&json!({"origin":"pr_watch"}),"epoch-a",0,None,true).unwrap();
         db.finish_message_delivery("wake","rejected",None,Some("before send")).unwrap();
         assert!(db.message_delivery("wake").unwrap().unwrap().can_retry());
-        db.reconcile_pr_watch_deliveries().unwrap();
+        assert_eq!(db.reconcile_pr_watch_deliveries().unwrap(),vec!["receiver"]);
+        assert!(db.reconcile_pr_watch_deliveries().unwrap().is_empty());
         assert!(!db.message_delivery("wake").unwrap().unwrap().can_retry());
         assert!(db.retry_message_delivery("receiver","wake").is_err());
         assert!(!db.claim_message_delivery("wake").unwrap());

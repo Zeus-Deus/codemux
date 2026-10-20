@@ -513,7 +513,14 @@ pub(crate) async fn send_saved_queued_turn<R: Runtime>(
     context.provenance = row.provenance.clone();
     context.provenance.input_intent = crate::agent_provider::message::InputIntent::QueuedTurn;
     context.delivery_id = context.provenance.delivery_id.clone();
-    if let Some(id) = &context.delivery_id { db.rearm_saved_message_delivery(id,&thread_id.0,&queued_id)?; context.claimed=true; }
+    if let Some(id) = &context.delivery_id {
+        db.rearm_saved_message_delivery(id,&thread_id.0,&queued_id)?;
+        context.claimed=true;
+    } else {
+        // Legacy saved messages have no delivery journal row, but their old
+        // native queue admission must still retire before replay.
+        db.control_record_queue_event(&ProviderRuntimeEvent::QueuedTurnCancelled {thread_id:thread_id.clone(),queued_id:queued_id.clone()})?;
+    }
     context.release_queue = release_queue;
     if release_queue { db.resume_message_delivery_thread(&thread_id.0)?; }
     let result = super::agent_chat::send_turn_with_context(app.clone(), provider, input, context).await?;
