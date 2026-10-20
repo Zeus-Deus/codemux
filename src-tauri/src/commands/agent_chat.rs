@@ -8724,20 +8724,12 @@ fn map_event_to_pane_status(
                     .filter(|status| *status != PaneStatus::Working)
             }
         },
-        ProviderRuntimeEvent::TurnCompleted { status, .. } => {
+        ProviderRuntimeEvent::TurnCompleted { .. } => {
             // The run is over as far as the parent is concerned. Whether it
             // *settles* depends only on real agent work still being tracked;
             // watch loops deliberately do not hold it open, they only change
             // which settled status is shown.
             state.turn_settled = true;
-            // A provider-side interrupt (Send now promotes a queued turn by
-            // interrupting the running one) ends the tasks the turn spawned,
-            // as a Stop does, without their terminal snapshots. Release the
-            // fork/switch hold here: the replacement turn's own children
-            // arrive after this, in event order.
-            if matches!(status, crate::agent_provider::TurnStatus::Error { subtype, .. } if subtype == "interrupted") {
-                state.live_agents.clear();
-            }
             state.settled_status()
         }
         ProviderRuntimeEvent::SessionStateChanged { status, .. } => match status {
@@ -12876,30 +12868,6 @@ mod tests {
         assert_eq!(tracker.decide("t", &subagent_event("s1", SubagentStatus::Completed), now), None);
         assert!(!tracker.delegated_work_live("t"));
         assert_eq!(tracker.tracked_thread_count(), 0);
-    }
-
-    // Send now promotes a queued turn by interrupting the running one: the
-    // interrupted end releases the cancelled children's fork/switch hold,
-    // and the replacement turn's own children hold it again.
-    #[test]
-    fn an_interrupted_turn_end_releases_the_hold_and_the_next_child_takes_it() {
-        let tracker = SubagentTracker::default();
-        let now = SystemTime::now();
-        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), now);
-        let ended = |subtype: &str| ProviderRuntimeEvent::TurnCompleted {
-            thread_id: tid(),
-            turn_id: turn(),
-            status: TurnStatus::Error { subtype: subtype.into(), message: String::new() },
-            usage: None,
-        };
-        tracker.decide("t", &ended("interrupted"), now);
-        assert!(!tracker.delegated_work_live("t"), "the interrupt ended s1");
-        tracker.begin_turn("t");
-        tracker.decide("t", &subagent_event("s2", SubagentStatus::Running), now);
-        assert!(tracker.delegated_work_live("t"), "the replacement turn's child holds again");
-        // A turn that merely fails keeps the hold.
-        tracker.decide("t", &ended("error"), now);
-        assert!(tracker.delegated_work_live("t"));
     }
 
     // `agent_chat_turn_active`'s second signal, exercised through the
