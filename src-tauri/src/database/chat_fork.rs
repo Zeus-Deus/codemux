@@ -65,12 +65,13 @@ pub struct NewChatFork<'a> {
     pub title: &'a str,
     /// Copy only rows before this source row id; `None` copies them all.
     pub cut_before: Option<i64>,
-    /// The chat-image root and the fork's folder. Inherited images anywhere
-    /// under the root (the source's folder, or that of a chat it absorbed by
-    /// a history reopen) are re-pointed into the fork's own folder, so the
-    /// fork and its source never share a file: deleting or reverting either
-    /// can't break the other.
-    pub image_dirs: Option<(&'a Path, &'a Path)>,
+    /// The chat-image root, as written and as canonicalized (a resent image
+    /// is stored by its canonical path), and the fork's folder. Inherited
+    /// images anywhere under the root (the source's folder, or that of a
+    /// chat it absorbed by a history reopen) are re-pointed into the fork's
+    /// own folder, so the fork and its source never share a file: deleting
+    /// or reverting either can't break the other.
+    pub image_dirs: Option<(&'a [PathBuf], &'a Path)>,
 }
 
 /// An inherited image the fork's transcript now points at: copy `from` to
@@ -97,7 +98,7 @@ pub(crate) fn rewrite_forked_payload(
     payload: &str,
     fork_thread_id: &str,
     copied_ids: &HashMap<i64, i64>,
-    image_dirs: Option<(&Path, &Path)>,
+    image_dirs: Option<(&[PathBuf], &Path)>,
     images: &mut Vec<ForkedImage>,
 ) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
@@ -115,7 +116,7 @@ pub(crate) fn rewrite_forked_payload(
             object.insert("user_message_id".into(), (*copied).into());
         }
     }
-    if let (Some((root, fork_dir)), Some(list)) = (
+    if let (Some((roots, fork_dir)), Some(list)) = (
         image_dirs,
         object.get_mut("images").and_then(serde_json::Value::as_array_mut),
     ) {
@@ -125,8 +126,10 @@ pub(crate) fn rewrite_forked_payload(
             };
             let from = PathBuf::from(path);
             // A transcript row is data: only plain paths under the root move.
-            let inside = from.strip_prefix(root).is_ok_and(|rest| {
-                rest.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+            let inside = roots.iter().any(|root| {
+                from.strip_prefix(root).is_ok_and(|rest| {
+                    rest.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+                })
             });
             let (true, Some(name)) = (inside, from.file_name()) else {
                 continue;
@@ -416,13 +419,15 @@ mod tests {
     #[test]
     fn rewrite_moves_inherited_images_into_the_forks_folder() {
         let mut images = Vec::new();
-        // `/img/old` belongs to a chat the source absorbed by a history
-        // reopen: its images are the source's now, so they move too.
+        // `old` belongs to a chat the source absorbed by a history reopen:
+        // its images are the source's now, so they move too, whichever form
+        // of the root (`/real/img` is its canonical path) they were saved by.
+        let roots = vec![PathBuf::from("/real/img"), PathBuf::from("/img")];
         let row = rewrite_forked_payload(
-            r#"{"type":"user_message","text":"look","images":[{"path":"/img/src/a.png","media_type":"image/png"},{"path":"/elsewhere/b.png"},{"path":"/img/old/c.png"},{"path":"/img/../etc/d.png"}]}"#,
+            r#"{"type":"user_message","text":"look","images":[{"path":"/img/src/a.png","media_type":"image/png"},{"path":"/elsewhere/b.png"},{"path":"/real/img/old/c.png"},{"path":"/img/../etc/d.png"}]}"#,
             "fork",
             &HashMap::new(),
-            Some((Path::new("/img"), Path::new("/img/fork"))),
+            Some((roots.as_slice(), Path::new("/img/fork"))),
             &mut images,
         );
         let row: serde_json::Value = serde_json::from_str(&row).unwrap();
@@ -435,7 +440,7 @@ mod tests {
             images,
             vec![
                 (PathBuf::from("/img/src/a.png"), fork("a.png")),
-                (PathBuf::from("/img/old/c.png"), fork("c.png")),
+                (PathBuf::from("/real/img/old/c.png"), fork("c.png")),
             ]
         );
     }

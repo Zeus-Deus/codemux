@@ -6607,6 +6607,10 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
     select: Option<bool>,
 ) -> Result<OpenAgentChatSearchResult, String> {
     feature_flag_on(&observability)?;
+    // Held from reading the chat through binding its pane, so a history
+    // reopen can't merge the chat away in between (`merge_reopened_chat`).
+    let gate = native_thread_gate(&app, &thread_id);
+    let dispatch_guard = gate.dispatch.clone().lock_owned().await;
     let record = db
         .get_agent_chat_session(&thread_id)
         .ok_or_else(|| format!("conversation_not_found: {thread_id}"))?;
@@ -6636,6 +6640,7 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
             .0;
         pane_id.0
     };
+    drop(dispatch_guard);
 
     // Pane activation selects the workspace/surface, while tab activation is
     // a separate state field. Resolve both from one immutable snapshot and
@@ -6884,6 +6889,10 @@ fn agent_chat_sessions_merged<R: Runtime>(
         }
         if !db.list_follow_up_tasks(&survivor).is_empty() {
             super::follow_ups::emit_changed(app, &survivor);
+        }
+        // A reopened follow-up task: its parent's card now links the survivor.
+        if let Some(task) = db.get_follow_up_task(&survivor) {
+            super::follow_ups::emit_changed(app, &task.parent_thread_id);
         }
     }
     cleanup_collapsed_session_resources(cleanup)
@@ -9852,6 +9861,7 @@ mod tests {
         db.append_agent_chat_message("b", &message.to_string()).unwrap();
         let source = db.get_agent_chat_session("b").unwrap();
         let fork_dir = root.path().join("c");
+        let roots = vec![root.path().to_path_buf()];
         let images = db
             .create_agent_chat_fork(&crate::database::chat_fork::NewChatFork {
                 thread_id: "c",
@@ -9861,7 +9871,7 @@ mod tests {
                 cwd: "/repo",
                 title: "fork",
                 cut_before: None,
-                image_dirs: Some((root.path(), &fork_dir)),
+                image_dirs: Some((roots.as_slice(), &fork_dir)),
             })
             .unwrap();
         for (from, to) in images {

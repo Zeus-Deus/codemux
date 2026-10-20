@@ -294,7 +294,14 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
     let title = fork_title(plan.source.title.as_deref());
     let cwd = plan.target_cwd.to_string_lossy().into_owned();
     let fork_images = chat_images_dir_pub(&thread_id);
-    let image_root = fork_images.as_deref().and_then(std::path::Path::parent);
+    let image_roots = fork_images
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .map(|root| {
+            let mut roots = vec![root.to_path_buf()];
+            roots.extend(root.canonicalize().ok().filter(|canonical| canonical != root));
+            roots
+        });
     let images = db.create_agent_chat_fork(&NewChatFork {
         thread_id: &thread_id,
         source: &plan.source,
@@ -303,7 +310,7 @@ pub async fn agent_chat_fork_thread<R: Runtime>(
         cwd: &cwd,
         title: &title,
         cut_before,
-        image_dirs: image_root.zip(fork_images.as_deref()),
+        image_dirs: image_roots.as_deref().zip(fork_images.as_deref()),
     })?;
     // The fork resumes on the account that holds its native session.
     db.copy_provider_account_bindings(&plan.source.thread_id, &thread_id)?;
