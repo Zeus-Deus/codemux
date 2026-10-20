@@ -2275,3 +2275,16 @@ async fn native_callers_saved_agent_send_rearms_after_sender_pane_closes() {
     assert_eq!(row.message_id,"saved-agent-message");assert!(row.attempted);assert_eq!(row.state,"accepted");
     assert_eq!(provider.calls.snapshot().iter().filter(|c|matches!(c,mock_agent_provider::MockCall::SendTurn(t,text) if t.0==receiver && text=="Retained agent report")).count(),1);
 }
+
+#[tokio::test]
+async fn native_callers_queued_human_keeps_active_turn_authority_until_stop() {
+    let (app,_,_root,_workspace,thread,authority,actor)=native_caller_fixture("default").await;
+    let caller=native::qualify(app.handle(),&actor).await.unwrap();
+    crate::delegation::authority::NativeAuthority::user_activity_thread(&thread,false);
+    service::authorize(app.handle(),&caller).unwrap();
+    caller.admit(||Ok(())).unwrap();
+    actor.permit.identity().unwrap();
+    authority.invalidate();
+    assert!(service::authorize(app.handle(),&caller).is_err());
+    assert!(caller.admit(||Ok(())).is_err());
+}

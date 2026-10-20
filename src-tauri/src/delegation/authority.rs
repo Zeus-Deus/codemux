@@ -37,7 +37,6 @@ pub(crate) struct NativePermit {
 pub struct AuthorityIdentity {
     session_key: String,
     generation: u64,
-    activity: u64,
     pub run_id: Option<String>,
 }
 impl AuthorityIdentity {
@@ -90,7 +89,6 @@ impl AuthorityIdentity {
             || !state.live
             || !state.tools_live
             || state.generation != self.generation
-            || state.activity != self.activity
             || state.turn.is_none()
             || state.turn != self.run_id
         {
@@ -327,7 +325,6 @@ impl NativePermit {
         Ok(AuthorityIdentity {
             session_key: self.owner.session_key.clone(),
             generation: self.generation,
-            activity: state.activity,
             run_id: state.turn.clone(),
         })
     }
