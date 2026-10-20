@@ -916,6 +916,12 @@ pub(crate) fn tests_claim_waking(thread_id: &str) -> impl Drop {
     Waking::claim(thread_id)
 }
 
+/// Run `f` with the chats a wake is in flight for, atomically with a wake
+/// claiming one (see [`unless_waking`]): `f` must leave those chats alone.
+pub(crate) fn unless_any_waking<T>(f: impl FnOnce(&HashSet<String>) -> T) -> T {
+    f(&waking())
+}
+
 /// Undo what [`evaluate`] spent on a wake that never reached the chat.
 fn refund_wake(next: &mut PrWatchRecord, before: &PrWatchRecord, report: &WakeReport) {
     if report.is_fix() {

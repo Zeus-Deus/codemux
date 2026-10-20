@@ -4648,6 +4648,16 @@ impl DatabaseStore {
         &self,
         sdk_session_id: &str,
     ) -> Result<AgentChatSessionCleanup, String> {
+        self.collapse_duplicate_agent_chat_sessions_sparing(sdk_session_id, &HashSet::new())
+    }
+
+    /// [`Self::collapse_duplicate_agent_chat_sessions`], skipped while any
+    /// row that would be merged away is in `spared`.
+    pub fn collapse_duplicate_agent_chat_sessions_sparing(
+        &self,
+        sdk_session_id: &str,
+        spared: &HashSet<String>,
+    ) -> Result<AgentChatSessionCleanup, String> {
         let mut conn = self.conn.lock().unwrap();
         let transaction = conn
             .transaction()
@@ -4665,6 +4675,22 @@ impl DatabaseStore {
         let Some(survivor) = survivor else {
             return Ok(AgentChatSessionCleanup::default());
         };
+        if !spared.is_empty() {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT thread_id FROM agent_chat_sessions
+                     WHERE sdk_session_id = ?1 AND thread_id != ?2",
+                )
+                .map_err(|e| format!("Failed to read duplicate sessions: {e}"))?;
+            let merged = statement
+                .query_map(params![sdk_session_id, survivor], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("Failed to read duplicate sessions: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to read duplicate sessions: {e}"))?;
+            if merged.iter().any(|thread| spared.contains(thread)) {
+                return Ok(AgentChatSessionCleanup::default());
+            }
+        }
         let cleanup = merge_agent_chat_session_rows(
             &transaction,
             "sdk_session_id = ?1",
@@ -7944,6 +7970,28 @@ mod tests {
         assert!(db.merge_reopened_agent_chat_session("codex-new", "claude-new").unwrap().thread_ids.is_empty());
         assert!(db.merge_reopened_agent_chat_session("missing", "other").unwrap().thread_ids.is_empty());
         assert!(db.get_agent_chat_session("codex-new").is_some());
+    }
+
+    #[test]
+    fn a_collapse_spares_a_chat_that_would_be_merged_away() {
+        let db = init_test_database();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('old', 'sdk-1', 'ws', 'claude', '2025-01-01', '2025-01-01'),
+                        ('new', 'sdk-1', 'ws', 'claude', '2025-03-01', '2025-03-01')",
+            )
+            .unwrap();
+        let spared = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<HashSet<_>>();
+        let skipped = db.collapse_duplicate_agent_chat_sessions_sparing("sdk-1", &spared(&["old"])).unwrap();
+        assert!(skipped.thread_ids.is_empty());
+        assert!(db.get_agent_chat_session("old").is_some());
+        // Sparing the survivor doesn't hold the merge back: it isn't deleted.
+        let merged = db.collapse_duplicate_agent_chat_sessions_sparing("sdk-1", &spared(&["new"])).unwrap();
+        assert_eq!(merged.thread_ids, vec!["old".to_string()]);
     }
 
     #[test]

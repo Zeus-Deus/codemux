@@ -6834,6 +6834,20 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     Ok(())
 }
 
+/// Resume creates a fresh DB row (new thread_id) carrying the same
+/// sdk_session_id as the original. Collapse the duplicates so the dropdown
+/// doesn't grow unboundedly, unless a pull-request wake already committed
+/// for one of the rows that would go is about to send to it.
+fn collapse_resumed_duplicates<R: Runtime>(app: &AppHandle<R>, db: &DatabaseStore, sdk_session_id: &str) {
+    let collapsed = crate::pr_watch::unless_any_waking(|waking| {
+        db.collapse_duplicate_agent_chat_sessions_sparing(sdk_session_id, waking)
+    });
+    match collapsed {
+        Ok(cleanup) => agent_chat_sessions_merged(app, db, cleanup),
+        Err(error) => eprintln!("[codemux::agent_chat] failed to collapse duplicates: {error}"),
+    }
+}
+
 /// Merge the chat a history pick reopened (`from`) into the thread that now
 /// runs it. The old chat must be idle: open in no pane, and with no live
 /// session (a pull-request wake can resume a closed chat headless). Its
@@ -7616,15 +7630,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             if let Err(error) = db.set_agent_chat_sdk_session_id(&thread_id.0, &sdk_session_id) {
                 eprintln!("[codemux::agent_chat] failed to persist sdk_session_id: {error}");
             }
-            // Resume creates a fresh DB row (new thread_id) carrying the
-            // same sdk_session_id as the original. Collapse the
-            // duplicates so the dropdown doesn't grow unboundedly.
-            match db.collapse_duplicate_agent_chat_sessions(&sdk_session_id) {
-                Ok(cleanup) => agent_chat_sessions_merged(app, &db, cleanup),
-                Err(error) => {
-                    eprintln!("[codemux::agent_chat] failed to collapse duplicates: {error}");
-                }
-            }
+            collapse_resumed_duplicates(app, &db, &sdk_session_id);
         } else if resume_cursor.is_null() {
             // A JSON-null cursor is the stale-session recovery signal (the
             // sidecar rebuilt a fresh query because the persisted id's
@@ -11382,7 +11388,16 @@ mod tests {
         let waking = crate::pr_watch::tests_claim_waking("old");
         merge().await;
         assert!(db.get_agent_chat_session("old").is_some(), "a committed PR wake is on its way");
-        drop(waking);
+        // Nor does a matching provider session id collapse it meanwhile
+        // (both rows are marked: they share a timestamp, so either could be
+        // the survivor; database tests pin which rows are spared).
+        let also_waking = crate::pr_watch::tests_claim_waking("reopened");
+        db.set_agent_chat_sdk_session_id("old", "native-1").unwrap();
+        db.set_agent_chat_sdk_session_id("reopened", "native-1").unwrap();
+        collapse_resumed_duplicates(&handle, &db, "native-1");
+        assert!(db.get_agent_chat_session("old").is_some());
+        assert!(db.get_agent_chat_session("reopened").is_some());
+        drop((waking, also_waking));
 
         merge().await;
         assert!(db.get_agent_chat_session("old").is_none());
