@@ -1,3 +1,4 @@
+import { nativeToolCall, presentationToolName } from "@/lib/agent-chat/native-tool-call";
 import {
   formatElapsed,
   isRunning,
@@ -72,7 +73,8 @@ export function describeStep(step: ActivityStep): { verb: string; summary: strin
   }
   const { target, argument } = describeToolCall(step);
   const summary = [target, argument].filter(Boolean).join(" ");
-  const verb = VERB_BY_TOOL[step.tool_name] ?? step.tool_name.toLowerCase();
+  const name = presentationToolName(step);
+  const verb = VERB_BY_TOOL[name] ?? name.toLowerCase();
   return { verb, summary };
 }
 
@@ -83,7 +85,7 @@ export function stepMeta(step: ActivityStep): string {
   if (status === "running") return "running";
   if (status === "error") return "failed";
   if (isReasoning(step)) return "";
-  switch (step.tool_name) {
+  switch (presentationToolName(step)) {
     case "Edit":
     case "MultiEdit":
     case "Write": {
@@ -167,12 +169,13 @@ export function traceStepTitle(step: ActivityStep): TraceStepTitle {
   }
   const described = describeToolCall(step);
   const status = stepStatus(step);
-  const verbs = TRACE_VERBS[step.tool_name];
+  const name = presentationToolName(step);
+  const verbs = TRACE_VERBS[name];
   let verb: string;
   if (status === "unconfirmed") {
     // The call started but never reported back, so the title must not claim
     // it finished ("Wrote") or failed.
-    verb = `Started ${verbs ? verbs.running.toLowerCase() : `calling ${step.tool_name}`}`;
+    verb = `Started ${verbs ? verbs.running.toLowerCase() : `calling ${name}`}`;
   } else if (verbs) {
     verb = status === "running" ? verbs.running : status === "error" ? verbs.error : verbs.done;
   } else if (!described.verb.startsWith("Called ")) {
@@ -182,10 +185,10 @@ export function traceStepTitle(step: ActivityStep): TraceStepTitle {
   } else {
     verb =
       status === "running"
-        ? `Calling ${step.tool_name}`
+        ? `Calling ${name}`
         : status === "error"
-          ? `Failed to call ${step.tool_name}`
-          : `Called ${step.tool_name}`;
+          ? `Failed to call ${name}`
+          : `Called ${name}`;
   }
   return { verb, target: described.target, argument: described.argument };
 }
@@ -336,7 +339,7 @@ export function deriveActivitySummary(steps: ActivityStep[]): string {
   let other = 0;
   for (const s of steps) {
     if (isReasoning(s)) continue;
-    switch (FAMILY_BY_TOOL[s.tool_name] ?? "other") {
+    switch (FAMILY_BY_TOOL[presentationToolName(s)] ?? "other") {
       case "read":
         reads += 1;
         break;
@@ -427,6 +430,16 @@ export function editCounts(item: ToolCallItem): EditCounts | null {
 }
 
 function computeEditCounts(item: ToolCallItem): EditCounts | null {
+  const native = nativeToolCall(item);
+  if (native?.kind === "file_change") {
+    // Codex already ships each file's diff; sum its lines instead of
+    // re-diffing.
+    if (native.changes.length === 0) return null;
+    return native.changes.reduce(
+      (sum, change) => ({ added: sum.added + change.added, removed: sum.removed + change.removed }),
+      { added: 0, removed: 0 },
+    );
+  }
   const input = isRecord(item.input) ? item.input : null;
   if (!input) return null;
   let oldText: string;

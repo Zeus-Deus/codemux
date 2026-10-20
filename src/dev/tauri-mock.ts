@@ -130,6 +130,7 @@ import {
   workflowRunningEnvelopes,
 } from "./mock-fixtures";
 import { HTML_RENDER_FIXTURE_HTML, HTML_RENDER_FIXTURE_TITLE } from "./html-render-fixture";
+import { codexNativeToolEnvelopes } from "./codex-native-tools-fixture";
 import {
   STRESS_THREAD_PREFIX,
   getStressFixture,
@@ -2382,6 +2383,10 @@ function mockChatTranscript(threadId = MOCK_CHAT_THREAD_ID): string[] {
       status: { kind: "success" },
       usage: null,
     });
+  }
+
+  if (new URLSearchParams(location.search).get("nativeTools") === "1") {
+    for (const envelope of codexNativeToolEnvelopes(T, "seed-native-tools")) push(envelope);
   }
 
   mockChatTranscriptCache.set(threadId, out);

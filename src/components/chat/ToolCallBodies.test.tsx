@@ -552,3 +552,157 @@ describe("Tool result images", () => {
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
   });
 });
+
+describe("Codex native items", () => {
+  const commandInput = {
+    type: "commandExecution",
+    id: "exec-1",
+    command: "/usr/bin/bash -lc 'npm test -- src/a.test.ts'",
+    cwd: "/repo",
+    aggregatedOutput: null,
+    exitCode: null,
+    status: "inProgress",
+  };
+
+  it("renders a command like Bash, from a stdout result", () => {
+    const { container } = render(
+      <ToolCallBody
+        item={makeTool({ tool_name: "commandExecution", input: commandInput, result_content: "Tests 3 passed" })}
+      />,
+      { wrapper: TooltipProvider },
+    );
+    expect(screen.getByText("npm test -- src/a.test.ts")).toBeInTheDocument();
+    expect(screen.getByText("Tests 3 passed")).toBeInTheDocument();
+    expect(container.textContent).not.toContain("/usr/bin/bash");
+    expect(container.textContent).not.toContain("exec-1");
+  });
+
+  it("reads output and exit code from a retained envelope result", () => {
+    const { container } = render(
+      <ToolCallBody
+        item={makeTool({
+          tool_name: "commandExecution",
+          input: commandInput,
+          status: "error",
+          result_content: { ...commandInput, aggregatedOutput: "1 failed", exitCode: 2, status: "failed" },
+        })}
+      />,
+      { wrapper: TooltipProvider },
+    );
+    expect(screen.getByText("1 failed")).toBeInTheDocument();
+    expect(screen.getByLabelText("Exit code 2")).toBeInTheDocument();
+    expect(container.textContent).not.toContain("aggregatedOutput");
+  });
+
+  it("renders each changed file as a diff", () => {
+    render(
+      <ToolCallBody
+        item={makeTool({
+          tool_name: "fileChange",
+          input: {
+            type: "fileChange",
+            id: "call-1",
+            changes: [
+              { path: "/repo/src/a.ts", kind: { type: "update", move_path: null }, diff: "@@ -1,1 +1,1 @@\n-const a = 1;\n+const a = 2;\n" },
+              { path: "/repo/src/new.ts", kind: { type: "add" }, diff: "export const b = 3;\n" },
+            ],
+          },
+          result_content: { type: "fileChange", id: "call-1", status: "completed", changes: [] },
+        })}
+      />,
+      { wrapper: TooltipProvider },
+    );
+    expect(screen.getByText("/repo/src/a.ts")).toBeInTheDocument();
+    expect(screen.getByText("/repo/src/new.ts")).toBeInTheDocument();
+    expect(screen.getByText("const a = 1;")).toBeInTheDocument();
+    expect(screen.getByText("const a = 2;")).toBeInTheDocument();
+    expect(screen.getByText("export const b = 3;")).toBeInTheDocument();
+    expect(screen.queryByText(/"changes"/)).not.toBeInTheDocument();
+  });
+
+  it("counts whole-file adds and deletes line for line, LF or CRLF", () => {
+    const counts = (kind: "add" | "delete", diff: string) => {
+      cleanup();
+      const { container } = render(
+        <ToolCallBody
+          item={makeTool({
+            tool_name: "fileChange",
+            input: { type: "fileChange", id: "c", changes: [{ path: "/repo/f.txt", kind: { type: kind }, diff }] },
+          })}
+        />,
+        { wrapper: TooltipProvider },
+      );
+      const rows = container.querySelectorAll(kind === "add" ? ".text-status-open.flex" : ".text-status-attention.flex");
+      const header = container.querySelector(".font-mono.text-label")?.textContent ?? "";
+      return { rows: rows.length, header };
+    };
+    expect(counts("add", "\n")).toEqual({ rows: 1, header: "+1 −0" });
+    expect(counts("add", "\r\n")).toEqual({ rows: 1, header: "+1 −0" });
+    expect(counts("add", "a\r\nb\r\n")).toEqual({ rows: 2, header: "+2 −0" });
+    expect(counts("add", "a\nb")).toEqual({ rows: 2, header: "+2 −0" });
+    expect(counts("delete", "\n")).toEqual({ rows: 1, header: "+0 −1" });
+    expect(counts("delete", "x\r\n\r\n")).toEqual({ rows: 2, header: "+0 −2" });
+    expect(screen.queryByText(/\r/)).not.toBeInTheDocument();
+  });
+
+  it("shows an MCP call's arguments and result text, not its envelope", () => {
+    const input = {
+      type: "mcpToolCall",
+      id: "call_secret_id",
+      server: "docs",
+      tool: "search",
+      arguments: { query: "retry policy" },
+      result: null,
+      error: null,
+      status: "inProgress",
+    };
+    const { container } = render(
+      <ToolCallBody
+        item={makeTool({
+          tool_name: "mcpToolCall",
+          input,
+          result_content: {
+            ...input,
+            status: "completed",
+            result: { content: [{ type: "text", text: "3 matches in guide.md" }], structuredContent: null },
+          },
+        })}
+      />,
+    );
+    expect(screen.getByText(/retry policy/)).toBeInTheDocument();
+    expect(screen.getByText("3 matches in guide.md")).toBeInTheDocument();
+    expect(container.textContent).not.toContain("call_secret_id");
+  });
+
+  it("shows a dynamic call's error-free text output and keeps unknown blocks visible", () => {
+    const input = {
+      type: "dynamicToolCall",
+      id: "exec-dyn",
+      tool: "codemux_mcp__codemux__browser_click",
+      arguments: { selector: "#save" },
+      contentItems: null,
+      status: "inProgress",
+    };
+    const { container } = render(
+      <ToolCallBody
+        item={makeTool({
+          tool_name: "dynamicToolCall",
+          input,
+          result_content: {
+            ...input,
+            status: "completed",
+            contentItems: [
+              { type: "inputText", text: "Clicked #save" },
+              { type: "futureBlock", payload: "kept" },
+              { type: "futureBlock", text: "Summary", payload: { critical: "details" } },
+            ],
+          },
+        })}
+      />,
+    );
+    expect(screen.getByText(/Clicked #save/)).toBeInTheDocument();
+    expect(container.textContent).toContain("futureBlock");
+    expect(container.textContent).toContain("critical");
+    expect(container.textContent).not.toContain("exec-dyn");
+  });
+});

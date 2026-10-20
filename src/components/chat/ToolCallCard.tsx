@@ -28,6 +28,7 @@ import {
   type PermissionScope,
 } from "@/lib/agent-chat/permission-rules";
 import { isLazyToolResultStub } from "@/lib/agent-chat/lazy-tool-result";
+import { presentationToolName } from "@/lib/agent-chat/native-tool-call";
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
@@ -123,10 +124,11 @@ export const ToolCallCard = memo(function ToolCallCard({
   //  - error: expanded (auto-expand on error).
   //  - Edit/Write diffs: expanded so the diff card reads inline (design D7).
   //  - everything else: collapsed; user can toggle.
+  const presentedName = presentationToolName(displayItem);
   const isDiffTool =
-    item.tool_name === "Edit" ||
-    item.tool_name === "MultiEdit" ||
-    item.tool_name === "Write";
+    presentedName === "Edit" ||
+    presentedName === "MultiEdit" ||
+    presentedName === "Write";
   // A result carrying an image (e.g. a screenshot) is a visual payload
   // meant to be seen — expand it inline like a diff rather than hiding
   // it behind a chevron.
@@ -151,9 +153,7 @@ export const ToolCallCard = memo(function ToolCallCard({
     if (launchFailed) setExpanded(true);
   }, [launchFailed]);
 
-  const visualName = isWorkspaceLaunch
-    ? "workspace_launch"
-    : displayItem.tool_name;
+  const visualName = isWorkspaceLaunch ? "workspace_launch" : presentedName;
   const Icon = toolIcon(visualName);
   const glyph = glyphForState({
     isPendingApproval,
