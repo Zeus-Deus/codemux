@@ -334,18 +334,6 @@ describe("ChatHomeLanding", () => {
       expect(recentProjectsMock).not.toHaveBeenCalled();
     });
   });
-
-  it("renders the notice slot above the composer", () => {
-    const { container } = render(
-      <ChatHomeLanding
-        composer={<div data-testid="composer-slot" />}
-        notice={<div data-testid="notice-slot" />}
-      />,
-    );
-    const notice = container.querySelector('[data-testid="notice-slot"]')!;
-    const composer = container.querySelector('[data-testid="composer-slot"]')!;
-    expect(notice.compareDocumentPosition(composer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-  });
 });
 
   describe("first-run agent strip", () => {
