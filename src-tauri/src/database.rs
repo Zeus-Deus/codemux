@@ -217,6 +217,7 @@ fn merge_agent_chat_session_rows(
     pr_watch::move_to_thread(tx, merged, survivor)?;
     chat_fork::move_to_thread(tx, merged, survivor)?;
     follow_ups::move_to_thread(tx, merged, survivor)?;
+    message_delivery::move_to_thread(tx, merged, survivor)?;
     // Delete the non-survivors.
     tx.execute(
         &format!("DELETE FROM agent_chat_sessions

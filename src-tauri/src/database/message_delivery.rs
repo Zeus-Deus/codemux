@@ -145,6 +145,29 @@ fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord> {
 }
 const COLUMNS: &str = "id,thread_id,message_id,payload,epoch,generation,attempt_id,state,principal,operation_id,queued_id,turn_id,result,error,attempted,dispatch_payload,attempt_count,origin_notified,hold_reason";
 
+/// Called inside the session merge transaction, before deleting aliases.
+pub(super) fn move_to_thread(conn: &Connection, merged: &[String], survivor: &str) -> Result<(), String> {
+    for source in merged {
+        conn.execute("INSERT INTO agent_thread_delivery_state(thread_id,generation,stopped)
+            SELECT ?2,generation,stopped FROM agent_thread_delivery_state WHERE thread_id=?1
+            ON CONFLICT(thread_id) DO UPDATE SET generation=MAX(generation,excluded.generation),stopped=MAX(stopped,excluded.stopped)",params![source,survivor]).map_err(|e|e.to_string())?;
+        conn.execute("UPDATE agent_message_deliveries SET thread_id=?2,
+            payload=json_set(payload,'$.input.thread_id',?2),
+            dispatch_payload=CASE WHEN dispatch_payload IS NULL THEN NULL ELSE json_set(dispatch_payload,'$.input.thread_id',?2) END
+            WHERE thread_id=?1",params![source,survivor]).map_err(|e|e.to_string())?;
+        conn.execute("UPDATE agent_message_delivery_results SET target_thread_id=?2 WHERE target_thread_id=?1",params![source,survivor]).map_err(|e|e.to_string())?;
+        conn.execute("UPDATE agent_control_operations SET thread_id=?2,
+            admitted_payload=CASE WHEN admitted_payload IS NULL THEN NULL ELSE json_set(admitted_payload,'$.input.thread_id',?2) END,
+            result=CASE WHEN result IS NULL THEN NULL ELSE json_set(result,'$.thread_id',?2) END
+            WHERE thread_id=?1 AND delivery_id IS NOT NULL",params![source,survivor]).map_err(|e|e.to_string())?;
+        conn.execute("DELETE FROM agent_thread_delivery_state WHERE thread_id=?1",[source]).map_err(|e|e.to_string())?;
+    }
+    // Both aliases now share the survivor's Stop fence. Existing held and
+    // disposed states remain authoritative; merging never rearms them.
+    conn.execute("UPDATE agent_message_deliveries SET generation=COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1),0) WHERE thread_id=?1 AND attempted=0",[survivor]).map_err(|e|e.to_string())?;
+    Ok(())
+}
+
 /// Optional outside-controller receipt, admitted atomically with its effect.
 pub struct DeliveryOperation<'a> {
     pub principal: &'a str,
@@ -563,6 +586,24 @@ mod tests {
     }
 
     #[test]
+    fn review_r1_saved_delivery_replays_after_session_merge() {
+        for release_queue in [false, true] {
+            let db = super::super::init_test_database();
+            for thread in ["source", "survivor"] { db.upsert_agent_chat_session(thread,"ws",None,"claude").unwrap(); }
+            let payload = json!({"origin":"controller","provider":"claude","input":{"thread_id":"source","text":"saved"},"provenance":{"message_id":"message"}});
+            db.admit_message_delivery("delivery","source","message",&payload,"old",0,None,true).unwrap();
+            db.finish_message_delivery("delivery","queued",Some(&json!({"queued_id":"saved"})),None).unwrap();
+            db.conn.lock().unwrap().execute("INSERT INTO agent_chat_queued_turns(thread_id,queued_id,position,text,epoch,provenance) VALUES ('source','saved',0,'saved','old',?1)",[json!({"delivery_id":"delivery","message_id":"message"}).to_string()]).unwrap();
+            db.merge_reopened_agent_chat_session("source","survivor").unwrap();
+            db.recover_message_deliveries("new").unwrap();
+            db.rearm_saved_message_delivery("delivery","survivor","saved",release_queue).unwrap();
+            let moved = db.message_delivery("delivery").unwrap().unwrap();
+            assert_eq!(moved.thread_id,"survivor");
+            assert_eq!(moved.payload["input"]["thread_id"],"survivor");
+        }
+    }
+
+    #[test]
     fn review_r1_recovery_ignores_synthetic_completion_without_prompt_evidence() {
         let db = super::super::init_test_database();
         db.upsert_agent_chat_session("receiver","ws",None,"acp").unwrap();
@@ -594,6 +635,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn review_r1_merge_moves_stop_fence_dispatch_target_and_result_ownership() {
+        let db=super::super::init_test_database();
+        for thread in ["source","survivor"] { db.upsert_agent_chat_session(thread,"ws",None,"claude").unwrap(); }
+        let payload=json!({"origin":"delegation","provider":"claude","input":{"thread_id":"source","text":"result"},"provenance":{"notification":{"source":{"kind":"delegated_task","task_ids":["task"]},"outcome":"completed"}}});
+        db.admit_message_delivery("result","source","result",&payload,"old",0,Some(DeliveryOperation {principal:"test",key:"result",hash:"hash",workspace:"ws"}),true).unwrap();
+        db.conn.lock().unwrap().execute("UPDATE agent_message_deliveries SET dispatch_payload=payload WHERE id='result'",[]).unwrap();
+        db.stop_message_deliveries("source").unwrap();
+        db.merge_reopened_agent_chat_session("source","survivor").unwrap();
+        let row=db.message_delivery("result").unwrap().unwrap();
+        assert_eq!(row.state,"cancelled"); assert_eq!(row.hold_reason.as_deref(),Some("stop"));
+        assert_eq!(row.dispatch_payload.unwrap()["input"]["thread_id"],"survivor");
+        assert_eq!(db.delivery_generation("survivor").unwrap().0,1);
+        let conn=db.conn.lock().unwrap();
+        assert_eq!(conn.query_row("SELECT target_thread_id FROM agent_message_delivery_results WHERE delivery_id='result'",[],|r|r.get::<_,String>(0)).unwrap(),"survivor");
+        let operation:(String,String)=conn.query_row("SELECT thread_id,json_extract(admitted_payload,'$.input.thread_id') FROM agent_control_operations WHERE delivery_id='result'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(operation,("survivor".into(),"survivor".into()));
+    }
     #[test]
     fn orchestration_message_migration_preserves_legacy_human_unknown() {
         let conn = Connection::open_in_memory().unwrap();

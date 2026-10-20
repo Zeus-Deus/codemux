@@ -37,6 +37,30 @@ async fn fixture() -> (tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_prov
     (app, provider, root, workspace)
 }
 
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn review_r1_merged_saved_queue_sends_with_original_delivery_identity() {
+    use crate::agent_provider::{message::*,types::MessageDelivery,ProviderKind,ThreadId};
+    for restart_replay in [false,true] {
+        let (app,provider,_root,workspace)=fixture().await;
+        let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"r1-merge-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+        let launched=settle_operation(&app,&receipt).await;
+        let survivor=launched["thread_id"].as_str().unwrap();
+        let db=app.state::<crate::database::DatabaseStore>();
+        db.upsert_agent_chat_session("merge-source",&workspace,None,"claude").unwrap();
+        let provenance=MessageProvenance {message_id:Some("merge-message".into()),delivery_id:Some("merge-delivery".into()),origin:Some(crate::commands::agent_chat::TurnOrigin::Controller),..Default::default()};
+        db.admit_message_delivery("merge-delivery","merge-source","merge-message",&json!({"provider":"claude","origin":"controller","input":{"thread_id":"merge-source","text":"saved task"},"provenance":provenance,"caller":null}),"old",0,None,true).unwrap();
+        db.finish_message_delivery("merge-delivery","queued",Some(&json!({"queued_id":"merge-queue"})),None).unwrap();
+        db.insert_queued_turn(&crate::database::queued_turns::QueuedTurnRecord {thread_id:"merge-source".into(),queued_id:"merge-queue".into(),position:0,text:"saved task".into(),prompt:None,provenance,skill_ids:vec![],skill_text:None,include_plugins:false,images:vec![],client_nonce:Some("merge-message".into()),model_override:None,effort_override:None,permission_mode_override:None,epoch:"old".into()}).unwrap();
+        db.merge_reopened_agent_chat_session("merge-source",survivor).unwrap();
+        if restart_replay { db.recover_message_deliveries("new").unwrap(); }
+        crate::commands::queued_turns::send_saved_queued_turn(app.handle().clone(),ProviderKind::Claude,ThreadId(survivor.into()),"merge-queue".into(),MessageDelivery::Queue,!restart_replay).await.unwrap();
+        assert!(db.get_queued_turn(survivor,"merge-queue").is_none());
+        let row=db.message_delivery("merge-delivery").unwrap().unwrap();
+        assert_eq!(row.state,"accepted"); assert_eq!(row.message_id,"merge-message");
+        assert_eq!(provider.calls.snapshot().into_iter().filter(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(..))).count(),1);
+    }
+}
+
 // Capture the actual native Channel serializer, never a hand-built DTO.
 fn mario_channel(app: &tauri::AppHandle<tauri::test::MockRuntime>, thread: &str) -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
     let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
