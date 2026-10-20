@@ -48,3 +48,5 @@ export type { ProviderRuntimeEvent } from "@/tauri/events";
 export function definePlugin<T extends import("@/contrib/plugin").CodemuxPlugin>(plugin: T): T {
   return plugin;
 }
+
+export type { PluginMcpScope, PluginMcpServer, PluginMcpTool, PluginMcpStatus, PluginMcpContent, PluginMcpCallResult, PluginMcpActivity } from "@/contrib/mcp";

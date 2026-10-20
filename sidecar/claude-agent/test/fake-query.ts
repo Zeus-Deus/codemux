@@ -26,6 +26,7 @@ export class FakeQuery implements AsyncIterable<SDKMessage> {
 
   public setModelCalls: Array<string | undefined> = [];
   public setPermissionModeCalls: PermissionMode[] = [];
+  public setMcpServersCalls: string[][] = [];
   public interruptCalls = 0;
   public closed = false;
   /** When set, `interrupt()` throws this from the iterator, emulating
@@ -207,8 +208,9 @@ export class FakeQuery implements AsyncIterable<SDKMessage> {
   async toggleMcpServer(): Promise<void> {
     /* noop */
   }
-  async setMcpServers(): Promise<Record<string, never>> {
-    return {};
+  async setMcpServers(servers: Record<string, unknown>): Promise<{added:string[];removed:string[];errors:Record<string,string>}> {
+    this.setMcpServersCalls.push(Object.keys(servers));
+    return {added:Object.keys(servers),removed:[],errors:{}};
   }
   async streamInput(): Promise<void> {
     /* noop */

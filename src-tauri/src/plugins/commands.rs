@@ -84,7 +84,7 @@ struct SavedCatalog {
     fetched_at: u64,
 }
 
-fn gui<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+pub(super) fn gui<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     crate::ensure_gui_mode(app).map_err(|_| "Plugins are available only in the desktop app".to_string())
 }
 

@@ -354,6 +354,7 @@ pub enum SidecarNotification {
         request_id: String,
         tool_name: String,
         tool_input: Value,
+        plugin_bridge_target: bool,
         /// Claude's own tool-use identifier, forwarded so the runtime can
         /// merge a permission request with its originating tool_use row.
         /// `None` when the sidecar did not populate `toolUseId`.
@@ -448,6 +449,10 @@ impl SidecarNotification {
                 request_id: field_string(&params, "requestId"),
                 tool_name: field_string(&params, "toolName"),
                 tool_input: field_value(&params, "toolInput"),
+                plugin_bridge_target: params
+                    .get("pluginBridgeTarget")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 tool_use_id: field_opt_string(&params, "toolUseId"),
                 kind: field_string(&params, "kind"),
             },

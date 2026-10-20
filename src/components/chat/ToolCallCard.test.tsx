@@ -735,3 +735,48 @@ describe("ToolCallCard", () => {
     expect(toast.success).not.toHaveBeenCalled();
   });
 });
+
+it("plugin bridge approval displays and allows the target tool, not the bridge", async () => {
+  const user = userEvent.setup();
+  const name = "mcp__codemux__fixture__write_scene";
+  const onDecide = vi.fn();
+  render(
+    <ToolCallCard
+      item={makeTool({
+        tool_name: "mcp__codemux__codemux_call_plugin_tool",
+        input: {
+          name: "fixture__write_scene",
+          arguments: { scene: "Chosen scene" },
+        },
+        approval_request_id: "req-1",
+      })}
+      approval={makePendingApproval({
+        payload: {
+          plugin_bridge_target: true,
+          tool_name: name,
+          tool_input: { scene: "Chosen scene" },
+        },
+      })}
+      onDecide={onDecide}
+    />,
+  );
+  await user.click(screen.getByText("Allow always"));
+  expect(screen.getByRole("group", { name })).toBeInTheDocument();
+  expect(
+    screen.queryByRole("group", {
+      name: "mcp__codemux__codemux_call_plugin_tool",
+    }),
+  ).not.toBeInTheDocument();
+  await user.click(screen.getByRole("menuitem", { name: /For this session/ }));
+  expect(onDecide).toHaveBeenCalledWith({
+    decision: "allow",
+    updated_permissions: [
+      {
+        type: "addRules",
+        rules: [{ toolName: name }],
+        behavior: "allow",
+        destination: "session",
+      },
+    ],
+  });
+});

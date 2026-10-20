@@ -308,6 +308,26 @@ fn restore_queued_position(
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all="camelCase")]
+struct PluginToolSnapshot {
+    direct_names: Vec<String>,
+    catalog_key: String,
+}
+
+impl PluginToolSnapshot {
+    fn fallback(resumed: bool, tools: &[DynamicToolSpec], catalog: &[crate::mcp::runtime::McpTool]) -> Self {
+        Self {
+            // A resumed rollout owns its original schemas, which may differ
+            // from today's registry. Unknown is safer than claiming direct calls.
+            direct_names: if resumed { Vec::new() } else {
+                tools.iter().map(|DynamicToolSpec::Function { name, .. }| registry_tool_name(name)).collect()
+            },
+            catalog_key: crate::mcp::registry::plugin_catalog_key(catalog),
+        }
+    }
+}
+
 /// Handle for a live Codex session.
 pub(crate) struct CodexSession {
     /// Runtime-owned thread identifier.
@@ -327,6 +347,9 @@ pub(crate) struct CodexSession {
     /// Mutable session state.
     pub state: Mutex<CodexSessionState>,
     outbound: Mutex<()>,
+    direct_tool_names: Vec<String>,
+    plugin_registry: Option<McpRegistry>,
+    plugin_catalog_seen: Mutex<String>,
     /// A send is being prepared or started (checkpoint, `turn/start` in
     /// flight) before `active_turn` is bound. Read by `runtime_status`.
     dispatching: AtomicUsize,
@@ -518,6 +541,10 @@ impl CodexSession {
         // Capture the live registry tool surface once for thread/start.
         // Codex persists dynamic tool definitions in the rollout, while the
         // request handler below always dispatches through the live registry.
+        let initial_plugin_catalog = match mcp_registry.as_ref().filter(|_| managed.is_none()) {
+            Some(registry) => registry.plugin_catalog(workspace_id.as_deref()).await,
+            None => Vec::new(),
+        };
         let dynamic_tools = if let Some(context) = managed.as_ref() {
             Some(
                 context
@@ -794,6 +821,15 @@ impl CodexSession {
         // guidance ride on collaboration-mode settings, which require one.
         let model = model.or_else(|| thread.model().map(str::to_owned));
 
+        let saved_plugin_state = resume_cursor.as_ref()
+            .filter(|cursor| codex_thread_id_from_resume_cursor(cursor).as_deref() == Some(&codex_thread_id))
+            .and_then(|cursor| cursor.get("pluginTools"))
+            .and_then(|value| serde_json::from_value::<PluginToolSnapshot>(value.clone()).ok());
+        let plugin_snapshot = saved_plugin_state.unwrap_or_else(|| PluginToolSnapshot::fallback(
+            resume_cursor.as_ref().and_then(codex_thread_id_from_resume_cursor).as_deref() == Some(&codex_thread_id),
+            dynamic_tools.as_deref().unwrap_or_default(), &initial_plugin_catalog,
+        ));
+
         // --- assemble session handle ----------------------------------------
         let mut demux=CodexSubagentDemux::new(codex_thread_id.clone());demux.set_recorded_usage_baseline(recorded_usage_baseline.unwrap_or_default());
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(4);
@@ -833,6 +869,9 @@ impl CodexSession {
             managed: managed.clone(),
             host_caller,
             guidance: dynamic_tools.as_deref().and_then(developer_guidance),
+            plugin_registry: mcp_registry.clone().filter(|_| managed.is_none()),
+            plugin_catalog_seen: Mutex::new(plugin_snapshot.catalog_key),
+            direct_tool_names: plugin_snapshot.direct_names,
             // A resumed thread continues in its last turn's mode until a
             // composer send names one, so restart auto-resume, and answers
             // given right after a rebuild, keep an interrupted Plan task in Plan.
@@ -1528,6 +1567,11 @@ impl CodexSession {
 
         let model = model_override.or(model_default);
         let effort = effort_override.or(effort_default);
+        let changed_catalog = if let Some(registry) = &self.plugin_registry {
+            let tools = registry.plugin_catalog(self.workspace_id.as_deref()).await;
+            let key = crate::mcp::registry::plugin_catalog_key(&tools);
+            (key != *self.plugin_catalog_seen.lock().await).then(|| (key, crate::mcp::registry::plugin_catalog_notice(&tools)))
+        } else { None };
         let collaboration_mode = runtime_collaboration_mode(
             model.as_deref(),
             effort.as_deref(),
@@ -1535,6 +1579,10 @@ impl CodexSession {
             self.plan_mode.load(Ordering::SeqCst),
         );
         let selected_mode = collaboration_mode.as_ref().map(|mode| mode.mode.clone());
+        let mut input_items = input_items;
+        if let Some((_,notice)) = &changed_catalog {
+            input_items.insert(0, TurnInputItem::Text { text: notice.clone(), text_elements: vec![] });
+        }
         let params = TurnStartParams {
             thread_id: codex_thread_id,
             input: input_items,
@@ -1597,6 +1645,12 @@ impl CodexSession {
             self.native_authority.finish_pending(generation);
             error
         })?;
+        if let Some((key,_)) = changed_catalog {
+            *self.plugin_catalog_seen.lock().await = key;
+            let _ = self.event_tx.send(ProviderRuntimeEvent::ResumeCursorUpdated {
+                thread_id: self.thread_id.clone(), resume_cursor: self.resume_cursor().await,
+            });
+        }
         let turn_id = TurnId(parsed.turn.id);
         if pending.completed_turns.contains(&turn_id) || pending.failed {
             self.native_authority.finish_pending(generation);
@@ -1618,6 +1672,14 @@ impl CodexSession {
             });
         }
         Ok(())
+    }
+
+    pub async fn resume_cursor(&self) -> Value {
+        // A known-empty snapshot still matters: plugins added while the app is
+        // closed need a reminder after resume, rather than being treated as seen.
+        json!({"threadId":self.provider_session_id.0,"pluginTools":PluginToolSnapshot {
+            direct_names:self.direct_tool_names.clone(),catalog_key:self.plugin_catalog_seen.lock().await.clone(),
+        }})
     }
 
     /// Whether the child-exit watchdog has declared this session's
@@ -2690,7 +2752,7 @@ fn spawn_incoming_requests_task(
                             mcp_registry.as_ref(),
                             session.workspace_id.as_deref(),
                             Some((&session.host_caller, session.provider_session_id.0.as_str())),
-                            params, actor,
+                            params, actor, &session.direct_tool_names,
                         )
                         .await;
                         if let Err(error) = child.respond(req.id, Ok(result)).await {
@@ -2751,13 +2813,14 @@ async fn dynamic_tool_specs(
 ) -> Option<Vec<DynamicToolSpec>> {
     let registry = registry?;
     let mut tools = if codex_home_managed {
-        registry.list_all_tools().await
+        registry.list_tools_for_workspace(&[], host_caller.workspace_id.as_deref()).await
     } else {
         registry
-            .list_all_tools_excluding_source(crate::mcp::McpConfigSource::CodexUser)
+            .list_tools_for_workspace(&[crate::mcp::McpConfigSource::CodexUser], host_caller.workspace_id.as_deref())
             .await
     };
     tools.extend(registry.host_tools(host_caller));
+    tools.extend(crate::mcp::registry::plugin_bridge_tools());
     Some(
         tools
             .into_iter()
@@ -2794,7 +2857,7 @@ async fn handle_dynamic_tool_call(
     host: Option<(&crate::mcp::registry::HostCaller, &str)>,
     raw: Value,
 ) -> Value {
-    handle_dynamic_tool_call_native(registry, workspace_id, host, raw, None).await
+    handle_dynamic_tool_call_native(registry, workspace_id, host, raw, None, &[]).await
 }
 
 async fn handle_dynamic_tool_call_native(
@@ -2803,6 +2866,7 @@ async fn handle_dynamic_tool_call_native(
     host: Option<(&crate::mcp::registry::HostCaller, &str)>,
     raw: Value,
     actor: Option<crate::delegation::app::NativeActor>,
+    direct_tools: &[String],
 ) -> Value {
     let parsed = serde_json::from_value::<DynamicToolCallParams>(raw);
     let dispatched = match (registry, parsed) {
@@ -2829,7 +2893,9 @@ async fn handle_dynamic_tool_call_native(
                         })
                 }
             });
+            let bridge = registry.call_plugin_bridge(&name, call.arguments.clone(), workspace_id, direct_tools).await;
             match host {
+                _ if bridge.is_some() => bridge.unwrap(),
                 Some(result) => Ok(result),
                 None => match actor {
                     Some(actor) => registry.dispatch_native_tool_call(&name, call.arguments, actor).await,
@@ -2854,13 +2920,50 @@ async fn handle_dynamic_tool_call_native(
         ),
     };
 
-    let content_items = result
+    let content_items = mcp_result_content_to_codex(&result);
+    json!({ "contentItems": content_items, "success": success })
+}
+
+const CODEX_STRUCTURED_CONTENT_MAX_BYTES: usize = 64 * 1024;
+const CODEX_STRUCTURED_CONTENT_TRUNCATED: &str = "\n[Codemux: structuredContent truncated]";
+
+/// Dynamic tool results accept content items, without MCP's structured field.
+/// Keep the server's blocks and add a bounded JSON copy only when needed.
+fn mcp_result_content_to_codex(result: &Value) -> Vec<Value> {
+    let blocks = result
         .get("content")
         .and_then(Value::as_array)
-        .map(|items| items.iter().map(mcp_content_to_codex).collect::<Vec<_>>())
-        .filter(|items| !items.is_empty())
-        .unwrap_or_else(|| vec![json!({ "type": "inputText", "text": result.to_string() })]);
-    json!({ "contentItems": content_items, "success": success })
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut items: Vec<Value> = blocks.iter().map(mcp_content_to_codex).collect();
+    if let Some(structured) = result.get("structuredContent") {
+        let has_json_copy = blocks.iter().any(|block| {
+            block.get("type").and_then(Value::as_str) == Some("text")
+                && block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                    .as_ref()
+                    == Some(structured)
+        });
+        if !has_json_copy {
+            let mut text = structured.to_string();
+            if text.len() > CODEX_STRUCTURED_CONTENT_MAX_BYTES {
+                let mut end =
+                    CODEX_STRUCTURED_CONTENT_MAX_BYTES - CODEX_STRUCTURED_CONTENT_TRUNCATED.len();
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                text.push_str(CODEX_STRUCTURED_CONTENT_TRUNCATED);
+            }
+            items.push(json!({ "type": "inputText", "text": text }));
+        }
+    }
+    if items.is_empty() {
+        items.push(json!({ "type": "inputText", "text": result.to_string() }));
+    }
+    items
 }
 
 /// Codex reserves the `mcp__` prefix for MCP servers configured directly in
@@ -2870,7 +2973,7 @@ async fn handle_dynamic_tool_call_native(
 fn codex_dynamic_tool_name(registry_name: &str) -> String {
     match registry_name.strip_prefix("mcp__") {
         Some(name) => format!("codemux_mcp__{name}"),
-        None => format!("codemux_mcp__{registry_name}"),
+        None => registry_name.to_owned(),
     }
 }
 
@@ -3286,6 +3389,10 @@ mod tests {
     #[test]
     fn resume_cursor_accepts_native_and_persisted_shapes() {
         assert_eq!(
+            codex_thread_id_from_resume_cursor(&json!({"threadId":"native-thread","pluginTools":{"directNames":[],"catalogKey":"known-empty"}})),
+            Some("native-thread".into())
+        );
+        assert_eq!(
             codex_thread_id_from_resume_cursor(&json!({"threadId": "native-thread"})),
             Some("native-thread".into())
         );
@@ -3396,6 +3503,86 @@ mod tests {
                 "data": "YWJj"
             })),
             json!({"type": "inputImage", "imageUrl": "data:image/png;base64,YWJj"})
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_codex_preserves_structured_results_once_for_native_and_bridge() {
+        let registry = crate::mcp::registry::test_support::plugin_fixture("all").await;
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/plugin_mcp_result.json"
+        ))
+        .unwrap();
+        for bridge in [false, true] {
+            for include_copy in [false, true] {
+                let arguments = json!({"includeStructuredText": include_copy});
+                let response = handle_dynamic_tool_call(
+                    Some(&registry),
+                    Some("ws-42"),
+                    None,
+                    json!({
+                        "threadId": "thread", "turnId": "turn", "callId": "call",
+                        "tool": if bridge { "codemux_call_plugin_tool" } else { "fixture__image" },
+                        "arguments": if bridge { json!({"name":"fixture__image","arguments":arguments}) } else { arguments }
+                    }),
+                ).await;
+                assert_eq!(response["success"], true, "{response}");
+                let items = response["contentItems"].as_array().unwrap();
+                assert_eq!(
+                    items.len(),
+                    3,
+                    "bridge={bridge}, copy={include_copy}: {response}"
+                );
+                assert_eq!(
+                    items[0],
+                    json!({"type":"inputImage","imageUrl":format!("data:image/png;base64,{}", fixture["content"][0]["data"].as_str().unwrap())})
+                );
+                assert_eq!(
+                    items[1],
+                    json!({"type":"inputText","text":"[0] Window\n[1] Text input"})
+                );
+                let structured: Value =
+                    serde_json::from_str(items[2]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(structured["snapshot_id"], "fixture-snapshot-742");
+                assert_eq!(structured["element_token"], "fixture-element-742");
+                assert_eq!(response.to_string().matches("STRUCTURED-581").count(), 1);
+            }
+        }
+        registry.shutdown_all().await;
+    }
+
+    #[test]
+    fn mcp_structured_content_fallback_is_bounded_and_utf8_safe() {
+        let result = json!({"content": [], "structuredContent": {"value": "界".repeat(40_000)}});
+        let items = mcp_result_content_to_codex(&result);
+        assert_eq!(items.len(), 1);
+        let text = items[0]["text"].as_str().unwrap();
+        assert!(text.len() <= CODEX_STRUCTURED_CONTENT_MAX_BYTES);
+        let prefix = text
+            .strip_suffix(CODEX_STRUCTURED_CONTENT_TRUNCATED)
+            .unwrap();
+        assert_eq!(prefix.chars().last(), Some('界'));
+        assert!(!text.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn mcp_structured_content_only_and_existing_json_copy_are_not_duplicated() {
+        let data = json!({"snapshot_id": "snapshot", "element_token": "element"});
+        let only = mcp_result_content_to_codex(&json!({"structuredContent": data}));
+        assert_eq!(
+            only,
+            vec![json!({"type":"inputText","text":data.to_string()})]
+        );
+        let copy = " \n{\"snapshot_id\": \"snapshot\", \"element_token\": \"element\"}\n";
+        let existing = json!({"content":[{"type":"text","text":copy}],"structuredContent":data});
+        assert_eq!(
+            mcp_result_content_to_codex(&existing),
+            vec![json!({"type":"inputText","text":copy})]
+        );
+        let empty = json!({"content":[]});
+        assert_eq!(
+            mcp_result_content_to_codex(&empty),
+            vec![json!({"type":"inputText","text":empty.to_string()})]
         );
     }
 
@@ -3529,6 +3716,35 @@ mod tests {
             .contains("aren't available to this thread"));
     }
 
+    #[test]
+    fn plugin_mcp_old_resume_does_not_claim_current_tools_are_direct() {
+        let tools = vec![DynamicToolSpec::Function { name: "fixture__late".into(), description: "late".into(), input_schema: json!({}), defer_loading: None }];
+        assert!(PluginToolSnapshot::fallback(true, &tools, &[]).direct_names.is_empty());
+        assert_eq!(PluginToolSnapshot::fallback(false, &tools, &[]).direct_names, vec!["fixture__late"]);
+    }
+
+    #[test]
+    fn plugin_mcp_resume_snapshot_preserves_native_catalog_and_notice_key() {
+        let snapshot=PluginToolSnapshot {direct_names:vec!["fixture__before".into()],catalog_key:"already-announced".into()};
+        let cursor=json!({"threadId":"native","pluginTools":snapshot});
+        let restored:PluginToolSnapshot=serde_json::from_value(cursor["pluginTools"].clone()).unwrap();
+        assert_eq!(restored.direct_names,vec!["fixture__before"]);
+        assert_eq!(restored.catalog_key,"already-announced");
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_codex_payload_has_guidance_and_hides_private_servers() {
+        let caller=crate::mcp::registry::HostCaller {thread_id:"thread".into(),provider:crate::agent_provider::ProviderKind::Codex,workspace_id:Some("ws".into()),permission_mode:None};
+        for scope in ["all","plugin"] {
+            let registry=crate::mcp::registry::test_support::plugin_fixture(scope).await;
+            let tools=dynamic_tool_specs(Some(&registry),false,&caller).await.unwrap();
+            let tool=tools.iter().find(|DynamicToolSpec::Function{name,..}|name=="fixture__new_tool");
+            if scope=="plugin" {assert!(tool.is_none());}
+            else {let DynamicToolSpec::Function{description,..}=tool.unwrap();assert_eq!(description,"Use structured tools first.\n\nAlways use background delivery.");}
+            registry.shutdown_all().await;
+        }
+    }
+
     #[tokio::test]
     async fn device_session_gets_and_runs_none_of_this_computers_tools() {
         let (_server, registry, call) =
@@ -3541,7 +3757,7 @@ mod tests {
         };
         let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
         let published = dynamic_tool_specs(local.as_ref(), false, &caller).await.unwrap();
-        assert_eq!(published.len(), 1);
+        assert_eq!(published.len(), 3); // shared tool plus the two live plugin entry points
 
         let device = crate::agent_provider::types::RemoteSpawnTarget {
             host_id: 3,

@@ -243,6 +243,7 @@ impl OpenCodeSession {
         // starts fresh. See `OpenCodeAgentProvider::usage_states`.
         carried_usage: Option<Arc<Mutex<OpenCodeUsageState>>>,
         directory: Option<std::path::PathBuf>,
+        workspace_id: Option<String>,
     ) -> Result<Arc<Self>, ProviderError> {
         let server_handle = manager.ensure_running().await.map_err(|err| {
             if err == "opencode_not_installed" {
@@ -286,7 +287,7 @@ impl OpenCodeSession {
         // Failures surface as a RuntimeWarning instead of killing the session.
         if let Some(registry) = mcp_registry.as_ref() {
             if let Err(error) =
-                attach_mcp_gateway_scoped(&http, &server_handle, registry, directory.as_deref())
+                attach_mcp_gateway_scoped(&http, &server_handle, registry, directory.as_deref(), workspace_id.as_deref())
                     .await
             {
                 eprintln!("[codemux::opencode] shared MCP gateway attach failed: {error}");
@@ -2339,7 +2340,7 @@ async fn attach_mcp_gateway(
     server: &OpenCodeServerHandle,
     registry: &McpRegistry,
 ) -> Result<(), ProviderError> {
-    attach_mcp_gateway_scoped(http, server, registry, None).await
+    attach_mcp_gateway_scoped(http, server, registry, None, None).await
 }
 
 async fn attach_mcp_gateway_scoped(
@@ -2347,6 +2348,7 @@ async fn attach_mcp_gateway_scoped(
     server: &OpenCodeServerHandle,
     registry: &McpRegistry,
     directory: Option<&std::path::Path>,
+    _workspace_id: Option<&str>,
 ) -> Result<(), ProviderError> {
     let connection =
         registry
@@ -2988,6 +2990,7 @@ pub(crate) mod tests {
             tx,
             None,
             None,
+            None,
         )
         .await;
 
@@ -3032,6 +3035,7 @@ pub(crate) mod tests {
             tx,
             None,
             Some(directory.path().to_path_buf()),
+            None,
         )
         .await
         .expect("OpenCode session should start");
@@ -3121,6 +3125,7 @@ pub(crate) mod tests {
             None,
             None,
             tx,
+            None,
             None,
             None,
         )
@@ -3305,7 +3310,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn v2_gateway_registration_is_scoped_and_verified_connected() {
+    async fn v2_gateway_registration_has_no_workspace_identity_and_verifies_connection() {
         let mut server = Server::new_async().await;
         let directory = tempfile::tempdir().unwrap();
         let query = mockito::Matcher::UrlEncoded(
@@ -3315,9 +3320,10 @@ pub(crate) mod tests {
         let put = server
             .mock("PUT", "/api/experimental/mcp/codemux")
             .match_query(query.clone())
-            .match_body(mockito::Matcher::PartialJson(
-                serde_json::json!({"config":{"type":"remote","disabled":false,"oauth":false}}),
-            ))
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJson(serde_json::json!({"config":{"type":"remote","disabled":false,"oauth":false}})),
+                mockito::Matcher::Regex(r#""url":"http://127\.0\.0\.1:[0-9]+/mcp""#.into()),
+            ]))
             .with_status(204)
             .create_async()
             .await;
@@ -3338,6 +3344,7 @@ pub(crate) mod tests {
             &server,
             &McpRegistry::new(),
             Some(directory.path()),
+            Some("workspace-fixture"),
         )
         .await
         .unwrap();
@@ -5725,6 +5732,7 @@ pub(crate) mod tests {
             None,
             Some("ses_keep".into()),
             tx,
+            None,
             None,
             None,
         )

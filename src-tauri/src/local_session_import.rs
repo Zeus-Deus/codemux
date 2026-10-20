@@ -171,6 +171,9 @@ fn parse_rows(provider: &str, rows: &[Value]) -> Option<ParsedSession> {
             let role = row["message"]["role"].as_str().unwrap_or("");
             (role, visible_text(&row["message"]["content"]))
         };
+        let text = if provider == "codex" && role == "user" {
+            crate::mcp::registry::strip_plugin_catalog_notice(&text)
+        } else { text };
         if role == "user"
             && [
                 "<environment_context>",
@@ -1006,6 +1009,16 @@ mod tests {
         assert_eq!(rows[0].imported_from.as_deref(), Some("claude"));
         assert!(rows[0].sdk_session_id.is_none());
     }
+    #[test]
+    fn plugin_mcp_notice_is_filtered_from_imported_codex_history() {
+        let notice=crate::mcp::registry::plugin_catalog_notice(&[]);
+        let meta=json!({"type":"session_meta","timestamp":"2026-09-29T10:00:00Z","payload":{"id":"22222222-2222-4222-8222-222222222222","cwd":synthetic_cwd("project"),"source":"cli"}});
+        let canonical=json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":notice},{"type":"input_text","text":"Human prompt"}]}});
+        let event=json!({"type":"event_msg","payload":{"type":"user_message","message":format!("{notice}\nHuman prompt")}});
+        let result=parse_rows("codex",&[meta,canonical,event]).unwrap();
+        assert_eq!(result.messages,vec![("user".into(),"Human prompt".into())]);
+    }
+
     #[test]
     fn local_import_codex_excludes_injected_context_and_analysis_channels() {
         let meta = json!({"type":"session_meta","timestamp":"2026-09-29T10:00:00Z","payload":{"id":"22222222-2222-4222-8222-222222222222","cwd":synthetic_cwd("project"),"source":"cli"}});

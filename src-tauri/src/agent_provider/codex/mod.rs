@@ -274,9 +274,7 @@ impl AgentProvider for CodexAgentProvider {
             provider: ProviderKind::Codex,
             session_id: session.provider_session_id.clone(),
             status: SessionStatus::Ready,
-            resume_cursor: Some(serde_json::json!({
-                "threadId": session.provider_session_id.0,
-            })),
+            resume_cursor: Some(session.resume_cursor().await),
         })
     }
 
@@ -604,9 +602,7 @@ impl AgentProvider for CodexAgentProvider {
                 provider: ProviderKind::Codex,
                 session_id: s.provider_session_id.clone(),
                 status,
-                resume_cursor: Some(serde_json::json!({
-                    "threadId": s.provider_session_id.0,
-                })),
+                resume_cursor: Some(s.resume_cursor().await),
             });
         }
         Ok(out)

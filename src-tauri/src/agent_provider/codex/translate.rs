@@ -1537,8 +1537,10 @@ fn translate_item_completed(
                 },
             }]
         }
-        // Other variants — userMessage, hookPrompt, etc. — are not
-        // currently rendered by the chat UI. Surface as a warning to
+        // User text is persisted from Codemux's original send. Provider
+        // echoes may contain private context fragments added at dispatch.
+        "userMessage" | "hookPrompt" => vec![],
+        // Other variants are not currently rendered by the chat UI. Surface as a warning to
         // make future SDK additions visible.
         other => vec![ProviderRuntimeEvent::RuntimeWarning {
             thread_id: Some(thread_id.clone()),
@@ -1964,6 +1966,12 @@ mod tests {
             }),
         );
         assert!(translate_notification(&tid(), msg).is_empty());
+    }
+
+    #[test]
+    fn plugin_mcp_notice_in_user_echo_never_becomes_a_transcript_event() {
+        let envelope:ItemEnvelope=serde_json::from_value(json!({"threadId":"native","turnId":"turn","item":{"id":"user","type":"userMessage","content":[{"type":"text","text":crate::mcp::registry::plugin_catalog_notice(&[])}]}})).unwrap();
+        assert!(translate_item_completed(&ThreadId("chat".into()),envelope).is_empty());
     }
 
     #[test]
