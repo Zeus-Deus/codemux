@@ -3,7 +3,8 @@
 //! The CLI's own sign-in is the implicit `default` account and has no row.
 //! Each extra account owns a home directory the CLI is pointed at with
 //! `CLAUDE_CONFIG_DIR` / `CODEX_HOME`. Defaults are scoped: the empty scope
-//! is the app-wide default, any other scope is a workspace id. A binding
+//! is the app-wide default. Other scopes are workspace ids from when defaults
+//! could be set per workspace; nothing reads them any more. A binding
 //! pins the account a chat thread runs on. No foreign keys: a binding must
 //! survive its session row being rebuilt, and a removed account simply
 //! stops resolving.

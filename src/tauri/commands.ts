@@ -3967,8 +3967,6 @@ export interface ThreadAccount {
   account_id: string;
   /** Started and pinned: changing it switches the running chat. */
   bound: boolean;
-  workspace_id: string | null;
-  workspace_default: string | null;
 }
 
 export interface AccountSwitchOutcome {
@@ -4003,22 +4001,15 @@ export const providerAccountRename = (accountId: string, label: string) =>
 export const providerAccountRemove = (accountId: string) =>
   invoke<ProviderAccountsState>("provider_account_remove", { accountId });
 
-/** App-wide when `workspaceId` is null; `accountId: null` clears it. */
-export const providerAccountSetDefault = (
-  provider: "claude" | "codex",
-  accountId: string | null,
-  workspaceId: string | null = null,
-) => invoke<ProviderAccountsState>("provider_account_set_default", { provider, accountId, workspaceId });
+/** The app-wide default for new chats; `accountId: null` clears it. */
+export const providerAccountSetDefault = (provider: "claude" | "codex", accountId: string | null) =>
+  invoke<ProviderAccountsState>("provider_account_set_default", { provider, accountId });
 
 export const providerAccountOpenSignIn = (workspaceId: string, accountId: string) =>
   invoke<void>("provider_account_open_sign_in", { workspaceId, accountId });
 
-/** `workspaceId` is where a draft will start; a started chat uses its own. */
-export const providerAccountThread = (
-  threadId: string,
-  provider: "claude" | "codex",
-  workspaceId: string | null = null,
-) => invoke<ThreadAccount>("provider_account_thread", { threadId, provider, workspaceId });
+export const providerAccountThread = (threadId: string, provider: "claude" | "codex") =>
+  invoke<ThreadAccount>("provider_account_thread", { threadId, provider });
 
 /** Move a started chat to another account, keeping its conversation. */
 export const providerAccountSwitchThread = (threadId: string, accountId: string) =>

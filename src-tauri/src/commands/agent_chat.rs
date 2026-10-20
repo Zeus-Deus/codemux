@@ -3026,7 +3026,6 @@ async fn ensure_live_session_locked<R: Runtime>(
         app,
         provider_kind,
         &thread_id.0,
-        Some(pane_workspace.as_deref().unwrap_or(&record.workspace_id)),
         record.sdk_session_id.as_deref(),
         env,
         device.is_some(),

@@ -8,9 +8,11 @@
 //! Which account a chat runs on, first match wins:
 //! 1. the thread's binding (a chat stays on its account until switched);
 //! 2. the account the caller picked for a new chat;
-//! 3. the workspace's default;
-//! 4. the app-wide default;
-//! 5. the CLI's own sign-in.
+//! 3. the app-wide default;
+//! 4. the CLI's own sign-in.
+//!
+//! Defaults once could be set per workspace too. Those rows may still be
+//! stored, but nothing reads them: the app-wide default is the only one.
 //!
 //! A thread that already has native history but no binding predates
 //! accounts, so its transcript lives in the CLI's own home: it binds there.
@@ -120,7 +122,6 @@ pub fn resolve(
     provider: ProviderKind,
     thread_id: Option<&str>,
     explicit: Option<&str>,
-    workspace_id: Option<&str>,
     has_history: bool,
 ) -> Result<Resolution, String> {
     let slug = provider_slug(provider);
@@ -135,11 +136,7 @@ pub fn resolve(
     if has_history {
         return Ok(fallback);
     }
-    let candidates = [
-        explicit.map(str::to_string),
-        workspace_id.map(|ws| db.provider_account_default(ws, slug)).transpose()?.flatten(),
-        db.provider_account_default("", slug)?,
-    ];
+    let candidates = [explicit.map(str::to_string), db.provider_account_default("", slug)?];
     for id in candidates.into_iter().flatten() {
         if let Some(account) = lookup(db, slug, &id)? {
             return Ok(Resolution { account, bound: false });
@@ -368,14 +365,14 @@ fn start_resolution(
         .get_agent_chat_session(&input.thread_id.0)
         .is_some_and(|record| record.provider == slug);
     if started {
-        return resolve(db, provider, Some(&input.thread_id.0), None, input.workspace_id.as_deref(), has_history);
+        return resolve(db, provider, Some(&input.thread_id.0), None, has_history);
     }
     // Reopening another persisted chat: its account has the transcript, and
     // stays the chat's account even if a stale cursor was dropped.
     if let Some(from) = extra(FROM_THREAD_EXTRA_KEY) {
-        return resolve(db, provider, Some(&from), None, None, true);
+        return resolve(db, provider, Some(&from), None, true);
     }
-    resolve(db, provider, None, explicit.as_deref(), input.workspace_id.as_deref(), has_history)
+    resolve(db, provider, None, explicit.as_deref(), has_history)
 }
 
 fn prepare_start_with(
@@ -438,15 +435,13 @@ pub struct Rebuild {
 
 /// Rebuild hook (`ensure_live_session`): the persisted thread resumes on
 /// the account it is bound to. `native` is the native session id the caller
-/// read and `workspace_id` where the chat lives. One without a usable
-/// binding (its account was removed) resolves like a new chat there, unless
-/// it still has native history, which predates accounts and lives with the
-/// CLI's own sign-in. Either way it binds there.
+/// read. One without a usable binding (its account was removed) resolves
+/// like a new chat, unless it still has native history, which predates
+/// accounts and lives with the CLI's own sign-in. Either way it binds there.
 pub fn rebuild_env<R: Runtime>(
     app: &AppHandle<R>,
     provider: ProviderKind,
     thread_id: &str,
-    workspace_id: Option<&str>,
     native: Option<&str>,
     env: Option<HashMap<String, String>>,
     on_device: bool,
@@ -465,7 +460,7 @@ pub fn rebuild_env<R: Runtime>(
     let mut removed = removed();
     let native = native.and_then(|id| removed.get_or_insert_with(Default::default).usable(&db, provider, thread_id, id));
     let slug = provider_slug(provider);
-    match resolve(&db, provider, Some(thread_id), None, workspace_id, native.is_some()) {
+    match resolve(&db, provider, Some(thread_id), None, native.is_some()) {
         Ok(resolution) => {
             if !resolution.bound {
                 let _ = db.set_provider_account_binding(thread_id, slug, resolution.account_id());
@@ -502,7 +497,7 @@ pub fn session_env_for_thread<R: Runtime>(
     let Some(db) = app.try_state::<DatabaseStore>() else {
         return HashMap::new();
     };
-    resolve(&db, provider, Some(thread_id), None, None, true)
+    resolve(&db, provider, Some(thread_id), None, true)
         .ok()
         .and_then(|resolution| apply_env(provider, resolution.account.as_ref(), None))
         .unwrap_or_default()
@@ -623,7 +618,7 @@ pub async fn switch_thread<R: Runtime>(
     let slug = provider_slug(provider);
     let target = lookup(&db, slug, account_id)?
         .ok_or_else(|| "That account no longer exists.".to_string())?;
-    let current = resolve(&db, provider, Some(thread_id), None, None, record.sdk_session_id.is_some())?;
+    let current = resolve(&db, provider, Some(thread_id), None, record.sdk_session_id.is_some())?;
     let target_id = target.as_ref().map(|a| a.id.clone()).unwrap_or_else(|| DEFAULT_ACCOUNT_ID.into());
     if current.account_id() == target_id {
         return Ok(SwitchOutcome { account_id: target_id, carried: true });
@@ -717,33 +712,43 @@ mod tests {
         db
     }
 
-    fn resolved(db: &DatabaseStore, thread: &str, explicit: Option<&str>, ws: Option<&str>, history: bool) -> String {
-        resolve(db, ProviderKind::Claude, Some(thread), explicit, ws, history)
+    fn resolved(db: &DatabaseStore, thread: &str, explicit: Option<&str>, history: bool) -> String {
+        resolve(db, ProviderKind::Claude, Some(thread), explicit, history)
             .unwrap()
             .account_id()
             .to_string()
     }
 
     #[test]
-    fn resolution_order_is_binding_pick_workspace_global_cli() {
+    fn resolution_order_is_binding_pick_global_cli() {
         let db = db_with(&[("work", "claude"), ("side", "claude"), ("cx", "codex")]);
-        assert_eq!(resolved(&db, "t", None, None, false), "default");
+        assert_eq!(resolved(&db, "t", None, false), "default");
         db.set_provider_account_default("", "claude", Some("work")).unwrap();
-        assert_eq!(resolved(&db, "t", None, Some("ws"), false), "work");
-        db.set_provider_account_default("ws", "claude", Some("side")).unwrap();
-        assert_eq!(resolved(&db, "t", None, Some("ws"), false), "side");
-        assert_eq!(resolved(&db, "t", Some("default"), Some("ws"), false), "default");
+        assert_eq!(resolved(&db, "t", None, false), "work");
+        assert_eq!(resolved(&db, "t", Some("side"), false), "side");
+        assert_eq!(resolved(&db, "t", Some("default"), false), "default");
         // Another provider's account is never used.
-        assert_eq!(resolved(&db, "t", Some("cx"), Some("ws"), false), "side");
+        assert_eq!(resolved(&db, "t", Some("cx"), false), "work");
         db.set_provider_account_binding("t", "claude", "work").unwrap();
-        assert_eq!(resolved(&db, "t", Some("side"), Some("ws"), false), "work");
+        assert_eq!(resolved(&db, "t", Some("side"), false), "work");
+    }
+
+    #[test]
+    fn a_stored_workspace_default_no_longer_applies() {
+        let db = db_with(&[("work", "claude"), ("side", "claude")]);
+        db.set_provider_account_default("", "claude", Some("work")).unwrap();
+        // Left behind by the per-workspace default the picker used to set.
+        db.set_provider_account_default("ws", "claude", Some("side")).unwrap();
+        let mut start = input("t", false, serde_json::Value::Null);
+        start.workspace_id = Some("ws".into());
+        assert_eq!(start_resolution(&db, ProviderKind::Claude, &start).unwrap().account_id(), "work");
     }
 
     #[test]
     fn unbound_history_stays_on_the_cli_sign_in() {
         let db = db_with(&[("work", "claude")]);
         db.set_provider_account_default("", "claude", Some("work")).unwrap();
-        assert_eq!(resolved(&db, "old", None, None, true), "default");
+        assert_eq!(resolved(&db, "old", None, true), "default");
     }
 
     #[test]
@@ -751,11 +756,11 @@ mod tests {
         let db = db_with(&[("work", "claude")]);
         db.set_provider_account_binding("t", "claude", "gone").unwrap();
         db.set_provider_account_default("", "claude", Some("work")).unwrap();
-        assert_eq!(resolved(&db, "t", None, None, false), "work");
+        assert_eq!(resolved(&db, "t", None, false), "work");
         // A binding for another provider (the chat switched providers) does
         // not pin this one.
         db.set_provider_account_binding("t2", "codex", "work").unwrap();
-        assert_eq!(resolved(&db, "t2", None, None, false), "work");
+        assert_eq!(resolved(&db, "t2", None, false), "work");
     }
 
     fn input(thread: &str, resume: bool, extra: serde_json::Value) -> StartSessionInput {
@@ -856,9 +861,9 @@ mod tests {
     }
 
     /// The account and native session `thread` rebuilds with, from a row
-    /// read as `(workspace, native)`.
-    fn rebuilt(app: &tauri::App<tauri::test::MockRuntime>, thread: &str, ws: &str, native: &str) -> (Option<String>, Option<String>) {
-        let rebuild = rebuild_env(app.handle(), ProviderKind::Claude, thread, Some(ws), Some(native), None, false);
+    /// whose native session id is `native`.
+    fn rebuilt(app: &tauri::App<tauri::test::MockRuntime>, thread: &str, native: &str) -> (Option<String>, Option<String>) {
+        let rebuild = rebuild_env(app.handle(), ProviderKind::Claude, thread, Some(native), None, false);
         (rebuild.env.and_then(|env| env.get(SESSION_ACCOUNT_ENV).cloned()), rebuild.native)
     }
 
@@ -883,19 +888,19 @@ mod tests {
 
         // Even from a row read before the removal, the removed account's
         // native session is not resumed elsewhere.
-        assert_eq!(rebuilt(&app, "rm-t", "ws", "native-1"), (Some("rm-personal".into()), None));
+        assert_eq!(rebuilt(&app, "rm-t", "native-1"), (Some("rm-personal".into()), None));
         assert_eq!(db.provider_account_binding("rm-t", "claude").unwrap().as_deref(), Some("rm-personal"));
-        // The chat's own workspace default comes first.
-        assert_eq!(rebuilt(&app, "rm-t-ws", "rm-ws", "native-1").0.as_deref(), Some("rm-side"));
+        // A default stored for the chat's workspace no longer applies.
+        assert_eq!(rebuilt(&app, "rm-t-ws", "native-1").0.as_deref(), Some("rm-personal"));
 
         // A first turn's native id that its session reports after the
         // delete came from the removed account too.
         db.set_agent_chat_sdk_session_id("rm-late", "late-native").unwrap();
-        assert_eq!(rebuilt(&app, "rm-late", "ws", "late-native"), (Some("rm-personal".into()), None));
+        assert_eq!(rebuilt(&app, "rm-late", "late-native"), (Some("rm-personal".into()), None));
         // Once bound again it stays refused, and the new account's own
         // sessions resume.
-        assert_eq!(rebuilt(&app, "rm-late", "ws", "late-native").1, None);
-        assert_eq!(rebuilt(&app, "rm-late", "ws", "personal-native").1.as_deref(), Some("personal-native"));
+        assert_eq!(rebuilt(&app, "rm-late", "late-native").1, None);
+        assert_eq!(rebuilt(&app, "rm-late", "personal-native").1.as_deref(), Some("personal-native"));
         // A start offering such a cursor goes fresh on the next default too.
         let mut start = input("rm-start", true, serde_json::Value::Null);
         prepare_start(app.handle(), ProviderKind::Claude, &mut start, false);
@@ -904,7 +909,7 @@ mod tests {
 
         // A chat from before accounts keeps its transcript's home.
         db.upsert_agent_chat_session("rm-legacy", "ws", Some("/repo"), "claude").unwrap();
-        assert_eq!(rebuilt(&app, "rm-legacy", "ws", "native-2"), (None, Some("native-2".into())));
+        assert_eq!(rebuilt(&app, "rm-legacy", "native-2"), (None, Some("native-2".into())));
         assert_eq!(db.provider_account_binding("rm-legacy", "claude").unwrap().as_deref(), Some("default"));
     }
 

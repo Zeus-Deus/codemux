@@ -7,7 +7,7 @@ vi.mock("@/tauri/commands", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/tauri/commands")>()),
   providerAccountThread: vi.fn(async () => {
     if (lookupFails.current) throw new Error("web-remote: not connected");
-    return { account_id: "codex-work", bound: true, workspace_id: "ws", workspace_default: null };
+    return { account_id: "codex-work", bound: true };
   }),
   listChatProviderCapabilities: vi.fn(async (_provider: string, _force?: boolean, accountId?: string) => {
     if (accountId === "codex-work") return { ...CAPS, models: [{ ...MODEL, id: "gpt-work", supports_images: true }] };

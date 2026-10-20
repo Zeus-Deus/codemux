@@ -69,7 +69,6 @@ if (typeof window !== "undefined" && new URLSearchParams(window.location.search)
   );
 }
 const defaults: Record<string, string> = { claude: "claude-work-3f9a1c", codex: "codex-work-5c1d22" };
-const workspaceDefaults = new Map<string, Record<string, string>>();
 const bindings = new Map<string, string>();
 let seq = 0;
 
@@ -163,12 +162,7 @@ export function createProviderAccountsMock() {
     provider_account_set_default: (a) => {
       const provider = String(a.provider);
       const id = (a.accountId as string | null) ?? null;
-      if (a.workspaceId) {
-        const scoped = workspaceDefaults.get(String(a.workspaceId)) ?? {};
-        if (id) scoped[provider] = id;
-        else delete scoped[provider];
-        workspaceDefaults.set(String(a.workspaceId), scoped);
-      } else if (!id || id === "default") delete defaults[provider];
+      if (!id || id === "default") delete defaults[provider];
       else defaults[provider] = id;
       return state();
     },
@@ -182,14 +176,9 @@ export function createProviderAccountsMock() {
       const thread = String(a.threadId);
       const provider = String(a.provider);
       const bound = bindings.get(`${provider}:${thread}`);
-      const workspace = "ws-mock";
-      const scoped = workspaceDefaults.get(workspace)?.[provider] ?? null;
-      const started = !thread.startsWith("draft");
       return {
-        account_id: bound ?? scoped ?? defaults[provider] ?? "default",
-        bound: started,
-        workspace_id: started ? workspace : null,
-        workspace_default: scoped,
+        account_id: bound ?? defaults[provider] ?? "default",
+        bound: !thread.startsWith("draft"),
       };
     },
     provider_account_switch_thread: async (a) => {
