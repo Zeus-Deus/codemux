@@ -508,8 +508,9 @@ async fn held_queue_survives_failed_config(send: HeldSend) {
     let mut completed = 0;
     tokio::time::timeout(Duration::from_secs(4), async { while failing_turn.is_none() || completed < 2 {
         let event = events.next().await.unwrap();
-        if let ProviderRuntimeEvent::TurnCompleted { .. } = &event {
+        if let ProviderRuntimeEvent::TurnCompleted { turn_id, .. } = &event {
             completed += 1;
+            if completed == 2 { failing_turn = Some(turn_id.clone()); }
             if completed == 1 {
                 match send {
                     HeldSend::IdleSendNow => f.provider.send_queued_turn_now(f.thread.clone(), q1.clone().unwrap()).await.unwrap(),
@@ -1227,4 +1228,68 @@ async fn rereview_automatic_resume_ignores_legacy_stale_generic_row() {
     let _=f.provider.stop_session(f.thread.clone()).await;
     assert!(matches!(resumed,Ok(Ok(()))),"auto-resume must not replay stale generic overrides: {resumed:?}");
     assert_eq!(catalog.current_model.as_deref(),Some("vendor:model [1m]"));
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_custom_acp_stop_machine_send_retains_controller_queue_until_human() {
+    let f=Fixture::new("dynamic-review5-queue").await;
+    f.start(None,None).await.unwrap();
+    f.command_send(json!({"thread_id":f.thread.0,"text":"first held prompt"})).await.unwrap();
+    wait_marker(&f.dir.path().join("wire.jsonl.ready")).await;
+    let input=|text:&str|serde_json::from_value(json!({"thread_id":f.thread.0,"text":text,"client_nonce":text,"delivery":"queue"})).unwrap();
+    let b=crate::commands::agent_chat::send_turn_with_context(f.app.handle().clone(),ProviderKind::Acp,input("controller B"),crate::agent_control::delivery::SendContext::controller(&crate::agent_control::ControlCaller::trusted())).await.unwrap().queued_id.unwrap();
+    let db=f.app.state::<DatabaseStore>();
+    db.stop_message_deliveries(&f.thread.0).unwrap();
+    f.provider.interrupt_turn(f.thread.clone(),None).await.unwrap();
+    std::fs::write(f.dir.path().join("wire.jsonl.release"),b"release").unwrap();
+    let session=f.provider.session(&f.thread).await.unwrap();
+    let idle=|| async { tokio::time::timeout(Duration::from_secs(4),async { while session.state.lock().await.active.is_some() { tokio::time::sleep(Duration::from_millis(5)).await; } }).await.unwrap(); };
+    idle().await;
+    crate::commands::agent_chat::send_turn_with_context(f.app.handle().clone(),ProviderKind::Acp,input("machine C"),crate::agent_control::delivery::SendContext::controller(&crate::agent_control::ControlCaller::trusted())).await.unwrap();
+    idle().await;
+    assert!(session.state.lock().await.queued.iter().any(|q|q.id==b),"machine send must not pop and lose B");
+    assert!(!db.message_delivery_for_message(&f.thread.0,"controller B").unwrap().unwrap().attempted);
+    let wire=std::fs::read_to_string(f.dir.path().join("wire.jsonl")).unwrap();
+    assert!(!wire.lines().any(|l|l.contains("session/prompt") && l.contains("controller B")));
+    f.command_send(json!({"thread_id":f.thread.0,"text":"human D"})).await.unwrap();
+    idle().await;
+    f.provider.stop_session(f.thread.clone()).await.unwrap();
+    let wire=std::fs::read_to_string(f.dir.path().join("wire.jsonl")).unwrap();
+    let prompts:Vec<Value>=wire.lines().filter_map(|l|serde_json::from_str::<Value>(l).ok()).filter(|v|v["method"]=="session/prompt").collect();
+    let texts:Vec<_>=prompts.iter().map(|v|v["params"]["prompt"][0]["text"].as_str().unwrap()).collect();
+    assert_eq!(texts,vec!["first held prompt","machine C","human D","controller B"]);
+}
+
+#[derive(Debug,Default)]
+struct RefusedQueueItem(std::sync::atomic::AtomicBool);
+#[async_trait]
+impl TurnDispatchCheckpoint for RefusedQueueItem {
+    fn authorize_dispatch(&self)->Result<(),ProviderError> { self.0.store(true,Ordering::SeqCst);Err(invalid("grant_revoked: synthetic queued client")) }
+    fn queued_delivery_state(&self)->crate::agent_provider::types::QueuedDeliveryState {
+        if self.0.load(Ordering::SeqCst) { crate::agent_provider::types::QueuedDeliveryState::Blocked }
+        else { crate::agent_provider::types::QueuedDeliveryState::Ready }
+    }
+    async fn prepare(&self){}
+    async fn commit(&self){}
+    async fn abort(&self){}
+}
+#[tokio::test]
+async fn orchestration_message_custom_acp_refused_item_stays_queued_and_later_item_dispatches() {
+    let f=Fixture::new("dynamic-review5-queue").await;f.start(None,None).await.unwrap();
+    let mut events=f.provider.event_stream();
+    f.provider.send_turn(serde_json::from_value(json!({"thread_id":f.thread.0,"text":"first held prompt"})).unwrap()).await.unwrap();
+    wait_marker(&f.dir.path().join("wire.jsonl.ready")).await;
+    let mut refused:SendTurnInput=serde_json::from_value(json!({"thread_id":f.thread.0,"text":"refused B"})).unwrap();
+    refused.turn_checkpoint=Some(Arc::new(RefusedQueueItem::default()));
+    let b=f.provider.send_turn(refused).await.unwrap().queued_id.unwrap();
+    let d=f.provider.send_turn(serde_json::from_value(json!({"thread_id":f.thread.0,"text":"allowed D"})).unwrap()).await.unwrap().queued_id.unwrap();
+    std::fs::write(f.dir.path().join("wire.jsonl.release"),b"release").unwrap();
+    let mut seen=vec![];
+    tokio::time::timeout(Duration::from_secs(4),async {loop {
+        let e=events.next().await.unwrap();let done=matches!(&e,ProviderRuntimeEvent::QueuedTurnDispatched {queued_id,..} if queued_id==&d);
+        seen.push(e);if done {break;}
+    }}).await.unwrap();
+    assert!(!seen.iter().any(|e|matches!(e,ProviderRuntimeEvent::QueuedTurnDispatched {queued_id,..} if queued_id==&b)));
+    assert!(f.provider.session(&f.thread).await.unwrap().state.lock().await.queued.iter().any(|q|q.id==b));
+    f.provider.stop_session(f.thread.clone()).await.unwrap();
 }

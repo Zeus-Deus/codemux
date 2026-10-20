@@ -1077,3 +1077,23 @@ fn hermes_offline_free_model_change_fails_without_mutating_binding() {
     assert_eq!(retained.acp_session_id, binding.acp_session_id);
     assert!(provider.validate_intent("thread", Some("opencode-free:mimo-v2.5-free"), None).is_ok());
 }
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_hermes_failed_human_release_preserves_stop_hold() {
+    let (_root,provider,runtime,_chat,task)=review_pump_fixture().await;
+    let mut events=provider.inner.events.subscribe();
+    runtime.queue.lock().await.running=true;
+    provider.interrupt_turn(ThreadId("thread".into()),None).await.unwrap();
+    let mut machine=turn("thread","held B");
+    machine.turn_checkpoint=Some(Arc::new(crate::agent_provider::queue_hold::TestCheckpoint {release:false,held:Default::default()}));
+    let b=provider.send_turn(machine).await.unwrap().queued_id.unwrap();
+    let revoked=Arc::new(ReviewDispatchAuthority::default());revoked.revoked.store(true,std::sync::atomic::Ordering::SeqCst);
+    let mut human=turn("thread","failed human C");human.turn_checkpoint=Some(revoked);
+    let c=provider.send_turn(human).await.unwrap().queued_id.unwrap();
+    tokio::time::timeout(Duration::from_secs(3),provider.inner.clone().pump(runtime.clone())).await.unwrap();
+    assert!(runtime.queue.lock().await.jobs.iter().any(|j|j.id==b));
+    let mut seen=vec![];while let Ok(e)=events.try_recv(){seen.push(e);}
+    assert!(seen.iter().any(|e|matches!(e,ProviderRuntimeEvent::QueuedTurnCancelled {queued_id,..} if queued_id==&c)));
+    assert!(!seen.iter().any(|e|matches!(e,ProviderRuntimeEvent::QueuedTurnDispatched {queued_id,..} if queued_id==&b)));
+    runtime.child.shutdown().await.unwrap();task.abort();let _=task.await;
+}

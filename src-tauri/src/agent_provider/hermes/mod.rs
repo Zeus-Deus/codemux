@@ -180,7 +180,7 @@ impl crate::agent_provider::queue_edit::QueueEntry for Job {
 struct Queue {
     jobs: VecDeque<Job>,
     running: bool,
-    held_threads: std::collections::HashSet<ThreadId>,
+    holds: HashMap<ThreadId, crate::agent_provider::queue_hold::QueueHold>,
 }
 struct Runtime {
     #[cfg(test)]
@@ -682,8 +682,8 @@ impl Inner {
             let _guard = runtime.operation.lock().await;
             let job = {
                 let mut queue = runtime.queue.lock().await;
-                let next = queue.jobs.iter().position(|job| !queue.held_threads.contains(&job.input.thread_id)
-                    && job.input.queued_delivery_state() != crate::agent_provider::types::QueuedDeliveryState::Held);
+                let queue = &mut *queue;
+                let next = queue.jobs.iter().position(|job| queue.holds.entry(job.input.thread_id.clone()).or_default().can_select(&job.id, job.input.queued_delivery_state()));
                 match next.and_then(|i|queue.jobs.remove(i)) {
                     Some(j) => j,
                     None => {
@@ -704,7 +704,7 @@ impl Inner {
                         let epoch = state.cancel_epoch;
                         drop(state);
                         let mut queue = runtime.queue.lock().await;
-                        queue.held_threads.insert(thread.clone());
+                        queue.holds.entry(thread.clone()).or_default().hold();
                         queue.jobs.push_front(Job { cancel_epoch: epoch, ..job });
                         continue;
                     }
@@ -718,6 +718,10 @@ impl Inner {
                 state.cancelled = false;
             }
             let result = async {
+                if job.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Disposed {
+                    rejected = true;
+                    return Err(invalid("Disposed queued delivery"));
+                }
                 let binding = chat.binding.lock().await.clone();
                 binding.profile.validate().map_err(invalid)?;
                 binding.validate_cwd().map_err(invalid)?;
@@ -749,6 +753,7 @@ impl Inner {
                     }
                 }
                 dispatched = true;
+                runtime.queue.lock().await.holds.entry(thread.clone()).or_default().settle(&job.id,true);
                 self.emit(ProviderRuntimeEvent::QueuedTurnDispatched {thread_id:thread.clone(),queued_id:job.id.clone(),turn_id:turn.clone(),text:job.input.display_text.clone().unwrap_or_else(||job.input.text.clone()),steered:false});
                 self.emit(ProviderRuntimeEvent::SessionStateChanged {thread_id:thread.clone(),status:SessionStatus::Running {active_turn:turn.clone()}});
                 let response = runtime.child.request_with_timeout("session/prompt",json!({"sessionId":binding.acp_session_id,"prompt":[{"type":"text","text":job.input.text}]}),Duration::from_secs(24*60*60)).await.map_err(rpc)?;
@@ -769,6 +774,9 @@ impl Inner {
                 if response.get("stopReason").and_then(Value::as_str).is_none() { return Err(invalid("unsupported: Hermes prompt returned no stop reason")); }
                 Ok::<(),ProviderError>(())
             }.await;
+            if !dispatched {
+                runtime.queue.lock().await.holds.entry(thread.clone()).or_default().settle(&job.id,false);
+            }
             let mut state = chat.state.lock().await;
             if rejected {
                 // No prompt was written. Reject only this input, leaving real
@@ -778,8 +786,14 @@ impl Inner {
                     let epoch = state.cancel_epoch;
                     drop(state);
                     let mut queue = runtime.queue.lock().await;
-                    queue.held_threads.insert(thread.clone());
+                    queue.holds.entry(thread.clone()).or_default().hold();
                     queue.jobs.push_front(Job { cancel_epoch: epoch, ..job });
+                    chat.finished.notify_waiters();
+                    continue;
+                }
+                if job.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Blocked {
+                    drop(state);
+                    runtime.queue.lock().await.jobs.push_front(job);
                     chat.finished.notify_waiters();
                     continue;
                 }
@@ -1287,7 +1301,9 @@ impl AgentProvider for HermesProvider {
         let id = Uuid::new_v4().to_string();
         let runtime = chat.runtime.clone();
         let mut queue = runtime.queue.lock().await;
-        let release = input.releases_queue_hold() && queue.held_threads.remove(&input.thread_id);
+        let hold = queue.holds.entry(input.thread_id.clone()).or_default();
+        let release = input.releases_queue_hold() && hold.goes_first();
+        if release { hold.release_with(&id); }
         let idle = chat.state.lock().await.active.is_none();
         self.inner.emit(ProviderRuntimeEvent::TurnQueued {
             provenance: Default::default(),
@@ -1351,7 +1367,7 @@ impl AgentProvider for HermesProvider {
             let Some(index) = queue.jobs.iter().position(|job|job.id == queued_id && job.input.thread_id == thread_id) else { return Ok(()) };
             let job = queue.jobs.remove(index).unwrap();
             queue.jobs.push_front(job);
-            queue.held_threads.remove(&thread_id);
+            queue.holds.entry(thread_id.clone()).or_default().release_with(&queued_id);
             if !queue.running {
                 queue.running = true;
                 tokio::spawn(self.inner.clone().pump(runtime.clone()));
@@ -1400,7 +1416,7 @@ impl AgentProvider for HermesProvider {
         let mut queue = chat.runtime.queue.lock().await;
         let mut s = chat.state.lock().await;
         if turn_id.is_none() {
-            queue.held_threads.insert(thread_id.clone());
+            queue.holds.entry(thread_id.clone()).or_default().hold();
             s.cancel_epoch += 1;
             for job in queue.jobs.iter_mut().filter(|job|job.input.thread_id == thread_id) {
                 job.cancel_epoch = s.cancel_epoch;

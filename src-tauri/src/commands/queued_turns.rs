@@ -514,7 +514,19 @@ pub(crate) async fn send_saved_queued_turn<R: Runtime>(
     context.provenance.input_intent = crate::agent_provider::message::InputIntent::QueuedTurn;
     context.delivery_id = context.provenance.delivery_id.clone();
     if let Some(id) = &context.delivery_id {
-        db.rearm_saved_message_delivery(id,&thread_id.0,&queued_id)?;
+        let record = db.message_delivery(id)?.ok_or("Saved message delivery is missing")?;
+        let payload: crate::agent_control::delivery::DeliveryPayload = serde_json::from_value(record.payload).map_err(|e|e.to_string())?;
+        context.control = payload.caller.map(|caller| crate::agent_control::NativeControlGuard {
+            caller, workspace_id: db.get_agent_chat_session(&thread_id.0).map(|r|r.workspace_id).unwrap_or_default(),
+            thread_id: thread_id.0.clone(), provider, admission: None,
+        }.retain_admission(&app));
+        if let Some(control) = &context.control {
+            if let Err(error) = control.verify(&app) {
+                db.finish_message_delivery(id,"held",None,Some(&error))?;
+                return Err(error);
+            }
+        }
+        db.rearm_saved_message_delivery(id,&thread_id.0,&queued_id,release_queue)?;
         context.claimed=true;
     } else {
         // Legacy saved messages have no delivery journal row, but their old

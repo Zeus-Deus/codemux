@@ -360,15 +360,8 @@ impl AcpSessionState {
 
     /// The next queued turn to dispatch, unless a user Stop holds the queue.
     fn next_queued(&mut self) -> Option<QueuedTurn> {
-        if self.queued.front().is_some_and(|q| q.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Held) {
-            self.queue_hold.hold();
-            return None;
-        }
-        let front = self.queued.front().map(|queued| queued.id.as_str());
-        if !self.queue_hold.admits(front) {
-            return None;
-        }
-        self.queued.pop_front()
+        let next = self.queued.iter().position(|q| self.queue_hold.can_select(&q.id, q.input.queued_delivery_state()));
+        next.and_then(|i|self.queued.remove(i))
     }
 
     /// Release the prompt slot. Drops any Stop still aimed at the
@@ -1196,6 +1189,14 @@ impl AcpSession {
             #[cfg(test)]
             selected_prepare_test_schedule(&self.thread_id).await;
             checkpoint = queued.input.turn_checkpoint.clone();
+            if queued.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Disposed {
+                self.cancel_selected_queued(&queued.id).await;
+                let mut state = self.state.lock().await;
+                state.release_turn();
+                state.status = SessionStatus::Ready;
+                next = state.next_queued().map(|queued| self.claim_queued_turn(&mut state, queued));
+                continue;
+            }
             match self
                 .prepare_turn(queued.input.clone(), queued.dispatch.clone())
                 .await
@@ -1216,6 +1217,15 @@ impl AcpSession {
                     state.queue_hold.hold();
                     state.queued.push_front(QueuedTurn { dispatch: None, ..queued });
                     return;
+                }
+                Err(PrepareTurnError::Rejected(_)) if queued.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Blocked => {
+                    let mut state = self.state.lock().await;
+                    state.selected_queued.take();
+                    state.queue_hold.settle(&queued.id, false);
+                    state.release_turn();
+                    state.status = SessionStatus::Ready;
+                    state.queued.push_front(QueuedTurn { dispatch: None, ..queued });
+                    next = state.next_queued().map(|queued| self.claim_queued_turn(&mut state, queued));
                 }
                 Err(PrepareTurnError::Rejected(_)) => {
                     self.cancel_selected_queued(&queued.id).await;

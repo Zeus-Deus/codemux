@@ -801,23 +801,18 @@ impl OpenCodeSession {
         }
         while !self.turn_active().await {
             let mut queue = self.queued.lock().await;
-            if queue.front().is_some_and(|(_, input)| input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Held) {
-                self.queue_hold().hold();
-                return;
-            }
-            let front = queue.front().map(|(id, _)| id.clone());
-            if !self.queue_hold().admits(front.as_deref()) {
-                return;
-            }
-            let Some((id, input)) = queue.pop_front() else {
-                return;
-            };
+            let next = queue.iter().position(|(id,input)| self.queue_hold().can_select(id, input.queued_delivery_state()));
+            let Some((id, input)) = next.and_then(|i|queue.remove(i)) else { return; };
             drop(queue);
             let text = input
                 .display_text
                 .clone()
                 .unwrap_or_else(|| input.text.clone());
             let retained_input = input.clone();
+            if input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Disposed {
+                let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {thread_id:self.thread_id.clone(),queued_id:id});
+                continue;
+            }
             match self.dispatch_input(input, false, Some(id.clone())).await {
                 Ok(result) if result.queued_id.is_some() => return,
                 Ok(result) => {
@@ -840,6 +835,10 @@ impl OpenCodeSession {
                             self.queued.lock().await.push_front((id, retained_input));
                             self.queue_hold().hold();
                             return;
+                        }
+                        crate::agent_provider::types::QueuedDeliveryState::Blocked => {
+                            self.queued.lock().await.push_front((id, retained_input));
+                            continue;
                         }
                         crate::agent_provider::types::QueuedDeliveryState::Disposed => {
                             log::debug!("Disposed queued wake {id}");

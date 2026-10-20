@@ -84,7 +84,14 @@ pub struct ProviderCapabilities {
 /// A durable queue item may be held by Stop or disposed before its adapter
 /// notices. Neither condition is a provider dispatch failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueuedDeliveryState { Ready, Held, Disposed }
+pub enum QueuedDeliveryState {
+    Ready,
+    /// Stop holds the whole queue until a human action.
+    Held,
+    /// This item needs attention; unrelated queued items may proceed.
+    Blocked,
+    Disposed,
+}
 
 /// Lifecycle hook executed at the provider's actual dispatch boundary.
 /// Provider queues call this immediately before an accepted turn so queued

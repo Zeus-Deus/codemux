@@ -1494,3 +1494,71 @@ async fn orchestration_message_controller_queue_release_refreshes_only_stop_fenc
     gate.cancel();
     assert!(checkpoint.authorize_dispatch().is_err());
 }
+
+#[tokio::test]
+async fn orchestration_message_saved_replay_rechecks_revoked_caller_before_rearm() {
+    use crate::agent_provider::{message::*,types::MessageDelivery,ProviderKind,ThreadId};
+    for release in [false,true] {
+        let (app,provider,_root,workspace)=fixture().await;
+        app.manage(crate::mcp_connector::McpConnectorState::default());
+        app.manage(crate::web_remote::WebRemoteState::default());
+        let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"saved-revoked-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+        let launched=settle_operation(&app,&receipt).await;let thread=launched["thread_id"].as_str().unwrap();
+        let db=app.state::<crate::database::DatabaseStore>();
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port=listener.local_addr().unwrap().port();drop(listener);
+        crate::web_remote::web_remote_set_config(app.handle().clone(),Some(port),None,Some("loopback".into()),Some(false),Some(false),Some(false),Some(true)).await.unwrap();
+        crate::web_remote::web_remote_enable(app.handle().clone()).await.unwrap();
+        crate::mcp_connector::agent_connector_set_config(app.handle().clone(),true,None).unwrap();
+        let now=chrono::Utc::now().timestamp_millis();
+        db.mcp_register_client(crate::database::mcp_connector::NewMcpClient {id:"revoked-client".into(),name:"Synthetic replay client".into(),redirects:vec!["https://client.example/cb".into()],created_at:now},now).unwrap();
+        db.mcp_mint_grant(crate::database::mcp_connector::NewMcpGrant {id:"revoked-grant".into(),client_id:"revoked-client".into(),token_hash:"synthetic-hash".into(),redirect_uri:"https://client.example/cb".into(),resource:format!("http://127.0.0.1:{port}/mcp"),access:"full_access".into(),created_at:now,expires_at:now+60_000}).unwrap();
+        let caller=ControlCaller::outside("revoked-client".into(),"revoked-grant".into(),ControlAccess::FullAccess);
+        crate::mcp_connector::validate_caller(app.handle(),&caller).unwrap();
+        let provenance=MessageProvenance {message_id:Some("B".into()),delivery_id:Some("B".into()),origin:Some(crate::commands::agent_chat::TurnOrigin::Controller),created_by:CreatedBy::User,creation_source:CreationSource::Mcp,..Default::default()};
+        db.admit_message_delivery("B",thread,"B",&json!({"provider":"claude","origin":"controller","input":{"thread_id":thread,"text":"must not send"},"provenance":provenance,"caller":caller}),"old",0,None,true).unwrap();
+        db.finish_message_delivery("B","queued",Some(&json!({"queued_id":"saved-B"})),None).unwrap();
+        db.control_record_queue_admission(thread,"saved-B").unwrap();
+        db.insert_queued_turn(&crate::database::queued_turns::QueuedTurnRecord {thread_id:thread.into(),queued_id:"saved-B".into(),position:0,text:"must not send".into(),prompt:None,provenance,skill_ids:vec![],skill_text:None,include_plugins:false,images:vec![],client_nonce:Some("B".into()),model_override:None,effort_override:None,permission_mode_override:None,epoch:"old".into()}).unwrap();
+        crate::mcp_connector::agent_connector_revoke(app.handle().clone(),"revoked-client".into()).unwrap();
+        db.recover_message_deliveries("new").unwrap();
+        let calls=provider.calls.snapshot().len();
+        let result=crate::commands::queued_turns::send_saved_queued_turn(app.handle().clone(),ProviderKind::Claude,ThreadId(thread.into()),"saved-B".into(),MessageDelivery::Queue,release).await;
+        assert!(result.is_err(),"revoked caller replay was allowed: {result:?}");
+        assert_eq!(provider.calls.snapshot().len(),calls);
+        assert!(db.get_queued_turn(thread,"saved-B").is_some());
+        let row=db.message_delivery("B").unwrap().unwrap();
+        assert_eq!(row.state,"held");assert!(!row.attempted);
+        assert!(row.error.unwrap().contains("grant_revoked"));
+        assert_eq!(db.thread_message_delivery_attention(thread).unwrap().len(),1);
+        if !release {
+            let mut next=db.get_queued_turn(thread,"saved-B").unwrap();
+            next.queued_id="saved-D".into();next.position=1;next.text="allowed saved D".into();
+            next.client_nonce=Some("saved-D".into());
+            next.provenance=MessageProvenance {message_id:Some("saved-D".into()),..Default::default()};
+            db.insert_queued_turn(&next).unwrap();
+            crate::commands::restart_resume::test_drain_saved_queue(app.handle(),&ThreadId(thread.into())).await;
+            assert!(db.get_queued_turn(thread,"saved-B").is_some());
+            assert!(db.get_queued_turn(thread,"saved-D").is_none(),"a refused saved item must not block later replay");
+            assert!(provider.calls.snapshot().iter().any(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(_,text) if text=="allowed saved D")));
+        }
+        crate::web_remote::web_remote_disable(app.handle().clone()).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn orchestration_message_stop_with_disposed_queue_and_inactive_session_settles() {
+    use crate::agent_provider::{ProviderKind,ThreadId};
+    let (app,_provider,_root,_workspace)=fixture().await;
+    let cursor=Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(crate::agent_provider::cursor::CursorProviderConfig {binary:"unused-synthetic-peer".into(),event_channel_capacity:16,mcp_registry:None}));
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_cursor(cursor).await;
+    let db=app.state::<crate::database::DatabaseStore>();
+    // A late provider ACK can outlive a deleted/inactive persisted session.
+    db.admit_message_delivery("wake","inactive","wake",&json!({"origin":"pr_watch"}),"old",0,None,true).unwrap();
+    db.stop_message_deliveries("inactive").unwrap();
+    db.finish_message_delivery("wake","queued",Some(&json!({"queued_id":"late-wake"})),None).unwrap();
+    assert_eq!(db.disposed_delivery_queue_ids("inactive").unwrap(),vec!["late-wake"]);
+    let reached=crate::commands::agent_chat::agent_chat_interrupt_turn(app.handle().clone(),ProviderKind::Cursor,ThreadId("inactive".into()),None).await.unwrap();
+    assert!(!reached);
+    assert!(!app.state::<crate::commands::agent_chat::SubagentTracker>().delegated_work_holding_turn("inactive"));
+}

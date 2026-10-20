@@ -247,7 +247,8 @@ impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
         use crate::agent_provider::types::QueuedDeliveryState::*;
         match self.app.state::<DatabaseStore>().message_delivery(&self.id) {
             Ok(Some(row)) if row.state == "cancelled" => Disposed,
-            Ok(Some(row)) if row.state == "held" || row.state == "held_unknown" => Held,
+            Ok(Some(row)) if row.state == "held" && row.hold_reason.as_deref() == Some("stop") => Held,
+            Ok(Some(row)) if matches!(row.state.as_str(), "held" | "held_unknown" | "rejected") => Blocked,
             Ok(Some(_)) => Ready,
             _ => Held,
         }
@@ -257,7 +258,11 @@ impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
         let record = db.message_delivery(&self.id).map_err(|message|crate::agent_provider::ProviderError::ValidationError {message})?;
         let released_stops = record.as_ref().and_then(|row|row.generation.checked_sub(self.admitted_generation)).unwrap_or(0);
         if let Some(inner) = &self.inner {
-            inner.authorize_rearmed_dispatch(released_stops)?;
+            if let Err(error) = inner.authorize_rearmed_dispatch(released_stops) {
+                let _ = db.fail_message_delivery(&self.id, &error.to_string());
+                changed(&self.app, &self.thread);
+                return Err(error);
+            }
         }
         let binding = db.get_agent_chat_session(&self.thread);
         let valid = binding.as_ref().is_some_and(|record| {

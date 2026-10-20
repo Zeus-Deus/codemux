@@ -1218,15 +1218,9 @@ impl ClaudeSession {
                 if !idle {
                     return;
                 }
-                if state.queued_turns.front().is_some_and(|q| q.input.queued_delivery_state() == crate::agent_provider::types::QueuedDeliveryState::Held) {
-                    state.queue_hold.hold();
-                    return;
-                }
-                let front = state.queued_turns.front().map(|q| q.queued_id.clone());
-                if !state.queue_hold.admits(front.as_deref()) {
-                    return;
-                }
-                match state.queued_turns.pop_front() {
+                let state = &mut *state;
+                let next = state.queued_turns.iter().position(|q| state.queue_hold.can_select(&q.queued_id, q.input.queued_delivery_state()));
+                match next.and_then(|i| state.queued_turns.remove(i)) {
                     Some(queued) => {
                         state.dispatching = true;
                         Some(queued)
@@ -1296,6 +1290,10 @@ impl ClaudeSession {
                             state.queued_turns.push_front(QueuedTurn { queued_id: queued.queued_id, input: retained_input });
                             state.queue_hold.hold();
                             return;
+                        }
+                        crate::agent_provider::types::QueuedDeliveryState::Blocked => {
+                            self.state.lock().await.queued_turns.push_front(QueuedTurn { queued_id: queued.queued_id, input: retained_input });
+                            continue;
                         }
                         crate::agent_provider::types::QueuedDeliveryState::Disposed => {
                             log::debug!("Disposed queued wake {}", queued.queued_id);

@@ -83,12 +83,14 @@ pub(super) fn migrate(conn: &Connection) -> Result<(), String> {
         );
         CREATE INDEX IF NOT EXISTS agent_message_delivery_pending ON agent_message_deliveries(state,retry_at);
     ").map_err(|e| e.to_string())?;
-    for (column, definition) in [("attempt_count", "INTEGER NOT NULL DEFAULT 0"), ("attention_acknowledged", "INTEGER NOT NULL DEFAULT 0"), ("origin_notified", "INTEGER NOT NULL DEFAULT 0")] {
+    for (column, definition) in [("attempt_count", "INTEGER NOT NULL DEFAULT 0"), ("attention_acknowledged", "INTEGER NOT NULL DEFAULT 0"), ("origin_notified", "INTEGER NOT NULL DEFAULT 0"), ("dispatch_owned", "INTEGER NOT NULL DEFAULT 0"), ("hold_reason", "TEXT")] {
         let present = conn.prepare("PRAGMA table_info(agent_message_deliveries)").map_err(|e| e.to_string())?
             .query_map([], |row| row.get::<_, String>(1)).map_err(|e| e.to_string())?
             .any(|name| name.is_ok_and(|name| name == column));
         if !present { conn.execute_batch(&format!("ALTER TABLE agent_message_deliveries ADD COLUMN {column} {definition}")).map_err(|e| e.to_string())?; }
     }
+    // Preserve Stop intent from journals written before hold reasons existed.
+    conn.execute("UPDATE agent_message_deliveries SET hold_reason='stop' WHERE state='held' AND hold_reason IS NULL AND error LIKE 'Thread stopped%'",[]).map_err(|e|e.to_string())?;
     Ok(())
 }
 
@@ -112,6 +114,7 @@ pub struct DeliveryRecord {
     pub attempted: bool,
     pub attempt_count: u32,
     pub origin_notified: bool,
+    pub hold_reason: Option<String>,
 }
 fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord> {
     let payload: String = row.get(3)?;
@@ -137,9 +140,10 @@ fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord> {
         attempted: row.get(14)?,
         attempt_count: row.get(16)?,
         origin_notified: row.get(17)?,
+        hold_reason: row.get(18)?,
     })
 }
-const COLUMNS: &str = "id,thread_id,message_id,payload,epoch,generation,attempt_id,state,principal,operation_id,queued_id,turn_id,result,error,attempted,dispatch_payload,attempt_count,origin_notified";
+const COLUMNS: &str = "id,thread_id,message_id,payload,epoch,generation,attempt_id,state,principal,operation_id,queued_id,turn_id,result,error,attempted,dispatch_payload,attempt_count,origin_notified,hold_reason";
 
 /// Optional outside-controller receipt, admitted atomically with its effect.
 pub struct DeliveryOperation<'a> {
@@ -164,10 +168,10 @@ impl DatabaseStore {
         let rows=stmt.query_map([thread],|r|r.get(0)).map_err(|e|e.to_string())?;
         rows.collect::<Result<_,_>>().map_err(|e|e.to_string())
     }
-    pub fn rearm_saved_message_delivery(&self, id: &str, thread: &str, queued: &str) -> Result<(), String> {
+    pub fn rearm_saved_message_delivery(&self, id: &str, thread: &str, queued: &str, release_queue: bool) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e|e.to_string())?;
-        let n=tx.execute("UPDATE agent_message_deliveries SET state='preparing',generation=COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?2),0),error=NULL WHERE id=?1 AND thread_id=?2 AND queued_id=?3 AND attempted=0 AND state IN ('queued','held','rejected')",params![id,thread,queued]).map_err(|e|e.to_string())?;
+        let n=tx.execute("UPDATE agent_message_deliveries SET state='preparing',dispatch_owned=1,hold_reason=NULL,generation=COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?2),0),error=NULL WHERE id=?1 AND thread_id=?2 AND queued_id=?3 AND attempted=0 AND state IN ('queued','held','rejected') AND (?4 OR COALESCE(hold_reason,'')<>'stop')",params![id,thread,queued,release_queue]).map_err(|e|e.to_string())?;
         if n == 0 {
             return Err("Saved message identity no longer owns this queue row, or may already have reached the provider".into());
         }
@@ -201,8 +205,8 @@ impl DatabaseStore {
     /// Pending machine wakes disposed by Stop must never walk back in.
     pub fn resume_message_delivery_thread(&self, thread: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE agent_message_deliveries SET state=CASE WHEN queued_id IS NOT NULL THEN 'queued' WHEN json_extract(payload,'$.origin')='controller' AND (attempt_count=0 OR retry_at IS NOT NULL) THEN 'pending' ELSE 'preparing' END,generation=COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1),0),error=NULL
-            WHERE thread_id=?1 AND state='held' AND attempted=0 AND json_extract(payload,'$.origin') IN ('user','controller')", [thread]).map(drop).map_err(|e|e.to_string())
+        conn.execute("UPDATE agent_message_deliveries SET state=CASE WHEN queued_id IS NOT NULL THEN 'queued' WHEN json_extract(payload,'$.origin')='controller' AND dispatch_owned=0 THEN 'pending' ELSE 'preparing' END,generation=COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1),0),error=NULL,hold_reason=NULL
+            WHERE thread_id=?1 AND state='held' AND COALESCE(hold_reason,'') IN ('stop','') AND attempted=0 AND json_extract(payload,'$.origin') IN ('user','controller')", [thread]).map(drop).map_err(|e|e.to_string())
     }
     pub fn acknowledge_message_delivery(&self, thread: &str, id: &str) -> Result<(), String> {
         self.conn.lock().unwrap().execute("UPDATE agent_message_deliveries SET attention_acknowledged=1 WHERE thread_id=?1 AND id=?2 AND state IN ('held','held_unknown','rejected')", params![thread,id]).map(drop).map_err(|e|e.to_string())
@@ -220,15 +224,19 @@ impl DatabaseStore {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO agent_thread_delivery_state (thread_id,generation,stopped) VALUES (?1,1,0) ON CONFLICT(thread_id) DO UPDATE SET generation=generation+1,stopped=0",[thread]).map_err(|e|e.to_string())?;
-        tx.execute("UPDATE agent_message_deliveries SET state=CASE WHEN attempted=1 THEN CASE WHEN json_extract(payload,'$.origin')='user' THEN 'rejected' ELSE 'held_unknown' END WHEN json_extract(payload,'$.origin') IN ('user','controller') THEN 'held' ELSE 'cancelled' END,error='Thread stopped; explicit messages held and automatic wakes disposed' WHERE thread_id=?1 AND state IN ('pending','preparing','queued','submitting')",[thread]).map_err(|e|e.to_string())?;
+        tx.execute("UPDATE agent_message_deliveries SET state=CASE WHEN attempted=1 THEN CASE WHEN json_extract(payload,'$.origin')='user' THEN 'rejected' ELSE 'held_unknown' END WHEN json_extract(payload,'$.origin') IN ('user','controller') THEN 'held' ELSE 'cancelled' END,hold_reason='stop',error='Thread stopped; explicit messages held and automatic wakes disposed' WHERE thread_id=?1 AND state IN ('pending','preparing','queued','submitting')",[thread]).map_err(|e|e.to_string())?;
         tx.execute("UPDATE agent_control_operations SET state=CASE (SELECT state FROM agent_message_deliveries WHERE id=delivery_id) WHEN 'cancelled' THEN 'failed' WHEN 'rejected' THEN 'failed' ELSE 'needs_attention' END,dispatch_disposition=(SELECT state FROM agent_message_deliveries WHERE id=delivery_id),error=json_object('code','delivery_held','message','Thread stopped') WHERE delivery_id IN (SELECT id FROM agent_message_deliveries WHERE thread_id=?1 AND state IN ('held','held_unknown','cancelled','rejected'))",[thread]).map_err(|e|e.to_string())?;
         retire_automatic_queues(&tx, Some(thread))?;
         tx.commit().map_err(|e| e.to_string())
     }
 
+    pub fn is_disposed_delivery_queue(&self, thread: &str, queued: &str) -> Result<bool, String> {
+        self.conn.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM agent_message_deliveries WHERE thread_id=?1 AND queued_id=?2 AND state='cancelled' AND json_extract(payload,'$.origin') NOT IN ('user','controller'))",params![thread,queued],|r|r.get(0)).map_err(|e|e.to_string())
+    }
+
     pub fn disposed_delivery_queue_ids(&self, thread: &str) -> Result<Vec<String>, String> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT queued_id FROM agent_message_deliveries WHERE thread_id=?1 AND state='cancelled' AND queued_id IS NOT NULL AND json_extract(payload,'$.origin') NOT IN ('user','controller')").map_err(|e|e.to_string())?;
+        let mut stmt = conn.prepare("SELECT d.queued_id FROM agent_message_deliveries d WHERE d.thread_id=?1 AND d.state='cancelled' AND d.queued_id IS NOT NULL AND json_extract(d.payload,'$.origin') NOT IN ('user','controller') AND NOT EXISTS (SELECT 1 FROM agent_chat_messages m WHERE m.thread_id=d.thread_id AND json_extract(m.payload,'$.type')='native_queue_control' AND json_extract(m.payload,'$.queued_id')=d.queued_id AND json_extract(m.payload,'$.disposition') IN ('cancelled','dispatched','steered'))").map_err(|e|e.to_string())?;
         let rows = stmt.query_map([thread], |row| row.get(0)).map_err(|e|e.to_string())?;
         rows.collect::<Result<_,_>>().map_err(|e|e.to_string())
     }
@@ -279,8 +287,8 @@ impl DatabaseStore {
             }
             None => (None, None),
         };
-        tx.execute("INSERT INTO agent_message_deliveries (id,thread_id,message_id,payload,epoch,generation,attempt_id,principal,operation_id,state,attempt_count)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![id,thread,message,payload.to_string(),epoch,generation,id,principal,operation_id,if claim_immediately {"preparing"}else{"pending"},u32::from(claim_immediately)]).map_err(|e|e.to_string())?;
+        tx.execute("INSERT INTO agent_message_deliveries (id,thread_id,message_id,payload,epoch,generation,attempt_id,principal,operation_id,state,attempt_count,dispatch_owned)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",params![id,thread,message,payload.to_string(),epoch,generation,id,principal,operation_id,if claim_immediately {"preparing"}else{"pending"},u32::from(claim_immediately)]).map_err(|e|e.to_string())?;
         let source = &payload["provenance"]["notification"]["source"];
         let terminal = payload["provenance"]["notification"]["outcome"]
             .as_str()
@@ -349,7 +357,7 @@ impl DatabaseStore {
         rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
     }
     pub fn claim_message_delivery(&self, id: &str) -> Result<bool, String> {
-        self.conn.lock().unwrap().execute("UPDATE agent_message_deliveries SET state='preparing',attempt_count=attempt_count+1,updated_at=datetime('now') WHERE id=?1 AND state='pending'",[id]).map(|n|n==1).map_err(|e|e.to_string())
+        self.conn.lock().unwrap().execute("UPDATE agent_message_deliveries SET state='preparing',dispatch_owned=1,attempt_count=attempt_count+1,updated_at=datetime('now') WHERE id=?1 AND state='pending'",[id]).map(|n|n==1).map_err(|e|e.to_string())
     }
     /// Called at the adapter's actual dispatch boundary, after all fallible
     /// authority checks. A crash from this point is possible acceptance.
@@ -374,7 +382,7 @@ impl DatabaseStore {
         if state == "queued" {
             tx.execute("UPDATE agent_message_deliveries SET queued_id=COALESCE(json_extract(?2,'$.queued_id'),queued_id) WHERE id=?1 AND state='cancelled'", params![id,result.map(Value::to_string)]).map_err(|e|e.to_string())?;
         }
-        tx.execute("UPDATE agent_message_deliveries SET state=CASE WHEN state='held' AND ?2='queued' THEN state ELSE ?2 END,result=COALESCE(?3,result),error=CASE WHEN state='held' AND ?2='queued' THEN error ELSE ?4 END,
+        tx.execute("UPDATE agent_message_deliveries SET dispatch_owned=0,hold_reason=CASE WHEN ?2='held' OR (state='held' AND ?2='queued') THEN COALESCE(hold_reason,'refused') ELSE NULL END,state=CASE WHEN state='held' AND ?2='queued' THEN state ELSE ?2 END,result=COALESCE(?3,result),error=CASE WHEN state='held' AND ?2='queued' THEN error ELSE ?4 END,
             queued_id=COALESCE(json_extract(?3,'$.queued_id'),queued_id),turn_id=COALESCE(json_extract(?3,'$.turn_id'),turn_id),
             retry_at=CASE WHEN ?2='pending' THEN datetime('now','+' || MIN(300,5 * (1 << MIN(attempt_count,6))) || ' seconds') ELSE NULL END,updated_at=datetime('now')
             WHERE id=?1 AND state<>'cancelled' AND (state<>'accepted' OR ?2='accepted') AND ((state='held' AND ?2='queued') OR ?2 IN ('held','held_unknown','cancelled','accepted','submitting','rejected') OR (state NOT IN ('held','held_unknown','rejected') AND (state<>'accepted' OR ?2='accepted') AND NOT (state='pending' AND error IS NOT NULL AND ?2 IN ('accepted','submitting'))))",params![id,state,result.map(Value::to_string),error]).map_err(|e|e.to_string())?;
@@ -403,6 +411,9 @@ impl DatabaseStore {
         Ok(())
     }
     pub fn fail_message_delivery(&self, id: &str, error: &str) -> Result<String, String> {
+        // Give-up clears dispatch ownership even when Stop already held the
+        // row. A later human release can hand definite-no-send work to the outbox.
+        self.conn.lock().unwrap().execute("UPDATE agent_message_deliveries SET dispatch_owned=0 WHERE id=?1",[id]).map_err(|e|e.to_string())?;
         let record = self.message_delivery(id)?.ok_or("delivery_not_found")?;
         if !matches!(record.state.as_str(), "preparing" | "submitting" | "queued") { return Ok(record.state); }
         let human = record.payload["origin"] == "user";
@@ -442,7 +453,7 @@ impl DatabaseStore {
         conn.execute("UPDATE agent_control_operations SET state='succeeded',dispatch_disposition='accepted',error=NULL WHERE delivery_id IN (SELECT id FROM agent_message_deliveries WHERE state='accepted')",[]).map_err(|e|e.to_string())?;
         conn.execute("UPDATE agent_message_deliveries SET state=CASE WHEN attempted=1 THEN CASE WHEN json_extract(payload,'$.origin')='user' THEN 'rejected' ELSE 'held_unknown' END WHEN (queued_id IS NOT NULL AND json_extract(payload,'$.origin') IN ('user','controller')) OR json_extract(payload,'$.origin')='user' THEN 'held' ELSE 'pending' END,
             error=CASE WHEN attempted=1 THEN 'Provider acceptance could not be confirmed after restart; automatic resend held' WHEN queued_id IS NOT NULL AND json_extract(payload,'$.origin') IN ('user','controller') THEN 'Saved queue awaits manual delivery' ELSE NULL END,
-            epoch=?1,updated_at=datetime('now') WHERE epoch<>?1 AND state IN ('preparing','submitting','queued')",[epoch]).map_err(|e|e.to_string())?;
+            dispatch_owned=0,hold_reason=CASE WHEN attempted=0 AND (queued_id IS NOT NULL OR json_extract(payload,'$.origin')='user') THEN 'recovery' ELSE hold_reason END,epoch=?1,updated_at=datetime('now') WHERE epoch<>?1 AND state IN ('preparing','submitting','queued')",[epoch]).map_err(|e|e.to_string())?;
         conn.execute("UPDATE agent_control_operations SET state='needs_attention',dispatch_disposition=(SELECT state FROM agent_message_deliveries WHERE id=delivery_id),
             error=json_object('code','delivery_held','message',(SELECT error FROM agent_message_deliveries WHERE id=delivery_id))
             WHERE delivery_id IN (SELECT id FROM agent_message_deliveries WHERE state IN ('held','held_unknown'))",[]).map_err(|e|e.to_string())?;
@@ -1098,14 +1109,14 @@ mod tests {
             assert_eq!(row.state,"held");assert_eq!(row.queued_id.as_deref(),Some(format!("old-{origin}").as_str()));
             assert_eq!(db.get_queued_turn("receiver",&format!("old-{origin}")).unwrap().provenance.message_id.as_deref(),Some(origin));
         }
-        assert!(db.rearm_saved_message_delivery("controller","receiver","different-queue").is_err());
-        db.rearm_saved_message_delivery("controller","receiver","old-controller").unwrap();
+        assert!(db.rearm_saved_message_delivery("controller","receiver","different-queue",true).is_err());
+        db.rearm_saved_message_delivery("controller","receiver","old-controller",true).unwrap();
         db.finish_message_delivery("controller","queued",Some(&json!({"queued_id":"new-controller"})),None).unwrap();
         assert!(!db.control_unresolved_queued_ids("receiver").unwrap().contains(&"old-controller".into()));
-        assert!(db.rearm_saved_message_delivery("controller","receiver","old-controller").is_err());
+        assert!(db.rearm_saved_message_delivery("controller","receiver","old-controller",true).is_err());
         db.message_delivery_submitting("controller").unwrap();
         db.finish_message_delivery("controller","accepted",Some(&json!({"turn_id":"actual"})),None).unwrap();
-        assert!(db.rearm_saved_message_delivery("controller","receiver","old-controller").is_err());
+        assert!(db.rearm_saved_message_delivery("controller","receiver","old-controller",true).is_err());
         assert!(!db.control_unresolved_queued_ids("receiver").unwrap().contains(&"old-controller".into()));
     }
 
@@ -1120,7 +1131,7 @@ mod tests {
         assert!(db.control_unresolved_queued_ids("receiver").unwrap().is_empty());
         for row in db.pending_message_deliveries().unwrap() {
             assert!(row.queued_id.is_none());assert!(row.result.is_none());
-            assert!(db.rearm_saved_message_delivery(&row.id,"receiver",&format!("old-{}",row.id)).is_err());
+            assert!(db.rearm_saved_message_delivery(&row.id,"receiver",&format!("old-{}",row.id),true).is_err());
         }
         db.recover_message_deliveries("epoch-b").unwrap();
         assert_eq!(db.pending_message_deliveries().unwrap().len(),5);
@@ -1148,6 +1159,40 @@ mod tests {
         let row=db.message_delivery("wake").unwrap().unwrap();
         assert_eq!(row.state,"cancelled");assert_eq!(row.queued_id.as_deref(),Some("late-queue"));
         assert_eq!(db.disposed_delivery_queue_ids("receiver").unwrap(),vec!["late-queue"]);
+    }
+
+    #[test]
+    fn orchestration_message_worker_give_up_then_human_release_is_pending() {
+        let db=super::super::init_test_database();
+        db.admit_message_delivery("b","receiver","b",&json!({"origin":"controller"}),"epoch",0,None,false).unwrap();
+        assert!(db.claim_message_delivery("b").unwrap());
+        db.stop_message_deliveries("receiver").unwrap();
+        db.fail_message_delivery("b","dispatch cancelled before provider acknowledgement").unwrap();
+        db.resume_message_delivery_thread("receiver").unwrap();
+        assert_eq!(db.message_delivery("b").unwrap().unwrap().state,"pending");
+        assert_eq!(db.pending_message_deliveries().unwrap().len(),1);
+        assert!(db.claim_message_delivery("b").unwrap());
+    }
+
+    #[test]
+    fn orchestration_message_restart_drain_cannot_rearm_stop_held_saved_row() {
+        let db=super::super::init_test_database();
+        db.upsert_agent_chat_session("receiver","workspace",None,"claude").unwrap();
+        saved(&db,"b","controller","b-queue");
+        db.stop_message_deliveries("receiver").unwrap();
+        db.recover_message_deliveries("epoch-b").unwrap();
+        assert!(db.rearm_saved_message_delivery("b","receiver","b-queue",false).is_err());
+        assert_eq!(db.message_delivery("b").unwrap().unwrap().state,"held");
+        db.rearm_saved_message_delivery("b","receiver","b-queue",true).unwrap();
+    }
+
+    #[test]
+    fn orchestration_message_disposed_queue_cleanup_excludes_terminal_rows() {
+        let db=super::super::init_test_database();
+        db.upsert_agent_chat_session("receiver","workspace",None,"claude").unwrap();
+        saved(&db,"wake","pr_watch","old-queue");
+        db.stop_message_deliveries("receiver").unwrap();
+        assert!(db.disposed_delivery_queue_ids("receiver").unwrap().is_empty());
     }
 
 }

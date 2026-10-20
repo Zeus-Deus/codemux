@@ -53,6 +53,19 @@ impl QueueHold {
         }
     }
 
+    /// Shared drain policy for every adapter. Stop retains the queue, a
+    /// refused item stays visible without blocking later work, and disposed
+    /// wakes can be retired even while the queue is held.
+    pub fn can_select(&mut self, id: &str, state: super::types::QueuedDeliveryState) -> bool {
+        use super::types::QueuedDeliveryState::*;
+        match state {
+            Held => { self.hold(); false }
+            Blocked => false,
+            Disposed => true,
+            Ready => self.admits(Some(id)),
+        }
+    }
+
     /// An explicit send of queued item `id`: let it through a held queue.
     /// Returns the release it replaced, for [`revert_release`](Self::revert_release).
     pub fn release_with(&mut self, id: &str) -> Option<String> {
@@ -235,6 +248,25 @@ mod tests {
         assert!(hold.settle_take(was_held, true));
         assert!(!hold.goes_first());
         assert!(!hold.is_held());
+    }
+
+    #[test]
+    fn orchestration_message_drain_policy_skips_refused_items_without_releasing_stop() {
+        use crate::agent_provider::types::QueuedDeliveryState::*;
+        let mut hold=QueueHold::default();
+        assert!(!hold.can_select("revoked",Blocked));
+        assert!(hold.can_select("next",Ready));
+        hold.hold();
+        assert!(!hold.can_select("revoked",Blocked));
+        assert!(!hold.can_select("next",Ready));
+        assert!(hold.can_select("disposed",Disposed));
+        hold.release_with("human");
+        assert!(hold.can_select("human",Ready));
+        hold.settle("human",false);
+        assert!(!hold.can_select("next",Ready));
+        hold.release_with("human-2");
+        hold.settle("human-2",true);
+        assert!(hold.can_select("next",Ready));
     }
 
     #[test]

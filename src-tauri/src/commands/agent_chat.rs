@@ -3549,10 +3549,8 @@ async fn send_turn_context_reporting<R: Runtime>(
             if machine && state == "held" {
                 crate::agent_control::delivery::warn_held(&app, &input.thread_id.0, error);
             }
-            if !matches!(state.as_str(), "held" | "cancelled" | "held_unknown" | "rejected") {
-                if db.fail_message_delivery(&id, error)? == "held_unknown" {
-                    crate::agent_control::delivery::warn_held(&app, &input.thread_id.0, error);
-                }
+            if db.fail_message_delivery(&id, error)? == "held_unknown" {
+                crate::agent_control::delivery::warn_held(&app, &input.thread_id.0, error);
             }
         }
     }
@@ -5061,7 +5059,10 @@ pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
     if turn_id.is_none() {
         for queued_id in app.state::<DatabaseStore>().disposed_delivery_queue_ids(&thread_id.0)? {
             log::debug!("Disposing automatic queued wake {queued_id} after Stop");
-            impl_.cancel_queued_turn(thread_id.clone(), queued_id).await.map_err(provider_err)?;
+            match impl_.cancel_queued_turn(thread_id.clone(), queued_id).await {
+                Ok(_) | Err(ProviderError::SessionNotFound { .. } | ProviderError::SessionClosed { .. }) => {}
+                Err(error) => return Err(provider_err(error)),
+            }
         }
     }
     let reached = match impl_.interrupt_turn(thread_id.clone(), turn_id).await {
@@ -7889,7 +7890,7 @@ fn delivery_transition(event: &ProviderRuntimeEvent) -> bool {
 /// resume this session after a restart.
 pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeEvent) {
     if let ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, queued_id } = &event {
-        if app.state::<DatabaseStore>().disposed_delivery_queue_ids(&thread_id.0).is_ok_and(|ids|ids.contains(queued_id)) {
+        if app.state::<DatabaseStore>().is_disposed_delivery_queue(&thread_id.0, queued_id).unwrap_or(false) {
             event = ProviderRuntimeEvent::QueuedTurnDisposed { thread_id: thread_id.clone(), queued_id: queued_id.clone() };
         }
     }
