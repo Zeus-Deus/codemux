@@ -36,6 +36,7 @@ import {
   agentChatOpenSearchResult,
   type AgentChatTurnCheckpointRecord,
 } from "@/tauri/commands";
+import { onAgentChatSessionsMerged } from "@/tauri/events";
 import type { AgentChatProviderKind, ChatForkOrigin } from "@/tauri/types";
 
 import { MESSAGE_ACTION_CLASS } from "./message-action";
@@ -238,9 +239,36 @@ async function openOriginal(threadId: string): Promise<void> {
   }
 }
 
-/** This chat's fork origin, or `null` when it isn't a fork. */
-function useChatForkOrigin(threadId: string | null): ChatForkOrigin | null {
+/** This chat's fork origin, or `null` when it isn't a fork. Read again when
+ *  a reopen from history merges into this chat (the pane is bound to its
+ *  new thread before the lineage moves there) or merges its source away. */
+export function useChatForkOrigin(threadId: string | null): ChatForkOrigin | null {
   const [origin, setOrigin] = useState<{ threadId: string; origin: ChatForkOrigin | null } | null>(null);
+  const [merges, setMerges] = useState(0);
+  // `undefined` until this chat's first read lands: a merge meanwhile may
+  // have moved its source, so it reads again.
+  const source = useRef<string | null | undefined>(undefined);
+  source.current = origin?.threadId === threadId ? (origin.origin?.source_thread_id ?? null) : undefined;
+  useEffect(() => {
+    if (!threadId) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    onAgentChatSessionsMerged((payload) => {
+      const ours = payload.survivor === threadId;
+      const known = source.current;
+      const ourSource = known === undefined || (known !== null && payload.merged.includes(known));
+      if (ours || ourSource) setMerges((count) => count + 1);
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [threadId]);
   useEffect(() => {
     if (!threadId) return;
     let cancelled = false;
@@ -252,7 +280,7 @@ function useChatForkOrigin(threadId: string | null): ChatForkOrigin | null {
     return () => {
       cancelled = true;
     };
-  }, [threadId]);
+  }, [threadId, merges]);
   return origin?.threadId === threadId ? origin.origin : null;
 }
 

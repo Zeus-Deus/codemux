@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 
 import { ToolCallBody } from "./ToolCallBodies";
@@ -192,6 +193,8 @@ describe("EditToolBody", () => {
           },
         })}
       />,
+      // The diff card's copy button carries a Tooltip.
+      { wrapper: TooltipProvider },
     );
     // Filename header.
     expect(screen.getByText("src/foo.ts")).toBeInTheDocument();
@@ -213,6 +216,8 @@ describe("EditToolBody", () => {
           input: { file_path: "src/new.ts", content: "export const a = 1;" },
         })}
       />,
+      // The diff card's copy button carries a Tooltip.
+      { wrapper: TooltipProvider },
     );
     expect(screen.getByText("src/new.ts")).toBeInTheDocument();
     expect(screen.getByText("+1")).toBeInTheDocument();

@@ -200,7 +200,7 @@ export function WorkspaceStatusCluster({
           disabled={initializing}
           aria-label="Initialize a git repository in this project folder"
           title="This project is not a git repository — worktrees, diffs, and checkpoints are unavailable until one is initialized"
-          className="inline-flex h-[26px] shrink-0 items-center rounded-md border px-2 font-mono text-label font-semibold text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+          className="inline-flex h-6 shrink-0 items-center rounded-md border px-2 font-mono text-label font-semibold text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
         >
           {initializing ? "Initializing…" : "Initialize Git"}
         </button>
@@ -213,7 +213,7 @@ export function WorkspaceStatusCluster({
           {showBehind && (
             <span
               className={cn(
-                "inline-flex h-[26px] items-center gap-1 rounded-md px-2 font-mono text-label tabular-nums text-warning",
+                "inline-flex h-6 items-center gap-1 rounded-md px-2 font-mono text-label tabular-nums text-warning",
                 CONTEXT_ROW_HIDE_GIT_COUNTS,
               )}
               title={`${workspace.git_behind} commit${workspace.git_behind === 1 ? "" : "s"} behind`}
@@ -225,7 +225,7 @@ export function WorkspaceStatusCluster({
           {showAhead && (
             <span
               className={cn(
-                "inline-flex h-[26px] items-center gap-1 rounded-md px-2 font-mono text-label tabular-nums text-success",
+                "inline-flex h-6 items-center gap-1 rounded-md px-2 font-mono text-label tabular-nums text-success",
                 CONTEXT_ROW_HIDE_GIT_COUNTS,
               )}
               title={`${workspace.git_ahead} commit${workspace.git_ahead === 1 ? "" : "s"} ahead`}
@@ -252,7 +252,7 @@ export function WorkspaceStatusCluster({
                   : undefined
               }
               className={cn(
-                "inline-flex h-[26px] shrink-0 items-center gap-1 px-1.5 font-mono text-label font-semibold transition-opacity duration-150 hover:enabled:opacity-80",
+                "inline-flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 font-mono text-label font-semibold transition-colors duration-150 hover:enabled:bg-surface-2",
                 prStatusTextClass(prState),
                 !workspace.pr_url && "cursor-not-allowed opacity-60",
               )}
@@ -279,7 +279,7 @@ export function WorkspaceStatusCluster({
                 aria-label="Workspace details"
                 title="Workspace details"
                 className={cn(
-                  "relative inline-flex h-[26px] shrink-0 items-center gap-1 rounded-md px-2 text-body-sm font-semibold text-foreground/80 transition-colors duration-150 hover:bg-surface-2",
+                  "relative inline-flex h-6 shrink-0 items-center gap-1 rounded-md px-2 text-body-sm font-semibold text-foreground/80 transition-colors duration-150 hover:bg-surface-2",
                   open && "bg-surface-3",
                 )}
               >

@@ -403,10 +403,13 @@ export const getOrCreateHomeWorkspace = () =>
 export const listChatProviderCapabilities = (
   provider: AgentChatProviderKind,
   force?: boolean,
+  /** An extra account's own catalog (Codex); omitted for the CLI sign-in. */
+  accountId?: string,
 ) =>
   invoke<ProviderChatCapabilities>("list_chat_provider_capabilities", {
     provider,
     force,
+    accountId,
   });
 
 /** Probe the health of a chat provider's local runtime (installed /
@@ -3748,6 +3751,9 @@ export type QuestionAction =
       answers: string[];
       submission_id: string;
       retry_unknown?: boolean;
+      /** Composer mode the answer was given in; Codex plans an answer's
+       *  new turn while the Plan or Ask pill is on. */
+      permission_mode_override?: string | null;
     }
   | { action: "dismiss" | "reopen" | "reconcile" };
 export const agentChatAnswerQuestion = (

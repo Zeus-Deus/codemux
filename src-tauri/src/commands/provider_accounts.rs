@@ -251,12 +251,18 @@ pub async fn provider_account_remove<R: Runtime>(
     let account = db.provider_account(&account_id)?.ok_or("That account no longer exists.")?;
     // Forget it first so nothing new resolves to it, then stop what still
     // runs signed in as it. Its chats restart on the next default.
-    accounts::forget_cursors(db.delete_provider_account(&account_id)?);
+    accounts::delete_account(&db, &account_id)?;
     for (provider, thread) in accounts::threads_on_account(&account_id) {
+        // Stopping is thread-wide: check the chat still runs there, and stop
+        // it, with no provider switch able to move it in between.
+        let _still = crate::commands::provider_switch::hold_still(&thread).await;
+        if !accounts::still_on_account(&db, provider, &thread, &account_id) {
+            continue;
+        }
         if let Err(error) = crate::commands::agent_chat::agent_chat_stop_session(
             app.clone(),
             provider,
-            crate::agent_provider::ThreadId(thread),
+            crate::agent_provider::ThreadId(thread.clone()),
         )
         .await
         {

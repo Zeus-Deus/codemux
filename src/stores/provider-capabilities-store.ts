@@ -78,7 +78,20 @@ interface ProviderCapabilitiesStore {
    *  whether it returned models, an empty catalog, or an error. */
   loadedProviders: Partial<Record<AgentChatProviderKind, boolean>>;
   refresh: (provider: AgentChatProviderKind) => Promise<void>;
+  /** Extra accounts' catalogs by `accountCatalogKey`. Each extra Codex
+   *  account signs in on its own, so it offers its own models and its own
+   *  sign-in errors. Absent until its first refresh settles. */
+  accountCatalogs: Record<string, AccountCatalog>;
+  /** `force` asks the account's login again instead of the cached answer. */
+  refreshAccount: (provider: "codex", accountId: string, force?: boolean) => Promise<void>;
 }
+
+export interface AccountCatalog {
+  caps: ProviderChatCapabilities | null;
+  error: string | null;
+}
+
+export const accountCatalogKey = (provider: string, accountId: string) => `${provider}:${accountId}`;
 
 // Settings can render more than one model picker, and a provider harvest may
 // launch a CLI. Dedupe at the store boundary so concurrent explicit intents
@@ -88,6 +101,7 @@ const providerRefreshInFlight = new Map<
   Promise<void>
 >();
 const providerIntentRefreshedAt = new Map<AgentChatProviderKind, number>();
+const accountRefreshInFlight = new Map<string, Promise<void>>();
 // Sign-out generation counter. A harvest can spend seconds in a CLI while the
 // user signs out; `resetProviderCapabilities` bumps this, and every refresh
 // compares the epoch it captured at flight start before writing results. A
@@ -124,6 +138,25 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>()(
       grokError: null,
       opencodeError: null,
       loadedProviders: {},
+      accountCatalogs: {},
+      refreshAccount: (provider, accountId, force = false) => {
+        const key = accountCatalogKey(provider, accountId);
+        const existing = accountRefreshInFlight.get(key);
+        if (existing) return existing;
+        const startedEpoch = providerResetEpoch;
+        const settle = (catalog: AccountCatalog) => {
+          if (providerResetEpoch !== startedEpoch) return;
+          set((state) => ({ accountCatalogs: { ...state.accountCatalogs, [key]: catalog } }));
+        };
+        const request = listChatProviderCapabilities(provider, force, accountId)
+          .then((caps) => settle({ caps, error: null }))
+          .catch((err) => settle({ caps: null, error: err instanceof Error ? err.message : String(err) }))
+          .finally(() => {
+            if (accountRefreshInFlight.get(key) === request) accountRefreshInFlight.delete(key);
+          });
+        accountRefreshInFlight.set(key, request);
+        return request;
+      },
       refresh: (provider) => {
         if (provider === "hermes" || provider === "acp") return Promise.resolve();
         const existing = providerRefreshInFlight.get(provider);
@@ -268,7 +301,9 @@ export function resetProviderCapabilities(): void {
   providerResetEpoch += 1;
   providerRefreshInFlight.clear();
   providerIntentRefreshedAt.clear();
+  accountRefreshInFlight.clear();
   useProviderCapabilities.setState({
+    accountCatalogs: {},
     claude: null,
     codex: null,
     cursor: null,

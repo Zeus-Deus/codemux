@@ -29,8 +29,6 @@ interface Props {
     selected: AgentChatProviderKind;
     onSelect: (provider: AgentChatProviderKind) => void;
   };
-  /** Optional line above the composer (e.g. the Full access notice). */
-  notice?: ReactNode;
   /** A project was opened from the zero-project actions below. */
   onProjectOpened?: (projectPath: string) => void;
   /** Project the new thread will run in. `undefined` keeps the generic
@@ -62,7 +60,6 @@ interface Props {
 export function ChatHomeLanding({
   composer,
   agents,
-  notice,
   onProjectOpened,
   projectName,
   projectPicker,
@@ -181,12 +178,7 @@ export function ChatHomeLanding({
           {/* The composer carries the shared column rails itself (see
               chat-column.ts), so the landing card lines up with the
               mid-conversation composer at every pane width. */}
-          {/* No gap: the notice tucks under the composer card's top edge,
-              mirroring the scope strip under its bottom edge. */}
-          <div className="flex w-full flex-col">
-            {notice}
-            {composer}
-          </div>
+          {composer}
           {noWorkspaces && (
             <FirstProjectActions onProjectOpened={onProjectOpened} />
           )}

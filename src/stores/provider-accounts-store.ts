@@ -28,6 +28,10 @@ interface ProviderAccountsStore {
    *  `pickKey(provider, threadId)`: a draft that changes provider starts
    *  over from that provider's default. */
   picks: Record<string, string>;
+  /** Picks the app made to match what a draft shows, by `pickKey`, rather
+   *  than ones the user chose: only these follow the draft's target. Shared
+   *  so every view of a draft agrees. */
+  autoPicks: Record<string, boolean>;
   load: (force?: boolean) => Promise<void>;
   /** Also asks Codex who each home is signed in as (spawns the CLI). */
   refresh: () => Promise<void>;
@@ -35,7 +39,7 @@ interface ProviderAccountsStore {
   rename: (accountId: string, label: string) => Promise<void>;
   remove: (accountId: string) => Promise<void>;
   setDefault: (provider: AccountProvider, accountId: string | null, workspaceId?: string | null) => Promise<void>;
-  pick: (provider: AccountProvider, threadId: string, accountId: string) => void;
+  pick: (provider: AccountProvider, threadId: string, accountId: string, auto?: boolean) => void;
   /** Ask the composer's model picker to open on `provider`'s accounts
    *  (the usage-limit notice's "Choose account…"). */
   pickerRequest: { provider: AccountProvider; threadId: string; seq: number } | null;
@@ -58,6 +62,7 @@ export const useProviderAccounts = create<ProviderAccountsStore>((set, get) => (
   accounts: null,
   defaults: {},
   picks: {},
+  autoPicks: {},
   load: async (force = false) => {
     if (get().accounts && !force) return;
     loadFlight ??= providerAccountsList()
@@ -82,8 +87,11 @@ export const useProviderAccounts = create<ProviderAccountsStore>((set, get) => (
   },
   setDefault: async (provider, accountId, workspaceId = null) =>
     accept(await providerAccountSetDefault(provider, accountId, workspaceId)),
-  pick: (provider, threadId, accountId) =>
-    set((s) => ({ picks: { ...s.picks, [pickKey(provider, threadId)]: accountId } })),
+  pick: (provider, threadId, accountId, auto = false) =>
+    set((s) => {
+      const key = pickKey(provider, threadId);
+      return { picks: { ...s.picks, [key]: accountId }, autoPicks: { ...s.autoPicks, [key]: auto } };
+    }),
   pickerRequest: null,
   bindingRevisions: {},
   bindingChanged: (provider, threadId) =>

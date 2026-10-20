@@ -92,7 +92,7 @@ function jumpToWorkspace(workspaceId: string, projectPath: string, remote = fals
  * block, above the workspace list, only while ≥1 workspace is waiting on the
  * user (workspace status `permission`). Absent otherwise.
  *
- * Each entry is a jump-link (project chip + blocker summary + age) that
+ * Each entry is a jump-link (project chip + workspace title + age) that
  * activates and scrolls to the blocked workspace. The workspace's own card
  * stays exactly where it is, so the strip surfaces blocked work WITHOUT
  * reordering the list — the whole point. Because it is pinned, blocked work
@@ -211,7 +211,7 @@ export function SidebarNeedsYouStrip({
 
   return (
     <div
-      className="mx-1.5 mt-1.5 mb-1.5 rounded-lg border border-status-attention/25 bg-status-attention/5 px-2 py-[7px] animate-in fade-in slide-in-from-top-1 duration-250"
+      className="mx-1.5 mt-1.5 mb-1.5 rounded-lg border border-border bg-surface-2 px-2 py-[7px] animate-in fade-in slide-in-from-top-1 duration-250"
       role="region"
       aria-label="Workspaces needing you"
     >
@@ -229,13 +229,15 @@ export function SidebarNeedsYouStrip({
           .map(({ workspace, projectName, projectPath, remote }) => {
             const mark = statusSince[workspace.workspace_id];
             const age = formatElapsed(mark != null ? now - mark.at : 0);
+            const blockerText = permissionBlockerText(workspace);
             return (
               <button
                 key={workspace.workspace_id}
                 type="button"
                 onClick={() => jumpToWorkspace(workspace.workspace_id, projectPath, remote)}
                 className="group/needs flex items-center gap-2 rounded-sm px-1 py-[3px] text-left hover:bg-surface-2 transition-colors duration-150"
-                aria-label={`Jump to ${workspace.title} — waiting for your input`}
+                aria-label={`Jump to ${workspace.title} — ${blockerText.toLowerCase()}`}
+                title={blockerText}
               >
                 <ProjectAvatar
                   name={projectName}
@@ -245,7 +247,7 @@ export function SidebarNeedsYouStrip({
                   className="font-bold"
                 />
                 <span className="min-w-0 flex-1 truncate text-body-sm text-foreground">
-                  {permissionBlockerText(workspace)}
+                  {workspace.title}
                 </span>
                 <span className="ml-auto flex items-center gap-1 shrink-0 font-mono text-caption text-muted-foreground tabular-nums">
                   {age}
@@ -257,7 +259,7 @@ export function SidebarNeedsYouStrip({
         {/* Never let the cap hide work silently — say how many blocked
             workspaces are only reachable by scrolling. */}
         {entries.length > MAX_VISIBLE_ENTRIES && (
-          <span className="px-1 pt-1 font-mono text-caption text-status-attention/70">
+          <span className="px-1 pt-1 font-mono text-caption text-muted-foreground">
             +{entries.length - MAX_VISIBLE_ENTRIES} more below
           </span>
         )}

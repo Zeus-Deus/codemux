@@ -24,7 +24,7 @@ export function PrWatchChip({ threadId }: { threadId: string }) {
       aria-label={view.active ? `Stop watching #${watch.pr_number}` : `Watch #${watch.pr_number} again`}
       title={view.title}
       className={cn(
-        "inline-flex h-[26px] shrink-0 items-center gap-1 rounded-md px-1.5 font-mono text-label font-semibold tabular-nums transition-colors duration-150 hover:bg-surface-2 disabled:opacity-60",
+        "inline-flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 font-mono text-label font-semibold tabular-nums transition-colors duration-150 hover:bg-surface-2 disabled:opacity-60",
         PR_WATCH_TONE_CLASS[view.tone],
       )}
     >

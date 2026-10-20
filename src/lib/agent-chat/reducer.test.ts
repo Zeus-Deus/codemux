@@ -2890,6 +2890,23 @@ describe("agent-chat reducer — interim turn ends (provider yields on backgroun
     expect(turnEnds(state)[0]).not.toHaveProperty("interim");
   });
 
+  it("reopens on resumed output after a leaked spawn result with no row of its own", () => {
+    let state = runEvents([
+      running(),
+      subagent({ subagent_id: "spawn-1", status: "running", background_task: true }),
+      completed(),
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: { kind: "tool_result", tool_use_id: "spawn-1", content: "launched", is_error: false },
+      },
+    ]);
+    state = applyEvent(state, text("The task reported back."));
+    expect(state.streaming).toBe(true);
+    expect(turnEnds(state)[0]).toMatchObject({ interim: true });
+  });
+
   it("never reopens an error boundary (a stopped turn stays stopped)", () => {
     let state = runEvents([
       running(),
@@ -3330,5 +3347,91 @@ describe("tool calls a dead run cut off", () => {
     const state = runEvents([toolUse("turn-1", "tu-1"), text("turn-1"), toolUse("turn-1", "tu-2")]);
     expect(status(state, "tu-1")).toBe("running");
     expect(status(state, "tu-2")).toBe("running");
+  });
+
+  const result = (turn: string, id: string): ProviderRuntimeEvent => ({
+    type: "item_completed",
+    thread_id: "t1",
+    turn_id: turn,
+    item: { kind: "tool_result", tool_use_id: id, content: "ok", is_error: false },
+  });
+  const stopped = (turn: string): ProviderRuntimeEvent => ({
+    type: "turn_completed",
+    thread_id: "t1",
+    turn_id: turn,
+    status: { kind: "error", subtype: "interrupted", message: "turn interrupted" },
+    usage: null,
+  });
+
+  it("settles a stopped turn's running calls when no result arrives", () => {
+    const state = runEvents([
+      toolUse("turn-1", "tu-1"),
+      result("turn-1", "tu-1"),
+      toolUse("turn-1", "tu-2"),
+      stopped("turn-1"),
+    ]);
+    expect(status(state, "tu-1")).toBe("done");
+    expect(status(state, "tu-2")).toBe("unconfirmed");
+  });
+
+  it("treats a stop with no turn id as the current turn's", () => {
+    const state = runEvents([toolUse("turn-1", "tu-1"), stopped("")]);
+    expect(status(state, "tu-1")).toBe("unconfirmed");
+  });
+
+  it("leaves another turn's call running when a stale stop lands", () => {
+    const state = runEvents([toolUse("turn-2", "tu-2"), stopped("turn-1")]);
+    expect(status(state, "tu-2")).toBe("running");
+  });
+
+  it("still settles a turn's call when its stop lands after a stale one", () => {
+    const state = runEvents([
+      toolUse("turn-2", "tu-2"),
+      stopped("turn-1"),
+      text("turn-2"),
+      stopped("turn-2"),
+    ]);
+    expect(status(state, "tu-2")).toBe("unconfirmed");
+  });
+
+  it("lets a result that arrives after the stop overwrite the settled row", () => {
+    const state = runEvents([toolUse("turn-1", "tu-1"), stopped("turn-1"), result("turn-1", "tu-1")]);
+    expect(status(state, "tu-1")).toBe("done");
+  });
+
+  it("keeps the next turn's call running when a stopped call's late result lands", () => {
+    const state = runEvents([
+      toolUse("turn-1", "tu-1"),
+      stopped("turn-1"),
+      toolUse("turn-2", "tu-2"),
+      result("turn-1", "tu-1"),
+    ]);
+    expect(status(state, "tu-1")).toBe("done");
+    expect(status(state, "tu-2")).toBe("running");
+  });
+
+  it("keeps the next turn finished when a stopped call's late result lands", () => {
+    const state = runEvents([
+      toolUse("turn-1", "tu-1"),
+      stopped("turn-1"),
+      text("turn-2"),
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-2",
+        status: { kind: "success" },
+        usage: null,
+      },
+      result("turn-1", "tu-1"),
+    ]);
+    expect(status(state, "tu-1")).toBe("done");
+    expect(state.streaming).toBe(false);
+    expect(state.messages.some((m) => m.kind === "turn_ended" && m.interim)).toBe(false);
+  });
+
+  it("leaves a running call alone when a message is steered into its turn", () => {
+    const steered = appendUserMessage(runEvents([toolUse("turn-1", "tu-1")]), "use the fast config");
+    const state = runEvents([text("turn-1")], steered);
+    expect(status(state, "tu-1")).toBe("running");
   });
 });

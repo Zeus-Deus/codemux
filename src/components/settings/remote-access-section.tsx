@@ -94,7 +94,7 @@ import { Spinner } from "@/components/ui/spinner";
 
 // ── Small presentational bits ────────────────────────────────────────
 
-function CopyButton({ text, label }: { text: string; label: string }) {
+export function CopyButton({ text, label }: { text: string; label: string }) {
   const [copied, setCopied] = useState(false);
   return (
     <Button
