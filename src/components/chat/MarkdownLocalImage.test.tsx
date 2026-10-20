@@ -294,6 +294,64 @@ describe("MarkdownLocalImage", () => {
       }
     });
 
+    it("shows a copy the lightbox loaded after the thumbnail gave up on it", async () => {
+      const originalCreateObjectUrl = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+      Object.defineProperty(URL, "createObjectURL", {
+        configurable: true,
+        value: vi.fn(() => "blob:lightbox-copy"),
+      });
+      readChatImageMock
+        .mockRejectedValueOnce(new Error("not yet"))
+        .mockResolvedValue({ bytes: new Uint8Array([137, 80, 78, 71]), media_type: "image/png" });
+      readLocalChatImageMock.mockRejectedValue(new Error("gone"));
+      const { container, getByRole } = renderKept();
+      const thumbnail = () => container.querySelector("[data-chat-local-image] img")!;
+
+      // The thumbnail misses the copy and moves on to the original.
+      fireEvent.error(thumbnail());
+      await waitFor(() => expect(thumbnail()).toHaveAttribute("src", "mock-asset:/tmp/proof.png"));
+      // Meanwhile the lightbox reads the landed copy into the shared cache.
+      fireEvent.click(getByRole("button", { name: "Open Proof" }));
+      const dialog = getByRole("dialog");
+      fireEvent.error(dialog.querySelector("img")!);
+      await waitFor(() =>
+        expect(dialog.querySelector("img")).toHaveAttribute("src", "blob:lightbox-copy"),
+      );
+      // The original fails: the thumbnail picks up the cached copy.
+      fireEvent.error(thumbnail());
+      await waitFor(() => expect(thumbnail()).toHaveAttribute("src", "blob:lightbox-copy"));
+      if (originalCreateObjectUrl) {
+        Object.defineProperty(URL, "createObjectURL", originalCreateObjectUrl);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+    });
+
+    it("starts over when it shows a link again after another", async () => {
+      readChatImageMock.mockRejectedValue(new Error("not yet"));
+      readLocalChatImageMock.mockRejectedValue(new Error("gone"));
+      const card = (path: string) => (
+        <RetainedImagesProvider images={kept}>
+          <MarkdownLocalImage path={path} caption="Proof" />
+        </RetainedImagesProvider>
+      );
+      const { container, findByText, rerender } = render(card("/tmp/proof.png"));
+      fireEvent.error(container.querySelector("img")!);
+      await waitFor(() =>
+        expect(container.querySelector("img")).toHaveAttribute("src", "mock-asset:/tmp/proof.png"),
+      );
+      fireEvent.error(container.querySelector("img")!);
+      expect(await findByText("Image unavailable")).toBeInTheDocument();
+
+      rerender(card("/tmp/other.png"));
+      rerender(card("/tmp/proof.png"));
+
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "mock-asset:/cfg/images/t/k.png",
+      );
+    });
+
     it("ignores copies kept for other links", () => {
       const { container } = render(
         <RetainedImagesProvider images={kept}>

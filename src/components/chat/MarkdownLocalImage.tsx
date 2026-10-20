@@ -56,6 +56,8 @@ function whenKeptCopyLands(path: string, onLanded: () => void): () => void {
 
 const blobUrlCache = new Map<string, string>();
 const blobRequestCache = new Map<string, Promise<string>>();
+/** Blob URLs whose bytes the browser failed to decode. */
+const undecodableBlobs = new Set<string>();
 const BLOB_CACHE_MAX = 64;
 
 function revokeBlobUrl(url: string) {
@@ -156,6 +158,8 @@ interface SourceState {
   index: number;
   blob: string | null;
   failed: boolean;
+  /** The one immediate kept-copy read after a failure has been made. */
+  caughtUp: boolean;
 }
 
 function firstSource(
@@ -168,6 +172,7 @@ function firstSource(
     index: 0,
     blob: first ? (blobUrlCache.get(first.path) ?? null) : null,
     failed: !first,
+    caughtUp: false,
   };
 }
 
@@ -182,6 +187,8 @@ function useLocalImageSource(candidates: readonly ImageCandidate[]) {
   const currentKey = useRef(key);
   currentKey.current = key;
   const [stored, setStored] = useState(() => firstSource(key, candidates));
+  // A new source list starts over rather than inheriting another's outcome.
+  if (stored.key !== key) setStored(firstSource(key, candidates));
   const state = stored.key === key ? stored : firstSource(key, candidates);
   const candidate = candidates[state.index];
 
@@ -201,6 +208,8 @@ function useLocalImageSource(candidates: readonly ImageCandidate[]) {
       );
     };
     if (state.blob) {
+      // The bytes arrived but the browser could not decode them.
+      undecodableBlobs.add(state.blob);
       advance();
       return;
     }
@@ -216,29 +225,31 @@ function useLocalImageSource(candidates: readonly ImageCandidate[]) {
   // Every source failed, but the kept copy may only have been landing (its
   // background copy can hold the bytes after the original is gone): load it
   // when the backend records it, and read it once more right away in case
-  // it landed before this card started waiting. A copy that already has a
-  // blob was read in full and failed to decode, so it is never re-read.
-  const caughtUp = useRef<string | null>(null);
+  // it landed before this card started waiting. A blob another view of the
+  // same copy already holds is reused, unless the browser rejected it.
   useEffect(() => {
     const kept = candidates[0];
     if (!state.failed || !kept?.kept) return;
     const load = () => {
-      if (blobUrlCache.has(kept.path)) return;
-      settledBlobUrl(kept)
+      const cached = blobUrlCache.get(kept.path);
+      if (cached && undecodableBlobs.has(cached)) return;
+      (cached ? Promise.resolve(cached) : settledBlobUrl(kept))
         .then((url) => {
           if (currentKey.current === key) {
-            setStored({ key, index: 0, blob: url, failed: false });
+            setStored({ key, index: 0, blob: url, failed: false, caughtUp: true });
           }
         })
         .catch(() => {});
     };
     const stop = whenKeptCopyLands(kept.path, load);
-    if (caughtUp.current !== key) {
-      caughtUp.current = key;
+    if (!state.caughtUp) {
+      setStored((current) =>
+        current.key === key ? { ...current, caughtUp: true } : current,
+      );
       load();
     }
     return stop;
-  }, [candidates, key, state.failed]);
+  }, [candidates, key, state.failed, state.caughtUp]);
 
   return {
     src:
@@ -255,6 +266,7 @@ export function resetLocalImageBlobCache() {
   for (const url of blobUrlCache.values()) revokeBlobUrl(url);
   blobUrlCache.clear();
   blobRequestCache.clear();
+  undecodableBlobs.clear();
 }
 
 /**
