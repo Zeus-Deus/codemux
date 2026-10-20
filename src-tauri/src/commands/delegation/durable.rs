@@ -339,6 +339,23 @@ pub(super) fn current_child_provider(
         .or_else(|| parse_provider(&task.provider))
 }
 
+/// Run identity survives Running's live-only event through the task and
+/// restart ledgers. Terminal replay must belong to that current run.
+fn event_child_run(event: &ProviderRuntimeEvent) -> Option<&str> {
+    match event {
+        ProviderRuntimeEvent::ItemCompleted { turn_id, .. }
+        | ProviderRuntimeEvent::TurnCompleted { turn_id, .. }
+        | ProviderRuntimeEvent::RequestOpened { turn_id, .. }
+        | ProviderRuntimeEvent::SessionStateChanged {
+            status: SessionStatus::Running {
+                active_turn: turn_id,
+            },
+            ..
+        } => Some(&turn_id.0),
+        _ => None,
+    }
+}
+
 pub(super) fn recover_tasks<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let db = app.state::<DatabaseStore>();
     let state = app.state::<DelegationState>();
@@ -431,29 +448,35 @@ pub(super) fn recover_tasks<R: Runtime>(app: &AppHandle<R>) -> Result<(), String
                 r.completion_delivery = "held".into();
             })?;
         } else {
-            // Reconcile the exact durable child run; a later run cannot replace
-            // the original published result. No terminal event means interrupted.
             task.phase = Phase::Running;
-            let mut latest_run = None;
-            for payload in db.list_agent_chat_messages(child) {
-                if let Ok(event) = serde_json::from_str::<ProviderRuntimeEvent>(&payload) {
-                    if let ProviderRuntimeEvent::ItemCompleted { turn_id, .. }
-                    | ProviderRuntimeEvent::TurnCompleted { turn_id, .. } = &event
-                    {
-                        latest_run = Some(turn_id.0.clone());
-                    }
-                    task.observe(&event, None, false);
+            let events: Vec<ProviderRuntimeEvent> = db.list_agent_chat_messages(child)
+                .iter().filter_map(|payload| serde_json::from_str(payload).ok()).collect();
+            let current_run = db.get_restart_turn(child).map(|run| run.turn_id)
+                .or_else(|| record.child_run_ids.last().cloned())
+                .or_else(|| events.iter().rev().find_map(event_child_run).map(str::to_owned));
+            let latest_terminal_run = events.iter().rev().find_map(|event| match event {
+                ProviderRuntimeEvent::TurnCompleted { turn_id, .. } => Some(turn_id.0.clone()),
+                _ => None,
+            });
+            let completed_current_run = events.iter().any(|event| matches!(event,
+                ProviderRuntimeEvent::TurnCompleted { turn_id, .. }
+                    if current_run.as_deref() == Some(turn_id.0.as_str())));
+            for event in &events {
+                if event_child_run(event).zip(current_run.as_deref())
+                    .is_some_and(|(run, current)| run != current) {
+                    continue;
                 }
+                task.observe(event, None, false);
             }
             let durable_question = db.has_open_async_question(child);
             db.update_delegation_task(&record.task_id, |r| {
-                r.latest_terminal_run_id = latest_run.clone();
+                r.latest_terminal_run_id = if completed_current_run { current_run.clone() } else { latest_terminal_run.clone() };
                 if !durable_question {
                     r.pending_request = None;
                 }
             })?;
             let waiting = task.awaits_user() || db.has_open_async_question(child);
-            if task.last_status.is_some() && !waiting && !resume_armed(&db, child) {
+            if completed_current_run && task.last_status.is_some() && !waiting && !resume_armed(&db, child) {
                 if record.preparation_state == "legacy_import" && record.delivery_id.is_none() {
                     // A retained legacy terminal row cannot prove whether its
                     // old in-memory report reached the parent before a crash.
@@ -497,6 +520,11 @@ pub(super) fn recover_tasks<R: Runtime>(app: &AppHandle<R>) -> Result<(), String
         state.lock().tasks.insert(child.clone(), task.clone());
         if task.phase.is_terminal() {
             publish_finished(app, child)?;
+            // Publication and follow-up state live in separate stores. Repair
+            // either crash window, including an already committed result.
+            if !task.placement.is_tab() {
+                super::super::follow_ups::on_task_finished(app, child, outcome_id(&task.phase));
+            }
         }
         state.emit_card(app, child);
     }
@@ -598,6 +626,257 @@ pub(crate) fn stop_confirmed<R: Runtime>(app: &AppHandle<R>, child: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_provider::TurnId;
+
+    fn recovery_app() -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_app();
+        let db = DatabaseStore::new_in_memory();
+        for thread in ["parent", "child"] {
+            db.upsert_agent_chat_session(thread, "workspace", None, "codex")
+                .unwrap();
+        }
+        app.manage(db);
+        app.manage(DelegationState::default());
+        app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+        app.manage(crate::commands::agent_chat::GrokUsageLedgerBridge::default());
+        app.manage(crate::commands::agent_chat::SubagentTracker::default());
+        app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+        app.manage(crate::commands::agent_chat::ProviderRegistry::new());
+        app.manage(crate::observability::ObservabilityStore::default());
+        app.manage(AppStateStore::default());
+        app
+    }
+
+    fn completed_event(status: TurnStatus) -> ProviderRuntimeEvent {
+        ProviderRuntimeEvent::TurnCompleted {
+            thread_id: ThreadId("child".into()),
+            turn_id: TurnId("rate-limited".into()),
+            status,
+            usage: None,
+        }
+    }
+
+    fn append_report(db: &DatabaseStore, run: &str) {
+        let event = ProviderRuntimeEvent::ItemCompleted {
+            thread_id: ThreadId("child".into()),
+            turn_id: TurnId(run.into()),
+            item: CompletedItem::AssistantText {
+                text: "Completed the task".into(),
+            },
+            subagent_id: None,
+        };
+        db.append_agent_chat_message("child", &serde_json::to_string(&event).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn delegation_delivery_recovery_does_not_publish_previous_usage_failure_for_resumed_run() {
+        for restore_enabled in [true, false] {
+            let app = recovery_app();
+            let db = app.state::<DatabaseStore>();
+            db.set_agent_chat_sdk_session_id("child", "sdk-child")
+                .unwrap();
+            if !restore_enabled {
+                db.set_setting(
+                    super::super::super::restart_resume::RESTART_RESUME_SETTING_KEY,
+                    "false",
+                )
+                .unwrap();
+            }
+            let mut record = record_of(
+                "child",
+                &Task::new("parent", ProviderKind::Codex, "Review", "Brief", 1),
+            );
+            record.preparation_state = "ready".into();
+            record.original_child_run_id = Some("rate-limited".into());
+            record.child_run_ids = vec!["rate-limited".into(), "resumed".into()];
+            record.latest_terminal_run_id = Some("rate-limited".into());
+            record.has_pending_child_runs = true;
+            db.admit_delegation_task(&record, None, &json!({})).unwrap();
+            db.append_agent_chat_message(
+                "child",
+                &serde_json::to_string(&completed_event(TurnStatus::Error {
+                    subtype: "usage_limit".into(),
+                    message: "Rate limited".into(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            // Running is live-only; the restart ledger is its durable witness.
+            db.mark_restart_turn_running("child", "resumed", "old-epoch", 1, 2)
+                .unwrap();
+            recover_tasks(app.handle()).unwrap();
+            let recovered = db.delegation_task(&record.task_id).unwrap().unwrap();
+            if restore_enabled {
+                assert!(
+                    recovered.result.is_none(),
+                    "older failure was published: {recovered:?}"
+                );
+                assert_eq!(recovered.preparation_state, "restoring");
+                assert!(app.state::<DelegationState>().is_running_child("child"));
+                append_report(&db, "resumed");
+                let mut success = completed_event(TurnStatus::Success);
+                if let ProviderRuntimeEvent::TurnCompleted { turn_id, .. } = &mut success {
+                    *turn_id = TurnId("resumed".into());
+                }
+                db.append_agent_chat_message("child", &serde_json::to_string(&success).unwrap())
+                    .unwrap();
+                db.end_restart_turn("child", "resumed").unwrap();
+                recover_tasks(app.handle()).unwrap();
+                let result = db
+                    .delegation_task(&record.task_id)
+                    .unwrap()
+                    .unwrap()
+                    .result
+                    .unwrap();
+                assert_eq!(result.status, TaskStatus::Completed);
+                assert_eq!(result.run_id.as_deref(), Some("resumed"));
+            } else {
+                assert_eq!(recovered.result.unwrap().status, TaskStatus::Interrupted);
+                assert_eq!(recovered.preparation_state, "interrupted_on_restart");
+            }
+            assert_eq!(
+                recovered.latest_terminal_run_id.as_deref(),
+                Some("rate-limited")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_delivery_recovery_keeps_successful_worktree_mergeable_before_or_after_publication(
+    ) {
+        for already_published in [false, true] {
+            let app = recovery_app();
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().join("parent");
+            let child = dir.path().join("child");
+            std::fs::create_dir(&parent).unwrap();
+            let git = |cwd: &std::path::Path, args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .current_dir(cwd)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .args([
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.test",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                    ])
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap().trim().to_owned()
+            };
+            git(&parent, &["init", "-q", "-b", "main"]);
+            std::fs::write(parent.join("base.txt"), "base\n").unwrap();
+            git(&parent, &["add", "."]);
+            git(&parent, &["commit", "-qm", "base"]);
+            let base = git(&parent, &["rev-parse", "HEAD"]);
+            git(
+                &parent,
+                &[
+                    "worktree",
+                    "add",
+                    "-qb",
+                    "task-child",
+                    child.to_str().unwrap(),
+                ],
+            );
+            std::fs::write(child.join("result.txt"), "result\n").unwrap();
+            git(&child, &["add", "."]);
+            git(&child, &["commit", "-qm", "task result"]);
+            let workspace = app
+                .state::<AppStateStore>()
+                .create_workspace_at_path(parent.clone())
+                .0;
+            let db = app.state::<DatabaseStore>();
+            db.upsert_agent_chat_session("parent", &workspace, parent.to_str(), "codex")
+                .unwrap();
+            let mut row = super::super::super::follow_ups::tests::task_row("child", "parent");
+            row.workspace_id = "child-workspace".into();
+            row.parent_workspace_id = workspace;
+            row.repo_path = parent.to_str().unwrap().into();
+            row.worktree_path = child.to_str().unwrap().into();
+            row.base_sha = base;
+            db.insert_follow_up_task(&row).unwrap();
+            let mut record = record_of(
+                "child",
+                &Task::new("parent", ProviderKind::Codex, "Review", "Brief", 1),
+            );
+            record.preparation_state = "ready".into();
+            record.original_child_run_id = Some("rate-limited".into());
+            record.child_run_ids = vec!["rate-limited".into()];
+            db.admit_delegation_task(&record, None, &json!({})).unwrap();
+            append_report(&db, "rate-limited");
+            db.append_agent_chat_message(
+                "child",
+                &serde_json::to_string(&completed_event(TurnStatus::Success)).unwrap(),
+            )
+            .unwrap();
+            if already_published {
+                let result = PublishedResult {
+                    version: 1,
+                    run_id: Some("rate-limited".into()),
+                    text: "Done".into(),
+                    status: TaskStatus::Completed,
+                    published_at: 2,
+                };
+                persist_result(app.handle(), &record, &result).unwrap();
+            }
+            recover_tasks(app.handle()).unwrap();
+            super::super::super::follow_ups::reconcile_interrupted_starts(&db, |child| {
+                app.state::<DelegationState>().is_running_child(child)
+            });
+            let row = db.get_follow_up_task("child").unwrap();
+            assert_eq!(
+                row.outcome, "completed",
+                "Merge all selects completed worktree rows"
+            );
+            assert!(!row.merged);
+            assert_eq!(
+                db.delegation_task(&record.task_id)
+                    .unwrap()
+                    .unwrap()
+                    .result
+                    .unwrap()
+                    .status,
+                TaskStatus::Completed
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if db.get_follow_up_task("child").unwrap().commits == Some(1) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("recovery must refresh follow-up git statistics");
+            assert_eq!(db.get_follow_up_task("child").unwrap().additions, Some(1));
+            let merged = super::super::super::follow_ups::follow_up_merge_all(
+                app.handle().clone(),
+                "parent".into(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(merged.merged.len(), 1);
+            assert_eq!(merged.merged[0].child_thread_id, "child");
+            assert!(db.get_follow_up_task("child").unwrap().merged);
+            assert_eq!(
+                std::fs::read_to_string(parent.join("result.txt")).unwrap(),
+                "result\n"
+            );
+        }
+    }
 
     #[test]
     fn delegation_delivery_close_preserves_worktrees_and_records_workspace_close_wording() {
