@@ -9,6 +9,14 @@ vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (path: string) => `mock-asset:${path}`,
 }));
 
+let announceKept: ((paths: string[]) => void) | null = null;
+vi.mock("@/tauri/events", () => ({
+  onAgentChatReplyImagesKept: (cb: (paths: string[]) => void) => {
+    announceKept = cb;
+    return Promise.resolve(() => {});
+  },
+}));
+
 vi.mock("@/tauri/commands", () => ({
   readLocalChatImage: (...args: unknown[]) => readLocalChatImageMock(...args),
   readChatImage: (...args: unknown[]) => readChatImageMock(...args),
@@ -181,16 +189,14 @@ describe("MarkdownLocalImage", () => {
       expect(readLocalChatImageMock).toHaveBeenCalledWith("/tmp/proof.png");
     });
 
-    it("reads a copy that lands after every source failed", async () => {
+    it("loads a copy the backend records after every source failed", async () => {
       const originalCreateObjectUrl = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
       Object.defineProperty(URL, "createObjectURL", {
         configurable: true,
         value: vi.fn(() => "blob:landed-copy"),
       });
-      // Still copying on the first read; the original is already gone.
-      readChatImageMock
-        .mockRejectedValueOnce(new Error("not yet"))
-        .mockResolvedValue({ bytes: new Uint8Array([137, 80, 78, 71]), media_type: "image/png" });
+      // Still copying on every early read; the original is already gone.
+      readChatImageMock.mockRejectedValue(new Error("not yet"));
       readLocalChatImageMock.mockRejectedValue(new Error("gone"));
       const { container, findByText } = renderKept();
 
@@ -200,11 +206,17 @@ describe("MarkdownLocalImage", () => {
       });
       fireEvent.error(container.querySelector("img")!);
       expect(await findByText("Image unavailable")).toBeInTheDocument();
+      // However late the copy lands, its announcement loads it.
+      await waitFor(() => expect(readChatImageMock).toHaveBeenCalledTimes(2));
+      readChatImageMock.mockResolvedValue({
+        bytes: new Uint8Array([137, 80, 78, 71]),
+        media_type: "image/png",
+      });
+      announceKept?.(["/cfg/images/t/other.png", "/cfg/images/t/k.png"]);
 
-      await waitFor(
-        () => expect(container.querySelector("img")).toHaveAttribute("src", "blob:landed-copy"),
-        { timeout: 2_500 },
-      );
+      await waitFor(() => {
+        expect(container.querySelector("img")).toHaveAttribute("src", "blob:landed-copy");
+      });
       if (originalCreateObjectUrl) {
         Object.defineProperty(URL, "createObjectURL", originalCreateObjectUrl);
       } else {

@@ -17,7 +17,10 @@ import {
 } from "@/components/chat/ImageLightbox";
 import { resolveAssetSrc } from "@/lib/asset-url";
 import { readChatImage, readLocalChatImage } from "@/tauri/commands";
-import type { RetainedReplyImage } from "@/tauri/events";
+import {
+  onAgentChatReplyImagesKept,
+  type RetainedReplyImage,
+} from "@/tauri/events";
 
 type ImageReader = typeof readLocalChatImage;
 
@@ -30,9 +33,26 @@ interface ImageCandidate {
   kept?: boolean;
 }
 
-/** When a card found nothing while its kept copy may still have been
- *  landing, read the copy again after these delays. */
-const KEPT_COPY_RETRY_DELAYS_MS = [1_000, 4_000];
+/** Cards waiting for a kept copy to land, by the copy's path. */
+const keptCopyWaiters = new Map<string, Set<() => void>>();
+let keptCopyListener: Promise<unknown> | null = null;
+
+/** Call `onLanded` when the backend records the copy at `path`. One
+ *  app-wide listener serves every waiting card. */
+function whenKeptCopyLands(path: string, onLanded: () => void): () => void {
+  keptCopyListener ??= onAgentChatReplyImagesKept((paths) => {
+    for (const landed of paths) {
+      for (const notify of keptCopyWaiters.get(landed) ?? []) notify();
+    }
+  }).catch(() => null);
+  const waiters = keptCopyWaiters.get(path) ?? new Set();
+  waiters.add(onLanded);
+  keptCopyWaiters.set(path, waiters);
+  return () => {
+    waiters.delete(onLanded);
+    if (!waiters.size) keptCopyWaiters.delete(path);
+  };
+}
 
 const blobUrlCache = new Map<string, string>();
 const blobRequestCache = new Map<string, Promise<string>>();
@@ -129,8 +149,6 @@ interface SourceState {
   index: number;
   blob: string | null;
   failed: boolean;
-  /** Kept-copy reads retried after everything failed. */
-  retries: number;
 }
 
 function firstSource(
@@ -143,7 +161,6 @@ function firstSource(
     index: 0,
     blob: first ? (blobUrlCache.get(first.path) ?? null) : null,
     failed: !first,
-    retries: 0,
   };
 }
 
@@ -190,26 +207,25 @@ function useLocalImageSource(candidates: readonly ImageCandidate[]) {
   }, [candidate, candidates, key, state]);
 
   // Every source failed, but the kept copy may only have been landing (its
-  // background copy can hold the bytes after the original is gone): read it
-  // again a bounded number of times before settling on "unavailable".
+  // background copy can hold the bytes after the original is gone): load it
+  // when the backend records it. The immediate read covers a copy that
+  // landed before this card started waiting.
   useEffect(() => {
     const kept = candidates[0];
-    const delay = KEPT_COPY_RETRY_DELAYS_MS[state.retries];
-    if (!state.failed || !kept?.kept || delay === undefined) return;
-    const timer = setTimeout(() => {
-      const retries = state.retries + 1;
+    if (!state.failed || !kept?.kept) return;
+    const load = () => {
       requestBlobUrl(kept)
         .then((url) => {
           if (currentKey.current === key) {
-            setStored({ key, index: 0, blob: url, failed: false, retries });
+            setStored({ key, index: 0, blob: url, failed: false });
           }
         })
-        .catch(() => {
-          if (currentKey.current === key) setStored({ ...state, retries });
-        });
-    }, delay);
-    return () => clearTimeout(timer);
-  }, [candidates, key, state]);
+        .catch(() => {});
+    };
+    const stop = whenKeptCopyLands(kept.path, load);
+    load();
+    return stop;
+  }, [candidates, key, state.failed]);
 
   return {
     src:

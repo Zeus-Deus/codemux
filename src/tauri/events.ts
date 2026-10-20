@@ -723,6 +723,12 @@ export function withRetainedImages(
   return { ...event, item: { ...event.item, retained_images } };
 }
 
+/** Paths of reply image copies that just landed (see `RetainedReplyImage`). */
+export const onAgentChatReplyImagesKept = (
+  cb: EventCallback<string[]>,
+): Promise<UnlistenFn> =>
+  listen<string[]>("agent_chat_reply_images_kept", (e) => cb(e.payload));
+
 /** Low-frequency thread-less warnings; transcript traffic uses Channels. */
 export const onAgentChatGlobalEvent = (
   cb: EventCallback<AgentChatEventPayload>,

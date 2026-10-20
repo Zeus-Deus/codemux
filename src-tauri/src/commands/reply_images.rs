@@ -17,13 +17,17 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use super::agent_chat::{
     chat_image_extension, chat_images_dir, chat_images_root, media_type_from_extension,
     read_bounded_local_image, resolve_within, write_thread_chat_image,
 };
 use crate::database::DatabaseStore;
+
+/// Announces the copies a reply job recorded (their paths), so a card that
+/// gave up while its copy was still landing can load it.
+pub const REPLY_IMAGES_KEPT_EVENT: &str = "agent_chat_reply_images_kept";
 
 /// Most images one reply keeps.
 const MAX_RETAINED_PER_REPLY: usize = 8;
@@ -136,7 +140,7 @@ async fn run_job<R: Runtime>(app: &AppHandle<R>, row_id: i64) {
             // took its job with it).
             if db.has_reply_image_job(row_id) {
                 if let Some(payload) = db.get_agent_chat_message_payload(row_id) {
-                    retain_row(&db, row_id, planned_in_payload(&payload)).await;
+                    retain_row(app, &db, row_id, planned_in_payload(&payload)).await;
                 }
             }
         }
@@ -145,7 +149,12 @@ async fn run_job<R: Runtime>(app: &AppHandle<R>, row_id: i64) {
     forget_row_lock(row_id);
 }
 
-async fn retain_row(db: &DatabaseStore, row_id: i64, planned: Vec<RetainedReplyImage>) {
+async fn retain_row<R: Runtime>(
+    app: &AppHandle<R>,
+    db: &DatabaseStore,
+    row_id: i64,
+    planned: Vec<RetainedReplyImage>,
+) {
     let Some(root) = chat_images_root() else {
         return;
     };
@@ -168,6 +177,10 @@ async fn retain_row(db: &DatabaseStore, row_id: i64, planned: Vec<RetainedReplyI
         }
     }
     match db.finish_reply_image_job(row_id, &kept) {
+        Ok(true) if !kept.is_empty() => {
+            let paths: Vec<&str> = kept.iter().map(|image| image.path.as_str()).collect();
+            let _ = app.emit(REPLY_IMAGES_KEPT_EVENT, paths);
+        }
         Ok(true) => {}
         Ok(false) => remove_copies(&root, &kept),
         // The job stays queued for the next launch.
@@ -282,8 +295,11 @@ pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
                             fence = Some((marker, run, depth));
                             continue;
                         }
-                        Some((open, len, _))
-                            if open == marker && run >= len && trimmed[run..].trim().is_empty() =>
+                        Some((open, len, opened))
+                            if open == marker
+                                && run >= len
+                                && opened == depth
+                                && trimmed[run..].trim().is_empty() =>
                         {
                             fence = None;
                             continue;
@@ -494,9 +510,13 @@ fn character_reference(input: &str) -> Option<(char, usize)> {
 /// Whether `input` starts with something shaped like a named character
 /// reference (`&copy;`), which the renderer may resolve.
 fn named_reference(input: &str) -> bool {
-    let name = input[1..].split(';').next().unwrap_or("");
-    input[1..].contains(';')
-        && (2..=31).contains(&name.len())
+    // Bounded like `character_reference`: a run of bare `&`s stays linear.
+    let rest = &input[1..];
+    let Some((end, _)) = rest.char_indices().take(32).find(|(_, c)| *c == ';') else {
+        return false;
+    };
+    let name = &rest[..end];
+    name.len() >= 2
         && name.starts_with(|c: char| c.is_ascii_alphabetic())
         && name.chars().all(|c| c.is_ascii_alphanumeric())
 }
@@ -700,6 +720,20 @@ mod tests {
                     > ```\n> [quoted](/tmp/c.png)\n> ```\n\
                     Runs `` ` `` ``` and `[d](/tmp/d.png)` then [e](/tmp/e.png)";
         assert_eq!(local_image_sources(text), ["/tmp/e.png"]);
+    }
+
+    #[test]
+    fn a_quoted_fence_line_does_not_close_an_outer_fence() {
+        let text = "~~~\n> ~~~\n[example](/tmp/a.png)\n~~~\n[proof](/tmp/proof.png)";
+        assert_eq!(local_image_sources(text), ["/tmp/proof.png"]);
+    }
+
+    #[test]
+    fn bare_ampersands_stay_linear() {
+        let text = format!("[a](/tmp/{}.png)", "&".repeat(200_000));
+        let started = std::time::Instant::now();
+        assert_eq!(local_image_sources(&text).len(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
