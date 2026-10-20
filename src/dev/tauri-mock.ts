@@ -8130,12 +8130,11 @@ const handlers: Record<string, Handler> = {
   },
   set_workspace_pinned: (a) => {
     const ws = findWorkspace(a.workspaceId);
-    if (ws) {
-      const pinned = Boolean(a.pinned);
-      if (pinned && ws.pinned_at == null) ws.pinned_at = Date.now();
-      if (!pinned) ws.pinned_at = null;
-      emitAppState();
-    }
+    if (!ws) return Promise.reject(new Error(`No workspace found for ${String(a.workspaceId)}`));
+    const pinned = Boolean(a.pinned);
+    if (pinned === (ws.pinned_at != null)) return undefined;
+    replaceWorkspace(ws.workspace_id, () => ({ pinned_at: pinned ? Date.now() : null }));
+    emitAppState();
     return undefined;
   },
   close_workspace: (a) => removeWorkspace(a.workspaceId),

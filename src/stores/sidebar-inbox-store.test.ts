@@ -2,10 +2,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const mockDbGetUiState = vi.fn();
 const mockDbSetUiState = vi.fn();
+const mockSetWorkspacePinned = vi.fn();
 
 vi.mock("@/tauri/commands", () => ({
   dbGetUiState: (...args: unknown[]) => mockDbGetUiState(...args),
   dbSetUiState: (...args: unknown[]) => mockDbSetUiState(...args),
+  setWorkspacePinned: (...args: unknown[]) => mockSetWorkspacePinned(...args),
 }));
 
 import {
@@ -20,6 +22,7 @@ interface PersistedBlob {
   settled: { id: string; at: number; workEndedAt?: number }[];
   snoozed: { id: string; at: number; until: number }[];
   keepActive: string[];
+  keepWrapping: string[];
   activity: Record<string, number>;
 }
 
@@ -36,6 +39,7 @@ describe("sidebar-inbox-store", () => {
     vi.clearAllMocks();
     mockDbGetUiState.mockResolvedValue(null);
     mockDbSetUiState.mockResolvedValue(undefined);
+    mockSetWorkspacePinned.mockResolvedValue(undefined);
   });
 
   it("load() reads the persisted settled list", async () => {
@@ -465,5 +469,185 @@ describe("sidebar-inbox-store", () => {
       __resetSidebarInboxStoreForTests();
       expect(useSidebarInboxStore.getState().snoozed).toEqual([]);
     });
+  });
+});
+
+describe("inbox drag commits", () => {
+  beforeEach(() => {
+    __resetSidebarInboxStoreForTests();
+    vi.clearAllMocks();
+    mockDbGetUiState.mockResolvedValue(null);
+    mockDbSetUiState.mockResolvedValue(undefined);
+    mockSetWorkspacePinned.mockResolvedValue(undefined);
+  });
+  const unpin = { id: "a", pinned: false, order: ["b", "a"], destination: "active" as const };
+
+  it("loads valid unique ranks from new blobs and supports old blobs", async () => {
+    mockDbGetUiState.mockResolvedValue(JSON.stringify({ order: ["b", 3, "", "a", "b"] }));
+    await useSidebarInboxStore.getState().load();
+    expect(useSidebarInboxStore.getState().order).toEqual(["b", "a"]);
+    __resetSidebarInboxStoreForTests();
+    mockDbGetUiState.mockResolvedValue(JSON.stringify([{ id: "a", at: 1 }]));
+    await useSidebarInboxStore.getState().load();
+    expect(useSidebarInboxStore.getState().order).toEqual([]);
+  });
+
+  it("clears both shelves and keeps Active with one persisted write before unpinning", async () => {
+    useSidebarInboxStore.setState({ settled: [{ id: "a", at: 1 }], snoozed: [{ id: "a", at: 1, until: 10 }] });
+    mockSetWorkspacePinned.mockImplementation(async () => {
+      expect(mockDbSetUiState).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(mockDbSetUiState.mock.calls[0][1])).toMatchObject({ order: ["b", "a"], settled: [], snoozed: [], keepActive: ["a"] });
+    });
+    await useSidebarInboxStore.getState().applyDrop(unpin, true);
+    expect(useSidebarInboxStore.getState()).toMatchObject({ settled: [], snoozed: [], keepActive: { a: true }, pendingDrop: false });
+  });
+
+  it("does not change pin membership if order persistence fails", async () => {
+    mockDbSetUiState.mockRejectedValueOnce(new Error("disk full"));
+    await expect(useSidebarInboxStore.getState().applyDrop(unpin, true)).rejects.toThrow("disk full");
+    expect(mockSetWorkspacePinned).not.toHaveBeenCalled();
+    expect(useSidebarInboxStore.getState()).toMatchObject({ order: [], pinOverrides: {}, keepActive: {}, pendingDrop: false });
+  });
+
+  it("rolls back a rejected unpin without losing another workspace's activity", async () => {
+    const entry = { id: "a", at: 123 };
+    useSidebarInboxStore.setState({ settled: [entry], order: ["a", "b"] });
+    mockSetWorkspacePinned.mockImplementation(async () => {
+      useSidebarInboxStore.getState().noteActivity("b", 500);
+      throw new Error("offline");
+    });
+    await expect(useSidebarInboxStore.getState().applyDrop(unpin, true)).rejects.toThrow("offline");
+    expect(useSidebarInboxStore.getState()).toMatchObject({ order: ["a", "b"], settled: [entry], keepActive: {}, activity: { b: 500 }, pinOverrides: {} });
+    expect(lastPersistedBlob()).toMatchObject({ settled: [entry], activity: { b: 500 } });
+  });
+
+  it("does not restore an obsolete shelf after new agent activity", async () => {
+    useSidebarInboxStore.setState({ settled: [{ id: "a", at: 1 }] });
+    mockSetWorkspacePinned.mockImplementation(async () => {
+      useSidebarInboxStore.getState().noteActivity("a", 500, { clearPin: true });
+      throw new Error("offline");
+    });
+    await expect(useSidebarInboxStore.getState().applyDrop(unpin, true)).rejects.toThrow("offline");
+    expect(useSidebarInboxStore.getState().settled).toEqual([]);
+  });
+
+  it.each(["active", "wrapping"] as const)("restores the previous shelf after a rejected %s drop despite a timestamp-only observation", async (destination) => {
+    const settled = destination === "active" ? [{ id: "a", at: 1 }] : [];
+    const snoozed = destination === "wrapping" ? [{ id: "a", at: 1, until: 10 }] : [];
+    const keepActive: Record<string, true> = destination === "active" ? {} : { a: true };
+    useSidebarInboxStore.setState({ settled, snoozed, keepActive, activity: { a: 100 } });
+    mockSetWorkspacePinned.mockImplementation(async () => {
+      // A visit updates the observation stamp without changing lifecycle intent.
+      useSidebarInboxStore.getState().noteActivity("a", 100_000);
+      throw new Error("offline");
+    });
+    await expect(useSidebarInboxStore.getState().applyDrop({ ...unpin, destination }, true)).rejects.toThrow("offline");
+    expect(useSidebarInboxStore.getState()).toMatchObject({ settled, snoozed, keepActive, activity: { a: 100_000 } });
+    expect(useSidebarInboxStore.getState().keepActive).toEqual(keepActive);
+    expect(lastPersistedBlob()).toMatchObject({ settled, snoozed, keepActive: Object.keys(keepActive), keepWrapping: [], activity: { a: 100_000 } });
+  });
+
+  it("keeps pin overrides until the snapshot acknowledges them", async () => {
+    await useSidebarInboxStore.getState().applyDrop(unpin, true);
+    useSidebarInboxStore.getState().reconcilePins([{ workspace_id: "a", pinned_at: 100 }]);
+    expect(useSidebarInboxStore.getState().pinOverrides).toEqual({ a: false });
+    useSidebarInboxStore.getState().reconcilePins([{ workspace_id: "a", pinned_at: null }]);
+    expect(useSidebarInboxStore.getState().pinOverrides).toEqual({});
+  });
+
+  it("does not mask future pin changes after an in-section reorder", async () => {
+    await useSidebarInboxStore.getState().applyDrop({ ...unpin, pinned: true, destination: "pinned" }, true);
+    expect(useSidebarInboxStore.getState().pinOverrides).toEqual({});
+    expect(mockSetWorkspacePinned).not.toHaveBeenCalled();
+  });
+
+  it("prunes ranks only when a workspace disappears, not when it unpins", async () => {
+    await useSidebarInboxStore.getState().applyDrop(unpin, true);
+    useSidebarInboxStore.getState().prune(new Set(["a", "b"]));
+    expect(useSidebarInboxStore.getState().order).toEqual(["b", "a"]);
+    useSidebarInboxStore.getState().prune(new Set(["a"]));
+    expect(useSidebarInboxStore.getState().order).toEqual(["a"]);
+  });
+
+  it("preserves lifecycle state when reordering Active", async () => {
+    await useSidebarInboxStore.getState().applyDrop(unpin, false);
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({});
+    expect(mockSetWorkspacePinned).not.toHaveBeenCalled();
+  });
+
+  it("clears hidden shelves when dropping into Wrapping up without suppressing its automatic lifecycle", async () => {
+    useSidebarInboxStore.setState({ settled: [{ id: "a", at: 1 }], keepActive: { a: true } });
+    await useSidebarInboxStore.getState().applyDrop({ ...unpin, destination: "wrapping" }, true);
+    expect(useSidebarInboxStore.getState()).toMatchObject({ settled: [], keepActive: { a: "wrapping" } });
+  });
+
+  it("restores hidden shelves and their previous keep-active decision if a wrapping drop fails", async () => {
+    const entry = { id: "a", at: 1 };
+    useSidebarInboxStore.setState({ settled: [entry], keepActive: { a: true } });
+    mockSetWorkspacePinned.mockRejectedValueOnce(new Error("offline"));
+    await expect(useSidebarInboxStore.getState().applyDrop({ ...unpin, destination: "wrapping" }, true)).rejects.toThrow("offline");
+    expect(useSidebarInboxStore.getState()).toMatchObject({ settled: [entry], keepActive: { a: true } });
+  });
+
+  it("persists the Wrapping up idle exemption, prunes it, and clears it on real activity", async () => {
+    await useSidebarInboxStore.getState().applyDrop({ ...unpin, destination: "wrapping" }, true);
+    expect(lastPersistedBlob()).toMatchObject({ keepActive: [], keepWrapping: ["a"] });
+    const raw = JSON.stringify(lastPersistedBlob());
+    __resetSidebarInboxStoreForTests();
+    mockDbGetUiState.mockResolvedValue(raw);
+    await useSidebarInboxStore.getState().load();
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({ a: "wrapping" });
+    useSidebarInboxStore.getState().noteActivity("a", 100);
+    useSidebarInboxStore.getState().prune(new Set(["a"]));
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({ a: "wrapping" });
+    // Genuine activity clears even when its timestamp is inside the throttle.
+    useSidebarInboxStore.getState().noteActivity("a", 101, { clearPin: true });
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({});
+    expect(lastPersistedBlob().keepWrapping).toEqual([]);
+    useSidebarInboxStore.setState({ keepActive: { gone: "wrapping" } });
+    useSidebarInboxStore.getState().prune(new Set(["a"]));
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({});
+  });
+
+  it("restores the Wrapping up exemption when a later Active drop is rejected", async () => {
+    useSidebarInboxStore.setState({ keepActive: { a: "wrapping" } });
+    mockSetWorkspacePinned.mockRejectedValueOnce(new Error("offline"));
+    await expect(useSidebarInboxStore.getState().applyDrop(unpin, true)).rejects.toThrow("offline");
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({ a: "wrapping" });
+  });
+
+  it("lets a later menu action win after an in-flight drop and clears its override", async () => {
+    let finishPin = () => {};
+    mockSetWorkspacePinned.mockReturnValueOnce(new Promise<void>((resolve) => { finishPin = resolve; }));
+    const drop = useSidebarInboxStore.getState().applyDrop({ ...unpin, pinned: true, destination: "pinned" }, false);
+    await vi.waitFor(() => expect(mockSetWorkspacePinned).toHaveBeenCalledWith("a", true));
+    const menu = useSidebarInboxStore.getState().setPinned("a", false);
+    await Promise.resolve();
+    expect(mockSetWorkspacePinned).toHaveBeenCalledTimes(1);
+    finishPin();
+    await Promise.all([drop, menu]);
+    expect(mockSetWorkspacePinned).toHaveBeenLastCalledWith("a", false);
+    expect(useSidebarInboxStore.getState().pinOverrides).toEqual({});
+  });
+
+  it("restores the committed order and keep-active decision on reload", async () => {
+    await useSidebarInboxStore.getState().applyDrop(unpin, true);
+    const raw = mockDbSetUiState.mock.calls[mockDbSetUiState.mock.calls.length - 1]?.[1];
+    __resetSidebarInboxStoreForTests();
+    mockDbGetUiState.mockResolvedValue(raw);
+    await useSidebarInboxStore.getState().load();
+    expect(useSidebarInboxStore.getState()).toMatchObject({ order: ["b", "a"], keepActive: { a: true }, settled: [], snoozed: [] });
+  });
+
+  it("blocks concurrent drops and drains older writes before saving a new order", async () => {
+    let resolveWrite = () => {};
+    mockDbSetUiState.mockReturnValueOnce(new Promise<void>((resolve) => { resolveWrite = resolve; }));
+    useSidebarInboxStore.getState().noteActivity("b", 100);
+    const first = useSidebarInboxStore.getState().applyDrop(unpin, true);
+    await expect(useSidebarInboxStore.getState().applyDrop(unpin, true)).rejects.toThrow("already being saved");
+    expect(mockDbSetUiState).toHaveBeenCalledTimes(1);
+    resolveWrite();
+    await first;
+    expect(mockDbSetUiState).toHaveBeenCalledTimes(2);
   });
 });

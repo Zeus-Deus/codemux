@@ -1,4 +1,5 @@
 import { Checkbox } from "@/components/ui/checkbox";
+import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import { AgentQuestionBadge } from "./agent-question-badge";
 import { useEffect, useState } from "react";
 import {
@@ -75,7 +76,6 @@ import {
   closeWorkspaceWithWorktree,
   unarchiveWorkspace,
   setWorkspaceMuted,
-  setWorkspacePinned,
   openInEditor,
   runWorkspaceSetup,
   workspacePullBack,
@@ -670,7 +670,7 @@ export function WorkspaceContextMenuItems({
   const handleTogglePinned = async () => {
     const pinned = workspace.pinned_at != null;
     try {
-      await setWorkspacePinned(workspace.workspace_id, !pinned);
+      await useSidebarInboxStore.getState().setPinned(workspace.workspace_id, !pinned);
     } catch (err) {
       toast.error(pinned ? "Unpin failed" : "Pin failed", {
         description: err instanceof Error ? err.message : String(err),

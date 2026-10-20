@@ -48,6 +48,7 @@ import {
 } from "@/lib/hover-card-group";
 import { useProjectAppearance } from "./use-project-appearance";
 import { WorkspaceMenuOpenContext } from "./workspace-menu-open-context";
+import { SidebarDragContext } from "./sidebar-drag-context";
 import { cn } from "@/lib/utils";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import {
@@ -117,7 +118,8 @@ export function WorkspaceHoverCard({
 }: Props) {
   const groupActive = useHoverCardGroupActive();
   const suppressUntilPointerLeave = useRef(false);
-  const menuOpen = useContext(WorkspaceMenuOpenContext);
+  const dragging = useContext(SidebarDragContext);
+  const menuOpen = useContext(WorkspaceMenuOpenContext) || dragging;
   const menuOpenRef = useRef(menuOpen);
   // `instant` is captured when the card opens, not read live, and it governs
   // BOTH ends of the card's motion (see `data-instant` in

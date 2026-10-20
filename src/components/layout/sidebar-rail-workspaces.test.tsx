@@ -558,3 +558,11 @@ describe("SidebarRailWorkspaces — keyboard jumps while collapsed", () => {
     expect(container.querySelector("[data-rail-needs-you]")).toBeNull();
   });
 });
+
+it("uses the Activity presentation order for pins and ordinary rail workspaces", async () => {
+  workspaces = [makeWorkspace({ pinned_at: 1 }), makeWorkspace({ pinned_at: 2 }), makeWorkspace(), makeWorkspace()];
+  persistedSettled = JSON.stringify({ order: ["ws-1", "ws-2", "ws-3", "ws-4"] });
+  const { container } = await renderRail();
+  expect([...container.querySelectorAll("[data-rail-ws]")].map((row) => row.getAttribute("data-rail-ws"))).toEqual(["ws-1", "ws-2", "ws-3", "ws-4"]);
+  expect(getJumpTarget(1)).toBe("ws-1");
+});

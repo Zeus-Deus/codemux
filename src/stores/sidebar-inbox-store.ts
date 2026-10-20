@@ -1,5 +1,6 @@
 import { create } from "zustand";
-import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
+import { dbGetUiState, dbSetUiState, setWorkspacePinned } from "@/tauri/commands";
+import type { InboxDrop } from "@/components/layout/sidebar-inbox-order";
 
 /** Persisted UI-state key holding the settled-inbox JSON blob. "Settled" is a
  *  purely visual inbox flag — the workspace is untouched (no archive, no
@@ -51,6 +52,7 @@ export function resolveSettledTimestamp(entry: SettledEntry): number {
 
 /** The full persisted inbox blob. */
 interface PersistedInbox {
+  order: string[];
   settled: SettledEntry[];
   /** Workspaces the user asked to see again later, with their wake times.
    *  Persisted so a snooze survives a restart — a snooze that evaporated on
@@ -59,6 +61,8 @@ interface PersistedInbox {
   /** Workspace ids the user explicitly un-settled — a "keep active" pin that
    *  suppresses auto-settle until real agent activity clears it. */
   keepActive: string[];
+  /** Explicit Wrapping up drops suppress idle settlement, but allow completion. */
+  keepWrapping: string[];
   /** Last-observed activity (ms epoch) per workspace. Client-tracked because
    *  the backend stamps no status-changed-at. */
   activity: Record<string, number>;
@@ -69,7 +73,16 @@ interface PersistedInbox {
  *  throttle it would write on every clock tick for a long-running agent. */
 const ACTIVITY_WRITE_THROTTLE_MS = 60_000;
 
+type KeepActive = Record<string, true | "wrapping">;
+
 interface SidebarInboxStore {
+  order: string[];
+  /** Retained until the backend snapshot acknowledges the requested membership. */
+  pinOverrides: Record<string, boolean>;
+  pendingDrop: boolean;
+  applyDrop: (drop: InboxDrop, wasPinned: boolean) => Promise<void>;
+  setPinned: (id: string, pinned: boolean) => Promise<void>;
+  reconcilePins: (workspaces: readonly { workspace_id: string; pinned_at?: number | null }[]) => void;
   /** True once the persisted blob has been read (or failed to read — either
    *  way the inbox can render without flashing settled rows late). */
   loaded: boolean;
@@ -81,10 +94,10 @@ interface SidebarInboxStore {
    *  render twice and give the user two contradictory affordances for the
    *  same card. Persisted. */
   snoozed: SnoozeEntry[];
-  /** "Keep active" pins keyed by workspace id — set when the user un-settles a
-   *  card, cleared when its agent next shows activity or the user settles it
-   *  again. While pinned, auto-settle skips the workspace. Persisted. */
-  keepActive: Record<string, true>;
+  /** Explicit Active drops skip auto-settle; Wrapping up drops skip only its
+   *  idle fallback so a PR merge/closure still settles the card. Both clear
+   *  when its agent next shows activity or the user parks it. Persisted. */
+  keepActive: KeepActive;
   /** Last-observed activity ms-epoch per workspace, used by the inactivity
    *  auto-settle rule. Persisted. */
   activity: Record<string, number>;
@@ -142,26 +155,42 @@ interface SidebarInboxStore {
 }
 
 let loadPromise: Promise<void> | null = null;
+const writes = new Set<Promise<void>>();
+let dropInFlight = false;
+let dropDone = Promise.resolve();
+let dirtyDuringDrop = false;
+
+function writeInbox(state: Pick<SidebarInboxStore, "settled" | "snoozed" | "keepActive" | "activity" | "order">): Promise<void> {
+  const blob: PersistedInbox = {
+    order: state.order,
+    settled: state.settled,
+    snoozed: state.snoozed,
+    keepActive: Object.keys(state.keepActive).filter((id) => state.keepActive[id] === true),
+    keepWrapping: Object.keys(state.keepActive).filter((id) => state.keepActive[id] === "wrapping"),
+    activity: state.activity,
+  };
+  const write = Promise.resolve(dbSetUiState(SETTLED_UI_STATE_KEY, JSON.stringify(blob))).then(() => {});
+  writes.add(write);
+  void write.then(() => writes.delete(write), () => writes.delete(write));
+  return write;
+}
 
 function persist(state: {
   settled: SettledEntry[];
   snoozed: SnoozeEntry[];
-  keepActive: Record<string, true>;
+  keepActive: KeepActive;
   activity: Record<string, number>;
 }): void {
-  const blob: PersistedInbox = {
-    settled: state.settled,
-    snoozed: state.snoozed,
-    keepActive: Object.keys(state.keepActive),
-    activity: state.activity,
-  };
-  dbSetUiState(SETTLED_UI_STATE_KEY, JSON.stringify(blob)).catch(console.error);
+  // Do not let a lifecycle write overtake the drop's persisted snapshot.
+  if (dropInFlight) { dirtyDuringDrop = true; return; }
+  void writeInbox({ ...state, order: useSidebarInboxStore.getState().order }).catch(console.error);
 }
 
 interface ParsedInbox {
+  order: string[];
   settled: SettledEntry[];
   snoozed: SnoozeEntry[];
-  keepActive: Record<string, true>;
+  keepActive: KeepActive;
   activity: Record<string, number>;
 }
 
@@ -189,7 +218,7 @@ function parseSnoozeEntries(value: unknown): SnoozeEntry[] {
 }
 
 function parseInbox(raw: string | null): ParsedInbox {
-  const empty: ParsedInbox = { settled: [], snoozed: [], keepActive: {}, activity: {} };
+  const empty: ParsedInbox = { order: [], settled: [], snoozed: [], keepActive: {}, activity: {} };
   if (!raw) return empty;
   try {
     const parsed: unknown = JSON.parse(raw);
@@ -198,6 +227,7 @@ function parseInbox(raw: string | null): ParsedInbox {
     // both older shapes land on an empty snooze shelf rather than failing.
     if (Array.isArray(parsed)) {
       return {
+        order: [],
         settled: parseSettledEntries(parsed),
         snoozed: [],
         keepActive: {},
@@ -206,10 +236,15 @@ function parseInbox(raw: string | null): ParsedInbox {
     }
     if (typeof parsed !== "object" || parsed === null) return empty;
     const obj = parsed as Record<string, unknown>;
-    const keepActive: Record<string, true> = {};
+    const keepActive: KeepActive = {};
     if (Array.isArray(obj.keepActive)) {
       for (const id of obj.keepActive) {
         if (typeof id === "string") keepActive[id] = true;
+      }
+    }
+    if (Array.isArray(obj.keepWrapping)) {
+      for (const id of obj.keepWrapping) {
+        if (typeof id === "string" && !keepActive[id]) keepActive[id] = "wrapping";
       }
     }
     const activity: Record<string, number> = {};
@@ -219,6 +254,9 @@ function parseInbox(raw: string | null): ParsedInbox {
       }
     }
     return {
+      order: Array.isArray(obj.order)
+        ? [...new Set(obj.order.filter((id): id is string => typeof id === "string" && id.length > 0))]
+        : [],
       settled: parseSettledEntries(obj.settled),
       snoozed: parseSnoozeEntries(obj.snoozed),
       keepActive,
@@ -231,6 +269,9 @@ function parseInbox(raw: string | null): ParsedInbox {
 }
 
 export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
+  order: [],
+  pinOverrides: {},
+  pendingDrop: false,
   loaded: false,
   settled: [],
   snoozed: [],
@@ -244,6 +285,7 @@ export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
       .then((raw) => {
         const parsed = parseInbox(raw);
         set({
+          order: parsed.order,
           settled: parsed.settled,
           snoozed: parsed.snoozed,
           keepActive: parsed.keepActive,
@@ -257,10 +299,95 @@ export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
     return loadPromise;
   },
 
+  reconcilePins: (workspaces) => {
+    const overrides = get().pinOverrides;
+    if (Object.keys(overrides).length === 0) return;
+    const actual = new Map(workspaces.map((ws) => [ws.workspace_id, ws.pinned_at != null]));
+    const remaining = Object.fromEntries(Object.entries(overrides).filter(
+      ([id, pinned]) => actual.has(id) && actual.get(id) !== pinned,
+    ));
+    if (Object.keys(remaining).length !== Object.keys(overrides).length) set({ pinOverrides: remaining });
+  },
+
+  setPinned: async (id, pinned) => {
+    // A menu action made during a drag save must win after that save finishes.
+    if (dropInFlight) await dropDone;
+    const pinOverrides = { ...get().pinOverrides };
+    delete pinOverrides[id];
+    set({ pinOverrides });
+    await setWorkspacePinned(id, pinned);
+  },
+
+  applyDrop: async (drop, wasPinned) => {
+    if (dropInFlight) throw new Error("A workspace move is already being saved");
+    const { id, pinned, order } = drop;
+    const before = get();
+    const oldSettled = before.settled.filter((entry) => entry.id === id);
+    const oldSnoozed = before.snoozed.filter((entry) => entry.id === id);
+    const nextKeepActive = { ...before.keepActive };
+    if (drop.destination === "active") nextKeepActive[id] = true;
+    else if (drop.destination === "wrapping") nextKeepActive[id] = "wrapping";
+    else delete nextKeepActive[id];
+    dropInFlight = true;
+    let finishDrop = () => {};
+    dropDone = new Promise<void>((resolve) => { finishDrop = resolve; });
+    dirtyDuringDrop = false;
+    set({
+      pendingDrop: true,
+      order,
+      pinOverrides: wasPinned !== pinned ? { ...before.pinOverrides, [id]: pinned } : before.pinOverrides,
+      ...(wasPinned && !pinned ? {
+        settled: before.settled.filter((entry) => entry.id !== id),
+        snoozed: before.snoozed.filter((entry) => entry.id !== id),
+        keepActive: nextKeepActive,
+      } : {}),
+    });
+    try {
+      await Promise.allSettled([...writes]);
+      // Save order and the entire keep-active decision in one write before
+      // unpinning can expose a hidden shelf or trigger the auto-settle sweep.
+      dirtyDuringDrop = false;
+      await writeInbox(get());
+      if (wasPinned !== pinned) await setWorkspacePinned(id, pinned);
+    } catch (error) {
+      const current = get();
+      const pinOverrides = { ...current.pinOverrides };
+      delete pinOverrides[id];
+      // Visits may update activity without changing the shelf decision. Only
+      // lifecycle changes (which clear the exemption or add a shelf) revoke it.
+      const canRestoreShelves = wasPinned && !pinned &&
+        current.keepActive[id] === nextKeepActive[id] &&
+        !current.settled.some((entry) => entry.id === id) &&
+        !current.snoozed.some((entry) => entry.id === id);
+      const keepActive = { ...current.keepActive };
+      if (canRestoreShelves) {
+        if (before.keepActive[id]) keepActive[id] = before.keepActive[id];
+        else delete keepActive[id];
+      }
+      set({
+        pinOverrides,
+        order: before.order.filter((key) => current.order.includes(key)),
+        ...(canRestoreShelves ? {
+          settled: [...current.settled, ...oldSettled],
+          snoozed: [...current.snoozed, ...oldSnoozed],
+          keepActive,
+        } : {}),
+      });
+      await writeInbox(get()).catch(console.error);
+      throw error;
+    } finally {
+      dropInFlight = false;
+      set({ pendingDrop: false });
+      if (dirtyDuringDrop) persist(get());
+      dirtyDuringDrop = false;
+      finishDrop();
+    }
+  },
+
   settle: (workspaceId, workEndedAt) => {
     const { settled, snoozed, keepActive, activity } = get();
     const alreadySettled = settled.some((e) => e.id === workspaceId);
-    const pinned = keepActive[workspaceId] === true;
+    const pinned = keepActive[workspaceId] !== undefined;
     const wasSnoozed = snoozed.some((e) => e.id === workspaceId);
     if (alreadySettled && !pinned && !wasSnoozed) return;
     const entry: SettledEntry = { id: workspaceId, at: Date.now() };
@@ -289,17 +416,17 @@ export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
   unsettle: (workspaceId, reason) => {
     const { settled, snoozed, keepActive, activity } = get();
     const wasSettled = settled.some((e) => e.id === workspaceId);
-    const pinned = keepActive[workspaceId] === true;
+    const pinned = keepActive[workspaceId] !== undefined;
     // "user" adds a pin; "activity" clears one. Nothing to do if neither the
     // settled entry nor the pin state would change.
     const willPin = reason === "user";
-    const pinChanges = willPin ? !pinned : pinned;
+    const pinChanges = willPin ? keepActive[workspaceId] !== true : pinned;
     if (!wasSettled && !pinChanges) return;
     const nextSettled = wasSettled
       ? settled.filter((e) => e.id !== workspaceId)
       : settled;
     let nextKeepActive = keepActive;
-    if (willPin && !pinned) {
+    if (willPin && keepActive[workspaceId] !== true) {
       nextKeepActive = { ...keepActive, [workspaceId]: true };
     } else if (!willPin && pinned) {
       nextKeepActive = { ...keepActive };
@@ -320,7 +447,7 @@ export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
     ];
     const nextSettled = settled.filter((e) => e.id !== workspaceId);
     let nextKeepActive = keepActive;
-    if (keepActive[workspaceId] === true) {
+    if (keepActive[workspaceId] !== undefined) {
       nextKeepActive = { ...keepActive };
       delete nextKeepActive[workspaceId];
     }
@@ -336,19 +463,19 @@ export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
   unsnooze: (workspaceId, reason) => {
     const { settled, snoozed, keepActive, activity } = get();
     const wasSnoozed = snoozed.some((e) => e.id === workspaceId);
-    const pinned = keepActive[workspaceId] === true;
+    const pinned = keepActive[workspaceId] !== undefined;
     // Same pin rules as unsettle, plus "timer": a wake time simply arriving is
     // not a user decision, so it must not create a pin that would then suppress
     // auto-settle on work nobody has looked at yet.
     const willPin = reason === "user";
     const willUnpin = reason === "activity" && pinned;
-    const pinChanges = willPin ? !pinned : willUnpin;
+    const pinChanges = willPin ? keepActive[workspaceId] !== true : willUnpin;
     if (!wasSnoozed && !pinChanges) return;
     const nextSnoozed = wasSnoozed
       ? snoozed.filter((e) => e.id !== workspaceId)
       : snoozed;
     let nextKeepActive = keepActive;
-    if (willPin && !pinned) {
+    if (willPin && keepActive[workspaceId] !== true) {
       nextKeepActive = { ...keepActive, [workspaceId]: true };
     } else if (willUnpin) {
       nextKeepActive = { ...keepActive };
@@ -364,7 +491,7 @@ export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
     // Only genuine agent activity un-pins a kept-active card; selection and
     // first-seen baselines merely stamp.
     const clearPin = opts?.clearPin === true;
-    const pinned = clearPin && keepActive[workspaceId] === true;
+    const pinned = clearPin && keepActive[workspaceId] !== undefined;
     // Write-throttle: only persist when the stamp jumps by more than a minute
     // (or on first observation). A pin still clears if it's set even when the
     // stamp itself is throttled, so a resurfacing agent always un-pins.
@@ -384,23 +511,26 @@ export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
 
   prune: (validIds) => {
     const { settled, snoozed, keepActive, activity } = get();
+    const nextOrder = get().order.filter((id) => validIds.has(id));
     const nextSettled = settled.filter((e) => validIds.has(e.id));
     const nextSnoozed = snoozed.filter((e) => validIds.has(e.id));
-    const nextKeepActive: Record<string, true> = {};
+    const nextKeepActive: KeepActive = {};
     for (const id of Object.keys(keepActive)) {
-      if (validIds.has(id)) nextKeepActive[id] = true;
+      if (validIds.has(id)) nextKeepActive[id] = keepActive[id];
     }
     const nextActivity: Record<string, number> = {};
     for (const [id, at] of Object.entries(activity)) {
       if (validIds.has(id)) nextActivity[id] = at;
     }
     const changed =
+      nextOrder.length !== get().order.length ||
       nextSettled.length !== settled.length ||
       nextSnoozed.length !== snoozed.length ||
       Object.keys(nextKeepActive).length !== Object.keys(keepActive).length ||
       Object.keys(nextActivity).length !== Object.keys(activity).length;
     if (!changed) return;
     set({
+      order: nextOrder,
       settled: nextSettled,
       snoozed: nextSnoozed,
       keepActive: nextKeepActive,
@@ -418,7 +548,14 @@ export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
 /** Test-only: reset the module-level load memoization + store state. */
 export function __resetSidebarInboxStoreForTests(): void {
   loadPromise = null;
+  writes.clear();
+  dropInFlight = false;
+  dropDone = Promise.resolve();
+  dirtyDuringDrop = false;
   useSidebarInboxStore.setState({
+    order: [],
+    pinOverrides: {},
+    pendingDrop: false,
     loaded: false,
     settled: [],
     snoozed: [],
