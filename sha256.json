@@ -1,6 +1,12 @@
 {
-  "computer-use-settings.png": "5358e0f6bfa8f24930cdc38a5100822ccc0154cf71e00e7ce5906d46aee047f0",
   "computer-use-chat.png": "160242df7547c67056470b0a15d3f4bc3204262086d0d25274f70fd101bac9dd",
+  "computer-use-main-compact.png": "55415500af58ba0bd1fdc003ce8787e2e753967386fc1e9298a48943c8d5f71e",
+  "computer-use-main-expanded.png": "219004fb233e50c5b5f71403eb5f1a51dfc11c3794be56e11ab2b9d98a8a07d2",
+  "computer-use-main-live.png": "9d185867ff83b8eb268e6c3a764be2c805933e5399bb91fcd6469aa3029f181b",
+  "computer-use-main-no-image.png": "9f9450136ad9804284c9d4a20f9b50aa43813ba5cf88f22605755fab5ea2f775",
+  "computer-use-main-peek.png": "6db342e6a00ca227bb84b60037317dab2c0f8eb2752fc061b41fb0ec9016eb89",
+  "computer-use-main-settings.png": "75032c1fb6b678ac75cf1435c06d49a690dd26cc505c3da03594bbc130fabcbd",
+  "computer-use-no-image.png": "793bf566e42182bfaac7c7277f473877471f848c34c60b1e1e7950667628f4d1",
   "computer-use-peek.png": "55e95428fd945e0123e72b31e1e197d742a124ebb6e877d5eeb12032aa812ef2",
-  "computer-use-no-image.png": "793bf566e42182bfaac7c7277f473877471f848c34c60b1e1e7950667628f4d1"
+  "computer-use-settings.png": "5358e0f6bfa8f24930cdc38a5100822ccc0154cf71e00e7ce5906d46aee047f0"
 }
