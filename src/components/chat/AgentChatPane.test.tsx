@@ -4250,6 +4250,136 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     expect(setPermissionModeMock).not.toHaveBeenCalled();
   });
 
+  describe("leaving Plan through Ask or Debug restores the mode Plan was entered from", () => {
+    // Setters write back into the mocked store, so one render can walk the
+    // whole Shift+Tab cycle the way the real store would.
+    const liveSlice = () => {
+      const patch = (next: SliceOverrides) => {
+        currentSliceOverrides = {
+          ...currentSliceOverrides,
+          "thread-x": { ...currentSliceOverrides["thread-x"], ...next },
+        };
+      };
+      setModeMock.mockImplementation((_id: string, mode: SliceOverrides["mode"]) =>
+        patch({ mode }),
+      );
+      setModePriorMock.mockImplementation((_id: string, prior: string | null) =>
+        patch({ modePriorPermissionMode: prior }),
+      );
+      setPermissionModeMock.mockImplementation((_id: string, permissionMode: string) =>
+        patch({ permissionMode }),
+      );
+    };
+    afterEach(() => {
+      setModeMock.mockReset();
+      setModePriorMock.mockReset();
+      setPermissionModeMock.mockReset();
+    });
+    const click = async (container: HTMLElement, testId: string) => {
+      await act(async () => {
+        (
+          container.querySelector(`[data-testid="${testId}"]`) as HTMLButtonElement
+        ).click();
+      });
+    };
+
+    it("OpenCode: Plan → Ask → remove sends the original mode, not plan", async () => {
+      currentSliceOverrides = {
+        "thread-x": { permissionMode: "bypassPermissions" },
+      };
+      liveSlice();
+      const { container } = render(
+        <AgentChatPane pane={{ ...pane, provider: "opencode" }} />,
+      );
+      await act(async () => {});
+      await click(container, "mode-activate-plan");
+      await click(container, "mode-activate-ask");
+      await click(container, "mode-remove");
+
+      const calls = vi.mocked(agentChatSetPermissionMode).mock.calls;
+      expect(calls[calls.length - 1]).toEqual([
+        "opencode",
+        "thread-x",
+        "bypassPermissions",
+      ]);
+      expect(currentSliceOverrides["thread-x"]?.mode).toBe("default");
+      expect(currentSliceOverrides["thread-x"]?.modePriorPermissionMode).toBeNull();
+    });
+
+    it("Claude: Plan → Ask → remove relaunches in the original mode", async () => {
+      currentSliceOverrides = {
+        "thread-x": { permissionMode: "acceptEdits", sessionLaunchMode: "acceptEdits" },
+      };
+      liveSlice();
+      const { container } = render(<AgentChatPane pane={pane} />);
+      await act(async () => {});
+      await click(container, "mode-activate-plan");
+      await click(container, "mode-activate-ask");
+      await click(container, "mode-remove");
+
+      await waitFor(() =>
+        expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledWith(
+          "pane-1",
+          "claude",
+          expect.objectContaining({ permission_mode: "acceptEdits" }),
+          "thread-x",
+        ),
+      );
+      expect(currentSliceOverrides["thread-x"]?.mode).toBe("default");
+    });
+
+    it("ignores a second mode change while the first waits on the provider", async () => {
+      currentSliceOverrides = {
+        "thread-x": {
+          mode: "ask",
+          modePriorPermissionMode: "bypassPermissions",
+          permissionMode: "bypassPermissions",
+        },
+      };
+      liveSlice();
+      let finish: () => void = () => {};
+      vi.mocked(agentChatSetPermissionMode).mockImplementationOnce(
+        () => new Promise<void>((resolve) => (finish = resolve)),
+      );
+      const { container } = render(
+        <AgentChatPane pane={{ ...pane, provider: "opencode" }} />,
+      );
+      await act(async () => {});
+      await click(container, "mode-activate-debug");
+      // Pressed again before OpenCode answered: must not start a second change.
+      await click(container, "mode-remove");
+      await act(async () => finish());
+
+      expect(vi.mocked(agentChatSetPermissionMode)).toHaveBeenCalledTimes(1);
+      expect(currentSliceOverrides["thread-x"]?.mode).toBe("debug");
+    });
+
+    it("OpenCode: Ask → Debug (the Shift+Tab cycle) leaves Plan first", async () => {
+      currentSliceOverrides = {
+        "thread-x": { permissionMode: "bypassPermissions" },
+      };
+      liveSlice();
+      const { container } = render(
+        <AgentChatPane pane={{ ...pane, provider: "opencode" }} />,
+      );
+      await act(async () => {});
+      await click(container, "mode-activate-plan");
+      await click(container, "mode-activate-ask");
+      await click(container, "mode-activate-debug");
+
+      const calls = vi.mocked(agentChatSetPermissionMode).mock.calls;
+      expect(calls[calls.length - 1]).toEqual([
+        "opencode",
+        "thread-x",
+        "bypassPermissions",
+      ]);
+      expect(currentSliceOverrides["thread-x"]?.mode).toBe("debug");
+      expect(currentSliceOverrides["thread-x"]?.permissionMode).toBe(
+        "bypassPermissions",
+      );
+    });
+  });
+
   it("activating Debug pill flips slice.mode without an SDK setPermissionMode call", async () => {
     const { container } = render(<AgentChatPane pane={pane} />);
     await act(async () => {});
