@@ -420,38 +420,22 @@ impl McpRegistry {
         actor: Option<&crate::delegation::app::NativeActor>,
     ) -> Option<Value> {
         // Native orchestration must acquire a qualified thread principal before
-        // reaching a host tool. Its admission rechecks the turn fence after any
+        // reaching a host tool. Admission rechecks the turn fence after any
         // asynchronous capability lookup, in the same critical section as Stop.
         if let Some(actor) = actor.filter(|_| crate::agent_control::native::tool_name(name).is_some()) {
-            if self.native_delegation.lock().unwrap().is_some() {
-                return Some(match self.dispatch_native_tool_call_with_id(name, args.clone(), actor.clone(), call_id.map(str::to_string)).await {
-                    Ok(result) => result,
-                    Err(error) => serde_json::json!({"content":[{"type":"text","text":error}],"isError":true}),
-                });
-            }
-        }
-        let permit = actor.map(|actor| &actor.permit);
-        let host = self.host.get()?;
-        if name != "mcp__codemux__delegate_task" {
-            return host.call_async(caller, name, args, call_id, run_id).await;
-        }
-        let mut call = host.call_async(caller, name, args, call_id, run_id);
-        let mut admitted = false;
-        futures_util::future::poll_fn(|cx| {
-            if admitted { return call.as_mut().poll(cx); }
-            let guard = match permit.ok_or_else(|| "Native caller runtime/turn authority was revoked".to_string())
-                .and_then(|permit| permit.admit()) {
-                Ok(guard) => guard,
-                Err(error) => return std::task::Poll::Ready(Some(serde_json::json!({"content":[{"type":"text","text":error}],"isError":true}))),
+            let result = match actor.permit.identity() {
+                Ok(_) => self.dispatch_native_tool_call_with_id(name, args.clone(), actor.clone(), call_id.map(str::to_string)).await,
+                Err(error) => Err(error),
             };
-            // delegate_task persists admission in its first synchronous poll.
-            // Stop uses this same fence before advancing the database generation.
-            // Release the guard before any asynchronous wait for its result.
-            let result = call.as_mut().poll(cx);
-            drop(guard);
-            admitted = true;
-            result
-        }).await
+            return Some(match result {
+                Ok(result) => result,
+                Err(error) => serde_json::json!({"content":[{"type":"text","text":error}],"isError":true}),
+            });
+        }
+        if name == "mcp__codemux__delegate_task" {
+            return Some(serde_json::json!({"content":[{"type":"text","text":"Native caller runtime/turn authority was revoked"}],"isError":true}));
+        }
+        self.host.get()?.call_async(caller, name, args, call_id, run_id).await
     }
 
     /// Tell live sessions to re-collect their tool lists because the host
