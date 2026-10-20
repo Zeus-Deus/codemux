@@ -22,7 +22,7 @@ use codemux_lib::agent_provider::{
 };
 use codemux_lib::agent_provider::types::MessageDelivery;
 use codemux_lib::commands::agent_chat::{
-    agent_chat_interrupt_turn, agent_chat_send_turn, forward_event, AgentChatChannelRegistry,
+    agent_chat_interrupt_turn, send_turn_with_origin, TurnOrigin, forward_event, AgentChatChannelRegistry,
     GrokUsageLedgerBridge, ProviderRegistry, RunActivityTracker, SendTurnCommandInput,
     SubagentTracker,
 };
@@ -154,6 +154,7 @@ impl Harness {
                 position: 0,
                 text: text.into(),
                 prompt: None,
+                provenance: Default::default(),
                 skill_ids: Vec::new(),
                 skill_text: None,
                 include_plugins: true,
@@ -676,7 +677,7 @@ async fn a_chat_the_user_takes_over_during_the_launch_pass_is_left_alone() {
         async move { resume_after_restart_for_test(&handle, "launch-2").await }
     });
     tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
-    agent_chat_send_turn(h.handle(), ProviderKind::Codex, typed("rr-take-b", "do this instead"))
+    send_turn_with_origin(h.handle(), ProviderKind::Codex, typed("rr-take-b", "do this instead"), TurnOrigin::User)
         .await
         .unwrap();
     // B's own turn finished before the pass reached it.
@@ -948,7 +949,7 @@ async fn a_message_steered_into_a_resumed_turn_resets_the_cap() {
     // The user writes into the running turn; no new turn starts.
     let mut steer = typed("rr-steer-cap", "also check the docs");
     steer.delivery = MessageDelivery::Steer;
-    let _ = agent_chat_send_turn(h.handle(), ProviderKind::Codex, steer).await;
+    let _ = send_turn_with_origin(h.handle(), ProviderKind::Codex, steer, TurnOrigin::User).await;
     assert_eq!(h.db().get_restart_turn("rr-steer-cap").unwrap().chain, 0);
     let decisions = resume_after_restart_for_test(&h.handle(), "launch-4").await;
     assert_eq!(decision(&decisions, "rr-steer-cap"), Some(ResumeDecision::Resume));
