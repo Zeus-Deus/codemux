@@ -116,13 +116,32 @@ describe("WebhookPanel", () => {
 
     await waitFor(() => expect(onChanged).toHaveBeenCalledWith(updated));
     // The value goes to the store byte for byte; the check gets only its id.
-    expect(commands.secretsStore).toHaveBeenCalledWith("On issue webhook", "  s3cret ");
+    expect(commands.secretsStore).toHaveBeenCalledWith("On issue webhook (#7)", "  s3cret ");
     expect(commands.automationsSetWebhookSignature).toHaveBeenCalledWith(7, {
       header: "x-hub-signature-256",
       encoding: "hex",
       prefix: "sha256=",
       secret_ref: "secret_new",
     });
+  });
+
+  it("keeps the secret label within the store's 200-byte limit for a long name", async () => {
+    // Names may be up to 200 bytes, and the secret label has the same limit.
+    // Emoji are surrogate pairs, so a cut must not split one.
+    const name = "😀".repeat(49) + "x";
+    commands.secretsStore.mockResolvedValue({ id: "secret_new", label: "x", created_at: "" });
+    commands.automationsSetWebhookSignature.mockResolvedValue(automation({ name }));
+    const user = userEvent.setup();
+    render(<WebhookPanel automation={automation({ id: 4242, name })} onChanged={vi.fn()} />);
+
+    await user.click(await screen.findByRole("button", { name: /Add check/ }));
+    await user.type(screen.getByLabelText("Signing secret"), "s3cret");
+    await user.click(screen.getByRole("button", { name: "Save check" }));
+
+    await waitFor(() => expect(commands.secretsStore).toHaveBeenCalled());
+    const label = commands.secretsStore.mock.calls[0][0] as string;
+    expect(new TextEncoder().encode(label).length).toBeLessThanOrEqual(200);
+    expect(label).toMatch(/^(?:😀)+ webhook \(#4242\)$/u);
   });
 
   it("deletes a stored secret when saving its check fails", async () => {

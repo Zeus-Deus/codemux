@@ -448,24 +448,42 @@ describe("Composer", () => {
     });
   });
 
-  describe("mode pill above textarea (Step 8 Stage 3 refactor)", () => {
-    // Stage 3 retired the `+ Mode` dropdown; the active mode chip
-    // moved out of the footer and now lives in the strip above the
-    // textarea, alongside any image attachment chips.
-    it("renders the strip with a Plan mode pill when mode is plan", () => {
-      const { getByTestId, getByRole } = renderComposer({ mode: "plan" });
-      expect(getByTestId("composer-attachment-strip")).toBeInTheDocument();
+  describe("mode tab on the card's top edge", () => {
+    // The active mode is a tab attached to the top edge of the composer
+    // frame, not a chip in the attachment strip.
+    it("renders a Plan tab above the card, outside the attachment strip", () => {
+      const { getByTestId, getByRole, queryByTestId } = renderComposer({
+        mode: "plan",
+      });
+      const tab = getByRole("status", { name: /Plan mode active/i });
+      expect(queryByTestId("composer-attachment-strip")).toBeNull();
+      expect(getByTestId("composer-wrapper")).not.toContainElement(tab);
       expect(
-        getByRole("status", { name: /Plan mode active/i }),
-      ).toBeInTheDocument();
+        getByTestId("composer-mode-tab").compareDocumentPosition(
+          getByTestId("composer-wrapper"),
+        ) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
     });
 
-    it("renders no strip when mode is default and no image attachments are staged", () => {
+    it("sits above anything docked in the strip slot", () => {
+      const { getByTestId } = renderComposer({
+        mode: "ask",
+        stripSlot: <div data-testid="docked-strip" />,
+      });
+      expect(
+        getByTestId("composer-mode-tab").compareDocumentPosition(
+          getByTestId("docked-strip"),
+        ) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it("renders no tab and no strip when mode is default", () => {
       const { queryByTestId } = renderComposer({ mode: "default" });
+      expect(queryByTestId("composer-mode-tab")).toBeNull();
       expect(queryByTestId("composer-attachment-strip")).toBeNull();
     });
 
-    it("the mode pill renders before image attachment chips in the strip", () => {
+    it("keeps image attachment chips in the strip next to a mode tab", () => {
       const { getByTestId } = renderComposer({
         mode: "ask",
         stagedAttachments: [
@@ -478,20 +496,17 @@ describe("Composer", () => {
         ],
       });
       const strip = getByTestId("composer-attachment-strip");
-      const text = strip.textContent ?? "";
-      const askIdx = text.indexOf("Ask");
-      const imgIdx = text.indexOf("shot.png");
-      expect(askIdx).toBeGreaterThanOrEqual(0);
-      expect(imgIdx).toBeGreaterThan(askIdx);
+      expect(strip).toHaveTextContent("shot.png");
+      expect(strip).not.toHaveTextContent("Ask");
     });
 
-    it("clicking X on the mode pill calls onModeRemove", () => {
+    it("clicking the tab's leave button calls onModeRemove", () => {
       const onModeRemove = vi.fn();
-      const { getByLabelText } = renderComposer({
+      const { getByRole } = renderComposer({
         mode: "debug",
         onModeRemove,
       });
-      fireEvent.click(getByLabelText(/Remove Debug mode/i));
+      fireEvent.click(getByRole("button", { name: "Leave Debug mode" }));
       expect(onModeRemove).toHaveBeenCalled();
     });
   });
@@ -651,7 +666,7 @@ describe("Composer", () => {
     });
   });
 
-  describe("Stage 3 — mode pill integration", () => {
+  describe("Stage 3 — mode integration", () => {
     it("swaps the textarea placeholder to match the active mode", () => {
       const { getByPlaceholderText } = renderComposer({
         mode: "plan",
@@ -1478,7 +1493,7 @@ describe("Composer", () => {
     it("mounts the attachment strip when the chip is its only occupant", () => {
       // Default mode + no staged attachments would normally hide the whole
       // strip — the chip alone must be enough to mount it, and nothing
-      // else (no mode pill, no attachment chips) should render inside.
+      // else (no attachment chips) should render inside.
       const { getByTestId } = renderComposer({
         interrupted: true,
         onContinueRun: vi.fn(),

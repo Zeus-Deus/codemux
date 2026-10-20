@@ -62,11 +62,7 @@ import {
 } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useHostsStore } from "@/stores/hosts-store";
-import {
-  selectCapabilities,
-  selectModel,
-  useProviderCapabilities,
-} from "@/stores/provider-capabilities-store";
+import { selectModel } from "@/stores/provider-capabilities-store";
 import { selectedAcpCatalog, useCustomAcp } from "@/stores/custom-acp-store";
 import { capabilityDefaults, defaultModelId } from "@/lib/agent-chat/capability-defaults";
 import {
@@ -87,6 +83,7 @@ import type {
 } from "@/tauri/types";
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
+import { useNativeCapabilities } from "./use-native-capabilities";
 import { FullAccessNotice } from "./FullAccessNotice";
 import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
@@ -99,7 +96,7 @@ import {
 } from "@/stores/provider-health-store";
 import { Composer } from "./Composer";
 import { UserMessage } from "./UserMessage";
-import type { ActivePillMode } from "./pickers/ModePill";
+import type { ActivePillMode } from "./pickers/ModeTab";
 import { ProjectScopePopover } from "./pickers/ProjectScopePopover";
 import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
 import { cn } from "@/lib/utils";
@@ -172,9 +169,7 @@ function DraftChatSurfaceInner({
   focusOnMount: boolean;
   onBackgroundStarted: (draftId: string) => void;
 }) {
-  const nativeCapabilities = useProviderCapabilities((s) =>
-    selectCapabilities(s, draft.provider),
-  );
+  const nativeCapabilities = useNativeCapabilities(draft.provider, draft.threadId).caps;
   const acpCatalog = useCustomAcp(s => selectedAcpCatalog(s, draft.threadId));
   const capabilities = draft.provider === "acp" ? acpCatalog?.capabilities ?? null : nativeCapabilities;
   const activeModel = draft.provider === "acp" ? capabilities?.models.find(m => m.id === draft.model) ?? null : selectModel(capabilities, draft.model);
@@ -692,11 +687,7 @@ function DraftChatSurfaceInner({
       // starts on a signed-in extra provider account.
       if (
         blocked?.installed && blocked.login_command
-        && await startsOnSignedInAccount(
-          finalDraft.provider,
-          finalDraft.threadId,
-          finalDraft.target.kind === "existing_workspace" ? finalDraft.target.workspaceId : null,
-        )
+        && await startsOnSignedInAccount(finalDraft.provider, finalDraft.threadId)
       ) blocked = null;
       if (blocked) {
         const reason = (blocked.message ?? "The agent isn't available").replace(
@@ -1500,6 +1491,16 @@ function DraftChatSurfaceInner({
       // hides Composer's own zone-1 slot rather than falling back to a
       // plain cwd string.
       zone1Override={null}
+      // The landing's one-time Full access explanation docks on the card's
+      // top edge, beneath the mode tab.
+      stripSlot={
+        pending ? null : (
+          <FullAccessNotice
+            permissionMode={draft.permissionMode}
+            permissionModes={permissionModes}
+          />
+        )
+      }
       belowComposerSlot={belowComposerSlot}
       mode={normalizedMode}
       stagedAttachments={stagedAttachments}
@@ -1598,12 +1599,6 @@ function DraftChatSurfaceInner({
           <ChatHomeLanding
             composer={composerEl}
             agents={threadHostId === null ? landingAgents : undefined}
-            notice={
-              <FullAccessNotice
-                permissionMode={draft.permissionMode}
-                permissionModes={permissionModes}
-              />
-            }
             onProjectOpened={handleProjectOpened}
             projectName={scopeProjectPath ? basename(scopeProjectPath) : null}
             projectPicker={(trigger) => (

@@ -2068,6 +2068,30 @@ describe("materializeWithPreset", () => {
       );
     });
 
+    it("a Codex draft in Plan launches in its own mode and plans its first turn", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        provider: "codex",
+        target: { kind: "project", projectPath: "/projects/foo" },
+        permissionMode: "workspace-write",
+        mode: "plan",
+      });
+
+      await materializeAndSend(draft, "hi", "/projects/foo", actions);
+
+      // Codex has no "plan" sandbox: Plan rides on the turn, not the session.
+      expect(agentChatStartSession).toHaveBeenCalledWith(
+        "pane-new",
+        "codex",
+        expect.objectContaining({ permission_mode: "workspace-write" }),
+      );
+      expect(agentChatSendTurn).toHaveBeenCalledWith(
+        "codex",
+        expect.objectContaining({ permission_mode_override: "plan" }),
+      );
+      expect(actions.setMode).toHaveBeenCalledWith(draft.threadId, "plan");
+    });
+
     it("draft.mode='default' leaves permission_mode as the draft's picker value", async () => {
       const actions = makeActions();
       const draft = makeDraft({

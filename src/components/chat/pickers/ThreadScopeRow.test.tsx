@@ -180,34 +180,33 @@ describe("ThreadScopeRow", () => {
     it("renders only the device control — no project, checkout, or branch controls", () => {
       const { container } = renderRow({ projectPath: null });
       expect(
-        screen.getByRole("button", { name: "Device: ai-node" }),
+        screen.getByRole("button", { name: "Run on: This device" }),
       ).toBeInTheDocument();
       expect(screen.getAllByRole("button")).toHaveLength(1);
       expect(screen.queryByText("Home")).toBeNull();
       expect(screen.queryByText("Current checkout")).toBeNull();
       expect(screen.queryByText("New worktree")).toBeNull();
-      expect(screen.queryByText(/^from$/)).toBeNull();
+      expect(screen.queryByText(/^From$/)).toBeNull();
       // No dangling separator after the lone device control.
       expect(container.textContent).not.toContain("·");
     });
   });
 
   describe("device control", () => {
-    it("leads the strip with this machine's name, ahead of the checkout control", () => {
+    it("folds the device and the checkout into one control", () => {
       renderRow();
-      const device = screen.getByRole("button", { name: "Device: ai-node" });
-      const checkout = screen.getByText("Current checkout").closest("button")!;
-      expect(
-        device.compareDocumentPosition(checkout) &
-          Node.DOCUMENT_POSITION_FOLLOWING,
-      ).toBeTruthy();
+      const control = screen.getByRole("button", {
+        name: "Run on: This device · Current checkout",
+      });
+      expect(control).toHaveTextContent("This device");
+      expect(control).toHaveTextContent("Current checkout");
     });
 
     it("shows the picked device's name", () => {
       currentHosts = [host(2, "zeus")];
       renderRow({ hostId: 2 });
       expect(
-        screen.getByRole("button", { name: "Device: zeus" }),
+        screen.getByRole("button", { name: "Run on: zeus · Current checkout" }),
       ).toBeInTheDocument();
     });
 
@@ -215,7 +214,7 @@ describe("ThreadScopeRow", () => {
       const user = userEvent.setup();
       currentHosts = [host(2, "zeus")];
       const { onChangeHostId } = renderRow();
-      await user.click(screen.getByRole("button", { name: "Device: ai-node" }));
+      await user.click(screen.getByRole("button", { name: /^Run on:/ }));
       const row = await waitFor(() => {
         const el = document.querySelector<HTMLElement>('[data-host-id="2"]');
         expect(el).not.toBeNull();
@@ -240,7 +239,7 @@ describe("ThreadScopeRow", () => {
 
       expect(screen.getByText("zeus's checkout")).toBeInTheDocument();
       expect(screen.queryByText("feature-x")).toBeNull();
-      expect(screen.queryByText(/^from$/)).toBeNull();
+      expect(screen.queryByText(/^From$/)).toBeNull();
       // Read-only: the device's branch can't be picked from here.
       expect(screen.getByText("zeus's checkout").closest("button")).toBeNull();
       // This machine's branches are never read for it.
@@ -273,7 +272,7 @@ describe("ThreadScopeRow", () => {
     it("hides checkout/branch controls when projectPath hasn't resolved yet", () => {
       renderRow({ projectPath: null });
       expect(screen.queryByText("Current checkout")).toBeNull();
-      expect(screen.queryByText(/^from$/)).toBeNull();
+      expect(screen.queryByText(/^From$/)).toBeNull();
     });
   });
 
@@ -281,24 +280,22 @@ describe("ThreadScopeRow", () => {
     it("selecting 'New worktree' calls onChangeCheckoutMode('worktree')", async () => {
       const user = userEvent.setup();
       const { onChangeCheckoutMode } = renderRow();
-      await user.click(screen.getByText("Current checkout"));
-      await screen.findByText("Where should the agent work?");
+      await user.click(screen.getByRole("button", { name: /^Run on:/ }));
+      await screen.findByText("Workspace");
       await user.click(screen.getByText("New worktree"));
       expect(onChangeCheckoutMode).toHaveBeenCalledWith("worktree");
     });
 
-    it("shows the name input + hint only when checkoutMode is 'worktree', and typing calls onChangeWorktreeName", async () => {
+    it("renaming the worktree reports the typed name", async () => {
       const user = userEvent.setup();
       const { onChangeWorktreeName } = renderRow({ checkoutMode: "worktree" });
-      await user.click(screen.getByText("New worktree"));
-      const input = await screen.findByPlaceholderText(
-        "name — leave empty to auto-name",
+      await user.click(screen.getByRole("button", { name: /^Run on:/ }));
+      await user.click(await screen.findByRole("button", { name: "Rename worktree" }));
+      await user.type(
+        screen.getByRole("textbox", { name: "Worktree name" }),
+        "x{Enter}",
       );
-      await user.type(input, "x");
       expect(onChangeWorktreeName).toHaveBeenCalledWith("x");
-      expect(
-        screen.getByText(/CodeMux names it from your first message/i),
-      ).toBeInTheDocument();
     });
   });
 
@@ -394,7 +391,7 @@ describe("ThreadScopeRow", () => {
       await screen.findByText("New worktree");
 
       await user.click(screen.getByText("New worktree"));
-      await screen.findByText("Where should the agent work?");
+      await screen.findByText("Workspace");
       await user.click(screen.getByText("Current checkout"));
 
       await waitFor(() => {

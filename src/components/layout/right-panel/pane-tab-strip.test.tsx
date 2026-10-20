@@ -80,12 +80,14 @@ function stubRect(el: HTMLElement, left: number, width: number) {
 
 /**
  * jsdom has no layout. Report widths per test id: `scrollWidth` for the
- * scroller and the tab content, `clientWidth` for the scroller and header.
+ * scroller, the tab content and the inline pane actions, `clientWidth` for
+ * the scroller and header.
  */
 function stubLayout(widths: {
   header: number;
   tabs: number;
   scroller: number;
+  actions?: number;
 }) {
   const testId = (el: HTMLElement) => el.dataset?.testid;
   const proto = HTMLElement.prototype;
@@ -103,6 +105,7 @@ function stubLayout(widths: {
     configurable: true,
     get() {
       const id = testId(this);
+      if (id === "right-panel-pane-actions") return widths.actions ?? 0;
       return id === "right-panel-tabs-scroll" ||
         id === "right-panel-tabs-content"
         ? widths.tabs
@@ -276,6 +279,218 @@ describe("PaneTabStrip — overflow", () => {
     expect(screen.getByText("2")).toHaveClass("text-status-attention");
   });
 
+  // A badge can be a count plus a status icon (Review); the two sit in one
+  // row instead of stacking out of the 26px chip.
+  it("lays a badge's count and icon out in a row", () => {
+    renderStrip();
+    expect(screen.getByText("4")).toHaveClass("inline-flex", "items-center");
+  });
+
+  // At the default panel width the top-right reserve leaves the row about
+  // 160px. The tabs keep their floor and the actions fold into "…" instead
+  // of being squeezed or clipped out of reach.
+  describe("pane actions in a narrow row", () => {
+    const onRefresh = vi.fn();
+    const actions = (
+      <>
+        <button type="button" onClick={onRefresh}>
+          Refresh
+        </button>
+        <button type="button">Filter</button>
+      </>
+    );
+
+    it("keeps the actions inline while they fit beside the tabs", () => {
+      const restore = stubLayout({
+        header: 2000,
+        tabs: 300,
+        scroller: 300,
+        actions: 50,
+      });
+      try {
+        renderStrip({ actions });
+        expect(screen.getByTestId("right-panel-pane-actions")).toHaveTextContent(
+          "RefreshFilter",
+        );
+        expect(screen.queryByLabelText("Pane actions")).toBeNull();
+        expect(
+          screen.getByTestId("right-panel-tabs-header"),
+        ).toContainElement(screen.getByLabelText("Open pane"));
+      } finally {
+        restore();
+      }
+    });
+
+    it("folds them and the + into one button whose popover holds the same controls", async () => {
+      const restore = stubLayout({
+        header: 300,
+        tabs: 300,
+        scroller: 100,
+        actions: 120,
+      });
+      try {
+        renderStrip({ actions });
+        expect(screen.queryByTestId("right-panel-pane-actions")).toBeNull();
+        expect(screen.queryByText("Refresh")).toBeNull();
+        // The "+" leaves the row too, so the tabs keep its width.
+        expect(screen.queryByLabelText("Open pane")).toBeNull();
+
+        fireEvent.click(screen.getByLabelText("Pane actions"));
+        const popover = await screen.findByTestId(
+          "right-panel-pane-actions-popover",
+        );
+        expect(popover).toHaveTextContent("RefreshFilter");
+        // First in the row, ahead of the pane's own actions.
+        expect(popover.querySelector("button")).toHaveAttribute(
+          "aria-label",
+          "Open pane",
+        );
+        fireEvent.click(screen.getByText("Refresh"));
+        expect(onRefresh).toHaveBeenCalledTimes(1);
+      } finally {
+        restore();
+      }
+    });
+
+    it("unfolds them once the row has room again, and holds the tabs' floor", () => {
+      const widths = { header: 300, tabs: 300, scroller: 100, actions: 120 };
+      const restore = stubLayout(widths);
+      try {
+        const view = renderStrip({ actions });
+        expect(screen.getByLabelText("Pane actions")).toBeInTheDocument();
+        expect(screen.getByTestId("right-panel-tabs-scroll").style.minWidth).toBe(
+          "min(140px, calc(100% - 44px))",
+        );
+
+        widths.header = 2000;
+        view.rerender(
+          <TooltipProvider>
+            <PaneTabStrip
+              tabs={TABS}
+              activeTab="files"
+              onSelect={() => {}}
+              onClose={() => {}}
+              onCloseMany={() => {}}
+              onReorder={() => {}}
+              surfaces={[]}
+              onOpenFile={() => {}}
+              openFileKeys=""
+              inTitlebar
+              onToggleExpand={() => {}}
+              expanded={false}
+              onCollapsePanel={() => {}}
+              actions={actions}
+            />
+          </TooltipProvider>,
+        );
+        expect(screen.queryByLabelText("Pane actions")).toBeNull();
+        expect(screen.getByTestId("right-panel-pane-actions")).toBeInTheDocument();
+        expect(screen.getByLabelText("Open pane")).toBeInTheDocument();
+        expect(screen.getByTestId("right-panel-tabs-scroll").style.minWidth).toBe(
+          "min(140px, calc(100% - 49px))",
+        );
+      } finally {
+        restore();
+      }
+    });
+
+    const stripWith = (paneActions: React.ReactNode) => (
+      <TooltipProvider>
+        <PaneTabStrip
+          tabs={TABS}
+          activeTab="files"
+          onSelect={() => {}}
+          onClose={() => {}}
+          onCloseMany={() => {}}
+          onReorder={() => {}}
+          surfaces={[]}
+          onOpenFile={() => {}}
+          openFileKeys=""
+          inTitlebar
+          onToggleExpand={() => {}}
+          expanded={false}
+          onCollapsePanel={() => {}}
+          actions={paneActions}
+        />
+      </TooltipProvider>
+    );
+    const oneAction = <button type="button">Split view</button>;
+
+    // A toggle can swap a pane's buttons without a pane switch (the Diff
+    // layout); a folded row must not keep deciding on the old width.
+    it("measures folded actions again when they change in place", () => {
+      const widths = { header: 600, tabs: 300, scroller: 100, actions: 200 };
+      const restore = stubLayout(widths);
+      try {
+        const view = render(stripWith(actions));
+        expect(screen.getByLabelText("Pane actions")).toBeInTheDocument();
+
+        widths.actions = 50;
+        view.rerender(stripWith(oneAction));
+        expect(screen.queryByLabelText("Pane actions")).toBeNull();
+        expect(screen.getByTestId("right-panel-pane-actions")).toHaveTextContent(
+          "Split view",
+        );
+      } finally {
+        restore();
+      }
+    });
+
+    it("waits for the popover to close before measuring a change made inside it", async () => {
+      const widths = { header: 600, tabs: 300, scroller: 100, actions: 200 };
+      const restore = stubLayout(widths);
+      try {
+        const view = render(stripWith(actions));
+        fireEvent.click(screen.getByLabelText("Pane actions"));
+        await screen.findByTestId("right-panel-pane-actions-popover");
+
+        widths.actions = 50;
+        view.rerender(stripWith(oneAction));
+        const popover = screen.getByTestId("right-panel-pane-actions-popover");
+        expect(popover).toHaveAccessibleName("Pane actions");
+        expect(popover).toHaveTextContent("Split view");
+
+        fireEvent.keyDown(popover, { key: "Escape" });
+        expect(screen.queryByTestId("right-panel-pane-actions-more")).toBeNull();
+        expect(screen.getByTestId("right-panel-pane-actions")).toHaveTextContent(
+          "Split view",
+        );
+      } finally {
+        restore();
+      }
+    });
+
+    // The interface-size setting rescales rem: the drag gap's floor and the
+    // "…" grow with it, and the budget has to as well.
+    it("budgets the row in the current root font size", () => {
+      const restore = stubLayout({
+        header: 300,
+        tabs: 300,
+        scroller: 100,
+        actions: 120,
+      });
+      document.documentElement.style.fontSize = "20px";
+      try {
+        renderStrip({ actions });
+        expect(screen.getByLabelText("Pane actions")).toBeInTheDocument();
+        // 20px drag gap + 30px "…" + two 2px gaps.
+        expect(screen.getByTestId("right-panel-tabs-scroll").style.minWidth).toBe(
+          "min(140px, calc(100% - 54px))",
+        );
+      } finally {
+        document.documentElement.style.fontSize = "";
+        restore();
+      }
+    });
+  });
+
+  it("names the band as the container narrow pane actions query", () => {
+    renderStrip();
+    expect(screen.getByTestId("right-panel-tabs-header")).toHaveClass(
+      "@container/pane-band",
+    );
+  });
+
   it("keeps every tab full-size and fades the clipped edge on overflow", () => {
     const restore = stubLayout({ header: 2000, tabs: 800, scroller: 400 });
     try {
@@ -297,22 +512,24 @@ describe("PaneTabStrip — overflow", () => {
 
   // The row used to drop its tabs into a second row whenever they didn't all
   // fit beside the titlebar cluster, so the header jumped mid-drag. Narrow
-  // or not, it stays one row and the tabs scroll.
+  // or not, it stays one row and the tabs scroll; a narrow row folds the
+  // pane actions and the `+` behind "…" in that same row.
   it.each([
-    ["narrow", true, 360],
-    ["wide", true, 900],
-    ["legacy chrome", false, 200],
-  ])("keeps one row in a %s panel", (_name, inTitlebar, header) => {
+    ["narrow", true, 360, true],
+    ["wide", true, 900, false],
+    ["legacy chrome", false, 200, true],
+  ])("keeps one row in a %s panel", (_name, inTitlebar, header, folded) => {
     const restore = stubLayout({ header, tabs: 300, scroller: 100 });
     try {
       renderStrip({ inTitlebar, actions: <button type="button">act</button> });
       const row = screen.getByTestId("right-panel-tabs-header");
       expect(row).not.toHaveAttribute("data-stacked");
-      // The tabs, the pane actions and the `+` all share that row.
+      const shared = folded
+        ? [screen.getByLabelText("Pane actions")]
+        : [screen.getByText("act"), screen.getByTestId("right-panel-add-pane")];
       for (const node of [
         screen.getByTestId("right-panel-tabs-scroll"),
-        screen.getByText("act"),
-        screen.getByTestId("right-panel-add-pane"),
+        ...shared,
       ]) {
         expect(row).toContainElement(node);
       }

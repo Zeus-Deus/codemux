@@ -17,7 +17,7 @@ function StatusChip() {
 export default {
   id: "peek-view",
   name: "Peek view example",
-  description: "A shared floating preview and compact composer chip",
+  description: "A shared floating preview and compact live-status chip",
   version: "0.1.0",
   register(ctx) {
     ctx.registerMany([

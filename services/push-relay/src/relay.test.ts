@@ -269,6 +269,54 @@ describe("notification validation", () => {
     expect(t.apnsCalls).toHaveLength(0);
   });
 
+  it("counts text limits in Unicode code points, as the desktop clips them", async () => {
+    // Emoji take two UTF-16 units each, so these sit over the limits in
+    // JavaScript's `length` but exactly at them in code points.
+    const t = setup();
+    const device = await t.register();
+    const res = await t.notify(device, {
+      title: `${"a".repeat(119)}😀`,
+      body: "😀".repeat(400),
+      category: "complete",
+      data: { threadId: "😀".repeat(256) },
+    });
+    expect(res.status).toBe(202);
+    expect(new TextEncoder().encode(JSON.stringify(t.apnsCalls[0].body)).byteLength).toBeLessThanOrEqual(4096);
+    for (const body of [
+      { ...valid, title: "😀".repeat(121) },
+      { ...valid, body: "😀".repeat(401) },
+      { ...valid, data: { v: "😀".repeat(257) } },
+    ]) {
+      expect((await t.notify(device, body)).status).toBe(400);
+    }
+  });
+
+  it("still caps the content in bytes", async () => {
+    const t = setup();
+    const device = await t.register();
+    const res = await t.notify(device, {
+      title: "😀".repeat(120),
+      body: "😀".repeat(400),
+      category: "complete",
+      data: { a: "😀".repeat(256) },
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ detail: expect.stringContaining("3072 bytes") });
+  });
+
+  it("counts workspaceId twice toward the byte cap, as APNs repeats it as thread-id", async () => {
+    const t = setup();
+    const device = await t.register("ios");
+    const res = await t.notify(device, {
+      title: "😀".repeat(119),
+      body: "😀".repeat(385),
+      category: "complete",
+      data: { workspaceId: "😀".repeat(256) },
+    });
+    expect(res.status).toBe(400);
+    expect(t.apnsCalls).toHaveLength(0);
+  });
+
   it("rate-limits sends per device", async () => {
     const t = setup({ limits: { sendsPerHour: 1 } });
     const device = await t.register();

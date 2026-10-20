@@ -96,7 +96,7 @@ Import the constants from `@codemux/sdk`.
 | `COMPOSER_ACTIONS_AREA` | Rows in the composer "+" menu | `data: { label, description?, icon?, run({ workspaceId, threadId, composer }) }` |
 | `COMPOSER_ACCESSORY_AREA` | Above the composer footer | `render({ workspaceId, threadId })` |
 | `COMPOSER_FOOTER_AREA` | Below the composer card | `render({ workspaceId, threadId })` |
-| `COMPOSER_STATUS_AREA` | Inside the existing composer status cluster, next to the background-browser chip; adds no row | `render({ workspaceId, threadId })`; keep content compact |
+| `COMPOSER_STATUS_AREA` | Workspace details → Live on desktop; the existing status cluster on phones; adds no composer row | `render({ workspaceId, threadId })`; keep content compact |
 | `TITLEBAR_ACTIONS_AREA` | The action island in regular, covered, utility-page and standalone Settings chrome | `render()` (stop `pointerdown` on controls so the window doesn't drag) |
 | `SIDEBAR_SECTION_AREA` | Between the workspace list and the sidebar footer | `render()` |
 | `SIDEBAR_EMPTY_STATE_AREA` | Replaces the empty-sidebar plate (first one wins) | `render()` |
@@ -147,8 +147,9 @@ Register `PEEK_AREA` to supply a preview body. The shared shell owns the title,
 status dot, close button, resize handle, placement and entrance/exit motion.
 It uses the browser peek's persisted size, readable minimum and 60% window
 clamp, and honors both app and OS reduced motion. One browser or plugin peek
-can be open at a time. When title-bar actions are present, the peek moves below
-the title-bar band with a gap; without them, the browser's position is unchanged.
+can be open at a time. Both dock bottom-right and lift above any composer
+under that corner, leaving its send button and queue usable. The resize handle
+is at the top-left, so dragging grows the preview up and left.
 Plugin titles are plain header text; only the browser keeps its URL field.
 Workspace switches close it, including while Settings
 is open; removing the contribution dismisses its body immediately.

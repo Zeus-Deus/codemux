@@ -847,10 +847,12 @@ export const RightPanel = memo(function RightPanel({
       case "changes":
         actions = (
           <>
-            <span className="shrink-0 font-mono text-label tabular-nums text-success">
+            {/* The pane's footer carries the same numbers, so a narrow
+                band drops these first. */}
+            <span className="shrink-0 font-mono text-label tabular-nums text-success @max-2xs/pane-band:hidden">
               +{workspace.git_additions}
             </span>
-            <span className="shrink-0 font-mono text-label tabular-nums text-danger">
+            <span className="shrink-0 font-mono text-label tabular-nums text-danger @max-2xs/pane-band:hidden">
               −{workspace.git_deletions}
             </span>
             <DropdownMenu>

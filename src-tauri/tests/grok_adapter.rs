@@ -20,6 +20,7 @@ fn fixture_provider() -> (GrokAgentProvider, Arc<AcpSlashCommandCache>) {
         GrokProviderConfig {
             binary: PathBuf::from(env!("CARGO_BIN_EXE_fake_grok_acp")),
             event_channel_capacity: 1024,
+            mcp_registry: None,
         },
         Arc::clone(&commands),
     );

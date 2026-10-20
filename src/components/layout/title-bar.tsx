@@ -646,7 +646,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       >
         <div
           data-testid="titlebar-workspace-island"
-          className="pointer-events-auto flex h-8 min-w-0 max-w-[58%] items-center"
+          className="pointer-events-auto flex h-8 min-w-0 items-center"
           onPointerDown={(e) => e.stopPropagation()}
         >
           {guiChrome ? <TitleBarWorkspaceSlots /> : <TitleBarDraftSlots />}
@@ -655,12 +655,14 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         {/* Calm drag gap between the two islands. Same web-client rule as
             the full-width layer above: keep the flex spacer for layout, but
             stay transparent to pointer events where there is no window to
-            drag. */}
+            drag. Its floor is what keeps the band draggable once the tabs
+            fill it; the tab island takes everything else and scrolls past
+            that. */}
         <div
           data-testid="titlebar-drag-gap"
           data-tauri-drag-region={remoteClient ? undefined : true}
           className={cn(
-            "min-w-4 flex-1 self-stretch",
+            "min-w-16 flex-1 self-stretch",
             remoteClient ? "pointer-events-none" : "pointer-events-auto",
           )}
         />

@@ -8,6 +8,7 @@ import {
   canWatchPr,
   describePrWatch,
   watchTargetThreadId,
+  workspaceChatThreadIds,
 } from "@/lib/pr-watch";
 import { cn } from "@/lib/utils";
 import type { WorkspaceSnapshot } from "@/tauri/types";
@@ -26,6 +27,25 @@ import { DETAILS_ICON, DETAILS_LABEL, DETAILS_ROW, DETAILS_TRAILING } from "./st
 export function PrWatchRow({ workspace }: { workspace: WorkspaceSnapshot }) {
   const { threadId: focused } = useActiveChatTasks(workspace);
   const threadId = watchTargetThreadId(workspace, focused);
+  return (
+    <>
+      <TargetWatchRow workspace={workspace} threadId={threadId} />
+      {workspaceChatThreadIds(workspace)
+        .filter((id) => id !== threadId)
+        .map((id) => (
+          <OtherChatWatchRow key={id} threadId={id} />
+        ))}
+    </>
+  );
+}
+
+function TargetWatchRow({
+  workspace,
+  threadId,
+}: {
+  workspace: WorkspaceSnapshot;
+  threadId: string | null;
+}) {
   const { watch, load, busy, toggle } = usePrWatch(threadId);
   if (!canWatchPr(workspace) && watch?.status !== "active") return null;
 
@@ -66,6 +86,34 @@ export function PrWatchRow({ workspace }: { workspace: WorkspaceSnapshot }) {
         ) : (
           "…"
         )}
+      </span>
+    </button>
+  );
+}
+
+/**
+ * An active watch started from another chat in the workspace (a split, a
+ * second tab). It only shows while active, so that chat's watch can be
+ * stopped without focusing it first.
+ */
+function OtherChatWatchRow({ threadId }: { threadId: string }) {
+  const { watch, busy, toggle } = usePrWatch(threadId);
+  if (watch?.status !== "active") return null;
+  const view = describePrWatch(watch);
+  return (
+    <button
+      type="button"
+      data-testid="workspace-details-pr-watch-other"
+      disabled={busy}
+      onClick={() => toggle()}
+      className={DETAILS_ROW}
+      title={`Another chat in this workspace is watching #${watch.pr_number}. Click to stop.`}
+      aria-pressed
+    >
+      <Eye className={DETAILS_ICON} />
+      <span className={DETAILS_LABEL}>Watch #{watch.pr_number} · other chat</span>
+      <span className={cn(DETAILS_TRAILING, "font-sans", PR_WATCH_TONE_CLASS[view.tone])}>
+        {busy ? <Spinner className="size-3" /> : view.label}
       </span>
     </button>
   );
