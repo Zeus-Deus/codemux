@@ -12870,6 +12870,18 @@ mod tests {
         assert_eq!(tracker.tracked_thread_count(), 0);
     }
 
+    // Closing the chat is the way out of a hold whose child ended without
+    // reporting it, as the fork/switch refusal says.
+    #[test]
+    fn closing_the_chat_releases_the_fork_switch_hold() {
+        let tracker = SubagentTracker::default();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), SystemTime::now());
+        tracker.begin_turn("t");
+        assert!(tracker.delegated_work_live("t"));
+        tracker.clear_thread("t");
+        assert!(!tracker.delegated_work_live("t"));
+    }
+
     // `agent_chat_turn_active`'s second signal, exercised through the
     // provider-agnostic event vocabulary it actually keys on. Claude hits
     // this on every SDK `result` it emits to yield; Codex hits it whenever a

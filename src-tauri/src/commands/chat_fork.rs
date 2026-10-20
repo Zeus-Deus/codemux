@@ -225,11 +225,17 @@ pub(crate) enum Busy {
 impl Busy {
     /// The refusal, ending in what to do once it's over (`then`).
     pub(crate) fn refusal(self, then: &str) -> String {
-        let what = match self {
-            Busy::Turn => "the current turn and any queued messages",
-            Busy::Subagents => "the chat's subagents",
-        };
-        format!("Wait for {what} to finish, then {then}.")
+        match self {
+            Busy::Turn => {
+                format!("Wait for the current turn and any queued messages to finish, then {then}.")
+            }
+            // A subagent cancelled without reporting it would hold forever;
+            // closing the chat clears the hold (see `agent_chat_close_pane`).
+            Busy::Subagents => format!(
+                "Wait for the chat's subagents to finish, then {then}. \
+                 If none are running, close and reopen the chat."
+            ),
+        }
     }
 }
 
@@ -484,6 +490,9 @@ mod tests {
     use crate::commands::agent_chat::forward_event;
     use fork_mock::{MockAgentProvider, MockCall};
 
+    const FORK_REFUSED: &str =
+        "Wait for the chat's subagents to finish, then fork the chat. If none are running, close and reopen the chat.";
+
     fn start_input(thread: &str, cwd: &Path) -> StartSessionInput {
         StartSessionInput {
             thread_id: ThreadId(thread.into()),
@@ -591,7 +600,7 @@ mod tests {
         );
         assert!(turn_active.await.unwrap(), "the run is still live");
         let refused = agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await;
-        assert_eq!(refused.unwrap_err(), "Wait for the chat's subagents to finish, then fork the chat.");
+        assert_eq!(refused.unwrap_err(), FORK_REFUSED);
         finish_subagent(&app, THREAD);
         agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await.unwrap();
     }
@@ -612,7 +621,8 @@ mod tests {
         };
         assert_eq!(
             switch().await.unwrap_err(),
-            "provider_switch_refused: Wait for the chat's subagents to finish, then switch providers."
+            "provider_switch_refused: Wait for the chat's subagents to finish, then switch providers. \
+             If none are running, close and reopen the chat."
         );
         assert_eq!(stops(&provider), 0, "the source session keeps running");
         finish_subagent(&app, THREAD);
@@ -630,7 +640,7 @@ mod tests {
         const THREAD: &str = "handoff-parent";
         let (app, provider, root) = parent_running_subagent(THREAD).await;
         let refused = agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await;
-        assert_eq!(refused.unwrap_err(), "Wait for the chat's subagents to finish, then fork the chat.");
+        assert_eq!(refused.unwrap_err(), FORK_REFUSED);
         let switched = super::super::provider_switch::agent_chat_switch_provider(
             app.handle().clone(),
             "pane".into(),
@@ -663,7 +673,7 @@ mod tests {
             usage: None,
         });
         let refused = agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await;
-        assert_eq!(refused.unwrap_err(), "Wait for the chat's subagents to finish, then fork the chat.");
+        assert_eq!(refused.unwrap_err(), FORK_REFUSED);
         let switched = super::super::provider_switch::agent_chat_switch_provider(
             app.handle().clone(),
             "pane".into(),
@@ -689,7 +699,7 @@ mod tests {
         assert_eq!(tracker.take_overdue_reviews(later, Duration::ZERO), [THREAD]);
         assert!(!tracker.delegated_work_holding_turn(THREAD), "the pane settled");
         let refused = agent_chat_fork_check(app.handle().clone(), THREAD.into(), None).await;
-        assert_eq!(refused.unwrap_err(), "Wait for the chat's subagents to finish, then fork the chat.");
+        assert_eq!(refused.unwrap_err(), FORK_REFUSED);
         let switched = super::super::provider_switch::agent_chat_switch_provider(
             app.handle().clone(),
             "pane".into(),
