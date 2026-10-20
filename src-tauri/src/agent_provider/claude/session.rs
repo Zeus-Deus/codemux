@@ -2184,10 +2184,21 @@ fn spawn_incoming_requests_task(
                         let job = tokio::spawn(async move {
                             // The SDK can call tools before send-turn acknowledges.
                             // Wait only for this captured generation to bind.
-                            let _ = actor.permit.wait_ready().await;
-                            handle_mcp_tool_call(session_for_task, event_tx_for_task, req, actor).await;
+                            if let Err(error) = actor.permit.wait_ready().await {
+                                return Ok(tool_result_text(error, true));
+                            }
+                            handle_mcp_tool_call(session_for_task, event_tx_for_task, req.params, actor).await
                         });
                         session.native_authority.track(job.abort_handle());
+                        // Stop cancels tool work, never the obligation to answer
+                        // the sidecar's RPC, including immediate track rejection.
+                        let sidecar = session.sidecar.clone();
+                        tokio::spawn(async move {
+                            let response = job.await.unwrap_or_else(|error| {
+                                Ok(tool_result_text(format!("MCP tool call cancelled: {error}"), true))
+                            });
+                            let _ = sidecar.respond(req.id, response).await;
+                        });
                         continue;
                     }
 
@@ -2396,26 +2407,18 @@ fn tool_result_text(text: impl Into<String>, is_error: bool) -> Value {
 async fn handle_mcp_tool_call(
     session: Arc<ClaudeSession>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
-    req: crate::json_rpc_child::IncomingRequest,
+    params: Value,
     actor: crate::delegation::app::NativeActor,
-) {
+) -> Result<Value, crate::json_rpc_child::RpcError> {
     // Validate params shape.
-    let params = req.params.clone();
     let prefixed_name = match params.get("name").and_then(Value::as_str) {
         Some(n) => n.to_string(),
         None => {
-            let _ = session
-                .sidecar
-                .respond(
-                    req.id,
-                    Err(crate::json_rpc_child::RpcError {
-                        code: -32602,
-                        message: "mcp-tool-call requires a string `name`".into(),
-                        data: None,
-                    }),
-                )
-                .await;
-            return;
+            return Err(crate::json_rpc_child::RpcError {
+                code: -32602,
+                message: "mcp-tool-call requires a string `name`".into(),
+                data: None,
+            })
         }
     };
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -2425,8 +2428,7 @@ async fn handle_mcp_tool_call(
             Ok(value) => tool_result_text(value.to_string(), false),
             Err(error) => tool_result_text(error, true),
         };
-        let _ = session.sidecar.respond(req.id, Ok(payload)).await;
-        return;
+        return Ok(payload);
     }
 
     let caller = session.host_caller().await;
@@ -2447,7 +2449,7 @@ async fn handle_mcp_tool_call(
             original_payload: None,
         });
     }
-    let _ = session.sidecar.respond(req.id, Ok(payload)).await;
+    Ok(payload)
 }
 
 /// Sidecar-supplied snapshot metadata, never model arguments. It only labels

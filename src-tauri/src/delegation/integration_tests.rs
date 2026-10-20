@@ -1534,7 +1534,7 @@ async fn claude_callback_authority_ends_with_turn_and_callback_job_ends_with_run
     use futures_util::StreamExt;
     use std::os::unix::fs::PermissionsExt;
     use tokio::sync::{oneshot, Notify};
-    for (replacement, early_result) in [(false, false), (false, true), (true, false)] {
+    for (replacement, early_result, stop_callback, reject_callback) in [(false, false, false, false), (false, true, false, false), (true, false, false, false), (false, false, true, false), (false, false, false, true)] {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
         let thread = if replacement {
@@ -1551,7 +1551,10 @@ async fn claude_callback_authority_ends_with_turn_and_callback_job_ends_with_run
             json!({"after":"send-turn","delay_ms":100,"emit":"server_request","method":"mcp-tool-call",
             "params":{"name":"mcp__codemux__delegation_targets","arguments":{}}}),
         ];
-        if !replacement {
+        if reject_callback {
+            script[0]["wait_for"] = json!(root.join("release-callback"));
+        }
+        if !replacement && !stop_callback && !reject_callback {
             script.push(json!({"after":"send-turn","delay_ms":100,"emit":"notification","method":"sdk-message",
                 "params":{"threadId":thread,"message":{"type":"result","subtype":"success","result":"fixture completed","is_error":false,"usage":{}}}}));
         }
@@ -1563,6 +1566,8 @@ async fn claude_callback_authority_ends_with_turn_and_callback_job_ends_with_run
             ""
         };
         std::fs::write(&sidecar, format!("#!/bin/sh\nexport HOME='{}'\nexport XDG_CONFIG_HOME='{}'\nexport XDG_DATA_HOME='{}'\nexport FAKE_CLAUDE_SIDECAR_SCRIPT='{}'\n{}exec '{}' \"$@\"\n", root.display(),root.join("config").display(),root.join("data").display(),script_path.display(),early_ack,helper.display())).unwrap();
+        let wrapper = std::fs::read_to_string(&sidecar).unwrap();
+        std::fs::write(&sidecar, wrapper.replace("#!/bin/sh\n", &format!("#!/bin/sh\nexport FAKE_CLAUDE_SIDECAR_CAPTURE='{}'\n", root.join("trace.jsonl").display()))).unwrap();
         std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o700)).unwrap();
         let app = tauri::test::mock_app();
         let state = crate::state::AppStateStore::default();
@@ -1643,10 +1648,35 @@ async fn claude_callback_authority_ends_with_turn_and_callback_job_ends_with_run
         )
         .unwrap();
         provider.send_turn(send).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), entered.notified())
-            .await
-            .unwrap();
-        if replacement {
+        if reject_callback {
+            // Tools are revoked after the send ACK but before the delayed
+            // incoming callback is tracked.
+            super::authority::NativeAuthority::user_activity_thread(thread, true);
+            std::fs::write(root.join("release-callback"), "ready").unwrap();
+        }
+        if !reject_callback {
+            tokio::time::timeout(Duration::from_secs(10), entered.notified()).await.unwrap();
+        }
+        if stop_callback || reject_callback {
+            if stop_callback {
+                super::authority::NativeAuthority::user_activity_thread(thread, true);
+                assert!(tokio::time::timeout(Duration::from_secs(2), rx).await.unwrap().is_err(), "Stop must cancel the tool worker");
+            }
+            let response = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let trace = std::fs::read_to_string(root.join("trace.jsonl")).unwrap_or_default();
+                    if let Some(response) = trace.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .find(|row| row["method"] == "server-response" && row["params"]["id"] == "fixture-mcp-call") {
+                        break response["params"].clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("cancelled/rejected callback must answer its outstanding RPC");
+            provider.stop_session(ThreadId(thread.into())).await.unwrap();
+            assert_eq!(response["result"]["isError"], true);
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("cancelled") || (reject_callback && text.contains("revoked")), "{response}");
+        } else if replacement {
             provider
                 .stop_session(ThreadId(thread.into()))
                 .await

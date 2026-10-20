@@ -252,6 +252,24 @@ describe("sendUpstreamRequest", () => {
     expect(_pendingCountForTests()).toBe(0);
   });
 
+  test("host cancellation settles an outstanding tool callback", async () => {
+    const written: string[] = [];
+    const promise = sendUpstreamRequest(
+      "mcp-tool-call",
+      { name: "mcp__codemux__delegate_task", arguments: { mode: "wait" } },
+      (line) => written.push(line),
+    );
+    expect(_pendingCountForTests()).toBe(1);
+    const wire = JSON.parse(written[0]!);
+    const result = {
+      content: [{ type: "text", text: "MCP tool call cancelled: task was cancelled" }],
+      isError: true,
+    };
+    dispatchResponse({ jsonrpc: "2.0", id: wire.id, result });
+    await expect(promise).resolves.toEqual(result);
+    expect(_pendingCountForTests()).toBe(0);
+  });
+
   test("rejects when the upstream returns an error response", async () => {
     const written: string[] = [];
     const promise = sendUpstreamRequest("x", {}, (line) => written.push(line));
