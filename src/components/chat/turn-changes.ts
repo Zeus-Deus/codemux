@@ -1,5 +1,5 @@
 import type { ChatViewItem, ToolCallItem } from "@/lib/agent-chat/types";
-import { parseDiff } from "@/lib/diff-parser";
+import { nativeFileChanges } from "@/lib/agent-chat/native-tool-call";
 
 import { editCounts, type EditCounts } from "./activity-steps";
 
@@ -33,44 +33,6 @@ function stringField(record: Record<string, unknown>, key: string): string | nul
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-function lineCount(text: string): number {
-  if (text.length === 0) return 0;
-  const lines = text.split("\n");
-  return lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
-}
-
-/** Codex reports a file change as `{ path, kind: { type }, diff }`, where an
- *  added or deleted file carries its whole content and an update carries a
- *  unified diff. */
-function codexFileEdits(input: Record<string, unknown>): FileEdit[] {
-  const changes = Array.isArray(input.changes) ? input.changes : [];
-  const edits: FileEdit[] = [];
-  for (const change of changes) {
-    if (!isRecord(change)) continue;
-    const path = stringField(change, "path");
-    if (!path) continue;
-    const diff = typeof change.diff === "string" ? change.diff : "";
-    const kind = isRecord(change.kind) ? stringField(change.kind, "type") : null;
-    if (kind === "add") {
-      edits.push({ path, added: lineCount(diff), removed: 0 });
-      continue;
-    }
-    if (kind === "delete") {
-      edits.push({ path, added: 0, removed: lineCount(diff) });
-      continue;
-    }
-    // The shared parser only treats `---`/`+++` as file headers before the
-    // first hunk; inside one they are content (a deleted `-- note` line).
-    const rows = parseDiff(diff);
-    edits.push({
-      path,
-      added: rows.filter((row) => row.type === "add").length,
-      removed: rows.filter((row) => row.type === "del").length,
-    });
-  }
-  return edits;
-}
-
 // Slots are rebuilt on every streamed token, and the line diff behind an
 // Edit's counts is an LCS. The reducer keeps a settled call's object stable,
 // so caching by identity makes re-summarising old turns free.
@@ -82,7 +44,8 @@ function fileEdits(item: ToolCallItem): FileEdit[] {
   let edits: FileEdit[] = [];
   const input = isRecord(item.input) ? item.input : null;
   if (input && item.tool_name === "fileChange") {
-    edits = codexFileEdits(input);
+    const changes = Array.isArray(input.changes) ? input.changes : [];
+    edits = nativeFileChanges(changes).map(({ path, added, removed }) => ({ path, added, removed }));
   } else if (input && EDIT_TOOLS.has(item.tool_name)) {
     const path =
       stringField(input, "file_path") ??

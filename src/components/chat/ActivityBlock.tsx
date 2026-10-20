@@ -16,6 +16,7 @@ import {
   type TraceStatus,
 } from "@/components/ui/trace";
 import { turnOrbActivity } from "@/lib/agent-chat/orb-activity";
+import { presentationToolName } from "@/lib/agent-chat/native-tool-call";
 import type { SubagentRunItem } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 import { useUIStore } from "@/stores/ui-store";
@@ -220,7 +221,7 @@ function StepIcon({
       </TraceIcon>
     );
   }
-  const Icon = step.kind === "reasoning" ? Lightbulb : toolIcon(step.tool_name);
+  const Icon = step.kind === "reasoning" ? Lightbulb : toolIcon(presentationToolName(step));
   return (
     <TraceIcon>
       <Icon />

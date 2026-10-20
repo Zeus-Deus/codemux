@@ -1,5 +1,6 @@
 import { workspaceLaunchBranch, workspaceLaunchFailed, workspaceLaunchInput } from "@/lib/agent-chat/workspace-launch";
 import { hermesLearningLabel } from "@/lib/agent-chat/hermes-learning";
+import { nativeToolCall, toolPresentation } from "@/lib/agent-chat/native-tool-call";
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 
 /**
@@ -65,9 +66,11 @@ export function describeToolCall(item: ToolCallItem): ToolDescription {
   }
   const learning = hermesLearningLabel(item);
   if (learning) return { verb: learning, target: null, targetMono: false, argument: null };
-  const verb = VERB_MAP[item.tool_name] ?? `Called ${item.tool_name}`;
-  const inputRecord = isRecord(item.input) ? item.input : {};
-  const toolName = item.tool_name;
+  // Codex native items describe as the tool they stand for (a command as
+  // Bash, an MCP call as its own tool) rather than as their envelope type.
+  const { name: toolName, input } = toolPresentation(item);
+  const verb = VERB_MAP[toolName] ?? `Called ${toolName}`;
+  const inputRecord = isRecord(input) ? input : {};
 
   switch (toolName) {
     case "Read": {
@@ -85,7 +88,14 @@ export function describeToolCall(item: ToolCallItem): ToolDescription {
     case "MultiEdit":
     case "Write": {
       const path = stringField(inputRecord, "file_path") ?? stringField(inputRecord, "path");
-      return { verb, target: path, targetMono: true, argument: null };
+      const native = nativeToolCall(item);
+      const others = native?.kind === "file_change" ? native.changes.length - 1 : 0;
+      return {
+        verb,
+        target: path,
+        targetMono: true,
+        argument: others > 0 ? `and ${others} more file${others === 1 ? "" : "s"}` : null,
+      };
     }
     case "Bash": {
       const cmd = stringField(inputRecord, "command");
