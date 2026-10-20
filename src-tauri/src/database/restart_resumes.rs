@@ -299,6 +299,11 @@ mod tests {
         // A side chat has no session row to resume.
         db.set_agent_chat_turn_mode("side-chat", "plan").unwrap();
         assert_eq!(db.agent_chat_turn_mode("side-chat"), None);
+        // Restarting on the same provider keeps it; another provider drops it.
+        db.upsert_agent_chat_session("t", "w", None, "claude").unwrap();
+        assert_eq!(db.agent_chat_turn_mode("t").as_deref(), Some("danger-full-access"));
+        db.upsert_agent_chat_session("t", "w", None, "codex").unwrap();
+        assert_eq!(db.agent_chat_turn_mode("t"), None);
     }
 
     #[test]

@@ -3680,6 +3680,16 @@ impl DatabaseStore {
         provider: &str,
     ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
+        // A turn mode belongs to the provider that ran the turn; another one
+        // starting on this thread must not replay it.
+        conn.execute(
+            "DELETE FROM agent_chat_turn_modes
+             WHERE thread_id = ?1 AND EXISTS (
+                 SELECT 1 FROM agent_chat_sessions WHERE thread_id = ?1 AND provider != ?2
+             )",
+            params![thread_id, provider],
+        )
+        .map_err(|e| format!("Failed to clear turn mode: {e}"))?;
         conn.execute(
             "INSERT INTO agent_chat_sessions
                  (thread_id, workspace_id, cwd, provider, created_at, last_active_at)

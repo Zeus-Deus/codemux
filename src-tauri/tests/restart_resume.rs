@@ -586,6 +586,15 @@ async fn a_codex_chat_interrupted_in_plan_resumes_in_plan() {
     agent_chat_send_turn(h.handle(), ProviderKind::Codex, planned)
         .await
         .unwrap();
+    // A send the provider rejects started no turn, so it changes nothing.
+    h.provider.fail_next_send(codemux_lib::agent_provider::ProviderError::ValidationError {
+        message: "busy".into(),
+    });
+    let rejected = SendTurnCommandInput {
+        permission_mode_override: Some("danger-full-access".into()),
+        ..typed("rr-plan", "never mind")
+    };
+    assert!(agent_chat_send_turn(h.handle(), ProviderKind::Codex, rejected).await.is_err());
     h.provider.set_turn_active("rr-plan", false);
     h.running("rr-plan", "turn-1");
     on_exit(&h.handle());
@@ -593,8 +602,7 @@ async fn a_codex_chat_interrupted_in_plan_resumes_in_plan() {
     let decisions = resume_after_restart_for_test(&h.handle(), "launch-2").await;
     assert_eq!(decision(&decisions, "rr-plan"), Some(ResumeDecision::Resume));
     let modes = h.provider.send_modes();
-    assert_eq!(modes.len(), 2);
-    assert_eq!(modes[1].as_deref(), Some("plan"));
+    assert_eq!(modes.last().cloned().flatten().as_deref(), Some("plan"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

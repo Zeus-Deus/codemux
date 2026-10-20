@@ -114,12 +114,6 @@ pub async fn agent_chat_answer_question<R: Runtime>(
         QuestionAction::Answer { permission_mode_override, .. } => permission_mode_override.clone(),
         _ => None,
     };
-    if let (ProviderKind::Codex, Some(mode)) = (provider_kind, &permission_mode_override) {
-        // As for a send: an answer can start the turn a restart interrupts.
-        if let Err(error) = db.set_agent_chat_turn_mode(&thread_id.0, mode) {
-            eprintln!("[codemux::agent_chat] {error}");
-        }
-    }
     let (submission_id, answers, reconcile) = match action {
         QuestionAction::Dismiss | QuestionAction::Reopen => {
             let next = match (&action, &previous) {
@@ -188,9 +182,13 @@ pub async fn agent_chat_answer_question<R: Runtime>(
                 record.cwd.clone().map(|cwd| Arc::new(GitTurnDispatchCheckpoint::new(app.clone(), thread_id.0.clone(), record.workspace_id, cwd, Some(submission_id.clone()))) as Arc<dyn TurnDispatchCheckpoint>)
             } else { None };
             let checkpoint = super::turn_diff::wrap_dispatch_checkpoint(&app, &thread_id.0, record.cwd, Some(&submission_id), checkpoint);
-            let delivered = provider.answer_question(AnswerQuestionInput { thread_id: thread_id.clone(), question, answers: answers.clone(), submission_id: submission_id.clone(), checkpoint, permission_mode_override }).await;
+            let delivered = provider.answer_question(AnswerQuestionInput { thread_id: thread_id.clone(), question, answers: answers.clone(), submission_id: submission_id.clone(), checkpoint, permission_mode_override: permission_mode_override.clone() }).await;
             if let Ok(QuestionDelivery::NewTurn { turn_id }) = &delivered {
                 super::turn_diff::on_turn_bound(&app, &thread_id.0, Some(&submission_id), &turn_id.0);
+                // An answer that starts a turn sets its mode, as a send does.
+                if provider_kind == ProviderKind::Codex {
+                    super::agent_chat::record_turn_mode(&db, &thread_id.0, permission_mode_override.as_deref());
+                }
             }
             delivered
         }

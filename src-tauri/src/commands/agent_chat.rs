@@ -3402,16 +3402,6 @@ async fn send_turn_internal<R: Runtime>(
     feature_flag_on(&observability)?;
     let hermes_gate = matches!(provider, ProviderKind::Hermes | ProviderKind::Acp).then(|| hermes_send_gate(&input.thread_id.0));
     let send_generation = hermes_gate.as_ref().map(|gate| gate.cancelled.load(Ordering::SeqCst));
-    if provider == ProviderKind::Codex {
-        if let Some(mode) = &input.permission_mode_override {
-            // Codex takes the Plan pill per turn and the pill does not survive
-            // a restart; an automatic continuation reuses the mode kept here.
-            let db: State<'_, DatabaseStore> = app.state();
-            if let Err(error) = db.set_agent_chat_turn_mode(&input.thread_id.0, mode) {
-                eprintln!("[codemux::agent_chat] {error}");
-            }
-        }
-    }
     if origin == TurnOrigin::User {
         crate::delegation::app::user_activity(&app, &input.thread_id.0, false)?;
         let db: State<'_, DatabaseStore> = app.state();
@@ -3755,6 +3745,11 @@ async fn send_turn_internal<R: Runtime>(
     }
     drop(dispatch_guard);
     let result = sent.map_err(provider_err)?;
+    if provider == ProviderKind::Codex && result.queued_id.is_none() && !result.steered {
+        // The turn this send started runs in the mode it named; queued ones
+        // are recorded when they are dispatched.
+        record_turn_mode(&db, &input.thread_id.0, input.permission_mode_override.as_deref());
+    }
     super::provider_switch::seed_delivered(&db, &thread_id_for_persist, provider, &switch_nonce, switch_seed);
     if let Some(queued_id) = &result.queued_id {
         // Do not acknowledge queued acceptance without durable evidence.
@@ -5295,6 +5290,18 @@ pub async fn agent_chat_set_service_tier<R: Runtime>(
             ..Default::default()
         },
     )
+}
+
+/// Codex takes the Plan pill per turn and the pill does not survive a restart:
+/// remember the mode a started turn runs in, so its automatic continuation
+/// (see `usage_resume::resume_mode`) runs in it too. A turn that names no mode
+/// keeps the previous one, as the session does.
+pub(super) fn record_turn_mode(db: &DatabaseStore, thread_id: &str, mode: Option<&str>) {
+    if let Some(mode) = mode {
+        if let Err(error) = db.set_agent_chat_turn_mode(thread_id, mode) {
+            eprintln!("[codemux::agent_chat] {error}");
+        }
+    }
 }
 
 /// Change a session's permission mode (accept-edits, bypass, plan,
