@@ -17,7 +17,8 @@ const tools: Record<string, Presentation> = {
   thread_interrupt: { present: "Interrupt chat run", progressive: "Interrupting chat run", past: "Requested chat run interruption", icon: CircleStop },
 };
 export function codemuxToolPresentation(name: string): Presentation | null {
-  return tools[name.split("__").pop() ?? ""] ?? null;
+  const raw = name.startsWith("mcp__codemux__") ? name.slice("mcp__codemux__".length) : name;
+  return tools[raw] ?? null;
 }
 export function orchestrationSummary(item: ToolCallItem): { verb: string; target: string } | null {
   const presentation = codemuxToolPresentation(item.tool_name);

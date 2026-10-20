@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 
-import { delegationRow } from "@/lib/agent-chat/delegation";
 import type {
   ChatViewItem,
   SubagentRunItem,
@@ -103,6 +102,13 @@ describe("delegation slots", () => {
     expect(groups[0][0].view).toBe(view);
     // Neither the call nor the card leaks into the work log.
     expect(slots.some((slot) => slot.body.kind === "activity")).toBe(false);
+  });
+
+  it("keeps a refused delegation in the ordinary tool activity", () => {
+    const refused = {...delegateCall(1, null), status: "error" as const, result_content: [{type:"text",text:"permission_ceiling: child mode exceeds this chat"}]};
+    const slots=buildTranscriptSlots([user(0),refused],true);
+    expect(delegationSlots(slots)).toEqual([]);
+    expect(slots.some(slot=>slot.body.kind==="activity")).toBe(true);
   });
 
   it("shows a call still starting on its own, before any row exists", () => {
@@ -209,7 +215,7 @@ describe("delegation slots", () => {
     ]);
   });
 
-  it("shows a refused call as failed beside the sibling that started", () => {
+  it("keeps a refused call in activity beside the sibling that started", () => {
     const refused: ToolCallItem = {
       ...delegateCall(1, null),
       status: "error",
@@ -220,13 +226,9 @@ describe("delegation slots", () => {
       buildTranscriptSlots([user(0), refused, delegateCall(2, null), card(3, [started])], true),
     );
     expect(group.map((entry) => [entry.key, entry.view])).toEqual([
-      ["tc-1", null],
       ["tc-2", started],
     ]);
-    expect(delegationRow(group[0].call, group[0].view)).toMatchObject({
-      phase: "failed",
-      line: "Delegation is off.",
-    });
+    expect(group).toHaveLength(1);
   });
 
   it("keeps a gated call's approval prompt beside the card", () => {

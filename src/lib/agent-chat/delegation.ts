@@ -111,7 +111,7 @@ export function providerKindOf(
 /** The model-visible name depends on each adapter's prefixing
  *  (`mcp__codemux__delegate_task` on Claude), so match the suffix. */
 export function isDelegateToolName(name: string): boolean {
-  return name.endsWith("delegate_task");
+  return name === "delegate_task" || name === "mcp__codemux__delegate_task" || name === "codemux_mcp__codemux__delegate_task";
 }
 
 export interface DelegateCallInput {
@@ -230,7 +230,8 @@ export function isDelegateToolCall(item: ChatViewItem): item is ToolCallItem {
   if (item.tool_name !== CODEX_DYNAMIC_TOOL && !isDelegateToolName(item.tool_name)) {
     return false;
   }
-  return delegateCallInfo(item) !== null;
+  const info = delegateCallInfo(item);
+  return info !== null && info.result?.kind !== "error" && item.status !== "error";
 }
 
 // ── Linking calls to their rows ──
