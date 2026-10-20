@@ -35,6 +35,70 @@ async fn review_r1_delayed_configuration_failure_never_confirms_prompt_acceptanc
     assert!(!wire.contains("session/prompt"));
     f.provider.stop_session(f.thread.clone()).await.unwrap();
 }
+// Exercise asynchronous worker settlement with the common delivery journal.
+async fn unanswered_controller_prompt(mode: &str, interrupt: bool) {
+    let f = Fixture::new(mode).await;
+    f.start(None, None).await.unwrap();
+    f.app.manage(crate::commands::agent_chat::SubagentTracker::default());
+    f.app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+    f.app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+    let mut events = f.provider.event_stream();
+    let sent = crate::commands::agent_chat::send_turn_with_origin(
+        f.app.handle().clone(), ProviderKind::Acp,
+        serde_json::from_value(json!({"thread_id":f.thread.0,"text":"controller instruction","client_nonce":"review-r2-unanswered"})).unwrap(),
+        crate::commands::agent_chat::TurnOrigin::Controller,
+    ).await.unwrap();
+    wait_marker(&f.dir.path().join("wire.jsonl.ready")).await;
+    if interrupt {
+        f.provider.interrupt_turn(f.thread.clone(), Some(sent.turn_id)).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(9), async {
+        loop {
+            if matches!(events.next().await, Some(ProviderRuntimeEvent::SessionStateChanged {status:SessionStatus::Error {..},..})) { break; }
+        }
+    }).await.expect("terminal transport failure must settle in process");
+    let db = f.app.state::<DatabaseStore>();
+    let row = db.message_delivery_for_message(&f.thread.0, "review-r2-unanswered").unwrap().unwrap();
+    let attention = db.thread_message_delivery_attention(&f.thread.0).unwrap();
+    let wire = std::fs::read_to_string(f.dir.path().join("wire.jsonl")).unwrap();
+    f.provider.stop_session(f.thread.clone()).await.unwrap();
+    assert!(row.attempted);
+    assert!(!db.has_inflight_message_deliveries(&f.thread.0).unwrap());
+    assert_eq!(row.state, "held_unknown", "unanswered prompt has no native acceptance evidence");
+    assert!(attention.iter().any(|entry| entry.id == row.id));
+    assert!(db.pending_message_deliveries().unwrap().iter().all(|entry| entry.id != row.id));
+    assert_eq!(wire.lines().filter(|line| line.contains("session/prompt")).count(), 1);
+    if interrupt { assert!(wire.contains("session/cancel")); }
+    db.recover_message_deliveries("review-r2-restart").unwrap();
+    assert_eq!(db.message_delivery(&row.id).unwrap().unwrap().state, "held_unknown");
+}
+
+#[tokio::test]
+async fn review_r2_child_exit_without_prompt_reply_is_held_unknown() {
+    unanswered_controller_prompt("review-r2-exit-prompt", false).await;
+}
+
+#[tokio::test]
+async fn review_r2_interrupted_unanswered_prompt_settles_journal_and_attention() {
+    unanswered_controller_prompt("review-r2-unanswered-prompt", true).await;
+}
+
+#[tokio::test]
+async fn review_r2_correlated_native_error_remains_acceptance_evidence() {
+    let f=Fixture::new("review-r2-native-error").await;
+    f.start(None,None).await.unwrap();
+    let mut events=f.provider.event_stream();
+    f.command_send(json!({"thread_id":f.thread.0,"text":"native rejection","client_nonce":"native-error"})).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3),async {
+        while !matches!(events.next().await,Some(ProviderRuntimeEvent::TurnCompleted {..})) {}
+    }).await.unwrap();
+    let db=f.app.state::<DatabaseStore>();
+    assert_eq!(db.message_delivery_for_message(&f.thread.0,"native-error").unwrap().unwrap().state,"accepted");
+    db.recover_message_deliveries("native-error-restart").unwrap();
+    assert_eq!(db.message_delivery_for_message(&f.thread.0,"native-error").unwrap().unwrap().state,"accepted");
+    f.provider.stop_session(f.thread.clone()).await.unwrap();
+}
+
 impl Fixture {
     async fn new(mode: &str) -> Self {
         let dir=tempfile::tempdir().unwrap();

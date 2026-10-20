@@ -84,6 +84,51 @@ async fn review_r1_merged_saved_queue_sends_with_original_delivery_identity() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn review_r2_cursor_unanswered_prompts_settle_without_native_acceptance() {
+    use crate::agent_provider::{AgentProvider,ProviderKind,ProviderRuntimeEvent,SendTurnInput,ThreadId};
+    use futures_util::StreamExt;
+    use std::os::unix::fs::PermissionsExt;
+    for interrupt in [false,true] {
+        let root=tempfile::tempdir().unwrap();
+        let binary=root.path().join("peer.py");
+        std::fs::write(&binary,include_str!("../../tests/helpers/agent_control_acp_peer.py")).unwrap();
+        std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let provider=crate::agent_provider::cursor::CursorAgentProvider::new(crate::agent_provider::cursor::CursorProviderConfig {binary,event_channel_capacity:64,mcp_registry:None});
+        let thread=ThreadId(format!("review-r2-cursor-{interrupt}"));
+        provider.start_session(serde_json::from_value(json!({"thread_id":thread,"cwd":root.path(),"permission_mode":"ask","additional_directories":[],"env":{"CODEMUX_AGENT_CONTROL_FIXTURE_ROOT":root.path()}})).unwrap()).await.unwrap();
+        let app=tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(crate::commands::agent_chat::SubagentTracker::default());
+    app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+        app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+        let db=app.state::<crate::database::DatabaseStore>();
+        db.upsert_agent_chat_session(&thread.0,"workspace",None,"cursor").unwrap();
+        db.admit_message_delivery("unanswered",&thread.0,"unanswered",&json!({"origin":"controller","provider":"cursor"}),"epoch",0,None,true).unwrap();
+        let mut input:SendTurnInput=serde_json::from_value(json!({"thread_id":thread,"text":if interrupt {"review-r2-unanswered-prompt"} else {"review-r2-exit-prompt"}})).unwrap();
+        input.turn_checkpoint=Some(Arc::new(super::delivery::DeliveryCheckpoint {app:app.handle().clone(),id:"unanswered".into(),thread:thread.0.clone(),provider:ProviderKind::Cursor,inner:None,release_queue:false,admitted_generation:0,resumed_ids:vec![]}));
+        let mut events=provider.event_stream();
+        let sent=provider.send_turn(input).await.unwrap();
+        if interrupt {
+            tokio::time::timeout(std::time::Duration::from_secs(3),async {
+                while !root.path().join("prompt-ready").exists() {tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+            }).await.unwrap();
+            provider.interrupt_turn(thread.clone(),Some(sent.turn_id)).await.unwrap();
+        }
+        let completed=tokio::time::timeout(std::time::Duration::from_secs(8),async {
+            while !matches!(events.next().await,Some(ProviderRuntimeEvent::TurnCompleted {..})) {}
+        }).await;
+        provider.stop_session(thread.clone()).await.unwrap();
+        assert!(completed.is_ok(),"an unanswered interrupted prompt must have a cancellation deadline");
+        let row=db.message_delivery("unanswered").unwrap().unwrap();
+        assert!(row.attempted);
+        assert_eq!(row.state,"held_unknown");
+        assert_eq!(db.thread_message_delivery_attention(&thread.0).unwrap().len(),1);
+        assert!(!db.has_inflight_message_deliveries(&thread.0).unwrap());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn review_r1_acp_local_rpc_refusal_is_not_native_acceptance() {
     use crate::agent_provider::{AgentProvider,ProviderKind,ProviderRuntimeEvent,SendTurnInput,ThreadId,TurnDispatchCheckpoint};
     use futures_util::StreamExt;

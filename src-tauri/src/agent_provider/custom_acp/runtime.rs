@@ -1865,8 +1865,14 @@ impl Session {
                 }
                 }
             };
-            if prompt_responded {
-                if let Some(checkpoint) = &input.turn_checkpoint { checkpoint.accepted(&turn).await; }
+            if let Some(checkpoint) = &input.turn_checkpoint {
+                if prompt_responded {
+                    checkpoint.accepted(&turn).await;
+                } else if result.is_err() {
+                    // A terminal transport failure has no native acceptance
+                    // evidence, including cancellation whose reply never arrived.
+                    checkpoint.abort().await;
+                }
             }
             drop(control);
             // Cancelled or misconfigured before its prompt: the rest of a held

@@ -482,6 +482,15 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": {"sessionUpdate": "config_option_update", "configOptions": options}}})
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": {"sessionUpdate": "current_mode_update", "currentModeId": "agent"}}})
     elif method == "session/prompt":
+        if mode == "review-r2-native-error":
+            send({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "native prompt error"}})
+            continue
+        if mode in ("review-r2-exit-prompt", "review-r2-unanswered-prompt"):
+            with open(log_path + ".ready", "w", encoding="utf-8") as ready:
+                ready.write("prompt received")
+            if mode == "review-r2-exit-prompt":
+                sys.exit(7)
+            continue
         if mode == "review4-slow-model":
             record({"fixture_prompt_model": selected_model})
         if mode == "dynamic-review5-queue":
