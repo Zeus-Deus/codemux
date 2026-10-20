@@ -1,4 +1,4 @@
-import { Plus, Trash2 } from "lucide-react";
+import { Check, Plus, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import {
@@ -110,7 +110,7 @@ export interface SessionHistoryListProps {
  * The New Chat row + grouped session list. Renders INSIDE a
  * `DropdownMenuContent`, so both consumers wrap it in their own
  * `DropdownMenu`. One source of truth for the list markup + row
- * behavior (delete-on-hover, active highlight, resume-on-click).
+ * behavior (delete-on-hover, current indicator, resume-on-click).
  */
 export function SessionHistoryList({
   sessions,
@@ -195,10 +195,12 @@ function SessionRow({ session, isActive, onSelect, onDelete }: SessionRowProps) 
       }}
       className={cn(
         "group/row flex items-center justify-between gap-2 pr-1",
-        // Active-row highlight stays neutral — accent is reserved for the
-        // app shell, not in-pane surfaces.
-        isActive && "bg-surface-3 text-foreground",
+        isActive && "font-medium text-foreground",
       )}
+      // The check marks the session this chat is showing; the radio role
+      // exposes that as the menu's checked row.
+      role="menuitemradio"
+      aria-checked={isActive}
       data-testid={`session-row-${session.thread_id}`}
     >
       <span className="flex-1 truncate text-label">
@@ -218,6 +220,9 @@ function SessionRow({ session, isActive, onSelect, onDelete }: SessionRowProps) 
       >
         <Trash2 className="size-3" />
       </button>
+      <span className="size-4 shrink-0" aria-hidden>
+        {isActive && <Check className="size-4" />}
+      </span>
     </DropdownMenuItem>
   );
 }

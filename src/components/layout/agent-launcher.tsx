@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Pin,
   PinOff,
@@ -22,7 +22,8 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { ShortcutTooltip } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { ScrollEdgeFade, useScrollEdges } from "@/components/ui/scroll-edge-fade";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { BAND_CONTROL_RADIUS } from "@/components/layout/titlebar-control-style";
 import {
@@ -202,58 +203,15 @@ function LauncherCommandList({
   onManagePresets?: () => void;
 }) {
   const listRef = useRef<HTMLDivElement | null>(null);
-  const [overflow, setOverflow] = useState({ top: false, bottom: false });
-
-  const syncOverflow = useCallback((node: HTMLDivElement | null) => {
-    if (!node) return;
-    const top = node.scrollTop > 3;
-    const bottom = node.scrollHeight - node.clientHeight - node.scrollTop > 3;
-    setOverflow((current) =>
-      current.top === top && current.bottom === bottom
-        ? current
-        : { top, bottom },
-    );
-  }, []);
-
-  useLayoutEffect(() => {
-    const node = listRef.current;
-    if (!node) return;
-
-    syncOverflow(node);
-    const resizeObserver =
-      typeof ResizeObserver === "undefined"
-        ? null
-        : new ResizeObserver(() => syncOverflow(node));
-    resizeObserver?.observe(node);
-
-    // cmdk filters by toggling descendants, which can change scrollHeight
-    // without changing the list's own border box.
-    const mutationObserver = new MutationObserver(() => syncOverflow(node));
-    mutationObserver.observe(node, {
-      attributes: true,
-      attributeFilter: ["hidden"],
-      childList: true,
-      subtree: true,
-    });
-
-    const handleResize = () => syncOverflow(node);
-    window.addEventListener("resize", handleResize);
-    return () => {
-      resizeObserver?.disconnect();
-      mutationObserver.disconnect();
-      window.removeEventListener("resize", handleResize);
-    };
-  }, [syncOverflow]);
+  const overflow = useScrollEdges(listRef);
 
   return (
     <div className="relative min-h-0">
       <CommandList
         ref={listRef}
         data-testid={`${testId}-list`}
-        // `scroll-pb` keeps the keyboard-selected row clear of the footer that
-        // is parked over the bottom of the scrollport.
-        className="thin-scrollbar max-h-80 scroll-pb-11"
-        onScroll={(event) => syncOverflow(event.currentTarget)}
+        // Keep keyboard selection clear of the fades and sticky footer.
+        className="thin-scrollbar max-h-80 scroll-pt-5 scroll-pb-[68px]"
       >
         {children}
         {/* The footer stays INSIDE the list: cmdk only treats items inside
@@ -263,26 +221,20 @@ function LauncherCommandList({
             footer away this wrapper collapses to zero height, which drops
             the bottom fade back onto the list's own bottom edge. */}
         <div className="sticky bottom-0 z-20">
-          <div
-            aria-hidden="true"
+          <ScrollEdgeFade
+            edge="bottom"
+            visible={overflow.bottom}
             data-testid={`${testId}-bottom-fade`}
-            data-visible={overflow.bottom}
-            className={cn(
-              "pointer-events-none absolute inset-x-0 bottom-full h-[26px] bg-gradient-to-t from-popover to-transparent transition-opacity duration-150",
-              overflow.bottom ? "opacity-100" : "opacity-0",
-            )}
+            className="bottom-full h-[26px]"
           />
           {onManagePresets && <LauncherFooter onSelect={onManagePresets} />}
         </div>
       </CommandList>
-      <div
-        aria-hidden="true"
+      <ScrollEdgeFade
+        edge="top"
+        visible={overflow.top}
         data-testid={`${testId}-top-fade`}
-        data-visible={overflow.top}
-        className={cn(
-          "pointer-events-none absolute inset-x-0 top-0 z-10 h-[18px] bg-gradient-to-b from-popover to-transparent transition-opacity duration-150",
-          overflow.top ? "opacity-100" : "opacity-0",
-        )}
+        className="h-[18px]"
       />
     </div>
   );
@@ -342,6 +294,7 @@ function useLauncherOpenRequest(open: () => void, enabled: boolean) {
  */
 export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps) {
   const [open, setOpen] = useState(false);
+  const pointerClose = useRef(false);
   const presetStore = usePresetStore();
   // Track whether Shift was held when a CLI row was chosen so keyboard
   // and mouse both reach the split path (cmdk's onSelect drops the event).
@@ -415,29 +368,45 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
 
   return (
     <Popover open={open} onOpenChange={handleOpenChange}>
-      <ShortcutTooltip label="Launch an agent" shortcut="openLauncher">
+      <Tooltip>
         <PopoverTrigger asChild>
-          <button
-            type="button"
-            aria-label="Launch an agent"
-            data-testid="agent-launcher-trigger"
-            className={cn(
-              "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
-              BAND_CONTROL_RADIUS,
-              open
-                ? "bg-accent text-foreground"
-                : "text-muted-foreground hover:bg-accent hover:text-foreground",
-            )}
-          >
-            <Plus className="size-4" />
-          </button>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label="Launch an agent"
+              data-testid="agent-launcher-trigger"
+              className={cn(
+                "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
+                BAND_CONTROL_RADIUS,
+                open
+                  ? "bg-accent text-foreground"
+                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
+              )}
+            >
+              <Plus className="size-4" />
+            </button>
+          </TooltipTrigger>
         </PopoverTrigger>
-      </ShortcutTooltip>
+        <TooltipContent side="bottom" sideOffset={4} shortcut="openLauncher">
+          Launch an agent
+        </TooltipContent>
+      </Tooltip>
       <PopoverContent
         align="start"
         sideOffset={6}
         className="w-80 overflow-hidden p-0"
         data-testid="agent-launcher-popover"
+        onPointerDownCapture={() => {
+          pointerClose.current = true;
+        }}
+        onKeyDownCapture={() => {
+          pointerClose.current = false;
+        }}
+        onCloseAutoFocus={(event) => {
+          // Pointer picks must not refocus the launcher and open its tooltip.
+          if (pointerClose.current) event.preventDefault();
+          pointerClose.current = false;
+        }}
       >
         <Command>
           <CommandInput
@@ -566,6 +535,7 @@ interface DraftAgentLauncherProps {
  */
 export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
   const [open, setOpen] = useState(false);
+  const pointerClose = useRef(false);
   const presetStore = usePresetStore();
   const installed = usePresetAvailability(open);
 
@@ -600,31 +570,46 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <ShortcutTooltip label="Launch an agent" shortcut="openLauncher">
+      <Tooltip>
         <PopoverTrigger asChild>
-          <button
-            type="button"
-            aria-label="Launch an agent"
-            data-testid="draft-agent-launcher-trigger"
-            disabled={draft.promoting}
-            className={cn(
-              "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
-              BAND_CONTROL_RADIUS,
-              open
-                ? "bg-accent text-foreground"
-                : "text-muted-foreground hover:bg-accent hover:text-foreground",
-              draft.promoting && "opacity-40 pointer-events-none",
-            )}
-          >
-            <Plus className="size-4" />
-          </button>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label="Launch an agent"
+              data-testid="draft-agent-launcher-trigger"
+              disabled={draft.promoting}
+              className={cn(
+                "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
+                BAND_CONTROL_RADIUS,
+                open
+                  ? "bg-accent text-foreground"
+                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                draft.promoting && "opacity-40 pointer-events-none",
+              )}
+            >
+              <Plus className="size-4" />
+            </button>
+          </TooltipTrigger>
         </PopoverTrigger>
-      </ShortcutTooltip>
+        <TooltipContent side="bottom" sideOffset={4} shortcut="openLauncher">
+          Launch an agent
+        </TooltipContent>
+      </Tooltip>
       <PopoverContent
         align="start"
         sideOffset={6}
         className="w-80 overflow-hidden p-0"
         data-testid="draft-agent-launcher-popover"
+        onPointerDownCapture={() => {
+          pointerClose.current = true;
+        }}
+        onKeyDownCapture={() => {
+          pointerClose.current = false;
+        }}
+        onCloseAutoFocus={(event) => {
+          if (pointerClose.current) event.preventDefault();
+          pointerClose.current = false;
+        }}
       >
         <Command>
           <CommandInput placeholder="Start with an agent…" />

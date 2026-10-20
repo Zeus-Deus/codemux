@@ -73,7 +73,11 @@ describe("SidebarSetupBanner", () => {
   it("shows banner when no scripts configured and has worktrees", async () => {
     render(<SidebarSetupBanner />);
     await flushPromises();
-    expect(screen.getByText("Setup")).toBeInTheDocument();
+    const title = screen.getByText("Setup scripts");
+    expect(title).toBeInTheDocument();
+    expect(screen.queryByText("Setup")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Dismiss setup tip" }).parentElement)
+      .toBe(title.parentElement);
     expect(screen.getByText(/Automate workspace setup/)).toBeInTheDocument();
   });
 
@@ -90,7 +94,7 @@ describe("SidebarSetupBanner", () => {
     };
     render(<SidebarSetupBanner />);
     await flushPromises();
-    expect(screen.getByText("Setup")).toBeInTheDocument();
+    expect(screen.getByText("Setup scripts")).toBeInTheDocument();
   });
 
   it("hides when no project root", async () => {
@@ -106,7 +110,7 @@ describe("SidebarSetupBanner", () => {
     };
     render(<SidebarSetupBanner />);
     await flushPromises();
-    expect(screen.queryByText("Setup")).not.toBeInTheDocument();
+    expect(screen.queryByText("Setup scripts")).not.toBeInTheDocument();
   });
 
   it("hides for home-rooted workspaces (project_root === $HOME)", async () => {
@@ -128,7 +132,7 @@ describe("SidebarSetupBanner", () => {
     };
     render(<SidebarSetupBanner />);
     await flushPromises();
-    expect(screen.queryByText("Setup")).not.toBeInTheDocument();
+    expect(screen.queryByText("Setup scripts")).not.toBeInTheDocument();
   });
 
   it("calls correct APIs with project root", async () => {
