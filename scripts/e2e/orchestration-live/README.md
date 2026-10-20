@@ -6,12 +6,13 @@ bwrap sandbox, a headless browser paired to it over the web remote, and
 read-only assertions against its store.
 
 ```
-up.sh        isolated root, sandbox, serve, workspace, pairing → <root>/env
-down.sh      stop only the recorded sandbox (graceful, or --hard)
-drive.mjs    headless browser driver (library + CLI)
-assert.sh    read-only sqlite + `codemux json conversation_read` helpers
-run.mjs      run scenarios/*.mjs → <root>/report.md, report.json, shots/
-lib.sh       shared env, sandbox and process helpers
+up.sh               isolated root, sandbox, isolation pre-flight, serve, workspace, pairing → <root>/env
+down.sh             stop only the recorded sandbox (graceful, or --hard), then check the real credentials
+drive.mjs           headless browser driver (library + CLI)
+assert.sh           read-only sqlite + `codemux json conversation_read` helpers
+run.mjs             run scenarios/*.mjs → <root>/report.md, report.json, shots/
+lib.sh              shared env, sandbox, stop and credential-check helpers
+isolation-check.sh  runs inside the sandbox during up.sh; asserts what must be out of reach
 ```
 
 ## Run it
@@ -92,8 +93,13 @@ export async function run(ctx) {
 | `observe(key, value)` | Record ids for the report. |
 | `shot(name, {phone})` | Screenshot at 1440×900 and 390×844. Below the phone breakpoint the app shows the phone shell; `phone(driver)` navigates it first. |
 
-Each scenario has a 10-minute budget (`ORCH_LIVE_SCENARIO_TIMEOUT_MS`). A
-failure takes a `<name>-failure` screenshot. Prompts should be imperative and
+Each scenario has a 10-minute budget (`ORCH_LIVE_SCENARIO_TIMEOUT_MS`). When
+it runs out, `ctx.signal` aborts: browser, CLI and assert calls in flight are
+killed and every `waitFor` throws. A scenario that is still running 30 s
+later ends the whole run. A failure takes a `<name>-failure` screenshot.
+Assert on what the model produced, never on text the prompt already contains
+(the smoke scenario asks for a computed token and looks for it only in
+`[data-testid="assistant-message"]`). Prompts should be imperative and
 name the exact tool and arguments, so runs are close to deterministic. Inside
 agent tasks, wait with `python3 -c 'import time; time.sleep(N)'`; Claude's
 harness blocks a standalone `sleep`.
@@ -104,42 +110,93 @@ Default to cheap models: `claude-haiku-4-5` for Claude and `gpt-6-luna` with
 low effort for Codex (`ORCH_LIVE_CLAUDE_MODEL` / `ORCH_LIVE_CODEX_MODEL`
 override the smoke scenario). `up.sh` spends one Haiku call on its credential
 pre-flight (`ORCH_LIVE_SKIP_CLI_PREFLIGHT=1` skips it). The smoke scenario is
-two one-line turns. Run only the scenarios you need.
+two one-line turns (`ORCH_LIVE_SMOKE_PROVIDERS=claude` or `=codex` runs one;
+unknown or empty values are an error). Run only the scenarios you need.
 
 ## Safety rules
 
 - **Never copy credential files.** Refreshing a copied OAuth token rotates the
   refresh token and can sign the user out of every real session. The sandbox
-  bind-mounts them read-write:
-  - Claude persists a refreshed token with a temp file + rename, and a rename
-    onto a file bind-mount fails with `EBUSY` (the new token would be lost).
-    So the real `~/.claude` directory is bound, and run-local directories are
-    mounted over its `projects sessions todos file-history session-env
-    shell-snapshots tasks backups plugins skills`; `settings.json`,
-    `settings.local.json` and `CLAUDE.md` are replaced by empty files.
-  - Codex rewrites `auth.json` in place, so only that file is bound into an
-    otherwise private `~/.codex`.
-  - Hermes is not wired yet. It also writes `auth.json` with temp + replace,
-    so it needs the Claude treatment (bind the profile directory, overlay
-    its run state), not a file bind. Add that before any Hermes scenario.
+  bind-mounts the real files instead, and exposes nothing else of the profile
+  directories:
+  - **Claude.** The sandbox's `~/.claude` is private (`<root>/home/.claude`):
+    transcripts, sessions, settings, history and plugins are all run-local.
+    Credentials come from the real `~/.claude`, bound at
+    `/run/orch-live/claude-auth` and selected with
+    `CLAUDE_SECURESTORAGE_CONFIG_DIR` (the CLI reads `.credentials.json` and
+    takes its refresh lock in that directory; checked in the 2.1.299
+    binary). The directory itself is bound because Claude persists a
+    refreshed token with temp file + rename, which fails with `EBUSY` on a
+    file bind-mount (the new refresh token would be lost). Every existing
+    entry there except `.credentials.json` and the refresh lock is covered
+    by a read-only empty file or directory, so the only things the sandbox
+    can create in the real `~/.claude` are new top-level entries, which is
+    what Claude's credential writes need. `down.sh` lists any new top-level
+    entry other than `.credentials.json`, `.credentials.json.tmp.*` and
+    `.oauth_refresh.lock*`, or a changed symlink, and fails.
+  - **Codex** rewrites `auth.json` in place, so only that file is bound into
+    an otherwise private `~/.codex`.
+  - `down.sh` checks that both real files are still non-empty JSON objects
+    and fails loudly if not. It never restores them: re-login instead.
+  - Hermes is not wired yet. It writes `auth.json` with temp + replace, so it
+    needs the Claude treatment (its storage dir bound, everything else in it
+    covered). Add that before any Hermes scenario.
   - Only `claude`, `codex` and `node`/`npm`/`npx` are linked into
     `<root>/bin` (the sandbox PATH). Other provider CLIs need a link there,
     a `--ro-bind` if they live outside `~/.local/share/mise` or `/usr`, and
     their own credential treatment.
   - `up.sh` proves both are the host's files (same device and inode) and that
-    a rename inside `~/.claude` reaches the host, then runs `claude -p` and
-    `codex login status` inside the sandbox.
-- **No X server, ever.** The browser is headless Chromium via `agent-browser`.
-  The sandbox environment is an allow-list without `DISPLAY` or
-  `WAYLAND_DISPLAY`. Never start Xvfb or Xwayland on the host.
-- **Kill only your own processes.** `down.sh` signals only the PID in
-  `<root>/serve.pid` (checked to still be our `bwrap` and its process-group
-  leader) and its descendants. The sandbox has its own PID namespace, so
-  provider CLIs die with it. Never `pkill`, and never `pgrep -f` a pattern.
-- **Isolation.** The sandbox's HOME is `<root>/home` mounted at the real HOME
-  path; XDG dirs point into the root; the caller's `CODEMUX_*` and `CLAUDE*`
-  variables never reach it. Release builds are refused (they use the real
-  store and socket names).
+    a rename in Claude's storage dir reaches the host, then runs `claude -p`
+    and `codex login status` inside the sandbox.
+- **Concurrent refresh with the host (residual risk).** The user's own Claude
+  and Codex sessions keep running while a live run uses the same login.
+  Claude serialises refreshes across processes with a lock directory
+  (`.oauth_refresh.lock`) in the shared storage dir and re-reads the file
+  after taking it, so the sandbox and the host don't both spend the same
+  refresh token; the lock's dead-holder takeover refuses holders in another
+  PID namespace, so a crashed sandbox refresh can delay a host refresh by up
+  to the lock's 60 s staleness window. Codex (0.162.1) has no cross-process
+  lock for `auth.json`; on a 401 it reloads `auth.json` and uses tokens
+  another process already refreshed, but two Codex processes refreshing in
+  the same instant can still both spend the refresh token, and the loser
+  reports "Your access token could not be refreshed. Please log out and sign
+  in again." Codex refreshes rarely (tokens last days), so the window is
+  small but real; keep live runs short.
+- **Shutdown never SIGKILLs a provider.** Codex writes `auth.json` by
+  truncate + write, so a kill mid-refresh can leave it empty. `down.sh`
+  stops serve (SIGTERM; with `--hard`, SIGKILL to the serve process alone),
+  lets provider CLIs exit on stdin EOF, sends SIGTERM to anything still
+  running after 30 s, and otherwise fails and leaves the survivors for a
+  human. (Codemux's own provider shutdown is out of the harness's hands.)
+- **Isolation.** The sandbox mounts the host read-only and gives the run
+  private `/dev`, `/proc` (own PID namespace), `/tmp`, `/var/tmp`, `/dev/shm`
+  and `/run` (only systemd-resolved's directory is re-exposed when
+  `/etc/resolv.conf` points there). HOME is `<root>/home` mounted at the real
+  HOME path; XDG dirs, including `XDG_RUNTIME_DIR`, point into the root. The
+  environment is an allow-list: no `DISPLAY`, `WAYLAND_DISPLAY`,
+  `DBUS_SESSION_BUS_ADDRESS`, `CODEMUX_*` or `CLAUDE*` from the caller. The
+  only writable host paths are the root, the private HOME and the two
+  credential binds. `up.sh` runs `isolation-check.sh` inside the sandbox and
+  refuses to continue unless the real Codemux sockets
+  (`/run/user/<uid>/codemux{,-dev}.sock`), the session bus, keyring and X
+  sockets are unreachable, the repo and its git dir are read-only or
+  invisible, every writable mount is an expected one, and probes written to
+  the sandbox's `/tmp` and `/var/tmp` don't appear on the host. The network
+  namespace is shared (providers need the internet), so abstract Unix
+  sockets such as X's `@/tmp/.X11-unix/X0` remain reachable in principle;
+  nothing in the sandbox is told about them. Release builds are refused
+  (they use the real store and socket names).
+- **No X server, ever.** The browser is headless Chromium via
+  `agent-browser`. Never start Xvfb or Xwayland on the host.
+- **Kill only your own processes.** `down.sh` signals only the sandbox
+  recorded in `<root>/env` after checking its PID, its start time
+  (`/proc/<pid>/stat` field 22) and the run's `ORCH_LIVE_RUN_ID` marker in its
+  environment, and only processes below it. `up.sh` records that metadata
+  right after launch, and stops the sandbox again if startup fails or is
+  interrupted. Never `pkill`, and never `pgrep -f` a pattern.
+- **Ports.** `up.sh` picks a free port, then verifies serve's own status and
+  that the listener belongs to its serve process; a lost race retries on
+  another port (`ORCH_LIVE_PORT` pins one, or a comma list to try in order).
 - **Roots live under `~/.cache`, never `/tmp`.** `/tmp` has a per-user quota
   shared by every agent, and SQLite there has failed with "disk I/O error".
 
