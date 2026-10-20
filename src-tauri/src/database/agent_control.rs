@@ -257,8 +257,16 @@ impl DatabaseStore {
         &self, principal: &str, request_key: &str, tool: &str, payload_hash: &str,
         epoch: &str, workspace_id: Option<&str>, thread_id: Option<&str>,
     ) -> Result<Admission, String> {
-        let conn = self.conn.lock().unwrap();
-        let existing: Option<(String, String, String)> = conn.query_row(
+        self.admit_control_operation_for_thread(principal, request_key, tool, payload_hash, epoch, workspace_id, thread_id, None)
+    }
+
+    pub(crate) fn admit_control_operation_for_thread(
+        &self, principal: &str, request_key: &str, tool: &str, payload_hash: &str,
+        epoch: &str, workspace_id: Option<&str>, thread_id: Option<&str>, sender: Option<&str>,
+    ) -> Result<Admission, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e|e.to_string())?;
+        let existing: Option<(String, String, String)> = tx.query_row(
             "SELECT id, tool, payload_hash FROM agent_control_operations
              WHERE principal=?1 AND request_key=?2",
             params![principal, request_key],
@@ -268,6 +276,7 @@ impl DatabaseStore {
             if admitted_tool != tool || admitted_hash != payload_hash {
                 return Err("request_key_conflict: retry arguments must be unchanged".into());
             }
+            tx.commit().map_err(|e|e.to_string())?;
             drop(conn);
             return Ok(Admission {
                 receipt: self.control_operation(principal, &id, epoch)?.ok_or("operation_not_found")?,
@@ -275,12 +284,18 @@ impl DatabaseStore {
             });
         }
         let id = uuid::Uuid::new_v4().to_string();
-        conn.execute(
+        if tool == "thread_launch" {
+            if let (Some(sender), Some(target)) = (sender, thread_id) {
+                super::delegation_tasks::admit_launch(&tx, sender, target, &id)?;
+            }
+        }
+        tx.execute(
             "INSERT INTO agent_control_operations
              (id, principal, request_key, tool, payload_hash, epoch, state, workspace_id, thread_id)
              VALUES (?1,?2,?3,?4,?5,?6,'accepted',?7,?8)",
             params![id, principal, request_key, tool, payload_hash, epoch, workspace_id, thread_id],
         ).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e|e.to_string())?;
         drop(conn);
         Ok(Admission { receipt: self.control_operation(principal, &id, epoch)?.ok_or("operation_not_found")?, newly_admitted: true })
     }

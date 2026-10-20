@@ -2045,3 +2045,177 @@ async fn native_callers_superseded_wait_releases_delivery_without_cancelling_tas
     let tasks=app.state::<crate::database::DatabaseStore>().delegation_tasks(Some(&thread)).unwrap();
     assert_eq!(tasks.len(),1);assert!(tasks[0].wait_until.is_none());assert!(!tasks[0].status.terminal());
 }
+
+#[tokio::test]
+async fn native_callers_toggle_is_enforced_at_dispatch_but_suggestions_still_work() {
+    let (app,_,_root,_workspace,thread,authority,mut actor)=native_caller_fixture("bypassPermissions").await;
+    app.state::<crate::database::DatabaseStore>().set_setting("agents.cross_provider_delegation","false").unwrap();
+    let error=native::call(app.handle().clone(),actor.clone(),"thread_list".into(),json!({})).await.unwrap_err();
+    assert!(error.contains("orchestration_disabled"),"{error}");
+    authority.set_policy(crate::agent_provider::ProviderKind::Claude,Some("unmapped"));
+    actor.permission_mode=Some("unmapped".into());
+    let result=native::call(app.handle().clone(),actor,"suggest_tasks".into(),json!({"tasks":[{"title":"Review","task":"Review the parser and run its focused regression tests."}]})).await.unwrap();
+    assert!(!result.to_string().contains("orchestration_disabled"));
+    assert!(app.state::<crate::database::DatabaseStore>().get_agent_chat_session(&thread).is_some());
+}
+
+#[tokio::test]
+async fn native_callers_validate_every_explicit_delegate_mode_against_catalog() {
+    use crate::mcp::registry::{HostCaller,HostTools};
+    use crate::agent_provider::ProviderKind;
+    for (parent_mode,child_mode,expected_plan) in [("plan","plan",true),("bypassPermissions","read-only",false),("bypassPermissions","invented",false),("bypassPermissions","workspace-write",false)] {
+        let (app,_,_root,workspace,thread,_authority,actor)=native_caller_fixture(parent_mode).await;
+        let mut caps=crate::agent_provider::codex::capabilities::build_capabilities(vec![]);
+        caps.permission_modes.retain(|m| m.value!="workspace-write");
+        app.state::<NativeControlState>().fixture_capabilities.lock().unwrap().insert(ProviderKind::Codex,caps);
+        let caller=HostCaller {control:Some(native::qualify(app.handle(),&actor).await.unwrap()),thread_id:thread.clone(),provider:ProviderKind::Claude,workspace_id:Some(workspace),permission_mode:Some(parent_mode.into())};
+        let host=crate::commands::delegation::DelegationHost::with_install_check(app.handle().clone(),|_|true);
+        let result=host.call_async(&caller,"mcp__codemux__delegate_task",&json!({"provider":"codex","permission_mode":child_mode,"task":"Compute 17 plus 18 without using tools.","title":"Policy child"}),None,None).await.unwrap();
+        if matches!(child_mode,"invented"|"workspace-write") {
+            assert_eq!(result["isError"],true,"{result}");
+            assert!(result.to_string().contains("unsupported_permission_mode"),"{result}");
+            assert!(app.state::<crate::database::DatabaseStore>().delegation_tasks(Some(&thread)).unwrap().is_empty());
+        } else {
+            assert_ne!(result["isError"],true,"{result}");
+            let task=app.state::<crate::database::DatabaseStore>().delegation_tasks(Some(&thread)).unwrap().remove(0);
+            assert_eq!(task.permission_mode.as_deref(),Some("read-only"));
+            assert_eq!(task.plan_mode,expected_plan);
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_callers_admitted_message_survives_sender_pane_change_and_human_release() {
+    let (app,provider,_root,workspace,thread,authority,actor)=native_caller_fixture("default").await;
+    let target=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"receiver","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let target=settle_operation(&app,&target).await;
+    let receiver=target["thread_id"].as_str().unwrap();
+    let barrier=Arc::new(tokio::sync::Semaphore::new(0));
+    *app.state::<NativeControlState>().fixture_operation_barrier.lock().unwrap()=Some(barrier.clone());
+    let receipt=native::call(app.handle().clone(),actor,"thread_send".into(),json!({"thread_id":receiver,"message":"Accepted before pane closed","client_request_id":"accepted-pane-change"})).await.unwrap();
+    let id=receipt["delivery_id"].as_str().unwrap();
+    let db=app.state::<crate::database::DatabaseStore>();
+    let mut caller:ControlCaller=serde_json::from_value(db.message_delivery(id).unwrap().unwrap().payload["caller"].clone()).unwrap();
+    caller.admitted=Some(AdmittedAuthority::Delivery{delivery_id:id.into()});
+    let pane=app.state::<crate::state::AppStateStore>().agent_chat_pane_id_for_thread(&thread).unwrap();
+    app.state::<crate::state::AppStateStore>().close_pane(&pane).unwrap();authority.invalidate();
+    service::authorize(app.handle(),&caller).unwrap();
+    db.finish_message_delivery(id,"queued",Some(&json!({"queued_id":"accepted-queue"})),None).unwrap();
+    // This base disposes controller sends on Stop. Exercise the retained held
+    // row used by PR1's re-arm path before the coordinator rebases that layer.
+    db.finish_message_delivery(id,"held",None,None).unwrap();
+    assert!(service::authorize(app.handle(),&caller).is_err());
+    db.resume_message_delivery_thread(receiver).unwrap();
+    assert_eq!(db.message_delivery(id).unwrap().unwrap().state,"queued");
+    service::authorize(app.handle(),&caller).unwrap();
+    db.retry_message_delivery(receiver,id).err();
+    // Return the queued row to dispatchable state, retaining its identity.
+    db.finish_message_delivery(id,"pending",None,None).unwrap();
+    barrier.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5),async {loop {if provider.calls.snapshot().iter().any(|c|matches!(c,mock_agent_provider::MockCall::SendTurn(t,_) if t.0==receiver)){break;}tokio::time::sleep(std::time::Duration::from_millis(10)).await;}}).await.unwrap();
+    assert_ne!(db.message_delivery(id).unwrap().unwrap().state,"rejected");
+}
+
+#[tokio::test]
+async fn native_callers_batch_partial_retry_preserves_receipts_and_never_takes_focus() {
+    let (app,_,_root,workspace,thread,_authority,actor)=native_caller_fixture("default").await;
+    let before=app.state::<crate::state::AppStateStore>().snapshot();
+    let args=json!({"workspace_id":workspace,"threads":[{"title":"First","select":true},{"title":"Bad","permission_mode":"invented"}]});
+    let first=native::call(app.handle().clone(),actor.clone(),"create_threads".into(),args.clone()).await.unwrap();
+    assert_eq!(first["failed_index"],1,"{first}");assert_eq!(first["threads"].as_array().unwrap().len(),1);
+    let retry=native::call(app.handle().clone(),actor,"create_threads".into(),args).await.unwrap();
+    assert_eq!(first["client_request_id"],retry["client_request_id"]);
+    assert_eq!(first["threads"][0]["operation_id"],retry["threads"][0]["operation_id"]);
+    let receipt=tokio::time::timeout(std::time::Duration::from_secs(10),async {loop {
+        let receipt=app.state::<crate::database::DatabaseStore>().control_operation(&format!("thread:{thread}"),first["threads"][0]["operation_id"].as_str().unwrap(),&app.state::<NativeControlState>().epoch).unwrap().unwrap();
+        if !matches!(receipt.state.as_str(),"accepted"|"running") {break receipt;}
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }}).await.unwrap();
+    assert_eq!(receipt.state,"succeeded");
+    let after=app.state::<crate::state::AppStateStore>().snapshot();
+    let before_workspace=before.workspaces.iter().find(|w|w.workspace_id.0==workspace).unwrap();
+    let after_workspace=after.workspaces.iter().find(|w|w.workspace_id.0==workspace).unwrap();
+    assert_eq!(before_workspace.active_surface_id,after_workspace.active_surface_id);
+    assert_eq!(before_workspace.surfaces.iter().find(|s|s.surface_id==before_workspace.active_surface_id).unwrap().active_pane_id,after_workspace.surfaces.iter().find(|s|s.surface_id==after_workspace.active_surface_id).unwrap().active_pane_id);
+    assert!(app.state::<crate::state::AppStateStore>().agent_chat_pane_id_for_thread(&thread).is_some());
+}
+
+#[tokio::test]
+async fn native_callers_agent_ping_pong_stops_at_24_hops() {
+    let (app,_provider,_root,workspace,a,authority_a,actor_a)=native_caller_fixture("default").await;
+    let launch=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"ping-b","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let b=settle_operation(&app,&launch).await["thread_id"].as_str().unwrap().to_string();
+    let authority_b=crate::delegation::authority::NativeAuthority::with_policy(&b,crate::agent_provider::ProviderKind::Claude,Some("default"));
+    let generation=authority_b.begin();authority_b.bind(generation,"ping-b-run");
+    let actor_b=crate::delegation::app::NativeActor {thread_id:b.clone(),session_id:format!("mock-{b}"),permit:authority_b.capture(),..actor_a.clone()};
+    let root=app.state::<crate::database::DatabaseStore>().orchestration_context(&a).unwrap().root_id;
+    for hop in 0..=24 {
+        let (sender,target)=if hop%2==0 {(actor_a.clone(),&b)} else {(actor_b.clone(),&a)};
+        let barrier=Arc::new(tokio::sync::Semaphore::new(0));
+        *app.state::<NativeControlState>().fixture_operation_barrier.lock().unwrap()=Some(barrier.clone());
+        let result=native::call(app.handle().clone(),sender,"thread_send".into(),json!({"thread_id":target,"message":format!("Ping hop {hop}"),"client_request_id":format!("hop-{hop}")})).await;
+        if hop==24 {assert!(result.unwrap_err().contains("resource_limit"));break;}
+        let receipt=result.unwrap();let id=receipt["delivery_id"].as_str().unwrap();
+        app.state::<crate::database::DatabaseStore>().claim_message_delivery(id).unwrap();
+        app.state::<crate::database::DatabaseStore>().message_delivery_submitting(id).unwrap();
+        app.state::<crate::database::DatabaseStore>().finish_message_delivery(id,"accepted",None,None).unwrap();
+        barrier.add_permits(1);
+    }
+    assert_eq!(app.state::<crate::database::DatabaseStore>().orchestration_context(&a).unwrap().root_id,root);
+    drop((authority_a,authority_b));
+}
+
+#[tokio::test]
+async fn native_callers_task_cancel_checks_ownership_before_target_ceiling() {
+    let (app,_,_root,_workspace,_thread,_authority,actor)=native_caller_fixture("plan").await;
+    let mut task=crate::database::delegation_tasks::TaskRecord::new("foreign-task".into(),"foreign-parent".into(),None,"codex".into(),"Foreign".into(),"A foreign task brief".into(),1);
+    task.permission_mode=Some("danger-full-access".into());
+    app.state::<crate::database::DatabaseStore>().admit_delegation_task(&task,None,&json!({})).unwrap();
+    let error=native::call(app.handle().clone(),actor,"task_cancel".into(),json!({"task_id":"foreign-task"})).await.unwrap_err();
+    assert_eq!(error,"Task is not owned by this parent");
+}
+
+#[tokio::test]
+async fn native_callers_self_tools_restore_full_access_and_keep_lower_modes_read_only() {
+    for mode in ["bypassPermissions","plan"] {
+        let (app,_,_root,_workspace,_thread,_authority,actor)=native_caller_fixture(mode).await;
+        app.state::<crate::database::DatabaseStore>().set_setting("agents.cross_provider_delegation","false").unwrap();
+        let error=native::call(app.handle().clone(),actor,"terminal_write".into(),json!({"pane_id":"missing","text":"fixture"})).await.unwrap_err();
+        if mode=="plan" {assert!(error.contains("provider_control_denied"),"{error}");}
+        else {assert!(!error.contains("provider_control_denied") && !error.contains("orchestration_disabled"),"{error}");}
+    }
+}
+
+#[tokio::test]
+async fn native_callers_workspace_launch_routes_and_keeps_admitted_thread_authority() {
+    let (app,provider,root,workspace,thread,_authority,actor)=native_caller_fixture("bypassPermissions").await;
+    app.state::<crate::database::DatabaseStore>().set_setting("agents.cross_provider_delegation","false").unwrap();
+    let result=native::call(app.handle().clone(),actor.clone(),"workspace_launch".into(),json!({"title":"","message":"A complete fixture brief"})).await.unwrap();
+    assert_eq!(result["isError"],true);assert!(result.to_string().contains("title"));
+    assert!(!result.to_string().contains("unsupported_operation"));
+    // The host admits the same authenticated principal before handing startup
+    // to PreparedWorkspaceChat; pane changes cannot revoke accepted startup.
+    app.state::<crate::database::DatabaseStore>().set_setting("agents.cross_provider_delegation","true").unwrap();
+    let mut caller=native::qualify(app.handle(),&actor).await.unwrap();
+    let admission=app.state::<crate::database::DatabaseStore>().admit_control_operation(&caller.principal,"workspace-launch","workspace_launch","payload",&app.state::<NativeControlState>().epoch,Some(&workspace),None).unwrap();
+    caller.admitted=Some(AdmittedAuthority::Operation {operation_id:admission.receipt.operation_id});
+    app.state::<crate::database::DatabaseStore>().set_setting("agents.cross_provider_delegation","false").unwrap();
+    let pane=app.state::<crate::state::AppStateStore>().agent_chat_pane_id_for_thread(&thread).unwrap();
+    app.state::<crate::state::AppStateStore>().close_pane(&pane).unwrap();
+    let child_workspace=app.state::<crate::state::AppStateStore>().create_empty_workspace_at_path(root.path().into());
+    let prepared=service::PreparedWorkspaceChat::prepare(app.handle(),&caller,crate::agent_provider::ProviderKind::Claude,"Independent workspace".into(),"Work independently on this fixture".into(),None,None).await.unwrap();
+    let launched=prepared.materialize(app.handle(),&caller,child_workspace.0).await.unwrap();
+    let child=launched["thread_id"].as_str().unwrap();
+    assert!(provider.calls.snapshot().iter().any(|c|matches!(c,mock_agent_provider::MockCall::SendTurn(t,_) if t.0==child)));
+}
+
+#[test]
+fn orchestration_message_stale_caller_fences_hold_without_definitive_rejection() {
+    let db=crate::database::DatabaseStore::new_in_memory();
+    db.admit_message_delivery("stale","target","stale",&json!({"origin":"controller"}),"epoch",0,None,false).unwrap();
+    for _ in 0..4 {
+        db.claim_message_delivery("stale").unwrap();
+        assert_eq!(db.fail_message_delivery("stale","stale_caller: generation fence changed").unwrap(),"held");
+        db.retry_message_delivery("target","stale").unwrap();
+    }
+}

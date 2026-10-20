@@ -2779,6 +2779,10 @@ impl AppStateStore {
     ) -> Result<(PaneId, bool), String> {
         let mut snapshot = self.inner.lock().unwrap();
         let desktop_selection = snapshot.active_workspace_id.clone();
+        let workspace_selection = (!select).then(|| snapshot.workspaces.iter().find(|w|w.workspace_id.0==workspace_id).map(|w|(
+            w.active_tab_id.clone(),w.active_surface_id.clone(),
+            w.surfaces.iter().map(|s|(s.surface_id.clone(),s.active_pane_id.clone())).collect::<Vec<_>>()
+        ))).flatten();
         let result = Self::create_chat_pane_locked(
             &mut snapshot,
             workspace_id,
@@ -2795,6 +2799,17 @@ impl AppStateStore {
                     .any(|w| w.workspace_id == desktop_selection))
         {
             snapshot.active_workspace_id = desktop_selection;
+        }
+        if let Some((tab,surface,panes)) = workspace_selection {
+            if let Some(workspace) = snapshot.workspaces.iter_mut().find(|w|w.workspace_id.0==workspace_id) {
+                // A background launch must preserve selection inside the
+                // workspace too. Leave a first-ever surface selected.
+                if workspace.tabs.iter().any(|t|t.tab_id==tab) {workspace.active_tab_id=tab;}
+                if workspace.surfaces.iter().any(|s|s.surface_id==surface) {workspace.active_surface_id=surface;}
+                for (surface,pane) in panes {
+                    if let Some(existing)=workspace.surfaces.iter_mut().find(|s|s.surface_id==surface) {existing.active_pane_id=pane;}
+                }
+            }
         }
         result
     }

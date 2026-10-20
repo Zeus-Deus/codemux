@@ -2384,7 +2384,7 @@ async fn collect_shared_tools_for_claude(
             caller.workspace_id.as_deref(),
         )
         .await;
-    tools.retain(crate::mcp::registry::native_tool_visible);
+    tools.retain(|tool| crate::mcp::registry::native_tool_visible(tool, caller));
     let host_tools=registry.host_tools(caller);
     // App-owned task tools also serve local IDs; replace the SSH-only schema
     // rather than publishing duplicate names to the native provider.

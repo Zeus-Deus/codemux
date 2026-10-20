@@ -28,6 +28,9 @@ impl Ceiling {
             plan,
         })
     }
+    pub fn full_access(self) -> bool {
+        self.filesystem == 2 && self.approvals == 2 && !self.plan
+    }
     pub fn intersection(self, other: Self) -> Self {
         Self {
             filesystem: self.filesystem.min(other.filesystem),

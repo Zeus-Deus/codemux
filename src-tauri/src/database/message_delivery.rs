@@ -410,6 +410,7 @@ impl DatabaseStore {
         if n == 0 {
             return Err("delivery_held: delivery is no longer authorized for submission".into());
         }
+        super::delegation_tasks::activate_message_causation(&conn, id)?;
         Ok(())
     }
     /// Adapter-owned exact-byte evidence can narrow the generic pre-send
@@ -483,7 +484,7 @@ impl DatabaseStore {
         if !matches!(record.state.as_str(), "preparing" | "submitting" | "queued") { return Ok(record.state); }
         let human = record.payload["origin"] == "user";
         let explicit_queue = record.queued_id.is_some() && matches!(record.payload["origin"].as_str(), Some("user"|"controller"));
-        let state = if !record.attempted && explicit_queue { "held" }
+        let state = if !record.attempted && (explicit_queue || error.starts_with("stale_caller")) { "held" }
             else if record.attempted && !human { "held_unknown" }
             else if record.attempted || human || record.attempt_count >= 3 { "rejected" }
             else { "pending" };
@@ -598,7 +599,7 @@ pub(super) fn admit_in_transaction(
         if payload["caller"]["identity"]["kind"] == "thread" && payload["provenance"]["created_by"] == "agent" {
             let sender=payload["caller"]["identity"]["thread_id"].as_str().ok_or("Missing agent sender")?;
             if !super::delegation_tasks::admitted_task_start(tx,sender,thread,payload)? {
-                super::delegation_tasks::admit_agent_message(tx,sender,thread,id)?;
+                super::delegation_tasks::admit_agent_message(tx,sender,thread,id,payload)?;
                 super::delegation_tasks::admit_followup(tx,sender,thread,id,payload)?;
             }
         }

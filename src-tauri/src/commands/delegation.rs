@@ -885,8 +885,16 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                 return self.call(caller, name, args);
             }
             let requested_deadline = now_ms() + args["wait_ms"].as_u64().unwrap_or(20_000).min(20_000) as i64;
-            let result =
-                delegate_with_call(&self.app, caller, args, self.is_installed, call_id, run_id);
+            let validation = async {
+                let input: DelegateArgs = serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+                let provider = parse_provider(&input.provider).ok_or("unsupported_provider")?;
+                if let Some(mode) = input.permission_mode.as_deref() {
+                    let caps = crate::agent_control::service::capabilities(&self.app, provider).await.map_err(|e| e.to_string())?;
+                    crate::agent_control::service::validate_permission_mode(provider, Some(mode), &caps).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }.await;
+            let result = validation.and_then(|()| delegate_with_call(&self.app, caller, args, self.is_installed, call_id, run_id, true));
             let result = match result {
                 Ok(mut receipt) => {
                     if args["mode"] == "wait" {
@@ -1049,7 +1057,7 @@ fn delegate<R: Runtime>(
     arguments: &Value,
     is_installed: fn(ProviderKind) -> bool,
 ) -> Result<Value, String> {
-    delegate_with_call(app, caller, arguments, is_installed, None, None)
+    delegate_with_call(app, caller, arguments, is_installed, None, None, false)
 }
 fn delegate_with_call<R: Runtime>(
     app: &AppHandle<R>,
@@ -1058,6 +1066,7 @@ fn delegate_with_call<R: Runtime>(
     is_installed: fn(ProviderKind) -> bool,
     tool_call_id: Option<&str>,
     run_id: Option<&str>,
+    validated_mode: bool,
 ) -> Result<Value, String> {
     let unavailable = || "Delegation is unavailable in this Codemux build.".to_string();
     let db = app.try_state::<DatabaseStore>().ok_or_else(unavailable)?;
@@ -1149,7 +1158,11 @@ fn delegate_with_call<R: Runtime>(
     let mode = args.permission_mode.clone().map(Ok).unwrap_or_else(|| ceiling.inherited(provider).map_err(|e|e.to_string()))?;
     let target = crate::agent_control::permissions::Ceiling::for_mode(provider,Some(&mode)).ok_or("unsupported_permission_ceiling")?;
     if !ceiling.permits(target) { return Err("permission_ceiling: child mode exceeds this chat".into()); }
-    record.permission_mode = Some(mode);
+    if args.permission_mode.is_some() && !validated_mode {
+        return Err("unsupported_permission_mode: explicit delegate modes require async catalog validation".into());
+    }
+    record.plan_mode = provider == ProviderKind::Codex && (mode == "plan" || (args.permission_mode.is_none() && ceiling.plan));
+    record.permission_mode = Some(if provider == ProviderKind::Codex && mode == "plan" { "read-only".into() } else { mode });
     record.caller = caller.control.clone().map(|mut caller|{caller.admitted=Some(crate::agent_control::AdmittedAuthority::Task {task_id:record.task_id.clone()});caller});
     record.admission_generation = Some(admission_generation);
     record.wait_until = wait_until;
@@ -1291,7 +1304,7 @@ pub(crate) async fn run_starter<R: Runtime>(
                     task.brief
                 ),
             );
-            if provider == ProviderKind::Codex && record.permission_mode.as_deref() == Some("read-only") { turn.permission_mode_override = Some("plan".into()); }
+            if provider == ProviderKind::Codex && record.plan_mode { turn.permission_mode_override = Some("plan".into()); }
             turn.display_text = Some(task.brief.clone());
             turn.client_nonce = Some(format!("delegated-task:{child}"));
             let mut context =

@@ -258,9 +258,20 @@ impl<R: Runtime> WorkspaceLaunchHost<R> {
             "note": "The workspace appears in the sidebar shortly. Give the user a one-line status and end your turn.",
         });
         let app = self.app.clone();
-        let caller = caller.clone();
+        let mut caller = caller.clone();
+        let control = caller.control.as_mut().ok_or("stale_caller: workspace launch requires authenticated chat authority")?;
+        if control.ceiling().is_some_and(|c| !c.full_access()) {return Err("permission_ceiling: workspace_launch requires full access".into());}
+        service::authorize_native(&app, control, false).map_err(|e|e.to_string())?;
+        let epoch = app.state::<crate::agent_control::NativeControlState>().epoch.clone();
+        let admission = control.admit(|| app.state::<crate::database::DatabaseStore>().admit_control_operation(
+            &control.principal, &uuid::Uuid::new_v4().to_string(), "workspace_launch", &arguments.to_string(), &epoch, Some(&workspace.workspace_id.0), None,
+        ))?;
+        let operation = admission.receipt.operation_id;
+        if control.thread_id().is_some() {control.admitted=Some(crate::agent_control::AdmittedAuthority::Operation {operation_id:operation.clone()});}
         tauri::async_runtime::spawn(async move {
             let outcome = start(&app, &caller, input, provider, repo, branch, base).await;
+            let (status,error) = match &outcome { Ok(()) => ("succeeded",None), Err(error) => ("failed",Some(json!({"message":error}))) };
+            let _ = app.state::<crate::database::DatabaseStore>().update_control_operation(&caller.control.as_ref().unwrap().principal,&operation,&epoch,status,None,None,None,error.as_ref());
             if let Err(error) = outcome {
                 eprintln!("[codemux::workspace_launch] {error}");
                 let state = app.state::<AppStateStore>();
@@ -645,6 +656,10 @@ mod tests {
             permission_mode: Some("bypassPermissions".into()),
         };
         let workspace_count = app.state::<AppStateStore>().snapshot().workspaces.len();
+        let mut caller=caller;
+        caller.control=Some(crate::agent_control::ControlCaller::trusted());
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(crate::agent_control::NativeControlState::default());
         let receipt = host
             .launch(
                 &caller,

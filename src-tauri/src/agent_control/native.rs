@@ -37,6 +37,8 @@ pub(crate) fn tool_name(name: &str) -> Option<&str> {
                     | "task_cancel"
                     | "workspace_launch"
                     | "suggest_tasks"
+                    | "delegation_targets"
+                    | "delegate_remote_task"
             )
     })
 }
@@ -89,6 +91,10 @@ pub(crate) async fn qualify<R: Runtime>(
     app: &AppHandle<R>,
     actor: &crate::delegation::app::NativeActor,
 ) -> Result<ControlCaller, ControlError> {
+    qualify_for(app, actor, true).await
+}
+
+async fn qualify_for<R: Runtime>(app: &AppHandle<R>, actor: &crate::delegation::app::NativeActor, orchestration: bool) -> Result<ControlCaller, ControlError> {
     actor
         .permit
         .wait_ready()
@@ -145,7 +151,7 @@ pub(crate) async fn qualify<R: Runtime>(
         access: ControlAccess::Supervised,
         grant_id: None,
     };
-    service::authorize(app, &caller)?;
+    service::authorize_native(app, &caller, orchestration)?;
     Ok(caller)
 }
 
@@ -155,7 +161,21 @@ pub(crate) async fn call<R: Runtime>(
     name: String,
     mut args: Value,
 ) -> Result<Value, String> {
-    let caller = qualify(&app, &actor).await.map_err(|e| e.to_string())?;
+    if name == "suggest_tasks" {
+        actor.permit.wait_ready().await?;
+        actor.permit.identity()?.verify(&actor.thread_id)?;
+        let record = app.state::<DatabaseStore>().get_agent_chat_session(&actor.thread_id).ok_or("stale_caller: calling chat missing")?;
+        let caller = HostCaller {control:None, thread_id:actor.thread_id.clone(), provider:actor.provider, workspace_id:Some(record.workspace_id), permission_mode:actor.permission_mode.clone()};
+        return Ok(crate::commands::follow_ups::call(&app, &caller, &args));
+    }
+    let orchestration = tool_name(&prefix_tool_name("codemux", &name)).is_some() && name != "workspace_launch";
+    let caller = qualify_for(&app, &actor, orchestration).await.map_err(|e| e.to_string())?;
+    if !orchestration && name != "workspace_launch" {
+        if !crate::mcp::registry::native_relay_allowed(&name, caller.ceiling().is_some_and(|c| c.full_access())) {
+            return Err("provider_control_denied: this self-tool requires full access".into());
+        }
+        return app.state::<crate::mcp::registry::McpRegistry>().dispatch_tool_call(&prefix_tool_name("codemux", &name), args, actor.workspace_id.as_deref()).await;
+    }
     if matches!(name.as_str(), "delegation_targets" | "delegate_remote_task") {
         return crate::delegation::app::native_call(
             app,
@@ -181,6 +201,7 @@ pub(crate) async fn call<R: Runtime>(
                 .state::<DatabaseStore>()
                 .delegation_task(args["task_id"].as_str().ok_or("task_id required")?)?
             {
+                if task.parent_thread_id != actor.thread_id { return Err("Task is not owned by this parent".into()); }
                 let provider: ProviderKind = serde_json::from_value(json!(task.provider))
                     .map_err(|_| "unsupported_provider")?;
                 service::permission_ceiling(&caller, provider, task.permission_mode.as_deref())
@@ -219,7 +240,9 @@ pub(crate) async fn call<R: Runtime>(
         return crate::delegation::app::native_call(app, actor, name, args).await;
     }
     if name == "workspace_launch" {
-        return Err("unsupported_operation: use thread_launch in an existing workspace; worktree strategies are not available yet".into());
+        let record = app.state::<DatabaseStore>().get_agent_chat_session(&actor.thread_id).ok_or("Calling chat missing")?;
+        let host_caller = HostCaller {control:Some(caller), thread_id:actor.thread_id, provider:actor.provider, workspace_id:Some(record.workspace_id), permission_mode:actor.permission_mode};
+        return crate::commands::workspace_launch::WorkspaceLaunchHost::new(app).call(&host_caller, "mcp__codemux__workspace_launch", &args).ok_or("Workspace launch is unavailable".into());
     }
     if !TOOLS.contains(&name.as_str()) {
         return Err(
@@ -268,7 +291,7 @@ pub(crate) async fn call<R: Runtime>(
                 for provider in providers {
                     provider["provider_instance_id"] = provider["provider"].clone();
                     provider["models"] = provider["capabilities"]["models"].clone();
-                    if provider["provider"] == "claude" {
+                    if matches!(provider["provider"].as_str(), Some("claude" | "codex")) {
                         if let Some(modes) = provider["allowed_permission_modes"].as_array_mut() {
                             modes.push(json!("plan"));
                         }
@@ -309,28 +332,32 @@ pub(crate) async fn call<R: Runtime>(
                 client_request_id: Option<String>,
                 threads: Vec<Value>,
             }
+            use sha2::{Digest, Sha256};
+            // A retry without an explicit key must recover the same per-entry
+            // receipts, including after a partially successful batch.
+            let implicit_key = format!("batch:{:x}", Sha256::digest(serde_json::to_vec(&json!({"session":actor.session_id,"run":actor.permit.identity()?.run_id,"args":args})).map_err(|e|e.to_string())?));
             let input: Batch = service::parse(args).map_err(|e| e.to_string())?;
             if input.threads.is_empty() || input.threads.len() > 20 {
                 return Err("invalid_arguments: batch size must be 1–20".into());
             }
             let key = input
                 .client_request_id
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                .unwrap_or(implicit_key);
             let mut receipts = vec![];
             for (index, mut entry) in input.threads.into_iter().enumerate() {
-                if !entry.is_object() {
-                    return Err("invalid_arguments: each thread must be an object".into());
+                let result = async {
+                    if !entry.is_object() { return Err("invalid_arguments: each thread must be an object".into()); }
+                    entry["workspace_id"] = json!(input.workspace_id);
+                    entry["client_request_id"] = json!(format!("{key}:{index}"));
+                    prepare_launch(&caller, &actor, &mut entry)?;
+                    service::launch(&app, &caller, entry).await.map_err(|e| e.to_string())
+                }.await;
+                match result {
+                    Ok(receipt) => receipts.push(receipt),
+                    Err(error) => return Ok(json!({"threads":receipts,"client_request_id":key,"failed_index":index,"error":error})),
                 }
-                entry["workspace_id"] = json!(input.workspace_id);
-                entry["client_request_id"] = json!(format!("{key}:{index}"));
-                prepare_launch(&caller, &actor, &mut entry)?;
-                receipts.push(
-                    service::launch(&app, &caller, entry)
-                        .await
-                        .map_err(|e| e.to_string())?,
-                );
             }
-            json!({"threads":receipts})
+            json!({"threads":receipts,"client_request_id":key})
         }
         "thread_launch" => {
             prepare_launch(&caller, &actor, &mut args)?;
@@ -365,6 +392,7 @@ fn prepare_launch(
         }
         args["provider"] = instance;
     }
+    args["select"] = json!(false);
     if args.get("provider").is_none_or(Value::is_null) {
         args["provider"] = json!(actor.provider);
     }

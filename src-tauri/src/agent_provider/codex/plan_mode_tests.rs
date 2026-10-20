@@ -430,3 +430,30 @@ async fn native_wait_tool_does_not_block_codex_approval_reader() {
     provider.stop_session(thread).await.unwrap();
     assert_eq!(approval.unwrap(),"command");
 }
+
+#[tokio::test]
+async fn explicit_plan_start_is_read_only_and_unknown_explicit_modes_fail_closed() {
+    for mode in ["plan","not-a-mode"] {
+        let dir=tempfile::tempdir().unwrap();
+        let provider=CodexAgentProvider::new(CodexProviderConfig {codex_binary:fixture_binary(dir.path()),..Default::default()});
+        let thread=ThreadId(format!("explicit-{mode}"));
+        let mut input=start_input(dir.path(),&thread);
+        input.permission_mode=Some(mode.into());
+        let result=provider.start_session(input).await;
+        if mode=="plan" {
+            result.unwrap();send(&provider,&thread,None).await;
+            let wire=std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
+            let messages:Vec<Value>=wire.lines().map(|l|serde_json::from_str(l).unwrap()).collect();
+            let start=messages.iter().find(|m|m["method"]=="thread/start").unwrap();
+            assert_eq!(start["params"]["sandbox"],"read-only");
+            assert_eq!(start["params"]["approvalPolicy"],"untrusted");
+            let turn=messages.iter().find(|m|m["method"]=="turn/start").unwrap();
+            assert_eq!(turn["params"]["collaborationMode"]["mode"],"plan");
+            provider.stop_session(thread).await.unwrap();
+        } else {
+            assert!(result.unwrap_err().to_string().contains("Unsupported explicit Codex permission mode"));
+            let wire=std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap_or_default();
+            assert!(!wire.contains("\"method\": \"thread/start\""));
+        }
+    }
+}

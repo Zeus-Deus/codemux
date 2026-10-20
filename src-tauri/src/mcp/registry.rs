@@ -241,17 +241,19 @@ impl Default for McpRegistry {
     }
 }
 
-/// Legacy self-server mutations cannot borrow local-controller authority.
+/// Full-access native callers retain the base self-server catalog.
 /// Provider adapters apply the same predicate to discovery and dispatch.
-pub(crate) fn native_relay_allowed(raw:&str)->bool {
-    raw.starts_with("browser_") || matches!(raw,
-        "html_render" | "notify" | "app_status" | "pane_list" | "port_list" |
+pub(crate) fn native_relay_allowed(raw:&str, full_access:bool)->bool {
+    full_access || matches!(raw,
+        "browser_snapshot" | "browser_accessibility_snapshot" | "browser_screenshot" | "browser_console_logs" | "browser_get_styles" | "browser_viewport_presets" | "browser_wait" |
+        "app_status" | "pane_list" | "port_list" |
         "conversation_read" | "conversation_search" | "workspace_list" | "workspace_info" | "workspace_archive_list" |
         "automation_list" | "automation_get" | "automation_runs" | "git_status" | "git_diff" | "terminal_read" |
         "issue_list" | "issue_get" | "preset_list" | "delegation_targets" | "delegate_remote_task")
 }
-pub(crate) fn native_tool_visible(tool:&McpTool)->bool {
-    !tool.prefixed_name.starts_with("mcp__codemux__") || native_relay_allowed(&tool.name)
+pub(crate) fn native_tool_visible(tool:&McpTool, caller:&HostCaller)->bool {
+    let full = crate::agent_control::permissions::Ceiling::for_mode(caller.provider, caller.permission_mode.as_deref()).is_some_and(|c| c.full_access());
+    !tool.prefixed_name.starts_with("mcp__codemux__") || native_relay_allowed(&tool.name, full)
 }
 
 pub(crate) type NativeDelegationHandler = Arc<
@@ -315,8 +317,9 @@ impl McpRegistry {
             let value = handler(actor, command.into(), arguments).await?;
             return Ok(serde_json::json!({"content":[{"type":"text","text":value.to_string()}]}));
         }
-        if name.starts_with("mcp__codemux__") && !native_relay_allowed(name.strip_prefix("mcp__codemux__").unwrap_or_default()) {
-            return Err("provider_control_denied: this legacy mutation has no thread permission policy".into());
+        if let Some(raw) = name.strip_prefix("mcp__codemux__") {
+            let handler = self.native_delegation.lock().unwrap().clone().ok_or("Native caller policy is unavailable")?;
+            return handler(actor, raw.into(), arguments).await;
         }
         self.dispatch_tool_call(name, arguments, actor.workspace_id.as_deref()).await
     }
@@ -2252,11 +2255,20 @@ mod tests {
 mod native_visibility_tests {
     use super::*;
     #[test]
-    fn native_listing_and_legacy_dispatch_use_the_same_policy(){
-        for name in ["automation_create","workspace_create","worktree_create","thread_respond","git_push","terminal_write"] {
-            let tool=McpTool{name:name.into(),prefixed_name:format!("mcp__codemux__{name}"),description:None,input_schema:serde_json::json!({}),server_id:"codemux-self".into()};
-            assert!(!native_tool_visible(&tool));assert!(!native_relay_allowed(name));
+    fn native_listing_and_legacy_dispatch_use_the_same_policy() {
+        for (provider, full_mode, low_mode) in [(crate::agent_provider::ProviderKind::Claude,"bypassPermissions","plan"),(crate::agent_provider::ProviderKind::Codex,"danger-full-access","read-only")] {
+            let mut caller=HostCaller {control:None,thread_id:"caller".into(),provider,workspace_id:None,permission_mode:None};
+            for (mode,full) in [(full_mode,true),(low_mode,false)] {
+                caller.permission_mode=Some(mode.into());
+                for name in ["automation_create","workspace_create","worktree_create","git_commit","git_stage","git_push","terminal_write","pane_close","preset_apply","issue_link_workspace","browser_navigate","html_render"] {
+                    let tool=McpTool{name:name.into(),prefixed_name:format!("mcp__codemux__{name}"),description:None,input_schema:serde_json::json!({}),server_id:"codemux-self".into()};
+                    assert_eq!(native_tool_visible(&tool,&caller),full,"{name} {mode}");
+                    assert_eq!(native_relay_allowed(name,full),full);
+                }
+                for name in ["conversation_read","workspace_info","browser_snapshot","git_status","terminal_read"] {assert!(native_relay_allowed(name,full));}
+                let plugin=McpTool{name:"write".into(),prefixed_name:"mcp__plugin__write".into(),description:None,input_schema:serde_json::json!({}),server_id:"plugin".into()};
+                assert!(native_tool_visible(&plugin,&caller));
+            }
         }
-        for name in ["conversation_read","workspace_info","browser_snapshot"]{assert!(native_relay_allowed(name));}
     }
 }

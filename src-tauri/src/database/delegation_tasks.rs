@@ -33,6 +33,17 @@ pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
         CREATE TABLE IF NOT EXISTS agent_orchestration_admissions (
             id TEXT PRIMARY KEY, root_id TEXT NOT NULL, kind TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS orchestration_admission_root ON agent_orchestration_admissions(root_id);
+        CREATE INDEX IF NOT EXISTS delegation_task_budget ON agent_delegation_tasks(json_extract(record,'$.budget_root_id'),json_extract(record,'$.status'),json_extract(record,'$.workState'));
+        CREATE TABLE IF NOT EXISTS agent_orchestration_launches (
+            id TEXT PRIMARY KEY, thread_id TEXT UNIQUE NOT NULL, root_id TEXT NOT NULL,
+            executing INTEGER NOT NULL DEFAULT 1);
+        CREATE INDEX IF NOT EXISTS orchestration_launch_root ON agent_orchestration_launches(root_id,executing);
+        CREATE TABLE IF NOT EXISTS agent_message_causation (
+            id TEXT PRIMARY KEY, sender TEXT NOT NULL, target TEXT NOT NULL, root_id TEXT NOT NULL,
+            hop INTEGER NOT NULL, causation_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            UNIQUE(sender,target,causation_id,fingerprint));
+        CREATE TABLE IF NOT EXISTS agent_message_active_causation (
+            thread_id TEXT PRIMARY KEY, root_id TEXT NOT NULL, hop INTEGER NOT NULL, causation_id TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS agent_delegation_imports (
             source_id TEXT NOT NULL, source_version INTEGER NOT NULL, task_id TEXT NOT NULL,
             PRIMARY KEY(source_id, source_version));")
@@ -109,6 +120,8 @@ pub struct TaskRecord {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub plan_mode: bool,
     pub role: Option<String>,
     pub title: String,
     pub brief: String,
@@ -168,6 +181,7 @@ impl TaskRecord {
             model: None,
             effort: None,
             permission_mode: None,
+            plan_mode: false,
             role: None,
             title,
             brief,
@@ -247,31 +261,72 @@ pub(super) fn admitted_task_start(
         task.parent_thread_id == sender && task.child_thread_id.as_deref() == Some(target)
     }))
 }
-pub(super) fn admit_agent_message(
-    tx: &Connection,
-    sender: &str,
-    target: &str,
-    id: &str,
-) -> Result<(), String> {
-    tx.execute("INSERT OR IGNORE INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,0,0,?2)",params![sender,uuid::Uuid::new_v4().to_string()]).map_err(|e|e.to_string())?;
-    let context=tx.query_row("SELECT root_id,depth,hop,causation_id FROM agent_orchestration_context WHERE thread_id=?1",[sender],|r|Ok(RootContext{root_id:r.get(0)?,depth:r.get(1)?,hop:r.get(2)?,causation_id:r.get(3)?})).map_err(|e|e.to_string())?;
-    let count: u32 = tx
-        .query_row(
-            "SELECT COUNT(*) FROM agent_orchestration_admissions WHERE root_id=?1",
-            [&context.root_id],
-            |r| r.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    if count >= 6 || context.hop >= 8 {
-        return Err("resource_limit: agent message causation budget reached".into());
+pub(super) fn admit_agent_message(tx: &Connection, sender: &str, target: &str, id: &str, payload: &Value) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let context = message_context(tx, sender)?;
+    if context.hop >= 24 {
+        return Err("resource_limit: automatic agent message chain reached 24 hops; a human message is required to start a new chain".into());
     }
-    tx.execute(
-        "INSERT INTO agent_orchestration_admissions(id,root_id,kind) VALUES (?1,?2,'message')",
-        params![id, context.root_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute("INSERT INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(thread_id) DO UPDATE SET root_id=excluded.root_id,depth=excluded.depth,hop=excluded.hop,causation_id=excluded.causation_id",params![target,context.root_id,context.depth,context.hop+1,id]).map_err(|e|e.to_string())?;
+    let fingerprint = format!("{:x}", Sha256::digest(payload["input"]["text"].as_str().unwrap_or_default().as_bytes()));
+    let inserted = tx.execute("INSERT OR IGNORE INTO agent_message_causation(id,sender,target,root_id,hop,causation_id,fingerprint) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![id,sender,target,context.root_id,context.hop+1,context.causation_id,fingerprint]).map_err(|e|e.to_string())?;
+    if inserted == 0 { return Err("duplicate_causation: identical agent message already admitted for this cause".into()); }
+    // Messages carry causation separately. They never replace a recipient's
+    // human work root or reserve a new-work admission.
     Ok(())
+}
+fn root_context(conn: &Connection, thread: &str) -> Result<RootContext, String> {
+    conn.execute("INSERT OR IGNORE INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,0,0,?2)",params![thread,uuid::Uuid::new_v4().to_string()]).map_err(|e|e.to_string())?;
+    conn.query_row("SELECT root_id,depth,hop,causation_id FROM agent_orchestration_context WHERE thread_id=?1",[thread],|r|Ok(RootContext{root_id:r.get(0)?,depth:r.get(1)?,hop:r.get(2)?,causation_id:r.get(3)?})).map_err(|e|e.to_string())
+}
+fn message_context(conn: &Connection, thread: &str) -> Result<RootContext, String> {
+    conn.query_row("SELECT root_id,hop,causation_id FROM agent_message_active_causation WHERE thread_id=?1",[thread],|r|Ok(RootContext{root_id:r.get(0)?,depth:0,hop:r.get(1)?,causation_id:r.get(2)?})).optional().map_err(|e|e.to_string())?.map(Ok).unwrap_or_else(||root_context(conn,thread))
+}
+pub(super) fn activate_message_causation(conn: &Connection, id: &str) -> Result<(), String> {
+    conn.execute("INSERT INTO agent_message_active_causation(thread_id,root_id,hop,causation_id) SELECT target,root_id,hop,id FROM agent_message_causation WHERE id=?1 ON CONFLICT(thread_id) DO UPDATE SET root_id=excluded.root_id,hop=excluded.hop,causation_id=excluded.causation_id",[id]).map(drop).map_err(|e|e.to_string())
+}
+fn waiting_on_children(conn: &Connection, parent: &str) -> Result<bool, String> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM agent_delegation_tasks WHERE parent_thread_id=?1 AND json_extract(record,'$.wait_until')>?2)",params![parent,chrono::Utc::now().timestamp_millis()],|r|r.get(0)).map_err(|e|e.to_string())
+}
+fn refresh_waiting(conn: &Connection, parent: &str) -> Result<(), String> {
+    let waiting = waiting_on_children(conn, parent)?;
+    let data:Option<String> = conn.query_row("SELECT record FROM agent_delegation_tasks WHERE child_thread_id=?1 AND backend='local' ORDER BY rowid DESC LIMIT 1",[parent],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+    if let Some(mut task) = data.map(decode).transpose()? {
+        if !task.status.terminal() {
+            task.work_state = if waiting {WorkState::WaitingForChildren} else {WorkState::Working};
+            write(conn, &task)?;
+        }
+    }
+    Ok(())
+}
+fn active_work(conn: &Connection, root: &str, yielding: Option<&str>) -> Result<Vec<String>, String> {
+    // Both halves are root-indexed. Message follow-ups have no new-work
+    // reservation and therefore do not consume execution slots.
+    let mut statement = conn.prepare("SELECT task_id FROM agent_delegation_tasks t
+        WHERE json_extract(record,'$.budget_root_id')=?1
+        AND task_id IN (SELECT id FROM agent_orchestration_admissions WHERE root_id=?1 AND kind='task')
+        AND json_extract(record,'$.status') IN ('queued','running','waiting')
+        AND (json_extract(record,'$.workState')<>'waiting_for_children'
+            OR (EXISTS(SELECT 1 FROM agent_delegation_tasks c WHERE c.parent_thread_id=t.child_thread_id AND json_extract(c.record,'$.wait_until') IS NOT NULL)
+                AND NOT EXISTS(SELECT 1 FROM agent_delegation_tasks c WHERE c.parent_thread_id=t.child_thread_id AND json_extract(c.record,'$.wait_until')>?3)))
+        AND (?2 IS NULL OR child_thread_id IS NULL OR child_thread_id<>?2)
+        UNION ALL SELECT id FROM agent_orchestration_launches l
+        WHERE root_id=?1 AND executing=1 AND (?2 IS NULL OR thread_id<>?2)
+        AND NOT EXISTS(SELECT 1 FROM agent_delegation_tasks c WHERE c.parent_thread_id=l.thread_id AND json_extract(c.record,'$.wait_until')>?3)").map_err(|e|e.to_string())?;
+    let rows = statement.query_map(params![root,yielding,chrono::Utc::now().timestamp_millis()],|r|r.get(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<String>,_>>().map_err(|e|e.to_string())?;
+    Ok(rows)
+}
+fn reserve_work(conn: &Connection, root: &str, depth: usize, id: &str, kind: &str, yielding: Option<&str>) -> Result<(), String> {
+    let active = active_work(conn,root,yielding)?;
+    if depth > 4 || active.len() >= 3 { return Err(format!("resource_limit: depth 4, 3 executing per root; active work IDs: {}",active.join(", "))); }
+    let count:u32 = conn.query_row("SELECT COUNT(*) FROM agent_orchestration_admissions WHERE root_id=?1 AND kind IN ('task','launch')",[root],|r|r.get(0)).map_err(|e|e.to_string())?;
+    if count >= 6 { return Err("resource_limit: 6 new-work admissions per human root".into()); }
+    conn.execute("INSERT INTO agent_orchestration_admissions(id,root_id,kind) VALUES (?1,?2,?3)",params![id,root,kind]).map(drop).map_err(|e|e.to_string())
+}
+pub(super) fn admit_launch(conn: &Connection, sender: &str, target: &str, id: &str) -> Result<(), String> {
+    let context = root_context(conn,sender)?;
+    reserve_work(conn,&context.root_id,context.depth+1,id,"launch",None)?;
+    conn.execute("INSERT INTO agent_orchestration_launches(id,thread_id,root_id) VALUES (?1,?2,?3)",params![id,target,context.root_id]).map_err(|e|e.to_string())?;
+    conn.execute("INSERT INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,?3,0,?4)",params![target,context.root_id,context.depth+1,id]).map(drop).map_err(|e|e.to_string())
 }
 /// A direct-owner follow-up has a fresh result identity in the existing child.
 /// This is part of the message transaction, so retries cannot create tasks twice.
@@ -325,18 +380,6 @@ pub(super) fn admit_followup(
         task.lineage.push(ancestor.task_id);
         task.root_task_id = ancestor.root_task_id;
     }
-    if task.lineage.len() >= 4 {
-        return Err("resource_limit: nested task depth limit reached".into());
-    }
-    let executing:u32=tx.query_row("SELECT COUNT(*) FROM agent_delegation_tasks WHERE json_extract(record,'$.budget_root_id')=?1 AND json_extract(record,'$.status') IN ('queued','running','waiting') AND json_extract(record,'$.workState')<>'waiting_for_children'",[&root],|r|r.get(0)).map_err(|e|e.to_string())?;
-    if executing >= 3 {
-        return Err("resource_limit: executing task budget reached".into());
-    }
-    tx.execute(
-        "UPDATE agent_orchestration_admissions SET kind='followup' WHERE id=?1",
-        [delivery],
-    )
-    .map_err(|e| e.to_string())?;
     tx.execute("INSERT INTO agent_delegation_tasks(task_id,parent_thread_id,child_thread_id,backend,admission_payload,record) VALUES (?1,?2,?3,'local',?4,?5)",params![id,parent,child,payload.to_string(),serde_json::to_string(&task).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
     Ok(())
 }
@@ -372,13 +415,21 @@ impl DatabaseStore {
         Ok(covered >= total)
     }
     pub(crate) fn orchestration_human_root(&self, thread: &str) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e|e.to_string())?;
         let id = uuid::Uuid::new_v4().to_string();
-        self.conn.lock().unwrap().execute("INSERT INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,0,0,?2) ON CONFLICT(thread_id) DO UPDATE SET root_id=excluded.root_id,depth=0,hop=0,causation_id=excluded.causation_id",params![thread,id]).map(drop).map_err(|e|e.to_string())
+        tx.execute("DELETE FROM agent_message_active_causation WHERE thread_id=?1",[thread]).map_err(|e|e.to_string())?;
+        tx.execute("INSERT INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,0,0,?2) ON CONFLICT(thread_id) DO UPDATE SET root_id=excluded.root_id,depth=0,hop=0,causation_id=excluded.causation_id",params![thread,id]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e|e.to_string())
     }
     pub(crate) fn orchestration_context(&self, thread: &str) -> Result<RootContext, String> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("INSERT OR IGNORE INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,0,0,?2)",params![thread,uuid::Uuid::new_v4().to_string()]).map_err(|e|e.to_string())?;
-        conn.query_row("SELECT root_id,depth,hop,causation_id FROM agent_orchestration_context WHERE thread_id=?1",[thread],|r|Ok(RootContext{root_id:r.get(0)?,depth:r.get(1)?,hop:r.get(2)?,causation_id:r.get(3)?})).map_err(|e|e.to_string())
+        root_context(&self.conn.lock().unwrap(),thread)
+    }
+    pub(crate) fn orchestration_launch_finished(&self, thread: &str) -> Result<(), String> {
+        self.conn.lock().unwrap().execute("UPDATE agent_orchestration_launches SET executing=0 WHERE thread_id=?1",[thread]).map(drop).map_err(|e|e.to_string())
+    }
+    pub(crate) fn delegation_waiting_on_children(&self, parent: &str) -> bool {
+        waiting_on_children(&self.conn.lock().unwrap(),parent).unwrap_or(false)
     }
     /// PR1 result memberships used child IDs. Reuse their acceptance evidence
     /// when importing an old open-task row into the canonical task table.
@@ -426,6 +477,7 @@ impl DatabaseStore {
                 .map_err(|e| e.to_string())?;
             }
             write(&conn, &task)?;
+            refresh_waiting(&conn, &task.parent_thread_id)?;
         }
         Ok(())
     }
@@ -562,64 +614,11 @@ impl DatabaseStore {
         let mut task = task.clone();
         task.admission_generation = Some(generation);
         if let Some(root) = &task.budget_root_id {
-            let all: Vec<TaskRecord> = {
-                let mut statement = tx
-                    .prepare("SELECT record FROM agent_delegation_tasks")
-                    .map_err(|e| e.to_string())?;
-                let rows = statement
-                    .query_map([], |r| r.get::<_, String>(0))
-                    .map_err(|e| e.to_string())?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| e.to_string())?;
-                rows.into_iter().map(decode).collect::<Result<_, _>>()?
-            };
-            let active: Vec<_> = all
-                .iter()
-                .filter(|t| {
-                    t.budget_root_id.as_ref() == Some(root)
-                        && !t.status.terminal()
-                        && t.work_state != WorkState::WaitingForChildren
-                        && !(payload["mode"] == "wait"
-                            && t.child_thread_id.as_deref() == Some(&task.parent_thread_id))
-                })
-                .map(|t| t.task_id.clone())
-                .collect();
-            if active.len() >= 3 || task.lineage.len() >= 4 {
-                return Err(format!(
-                    "resource_limit: depth 4, 3 executing per root; active task IDs: {}",
-                    active.join(", ")
-                ));
-            }
-            let admitted: u32 = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM agent_orchestration_admissions WHERE root_id=?1",
-                    [root],
-                    |r| r.get(0),
-                )
-                .map_err(|e| e.to_string())?;
-            if admitted >= 6 {
-                return Err(format!(
-                    "resource_limit: 6 admissions per human root; active task IDs: {}",
-                    active.join(", ")
-                ));
-            }
-            tx.execute(
-                "INSERT INTO agent_orchestration_admissions(id,root_id,kind) VALUES (?1,?2,'task')",
-                params![task.task_id, root],
-            )
-            .map_err(|e| e.to_string())?;
+            let context = root_context(&tx,&task.parent_thread_id)?;
+            let yielding = (payload["mode"] == "wait").then_some(task.parent_thread_id.as_str());
+            reserve_work(&tx,root,context.depth+1,&task.task_id,"task",yielding)?;
             if let Some(child) = &task.child_thread_id {
-                tx.execute("INSERT INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,?3,?3,?4)",params![child,root,task.lineage.len()+1,task.task_id]).map_err(|e|e.to_string())?;
-            }
-            // Waiting ancestors yield execution capacity to their own leaves.
-            if let Some(parent) = all.iter().find(|t| {
-                payload["mode"] == "wait"
-                    && t.child_thread_id.as_deref() == Some(&task.parent_thread_id)
-                    && !t.status.terminal()
-            }) {
-                let mut parent = parent.clone();
-                parent.work_state = WorkState::WaitingForChildren;
-                write(&tx, &parent)?;
+                tx.execute("INSERT INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,?3,0,?4)",params![child,root,context.depth+1,task.task_id]).map_err(|e|e.to_string())?;
             }
         }
         if task.backend == TaskBackend::Local {
@@ -628,6 +627,7 @@ impl DatabaseStore {
             }
         }
         tx.execute("INSERT INTO agent_delegation_tasks (task_id,parent_thread_id,child_thread_id,backend,client_request_id,admission_payload,record) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![task.task_id,task.parent_thread_id,task.child_thread_id,if task.backend==TaskBackend::Local {"local"}else{"ssh"},key,payload.to_string(),serde_json::to_string(&task).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        refresh_waiting(&tx, &task.parent_thread_id)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok((task.clone(), true))
     }
@@ -1280,7 +1280,8 @@ mod native_budget_tests {
         for depth in 0..4 {
             let child = format!("nested-{depth}");
             let id = format!("task-{depth}");
-            let task = record(&db, &parent, &child, &id, lineage.clone());
+            let mut task = record(&db, &parent, &child, &id, lineage.clone());
+            task.wait_until=Some(chrono::Utc::now().timestamp_millis()+20_000);
             db.admit_delegation_task(&task, None, &serde_json::json!({"mode":"wait"}))
                 .unwrap();
             lineage.push(id);
@@ -1369,26 +1370,68 @@ mod native_budget_tests {
             .is_err());
     }
     #[test]
-    fn native_agent_message_retries_are_atomic_and_do_not_mint_budget_roots() {
+    fn native_agent_message_retries_do_not_spend_work_or_replace_recipient_root() {
         let db = DatabaseStore::new_in_memory();
         db.orchestration_human_root("a").unwrap();
-        let root = db.orchestration_context("a").unwrap().root_id;
-        let payload = serde_json::json!({"origin":"controller","caller":{"identity":{"kind":"thread","thread_id":"a"}},"provenance":{"created_by":"agent"}});
-        for i in 0..6 {
+        db.orchestration_human_root("b").unwrap();
+        let root = db.orchestration_context("b").unwrap().root_id;
+        for i in 0..30 {
             let id = format!("send-{i}");
-            db.admit_message_delivery(&id, "b", &id, &payload, "epoch", 0, None, false)
-                .unwrap();
-            assert!(
-                !db.admit_message_delivery(&id, "b", &id, &payload, "epoch", 0, None, false)
-                    .unwrap()
-                    .1
-            );
+            let payload = serde_json::json!({"origin":"controller","input":{"text":id},"caller":{"identity":{"kind":"thread","thread_id":"a"}},"provenance":{"created_by":"agent"}});
+            assert!(db.admit_message_delivery(&id,"b",&id,&payload,"epoch",0,None,false).unwrap().1);
+            assert!(!db.admit_message_delivery(&id,"b",&id,&payload,"epoch",0,None,false).unwrap().1);
+            assert!(db.admit_message_delivery(&format!("duplicate-{i}"),"b",&format!("duplicate-{i}"),&payload,"epoch",0,None,false).unwrap_err().contains("duplicate_causation"));
         }
-        assert_eq!(db.orchestration_context("b").unwrap().root_id, root);
-        assert!(db
-            .admit_message_delivery("extra", "b", "extra", &payload, "epoch", 0, None, false)
-            .unwrap_err()
-            .contains("resource_limit"));
+        assert_eq!(db.orchestration_context("b").unwrap().root_id,root);
+        let conn=db.conn.lock().unwrap();
+        let count:u32=conn.query_row("SELECT COUNT(*) FROM agent_orchestration_admissions",[],|r|r.get(0)).unwrap();
+        assert_eq!(count,0);
+    }
+    #[test]
+    fn native_waiting_ancestors_yield_and_release_their_execution_slots() {
+        let db=DatabaseStore::new_in_memory();
+        let mut parent="root".to_string();
+        for i in 0..4 {
+            let id=format!("wait-{i}");let child=format!("child-{i}");
+            let mut task=record(&db,&parent,&child,&id,vec![]);
+            task.wait_until=Some(chrono::Utc::now().timestamp_millis()+20_000);
+            db.admit_delegation_task(&task,None,&serde_json::json!({"mode":"wait"})).unwrap();
+            parent=child;
+        }
+        assert_eq!(db.delegation_task("wait-0").unwrap().unwrap().work_state,WorkState::WaitingForChildren);
+        db.release_delegation_wait("wait-1").unwrap();
+        assert_eq!(db.delegation_task("wait-0").unwrap().unwrap().work_state,WorkState::Working);
+        let conn=db.conn.lock().unwrap();
+        let plan:String=conn.query_row("EXPLAIN QUERY PLAN SELECT task_id FROM agent_delegation_tasks WHERE json_extract(record,'$.budget_root_id')='root' AND json_extract(record,'$.status')='running'",[],|r|r.get(3)).unwrap();
+        assert!(plan.contains("delegation_task_budget"),"{plan}");
+    }
+    #[test]
+    fn native_batch_launches_reports_and_later_human_rounds_keep_separate_budgets() {
+        let db=DatabaseStore::new_in_memory();
+        db.orchestration_human_root("coordinator").unwrap();
+        let original=db.orchestration_context("coordinator").unwrap().root_id;
+        for i in 0..3 {
+            let child=format!("launch-{i}");
+            db.admit_control_operation_for_thread("thread:coordinator",&child,"thread_launch",&child,"epoch",Some("workspace"),Some(&child),Some("coordinator")).unwrap();
+            db.orchestration_launch_finished(&child).unwrap();
+        }
+        for i in 0..3 {
+            let id=format!("report-{i}");let child=format!("launch-{i}");
+            let payload=serde_json::json!({"origin":"controller","input":{"text":id},"caller":{"identity":{"kind":"thread","thread_id":child}},"provenance":{"created_by":"agent"}});
+            db.admit_message_delivery(&id,"coordinator",&id,&payload,"epoch",0,None,false).unwrap();
+        }
+        for i in 3..6 {
+            let child=format!("launch-{i}");
+            db.admit_control_operation_for_thread("thread:coordinator",&child,"thread_launch",&child,"epoch",Some("workspace"),Some(&child),Some("coordinator")).unwrap();
+            db.orchestration_launch_finished(&child).unwrap();
+        }
+        assert!(db.admit_control_operation_for_thread("thread:coordinator","seventh","thread_launch","seventh","epoch",Some("workspace"),Some("seventh"),Some("coordinator")).err().unwrap().contains("resource_limit"));
+        db.orchestration_human_root("coordinator").unwrap();
+        let new_root=db.orchestration_context("coordinator").unwrap().root_id;
+        let payload=serde_json::json!({"origin":"controller","input":{"text":"Late result from earlier round"},"caller":{"identity":{"kind":"thread","thread_id":"launch-0"}},"provenance":{"created_by":"agent"}});
+        db.admit_message_delivery("late","coordinator","late",&payload,"epoch",0,None,false).unwrap();
+        assert_eq!(db.orchestration_context("coordinator").unwrap().root_id,new_root);
+        assert_ne!(new_root,original);
     }
     #[test]
     fn native_task_start_uses_reserved_budget_and_preserves_child_context() {
@@ -1411,6 +1454,7 @@ mod native_budget_tests {
         let extra = record(&db, "parent", "extra", "extra", vec![]);
         assert!(db.admit_delegation_task(&extra, None, &Value::Null).unwrap_err().contains("resource_limit"));
         let wrong_target = serde_json::json!({"origin":"delegation","caller":{"identity":{"kind":"thread","thread_id":"parent"},"admitted":{"kind":"task","task_id":"task-0"}},"provenance":{"created_by":"agent"}});
-        assert!(db.admit_message_delivery("spoof", "other", "spoof", &wrong_target, "epoch", 0, None, false).unwrap_err().contains("resource_limit"));
+        assert!(db.admit_message_delivery("spoof", "other", "spoof", &wrong_target, "epoch", 0, None, false).unwrap().1);
+        assert!(db.orchestration_context("other").unwrap().root_id != root);
     }
 }

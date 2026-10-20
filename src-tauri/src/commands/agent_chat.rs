@@ -8253,6 +8253,9 @@ fn delivery_transition(event: &ProviderRuntimeEvent) -> bool {
 /// UUID carried by `ResumeCursorUpdated` so the history dropdown can
 /// resume this session after a restart.
 pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeEvent) {
+    if let ProviderRuntimeEvent::TurnCompleted { thread_id, .. } = &event {
+        if let Some(db) = app.try_state::<DatabaseStore>() { let _ = db.orchestration_launch_finished(&thread_id.0); }
+    }
     if let ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, queued_id } = &event {
         if app.state::<DatabaseStore>().is_disposed_delivery_queue(&thread_id.0, queued_id).unwrap_or(false) {
             event = ProviderRuntimeEvent::QueuedTurnDisposed { thread_id: thread_id.clone(), queued_id: queued_id.clone() };

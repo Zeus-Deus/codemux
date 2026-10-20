@@ -793,7 +793,8 @@ impl CodexSession {
                             permission_mode.as_deref(),
                         ) {
                             Some((ap, sb)) => (Some(ap), Some(sb)),
-                            None => (None, None),
+                            None if permission_mode.is_none() => (None, None),
+            None => return Err(ProviderError::ValidationError { message: "Unsupported explicit Codex permission mode".into() }),
                         };
                         let params = ThreadResumeParams {
                             thread_id: rid.clone(),
@@ -934,9 +935,9 @@ impl CodexSession {
             // A resumed thread continues in its last turn's mode until a
             // composer send names one, so restart auto-resume, and answers
             // given right after a rebuild, keep an interrupted Plan task in Plan.
-            plan_mode: AtomicBool::new(resumed_plan.unwrap_or(false)),
+            plan_mode: AtomicBool::new(resumed_plan.unwrap_or(false) || permission_mode.as_deref() == Some("plan")),
             turn_modes: std::sync::Mutex::new(TurnModes {
-                inherited: resumed_plan.unwrap_or(false),
+                inherited: resumed_plan.unwrap_or(false) || permission_mode.as_deref() == Some("plan"),
                 ..Default::default()
             }),
             mode_reported: resumed_plan.is_some(),
@@ -2579,7 +2580,7 @@ impl Drop for CodexSession {
 pub(crate) fn codex_permission_mode_to_policy_pair(mode: Option<&str>) -> Option<(String, String)> {
     match mode? {
         "managed-read-only" => Some(("never".into(), "read-only".into())),
-        "read-only" => Some(("untrusted".into(), "read-only".into())),
+        "read-only" | "plan" => Some(("untrusted".into(), "read-only".into())),
         "workspace-write" => Some(("on-request".into(), "workspace-write".into())),
         "danger-full-access" => Some(("never".into(), "danger-full-access".into())),
         _ => None,
@@ -2631,7 +2632,8 @@ async fn start_fresh_thread(
     let (approval_policy, sandbox) =
         match codex_permission_mode_to_policy_pair(permission_mode.as_deref()) {
             Some((ap, sb)) => (Some(ap), Some(sb)),
-            None => (None, None),
+            None if permission_mode.is_none() => (None, None),
+            None => return Err(ProviderError::ValidationError { message: "Unsupported explicit Codex permission mode".into() }),
         };
     let params = ThreadStartParams {
         model,
@@ -2947,7 +2949,7 @@ async fn dynamic_tool_specs(
             .list_tools_for_workspace(&[crate::mcp::McpConfigSource::CodexUser], host_caller.workspace_id.as_deref())
             .await
     };
-    tools.retain(crate::mcp::registry::native_tool_visible);
+    tools.retain(|tool| crate::mcp::registry::native_tool_visible(tool, host_caller));
     let host_tools=registry.host_tools(host_caller);
     // App-owned task tools also serve local IDs; replace the SSH-only schema
     // rather than publishing duplicate names to the native provider.
@@ -3005,7 +3007,7 @@ async fn handle_dynamic_tool_call_native(
     let dispatched = match (registry, parsed) {
         (Some(registry), Ok(call)) => {
             let name = registry_tool_name(&call.tool);
-            if host.is_some() && actor.is_none() {
+            if host.is_some() && actor.is_none() && crate::agent_control::native::tool_name(&name).is_some() {
                 return json!({"success":false,"contentItems":[{"type":"inputText","text":"stale_caller: injected tools require the app-owned live session and run; provider-native children cannot borrow its identity"}]});
             }
             // Host tools answer synchronously (no provider waits), which
@@ -3845,6 +3847,18 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("app-owned root conversation"));
+    }
+
+    #[tokio::test]
+    async fn unqualified_and_provider_native_children_keep_plugin_tools_and_bridges() {
+        let registry=crate::mcp::registry::test_support::plugin_fixture("all").await;
+        let caller=crate::mcp::registry::HostCaller {control:None,thread_id:"app-root".into(),provider:crate::agent_provider::ProviderKind::Codex,workspace_id:Some("ws-42".into()),permission_mode:Some("danger-full-access".into())};
+        for bridge in [false,true] {
+            let response=handle_dynamic_tool_call(Some(&registry),Some("ws-42"),Some((&caller,"native-root")),json!({"threadId":"provider-native-child","turnId":"turn","callId":"call","tool":if bridge {"codemux_call_plugin_tool"} else {"fixture__new_tool"},"arguments":if bridge {json!({"name":"fixture__new_tool","arguments":{}})} else {json!({})}})).await;
+            assert_eq!(response["success"],true,"{response}");
+            assert!(response.to_string().contains("ORCHID-742"));
+        }
+        registry.shutdown_all().await;
     }
 
     #[tokio::test]
