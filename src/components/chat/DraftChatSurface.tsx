@@ -62,11 +62,7 @@ import {
 } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useHostsStore } from "@/stores/hosts-store";
-import {
-  selectCapabilities,
-  selectModel,
-  useProviderCapabilities,
-} from "@/stores/provider-capabilities-store";
+import { selectModel } from "@/stores/provider-capabilities-store";
 import { selectedAcpCatalog, useCustomAcp } from "@/stores/custom-acp-store";
 import { capabilityDefaults, defaultModelId } from "@/lib/agent-chat/capability-defaults";
 import {
@@ -87,6 +83,7 @@ import type {
 } from "@/tauri/types";
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
+import { useNativeCapabilities } from "./use-native-capabilities";
 import { FullAccessNotice } from "./FullAccessNotice";
 import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
@@ -172,9 +169,7 @@ function DraftChatSurfaceInner({
   focusOnMount: boolean;
   onBackgroundStarted: (draftId: string) => void;
 }) {
-  const nativeCapabilities = useProviderCapabilities((s) =>
-    selectCapabilities(s, draft.provider),
-  );
+  const nativeCapabilities = useNativeCapabilities(draft.provider, draft.threadId).caps;
   const acpCatalog = useCustomAcp(s => selectedAcpCatalog(s, draft.threadId));
   const capabilities = draft.provider === "acp" ? acpCatalog?.capabilities ?? null : nativeCapabilities;
   const activeModel = draft.provider === "acp" ? capabilities?.models.find(m => m.id === draft.model) ?? null : selectModel(capabilities, draft.model);

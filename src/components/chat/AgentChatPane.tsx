@@ -3,6 +3,7 @@ import { resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { parseMessageDelivery, STEERING_UNAVAILABLE } from "@/lib/agent-chat/message-delivery";
 import { AsyncQuestionPanel } from "./AsyncQuestionPanel";
+import { useNativeCapabilities } from "./use-native-capabilities";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
@@ -97,7 +98,6 @@ import { useUIStore } from "@/stores/ui-store";
 import { useShallow } from "zustand/react/shallow";
 import {
   refreshProviderCapabilitiesForIntent,
-  selectCapabilities,
   selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
@@ -688,9 +688,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // Chat-side capabilities for the active provider. `null` until the
   // refresh hook resolves (or when the backend errors — pickers render
   // a disabled "unavailable" state in that case).
-  const nativeCapabilities = useProviderCapabilities((s) =>
-    selectCapabilities(s, provider),
-  );
+  const native = useNativeCapabilities(provider, threadId);
+  const nativeCapabilities = native.caps;
   const acpCatalog = useCustomAcp(s => selectedAcpCatalog(s, threadId));
   const capabilities = provider === "acp" ? acpCatalog?.capabilities ?? null : nativeCapabilities;
 
@@ -3463,7 +3462,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           const message = formatProviderError(err);
           toast.error(`Failed to set service tier: ${message}`);
           if (provider === "codex" && message.includes("service tier is unavailable")) {
-            void useProviderCapabilities.getState().refresh(provider);
+            const capabilities = useProviderCapabilities.getState();
+            void (native.accountId
+              ? capabilities.refreshAccount("codex", native.accountId, true)
+              : capabilities.refresh(provider));
           }
         })
         .finally(() => serviceTierChangesInFlightRef.current.delete(threadId));
@@ -3474,6 +3476,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       activeModel,
       grokConfigurationBusy,
       setStoreServiceTier,
+      native.accountId,
     ],
   );
 

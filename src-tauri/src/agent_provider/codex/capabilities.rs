@@ -83,6 +83,8 @@ pub struct CodexCapabilityCache {
     inner: Mutex<Option<ProviderChatCapabilities>>,
     generation: std::sync::atomic::AtomicU64,
     key: Mutex<Option<String>>,
+    /// Extra accounts' catalogs by account id: each signs in on its own.
+    accounts: Mutex<HashMap<String, ProviderChatCapabilities>>,
 }
 
 impl CodexCapabilityCache {
@@ -91,7 +93,27 @@ impl CodexCapabilityCache {
             inner: Mutex::new(None),
             generation: std::sync::atomic::AtomicU64::new(0),
             key: Mutex::new(None),
+            accounts: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// An extra account's catalog, harvested from its own home (its own
+    /// sign-in) and cached per account. `force` harvests again.
+    pub async fn get_or_harvest_account(
+        &self,
+        binary_path: &std::path::Path,
+        account_id: &str,
+        home: &std::path::Path,
+        force: bool,
+    ) -> Result<ProviderChatCapabilities, HarvestError> {
+        if !force {
+            if let Some(cached) = self.accounts.lock().await.get(account_id) {
+                return Ok(cached.clone());
+            }
+        }
+        let fresh = harvest_codex_capabilities(binary_path, Some(home)).await?;
+        self.accounts.lock().await.insert(account_id.to_string(), fresh.clone());
+        Ok(fresh)
     }
 
     /// Return the cached value if present; otherwise run the live
@@ -536,6 +558,27 @@ mod tests {
             .await
             .expect("cached value returned");
         assert_eq!(result.models.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn extra_accounts_keep_their_own_catalog() {
+        let cache = CodexCapabilityCache::new();
+        *cache.inner.lock().await = Some(build_capabilities(vec![entry("cli", false, vec!["text"])]));
+        let bogus = std::path::Path::new("/no/such/codex");
+        let home = std::path::Path::new("/no/such/home");
+        // The CLI sign-in's catalog is never served for an extra account:
+        // an uncached account harvests from its own home.
+        assert!(cache.get_or_harvest_account(bogus, "work", home, false).await.is_err());
+        cache
+            .accounts
+            .lock()
+            .await
+            .insert("work".into(), build_capabilities(vec![entry("work-model", false, vec!["text"])]));
+        let work = cache.get_or_harvest_account(bogus, "work", home, false).await.unwrap();
+        assert_eq!(work.models[0].id, "work-model");
+        assert!(cache.get_or_harvest_account(bogus, "side", home, false).await.is_err());
+        // A forced refresh asks that account's login again.
+        assert!(cache.get_or_harvest_account(bogus, "work", home, true).await.is_err());
     }
 
     #[tokio::test]

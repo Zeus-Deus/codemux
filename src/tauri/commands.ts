@@ -403,10 +403,13 @@ export const getOrCreateHomeWorkspace = () =>
 export const listChatProviderCapabilities = (
   provider: AgentChatProviderKind,
   force?: boolean,
+  /** An extra account's own catalog (Codex); omitted for the CLI sign-in. */
+  accountId?: string,
 ) =>
   invoke<ProviderChatCapabilities>("list_chat_provider_capabilities", {
     provider,
     force,
+    accountId,
   });
 
 /** Probe the health of a chat provider's local runtime (installed /

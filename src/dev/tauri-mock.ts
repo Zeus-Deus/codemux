@@ -187,6 +187,8 @@ let appState: AppStateSnapshot = createSeedAppState();
 // Synthetic, browser-only histories: never reads native provider files.
 const serviceTierFixture = new URLSearchParams(window.location.search).get("fixture") === "service-tiers";
 const sessionImportFixture = new URLSearchParams(window.location.search).get("fixture") === "session-import";
+// The CLI's own Codex sign-in is signed out; extra accounts sign in on their own.
+const codexCliSignedOutFixture = new URLSearchParams(window.location.search).get("fixture") === "codex-cli-signed-out";
 if (sessionImportFixture) {
   appState = { ...appState, workspaces: [], active_workspace_id: "", archived_workspaces: [], pane_statuses: {} };
 }
@@ -5023,7 +5025,9 @@ const handlers: Record<string, Handler> = {
   hermes_disconnect: () => null,
   hermes_catalog: (a) => ({ state: "ready", message: null, session: { models: { currentModelId: (a.profile as {id:string}).id === "research" ? "service:research-model" : "service:coding-model", availableModels: [{ modelId: "service:coding-model", name: "Example service · Coding model", description: "Synthetic UI fixture", _meta: {provider:"Example service"} }, { modelId: "service:research-model", name: "Example service · Research model", description: "Synthetic UI fixture", _meta: {provider:"Example service"} }] } } }),
   list_chat_provider_capabilities: (a) =>
-    ({ ... (a.provider === "claude"
+    codexCliSignedOutFixture && a.provider === "codex" && !a.accountId
+      ? Promise.reject("codex_not_authenticated: Codex is not signed in. Run `codex login`.")
+      : ({ ... (a.provider === "claude"
       ? CLAUDE_CAPABILITIES
       : a.provider === "codex"
         ? (serviceTierFixture
