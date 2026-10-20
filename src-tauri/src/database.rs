@@ -5197,6 +5197,29 @@ impl DatabaseStore {
         .ok()
     }
 
+    /// Rare cache cleanup must preserve durable image references even when
+    /// their original session has already merged away. Keep large tool rows
+    /// out of Rust unless they carry an ownership field. The text gate avoids
+    /// parsing ordinary base64 tool rows; escaped keys still take the JSON path.
+    pub(crate) fn list_agent_chat_image_payloads(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            r#"SELECT payload FROM agent_chat_messages
+               WHERE CASE
+                 WHEN instr(payload, '"images"') = 0
+                  AND instr(payload, '"retained_images"') = 0
+                  AND instr(payload, '\u') = 0 THEN 0
+                 ELSE json_type(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END, '$.images') IS NOT NULL
+                   OR json_type(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END, '$.item.retained_images') IS NOT NULL
+               END"#
+        ).map_err(|error| format!("Failed to list image references: {error}"))?;
+        let rows = statement
+            .query_map([], |row| row.get(0))
+            .map_err(|error| format!("Failed to read image references: {error}"))?;
+        rows.collect::<Result<Vec<String>, _>>()
+            .map_err(|error| format!("Failed to read image reference: {error}"))
+    }
+
     /// Drop every persisted message for a thread without touching the
     /// session row. Used when the user picks "New Chat" against an
     /// existing thread (we'd rather not pollute history with the
@@ -9578,6 +9601,39 @@ mod tests {
             rows,
             vec![r#"{"i":1}"#.to_string(), r#"{"i":2}"#.to_string()]
         );
+    }
+
+    #[test]
+    fn tool_result_image_reference_payloads_handle_escaped_keys_and_malformed_rows() {
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("images", "ws", None, "claude")
+            .unwrap();
+        let attachment = r#"{"type":"user_message","\u0069mages":[{"path":"/img/a.png"}]}"#;
+        let retained =
+            r#"{"type":"item_completed","item":{"retained_images":[{"path":"/img/b.png"}]}}"#;
+        let duplicate = r#"{"type":"user_message","images":null,"images":[{"path":"/img/c.png"}]}"#;
+        let nonarray = r#"{"images":"text"}"#;
+        for payload in [
+            attachment,
+            retained,
+            duplicate,
+            nonarray,
+            "malformed",
+            r#"{"images":["#,
+            r#"{"item":{"content":[{"type":"image","data":"AAAA"}]}}"#,
+        ] {
+            db.append_agent_chat_message("images", payload).unwrap();
+        }
+        let mut found = db.list_agent_chat_image_payloads().unwrap();
+        found.sort();
+        let mut expected = vec![
+            attachment.to_string(),
+            retained.to_string(),
+            duplicate.to_string(),
+            nonarray.to_string(),
+        ];
+        expected.sort();
+        assert_eq!(found, expected);
     }
 
     #[test]

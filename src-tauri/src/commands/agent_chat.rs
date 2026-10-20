@@ -2296,6 +2296,89 @@ fn delete_chat_images_in(root: &std::path::Path, db: &DatabaseStore, thread_id: 
     delete_referenced_chat_images_in(root, &db.list_agent_chat_messages(thread_id));
 }
 
+/// Reclaim only this feature's deterministic raster cache files. Durable
+/// references (including retained reply images) always win over eviction.
+fn delete_tool_result_image_cache_in(root: &std::path::Path, db: &DatabaseStore, thread_id: &str) {
+    let mut components = std::path::Path::new(thread_id).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(name)) if name == thread_id)
+        || components.next().is_some()
+    {
+        return;
+    }
+    let dir = root.join(thread_id);
+    // Never traverse a symlink in place of a session folder or cache file.
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|metadata| metadata.is_dir()) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut paths = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some((stem, ext)) = name.rsplit_once('.') else {
+            continue;
+        };
+        let Some((row, digest)) = stem
+            .strip_prefix("tool-")
+            .and_then(|stem| stem.split_once('-'))
+        else {
+            continue;
+        };
+        if !matches!(ext, "png" | "jpg" | "gif" | "webp")
+            || !row
+                .parse::<i64>()
+                .is_ok_and(|id| id > 0 && id.to_string() == row)
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            continue;
+        }
+        paths.push(entry.path());
+    }
+    if !paths.is_empty() {
+        let Ok(retained_payloads) = db.list_agent_chat_image_payloads() else {
+            return;
+        };
+        let retained = retained_payloads
+            .iter()
+            .flat_map(|payload| chat_image_paths_in_payload(payload))
+            .filter_map(|path| resolve_within(root, &path).ok())
+            .collect::<std::collections::HashSet<_>>();
+        for path in paths {
+            if resolve_within(root, &path.to_string_lossy())
+                .is_ok_and(|path| !retained.contains(&path))
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    // Other assets or referenced cache files keep their folder intact.
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// Finish a materialization after a concurrent delete/merge. Cache cleanup
+/// preserves durable references even if the original row has since gone.
+fn finish_tool_result_image_cache(
+    db: &DatabaseStore,
+    thread_id: &str,
+    path: &std::path::Path,
+) -> bool {
+    if !matches!(db.has_agent_chat_session(thread_id), Ok(false)) {
+        return true;
+    }
+    if let Some(root) = path.parent().and_then(std::path::Path::parent) {
+        delete_tool_result_image_cache_in(root, db, thread_id);
+    }
+    false
+}
+
 fn delete_referenced_chat_images_in(root: &std::path::Path, payloads: &[String]) {
     let Ok(canon_root) = root.canonicalize() else {
         return;
@@ -6872,6 +6955,7 @@ pub async fn agent_chat_delete_session<R: Runtime>(
                 .map_err(|e| e.to_string())?;
         }
     }
+    let existed = db.has_agent_chat_session(&thread_id)?;
     // Best-effort: drop the chat's images alongside the DB rows. The
     // messages cascade via FK, but the image files live outside SQLite, so
     // nothing else would ever reclaim them. A failure here (missing dir is
@@ -6917,6 +7001,13 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     }));
     let turn_diff_cleanup = super::turn_diff::thread_cleanup(&db, &thread_id);
     db.delete_agent_chat_session(&thread_id)?;
+    if existed {
+        if let Some(root) = chat_images_root() {
+            // A materializer may have completed between the first image
+            // cleanup and the DB delete. Later writes check ownership too.
+            delete_tool_result_image_cache_in(&root, &db, &thread_id);
+        }
+    }
     super::async_questions::publish_attention(&app);
     // The thread is gone; its dispatch lock can never be contended again.
     forget_turn_checkpoint_lock(&thread_id);
@@ -7026,6 +7117,11 @@ fn agent_chat_sessions_merged<R: Runtime>(
 ) {
     super::queued_turns::after_sessions_merged(app, db, chat_images_dir);
     if !cleanup.thread_ids.is_empty() {
+        if let Some(root) = chat_images_root() {
+            for thread_id in &cleanup.thread_ids {
+                delete_tool_result_image_cache_in(&root, db, thread_id);
+            }
+        }
         let survivor = cleanup.survivor.clone();
         let _ = app.emit(
             AGENT_CHAT_SESSIONS_MERGED_EVENT,
@@ -7285,13 +7381,7 @@ pub async fn agent_chat_get_tool_result_image(
         return Ok(ToolResultImageSource { src, local: false });
     };
     match write_thread_chat_image(&thread_id, &stem, &bytes).await {
-        Ok((path, _)) if matches!(db.has_agent_chat_session(&thread_id), Ok(false)) => {
-            // A delete may have removed the session while the cache write was
-            // in flight. Reclaim only this image and its now-empty directory.
-            let _ = tokio::fs::remove_file(&path).await;
-            if let Some(dir) = path.parent() {
-                let _ = tokio::fs::remove_dir(dir).await;
-            }
+        Ok((path, _)) if !finish_tool_result_image_cache(&db, &thread_id, &path) => {
             Ok(ToolResultImageSource { src, local: false })
         }
         Ok((path, _)) => Ok(ToolResultImageSource {
@@ -10351,6 +10441,12 @@ mod tests {
             chat_image_paths_in_payload(user),
             vec!["/img/a.png".to_string(), "/img/b.png".to_string()]
         );
+        assert_eq!(
+            chat_image_paths_in_payload(
+                r#"{"type":"item_completed","item":{"retained_images":[{"source":"/original.png","path":"/img/kept.png"}]}}"#
+            ),
+            vec!["/img/kept.png".to_string()]
+        );
         // Image-less turns, provider rows and unparsable payloads contribute
         // nothing to the revert cleanup set.
         assert!(chat_image_paths_in_payload(r#"{"type":"user_message","text":"hi"}"#).is_empty());
@@ -10616,6 +10712,148 @@ mod tests {
             .get("content")?
             .get(LAZY_TOOL_RESULT_KEY)
             .cloned()
+    }
+
+    #[test]
+    fn tool_result_image_cache_cleanup_covers_both_delete_write_orders() {
+        let root = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("deleted", "ws", None, "claude")
+            .unwrap();
+        let dir = root.path().join("deleted");
+        let path = dir.join(format!("tool-1-{}.png", "a".repeat(64)));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"cache").unwrap();
+        delete_chat_images_in(root.path(), &db, "deleted");
+        assert!(!dir.exists());
+        // The write finishes after folder cleanup but before the DB delete.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"late cache").unwrap();
+        assert!(finish_tool_result_image_cache(&db, "deleted", &path));
+        db.delete_agent_chat_session("deleted").unwrap();
+        delete_tool_result_image_cache_in(root.path(), &db, "deleted");
+        assert!(
+            !dir.exists(),
+            "the post-delete sweep reclaims the late write"
+        );
+        // Or the write finishes after the DB delete and its final sweep.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"later cache").unwrap();
+        assert!(!finish_tool_result_image_cache(&db, "deleted", &path));
+        assert!(
+            !dir.exists(),
+            "post-write ownership check reclaims this order"
+        );
+    }
+
+    #[test]
+    fn tool_result_image_cache_merge_preserves_all_durable_references_and_other_files() {
+        let root = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::new_in_memory();
+        for thread in ["source", "survivor", "other"] {
+            db.upsert_agent_chat_session(thread, "ws", Some("/repo"), "claude")
+                .unwrap();
+        }
+        let row = db
+            .append_agent_chat_message("source", &tool_result_payload(json!("image")))
+            .unwrap()
+            .unwrap();
+        let dir = root.path().join("source");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = |id, ext| dir.join(format!("tool-{id}-{}.{ext}", "b".repeat(64)));
+        let unused = cache(row, "png");
+        let attachment = cache(row + 1, "jpg");
+        let retained_reply = cache(row + 2, "webp");
+        let foreign_attachment = cache(row + 3, "gif");
+        for path in [&unused, &attachment, &retained_reply, &foreign_attachment] {
+            std::fs::write(path, b"cache").unwrap();
+        }
+        for (thread, payload) in [
+            (
+                "source",
+                json!({"type":"user_message", "images":[{"path":attachment}]}),
+            ),
+            (
+                "source",
+                json!({"type":"item_completed", "item":{"kind":"assistant_text", "retained_images":[{"source":unused, "path":retained_reply}]}}),
+            ),
+            (
+                "other",
+                json!({"type":"user_message", "images":[{"path":foreign_attachment}]}),
+            ),
+        ] {
+            db.append_agent_chat_message(thread, &payload.to_string())
+                .unwrap();
+        }
+        let other_names = [
+            "attachment.png".to_string(),
+            format!("tool-0-{}.png", "b".repeat(64)),
+            format!("tool-01-{}.png", "b".repeat(64)),
+            format!("tool-1-{}.svg", "b".repeat(64)),
+            format!("tool-1-{}.png", "B".repeat(64)),
+            "tool-1-short.png".to_string(),
+            ".tool-1-temp.tmp".to_string(),
+        ];
+        for name in &other_names {
+            std::fs::write(dir.join(name), b"preserve").unwrap();
+        }
+        let named_dir = cache(row + 10, "png");
+        std::fs::create_dir(&named_dir).unwrap();
+        db.merge_reopened_agent_chat_session("source", "survivor")
+            .unwrap();
+        delete_tool_result_image_cache_in(root.path(), &db, "source");
+        assert!(!unused.exists());
+        for path in [&attachment, &retained_reply, &foreign_attachment] {
+            assert!(path.exists());
+        }
+        for name in &other_names {
+            assert!(dir.join(name).exists());
+        }
+        assert!(named_dir.is_dir());
+        // A late materializer must also preserve references after its source
+        // session and even its original result row are both gone.
+        db.delete_agent_chat_messages_for_thread("survivor")
+            .unwrap();
+        db.append_agent_chat_message(
+            "survivor",
+            &json!({"type":"item_completed", "item":{"retained_images":[{"path":retained_reply}]}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(&unused, b"late cache").unwrap();
+        assert!(!finish_tool_result_image_cache(&db, "source", &unused));
+        assert!(!unused.exists());
+        assert!(retained_reply.exists());
+        assert!(foreign_attachment.exists());
+        assert!(dir.join("attachment.png").exists());
+        std::fs::write(&unused, b"traversal guard").unwrap();
+        delete_tool_result_image_cache_in(root.path(), &db, "source/../source");
+        assert!(
+            unused.exists(),
+            "a non-plain alias must not sweep the live directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_result_image_cache_cleanup_never_follows_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::new_in_memory();
+        let name = format!("tool-1-{}.png", "c".repeat(64));
+        let target = outside.path().join(&name);
+        std::fs::write(&target, b"preserve").unwrap();
+        let dir = root.path().join("linked");
+        std::os::unix::fs::symlink(outside.path(), &dir).unwrap();
+        delete_tool_result_image_cache_in(root.path(), &db, "linked");
+        assert!(target.exists());
+        let ordinary = root.path().join("ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        let link = ordinary.join(name);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        delete_tool_result_image_cache_in(root.path(), &db, "ordinary");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(target).unwrap(), b"preserve");
     }
 
     #[test]
