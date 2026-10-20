@@ -283,25 +283,31 @@ impl Removed {
     }
 }
 
-/// Whether the native id a session just reported for `thread_id` left with a
-/// removed account (see [`Removed`]): the chat lost its binding to a removal
-/// and hasn't bound again, or that very id was refused. Such an id is never
-/// stored, so it can't outlive the in-memory record of the removal.
-pub fn refuses_reported_native(db: &DatabaseStore, thread_id: &str, native: &str) -> bool {
-    let Some(provider) = db
-        .get_agent_chat_session(thread_id)
-        .and_then(|record| serde_json::from_value::<ProviderKind>(serde_json::json!(record.provider)).ok())
-        .filter(|provider| supports(*provider))
-    else {
-        return false;
-    };
+/// Store the native id a session reported for `thread_id` (at start or by
+/// event), unless it left with a removed account (see [`Removed`]): the chat
+/// lost its binding to a removal and hasn't bound again, or that very id was
+/// refused. Such an id is never stored, so it can't outlive the in-memory
+/// record of the removal. Decided and written under the removal lock, so a
+/// removal lands wholly before (the id is refused) or after (it clears the
+/// id). Returns whether the id was stored.
+pub fn store_reported_native(db: &DatabaseStore, thread_id: &str, native: &str) -> Result<bool, String> {
     let mut removed = removed();
     let removed = removed.get_or_insert_with(Default::default);
-    if removed.orphaned(db, provider, thread_id) {
-        removed.refuse(thread_id, native.to_string());
-        return true;
+    let provider = db
+        .get_agent_chat_session(thread_id)
+        .and_then(|record| serde_json::from_value::<ProviderKind>(serde_json::json!(record.provider)).ok())
+        .filter(|provider| supports(*provider));
+    if let Some(provider) = provider {
+        if removed.orphaned(db, provider, thread_id) {
+            removed.refuse(thread_id, native.to_string());
+            return Ok(false);
+        }
+        if removed.natives.get(thread_id).is_some_and(|ids| ids.contains(native)) {
+            return Ok(false);
+        }
     }
-    removed.natives.get(thread_id).is_some_and(|ids| ids.contains(native))
+    db.set_agent_chat_sdk_session_id(thread_id, native)?;
+    Ok(true)
 }
 
 /// Delete an account with its defaults and bindings, and remember what its
@@ -1018,12 +1024,15 @@ mod tests {
         // Nor does the id outlive this process: it is off the old row, so
         // the reopen merge doesn't copy it onto the reopened chat's. The old
         // session reporting it again late isn't stored either.
-        assert!(refuses_reported_native(&db2, "rp-old", "late-native"));
+        assert!(!store_reported_native(&db2, "rp-old", "late-native").unwrap());
+        assert_eq!(db2.get_agent_chat_session("rp-old").unwrap().sdk_session_id, None);
         db2.upsert_agent_chat_session("rp-new", "ws", Some("/repo"), "claude").unwrap();
-        assert!(!refuses_reported_native(&db2, "rp-new", "fresh-native"), "the reopened chat's own session");
-        assert!(refuses_reported_native(&db2, "rp-new", "late-native"));
+        assert!(!store_reported_native(&db2, "rp-new", "late-native").unwrap());
         db2.merge_reopened_agent_chat_session("rp-old", "rp-new").unwrap();
         assert_eq!(db2.get_agent_chat_session("rp-new").unwrap().sdk_session_id, None);
+        // The reopened chat's own session is stored as usual.
+        assert!(store_reported_native(&db2, "rp-new", "fresh-native").unwrap());
+        assert_eq!(db2.get_agent_chat_session("rp-new").unwrap().sdk_session_id.as_deref(), Some("fresh-native"));
 
         // A chat from before accounts still resumes on the CLI's own sign-in.
         db.upsert_agent_chat_session("ro-legacy", "ws", Some("/repo"), "codex").unwrap();
