@@ -2,11 +2,15 @@ import { useLayoutEffect, useState, type ComponentProps, type RefObject } from "
 
 import { cn } from "@/lib/utils";
 
-export function useScrollEdges(ref: RefObject<HTMLElement | null>, enabled = true) {
+/** Which edges of a scroller have more content past them. Pass a ref whose
+ *  element mounts with the caller, or the element itself (kept in state via
+ *  a callback ref) when it can mount, unmount or be replaced later, e.g.
+ *  inside a popover that renders its content a commit after opening. */
+export function useScrollEdges(target: RefObject<HTMLElement | null> | HTMLElement | null, enabled = true) {
   const [edges, setEdges] = useState({ top: false, bottom: false });
 
   useLayoutEffect(() => {
-    const node = ref.current;
+    const node = target && "current" in target ? target.current : target;
     if (!enabled || !node) return;
 
     const sync = () => {
@@ -42,7 +46,7 @@ export function useScrollEdges(ref: RefObject<HTMLElement | null>, enabled = tru
       node.removeEventListener("scroll", sync);
       window.removeEventListener("resize", sync);
     };
-  }, [ref, enabled]);
+  }, [target, enabled]);
 
   return edges;
 }

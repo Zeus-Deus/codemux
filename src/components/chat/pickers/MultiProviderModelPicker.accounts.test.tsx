@@ -248,3 +248,29 @@ it("a switch made from one view moves every view of the chat", async () => {
   });
   await waitFor(() => expect(result.current.chip.current?.id).toBe("default"));
 });
+
+it("the model list's fades follow its scroll, also after the picker reopens", async () => {
+  // jsdom has no layout: 300px of rows in a 100px list, scrolled to the top.
+  const overflow = (list: HTMLElement) => {
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 300 });
+    Object.defineProperty(list, "clientHeight", { configurable: true, value: 100 });
+    fireEvent.scroll(list);
+  };
+  renderPicker();
+  const trigger = screen.getByTestId("multi-provider-model-picker-trigger");
+  fireEvent.click(trigger);
+  overflow(await screen.findByTestId("multi-provider-model-list"));
+  expect(screen.getByTestId("multi-provider-model-list-bottom-fade")).toHaveAttribute("data-visible", "true");
+  expect(screen.getByTestId("multi-provider-model-list-top-fade")).toHaveAttribute("data-visible", "false");
+
+  // Closing unmounts the list; the reopened one is a new element.
+  fireEvent.click(trigger);
+  await waitFor(() => expect(screen.queryByTestId("multi-provider-model-list")).toBeNull());
+  fireEvent.click(trigger);
+  const list = await screen.findByTestId("multi-provider-model-list");
+  overflow(list);
+  list.scrollTop = 200;
+  fireEvent.scroll(list);
+  expect(screen.getByTestId("multi-provider-model-list-top-fade")).toHaveAttribute("data-visible", "true");
+  expect(screen.getByTestId("multi-provider-model-list-bottom-fade")).toHaveAttribute("data-visible", "false");
+});

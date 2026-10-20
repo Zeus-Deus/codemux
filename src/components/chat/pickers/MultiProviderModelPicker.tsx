@@ -66,7 +66,7 @@ import type { ProviderAccount } from "@/tauri/commands";
 import { useNativeCapabilities } from "../use-native-capabilities";
 import { accountSummary, useThreadAccount, type ThreadAccountView } from "../use-thread-account";
 import { AccountBadge, AccountListHeader } from "./provider-account-parts";
-import { EdgeFades, useScrollEdges } from "./scroll-fades";
+import { ScrollEdgeFade, useScrollEdges } from "@/components/ui/scroll-edge-fade";
 import { useUIStore } from "@/stores/ui-store";
 
 /**
@@ -586,7 +586,10 @@ export function MultiProviderModelPicker({
   const triggerTitle = triggerDetails ? `${triggerLabel} · ${triggerDetails}` : triggerLabel;
   // Held closed while the picker is open so it never sits over the popup.
   const [tooltipOpen, setTooltipOpen] = useState(false);
-  const [listRef, listEdges] = useScrollEdges<HTMLDivElement>();
+  // The list mounts a commit after the popover opens, unmounts on close, and
+  // gives way to the Hermes and custom-agent panes: follow the element.
+  const [listNode, setListNode] = useState<HTMLDivElement | null>(null);
+  const listEdges = useScrollEdges(listNode);
   const showReveal = !iconOnly && !leafLabel && triggerReveal !== "";
   // The reveal's natural width. The pill grows left by exactly this and
   // pulls its left margin in by the same amount, so its layout footprint
@@ -778,7 +781,7 @@ export function MultiProviderModelPicker({
                     a fully-configured machine — without a scrollbar
                     half the list is unreachable). */}
                 <CommandList
-                  ref={listRef}
+                  ref={setListNode}
                   data-testid="multi-provider-model-list"
                   className="max-h-none flex-1 overflow-y-auto thin-scrollbar [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-muted-foreground/30 hover:[&::-webkit-scrollbar-thumb]:bg-muted-foreground/50"
                 >
@@ -845,7 +848,8 @@ export function MultiProviderModelPicker({
                   )}
                 </CommandList>
                 {/* Short of the scrollbar, so it stays crisp. */}
-                <EdgeFades edges={listEdges} className="right-2 from-popover" testId="multi-provider-model-list" />
+                <ScrollEdgeFade edge="top" visible={listEdges.top} style={{ right: "0.5rem" }} data-testid="multi-provider-model-list-top-fade" />
+                <ScrollEdgeFade edge="bottom" visible={listEdges.bottom} style={{ right: "0.5rem" }} data-testid="multi-provider-model-list-bottom-fade" />
               </div>
             </Command>}
             {/* A switch to another provider says so under the list it
@@ -870,6 +874,9 @@ export function MultiProviderModelPicker({
     </Popover>
   );
 }
+
+/** The rail's `bg-muted/30` over the popover, so its fades melt into it. */
+const RAIL_SURFACE = "color-mix(in oklab, var(--muted) 30%, var(--popover))";
 
 function ProviderRail({
   providers,
@@ -900,7 +907,8 @@ function ProviderRail({
   getError: (kind: AgentChatProviderKind) => string | null;
   onSelect: (next: RailKey) => void;
 }) {
-  const [railRef, railEdges] = useScrollEdges<HTMLDivElement>();
+  const railRef = useRef<HTMLDivElement | null>(null);
+  const railEdges = useScrollEdges(railRef);
   return (
     <TooltipProvider delayDuration={200}>
       <div className="flex min-h-0 flex-col border-r bg-muted/30">
@@ -1073,12 +1081,8 @@ function ProviderRail({
               );
             })}
           </div>
-          {/* The rail's tint over the popover, so the fade melts into it. */}
-          <EdgeFades
-            edges={railEdges}
-            className="from-[color-mix(in_oklab,var(--muted)_30%,var(--popover))]"
-            testId="multi-provider-rail"
-          />
+          <ScrollEdgeFade edge="top" visible={railEdges.top} surface={RAIL_SURFACE} data-testid="multi-provider-rail-top-fade" />
+          <ScrollEdgeFade edge="bottom" visible={railEdges.bottom} surface={RAIL_SURFACE} data-testid="multi-provider-rail-bottom-fade" />
         </div>
         {onManageAccounts && (
           <div className="shrink-0 border-t border-border/60 p-1">

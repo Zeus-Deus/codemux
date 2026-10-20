@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { CheckIcon, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -6,7 +6,7 @@ import { Eyebrow } from "@/components/ui/eyebrow";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { useHermes, hermesProfileKey, hermesModelUnavailable, pickHermesProfile, type HermesProfile } from "@/stores/hermes-store";
-import { EdgeFades, useScrollEdges } from "./scroll-fades";
+import { ScrollEdgeFade, useScrollEdges } from "@/components/ui/scroll-edge-fade";
 
 /** One selectable model row, on the same row recipe as the provider picker's model list. */
 function HermesModelRow({ title, subtitle, selected, disabled, tooltip, onClick }: {
@@ -67,7 +67,8 @@ export function HermesProfileModels({ threadId, projectPath, model, onSelect, on
   const modes = slot?.value?.session.modes;
   // `model` is null unless Hermes is the active provider, so no row checks then.
   const usingDefault = model === "profile_default";
-  const [listRef, listEdges] = useScrollEdges<HTMLDivElement>();
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const listEdges = useScrollEdges(listRef);
   return <div className="flex min-h-0 flex-1 flex-col p-3 text-label" data-testid="hermes-profile-models">
     <div className="mb-3 flex items-center justify-between"><strong className="text-body">Hermes</strong><span className="text-muted-foreground">Experimental</span></div>
     <label className="mb-1 text-muted-foreground" htmlFor="hermes-profile">Profile {fixed ? "· fixed for this chat" : ""}</label>
@@ -118,6 +119,9 @@ export function HermesProfileModels({ threadId, projectPath, model, onSelect, on
       </section>)}
       {models?.availableModels.length === 0 && <p className="p-2 text-muted-foreground">No models advertised. Configure this profile in Hermes and refresh.</p>}
       {model && model !== "profile_default" && models && !models.availableModels.some(m => m.modelId === model) && <p role="status" className="p-2 text-muted-foreground">Selected model unavailable: {model}</p>}
-    </div><EdgeFades edges={listEdges} className="from-popover" testId="hermes-profile-models-list" /></div>
+    </div>
+      <ScrollEdgeFade edge="top" visible={listEdges.top} />
+      <ScrollEdgeFade edge="bottom" visible={listEdges.bottom} />
+    </div>
   </div>;
 }
