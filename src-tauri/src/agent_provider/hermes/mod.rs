@@ -737,7 +737,7 @@ impl Inner {
                     return Err(invalid("Hermes turn cancelled before dispatch"));
                 }
                 if let Some(checkpoint) = job.input.turn_checkpoint.as_ref() {
-                    if let Err(error) = checkpoint.authorize_dispatch() {
+                    if let Err(error) = checkpoint.verify_dispatch() {
                         checkpoint.abort().await;
                         rejected = true;
                         return Err(error);

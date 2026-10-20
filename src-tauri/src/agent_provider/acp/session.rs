@@ -1114,7 +1114,7 @@ impl AcpSession {
         }
 
         if let Some(checkpoint) = &input.turn_checkpoint {
-            if let Err(error) = checkpoint.authorize_dispatch() { Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await; return Err(PrepareTurnError::Rejected(error)); }
+            if let Err(error) = checkpoint.verify_dispatch() { Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await; return Err(PrepareTurnError::Rejected(error)); }
         }
         let turn_id = TurnId(self.opaque_id("turn"));
         {
