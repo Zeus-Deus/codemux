@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { appLogDir, join } from "@tauri-apps/api/path";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -6,6 +6,7 @@ import { Check, Copy, ExternalLink } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import { Spinner } from "@/components/ui/spinner";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -205,6 +206,14 @@ function UpdatesRow({ canAutoUpdate }: { canAutoUpdate: boolean }) {
 function DiagnosticsRow() {
   const [copying, setCopying] = useState(false);
   const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
 
   const copy = async () => {
     if (copying) return;
@@ -216,7 +225,11 @@ function DiagnosticsRow() {
         return;
       }
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 1_400);
+      if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
+      copiedTimer.current = window.setTimeout(() => {
+        setCopied(false);
+        copiedTimer.current = null;
+      }, 1_400);
       toast.success("Performance diagnostics copied");
     } catch (error) {
       toast.failure("Couldn't collect performance diagnostics", error);
@@ -230,9 +243,17 @@ function DiagnosticsRow() {
       label="Performance diagnostics"
       description="Copy bounded startup, workspace-switch, renderer, payload-size and native timing summaries. Paths, titles, messages and IDs are excluded."
     >
+      {/* Only the glyph reports progress, so the button never changes width;
+          the toast announces the result. */}
       <Button variant="outline" size="sm" disabled={copying} onClick={() => void copy()}>
-        {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-        {copied ? "Copied" : copying ? "Collecting…" : "Copy diagnostics"}
+        {copying ? (
+          <Spinner className="size-3.5" aria-hidden />
+        ) : copied ? (
+          <Check className="size-3.5 text-status-open" aria-hidden />
+        ) : (
+          <Copy className="size-3.5" aria-hidden />
+        )}
+        Copy diagnostics
       </Button>
     </SettingRow>
   );

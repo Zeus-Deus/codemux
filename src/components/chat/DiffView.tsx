@@ -1,6 +1,14 @@
 import { Check, Copy, FileText } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
+import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
+import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { parseDiff } from "@/lib/diff-parser";
 import { resolveChatFileLink } from "@/lib/agent-chat/file-links";
@@ -147,23 +155,52 @@ export function DiffView({
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
+
+  async function copyDiff() {
+    if (copied) return;
+    if (!(await copyToClipboard(text))) {
+      toast.error(COPY_FAILED_MESSAGE);
+      return;
+    }
+    setCopied(true);
+    if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
+    copiedTimer.current = window.setTimeout(() => {
+      setCopied(false);
+      copiedTimer.current = null;
+    }, 1500);
+  }
+
+  const copyLabel = copied ? "Copied" : "Copy diff";
   return (
-    <button
-      type="button"
-      aria-label="Copy"
-      onClick={() => {
-        void navigator.clipboard?.writeText(text);
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 1500);
-      }}
-      className="flex text-muted-foreground/70 hover:text-foreground"
-    >
-      {copied ? (
-        <Check className="size-3.5 text-status-open" aria-hidden />
-      ) : (
-        <Copy className="size-3.5" aria-hidden />
-      )}
-    </button>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          aria-label={copyLabel}
+          onClick={() => void copyDiff()}
+          // A 24px target in a header sized for 14px glyphs: the negative
+          // margin keeps the header height unchanged.
+          className="-my-1 text-muted-foreground/70 hover:text-foreground"
+        >
+          {copied ? (
+            <Check className="size-3.5 text-status-open" aria-hidden />
+          ) : (
+            <Copy className="size-3.5" aria-hidden />
+          )}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="top">{copyLabel}</TooltipContent>
+    </Tooltip>
   );
 }
 

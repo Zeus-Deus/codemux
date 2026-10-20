@@ -655,6 +655,17 @@ describe("TitleBar GUI chrome — drag regions", () => {
     );
   });
 
+  // The tab island used to stop at 58% of the band, so tabs scrolled while
+  // the drag gap beside them sat empty. The gap's floor is the cap now.
+  it("lets the tabs fill the band down to the drag gap's floor", () => {
+    state.enableAgentChat = true;
+    const { getByTestId } = renderBar();
+    expect(getByTestId("titlebar-workspace-island").className).not.toMatch(
+      /max-w-/,
+    );
+    expect(getByTestId("titlebar-drag-gap")).toHaveClass("min-w-16", "flex-1");
+  });
+
   it("drops every pointer-eating drag surface on the web client", () => {
     // Regression: `data-tauri-drag-region` does nothing in a browser, but the
     // full-width `inset-0` layer still swallowed pointer + wheel events for

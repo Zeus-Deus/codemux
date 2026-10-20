@@ -7,6 +7,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 
 import type {
@@ -683,6 +684,20 @@ describe("TitleBarTabs overflow", () => {
     } finally {
       globalThis.ResizeObserver = Original;
     }
+  });
+
+  it("turns the tab's leading icon into its close button", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    const pill = screen.getByText("term-b").closest("[data-tab-id]") as HTMLElement;
+    const close = within(pill).getByRole("button", { name: "Close tab" });
+    // Drawn leading, but the label stays the pill's first button.
+    expect(pill.querySelector("button")).toHaveAttribute("title", "term-b");
+    expect(close).toHaveClass("order-first");
+    // Icon and × share one footprint: hover or keyboard focus swaps them,
+    // and touch (no hover) always shows the ×.
+    const [icon, x] = Array.from(close.children);
+    expect(icon).toHaveClass("group-hover/tab:hidden", "group-focus-visible/close:hidden", "pointer-coarse:hidden");
+    expect(x).toHaveClass("hidden", "group-hover/tab:block", "group-focus-visible/close:block", "pointer-coarse:block");
   });
 
   it("keeps a revealed tab clear of the edge fade", () => {

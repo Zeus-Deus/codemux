@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { useUIStore } from "@/stores/ui-store";
 import type { AgentChatTurnDiff } from "@/tauri/types";
 
@@ -66,6 +67,7 @@ function open(workspaceId: string | null = "ws-1") {
       turnId="turn-1"
       workspaceId={workspaceId}
     />,
+    { wrapper: TooltipProvider },
   );
 }
 
@@ -195,6 +197,7 @@ describe("TurnDiffDialog", () => {
     const ref = { current: opener };
     const { rerender } = render(
       <TurnDiffDialog open onOpenChange={() => {}} threadId="t1" turnId="turn-1" returnFocusRef={ref} />,
+      { wrapper: TooltipProvider },
     );
     await screen.findByText(/weren't captured/);
     rerender(
