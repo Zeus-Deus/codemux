@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -378,5 +378,33 @@ describe("footerMinGapFor", () => {
     // Desktop reserves 50px for the context ring; a phone only has padding.
     expect(footerMinGapFor(358, 50)).toBe(54);
     expect(footerMinGapFor(358, 8)).toBe(12);
+  });
+});
+
+describe("Composer /permissions", () => {
+  it("opens the access picker from the + menu once the row has moved it there", async () => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.dataset.testid === "composer-wrapper") return new DOMRect(0, 0, 300, 100);
+      return new DOMRect(0, 0, 0, 0);
+    });
+    const result = renderComposer({
+      draft: "/permissions",
+      permissionModes: [
+        { value: "default", label: "Ask", description: "", is_default: true },
+        { value: "bypassPermissions", label: "Full access", description: "", is_default: false },
+      ],
+    });
+    // The row gave up its last step: access lives in the + menu.
+    const row = within(result.getByTestId("composer-controls-row"));
+    expect(row.queryByRole("button", { name: /Ask/ })).toBeNull();
+    const textarea = result.textarea();
+    fireEvent.focus(textarea);
+    await act(async () => {});
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    });
+    const menu = within(result.getByTestId("composer-command-menu"));
+    expect(menu.getByRole("button", { name: /Ask/ })).toHaveAttribute("data-state", "open");
   });
 });

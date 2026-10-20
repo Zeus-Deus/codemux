@@ -87,6 +87,13 @@ function chatThreads(node: PaneNodeSnapshot, out: string[]): string[] {
   return out;
 }
 
+/** Every chat in the workspace, across its surfaces and splits. */
+export function workspaceChatThreadIds(workspace: WorkspaceSnapshot): string[] {
+  const out: string[] = [];
+  for (const surface of workspace.surfaces) chatThreads(surface.root, out);
+  return out;
+}
+
 /**
  * The chat a workspace-level watch control acts for: the focused chat,
  * else the first chat on the active surface, else the first chat anywhere

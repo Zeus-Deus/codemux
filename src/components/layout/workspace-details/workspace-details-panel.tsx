@@ -475,7 +475,10 @@ function Section({
   return (
     <section
       data-testid={testId}
-      className={cn("flex flex-col gap-px p-1.5", separated && "border-t border-border/65")}
+      className={cn(
+        "flex flex-col gap-px p-1.5 empty:hidden",
+        separated && "border-t border-border/65",
+      )}
     >
       {title && (
         <h3 className="flex h-7 items-center px-2.5 text-label font-medium text-muted-foreground">
@@ -639,7 +642,7 @@ function VersionControlSection({
 
   if (!branch) {
     const showNoGit = showNoGitState(workspace, homeDir);
-    if (!showNoGit && !workspace.linked_issue) return null;
+    // Every row here may render nothing; `Section` then hides itself.
     return (
       <Section testId="workspace-details-git">
         {showNoGit && (
@@ -656,6 +659,8 @@ function VersionControlSection({
             </span>
           </button>
         )}
+        {/* A watch outlives its branch; keep its Stop reachable. */}
+        <PrWatchRow workspace={workspace} />
         <IssueRow workspace={workspace} />
       </Section>
     );

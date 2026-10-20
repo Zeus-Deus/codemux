@@ -825,6 +825,9 @@ export function Composer({
   // (state-only activation, same handling as mode picks).
   const [modelPickerOpenSignal, setModelPickerOpenSignal] = useState(0);
   const [permissionPickerOpenSignal, setPermissionPickerOpenSignal] = useState(0);
+  // Whether the footer ladder has moved effort + access into the `+` menu.
+  // Read by `/permissions`, which is defined before the ladder resolves.
+  const configInMenuRef = useRef(false);
   const [hooksOpen, setHooksOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const modelCommand = useMemo(
@@ -1027,7 +1030,18 @@ export function Composer({
         id: "composer:permissions", label: "Permissions", command: "/permissions", icon: Settings,
         description: "Choose this provider's access mode", group: "CHAT",
         disabled: !configurationEnabled || mode !== "default" || !permissionModes?.length,
-        onSelect: () => setPermissionPickerOpenSignal((signal) => signal + 1),
+        onSelect: () => {
+          // A narrow composer keeps the access picker in the `+` menu's
+          // header: open the menu, then the picker once it has mounted.
+          if (configInMenuRef.current) {
+            setAttachOpen(true);
+            setAttachSubmode("main");
+            setAttachQuery("");
+            requestAnimationFrame(() => setPermissionPickerOpenSignal((signal) => signal + 1));
+            return;
+          }
+          setPermissionPickerOpenSignal((signal) => signal + 1);
+        },
       },
       {
         id: "composer:refresh", label: "Refresh commands and skills", command: "/refresh", icon: RotateCw,
@@ -2852,6 +2866,7 @@ export function Composer({
     return () => observer.disconnect();
   }, [fitFooter]);
   const footerLadder = composerFooterLadder(footerFit.level);
+  configInMenuRef.current = footerLadder.configInMenu;
 
   const [focusWithin, setFocusWithin] = useState(false);
   const markPluginComposerFocused = pluginComposer.markFocused;
@@ -3371,6 +3386,7 @@ export function Composer({
                       disabled={!configurationEnabled}
                     />
                     <PermissionModePicker
+                      openSignal={permissionPickerOpenSignal}
                       modes={permissionModes}
                       value={permissionMode}
                       onChange={onPermissionModeChange}
