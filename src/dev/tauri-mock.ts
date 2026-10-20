@@ -6958,6 +6958,7 @@ const handlers: Record<string, Handler> = {
   // mutators patch it and re-emit `web-remote-state-changed`, so the panel
   // (and any second desktop UI) live-updates just like the real backend.
   web_remote_status: () => buildWebRemoteStatus(),
+  web_remote_e2e_local_mode: () => false,
   web_remote_enable: () => {
     webRemoteEnabled = true;
     // Like the backend: a failed LAN bind with relay mode off rolls the

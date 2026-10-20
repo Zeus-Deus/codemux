@@ -20,3 +20,6 @@ export const disconnectChatGpt = () => invoke<ChatGptStatus>("disconnect_chatgpt
 export const acknowledgeChatGptWelcome = () => invoke<ChatGptStatus>("acknowledge_chatgpt_welcome");
 export const getLocalWorkbench = () => invoke<boolean>("get_local_workbench");
 export const setLocalWorkbench = (enabled: boolean) => invoke<void>("set_local_workbench", { enabled });
+/** Paired browsers only: true when a debug-build host runs the live test
+ *  harness (`CODEMUX_E2E_LOCAL_REMOTE=1`). Always false on release hosts. */
+export const getE2eLocalRemote = () => invoke<boolean>("web_remote_e2e_local_mode");

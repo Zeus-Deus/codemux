@@ -23,6 +23,8 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "set_preset_pinned"
             | "refresh_workspace_issue"
             | "agent_chat_provider_health"
+            // Read-only harness flag; always false in release builds.
+            | "web_remote_e2e_local_mode"
             // Settings → Updates from a paired browser or phone. Each command
             // only picks a provider or a configured device; the executable
             // and installer are resolved on the machine that owns the CLI.
@@ -329,6 +331,10 @@ mod tests {
         ] {
             assert!(!allowed(cmd), "{cmd} exposes local-only ChatGPT account/preferences authority");
         }
+    }
+    #[test]
+    fn paired_clients_can_read_the_e2e_local_mode_flag() {
+        assert!(allowed("web_remote_e2e_local_mode"));
     }
     #[test]
     fn web_remote_reads_environment_identity_but_never_dials_out() {

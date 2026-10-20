@@ -46,6 +46,7 @@ export const AssistantMessage = memo(function AssistantMessage({
 }) {
   return (
     <div
+      data-testid="assistant-message"
       className={cn(
         MESSAGE_GROUP_CLASS,
         "conversation-text leading-relaxed text-foreground break-words",

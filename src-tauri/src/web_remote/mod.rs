@@ -1401,7 +1401,31 @@ fn write_pairing_file(path: &str, url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Whether a paired browser may enter local mode without a Codemux account.
+///
+/// Harness-only: the live orchestration harness
+/// (`scripts/e2e/orchestration-live`) drives an isolated `codemux serve`
+/// whose desktop side runs in local mode, and a paired browser otherwise
+/// stops at the sign-in screen. Compiled to `false` in release builds, and
+/// dormant in debug builds unless `CODEMUX_E2E_LOCAL_REMOTE=1` is set.
+pub fn e2e_local_remote_enabled() -> bool {
+    e2e_local_remote_gate(
+        cfg!(debug_assertions),
+        std::env::var("CODEMUX_E2E_LOCAL_REMOTE").ok().as_deref(),
+    )
+}
+
+fn e2e_local_remote_gate(debug_build: bool, env: Option<&str>) -> bool {
+    debug_build && env == Some("1")
+}
+
 // ── Tauri commands ──────────────────────────────────────────────────
+
+/// Read by a paired browser at boot; see [`e2e_local_remote_enabled`].
+#[tauri::command]
+pub fn web_remote_e2e_local_mode() -> bool {
+    e2e_local_remote_enabled()
+}
 
 #[tauri::command]
 pub fn web_remote_status<R: Runtime>(app: AppHandle<R>) -> WebRemoteStatus {
@@ -1795,6 +1819,16 @@ pub fn web_remote_request_update<R: Runtime>(app: AppHandle<R>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn e2e_local_remote_gate_requires_a_debug_build_and_the_env_flag() {
+        assert!(e2e_local_remote_gate(true, Some("1")));
+        // Release builds can never enable it, whatever the environment says.
+        assert!(!e2e_local_remote_gate(false, Some("1")));
+        assert!(!e2e_local_remote_gate(true, None));
+        assert!(!e2e_local_remote_gate(true, Some("0")));
+        assert!(!e2e_local_remote_gate(true, Some("true")));
+    }
 
     #[test]
     fn config_default_is_off_on_4377() {

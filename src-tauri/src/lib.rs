@@ -3150,6 +3150,7 @@ fn build_core_app<R: tauri::Runtime>(
             session_adapters::get_scanner_captures,
             // Web remote access.
             web_remote::web_remote_status,
+            web_remote::web_remote_e2e_local_mode,
             web_remote::web_remote_enable,
             web_remote::web_remote_disable,
             web_remote::web_remote_set_config,
