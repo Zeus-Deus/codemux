@@ -246,6 +246,21 @@ impl Removed {
         (!stale).then_some(native)
     }
 
+    /// A history reopen continues `from` as `to`, and merges `from`'s row
+    /// into `to`'s, native id included: `to` refuses whatever `from` would,
+    /// whether or not the start still offers a cursor (Claude's preflight
+    /// may have dropped it).
+    fn inherit(&mut self, db: &DatabaseStore, provider: ProviderKind, from: &str, to: &str) {
+        let mut refused: Vec<String> = self.natives.get(from).into_iter().flatten().cloned().collect();
+        if self.orphaned(db, provider, from) {
+            refused.extend(db.get_agent_chat_session(from).and_then(|record| record.sdk_session_id));
+        }
+        for native in refused {
+            self.refuse(from, native.clone());
+            self.refuse(to, native);
+        }
+    }
+
     /// Whether a start's `cursor` resumes a session that left with a removed
     /// account.
     fn refuses_cursor(&mut self, db: &DatabaseStore, provider: ProviderKind, thread_id: &str, cursor: &serde_json::Value) -> bool {
@@ -397,6 +412,9 @@ fn prepare_start_with(
         .and_then(serde_json::Value::as_str)
         .filter(|from| *from != thread_id)
         .map(str::to_string);
+    if let Some(from) = from.as_deref() {
+        removed.inherit(db, provider, from, &thread_id);
+    }
     let refused = input.resume_cursor.as_ref().is_some_and(|cursor| {
         let refused_here = removed.refuses_cursor(db, provider, &thread_id, cursor);
         let refused_from = from
@@ -951,6 +969,23 @@ mod tests {
         // The reopen merges the old row in, its native id included: a later
         // rebuild of the reopened chat doesn't resume that session either.
         let rebuild = rebuild_env(app.handle(), ProviderKind::Codex, "ro-new", Some("ws"), Some("native-1"), None, false);
+        assert_eq!(rebuild.native, None);
+
+        // Claude's start preflight may already have dropped the cursor (the
+        // session file isn't in the CLI home): the reopened chat still won't
+        // resume the removed session the merge copies onto it.
+        let app2 = app_with(db_with(&[("rp-work", "claude"), ("rp-personal", "claude")]));
+        let db2 = app2.state::<DatabaseStore>();
+        db2.set_provider_account_default("", "claude", Some("rp-personal")).unwrap();
+        db2.upsert_agent_chat_session("rp-old", "ws", Some("/repo"), "claude").unwrap();
+        db2.set_provider_account_binding("rp-old", "claude", "rp-work").unwrap();
+        delete_account(&db2, "rp-work").unwrap();
+        // A first turn's id reported after the removal.
+        db2.set_agent_chat_sdk_session_id("rp-old", "late-native").unwrap();
+        let mut preflighted = input("rp-new", false, serde_json::json!({ FROM_THREAD_EXTRA_KEY: "rp-old" }));
+        prepare_start(app2.handle(), ProviderKind::Claude, &mut preflighted, false);
+        assert_eq!(db2.provider_account_binding("rp-new", "claude").unwrap().as_deref(), Some("rp-personal"));
+        let rebuild = rebuild_env(app2.handle(), ProviderKind::Claude, "rp-new", Some("ws"), Some("late-native"), None, false);
         assert_eq!(rebuild.native, None);
 
         // A chat from before accounts still resumes on the CLI's own sign-in.
