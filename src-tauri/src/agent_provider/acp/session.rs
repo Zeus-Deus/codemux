@@ -1599,44 +1599,35 @@ impl AcpSession {
             status,
             usage: turn_usage,
         });
-        let (next, status) = {
+        let next = {
             let mut state = self.state.lock().await;
-            if self.is_dead() {
-                // An unanswered cancelled prompt owns this dead transport.
-                // Keep later saved inputs unattempted for manual recovery.
-                state.release_turn();
-                state.status = SessionStatus::Error {message:format!("{} ACP prompt transport failed",self.dialect.label())};
-                (None, state.status.clone())
-            } else {
-                state.status = SessionStatus::Ready;
-                // A Stop can also land in the gap between the two locked
-                // sections above, where `active_turn` still names the turn
-                // that just finished. Dropping it here — and claiming a fresh
-                // generation for any queued turn — is what stops it becoming
-                // an instant cancellation of somebody else's turn.
-                state.interrupt_generation = None;
-                let next = match state.next_queued() {
-                    Some(queued) => {
-                        // Reserve the dispatch slot before releasing the lock.
-                        // Without this marker a concurrent send could observe
-                        // an idle session between popping the queued turn and
-                        // preparing it, starting a second prompt worker for
-                        // the same ACP session.
-                        Some(self.claim_queued_turn(&mut state, queued))
-                    }
-                    None => {
-                        state.release_turn();
-                        None
-                    }
-                };
-                (next, SessionStatus::Ready)
+            state.status = SessionStatus::Ready;
+            // A Stop can also land in the gap between the two locked
+            // sections above, where `active_turn` still names the turn
+            // that just finished. Dropping it here — and claiming a fresh
+            // generation for any queued turn — is what stops it becoming
+            // an instant cancellation of somebody else's turn.
+            state.interrupt_generation = None;
+            match state.next_queued() {
+                Some(queued) => {
+                    // Reserve the dispatch slot before releasing the lock.
+                    // Without this marker a concurrent send could observe
+                    // an idle session between popping the queued turn and
+                    // preparing it, starting a second prompt worker for
+                    // the same ACP session.
+                    Some(self.claim_queued_turn(&mut state, queued))
+                }
+                None => {
+                    state.release_turn();
+                    None
+                }
             }
         };
         let _ = self
             .event_tx
             .send(ProviderRuntimeEvent::SessionStateChanged {
                 thread_id: self.thread_id.clone(),
-                status,
+                status: SessionStatus::Ready,
             });
         next
     }
