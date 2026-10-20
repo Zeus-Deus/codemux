@@ -160,6 +160,16 @@ fn record_applied(thread_id: &str, provider: ProviderKind, account_id: &str) {
     }
 }
 
+/// A start that runs on no local account replaces whatever the thread ran
+/// on before (another provider, or this one on another device).
+fn forget_applied(thread_id: &str) {
+    if let Ok(mut map) = APPLIED.lock() {
+        if let Some(map) = map.as_mut() {
+            map.remove(thread_id);
+        }
+    }
+}
+
 /// Threads whose session was started on `account_id`.
 pub fn threads_on_account(account_id: &str) -> Vec<(ProviderKind, String)> {
     APPLIED
@@ -176,31 +186,92 @@ pub fn threads_on_account(account_id: &str) -> Vec<(ProviderKind, String)> {
         .unwrap_or_default()
 }
 
-/// Chats whose native id left with a removed account. An open pane may
-/// still hold the old cursor and offer it on its next restart; it names a
-/// transcript that is gone or an older copy, so that start goes fresh.
-static STALE_CURSORS: std::sync::Mutex<Option<HashMap<String, HashSet<String>>>> = std::sync::Mutex::new(None);
+/// Whether `thread_id`'s session still runs on `provider` signed in as
+/// `account_id`, for removal to stop. A chat that moved to another provider
+/// since owns its thread's continuation work now, which a stop would cancel.
+/// Removal checks while holding the chat still (`provider_switch::hold_still`).
+pub fn still_on_account(db: &DatabaseStore, provider: ProviderKind, thread_id: &str, account_id: &str) -> bool {
+    let applied = APPLIED.lock().ok().and_then(|m| m.as_ref().and_then(|m| m.get(thread_id).cloned()));
+    applied.is_some_and(|(p, id)| p == provider && id == account_id)
+        && db
+            .get_agent_chat_session(thread_id)
+            .is_none_or(|record| record.provider == provider_slug(provider))
+}
 
-/// Remember the native sessions a removal cleared, by thread, so a pane
-/// still holding one of them starts fresh instead of resuming it.
-pub fn forget_cursors(cleared: Vec<(String, String)>) {
-    if let Ok(mut map) = STALE_CURSORS.lock() {
-        let map = map.get_or_insert_with(Default::default);
-        for (thread, native) in cleared {
-            map.entry(thread).or_default().insert(native);
+/// What account removals left behind, so a chat they unbound starts fresh
+/// on the next default instead of resuming what left with the account.
+#[derive(Default)]
+struct Removed {
+    /// Native sessions that left with a removed account, by thread. An open
+    /// pane may still hold one and offer it on its next restart; it names a
+    /// transcript that is gone or an older copy, so that start goes fresh.
+    /// They stay refused (a failed start leaves the pane holding the same
+    /// cursor); a newer session the thread started since is left alone.
+    natives: HashMap<String, HashSet<String>>,
+    /// `(thread, provider)` whose binding left with a removed account. Until
+    /// the chat binds again, any native id it has came from that account,
+    /// even one its session reported after the removal.
+    unbound: HashSet<(String, String)>,
+}
+
+static REMOVED: std::sync::Mutex<Option<Removed>> = std::sync::Mutex::new(None);
+
+/// Held across a removal's delete and across resolving a session, so each
+/// sees a removal wholly or not at all.
+fn removed() -> std::sync::MutexGuard<'static, Option<Removed>> {
+    REMOVED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Removed {
+    fn refuse(&mut self, thread_id: &str, native: String) {
+        self.natives.entry(thread_id.to_string()).or_default().insert(native);
+    }
+
+    /// Whether `thread_id` lost its `provider` binding to a removal and has
+    /// not bound again.
+    fn orphaned(&self, db: &DatabaseStore, provider: ProviderKind, thread_id: &str) -> bool {
+        let slug = provider_slug(provider);
+        self.unbound.contains(&(thread_id.to_string(), slug.to_string()))
+            && db.provider_account_binding(thread_id, slug).ok().flatten().is_none()
+    }
+
+    /// The native session `thread_id` may resume: `native`, unless it left
+    /// with a removed account.
+    fn usable(&mut self, db: &DatabaseStore, provider: ProviderKind, thread_id: &str, native: String) -> Option<String> {
+        if self.orphaned(db, provider, thread_id) {
+            self.refuse(thread_id, native);
+            return None;
         }
+        let stale = self.natives.get(thread_id).is_some_and(|ids| ids.contains(&native));
+        (!stale).then_some(native)
+    }
+
+    /// Whether a start's `cursor` resumes a session that left with a removed
+    /// account.
+    fn refuses_cursor(&mut self, db: &DatabaseStore, provider: ProviderKind, thread_id: &str, cursor: &serde_json::Value) -> bool {
+        if self.orphaned(db, provider, thread_id) {
+            if let Some(native) = crate::commands::agent_chat::extract_sdk_session_id(cursor) {
+                self.refuse(thread_id, native);
+            }
+            return true;
+        }
+        self.natives
+            .get(thread_id)
+            .is_some_and(|stale| stale.iter().any(|id| cursor_mentions(cursor, id)))
     }
 }
 
-/// Whether `cursor` resumes a native session that removal cleared for
-/// `thread_id`. Only those exact sessions are refused, and they stay refused
-/// (a failed start leaves the pane holding the same cursor); a newer session
-/// the thread started since is left alone.
-fn is_stale_cursor(thread_id: &str, cursor: &serde_json::Value) -> bool {
-    let Ok(map) = STALE_CURSORS.lock() else { return false };
-    map.as_ref()
-        .and_then(|m| m.get(thread_id))
-        .is_some_and(|stale| stale.iter().any(|id| cursor_mentions(cursor, id)))
+/// Delete an account with its defaults and bindings, and remember what its
+/// chats lost (see [`Removed`]).
+pub fn delete_account(db: &DatabaseStore, account_id: &str) -> Result<(), String> {
+    let mut removed = removed();
+    let gone = db.delete_provider_account(account_id)?;
+    let removed = removed.get_or_insert_with(Default::default);
+    for (thread, native) in gone.cleared {
+        removed.refuse(&thread, native);
+    }
+    removed.unbound.extend(gone.unbound);
+    Ok(())
 }
 
 /// Cursors are provider-shaped JSON; look for the native id anywhere in it.
@@ -268,6 +339,7 @@ pub fn prepare_start<R: Runtime>(
     on_device: bool,
 ) {
     if !supports(provider) || on_device {
+        forget_applied(&input.thread_id.0);
         return;
     }
     let Some(db) = app.try_state::<DatabaseStore>() else {
@@ -311,7 +383,13 @@ fn prepare_start_with(
     provider: ProviderKind,
     input: &mut StartSessionInput,
 ) -> Result<(), String> {
-    if input.resume_cursor.as_ref().is_some_and(|c| is_stale_cursor(&input.thread_id.0, c)) {
+    let mut removed = removed();
+    let refused = input.resume_cursor.as_ref().is_some_and(|cursor| {
+        removed
+            .get_or_insert_with(Default::default)
+            .refuses_cursor(db, provider, &input.thread_id.0, cursor)
+    });
+    if refused {
         input.resume_cursor = None;
     }
     let resolution = start_resolution(db, provider, input)?;
@@ -349,32 +427,56 @@ pub fn follow_thread<R: Runtime>(app: &AppHandle<R>, from: &str, to: &str) {
     }
 }
 
+/// What a rebuilt session runs with.
+#[derive(Debug, PartialEq)]
+pub struct Rebuild {
+    pub env: Option<HashMap<String, String>>,
+    /// The native session to resume: the caller's, unless removing its
+    /// account took it.
+    pub native: Option<String>,
+}
+
 /// Rebuild hook (`ensure_live_session`): the persisted thread resumes on
-/// the account it is bound to.
+/// the account it is bound to. `native` is the native session id the caller
+/// read and `workspace_id` where the chat lives. One without a usable
+/// binding (its account was removed) resolves like a new chat there, unless
+/// it still has native history, which predates accounts and lives with the
+/// CLI's own sign-in. Either way it binds there.
 pub fn rebuild_env<R: Runtime>(
     app: &AppHandle<R>,
     provider: ProviderKind,
     thread_id: &str,
+    workspace_id: Option<&str>,
+    native: Option<&str>,
     env: Option<HashMap<String, String>>,
     on_device: bool,
-) -> Option<HashMap<String, String>> {
+) -> Rebuild {
+    let native = native.map(str::to_string);
     if !supports(provider) || on_device {
-        return env;
+        forget_applied(thread_id);
+        return Rebuild { env, native };
     }
     let Some(db) = app.try_state::<DatabaseStore>() else {
-        return env;
+        return Rebuild { env, native };
     };
-    match resolve(&db, provider, Some(thread_id), None, None, true) {
+    // Held while resolving, so a removal is wholly before (its cursor is
+    // refused, its binding gone) or after (this records the account, and
+    // the removal stops the session).
+    let mut removed = removed();
+    let native = native.and_then(|id| removed.get_or_insert_with(Default::default).usable(&db, provider, thread_id, id));
+    let slug = provider_slug(provider);
+    match resolve(&db, provider, Some(thread_id), None, workspace_id, native.is_some()) {
         Ok(resolution) => {
             if !resolution.bound {
-                let _ = db.set_provider_account_binding(thread_id, provider_slug(provider), DEFAULT_ACCOUNT_ID);
+                let _ = db.set_provider_account_binding(thread_id, slug, resolution.account_id());
             }
             record_applied(thread_id, provider, resolution.account_id());
-            apply_env(provider, resolution.account.as_ref(), env)
+            drop(removed);
+            Rebuild { env: apply_env(provider, resolution.account.as_ref(), env), native }
         }
         Err(error) => {
             eprintln!("[codemux::provider_accounts] resolving {thread_id}: {error}");
-            env
+            Rebuild { env, native }
         }
     }
 }
@@ -688,14 +790,17 @@ mod tests {
 
     #[test]
     fn only_the_removed_native_session_is_dropped() {
-        forget_cursors(vec![("stale-t".into(), "native-1".into())]);
+        let db = DatabaseStore::new_in_memory();
+        let mut removed = Removed::default();
+        removed.refuse("stale-t", "native-1".into());
         let newer = serde_json::json!({ "resume": "native-2" });
-        let removed = serde_json::json!({ "resume": "native-1" });
-        assert!(!is_stale_cursor("stale-t", &newer));
-        assert!(!is_stale_cursor("other-t", &removed));
-        assert!(is_stale_cursor("stale-t", &removed));
+        let gone = serde_json::json!({ "resume": "native-1" });
+        let claude = ProviderKind::Claude;
+        assert!(!removed.refuses_cursor(&db, claude, "stale-t", &newer));
+        assert!(!removed.refuses_cursor(&db, claude, "other-t", &gone));
+        assert!(removed.refuses_cursor(&db, claude, "stale-t", &gone));
         // A retry after a failed start is refused too.
-        assert!(is_stale_cursor("stale-t", &removed));
+        assert!(removed.refuses_cursor(&db, claude, "stale-t", &gone));
     }
 
     #[test]
@@ -724,6 +829,91 @@ mod tests {
         assert!(!on_chatgpt_route(ProviderKind::Codex, &extra, true));
         assert!(!on_chatgpt_route(ProviderKind::Codex, &cli, false));
         assert!(!on_chatgpt_route(ProviderKind::Claude, &cli, true));
+    }
+
+    fn app_with(db: DatabaseStore) -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        app
+    }
+
+    /// The account and native session `thread` rebuilds with, from a row
+    /// read as `(workspace, native)`.
+    fn rebuilt(app: &tauri::App<tauri::test::MockRuntime>, thread: &str, ws: &str, native: &str) -> (Option<String>, Option<String>) {
+        let rebuild = rebuild_env(app.handle(), ProviderKind::Claude, thread, Some(ws), Some(native), None, false);
+        (rebuild.env.and_then(|env| env.get(SESSION_ACCOUNT_ENV).cloned()), rebuild.native)
+    }
+
+    #[test]
+    fn a_chat_whose_account_was_removed_rebuilds_on_the_next_default() {
+        let db = db_with(&[("rm-work", "claude"), ("rm-personal", "claude"), ("rm-side", "claude")]);
+        db.set_provider_account_default("", "claude", Some("rm-personal")).unwrap();
+        db.set_provider_account_default("rm-ws", "claude", Some("rm-side")).unwrap();
+        for (thread, ws) in [("rm-t", "ws"), ("rm-t-ws", "rm-ws")] {
+            db.upsert_agent_chat_session(thread, ws, Some("/repo"), "claude").unwrap();
+            db.set_agent_chat_sdk_session_id(thread, "native-1").unwrap();
+            db.set_provider_account_binding(thread, "claude", "rm-work").unwrap();
+        }
+        // First turns still running: no native id yet.
+        for thread in ["rm-late", "rm-start"] {
+            db.upsert_agent_chat_session(thread, "ws", Some("/repo"), "claude").unwrap();
+            db.set_provider_account_binding(thread, "claude", "rm-work").unwrap();
+        }
+        delete_account(&db, "rm-work").unwrap();
+        let app = app_with(db);
+        let db = app.state::<DatabaseStore>();
+
+        // Even from a row read before the removal, the removed account's
+        // native session is not resumed elsewhere.
+        assert_eq!(rebuilt(&app, "rm-t", "ws", "native-1"), (Some("rm-personal".into()), None));
+        assert_eq!(db.provider_account_binding("rm-t", "claude").unwrap().as_deref(), Some("rm-personal"));
+        // The chat's own workspace default comes first.
+        assert_eq!(rebuilt(&app, "rm-t-ws", "rm-ws", "native-1").0.as_deref(), Some("rm-side"));
+
+        // A first turn's native id that its session reports after the
+        // delete came from the removed account too.
+        db.set_agent_chat_sdk_session_id("rm-late", "late-native").unwrap();
+        assert_eq!(rebuilt(&app, "rm-late", "ws", "late-native"), (Some("rm-personal".into()), None));
+        // Once bound again it stays refused, and the new account's own
+        // sessions resume.
+        assert_eq!(rebuilt(&app, "rm-late", "ws", "late-native").1, None);
+        assert_eq!(rebuilt(&app, "rm-late", "ws", "personal-native").1.as_deref(), Some("personal-native"));
+        // A start offering such a cursor goes fresh on the next default too.
+        let mut start = input("rm-start", true, serde_json::Value::Null);
+        prepare_start(app.handle(), ProviderKind::Claude, &mut start, false);
+        assert_eq!(start.resume_cursor, None);
+        assert_eq!(db.provider_account_binding("rm-start", "claude").unwrap().as_deref(), Some("rm-personal"));
+
+        // A chat from before accounts keeps its transcript's home.
+        db.upsert_agent_chat_session("rm-legacy", "ws", Some("/repo"), "claude").unwrap();
+        assert_eq!(rebuilt(&app, "rm-legacy", "ws", "native-2"), (None, Some("native-2".into())));
+        assert_eq!(db.provider_account_binding("rm-legacy", "claude").unwrap().as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn removing_an_account_leaves_a_chat_that_moved_to_another_provider() {
+        let app = app_with(db_with(&[("mv-work", "codex")]));
+        let db = app.state::<DatabaseStore>();
+        let pick = serde_json::json!({ START_EXTRA_KEY: "mv-work" });
+        for thread in ["mv-t", "mv-stay"] {
+            prepare_start(app.handle(), ProviderKind::Codex, &mut input(thread, false, pick.clone()), false);
+            db.upsert_agent_chat_session(thread, "ws", Some("/repo"), "codex").unwrap();
+        }
+        let mut on_work: Vec<_> = threads_on_account("mv-work").into_iter().map(|(_, thread)| thread).collect();
+        on_work.sort();
+        assert_eq!(on_work, ["mv-stay", "mv-t"]);
+        assert!(still_on_account(&db, ProviderKind::Codex, "mv-t", "mv-work"));
+
+        // The chat switches to OpenCode: its Codex session is replaced.
+        db.upsert_agent_chat_session("mv-t", "ws", Some("/repo"), "opencode").unwrap();
+        prepare_start(app.handle(), ProviderKind::OpenCode, &mut input("mv-t", false, serde_json::Value::Null), false);
+        assert_eq!(threads_on_account("mv-work"), [(ProviderKind::Codex, "mv-stay".to_string())]);
+
+        // Even a leftover entry is not stopped once the chat runs elsewhere.
+        record_applied("mv-t", ProviderKind::Codex, "mv-work");
+        assert!(!still_on_account(&db, ProviderKind::Codex, "mv-t", "mv-work"));
+        assert!(still_on_account(&db, ProviderKind::Codex, "mv-stay", "mv-work"));
+        assert!(!still_on_account(&db, ProviderKind::Codex, "mv-stay", "other"));
     }
 
     #[test]
