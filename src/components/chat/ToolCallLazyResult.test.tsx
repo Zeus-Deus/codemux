@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { LAZY_TOOL_RESULT_KEY } from "@/lib/agent-chat/lazy-tool-result";
@@ -11,9 +11,14 @@ import { ToolCallBody } from "./ToolCallBodies";
 
 vi.mock("@/tauri/commands", () => ({
   agentChatGetToolResult: vi.fn(),
+  agentChatGetToolResultImage: vi.fn(),
+  readChatImage: vi.fn(),
 }));
 
-import { agentChatGetToolResult } from "@/tauri/commands";
+vi.mock("@/lib/clipboard", () => ({ copyToClipboard: vi.fn().mockResolvedValue(true) }));
+import { copyToClipboard } from "@/lib/clipboard";
+vi.mock("@tauri-apps/api/core", () => ({ convertFileSrc: (path: string) => `asset:${path}` }));
+import { agentChatGetToolResult, agentChatGetToolResultImage, readChatImage } from "@/tauri/commands";
 
 afterEach(() => cleanup());
 
@@ -42,7 +47,15 @@ function stubbedTool(overrides: Partial<ToolCallItem> = {}): ToolCallItem {
   };
 }
 
-function fullPayload(text: string): string {
+function imageStub(): ToolCallItem {
+  const item = stubbedTool();
+  return { ...item, result_content: { [LAZY_TOOL_RESULT_KEY]: {
+    row_id: ROW_ID, bytes: 96 * 1024, preview: "evidence", line_count: 1, has_images: true,
+    images: [{ pointer: "/1" }],
+  } } };
+}
+
+function fullPayload(text: unknown): string {
   return JSON.stringify({
     type: "item_completed",
     thread_id: "t",
@@ -54,6 +67,9 @@ function fullPayload(text: string): string {
 describe("lazy tool-result body", () => {
   beforeEach(() => {
     vi.mocked(agentChatGetToolResult).mockReset();
+    vi.mocked(agentChatGetToolResultImage).mockReset();
+    vi.mocked(readChatImage).mockReset();
+    vi.mocked(copyToClipboard).mockResolvedValue(true);
     useAgentChatStore.setState({ threads: {} });
   });
 
@@ -92,6 +108,77 @@ describe("lazy tool-result body", () => {
       expect(item.result_content).toBe("the whole thing");
     });
     expect(vi.mocked(agentChatGetToolResult)).toHaveBeenCalledWith(ROW_ID);
+  });
+
+  it("loads only the image for a thumbnail/lightbox, and copies the full original on demand", async () => {
+    vi.mocked(agentChatGetToolResultImage).mockResolvedValue({ src: "data:image/png;base64,AAAA", local: false });
+    const content = [{ type: "text", text: "evidence" }, { type: "image", source: { type: "base64", data: "AAAA" } }];
+    vi.mocked(agentChatGetToolResult).mockResolvedValue(fullPayload(content));
+    const item = stubbedTool();
+    const envelope = item.result_content as { [LAZY_TOOL_RESULT_KEY]: { has_images: boolean; images?: { pointer: string }[] } };
+    envelope[LAZY_TOOL_RESULT_KEY].has_images = true;
+    envelope[LAZY_TOOL_RESULT_KEY].images = [{ pointer: "/1" }];
+    render(<ToolCallBody item={item} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open image" })).toBeInTheDocument());
+    expect(agentChatGetToolResultImage).toHaveBeenCalledWith(ROW_ID, "/1");
+    expect(agentChatGetToolResult).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Open image" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+    await userEvent.click(screen.getByRole("button", { name: "Copy full result" }));
+    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith(JSON.stringify(content, null, 2)));
+    expect(screen.getByText(/line 1/)).toBeInTheDocument();
+  });
+
+  it("shows inline compatibility sources without requesting an unreachable handle", () => {
+    const item = stubbedTool({ result_content: { [LAZY_TOOL_RESULT_KEY]: {
+      row_id: ROW_ID, bytes: 40_000, preview: "svg", line_count: 1, has_images: true,
+      images: [{ pointer: "/0", src: "data:image/svg+xml;base64,AAAA" }],
+    } } });
+    render(<ToolCallBody item={item} />);
+    expect(screen.getByRole("img")).toHaveAttribute("src", "data:image/svg+xml;base64,AAAA");
+  });
+
+  it("uses bounded IPC readback when a hosted client cannot reach the image asset, and releases its blob", async () => {
+    vi.mocked(agentChatGetToolResultImage).mockResolvedValue({ src: "/managed/tool.png", local: true });
+    vi.mocked(readChatImage).mockResolvedValue({ bytes: new Uint8Array([1, 2, 3]), media_type: "image/png" });
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => "blob:tool-image") });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+    const item = imageStub();
+    const view = render(<ToolCallBody item={item} />);
+    await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "asset:/managed/tool.png"));
+    fireEvent.error(screen.getByRole("img"));
+    await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "blob:tool-image"));
+    await userEvent.click(screen.getByRole("button", { name: "Open image" }));
+    expect(screen.getByRole("dialog").querySelector("img")).toHaveAttribute("src", "blob:tool-image");
+    expect(readChatImage).toHaveBeenCalledTimes(1);
+    expect(agentChatGetToolResult).not.toHaveBeenCalled();
+    view.unmount();
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:tool-image");
+    render(<ToolCallBody item={item} />);
+    await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "asset:/managed/tool.png"));
+    expect(agentChatGetToolResultImage).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a failed image request without fetching the entire result", async () => {
+    vi.mocked(agentChatGetToolResultImage).mockRejectedValueOnce(new Error("unavailable"))
+      .mockResolvedValueOnce({ src: "data:image/png;base64,AAAA", local: false });
+    render(<ToolCallBody item={imageStub()} />);
+    const retry = await screen.findByRole("button", { name: "Image preview unavailable — retry" });
+    await userEvent.click(retry);
+    expect(await screen.findByRole("button", { name: "Open image" })).toBeInTheDocument();
+    expect(agentChatGetToolResultImage).toHaveBeenCalledTimes(2);
+    expect(agentChatGetToolResult).not.toHaveBeenCalled();
+  });
+
+  it("reports copy failure separately from full-result load", async () => {
+    vi.mocked(agentChatGetToolResultImage).mockResolvedValue({ src: "data:image/png;base64,AAAA", local: false });
+    vi.mocked(agentChatGetToolResult).mockResolvedValue(fullPayload("original"));
+    vi.mocked(copyToClipboard).mockResolvedValue(false);
+    render(<ToolCallBody item={imageStub()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Copy full result" }));
+    expect(await screen.findByRole("button", { name: "Couldn't copy the full result — retry" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load full output (96 KB)" })).toBeInTheDocument();
   });
 
   it("offers a retry when the fetch fails", async () => {

@@ -47,7 +47,7 @@ import { randomUUID } from "@/lib/uuid";
  * falls through to a logged, shape-safe default.
  */
 import { workspaceLaunchScenario, streamWorkspaceLaunch, type MockWorkspaceLaunch } from "./workspace-launch-mock";
-import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
+import { extractToolResultImages, toolResultImagePointers, withoutToolResultImages } from "@/lib/agent-chat/tool-result-images";
 import { createAgentConnectorMock } from "./agent-connector-mock";
 import { workflowMockHandlers } from "./workflow-mock";
 import { createCustomAcpMock } from "./custom-acp-mock";
@@ -2011,7 +2011,7 @@ function mockPayloadIsUserMessage(payload: string): boolean {
   return /"type"\s*:\s*"user_message"/.test(payload);
 }
 
-/** Mirror of `shape_persisted_payload`: replace an oversized, non-image
+/** Mirror of `shape_persisted_payload`: replace an oversized
  *  tool-result body with a stub. Exported so a test can pin the parity
  *  with the Rust twin on shapes the stress fixture never produces.
  *
@@ -2032,12 +2032,12 @@ export function mockShapePayload(rowId: number, payload: string): string {
   if (!item || item.kind !== "tool_result" || item.content == null)
     return payload;
   const content = item.content;
-  // The same accept-set the Rust side mirrors — this IS the frontend's.
-  if (hasToolResultImages(content)) return payload;
+  const images = toolResultImagePointers(content);
   const serialized = JSON.stringify(content);
   if (serialized.length <= MOCK_LAZY_TOOL_RESULT_THRESHOLD_BYTES)
     return payload;
-  const text = mockStringifyToolContent(content);
+  mockFullPayloadById.set(rowId, payload);
+  const text = mockStringifyToolContent(images.length ? withoutToolResultImages(content) : content);
   item.content = {
     __codemux_lazy_tool_result: {
       row_id: rowId,
@@ -2047,7 +2047,8 @@ export function mockShapePayload(rowId: number, payload: string): string {
         MOCK_LAZY_TOOL_RESULT_PREVIEW_BYTES,
       ),
       line_count: text.split("\n").length,
-      has_images: false,
+      has_images: images.length > 0,
+      images,
     },
   };
   return JSON.stringify(value);
@@ -5259,6 +5260,20 @@ const handlers: Record<string, Handler> = {
         score: query ? 200 - index : 0,
         item_count: itemCount,
       }));
+  },
+  agent_chat_get_tool_result_image: (a) => {
+    const payload = mockFullPayloadById.get(a.rowId as number);
+    if (payload == null) throw new Error(`not_found: row ${a.rowId}`);
+    const content: unknown = JSON.parse(payload).item.content;
+    const pointer = a.pointer as string;
+    if (!toolResultImagePointers(content).some((image) => image.pointer === pointer)) {
+      throw new Error("validation_error: invalid image pointer");
+    }
+    const entry = pointer === "" ? content : pointer.slice(1).split("/").reduce<unknown>((value, token) =>
+      value != null && typeof value === "object" ? Reflect.get(value, token) : undefined, content);
+    const image = extractToolResultImages(entry)[0];
+    if (!image) throw new Error("validation_error: image missing");
+    return { src: image.src, local: false };
   },
   agent_chat_get_tool_result: (a) => {
     const payload = mockFullPayloadById.get(a.rowId as number);

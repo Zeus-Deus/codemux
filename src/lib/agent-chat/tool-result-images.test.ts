@@ -5,6 +5,8 @@ import {
   extractToolResultImages,
   hasToolResultImages,
   isRenderableImageBlock,
+  withoutToolResultImages,
+  toolResultImagePointers,
 } from "./tool-result-images";
 
 describe("extractToolResultImages", () => {
@@ -110,6 +112,26 @@ describe("extractToolResultImages", () => {
         { type: "image", source: { type: "url", url: "file:///etc/passwd" } },
       ]),
     ).toEqual([]);
+  });
+
+  it("extracts native result envelopes without scanning arbitrary tool inputs", () => {
+    const image = { type: "image", source: { type: "base64", data: "A".repeat(40_000) } };
+    for (const [content, pointer] of [
+      [{ type: "mcpToolCall", result: { content: [{ type: "text", text: "captured" }, image] } }, "/result/content/1"],
+      [{ type: "dynamicToolCall", contentItems: [image] }, "/contentItems/0"],
+    ] as const) {
+      expect(extractToolResultImages(content)).toHaveLength(1);
+      expect(toolResultImagePointers(content)).toEqual([{ pointer }]);
+      expect(JSON.stringify(withoutToolResultImages(content))).not.toContain("AAAA");
+      expect(JSON.stringify(content)).toContain("AAAA");
+    }
+    expect(extractToolResultImages({ input: { content: [image] } })).toEqual([]);
+  });
+
+  it("keeps small, unsupported and parameterized sources inline in the mock projection", () => {
+    for (const src of ["https://example.test/a.png", `data:image/svg+xml;base64,${"A".repeat(40_000)}`, `data:image/avif;base64,${"A".repeat(40_000)}`, `data:image/png;charset=utf-8;base64,${"A".repeat(40_000)}`]) {
+      expect(toolResultImagePointers([{ type: "image_url", image_url: src }])).toEqual([{ pointer: "/0", src }]);
+    }
   });
 
   it("returns [] for string / empty / non-array content", () => {

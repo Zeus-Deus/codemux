@@ -157,7 +157,7 @@ describe("dev mock stub preview parity with the Rust shaper", () => {
     expect(previewBytes).toBeGreaterThan(2 * 1024 - 4);
   });
 
-  it("does not stub a body carrying a renderable image block", async () => {
+  it("stubs image bodies with handles and keeps the original accessible", async () => {
     const { mockShapePayload } = await import("./tauri-mock");
     const data = "A".repeat(40_000);
     const payload = toolResult([
@@ -167,7 +167,16 @@ describe("dev mock stub preview parity with the Rust shaper", () => {
         source: { type: "base64", media_type: "image/png", data },
       },
     ]);
-    expect(mockShapePayload(7, payload)).toBe(payload);
+    const shaped = JSON.parse(mockShapePayload(7, payload));
+    expect(shaped.item.content[LAZY_TOOL_RESULT_KEY]).toMatchObject({
+      has_images: true, images: [{ pointer: "/1" }], preview: "screenshot:",
+    });
+    expect(JSON.stringify(shaped).length).toBeLessThan(1024);
+    expect(await invoke("agent_chat_get_tool_result", { rowId: 7 })).toBe(payload);
+    expect(await invoke("agent_chat_get_tool_result_image", { rowId: 7, pointer: "/1" })).toMatchObject({
+      src: `data:image/png;base64,${data}`, local: false,
+    });
+    await expect(invoke("agent_chat_get_tool_result_image", { rowId: 7, pointer: "/0/text" })).rejects.toThrow("invalid image pointer");
 
     // …but a base64 PDF is not an image, and must be stubbed.
     const pdf = toolResult([

@@ -24,6 +24,12 @@ describe("isLazyToolResultStub", () => {
     expect(lazyToolResultStub(stub)?.row_id).toBe(12);
   });
 
+  it("rejects malformed image metadata instead of crashing the image row", () => {
+    for (const images of ["bad", [null], [{ pointer: 7 }], [{ pointer: "/0", src: "javascript:alert(1)" }]]) {
+      expect(isLazyToolResultStub({ [LAZY_TOOL_RESULT_KEY]: { ...stub[LAZY_TOOL_RESULT_KEY], images } })).toBe(false);
+    }
+  });
+
   it("rejects real bodies — a stub must never be inferred from content", () => {
     // A false positive here would hide a genuine tool result behind a
     // fetch affordance pointing at a row that does not exist.
