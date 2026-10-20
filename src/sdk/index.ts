@@ -10,6 +10,7 @@
  */
 export * from "./areas";
 export { host } from "./host";
+export { randomUUID } from "@/lib/uuid";
 export * from "./ui";
 export type { PeekData, PeekRenderProps, PeekBody, PeekSize, PeekStatusKind, PluginPeekSnapshot } from "@/contrib/peek";
 export * as icons from "lucide-react";

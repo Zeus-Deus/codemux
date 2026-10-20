@@ -138,7 +138,7 @@ The SDK also exports the app's UI kit, so plugins look native: `Button`,
 `Popover*`, `Tooltip*`, `DropdownMenu*`, `Badge`, `Tabs*`, `ScrollArea`,
 `Separator`, `Kbd`, `Spinner` and `cn`. It also exports lucide icons as `icons`,
 zustand's `create`, React Query's `useQuery`, `useMutation` and
-`useQueryClient`, and `definePlugin` for typed plugins. The current export list
+`useQueryClient`, `randomUUID` for UUID creation, and `definePlugin` for typed plugins. The current export list
 is `src/sdk/index.ts`.
 
 ## Floating previews and compact status
@@ -276,6 +276,9 @@ The app itself ships plugins in `src/plugins/<id>/`:
 - Bundled code may import only `@codemux/sdk`, `react`, and sibling files in its own folder (`./field`). Assets and anything outside the folder go through the SDK. This is enforced by `src/plugins/import-fence.test.ts`.
 
 `src/plugins/example` uses every area and is off by default. `src/plugins/thread-backdrop` (Official, on by default) is a complete real plugin: an engraving typed out in faint monospace behind a new thread, built on `LANDING_BACKDROP_AREA`, `ctx.host.theme`, `PLATES` and `onCalmChange`.
+
+[Computer use](./computer-use.md) is an optional Official plugin for a chosen
+application window. It starts off and requires a separate workspace opt-in.
 
 ## Decisions
 
