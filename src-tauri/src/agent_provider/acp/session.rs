@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -148,7 +148,7 @@ async fn acp_mcp_servers(
 #[derive(Debug)]
 struct XAiPromptCompletion {
     prompt_id: String,
-    tx: oneshot::Sender<Value>,
+    tx: watch::Sender<Option<Value>>,
     announced: Option<Value>,
 }
 
@@ -1315,7 +1315,7 @@ impl AcpSession {
     async fn send_prompt(&self, turn: &TurnId, prompt: &[Value], generation: u64, checkpoint: Option<&Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>) -> Result<Value, RpcChildError> {
         let prompt_id = self.dialect.is_grok().then(|| self.opaque_id("prompt"));
         let fallback_rx = if let Some(prompt_id) = prompt_id.as_ref() {
-            let (tx, rx) = oneshot::channel();
+            let (tx, rx) = watch::channel(None);
             *self.xai_prompt_completion.lock().await = Some(XAiPromptCompletion {
                 prompt_id: prompt_id.clone(),
                 tx,
@@ -1344,10 +1344,18 @@ impl AcpSession {
         let mut cancellation_expired = false;
         let response = {
             let request = self.child.request_with_timeout("session/prompt", params, PROMPT_TIMEOUT);
-            let fallback = async move {
-                match fallback_rx {
-                    Some(rx) => rx.await.ok(),
-                    None => std::future::pending::<Option<Value>>().await,
+            // Keep a receiver outside the response arbiter: cancellation may
+            // end its grace after the durable terminal has already arrived.
+            let fallback = {
+                let fallback_rx = fallback_rx.clone();
+                async move {
+                    match fallback_rx {
+                        Some(mut rx) => {
+                            let completion = rx.wait_for(|value| value.is_some()).await;
+                            completion.ok().and_then(|value| value.clone())
+                        }
+                        None => std::future::pending::<Option<Value>>().await,
+                    }
                 }
             };
             let completion = prefer_standard_prompt_response(request, fallback, XAI_TERMINAL_RESPONSE_GRACE);
@@ -1389,6 +1397,11 @@ impl AcpSession {
                         });
                     }
                     () = &mut cancel_at, if cancelling => {
+                        if let Some(completion) = fallback_rx.as_ref().and_then(|rx| rx.borrow().clone()) {
+                            // Correlated durable completion proves acceptance
+                            // even when the standard response was omitted.
+                            break Ok(completion);
+                        }
                         cancellation_expired = true;
                         break Err(RpcChildError::Timeout {method:"session/prompt cancellation".into(),elapsed:PROMPT_CANCEL_TIMEOUT});
                     }
@@ -1403,7 +1416,8 @@ impl AcpSession {
             }
         }
         self.clear_xai_prompt_completion(prompt_id.as_deref()).await;
-        // Drop the unanswered request before shutting down its transport.
+        // The request is dropped before bounded shutdown. A durable terminal
+        // leaves the child usable and does not require transport teardown.
         if cancellation_expired { let _ = self.child.shutdown().await; }
         response
     }
@@ -1461,7 +1475,7 @@ impl AcpSession {
         let Some(entry) = pending.take() else {
             return;
         };
-        let _ = entry.tx.send(completion);
+        let _ = entry.tx.send(Some(completion));
     }
 
     /// xAI extension envelopes carry the live context occupancy separately
@@ -3096,8 +3110,8 @@ fn xai_terminal_completion(
 /// current Grok builds can emit their durable lifecycle event while the
 /// standard RPC response is still being finalized. Keeping this arbitration
 /// independent from the subprocess makes the ordering contract directly
-/// testable and leaves [`AcpSession::send_prompt`] responsible only for Stop
-/// forwarding.
+/// testable and leaves [`AcpSession::send_prompt`] responsible for cancellation
+/// and acceptance settlement.
 async fn prefer_standard_prompt_response<R, F>(
     request: R,
     fallback: F,

@@ -170,6 +170,105 @@ async fn review_r1_acp_local_rpc_refusal_is_not_native_acceptance() {
     assert_eq!(provider.kind(),ProviderKind::Cursor);
 }
 
+#[tokio::test]
+async fn review_r3_grok_terminal_survives_interrupt_during_standard_response_grace() {
+    use crate::agent_provider::{AgentProvider, ProviderKind, ProviderRuntimeEvent, SendTurnInput, ThreadId, TurnStatus};
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap()
+        .join(format!("fake_grok_acp{}", std::env::consts::EXE_SUFFIX));
+    assert!(binary.is_file(), "build the fake_grok_acp test fixture first");
+    let provider = crate::agent_provider::grok::GrokAgentProvider::new(
+        crate::agent_provider::grok::GrokProviderConfig { binary, event_channel_capacity: 128, mcp_registry: None },
+    );
+    let root = tempfile::tempdir().unwrap();
+    let thread = ThreadId("review-r3-grok-terminal".into());
+    provider.start_session(serde_json::from_value(json!({
+        "thread_id": thread, "cwd": root.path(), "model": "grok-4.6", "effort": "high",
+        "fresh_session": true, "permission_mode": "agent", "additional_directories": []
+    })).unwrap()).await.unwrap();
+    let app = tauri::test::mock_app();
+    app.manage(crate::database::DatabaseStore::new_in_memory());
+    app.manage(crate::commands::agent_chat::SubagentTracker::default());
+    app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+    app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+    let db = app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_session(&thread.0, "workspace", None, "grok").unwrap();
+    db.admit_message_delivery("grok-terminal", &thread.0, "grok-terminal",
+        &json!({"origin": "controller", "provider": "grok"}), "epoch", 0, None, true).unwrap();
+    let mut input: SendTurnInput = serde_json::from_value(json!({
+        "thread_id": thread, "text": "process boundary omitted-standard"
+    })).unwrap();
+    input.turn_checkpoint = Some(Arc::new(super::delivery::DeliveryCheckpoint {
+        app: app.handle().clone(), id: "grok-terminal".into(), thread: thread.0.clone(),
+        provider: ProviderKind::Grok, inner: None, release_queue: false, admitted_generation: 0, resumed_ids: vec![],
+    }));
+    let mut events = provider.event_stream();
+    let sent = provider.send_turn(input).await.unwrap();
+    // This fixture marker follows the durable terminal on the same ordered
+    // notification stream. No standard session/prompt response will arrive.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match events.next().await {
+                Some(ProviderRuntimeEvent::ContextCompactionChanged { active: false, .. }) => break,
+                Some(ProviderRuntimeEvent::TurnCompleted { .. }) => panic!("terminal grace ended before interrupt"),
+                Some(_) => {}
+                None => panic!("provider stream closed"),
+            }
+        }
+    }).await.unwrap();
+    provider.interrupt_turn(thread.clone(), Some(sent.turn_id)).await.unwrap();
+    let mut usage_events = vec![];
+    let (status, usage) = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            match events.next().await {
+                Some(event @ ProviderRuntimeEvent::UsageRecorded { .. }) => usage_events.push(event),
+                Some(ProviderRuntimeEvent::TurnCompleted { status, usage, .. }) => break (status, usage),
+                Some(_) => {}
+                None => panic!("provider stream closed"),
+            }
+        }
+    }).await.expect("cancellation must settle before the 30-second response grace");
+    let row = db.message_delivery("grok-terminal").unwrap().unwrap();
+    let attention = db.thread_message_delivery_attention(&thread.0).unwrap();
+    db.recover_message_deliveries("restart").unwrap();
+    let recovered = db.message_delivery("grok-terminal").unwrap().unwrap();
+
+    // Reusing the same session also catches unnecessary child shutdown and
+    // stale cancellation leaking into the next prompt.
+    let next = provider.send_turn(serde_json::from_value(json!({
+        "thread_id": thread, "text": "process boundary follow-up"
+    })).unwrap()).await;
+    let next_status = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match events.next().await {
+                Some(ProviderRuntimeEvent::TurnCompleted { status, .. }) => break status,
+                Some(_) => {}
+                None => panic!("provider stream closed before follow-up completed"),
+            }
+        }
+    }).await;
+    provider.stop_session(thread).await.unwrap();
+
+    assert_eq!(row.state, "accepted", "durable terminal proves native acceptance: {status:?}");
+    assert!(row.attempted);
+    assert!(attention.is_empty());
+    assert_eq!(recovered.state, "accepted");
+    assert!(matches!(status, TurnStatus::Error { ref subtype, ref message }
+        if subtype == "grok_acp" && message == "durable fallback must lose to standard response"));
+    assert_eq!(usage_events.len(), 1);
+    assert!(matches!(&usage_events[0], ProviderRuntimeEvent::UsageRecorded {
+        input_tokens: 800, output_tokens: 80, cost_usd: Some(cost), ..
+    } if (*cost - 0.9).abs() < f64::EPSILON));
+    let usage = usage.expect("durable terminal usage");
+    assert_eq!(usage.total_cost_usd, Some(0.9));
+    assert_eq!(usage.duration_ms, 321);
+    assert_eq!(usage.num_turns, 3);
+    assert!(next.is_ok(), "healthy child must accept follow-up: {next:?}");
+    assert!(matches!(next_status, Ok(TurnStatus::Success)), "follow-up must complete on the same child: {next_status:?}");
+}
+
 // Capture the actual native Channel serializer, never a hand-built DTO.
 fn mario_channel(app: &tauri::AppHandle<tauri::test::MockRuntime>, thread: &str) -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
     let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
