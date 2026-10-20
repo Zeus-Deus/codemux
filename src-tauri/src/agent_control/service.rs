@@ -62,6 +62,14 @@ pub(crate) fn authorize<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller) 
 }
 
 pub(crate) fn authorize_native<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, orchestration: bool) -> Result<(), ControlError> {
+    authorize_with_delivery_retry(app, caller, orchestration, false)
+}
+
+pub(crate) fn authorize_delivery_retry<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller) -> Result<(), ControlError> {
+    authorize_with_delivery_retry(app, caller, true, true)
+}
+
+fn authorize_with_delivery_retry<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, orchestration: bool, retry_held: bool) -> Result<(), ControlError> {
     if let super::CallerPrincipal::Thread { thread_id, provider, authority, ceiling, .. } = &caller.identity {
         let db = app.state::<DatabaseStore>();
         let mut orchestration = orchestration;
@@ -78,7 +86,8 @@ pub(crate) fn authorize_native<R: Runtime>(app: &AppHandle<R>, caller: &ControlC
             }
             Some(super::AdmittedAuthority::Delivery {delivery_id}) => {
                 let row=db.message_delivery(delivery_id)?.ok_or_else(||ControlError::new("stale_delivery","Accepted message missing"))?;
-                if row.payload["caller"]["principal"]!=caller.principal || matches!(row.state.as_str(),"disposed"|"held"|"held_unknown"|"rejected") {return Err(ControlError::new("stale_delivery","Accepted message authority was revoked"));}
+                let retryable = retry_held && !row.attempted && matches!(row.state.as_str(), "held" | "rejected");
+                if row.payload["caller"]["principal"]!=caller.principal || (!retryable && matches!(row.state.as_str(),"cancelled"|"disposed"|"held"|"held_unknown"|"rejected")) {return Err(ControlError::new("stale_delivery","Accepted message authority was revoked"));}
             }
         }
         if orchestration && !crate::commands::delegation::setting_on(&db) { return Err(ControlError::new("orchestration_disabled", "Agent collaboration is off in Settings")); }

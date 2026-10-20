@@ -2508,7 +2508,7 @@ async fn run_mcp_tool_call(
 
     // Host tools precede child dispatch. The caller carries the LIVE permission mode, so a
     // Plan/Ask pill flipped after the session started is honoured.
-    if let Some(result) = registry.host_call_native(caller, prefixed_name, &arguments, None, None, actor.as_ref().map(|actor| &actor.permit)).await {
+    if let Some(result) = registry.host_call_native(caller, prefixed_name, &arguments, None, None, actor.as_ref()).await {
         return (result, None);
     }
 

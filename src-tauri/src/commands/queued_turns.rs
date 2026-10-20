@@ -516,12 +516,16 @@ pub(crate) async fn send_saved_queued_turn<R: Runtime>(
     if let Some(id) = &context.delivery_id {
         let record = db.message_delivery(id)?.ok_or("Saved message delivery is missing")?;
         let payload: crate::agent_control::delivery::DeliveryPayload = serde_json::from_value(record.payload).map_err(|e|e.to_string())?;
-        context.control = payload.caller.map(|caller| crate::agent_control::NativeControlGuard {
+        context.control = payload.caller.map(|mut caller| {
+            if caller.thread_id().is_some() {
+                caller.admitted=Some(crate::agent_control::AdmittedAuthority::Delivery{delivery_id:id.clone()});
+            }
+            crate::agent_control::NativeControlGuard {
             caller, workspace_id: db.get_agent_chat_session(&thread_id.0).map(|r|r.workspace_id).unwrap_or_default(),
             thread_id: thread_id.0.clone(), provider, admission: None,
-        }.retain_admission(&app));
+        }.retain_admission(&app)});
         if let Some(control) = &context.control {
-            if let Err(error) = control.verify(&app) {
+            if let Err(error) = control.verify_saved_delivery(&app) {
                 db.refuse_message_delivery(id,&error)?;
                 return Err(error);
             }

@@ -159,7 +159,14 @@ pub(crate) async fn call<R: Runtime>(
     app: AppHandle<R>,
     actor: crate::delegation::app::NativeActor,
     name: String,
-    mut args: Value,
+    args: Value,
+) -> Result<Value, String> {
+    call_with_id(app, actor, name, args, None).await
+}
+
+pub(crate) async fn call_with_id<R: Runtime>(
+    app: AppHandle<R>, actor: crate::delegation::app::NativeActor,
+    name: String, mut args: Value, call_id: Option<String>,
 ) -> Result<Value, String> {
     if name == "suggest_tasks" {
         actor.permit.wait_ready().await?;
@@ -230,7 +237,7 @@ pub(crate) async fn call<R: Runtime>(
                 &host_caller,
                 &prefix_tool_name("codemux", &name),
                 &args,
-                None,
+                call_id.as_deref(),
                 actor.permit.identity()?.run_id.as_deref(),
             )
             .await

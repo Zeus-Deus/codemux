@@ -227,7 +227,7 @@ async fn dispatch_with_control<R: Runtime>(
             let _=db.finish_message_delivery(&row.id,"held",None,Some(&error));warn_held(app,&row.thread_id,&error);crate::delegation::app::completion_delivery_changed(app,&row.id);return Err(error);
         }
     }
-    let control = admitted_control.or_else(|| payload.caller.map(|mut caller| {
+    let mut control = admitted_control.or_else(|| payload.caller.map(|mut caller| {
         if caller.thread_id().is_some() { caller.admitted=Some(super::AdmittedAuthority::Delivery { delivery_id:row.id.clone() }); }
         NativeControlGuard {
             caller,
@@ -241,6 +241,11 @@ async fn dispatch_with_control<R: Runtime>(
         }
         .retain_admission(app)
     }));
+    if let Some(control) = &mut control {
+        if control.caller.thread_id().is_some() {
+            control.caller.admitted = Some(super::AdmittedAuthority::Delivery { delivery_id: row.id.clone() });
+        }
+    }
     if let Some(control) = &control {
         if let Err(error) = control.verify(app) {
             // A definite refusal or cancellation settles this unqueued operation.

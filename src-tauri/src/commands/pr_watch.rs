@@ -407,6 +407,7 @@ mod tests {
 
     fn caller(provider: ProviderKind, mode: Option<&str>) -> HostCaller {
         HostCaller {
+            control: None,
             thread_id: "chat".into(),
             provider,
             workspace_id: None,

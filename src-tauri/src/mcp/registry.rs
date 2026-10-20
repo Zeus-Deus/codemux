@@ -261,6 +261,7 @@ pub(crate) type NativeDelegationHandler = Arc<
             crate::delegation::app::NativeActor,
             String,
             serde_json::Value,
+            Option<String>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>,
         > + Send
@@ -276,10 +277,16 @@ impl McpRegistry {
         arguments: serde_json::Value,
         actor: crate::delegation::app::NativeActor,
     ) -> Result<serde_json::Value, String> {
+        self.dispatch_native_tool_call_with_id(name, arguments, actor, None).await
+    }
+    async fn dispatch_native_tool_call_with_id(
+        &self, name: &str, arguments: serde_json::Value,
+        actor: crate::delegation::app::NativeActor, call_id: Option<String>,
+    ) -> Result<serde_json::Value, String> {
         if let Some(raw) = crate::agent_control::native::tool_name(name) {
             let handler = self.native_delegation.lock().unwrap().clone()
                 .ok_or("Native orchestration service is unavailable")?;
-            let value = handler(actor, raw.into(), arguments).await?;
+            let value = handler(actor, raw.into(), arguments, call_id).await?;
             return Ok(if value.get("content").is_some() { value } else {serde_json::json!({"content":[{"type":"text","text":value.to_string()}]})});
         }
         let raw = {
@@ -314,12 +321,12 @@ impl McpRegistry {
             // Keep the coordinator/Tauri command stable while giving remote MCP
             // launch a distinct identity from the local delegate_task host tool.
             let command = raw.as_str();
-            let value = handler(actor, command.into(), arguments).await?;
+            let value = handler(actor, command.into(), arguments, call_id).await?;
             return Ok(serde_json::json!({"content":[{"type":"text","text":value.to_string()}]}));
         }
         if let Some(raw) = name.strip_prefix("mcp__codemux__") {
             let handler = self.native_delegation.lock().unwrap().clone().ok_or("Native caller policy is unavailable")?;
-            return handler(actor, raw.into(), arguments).await;
+            return handler(actor, raw.into(), arguments, call_id).await;
         }
         self.dispatch_tool_call(name, arguments, actor.workspace_id.as_deref()).await
     }
@@ -410,8 +417,20 @@ impl McpRegistry {
     pub(crate) async fn host_call_native(
         &self, caller: &HostCaller, name: &str, args: &Value,
         call_id: Option<&str>, run_id: Option<&str>,
-        permit: Option<&crate::delegation::authority::NativePermit>,
+        actor: Option<&crate::delegation::app::NativeActor>,
     ) -> Option<Value> {
+        // Native orchestration must acquire a qualified thread principal before
+        // reaching a host tool. Its admission rechecks the turn fence after any
+        // asynchronous capability lookup, in the same critical section as Stop.
+        if let Some(actor) = actor.filter(|_| crate::agent_control::native::tool_name(name).is_some()) {
+            if self.native_delegation.lock().unwrap().is_some() {
+                return Some(match self.dispatch_native_tool_call_with_id(name, args.clone(), actor.clone(), call_id.map(str::to_string)).await {
+                    Ok(result) => result,
+                    Err(error) => serde_json::json!({"content":[{"type":"text","text":error}],"isError":true}),
+                });
+            }
+        }
+        let permit = actor.map(|actor| &actor.permit);
         let host = self.host.get()?;
         if name != "mcp__codemux__delegate_task" {
             return host.call_async(caller, name, args, call_id, run_id).await;
@@ -1562,6 +1581,39 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn native_callers_host_delegation_uses_native_admission_after_async_validation() {
+        let reg=McpRegistry::new();
+        reg.set_host_tools(Arc::new(EchoHost));
+        let owner=crate::delegation::authority::NativeAuthority::new("native-host-admission");
+        let generation=owner.begin();assert!(owner.bind(generation,"turn"));
+        let caller=HostCaller{control:None,thread_id:"native-host-admission".into(),provider:crate::agent_provider::ProviderKind::Claude,workspace_id:None,permission_mode:Some("default".into())};
+        let actor=crate::delegation::app::NativeActor{thread_id:caller.thread_id.clone(),provider:caller.provider,workspace_id:None,session_id:"session".into(),permission_mode:caller.permission_mode.clone(),permit:owner.capture_for_turn("turn")};
+        let entered=Arc::new(tokio::sync::Notify::new());
+        let release=Arc::new(tokio::sync::Semaphore::new(0));
+        let admitted=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (start,gate,count)=(entered.clone(),release.clone(),admitted.clone());
+        reg.set_native_delegation_handler(Arc::new(move|actor,name,_,call_id|{
+            let(start,gate,count)=(start.clone(),gate.clone(),count.clone());
+            Box::pin(async move{
+                assert_eq!(name,"delegate_task");
+                assert_eq!(call_id.as_deref(),Some("provider-tool-call"));
+                let identity=actor.permit.identity()?;
+                start.notify_one();gate.acquire().await.unwrap().forget();
+                identity.admit(&actor.thread_id,||{count.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Ok(serde_json::json!({"task_id":"admitted"}))})
+            })
+        }));
+        let args=serde_json::json!({"permission_mode":"plan"});
+        let call=reg.host_call_native(&caller,"mcp__codemux__delegate_task",&args,Some("provider-tool-call"),Some("turn"),Some(&actor));
+        tokio::pin!(call);
+        tokio::select!{result=&mut call=>panic!("admitted before validation: {result:?}"),_=entered.notified()=>{}}
+        owner.invalidate();release.add_permits(1);
+        let result=call.await.unwrap();
+        assert_eq!(result["isError"],true,"{result}");
+        assert!(result.to_string().contains("stale_caller"));
+        assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst),0);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn local_and_remote_delegation_keep_distinct_real_prefixes_when_local_is_disabled() {
@@ -1601,7 +1653,7 @@ mod tests {
         let expected = input.clone();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = calls.clone();
-        reg.set_native_delegation_handler(Arc::new(move |actor, command, arguments| {
+        reg.set_native_delegation_handler(Arc::new(move |actor, command, arguments, _call_id| {
             let expected = expected.clone();
             let count = count.clone();
             Box::pin(async move {

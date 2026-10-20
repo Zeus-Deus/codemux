@@ -2100,17 +2100,17 @@ async fn native_callers_admitted_message_survives_sender_pane_change_and_human_r
     let pane=app.state::<crate::state::AppStateStore>().agent_chat_pane_id_for_thread(&thread).unwrap();
     app.state::<crate::state::AppStateStore>().close_pane(&pane).unwrap();authority.invalidate();
     service::authorize(app.handle(),&caller).unwrap();
-    db.finish_message_delivery(id,"queued",Some(&json!({"queued_id":"accepted-queue"})),None).unwrap();
-    // This base disposes controller sends on Stop. Exercise the retained held
-    // row used by PR1's re-arm path before the coordinator rebases that layer.
-    db.finish_message_delivery(id,"held",None,None).unwrap();
+    let gate=app.state::<NativeControlState>().thread_gate(receiver);
+    gate.cancel();
+    db.stop_message_deliveries(receiver).unwrap();
+    let held=db.message_delivery(id).unwrap().unwrap();
+    assert_eq!(held.state,"held");
+    assert_eq!(held.hold_reason.as_deref(),Some("stop"));
+    assert!(!held.attempted);
     assert!(service::authorize(app.handle(),&caller).is_err());
-    db.resume_message_delivery_thread(receiver).unwrap();
-    assert_eq!(db.message_delivery(id).unwrap().unwrap().state,"queued");
+    assert_eq!(db.resume_message_delivery_thread(receiver).unwrap(),vec![id]);
+    assert_eq!(db.message_delivery(id).unwrap().unwrap().state,"preparing");
     service::authorize(app.handle(),&caller).unwrap();
-    db.retry_message_delivery(receiver,id).err();
-    // Return the queued row to dispatchable state, retaining its identity.
-    db.finish_message_delivery(id,"pending",None,None).unwrap();
     barrier.add_permits(1);
     tokio::time::timeout(std::time::Duration::from_secs(5),async {loop {if provider.calls.snapshot().iter().any(|c|matches!(c,mock_agent_provider::MockCall::SendTurn(t,_) if t.0==receiver)){break;}tokio::time::sleep(std::time::Duration::from_millis(10)).await;}}).await.unwrap();
     assert_ne!(db.message_delivery(id).unwrap().unwrap().state,"rejected");
@@ -2218,4 +2218,60 @@ fn orchestration_message_stale_caller_fences_hold_without_definitive_rejection()
         assert_eq!(db.fail_message_delivery("stale","stale_caller: generation fence changed").unwrap(),"held");
         db.retry_message_delivery("target","stale").unwrap();
     }
+}
+
+#[tokio::test]
+async fn native_callers_rearmed_queued_agent_message_keeps_its_identity_and_authority() {
+    use crate::agent_provider::{ProviderKind, TurnDispatchCheckpoint};
+    let (app,_,_root,workspace,thread,authority,actor)=native_caller_fixture("default").await;
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"rearm-target","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let receiver=settle_operation(&app,&receipt).await["thread_id"].as_str().unwrap().to_string();
+    let mut caller=native::qualify(app.handle(),&actor).await.unwrap();
+    let db=app.state::<crate::database::DatabaseStore>();
+    let payload=json!({"origin":"controller","caller":caller});
+    db.admit_message_delivery("queued-agent",&receiver,"original-message",&payload,"epoch",0,None,false).unwrap();
+    db.finish_message_delivery("queued-agent","queued",Some(&json!({"queued_id":"original-queue"})),None).unwrap();
+    caller.admitted=Some(AdmittedAuthority::Delivery{delivery_id:"queued-agent".into()});
+    let control=NativeControlGuard{caller,workspace_id:workspace,thread_id:receiver.clone(),provider:ProviderKind::Claude,admission:None}.retain_admission(app.handle());
+    let checkpoint=super::delivery::DeliveryCheckpoint{
+        app:app.handle().clone(),id:"queued-agent".into(),thread:receiver.clone(),provider:ProviderKind::Claude,
+        release_queue:false,resumed_ids:vec![],admitted_generation:0,
+        inner:Some(Arc::new(super::GuardedTurnCheckpoint{app:app.handle().clone(),control,inner:None})),
+    };
+    let pane=app.state::<crate::state::AppStateStore>().agent_chat_pane_id_for_thread(&thread).unwrap();
+    app.state::<crate::state::AppStateStore>().close_pane(&pane).unwrap();
+    authority.invalidate();
+    let gate=app.state::<NativeControlState>().thread_gate(&receiver);
+    gate.cancel();db.stop_message_deliveries(&receiver).unwrap();
+    let held=db.message_delivery("queued-agent").unwrap().unwrap();
+    assert_eq!(held.state,"held");assert_eq!(held.hold_reason.as_deref(),Some("stop"));assert!(!held.attempted);
+    assert!(checkpoint.authorize_dispatch().is_err());
+    assert_eq!(db.resume_message_delivery_thread(&receiver).unwrap(),vec!["queued-agent"]);
+    let rearmed=db.message_delivery("queued-agent").unwrap().unwrap();
+    assert_eq!(rearmed.state,"queued");assert_eq!(rearmed.message_id,"original-message");assert_eq!(rearmed.queued_id.as_deref(),Some("original-queue"));
+    checkpoint.authorize_dispatch().unwrap();
+    assert!(db.message_delivery("queued-agent").unwrap().unwrap().attempted);
+    gate.cancel();assert!(checkpoint.authorize_dispatch().is_err());
+}
+
+#[tokio::test]
+async fn native_callers_saved_agent_send_rearms_after_sender_pane_closes() {
+    use crate::agent_provider::{message::*, types::MessageDelivery, ProviderKind, ThreadId};
+    let (app,provider,_root,workspace,thread,authority,actor)=native_caller_fixture("default").await;
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"saved-agent-target","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let receiver=settle_operation(&app,&receipt).await["thread_id"].as_str().unwrap().to_string();
+    let caller=native::qualify(app.handle(),&actor).await.unwrap();
+    let db=app.state::<crate::database::DatabaseStore>();
+    let provenance=MessageProvenance{message_id:Some("saved-agent-message".into()),delivery_id:Some("saved-agent-delivery".into()),origin:Some(crate::commands::agent_chat::TurnOrigin::Controller),created_by:CreatedBy::Agent,creation_source:CreationSource::Provider,sender_thread_id:Some(thread.clone()),..Default::default()};
+    let payload=json!({"provider":"claude","origin":"controller","input":{"thread_id":receiver,"text":"Retained agent report"},"provenance":provenance,"caller":caller});
+    db.admit_message_delivery("saved-agent-delivery",&receiver,"saved-agent-message",&payload,"old",0,None,false).unwrap();
+    db.finish_message_delivery("saved-agent-delivery","queued",Some(&json!({"queued_id":"saved-agent-queue"})),None).unwrap();
+    db.insert_queued_turn(&crate::database::queued_turns::QueuedTurnRecord{thread_id:receiver.clone(),queued_id:"saved-agent-queue".into(),position:0,text:"Retained agent report".into(),prompt:None,provenance,skill_ids:vec![],skill_text:None,include_plugins:false,images:vec![],client_nonce:Some("saved-agent-message".into()),model_override:None,effort_override:None,permission_mode_override:None,epoch:"old".into()}).unwrap();
+    db.stop_message_deliveries(&receiver).unwrap();
+    let pane=app.state::<crate::state::AppStateStore>().agent_chat_pane_id_for_thread(&thread).unwrap();
+    app.state::<crate::state::AppStateStore>().close_pane(&pane).unwrap();authority.invalidate();
+    crate::commands::queued_turns::send_saved_queued_turn(app.handle().clone(),ProviderKind::Claude,ThreadId(receiver.clone()),"saved-agent-queue".into(),MessageDelivery::Queue,true).await.unwrap();
+    let row=db.message_delivery("saved-agent-delivery").unwrap().unwrap();
+    assert_eq!(row.message_id,"saved-agent-message");assert!(row.attempted);assert_eq!(row.state,"accepted");
+    assert_eq!(provider.calls.snapshot().iter().filter(|c|matches!(c,mock_agent_provider::MockCall::SendTurn(t,text) if t.0==receiver && text=="Retained agent report")).count(),1);
 }

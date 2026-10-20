@@ -8,7 +8,7 @@ pub enum ControlAccess {
     FullAccess,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CallerPrincipal {
     LocalController,
@@ -24,7 +24,7 @@ pub enum CallerPrincipal {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AdmittedAuthority {
     Task { task_id: String },
@@ -32,7 +32,7 @@ pub enum AdmittedAuthority {
     Operation { operation_id: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ControlCaller {
     #[serde(default)]
     pub created_by: crate::agent_provider::message::CreatedBy,

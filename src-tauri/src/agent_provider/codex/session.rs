@@ -3010,13 +3010,10 @@ async fn handle_dynamic_tool_call_native(
             if host.is_some() && actor.is_none() && crate::agent_control::native::tool_name(&name).is_some() {
                 return json!({"success":false,"contentItems":[{"type":"inputText","text":"stale_caller: injected tools require the app-owned live session and run; provider-native children cannot borrow its identity"}]});
             }
-            // Host tools answer synchronously (no provider waits), which
-            // matters here: this request loop handles approvals too. They act
-            // as the root chat, so a call from another thread (a native
-            // subagent that inherited the dynamic tools) is refused rather
-            // than handed the root's identity and permission mode.
+            // Only the adapter's app-owned session/run may invoke host tools.
+            // Waits run in tracked tasks outside the approval reader.
             let host = if let Some((caller, root_thread))=host {
-                if call.thread_id==root_thread {registry.host_call_native(caller,&name,&call.arguments,Some(&call.call_id),Some(&call.turn_id),actor.as_ref().map(|actor| &actor.permit)).await}
+                if call.thread_id==root_thread {registry.host_call_native(caller,&name,&call.arguments,Some(&call.call_id),Some(&call.turn_id),actor.as_ref()).await}
                 else {registry.host_tools(caller).iter().any(|tool|tool.prefixed_name==name).then(||json!({"content":[{"type":"text","text":"This tool requires the app-owned root conversation"}],"isError":true}))}
             } else {None};
             if actor.is_none() && crate::agent_control::native::tool_name(&name).is_some() {
@@ -3784,7 +3781,7 @@ mod tests {
         for stop_before_capture in [false, true] {
             let registry = McpRegistry::new();
             registry.set_host_tools(Arc::new(HandOffHost));
-            let caller = crate::mcp::registry::HostCaller { thread_id: format!("codex-late-host-{stop_before_capture}"), provider: crate::agent_provider::ProviderKind::Codex, workspace_id: None, permission_mode: Some("danger-full-access".into()) };
+            let caller = crate::mcp::registry::HostCaller { control:None, thread_id: format!("codex-late-host-{stop_before_capture}"), provider: crate::agent_provider::ProviderKind::Codex, workspace_id: None, permission_mode: Some("danger-full-access".into()) };
             let owner = crate::delegation::authority::NativeAuthority::new(&caller.thread_id);
             let generation = owner.begin(); assert!(owner.bind(generation, "turn"));
             let db = crate::database::DatabaseStore::new_in_memory();
@@ -3819,15 +3816,12 @@ mod tests {
             })
         };
 
-        let owner = crate::delegation::authority::NativeAuthority::new(&caller.thread_id);
-        let generation = owner.begin(); assert!(owner.bind(generation, "turn"));
-        let actor = crate::delegation::app::NativeActor { thread_id:caller.thread_id.clone(), provider:caller.provider, workspace_id:None, session_id:"session".into(), permission_mode:caller.permission_mode.clone(), permit:owner.capture_for_turn("turn") };
         let root = handle_dynamic_tool_call_native(
             Some(&registry),
             None,
             Some((&caller, "codex-root")),
             request("codex-root"),
-            Some(actor), &[],
+            None, &[],
         )
         .await;
         assert_eq!(root["success"], false, "a root id alone is not authenticated authority: {root}");
@@ -3846,7 +3840,7 @@ mod tests {
         assert!(native_child["contentItems"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("app-owned root conversation"));
+            .contains("stale_caller"));
     }
 
     #[tokio::test]

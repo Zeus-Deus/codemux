@@ -24,11 +24,20 @@ impl NativeControlGuard {
         self
     }
     pub fn verify<R: Runtime>(&self, app: &AppHandle<R>) -> Result<(), String> {
+        self.verify_with_delivery_retry(app, false)
+    }
+    /// Saved Send now validates retained sender policy before re-arming the
+    /// durable hold. The delivery journal still gates actual submission.
+    pub(crate) fn verify_saved_delivery<R: Runtime>(&self, app: &AppHandle<R>) -> Result<(), String> {
+        self.verify_with_delivery_retry(app, true)
+    }
+    fn verify_with_delivery_retry<R: Runtime>(&self, app: &AppHandle<R>, retry_held: bool) -> Result<(), String> {
         if let Some((gate, generation)) = &self.admission { gate.verify(*generation)?; }
         // This is the parent's authority choke point. Until the connector is
         // adopted it denies every outside grant; afterwards it validates the
         // current connector config/grant rather than an admission snapshot.
-        authorize(app, &self.caller).map_err(|e| e.to_string())?;
+        if retry_held { super::service::authorize_delivery_retry(app, &self.caller) }
+        else { authorize(app, &self.caller) }.map_err(|e| e.to_string())?;
         let target = Target {
             workspace_id: self.workspace_id.clone(),
             thread_id: self.thread_id.clone(),

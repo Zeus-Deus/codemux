@@ -23,7 +23,7 @@ use crate::mcp::runtime::{prefix_tool_name, McpTool};
 use crate::state::AppStateStore;
 
 use super::agent_chat::{
-    agent_chat_start_session, fallback_permission_mode, forward_event,
+    fallback_permission_mode, forward_event,
     resolve_start_permission_mode, send_turn_with_context, thread_id_for_event, TurnOrigin,
 };
 use super::usage_resume::{self, now_ms, queued_turn};

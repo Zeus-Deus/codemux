@@ -33,7 +33,7 @@ pub(crate) struct NativePermit {
     turn: Option<String>,
     pending: bool,
 }
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AuthorityIdentity {
     session_key: String,
     generation: u64,
@@ -327,7 +327,7 @@ impl NativePermit {
         Ok(AuthorityIdentity {
             session_key: self.owner.session_key.clone(),
             generation: self.generation,
-            activity: self.activity,
+            activity: state.activity,
             run_id: state.turn.clone(),
         })
     }
