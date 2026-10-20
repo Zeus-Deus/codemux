@@ -39,15 +39,23 @@ pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
 
 /// A history reopen merges `merged` into `survivor`
 /// (`merge_agent_chat_session_rows`): tasks started from a merged chat's
-/// suggestions belong to the survivor, whose transcript now holds them.
+/// suggestions belong to the survivor, whose transcript now holds them, and
+/// a reopened task child is the survivor, so its parent's card opens it.
 pub(super) fn move_to_thread(conn: &Connection, merged: &[String], survivor: &str) -> Result<(), String> {
+    let move_error = |e: rusqlite::Error| format!("Failed to keep the started follow-up tasks: {e}");
     for thread in merged {
         conn.execute(
             "UPDATE OR IGNORE agent_follow_up_tasks SET parent_thread_id = ?2
              WHERE parent_thread_id = ?1",
             params![thread, survivor],
         )
-        .map_err(|e| format!("Failed to keep the started follow-up tasks: {e}"))?;
+        .map_err(move_error)?;
+        conn.execute(
+            "UPDATE OR IGNORE agent_follow_up_tasks SET child_thread_id = ?2
+             WHERE child_thread_id = ?1",
+            params![thread, survivor],
+        )
+        .map_err(move_error)?;
     }
     Ok(())
 }
@@ -383,6 +391,21 @@ mod tests {
         assert!(db.list_follow_up_tasks("parent").is_empty());
         let row = db.get_follow_up_for_suggestion("reopened", "call", 0).unwrap();
         assert_eq!(row.child_thread_id, "c1");
+
+        // The task's own chat reopened from history: the card opens it there.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('c1', 'sdk-c', 'ws', 'codex', '2025-01-01', '2025-01-01'),
+                        ('c1-reopened', 'sdk-c', 'ws', 'codex', '2025-03-01', '2025-03-01')",
+            )
+            .unwrap();
+        db.collapse_duplicate_agent_chat_sessions("sdk-c").unwrap();
+        assert!(db.get_follow_up_task("c1").is_none());
+        assert_eq!(db.get_follow_up_task("c1-reopened").unwrap().parent_thread_id, "reopened");
     }
 
     #[test]

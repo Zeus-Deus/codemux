@@ -65,9 +65,11 @@ pub struct NewChatFork<'a> {
     pub title: &'a str,
     /// Copy only rows before this source row id; `None` copies them all.
     pub cut_before: Option<i64>,
-    /// The source's and the fork's chat-image folders. Inherited images are
-    /// re-pointed into the fork's own folder, so deleting or reverting the
-    /// source can't break them.
+    /// The chat-image root and the fork's folder. Inherited images anywhere
+    /// under the root (the source's folder, or that of a chat it absorbed by
+    /// a history reopen) are re-pointed into the fork's own folder, so the
+    /// fork and its source never share a file: deleting or reverting either
+    /// can't break the other.
     pub image_dirs: Option<(&'a Path, &'a Path)>,
 }
 
@@ -89,7 +91,8 @@ pub struct ChatForkOrigin {
 /// Rewrite one copied transcript row for the fork: the envelope's
 /// `thread_id` names the fork, a user-turn journal row points at the fork's
 /// copy of its user message, and a user message's images inside the
-/// source's image folder move to the fork's (recorded in `images`).
+/// chat-image root move into the fork's folder by file name (unique per
+/// image), recorded in `images`.
 pub(crate) fn rewrite_forked_payload(
     payload: &str,
     fork_thread_id: &str,
@@ -112,7 +115,7 @@ pub(crate) fn rewrite_forked_payload(
             object.insert("user_message_id".into(), (*copied).into());
         }
     }
-    if let (Some((source_dir, fork_dir)), Some(list)) = (
+    if let (Some((root, fork_dir)), Some(list)) = (
         image_dirs,
         object.get_mut("images").and_then(serde_json::Value::as_array_mut),
     ) {
@@ -121,10 +124,14 @@ pub(crate) fn rewrite_forked_payload(
                 continue;
             };
             let from = PathBuf::from(path);
-            let Ok(rest) = from.strip_prefix(source_dir) else {
+            // A transcript row is data: only plain paths under the root move.
+            let inside = from.strip_prefix(root).is_ok_and(|rest| {
+                rest.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+            });
+            let (true, Some(name)) = (inside, from.file_name()) else {
                 continue;
             };
-            let to = fork_dir.join(rest);
+            let to = fork_dir.join(name);
             image["path"] = to.to_string_lossy().into_owned().into();
             images.push((from, to));
         }
@@ -409,18 +416,28 @@ mod tests {
     #[test]
     fn rewrite_moves_inherited_images_into_the_forks_folder() {
         let mut images = Vec::new();
+        // `/img/old` belongs to a chat the source absorbed by a history
+        // reopen: its images are the source's now, so they move too.
         let row = rewrite_forked_payload(
-            r#"{"type":"user_message","text":"look","images":[{"path":"/img/src/a.png","media_type":"image/png"},{"path":"/elsewhere/b.png"}]}"#,
+            r#"{"type":"user_message","text":"look","images":[{"path":"/img/src/a.png","media_type":"image/png"},{"path":"/elsewhere/b.png"},{"path":"/img/old/c.png"},{"path":"/img/../etc/d.png"}]}"#,
             "fork",
             &HashMap::new(),
-            Some((Path::new("/img/src"), Path::new("/img/fork"))),
+            Some((Path::new("/img"), Path::new("/img/fork"))),
             &mut images,
         );
         let row: serde_json::Value = serde_json::from_str(&row).unwrap();
-        let moved = Path::new("/img/fork").join("a.png");
-        assert_eq!(row["images"][0]["path"], moved.to_string_lossy().as_ref());
-        assert_eq!(row["images"][1]["path"], "/elsewhere/b.png", "only the source's own folder moves");
-        assert_eq!(images, vec![(PathBuf::from("/img/src/a.png"), PathBuf::from("/img/fork/a.png"))]);
+        let fork = |name: &str| Path::new("/img/fork").join(name);
+        assert_eq!(row["images"][0]["path"], fork("a.png").to_string_lossy().as_ref());
+        assert_eq!(row["images"][1]["path"], "/elsewhere/b.png", "only the chat-image root moves");
+        assert_eq!(row["images"][2]["path"], fork("c.png").to_string_lossy().as_ref());
+        assert_eq!(row["images"][3]["path"], "/img/../etc/d.png", "never a path that leaves the root");
+        assert_eq!(
+            images,
+            vec![
+                (PathBuf::from("/img/src/a.png"), fork("a.png")),
+                (PathBuf::from("/img/old/c.png"), fork("c.png")),
+            ]
+        );
     }
 
     #[test]

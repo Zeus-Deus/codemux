@@ -52,4 +52,17 @@ describe("useChatForkOrigin", () => {
     act(() => events.merged?.({ survivor: "source-reopened", merged: ["source"] }));
     await waitFor(() => expect(result.current).toEqual(moved));
   });
+
+  it("reads again when a merge lands while the first read is in flight", async () => {
+    let answer: (value: ChatForkOrigin) => void = () => {};
+    commands.agentChatForkOrigin.mockReset();
+    commands.agentChatForkOrigin
+      .mockReturnValueOnce(new Promise<ChatForkOrigin>((resolve) => (answer = resolve)))
+      .mockResolvedValue({ ...origin, source_thread_id: "source-reopened" });
+    const { result } = renderHook(() => useChatForkOrigin("fork"));
+    await waitFor(() => expect(commands.agentChatForkOrigin).toHaveBeenCalledTimes(1));
+    act(() => events.merged?.({ survivor: "source-reopened", merged: ["source"] }));
+    act(() => answer(origin));
+    await waitFor(() => expect(result.current?.source_thread_id).toBe("source-reopened"));
+  });
 });

@@ -9835,6 +9835,48 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_of_a_reopened_chat_owns_copies_of_its_images() {
+        // A reopened as B: B's transcript points at A's folder. Forking B
+        // into C copies that image into C's folder, so deleting either chat
+        // leaves the other's images intact.
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("a");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("img.png"), b"png").unwrap();
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("b", "ws", Some("/repo"), "claude").unwrap();
+        let message = serde_json::json!({
+            "type": "user_message", "thread_id": "b", "text": "look",
+            "images": [{"path": old.join("img.png"), "media_type": "image/png"}],
+        });
+        db.append_agent_chat_message("b", &message.to_string()).unwrap();
+        let source = db.get_agent_chat_session("b").unwrap();
+        let fork_dir = root.path().join("c");
+        let images = db
+            .create_agent_chat_fork(&crate::database::chat_fork::NewChatFork {
+                thread_id: "c",
+                source: &source,
+                sdk_session_id: "native-c",
+                workspace_id: "ws",
+                cwd: "/repo",
+                title: "fork",
+                cut_before: None,
+                image_dirs: Some((root.path(), &fork_dir)),
+            })
+            .unwrap();
+        for (from, to) in images {
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(from, to).unwrap();
+        }
+
+        delete_referenced_chat_images_in(root.path(), &db.list_agent_chat_messages("b"));
+        assert!(!old.join("img.png").exists());
+        assert!(fork_dir.join("img.png").exists(), "the fork has its own copy");
+        delete_referenced_chat_images_in(root.path(), &db.list_agent_chat_messages("c"));
+        assert!(!fork_dir.exists());
+    }
+
+    #[test]
     fn deleting_a_chat_deletes_the_images_its_transcript_points_at() {
         // A chat reopened from history points at images in the merged-away
         // thread's folder; deleting it removes them and the emptied folder.
