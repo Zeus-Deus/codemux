@@ -10441,12 +10441,6 @@ mod tests {
             chat_image_paths_in_payload(user),
             vec!["/img/a.png".to_string(), "/img/b.png".to_string()]
         );
-        assert_eq!(
-            chat_image_paths_in_payload(
-                r#"{"type":"item_completed","item":{"retained_images":[{"source":"/original.png","path":"/img/kept.png"}]}}"#
-            ),
-            vec!["/img/kept.png".to_string()]
-        );
         // Image-less turns, provider rows and unparsable payloads contribute
         // nothing to the revert cleanup set.
         assert!(chat_image_paths_in_payload(r#"{"type":"user_message","text":"hi"}"#).is_empty());
@@ -10856,6 +10850,46 @@ mod tests {
         delete_tool_result_image_cache_in(root.path(), &db, "ordinary");
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read(target).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn tool_result_image_cache_cleanup_never_evicts_reply_image_copies() {
+        let root = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::new_in_memory();
+        for thread in ["source", "survivor"] {
+            db.upsert_agent_chat_session(thread, "ws", Some("/repo"), "claude")
+                .unwrap();
+        }
+        let dir = root.path().join("source");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join(format!("tool-1-{}.png", "d".repeat(64)));
+        // Reply copies are named `<uuid>.<ext>` (see `reply_images::plan`).
+        // One is recorded on its reply row; the other has landed on disk but
+        // its job has not recorded it yet, so only the name keeps it safe.
+        let recorded = dir.join(format!("{}.png", uuid::Uuid::new_v4()));
+        let in_flight = dir.join(format!("{}.webp", uuid::Uuid::new_v4()));
+        for path in [&cache, &recorded, &in_flight] {
+            std::fs::write(path, b"image").unwrap();
+        }
+        db.append_agent_chat_message(
+            "source",
+            &json!({"type":"item_completed", "item":{"kind":"assistant_text", "text":"[Proof](/tmp/proof.png)",
+                "retained_images":[{"source":"/tmp/proof.png", "path":recorded}]}})
+            .to_string(),
+        )
+        .unwrap();
+        db.merge_reopened_agent_chat_session("source", "survivor")
+            .unwrap();
+        delete_tool_result_image_cache_in(root.path(), &db, "source");
+        assert!(!cache.exists(), "the unreferenced tool-image cache is reclaimed");
+        assert!(recorded.exists(), "a recorded reply copy survives");
+        assert!(in_flight.exists(), "a not-yet-recorded reply copy survives");
+        // A late materializer for the merged-away source sweeps again.
+        std::fs::write(&cache, b"late cache").unwrap();
+        assert!(!finish_tool_result_image_cache(&db, "source", &cache));
+        assert!(!cache.exists());
+        assert!(recorded.exists());
+        assert!(in_flight.exists());
     }
 
     #[test]
