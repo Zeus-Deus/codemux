@@ -142,6 +142,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   useAppStore.setState({ appState: null });
 });
 
@@ -300,6 +301,34 @@ describe("BrowserPeekOverlay", () => {
       Object.defineProperty(window, "innerWidth", { value: original.width, configurable: true });
       Object.defineProperty(window, "innerHeight", { value: original.height, configurable: true });
     }
+  });
+
+  it("lifts above a composer that mounts while it is open", async () => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.hasAttribute("data-composer-dock")) return new DOMRect(1000, 980, 484, 86);
+      if (this.querySelector(":scope > [role=dialog]")) return new DOMRect(0, 0, 1920, 1080);
+      return new DOMRect(0, 0, 0, 0);
+    });
+    setAppState([makeSession()]);
+    useBrowserPeekStore.getState().open("ws-1");
+    renderOverlay();
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.style.bottom).toBe("14px");
+
+    // A tab switch mounts the chat's composer under the peek's corner.
+    const dock = document.createElement("div");
+    dock.setAttribute("data-composer-dock", "");
+    await act(async () => {
+      dialog.parentElement!.appendChild(dock);
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    });
+    expect(dialog.style.bottom).toBe("112px");
+
+    await act(async () => {
+      dock.remove();
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    });
+    expect(dialog.style.bottom).toBe("14px");
   });
 
   it("shrinks to the 60% cap when the window gets smaller", () => {

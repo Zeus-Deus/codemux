@@ -207,28 +207,47 @@ export function BrowserPeekOverlay() {
   }, [open, activeWorkspaceId, close]);
 
   // Lift the peek over any composer under its corner, following the
-  // composer as it grows with a draft or a queue.
+  // composer as it grows with a draft or a queue, and picking up composers
+  // that mount while the peek is open (a keyboard tab switch, a new split).
   const liveSize = clampPeekSize(dragSize ?? storedSize, winSize);
   const { width: liveWidth, height: liveHeight } = liveSize;
   useLayoutEffect(() => {
     const panel = panelRef.current;
-    const container = panel?.offsetParent;
+    const container = panel?.offsetParent ?? panel?.parentElement;
     if (!open || !panel || !container) return;
-    const docks = Array.from(document.querySelectorAll<HTMLElement>("[data-composer-dock]"));
-    const update = () =>
+    const resize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => schedule());
+    let observed = new Set<HTMLElement>();
+    const sync = () => {
+      const docks = new Set(container.querySelectorAll<HTMLElement>("[data-composer-dock]"));
+      for (const dock of docks) if (!observed.has(dock)) resize?.observe(dock);
+      for (const dock of observed) if (!docks.has(dock)) resize?.unobserve(dock);
+      observed = docks;
       setBottom(
         peekBottomOffset(
           container.getBoundingClientRect(),
-          docks.map((dock) => dock.getBoundingClientRect()),
+          Array.from(docks, (dock) => dock.getBoundingClientRect()),
           { width: liveWidth, height: liveHeight },
         ),
       );
-    update();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(update);
-    observer.observe(container);
-    docks.forEach((dock) => observer.observe(dock));
-    return () => observer.disconnect();
+    };
+    // Coalesce bursts (a streaming transcript mutates every frame).
+    let frame = 0;
+    const schedule = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        sync();
+      });
+    };
+    sync();
+    resize?.observe(container);
+    const mutations = new MutationObserver(schedule);
+    mutations.observe(container, { childList: true, subtree: true });
+    return () => {
+      cancelAnimationFrame(frame);
+      mutations.disconnect();
+      resize?.disconnect();
+    };
   }, [open, liveWidth, liveHeight]);
 
   const last = lastShownRef.current;
