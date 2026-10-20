@@ -104,7 +104,9 @@ export function RunContextControl({
   const workspaceLabel = isWorktree
     ? typedName || "New worktree"
     : "Current checkout";
-  const showDevices = hosts.length > 0 || !showWorkspace;
+  // A selected device keeps the list too: if the host list failed to load,
+  // "this device" is the only way back from a target that reads unavailable.
+  const showDevices = hosts.length > 0 || !showWorkspace || hostId !== null;
   const mobileLocal = hostId === null;
 
   // Measure both labels so the pill eases between their widths. Left unset
@@ -197,6 +199,8 @@ export function RunContextControl({
   const handleNameKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     // Keep cmdk's arrow/Enter handling on the root out of the text field.
     event.stopPropagation();
+    // Enter that confirms an IME candidate belongs to the composition.
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
     if (event.key === "Enter") {
       event.preventDefault();
       commitName();
@@ -356,6 +360,9 @@ export function RunContextControl({
                           startEditing();
                         }}
                         onPointerDown={(e) => e.stopPropagation()}
+                        // cmdk's root turns Enter into a select of the
+                        // highlighted row; keep the button's own activation.
+                        onKeyDown={(e) => e.stopPropagation()}
                         className="grid size-5 shrink-0 place-items-center rounded-sm text-muted-foreground opacity-0 transition-opacity duration-150 group-hover/command-item:opacity-70 group-data-[selected=true]/command-item:opacity-70 hover:bg-surface-2 hover:text-foreground hover:opacity-100! focus-visible:opacity-100 in-[[data-mobile]]:opacity-70"
                       >
                         <Pencil className="size-3" />

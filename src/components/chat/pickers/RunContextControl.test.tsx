@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { host, status } from "@/components/devices/host-fixtures.test-utils";
@@ -149,6 +149,16 @@ describe("RunContextControl", () => {
       expect(useAddDeviceDialogStore.getState().open).toBe(false);
     });
 
+    it("keeps this device on offer when the device list failed to load", async () => {
+      // The draft keeps its remote target while the host store errors, so
+      // the menu must still offer the way back to this device.
+      const user = userEvent.setup();
+      const { onChangeHostId } = renderControl({ hostId: 999, showWorkspace: true });
+      await user.click(trigger());
+      await user.click(await screen.findByText("this device"));
+      expect(onChangeHostId).toHaveBeenLastCalledWith(null);
+    });
+
     it("does not open while disabled", async () => {
       const user = userEvent.setup();
       renderControl({ disabled: true });
@@ -220,6 +230,38 @@ describe("RunContextControl", () => {
       // The menu stays open on the workspace choices.
       expect(screen.queryByRole("textbox", { name: "Worktree name" })).toBeNull();
       expect(screen.getByText("Current checkout")).toBeInTheDocument();
+    });
+
+    it("opens the rename from the keyboard without picking the highlighted row", async () => {
+      const user = userEvent.setup();
+      hosts = [host(7, "homelab")];
+      const { onChangeHostId, onChangeCheckoutMode } = renderControl({
+        hostId: 7,
+        showWorkspace: true,
+        checkoutMode: "worktree",
+      });
+      await user.click(trigger());
+      screen.getByRole("button", { name: "Rename worktree" }).focus();
+      await user.keyboard("{Enter}");
+
+      expect(screen.getByRole("textbox", { name: "Worktree name" })).toHaveFocus();
+      expect(onChangeHostId).not.toHaveBeenCalled();
+      expect(onChangeCheckoutMode).not.toHaveBeenCalled();
+    });
+
+    it("leaves the editor open while Enter confirms an IME candidate", async () => {
+      const user = userEvent.setup();
+      const { onChangeWorktreeName } = renderControl({ showWorkspace: true });
+      await user.click(trigger());
+      await user.click(await screen.findByRole("button", { name: "Rename worktree" }));
+      const input = screen.getByRole("textbox", { name: "Worktree name" });
+      fireEvent.change(input, { target: { value: "修正" } });
+      fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+      expect(screen.getByRole("textbox", { name: "Worktree name" })).toBeInTheDocument();
+      expect(onChangeWorktreeName).not.toHaveBeenCalled();
+
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(onChangeWorktreeName).toHaveBeenCalledWith("修正");
     });
 
     it("switches to a new worktree when renaming from the current checkout", async () => {
