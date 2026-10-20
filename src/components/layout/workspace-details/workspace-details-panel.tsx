@@ -18,7 +18,7 @@
  *   Git action   Commit / Push / Pull / Sync / Publish, chevron for the rest
  *   Changes      +N −N, opens the Changes pane
  *   ──────────
- *   Live         the background browser, opens its peek
+ *   Live         background browser and plugin status controls
  *   ──────────
  *   Agents       running subagents, workflow run, task list
  *
@@ -53,6 +53,9 @@ import {
 } from "lucide-react";
 
 import { useBackgroundBrowserSession } from "@/components/browser/background-browser-indicator";
+import { Slot } from "@/contrib/react/slot";
+import { useContributions } from "@/contrib/react/use-contributions";
+import { COMPOSER_STATUS_AREA } from "@/sdk/areas";
 import { openDelegatedChat } from "@/components/chat/delegation-actions";
 import { TickingText } from "@/components/chat/TickingText";
 import {
@@ -1022,31 +1025,41 @@ function LiveSection({
   const session = useBackgroundBrowserSession(workspaceId);
   const peekOpen = useBrowserPeekStore((s) => s.openWorkspaceId === workspaceId);
   const togglePeek = useBrowserPeekStore((s) => s.toggle);
-  if (!session) return null;
-  const host = pageHost(session.current_url);
+  const statusContributions = useContributions(COMPOSER_STATUS_AREA);
+  const { threadId } = useActiveChatTasks(workspace);
+  const hasStatus = statusContributions.some((c) => c.render);
+  if (!session && !hasStatus) return null;
+  const host = pageHost(session?.current_url);
 
   return (
     <Section testId="workspace-details-live" title="Live">
-      <button
-        type="button"
-        data-testid="workspace-details-browser"
-        data-state={peekOpen ? "open" : "closed"}
-        aria-pressed={peekOpen}
-        // The peek closes on any press outside it, this row included, so
-        // stop the press here and let the click decide.
-        onPointerDown={(e) => e.stopPropagation()}
-        onClick={() => {
-          togglePeek(workspaceId);
-          onOpened();
-        }}
-        className={DETAILS_ROW}
-        title={session.current_url ?? "Background browser"}
-      >
-        <Globe className={DETAILS_ICON} />
-        <span className={DETAILS_LABEL}>Browser</span>
-        {host && <span className={DETAILS_TRAILING}>{host}</span>}
-        <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-status-open" />
-      </button>
+      {session && (
+        <button
+          type="button"
+          data-testid="workspace-details-browser"
+          data-state={peekOpen ? "open" : "closed"}
+          aria-pressed={peekOpen}
+          // The peek closes on any press outside it, this row included, so
+          // stop the press here and let the click decide.
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => {
+            togglePeek(workspaceId);
+            onOpened();
+          }}
+          className={DETAILS_ROW}
+          title={session.current_url ?? "Background browser"}
+        >
+          <Globe className={DETAILS_ICON} />
+          <span className={DETAILS_LABEL}>Browser</span>
+          {host && <span className={DETAILS_TRAILING}>{host}</span>}
+          <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-status-open" />
+        </button>
+      )}
+      {hasStatus && (
+        <div className="flex flex-wrap items-center gap-1 px-1">
+          <Slot area={COMPOSER_STATUS_AREA} props={{ workspaceId, threadId }} />
+        </div>
+      )}
     </Section>
   );
 }

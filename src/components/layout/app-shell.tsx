@@ -2,7 +2,7 @@ import { useNotificationLink } from "@/hooks/use-notification-link";
 import { useRemotePairingRequests } from "@/hooks/use-remote-pairing-requests";
 import { useMobileLayout, useMobileViewport } from "@/hooks/use-mobile-layout";
 import { lazy, useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
-import { useAppStore } from "@/stores/app-store";
+import { useActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
@@ -124,7 +124,13 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   const commandPaletteMounted = useMountedOnceOpen(commandPaletteOpen);
   const fileSearchMounted = useMountedOnceOpen(fileSearchOpen);
   const contentSearchMounted = useMountedOnceOpen(contentSearchOpen);
-  const browserPeekOpen = useBrowserPeekStore((s) => s.openWorkspaceId !== null);
+  const activeWorkspaceId = useActiveWorkspaceId();
+  const browserPeekOpen = useBrowserPeekStore((s) => s.openWorkspaceId !== null || s.pluginPeek !== null);
+  useEffect(() => {
+    const state = useBrowserPeekStore.getState();
+    if ((state.openWorkspaceId !== null && state.openWorkspaceId !== activeWorkspaceId) ||
+      (state.pluginPeek !== null && state.pluginPeek.workspaceId !== activeWorkspaceId)) state.closeAll();
+  }, [activeWorkspaceId]);
   // Once opened, the peek stays mounted so it can play its own exit animation;
   // it renders nothing while closed.
   const [browserPeekMounted, setBrowserPeekMounted] = useState(false);
@@ -383,10 +389,10 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
               </LazyBoundary>
             </div>
           )}
-          {/* GUI-mode background browser peek — absolutely positioned
+          {/* Shared browser/plugin peek — absolutely positioned
               inside this `relative` SidebarInset, so it floats over
-              WorkspaceMain without resizing it. Renders nothing unless
-              GUI chrome applies and the peek is explicitly opened. */}
+              WorkspaceMain without resizing it. Browser views retain their
+              GUI-chrome gate; plugin views open through host.peek. */}
           {(browserPeekOpen || browserPeekMounted) && !utilityPage && (
             <LazyBoundary
               label="browser peek"

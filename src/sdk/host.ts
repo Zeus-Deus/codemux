@@ -5,6 +5,7 @@
  */
 import { createMcpHost } from "@/contrib/mcp";
 import { createNativeHost } from "@/contrib/host-native";
+import { createPeekHost } from "@/contrib/peek";
 import type { ComponentType, ReactNode } from "react";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
@@ -225,6 +226,7 @@ export function createHost(bound: Owner | null) {
 
   const api = {
     mcp: createMcpHost(ownerNow, subscription),
+    peek: createPeekHost(ownerNow, subscription),
     ...createNativeHost(ownerNow),
     theme: {
       get: (): ThemeDefinition => getActiveTheme(),
@@ -249,6 +251,16 @@ export function createHost(bound: Owner | null) {
     },
     openSettings(section?: string) {
       useUIStore.getState().setShowSettings(true, section ?? null);
+    },
+    /** Explicitly return to the active workspace without changing its selection. */
+    showWorkspace(): boolean {
+      if (ownerNow()?.ended || !currentWorkspace()) return false;
+      const ui = useUIStore.getState();
+      if (ui.showSettings) ui.setShowSettings(false);
+      ui.closeUtilityPages();
+      if (ui.showNewProjectScreen) ui.setShowNewProjectScreen(false);
+      if (ui.rightPanelMaximized) useUIStore.setState({ rightPanelMaximized: false });
+      return true;
     },
     /** Open a right-panel pane by its full contribution id, in the active workspace. */
     openRightPane(id: string): boolean {

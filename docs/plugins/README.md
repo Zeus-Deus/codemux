@@ -90,12 +90,14 @@ Import the constants from `@codemux/sdk`.
 | `PALETTE_AREA` | Command palette, under "Plugins" | `data: { label, icon?, keywords?, requiresWorkspace?, run({ workspaceId }) }` |
 | `KEYBINDS_AREA` | Global shortcuts, listed and rebindable in Settings → Shortcuts | `data: { label, defaultKeys: "Ctrl+Alt+H", category?, description?, run(event) }` (return `false` to let the key through) |
 | `RIGHT_PANEL_AREA` | A right-panel pane, offered in the panel's "+" menu under PLUGINS | `title`, `data: { icon? }`, `render({ workspaceId })` |
+| `PEEK_AREA` | A floating preview using the browser peek's shell | `title`, `data: PeekData`, `render(PeekRenderProps)`; body only |
 | `PAGES_AREA` | A full page, opened with `host.openPage("<id>:<localId>")` | `title`, `render()` |
 | `APPEARANCE_EXTRA_AREA` | End of Settings → Appearance | `render()` |
 | `COMPOSER_ACTIONS_AREA` | Rows in the composer "+" menu | `data: { label, description?, icon?, run({ workspaceId, threadId, composer }) }` |
 | `COMPOSER_ACCESSORY_AREA` | Above the composer footer | `render({ workspaceId, threadId })` |
 | `COMPOSER_FOOTER_AREA` | Below the composer card | `render({ workspaceId, threadId })` |
-| `TITLEBAR_ACTIONS_AREA` | The title bar's action island | `render()` (stop `pointerdown` on controls so the window doesn't drag) |
+| `COMPOSER_STATUS_AREA` | Workspace details → Live on desktop; the existing status cluster on phones; adds no composer row | `render({ workspaceId, threadId })`; keep content compact |
+| `TITLEBAR_ACTIONS_AREA` | The action island in regular, covered, utility-page and standalone Settings chrome | `render()` (stop `pointerdown` on controls so the window doesn't drag) |
 | `SIDEBAR_SECTION_AREA` | Between the workspace list and the sidebar footer | `render()` |
 | `SIDEBAR_EMPTY_STATE_AREA` | Replaces the empty-sidebar plate (first one wins) | `render()` |
 | `LANDING_BACKDROP_AREA` | Behind the new-thread landing, `pointer-events: none` | `render({ onPulse, calmRect, onCalmChange })` |
@@ -120,6 +122,8 @@ Settings pages use `ctx.registerSettingsPage`, not an area.
 | `host.reducedMotion()`, `host.onReducedMotionChange(fn)` | `true` when the app's reduce-motion setting **or** the OS `prefers-reduced-motion` is on. Respect it. `onReducedMotionChange` calls `fn(reduced)` whenever either source flips the result. |
 | `host.notify({ kind?, message, description? })` | A toast. It is not stamped with your plugin's name, so say who you are in the message. (Load errors, render crashes and failed commands are reported by the app, named after your plugin.) |
 | `host.openPage(id)`, `host.openSettings(section?)`, `host.openRightPane(id)` | Navigation. Ids are full contribution ids, `"<pluginId>:<localId>"`. |
+| `host.showWorkspace()` | Explicitly return to the active workspace's normal view without changing the active workspace. Returns `false` if there is no known active workspace or the calling owner has ended; otherwise `true`, including when already there. |
+| `host.peek.open(id, { workspaceId? }?)`, `.close(id)`, `.toggle(id, { workspaceId? }?)`, `.isOpen(id)`, `.subscribe(fn)` | Open a registered preview in the active workspace. Open/toggle return `false` for missing views, ended owners or an inactive/missing workspace. Subscriptions report `{ id, workspaceId }` or `null` when the plugin view closes or a browser replaces it. |
 | `host.workspace.current()`, `host.workspace.subscribe(fn)` | The active workspace (`workspace_id`, name, path, …). |
 | `host.settings.get(key)`, `host.settings.subscribe(key, fn)` | App settings, read-only. |
 | `host.composer.insertText(text)`, `.getDraft()`, `.focus()` | The focused composer (or the only one). Return `false`/`null` when none is mounted. |
@@ -136,6 +140,87 @@ The SDK also exports the app's UI kit, so plugins look native: `Button`,
 zustand's `create`, React Query's `useQuery`, `useMutation` and
 `useQueryClient`, and `definePlugin` for typed plugins. The current export list
 is `src/sdk/index.ts`.
+
+## Floating previews and compact status
+
+Register `PEEK_AREA` to supply a preview body. The shared shell owns the title,
+status dot, close button, resize handle, placement and entrance/exit motion.
+It uses the browser peek's persisted size, readable minimum and 60% window
+clamp, and honors both app and OS reduced motion. One browser or plugin peek
+can be open at a time. Both dock bottom-right and lift above any composer
+under that corner, leaving its send button and queue usable. The resize handle
+is at the top-left, so dragging grows the preview up and left.
+Plugin titles are plain header text; only the browser keeps its URL field.
+Workspace switches close it, including while Settings
+is open; removing the contribution dismisses its body immediately.
+Peeks display over the workspace. Settings and utility pages temporarily hide
+the viewer; their title-bar actions remain mounted.
+
+```tsx
+import {
+  PEEK_AREA, RIGHT_PANEL_AREA, COMPOSER_STATUS_AREA,
+  PeekChip, icons, type PeekRenderProps,
+} from "@codemux/sdk";
+
+// Keep component identities stable. Fill the body container; size describes
+// the outer shell, including its header.
+function Preview({ workspaceId, size, close, onStatusChange }: PeekRenderProps) {
+  // Your viewer can call onStatusChange("live", "Editor connected") when ready.
+  return <Viewer workspaceId={workspaceId} width={size.width} onClose={close}
+    onStatusChange={onStatusChange} />;
+}
+function PreviewChip() {
+  return <PeekChip peekId="my-plugin:live" label="Unity" icon={icons.Box} status="live" />;
+}
+
+// Inside register(ctx); Viewer and DockedViewer are your plugin components.
+ctx.register({ id: "pane", area: RIGHT_PANEL_AREA, title: "Unity", render: DockedViewer });
+ctx.register({
+  id: "live", area: PEEK_AREA, title: "Unity",
+  data: { icon: icons.Box, dockPaneId: `${ctx.id}:pane` },
+  render: Preview,
+});
+ctx.register({ id: "chip", area: COMPOSER_STATUS_AREA, render: PreviewChip });
+ctx.host.peek.open(`${ctx.id}:live`);
+```
+
+`PeekData.icon` is an icon component, matching other SDK areas. `dockPaneId`
+is the full id of a right-panel contribution owned by the same plugin. The
+shell offers **Open in side panel** only while that pane is registered.
+`PeekRenderProps` supplies `workspaceId`, `size: { width, height }`, `close()`
+and `onStatusChange(status, label?)`. Status is `"live" | "connecting" | "stale"
+| "error"`; it starts as `connecting`. A label overrides the dot's accessible
+name and tooltip. Late `close` and status callbacks from a previous open are ignored.
+
+`host.peek.open` defaults to the active workspace and never switches it.
+`toggle` closes an already open id; `host.peek.close(id)` closes the current
+view with that id. Use the render's `close()` for async work tied to one open.
+`subscribe` reports subsequent plugin-view changes and is owner-cleaned like
+other host subscriptions. Browser opening reports `null`. Only size persists;
+views remain closed after restart.
+
+`peek.open` and `peek.toggle` change only peek state: they never leave Settings
+or a utility page. To show a live view from a user-initiated action there, use:
+
+```ts
+// In the plugin's "Live view" click handler:
+if (ctx.host.showWorkspace()) {
+  ctx.host.peek.open(`${ctx.id}:live`);
+}
+```
+
+`showWorkspace()` closes full Settings, utility pages (including plugin pages)
+and the full New Project page, and restores a maximized right panel without
+closing its selected pane or changing its saved width. It never selects another
+workspace, and is a no-op returning `true` in the normal workspace view.
+
+`PeekStatus` is the standalone accessible dot with the same `status` and
+optional `label`. `PeekChip` accepts `peekId`, `label`, optional `icon` and
+`status`; it toggles the registered view and fits `COMPOSER_STATUS_AREA`
+without another composer row. Use `TITLEBAR_ACTIONS_AREA` for compact actions
+that must remain visible in Settings, utility pages and a maximized panel.
+
+A copyable plain-ESM example is [peek-view/plugin.js](./examples/peek-view/plugin.js).
 
 ## Imports and bundling
 

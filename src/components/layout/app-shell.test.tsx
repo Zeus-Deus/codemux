@@ -1,9 +1,10 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 // ── Mutable mock state ──
 let hasWorkspacesFlag = false;
+let activeWorkspaceIdFlag = "ws-1";
 let enableLazyFlag = false;
 let enableAgentChatFlag = false;
 let flagsLoadedFlag = true;
@@ -17,6 +18,7 @@ let showAutomationsFlag = false;
 let showDevicesFlag = false;
 let showNewProjectScreenFlag = false;
 let commandPaletteOpenFlag = false;
+let renderPluginPeekFlag = false;
 // Appearance state: the machine-local legacy palette key, the synced theme id,
 // and the two writes the shell can make in response to them.
 let localSettings: Record<string, string> = {};
@@ -57,10 +59,10 @@ vi.mock("./app-sidebar", () => ({
 vi.mock("./workspace-main", () => ({
   WorkspaceMain: () => <div data-testid="workspace-main" />,
 }));
-// The peek overlay has its own dedicated test file
-// (BrowserPeekOverlay.test.tsx); here it's just a shell child.
+// Most shell cases use a sentinel; navigation cases keep the plugin overlay
+// real to verify that leaving a covered view actually reveals its body.
 vi.mock("@/components/browser/BrowserPeekOverlay", () => ({
-  BrowserPeekOverlay: () => <div data-testid="browser-peek-overlay" />,
+  BrowserPeekOverlay: () => renderPluginPeekFlag ? <PluginPeekOverlay /> : <div data-testid="browser-peek-overlay" />,
 }));
 vi.mock("./window-chrome", () => ({ WindowChrome: () => null }));
 vi.mock("./empty-state", () => ({
@@ -105,6 +107,8 @@ vi.mock("@/components/ui/sidebar", () => ({
 }));
 
 vi.mock("@/stores/app-store", () => ({
+  useActiveWorkspaceId: () => hasWorkspacesFlag ? activeWorkspaceIdFlag : null,
+  selectActiveWorkspaceId: () => hasWorkspacesFlag ? activeWorkspaceIdFlag : null,
   useAppStore: Object.assign(
     vi.fn((selector: (s: unknown) => unknown) =>
       selector({
@@ -117,7 +121,10 @@ vi.mock("@/stores/app-store", () => ({
           : null,
       }),
     ),
-    { subscribe: () => () => {} },
+    {
+      subscribe: () => () => {},
+      getState: () => ({ appState: { workspaces: hasWorkspacesFlag ? [{ workspace_id: "ws-1" }] : [] } }),
+    },
   ),
 }));
 
@@ -156,9 +163,11 @@ vi.mock("@/stores/ui-store", () => ({
     {
       getState: () => ({
         setSidebarToggleFn: vi.fn(),
+        showSettings: showSettingsFlag,
+        showNewProjectScreen: showNewProjectScreenFlag,
         setShowSettings: (show: boolean) => { showSettingsFlag = show; },
         setShowAutomations: (show: boolean) => { showAutomationsFlag = show; },
-        closeUtilityPages: vi.fn(),
+        closeUtilityPages: () => { showAutomationsFlag = false; showDevicesFlag = false; },
       }),
     },
   ),
@@ -177,6 +186,7 @@ vi.mock("@/stores/settings-store", () => ({
   // Appearance selectors read by AppShell to apply palette/density attrs.
   selectPalette: () => "cool",
   selectDensity: () => "comfortable",
+  selectReduceMotion: () => false,
 }));
 
 const EMPTY_CUSTOM_THEMES: unknown[] = [];
@@ -212,6 +222,11 @@ vi.mock("@/lib/idle-prefetch", () => ({
 }));
 
 import { AppShell } from "./app-shell";
+import { useBrowserPeekStore } from "@/stores/browser-peek-store";
+import { PluginPeekOverlay } from "@/components/peek/PluginPeekOverlay";
+import { host } from "@/sdk/host";
+import { registry } from "@/contrib/registry";
+import { PEEK_AREA } from "@/sdk/areas";
 
 afterEach(() => {
   cleanup();
@@ -219,7 +234,9 @@ afterEach(() => {
 });
 
 function resetMockState() {
+  useBrowserPeekStore.getState().closeAll();
   hasWorkspacesFlag = false;
+  activeWorkspaceIdFlag = "ws-1";
   enableLazyFlag = false;
   enableAgentChatFlag = false;
   flagsLoadedFlag = true;
@@ -233,6 +250,7 @@ function resetMockState() {
   showDevicesFlag = false;
   showNewProjectScreenFlag = false;
   commandPaletteOpenFlag = false;
+  renderPluginPeekFlag = false;
   localSettings = {};
   syncedThemeId = "default";
   applyThemeSpy.mockClear();
@@ -245,6 +263,43 @@ function resetMockState() {
 
 describe("AppShell rendering gates", () => {
   beforeEach(resetMockState);
+
+  it.each(["Settings", "utility page"])("explicitly returns from %s to show a plugin peek without changing workspace", async (page) => {
+    hasWorkspacesFlag = true;
+    renderPluginPeekFlag = true;
+    showSettingsFlag = page === "Settings";
+    showDevicesFlag = page === "utility page";
+    const off = registry.register({
+      id: "demo:live", area: PEEK_AREA, title: "Live view", render: () => <div>Live content</div>,
+    });
+    try {
+      const view = render(<AppShell />);
+      await view.findByTestId(page === "Settings" ? "settings-view" : "devices-view");
+      act(() => { expect(host.peek.open("demo:live")).toBe(true); });
+      view.rerender(<AppShell />);
+      expect(view.queryByRole("dialog", { name: "Live view preview" })).toBeNull();
+      act(() => {
+        expect(host.showWorkspace()).toBe(true);
+        expect(host.peek.open("demo:live")).toBe(true);
+      });
+      view.rerender(<AppShell />);
+      expect(await view.findByRole("dialog", { name: "Live view preview" })).toHaveTextContent("Live content");
+      expect(host.workspace.current()?.workspace_id).toBe("ws-1");
+      expect(activeWorkspaceIdFlag).toBe("ws-1");
+    } finally { cleanup(); off(); }
+  });
+
+  it("mounts the shared overlay for a plugin and closes it on workspace switch even in Settings", async () => {
+    hasWorkspacesFlag = true;
+    useBrowserPeekStore.getState().openPlugin("demo:live", "ws-1");
+    const view = render(<AppShell />);
+    expect(await view.findByTestId("browser-peek-overlay")).toBeInTheDocument();
+    showSettingsFlag = true;
+    view.rerender(<AppShell />);
+    activeWorkspaceIdFlag = "ws-2";
+    view.rerender(<AppShell />);
+    expect(useBrowserPeekStore.getState().pluginPeek).toBeNull();
+  });
 
   it("keeps the import overlay mounted across the first-workspace emission and Settings", async () => {
     showImportFlag = true;

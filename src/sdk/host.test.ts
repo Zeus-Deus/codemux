@@ -62,13 +62,14 @@ const workspaces = vi.hoisted(() => {
   return {
     state,
     listeners,
+    activeId: null as string | null,
     notify: () => {
       for (const fn of [...listeners]) fn();
     },
   };
 });
 vi.mock("@/stores/app-store", () => ({
-  selectActiveWorkspaceId: () => null,
+  selectActiveWorkspaceId: () => workspaces.activeId,
   useAppStore: {
     getState: () => workspaces.state,
     subscribe: (fn: () => void) => {
@@ -79,10 +80,12 @@ vi.mock("@/stores/app-store", () => ({
 }));
 
 import { activatePlugin, resetActivationForTests, unloadPlugin } from "@/contrib/activation";
-import { resetLifetimeForTests } from "@/contrib/lifetime";
+import { Owner, resetLifetimeForTests } from "@/contrib/lifetime";
 import { resetPluginsStoreForTests } from "@/contrib/plugins-store";
 import type { CodemuxPlugin } from "@/contrib/plugin";
-import { host } from "./host";
+import { createHost, host } from "./host";
+import { useUIStore } from "@/stores/ui-store";
+import { selectUtilityPage } from "@/lib/utility-pages";
 
 /** A controllable `prefers-reduced-motion` media query. */
 function installMediaQuery(initial: boolean) {
@@ -111,6 +114,9 @@ const record = { id: "demo", name: "Demo", kind: "disk" as const, tier: "local" 
 beforeEach(() => {
   settings.state.settings = {};
   settings.listeners.clear();
+  workspaces.activeId = null;
+  workspaces.state.appState.workspaces = [];
+  useUIStore.setState(useUIStore.getInitialState(), true);
 });
 
 afterEach(() => {
@@ -254,5 +260,80 @@ describe("host.workspace list", () => {
     workspaces.state.appState.workspaces = [];
     workspaces.notify();
     expect(callback).toHaveBeenCalledOnce();
+  });
+});
+
+describe("host.showWorkspace", () => {
+  beforeEach(() => {
+    workspaces.activeId = "ws-1";
+    workspaces.state.appState.workspaces = [
+      { workspace_id: "ws-1", title: "Project", cwd: "/project" },
+      { workspace_id: "ws-2", title: "Other", cwd: "/other" },
+    ];
+  });
+
+  it("is a no-op in the normal workspace view", () => {
+    const state = useUIStore.getState();
+    expect(host.showWorkspace()).toBe(true);
+    expect(useUIStore.getState()).toBe(state);
+    expect(host.workspace.current()?.workspace_id).toBe("ws-1");
+  });
+
+  it.each(["automations", "devices", "pull-requests", "usage", "plugin"])("leaves the %s utility page", (page) => {
+    const ui = useUIStore.getState();
+    if (page === "automations") ui.setShowAutomations(true);
+    if (page === "devices") ui.setShowDevices(true);
+    if (page === "pull-requests") ui.setShowPullRequests(true);
+    if (page === "usage") ui.setShowUsage(true);
+    if (page === "plugin") ui.setShowPluginPage("demo:page");
+    expect(selectUtilityPage(useUIStore.getState())).not.toBeNull();
+    expect(host.showWorkspace()).toBe(true);
+    expect(selectUtilityPage(useUIStore.getState())).toBeNull();
+    expect(host.workspace.current()?.workspace_id).toBe("ws-1");
+  });
+
+  it("leaves Settings and restores a maximized panel without closing or resizing it", () => {
+    useUIStore.setState({
+      showSettings: true,
+      settingsSection: "plugin:demo",
+      showDevices: true,
+      rightPanelTabs: { "ws-1": "files" },
+      rightPanelMaximized: true,
+      rightPanelWidth: 420,
+    });
+    expect(host.showWorkspace()).toBe(true);
+    const ui = useUIStore.getState();
+    expect(ui.showSettings).toBe(false);
+    expect(ui.settingsSection).toBeNull();
+    expect(selectUtilityPage(ui)).toBeNull();
+    expect(ui.rightPanelMaximized).toBe(false);
+    expect(ui.rightPanelTabs["ws-1"]).toBe("files");
+    expect(ui.rightPanelWidth).toBe(420);
+    expect(host.workspace.current()?.workspace_id).toBe("ws-1");
+  });
+
+  it("leaves the full New Project page", () => {
+    useUIStore.getState().setShowNewProjectScreen(true);
+    expect(host.showWorkspace()).toBe(true);
+    expect(useUIStore.getState().showNewProjectScreen).toBe(false);
+    expect(host.workspace.current()?.workspace_id).toBe("ws-1");
+  });
+
+  it.each([null, "missing"])("refuses without a known active workspace (%s)", (activeId) => {
+    workspaces.activeId = activeId;
+    useUIStore.getState().setShowSettings(true);
+    const state = useUIStore.getState();
+    expect(host.showWorkspace()).toBe(false);
+    expect(useUIStore.getState()).toBe(state);
+  });
+
+  it("ignores an unloaded plugin owner's late navigation", () => {
+    const owner = new Owner("demo");
+    const pluginHost = createHost(owner);
+    useUIStore.getState().setShowSettings(true);
+    const state = useUIStore.getState();
+    owner.end();
+    expect(pluginHost.showWorkspace()).toBe(false);
+    expect(useUIStore.getState()).toBe(state);
   });
 });

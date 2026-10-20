@@ -1,23 +1,12 @@
-import { PanelRightOpen, X } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
-
-import { selectBackgroundBrowserSession } from "@/components/browser/background-browser-indicator";
-import { BrowserPane, type BrowserStreamStatus } from "@/components/browser/BrowserPane";
+import { useEffect, useState } from "react";
+import { selectBackgroundBrowserSession } from "./background-browser-indicator";
+import { BrowserPane, type BrowserStreamStatus } from "./BrowserPane";
+import { PeekShell, type PeekContent } from "@/components/peek/PeekShell";
+import { PluginPeekOverlay } from "@/components/peek/PluginPeekOverlay";
 import { toast } from "@/lib/toast";
-import type { AgentBrowserSession } from "@/tauri/types";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { useGuiChrome } from "@/hooks/use-gui-chrome";
-import { cn } from "@/lib/utils";
 import { useActiveWorkspaceId, useAppStore } from "@/stores/app-store";
-import {
-  clampPeekSize,
-  useBrowserPeekStore,
-  type PeekSize,
-} from "@/stores/browser-peek-store";
+import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 import {
   parseViewportString,
   selectBackgroundBrowserDesktopViewport,
@@ -26,368 +15,51 @@ import {
 } from "@/stores/synced-settings-store";
 import { useUIStore } from "@/stores/ui-store";
 import { dockBrowserInRightPanel } from "@/tauri/commands";
-import { PanelHeader } from "@/components/ui/panel-header";
 
-/** Fallback pinned viewport for the "Desktop-size background browser"
- *  setting when no `browser.default_viewport` is configured. Matches
- *  the `desktop` preset / `RESET_SPEC` in
- *  `src-tauri/src/browser_viewport.rs` (1280×800 @ 1× DPR), so the peek
- *  shows pages at the same baseline agents get from
- *  `codemux browser viewport reset`. With a configured default (e.g.
- *  `"2560x1440"` to match the user's monitor) the peek pins to that
- *  instead — same size the backend applies to fresh daemons — so the
- *  peek and the agent's screenshots stay consistent. */
+// Matches the backend's desktop viewport preset when no default is configured.
 const DESKTOP_PEEK_VIEWPORT = { width: 1280, height: 800 };
 
-/** Matches the `duration-250` (overlay) exit animation below. */
-const EXIT_MS = 250;
-
-/** The peek's inset from its container's edges (`right-3.5` / `bottom-3.5`). */
-const PEEK_INSET_PX = 14;
-/** Air the peek keeps above a composer it would otherwise cover. */
-const COMPOSER_GAP_PX = 12;
-
-/**
- * Bottom offset that keeps a bottom-right peek of `width` × `height` off
- * every composer (`[data-composer-dock]`) it would overlap horizontally,
- * so the send button and the queue stay usable while the peek is up. When
- * there is not enough height to clear one, the peek stays at its corner
- * and overlaps rather than leaving its container.
- */
-export function peekBottomOffset(
-  container: { right: number; top: number; bottom: number },
-  docks: ReadonlyArray<{ left: number; right: number; top: number }>,
-  size: PeekSize,
-): number {
-  const right = container.right - PEEK_INSET_PX;
-  const left = right - size.width;
-  let bottom = PEEK_INSET_PX;
-  for (const dock of docks) {
-    if (dock.right <= left || dock.left >= right) continue;
-    bottom = Math.max(bottom, container.bottom - dock.top + COMPOSER_GAP_PX);
-  }
-  const roomAbove = container.bottom - container.top - PEEK_INSET_PX - size.height;
-  return bottom <= roomAbove ? bottom : PEEK_INSET_PX;
-}
-
-const STATUS_DOT: Record<BrowserStreamStatus, { className: string; label: string }> = {
-  live: { className: "bg-status-open", label: "Live" },
-  starting: { className: "bg-muted-foreground/60 motion-safe:animate-pulse", label: "Connecting" },
-  connecting: { className: "bg-muted-foreground/60 motion-safe:animate-pulse", label: "Connecting" },
-  waiting: { className: "bg-muted-foreground/60 motion-safe:animate-pulse", label: "Connecting" },
-  error: { className: "bg-destructive", label: "Disconnected" },
-};
-
-function prefersReducedMotion(): boolean {
-  return (
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(prefers-reduced-motion: reduce)").matches
-  );
-}
-
-type Shown = { workspaceId: string; session: AgentBrowserSession };
-
-function windowSize(): PeekSize {
-  return { width: window.innerWidth, height: window.innerHeight };
-}
-
-/**
- * Floating "peek" overlay for a GUI-mode background browser session: clicking the
- * inline chat chip or terminal-header indicator opens this instead of
- * splitting the chat into a pane. Renders the live browser stream as a
- * bottom-right floating panel absolutely positioned over the chat surface —
- * it never resizes or reflows the chat, and it stays clear of the Workspace
- * details card pinned in the top-right corner. "Open in side panel" graduates the
- * session into the right-panel deck's `browser` pane via
- * `dock_browser_in_right_panel` — the deck is the one persistent home for a
- * browser, so the peek stays a transient look rather than a second place a
- * browser can permanently live. Closing the overlay just hides it; the
- * background session keeps running.
- *
- * Mounted once at the app-shell level, inside `SidebarInset` (already a
- * `position: relative` anchor) so `absolute` positioning here never
- * affects layout. Scoped to the active workspace — GUI chrome (and
- * therefore this overlay) only ever applies to the active workspace's chat
- * surface.
- */
-export function BrowserPeekOverlay() {
+function BrowserPeek() {
   const guiChrome = useGuiChrome();
-  const activeWorkspaceId = useActiveWorkspaceId();
-  const isOpen = useBrowserPeekStore((s) =>
-    activeWorkspaceId ? s.isOpen(activeWorkspaceId) : false,
-  );
+  const workspaceId = useActiveWorkspaceId();
+  const isOpen = useBrowserPeekStore((s) => workspaceId ? s.isOpen(workspaceId) : false);
+  const pluginOpen = useBrowserPeekStore((s) => s.pluginPeek !== null);
   const close = useBrowserPeekStore((s) => s.close);
-  const session = useAppStore((s) =>
-    selectBackgroundBrowserSession(s.appState, activeWorkspaceId),
-  );
-  const desktopViewport = useSyncedSettingsStore(
-    selectBackgroundBrowserDesktopViewport,
-  );
-  const defaultViewportRaw = useSyncedSettingsStore(selectBrowserDefaultViewport);
-  const pinnedViewport =
-    parseViewportString(defaultViewportRaw) ?? DESKTOP_PEEK_VIEWPORT;
-  const panelRef = useRef<HTMLDivElement>(null);
-  const [bottom, setBottom] = useState(PEEK_INSET_PX);
-  const [streamStatus, setStreamStatus] = useState<BrowserStreamStatus>("starting");
-  const storedSize = useBrowserPeekStore((s) => s.size);
-  const setStoredSize = useBrowserPeekStore((s) => s.setSize);
-  // Live size while a resize drag is in progress; committed on release.
-  const [dragSize, setDragSize] = useState<PeekSize | null>(null);
-  // The 60%-of-window cap has to follow the window, not just re-renders.
-  const [winSize, setWinSize] = useState<PeekSize>(windowSize);
-
-  const open = guiChrome && isOpen && !!session && !!activeWorkspaceId;
-
-  // Closing keeps the last shown peek mounted for the exit animation.
-  // Switching workspaces skips it: the content no longer belongs here.
-  const current: Shown | null =
-    open && activeWorkspaceId && session
-      ? { workspaceId: activeWorkspaceId, session }
-      : null;
-  const lastShownRef = useRef<Shown | null>(null);
-  if (current) lastShownRef.current = current;
-  else if (lastShownRef.current?.workspaceId !== activeWorkspaceId) lastShownRef.current = null;
-  const [exitDone, setExitDone] = useState(true);
+  const session = useAppStore((s) => selectBackgroundBrowserSession(s.appState, workspaceId));
+  const desktopViewport = useSyncedSettingsStore(selectBackgroundBrowserDesktopViewport);
+  const defaultViewport = useSyncedSettingsStore(selectBrowserDefaultViewport);
+  const pinnedViewport = parseViewportString(defaultViewport) ?? DESKTOP_PEEK_VIEWPORT;
+  const [status, setStatus] = useState<BrowserStreamStatus>("starting");
   useEffect(() => {
-    if (open) {
-      setExitDone(false);
-      return;
-    }
-    const timer = setTimeout(() => {
-      lastShownRef.current = null;
-      setExitDone(true);
-    }, EXIT_MS);
-    return () => clearTimeout(timer);
-  }, [open, activeWorkspaceId]);
-
-  // Switching workspaces dismisses the peek: it is a transient "look at
-  // this now" affordance, so navigating A → B → back to A must not pop it
-  // open again unprompted. The store holds a single `openWorkspaceId`;
-  // whenever the active workspace no longer matches it, clear it.
-  useEffect(() => {
-    const { openWorkspaceId, closeAll } = useBrowserPeekStore.getState();
-    if (openWorkspaceId !== null && openWorkspaceId !== activeWorkspaceId) {
-      closeAll();
-    }
-  }, [activeWorkspaceId]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onResize = () => setWinSize(windowSize());
-    onResize();
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, [open]);
-
-  // Escape closes. Marking the key handled keeps the same press from also
-  // stopping the agent when the chat composer still has focus.
-  useEffect(() => {
-    if (!open || !activeWorkspaceId) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      e.preventDefault();
-      close(activeWorkspaceId);
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, activeWorkspaceId, close]);
-
-  // Click-outside closes (an invisible full-surface backdrop would also
-  // work, but a document listener keeps the overlay from having to sit
-  // above a synthetic scrim that could itself intercept chat clicks).
-  useEffect(() => {
-    if (!open || !activeWorkspaceId) return;
-    const onPointerDown = (e: PointerEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
-        close(activeWorkspaceId);
+    const state = useBrowserPeekStore.getState();
+    if (state.openWorkspaceId !== null && state.openWorkspaceId !== workspaceId) state.closeAll();
+  }, [workspaceId]);
+  const content: PeekContent | null = guiChrome && isOpen && session && workspaceId ? {
+    id: "browser",
+    workspaceId,
+    title: session.current_url ?? "about:blank",
+    titlePresentation: "url",
+    ariaLabel: "Background browser preview",
+    status: status === "live" || status === "error" ? status : "connecting",
+    statusLabel: status === "error" ? "Disconnected" : undefined,
+    close: () => close(workspaceId),
+    dock: async () => {
+      try {
+        await dockBrowserInRightPanel(workspaceId);
+        useUIStore.getState().setRightPanelTab(workspaceId, "browser");
+        close(workspaceId);
+      } catch (error) {
+        toast.error("Couldn't open the browser in the side panel", { description: String(error) });
       }
-    };
-    document.addEventListener("pointerdown", onPointerDown);
-    return () => document.removeEventListener("pointerdown", onPointerDown);
-  }, [open, activeWorkspaceId, close]);
+    },
+    render: ({ visible }) => <BrowserPane browserId={session.cli_session_name} workspaceId={workspaceId}
+      focused={false} visible={visible} hideToolbar
+      fixedViewport={desktopViewport ? pinnedViewport : undefined} onStatusChange={setStatus} />,
+  } : null;
+  return <PeekShell content={content} workspaceId={workspaceId} allowExit={!pluginOpen} />;
+}
 
-  // Lift the peek over any composer under its corner, following the
-  // composer as it grows with a draft or a queue, and picking up composers
-  // that mount while the peek is open (a keyboard tab switch, a new split).
-  const liveSize = clampPeekSize(dragSize ?? storedSize, winSize);
-  const { width: liveWidth, height: liveHeight } = liveSize;
-  useLayoutEffect(() => {
-    const panel = panelRef.current;
-    const container = panel?.offsetParent ?? panel?.parentElement;
-    if (!open || !panel || !container) return;
-    const resize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => schedule());
-    let observed = new Set<HTMLElement>();
-    const sync = () => {
-      const docks = new Set(container.querySelectorAll<HTMLElement>("[data-composer-dock]"));
-      for (const dock of docks) if (!observed.has(dock)) resize?.observe(dock);
-      for (const dock of observed) if (!docks.has(dock)) resize?.unobserve(dock);
-      observed = docks;
-      setBottom(
-        peekBottomOffset(
-          container.getBoundingClientRect(),
-          Array.from(docks, (dock) => dock.getBoundingClientRect()),
-          { width: liveWidth, height: liveHeight },
-        ),
-      );
-    };
-    // Coalesce bursts (a streaming transcript mutates every frame).
-    let frame = 0;
-    const schedule = () => {
-      if (frame) return;
-      frame = requestAnimationFrame(() => {
-        frame = 0;
-        sync();
-      });
-    };
-    sync();
-    resize?.observe(container);
-    const mutations = new MutationObserver(schedule);
-    mutations.observe(container, { childList: true, subtree: true });
-    return () => {
-      cancelAnimationFrame(frame);
-      mutations.disconnect();
-      resize?.disconnect();
-    };
-  }, [open, liveWidth, liveHeight]);
-
-  const last = lastShownRef.current;
-  const exiting = !current && !exitDone && last !== null && !prefersReducedMotion();
-  const shown = current ?? (exiting ? last : null);
-  if (!shown) return null;
-  const closing = !open;
-  const workspaceId = shown.workspaceId;
-  const size = liveSize;
-  const dot = STATUS_DOT[streamStatus];
-
-  // Anchored bottom-right, so the handle sits top-left and the peek
-  // grows up and toward the chat it floats over.
-  const startResize = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return;
-    e.preventDefault();
-    const handle = e.currentTarget;
-    const origin = { x: e.clientX, y: e.clientY, ...size };
-    let latest = size;
-    try {
-      handle.setPointerCapture(e.pointerId);
-    } catch {
-      // Capture is best-effort; the drag still tracks over the handle.
-    }
-    const onMove = (ev: PointerEvent) => {
-      latest = clampPeekSize(
-        {
-          width: origin.width + (origin.x - ev.clientX),
-          height: origin.height + (origin.y - ev.clientY),
-        },
-        windowSize(),
-      );
-      setDragSize(latest);
-    };
-    const onEnd = () => {
-      handle.removeEventListener("pointermove", onMove);
-      handle.removeEventListener("pointerup", onEnd);
-      handle.removeEventListener("pointercancel", onEnd);
-      setDragSize(null);
-      setStoredSize(latest);
-    };
-    handle.addEventListener("pointermove", onMove);
-    handle.addEventListener("pointerup", onEnd);
-    handle.addEventListener("pointercancel", onEnd);
-  };
-
-  const handlePromote = async () => {
-    // Promote into the right-panel deck, not a pane-tree split — the same
-    // action the deck's "+" ▸ Browser item performs, so there is exactly
-    // one persistent home for a browser and the peek stays what it is: a
-    // transient look that graduates into that home. Splitting the chat
-    // in half to show a browser was the old model; the deck gives the
-    // browser real estate without reflowing the conversation.
-    //
-    // `dock_browser_in_right_panel` docks *this* session (same
-    // `cli_session_name`, same daemon), so the agent keeps driving the
-    // browser the user just took hold of.
-    try {
-      await dockBrowserInRightPanel(workspaceId);
-      useUIStore.getState().setRightPanelTab(workspaceId, "browser");
-      close(workspaceId);
-    } catch (err) {
-      toast.error("Couldn't open the browser in the side panel", {
-        description: String(err),
-      });
-    }
-  };
-
-  return (
-    <div
-      ref={panelRef}
-      role="dialog"
-      aria-label="Background browser preview"
-      data-state={closing ? "closed" : "open"}
-      style={
-        {
-          "--peek-w": `${size.width}px`,
-          "--peek-h": `${size.height}px`,
-          bottom,
-        } as CSSProperties
-      }
-      className={cn(
-        "absolute right-3.5 z-30 flex h-(--peek-h) w-(--peek-w) flex-col overflow-hidden",
-        "rounded-lg border border-border bg-popover shadow-2xl",
-        "animate-in fade-in slide-in-from-bottom-1 duration-250 ease-out motion-reduce:animate-none",
-        "data-[state=closed]:pointer-events-none data-[state=closed]:animate-out data-[state=closed]:fade-out data-[state=closed]:slide-out-to-bottom-1 data-[state=closed]:fill-mode-forwards",
-      )}
-    >
-      <PanelHeader>
-        <span
-          role="img"
-          aria-label={dot.label}
-          title={dot.label}
-          className={cn("h-[7px] w-[7px] shrink-0 rounded-full", dot.className)}
-        />
-        <span className="min-w-0 flex-1 truncate rounded-md border border-border px-2 py-1 font-mono text-label text-muted-foreground">
-          {shown.session.current_url ?? "about:blank"}
-        </span>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              onClick={handlePromote}
-              aria-label="Open in side panel"
-              className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
-            >
-              <PanelRightOpen className="size-3.5" aria-hidden />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" sideOffset={4}>
-            Open in side panel
-          </TooltipContent>
-        </Tooltip>
-        <button
-          type="button"
-          onClick={() => close(workspaceId)}
-          aria-label="Close preview"
-          className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
-        >
-          <X className="size-3.5" aria-hidden />
-        </button>
-      </PanelHeader>
-      <div className="min-h-0 flex-1">
-        <BrowserPane
-          browserId={shown.session.cli_session_name}
-          workspaceId={workspaceId}
-          focused={false}
-          visible={open}
-          hideToolbar
-          fixedViewport={desktopViewport ? pinnedViewport : undefined}
-          onStatusChange={setStreamStatus}
-        />
-      </div>
-      <div
-        data-peek-resize
-        aria-hidden
-        title="Drag to resize"
-        onPointerDown={startResize}
-        className="absolute left-0 top-0 z-20 size-3 cursor-nwse-resize"
-      />
-    </div>
-  );
+/** Browser and plugin bodies share chrome and one mutually exclusive open state. */
+export function BrowserPeekOverlay() {
+  return <><BrowserPeek /><PluginPeekOverlay /></>;
 }

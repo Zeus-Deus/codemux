@@ -6,6 +6,18 @@ export interface PeekSize {
   height: number;
 }
 
+export type PeekStatusKind = "live" | "connecting" | "stale" | "error";
+export interface PluginPeekSnapshot {
+  id: string;
+  workspaceId: string;
+}
+interface PluginPeek extends PluginPeekSnapshot {
+  generation: number;
+  status: PeekStatusKind;
+  statusLabel?: string;
+}
+let generation = 0;
+
 export const DEFAULT_PEEK_SIZE: PeekSize = { width: 440, height: 300 };
 export const MIN_PEEK_SIZE: PeekSize = { width: 360, height: 240 };
 /** Largest share of the window the peek may cover on either axis. */
@@ -32,17 +44,18 @@ function validPeekSize(value: unknown): PeekSize {
 }
 
 /**
- * Peek-overlay state for the GUI-mode background browser.
+ * Shared transient state for browser and plugin peeks.
  *
- * A single `openWorkspaceId` (not a per-workspace map): the peek is a
+ * One browser or plugin peek (not a per-workspace map): the peek is a
  * transient "look at this now" affordance, so at most one can be open and
  * it must not silently re-open when the user later returns to a workspace
- * where it was left open. `BrowserPeekOverlay` additionally closes the peek
+ * where it was left open. The shell additionally closes the peek
  * whenever the active workspace changes, so switching away always dismisses
  * it. Only the user's chosen `size` is persisted; open state never is.
  */
 interface BrowserPeekState {
   openWorkspaceId: string | null;
+  pluginPeek: PluginPeek | null;
   size: PeekSize;
   isOpen: (workspaceId: string) => boolean;
   open: (workspaceId: string) => void;
@@ -52,25 +65,40 @@ interface BrowserPeekState {
   closeAll: () => void;
   toggle: (workspaceId: string) => void;
   setSize: (size: PeekSize) => void;
+  openPlugin: (id: string, workspaceId: string) => void;
+  closePlugin: (id: string) => void;
+  setPluginStatus: (generation: number, status: PeekStatusKind, label?: string) => void;
 }
 
 export const useBrowserPeekStore = create<BrowserPeekState>()(
   persist(
     (set, get) => ({
       openWorkspaceId: null,
+      pluginPeek: null,
       size: DEFAULT_PEEK_SIZE,
       isOpen: (workspaceId) => get().openWorkspaceId === workspaceId,
-      open: (workspaceId) => set({ openWorkspaceId: workspaceId }),
+      open: (workspaceId) => set({ openWorkspaceId: workspaceId, pluginPeek: null }),
       close: (workspaceId) =>
         set((s) =>
           s.openWorkspaceId === workspaceId ? { openWorkspaceId: null } : s,
         ),
-      closeAll: () => set({ openWorkspaceId: null }),
+      closeAll: () => set({ openWorkspaceId: null, pluginPeek: null }),
       toggle: (workspaceId) =>
         set((s) => ({
           openWorkspaceId: s.openWorkspaceId === workspaceId ? null : workspaceId,
+          pluginPeek: null,
         })),
       setSize: (size) => set({ size }),
+      openPlugin: (id, workspaceId) => set({
+        openWorkspaceId: null,
+        pluginPeek: { id, workspaceId, generation: ++generation, status: "connecting" },
+      }),
+      closePlugin: (id) => set((s) => s.pluginPeek?.id === id ? { pluginPeek: null } : s),
+      setPluginStatus: (target, status, statusLabel) => set((s) => {
+        const peek = s.pluginPeek;
+        if (!peek || peek.generation !== target || (peek.status === status && peek.statusLabel === statusLabel)) return s;
+        return { pluginPeek: { ...peek, status, statusLabel } };
+      }),
     }),
     {
       name: "codemux:browser-peek",

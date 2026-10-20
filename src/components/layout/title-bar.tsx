@@ -1,5 +1,4 @@
-import { Slot } from "@/contrib/react/slot";
-import { TITLEBAR_ACTIONS_AREA } from "@/sdk/areas";
+import { TitlebarActions, useTitlebarActionsWidth } from "@/contrib/react/titlebar-actions";
 import {
   PanelLeft,
   PanelRight,
@@ -186,9 +185,11 @@ function SidebarToggleButton({
 function RightPanelChromeCluster({
   workspaceId,
   remPx,
+  pluginWidth,
 }: {
   workspaceId: string;
   remPx: number;
+  pluginWidth: number;
 }) {
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
   const collapseRightPanel = useUIStore((s) => s.collapseRightPanel);
@@ -213,7 +214,7 @@ function RightPanelChromeCluster({
     <div
       data-testid="titlebar-panel-cluster"
       className="pointer-events-auto absolute top-1 z-10 flex h-8 items-center gap-1"
-      style={{ right: `${panelClusterRight(isRemoteClient(), remPx)}px` }}
+      style={{ right: `${panelClusterRight(isRemoteClient(), remPx) + pluginWidth}px` }}
       onPointerDown={(e) => e.stopPropagation()}
     >
       {/* Leads the run so it keeps its place when the panel opens, rather
@@ -444,6 +445,7 @@ interface TitleBarProps {
 const COLLAPSED_RAIL_MAX_WIDTH = 64;
 
 export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
+  const pluginWidth = useTitlebarActionsWidth();
   const activeWorkspaceId = useActiveWorkspaceId();
   // Called unconditionally (Rules of Hooks) even though only the GUI-chrome
   // branch below renders the sidebar-matched left cluster that consumes it.
@@ -503,7 +505,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   // floating apart from it (see `TITLEBAR_RHYTHM_GAP`). Panel open, the
   // band tracks the panel's edge. A draft has no panel cluster to clear,
   // only the native window buttons.
-  const bandRightInset = rightPanelOpen
+  const normalBandRightInset = rightPanelOpen
     ? panelBandWidth + 8
     : guiChrome
       ? topRightReserve(remoteClient, {
@@ -514,6 +516,9 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       : remoteClient
         ? 6
         : 104;
+  const bandRightInset = pluginWidth > 0
+    ? Math.max(normalBandRightInset, topRightReserve(remoteClient, { panelOpen: rightPanelOpen, monitor: resourceMonitorShown, remPx }) + pluginWidth)
+    : normalBandRightInset;
 
   if (!guiChrome && !draftGuiChrome) {
     return (
@@ -532,6 +537,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
 
         {/* Right */}
         <div className="flex items-center gap-1.5 pr-0.5">
+          <TitlebarActions />
           {/* Resource monitor — CPU/memory usage of Codemux + every
               terminal process tree. Self-gates on the
               appearance.show_resource_monitor setting and renders null
@@ -674,18 +680,18 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
               details card, and the resource monitor into the fixed corner
               cluster, so only plugin actions are left here. */}
           {!guiChrome && <ResourceMonitor />}
-          {/* Plugin actions, in both layouts. Nothing without a plugin. */}
-          <Slot area={TITLEBAR_ACTIONS_AREA} />
           {remoteClient && <RemoteConnectionChip compact />}
         </div>
       </div>
+
+      <TitlebarActions floating className="fixed top-1 z-40 h-8 rounded-md bg-card" style={{ right: panelClusterRight(remoteClient, remPx) - 4 }} />
 
       {/* Panel controls. Fixed to the window's top-right corner, just inside
           the native buttons — the one cluster in this band whose position
           never depends on the panel. Workspace-only: a draft renders no
           right panel, so there is nothing for it to control. */}
       {guiChrome && activeWorkspaceId && !pageOpen && (
-        <RightPanelChromeCluster workspaceId={activeWorkspaceId} remPx={remPx} />
+        <RightPanelChromeCluster workspaceId={activeWorkspaceId} remPx={remPx} pluginWidth={pluginWidth} />
       )}
 
       {/* The Workspace details card, pinned to the workspace column's

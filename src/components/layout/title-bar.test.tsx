@@ -1,6 +1,8 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { geometryFingerprint } from "@/lib/geometry-fingerprint";
+import { registry } from "@/contrib/registry";
+import { TITLEBAR_ACTIONS_AREA } from "@/sdk/areas";
 import {
   cleanup,
   fireEvent,
@@ -26,6 +28,7 @@ const state = {
   rightPanelTab: null as "files" | null,
   rightPanelRowWidth: 0,
   rightPanelMaximized: false,
+  showAutomations: false,
   setRightPanelTab: vi.fn(),
   collapseRightPanel: vi.fn(),
   toggleMaximized: vi.fn(),
@@ -183,6 +186,7 @@ vi.mock("@/stores/ui-store", () => ({
         rightPanelWidth: 320,
         rightPanelRowWidth: state.rightPanelRowWidth,
         rightPanelMaximized: state.rightPanelMaximized,
+        showAutomations: state.showAutomations,
         setRightPanelTab: state.setRightPanelTab,
         collapseRightPanel: state.collapseRightPanel,
         toggleRightPanelMaximized: state.toggleMaximized,
@@ -268,6 +272,7 @@ beforeEach(() => {
   state.rightPanelTab = null;
   state.rightPanelRowWidth = 0;
   state.rightPanelMaximized = false;
+  state.showAutomations = false;
   state.setRightPanelTab.mockClear();
   state.collapseRightPanel.mockClear();
   state.toggleMaximized.mockClear();
@@ -288,6 +293,25 @@ afterEach(() => {
 });
 
 describe("TitleBar chrome gating", () => {
+  it.each(["legacy", "GUI", "utility", "covered"])("keeps plugin safety actions outside hidden chrome in %s state", (kind) => {
+    state.enableAgentChat = kind !== "legacy";
+    state.showAutomations = kind === "utility";
+    if (kind === "covered") {
+      state.rightPanelTab = "files";
+      state.rightPanelMaximized = true;
+    }
+    const off = registry.register({
+      id: "demo:safety", area: TITLEBAR_ACTIONS_AREA,
+      render: () => <button type="button">Stop plugin control</button>,
+    });
+    try {
+      renderBar();
+      const stop = screen.getByRole("button", { name: "Stop plugin control" });
+      expect(stop.closest(".hidden")).toBeNull();
+      expect(document.querySelectorAll("[data-plugin-titlebar-actions]")).toHaveLength(1);
+    } finally { cleanup(); off(); }
+  });
+
   it("renders the legacy bar (no tabs/launcher) when the Beta is OFF", () => {
     state.enableAgentChat = false;
     const { queryByTestId } = renderBar();

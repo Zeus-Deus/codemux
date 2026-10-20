@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, Square, Copy, X } from "lucide-react";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { TitlebarActions } from "@/contrib/react/titlebar-actions";
 
 /**
  * Standalone window controls (minimize / maximize / close) used by full-
@@ -100,12 +101,13 @@ export function WindowControls() {
  */
 export function WindowChrome() {
   // On the web remote client there is no OS window to drag or control, so the
-  // whole strip (drag region + controls) is inert. Render nothing — callers
+  // drag region + window controls are inert; plugin actions still mount.
+  // With no contributions this renders nothing — callers
   // reserve the top spacing (`pt-7`) themselves, so layout stays stable and
   // the strip's `data-tauri-drag-region` overlay never becomes a click dead
   // zone in the browser. Desktop behavior is unchanged.
   const mobile = useMobileLayout();
-  if (isRemoteClient() || mobile) return null;
+  if (isRemoteClient() || mobile) return <TitlebarActions className="absolute right-1 top-1 z-50" />;
 
   return (
     <div className="pointer-events-none absolute inset-x-0 top-0 z-50 flex h-7 items-center justify-end">
@@ -113,7 +115,8 @@ export function WindowChrome() {
         data-tauri-drag-region
         className="pointer-events-auto absolute inset-0"
       />
-      <div className="pointer-events-auto relative">
+      <div className="pointer-events-auto relative flex items-center">
+        <TitlebarActions />
         <WindowControls />
       </div>
     </div>

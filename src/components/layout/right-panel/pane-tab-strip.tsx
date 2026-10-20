@@ -93,6 +93,7 @@ import {
 } from "@/components/ui/tooltip";
 import { useTabReorder, type PillReorderHandlers } from "@/lib/tab-reorder";
 import { topRightReserve } from "@/lib/titlebar-geometry";
+import { useTitlebarActionsWidth } from "@/contrib/react/titlebar-actions";
 import { cn } from "@/lib/utils";
 import { useHorizontalWheelScroll } from "@/lib/wheel";
 import type { RightPanelTab } from "@/stores/ui-store";
@@ -566,8 +567,9 @@ export const PaneTabStrip = memo(function PaneTabStrip({
   const remoteClient = isRemoteClient();
   const remPx = useRootFontPx();
   const monitor = useSyncedSettingsStore(selectShowResourceMonitor);
+  const pluginWidth = useTitlebarActionsWidth();
   const reserve = inTitlebar
-    ? topRightReserve(remoteClient, { panelOpen: true, monitor, remPx })
+    ? topRightReserve(remoteClient, { panelOpen: true, monitor, remPx }) + pluginWidth
     : 0;
   const coreSurfaces = surfaces.filter((surface) => !isPluginPane(surface.id));
   const pluginSurfaces = surfaces.filter((surface) => isPluginPane(surface.id));

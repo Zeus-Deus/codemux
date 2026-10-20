@@ -47,7 +47,8 @@ vi.mock("@/tauri/commands", () => ({
     mocks.dockBrowserInRightPanel(...a),
 }));
 
-import { BrowserPeekOverlay, peekBottomOffset } from "./BrowserPeekOverlay";
+import { BrowserPeekOverlay } from "./BrowserPeekOverlay";
+import { peekBottomOffset } from "@/components/peek/PeekShell";
 
 function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSnapshot {
   return {
@@ -137,7 +138,7 @@ beforeEach(() => {
   mocks.dockBrowserInRightPanel.mockReset().mockResolvedValue(undefined);
   mocks.toastError.mockClear();
   useUIStore.setState({ rightPanelTabs: {}, rightPanelPanes: {} });
-  useBrowserPeekStore.setState({ openWorkspaceId: null, size: DEFAULT_PEEK_SIZE });
+  useBrowserPeekStore.setState({ openWorkspaceId: null, pluginPeek: null, size: DEFAULT_PEEK_SIZE });
 });
 
 afterEach(() => {
@@ -174,6 +175,7 @@ describe("BrowserPeekOverlay", () => {
     renderOverlay();
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(screen.getByText("https://example.com/dashboard")).toBeInTheDocument();
+    expect(screen.getByText("https://example.com/dashboard")).toHaveClass("border", "font-mono");
     const stub = screen.getByTestId("browser-pane-stub");
     expect(stub.dataset.browserId).toBe("ws-abc123");
     expect(stub.dataset.workspaceId).toBe("ws-1");

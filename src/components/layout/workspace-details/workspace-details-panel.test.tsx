@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import type { WorkspaceSnapshot } from "@/tauri/types";
@@ -63,6 +63,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
 import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 import { useUIStore } from "@/stores/ui-store";
+import { registry } from "@/contrib/registry";
+import { COMPOSER_STATUS_AREA } from "@/sdk/areas";
 import type { AgentBrowserSession, AppStateSnapshot } from "@/tauri/types";
 import {
   WorkspaceDetailsHost,
@@ -175,7 +177,36 @@ beforeEach(() => {
   });
 });
 
-afterEach(cleanup);
+const contributionDisposers: (() => void)[] = [];
+afterEach(() => {
+  cleanup();
+  for (const dispose of contributionDisposers.splice(0)) dispose();
+});
+
+it("shows plugin contributions in Live without a browser and follows the focused chat", () => {
+  const renderStatus = vi.fn(({ workspaceId, threadId }: { workspaceId: string; threadId: string | null }) =>
+    <button>{workspaceId}:{threadId}</button>,
+  );
+  mocks.workspace = makeWorkspace({ surfaces: [{ ...CHAT_SURFACE, root: {
+    kind: "agent_chat", pane_id: "pane-1", title: "Agent Chat",
+    thread_id: "thread-live", provider: null, cwd: "/p",
+  } }] });
+  const view = renderToggle();
+  expect(screen.queryByTestId("workspace-details-live")).toBeNull();
+  let dispose!: () => void;
+  act(() => {
+    dispose = registry.register({ id: "demo:status", source: "plugin:demo", area: COMPOSER_STATUS_AREA, render: renderStatus });
+    contributionDisposers.push(dispose);
+  });
+  const live = screen.getByTestId("workspace-details-live");
+  expect(within(live).getByRole("button", { name: "ws-1:thread-live" })).toBeInTheDocument();
+  expect(renderStatus).toHaveBeenLastCalledWith(expect.objectContaining({ workspaceId: "ws-1", threadId: "thread-live" }), undefined);
+  mocks.workspace = makeWorkspace();
+  view.rerender(<TooltipProvider><WorkspaceDetailsHost workspaceId="ws-1" columnWidth={1600} rightInset={0} edgeGap={4} remPx={16} /></TooltipProvider>);
+  expect(within(screen.getByTestId("workspace-details-live")).getByRole("button", { name: "ws-1:" })).toBeInTheDocument();
+  act(dispose);
+  expect(screen.queryByTestId("workspace-details-live")).toBeNull();
+});
 
 describe("primaryGitAction", () => {
   const base = { changedFiles: 0, ahead: 0, behind: 0, hasUpstream: true };
@@ -615,6 +646,18 @@ describe("WorkspaceDetailsToggle — issue and live rows", () => {
     withBrowser({ ...browserSession, right_panel_docked: true });
     renderToggle();
     expect(screen.queryByTestId("workspace-details-live")).toBeNull();
+  });
+
+  it("keeps plugin contributions beside Browser in the same Live section", () => {
+    withBrowser(browserSession);
+    contributionDisposers.push(registry.register({
+      id: "demo:status", source: "plugin:demo", area: COMPOSER_STATUS_AREA,
+      render: () => <button>Unity</button>,
+    }));
+    renderToggle();
+    const live = within(screen.getByTestId("workspace-details-live"));
+    expect(live.getByTestId("workspace-details-browser")).toBeInTheDocument();
+    expect(live.getByRole("button", { name: "Unity" })).toBeInTheDocument();
   });
 
   it("dots the toggle for a live browser only while the card is hidden", async () => {
