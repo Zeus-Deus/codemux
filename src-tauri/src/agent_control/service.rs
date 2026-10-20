@@ -62,7 +62,7 @@ pub(crate) async fn capabilities<R: Runtime>(app: &AppHandle<R>, provider: Provi
         if let Some(caps) = state.fixture_capabilities.lock().unwrap().get(&provider).cloned() { return Ok(caps); }
     }
     agent_chat::list_chat_provider_capabilities(
-        app.clone(), provider, None,
+        app.clone(), provider, None, None,
         app.state::<std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>>(),
         app.state::<std::sync::Arc<crate::agent_provider::cursor::capabilities::CursorCapabilityCache>>(),
         app.state::<std::sync::Arc<crate::agent_provider::grok::capabilities::GrokCapabilityCache>>(),

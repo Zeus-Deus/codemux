@@ -108,11 +108,11 @@ async function newChatInProject(projectPath: string, shiftKey: boolean) {
 
 /** The hover `+` on the Chats and project headers, laid over the shared
  *  sidebar action primitives: 24px with a 14px glyph, hidden until its
- *  header is hovered or the button itself takes keyboard focus. The
+ *  header is hovered or contains keyboard focus, and visible on touch. The
  *  primitive's enlarged touch target (`after:`) is dropped so it never
  *  overlaps the header's own toggle. */
 const HEADER_PLUS_CLASS =
-  "top-1 right-1 size-6 text-muted-foreground opacity-0 transition-opacity duration-150 after:hidden hover:bg-surface-3 hover:text-foreground focus-visible:opacity-100 [&>svg]:size-3.5";
+  "top-1 right-1 size-6 text-muted-foreground pointer-events-none opacity-0 transition-opacity duration-150 motion-reduce:transition-none after:hidden hover:bg-surface-3 hover:text-foreground focus-visible:pointer-events-auto focus-visible:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100 [&>svg]:size-3.5";
 
 /** Status glyph at the start of a row. Each state has its own shape, so the
  *  row reads correctly in any palette; colour only reinforces it. */
@@ -702,7 +702,7 @@ function ChatsHeader() {
             onClick={handleNewAgent}
             className={cn(
               HEADER_PLUS_CLASS,
-              "right-2 hover:bg-surface-2 group-hover/chats:opacity-100",
+              "right-2 hover:bg-surface-2 group-hover/chats:pointer-events-auto group-hover/chats:opacity-100 group-focus-within/chats:pointer-events-auto group-focus-within/chats:opacity-100",
             )}
           >
             <Plus />
@@ -735,16 +735,14 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
   const { getKeysForAction } = useResolvedKeybinds();
   const newKeys = getKeysForAction("newWorkspaceInProject");
   return (
-    <div className="group/proj relative flex h-8 items-center rounded-lg transition-colors duration-150 hover:bg-surface-2">
-      {/* Right padding reserves the hover `+` (24px at 4px from the edge),
-          which the action primitive lays over the row. */}
+    <div className="group/proj relative grid h-8 grid-cols-[minmax(0,1fr)_auto] items-center rounded-lg pr-1 transition-colors duration-150 hover:bg-surface-2">
       <button
         type="button"
         aria-expanded={!folded}
         aria-label={`${name} (${count})`}
         data-project-header={path}
         onClick={() => onToggle(path, !folded)}
-        className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-lg pr-[34px] pl-1.5 text-left outline-none focus-visible:bg-surface-2"
+        className="col-start-1 row-start-1 flex h-full min-w-0 items-center gap-2 rounded-lg pl-1.5 text-left outline-none focus-visible:bg-surface-2"
       >
         <ChevronRight
           aria-hidden
@@ -757,9 +755,6 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
         <span className="min-w-0 truncate text-body font-semibold text-foreground">
           {name}
         </span>
-        <span className="shrink-0 text-label tabular-nums text-muted-foreground/70">
-          {count}
-        </span>
         {needsYou && (
           <span
             data-folded-needs-you
@@ -771,12 +766,22 @@ const ProjectGroupHeader = memo(function ProjectGroupHeader({
           </span>
         )}
       </button>
+      {/* The count and create action share a cell, outside the fold toggle. */}
+      <span
+        aria-hidden
+        className="pointer-events-none col-start-2 row-start-1 min-w-6 px-1 text-center text-label tabular-nums text-muted-foreground/70 transition-opacity duration-150 motion-reduce:transition-none group-hover/proj:opacity-0 group-focus-within/proj:opacity-0 pointer-coarse:opacity-0"
+      >
+        {count}
+      </span>
       <Tooltip>
         <TooltipTrigger asChild>
           <SidebarMenuAction
             aria-label={`New chat in ${name}`}
             onClick={(e) => void newChatInProject(path, e.shiftKey)}
-            className={cn(HEADER_PLUS_CLASS, "group-hover/proj:opacity-100")}
+            className={cn(
+              HEADER_PLUS_CLASS,
+              "static col-start-2 row-start-1 justify-self-center group-hover/proj:pointer-events-auto group-hover/proj:opacity-100 group-focus-within/proj:pointer-events-auto group-focus-within/proj:opacity-100",
+            )}
           >
             <Plus />
           </SidebarMenuAction>

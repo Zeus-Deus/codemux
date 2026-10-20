@@ -2529,6 +2529,7 @@ async fn async_question_command_claims_once_and_keeps_other_providers_disabled()
             answers: vec!["SQLite".into()],
             submission_id: "b531755f-e50c-47e0-8d75-ed3a7d70b522".into(),
             retry_unknown: false,
+            permission_mode_override: None,
         };
         let (first, second) = tokio::join!(
             agent_chat_answer_question(

@@ -6,6 +6,8 @@ import type { PrWatchStatus, WorkspaceSnapshot } from "@/tauri/types";
 
 const mocks = vi.hoisted(() => ({
   status: null as PrWatchStatus | null,
+  /** Watches of chats other than thread-1. */
+  others: {} as Record<string, PrWatchStatus>,
   start: vi.fn(),
   stop: vi.fn(),
   listener: null as ((payload: { thread_id: string; watch: PrWatchStatus | null }) => void) | null,
@@ -25,7 +27,7 @@ vi.mock("@/tauri/commands", () => ({
       new Promise<PrWatchStatus | null>((resolve, reject) => {
         if (mocks.readFails) reject("bridge unavailable");
         else if (mocks.deferred) mocks.deferred.resolve = resolve;
-        else resolve(thread === "thread-1" ? mocks.status : null);
+        else resolve(thread === "thread-1" ? mocks.status : (mocks.others[thread] ?? null));
       }),
   ),
   prWatchStart: mocks.start,
@@ -91,6 +93,7 @@ const workspace = (patch: Partial<WorkspaceSnapshot> = {}) =>
 
 beforeEach(() => {
   mocks.status = null;
+  mocks.others = {};
   mocks.focused = "thread-1";
   mocks.epoch = 0;
   mocks.deferred = null;
@@ -103,6 +106,32 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("PrWatchRow", () => {
+  it("keeps Stop for another chat's active watch without focusing that chat", async () => {
+    mocks.others["thread-2"] = watch({ thread_id: "thread-2", pr_number: 99 });
+    const split = workspace({
+      surfaces: [
+        {
+          surface_id: "s",
+          root: {
+            kind: "split",
+            children: [
+              { kind: "agent_chat", thread_id: "thread-1" },
+              { kind: "agent_chat", thread_id: "thread-2" },
+            ],
+          },
+        },
+      ],
+      active_surface_id: "s",
+    } as unknown as Partial<WorkspaceSnapshot>);
+    render(<PrWatchRow workspace={split} />);
+    const other = await screen.findByTestId("workspace-details-pr-watch-other");
+    expect(other).toHaveTextContent("Watch #99 · other chat");
+    // The focused chat's own row is still there to start a watch.
+    expect(screen.getByTestId("workspace-details-pr-watch")).toHaveTextContent("Off");
+    fireEvent.click(other);
+    await waitFor(() => expect(mocks.stop).toHaveBeenCalledWith("thread-2"));
+  });
+
   it("starts watching the workspace's pull request for its chat", async () => {
     render(<PrWatchRow workspace={workspace()} />);
     const row = await screen.findByTestId("workspace-details-pr-watch");

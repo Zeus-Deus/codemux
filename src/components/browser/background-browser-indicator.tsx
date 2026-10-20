@@ -14,8 +14,8 @@ import type { AgentBrowserSession, AppStateSnapshot } from "@/tauri/types";
  * a pane-tree node (`pane_id === null`) *and* not docked in the
  * right-panel deck (`right_panel_docked !== true`). Every surface that
  * offers to *reveal* a background browser — the terminal pane header, the
- * Context Row's `WorkspaceStatusCluster`, the inline chat chip and the
- * peek overlay — resolves it here so none of them can drift into offering
+ * Workspace details card's Live row, the phone shell's status cluster and
+ * the peek overlay — resolves it here so none of them can drift into offering
  * to reveal a browser the user is already looking at.
  */
 export function selectBackgroundBrowserSession(
@@ -44,8 +44,8 @@ export function useBackgroundBrowserSession(
  * The background-browser indicator — a "Browser" control whose presence
  * already communicates that the session is live, so it needs no tint,
  * border or blinking dot. Click opens the floating peek overlay
- * (`BrowserPeekOverlay`) for the workspace. The Agent Chat Context Row
- * gets the labelled chip; the terminal pane header gets a bare globe
+ * (`BrowserPeekOverlay`) for the workspace. The phone shell's status
+ * cluster gets the labelled chip; the terminal pane header gets a bare globe
  * button sized to sit beside the other pane actions. Render it only
  * when `useBackgroundBrowserSession` resolves a session; the control
  * itself is presentation + click only.
@@ -78,7 +78,7 @@ export function BackgroundBrowserIndicator({
       type="button"
       onClick={() => openPeek(workspaceId)}
       aria-label="Browser running in background — view"
-      className="inline-flex h-[26px] shrink-0 items-center gap-1.5 px-1.5 text-label font-semibold text-status-remote transition-opacity duration-150 hover:opacity-80"
+      className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-1.5 text-label font-semibold text-status-remote transition-colors duration-150 hover:bg-surface-2"
     >
       <Globe className="size-3.5" aria-hidden />
       Browser

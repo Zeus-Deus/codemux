@@ -2,6 +2,7 @@ import { Command as CommandPrimitive } from "cmdk";
 import { memo, useCallback, useLayoutEffect, useMemo, useRef, type SyntheticEvent } from "react";
 
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { ScrollEdgeFade, useScrollEdges } from "@/components/ui/scroll-edge-fade";
 import { cn } from "@/lib/utils";
 import { CommandSourceIcon } from "./CommandSourceIcon";
 import {
@@ -86,6 +87,12 @@ export function SlashCommandPopup({
   footerNote = null,
 }: Props) {
   const listRef = useRef<HTMLDivElement | null>(null);
+  const viewportRef = useRef<HTMLElement | null>(null);
+  const edges = useScrollEdges(viewportRef, open);
+  const setListRef = useCallback((node: HTMLDivElement | null) => {
+    listRef.current = node;
+    viewportRef.current = node?.closest<HTMLElement>("[data-slot=scroll-area-viewport]") ?? null;
+  }, []);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const room = useRoomAbove(rootRef, open);
   const pointerHighlightRef = useRef<string | null>(null);
@@ -111,8 +118,11 @@ export function SlashCommandPopup({
     if (!viewport || !target) return;
     const bounds = viewport.getBoundingClientRect();
     const row = target.getBoundingClientRect();
-    if (row.top < bounds.top) viewport.scrollTop += row.top - bounds.top;
-    else if (row.bottom > bounds.bottom) viewport.scrollTop += row.bottom - bounds.bottom;
+    const style = getComputedStyle(viewport);
+    const top = bounds.top + (parseFloat(style.scrollPaddingTop) || 0);
+    const bottom = bounds.bottom - (parseFloat(style.scrollPaddingBottom) || 0);
+    if (row.top < top) viewport.scrollTop += row.top - top;
+    else if (row.bottom > bottom) viewport.scrollTop += row.bottom - bottom;
   }, [highlightedId, open]);
 
   // Keep the scroll area out of highlight moves: cmdk's store updates only the
@@ -154,6 +164,7 @@ export function SlashCommandPopup({
             // default flex layout otherwise stretches a single child).
             "[&>[data-slot=scroll-area-viewport]]:max-h-80",
             "[&>[data-slot=scroll-area-viewport]]:overscroll-contain",
+            "[&>[data-slot=scroll-area-viewport]]:scroll-py-5",
             // Radix's viewport wraps children in a `display: table;
             // min-width: 100%` div (inline styles). A table box is
             // shrink-to-fit, so any row wider than the popup — a long
@@ -174,7 +185,7 @@ export function SlashCommandPopup({
           )}
         >
           <CommandPrimitive.List
-            ref={listRef}
+            ref={setListRef}
             className="outline-none"
           >
           <CommandRows items={items} onSelect={selectItem} />
@@ -196,7 +207,7 @@ export function SlashCommandPopup({
         </ScrollArea>
       </>
     ),
-    [items, footerNote, selectItem],
+    [items, footerNote, selectItem, setListRef],
   );
 
   if (!open) return null;
@@ -265,7 +276,11 @@ export function SlashCommandPopup({
         }}
         className="flex min-h-0 flex-col text-popover-foreground"
       >
-        {list}
+        <div className="relative flex min-h-0 flex-col">
+          {list}
+          <ScrollEdgeFade edge="top" visible={edges.top} surface="color-mix(in oklab, var(--muted) 40%, var(--background))" />
+          <ScrollEdgeFade edge="bottom" visible={edges.bottom} surface="color-mix(in oklab, var(--muted) 40%, var(--background))" />
+        </div>
         {items.find((item) => item.id === highlightedId)?.identity && <div data-testid="slash-item-source" className="shrink-0 border-t border-hairline px-3 py-2 text-label text-muted-foreground">
           {items.find((item) => item.id === highlightedId)?.identity?.label}
         </div>}

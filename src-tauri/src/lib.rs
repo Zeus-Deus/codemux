@@ -816,8 +816,9 @@ fn build_core_app<R: tauri::Runtime>(
             diagnostics::record_startup_milestone("startup.setup-enter");
             // Configuration and explicit connection probes remain available
             // when chat is disabled. Constructing the aggregate starts no CLI.
-            let acp = std::sync::Arc::new(agent_provider::custom_acp::GenericAcpProvider::new(
+            let acp = std::sync::Arc::new(agent_provider::custom_acp::GenericAcpProvider::new_with_mcp_registry(
                 std::sync::Arc::new(commands::custom_acp::AppAcpStore(app.handle().clone())),
+                Some(app.state::<mcp::registry::McpRegistry>().inner().clone()),
             ));
             let mut catalogs = acp.catalog_updates();
             let catalog_handle = app.handle().clone();
@@ -1460,7 +1461,10 @@ fn build_core_app<R: tauri::Runtime>(
                         > = registry_handle.state();
                         let cursor =
                             agent_provider::cursor::CursorAgentProvider::new_with_slash_command_cache(
-                                agent_provider::cursor::CursorProviderConfig::default(),
+                                agent_provider::cursor::CursorProviderConfig {
+                                    mcp_registry: Some(mcp_registry.clone()),
+                                    ..Default::default()
+                                },
                                 acp_slash_commands.inner().clone(),
                             );
                         registry
@@ -1471,15 +1475,19 @@ fn build_core_app<R: tauri::Runtime>(
                         // spawned lazily per chat session.
                         let grok =
                             agent_provider::grok::GrokAgentProvider::new_with_slash_command_cache(
-                                agent_provider::grok::GrokProviderConfig::default(),
+                                agent_provider::grok::GrokProviderConfig {
+                                    mcp_registry: Some(mcp_registry.clone()),
+                                    ..Default::default()
+                                },
                                 acp_slash_commands.inner().clone(),
                             );
                         registry
                             .set_grok(std::sync::Arc::new(grok) as _)
                             .await;
 
-                        let hermes = std::sync::Arc::new(agent_provider::hermes::HermesProvider::new(
+                        let hermes = std::sync::Arc::new(agent_provider::hermes::HermesProvider::new_with_mcp_registry(
                             std::sync::Arc::new(agent_provider::hermes::binding::AppBindingStore(registry_handle.clone())),
+                            Some(mcp_registry.clone()),
                         ));
                         registry_handle.manage(hermes.clone());
                         registry.set_hermes(hermes).await;

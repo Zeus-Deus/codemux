@@ -3,13 +3,23 @@
 //! The CLI's own sign-in is the implicit `default` account and has no row.
 //! Each extra account owns a home directory the CLI is pointed at with
 //! `CLAUDE_CONFIG_DIR` / `CODEX_HOME`. Defaults are scoped: the empty scope
-//! is the app-wide default, any other scope is a workspace id. A binding
+//! is the app-wide default. Other scopes are workspace ids from when defaults
+//! could be set per workspace; nothing reads them any more. A binding
 //! pins the account a chat thread runs on. No foreign keys: a binding must
 //! survive its session row being rebuilt, and a removed account simply
 //! stops resolving.
 use super::*;
 
 /// One extra account, as stored.
+/// What removing an account took from its chats.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemovedAccount {
+    /// `(thread, native id)` of chats whose native id was cleared.
+    pub cleared: Vec<(String, String)>,
+    /// `(thread, provider)` of every binding that named the account.
+    pub unbound: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderAccountRow {
     pub id: String,
@@ -120,11 +130,20 @@ impl DatabaseStore {
     /// that ran on it fall back to whatever default applies next, starting
     /// fresh: their native id names a transcript that left with the account,
     /// and any older copy elsewhere predates what the chat shows.
-    ///
-    /// Returns the chats whose native id was cleared.
-    pub fn delete_provider_account(&self, id: &str) -> Result<Vec<(String, String)>, String> {
+    pub fn delete_provider_account(&self, id: &str) -> Result<RemovedAccount, String> {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let unbound: Vec<(String, String)> = {
+            let mut stmt = tx
+                .prepare("SELECT thread_id, provider FROM provider_account_bindings WHERE account_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            rows
+        };
         let cleared: Vec<(String, String)> = {
             let mut stmt = tx
                 .prepare(
@@ -157,7 +176,7 @@ impl DatabaseStore {
         tx.execute("DELETE FROM provider_account_bindings WHERE account_id = ?1", [id])
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(cleared)
+        Ok(RemovedAccount { cleared, unbound })
     }
 
     /// The default for `provider` in `scope` (`""` = app-wide).
@@ -295,7 +314,10 @@ mod tests {
         db.set_agent_chat_sdk_session_id("t1", "native-1").unwrap();
         assert_eq!(
             db.delete_provider_account("work").unwrap(),
-            vec![("t1".to_string(), "native-1".to_string())]
+            RemovedAccount {
+                cleared: vec![("t1".to_string(), "native-1".to_string())],
+                unbound: vec![("t1".to_string(), "claude".to_string())],
+            }
         );
         assert_eq!(db.get_agent_chat_session("t1").unwrap().sdk_session_id, None);
         assert_eq!(db.provider_account_default("", "claude").unwrap(), None);

@@ -29,6 +29,110 @@ pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
     .map_err(|e| format!("Failed to create provider switch table: {e}"))
 }
 
+/// How a seed names the chat whose full history it points at.
+pub(crate) fn history_ref(thread_id: &str) -> String {
+    format!("conversation_id `{thread_id}`")
+}
+
+/// `seed` with its history pointer moved from `from` to `to`. Only the
+/// header Codemux wrote is touched, never the conversation in the body.
+pub(crate) fn retarget_seed(seed: &str, from: &str, to: &str) -> String {
+    let (header, body) = seed.split_once("\n\n").unwrap_or((seed, ""));
+    let header = header.replacen(&history_ref(from), &history_ref(to), 1);
+    if body.is_empty() {
+        header
+    } else {
+        format!("{header}\n\n{body}")
+    }
+}
+
+/// See [`DatabaseStore::agent_chat_turn_answered_after`].
+fn turn_answered_after(conn: &Connection, thread_id: &str, nonce: &str, after_id: i64) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_chat_messages u
+            WHERE u.thread_id = ?1 AND u.id > ?3 AND json_valid(u.payload)
+              AND json_extract(u.payload, '$.type') = 'user_message'
+              AND json_extract(u.payload, '$.client_nonce') = ?2
+              AND EXISTS(SELECT 1 FROM agent_chat_messages r
+                  WHERE r.thread_id = u.thread_id AND r.id > u.id AND json_valid(r.payload)
+                    AND json_extract(r.payload, '$.type') = 'item_completed'))",
+        params![thread_id, nonce, after_id],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
+}
+
+/// Tells a provider that already has a handoff where the chat's full
+/// history lives now that a history reopen gave the chat a new id.
+fn reopen_correction(thread_id: &str) -> String {
+    format!(
+        "<codemux-provider-handoff>\nThis chat was reopened under a new id. Its complete conversation is now under {}: use that with `conversation_search` and `conversation_read`, not the conversation an earlier handoff named.\n</codemux-provider-handoff>",
+        history_ref(thread_id)
+    )
+}
+
+/// A history reopen merges `merged` into `survivor`
+/// (`merge_agent_chat_session_rows`, after the transcript moved). Unless the
+/// survivor has a seed of its own, it takes the newest of theirs: as it
+/// stood, history pointer moved to the survivor, while the provider hasn't
+/// answered it; once it has, a short correction naming the survivor
+/// instead, which the next turn carries. The merged ids are gone.
+pub(super) fn move_to_thread(conn: &Connection, merged: &[String], survivor: &str) -> Result<(), String> {
+    let read_error = |e: rusqlite::Error| format!("Failed to read the provider switch context: {e}");
+    let own: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_chat_provider_switch_seeds WHERE thread_id = ?1)",
+            params![survivor],
+            |row| row.get(0),
+        )
+        .map_err(read_error)?;
+    if own {
+        return Ok(());
+    }
+    let mut newest: Option<(&String, String, String, i64, Option<String>, String)> = None;
+    for thread in merged {
+        let seed = conn
+            .query_row(
+                "SELECT provider, content, anchor_id, sent_nonce, created_at
+                 FROM agent_chat_provider_switch_seeds WHERE thread_id = ?1",
+                params![thread],
+                |row| Ok((thread, row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()
+            .map_err(read_error)?;
+        if let Some(seed) = seed.filter(|seed| newest.as_ref().map_or(true, |n| seed.5 > n.5)) {
+            newest = Some(seed);
+        }
+    }
+    let Some((from, provider, mut content, mut anchor_id, mut sent_nonce, created_at)) = newest else {
+        return Ok(());
+    };
+    let answered = sent_nonce
+        .as_deref()
+        .is_some_and(|sent| turn_answered_after(conn, survivor, sent, anchor_id));
+    if answered {
+        content = reopen_correction(survivor);
+        anchor_id = conn
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM agent_chat_messages WHERE thread_id = ?1",
+                params![survivor],
+                |row| row.get(0),
+            )
+            .map_err(read_error)?;
+        sent_nonce = None;
+    } else {
+        content = retarget_seed(&content, from, survivor);
+    }
+    conn.execute(
+        "INSERT INTO agent_chat_provider_switch_seeds
+            (thread_id, provider, content, anchor_id, sent_nonce, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![survivor, provider, content, anchor_id, sent_nonce, created_at],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("Failed to keep the provider switch context: {e}"))
+}
+
 /// A thread's switch seed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSwitchSeed {
@@ -112,21 +216,7 @@ impl DatabaseStore {
     /// item follows it. A turn stopped or rejected before the provider took
     /// it leaves no reply behind.
     pub fn agent_chat_turn_answered_after(&self, thread_id: &str, nonce: &str, after_id: i64) -> bool {
-        self.conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM agent_chat_messages u
-                    WHERE u.thread_id = ?1 AND u.id > ?3 AND json_valid(u.payload)
-                      AND json_extract(u.payload, '$.type') = 'user_message'
-                      AND json_extract(u.payload, '$.client_nonce') = ?2
-                      AND EXISTS(SELECT 1 FROM agent_chat_messages r
-                          WHERE r.thread_id = u.thread_id AND r.id > u.id AND json_valid(r.payload)
-                            AND json_extract(r.payload, '$.type') = 'item_completed'))",
-                params![thread_id, nonce, after_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false)
+        turn_answered_after(&self.conn.lock().unwrap(), thread_id, nonce, after_id)
     }
 
     /// A thread's seed and the provider it is for.
@@ -213,6 +303,48 @@ mod tests {
         db.put_provider_switch_seed("t", "codex", "SEED", 3).unwrap();
         let (provider, seed) = db.provider_switch_seed_of("t").unwrap();
         assert_eq!((provider.as_str(), seed.content.as_str(), seed.anchor_id), ("codex", "SEED", 3));
+    }
+
+    /// `old` and its history reopen `new`, sharing one native session.
+    fn reopened(db: &DatabaseStore) {
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('old', 'sdk-1', 'ws', 'codex', '2025-01-01', '2025-01-01'),
+                        ('new', 'sdk-1', 'ws', 'codex', '2025-03-01', '2025-03-01')",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn reopening_from_history_keeps_the_seed_and_where_it_stands() {
+        let db = DatabaseStore::new_in_memory();
+        reopened(&db);
+        let seed = "<codemux-provider-handoff>\nSee conversation_id `old`.\n</codemux-provider-handoff>\n\nuser: conversation_id `old`";
+        db.put_provider_switch_seed("old", "codex", seed, 7).unwrap();
+        db.mark_provider_switch_seed_sent("old", "codex", seed, "n1").unwrap();
+        db.collapse_duplicate_agent_chat_sessions("sdk-1").unwrap();
+        let moved = db.provider_switch_seed("new", "codex").unwrap();
+        assert_eq!(
+            moved.content,
+            "<codemux-provider-handoff>\nSee conversation_id `new`.\n</codemux-provider-handoff>\n\nuser: conversation_id `old`",
+            "only the header's history pointer follows the chat"
+        );
+        assert_eq!((moved.anchor_id, moved.sent_nonce.as_deref()), (7, Some("n1")));
+    }
+
+    #[test]
+    fn reopening_keeps_a_seed_the_survivor_already_has() {
+        let db = DatabaseStore::new_in_memory();
+        reopened(&db);
+        db.put_provider_switch_seed("old", "codex", "older", 1).unwrap();
+        db.put_provider_switch_seed("new", "claude", "newer", 2).unwrap();
+        db.collapse_duplicate_agent_chat_sessions("sdk-1").unwrap();
+        let (provider, seed) = db.provider_switch_seed_of("new").unwrap();
+        assert_eq!((provider.as_str(), seed.content.as_str()), ("claude", "newer"));
     }
 
     #[test]

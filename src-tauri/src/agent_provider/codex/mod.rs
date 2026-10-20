@@ -257,6 +257,11 @@ impl AgentProvider for CodexAgentProvider {
         )
         .await?;
         let mut startup_guard = session.managed_startup_guard().await;
+        // The mode the thread's last turn ran in, as Codemux recorded it, for
+        // servers that do not report it on resume.
+        if let Some(mode) = input.extra.get("turnMode").and_then(|v| v.as_str()) {
+            session.seed_recorded_mode(mode);
+        }
 
         {
             let mut sessions = self.sessions.write().await;

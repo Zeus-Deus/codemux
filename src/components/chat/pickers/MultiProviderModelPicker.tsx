@@ -4,7 +4,7 @@ import { CustomAcpModels } from "./CustomAcpModels";
 import { selectedAcpCatalog, useCustomAcp } from "@/stores/custom-acp-store";
 import { HermesProfileModels } from "./HermesProfileModels";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { ChevronDown, Star } from "lucide-react";
+import { ChevronDown, Settings2, Star } from "lucide-react";
 
 import {
   Command,
@@ -63,8 +63,11 @@ import { Eyebrow } from "@/components/ui/eyebrow";
 import { useDisabledProviders } from "@/lib/agent-chat/provider-enablement";
 import { accountName, useProviderAccounts } from "@/stores/provider-accounts-store";
 import type { ProviderAccount } from "@/tauri/commands";
+import { useNativeCapabilities } from "../use-native-capabilities";
 import { accountSummary, useThreadAccount, type ThreadAccountView } from "../use-thread-account";
-import { AccountBadge, AccountFooter, AccountListHeader } from "./provider-account-parts";
+import { AccountBadge, AccountListHeader } from "./provider-account-parts";
+import { ScrollEdgeFade, useScrollEdges } from "@/components/ui/scroll-edge-fade";
+import { useUIStore } from "@/stores/ui-store";
 
 /**
  * Step 12 Stage 4 — unified provider + model picker.
@@ -383,8 +386,18 @@ export function MultiProviderModelPicker({
     const profile = hermesThreadId ? s.selections[hermesThreadId] : undefined;
     return profile ? s.catalogs[hermesProfileKey(profile)]?.value?.session.models?.availableModels.find(m => m.modelId === model)?.name : undefined;
   });
+  // An extra Codex account signs in on its own, so it lists its own models
+  // (and its own sign-in errors), refreshed whenever it becomes the choice.
+  const codexCatalog = useNativeCapabilities("codex", hermesThreadId);
+  const codexAccountId = codexCatalog.accountId;
+  useEffect(() => {
+    if (open && codexAccountId) void useProviderCapabilities.getState().refreshAccount("codex", codexAccountId);
+  }, [open, codexAccountId]);
   const claudeCaps = allCaps.claude;
-  const codexCaps = allCaps.codex;
+  const codexCaps = codexCatalog.caps;
+  const codexError = codexCatalog.error;
+  const railError = (kind: RailKey): string | null =>
+    kind === "grok" ? grokAvailabilityError : kind === "codex" ? codexError : errorForRail(kind, allCaps);
   const cursorCaps = allCaps.cursor;
   const grokCaps = allCaps.grok;
   const opencodeCaps = allCaps.opencode;
@@ -533,7 +546,7 @@ export function MultiProviderModelPicker({
   // out by the backend — resolves to the concrete `models[0]` row.
   // The trigger label/subtitle/tooltip and the active-row highlight
   // all derive from this one resolution so they can't disagree.
-  const capsForCurrentProvider = selectCapabilities(allCaps, provider);
+  const capsForCurrentProvider = provider === "codex" ? codexCaps : selectCapabilities(allCaps, provider);
   const resolvedModel = useMemo(
     () => selectModel(capsForCurrentProvider, model),
     [capsForCurrentProvider, model],
@@ -573,6 +586,10 @@ export function MultiProviderModelPicker({
   const triggerTitle = triggerDetails ? `${triggerLabel} · ${triggerDetails}` : triggerLabel;
   // Held closed while the picker is open so it never sits over the popup.
   const [tooltipOpen, setTooltipOpen] = useState(false);
+  // The list mounts a commit after the popover opens, unmounts on close, and
+  // gives way to the Hermes and custom-agent panes: follow the element.
+  const [listNode, setListNode] = useState<HTMLDivElement | null>(null);
+  const listEdges = useScrollEdges(listNode);
   const showReveal = !iconOnly && !leafLabel && triggerReveal !== "";
   // The reveal's natural width. The pill grows left by exactly this and
   // pulls its left margin in by the same amount, so its layout footprint
@@ -681,8 +698,9 @@ export function MultiProviderModelPicker({
         </Tooltip>
       </TooltipProvider>
       <PopoverContent
-        // Compact popup: 400px wide (48px provider rail + fluid list),
-        // 384px tall — a scannable column instead of a wide panel.
+        // Fixed 400×360 (48px provider rail + fluid list) however many
+        // providers, accounts and models there are: the rail and the list
+        // scroll on their own instead of growing the popup.
         className="w-[400px] max-w-[calc(100vw-2rem)] p-0"
         {...(inContextRow ? CONTEXT_ROW_POPOVER : { align: "start" as const })}
         // Keep the popup inside the chat column's gutter on phones.
@@ -693,7 +711,7 @@ export function MultiProviderModelPicker({
             min-width auto, so a long unbreakable subtitle line would
             otherwise force the list column past the popup width and
             clip the rows against the rail. */}
-        <div className="grid grid-cols-[48px_minmax(0,1fr)] h-[384px] overflow-hidden">
+        <div className="grid h-[360px] grid-cols-[48px_minmax(0,1fr)] overflow-hidden">
           <ProviderRail
             providers={railProviders}
             acpEntries={acpRailEntries}
@@ -710,13 +728,17 @@ export function MultiProviderModelPicker({
               setQuery("");
               void accountView(kind)?.choose(account);
             }}
+            onManageAccounts={
+              claudeAccount.multi || codexAccount.multi
+                ? () => {
+                    setOpen(false);
+                    useUIStore.getState().setShowSettings(true, "providers");
+                  }
+                : undefined
+            }
             favoritesCount={visibleFavoritesCount}
             getCount={(kind) => rowsByProvider[kind]?.length ?? 0}
-            getError={(kind) =>
-              kind === "grok"
-                ? grokAvailabilityError
-                : selectError(allCaps, kind)
-            }
+            getError={railError}
             onSelect={(next) => {
               setRailKey(next);
               setQuery("");
@@ -738,7 +760,7 @@ export function MultiProviderModelPicker({
             }}
           />
           <div className="flex min-h-0 min-w-0 flex-col">
-            {railKey === "acp" && acpAllowed ? <CustomAcpModels disabled={disabled} agentId={railAcpAgentId} threadId={hermesThreadId} projectPath={hermesProjectPath} active={provider === "acp" && activeAcpAgentId === railAcpAgentId} model={provider === "acp" ? model : null} onSelect={value => { onProviderModelChange("acp", value); }} /> : railKey === "hermes" ? <HermesProfileModels onProfileChange={() => onProviderModelChange("hermes", "profile_default")} threadId={hermesThreadId} projectPath={hermesProjectPath} model={provider === "hermes" ? model : null} onSelect={(model) => { onProviderModelChange("hermes", model); setOpen(false); }} /> : <Command shouldFilter={false}>
+            {railKey === "acp" && acpAllowed ? <CustomAcpModels disabled={disabled} agentId={railAcpAgentId} threadId={hermesThreadId} projectPath={hermesProjectPath} active={provider === "acp" && activeAcpAgentId === railAcpAgentId} model={provider === "acp" ? model : null} onSelect={value => { onProviderModelChange("acp", value); }} /> : railKey === "hermes" ? <HermesProfileModels onProfileChange={() => onProviderModelChange("hermes", "profile_default")} threadId={hermesThreadId} projectPath={hermesProjectPath} model={provider === "hermes" ? model : null} onSelect={(model) => { onProviderModelChange("hermes", model); setOpen(false); }} /> : <Command shouldFilter={false} className="h-auto min-h-0 flex-1">
               <CommandInput
                 placeholder="Search models..."
                 value={query}
@@ -751,100 +773,97 @@ export function MultiProviderModelPicker({
                   <AccountListHeader view={view} providerLabel={providerDisplayLabel(railKey as AgentChatProviderKind)} />
                 ) : null;
               })()}
-              {/* Override cmdk's default `no-scrollbar max-h-72` so the
-                  list fills the popover and shows a real scrollbar
-                  when models overflow (Claude has 5, Codex 4, but
-                  OpenCode federates ~150 connected-upstream models on
-                  a fully-configured machine — without a scrollbar
-                  half the list is unreachable). */}
-              <CommandList className="max-h-none flex-1 overflow-y-auto thin-scrollbar [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-muted-foreground/30 hover:[&::-webkit-scrollbar-thumb]:bg-muted-foreground/50">
-                <CommandEmpty>
-                  <ModelListEmptyState
-                    railKey={railKey}
-                    query={query}
-                    caps={capsForRail(
-                      railKey,
-                      claudeCaps,
-                      codexCaps,
-                      cursorCaps,
-                      grokCaps,
-                      opencodeCaps,
-                    )}
-                    error={
-                      railKey === "grok"
-                        ? grokAvailabilityError
-                        : errorForRail(railKey, allCaps)
-                    }
-                  />
-                </CommandEmpty>
-                {visibleRows.length === 0 ? (
-                  <LoadingFallback
-                    railKey={railKey}
-                    caps={capsForRail(
-                      railKey,
-                      claudeCaps,
-                      codexCaps,
-                      cursorCaps,
-                      grokCaps,
-                      opencodeCaps,
-                    )}
-                    error={
-                      railKey === "grok"
-                        ? grokAvailabilityError
-                        : errorForRail(railKey, allCaps)
-                    }
-                    query={query}
-                  />
-                ) : (
-                  visibleRows.map((row, index) => {
-                    // Compare against the resolved id (not the raw
-                    // stored one) so a persisted "default" alias
-                    // highlights the concrete row it resolved to.
-                    const isActive =
-                      row.provider === provider &&
-                      row.model.id === resolvedModelId;
-                    const key = pickerFavoriteKey(row.provider, row.model.id);
-                    return (
-                      <ModelRow
-                        key={key}
-                        row={row}
-                        isActive={isActive}
-                        isFavorite={favoritesSet.has(key)}
-                        jumpLabel={
-                          index < 9 ? `${JUMP_MOD_LABEL}${index + 1}` : null
-                        }
-                        onSelect={() => {
-                          onProviderModelChange(row.provider, row.model.id);
-                          setOpen(false);
-                          setQuery("");
-                        }}
-                        onToggleFavorite={() =>
-                          usePickerFavorites
-                            .getState()
-                            .toggle(row.provider, row.model.id)
-                        }
-                      />
-                    );
-                  })
-                )}
-              </CommandList>
+              <div className="relative flex min-h-0 flex-1 flex-col">
+                {/* Override cmdk's default `no-scrollbar max-h-72` so the
+                    list fills the popover and shows a real scrollbar
+                    when models overflow (Claude has 5, Codex 4, but
+                    OpenCode federates ~150 connected-upstream models on
+                    a fully-configured machine — without a scrollbar
+                    half the list is unreachable). */}
+                <CommandList
+                  ref={setListNode}
+                  data-testid="multi-provider-model-list"
+                  className="max-h-none flex-1 overflow-y-auto thin-scrollbar [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-muted-foreground/30 hover:[&::-webkit-scrollbar-thumb]:bg-muted-foreground/50"
+                >
+                  <CommandEmpty>
+                    <ModelListEmptyState
+                      railKey={railKey}
+                      query={query}
+                      caps={capsForRail(
+                        railKey,
+                        claudeCaps,
+                        codexCaps,
+                        cursorCaps,
+                        grokCaps,
+                        opencodeCaps,
+                      )}
+                      error={railError(railKey)}
+                    />
+                  </CommandEmpty>
+                  {visibleRows.length === 0 ? (
+                    <LoadingFallback
+                      railKey={railKey}
+                      caps={capsForRail(
+                        railKey,
+                        claudeCaps,
+                        codexCaps,
+                        cursorCaps,
+                        grokCaps,
+                        opencodeCaps,
+                      )}
+                      error={railError(railKey)}
+                      query={query}
+                    />
+                  ) : (
+                    visibleRows.map((row, index) => {
+                      // Compare against the resolved id (not the raw
+                      // stored one) so a persisted "default" alias
+                      // highlights the concrete row it resolved to.
+                      const isActive =
+                        row.provider === provider &&
+                        row.model.id === resolvedModelId;
+                      const key = pickerFavoriteKey(row.provider, row.model.id);
+                      return (
+                        <ModelRow
+                          key={key}
+                          row={row}
+                          isActive={isActive}
+                          isFavorite={favoritesSet.has(key)}
+                          jumpLabel={
+                            index < 9 ? `${JUMP_MOD_LABEL}${index + 1}` : null
+                          }
+                          onSelect={() => {
+                            onProviderModelChange(row.provider, row.model.id);
+                            setOpen(false);
+                            setQuery("");
+                          }}
+                          onToggleFavorite={() =>
+                            usePickerFavorites
+                              .getState()
+                              .toggle(row.provider, row.model.id)
+                          }
+                        />
+                      );
+                    })
+                  )}
+                </CommandList>
+                {/* Short of the scrollbar, so it stays crisp. */}
+                <ScrollEdgeFade edge="top" visible={listEdges.top} style={{ right: "0.5rem" }} data-testid="multi-provider-model-list-top-fade" />
+                <ScrollEdgeFade edge="bottom" visible={listEdges.bottom} style={{ right: "0.5rem" }} data-testid="multi-provider-model-list-bottom-fade" />
+              </div>
             </Command>}
+            {/* A switch to another provider says so under the list it
+                lands on, inside the popup's fixed height. */}
+            {switchHint && (
+              <div
+                data-testid="provider-switch-hint"
+                className="shrink-0 border-t px-3 py-1.5 text-label text-muted-foreground"
+              >
+                {switchHint}
+              </div>
+            )}
           </div>
         </div>
-        {/* A switch to another provider says so above the account it
-            lands on. */}
-        {switchHint && (
-          <div
-            data-testid="provider-switch-hint"
-            className="border-t px-3 py-1.5 text-label text-muted-foreground"
-          >
-            {switchHint}
-          </div>
-        )}
-        {(() => {
-          const view = accountView(railKey);
-          return view ? <AccountFooter view={view} onManage={() => setOpen(false)} /> : null;
-        })()}
         {/* Defensive: keep the cmdk-required outer Command wrapper out of
             the visible flow when no rows pass the filter — cmdk would
             otherwise refuse to render `<CommandEmpty>` because we
@@ -856,6 +875,9 @@ export function MultiProviderModelPicker({
   );
 }
 
+/** The rail's `bg-muted/30` over the popover, so its fades melt into it. */
+const RAIL_SURFACE = "color-mix(in oklab, var(--muted) 30%, var(--popover))";
+
 function ProviderRail({
   providers,
   acpEntries,
@@ -864,6 +886,7 @@ function ProviderRail({
   selected,
   accountView = () => null,
   onChooseAccount = () => {},
+  onManageAccounts,
   favoritesCount,
   getCount,
   getError,
@@ -877,178 +900,210 @@ function ProviderRail({
   /** Accounts of a provider signed in more than once, one entry each. */
   accountView?: (kind: RailKey) => ThreadAccountView | null;
   onChooseAccount?: (kind: AgentChatProviderKind, account: ProviderAccount) => void;
+  /** Opens Settings → Providers; the button is left out without it. */
+  onManageAccounts?: () => void;
   favoritesCount: number;
   getCount: (kind: AgentChatProviderKind) => number;
   getError: (kind: AgentChatProviderKind) => string | null;
   onSelect: (next: RailKey) => void;
 }) {
+  const railRef = useRef<HTMLDivElement | null>(null);
+  const railEdges = useScrollEdges(railRef);
   return (
     <TooltipProvider delayDuration={200}>
-      <div
-        // Custom agents add one entry each, so the rail scrolls once it
-        // outgrows the fixed-height popup instead of clipping entries.
-        className="flex min-h-0 flex-col gap-1 overflow-y-auto overflow-x-hidden border-r bg-muted/30 p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-        data-testid="multi-provider-rail"
-      >
-        {/* Favorites pseudo-tab — sits above the driver entries with
-            a hairline separator. Click filters the right column to
-            every starred row across drivers. Hidden when the user has
-            zero favorites so we don't surface an empty tab on a
-            fresh install. */}
-        {favoritesCount > 0 ? (
-          <>
-            <div className="relative shrink-0">
-              {selected === "favorites" && (
-                <span
-                  className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
-                  aria-hidden
-                />
-              )}
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={() => onSelect("favorites")}
-                    data-testid="provider-rail-favorites"
-                    data-selected={selected === "favorites" || undefined}
-                    aria-label="Favorites"
-                    aria-pressed={selected === "favorites"}
-                    className={cn(
-                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
-                      "hover:bg-muted",
-                      selected === "favorites" &&
-                        "bg-background text-foreground shadow-sm",
-                    )}
-                  >
-                    <Star
-                      className="size-5 shrink-0 text-status-working"
-                      fill="currentColor"
+      <div className="flex min-h-0 flex-col border-r bg-muted/30">
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <div
+            ref={railRef}
+            // Accounts and custom agents add one entry each, so the rail
+            // scrolls (scrollbar hidden; the edge fades show there is more)
+            // once it outgrows the fixed-height popup.
+            className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto overflow-x-hidden overscroll-contain p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            data-testid="multi-provider-rail"
+          >
+            {/* Favorites pseudo-tab — sits above the driver entries with
+                a hairline separator. Click filters the right column to
+                every starred row across drivers. Hidden when the user has
+                zero favorites so we don't surface an empty tab on a
+                fresh install. */}
+            {favoritesCount > 0 ? (
+              <>
+                <div className="relative shrink-0">
+                  {selected === "favorites" && (
+                    <span
+                      className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
+                      aria-hidden
                     />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent side="right" sideOffset={8}>
-                  Favorites
-                  <span className="ml-2 text-muted-foreground tabular-nums">
-                    {favoritesCount}
-                  </span>
-                </TooltipContent>
-              </Tooltip>
-            </div>
-            <div className="my-1 border-t border-border/60" aria-hidden />
-          </>
-        ) : null}
-        {providers.map((p) => {
-          const isSelected = selected === p.kind;
-          const count = getCount(p.kind);
-          const error = getError(p.kind);
-          // A driver is "unavailable" when its capabilities harvest
-          // failed. Both OpenCode (bare token) and Codex (prefixed
-          // string with hint) can hit this; Claude ships a static
-          // fallback bundle that never errors. The icon stays
-          // clickable so the empty state in the right column can
-          // render the install / sign-in hint; the dim opacity is
-          // just a rail-level heads-up.
-          const parsedError = parseProviderError(error);
-          const isUnavailable = parsedError !== null;
-          const view = accountView(p.kind);
-          if (view) {
-            return view.options.map((account) => (
-              <AccountRailEntry
-                key={`${p.kind}:${account.id}`}
-                kind={p.kind}
-                label={p.label}
-                account={account}
-                view={view}
-                selected={isSelected && account.id === view.current?.id}
-                onChoose={() => onChooseAccount(p.kind, account)}
-              />
-            ));
-          }
-          return (
-            <div key={p.kind} className="relative shrink-0">
-              {isSelected && (
-                <span
-                  className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
-                  aria-hidden
-                />
-              )}
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={() => onSelect(p.kind)}
-                    data-testid={`provider-rail-${p.kind}`}
-                    data-selected={isSelected || undefined}
-                    data-unavailable={isUnavailable || undefined}
-                    aria-label={p.label}
-                    aria-pressed={isSelected}
-                    className={cn(
-                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
-                      "hover:bg-muted",
-                      isSelected && "bg-background text-foreground shadow-sm",
-                      isUnavailable &&
-                        !isSelected &&
-                        "opacity-40 hover:opacity-70",
-                    )}
-                  >
-                    <ProviderLogo
-                      provider={p.kind}
-                      className="size-5 shrink-0"
+                  )}
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={() => onSelect("favorites")}
+                        data-testid="provider-rail-favorites"
+                        data-selected={selected === "favorites" || undefined}
+                        aria-label="Favorites"
+                        aria-pressed={selected === "favorites"}
+                        className={cn(
+                          "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
+                          "hover:bg-muted",
+                          selected === "favorites" &&
+                            "bg-background text-foreground shadow-sm",
+                        )}
+                      >
+                        <Star
+                          className="size-5 shrink-0 text-status-working"
+                          fill="currentColor"
+                        />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="right" sideOffset={8}>
+                      Favorites
+                      <span className="ml-2 text-muted-foreground tabular-nums">
+                        {favoritesCount}
+                      </span>
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+                <div className="my-1 border-t border-border/60" aria-hidden />
+              </>
+            ) : null}
+            {providers.map((p) => {
+              const isSelected = selected === p.kind;
+              const count = getCount(p.kind);
+              const error = getError(p.kind);
+              // A driver is "unavailable" when its capabilities harvest
+              // failed. Both OpenCode (bare token) and Codex (prefixed
+              // string with hint) can hit this; Claude ships a static
+              // fallback bundle that never errors. The icon stays
+              // clickable so the empty state in the right column can
+              // render the install / sign-in hint; the dim opacity is
+              // just a rail-level heads-up.
+              const parsedError = parseProviderError(error);
+              const isUnavailable = parsedError !== null;
+              const view = accountView(p.kind);
+              if (view) {
+                return view.options.map((account) => (
+                  <AccountRailEntry
+                    key={`${p.kind}:${account.id}`}
+                    kind={p.kind}
+                    label={p.label}
+                    account={account}
+                    view={view}
+                    selected={isSelected && account.id === view.current?.id}
+                    onChoose={() => onChooseAccount(p.kind, account)}
+                  />
+                ));
+              }
+              return (
+                <div key={p.kind} className="relative shrink-0">
+                  {isSelected && (
+                    <span
+                      className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
+                      aria-hidden
                     />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent side="right" sideOffset={8}>
-                  <div className="flex items-center gap-2">
-                    <span>{p.label}</span>
-                    {!isUnavailable && count > 0 ? (
-                      <span className="text-muted-foreground tabular-nums">{count}</span>
-                    ) : null}
-                  </div>
-                  {parsedError ? (
-                    <div className="mt-0.5 text-muted-foreground">
-                      {providerErrorTooltipLabel(parsedError)}
-                    </div>
-                  ) : null}
-                </TooltipContent>
-              </Tooltip>
-            </div>
-          );
-        })}
-        {acpEntries.map((agent) => {
-          const isSelected = selected === "acp" && selectedAcpAgentId === agent.id;
-          return (
-            <div key={`acp:${agent.id}`} className="relative shrink-0">
-              {isSelected && (
-                <span
-                  className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
-                  aria-hidden
-                />
-              )}
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={() => onSelectAcp(agent.id)}
-                    data-testid={`provider-rail-acp-${agent.id}`}
-                    data-selected={isSelected || undefined}
-                    aria-label={agent.name}
-                    aria-pressed={isSelected}
-                    className={cn(
-                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
-                      "hover:bg-muted",
-                      isSelected && "bg-background text-foreground shadow-sm",
-                    )}
-                  >
-                    <ProviderLogo provider="acp" className="size-5 shrink-0" />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent side="right" sideOffset={8}>
-                  {agent.name}
-                </TooltipContent>
-              </Tooltip>
-            </div>
-          );
-        })}
+                  )}
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={() => onSelect(p.kind)}
+                        data-testid={`provider-rail-${p.kind}`}
+                        data-selected={isSelected || undefined}
+                        data-unavailable={isUnavailable || undefined}
+                        aria-label={p.label}
+                        aria-pressed={isSelected}
+                        className={cn(
+                          "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
+                          "hover:bg-muted",
+                          isSelected && "bg-background text-foreground shadow-sm",
+                          isUnavailable &&
+                            !isSelected &&
+                            "opacity-40 hover:opacity-70",
+                        )}
+                      >
+                        <ProviderLogo
+                          provider={p.kind}
+                          className="size-5 shrink-0"
+                        />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="right" sideOffset={8}>
+                      <div className="flex items-center gap-2">
+                        <span>{p.label}</span>
+                        {!isUnavailable && count > 0 ? (
+                          <span className="text-muted-foreground tabular-nums">{count}</span>
+                        ) : null}
+                      </div>
+                      {parsedError ? (
+                        <div className="mt-0.5 text-muted-foreground">
+                          {providerErrorTooltipLabel(parsedError)}
+                        </div>
+                      ) : null}
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+              );
+            })}
+            {acpEntries.map((agent) => {
+              const isSelected = selected === "acp" && selectedAcpAgentId === agent.id;
+              return (
+                <div key={`acp:${agent.id}`} className="relative shrink-0">
+                  {isSelected && (
+                    <span
+                      className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
+                      aria-hidden
+                    />
+                  )}
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={() => onSelectAcp(agent.id)}
+                        data-testid={`provider-rail-acp-${agent.id}`}
+                        data-selected={isSelected || undefined}
+                        aria-label={agent.name}
+                        aria-pressed={isSelected}
+                        className={cn(
+                          "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
+                          "hover:bg-muted",
+                          isSelected && "bg-background text-foreground shadow-sm",
+                        )}
+                      >
+                        <ProviderLogo provider="acp" className="size-5 shrink-0" />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="right" sideOffset={8}>
+                      {agent.name}
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+              );
+            })}
+          </div>
+          <ScrollEdgeFade edge="top" visible={railEdges.top} surface={RAIL_SURFACE} data-testid="multi-provider-rail-top-fade" />
+          <ScrollEdgeFade edge="bottom" visible={railEdges.bottom} surface={RAIL_SURFACE} data-testid="multi-provider-rail-bottom-fade" />
+        </div>
+        {onManageAccounts && (
+          <div className="shrink-0 border-t border-border/60 p-1">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  onClick={onManageAccounts}
+                  data-testid="provider-rail-manage-accounts"
+                  aria-label="Manage accounts"
+                  className="flex h-8 w-full items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:bg-surface-2 focus-visible:text-foreground focus-visible:outline-none"
+                >
+                  <Settings2 className="size-4" aria-hidden />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="right" sideOffset={8}>
+                Manage accounts
+              </TooltipContent>
+            </Tooltip>
+          </div>
+        )}
       </div>
     </TooltipProvider>
   );
@@ -1072,10 +1127,14 @@ function AccountRailEntry({
   onChoose: () => void;
 }) {
   const isCurrent = account.id === view.current?.id;
-  // Moving needs a signed-in account and an idle chat.
+  // Nothing is chosen before the chat's binding is known: a started chat
+  // must move rather than record a pick. Moving needs a signed-in account
+  // and an idle chat.
+  const waitsForTurn = !isCurrent && view.bound && view.busy;
   const blocked =
-    !isCurrent &&
-    (account.identity.signed_in === false || (view.bound && (view.busy || view.switching !== null)));
+    !view.ready ||
+    (!isCurrent &&
+      (account.identity.signed_in === false || waitsForTurn || (view.bound && view.switching !== null)));
   const name = accountName(account);
   return (
     <div className="relative shrink-0">
@@ -1087,17 +1146,19 @@ function AccountRailEntry({
       )}
       <Tooltip>
         <TooltipTrigger asChild>
+          {/* `aria-disabled`, not `disabled`: a disabled button gets no
+              pointer events, and its tooltip says why it can't be chosen. */}
           <button
             type="button"
-            onClick={onChoose}
-            disabled={blocked}
+            onClick={blocked ? undefined : onChoose}
+            aria-disabled={blocked || undefined}
             data-testid={`provider-rail-${kind}-${account.id}`}
             data-selected={selected || undefined}
             aria-label={`${label} · ${name}`}
             aria-pressed={isCurrent}
             className={cn(
               "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
-              "hover:bg-surface-2 disabled:opacity-40 disabled:hover:bg-transparent",
+              "hover:bg-surface-2 aria-disabled:cursor-default aria-disabled:opacity-40 aria-disabled:hover:bg-transparent",
               selected && "bg-background text-foreground shadow-sm",
             )}
           >
@@ -1112,8 +1173,11 @@ function AccountRailEntry({
             )}
           </button>
         </TooltipTrigger>
-        <TooltipContent side="right" sideOffset={8}>
-          {label} <span className="text-muted-foreground">·</span> {accountSummary(account)}
+        <TooltipContent side="right" sideOffset={8} className="flex-col items-start gap-0.5">
+          <span>
+            {label} <span className="text-muted-foreground">·</span> {accountSummary(account)}
+          </span>
+          {waitsForTurn && <span className="opacity-70">Accounts can be switched once this turn finishes.</span>}
         </TooltipContent>
       </Tooltip>
     </div>

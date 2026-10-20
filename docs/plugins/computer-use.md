@@ -31,13 +31,14 @@ links the user-bin path into that application bundle. An explicit custom path
 takes precedence; Codemux does not change PATH or run an installer.
 
 The title-bar indicator shows when control is enabled and when an agent is
-calling its tools. The **Computer** chip beside the chat's browser status opens
-the live view. **Stop** unregisters Codemux's direct input child using
+calling its tools. On desktop, the **Computer** chip sits beside Browser in **Workspace details →
+Live** and opens the live view. Phones keep the chip in their compact status cluster. **Stop** unregisters Codemux's direct input child using
 immediate shutdown and waits for confirmed exit. It also closes the read-only
 capture child. The indicator stays pending if shutdown cannot be confirmed.
 The plugin never starts, stops, revokes, or reuses an existing driver daemon.
 
-**Live view** opens the shared peek. It polls only the chosen window, only while
+**Live view** opens the shared peek at the bottom-right, above any composer
+under that corner. It polls only the chosen window, only while
 the view is mounted. The capture child is read-only and invisible to agents;
 its snapshots do not replace the agent's element tokens or enter the chat.
 Missing or refused capture shows a no-image state.

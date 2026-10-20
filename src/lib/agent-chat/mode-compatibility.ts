@@ -20,3 +20,25 @@ export function normalizeChatModeForProvider(
 ): ChatMode {
   return isChatModeSupported(provider, mode) ? mode : "default";
 }
+
+/** Codex runs the Plan and Ask pills as its per-turn `plan` collaboration
+ *  mode rather than a session permission mode, so each send names the mode
+ *  its turn runs in: "plan" with the pill on, otherwise the thread's
+ *  permission mode. Other providers apply their mode to the session. */
+export function codexTurnPermissionOverride(
+  provider: AgentChatProviderKind,
+  mode: ChatMode,
+  permissionMode: string | null,
+): string | null {
+  if (provider !== "codex") return null;
+  return turnPermissionMode(mode, permissionMode);
+}
+
+/** The mode a turn started from this composer state runs in: "plan" while
+ *  the Plan or Ask pill is on, otherwise the thread's permission mode. */
+export function turnPermissionMode(
+  mode: ChatMode,
+  permissionMode: string | null,
+): string | null {
+  return mode === "plan" || mode === "ask" ? "plan" : permissionMode;
+}

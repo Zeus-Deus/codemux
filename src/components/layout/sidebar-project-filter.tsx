@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronDown, Folder, FolderOpen, FolderPlus } from "lucide-react";
+import { Check, ChevronDown, Folder, FolderOpen, FolderPlus } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
@@ -54,15 +54,22 @@ function ProjectFilterItem({
     <DropdownMenuItem
       onClick={onSelect}
       aria-label={name}
+      // A single-choice filter: the check marks the selected row, and the
+      // radio role is what tells assistive tech which one that is.
+      role="menuitemradio"
+      aria-checked={active}
       className={cn(
-        "h-8 gap-2 rounded-md px-2 text-label font-semibold",
-        active && "bg-surface-3 text-foreground",
+        "h-8 gap-2 rounded-md px-2 text-label",
+        active && "font-medium text-foreground",
       )}
     >
       <ProjectMiniAvatar name={name} path={path} />
       <span className="min-w-0 flex-1 truncate">{name}</span>
       <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
         {count}
+      </span>
+      <span className="size-4 shrink-0" aria-hidden>
+        {active && <Check className="size-4" />}
       </span>
     </DropdownMenuItem>
   );
@@ -164,9 +171,11 @@ export function SidebarProjectFilter({
           <DropdownMenuItem
             onClick={() => setFilter(null)}
             aria-label="All projects"
+            role="menuitemradio"
+            aria-checked={filter === null}
             className={cn(
-              "h-8 gap-2 rounded-md px-2 text-label font-semibold",
-              filter === null && "bg-surface-3 text-foreground",
+              "h-8 gap-2 rounded-md px-2 text-label",
+              filter === null && "font-medium text-foreground",
             )}
           >
             <Folder className="size-3.5 shrink-0 text-muted-foreground" />
@@ -174,9 +183,12 @@ export function SidebarProjectFilter({
             <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
               {counts.total}
             </span>
+            <span className="size-4 shrink-0" aria-hidden>
+              {filter === null && <Check className="size-4" />}
+            </span>
           </DropdownMenuItem>
         </div>
-        <div className="thin-scrollbar [scrollbar-gutter:stable] min-h-0 flex-1 overflow-y-auto p-1.5">
+        <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto p-1.5">
           {projectGroups.map((group) => (
             <ProjectFilterItem
               key={group.projectPath}

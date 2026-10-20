@@ -240,9 +240,28 @@ jobs:
 
       - name: Install Windows system dependencies
         if: matrix.os == 'windows-latest'
-        # Chocolatey is pre-installed on windows-latest runners. ripgrep
-        # is needed for the same `grep_count_pattern_*` tests as Linux.
-        run: choco install ripgrep -y --no-progress
+        # ripgrep is needed for the same `grep_count_pattern_*` tests as
+        # Linux; the app spawns `rg` from PATH, so CI only has to put it there.
+        # The runner image doesn't ship it. Fetch a pinned release straight
+        # from GitHub and verify its checksum instead of using Chocolatey,
+        # whose community feed intermittently returns 503 and fails the job.
+        env:
+          RG_VERSION: "15.2.0"
+          RG_SHA256: "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5"
+        run: |
+          $name = "ripgrep-$env:RG_VERSION-x86_64-pc-windows-msvc"
+          $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
+          $url = "https://github.com/BurntSushi/ripgrep/releases/download/$env:RG_VERSION/$name.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 5 -RetryIntervalSec 5
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($hash -ne $env:RG_SHA256) {
+            throw "ripgrep checksum mismatch: expected $env:RG_SHA256, got $hash"
+          }
+          Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
+          $dir = Join-Path $env:RUNNER_TEMP $name
+          & (Join-Path $dir "rg.exe") --version
+          if ($LASTEXITCODE -ne 0) { throw "rg.exe failed to run" }
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
         shell: pwsh
 
       - name: Setup Rust

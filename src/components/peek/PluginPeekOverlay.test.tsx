@@ -76,6 +76,31 @@ it("owns header, dimensions and live status while the plugin supplies only the b
   expect(useBrowserPeekStore.getState().pluginPeek).toBeNull();
 });
 
+it("docks plugin peeks bottom-right and clears composers mounted under the corner", async () => {
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+    if (this.hasAttribute("data-composer-dock")) return new DOMRect(1000, 980, 484, 86);
+    if (this.querySelector(":scope > [role=dialog]")) return new DOMRect(0, 0, 1920, 1080);
+    return new DOMRect();
+  });
+  register();
+  show();
+  const dialog = screen.getByRole("dialog");
+  expect(dialog).not.toHaveClass("top-3.5");
+  expect(dialog.style.bottom).toBe("14px");
+  const dock = document.createElement("div");
+  dock.setAttribute("data-composer-dock", "");
+  await act(async () => {
+    dialog.parentElement!.appendChild(dock);
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+  });
+  expect(dialog.style.bottom).toBe("112px");
+  await act(async () => {
+    dock.remove();
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+  });
+  expect(dialog.style.bottom).toBe("14px");
+});
+
 it("isolates a failing plugin icon while keeping shell controls available", () => {
   const error = vi.spyOn(console, "error").mockImplementation(() => {});
   try {
@@ -182,7 +207,7 @@ it("persists drag size and removes drag listeners when closed", () => {
   show();
   const handle = document.querySelector("[data-peek-resize]")!;
   fireEvent.pointerDown(handle, { button: 0, clientX: 500, clientY: 100 });
-  fireEvent.pointerMove(handle, { clientX: 450, clientY: 130 });
+  fireEvent.pointerMove(handle, { clientX: 450, clientY: 70 });
   fireEvent.pointerUp(handle);
   expect(useBrowserPeekStore.getState().size).toEqual({ width: 490, height: 330 });
   fireEvent.pointerDown(handle, { button: 0, clientX: 500, clientY: 100 });

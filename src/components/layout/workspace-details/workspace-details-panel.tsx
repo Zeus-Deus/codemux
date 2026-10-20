@@ -13,8 +13,12 @@
  *   ──────────
  *   Branch       ahead / behind
  *   PR           the branch's change request, when there is one
+ *   Watch        CI & review watch on that PR
+ *   Issue        the linked issue, opens its details
  *   Git action   Commit / Push / Pull / Sync / Publish, chevron for the rest
  *   Changes      +N −N, opens the Changes pane
+ *   ──────────
+ *   Live         background browser and plugin status controls
  *   ──────────
  *   Agents       running subagents, workflow run, task list
  *
@@ -32,6 +36,7 @@ import {
   ArrowUpDown,
   Bot,
   ChevronDown,
+  CircleDot,
   Download,
   FileDiff,
   Folder,
@@ -39,6 +44,7 @@ import {
   GitBranch,
   GitCommitHorizontal,
   GitPullRequestCreateArrow,
+  Globe,
   ListChecks,
   Monitor,
   SquareMenu,
@@ -46,6 +52,10 @@ import {
   Workflow,
 } from "lucide-react";
 
+import { useBackgroundBrowserSession } from "@/components/browser/background-browser-indicator";
+import { Slot } from "@/contrib/react/slot";
+import { useContributions } from "@/contrib/react/use-contributions";
+import { COMPOSER_STATUS_AREA } from "@/sdk/areas";
 import { openDelegatedChat } from "@/components/chat/delegation-actions";
 import { TickingText } from "@/components/chat/TickingText";
 import {
@@ -54,6 +64,7 @@ import {
   normalizePrState,
   prStatusTextClass,
 } from "@/components/github/pr-status-icon";
+import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import {
   DropdownMenu,
@@ -87,6 +98,7 @@ import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useActiveWorkspace, useHomeDir } from "@/stores/app-store";
+import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 import { useHosts } from "@/stores/hosts-store";
 import { useLocalDeviceName } from "@/stores/local-device-store";
 import { useUIStore, type RightPanelTab } from "@/stores/ui-store";
@@ -366,6 +378,15 @@ export function WorkspaceDetailsToggle({ disabled = false }: { disabled?: boolea
   );
   const toggle = useUIStore((s) => s.toggleWorkspaceDetails);
   const agentsRunning = useAgentsRunning(visible && !disabled);
+  const workspace = useActiveWorkspace();
+  const browserLive = !!useBackgroundBrowserSession(workspace?.workspace_id);
+  const dot = visible && !disabled
+    ? null
+    : agentsRunning
+      ? "bg-status-working"
+      : browserLive
+        ? "bg-status-remote"
+        : null;
 
   return (
     <span className="relative flex">
@@ -379,13 +400,13 @@ export function WorkspaceDetailsToggle({ disabled = false }: { disabled?: boolea
         shortcut="toggleWorkspaceDetails"
         onClick={toggle}
       />
-      {/* Hidden card, live agents: a quiet dot says there is something to
-          watch behind the button. */}
-      {agentsRunning && (
+      {/* Hidden card, live agents or browser: a quiet dot says there is
+          something to watch behind the button. */}
+      {dot && (
         <span
           aria-hidden
           data-testid="workspace-details-activity-dot"
-          className="pointer-events-none absolute right-1 top-1 size-1.5 rounded-full bg-status-working"
+          className={cn("pointer-events-none absolute right-1 top-1 size-1.5 rounded-full", dot)}
         />
       )}
     </span>
@@ -437,6 +458,7 @@ function WorkspaceDetailsCard({
     <div className="flex flex-col">
       <WorkspaceSection workspace={workspace} onClose={onClose} />
       <VersionControlSection workspace={workspace} openPane={openPane} onClose={onClose} />
+      <LiveSection workspace={workspace} onOpened={onClose} />
       <AgentsSection workspace={workspace} openPane={openPane} onNavigate={onClose} />
     </div>
   );
@@ -456,7 +478,10 @@ function Section({
   return (
     <section
       data-testid={testId}
-      className={cn("flex flex-col gap-px p-1.5", separated && "border-t border-border/65")}
+      className={cn(
+        "flex flex-col gap-px p-1.5 empty:hidden",
+        separated && "border-t border-border/65",
+      )}
     >
       {title && (
         <h3 className="flex h-7 items-center px-2.5 text-label font-medium text-muted-foreground">
@@ -619,21 +644,27 @@ function VersionControlSection({
   const branch = workspace.git_branch;
 
   if (!branch) {
-    if (!showNoGitState(workspace, homeDir)) return null;
+    const showNoGit = showNoGitState(workspace, homeDir);
+    // Every row here may render nothing; `Section` then hides itself.
     return (
       <Section testId="workspace-details-git">
-        <button
-          type="button"
-          onClick={initialize}
-          disabled={initializing}
-          className={DETAILS_ROW}
-          title="Worktrees, diffs, and checkpoints need a git repository"
-        >
-          <GitBranch className={DETAILS_ICON} />
-          <span className={DETAILS_LABEL}>
-            {initializing ? "Initializing…" : "Initialize Git"}
-          </span>
-        </button>
+        {showNoGit && (
+          <button
+            type="button"
+            onClick={initialize}
+            disabled={initializing}
+            className={DETAILS_ROW}
+            title="Worktrees, diffs, and checkpoints need a git repository"
+          >
+            <GitBranch className={DETAILS_ICON} />
+            <span className={DETAILS_LABEL}>
+              {initializing ? "Initializing…" : "Initialize Git"}
+            </span>
+          </button>
+        )}
+        {/* A watch outlives its branch; keep its Stop reachable. */}
+        <PrWatchRow workspace={workspace} />
+        <IssueRow workspace={workspace} />
       </Section>
     );
   }
@@ -643,6 +674,7 @@ function VersionControlSection({
       <BranchRow workspace={workspace} branch={branch} />
       <PullRequestRow workspace={workspace} onOpened={onClose} />
       <PrWatchRow workspace={workspace} />
+      <IssueRow workspace={workspace} />
       {/* Push / pull / fetch / publish and the upstream probe run git in a
           local path. A workspace on another device (or attached in place
           there) has no local checkout to run them in, so — like the right
@@ -754,6 +786,37 @@ function PullRequestRow({
         {humanizePrState(workspace.pr_state)}
       </span>
     </button>
+  );
+}
+
+/** The workspace's linked issue; opens the same details popover the
+ *  sidebar row does, beside the card. */
+function IssueRow({ workspace }: { workspace: WorkspaceSnapshot }) {
+  const issue = workspace.linked_issue;
+  if (!issue) return null;
+  const open = issue.state === "Open";
+  return (
+    <IssueDetailPopover
+      workspaceId={workspace.workspace_id}
+      issue={issue}
+      providerKind={workspace.provider_kind}
+      side="left"
+      align="start"
+      trigger={
+        <button
+          type="button"
+          data-testid="workspace-details-issue"
+          className={DETAILS_ROW}
+          title={issue.title}
+        >
+          <CircleDot className={cn(DETAILS_ICON, open && "text-success")} />
+          <span className={DETAILS_LABEL}>Issue #{issue.number}</span>
+          <span className={cn(DETAILS_TRAILING, "font-sans", open && "text-success")}>
+            {open ? "Open" : "Closed"}
+          </span>
+        </button>
+      }
+    />
   );
 }
 
@@ -936,6 +999,68 @@ function DiffStat({
       <span className="text-success/80">+{additions}</span>
       <span className="text-danger/80">−{deletions}</span>
     </span>
+  );
+}
+
+// ── Live: tools the agent is driving in the background ──
+
+/** Host (and port) of a page, for a row's trailing label. */
+function pageHost(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).host || null;
+  } catch {
+    return null;
+  }
+}
+
+function LiveSection({
+  workspace,
+  onOpened,
+}: {
+  workspace: WorkspaceSnapshot;
+  onOpened: () => void;
+}) {
+  const workspaceId = workspace.workspace_id;
+  const session = useBackgroundBrowserSession(workspaceId);
+  const peekOpen = useBrowserPeekStore((s) => s.openWorkspaceId === workspaceId);
+  const togglePeek = useBrowserPeekStore((s) => s.toggle);
+  const statusContributions = useContributions(COMPOSER_STATUS_AREA);
+  const { threadId } = useActiveChatTasks(workspace);
+  const hasStatus = statusContributions.some((c) => c.render);
+  if (!session && !hasStatus) return null;
+  const host = pageHost(session?.current_url);
+
+  return (
+    <Section testId="workspace-details-live" title="Live">
+      {session && (
+        <button
+          type="button"
+          data-testid="workspace-details-browser"
+          data-state={peekOpen ? "open" : "closed"}
+          aria-pressed={peekOpen}
+          // The peek closes on any press outside it, this row included, so
+          // stop the press here and let the click decide.
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => {
+            togglePeek(workspaceId);
+            onOpened();
+          }}
+          className={DETAILS_ROW}
+          title={session.current_url ?? "Background browser"}
+        >
+          <Globe className={DETAILS_ICON} />
+          <span className={DETAILS_LABEL}>Browser</span>
+          {host && <span className={DETAILS_TRAILING}>{host}</span>}
+          <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-status-open" />
+        </button>
+      )}
+      {hasStatus && (
+        <div className="flex flex-wrap items-center gap-1 px-1">
+          <Slot area={COMPOSER_STATUS_AREA} props={{ workspaceId, threadId }} />
+        </div>
+      )}
+    </Section>
   );
 }
 

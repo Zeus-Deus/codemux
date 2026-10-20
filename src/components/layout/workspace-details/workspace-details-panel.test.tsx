@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import type { WorkspaceSnapshot } from "@/tauri/types";
@@ -51,6 +51,7 @@ vi.mock("@/tauri/commands", () => ({
   gitPullChanges: mocks.gitPullChanges,
   gitFetchChanges: mocks.gitFetchChanges,
   initGitRepoNoCommit: vi.fn(),
+  getGithubIssue: vi.fn(() => new Promise(() => {})),
   undockBrowserFromRightPanel: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@/lib/toast", () => ({
@@ -59,7 +60,12 @@ vi.mock("@/lib/toast", () => ({
 }));
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useAppStore } from "@/stores/app-store";
+import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 import { useUIStore } from "@/stores/ui-store";
+import { registry } from "@/contrib/registry";
+import { COMPOSER_STATUS_AREA } from "@/sdk/areas";
+import type { AgentBrowserSession, AppStateSnapshot } from "@/tauri/types";
 import {
   WorkspaceDetailsHost,
   WorkspaceDetailsToggle,
@@ -171,7 +177,36 @@ beforeEach(() => {
   });
 });
 
-afterEach(cleanup);
+const contributionDisposers: (() => void)[] = [];
+afterEach(() => {
+  cleanup();
+  for (const dispose of contributionDisposers.splice(0)) dispose();
+});
+
+it("shows plugin contributions in Live without a browser and follows the focused chat", () => {
+  const renderStatus = vi.fn(({ workspaceId, threadId }: { workspaceId: string; threadId: string | null }) =>
+    <button>{workspaceId}:{threadId}</button>,
+  );
+  mocks.workspace = makeWorkspace({ surfaces: [{ ...CHAT_SURFACE, root: {
+    kind: "agent_chat", pane_id: "pane-1", title: "Agent Chat",
+    thread_id: "thread-live", provider: null, cwd: "/p",
+  } }] });
+  const view = renderToggle();
+  expect(screen.queryByTestId("workspace-details-live")).toBeNull();
+  let dispose!: () => void;
+  act(() => {
+    dispose = registry.register({ id: "demo:status", source: "plugin:demo", area: COMPOSER_STATUS_AREA, render: renderStatus });
+    contributionDisposers.push(dispose);
+  });
+  const live = screen.getByTestId("workspace-details-live");
+  expect(within(live).getByRole("button", { name: "ws-1:thread-live" })).toBeInTheDocument();
+  expect(renderStatus).toHaveBeenLastCalledWith(expect.objectContaining({ workspaceId: "ws-1", threadId: "thread-live" }), undefined);
+  mocks.workspace = makeWorkspace();
+  view.rerender(<TooltipProvider><WorkspaceDetailsHost workspaceId="ws-1" columnWidth={1600} rightInset={0} edgeGap={4} remPx={16} /></TooltipProvider>);
+  expect(within(screen.getByTestId("workspace-details-live")).getByRole("button", { name: "ws-1:" })).toBeInTheDocument();
+  act(dispose);
+  expect(screen.queryByTestId("workspace-details-live")).toBeNull();
+});
 
 describe("primaryGitAction", () => {
   const base = { changedFiles: 0, ahead: 0, behind: 0, hasUpstream: true };
@@ -543,5 +578,93 @@ describe("WorkspaceDetailsToggle — Mario review regressions", () => {
     renderToggle();
     await flush();
     expect(screen.queryByRole("button", { name: "Git actions" })).toBeNull();
+  });
+});
+
+describe("WorkspaceDetailsToggle — issue and live rows", () => {
+  const browserSession: AgentBrowserSession = {
+    session_id: "b-1",
+    workspace_id: "ws-1",
+    cli_session_name: "codemux-ws-1",
+    stream_url: "ws://127.0.0.1:9000",
+    current_url: "http://localhost:1420/settings",
+    is_active: true,
+    pane_id: null,
+    browser_id: null,
+    user_dismissed: false,
+  };
+
+  function withBrowser(session: AgentBrowserSession | null) {
+    useAppStore.setState({
+      appState: { agent_browser_sessions: session ? [session] : [] } as unknown as AppStateSnapshot,
+    });
+  }
+
+  afterEach(() => {
+    withBrowser(null);
+    useBrowserPeekStore.setState({ openWorkspaceId: null });
+  });
+
+  it("lists the linked issue and opens its details from the row", async () => {
+    mocks.workspace = makeWorkspace({
+      linked_issue: { number: 412, title: "Chin is cluttered", state: "Open", labels: [] },
+    });
+    renderToggle();
+    const row = screen.getByTestId("workspace-details-issue");
+    expect(row).toHaveTextContent("Issue #412");
+    expect(row).toHaveTextContent("Open");
+    await userEvent.click(row);
+    expect(await screen.findByTestId("issue-detail-content")).toBeInTheDocument();
+  });
+
+  it("keeps the issue row for a workspace without a git branch", () => {
+    mocks.workspace = makeWorkspace({
+      git_branch: null,
+      pr_number: null,
+      pr_state: null,
+      pr_url: null,
+      linked_issue: { number: 7, title: "x", state: "Closed", labels: [] },
+    });
+    renderToggle();
+    expect(screen.getByTestId("workspace-details-issue")).toHaveTextContent("Closed");
+  });
+
+  it("shows a live background browser and opens its peek from the row", async () => {
+    withBrowser(browserSession);
+    renderToggle();
+    const row = screen.getByTestId("workspace-details-browser");
+    expect(screen.getByTestId("workspace-details-live")).toHaveTextContent("Live");
+    expect(row).toHaveTextContent("localhost:1420");
+    await userEvent.click(row);
+    expect(useBrowserPeekStore.getState().openWorkspaceId).toBe("ws-1");
+    expect(row).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(row);
+    expect(useBrowserPeekStore.getState().openWorkspaceId).toBeNull();
+  });
+
+  it("leaves the Live section out when the browser is already on screen", () => {
+    withBrowser({ ...browserSession, right_panel_docked: true });
+    renderToggle();
+    expect(screen.queryByTestId("workspace-details-live")).toBeNull();
+  });
+
+  it("keeps plugin contributions beside Browser in the same Live section", () => {
+    withBrowser(browserSession);
+    contributionDisposers.push(registry.register({
+      id: "demo:status", source: "plugin:demo", area: COMPOSER_STATUS_AREA,
+      render: () => <button>Unity</button>,
+    }));
+    renderToggle();
+    const live = within(screen.getByTestId("workspace-details-live"));
+    expect(live.getByTestId("workspace-details-browser")).toBeInTheDocument();
+    expect(live.getByRole("button", { name: "Unity" })).toBeInTheDocument();
+  });
+
+  it("dots the toggle for a live browser only while the card is hidden", async () => {
+    withBrowser(browserSession);
+    renderToggle();
+    expect(screen.queryByTestId("workspace-details-activity-dot")).toBeNull();
+    await userEvent.click(screen.getByTestId("workspace-details-toggle"));
+    expect(screen.getByTestId("workspace-details-activity-dot")).toHaveClass("bg-status-remote");
   });
 });

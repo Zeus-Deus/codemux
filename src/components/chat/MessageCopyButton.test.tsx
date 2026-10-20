@@ -72,6 +72,10 @@ describe("message copy action", () => {
       expect(writeText).toHaveBeenCalledWith("  line one\nline two  ");
       expect(screen.getByRole("button", { name: "Copied" })).toBeInTheDocument();
     });
+    // Only the glyph flips: the visible word holds so the chip keeps its width,
+    // and the confirmation is announced from a live region instead.
+    expect(screen.getByTestId("message-copy-button")).toHaveTextContent(/^Copy$/);
+    expect(screen.getByRole("status")).toHaveTextContent("Copied");
   });
 
   it("copies the assistant's Markdown source, not its rendered output", async () => {

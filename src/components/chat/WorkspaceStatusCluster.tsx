@@ -40,9 +40,9 @@ import {
 } from "@/lib/source-control";
 
 /**
- * Context Row status cluster (design: `.design-import/Context Row.dc.html`)
- * — the passive git/PR status from the retired full-width workspace
- * context bar, relocated to sit RIGHT of the composer's scope row. Renders:
+ * Compact git/PR status cluster for the phone shell's workspace context
+ * line. (The desktop chat used to show it under the composer; it now keeps
+ * this state in the title bar's Workspace details card.) Renders:
  *
  *  - the GUI-mode background-browser indicator (the same sky-tinted
  *    "Browser" pill shown compactly in terminal headers — shared
@@ -54,20 +54,14 @@ import {
  *    the hosting product,
  *  - a linked-issue chip (Issue #N) that opens the issue detail
  *    popover upward — the same `IssueDetailPopover` (chip variant) the
- *    old bar rendered, so a thread's linked issue stays visible on the
- *    Context Row,
+ *    old bar rendered, so a thread's linked issue stays visible,
  *  - a "workspace details" button that opens a compact popover with
  *    the full picture (branch, base — the PR target, else the branch
  *    the worktree was created from — behind, ahead, uncommitted diff,
  *    PR, issue, device) plus quick view / sync actions.
  *
- * Self-contained: reads the active workspace directly. This only ever
- * renders from inside an `AgentChatPane`, and `PaneContainer` only
- * ever mounts panes for the currently active workspace — so
- * `useActiveWorkspace()` always resolves to the pane's own workspace.
- * (That mount context also makes the `enableAgentChat`
- * browser-indicator gate implicit here: a disabled flag renders a
- * placeholder instead of the pane.)
+ * Self-contained: reads the active workspace directly, which is the one
+ * the phone shell is showing.
  *
  * Renders nothing when there is no active workspace, or there is
  * neither a git branch, a no-git affordance, a background browser
@@ -206,7 +200,7 @@ export function WorkspaceStatusCluster({
           disabled={initializing}
           aria-label="Initialize a git repository in this project folder"
           title="This project is not a git repository — worktrees, diffs, and checkpoints are unavailable until one is initialized"
-          className="inline-flex h-[26px] shrink-0 items-center rounded-md border px-2 font-mono text-label font-semibold text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+          className="inline-flex h-6 shrink-0 items-center rounded-md border px-2 font-mono text-label font-semibold text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
         >
           {initializing ? "Initializing…" : "Initialize Git"}
         </button>
@@ -219,7 +213,7 @@ export function WorkspaceStatusCluster({
           {showBehind && (
             <span
               className={cn(
-                "inline-flex h-[26px] items-center gap-1 rounded-md px-2 font-mono text-label tabular-nums text-warning",
+                "inline-flex h-6 items-center gap-1 rounded-md px-2 font-mono text-label tabular-nums text-warning",
                 CONTEXT_ROW_HIDE_GIT_COUNTS,
               )}
               title={`${workspace.git_behind} commit${workspace.git_behind === 1 ? "" : "s"} behind`}
@@ -231,7 +225,7 @@ export function WorkspaceStatusCluster({
           {showAhead && (
             <span
               className={cn(
-                "inline-flex h-[26px] items-center gap-1 rounded-md px-2 font-mono text-label tabular-nums text-success",
+                "inline-flex h-6 items-center gap-1 rounded-md px-2 font-mono text-label tabular-nums text-success",
                 CONTEXT_ROW_HIDE_GIT_COUNTS,
               )}
               title={`${workspace.git_ahead} commit${workspace.git_ahead === 1 ? "" : "s"} ahead`}
@@ -258,7 +252,7 @@ export function WorkspaceStatusCluster({
                   : undefined
               }
               className={cn(
-                "inline-flex h-[26px] shrink-0 items-center gap-1 px-1.5 font-mono text-label font-semibold transition-opacity duration-150 hover:enabled:opacity-80",
+                "inline-flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 font-mono text-label font-semibold transition-colors duration-150 hover:enabled:bg-surface-2",
                 prStatusTextClass(prState),
                 !workspace.pr_url && "cursor-not-allowed opacity-60",
               )}
@@ -285,7 +279,7 @@ export function WorkspaceStatusCluster({
                 aria-label="Workspace details"
                 title="Workspace details"
                 className={cn(
-                  "relative inline-flex h-[26px] shrink-0 items-center gap-1 rounded-md px-2 text-body-sm font-semibold text-foreground/80 transition-colors duration-150 hover:bg-surface-2",
+                  "relative inline-flex h-6 shrink-0 items-center gap-1 rounded-md px-2 text-body-sm font-semibold text-foreground/80 transition-colors duration-150 hover:bg-surface-2",
                   open && "bg-surface-3",
                 )}
               >
