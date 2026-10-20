@@ -1,7 +1,8 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { afterEach, describe, it, expect } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { DiffView, computeLineDiff } from "./DiffView";
 
 afterEach(() => cleanup());
@@ -74,6 +75,7 @@ describe("DiffView", () => {
         newText='cur = getattr(cur, "__cause__", None)'
         copyText='cur = getattr(cur, "__cause__", None)'
       />,
+      { wrapper: TooltipProvider },
     );
     expect(screen.getByText("gateway/run.py")).toBeInTheDocument();
     expect(screen.getByText("+1")).toBeInTheDocument();
@@ -82,6 +84,21 @@ describe("DiffView", () => {
     expect(
       screen.getByText('cur = getattr(cur, "__cause__", None)'),
     ).toBeInTheDocument();
+  });
+
+  it("copies the diff and confirms on the button itself", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(window, "isSecureContext", { configurable: true, value: true });
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    render(
+      <DiffView filename="a.ts" oldText="a" newText="b" copyText="the patch" />,
+      { wrapper: TooltipProvider },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy diff" }));
+    await vi.waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith("the patch");
+      expect(screen.getByRole("button", { name: "Copied" })).toBeInTheDocument();
+    });
   });
 });
 
@@ -106,6 +123,7 @@ describe("DiffView with a git patch", () => {
   it("renders hunks with their real line numbers and counts", () => {
     const { container } = render(
       <DiffView filename="src/a.ts" patch={patch} copyText={patch} />,
+      { wrapper: TooltipProvider },
     );
     expect(screen.getByText("+2")).toBeInTheDocument();
     expect(screen.getByText("−1")).toBeInTheDocument();

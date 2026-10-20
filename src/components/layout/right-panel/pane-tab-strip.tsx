@@ -43,16 +43,20 @@
  * Right-click offers the bulk closes the main tab bar has.
  */
 import {
+  Children,
+  isValidElement,
   memo,
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
 } from "react";
 import {
   ChevronsLeftRight,
+  Ellipsis,
   PanelRight,
   Plus,
   Search,
@@ -77,6 +81,16 @@ import {
   DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useTabReorder, type PillReorderHandlers } from "@/lib/tab-reorder";
 import { topRightReserve } from "@/lib/titlebar-geometry";
 import { cn } from "@/lib/utils";
@@ -143,7 +157,9 @@ function DeckTabChip({
   const badge = tab.badge != null && (
     <span
       className={cn(
-        "font-mono text-caption tabular-nums",
+        // A row, not a run of inline text: a badge can be a count plus a
+        // status icon (Review), which must sit beside the count, not under it.
+        "inline-flex items-center gap-1 font-mono text-caption tabular-nums",
         tab.badgeTone === "attention"
           ? "text-status-attention"
           : active && tab.accentBadgeWhenActive
@@ -205,6 +221,244 @@ function DeckTabChip({
 
 /** Width of the edge fade that marks clipped tabs. */
 const EDGE_FADE_PX = 16;
+
+/** What the tab scroller is promised before the pane actions get any room:
+ *  enough for the active tab's label and badge. */
+const TAB_FLOOR_PX = 140;
+/**
+ * What the row spends besides the tab scroller and the pane actions, inline
+ * and folded. The "+", its margin, the divider and the row gaps are px; the
+ * drag gap's floor (`min-w-4`), the "…" and legacy chrome's expand/close
+ * buttons (`size-6`) are rem, so they grow with the interface-size setting.
+ */
+function rowBudgets(remPx: number, legacy: boolean) {
+  const dragGap = remPx;
+  // Divider with its margins, two buttons, three row gaps.
+  const legacyControls = legacy ? 11 + 3 * remPx + 6 : 0;
+  return {
+    // The "+" (24px plus its 3px margin), the drag gap, three row gaps.
+    inline: 27 + dragGap + 6 + legacyControls,
+    // The drag gap, the "…" and two row gaps; the "+" is in the popover.
+    folded: dragGap + 1.5 * remPx + 4 + legacyControls,
+  };
+}
+
+/**
+ * A cheap fingerprint of the actions' shape: element types, labels and text.
+ * Actions can change in place without a pane switch (the Diff layout toggle
+ * swaps its buttons), and a folded row has nothing inline to measure, so a
+ * changed fingerprint is what tells it to measure them again.
+ */
+function actionsShape(node: ReactNode): string {
+  const parts: string[] = [];
+  const walk = (child: ReactNode) => {
+    Children.forEach(child, (item) => {
+      if (typeof item === "string" || typeof item === "number") {
+        parts.push(String(item));
+        return;
+      }
+      if (!isValidElement<Record<string, unknown>>(item)) return;
+      const { type, props } = item;
+      parts.push(
+        typeof type === "string"
+          ? type
+          : typeof type === "function"
+            ? type.name
+            : "",
+      );
+      for (const key of ["label", "aria-label", "testId"]) {
+        if (typeof props[key] === "string") parts.push(props[key]);
+      }
+      walk(props.children as ReactNode);
+    });
+  };
+  walk(node);
+  return parts.join("|");
+}
+/** Slack a collapsed row needs before it expands again, so a row sitting
+ *  right on the line doesn't flip between the two layouts. */
+const COLLAPSE_HYSTERESIS_PX = 4;
+
+/**
+ * Whether the active pane's actions (and the "+") have to fold into the "…"
+ * popover to leave the tab scroller its floor. Action sets differ per pane
+ * (two icons for Files, three for Browser, a stat plus two for Changes), so
+ * this measures instead of using a fixed breakpoint. The actions' natural
+ * width is read whenever they are inline and kept while they are folded, so
+ * a collapsed row can tell when they would fit again. Each time a pane
+ * becomes active, or its actions change shape in place, they are shown
+ * inline once to be measured afresh, so a stale width never decides; both
+ * passes run in layout effects, before paint. A shape change while the
+ * popover is open waits for it to close rather than close it under the
+ * cursor.
+ *
+ * They stay inline only if that leaves the tabs at least what folding would
+ * give them (capped at `TAB_FLOOR_PX`), with a few px of hysteresis.
+ */
+function useCollapsedActions({
+  headerRef,
+  actionsRef,
+  actionsKey,
+  actionsShape,
+  hasActions,
+  budgets,
+}: {
+  headerRef: React.RefObject<HTMLElement | null>;
+  actionsRef: React.RefObject<HTMLDivElement | null>;
+  actionsKey: string;
+  actionsShape: string;
+  hasActions: boolean;
+  budgets: { inline: number; folded: number };
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+  const natural = useRef<{ key: string; shape: string; width: number } | null>(
+    null,
+  );
+  const popoverOpen = useRef(false);
+
+  const measure = useCallback(() => {
+    const header = headerRef.current;
+    // No actions, or no layout to measure (jsdom): keep them inline.
+    if (!hasActions || !header || header.clientWidth === 0) {
+      setCollapsed(false);
+      return;
+    }
+    const inline = actionsRef.current;
+    if (inline) {
+      natural.current = {
+        key: actionsKey,
+        shape: actionsShape,
+        width: inline.scrollWidth,
+      };
+    }
+    const known = natural.current;
+    if (
+      known?.key !== actionsKey ||
+      (known.shape !== actionsShape && !popoverOpen.current)
+    ) {
+      setCollapsed(false);
+      return;
+    }
+    const width = known.width;
+    const style = getComputedStyle(header);
+    const row =
+      header.clientWidth -
+      (parseFloat(style.paddingLeft) || 0) -
+      (parseFloat(style.paddingRight) || 0);
+    const floor = Math.min(TAB_FLOOR_PX, row - budgets.folded);
+    const room = row - budgets.inline - floor;
+    setCollapsed((prev) =>
+      prev ? width > room - COLLAPSE_HYSTERESIS_PX : width > room,
+    );
+  }, [actionsKey, actionsRef, actionsShape, budgets, hasActions, headerRef]);
+
+  // Every commit: a pane switch, or actions that changed width in place.
+  // `setCollapsed` bails out when nothing changed.
+  useLayoutEffect(measure);
+
+  useLayoutEffect(() => {
+    const header = headerRef.current;
+    if (!header || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(header);
+    if (actionsRef.current) observer.observe(actionsRef.current);
+    return () => observer.disconnect();
+  }, [actionsRef, collapsed, headerRef, measure]);
+
+  // An inline row has no popover; a pane switch can unmount an open one.
+  useLayoutEffect(() => {
+    if (!collapsed) popoverOpen.current = false;
+  }, [collapsed]);
+
+  const onPopoverOpenChange = useCallback(
+    (open: boolean) => {
+      popoverOpen.current = open;
+      // Catch up on a shape change made from inside the popover.
+      if (!open) measure();
+    },
+    [measure],
+  );
+
+  return { collapsed, onPopoverOpenChange };
+}
+
+/** The "+" and the pane actions folded behind one "…" button, for a row too
+ *  narrow to hold them inline. The popover renders the very same nodes, so
+ *  each keeps its own behavior, label, tooltip and menu. */
+function CollapsedPaneActions({
+  openPane,
+  actions,
+  onOpenChange,
+}: {
+  openPane: ReactNode;
+  actions: ReactNode;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [tooltipOpen, setTooltipOpen] = useState(false);
+  // A pointer open lands focus on the popover itself, not its first action,
+  // whose tooltip would otherwise pop up under the cursor. A keyboard open
+  // keeps the default: straight to the first action.
+  const openedByPointer = useRef(false);
+  const contentRef = useRef<HTMLDivElement>(null);
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        onOpenChange(next);
+      }}
+    >
+      {/* Popover outside the tooltip, so the button keeps the popover's
+          `data-state`, and no tooltip while the popover is up. */}
+      <Tooltip open={tooltipOpen && !open} onOpenChange={setTooltipOpen}>
+        <PopoverTrigger asChild>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label="Pane actions"
+              data-testid="right-panel-pane-actions-more"
+              onPointerDown={() => {
+                openedByPointer.current = true;
+              }}
+              onKeyDown={() => {
+                openedByPointer.current = false;
+              }}
+              className={cn(
+                "flex size-6 shrink-0 items-center justify-center rounded-md",
+                "transition-colors duration-100",
+                "text-foreground/42 hover:bg-surface-2 hover:text-foreground/80",
+                "data-[state=open]:bg-surface-3 data-[state=open]:text-foreground",
+              )}
+            >
+              <Ellipsis className="size-[13px]" />
+            </button>
+          </TooltipTrigger>
+        </PopoverTrigger>
+        <TooltipContent side="bottom" sideOffset={4}>
+          More actions
+        </TooltipContent>
+      </Tooltip>
+      <PopoverContent
+        align="end"
+        aria-label="Pane actions"
+        data-testid="right-panel-pane-actions-popover"
+        ref={contentRef}
+        tabIndex={-1}
+        onOpenAutoFocus={(event) => {
+          if (!openedByPointer.current) return;
+          event.preventDefault();
+          contentRef.current?.focus();
+        }}
+        className="flex w-auto items-center gap-[2px] rounded-lg px-1.5 py-1"
+      >
+        {openPane}
+        <div className="mx-[3px] h-[15px] w-px shrink-0 bg-border/60" aria-hidden />
+        {actions}
+      </PopoverContent>
+    </Popover>
+  );
+}
 
 /** Tracks which edges of the tab scroller have tabs hidden behind them. */
 function useEdgeFade(
@@ -338,17 +592,123 @@ export const PaneTabStrip = memo(function PaneTabStrip({
   const edges = useEdgeFade(containerRef, contentRef);
   const mask = edgeMask(edges);
 
+  const headerRef = useRef<HTMLElement>(null);
+  const actionsRef = useRef<HTMLDivElement>(null);
+  const budgets = useMemo(
+    () => rowBudgets(remPx, !inTitlebar),
+    [inTitlebar, remPx],
+  );
+  const { collapsed: actionsCollapsed, onPopoverOpenChange } =
+    useCollapsedActions({
+      headerRef,
+      actionsRef,
+      actionsKey: activeTab ?? "",
+      actionsShape: actionsShape(actions),
+      hasActions: actions != null,
+      budgets,
+    });
+  // The scroller's floor: `TAB_FLOOR_PX`, or whatever the rest of the row
+  // leaves once the reserve has taken its share, so the row never runs into
+  // the reserve.
+  const scrollerMinWidth = `min(${TAB_FLOOR_PX}px, calc(100% - ${
+    actionsCollapsed ? budgets.folded : budgets.inline
+  }px))`;
+
+  // The "+": inline after the tabs, or first in the "…" popover once the
+  // row has folded.
+  const openPaneMenu = (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          aria-label="Open pane"
+          data-testid="right-panel-add-pane"
+          className={cn(
+            "flex size-[24px] shrink-0 items-center justify-center rounded-md text-foreground/42 transition-colors duration-100 hover:bg-surface-2 hover:text-foreground data-[state=open]:bg-surface-3 data-[state=open]:text-foreground",
+            !actionsCollapsed && "ml-[3px]",
+          )}
+        >
+          <Plus className="size-[13px]" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="start"
+        className="w-[206px] rounded-lg p-[5px] [&_[role=menuitem]]:whitespace-nowrap"
+      >
+        <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
+          OPEN PANE
+        </DropdownMenuLabel>
+        {/* Same `surfaces` array the empty-panel picker renders as cards,
+            including Terminal, which is a *workspace* pane and routes to
+            the action the main tab strip's "+" uses. */}
+        {coreSurfaces.map((surface) => (
+          <DropdownMenuItem
+            key={surface.id}
+            className="h-[30px] rounded-md px-[9px] text-body font-medium"
+            onClick={surface.onOpen}
+          >
+            <surface.icon className="size-[14px]" />
+            {surface.label}
+          </DropdownMenuItem>
+        ))}
+        {/* Plugin panes get their own section, each attributed to its plugin,
+            so none can pass for a core pane. Absent without any. */}
+        {pluginSurfaces.length > 0 && (
+          <>
+            <DropdownMenuSeparator className="mx-1 my-[5px]" />
+            <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
+              PLUGINS
+            </DropdownMenuLabel>
+            {pluginSurfaces.map((surface) => (
+              <DropdownMenuItem
+                key={surface.id}
+                aria-label={`${surface.label} — ${surface.description}`}
+                className="h-[30px] rounded-md px-[9px] text-body font-medium"
+                onClick={surface.onOpen}
+              >
+                <surface.icon className="size-[14px]" />
+                <span className="min-w-0 truncate">{surface.label}</span>
+                <span className="ml-auto min-w-0 truncate pl-2 text-label font-normal text-muted-foreground">
+                  {surface.description}
+                </span>
+              </DropdownMenuItem>
+            ))}
+          </>
+        )}
+        <DropdownMenuSeparator className="mx-1 my-[5px]" />
+        <DropdownMenuItem
+          className="h-[30px] rounded-md px-[9px] text-body font-medium"
+          onClick={onOpenFile}
+        >
+          <Search className="size-[14px]" />
+          Open file…
+          {openFileKeys && (
+            <DropdownMenuShortcut className="font-mono text-caption">
+              {openFileKeys}
+            </DropdownMenuShortcut>
+          )}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+
   const tabRun = (
     <>
       {/* `no-scrollbar` is a real utility (shadcn/tailwind.css, imported by
           globals.css) — an earlier comment here claimed it was undefined,
           which is what spawned three hand-rolled copies of it.
-          `scroll-px-4` keeps a tab scrolled into view clear of the fade. */}
+          `scroll-px-4` keeps a tab scrolled into view clear of the fade.
+          The min width keeps the active tab readable once the top-right
+          reserve leaves the row ~160px; past it, the pane actions fold into
+          "…" rather than squeeze the tabs. */}
       <div
         ref={setScrollerNode}
         data-testid="right-panel-tabs-scroll"
         className="no-scrollbar relative flex min-w-0 scroll-px-4 items-center overflow-x-auto"
-        style={mask ? { maskImage: mask, WebkitMaskImage: mask } : undefined}
+        style={{
+          minWidth: scrollerMinWidth,
+          ...(mask ? { maskImage: mask, WebkitMaskImage: mask } : null),
+        }}
       >
         <div
           ref={contentRef}
@@ -405,76 +765,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
         )}
       </div>
 
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <button
-            type="button"
-            aria-label="Open pane"
-            data-testid="right-panel-add-pane"
-            className="ml-[3px] flex size-[24px] shrink-0 items-center justify-center rounded-md text-foreground/42 transition-colors duration-100 hover:bg-surface-2 hover:text-foreground data-[state=open]:bg-surface-3 data-[state=open]:text-foreground"
-          >
-            <Plus className="size-[13px]" />
-          </button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent
-          align="start"
-          className="w-[206px] rounded-lg p-[5px] [&_[role=menuitem]]:whitespace-nowrap"
-        >
-          <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
-            OPEN PANE
-          </DropdownMenuLabel>
-          {/* Same `surfaces` array the empty-panel picker renders as cards,
-              including Terminal, which is a *workspace* pane and routes to
-              the action the main tab strip's "+" uses. */}
-          {coreSurfaces.map((surface) => (
-            <DropdownMenuItem
-              key={surface.id}
-              className="h-[30px] rounded-md px-[9px] text-body font-medium"
-              onClick={surface.onOpen}
-            >
-              <surface.icon className="size-[14px]" />
-              {surface.label}
-            </DropdownMenuItem>
-          ))}
-          {/* Plugin panes get their own section, each attributed to its plugin,
-              so none can pass for a core pane. Absent without any. */}
-          {pluginSurfaces.length > 0 && (
-            <>
-              <DropdownMenuSeparator className="mx-1 my-[5px]" />
-              <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
-                PLUGINS
-              </DropdownMenuLabel>
-              {pluginSurfaces.map((surface) => (
-                <DropdownMenuItem
-                  key={surface.id}
-                  aria-label={`${surface.label} — ${surface.description}`}
-                  className="h-[30px] rounded-md px-[9px] text-body font-medium"
-                  onClick={surface.onOpen}
-                >
-                  <surface.icon className="size-[14px]" />
-                  <span className="min-w-0 truncate">{surface.label}</span>
-                  <span className="ml-auto min-w-0 truncate pl-2 text-label font-normal text-muted-foreground">
-                    {surface.description}
-                  </span>
-                </DropdownMenuItem>
-              ))}
-            </>
-          )}
-          <DropdownMenuSeparator className="mx-1 my-[5px]" />
-          <DropdownMenuItem
-            className="h-[30px] rounded-md px-[9px] text-body font-medium"
-            onClick={onOpenFile}
-          >
-            <Search className="size-[14px]" />
-            Open file…
-            {openFileKeys && (
-              <DropdownMenuShortcut className="font-mono text-caption">
-                {openFileKeys}
-              </DropdownMenuShortcut>
-            )}
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+      {!actionsCollapsed && openPaneMenu}
     </>
   );
 
@@ -493,18 +784,28 @@ export const PaneTabStrip = memo(function PaneTabStrip({
 
   // The active pane's controls. The panel-level controls (expand, close)
   // live in the fixed top-right cluster in GUI chrome, which the band's
-  // right padding clears.
-  const paneActions = actions != null && (
-    <div
-      data-testid="right-panel-pane-actions"
-      className="flex shrink-0 items-center gap-[2px]"
-    >
-      {actions}
-    </div>
-  );
+  // right padding clears. Never clipped: too narrow to sit inline beside
+  // the tabs' floor, they fold into "…" together with the "+".
+  const paneActions =
+    actions == null ? null : actionsCollapsed ? (
+      <CollapsedPaneActions
+        openPane={openPaneMenu}
+        actions={actions}
+        onOpenChange={onPopoverOpenChange}
+      />
+    ) : (
+      <div
+        ref={actionsRef}
+        data-testid="right-panel-pane-actions"
+        className="flex shrink-0 items-center gap-[2px]"
+      >
+        {actions}
+      </div>
+    );
 
   return (
     <PanelHeader
+      ref={headerRef}
       variant={inTitlebar ? "floating" : "inline"}
       data-testid="right-panel-tabs-header"
       data-in-titlebar={inTitlebar ? "true" : undefined}
@@ -513,7 +814,9 @@ export const PaneTabStrip = memo(function PaneTabStrip({
         // pane body. The body starts flush. The floating variant carries no
         // rule of its own, so the band row asks for one explicitly: its seam
         // is the bottom edge of the window band.
-        "gap-[2px] border-b border-hairline px-[7px]",
+        // A named container so pane actions can drop secondary text (the
+        // Changes diff stat) when the row is narrow.
+        "@container/pane-band gap-[2px] border-b border-hairline px-[7px]",
         // 40px when this row *is* the window band, so its seam lands exactly
         // on the band's bottom edge and its controls sit on the same
         // baseline as the sidebar toggle and the window buttons.

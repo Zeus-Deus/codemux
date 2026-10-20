@@ -12,7 +12,9 @@ const COPIED_RESET_MS = 1200;
 
 /**
  * The transcript's per-message copy action: a 10px icon-and-label chip in the
- * footer strip under a message, flipping to "Copied" for a beat to confirm.
+ * footer strip under a message. Only the glyph flips to a check for a beat to
+ * confirm — the label stays "Copy" so the chip never resizes and shifts its
+ * neighbours.
  * Reveal behaviour is shared with the Revert action it sits beside — see
  * `MESSAGE_ACTION_CLASS`.
  *
@@ -62,30 +64,34 @@ export function MessageCopyButton({
   }, [text, copied]);
 
   return (
-    <button
-      type="button"
-      aria-label={copied ? "Copied" : label}
-      title={label}
-      data-testid="message-copy-button"
-      onClick={() => void handleCopy()}
-      className={cn(
-        MESSAGE_ACTION_CLASS,
-        // Hold the confirmation visible even if the pointer has already left
-        // the message, so a copy made on the way out still reads as confirmed.
-        copied && "pointer-events-auto text-status-open opacity-100",
-        className,
-      )}
-    >
-      {copied ? (
-        <Check className="size-3" aria-hidden />
-      ) : (
-        <Copy className="size-3" aria-hidden />
-      )}
-      {/* Touch shows the strip under every message, so the word would repeat
-          down the whole transcript; the glyph alone carries it there. */}
-      <span className="pointer-coarse:sr-only">
-        {copied ? "Copied" : "Copy"}
+    <>
+      <button
+        type="button"
+        aria-label={copied ? "Copied" : label}
+        title={label}
+        data-testid="message-copy-button"
+        onClick={() => void handleCopy()}
+        className={cn(
+          MESSAGE_ACTION_CLASS,
+          // Hold the confirmation visible even if the pointer has already left
+          // the message, so a copy made on the way out still reads as confirmed.
+          copied && "pointer-events-auto opacity-100",
+          className,
+        )}
+      >
+        {copied ? (
+          <Check className="size-3 text-status-open" aria-hidden />
+        ) : (
+          <Copy className="size-3" aria-hidden />
+        )}
+        {/* Touch shows the strip under every message, so the word would repeat
+            down the whole transcript; the glyph alone carries it there. */}
+        <span className="pointer-coarse:sr-only">Copy</span>
+      </button>
+      {/* A button's own label change isn't reliably announced; this is. */}
+      <span role="status" className="sr-only">
+        {copied ? "Copied" : ""}
       </span>
-    </button>
+    </>
   );
 }

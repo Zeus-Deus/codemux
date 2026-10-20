@@ -304,7 +304,7 @@ async function openFilterMenu() {
 /** Open the filter dropdown and pick a project (or "All projects") by name. */
 async function pickFilter(name: string) {
   await openFilterMenu();
-  await userEvent.click(await screen.findByRole("menuitem", { name }));
+  await userEvent.click(await screen.findByRole("menuitemradio", { name }));
 }
 
 beforeEach(() => {
@@ -369,11 +369,14 @@ describe("SidebarInbox — cards", () => {
     expect(screen.getByText("Working")).toBeInTheDocument();
     expect(screen.getByText("Needs you")).toBeInTheDocument();
     expect(screen.getByText("Done · review")).toBeInTheDocument();
-    // Needs-you card carries the blocker line — twice over, because the
-    // pinned "needs you" strip above the list mirrors the same text as a
-    // jump-link. Duplication is the point: the blocker stays one click away
-    // however far down its card sits.
-    expect(screen.getAllByText("Waiting for your input")).toHaveLength(2);
+    // Needs-you card carries the blocker line. The pinned "needs you" strip
+    // above the list names the workspace instead and keeps the blocker in its
+    // jump-link's accessible name, so it stays one click away however far
+    // down its card sits.
+    expect(screen.getAllByText("Waiting for your input")).toHaveLength(1);
+    expect(
+      screen.getByRole("button", { name: /^Jump to .+ — waiting for your input$/ }),
+    ).toBeInTheDocument();
   });
 
   it("git stats obey the sidebar.show_git_stats setting (branch always shows)", async () => {
@@ -758,12 +761,12 @@ describe("SidebarInbox — project filter", () => {
 
     await openFilterMenu();
     expect(
-      await screen.findByRole("menuitem", { name: "All projects" }),
+      await screen.findByRole("menuitemradio", { name: "All projects" }),
     ).toHaveTextContent("3");
-    expect(screen.getByRole("menuitem", { name: "myapp" })).toHaveTextContent(
+    expect(screen.getByRole("menuitemradio", { name: "myapp" })).toHaveTextContent(
       "2",
     );
-    expect(screen.getByRole("menuitem", { name: "vexis" })).toHaveTextContent(
+    expect(screen.getByRole("menuitemradio", { name: "vexis" })).toHaveTextContent(
       "1",
     );
   });
@@ -2292,7 +2295,7 @@ describe("SidebarInbox — wrapping-up tier", () => {
 
     // Demotion is presentation only — a count that dropped would report the
     // workspace as gone.
-    const all = await screen.findByRole("menuitem", { name: "All projects" });
+    const all = await screen.findByRole("menuitemradio", { name: "All projects" });
     expect(all).toHaveTextContent("2");
   });
 });

@@ -1,12 +1,27 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { ComposerCommandMenu } from "./ComposerCommandMenu";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 
 afterEach(cleanup);
+
+it("tracks fades on the command list without including the fixed hints", () => {
+  const { container } = render(<ComposerCommandMenu
+    open submode="main" query="" onQueryChange={vi.fn()} onSelect={vi.fn()} onEscape={vi.fn()}
+    items={[{ id: "mode:plan", label: "Plan", command: "/plan", group: "MODES", onSelect: vi.fn() }]}
+  />);
+  const list = screen.getByRole("listbox");
+  Object.defineProperties(list, { clientHeight: { value: 100 }, scrollHeight: { value: 300 } });
+  list.scrollTop = 50;
+  fireEvent.scroll(list);
+  expect(container.querySelector('[data-scroll-edge="top"]')).toHaveAttribute("data-visible", "true");
+  expect(container.querySelector('[data-scroll-edge="bottom"]')).toHaveAttribute("data-visible", "true");
+  expect(list).toHaveClass("scroll-py-5");
+  expect(list).not.toContainElement(screen.getByText("move"));
+});
 
 it("lets the embedded access picker own Enter without selecting a composer command", async () => {
   const user = userEvent.setup();

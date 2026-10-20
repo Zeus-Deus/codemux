@@ -391,6 +391,8 @@ describe("RightPanel deck", () => {
     expect(screen.getByTestId("right-panel-pane-actions")).toHaveTextContent(
       "−12",
     );
+    // ...and give way first when the band is narrow: the footer repeats them.
+    expect(screen.getByText("+130")).toHaveClass("@max-2xs/pane-band:hidden");
   });
 
   it("keeps video previews free of text-editor actions", () => {
