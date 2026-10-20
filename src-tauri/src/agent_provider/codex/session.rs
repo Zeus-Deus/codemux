@@ -2852,29 +2852,41 @@ fn spawn_incoming_requests_task(
                                 permit: session.native_authority.capture_for_turn(turn.unwrap()),
                             })
                         };
-                        let owned_session=session.clone();let owned_child=child.clone();let owned_registry=mcp_registry.clone();let owned_events=event_tx.clone();
+                        let owned_session = session.clone();
+                        let owned_registry = mcp_registry.clone();
                         let job = tokio::spawn(async move {
-                            let session=owned_session;let child=owned_child;let mcp_registry=owned_registry;let event_tx=owned_events;
-                        if let Some(actor) = &actor {
-                            let _ = actor.permit.wait_ready().await;
-                        }
-                        let host_caller = session.host_caller_for_call(params.get("turnId").and_then(Value::as_str));
-                        let result = handle_dynamic_tool_call_native(
-                            mcp_registry.as_ref(),
-                            session.workspace_id.as_deref(),
-                            Some((&host_caller, session.provider_session_id.0.as_str())),
-                            params, actor, &session.direct_tool_names,
-                        )
-                        .await;
-                        if let Err(error) = child.respond(req.id, Ok(result)).await {
-                            let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
-                                thread_id: Some(session.thread_id.clone()),
-                                message: format!("failed to answer Codex dynamic tool call: {error}"),
-                                original_payload: None,
-                            });
-                        }
+                            let session = owned_session;
+                            if let Some(actor) = &actor {
+                                if let Err(error) = actor.permit.wait_ready().await {
+                                    return dynamic_tool_error(error);
+                                }
+                            }
+                            let host_caller = session.host_caller_for_call(params.get("turnId").and_then(Value::as_str));
+                            handle_dynamic_tool_call_native(
+                                owned_registry.as_ref(),
+                                session.workspace_id.as_deref(),
+                                Some((&host_caller, session.provider_session_id.0.as_str())),
+                                params, actor, &session.direct_tool_names,
+                            ).await
                         });
                         session.native_authority.track(job.abort_handle());
+                        // Revocation cancels the work, never the obligation to
+                        // answer the server request (including track rejection).
+                        let child = child.clone();
+                        let event_tx = event_tx.clone();
+                        let thread_id = session.thread_id.clone();
+                        tokio::spawn(async move {
+                            let result = job.await.unwrap_or_else(|error| {
+                                dynamic_tool_error(format!("Dynamic tool call cancelled: {error}"))
+                            });
+                            if let Err(error) = child.respond(req.id, Ok(result)).await {
+                                let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                                    thread_id: Some(thread_id),
+                                    message: format!("failed to answer Codex dynamic tool call: {error}"),
+                                    original_payload: None,
+                                });
+                            }
+                        });
                         continue;
                     }
                     let request_id = mint_request_id();
@@ -2995,7 +3007,7 @@ async fn handle_dynamic_tool_call_native(
             // subagent that inherited the dynamic tools) is refused rather
             // than handed the root's identity and permission mode.
             let host = if let Some((caller, root_thread))=host {
-                if call.thread_id==root_thread {registry.host_call_async(caller,&name,&call.arguments,Some(&call.call_id),Some(&call.turn_id)).await}
+                if call.thread_id==root_thread {registry.host_call_native(caller,&name,&call.arguments,Some(&call.call_id),Some(&call.turn_id),actor.as_ref().map(|actor| &actor.permit)).await}
                 else {registry.host_tools(caller).iter().any(|tool|tool.prefixed_name==name).then(||json!({"content":[{"type":"text","text":"This tool requires the app-owned root conversation"}],"isError":true}))}
             } else {None};
             let bridge = registry.call_plugin_bridge(&name, call.arguments.clone(), workspace_id, direct_tools).await;
@@ -3027,6 +3039,10 @@ async fn handle_dynamic_tool_call_native(
 
     let content_items = mcp_result_content_to_codex(&result);
     json!({ "contentItems": content_items, "success": success })
+}
+
+fn dynamic_tool_error(error: String) -> Value {
+    json!({"success":false,"contentItems":[{"type":"inputText","text":error}]})
 }
 
 const CODEX_STRUCTURED_CONTENT_MAX_BYTES: usize = 64 * 1024;
@@ -3752,6 +3768,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegation_delivery_round2_codex_late_host_delegate_cannot_cross_stop() {
+        for stop_before_capture in [false, true] {
+            let registry = McpRegistry::new();
+            registry.set_host_tools(Arc::new(HandOffHost));
+            let caller = crate::mcp::registry::HostCaller { thread_id: format!("codex-late-host-{stop_before_capture}"), provider: crate::agent_provider::ProviderKind::Codex, workspace_id: None, permission_mode: Some("danger-full-access".into()) };
+            let owner = crate::delegation::authority::NativeAuthority::new(&caller.thread_id);
+            let generation = owner.begin(); assert!(owner.bind(generation, "turn"));
+            let db = crate::database::DatabaseStore::new_in_memory();
+            if stop_before_capture { owner.invalidate(); db.stop_message_deliveries(&caller.thread_id).unwrap(); }
+            let actor = crate::delegation::app::NativeActor { thread_id:caller.thread_id.clone(), provider:caller.provider, workspace_id:None, session_id:"session".into(), permission_mode:caller.permission_mode.clone(), permit:owner.capture_for_turn("turn") };
+            if !stop_before_capture { owner.invalidate(); db.stop_message_deliveries(&caller.thread_id).unwrap(); }
+            let response = handle_dynamic_tool_call_native(Some(&registry), None, Some((&caller, "root")), json!({"threadId":"root","turnId":"turn","callId":"late","tool":"codemux_mcp__codemux__delegate_task","arguments":{}}), Some(actor), &[]).await;
+            assert_eq!(response["success"], false, "a late host call must not acquire the post-Stop generation: {response}");
+            assert!(response["contentItems"][0]["text"].as_str().unwrap().contains("revoked"));
+        }
+    }
+
+    #[tokio::test]
     async fn host_tools_answer_only_the_root_thread() {
         let registry = McpRegistry::new();
         registry.set_host_tools(Arc::new(HandOffHost));
@@ -3772,11 +3806,15 @@ mod tests {
             })
         };
 
-        let root = handle_dynamic_tool_call(
+        let owner = crate::delegation::authority::NativeAuthority::new(&caller.thread_id);
+        let generation = owner.begin(); assert!(owner.bind(generation, "turn"));
+        let actor = crate::delegation::app::NativeActor { thread_id:caller.thread_id.clone(), provider:caller.provider, workspace_id:None, session_id:"session".into(), permission_mode:caller.permission_mode.clone(), permit:owner.capture_for_turn("turn") };
+        let root = handle_dynamic_tool_call_native(
             Some(&registry),
             None,
             Some((&caller, "codex-root")),
             request("codex-root"),
+            Some(actor), &[],
         )
         .await;
         assert_eq!(root["success"], true, "{root}");
@@ -3795,7 +3833,7 @@ mod tests {
         assert!(native_child["contentItems"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("only available in the main conversation"));
+            .contains("app-owned root conversation"));
     }
 
     #[tokio::test]

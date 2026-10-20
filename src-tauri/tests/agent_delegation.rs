@@ -2229,3 +2229,66 @@ async fn delegation_delivery_wait_uses_one_deadline_including_admission_work() {
     assert!(task.wait_until.unwrap() <= INSTALL_ENTERED.load(std::sync::atomic::Ordering::SeqCst) + 20, "admission must not extend the wait budget");
     assert_eq!(receipt["wait_until"].as_i64(), task.wait_until);
 }
+
+#[tokio::test]
+async fn delegation_delivery_round2_async_task_retry_can_wait_for_the_existing_result() {
+    let h = Harness::new().await;
+    let mut input = json!({"provider":"codex","title":"Async then wait","task":TASK,"client_request_id":"async-wait"});
+    let first = h.call(FULL, input.clone()).unwrap();
+    let child = first["child_thread_id"].as_str().unwrap().to_string();
+    delegation_delivery_ready(&h, &child).await;
+    let caller = h.caller(FULL);
+    input["mode"] = json!("wait"); input["wait_ms"] = json!(2000);
+    let mut waiting = h.host.call_async(&caller, DELEGATE_TOOL, &input, Some("retry"), None);
+    assert!(futures_util::poll!(&mut waiting).is_pending(), "wait retry must wait rather than conflict/release immediately");
+    assert_eq!(h.db().delegation_tasks(Some(&h.parent)).unwrap().len(), 1);
+    h.child_reports(&child, "Existing task finished"); h.settle(&child).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap();
+    let receipt: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(receipt["task_id"], first["task_id"]);
+    assert_eq!(receipt["result"]["text"], "Existing task finished");
+    assert_ne!(receipt["wait_released"], true);
+    assert!(h.wakes().is_empty());
+}
+
+#[tokio::test]
+async fn delegation_delivery_round2_released_wait_retry_gets_a_bounded_window() {
+    let h = Harness::new().await;
+    let input = json!({"provider":"codex","title":"Wait again","task":TASK,"client_request_id":"wait-again","mode":"wait","wait_ms":40});
+    let caller = h.caller(FULL);
+    let first = h.host.call_async(&caller, DELEGATE_TOOL, &input, Some("first"), None).await.unwrap();
+    let first: Value = serde_json::from_str(first["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(first["wait_timed_out"], true);
+    let start = Instant::now();
+    let retry = h.host.call_async(&caller, DELEGATE_TOOL, &input, Some("retry"), None).await.unwrap();
+    let retry: Value = serde_json::from_str(retry["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(retry["task_id"], first["task_id"]);
+    assert_eq!(retry["wait_timed_out"], true);
+    assert_ne!(retry["wait_released"], true);
+    assert!(start.elapsed() >= Duration::from_millis(25));
+    assert!(start.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn delegation_delivery_round2_new_chat_and_pane_rebind_cancel_parent_ssh_tasks() {
+    use codemux_lib::delegation::{journal::Journal, DelegateTaskInput, Grant, Parent, WakeState};
+    for new_chat in [true, false] {
+        let h = Harness::new().await;
+        let dir = tempfile::tempdir().unwrap(); let journal = Arc::new(Journal::open(dir.path()).unwrap());
+        let parent = Parent { thread_id:h.parent.clone(), workspace_id:h.workspace.clone(), provider:ProviderKind::Claude, label:"Parent".into(), permission_mode:"bypassPermissions".into(), event_id:None };
+        let grant: Grant = serde_json::from_value(json!({"id":"grant","host_id":4,"host_name":"Fixture host","ssh_target":"fixture-host","workspace_path":"/fixture/checkout","workspace_name":"Checkout","provider":"codex","permission_mode":"danger-full-access","enabled":true,"created_at":"fixture"})).unwrap();
+        journal.put_grant(&h.workspace, &grant).unwrap();
+        let input = DelegateTaskInput { target_id:grant.id.clone(), prompt:"Existing SSH task".into(), title:None, model:None, effort:None, client_request_id:"ssh-close".into() };
+        let task = journal.admit(&parent, &grant, "checkout", &input).unwrap();
+        h.handle.manage(journal.clone());
+        if new_chat {
+            agent_chat_stop_session(h.handle.clone(), ProviderKind::Claude, ThreadId(h.parent.clone())).await.unwrap();
+        } else {
+            codemux_lib::commands::delegation::on_thread_stopped(&h.handle, &h.parent, codemux_lib::commands::delegation::StopKind::Close);
+        }
+        let stopped = journal.task(&task.id).unwrap();
+        assert!(stopped.cancel_requested, "New Chat/rebind must cancel its SSH tasks ({new_chat})");
+        assert_eq!(stopped.wake_state, WakeState::Suppressed);
+        assert_eq!(h.db().delivery_generation(&h.parent).unwrap(), (0, false), "closing must preserve local lifecycle semantics");
+    }
+}

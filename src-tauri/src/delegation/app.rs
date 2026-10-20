@@ -212,7 +212,7 @@ pub fn user_activity<R: Runtime>(
     thread: &str,
     stop: bool,
 ) -> Result<(), String> {
-    super::authority::NativeAuthority::invalidate_thread(thread);
+    super::authority::NativeAuthority::user_activity_thread(thread, stop);
     if let Some(store) = app.try_state::<Arc<Journal>>() {
         let _notice = store.tasks()?.iter().find(|task|task.parent_thread_id==thread)
             .map(|task|MutationNotice::for_task(app,task)).transpose()?;

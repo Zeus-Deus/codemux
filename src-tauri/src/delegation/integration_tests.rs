@@ -890,7 +890,7 @@ async fn completion_before_ack(kind: ProviderKind, mode: &str) {
         let first = send.await.unwrap().unwrap();
         assert!(provider.turn_active(&ThreadId(thread.clone())).await,
             "acknowledged ordinary execution lost its lifecycle after concurrent user activity");
-        assert!(super::authority::NativeAuthority::current_permit(&thread).admit().is_err());
+        assert_eq!(super::authority::NativeAuthority::current_permit(&thread).admit().is_ok(), mode == "activity-queue", "only Stop revokes the active turn tools");
         if mode == "activity-queue" {
             let second = provider.send_turn(serde_json::from_value(
                 json!({"thread_id":thread,"text":"second","images":[]})

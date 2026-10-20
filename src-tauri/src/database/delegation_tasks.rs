@@ -5,6 +5,17 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+fn same_admission_payload(saved: &str, requested: &Value) -> bool {
+    let Ok(mut saved) = serde_json::from_str::<Value>(saved) else { return false; };
+    let mut requested = requested.clone();
+    // Waiting changes only the receipt, never the admitted work. Strip these
+    // controls on both sides so pre-upgrade payloads remain retryable.
+    for value in [&mut saved, &mut requested] {
+        if let Some(object) = value.as_object_mut() { object.remove("mode"); object.remove("wait_ms"); }
+    }
+    saved == requested
+}
+
 pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_delegation_tasks (
         task_id TEXT PRIMARY KEY, parent_thread_id TEXT NOT NULL,
@@ -246,6 +257,19 @@ impl DatabaseStore {
         }
         Ok(())
     }
+    /// A retry can wait for an async-admitted task. Concurrent waiters share
+    /// the earliest deadline; observation never extends an existing lease.
+    pub(crate) fn arm_delegation_wait(&self, id: &str, until: i64) -> Result<i64, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut task = read(&conn, id)?.ok_or("Unknown task")?;
+        let until = task.wait_until.map_or(until, |saved| saved.min(until));
+        task.wait_until = Some(until);
+        if let Some(delivery) = &task.delivery_id {
+            conn.execute("UPDATE agent_message_deliveries SET retry_at=datetime(?2/1000.0,'unixepoch') WHERE id=?1 AND attempted=0 AND state='pending'",params![delivery,until]).map_err(|e|e.to_string())?;
+        }
+        write(&conn, &task)?;
+        Ok(until)
+    }
     pub fn has_restart_resume(&self, child: &str) -> bool {
         self.conn
             .lock()
@@ -317,7 +341,7 @@ impl DatabaseStore {
         let prior:Option<(String,String)>=conn.query_row("SELECT record,admission_payload FROM agent_delegation_tasks WHERE parent_thread_id=?1 AND client_request_id=?2",params![parent,key],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
         prior
             .map(|(data, old)| {
-                if serde_json::from_str::<Value>(&old).ok().as_ref() != Some(payload) {
+                if !same_admission_payload(&old, payload) {
                     return Err("client_request_id_conflict: retry payload changed".into());
                 }
                 decode(data)
@@ -339,7 +363,7 @@ impl DatabaseStore {
         if let Some(key) = key {
             let prior:Option<(String,String)>=tx.query_row("SELECT record,admission_payload FROM agent_delegation_tasks WHERE parent_thread_id=?1 AND client_request_id=?2",params![task.parent_thread_id,key],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
             if let Some((data, old)) = prior {
-                if serde_json::from_str::<Value>(&old).ok().as_ref() != Some(payload) {
+                if !same_admission_payload(&old, payload) {
                     return Err("client_request_id_conflict: retry payload changed".into());
                 }
                 return Ok((decode(data)?, false));

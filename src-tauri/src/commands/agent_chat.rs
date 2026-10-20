@@ -6082,7 +6082,7 @@ pub async fn agent_chat_stop_session_guarded<R: Runtime>(
     feature_flag_on(&observability)?;
     let native_gate = native_thread_gate(&app, &thread_id.0);
     native_gate.cancel();
-    crate::delegation::app::user_activity(&app, &thread_id.0, false)?;
+    crate::delegation::app::user_activity(&app, &thread_id.0, true)?;
     // A restart in place: a delegated child's task stops quietly, a
     // parent's tasks keep running (New Chat / history pick rebinds the
     // pane afterwards, and that rebind is what stops them).

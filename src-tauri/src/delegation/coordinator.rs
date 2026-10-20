@@ -298,10 +298,15 @@ pub fn install<R: Runtime>(handle: &AppHandle<R>) -> Result<(), String> {
         .join(crate::APP_DIR_NAME)
         .join("delegation");
     let store = Arc::new(Journal::open(&root)?);
-    store.recover_deliveries_with_stop_evidence(|task| {
+    install_store(handle, store)
+}
+fn install_store<R: Runtime>(handle: &AppHandle<R>, store: Arc<Journal>) -> Result<(), String> {
+    if let Err(error) = store.recover_deliveries_with_stop_evidence(|task| {
         handle.state::<crate::database::DatabaseStore>().legacy_parent_stop_after(
             &task.parent_thread_id, task.remote.as_ref().map(|r| r.updated_at.as_str()).unwrap_or(&task.updated_at))
-    })?;
+    }) {
+        log::error!("SSH delivery recovery failed; journal retained for repair: {error}");
+    }
     handle.manage(store.clone());
     handle.manage(Coordinator::new(Arc::new(SshTransport)));
     let callback_handle = handle.clone();
@@ -333,6 +338,27 @@ fn restore_tasks<R: Runtime>(handle: &AppHandle<R>, store: &Journal) -> Result<(
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
+    #[tokio::test]
+    async fn delegation_delivery_round2_recovery_failure_does_not_abort_coordinator_install() {
+        let app = tauri::test::mock_app();
+        let db = crate::database::DatabaseStore::new_in_memory();
+        let dir = tempfile::tempdir().unwrap(); let store = Arc::new(Journal::open(dir.path()).unwrap());
+        let (parent, grant, input) = super::super::tests::fixture();
+        db.upsert_agent_chat_session(&parent.thread_id, &parent.workspace_id, None, "codex").unwrap();
+        app.manage(db); app.manage(crate::mcp::registry::McpRegistry::new());
+        store.put_grant(&parent.workspace_id, &grant).unwrap();
+        let task = store.admit(&parent, &grant, "checkout", &input).unwrap();
+        store.apply_remote(&task.id, &super::super::tests::remote(&task, crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
+        store.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_recovery BEFORE UPDATE ON delivery_outcomes BEGIN SELECT RAISE(ABORT,'fixture recovery failure'); END;").unwrap();
+        store.conn.lock().unwrap().execute("INSERT OR REPLACE INTO delivery_outcomes VALUES (?1,'attempt','in_flight')", [&task.id]).unwrap();
+        install_store(app.handle(), store).unwrap();
+        let coordinator = app.state::<Coordinator>();
+        assert!(coordinator.owner_counts().2, "maintenance must be installed despite failed recovery");
+        let task = app.state::<crate::database::DatabaseStore>().delegation_task(&format!("ssh:{}", task.id)).unwrap().unwrap();
+        assert!(task.result.is_some());
+        assert_eq!(task.completion_delivery, "held_unknown");
+        coordinator.shutdown().await.unwrap();
+    }
     #[test]
     fn delegation_delivery_startup_isolates_one_failed_ssh_import() {
         let app = tauri::test::mock_app();

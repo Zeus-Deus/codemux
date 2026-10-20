@@ -777,6 +777,9 @@ impl Journal {
         let mut conn=self.conn.lock().unwrap();let tx=conn.transaction().map_err(|e|e.to_string())?;
         let mut task=read_task(&tx,id)?;
         if task.cancel_requested || task.wake_error.as_deref() == Some("disposed_by_stop") {return Err("Task cancelled".into());}
+        if matches!(task.wake_state, WakeState::Held | WakeState::Suppressed | WakeState::Delivered) {
+            return Err("Result is held or already delivered; explicit release is required".into());
+        }
         let prior:Option<(String,String)>=tx.query_row("SELECT attempt,state FROM delivery_outcomes WHERE task=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
         let attempt=match prior {
             Some((_,state)) if matches!(state.as_str(),"accepted"|"unknown")=>return Err("SSH acceptance may have occurred; automatic resend held".into()),
@@ -862,15 +865,29 @@ impl Journal {
         for task in self.tasks()? {
             let outcome = self.delivery_outcome(&task.id)?;
             let stopped = task.cancel_requested || task.wake_error.as_deref() == Some("disposed_by_stop")
-                || task.wake_state == WakeState::Suppressed && stopped_after(&task)?;
-            if !stopped && (task.wake_state == WakeState::Suppressed
-                || task.wake_state == WakeState::Delivering && outcome == DeliveryOutcome::BeforeSend)
+                || task.wake_state == WakeState::Suppressed && match stopped_after(&task) {
+                    Ok(stopped) => stopped,
+                    Err(error) => {
+                        log::error!("SSH task {} recovery evidence unavailable; result held: {error}", task.id);
+                        self.update(&task.id, |t| { t.wake_state = WakeState::Held; t.wake_error = Some(format!("Recovery evidence unavailable; result retained: {error}")); })?;
+                        continue;
+                    }
+                };
+            if !stopped && task.wake_state == WakeState::Delivering && outcome == DeliveryOutcome::BeforeSend
                 && matches!(outcome, DeliveryOutcome::NotAttempted | DeliveryOutcome::BeforeSend) {
                 self.update(&task.id, |t| { t.wake_state = WakeState::Pending; t.wake_error = None; })?;
                 continue;
             }
             if stopped {
                 self.update(&task.id, |t| { t.wake_state = WakeState::Suppressed; t.wake_error = Some("disposed_by_stop".into()); })?;
+                continue;
+            }
+            if task.wake_state == WakeState::Suppressed {
+                // Historical suppression is user intent to retain the report,
+                // never permission to wake after upgrade. Preserve byte/ack
+                // evidence so only a provably unsent result can be released.
+                self.conn.lock().unwrap().execute("INSERT OR IGNORE INTO delivery_outcomes(task,attempt,state) VALUES(?1,?2,'not_attempted')", params![task.id,uuid::Uuid::new_v4().to_string()]).map_err(|e|e.to_string())?;
+                self.update(&task.id, |t| { t.wake_state = WakeState::Held; t.wake_error = Some("Legacy result retained; deliver explicitly to continue".into()); })?;
                 continue;
             }
             if matches!(

@@ -737,13 +737,13 @@ fn delegation_delivery_human_messages_before_during_after_remote_completion_do_n
 }
 
 #[test]
-fn delegation_delivery_legacy_suppression_recovers_only_without_stop_or_claim_evidence() {
+fn delegation_delivery_legacy_suppression_holds_without_stop_and_preserves_claim_evidence() {
     for (outcome, stop, expected) in [
-        (None, false, WakeState::Pending),
+        (None, false, WakeState::Held),
         (Some("before_send"), true, WakeState::Suppressed),
         (None, true, WakeState::Suppressed),
-        (Some("unknown"), false, WakeState::Suppressed),
-        (Some("in_flight"), false, WakeState::Suppressed),
+        (Some("unknown"), false, WakeState::Held),
+        (Some("in_flight"), false, WakeState::Held),
     ] {
         let dir = tempfile::tempdir().unwrap(); let store = Journal::open(dir.path()).unwrap();
         let (parent, grant, input) = fixture(); store.put_grant(&parent.workspace_id, &grant).unwrap();
@@ -757,8 +757,7 @@ fn delegation_delivery_legacy_suppression_recovers_only_without_stop_or_claim_ev
         drop(store);
         let store = Journal::open(dir.path()).unwrap(); store.recover_deliveries().unwrap();
         assert_eq!(store.task(&task.id).unwrap().wake_state, expected, "{outcome:?}/{stop}");
-        if expected == WakeState::Pending { assert!(store.claim_outbox_delivery(&task.id).is_ok()); }
-        else if !stop { assert!(store.claim_outbox_delivery(&task.id).is_err()); }
+        if !stop { assert!(store.claim_outbox_delivery(&task.id).is_err()); }
     }
 }
 
@@ -771,4 +770,49 @@ fn delegation_delivery_legacy_stop_evidence_disposes_before_send_result() {
     store.update(&task.id, |t| { t.wake_state = WakeState::Suppressed; t.wake_error = Some("Parent user activity superseded automatic result delivery".into()); }).unwrap();
     store.recover_deliveries_with_stop_evidence(|_| Ok(true)).unwrap();
     assert_eq!(store.task(&task.id).unwrap().wake_error.as_deref(), Some("disposed_by_stop"));
+}
+
+#[test]
+fn delegation_delivery_round2_legacy_suppression_is_readable_held_until_explicit_action() {
+    use tauri::Manager;
+    for outcome in [None, Some("not_attempted"), Some("before_send")] {
+        let app = tauri::test::mock_app(); let db = crate::database::DatabaseStore::new_in_memory();
+        let dir = tempfile::tempdir().unwrap(); let store = Journal::open(dir.path()).unwrap();
+        let (parent, grant, input) = fixture(); store.put_grant(&parent.workspace_id, &grant).unwrap();
+        db.upsert_agent_chat_session(&parent.thread_id, &parent.workspace_id, None, "codex").unwrap(); app.manage(db);
+        let task = store.admit(&parent, &grant, "checkout", &input).unwrap();
+        store.apply_remote(&task.id, &remote(&task, TaskStatus::Completed)).unwrap();
+        store.update(&task.id, |t| { t.wake_state = WakeState::Suppressed; t.wake_error = Some("Parent user activity superseded automatic result delivery".into()); }).unwrap();
+        store.conn.lock().unwrap().execute("DELETE FROM delivery_outcomes WHERE task=?1", [&task.id]).unwrap();
+        if let Some(outcome) = outcome { store.conn.lock().unwrap().execute("INSERT INTO delivery_outcomes VALUES (?1,'old',?2)", rusqlite::params![task.id,outcome]).unwrap(); }
+        store.recover_deliveries().unwrap();
+        let held = store.task(&task.id).unwrap();
+        assert_eq!(held.wake_state, WakeState::Held);
+        assert!(held.remote.as_ref().unwrap().result.as_ref().unwrap().contains("specific final output"));
+        let id = super::canonical::ingest(app.handle(), &store, &held).unwrap();
+        let db = app.state::<crate::database::DatabaseStore>();
+        assert_eq!(db.delegation_task(&id).unwrap().unwrap().completion_delivery, "held");
+        assert!(db.delegation_task(&id).unwrap().unwrap().result.is_some());
+        assert!(db.pending_message_deliveries().unwrap().is_empty());
+        store.recover_deliveries().unwrap();
+        assert_eq!(store.task(&task.id).unwrap().wake_state, WakeState::Held);
+        store.explicit_delivery(&task.id).unwrap();
+        assert_eq!(store.task(&task.id).unwrap().wake_state, WakeState::Pending);
+    }
+}
+
+#[test]
+fn delegation_delivery_round2_one_recovery_evidence_error_keeps_other_tasks_available() {
+    let dir = tempfile::tempdir().unwrap(); let store = Journal::open(dir.path()).unwrap();
+    let (parent, grant, mut input) = fixture(); store.put_grant(&parent.workspace_id, &grant).unwrap();
+    let bad = store.admit(&parent, &grant, "checkout", &input).unwrap(); input.client_request_id = "good".into();
+    let good = store.admit(&parent, &grant, "checkout", &input).unwrap();
+    for task in [&bad, &good] {
+        store.apply_remote(&task.id, &remote(task, TaskStatus::Completed)).unwrap();
+        store.update(&task.id, |t| t.wake_state = WakeState::Suppressed).unwrap();
+    }
+    store.recover_deliveries_with_stop_evidence(|task| if task.id == bad.id { Err("fixture evidence read failure".into()) } else { Ok(false) }).unwrap();
+    assert_eq!(store.task(&bad.id).unwrap().wake_state, WakeState::Held);
+    assert!(store.task(&bad.id).unwrap().wake_error.unwrap().contains("fixture evidence read failure"));
+    assert_eq!(store.task(&good.id).unwrap().wake_state, WakeState::Held);
 }

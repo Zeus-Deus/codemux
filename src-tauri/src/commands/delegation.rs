@@ -64,7 +64,7 @@ const CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: another coding agent handed y
 /// The footer for a started suggested task, which runs on its own branch.
 pub(crate) const WORKTREE_CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: the user started this task from another chat's suggestions; that chat will read your final message. You are in your own git worktree on a new branch made from that chat's latest commit (its uncommitted edits are not here). Work independently. Ask a question if truly blocked; it reaches the coordinator. Otherwise choose a safe option and explain it. When done, COMMIT all of your work on this branch (do not push, do not switch branches) so it can be merged back; leave nothing uncommitted. End with a short report: what you changed (files), the commit(s), how you checked it, and anything left undone.";
 
-const TOOL_DESCRIPTION: &str = "Delegate a self-contained task to another installed coding agent in a background chat. The child sees only the brief. Results arrive independently through durable automatic delivery. Use client_request_id for retries: the same key and unchanged arguments return the same task and child. mode defaults to async; wait waits at most 20 seconds without cancelling on timeout. Use task_status/task_cancel with task_id; child_thread_id is a different identity. Read a complete terminal result with task_status to acknowledge its automatic delivery. Chat links use codemux-chat://v1/<threadId>. For another independent review round, delegate again with a fresh key and complete brief.";
+const TOOL_DESCRIPTION: &str = "Delegate a self-contained task to another installed coding agent in a background chat. The child sees only the brief. Results arrive independently through durable automatic delivery. Use client_request_id for retries: the same key and unchanged task arguments return the same task and child; async/wait controls may change on a retry. mode defaults to async; wait waits at most 20 seconds without cancelling on timeout. Use task_status/task_cancel with task_id; child_thread_id is a different identity. Read a complete terminal result with task_status to acknowledge its automatic delivery. Chat links use codemux-chat://v1/<threadId>. For another independent review round, delegate again with a fresh key and complete brief.";
 
 mod durable;
 pub(crate) use durable::{
@@ -886,6 +886,7 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
             if name != prefix_tool_name("codemux", TOOL_NAME) {
                 return self.call(caller, name, args);
             }
+            let requested_deadline = now_ms() + args["wait_ms"].as_u64().unwrap_or(20_000).min(20_000) as i64;
             let result =
                 delegate_with_call(&self.app, caller, args, self.is_installed, call_id, run_id);
             let result = match result {
@@ -894,7 +895,12 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                         let already_terminal = receipt["result"].is_object();
                         let id = receipt["task_id"].as_str().unwrap_or_default().to_string();
                         let _lease = WaitLease::acquire(self.app.clone(), id.clone());
-                        let remaining = receipt["wait_until"].as_i64().unwrap_or_else(now_ms).saturating_sub(now_ms()).max(0) as u64;
+                        let until = match self.app.state::<DatabaseStore>().arm_delegation_wait(&id, requested_deadline) {
+                            Ok(until) => until,
+                            Err(error) => return Some(mcp_result(Err(error))),
+                        };
+                        receipt["wait_until"] = json!(until);
+                        let remaining = until.saturating_sub(now_ms()).max(0) as u64;
                         let deadline = tokio::time::Instant::now() + Duration::from_millis(remaining);
                         loop {
                             // Register before reading to avoid losing a completion.
@@ -1623,6 +1629,10 @@ pub fn on_thread_stopped<R: Runtime>(app: &AppHandle<R>, thread_id: &str, kind: 
 /// Closing a parent retains independent worktree work. Only its direct tab
 /// children follow the old tab lifecycle; they do not recursively Stop a tree.
 fn close_tasks<R: Runtime>(app: &AppHandle<R>, thread: &str) {
+    // SSH tasks follow the parent's existing New Chat / pane rebind lifecycle.
+    if let Err(error) = crate::delegation::app::user_activity(app, thread, true) {
+        log::warn!("Could not cancel closed chat's SSH tasks: {error}");
+    }
     let Some(state) = app.try_state::<DelegationState>() else { return; };
     let reason = if state.task_matches(thread, |task| !task.placement.is_tab()) {
         StopReason::WorkspaceClosed

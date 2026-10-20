@@ -385,6 +385,34 @@ impl McpRegistry {
         self.host.get()?.call_async(caller,name,args,call_id,run_id).await
     }
 
+    pub(crate) async fn host_call_native(
+        &self, caller: &HostCaller, name: &str, args: &Value,
+        call_id: Option<&str>, run_id: Option<&str>,
+        permit: Option<&crate::delegation::authority::NativePermit>,
+    ) -> Option<Value> {
+        let host = self.host.get()?;
+        if name != "mcp__codemux__delegate_task" {
+            return host.call_async(caller, name, args, call_id, run_id).await;
+        }
+        let mut call = host.call_async(caller, name, args, call_id, run_id);
+        let mut admitted = false;
+        futures_util::future::poll_fn(|cx| {
+            if admitted { return call.as_mut().poll(cx); }
+            let guard = match permit.ok_or_else(|| "Native caller runtime/turn authority was revoked".to_string())
+                .and_then(|permit| permit.admit()) {
+                Ok(guard) => guard,
+                Err(error) => return std::task::Poll::Ready(Some(serde_json::json!({"content":[{"type":"text","text":error}],"isError":true}))),
+            };
+            // delegate_task persists admission in its first synchronous poll.
+            // Stop uses this same fence before advancing the database generation.
+            // Release the guard before any asynchronous wait for its result.
+            let result = call.as_mut().poll(cx);
+            drop(guard);
+            admitted = true;
+            result
+        }).await
+    }
+
     /// Tell live sessions to re-collect their tool lists because the host
     /// tool surface changed (e.g. a setting that gates it flipped). Rides the
     /// in-process status bus only — the Settings UI has no row for it.

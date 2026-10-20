@@ -29,7 +29,6 @@ pub(crate) struct NativePermit {
     owner: Arc<NativeAuthority>,
     generation: u64,
     turn: Option<String>,
-    activity: u64,
     pending: bool,
 }
 impl NativeAuthority {
@@ -58,9 +57,9 @@ impl NativeAuthority {
         owner
     }
     // Synchronous capability revocation precedes every asynchronous Stop wait.
-    pub fn invalidate_thread(thread: &str) {
+    pub fn user_activity_thread(thread: &str, stop: bool) {
         if let Some(owner) = RUNTIMES.lock().unwrap().get(thread).and_then(Weak::upgrade) {
-            owner.invalidate();
+            if stop { owner.invalidate(); } else { owner.human_activity(); }
         }
     }
     pub fn begin(&self) -> u64 {
@@ -118,9 +117,17 @@ impl NativeAuthority {
         for waker in state.dispatch_wakers.iter().filter_map(Weak::upgrade) {
             waker.wake();
         }
-        // User activity revokes tool/result capabilities immediately, but a
-        // successful ordinary send still needs its turn ID for Queue and Stop.
+        // Stop revokes tools, but the pending acknowledgement still owns its
+        // turn ID so Queue and Stop can settle it without reviving tools.
         self.changed.notify_waiters();
+    }
+    fn human_activity(&self) {
+        let mut state = self.state.lock().unwrap();
+        // A human send supersedes an automatic result dispatch, while the
+        // current turn (and any tool request it is waiting for) stays live.
+        state.activity += 1;
+        state.dispatch_wakers.retain(|w| w.strong_count() > 0);
+        for waker in state.dispatch_wakers.iter().filter_map(Weak::upgrade) { waker.wake(); }
     }
     pub fn finish_current(&self) {
         let mut state = self.state.lock().unwrap();
@@ -152,7 +159,6 @@ impl NativeAuthority {
             owner: self.clone(),
             generation: state.generation,
             turn: state.turn.clone(),
-            activity: state.activity,
             pending: state.pending,
         }
     }
@@ -230,7 +236,6 @@ impl NativePermit {
                 if !state.live
                     || !state.tools_live
                     || self.generation != state.generation
-                    || self.activity != state.activity
                 {
                     return Err("Native caller runtime/turn authority was revoked".into());
                 }
@@ -256,7 +261,6 @@ impl NativePermit {
             || !state.tools_live
             || state.turn.is_none()
             || self.generation != state.generation
-            || self.activity != state.activity
             || match &self.turn {
                 Some(turn) => state.turn.as_ref() != Some(turn),
                 None => !self.pending,
@@ -273,7 +277,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn user_activity_keeps_pending_and_acknowledged_lifecycle_but_revokes_tools() {
+    fn stop_keeps_pending_and_acknowledged_lifecycle_but_revokes_tools() {
         let owner = NativeAuthority::new("authority-overlapping-send");
         let generation = owner.begin();
         let early = owner.capture();
