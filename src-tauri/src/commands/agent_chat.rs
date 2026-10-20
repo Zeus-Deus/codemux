@@ -10790,7 +10790,9 @@ mod tests {
             format!("tool-0-{}.png", "b".repeat(64)),
             format!("tool-01-{}.png", "b".repeat(64)),
             format!("tool-1-{}.svg", "b".repeat(64)),
-            format!("tool-1-{}.png", "B".repeat(64)),
+            // A distinct row prevents this malformed name aliasing the valid
+            // lowercase cache file on case-insensitive filesystems.
+            format!("tool-{}-{}.png", row + 20, "B".repeat(64)),
             "tool-1-short.png".to_string(),
             ".tool-1-temp.tmp".to_string(),
         ];
