@@ -265,6 +265,10 @@ pub(crate) async fn call<R: Runtime>(
                     provider["provider_instance_id"] = provider["provider"].clone();
                     provider["models"] = provider["capabilities"]["models"].clone();
                     if provider["provider"] == "claude" {
+                        if let Some(modes) = provider["allowed_permission_modes"].as_array_mut() {
+                            modes.push(json!("plan"));
+                        }
+
                         if let Some(modes) =
                             provider["capabilities"]["permission_modes"].as_array_mut()
                         {

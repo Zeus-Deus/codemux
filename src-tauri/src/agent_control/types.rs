@@ -46,6 +46,19 @@ pub struct ControlCaller {
 }
 
 impl ControlCaller {
+    pub(crate) async fn revoked(&self) {
+        if let CallerPrincipal::Thread {
+            thread_id,
+            authority,
+            ceiling,
+            ..
+        } = &self.identity
+        {
+            authority.wait_revoked(thread_id, *ceiling).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
     pub(crate) fn admit<T>(&self, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         match (&self.identity, &self.admitted) {
             (

@@ -1985,6 +1985,8 @@ async fn native_callers_catalog_is_mode_independent_and_toggle_controls_new_sess
     let host=super::native::OrchestrationHost(app.handle().clone());
     let mut caller=HostCaller{control:None,thread_id:thread,provider:crate::agent_provider::ProviderKind::Claude,workspace_id:Some(workspace),permission_mode:Some("plan".into())};
     for provider in [crate::agent_provider::ProviderKind::Claude,crate::agent_provider::ProviderKind::Codex]{caller.provider=provider;for mode in ["plan","read-only","workspace-write","danger-full-access"]{caller.permission_mode=Some(mode.into());let tools=host.tools_for(&caller);assert!(tools.iter().any(|t|t.name=="thread_send"));assert!(tools.iter().any(|t|t.name=="thread_wait"));assert!(!tools.iter().any(|t|t.name=="thread_respond"));}}
+    let capabilities=super::native::call(app.handle().clone(),_actor,"orchestrator_capabilities".into(),json!({})).await.unwrap();
+    assert!(capabilities["providers"][0]["allowed_permission_modes"].as_array().unwrap().contains(&json!("plan")));
     app.state::<crate::database::DatabaseStore>().set_setting("agents.cross_provider_delegation","false").unwrap();
     assert!(host.tools_for(&caller).is_empty());
 }
@@ -2005,4 +2007,23 @@ async fn native_callers_project_inventory_bounded_reads_and_idle_wait_use_canoni
     assert_eq!(second["messages"][0]["content"]," bounded message");
     let wait=super::native::call(app.handle().clone(),actor,"thread_wait".into(),json!({"thread_id":thread,"timeout_ms":1})).await.unwrap();
     assert_eq!(wait["timed_out"],false);assert_eq!(wait["settled"],true);
+}
+
+#[tokio::test]
+async fn native_callers_superseded_wait_releases_delivery_without_cancelling_task(){
+    use crate::mcp::registry::{HostCaller,HostTools};
+    let (app,_,_root,workspace,thread,authority,actor)=native_caller_fixture("bypassPermissions").await;
+    let control=super::native::qualify(app.handle(),&actor).await.unwrap();
+    let handle=app.handle().clone();let parent=thread.clone();
+    let job=tokio::spawn(async move {
+        let host=crate::commands::delegation::DelegationHost::with_install_check(handle,|_|true);
+        let caller=HostCaller{control:Some(control),thread_id:parent,provider:crate::agent_provider::ProviderKind::Claude,workspace_id:Some(workspace),permission_mode:Some("bypassPermissions".into())};
+        host.call_async(&caller,"mcp__codemux__delegate_task",&json!({"provider":"claude","title":"Waiting child","task":"Complete this isolated mock child task independently.","mode":"wait","wait_ms":20000}),None,None).await.unwrap()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3),async{loop{if !app.state::<crate::database::DatabaseStore>().delegation_tasks(Some(&thread)).unwrap().is_empty(){break;}tokio::task::yield_now().await;}}).await.unwrap();
+    authority.invalidate();
+    let result=tokio::time::timeout(std::time::Duration::from_secs(3),job).await.unwrap().unwrap();
+    assert_eq!(result["isError"],true);
+    let tasks=app.state::<crate::database::DatabaseStore>().delegation_tasks(Some(&thread)).unwrap();
+    assert_eq!(tasks.len(),1);assert!(tasks[0].wait_until.is_none());assert!(!tasks[0].status.terminal());
 }

@@ -901,6 +901,9 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                         let remaining = until.saturating_sub(now_ms()).max(0) as u64;
                         let deadline = tokio::time::Instant::now() + Duration::from_millis(remaining);
                         loop {
+                            if let Some(control)=&caller.control {
+                                if let Err(error)=crate::agent_control::service::authorize(&self.app,control){return Some(mcp_result(Err(error.to_string())));}
+                            }
                             // Register before reading to avoid losing a completion.
                             let notified = task_changes().notified();
                             tokio::pin!(notified);
@@ -914,19 +917,18 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                                     break;
                                 }
                                 if task.result.is_some() {
-                                    if let Ok(task) = self
-                                        .app
-                                        .state::<DatabaseStore>()
-                                        .acknowledge_delegation_result(&caller.thread_id, &id)
-                                    {
-                                        receipt = task_receipt(&task);
-                                    }
+                                    let acknowledge=||self.app.state::<DatabaseStore>().acknowledge_delegation_result(&caller.thread_id,&id);
+                                    let acknowledged=if let Some(control)=&caller.control {control.admit(acknowledge)}else{acknowledge()};
+                                    match acknowledged {Ok(task)=>receipt=task_receipt(&task),Err(error)=>return Some(mcp_result(Err(error)))}
                                     break;
                                 }
                             }
-                            if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                                receipt["wait_timed_out"] = json!(true);
-                                break;
+                            let revoked=async {if let Some(control)=&caller.control {control.revoked().await;}else{std::future::pending::<()>().await;}};
+                            tokio::select! {
+                                biased;
+                                _=revoked=>return Some(mcp_result(Err("stale_caller: wait released; accepted task and result delivery remain available".into()))),
+                                _=tokio::time::sleep_until(deadline)=>{receipt["wait_timed_out"]=json!(true);break;},
+                                _=notified=>{},
                             }
                         }
                     }

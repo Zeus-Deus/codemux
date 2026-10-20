@@ -41,6 +41,34 @@ pub struct AuthorityIdentity {
     pub run_id: Option<String>,
 }
 impl AuthorityIdentity {
+    pub async fn wait_revoked(
+        &self,
+        thread: &str,
+        ceiling: crate::agent_control::permissions::Ceiling,
+    ) {
+        let owner = RUNTIMES.lock().unwrap().get(thread).and_then(Weak::upgrade);
+        let Some(owner) = owner else {
+            return;
+        };
+        loop {
+            let changed = owner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.verify(thread).is_err() {
+                return;
+            }
+            if owner
+                .state
+                .lock()
+                .unwrap()
+                .policy
+                .is_none_or(|current| !current.permits(ceiling))
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
     pub fn verify(&self, thread: &str) -> Result<(), String> {
         self.admit(thread, || Ok(()))
     }
@@ -84,6 +112,7 @@ impl NativeAuthority {
     pub fn set_policy(&self, provider: crate::agent_provider::ProviderKind, mode: Option<&str>) {
         self.state.lock().unwrap().policy =
             crate::agent_control::permissions::Ceiling::for_mode(provider, mode);
+        self.changed.notify_waiters();
     }
     pub fn effective_ceiling(
         thread: &str,
