@@ -146,8 +146,19 @@ pub(crate) async fn dispatch<R: Runtime>(
     app: &AppHandle<R>,
     row: crate::database::message_delivery::DeliveryRecord,
 ) {
+    dispatch_admitted(app, row, None).await;
+}
+
+pub(crate) async fn dispatch_admitted<R: Runtime>(
+    app: &AppHandle<R>,
+    row: crate::database::message_delivery::DeliveryRecord,
+    mut admitted_control: Option<NativeControlGuard>,
+) {
     let db = app.state::<DatabaseStore>();
-    if !db.claim_message_delivery(&row.id).unwrap_or(false) {
+    let admitted_generation = row.generation;
+    // The initial controller dispatch already owns its admission. Publishing
+    // it as pending would let the repair worker discard its native fence.
+    if admitted_control.is_none() && !db.claim_message_delivery(&row.id).unwrap_or(false) {
         return;
     }
     let _changed = DeliveryChange { app, thread: &row.thread_id };
@@ -155,6 +166,17 @@ pub(crate) async fn dispatch<R: Runtime>(
         Ok(Some(row)) => row,
         _ => return,
     };
+    if admitted_control.is_some() {
+        if row.state != "preparing" {
+            let _ = db.fail_message_delivery(&row.id, "Delivery held before initial dispatch");
+            return;
+        }
+        // Only a durable human release advances the admitted Stop fence.
+        // Session replacement alone cannot authorize an old operation.
+        if let Some((_, generation)) = admitted_control.as_mut().and_then(|control| control.admission.as_mut()) {
+            *generation = generation.saturating_add(row.generation.saturating_sub(admitted_generation));
+        }
+    }
     let payload = match serde_json::from_value::<DeliveryPayload>(
         row.dispatch_payload.unwrap_or(row.payload),
     ) {
@@ -169,7 +191,7 @@ pub(crate) async fn dispatch<R: Runtime>(
             return;
         }
     };
-    let control = payload.caller.map(|caller| {
+    let control = admitted_control.or_else(|| payload.caller.map(|caller| {
         NativeControlGuard {
             caller,
             workspace_id: db
@@ -181,10 +203,21 @@ pub(crate) async fn dispatch<R: Runtime>(
             admission: None,
         }
         .retain_admission(app)
-    });
+    }));
     if let Some(control) = &control {
         if let Err(error) = control.verify(app) {
-            if db.fail_message_delivery(&row.id, &error).ok().as_deref() == Some("rejected") {
+            // A definite refusal or cancellation settles this unqueued operation.
+            // Temporary binding failures still use the bounded retry path.
+            let denied = error.starts_with("permission_ceiling:")
+                || error.starts_with("permission_state_unconfirmed:")
+                || error.starts_with("grant_revoked:")
+                || error.starts_with("cancelled:");
+            let state = if denied {
+                db.finish_message_delivery(&row.id, "rejected", None, Some(&error)).map(|()| "rejected".to_string())
+            } else {
+                db.fail_message_delivery(&row.id, &error)
+            };
+            if state.ok().as_deref() == Some("rejected") {
                 warn_held(app, &row.thread_id, &error);
             }
             return;

@@ -340,7 +340,11 @@ pub(crate) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -
     let inflight = app.state::<DatabaseStore>().has_inflight_message_deliveries(&target.thread_id)?;
     let busy = inflight || active || !pending.is_empty() || !queued.is_empty() || !uncertain_queued.is_empty()
         || observed.as_ref().is_some_and(|view|matches!(view.phase.as_str(),"starting"|"running"|"waiting_approval"));
+    let historical_error = !active && observed.as_ref().is_none_or(|view| view.phase == "unknown")
+        && terminal.is_some_and(|event| super::state::turn_outcome(event["status"]["kind"].as_str(), event["status"]["subtype"].as_str()).0 == "error");
     let phase = if !pending.is_empty() { "waiting_approval" }
+    else if let Some(view) = observed.as_ref().filter(|view| matches!(view.phase.as_str(), "closed" | "error")) { view.phase.as_str() }
+    else if historical_error { "error" }
     else if !deliveries.is_empty() { "needs_attention" }
     else if !uncertain_queued.is_empty() && !active && queued.is_empty() { "needs_attention" }
     else if let Some(view) = observed.as_ref().filter(|view|view.phase != "unknown") { view.phase.as_str() }
@@ -408,9 +412,10 @@ pub(crate) async fn thread_send<R: Runtime>(
     let id = uuid::Uuid::new_v4().to_string();
     let mut context = super::delivery::SendContext::controller(caller);
     context.provenance.message_id = Some(id.clone());
+    let control = NativeControlGuard { caller:caller.clone(),workspace_id:input.workspace_id.clone(),thread_id:input.thread_id.clone(),provider,admission:None }.retain_admission(app);
     let command: SendTurnCommandInput = serde_json::from_value(json!({
         "thread_id":input.thread_id,"text":input.message,"delivery":input.delivery,
-        "model_override":null,"client_nonce":id,
+        "model_override":null,"client_nonce":input.client_request_id,
     }))
     .map_err(|e| ControlError::new("invalid_arguments", e.to_string()))?;
     let payload = serde_json::to_value(super::delivery::DeliveryPayload {
@@ -446,7 +451,7 @@ pub(crate) async fn thread_send<R: Runtime>(
                 hash: &hash,
                 workspace: &input.workspace_id,
             }),
-            false,
+            true,
         )
         .map_err(|e| {
             ControlError::new(
@@ -478,7 +483,7 @@ pub(crate) async fn thread_send<R: Runtime>(
             if let Some(barrier) = barrier {
                 barrier.acquire().await.unwrap().forget();
             }
-            super::delivery::dispatch(&owned, row).await;
+            super::delivery::dispatch_admitted(&owned, row, Some(control)).await;
         });
         super::delivery::notify();
     }

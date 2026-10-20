@@ -780,6 +780,10 @@ async fn review_l2_receipt_admitted_send_cannot_restart_after_completed_native_s
         "workspace_id":workspace,"thread_id":thread,"client_request_id":"review-l2-send","message":"Must not resurrect",
     })).await.unwrap();
     assert_eq!(send["state"], "accepted");
+    let row = app.state::<crate::database::DatabaseStore>().message_delivery(send["delivery_id"].as_str().unwrap()).unwrap().unwrap();
+    assert_eq!(row.state, "preparing");
+    super::delivery::dispatch(app.handle(), row).await;
+    assert_eq!(provider.calls.snapshot().iter().filter(|c| matches!(c, mock_agent_provider::MockCall::SendTurn(_, _))).count(), 0, "repair worker must not steal the original admission fence");
     crate::commands::agent_chat::agent_chat_stop_session(app.handle().clone(), ProviderKind::Claude, ThreadId(thread.into())).await.unwrap();
     assert!(!provider.has_session(&ThreadId(thread.into())).await);
     barrier.add_permits(1);
@@ -880,12 +884,24 @@ async fn capabilities_discover_provider_owned_models_and_operations() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupt_reaches_native_provider_without_deleting_thread_or_pane() {
+    use crate::agent_provider::{ProviderRuntimeEvent, SessionStatus, ThreadId};
     let (app, provider, root, workspace) = fixture().await;
     let launched = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
         "workspace_id":workspace,"client_request_id":"launch-interrupt","provider":"claude","permission_mode":"default",
     })).await.unwrap();
     let launched = settle_operation(&app,&launched).await;
     let thread = launched["thread_id"].as_str().unwrap();
+    // Controller interrupt selects an existing run; an idle session has none.
+    let idle = execute(app.handle(), &ControlCaller::trusted(), "thread_interrupt", json!({
+        "workspace_id":workspace,"thread_id":thread,"client_request_id":"interrupt-idle",
+    })).await.unwrap();
+    assert_eq!(settle_operation(&app, &idle).await["result"]["reached_provider"], false);
+    assert!(provider.calls.snapshot().iter().all(|call| !matches!(call, mock_agent_provider::MockCall::InterruptTurn(_, _))));
+    let turn = crate::commands::agent_chat::send_desktop_turn(app.handle().clone(), crate::agent_provider::ProviderKind::Claude,
+        serde_json::from_value(json!({"thread_id":thread,"text":"Interrupt this run"})).unwrap()).await.unwrap();
+    crate::commands::agent_chat::forward_event(app.handle(), ProviderRuntimeEvent::SessionStateChanged {
+        thread_id: ThreadId(thread.into()), status: SessionStatus::Running {active_turn: turn.turn_id.clone()},
+    });
     let receipt = execute(app.handle(), &ControlCaller::trusted(), "thread_interrupt", json!({
         "workspace_id":workspace,"thread_id":thread,"client_request_id":"interrupt-a",
     })).await.unwrap();
@@ -896,6 +912,7 @@ async fn interrupt_reaches_native_provider_without_deleting_thread_or_pane() {
     assert!(app.state::<crate::database::DatabaseStore>().get_agent_chat_session(thread).is_some());
     assert!(root.path().is_dir());
     assert_eq!(provider.calls.snapshot().iter().filter(|call|matches!(call,mock_agent_provider::MockCall::InterruptTurn(_, _))).count(),1);
+    assert!(provider.calls.snapshot().iter().any(|call| matches!(call,mock_agent_provider::MockCall::InterruptTurn(_, Some(id)) if id == &turn.turn_id)));
     assert_eq!(provider.calls.snapshot().iter().filter(|call|matches!(call,mock_agent_provider::MockCall::StopSession(_))).count(),0);
 }
 
@@ -1248,6 +1265,27 @@ async fn orchestration_message_held_queue_and_unknown_delivery_do_not_prevent_wa
     assert_eq!(result["settled"],true,"{result}");
     assert_eq!(result["status"]["phase"],"needs_attention");
     assert_eq!(result["status"]["deliveries_needing_attention"].as_array().unwrap().len(),1);
+}
+
+#[tokio::test]
+async fn orchestration_message_definite_error_survives_attention_and_cold_status() {
+    use crate::agent_provider::{ProviderRuntimeEvent,ThreadId,TurnId,TurnStatus};
+    let (app,_provider,_root,workspace)=fixture().await;
+    let thread="error-with-held-delivery";
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_session(thread,&workspace,None,"claude").unwrap();
+    db.admit_message_delivery("held",thread,"held",&json!({"origin":"controller"}),"epoch",0,None,true).unwrap();
+    db.refuse_message_delivery("held","permission_ceiling: refused before send").unwrap();
+    crate::commands::agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::TurnCompleted {
+        thread_id:ThreadId(thread.into()),turn_id:TurnId("failed-turn".into()),status:TurnStatus::Error {subtype:"provider_error".into(),message:"Definite failure".into()},usage:None,
+    });
+    for cold in [false,true] {
+        if cold { app.unmanage::<NativeControlState>().unwrap(); app.manage(NativeControlState::default()); }
+        let result=execute(app.handle(),&ControlCaller::trusted(),"thread_wait",json!({"workspace_id":workspace,"thread_id":thread,"timeout_ms":1})).await.unwrap();
+        assert_eq!(result["status"]["phase"],"error","{result}");
+        assert_eq!(result["settled"],true,"{result}");
+        assert_eq!(result["status"]["deliveries_needing_attention"].as_array().unwrap().len(),1);
+    }
 }
 
 #[tokio::test(flavor="multi_thread",worker_threads=2)]

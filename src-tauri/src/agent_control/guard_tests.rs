@@ -968,28 +968,70 @@ async fn review_s2_actual_acp_queue_drain_revalidates_native_worker_ceiling() {
     app.state::<ProviderRegistry>().set_cursor(provider.clone()).await;
     let mut input = start("guarded-queue", root.path()); input.permission_mode = Some("ask".into());
     agent_chat::agent_chat_start_session(app.handle().clone(), pane, ProviderKind::Cursor, input, Some("guarded-queue".into())).await.unwrap();
+    let bridge = bridge_queue_events(app.handle(), provider.as_ref());
     let mut events = provider.event_stream();
     let mut first = send("guarded-queue"); first.text = "await-cancel".into();
     let first = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
     let mut control = guard(&workspace, "guarded-queue"); control.provider=ProviderKind::Cursor; control.caller.access=ControlAccess::Supervised;
     let queued = agent_chat::send_turn_with_control(app.handle().clone(), ProviderKind::Cursor, send("guarded-queue"), Some(control)).await.unwrap();
     let queued_id = queued.queued_id.unwrap();
+    let saved = saved_queue(app.handle(), "guarded-queue", &queued_id).await;
+    let mut native = send("guarded-queue"); native.text = "native-after-refusal".into();
+    let native_id = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, native).await.unwrap().queued_id.unwrap();
     app.state::<crate::database::DatabaseStore>().update_agent_chat_session_config("guarded-queue",
         &crate::database::AgentChatSessionConfig {permission_mode:Some(Some("agent".into())),..Default::default()}).unwrap();
     // Interrupt the selected turn: a blanket Stop holds the queue instead.
     provider.interrupt_turn(ThreadId("guarded-queue".into()), Some(first.turn_id)).await.unwrap();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut observed = Vec::new(); let mut native_turn = None;
         while let Some(event) = events.next().await {
-            match &event {
-                ProviderRuntimeEvent::QueuedTurnCancelled {queued_id:id,..} | ProviderRuntimeEvent::QueuedTurnDispatched {queued_id:id,..} if id == &queued_id => return event,
-                _ => {}
+            if let ProviderRuntimeEvent::QueuedTurnDispatched {queued_id,turn_id,..} = &event {
+                if queued_id == &native_id { native_turn = Some(turn_id.clone()); }
             }
+            let done = matches!(&event, ProviderRuntimeEvent::TurnCompleted {turn_id,status:TurnStatus::Success,..} if Some(turn_id) == native_turn.as_ref());
+            observed.push(event);
+            if done { return observed; }
         }
         panic!("fixture stream closed before queue disposition")
     }).await.unwrap();
+    assert_refused_queue(app.handle(), &saved).await;
+    assert!(observed.iter().all(|e| !matches!(e, ProviderRuntimeEvent::QueuedTurnCancelled {queued_id:id,..} | ProviderRuntimeEvent::QueuedTurnDispatched {queued_id:id,..} if id == &queued_id)), "refused explicit input must stay held: {observed:?}");
+    let native_turn = observed.iter().find_map(|e| match e {
+        ProviderRuntimeEvent::QueuedTurnDispatched {queued_id,turn_id,..} if queued_id == &native_id => Some(turn_id),
+        _ => None,
+    }).unwrap();
+    assert!(observed.iter().any(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted {turn_id,item:CompletedItem::AssistantText {text},..} if turn_id == native_turn && text == "[0]")), "native Q2 must receive the fixture's actual transport chunk: {observed:?}");
     provider.stop_session(ThreadId("guarded-queue".into())).await.unwrap();
-    assert!(matches!(result, ProviderRuntimeEvent::QueuedTurnCancelled { .. }),
-        "the actual provider drain must cancel undispatched authority that changed after enqueue: {result:?}");
+    bridge.abort(); let _ = bridge.await;
+}
+
+fn bridge_queue_events(app: &tauri::AppHandle<tauri::test::MockRuntime>, provider: &dyn AgentProvider) -> tokio::task::JoinHandle<()> {
+    use futures_util::StreamExt;
+    let mut stream = provider.event_stream(); let app = app.clone();
+    tokio::spawn(async move { while let Some(event) = stream.next().await { agent_chat::forward_event(&app, event); } })
+}
+
+async fn saved_queue(app: &tauri::AppHandle<tauri::test::MockRuntime>, thread: &str, queued: &str) -> crate::database::queued_turns::QueuedTurnRecord {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if let Some(row) = app.state::<crate::database::DatabaseStore>().get_queued_turn(thread, queued) { break row; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("actual queue event must persist the saved identity")
+}
+
+async fn assert_refused_queue(app: &tauri::AppHandle<tauri::test::MockRuntime>, saved: &crate::database::queued_turns::QueuedTurnRecord) {
+    let db = app.state::<crate::database::DatabaseStore>();
+    let id = saved.provenance.delivery_id.as_deref().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !db.message_delivery(id).unwrap().is_some_and(|row| row.state == "held") { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    let row = db.message_delivery(id).unwrap().unwrap();
+    assert!(!row.attempted, "denied input must never reach submission");
+    assert_eq!(row.hold_reason.as_deref(), Some("refused"));
+    assert!(row.error.as_deref().unwrap().contains("permission"));
+    assert_eq!(db.get_queued_turn(&saved.thread_id, &saved.queued_id).as_ref(), Some(saved), "refusal must preserve the full saved identity and input");
+    assert!(db.thread_message_delivery_attention(&saved.thread_id).unwrap().iter().any(|attention| attention.id == id && attention.error == row.error), "the refusal reason must remain visible");
 }
 
 fn review_acp_rig(root: &std::path::Path) -> std::path::PathBuf {
@@ -1602,8 +1644,8 @@ async fn review_fr1_c1_stop_during_selected_config_rpc_terminalizes_every_id() {
     assert_eq!(status["runtime_live"], false);
     assert_eq!(status["queued_ids"], serde_json::json!([]));
     assert_eq!(status["phase"], "closed");
-    // Closed intentionally is not a completed-turn wait result.
-    assert_eq!(status["settled"], false);
+    // A definite shutdown settles even while explicit deliveries remain held.
+    assert_eq!(status["settled"], true);
 }
 
 #[cfg(unix)]
@@ -1775,6 +1817,7 @@ async fn review_r1_denied_guarded_acp_followup_preserves_native_followup() {
     use futures_util::StreamExt;
     let thread = "review-r1";
     let (app, _root, workspace, provider) = review_acp_fixture(thread).await;
+    let bridge = bridge_queue_events(app.handle(), provider.as_ref());
     let mut events = provider.event_stream();
     let mut first = send(thread); first.text = "review-hold".into();
     agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor, first).await.unwrap();
@@ -1792,6 +1835,7 @@ async fn review_r1_denied_guarded_acp_followup_preserves_native_followup() {
     let mut native = send(thread); native.text = "native-q2".into();
     let q2 = agent_chat::send_desktop_turn(app.handle().clone(), ProviderKind::Cursor,
         native).await.unwrap().queued_id.unwrap();
+    let saved = saved_queue(app.handle(), thread, &q1).await;
     // Revoke only Q1's dispatch authority, without Stop or provider failure.
     app.state::<crate::database::DatabaseStore>().update_agent_chat_session_config(thread,
         &crate::database::AgentChatSessionConfig {permission_mode: Some(Some("agent".into())), ..Default::default()}).unwrap();
@@ -1811,12 +1855,14 @@ async fn review_r1_denied_guarded_acp_followup_preserves_native_followup() {
         }
     }).await.unwrap();
     let healthy = provider.has_session(&ThreadId(thread.into())).await;
+    assert_refused_queue(app.handle(), &saved).await;
     provider.stop_session(ThreadId(thread.into())).await.unwrap();
-    assert!(observed.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnCancelled {queued_id, ..} if queued_id == &q1)), "{observed:?}");
+    assert!(!observed.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnCancelled {queued_id, ..} if queued_id == &q1)), "refused Q1 stays held for manual retry: {observed:?}");
     assert!(!observed.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnDispatched {queued_id, ..} if queued_id == &q1)), "unauthorized Q1 dispatched: {observed:?}");
     assert!(observed.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnDispatched {queued_id, ..} if queued_id == &q2)), "a per-input denial must not cancel native Q2: {observed:?}");
     assert!(observed.iter().any(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted {item: CompletedItem::AssistantText {text}, ..} if text == "native-q2")), "native Q2 must reach the real transport: {observed:?}");
     assert!(healthy);
+    bridge.abort(); let _ = bridge.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
