@@ -1178,11 +1178,8 @@ impl AcpSession {
             let response = if interrupted_before_send {
                 Ok(json!({ "stopReason": "cancelled" }))
             } else {
-                self.send_prompt(&prompt, generation, checkpoint.as_ref()).await
+                self.send_prompt(&turn_id, &prompt, generation, checkpoint.as_ref()).await
             };
-            if !interrupted_before_send && matches!(&response, Ok(_) | Err(RpcChildError::RpcError(_))) {
-                if let Some(checkpoint) = &checkpoint { checkpoint.accepted(&turn_id).await; }
-            }
             let mut next = self.finish_turn(turn_id, response, generation).await;
             loop {
                 let Some((queued, next_generation)) = next else {
@@ -1313,7 +1310,7 @@ impl AcpSession {
     /// and that mutex is FIFO so the cancel queues behind the prompt and
     /// still reaches the child second. `session/cancel` is a notification
     /// with no reply, so repeating it is harmless.
-    async fn send_prompt(&self, prompt: &[Value], generation: u64, checkpoint: Option<&Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>) -> Result<Value, RpcChildError> {
+    async fn send_prompt(&self, turn: &TurnId, prompt: &[Value], generation: u64, checkpoint: Option<&Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>) -> Result<Value, RpcChildError> {
         let prompt_id = self.dialect.is_grok().then(|| self.opaque_id("prompt"));
         let fallback_rx = if let Some(prompt_id) = prompt_id.as_ref() {
             let (tx, rx) = oneshot::channel();
@@ -1355,6 +1352,11 @@ impl AcpSession {
             tokio::select! {
                 biased;
                 response = &mut completion => {
+                    // Authority refusals above use the same RPC error type as
+                    // native replies, but carry no prompt-admission evidence.
+                    if matches!(&response, Ok(_) | Err(RpcChildError::RpcError(_))) {
+                        if let Some(checkpoint) = checkpoint { checkpoint.accepted(turn).await; }
+                    }
                     self.clear_xai_prompt_completion(prompt_id.as_deref()).await;
                     return response;
                 },

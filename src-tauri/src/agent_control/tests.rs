@@ -82,6 +82,49 @@ async fn review_r1_merged_saved_queue_sends_with_original_delivery_identity() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn review_r1_acp_local_rpc_refusal_is_not_native_acceptance() {
+    use crate::agent_provider::{AgentProvider,ProviderKind,ProviderRuntimeEvent,SendTurnInput,ThreadId,TurnDispatchCheckpoint};
+    use futures_util::StreamExt;
+    use std::{os::unix::fs::PermissionsExt,sync::atomic::{AtomicBool,AtomicUsize,Ordering}};
+    #[derive(Debug,Default)]
+    struct Refusal { calls:AtomicUsize, accepted:AtomicBool }
+    #[async_trait::async_trait]
+    impl TurnDispatchCheckpoint for Refusal {
+        fn authorize_dispatch(&self)->Result<(),crate::agent_provider::ProviderError> {
+            if self.calls.fetch_add(1,Ordering::SeqCst)==0 {Ok(())}
+            else {Err(crate::agent_provider::ProviderError::ValidationError {message:"refused at final prompt boundary".into()})}
+        }
+        async fn accepted(&self,_:&crate::agent_provider::TurnId) { self.accepted.store(true,Ordering::SeqCst); }
+        async fn prepare(&self) {}
+        async fn commit(&self) {}
+        async fn abort(&self) {}
+    }
+    let root=tempfile::tempdir().unwrap();
+    let binary=root.path().join("peer.py");
+    std::fs::write(&binary,include_str!("../../tests/helpers/agent_control_acp_peer.py")).unwrap();
+    std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let rig=root.path().join("rig");std::fs::create_dir(&rig).unwrap();
+    let provider=crate::agent_provider::cursor::CursorAgentProvider::new(crate::agent_provider::cursor::CursorProviderConfig {binary,event_channel_capacity:64,mcp_registry:None});
+    let thread=ThreadId("review-r1-local-rpc-refusal".into());
+    provider.start_session(serde_json::from_value(json!({"thread_id":thread,"cwd":root.path(),"permission_mode":"ask","additional_directories":[],"env":{"CODEMUX_AGENT_CONTROL_FIXTURE_ROOT":rig}})).unwrap()).await.unwrap();
+    let checkpoint=Arc::new(Refusal::default());
+    let mut input:SendTurnInput=serde_json::from_value(json!({"thread_id":thread,"text":"must not prompt"})).unwrap();
+    input.turn_checkpoint=Some(checkpoint.clone());
+    let mut events=provider.event_stream();
+    provider.send_turn(input).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3),async {
+        while !matches!(events.next().await,Some(ProviderRuntimeEvent::TurnCompleted {..})) {}
+    }).await.unwrap();
+    let wire=std::fs::read_to_string(rig.join("peer-wire.jsonl")).unwrap();
+    provider.stop_session(thread).await.unwrap();
+    assert_eq!(checkpoint.calls.load(Ordering::SeqCst),2);
+    assert!(!checkpoint.accepted.load(Ordering::SeqCst));
+    assert!(!wire.contains("session/prompt"));
+    assert_eq!(provider.kind(),ProviderKind::Cursor);
+}
+
 // Capture the actual native Channel serializer, never a hand-built DTO.
 fn mario_channel(app: &tauri::AppHandle<tauri::test::MockRuntime>, thread: &str) -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
     let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
