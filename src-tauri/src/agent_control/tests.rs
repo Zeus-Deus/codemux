@@ -1979,6 +1979,24 @@ async fn native_callers_plan_ceiling_and_dispatch_downgrade(){
 }
 
 #[tokio::test]
+async fn native_callers_null_launch_options_inherit_effective_ceiling(){
+    let (app,_,_root,_workspace,_thread,_authority,actor)=native_caller_fixture("plan").await;
+    for instance in [serde_json::Value::Null,json!("claude")] {
+        let receipt=super::native::call(app.handle().clone(),actor.clone(),"thread_launch".into(),json!({"workspace_id":null,"provider":null,"provider_instance_id":instance,"permission_mode":null,"client_request_id":null,"title":"Inherited Plan child"})).await.unwrap();
+        let outcome=tokio::time::timeout(std::time::Duration::from_secs(15),async {
+            loop {
+                let status=super::native::call(app.handle().clone(),actor.clone(),"operation_status".into(),json!({"operation_id":receipt["operation_id"]})).await.unwrap();
+                if !matches!(status["state"].as_str(),Some("accepted"|"running")) {break status;}
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(outcome["state"],"succeeded","{outcome}");
+        let child=outcome["thread_id"].as_str().unwrap();
+        assert_eq!(app.state::<crate::database::DatabaseStore>().get_agent_chat_session(child).unwrap().permission_mode.as_deref(),Some("plan"));
+    }
+}
+
+#[tokio::test]
 async fn native_callers_catalog_is_mode_independent_and_toggle_controls_new_sessions(){
     use crate::mcp::registry::{HostCaller,HostTools};
     let (app,_,_root,workspace,thread,_authority,_actor)=native_caller_fixture("plan").await;

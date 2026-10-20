@@ -59,6 +59,7 @@ impl<R: Runtime> HostTools for OrchestrationHost<R> {
         let mut result: Vec<_> = tools.into_iter().map(|mut tool| {
             if let Some(required) = tool.input_schema["required"].as_array_mut() { required.retain(|v| v != "workspace_id" && !(tool.name == "thread_launch" && (v == "permission_mode" || v == "provider" || v == "client_request_id"))); }
             if tool.name == "thread_launch" {
+                tool.description = "Start a top-level chat only when the user requests a separate conversation. Defaults to the caller's existing project-root checkout. Omitted or null permission_mode inherits the caller's effective ceiling; explicit modes cannot exceed it. Worktree strategies are unsupported. Returns an operation receipt; use operation_status. Use delegate_task for owned child work.";
                 tool.input_schema["properties"]["provider_instance_id"] = json!({"type":"string"});
                 tool.input_schema["properties"]["worktree"] = json!({"description":"Unsupported in this version"});
             }
@@ -66,7 +67,10 @@ impl<R: Runtime> HostTools for OrchestrationHost<R> {
                 tool.input_schema["properties"]["text_offset"]=json!({"type":"integer","minimum":0});
                 tool.input_schema["properties"]["max_chars"]=json!({"type":"integer","minimum":1,"maximum":16000});
             }
-            if tool.name == "thread_send" { tool.input_schema["properties"]["delivery"]["enum"] = json!(["auto","queue","steer"]); }
+            if tool.name == "thread_send" {
+                tool.description = "Send a message to another local chat as this authenticated agent. Auto starts an idle receiver, steers a ready busy receiver, or queues. Queue and steer may be selected explicitly. Use thread_interrupt for selected-run interruption. A queued receipt is not completion. Reuse client_request_id unchanged on retry.";
+                tool.input_schema["properties"]["delivery"]["enum"] = json!(["auto","queue","steer"]);
+            }
             let description = format!("{}\nUse codemux-chat://v1/<thread_id> for chat links. When asked to report to a coordinator, send the result with thread_send. Do not poll; after async delegation, end the turn and let the result wake you.", tool.description);
             McpTool { name: tool.name.into(), prefixed_name: prefix_tool_name("codemux", tool.name), description: Some(description), input_schema: tool.input_schema, server_id: "codemux".into() }
         }).collect();
@@ -234,10 +238,10 @@ pub(crate) async fn call<R: Runtime>(
             .state::<DatabaseStore>()
             .get_agent_chat_session(id)
             .ok_or("thread_not_found")?;
-        if args.get("workspace_id").is_none() {
+        if args.get("workspace_id").is_none_or(Value::is_null) {
             args["workspace_id"] = json!(target.workspace_id);
         }
-    } else if name != "operation_status" && args.get("workspace_id").is_none() {
+    } else if name != "operation_status" && args.get("workspace_id").is_none_or(Value::is_null) {
         let record = app
             .state::<DatabaseStore>()
             .get_agent_chat_session(&actor.thread_id)
@@ -354,13 +358,14 @@ fn prepare_launch(
     if let Some(instance) = args
         .as_object_mut()
         .and_then(|o| o.remove("provider_instance_id"))
+        .filter(|instance| !instance.is_null())
     {
-        if args.get("provider").is_some_and(|p| p != &instance) {
+        if args.get("provider").is_some_and(|p| !p.is_null() && p != &instance) {
             return Err("invalid_arguments: conflicting provider selection".into());
         }
         args["provider"] = instance;
     }
-    if args.get("provider").is_none() {
+    if args.get("provider").is_none_or(Value::is_null) {
         args["provider"] = json!(actor.provider);
     }
     let provider: ProviderKind =
@@ -368,14 +373,14 @@ fn prepare_launch(
     if !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
         return Err("unsupported_provider: native launch injection is currently available for Claude and Codex".into());
     }
-    if args.get("permission_mode").is_none() {
+    if args.get("permission_mode").is_none_or(Value::is_null) {
         args["permission_mode"] = json!(caller
             .ceiling()
             .ok_or("Missing caller ceiling")?
             .inherited(provider)
             .map_err(|e| e.to_string())?);
     }
-    if args.get("client_request_id").is_none() {
+    if args.get("client_request_id").is_none_or(Value::is_null) {
         args["client_request_id"] = json!(uuid::Uuid::new_v4().to_string());
     }
     Ok(())
