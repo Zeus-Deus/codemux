@@ -1,16 +1,17 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { EdgeFades, useScrollEdges } from "./scroll-fades";
 
 afterEach(cleanup);
 
-function Scroller() {
+function Scroller({ rows = [] }: { rows?: string[] }) {
   const [ref, edges] = useScrollEdges<HTMLDivElement>();
   return (
     <div>
       <div ref={ref} data-testid="scroller">
         <span data-testid="label">GPT-5.4</span>
+        {rows.map((row) => <span key={row}>{row}</span>)}
       </div>
       <EdgeFades edges={edges} className="from-popover" testId="list" />
     </div>
@@ -59,4 +60,32 @@ it("follows content that changes without a scroll", async () => {
     screen.getByTestId("label").firstChild!.textContent = "A much longer model name that wraps";
   });
   await waitFor(() => expect(screen.getByTestId("list-bottom-fade")).toHaveAttribute("data-visible", "true"));
+});
+
+it("stops observing rows that left", async () => {
+  const observed = new Set<Element>();
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe(el: Element) {
+        observed.add(el);
+      }
+      unobserve(el: Element) {
+        observed.delete(el);
+      }
+      disconnect() {
+        observed.clear();
+      }
+    },
+  );
+  try {
+    const { rerender } = render(<Scroller rows={["a", "b"]} />);
+    expect(observed.size).toBe(4);
+    rerender(<Scroller rows={["a"]} />);
+    await waitFor(() => expect(observed.size).toBe(3));
+    const scroller = screen.getByTestId("scroller");
+    expect([...observed].every((el) => el === scroller || el.parentElement === scroller)).toBe(true);
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

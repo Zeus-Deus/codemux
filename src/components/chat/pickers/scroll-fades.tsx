@@ -29,6 +29,8 @@ export function useScrollEdges<T extends HTMLElement>(): [(node: T | null) => vo
     // come and go or a refreshed label wraps.
     const resize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(sync);
     const observeContent = () => {
+      // Start over so rows that left are not kept observed.
+      resize?.disconnect();
       resize?.observe(node);
       for (const child of node.children) resize?.observe(child);
     };

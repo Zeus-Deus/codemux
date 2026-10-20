@@ -29,8 +29,8 @@ interface ProviderAccountsStore {
    *  over from that provider's default. */
   picks: Record<string, string>;
   /** Picks the app made to match what a draft shows, by `pickKey`, rather
-   *  than ones the user chose: only these follow the draft's target. Shared
-   *  so every view of a draft agrees. */
+   *  than ones the user chose: only these follow the app-wide default.
+   *  Shared so every view of a draft agrees. */
   autoPicks: Record<string, boolean>;
   load: (force?: boolean) => Promise<void>;
   /** Also asks Codex who each home is signed in as (spawns the CLI). */
