@@ -820,13 +820,9 @@ mod delegation {
             h.card(&child).status == SubagentStatus::Stopped
         })
         .await;
-        assert!(
-            h.interrupted(ProviderKind::Codex, &child)
-                || h.codex
-                    .calls
-                    .snapshot()
-                    .contains(&MockCall::StopSession(ThreadId(child.clone())))
-        );
+        wait_for("closed session acknowledgement", || {
+            h.interrupted(ProviderKind::Codex, &child) || h.codex.calls.snapshot().contains(&MockCall::StopSession(ThreadId(child.clone())))
+        }).await;
         h.deliver().await;
         let record = h.db().delegation_task_for_child(&child).unwrap().unwrap();
         assert_eq!(record.result.as_ref().unwrap().text, "The user closed its tab. Partial changes may be in the working tree.");

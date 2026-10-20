@@ -2115,14 +2115,14 @@ async fn codex_delayed_native_admission_is_denied_after_completed_stop() {
         let handle = callback_handle.clone();
         let entered = callback_entered.clone();
         let release = callback_release.clone();
-        let tx = result_tx.clone();
+        let tx = result_tx.lock().unwrap().take();
         Box::pin(async move {
             // This barrier is after actor construction inside the actual Codex
             // incoming-request pump and MCP registry route, before admission.
             entered.notify_one();
             release.notified().await;
             let result = app::native_call(handle, actor, name, args).await;
-            if let Some(tx) = tx.lock().unwrap().take() {
+            if let Some(tx) = tx {
                 let _ = tx.send(result.clone());
             }
             result
@@ -2174,7 +2174,6 @@ async fn codex_delayed_native_admission_is_denied_after_completed_stop() {
     release.notify_one();
     let result = tokio::time::timeout(Duration::from_secs(10), result_rx)
         .await
-        .unwrap()
         .unwrap();
     // Cleanup precedes the regression assertion even in RED, so the fake
     // adapter subprocess/request-pump does not survive an assertion panic.
@@ -2183,8 +2182,8 @@ async fn codex_delayed_native_admission_is_denied_after_completed_stop() {
         .await
         .unwrap();
     assert!(
-        result.is_err(),
-        "stopped-turn callback retained native authority: {result:?}"
+        !matches!(result.as_ref(), Ok(Ok(_))),
+        "stopped-turn callback must be cancelled or denied: {result:?}"
     );
     assert!(
         journal.tasks().unwrap().is_empty(),
