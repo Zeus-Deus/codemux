@@ -597,8 +597,10 @@ pub(super) fn admit_in_transaction(
         }
         if payload["caller"]["identity"]["kind"] == "thread" && payload["provenance"]["created_by"] == "agent" {
             let sender=payload["caller"]["identity"]["thread_id"].as_str().ok_or("Missing agent sender")?;
-            super::delegation_tasks::admit_agent_message(tx,sender,thread,id)?;
-            super::delegation_tasks::admit_followup(tx,sender,thread,id,payload)?;
+            if !super::delegation_tasks::admitted_task_start(tx,sender,thread,payload)? {
+                super::delegation_tasks::admit_agent_message(tx,sender,thread,id)?;
+                super::delegation_tasks::admit_followup(tx,sender,thread,id,payload)?;
+            }
         }
         let (principal, operation_id) = match &operation {
             Some(op) => {

@@ -229,6 +229,24 @@ pub(crate) struct RootContext {
     pub hop: u32,
     pub causation_id: String,
 }
+/// The initial task message spends the task's existing reservation. It must
+/// preserve the child's lineage context rather than treating it as a new send.
+pub(super) fn admitted_task_start(
+    tx: &Connection,
+    sender: &str,
+    target: &str,
+    payload: &Value,
+) -> Result<bool, String> {
+    if payload["origin"] != "delegation" || payload["caller"]["admitted"]["kind"] != "task" {
+        return Ok(false);
+    }
+    let Some(id) = payload["caller"]["admitted"]["task_id"].as_str() else {
+        return Ok(false);
+    };
+    Ok(read(tx, id)?.is_some_and(|task| {
+        task.parent_thread_id == sender && task.child_thread_id.as_deref() == Some(target)
+    }))
+}
 pub(super) fn admit_agent_message(
     tx: &Connection,
     sender: &str,
@@ -1371,5 +1389,28 @@ mod native_budget_tests {
             .admit_message_delivery("extra", "b", "extra", &payload, "epoch", 0, None, false)
             .unwrap_err()
             .contains("resource_limit"));
+    }
+    #[test]
+    fn native_task_start_uses_reserved_budget_and_preserves_child_context() {
+        let db = DatabaseStore::new_in_memory();
+        db.orchestration_human_root("parent").unwrap();
+        let root = db.orchestration_context("parent").unwrap().root_id;
+        for i in 0..6 {
+            let child = format!("child-{i}");
+            let id = format!("task-{i}");
+            let task = record(&db, "parent", &child, &id, vec![]);
+            db.admit_delegation_task(&task, None, &Value::Null).unwrap();
+            let payload = serde_json::json!({"origin":"delegation","caller":{"identity":{"kind":"thread","thread_id":"parent"},"admitted":{"kind":"task","task_id":id}},"provenance":{"created_by":"agent"}});
+            db.admit_message_delivery(&format!("delivery-{i}"), &child, &format!("message-{i}"), &payload, "epoch", 0, None, false).unwrap();
+            let context = db.orchestration_context(&child).unwrap();
+            assert_eq!(context.root_id, root);
+            assert_eq!(context.depth, 1);
+            assert_eq!(context.causation_id, id);
+            db.update_delegation_task(&id, |task| task.status = TaskStatus::Completed).unwrap();
+        }
+        let extra = record(&db, "parent", "extra", "extra", vec![]);
+        assert!(db.admit_delegation_task(&extra, None, &Value::Null).unwrap_err().contains("resource_limit"));
+        let wrong_target = serde_json::json!({"origin":"delegation","caller":{"identity":{"kind":"thread","thread_id":"parent"},"admitted":{"kind":"task","task_id":"task-0"}},"provenance":{"created_by":"agent"}});
+        assert!(db.admit_message_delivery("spoof", "other", "spoof", &wrong_target, "epoch", 0, None, false).unwrap_err().contains("resource_limit"));
     }
 }
