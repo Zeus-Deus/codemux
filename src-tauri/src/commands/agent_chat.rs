@@ -7694,8 +7694,12 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         resume_cursor,
     } = &event
     {
-        if let Some(sdk_session_id) = extract_sdk_session_id(resume_cursor) {
-            let db: State<'_, DatabaseStore> = app.state();
+        let db: State<'_, DatabaseStore> = app.state();
+        // A session that left with a removed account may still report its id
+        // late; it must not land on the row, where it would outlive the
+        // removal's in-memory refusal (and a reopen merge would carry it on).
+        let refused = |native: &str| crate::provider_accounts::refuses_reported_native(&db, &thread_id.0, native);
+        if let Some(sdk_session_id) = extract_sdk_session_id(resume_cursor).filter(|native| !refused(native)) {
             if let Err(error) = db.set_agent_chat_sdk_session_id(&thread_id.0, &sdk_session_id) {
                 eprintln!("[codemux::agent_chat] failed to persist sdk_session_id: {error}");
             }

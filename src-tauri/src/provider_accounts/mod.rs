@@ -283,6 +283,27 @@ impl Removed {
     }
 }
 
+/// Whether the native id a session just reported for `thread_id` left with a
+/// removed account (see [`Removed`]): the chat lost its binding to a removal
+/// and hasn't bound again, or that very id was refused. Such an id is never
+/// stored, so it can't outlive the in-memory record of the removal.
+pub fn refuses_reported_native(db: &DatabaseStore, thread_id: &str, native: &str) -> bool {
+    let Some(provider) = db
+        .get_agent_chat_session(thread_id)
+        .and_then(|record| serde_json::from_value::<ProviderKind>(serde_json::json!(record.provider)).ok())
+        .filter(|provider| supports(*provider))
+    else {
+        return false;
+    };
+    let mut removed = removed();
+    let removed = removed.get_or_insert_with(Default::default);
+    if removed.orphaned(db, provider, thread_id) {
+        removed.refuse(thread_id, native.to_string());
+        return true;
+    }
+    removed.natives.get(thread_id).is_some_and(|ids| ids.contains(native))
+}
+
 /// Delete an account with its defaults and bindings, and remember what its
 /// chats lost (see [`Removed`]).
 pub fn delete_account(db: &DatabaseStore, account_id: &str) -> Result<(), String> {
@@ -995,8 +1016,12 @@ mod tests {
         let rebuild = rebuild_env(app2.handle(), ProviderKind::Claude, "rp-new", Some("ws"), Some("late-native"), None, false);
         assert_eq!(rebuild.native, None);
         // Nor does the id outlive this process: it is off the old row, so
-        // the reopen merge doesn't copy it onto the reopened chat's.
+        // the reopen merge doesn't copy it onto the reopened chat's. The old
+        // session reporting it again late isn't stored either.
+        assert!(refuses_reported_native(&db2, "rp-old", "late-native"));
         db2.upsert_agent_chat_session("rp-new", "ws", Some("/repo"), "claude").unwrap();
+        assert!(!refuses_reported_native(&db2, "rp-new", "fresh-native"), "the reopened chat's own session");
+        assert!(refuses_reported_native(&db2, "rp-new", "late-native"));
         db2.merge_reopened_agent_chat_session("rp-old", "rp-new").unwrap();
         assert_eq!(db2.get_agent_chat_session("rp-new").unwrap().sdk_session_id, None);
 
