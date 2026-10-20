@@ -249,14 +249,21 @@ impl Removed {
     /// A history reopen continues `from` as `to`, and merges `from`'s row
     /// into `to`'s, native id included: `to` refuses whatever `from` would,
     /// whether or not the start still offers a cursor (Claude's preflight
-    /// may have dropped it).
+    /// may have dropped it). A refused id still on `from`'s row is cleared,
+    /// as a removal clears the ids it takes, so the merge can't carry it
+    /// onto `to`'s row, where it would outlive this in-memory record.
     fn inherit(&mut self, db: &DatabaseStore, provider: ProviderKind, from: &str, to: &str) {
-        let mut refused: Vec<String> = self.natives.get(from).into_iter().flatten().cloned().collect();
-        if self.orphaned(db, provider, from) {
-            refused.extend(db.get_agent_chat_session(from).and_then(|record| record.sdk_session_id));
+        let stored = db.get_agent_chat_session(from).and_then(|record| record.sdk_session_id);
+        if let Some(native) = stored.clone().filter(|_| self.orphaned(db, provider, from)) {
+            self.refuse(from, native);
+        }
+        let refused: Vec<String> = self.natives.get(from).into_iter().flatten().cloned().collect();
+        if stored.is_some_and(|native| refused.contains(&native)) {
+            if let Err(error) = db.clear_agent_chat_sdk_session_id(from) {
+                eprintln!("[codemux::provider_accounts] clearing {from}'s removed session: {error}");
+            }
         }
         for native in refused {
-            self.refuse(from, native.clone());
             self.refuse(to, native);
         }
     }
@@ -987,6 +994,11 @@ mod tests {
         assert_eq!(db2.provider_account_binding("rp-new", "claude").unwrap().as_deref(), Some("rp-personal"));
         let rebuild = rebuild_env(app2.handle(), ProviderKind::Claude, "rp-new", Some("ws"), Some("late-native"), None, false);
         assert_eq!(rebuild.native, None);
+        // Nor does the id outlive this process: it is off the old row, so
+        // the reopen merge doesn't copy it onto the reopened chat's.
+        db2.upsert_agent_chat_session("rp-new", "ws", Some("/repo"), "claude").unwrap();
+        db2.merge_reopened_agent_chat_session("rp-old", "rp-new").unwrap();
+        assert_eq!(db2.get_agent_chat_session("rp-new").unwrap().sdk_session_id, None);
 
         // A chat from before accounts still resumes on the CLI's own sign-in.
         db.upsert_agent_chat_session("ro-legacy", "ws", Some("/repo"), "codex").unwrap();
