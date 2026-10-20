@@ -388,6 +388,39 @@ describe("MarkdownLocalImage", () => {
       expect(srcFor("/tmp/a%20%62.png")).toBe("mock-asset:/tmp/a%20%62.png");
     });
 
+    it("starts over for a path that merely spells out the previous candidates", async () => {
+      const originalCreateObjectUrl = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+      Object.defineProperty(URL, "createObjectURL", {
+        configurable: true,
+        value: vi.fn(() => "blob:proof-copy"),
+      });
+      readChatImageMock.mockResolvedValue({
+        bytes: new Uint8Array([137, 80, 78, 71]),
+        media_type: "image/png",
+      });
+      const card = (path: string) => (
+        <RetainedImagesProvider images={kept}>
+          <MarkdownLocalImage path={path} caption="Proof" />
+        </RetainedImagesProvider>
+      );
+      const { container, rerender } = render(card("/tmp/proof.png"));
+      fireEvent.error(container.querySelector("img")!);
+      await waitFor(() =>
+        expect(container.querySelector("img")).toHaveAttribute("src", "blob:proof-copy"),
+      );
+
+      // A NUL inside a path must not read as the old kept + original pair.
+      const lookalike = "/cfg/images/t/k.png\0/tmp/proof.png";
+      rerender(card(lookalike));
+
+      expect(container.querySelector("img")).toHaveAttribute("src", `mock-asset:${lookalike}`);
+      if (originalCreateObjectUrl) {
+        Object.defineProperty(URL, "createObjectURL", originalCreateObjectUrl);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+    });
+
     it("ignores copies kept for other links", () => {
       const { container } = render(
         <RetainedImagesProvider images={kept}>

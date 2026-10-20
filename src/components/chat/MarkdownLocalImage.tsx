@@ -187,7 +187,8 @@ function firstSource(
  * both attempts before the next one is tried.
  */
 function useLocalImageSource(candidates: readonly ImageCandidate[]) {
-  const key = candidates.map((candidate) => candidate.path).join("\0");
+  // Unambiguous for any paths, NUL included.
+  const key = JSON.stringify(candidates.map((candidate) => candidate.path));
   const currentKey = useRef(key);
   currentKey.current = key;
   const [stored, setStored] = useState(() => firstSource(key, candidates));
