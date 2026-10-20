@@ -7,8 +7,10 @@ import { cn } from "@/lib/utils";
 import {
   searchSettings,
   splitHighlight,
+  type SettingsSearchGroup,
   type SettingsSearchResult,
 } from "@/lib/settings-search";
+import { settingsPageFor } from "@/lib/settings-sections";
 
 /** How long a found row stays lit after search lands on it. Matches the
  *  `cm-settings-flash` animation in globals.css. */
@@ -37,7 +39,7 @@ function keepInView(scroller: HTMLElement, row: HTMLElement) {
 export function SettingsNavSearch({
   agentChatEnabled,
   signedIn,
-  activeSection,
+  activePage,
   inputRef,
   onNavigate,
   children,
@@ -45,7 +47,7 @@ export function SettingsNavSearch({
   agentChatEnabled: boolean;
   signedIn: boolean;
   /** The open page; its nav row is kept in view when it changes. */
-  activeSection: string;
+  activePage: string;
   inputRef: React.RefObject<HTMLInputElement | null>;
   onNavigate: (result: SettingsSearchResult) => void;
   children: React.ReactNode;
@@ -70,7 +72,7 @@ export function SettingsNavSearch({
     if (searching || !scroller) return;
     const row = scroller.querySelector<HTMLElement>('[aria-current="page"]');
     if (row) keepInView(scroller, row);
-  }, [activeSection, searching]);
+  }, [activePage, searching]);
 
   const go = (result: SettingsSearchResult | undefined) => {
     if (!result) return;
@@ -151,7 +153,7 @@ export function SettingsNavSearch({
           <div id={listId} role="listbox" aria-label="Settings search results" className="space-y-4">
             {groups.map((group) => (
               <div key={group.section} role="group" aria-label={group.sectionLabel}>
-                <Eyebrow className="px-4 pb-1.5">{group.sectionLabel}</Eyebrow>
+                <Eyebrow className="px-4 pb-1.5">{searchGroupTitle(group, agentChatEnabled)}</Eyebrow>
                 <div className="space-y-px px-3">
                   {group.results.map((result) => {
                     index += 1;
@@ -198,6 +200,13 @@ export function SettingsNavSearch({
       </div>
     </>
   );
+}
+
+/** "Agents › Permissions" for a section stacked on a page, else the page. */
+function searchGroupTitle(group: SettingsSearchGroup, agentChatEnabled: boolean): string {
+  const page = settingsPageFor(group.section, agentChatEnabled);
+  if (!page || page.sections.length < 2) return group.sectionLabel;
+  return `${page.label} › ${group.sectionLabel}`;
 }
 
 function Highlighted({ text, query }: { text: string; query: string }) {

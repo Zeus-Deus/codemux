@@ -75,7 +75,7 @@ export function DelegateTaskDialog(props: DelegateTaskDialogProps) {
     setError(null);
     void delegationHostInfo(selectedHost.id).then(info => {
       if (!current || latest.current.selectionKey !== selectionKey) return;
-      if (info.protocol_version !== 1) throw new Error('This host needs a compatible codemux-remote helper. Update it in Settings → Devices.');
+      if (info.protocol_version !== 1) throw new Error('This host needs a compatible codemux-remote helper. Update it in Settings → Connections → Devices.');
       setReceiver({ key: selectionKey, info });
     }).catch(cause => {
       if (current && latest.current.selectionKey === selectionKey) setError(errorText(cause));
@@ -182,7 +182,7 @@ export function DelegateTaskDialog(props: DelegateTaskDialogProps) {
         {selectedHost && <p className="-mt-2 break-all text-body-sm text-muted-foreground">{selectedHost.ssh_target}</p>}
         {hostId && !selectedHost && <p role="alert" className="text-body-sm text-destructive">Host unavailable. Choose a configured host; this task will not run locally.</p>}
         {hostError && <p role="alert" className="text-body-sm text-destructive">Could not verify configured hosts: {hostError}</p>}
-        {!hostLoading && !hostError && !hosts.length && <p className="text-body-sm text-muted-foreground">Add a remote host in Settings → Devices, then reopen this dialog. Delegation never falls back to this device.</p>}
+        {!hostLoading && !hostError && !hosts.length && <p className="text-body-sm text-muted-foreground">Add a remote host in Settings → Connections → Devices, then reopen this dialog. Delegation never falls back to this device.</p>}
         {loading && <p role="status" className="text-body-sm text-muted-foreground">Reading receiver capabilities and checkouts…</p>}
         {select('Existing checkout', workspaceId, setWorkspaceId, <><option value="">Choose an existing checkout…</option>{workspaceId && !workspace && <option value={workspaceId}>Checkout unavailable</option>}{info?.workspaces.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</>, !info)}
         {workspace && <p className="-mt-2 break-all font-mono text-body-sm text-muted-foreground">{workspace.path}</p>}

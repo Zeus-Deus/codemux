@@ -101,7 +101,7 @@ export function MobileWorkspaceActions({
                 toast.undoable({
                   message: `Archived “${workspace.title}”`,
                   description:
-                    "Files stay on your desktop. Restore from Settings → Archive.",
+                    "Files stay on your desktop. Restore from Settings → Workspaces → Archive.",
                   onUndo: async () => {
                     await unarchiveWorkspace(id);
                   },

@@ -167,7 +167,7 @@ describe("errorMessage", () => {
   });
 
   it("keeps a Tauri string rejection as is", () => {
-    const message = "No run command configured. Set one in Settings > Projects.";
+    const message = "No run command configured. Set one in Settings → Workspaces → Projects.";
     expect(errorMessage(message)).toBe(message);
   });
 

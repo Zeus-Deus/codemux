@@ -26,6 +26,7 @@ import {
   Workflow,
   Boxes,
   Blocks,
+  SlidersHorizontal,
 } from "lucide-react";
 
 export type Section =
@@ -56,83 +57,149 @@ export type Section =
   | "session_restore"
   | "about";
 
-interface NavItem {
+export interface SettingsSectionItem {
   id: Section;
   label: string;
   icon: LucideIcon;
 }
-interface NavGroup {
+
+export type SettingsPageId =
+  | "general"
+  | "appearance"
+  | "agents"
+  | "providers"
+  | "usage"
+  | "extensions"
+  | "workspaces"
+  | "tools"
+  | "git"
+  | "connections"
+  | "system";
+
+/** One row of the Settings nav. Its sections render stacked on one page, in
+ *  this order, each still addressable by its `Section` id. */
+export interface SettingsPage {
+  id: SettingsPageId;
   label: string;
-  items: NavItem[];
+  icon: LucideIcon;
+  /** Shown under the title of a page that stacks several sections. */
+  description: string;
+  sections: SettingsSectionItem[];
 }
 
-/** Build the Settings nav groups for the current flag state.
+/** Build the Settings pages for the current flag state.
  *
- *  Groups follow what a row is *about*, so a setting can be guessed from
- *  the nav without knowing Codemux internals: who you are and how the app
- *  looks (Personal), how agents behave (Agents), the lifecycle of
- *  workspaces (Workspaces), what you and agents work through (Tools), and
- *  machine-level plumbing (System).
+ *  The nav lists few pages so it reads at a glance; each page holds the
+ *  related sections that used to be pages of their own, all open. Section
+ *  ids stay the unit of navigation: deep links, search results and footer
+ *  pins name a section, and Settings opens its page and scrolls to it.
  *
- *  - "Interface" (home of the Agent Chat GUI toggle) stays visible
+ *  - "Chat interface" (home of the Agent Chat GUI toggle) stays visible
  *    regardless of the flag so users in either mode can find their way
  *    back.
- *  - The chat-only rows (Usage, Permissions, Skills) are only
- *    surfaced when the GUI is on; they reach into chat-only data. Hiding
- *    them when off matches the "feature absent, no work performed"
- *    promise of the master toggle.
+ *  - The chat-only sections (Permissions, Workflows, Usage, Skills) are
+ *    only surfaced when the GUI is on; they reach into chat-only data.
+ *    Hiding them when off matches the "feature absent, no work performed"
+ *    promise of the master toggle. A page left with no sections is
+ *    dropped.
  */
-export function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
-  return [
+export function buildSettingsPages(agentChatEnabled: boolean): SettingsPage[] {
+  const chatOnly = (items: SettingsSectionItem[]) => (agentChatEnabled ? items : []);
+  const pages: SettingsPage[] = [
     {
-      label: "PERSONAL",
-      items: [
+      id: "general",
+      label: "General",
+      icon: SlidersHorizontal,
+      description: "Your account, notifications and keyboard shortcuts.",
+      sections: [
         { id: "account", label: "Account", icon: UserCircle },
-        { id: "appearance", label: "Appearance", icon: Palette },
         { id: "notifications", label: "Notifications", icon: Bell },
         { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
       ],
     },
     {
-      label: "AGENTS",
-      items: [
-        // Which agents exist, their accounts and setup. Agent covers how
-        // chats behave once an agent is chosen.
-        { id: "providers", label: "Providers", icon: Boxes },
-        { id: "agent", label: "Agent", icon: Bot },
-        { id: "interface", label: "Interface", icon: Sparkles },
-        // Inbound administration stays available in the CLI interface too.
-        { id: "mcp", label: "MCP Servers", icon: Plug },
-        ...(agentChatEnabled
-          ? ([
-              // Workflows run chat-launched agents, so they need the GUI too.
-              { id: "workflows", label: "Workflows", icon: Workflow },
-              { id: "permissions", label: "Permissions", icon: ShieldCheck },
-              { id: "skills", label: "Skills", icon: BookOpen },
-              // Reads the agent-chat usage ledger, which only fills when
-              // the GUI is on.
-              { id: "usage", label: "Usage", icon: ChartColumn },
-            ] as NavItem[])
-          : []),
+      id: "appearance",
+      label: "Appearance",
+      icon: Palette,
+      description: "",
+      sections: [{ id: "appearance", label: "Appearance", icon: Palette }],
+    },
+    {
+      id: "agents",
+      label: "Agents",
+      icon: Bot,
+      description: "How agent sessions look, how chats behave, and what agents may do.",
+      sections: [
+        { id: "interface", label: "Chat interface", icon: Sparkles },
+        // How chats behave once an agent is chosen; Providers covers which
+        // agents exist and their accounts.
+        { id: "agent", label: "Models & behavior", icon: Bot },
+        ...chatOnly([
+          { id: "permissions", label: "Permissions", icon: ShieldCheck },
+          // Workflows run chat-launched agents, so they need the GUI too.
+          { id: "workflows", label: "Workflows", icon: Workflow },
+        ]),
       ],
     },
     {
-      label: "WORKSPACES",
-      items: [
+      id: "providers",
+      label: "Providers",
+      icon: Boxes,
+      description: "",
+      sections: [{ id: "providers", label: "Providers", icon: Boxes }],
+    },
+    {
+      id: "usage",
+      label: "Usage",
+      icon: ChartColumn,
+      description: "",
+      // Reads the agent-chat usage ledger, which only fills when the GUI is
+      // on.
+      sections: chatOnly([{ id: "usage", label: "Usage", icon: ChartColumn }]),
+    },
+    {
+      id: "extensions",
+      label: "Extensions",
+      icon: Blocks,
+      description: "Skills, MCP servers and plugins that add to what agents and Codemux can do.",
+      sections: [
+        ...chatOnly([{ id: "skills", label: "Skills", icon: BookOpen }]),
+        // Inbound administration stays available in the CLI interface too.
+        { id: "mcp", label: "MCP Servers", icon: Plug },
+        { id: "plugins", label: "Plugins", icon: Blocks },
+      ],
+    },
+    {
+      id: "workspaces",
+      label: "Workspaces",
+      icon: FolderCog,
+      description: "Project scripts, launch presets, and what happens to sessions over time.",
+      sections: [
         { id: "projects", label: "Projects", icon: FolderCog },
         { id: "presets", label: "Presets", icon: Zap },
+        { id: "session_restore", label: "Session Restore", icon: RotateCcw },
         // The restore/delete surface for everything archived from the
         // sidebar.
         { id: "archive", label: "Archive", icon: Archive },
-        { id: "session_restore", label: "Session Restore", icon: RotateCcw },
       ],
     },
     {
-      label: "TOOLS",
-      items: [
+      id: "tools",
+      label: "Tools",
+      icon: TerminalSquare,
+      description: "The editor, terminal and browser you and your agents work through.",
+      sections: [
         { id: "editor", label: "Editor", icon: Code2 },
         { id: "terminal", label: "Terminal", icon: TerminalSquare },
         { id: "browser", label: "Browser", icon: Globe },
+      ],
+    },
+    {
+      id: "git",
+      label: "Git",
+      icon: GitBranch,
+      description: "Branches and commits, and the hosting service each checkout talks to.",
+      sections: [
         { id: "git", label: "Git", icon: GitBranch },
         // Which hosting product each checkout talks to, and whether its CLI
         // is installed and signed in: the hosting half of Git.
@@ -140,31 +207,52 @@ export function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
       ],
     },
     {
-      label: "SYSTEM",
-      items: [
-        { id: "plugins", label: "Plugins", icon: Blocks },
-        // Devices and Remote Access are both about reaching this machine (or
-        // its sessions) from somewhere else. Always visible: the daemon is
-        // built in, and remote access is default-off behind its own toggle.
+      id: "connections",
+      label: "Connections",
+      icon: MonitorSmartphone,
+      description: "Reach this machine and its sessions from other devices.",
+      // Always visible: the daemon is built in, and remote access is
+      // default-off behind its own toggle.
+      sections: [
         { id: "hosts", label: "Devices", icon: Laptop },
         { id: "remote_access", label: "Remote Access", icon: MonitorSmartphone },
+      ],
+    },
+    {
+      id: "system",
+      label: "System",
+      icon: Info,
+      description: "Updates for Codemux and every coding agent, and details about this build.",
+      sections: [
         // Codemux and every coding agent, here and on each device.
         { id: "updates", label: "Updates", icon: CircleArrowUp },
         { id: "about", label: "About", icon: Info },
       ],
     },
   ];
+  return pages.filter((page) => page.sections.length > 0);
 }
 
-export const SETTINGS_SECTIONS = buildNavGroups(true).flatMap(
-  (group) => group.items,
-);
+/** Every available section, in the order Settings shows them. */
+export function settingsSectionsFor(agentChatEnabled: boolean): SettingsSectionItem[] {
+  return buildSettingsPages(agentChatEnabled).flatMap((page) => page.sections);
+}
+
+export const SETTINGS_SECTIONS = settingsSectionsFor(true);
+
+/** The page that shows `section`, or undefined when the flags hide it. */
+export function settingsPageFor(
+  section: string,
+  agentChatEnabled: boolean,
+): SettingsPage | undefined {
+  return buildSettingsPages(agentChatEnabled).find((page) =>
+    page.sections.some((item) => item.id === section),
+  );
+}
 
 export function isSettingsSectionAvailable(
   id: string,
   agentChatEnabled: boolean,
 ): id is Section {
-  return buildNavGroups(agentChatEnabled).some((group) =>
-    group.items.some((section) => section.id === id),
-  );
+  return settingsPageFor(id, agentChatEnabled) !== undefined;
 }

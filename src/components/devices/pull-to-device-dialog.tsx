@@ -492,7 +492,7 @@ function HostNotConfiguredBlock({
         )}
       </p>
       <p className="text-warning/85">
-        Add the device in Settings → Devices, then come back and pull.
+        Add the device in Settings → Connections → Devices, then come back and pull.
       </p>
       <Button
         variant="outline"

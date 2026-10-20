@@ -375,7 +375,7 @@ export function SidebarProjectGroup({
               This will archive {workspaces.length} workspace{workspaces.length !== 1 ? "s" : ""} and
               stop the active terminals in this project. Files, branches, and
               worktrees stay on disk — everything can be restored from
-              Settings → Archive.
+              Settings → Workspaces → Archive.
             </DialogDescription>
           </DialogHeader>
           <div className="flex justify-end gap-2 pt-1">

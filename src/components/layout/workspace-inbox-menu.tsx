@@ -114,7 +114,7 @@ export function WorkspaceInboxMenu({
         const archiveId = await archiveWorkspace(workspace.workspace_id);
         toast.undoable({
           message: `Archived "${workspace.title}"`,
-          description: "Restore anytime from Settings → Archive.",
+          description: "Restore anytime from Settings → Workspaces → Archive.",
           onUndo: async () => {
             await unarchiveWorkspace(archiveId);
           },
