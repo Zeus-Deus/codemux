@@ -99,8 +99,9 @@ impl CodexCapabilityCache {
     }
 
     /// An extra account's catalog, harvested from its own home (its own
-    /// sign-in) and cached per account until that home signs in again.
-    /// `force` harvests again regardless.
+    /// sign-in) and cached per account until that home signs in again. A
+    /// login that leaves no file to compare (keyring storage) is asked every
+    /// time, as is any request with `force`.
     pub async fn get_or_harvest_account(
         &self,
         binary_path: &std::path::Path,
@@ -111,7 +112,7 @@ impl CodexCapabilityCache {
         let login = login_revision(home);
         if !force {
             if let Some((read_under, cached)) = self.accounts.lock().await.get(account_id) {
-                if *read_under == login {
+                if read_under.is_some() && *read_under == login {
                     return Ok(cached.clone());
                 }
             }
@@ -593,6 +594,14 @@ mod tests {
         let work = cache.get_or_harvest_account(bogus, "work", home, false).await.unwrap();
         assert_eq!(work.models[0].id, "work-model");
         assert!(cache.get_or_harvest_account(bogus, "side", home, false).await.is_err());
+        // A keyring login leaves nothing to compare, so it is asked each time.
+        cache.accounts.lock().await.insert(
+            "keyring".into(),
+            (None, build_capabilities(vec![entry("old-login", false, vec!["text"])])),
+        );
+        let keyring_home = home.join("keyring");
+        std::fs::create_dir_all(&keyring_home).unwrap();
+        assert!(cache.get_or_harvest_account(bogus, "keyring", &keyring_home, false).await.is_err());
         // A forced refresh asks that account's login again.
         assert!(cache.get_or_harvest_account(bogus, "work", home, true).await.is_err());
         // So does signing that home in again (another login, another plan).
