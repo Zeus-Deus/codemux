@@ -347,3 +347,141 @@ schemas cannot add them later.
 Plugin stdio servers on Linux and macOS use a 2 MiB limit per JSON-RPC frame,
 including image results. Windows and macOS shutdown behavior remains untested
 live.
+
+## Local processes, project files and plugin data
+
+These typed desktop APIs are bound to the plugin incarnation. Plugins already
+run with full authority; this is the supported, bounded route for CLI checks and
+project detection. The web remote refuses these commands.
+
+```ts
+const executable = await ctx.host.process.which("unity"); // absolute path or null
+const result = await ctx.host.process.run({
+  command: "unity",
+  args: ["status", "--project-path", projectPath, "--json"],
+  cwd: projectPath,                  // absolute local path
+  workspaceId,                      // optional locality check only
+  env: { MY_OPTION: "value", OLD_OPTION: null },
+  timeoutMs: 30_000,
+  maxOutputBytes: 1024 * 1024,
+});
+// { code: number | null, stdout, stderr, timedOut, truncated, pipesHeldOpen, cancelled }
+```
+
+`run` passes argv directly, without a shell. `command` resolves on PATH (including
+Windows PATHEXT), or names an executable path. Empty and relative PATH entries
+are ignored; a repository's files cannot become PATH candidates through `cwd`.
+On Windows an extensionless command uses PATHEXT, skipping extensionless shell
+shims. Children inherit the app's
+environment, with the app's usual AppImage environment cleanup; `env` overrides
+values, and `null` removes a key. Windows batch files (`.cmd`/`.bat`) are refused
+by `run`, including names with trailing dots or spaces, because launching them
+would invoke a shell. Call the wrapped `.exe` (for example, `node.exe` with the
+script) instead; `which` can still locate batch files. Do not pass untrusted
+arguments to `cmd.exe /c`: its shell quoting differs from normal argv. Windows
+`run` accepts `.exe` and `.com` programs, including `.exe` App Execution Aliases;
+children use `CREATE_NO_WINDOW` to avoid a console flash.
+Without `cwd`, the child uses the app’s current directory, not a workspace path.
+Inputs allow up to 256 arguments (16 KiB each, 1 MiB combined) and 128 environment
+overrides (16 KiB per value, 64 KiB combined).
+
+The default timeout is 30 seconds (maximum 10 minutes), shared by executable
+lookup, local cwd resolution, startup and execution. Filesystem lookup and OS
+process creation run off the async workers. A lookup finishing after timeout or
+disposal cannot launch a child; a process creation already in progress is
+supervised until its result can be killed and reaped. The combined stdout and
+stderr cap defaults to 1 MiB (maximum 8 MiB); excess bytes are drained and discarded,
+with `truncated: true`. Timeout or plugin disposal kills the owned process group
+on Linux and macOS, then waits for the child to exit. On normal launcher exit,
+the host gives descendants 100 ms to detach, then kills any still in its group
+before reaping the launcher. Windows currently kills the
+direct child only. A child that deliberately starts a separate session, such as
+an Editor launched by a CLI, remains independent. Inherited output pipes get at
+most 100 ms to collect after the launcher exits; `pipesHeldOpen` signals that a
+pipe stayed open. The host keeps reading and discarding until EOF so an Editor's
+later log writes do not hit a closed pipe. `truncated` reports the output cap or
+a pipe read failure, independently of `pipesHeldOpen`. The cap counts raw bytes;
+invalid UTF-8 is replaced without dropping valid text. Linux lifecycle tests
+cover a normal grandchild, delayed detachment and detached stdout writes.
+Windows and macOS have not been tested live.
+
+`workspaceId` is optional on `run` and every filesystem call. If supplied, it
+must name an open, local workspace. If omitted, the operation runs locally even
+when the selected workspace is remote. The id validates locality only: it does
+not select, change or check a path against the workspace directory.
+**Filesystem paths and `cwd` must be absolute and refer to this machine.** These APIs do not read files or launch programs over SSH.
+
+```ts
+await ctx.host.fs.exists(projectPath, { workspaceId });
+const entries = await ctx.host.fs.listDir(projectPath, { workspaceId });
+// [{ name, kind: "file" | "directory" | "symlink" | "other" }]
+const text = await ctx.host.fs.readText(absolutePath, { maxBytes: 1024 * 1024, workspaceId });
+```
+
+`readText` reads UTF-8 regular files and refuses files larger than `maxBytes`
+(default 1 MiB, maximum 8 MiB). `listDir` refuses more than 10,000 entries.
+These filesystem calls (and `which`) run on blocking workers. They have no
+per-operation timeout: an OS call stalled on a dead mount cannot be interrupted.
+App-exit cleanup waits at most three seconds for such calls.
+
+For CLI policies and manifests, the only supported write route is plugin-owned data:
+
+```ts
+const dir = await ctx.host.fs.dataDir();
+const policyPath = await ctx.host.fs.writeDataFile("policy.json", JSON.stringify(policy));
+await ctx.host.fs.removeDataFile("policy.json");
+```
+
+Files live under `<app data>/plugin-data/<pluginId>/`, separate from installed
+code. `name` is one segment: ASCII letters, digits, dots, underscores or dashes,
+at most 128 bytes, no leading dot, no `..`, and no Windows device names. Links
+are refused. Writes are atomic, capped at 1 MiB, and use owner-only directory
+and file permissions on Unix. Data is retained on disable, reload, update **and
+uninstall**, matching existing `ctx.storage` retention. Reinstalling the same
+plugin id can reuse it. `removeDataFile` deletes only that plugin's named file.
+On Windows, another program's open handle can prevent replacement. Sharing or
+access failures retry with short backoff for up to one second, then return an
+error asking you to close the file or check permissions and try again. A failed
+write removes its temporary file and leaves the previous data file intact.
+Acquiring the data directory sweeps abandoned writer temp files older than one
+day, without following links; recent writes and named data files are retained.
+Returned Windows paths use ordinary absolute spelling when safely equivalent;
+paths that require Windows verbatim syntax retain it. Containment checks always
+use canonical paths internally.
+
+`ctx.host.workspace.list()` returns the open workspaces as `{ id, name, path,
+remote }[]`. `ctx.host.workspace.onListChange(fn)` notifies when that list
+changes and unsubscribes on disposal. Use it to prune workspace registrations;
+`current()` and `subscribe()` still describe the selected workspace.
+
+For install locations that a running app's PATH does not yet include, use
+`await ctx.host.os.info()`:
+
+```ts
+// Exact Rust OS/architecture spellings, not Node's "darwin"/"arm64".
+{
+  platform: "linux" | "windows" | "macos",
+  arch: "x86_64" | "aarch64",
+  homeDir: string | null,
+  configDir: string | null,
+  dataDir: string | null,
+  localDataDir: string | null,
+}
+```
+
+These are `std::env::consts::OS` / `ARCH` on supported desktop targets;
+`info()` refuses other targets rather than returning an undocumented value.
+`configDir` uses `$XDG_CONFIG_HOME` (default `~/.config`) on Linux,
+`~/Library/Application Support` on macOS, and roaming AppData on Windows.
+Directories use native `dirs` resolution: Windows profile, roaming AppData and
+local AppData; Linux XDG data home (default `~/.local/share`); macOS
+`~/Library/Application Support` for both data directories. No general environment
+reader is exposed. `dataDir` here is the OS directory, whereas `fs.dataDir()` is
+the plugin's private directory beneath the app's data directory.
+
+On Linux the GUI inherits its launcher's PATH; it does not import a login shell's
+PATH. A desktop session may omit `~/.local/bin`, so an integration can fall back
+to `homeDir/.local/bin` when `which` misses a newly installed CLI. On Windows,
+`which` accepts non-directory reparse points, including zero-byte App Execution
+Aliases, and `run` passes that path through to CreateProcess. Classification and
+PATHEXT lookup have unit coverage; Windows execution remains untested live.

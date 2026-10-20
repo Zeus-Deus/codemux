@@ -46,6 +46,7 @@ notify = "8.2.0"
 toml = "1.0.3"
 json5 = "0.4"
 dirs = "6.0.0"
+dunce = "1"
 portable-pty = "0.8.1"
 tokio = { version = "1.0", features = ["full"] }
 chrono = "0.4"

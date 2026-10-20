@@ -56,7 +56,7 @@ function tokenFor(owner: Owner | null, id: string): { pluginId: string; localId:
   return { pluginId: owner.pluginId, localId: id, token };
 }
 let pageEpoch: Promise<number> | undefined;
-function pluginPageEpoch(): Promise<number> {
+export function pluginPageEpoch(): Promise<number> {
   return pageEpoch ??= new Promise((resolve) => {
     const read = () => {
       const epoch = (window as Window & { __CODEMUX_PLUGIN_PAGE_EPOCH__?: number }).__CODEMUX_PLUGIN_PAGE_EPOCH__;

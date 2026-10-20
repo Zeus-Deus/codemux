@@ -735,9 +735,33 @@ mod plugins_boundary_tests {
         let app = tauri::test::mock_app();
         let router = Arc::new(ChannelRouter::default());
         let (out, mut frames) = crate::web_remote::server::test_outbound();
-        for command in ["plugins_list", "plugins_read_source", "plugins_set_enabled", "plugins_chat_status", "plugins_chat_request_compaction", "plugins_future_command"] {
-            dispatch_invoke(app.handle(), &router, 7, &out, 1, command.into(), json!({"channel":"__CHANNEL__:12"})).await;
-            let Message::Text(frame) = frames.recv().await.unwrap() else { panic!("Expected rejection") };
+        for command in [
+            "plugins_list",
+            "plugins_read_source",
+            "plugins_set_enabled",
+            "plugins_chat_status",
+            "plugins_chat_request_compaction",
+            "plugins_host_acquire",
+            "plugins_host_release",
+            "plugins_process_run",
+            "plugins_process_which",
+            "plugins_os_info",
+            "plugins_fs",
+            "plugins_future_command",
+        ] {
+            dispatch_invoke(
+                app.handle(),
+                &router,
+                7,
+                &out,
+                1,
+                command.into(),
+                json!({"channel":"__CHANNEL__:12"}),
+            )
+            .await;
+            let Message::Text(frame) = frames.recv().await.unwrap() else {
+                panic!("Expected rejection")
+            };
             assert!(frame.contains("REMOTE_UNSUPPORTED"));
             assert!(router.routes.lock().unwrap().is_empty());
         }

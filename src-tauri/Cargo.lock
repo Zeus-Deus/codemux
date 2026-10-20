@@ -1204,6 +1204,7 @@ dependencies = [
  "clap",
  "codemux",
  "dirs",
+ "dunce",
  "flate2",
  "futures-core",
  "futures-util",
