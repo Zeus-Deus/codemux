@@ -541,7 +541,8 @@ mod delegation {
             .filter(|row| row["type"] == "user_message")
             .collect();
         assert_eq!(user_rows.len(), 1);
-        assert_eq!(user_rows[0]["text"], expected_text);
+        assert_eq!(user_rows[0]["text"], TASK);
+        assert_eq!(user_rows[0]["agent_text"], expected_text);
 
         // The parent's card: Starting, then Working, each with every field.
         let cards = h.cards(&child);
@@ -600,12 +601,16 @@ mod delegation {
         assert!(!wake.contains("A task failed"));
         assert!(wake.ends_with("No delegated tasks are still running."));
 
-        // Posted as the parent's next user message, exactly as the model reads it.
+        // The transcript shows the report; the model retains the wake framing.
         wait_for("the results message in the transcript", || {
             !h.parent_user_messages().is_empty()
         })
         .await;
-        assert_eq!(h.parent_user_messages(), vec![wake.clone()]);
+        assert_eq!(h.parent_user_messages(), vec![format!("Add slugify helper\n{report}")]);
+        let row: Value = h.db().list_agent_chat_messages(&h.parent).into_iter()
+            .filter_map(|row| serde_json::from_str::<Value>(&row).ok())
+            .find(|row| row["type"] == "user_message").unwrap();
+        assert_eq!(row["agent_text"], *wake);
 
         let card = h.card(&child);
         assert_eq!(card.status, SubagentStatus::Completed);

@@ -313,6 +313,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
         app.manage(journal.clone());
         app.manage(crate::commands::agent_chat::ProviderRegistry::new());
         app.manage(crate::commands::agent_chat::SubagentTracker::default());
+        app.manage(crate::commands::agent_chat::RunActivityTracker::default());
         app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
         app.manage(crate::observability::ObservabilityStore::default());
         let provider: Arc<dyn AgentProvider> = if kind == ProviderKind::Codex {

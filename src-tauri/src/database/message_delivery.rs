@@ -168,6 +168,15 @@ impl DatabaseStore {
         let rows=stmt.query_map([thread],|r|r.get(0)).map_err(|e|e.to_string())?;
         rows.collect::<Result<_,_>>().map_err(|e|e.to_string())
     }
+    /// A legacy saved replay can be stopped before it gets a native queue ID.
+    /// Retain its new journal identity on the original saved row for retry.
+    pub(crate) fn retain_saved_message_delivery(&self, thread: &str, queued: &str, message: &str) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e|e.to_string())?;
+        tx.execute("UPDATE agent_message_deliveries SET queued_id=?2 WHERE thread_id=?1 AND message_id=?3 AND attempted=0 AND state IN ('held','rejected') AND queued_id IS NULL AND EXISTS (SELECT 1 FROM agent_chat_queued_turns WHERE thread_id=?1 AND queued_id=?2)",params![thread,queued,message]).map_err(|e|e.to_string())?;
+        tx.execute("UPDATE agent_chat_queued_turns SET provenance=(SELECT json_set(COALESCE(json_extract(payload,'$.provenance'),'{}'),'$.delivery_id',id,'$.message_id',message_id,'$.input_intent','queued_turn') FROM agent_message_deliveries WHERE thread_id=?1 AND message_id=?3 AND queued_id=?2 AND attempted=0 AND state IN ('held','rejected')) WHERE thread_id=?1 AND queued_id=?2 AND EXISTS (SELECT 1 FROM agent_message_deliveries WHERE thread_id=?1 AND message_id=?3 AND queued_id=?2 AND attempted=0 AND state IN ('held','rejected'))",params![thread,queued,message]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e|e.to_string())
+    }
     pub fn rearm_saved_message_delivery(&self, id: &str, thread: &str, queued: &str, release_queue: bool) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e|e.to_string())?;

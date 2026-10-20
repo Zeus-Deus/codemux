@@ -603,14 +603,23 @@ async fn a_stop_during_the_drain_keeps_the_rest_saved() {
     stop.await.unwrap().unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let sent = h.sent("rr-drain-stop");
-    assert_eq!(&sent[1..], ["first saved"], "{sent:?}");
+    assert!(sent[1..].is_empty(), "Stop before submission must hold the selected saved input: {sent:?}");
     let left: Vec<_> = h
         .db()
         .list_queued_turns("rr-drain-stop")
         .into_iter()
         .map(|row| row.queued_id)
         .collect();
-    assert_eq!(left, ["q-2"]);
+    assert_eq!(left, ["q-1", "q-2"]);
+    let held = h.db().message_delivery_for_message("rr-drain-stop", "nonce-q-1").unwrap().unwrap();
+    assert_eq!(held.state, "held");
+    assert_eq!(held.hold_reason.as_deref(), Some("stop"));
+    assert!(!held.attempted);
+    codemux_lib::commands::queued_turns::agent_chat_send_saved_queued_turn(
+        h.handle(), ProviderKind::Codex, ThreadId("rr-drain-stop".into()), "q-1".into(), MessageDelivery::Queue,
+    ).await.unwrap();
+    assert_eq!(&h.sent("rr-drain-stop")[1..], ["first saved"]);
+    assert_eq!(h.db().list_queued_turns("rr-drain-stop").iter().map(|row| row.queued_id.as_str()).collect::<Vec<_>>(), ["q-2"]);
 }
 
 #[tokio::test]

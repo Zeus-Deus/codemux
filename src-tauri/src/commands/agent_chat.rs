@@ -3446,6 +3446,11 @@ async fn send_turn_context_reporting<R: Runtime>(
     reached: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
     use crate::agent_control::delivery::DeliveryPayload;
+    if context.origin == TurnOrigin::RemoteDelegation
+        && !matches!(provider, ProviderKind::Codex | ProviderKind::Claude)
+    {
+        return Err("Guarded remote result delivery is unsupported for this parent provider; result held without provider side effects".into());
+    }
     let db = app.state::<DatabaseStore>();
     let message_id = context
         .provenance
@@ -3592,11 +3597,6 @@ async fn send_turn_internal<R: Runtime>(
             control.verify_mode(Some(mode))?;
         }
     }
-    if origin == TurnOrigin::RemoteDelegation
-        && !matches!(provider, ProviderKind::Codex | ProviderKind::Claude)
-    {
-        return Err("Guarded remote result delivery is unsupported for this parent provider; result held without provider side effects".into());
-    }
     crate::local_session_import::require_live_session(&app, &input.thread_id.0)?;
     if provider == ProviderKind::Hermes && !input.skill_ids.is_empty() {
         return Err("unsupported: Hermes owns its native skills; projected Codemux skills cannot be injected".into());
@@ -3683,7 +3683,7 @@ async fn send_turn_internal<R: Runtime>(
         &app,
         provider,
         &input.thread_id,
-        !human,
+        !human && origin != TurnOrigin::UsageResume,
         control.as_ref(),
         &native_gate,
         native_generation,

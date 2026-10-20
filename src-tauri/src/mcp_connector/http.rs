@@ -1142,6 +1142,10 @@ mod tests {
         let first_token =
             consent_and_exchange(&f, "fixture-client", ControlAccess::FullAccess).await;
         let first_caller = authenticated_caller(&f, &first_token);
+        f.app.state::<agent_control::NativeControlState>().observe_event(&crate::agent_provider::ProviderRuntimeEvent::SessionStateChanged {
+            thread_id:crate::agent_provider::ThreadId("receipt-worker".into()),
+            status:crate::agent_provider::SessionStatus::Running {active_turn:crate::agent_provider::TurnId("receipt-run".into())},
+        });
         let args = json!({"workspace_id":workspace,"thread_id":"receipt-worker","client_request_id":"frozen-receipt-key"});
         let first = call_tool(&f, &first_token, "thread_interrupt", args.clone()).await;
         assert_ne!(
