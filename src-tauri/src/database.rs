@@ -4648,7 +4648,7 @@ impl DatabaseStore {
         &self,
         sdk_session_id: &str,
     ) -> Result<AgentChatSessionCleanup, String> {
-        self.collapse_duplicate_agent_chat_sessions_sparing(sdk_session_id, &HashSet::new())
+        self.collapse_agent_chat_sessions(sdk_session_id, None)
     }
 
     /// `(thread_id, provider)` of every chat on native session `sdk_session_id`.
@@ -4665,12 +4665,22 @@ impl DatabaseStore {
             .unwrap_or_default()
     }
 
-    /// [`Self::collapse_duplicate_agent_chat_sessions`], skipped while any
-    /// row that would be merged away is in `spared`.
-    pub fn collapse_duplicate_agent_chat_sessions_sparing(
+    /// [`Self::collapse_duplicate_agent_chat_sessions`], only if every row
+    /// it would merge away is in `cleared` (checked idle by the caller);
+    /// otherwise nothing changes. A row that joined the group since the
+    /// caller looked is never in it.
+    pub fn collapse_duplicate_agent_chat_sessions_if_cleared(
         &self,
         sdk_session_id: &str,
-        spared: &HashSet<String>,
+        cleared: &HashSet<String>,
+    ) -> Result<AgentChatSessionCleanup, String> {
+        self.collapse_agent_chat_sessions(sdk_session_id, Some(cleared))
+    }
+
+    fn collapse_agent_chat_sessions(
+        &self,
+        sdk_session_id: &str,
+        cleared: Option<&HashSet<String>>,
     ) -> Result<AgentChatSessionCleanup, String> {
         let mut conn = self.conn.lock().unwrap();
         let transaction = conn
@@ -4689,7 +4699,7 @@ impl DatabaseStore {
         let Some(survivor) = survivor else {
             return Ok(AgentChatSessionCleanup::default());
         };
-        if !spared.is_empty() {
+        if let Some(cleared) = cleared {
             let mut statement = transaction
                 .prepare(
                     "SELECT thread_id FROM agent_chat_sessions
@@ -4701,7 +4711,7 @@ impl DatabaseStore {
                 .map_err(|e| format!("Failed to read duplicate sessions: {e}"))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("Failed to read duplicate sessions: {e}"))?;
-            if merged.iter().any(|thread| spared.contains(thread)) {
+            if merged.iter().any(|thread| !cleared.contains(thread)) {
                 return Ok(AgentChatSessionCleanup::default());
             }
         }
@@ -7987,7 +7997,7 @@ mod tests {
     }
 
     #[test]
-    fn a_collapse_spares_a_chat_that_would_be_merged_away() {
+    fn a_collapse_merges_away_only_rows_cleared_by_the_caller() {
         let db = init_test_database();
         db.conn
             .lock()
@@ -7999,13 +8009,26 @@ mod tests {
                         ('new', 'sdk-1', 'ws', 'claude', '2025-03-01', '2025-03-01')",
             )
             .unwrap();
-        let spared = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<HashSet<_>>();
-        let skipped = db.collapse_duplicate_agent_chat_sessions_sparing("sdk-1", &spared(&["old"])).unwrap();
+        let cleared = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<HashSet<_>>();
+        // The survivor needn't be cleared (it isn't deleted); "old" must be.
+        let skipped = db.collapse_duplicate_agent_chat_sessions_if_cleared("sdk-1", &cleared(&["new"])).unwrap();
         assert!(skipped.thread_ids.is_empty());
         assert!(db.get_agent_chat_session("old").is_some());
-        // Sparing the survivor doesn't hold the merge back: it isn't deleted.
-        let merged = db.collapse_duplicate_agent_chat_sessions_sparing("sdk-1", &spared(&["new"])).unwrap();
-        assert_eq!(merged.thread_ids, vec!["old".to_string()]);
+        // A row that joined the group after the caller looked wasn't cleared.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('late', 'sdk-1', 'ws', 'claude', '2025-02-01', '2025-02-01')",
+            )
+            .unwrap();
+        let skipped = db.collapse_duplicate_agent_chat_sessions_if_cleared("sdk-1", &cleared(&["old"])).unwrap();
+        assert!(skipped.thread_ids.is_empty());
+        assert!(db.get_agent_chat_session("late").is_some());
+        let merged = db.collapse_duplicate_agent_chat_sessions_if_cleared("sdk-1", &cleared(&["old", "late"])).unwrap();
+        assert_eq!(merged.thread_ids, vec!["late".to_string(), "old".to_string()]);
     }
 
     #[test]

@@ -6844,12 +6844,14 @@ async fn collapse_resumed_duplicates<R: Runtime>(app: &AppHandle<R>, sdk_session
     let db = app.state::<DatabaseStore>();
     let state = app.state::<AppStateStore>();
     let registry = app.state::<ProviderRegistry>();
-    let mut busy = std::collections::HashSet::new();
+    // Rows checked idle, whose dispatch locks are held until the collapse is
+    // done. The collapse merges away no other row, so one that joins the
+    // group meanwhile is left alone.
+    let mut cleared = std::collections::HashSet::new();
     let mut held = Vec::new();
     for (thread, provider) in db.agent_chat_threads_for_sdk_session(sdk_session_id) {
         let gate = native_thread_gate(app, &thread);
         let Ok(guard) = gate.dispatch.clone().try_lock_owned() else {
-            busy.insert(thread);
             continue;
         };
         let live = match serde_json::from_value::<ProviderKind>(serde_json::json!(provider)) {
@@ -6859,15 +6861,14 @@ async fn collapse_resumed_duplicates<R: Runtime>(app: &AppHandle<R>, sdk_session
             },
             Err(_) => false,
         };
-        if live || state.agent_chat_pane_id_for_thread(&thread).is_some() {
-            busy.insert(thread);
-        } else {
+        if !live && state.agent_chat_pane_id_for_thread(&thread).is_none() {
+            cleared.insert(thread);
             held.push(guard);
         }
     }
     let collapsed = crate::pr_watch::unless_any_waking(|waking| {
-        busy.extend(waking.iter().cloned());
-        db.collapse_duplicate_agent_chat_sessions_sparing(sdk_session_id, &busy)
+        cleared.retain(|thread| !waking.contains(thread));
+        db.collapse_duplicate_agent_chat_sessions_if_cleared(sdk_session_id, &cleared)
     });
     drop(held);
     match collapsed {
