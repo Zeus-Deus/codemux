@@ -21,6 +21,7 @@ pub(crate) struct State {
     tools_live: bool,
     generation: u64,
     turn: Option<String>,
+    stop_generation: u64,
     callbacks: Vec<AbortHandle>,
     activity: u64,
     pending: bool,
@@ -38,6 +39,8 @@ pub struct AuthorityIdentity {
     session_key: String,
     generation: u64,
     pub run_id: Option<String>,
+    #[serde(default)]
+    pub stop_generation: u64,
 }
 impl AuthorityIdentity {
     pub async fn wait_revoked(
@@ -135,6 +138,7 @@ impl NativeAuthority {
                 tools_live: false,
                 generation: 0,
                 turn: None,
+                stop_generation: 0,
                 callbacks: Vec::new(),
                 activity: 0,
                 pending: false,
@@ -157,14 +161,25 @@ impl NativeAuthority {
             if stop { owner.invalidate(); } else { owner.human_activity(); }
         }
     }
-    pub fn begin(&self) -> u64 {
+    pub fn begin(&self, stop_generation: u64) -> u64 {
         let mut state = self.state.lock().unwrap();
         state.generation += 1;
         state.tools_live = true;
+        state.stop_generation = stop_generation;
         state.turn = None;
         state.pending = true;
         self.changed.notify_waiters();
         state.generation
+    }
+    /// A provider-owned steer continuation inherits the original Stop fence.
+    pub fn begin_continuation(&self) -> Option<u64> {
+        let mut state = self.state.lock().unwrap();
+        if !state.live || !state.tools_live { return None; }
+        state.generation += 1;
+        state.turn = None;
+        state.pending = true;
+        self.changed.notify_waiters();
+        Some(state.generation)
     }
     pub fn bind(&self, generation: u64, turn: &str) -> bool {
         let mut state = self.state.lock().unwrap();
@@ -326,6 +341,7 @@ impl NativePermit {
             session_key: self.owner.session_key.clone(),
             generation: self.generation,
             run_id: state.turn.clone(),
+            stop_generation: state.stop_generation,
         })
     }
 
@@ -381,9 +397,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_stop_generation_stays_with_turn_and_steer_continuations() {
+        let owner = NativeAuthority::new("authority-stop-generation");
+        let generation = owner.begin(7);
+        assert!(owner.bind(generation,"first"));
+        assert_eq!(owner.capture().identity().unwrap().stop_generation,7);
+        owner.finish("first");
+        let continuation = owner.begin_continuation().unwrap();
+        assert!(owner.bind(continuation,"continuation"));
+        assert_eq!(owner.capture().identity().unwrap().stop_generation,7);
+        owner.invalidate();
+        assert!(owner.begin_continuation().is_none());
+    }
+
+    #[test]
     fn stop_keeps_pending_and_acknowledged_lifecycle_but_revokes_tools() {
         let owner = NativeAuthority::new("authority-overlapping-send");
-        let generation = owner.begin();
+        let generation = owner.begin(0);
         let early = owner.capture();
         owner.invalidate();
         assert!(owner.observe_start("first-turn"));
@@ -407,7 +437,7 @@ mod tests {
     async fn early_callback_waits_for_its_original_ack_and_never_uses_a_later_turn() {
         for explicit in [false, true] {
             let owner = NativeAuthority::new(&format!("authority-early-{explicit}"));
-            let generation = owner.begin();
+            let generation = owner.begin(0);
             let early = if explicit {
                 owner.capture_for_turn("first")
             } else {
@@ -427,7 +457,7 @@ mod tests {
                 .await
                 .is_err());
             owner.finish("first");
-            let later = owner.begin();
+            let later = owner.begin(0);
             assert!(owner.bind(later, "second"));
             assert!(early.wait_ready().await.is_err());
             assert!(early.admit().is_err());
@@ -438,7 +468,7 @@ mod tests {
     async fn pending_callback_wakes_and_rejects_stop_completion_and_runtime_loss() {
         for ending in ["stop", "complete", "revoke"] {
             let owner = NativeAuthority::new(&format!("authority-end-{ending}"));
-            let generation = owner.begin();
+            let generation = owner.begin(0);
             let pending = owner.capture();
             let job = tokio::spawn(async move { pending.wait_ready().await });
             tokio::task::yield_now().await;

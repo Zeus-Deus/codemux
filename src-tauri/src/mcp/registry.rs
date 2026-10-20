@@ -1570,7 +1570,7 @@ mod tests {
         let reg=McpRegistry::new();
         reg.set_host_tools(Arc::new(EchoHost));
         let owner=crate::delegation::authority::NativeAuthority::new("native-host-admission");
-        let generation=owner.begin();assert!(owner.bind(generation,"turn"));
+        let generation=owner.begin(0);assert!(owner.bind(generation,"turn"));
         let caller=HostCaller{control:None,thread_id:"native-host-admission".into(),provider:crate::agent_provider::ProviderKind::Claude,workspace_id:None,permission_mode:Some("default".into())};
         let actor=crate::delegation::app::NativeActor{thread_id:caller.thread_id.clone(),provider:caller.provider,workspace_id:None,session_id:"session".into(),permission_mode:caller.permission_mode.clone(),permit:owner.capture_for_turn("turn")};
         let entered=Arc::new(tokio::sync::Notify::new());
@@ -1623,7 +1623,7 @@ mod tests {
             permission_mode: Some("danger-full-access".into()),
         };
         let owner = crate::delegation::authority::NativeAuthority::new(&caller.thread_id);
-        let generation = owner.begin();
+        let generation = owner.begin(0);
         assert!(owner.bind(generation, "turn"));
         let actor = crate::delegation::app::NativeActor {
             thread_id: caller.thread_id.clone(),

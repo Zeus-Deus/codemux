@@ -350,12 +350,18 @@ pub(crate) async fn call_with_id<R: Runtime>(
             let key = input
                 .client_request_id
                 .unwrap_or(implicit_key);
+            service::identifier(&key, "client_request_id", 128).map_err(|e| e.to_string())?;
+            // Keep the returned caller key intact while bounding every entry
+            // key, including its suffix, in the launch journal's 128 bytes.
             let mut receipts = vec![];
             for (index, mut entry) in input.threads.into_iter().enumerate() {
                 let result = async {
                     if !entry.is_object() { return Err("invalid_arguments: each thread must be an object".into()); }
                     entry["workspace_id"] = json!(input.workspace_id);
-                    entry["client_request_id"] = json!(format!("{key}:{index}"));
+                    let entry_key = format!("{key}:{index}");
+                    entry["client_request_id"] = json!(if entry_key.len() <= 128 {
+                        entry_key
+                    } else { format!("batch:{:x}:{index}", Sha256::digest(key.as_bytes())) });
                     prepare_launch(&caller, &actor, &mut entry)?;
                     service::launch(&app, &caller, entry).await.map_err(|e| e.to_string())
                 }.await;

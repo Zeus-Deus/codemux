@@ -312,6 +312,12 @@ impl<R: Runtime> std::fmt::Debug for DeliveryCheckpoint<R> {
 }
 #[async_trait::async_trait]
 impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> {
+        self.app.state::<DatabaseStore>().message_delivery(&self.id)
+            .map_err(|message| crate::agent_provider::ProviderError::ValidationError { message })?
+            .map(|row| row.generation)
+            .ok_or_else(|| crate::agent_provider::ProviderError::ValidationError { message: "Missing dispatch delivery".into() })
+    }
     fn releases_queue_hold(&self) -> bool { self.release_queue }
     fn queued_delivery_state(&self) -> crate::agent_provider::types::QueuedDeliveryState {
         use crate::agent_provider::types::QueuedDeliveryState::*;

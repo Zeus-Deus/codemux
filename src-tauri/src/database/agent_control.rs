@@ -262,7 +262,7 @@ impl DatabaseStore {
 
     pub(crate) fn admit_control_operation_for_thread(
         &self, principal: &str, request_key: &str, tool: &str, payload_hash: &str,
-        epoch: &str, workspace_id: Option<&str>, thread_id: Option<&str>, sender: Option<&str>,
+        epoch: &str, workspace_id: Option<&str>, thread_id: Option<&str>, sender: Option<(&str, u64)>,
     ) -> Result<Admission, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e|e.to_string())?;
@@ -284,9 +284,11 @@ impl DatabaseStore {
             });
         }
         let id = uuid::Uuid::new_v4().to_string();
-        if tool == "thread_launch" {
-            if let (Some(sender), Some(target)) = (sender, thread_id) {
-                super::delegation_tasks::admit_launch(&tx, sender, target, &id)?;
+        if let Some((sender, generation)) = sender {
+            if let Some(target) = thread_id.filter(|_| tool == "thread_launch") {
+                super::delegation_tasks::admit_launch(&tx, sender, target, &id, generation)?;
+            } else {
+                super::delegation_tasks::verify_admission_generation(&tx, sender, generation)?;
             }
         }
         tx.execute(

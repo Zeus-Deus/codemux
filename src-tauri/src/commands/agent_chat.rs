@@ -2599,7 +2599,7 @@ pub(super) fn resume_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-fn native_thread_gate<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Arc<ThreadGate> {
+pub(super) fn native_thread_gate<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Arc<ThreadGate> {
     if let Some(state) = app.try_state::<NativeControlState>() {
         return state.thread_gate(thread_id);
     }

@@ -261,8 +261,15 @@ pub(super) fn admitted_task_start(
         task.parent_thread_id == sender && task.child_thread_id.as_deref() == Some(target)
     }))
 }
+pub(super) fn verify_admission_generation(conn: &Connection, sender: &str, admitted: u64) -> Result<(), String> {
+    let current: u64 = conn.query_row("SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1", [sender], |r| r.get(0))
+        .optional().map_err(|e| e.to_string())?.unwrap_or(0);
+    if admitted != current { return Err("stale_caller: caller was stopped before admission".into()); }
+    Ok(())
+}
 pub(super) fn admit_agent_message(tx: &Connection, sender: &str, target: &str, id: &str, payload: &Value) -> Result<(), String> {
     use sha2::{Digest, Sha256};
+    verify_admission_generation(tx, sender, payload["caller"]["identity"]["authority"]["stop_generation"].as_u64().unwrap_or(0))?;
     let context = message_context(tx, sender)?;
     if context.hop >= 24 {
         return Err("resource_limit: automatic agent message chain reached 24 hops; a human message is required to start a new chain".into());
@@ -322,7 +329,8 @@ fn reserve_work(conn: &Connection, root: &str, depth: usize, id: &str, kind: &st
     if count >= 6 { return Err("resource_limit: 6 new-work admissions per human root".into()); }
     conn.execute("INSERT INTO agent_orchestration_admissions(id,root_id,kind) VALUES (?1,?2,?3)",params![id,root,kind]).map(drop).map_err(|e|e.to_string())
 }
-pub(super) fn admit_launch(conn: &Connection, sender: &str, target: &str, id: &str) -> Result<(), String> {
+pub(super) fn admit_launch(conn: &Connection, sender: &str, target: &str, id: &str, generation: u64) -> Result<(), String> {
+    verify_admission_generation(conn, sender, generation)?;
     let context = root_context(conn,sender)?;
     reserve_work(conn,&context.root_id,context.depth+1,id,"launch",None)?;
     conn.execute("INSERT INTO agent_orchestration_launches(id,thread_id,root_id) VALUES (?1,?2,?3)",params![id,target,context.root_id]).map_err(|e|e.to_string())?;
@@ -609,7 +617,7 @@ impl DatabaseStore {
             [&task.parent_thread_id], |r| r.get(0),
         ).optional().map_err(|e| e.to_string())?.unwrap_or(0);
         if task.admission_generation.is_some_and(|admitted| admitted != generation) {
-            return Err("Parent was stopped before task admission".into());
+            return Err("stale_caller: Parent was stopped before task admission".into());
         }
         let mut task = task.clone();
         task.admission_generation = Some(generation);
@@ -1412,7 +1420,7 @@ mod native_budget_tests {
         let original=db.orchestration_context("coordinator").unwrap().root_id;
         for i in 0..3 {
             let child=format!("launch-{i}");
-            db.admit_control_operation_for_thread("thread:coordinator",&child,"thread_launch",&child,"epoch",Some("workspace"),Some(&child),Some("coordinator")).unwrap();
+            db.admit_control_operation_for_thread("thread:coordinator",&child,"thread_launch",&child,"epoch",Some("workspace"),Some(&child),Some(("coordinator", 0))).unwrap();
             db.orchestration_launch_finished(&child).unwrap();
         }
         for i in 0..3 {
@@ -1422,10 +1430,10 @@ mod native_budget_tests {
         }
         for i in 3..6 {
             let child=format!("launch-{i}");
-            db.admit_control_operation_for_thread("thread:coordinator",&child,"thread_launch",&child,"epoch",Some("workspace"),Some(&child),Some("coordinator")).unwrap();
+            db.admit_control_operation_for_thread("thread:coordinator",&child,"thread_launch",&child,"epoch",Some("workspace"),Some(&child),Some(("coordinator", 0))).unwrap();
             db.orchestration_launch_finished(&child).unwrap();
         }
-        assert!(db.admit_control_operation_for_thread("thread:coordinator","seventh","thread_launch","seventh","epoch",Some("workspace"),Some("seventh"),Some("coordinator")).err().unwrap().contains("resource_limit"));
+        assert!(db.admit_control_operation_for_thread("thread:coordinator","seventh","thread_launch","seventh","epoch",Some("workspace"),Some("seventh"),Some(("coordinator", 0))).err().unwrap().contains("resource_limit"));
         db.orchestration_human_root("coordinator").unwrap();
         let new_root=db.orchestration_context("coordinator").unwrap().root_id;
         let payload=serde_json::json!({"origin":"controller","input":{"text":"Late result from earlier round"},"caller":{"identity":{"kind":"thread","thread_id":"launch-0"}},"provenance":{"created_by":"agent"}});
@@ -1457,4 +1465,23 @@ mod native_budget_tests {
         assert!(db.admit_message_delivery("spoof", "other", "spoof", &wrong_target, "epoch", 0, None, false).unwrap().1);
         assert!(db.orchestration_context("other").unwrap().root_id != root);
     }
+    #[test]
+    fn native_stop_generation_rejects_new_rows_atomically_after_rearm() {
+        let db=DatabaseStore::new_in_memory();
+        let generation=db.delivery_generation("sender").unwrap().0;
+        db.stop_message_deliveries("sender").unwrap();
+        db.resume_message_delivery_thread("sender").unwrap();
+        let mut task=record(&db,"sender","child","stale-task",vec![]);
+        task.admission_generation=Some(generation);
+        assert!(db.admit_delegation_task(&task,None,&Value::Null).unwrap_err().contains("stale_caller"));
+        assert!(db.admit_control_operation_for_thread("thread:sender","stale-launch","thread_launch","hash","epoch",Some("workspace"),Some("chat"),Some(("sender",generation))).err().unwrap().contains("stale_caller"));
+        let payload=serde_json::json!({"origin":"controller","input":{"text":"Late report"},"caller":{"identity":{"kind":"thread","thread_id":"sender","authority":{"stop_generation":generation}}},"provenance":{"created_by":"agent"}});
+        assert!(db.admit_message_delivery("stale-send","target","stale-message",&payload,"epoch",0,None,false).unwrap_err().contains("stale_caller"));
+        let conn=db.conn.lock().unwrap();
+        for table in ["agent_delegation_tasks","agent_control_operations","agent_message_deliveries","agent_message_causation","agent_orchestration_admissions","agent_orchestration_launches"] {
+            let count:u32=conn.query_row(&format!("SELECT COUNT(*) FROM {table}"),[],|r|r.get(0)).unwrap();
+            assert_eq!(count,0,"{table}");
+        }
+    }
+
 }

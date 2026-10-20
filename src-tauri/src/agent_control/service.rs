@@ -74,7 +74,10 @@ fn authorize_with_delivery_retry<R: Runtime>(app: &AppHandle<R>, caller: &Contro
         let db = app.state::<DatabaseStore>();
         let mut orchestration = orchestration;
         match &caller.admitted {
-            None => authority.verify(thread_id).map_err(|e| ControlError::new("stale_caller", e))?,
+            None => {
+                authority.verify(thread_id).map_err(|e| ControlError::new("stale_caller", e))?;
+                db.verify_delivery_generation(thread_id, authority.stop_generation).map_err(|e| ControlError::new("stale_caller", e))?;
+            }
             Some(super::AdmittedAuthority::Operation {operation_id}) => {
                 let receipt=db.control_operation(&caller.principal,operation_id,&app.state::<NativeControlState>().epoch)?.ok_or_else(||ControlError::new("stale_operation","Accepted operation missing"))?;
                 if receipt.tool == "workspace_launch" { orchestration = false; }
@@ -163,7 +166,7 @@ pub(crate) async fn launch<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
     let thread = uuid::Uuid::new_v4().to_string();
     let admitted = caller.admit(||app.state::<DatabaseStore>().admit_control_operation_for_thread(
         &caller.principal, &input.client_request_id, "thread_launch", &fingerprint, &epoch,
-        Some(&workspace.workspace_id.0), Some(&thread), caller.thread_id(),
+        Some(&workspace.workspace_id.0), Some(&thread), caller.thread_id().zip(caller.admission_generation()),
     )).map_err(|e| ControlError::new(if e.starts_with("request_key_conflict") { "request_key_conflict" } else if e.starts_with("resource_limit") { "resource_limit" } else { "operation_admission_failed" }, e))?;
     let receipt = serde_json::to_value(&admitted.receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
     if !admitted.newly_admitted { return Ok(receipt); }
@@ -582,7 +585,7 @@ fn admit_mutation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, tool: 
     identifier(key,"client_request_id",128)?;
     let hash = format!("{:x}",Sha256::digest(serde_json::to_vec(args).map_err(|e|ControlError::new("invalid_arguments",e.to_string()))?));
     let epoch = app.state::<NativeControlState>().epoch.clone();
-    caller.admit(||app.state::<DatabaseStore>().admit_control_operation_for_thread(&caller.principal,key,tool,&hash,&epoch,Some(&target.workspace_id),Some(&target.thread_id),caller.thread_id()))
+    caller.admit(||app.state::<DatabaseStore>().admit_control_operation_for_thread(&caller.principal,key,tool,&hash,&epoch,Some(&target.workspace_id),Some(&target.thread_id),caller.thread_id().zip(caller.admission_generation())))
         .map_err(|e|ControlError::new(if e.starts_with("request_key_conflict") {"request_key_conflict"} else {"operation_admission_failed"},e))
 }
 

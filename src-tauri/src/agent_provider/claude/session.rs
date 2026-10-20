@@ -1490,7 +1490,8 @@ impl ClaudeSession {
             images: encoded_images,
         };
         if let Some(checkpoint) = &checkpoint { checkpoint.authorize_dispatch()?; }
-        let generation = self.native_authority.begin();
+        let stop_generation = checkpoint.as_ref().map(|c| c.native_stop_generation()).transpose()?.unwrap_or(0);
+        let generation = self.native_authority.begin(stop_generation);
         let turn_id = TurnId(format!("claude-turn-{}", uuid::Uuid::new_v4()));
         {
             let mut state = self.state.lock().await;
@@ -2885,7 +2886,7 @@ mod tests {
             let registry = crate::mcp::registry::McpRegistry::new(); registry.set_host_tools(Arc::new(Host));
             let mut caller = test_caller(); caller.thread_id = format!("claude-late-host-{stop_before_capture}");
             let owner = crate::delegation::authority::NativeAuthority::new(&caller.thread_id);
-            let generation = owner.begin(); assert!(owner.bind(generation, "turn"));
+            let generation = owner.begin(0); assert!(owner.bind(generation, "turn"));
             let db = crate::database::DatabaseStore::new_in_memory();
             if stop_before_capture { owner.invalidate(); db.stop_message_deliveries(&caller.thread_id).unwrap(); }
             let actor = crate::delegation::app::NativeActor { thread_id:caller.thread_id.clone(), provider:caller.provider, workspace_id:caller.workspace_id.clone(), session_id:"session".into(), permission_mode:caller.permission_mode.clone(), permit:owner.capture() };

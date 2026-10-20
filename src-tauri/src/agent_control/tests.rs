@@ -1925,16 +1925,25 @@ async fn orchestration_message_queue_promotion_checks_authority_before_recording
 }
 
 async fn native_caller_fixture(mode:&str)->(tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String, String, Arc<crate::delegation::authority::NativeAuthority>, crate::delegation::app::NativeActor) {
-    let (app,provider,root,workspace)=fixture().await;
+    native_caller_provider_fixture(crate::agent_provider::ProviderKind::Claude, mode).await
+}
+
+async fn native_caller_provider_fixture(kind:crate::agent_provider::ProviderKind, mode:&str)->(tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String, String, Arc<crate::delegation::authority::NativeAuthority>, crate::delegation::app::NativeActor) {
+    let (app, mut provider, root, workspace)=fixture().await;
     app.manage(crate::commands::delegation::DelegationState::default());
+    if kind == crate::agent_provider::ProviderKind::Codex {
+        provider = Arc::new(mock_agent_provider::MockAgentProvider::new(kind));
+        app.state::<crate::commands::agent_chat::ProviderRegistry>().set_codex(provider.clone()).await;
+        app.state::<NativeControlState>().fixture_capabilities.lock().unwrap().insert(kind, crate::agent_provider::codex::capabilities::build_capabilities(vec![]));
+    }
     provider.enable_session_listing();
-    let launched=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"native-caller-launch","provider":"claude","permission_mode":mode})).await.unwrap();
+    let launched=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"native-caller-launch","provider":kind,"permission_mode":mode})).await.unwrap();
     let receipt=settle_operation(&app,&launched).await;
     assert_eq!(receipt["state"],"succeeded","{receipt}");
     let thread=receipt["thread_id"].as_str().unwrap().to_string();
-    let authority=crate::delegation::authority::NativeAuthority::with_policy(&thread,crate::agent_provider::ProviderKind::Claude,Some(mode));
-    let generation=authority.begin();assert!(authority.bind(generation,"native-run"));
-    let actor=crate::delegation::app::NativeActor {thread_id:thread.clone(),provider:crate::agent_provider::ProviderKind::Claude,workspace_id:Some(workspace.clone()),session_id:format!("mock-{thread}"),permission_mode:Some(mode.into()),permit:authority.capture()};
+    let authority=crate::delegation::authority::NativeAuthority::with_policy(&thread,kind,Some(mode));
+    let generation=authority.begin(0);assert!(authority.bind(generation,"native-run"));
+    let actor=crate::delegation::app::NativeActor {thread_id:thread.clone(),provider:kind,workspace_id:Some(workspace.clone()),session_id:format!("mock-{thread}"),permission_mode:Some(mode.into()),permit:authority.capture()};
     (app,provider,root,workspace,thread,authority,actor)
 }
 
@@ -2146,7 +2155,7 @@ async fn native_callers_agent_ping_pong_stops_at_24_hops() {
     let launch=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"ping-b","provider":"claude","permission_mode":"default"})).await.unwrap();
     let b=settle_operation(&app,&launch).await["thread_id"].as_str().unwrap().to_string();
     let authority_b=crate::delegation::authority::NativeAuthority::with_policy(&b,crate::agent_provider::ProviderKind::Claude,Some("default"));
-    let generation=authority_b.begin();authority_b.bind(generation,"ping-b-run");
+    let generation=authority_b.begin(0);authority_b.bind(generation,"ping-b-run");
     let actor_b=crate::delegation::app::NativeActor {thread_id:b.clone(),session_id:format!("mock-{b}"),permit:authority_b.capture(),..actor_a.clone()};
     let root=app.state::<crate::database::DatabaseStore>().orchestration_context(&a).unwrap().root_id;
     for hop in 0..=24 {
@@ -2287,4 +2296,137 @@ async fn native_callers_queued_human_keeps_active_turn_authority_until_stop() {
     authority.invalidate();
     assert!(service::authorize(app.handle(),&caller).is_err());
     assert!(caller.admit(||Ok(())).is_err());
+}
+
+#[tokio::test]
+async fn native_callers_round2_stop_revokes_live_descendants_before_interrupts() {
+    use crate::commands::delegation::{on_thread_stopped, StopKind};
+    use crate::database::delegation_tasks::{TaskRecord, TaskStatus};
+    let (app, _, _root, workspace, grandchild, _authority, actor) = native_caller_fixture("default").await;
+    let db = app.state::<crate::database::DatabaseStore>();
+    for (parent, child, id) in [("stopped-parent", "stopped-child", "first"), ("stopped-child", grandchild.as_str(), "second")] {
+        let mut task = TaskRecord::new(id.into(), parent.into(), Some(child.into()), "claude".into(), "Nested task".into(), "A complete nested task brief".into(), 1);
+        task.workspace_id = workspace.clone();
+        task.permission_mode = Some("default".into());
+        // Published tasks may still own a live native turn. Revocation must
+        // precede the terminal-status shortcut as well as provider waits.
+        task.status = TaskStatus::Completed;
+        db.admit_delegation_task(&task, None, &json!({})).unwrap();
+    }
+    let gate = app.state::<NativeControlState>().thread_gate(&grandchild);
+    let generation = gate.generation();
+    let tasks_before = db.delegation_tasks(None).unwrap().len();
+    let chats_before = db.control_thread_ids(&workspace, None, 100).unwrap();
+    on_thread_stopped(app.handle(), "stopped-parent", StopKind::Stop);
+    // No yield or provider acknowledgement between Stop and these calls.
+    for (name, args) in [
+        ("delegate_task", json!({"provider":"claude","title":"Late child","task":"This task must never be admitted after Stop","client_request_id":"late-task"})),
+        ("thread_launch", json!({"title":"Late chat","client_request_id":"late-launch"})),
+        ("thread_send", json!({"thread_id":grandchild,"message":"This message must never be admitted","client_request_id":"late-send"})),
+    ] {
+        let error = native::call(app.handle().clone(), actor.clone(), name.into(), args).await.unwrap_err();
+        assert!(error.contains("stale_caller"), "{name}: {error}");
+    }
+    assert!(gate.verify(generation).is_err());
+    assert_eq!(db.delegation_tasks(None).unwrap().len(), tasks_before);
+    assert_eq!(db.control_thread_ids(&workspace, None, 100).unwrap(), chats_before);
+    for key in ["late-launch", "late-send"] { assert!(db.control_operation_by_key(&format!("thread:{grandchild}"), key, if key == "late-launch" { "thread_launch" } else { "thread_send" }, "unused", &app.state::<NativeControlState>().epoch).unwrap().is_none()); }
+}
+
+#[tokio::test]
+async fn native_callers_round2_close_revokes_tab_child_before_interrupt() {
+    use crate::commands::delegation::{on_thread_stopped, DelegationState, StopKind, Task};
+    let (app, _, _root, _workspace, child, _authority, actor) = native_caller_fixture("default").await;
+    app.state::<DelegationState>().reserve_worktree(&child, Task::new("closed-parent", crate::agent_provider::ProviderKind::Claude, "Tab child", "A tab child task", 1));
+    let gate = app.state::<NativeControlState>().thread_gate(&child);
+    let generation = gate.generation();
+    let _dispatch = gate.dispatch.clone().lock_owned().await;
+    on_thread_stopped(app.handle(), "closed-parent", StopKind::Close);
+    assert!(actor.permit.identity().is_err());
+    assert!(gate.verify(generation).is_err());
+    let error = native::call(app.handle().clone(), actor, "thread_launch".into(), json!({"client_request_id":"closed-launch"})).await.unwrap_err();
+    assert!(error.contains("stale_caller"), "{error}");
+    assert!(gate.verify(generation).is_err());
+}
+
+#[tokio::test]
+async fn native_callers_round2_long_batch_keys_preserve_entry_receipts() {
+    for key in ["k".repeat(128), "é".repeat(64)] {
+        let (app, _, _root, workspace, _, _authority, actor) = native_caller_fixture("default").await;
+        let args = json!({"workspace_id":workspace,"client_request_id":key,"threads":[{"title":"First"},{"title":"Second"}]});
+        let first = native::call(app.handle().clone(), actor.clone(), "create_threads".into(), args.clone()).await.unwrap();
+        assert!(first.get("error").is_none(), "{first}");
+        assert_eq!(first["threads"].as_array().unwrap().len(), 2);
+        let retry = native::call(app.handle().clone(), actor, "create_threads".into(), args).await.unwrap();
+        assert_eq!(first["client_request_id"], key);
+        for index in 0..2 { assert_eq!(first["threads"][index]["operation_id"], retry["threads"][index]["operation_id"]); }
+    }
+}
+
+#[tokio::test]
+async fn native_callers_round2_workspace_launch_inherits_lower_modes_and_keeps_plan_refusal() {
+    use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller, HostTools};
+    for (kind, mode) in [(ProviderKind::Claude,"default"),(ProviderKind::Claude,"acceptEdits"),(ProviderKind::Codex,"workspace-write"),(ProviderKind::Claude,"plan"),(ProviderKind::Codex,"plan")] {
+        let (app, provider, root, workspace, thread, _authority, actor) = native_caller_provider_fixture(kind, mode).await;
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git").current_dir(root.path()).args(args).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        };
+        git(&["init","-b","main"]);
+        git(&["-c","user.name=Test","-c","user.email=test@example.com","-c","commit.gpgsign=false","commit","--allow-empty","-m","base"]);
+        app.manage(crate::terminal::PtyState::default());
+        app.manage(crate::presets::PresetStoreState::new(&app.state::<crate::database::DatabaseStore>()));
+        let control = native::qualify(app.handle(), &actor).await.unwrap();
+        let caller = HostCaller {control:Some(control),thread_id:thread.clone(),provider:kind,workspace_id:Some(workspace),permission_mode:Some(mode.into())};
+        let host = crate::commands::workspace_launch::WorkspaceLaunchHost::with_install_check(app.handle().clone(), |_|true);
+        let offered = host.tools_for(&caller).iter().any(|t|t.name=="workspace_launch");
+        let result = host.call(&caller,"mcp__codemux__workspace_launch",&json!({"title":"Lower mode workspace","message":"Work on this self-contained fixture","branch":"lower-mode-fixture"})).unwrap();
+        if mode == "plan" {
+            assert!(!offered);
+            assert_eq!(result["isError"],true);
+            assert!(result.to_string().contains("Plan mode"));
+            continue;
+        }
+        assert!(offered, "{kind:?} {mode}");
+        assert_eq!(result["isError"],false,"{result}");
+        let child = tokio::time::timeout(std::time::Duration::from_secs(10), async { loop {
+            if let Some(child) = provider.calls.snapshot().iter().find_map(|c| match c {mock_agent_provider::MockCall::SendTurn(t,_) if t.0!=thread => Some(t.0.clone()), _ => None}) {break child;}
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }}).await.unwrap();
+        let input = provider.start_inputs().into_iter().find(|i|i.thread_id.0==child).unwrap();
+        let launched_ceiling = super::permissions::Ceiling::for_mode(kind,input.permission_mode.as_deref()).unwrap();
+        assert!(caller.control.as_ref().unwrap().ceiling().unwrap().permits(launched_ceiling));
+        assert_eq!(input.permission_mode.as_deref(),Some(mode));
+        assert_eq!(app.state::<crate::database::DatabaseStore>().get_agent_chat_session(&child).unwrap().permission_mode,input.permission_mode);
+        // Only this test's checkout is removed; its repository is a TempDir.
+        git(&["worktree","remove","--force",input.cwd.to_str().unwrap()]);
+        std::fs::remove_dir(input.cwd.parent().unwrap()).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn native_callers_round2_dispatch_stop_fence_survives_late_callback_capture() {
+    let (app, _, _root, workspace, thread, authority, actor) = native_caller_fixture("default").await;
+    let db = app.state::<crate::database::DatabaseStore>();
+    // Model the interval after durable Stop but before native invalidation.
+    // Capturing callback identity now must retain the turn's old generation.
+    db.stop_message_deliveries(&thread).unwrap();
+    db.resume_message_delivery_thread(&thread).unwrap();
+    actor.permit.identity().unwrap().verify(&thread).unwrap();
+    for (name,args) in [
+        ("delegate_task",json!({"provider":"claude","task":"Never admit work from a stopped native turn"})),
+        ("thread_launch",json!({"client_request_id":"late-launch"})),
+        ("thread_send",json!({"thread_id":thread,"message":"Never admit this message","client_request_id":"late-send"})),
+    ] {
+        let error = native::call(app.handle().clone(),actor.clone(),name.into(),args).await.unwrap_err();
+        assert!(error.contains("stale_caller"),"{name}: {error}");
+    }
+    assert!(db.delegation_tasks(None).unwrap().is_empty());
+    assert_eq!(db.control_thread_ids(&workspace,None,100).unwrap(),vec![thread.clone()]);
+    let generation = authority.begin(db.delivery_generation(&thread).unwrap().0);
+    assert!(authority.bind(generation,"new-human-turn"));
+    let actor = crate::delegation::app::NativeActor {permit:authority.capture(),..actor};
+    let receipt = native::call(app.handle().clone(),actor,"thread_launch".into(),json!({"client_request_id":"fresh-launch"})).await.unwrap();
+    assert_eq!(receipt["state"],"accepted");
 }

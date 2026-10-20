@@ -1073,7 +1073,8 @@ fn delegate_with_call<R: Runtime>(
     let state = app.try_state::<DelegationState>().ok_or_else(unavailable)?;
     let app_state = app.try_state::<AppStateStore>().ok_or_else(unavailable)?;
     let parent = caller.thread_id.as_str();
-    let admission_generation = db.delivery_generation(parent)?.0;
+    let admission_generation = caller.control.as_ref().and_then(|c| c.admission_generation())
+        .map(Ok).unwrap_or_else(|| db.delivery_generation(parent).map(|g| g.0))?;
     let wait_until = (arguments["mode"] == "wait").then(|| now_ms() + arguments["wait_ms"].as_u64().unwrap_or(20_000).min(20_000) as i64);
 
     if !setting_on(&db) {
@@ -1609,6 +1610,12 @@ pub fn on_thread_stopped<R: Runtime>(app: &AppHandle<R>, thread_id: &str, kind: 
             }
             continue;
         }
+        if let Some(child) = &task.child_thread_id {
+            if let Err(error) = crate::delegation::app::user_activity(app, child, true) {
+                log::warn!("Could not revoke stopped descendant authority: {error}");
+            }
+            super::agent_chat::native_thread_gate(app, child).cancel();
+        }
         if task.status.terminal() && !task.has_pending_child_runs {
             continue;
         }
@@ -1666,6 +1673,10 @@ fn close_tasks<R: Runtime>(app: &AppHandle<R>, thread: &str) {
         .filter(|(_, task)| task.parent == thread && task.placement.is_tab())
         .map(|(child, task)| (child.clone(), task.clone())).collect();
     for (child, task) in children {
+        if let Err(error) = crate::delegation::app::user_activity(app, &child, true) {
+            log::warn!("Could not revoke closed child authority: {error}");
+        }
+        super::agent_chat::native_thread_gate(app, &child).cancel();
         if let Some(db) = app.try_state::<DatabaseStore>() {
             let _ = db.dispose_delegation_task_for_close(thread, &task.task_id);
         }

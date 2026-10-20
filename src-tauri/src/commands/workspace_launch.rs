@@ -13,13 +13,13 @@ use crate::mcp::registry::{HostCaller, HostTools};
 use crate::mcp::runtime::{prefix_tool_name, McpTool};
 use crate::state::{AppStateStore, NotificationLevel, WorkspaceSnapshot};
 
-use super::delegation::{offered_agents, parent_is_full, provider_id, DelegationState};
+use super::delegation::{offered_agents, provider_id, DelegationState};
 
 const TOOL_NAME: &str = "workspace_launch";
 const MAX_IN_FLIGHT: usize = 6;
 const TOOL_DESCRIPTION: &str = "Start a NEW top-level workspace with its own git worktree, branch and agent chat. Use ONLY when the user asks for separate/new workspaces, threads, or parallel independent work they will follow in the sidebar. Its results do NOT come back to this chat; use delegate_task when you need results back. Call workspace_launch once per workspace; several calls in one turn are fine. The caller stays in this chat.
 
-The new agent sees ONLY `message`. Write a self-contained brief: goal, relevant files, constraints, how to verify, and whether to open a PR. Omit provider to use your own provider. Pass model and effort only when the user asked for them; otherwise omit for that provider's defaults. The new chat runs with full access, like this chat.
+The new agent sees ONLY `message`. Write a self-contained brief: goal, relevant files, constraints, how to verify, and whether to open a PR. Omit provider to use your own provider. Pass model and effort only when the user asked for them; otherwise omit for that provider's defaults. The new chat inherits this chat's permission ceiling.
 
 It returns at once while the workspace starts. Give the user a one-line status naming the workspaces and END YOUR TURN. They appear in the sidebar shortly; do not poll or wait. Startup failures appear in Codemux notifications.";
 
@@ -62,7 +62,8 @@ impl LaunchArgs {
 }
 
 fn eligible(caller: &HostCaller, is_child: bool, workspace: &WorkspaceSnapshot) -> bool {
-    parent_is_full(caller.provider, caller.permission_mode.as_deref())
+    matches!(caller.provider, ProviderKind::Claude | ProviderKind::Codex)
+        && crate::agent_control::permissions::Ceiling::for_mode(caller.provider, caller.permission_mode.as_deref()).is_some_and(|ceiling| !ceiling.plan)
         && !is_child
         && workspace.host_id.is_none()
         && workspace.remote_cwd.is_none()
@@ -85,7 +86,7 @@ fn caller_workspace<R: Runtime>(
         .state::<DelegationState>()
         .is_running_child(&caller.thread_id);
     if !eligible(caller, is_child, &workspace) {
-        return Err("Workspace launch needs a main Claude or Codex chat in Full access, in a local git workspace (not a delegated task or imported snapshot).".into());
+        return Err("Workspace launch needs a main Claude or Codex chat outside Plan mode, in a local git workspace (not a delegated task or imported snapshot).".into());
     }
     let root = workspace.project_root.as_deref().unwrap_or(&workspace.cwd);
     let repo = crate::config::workspace_config::find_git_root(Path::new(root))
@@ -224,6 +225,11 @@ impl<R: Runtime> WorkspaceLaunchHost<R> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_install_check(app: AppHandle<R>, is_installed: fn(ProviderKind) -> bool) -> Self {
+        Self { app, state: Arc::default(), is_installed }
+    }
+
     fn launch(&self, caller: &HostCaller, arguments: &Value) -> Result<Value, String> {
         let input = LaunchArgs::parse(arguments)?;
         let (workspace, repo) = caller_workspace(&self.app, caller)?;
@@ -260,11 +266,10 @@ impl<R: Runtime> WorkspaceLaunchHost<R> {
         let app = self.app.clone();
         let mut caller = caller.clone();
         let control = caller.control.as_mut().ok_or("stale_caller: workspace launch requires authenticated chat authority")?;
-        if control.ceiling().is_some_and(|c| !c.full_access()) {return Err("permission_ceiling: workspace_launch requires full access".into());}
         service::authorize_native(&app, control, false).map_err(|e|e.to_string())?;
         let epoch = app.state::<crate::agent_control::NativeControlState>().epoch.clone();
-        let admission = control.admit(|| app.state::<crate::database::DatabaseStore>().admit_control_operation(
-            &control.principal, &uuid::Uuid::new_v4().to_string(), "workspace_launch", &arguments.to_string(), &epoch, Some(&workspace.workspace_id.0), None,
+        let admission = control.admit(|| app.state::<crate::database::DatabaseStore>().admit_control_operation_for_thread(
+            &control.principal, &uuid::Uuid::new_v4().to_string(), "workspace_launch", &arguments.to_string(), &epoch, Some(&workspace.workspace_id.0), None, control.thread_id().zip(control.admission_generation()),
         ))?;
         let operation = admission.receipt.operation_id;
         if control.thread_id().is_some() {control.admitted=Some(crate::agent_control::AdmittedAuthority::Operation {operation_id:operation.clone()});}
@@ -447,11 +452,15 @@ mod tests {
         assert!(!eligible(&caller, true, &workspace));
         for mode in ["plan", "default", "acceptEdits"] {
             caller.permission_mode = Some(mode.into());
-            assert!(!eligible(&caller, false, &workspace));
+            assert_eq!(eligible(&caller, false, &workspace), mode != "plan");
         }
         caller.provider = ProviderKind::Codex;
         caller.permission_mode = Some("workspace-write".into());
-        assert!(!eligible(&caller, false, &workspace));
+        assert!(eligible(&caller, false, &workspace));
+        for mode in ["read-only", "plan"] {
+            caller.permission_mode = Some(mode.into());
+            assert!(!eligible(&caller, false, &workspace));
+        }
         caller.permission_mode = Some("danger-full-access".into());
         assert!(eligible(&caller, false, &workspace));
         workspace.host_id = Some(1);
@@ -468,6 +477,18 @@ mod tests {
         caller.provider = ProviderKind::Codex;
         workspace.is_git = false;
         assert!(!eligible(&caller, false, &workspace));
+    }
+
+    #[test]
+    fn workspace_launch_round2_lower_modes_share_listing_and_dispatch_eligibility() {
+        let state = AppStateStore::default();
+        let root = tempfile::tempdir().unwrap();
+        let id = state.create_empty_workspace_at_path(root.path().into());
+        let workspace = state.find_workspace(&id.0).unwrap();
+        for (provider, mode) in [(ProviderKind::Claude, "default"), (ProviderKind::Claude, "acceptEdits"), (ProviderKind::Codex, "workspace-write")] {
+            let caller = HostCaller {control:None,thread_id:"parent".into(),provider,workspace_id:Some(id.0.clone()),permission_mode:Some(mode.into())};
+            assert!(eligible(&caller, false, &workspace), "{provider:?} {mode}");
+        }
     }
 
     #[test]
@@ -600,7 +621,7 @@ mod tests {
             .is_err());
         let mut supervised = caller.clone();
         supervised.permission_mode = Some("default".into());
-        assert!(host.tools_for(&supervised).is_empty());
+        assert_eq!(host.tools_for(&supervised).len(), 1);
         assert!(host
             .call(
                 &supervised,

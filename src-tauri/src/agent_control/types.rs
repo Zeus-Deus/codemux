@@ -78,6 +78,12 @@ impl ControlCaller {
             _ => None,
         }
     }
+    pub(crate) fn admission_generation(&self) -> Option<u64> {
+        match &self.identity {
+            CallerPrincipal::Thread { authority, .. } => Some(authority.stop_generation),
+            _ => None,
+        }
+    }
     pub fn ceiling(&self) -> Option<super::permissions::Ceiling> {
         match &self.identity {
             CallerPrincipal::Thread { ceiling, .. } => Some(*ceiling),

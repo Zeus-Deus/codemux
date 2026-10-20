@@ -1690,14 +1690,14 @@ impl CodexSession {
         if let Some(id) = client_id {
             params_value["clientUserMessageId"] = json!(id);
         }
-        if let Some(checkpoint) = &checkpoint {
-            checkpoint.authorize_dispatch().map_err(|error| TurnStartError::Rpc(
+        let stop_generation = if let Some(checkpoint) = &checkpoint {
+            checkpoint.authorize_dispatch().and_then(|()| checkpoint.native_stop_generation()).map_err(|error| TurnStartError::Rpc(
                 crate::json_rpc_child::RpcChildError::RpcError(crate::json_rpc_child::RpcError {code:-32001,message:error.to_string(),data:None})
-            ))?;
-        }
+            ))?
+        } else { 0 };
         let generation = {
             let mut state = self.state.lock().await;
-            let generation = self.native_authority.begin();
+            let generation = self.native_authority.begin(stop_generation);
             state.pending_turn_start = Some(PendingTurnStart::default());
             generation
         };
@@ -3783,7 +3783,7 @@ mod tests {
             registry.set_host_tools(Arc::new(HandOffHost));
             let caller = crate::mcp::registry::HostCaller { control:None, thread_id: format!("codex-late-host-{stop_before_capture}"), provider: crate::agent_provider::ProviderKind::Codex, workspace_id: None, permission_mode: Some("danger-full-access".into()) };
             let owner = crate::delegation::authority::NativeAuthority::new(&caller.thread_id);
-            let generation = owner.begin(); assert!(owner.bind(generation, "turn"));
+            let generation = owner.begin(0); assert!(owner.bind(generation, "turn"));
             let db = crate::database::DatabaseStore::new_in_memory();
             if stop_before_capture { owner.invalidate(); db.stop_message_deliveries(&caller.thread_id).unwrap(); }
             let actor = crate::delegation::app::NativeActor { thread_id:caller.thread_id.clone(), provider:caller.provider, workspace_id:None, session_id:"session".into(), permission_mode:caller.permission_mode.clone(), permit:owner.capture_for_turn("turn") };
