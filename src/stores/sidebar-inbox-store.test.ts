@@ -558,6 +558,20 @@ describe("inbox drag commits", () => {
     expect(mockSetWorkspacePinned).not.toHaveBeenCalled();
   });
 
+  it("clears hidden shelves when dropping into Wrapping up without suppressing its automatic lifecycle", async () => {
+    useSidebarInboxStore.setState({ settled: [{ id: "a", at: 1 }], keepActive: { a: true } });
+    await useSidebarInboxStore.getState().applyDrop({ ...unpin, destination: "wrapping" }, true);
+    expect(useSidebarInboxStore.getState()).toMatchObject({ settled: [], keepActive: {} });
+  });
+
+  it("restores hidden shelves and their previous keep-active decision if a wrapping drop fails", async () => {
+    const entry = { id: "a", at: 1 };
+    useSidebarInboxStore.setState({ settled: [entry], keepActive: { a: true } });
+    mockSetWorkspacePinned.mockRejectedValueOnce(new Error("offline"));
+    await expect(useSidebarInboxStore.getState().applyDrop({ ...unpin, destination: "wrapping" }, true)).rejects.toThrow("offline");
+    expect(useSidebarInboxStore.getState()).toMatchObject({ settled: [entry], keepActive: { a: true } });
+  });
+
   it("lets a later menu action win after an in-flight drop and clears its override", async () => {
     let finishPin = () => {};
     mockSetWorkspacePinned.mockReturnValueOnce(new Promise<void>((resolve) => { finishPin = resolve; }));

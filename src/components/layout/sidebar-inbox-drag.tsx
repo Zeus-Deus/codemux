@@ -126,12 +126,14 @@ function Boundary({
   target,
   resting,
   empty,
+  wrapping = false,
 }: {
   id: string;
   dragging: boolean;
   target: boolean;
   resting: boolean;
   empty: boolean;
+  wrapping?: boolean;
 }) {
   const { setNodeRef, transform, transition } = useSortable({
     id,
@@ -169,7 +171,11 @@ function Boundary({
           </div>
           {empty && (
             <div className="absolute inset-x-0 top-6 flex h-9 items-center justify-center rounded-md border border-dashed border-border text-caption text-muted-foreground">
-              {id === PINNED ? "Drop here to pin" : "Drop here to keep active"}
+              {id === PINNED
+                ? "Drop here to pin"
+                : wrapping
+                  ? "Unpin into Wrapping up"
+                  : "Drop here to keep active"}
             </div>
           )}
         </>
@@ -413,7 +419,12 @@ export function InboxDragList(props: Props) {
       point.x >= bounds.left &&
       point.x <= bounds.right &&
       point.y >= Math.max(bounds.top, viewport?.top ?? bounds.top) &&
-      point.y <= Math.min(bounds.bottom, viewport?.bottom ?? bounds.bottom);
+      // A wrapping card lands in the shelf below this list. Its entire
+      // sidebar lane stays a valid destination, including that shelf's slot.
+      point.y <=
+        (props.wraps.has(current.id) && viewport
+          ? viewport.bottom
+          : Math.min(bounds.bottom, viewport?.bottom ?? bounds.bottom));
     let to = current.to;
     if (valid && point.y < current.lastY && point.y <= boundary + 24)
       to = "pinned";
@@ -428,7 +439,9 @@ export function InboxDragList(props: Props) {
     const next = { ...current, to, index, point, lastY: point.y, valid };
     update(next);
     props.onWrappingPreview(
-      to === "active" && props.wraps.has(current.id) ? current.id : null,
+      valid && to === "active" && props.wraps.has(current.id)
+        ? current.id
+        : null,
     );
   }
 
@@ -440,7 +453,10 @@ export function InboxDragList(props: Props) {
     if (!current || (event.code !== "ArrowUp" && event.code !== "ArrowDown"))
       return;
     let { to, index } = current;
-    const count = props[to].filter((id) => id !== current.id).length;
+    const count =
+      to === "active" && props.wraps.has(current.id)
+        ? 0
+        : props[to].filter((id) => id !== current.id).length;
     if (event.code === "ArrowUp") {
       if (index > 0) index--;
       else if (to === "active") {
@@ -499,19 +515,29 @@ export function InboxDragList(props: Props) {
       .getState()
       .applyDrop(plan, current.from === "pinned")
       .catch((error: unknown) => {
+        if (current.keyboard && plan.destination === "wrapping")
+          requestAnimationFrame(() =>
+            container.current
+              ?.querySelector<HTMLElement>(
+                `[data-inbox-sortable="${window.CSS.escape(current.id)}"] [data-inbox-drag-handle]`,
+              )
+              ?.focus(),
+          );
         toast.error("Could not move workspace", {
           description: error instanceof Error ? error.message : String(error),
         });
       });
   }
   const verb = drag
-    ? drag.to === drag.from
-      ? "Move"
-      : drag.to === "pinned"
-        ? "Pin"
-        : props.wraps.has(drag.id)
-          ? "Unpin → Wrapping up"
-          : "Unpin"
+    ? !drag.valid
+      ? "Release to cancel"
+      : drag.to === drag.from
+        ? "Move"
+        : drag.to === "pinned"
+          ? "Pin"
+          : props.wraps.has(drag.id)
+            ? "Unpin → Wrapping up"
+            : "Unpin"
     : "";
   const originalHeight = drag
     ? [...drag.measurements.values()].reduce((sum, row) => sum + row.height, 0)
@@ -534,6 +560,7 @@ export function InboxDragList(props: Props) {
       target={drag?.to === "active"}
       resting={props.pinned.length > 0 && props.hasContentBelow}
       empty={layout?.active.length === 0}
+      wrapping={layout?.wrapping}
     />,
     <ActiveLeading key={LEADING}>{props.activeLeading}</ActiveLeading>,
     ...props.active.map((id, index) =>
@@ -588,7 +615,7 @@ export function InboxDragList(props: Props) {
               }}
             >
               {children}
-              {drag && layout && !layout.wrapping && (
+              {drag?.valid && layout && !layout.wrapping && (
                 <div
                   aria-hidden="true"
                   className="pointer-events-none absolute inset-x-0 rounded-lg border border-dashed border-foreground/25 bg-surface-1"

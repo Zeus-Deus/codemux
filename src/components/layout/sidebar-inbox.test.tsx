@@ -3701,16 +3701,48 @@ describe("Activity drag commits", () => {
       makeWorkspace({ title: "Ready pin", pinned_at: 1, worktree_path: "/wt/a", pr_number: 12, pr_state: "OPEN", last_active_at: base - 600_000, last_visited_at: base - 60_000 }),
       makeWorkspace({ title: "Already wrapping", worktree_path: "/wt/b", pr_number: 13, pr_state: "OPEN", last_active_at: base - 600_000, last_visited_at: base - 60_000 }),
     ];
-    const { container } = await renderInbox();
+    const { container, rerender } = await renderInbox();
     fireEvent.click(screen.getByRole("button", { name: "Wrapping up (1)" }));
     screen.getByRole("button", { name: 'Move "Ready pin"' }).focus();
     await userEvent.keyboard("[Space][ArrowDown]");
     expect(screen.getByRole("button", { name: "Wrapping up (2)" })).toHaveAttribute("aria-expanded", "true");
     expect(container.querySelector("[data-inbox-wrapping-preview]")).not.toBeNull();
+    expect(screen.queryByText("Drop here to keep active")).toBeNull();
     await userEvent.keyboard("[Enter]");
     await vi.waitFor(() => expect(document.activeElement).toBe(container.querySelector('[data-inbox-card="ws-1"]')));
     expect(container.querySelector('[data-inbox-drag-list] [data-inbox-card="ws-1"]')).toBeNull();
     expect(setWorkspacePinned).toHaveBeenCalledWith("ws-1", false);
+    expect(useSidebarInboxStore.getState().keepActive["ws-1"]).toBeUndefined();
+    workspaces = workspaces.map((workspace) => workspace.workspace_id === "ws-1"
+      ? { ...workspace, pinned_at: null, pr_state: "MERGED" } : workspace);
+    await rerenderInbox(rerender);
+    expect(useSidebarInboxStore.getState().settled.map((entry) => entry.id)).toContain("ws-1");
+  });
+
+  it("returns from Wrapping up to Pinned with one ArrowUp even after repeated ArrowDown", async () => {
+    workspaces = [
+      makeWorkspace({ title: "Ready pin", pinned_at: 1, worktree_path: "/wt/a", pr_number: 12, pr_state: "OPEN" }),
+      makeWorkspace({ title: "Active A" }), makeWorkspace({ title: "Active B" }),
+    ];
+    const { container } = await renderInbox();
+    screen.getByRole("button", { name: 'Move "Ready pin"' }).focus();
+    await userEvent.keyboard("[Space][ArrowDown][ArrowDown][ArrowDown][ArrowUp]");
+    expect(container.querySelector("[data-inbox-wrapping-preview]")).toBeNull();
+    await userEvent.keyboard("[Enter]");
+    expect(setWorkspacePinned).not.toHaveBeenCalled();
+  });
+
+  it("restores keyboard focus if a Wrapping up save is rejected", async () => {
+    workspaces = [makeWorkspace({ title: "Rejected pin", pinned_at: 1, worktree_path: "/wt/a", pr_number: 12, pr_state: "OPEN" })];
+    const { container } = await renderInbox();
+    let rejectPin = (_error: Error) => {};
+    vi.mocked(setWorkspacePinned).mockReturnValueOnce(new Promise<void>((_resolve, reject) => { rejectPin = reject; }));
+    screen.getByRole("button", { name: 'Move "Rejected pin"' }).focus();
+    await userEvent.keyboard("[Space][ArrowDown][Enter]");
+    await vi.waitFor(() => expect(document.activeElement).toBe(container.querySelector('[data-parked-shelves] [data-inbox-card="ws-1"]')));
+    await act(async () => { rejectPin(new Error("offline")); });
+    await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: 'Move "Rejected pin"' })));
+    expect(container.querySelector('[data-inbox-sortable="ws-1"] [aria-label="Pinned workspace"]')).not.toBeNull();
   });
 
   it("honors an optimistic pin during the lifecycle sweep", async () => {

@@ -314,6 +314,9 @@ export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
     const before = get();
     const oldSettled = before.settled.filter((entry) => entry.id === id);
     const oldSnoozed = before.snoozed.filter((entry) => entry.id === id);
+    const nextKeepActive = { ...before.keepActive };
+    if (drop.destination === "active") nextKeepActive[id] = true;
+    else delete nextKeepActive[id];
     dropInFlight = true;
     let finishDrop = () => {};
     dropDone = new Promise<void>((resolve) => { finishDrop = resolve; });
@@ -325,7 +328,7 @@ export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
       ...(wasPinned && !pinned ? {
         settled: before.settled.filter((entry) => entry.id !== id),
         snoozed: before.snoozed.filter((entry) => entry.id !== id),
-        keepActive: { ...before.keepActive, [id]: true },
+        keepActive: nextKeepActive,
       } : {}),
     });
     try {
@@ -339,7 +342,8 @@ export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
       const current = get();
       const pinOverrides = { ...current.pinOverrides };
       delete pinOverrides[id];
-      const canRestoreShelves = wasPinned && !pinned && current.keepActive[id] === true &&
+      const canRestoreShelves = wasPinned && !pinned &&
+        current.keepActive[id] === nextKeepActive[id] && current.activity[id] === before.activity[id] &&
         !current.settled.some((entry) => entry.id === id) &&
         !current.snoozed.some((entry) => entry.id === id);
       const keepActive = { ...current.keepActive };
