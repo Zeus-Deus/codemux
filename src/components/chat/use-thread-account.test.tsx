@@ -169,3 +169,20 @@ it("a second view of a draft never overrides its explicit pick", async () => {
 
   expect(useProviderAccounts.getState().picks[pickKey("codex", "draft-b")]).toBe("default");
 });
+
+it("refreshing one view of a chat re-reads every view of it", async () => {
+  // The picker's header and a catalog reader each hold a view.
+  const { result } = renderHook(() => ({
+    header: useThreadAccount("codex", "chat-c"),
+    catalog: useThreadAccount("codex", "chat-c"),
+  }));
+  await answer("chat-c", bound("default"));
+  await answer("chat-c", bound("default"));
+
+  // Another client moved the idle chat to Work; opening the picker refreshes.
+  act(() => result.current.header.refreshIdentities());
+  while (lookups.some((l) => l.threadId === "chat-c")) await answer("chat-c", bound("codex-work"));
+
+  expect(result.current.header.current?.id).toBe("codex-work");
+  expect(result.current.catalog.current?.id).toBe("codex-work");
+});

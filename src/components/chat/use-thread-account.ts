@@ -202,7 +202,9 @@ export function useThreadAccount(
     const store = useProviderAccounts.getState();
     const unsure = options.some((a) => a.identity.signed_in !== true);
     void (unsure ? store.refresh() : store.load(true)).catch(() => {});
-    if (multi) void reload();
+    // Another client may have moved the chat: every view of it re-reads,
+    // not only this one.
+    if (multi && threadId && isAccountProvider(provider)) store.bindingChanged(provider, threadId);
   };
 
   return {
