@@ -268,41 +268,132 @@ fn remove_copies(root: &std::path::Path, kept: &[RetainedReplyImage]) {
     }
 }
 
-/// The local image paths `markdown` links to, in order and deduplicated, as
-/// the transcript renders them: inline links, images and autolinks whose
-/// destination is an absolute path or a local `file:` URL ending in a
-/// supported image extension. Code is not scanned for links. Reference-style
-/// links are skipped because the transcript leaves them as text (it renders
-/// each block on its own, so a definition never reaches its use). Mirrors
-/// `localImagePath` in `src/lib/agent-chat/local-image-links.ts`.
+/// The local image paths `markdown` links to, in order and deduplicated:
+/// link and image destinations that are an absolute path or a local `file:`
+/// URL ending in a supported image extension, as the transcript turns them
+/// into image cards (`src/lib/agent-chat/local-image-links.ts`). Code is not
+/// scanned, an image's alt text is not, and a footnote counts only once it
+/// is referenced. Reference-style links are kept even though the
+/// transcript can leave them as text: an unused copy is cheap, a missing
+/// one is the loss this module exists to prevent.
 pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
-    use pulldown_cmark::{Event, LinkType, Options, Parser, Tag};
+    use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
 
+    if markdown.lines().any(|line| container_depth(line) > MAX_CONTAINER_DEPTH) {
+        eprintln!("[codemux::reply_images] not scanning a reply nested this deeply");
+        return Vec::new();
+    }
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES;
-    let mut sources: Vec<String> = Vec::new();
+    // Candidates with the footnote they sit in, if any.
+    let mut found: Vec<(Option<String>, String)> = Vec::new();
+    let mut referenced = std::collections::HashSet::new();
+    let mut footnote: Option<String> = None;
+    let mut inside_image = 0usize;
     for event in Parser::new_ext(markdown, options) {
-        let (Event::Start(Tag::Link { link_type, dest_url, .. })
-        | Event::Start(Tag::Image { link_type, dest_url, .. })) = event
-        else {
-            continue;
+        let destination = match event {
+            Event::FootnoteReference(label) => {
+                referenced.insert(label.to_lowercase());
+                continue;
+            }
+            Event::Start(Tag::FootnoteDefinition(label)) => {
+                footnote = Some(label.to_lowercase());
+                continue;
+            }
+            Event::End(TagEnd::FootnoteDefinition) => {
+                footnote = None;
+                continue;
+            }
+            Event::Start(Tag::Image { link_type, dest_url, .. }) => {
+                inside_image += 1;
+                // An image inside another's description is only alt text.
+                if inside_image > 1 {
+                    continue;
+                }
+                (link_type, dest_url)
+            }
+            Event::End(TagEnd::Image) => {
+                inside_image = inside_image.saturating_sub(1);
+                continue;
+            }
+            Event::Start(Tag::Link { link_type, dest_url, .. }) if inside_image == 0 => {
+                (link_type, dest_url)
+            }
+            _ => continue,
         };
-        if !matches!(link_type, LinkType::Inline | LinkType::Autolink) {
+        let (link_type, dest_url) = destination;
+        if link_type == LinkType::Email {
             continue;
         }
-        let Some(path) = local_image_path(&dest_url) else {
+        // Past the bound the scan keeps going only to see which footnotes
+        // are referenced, so a note defined early still counts.
+        if found.len() == MAX_SCANNED_CANDIDATES {
             continue;
-        };
-        if !sources.contains(&path) {
-            sources.push(path);
-            if sources.len() == MAX_RETAINED_PER_REPLY {
-                break;
+        }
+        if let Some(path) = local_image_path(&dest_url) {
+            let candidate = (footnote.clone(), path);
+            if !found.contains(&candidate) {
+                found.push(candidate);
             }
         }
     }
+    let mut sources: Vec<String> = Vec::new();
+    for (note, path) in found {
+        if note.is_some_and(|label| !referenced.contains(&label)) || sources.contains(&path) {
+            continue;
+        }
+        sources.push(path);
+        if sources.len() == MAX_RETAINED_PER_REPLY {
+            break;
+        }
+    }
     sources
+}
+
+/// Most lists and block quotes a line may sit inside before the reply is
+/// too odd to scan: the parser walks every open container on every line.
+const MAX_CONTAINER_DEPTH: usize = 32;
+/// Most distinct candidate links one scan keeps while footnotes resolve.
+const MAX_SCANNED_CANDIDATES: usize = 64;
+
+/// An upper bound on how many lists and block quotes `line` opens or sits
+/// in: its leading block-quote and list markers plus half its indentation.
+/// A container is only ever opened on a line that shows it this way.
+fn container_depth(line: &str) -> usize {
+    let mut depth = 0;
+    let mut indent = 0;
+    let mut rest = line;
+    loop {
+        let trimmed = rest.trim_start_matches([' ', '\t']);
+        indent += rest[..rest.len() - trimmed.len()]
+            .chars()
+            .map(|c| if c == '\t' { 4 } else { 1 })
+            .sum::<usize>();
+        rest = trimmed;
+        let marker = if rest.starts_with('>') {
+            1
+        } else if rest.starts_with(['-', '*', '+']) {
+            1
+        } else {
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if (1..=9).contains(&digits) && rest[digits..].starts_with(['.', ')']) {
+                digits + 1
+            } else {
+                0
+            }
+        };
+        let after = &rest[marker..];
+        let opens = marker > 0
+            && (rest.starts_with('>') || after.is_empty() || after.starts_with([' ', '\t']));
+        if !opens {
+            return depth + indent / 2;
+        }
+        depth += 1;
+        // The one space after a marker belongs to it, not to indentation.
+        rest = after.strip_prefix([' ', '\t']).unwrap_or(after);
+    }
 }
 
 /// The native absolute path a Markdown destination names, when it is a
@@ -334,14 +425,11 @@ fn local_image_path(destination: &str) -> Option<String> {
             && bytes[0].is_ascii_alphabetic()
             && bytes[1] == b':'
             && matches!(bytes[2], b'/' | b'\\'));
-    let extension = std::path::Path::new(&path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase);
-    let supported = matches!(
-        extension.as_deref(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp")
-    );
+    // The same test as the transcript's `/\.(?:png|jpe?g|gif|webp)$/i`.
+    let lower = path.to_ascii_lowercase();
+    let supported = [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+        .iter()
+        .any(|extension| lower.ends_with(extension));
     (absolute && supported).then_some(path)
 }
 
@@ -521,16 +609,64 @@ mod tests {
     }
 
     #[test]
-    fn rendered_forms_count_and_reference_links_do_not() {
+    fn rendered_forms_and_reference_links_count_but_raw_html_does_not() {
         let text = "Shot: <file:///tmp/auto.png>\n\n\
                     | a | b |\n| - | - |\n| [cell](/tmp/cell.png) | x |\n\n\
                     # Title [h](/tmp/h.png)\n\n\
-                    See [the mockup][m].\n\n[m]: /tmp/mockup.png\n\n\
+                    - [Listed][l]\n\n  [l]: /tmp/listed.png\n\n\
                     <a href=\"/tmp/html.png\">h</a>";
         assert_eq!(
             local_image_sources(text),
-            ["/tmp/auto.png", "/tmp/cell.png", "/tmp/h.png"]
+            ["/tmp/auto.png", "/tmp/cell.png", "/tmp/h.png", "/tmp/listed.png"]
         );
+    }
+
+    #[test]
+    fn images_in_alt_text_and_unreferenced_footnotes_take_no_slot() {
+        let hidden: String = (0..7).map(|i| format!("![{i}](/tmp/{i}.png) ")).collect();
+        let notes: String = (0..8).map(|i| format!("[^n{i}]: [hidden](/tmp/n{i}.png)\n\n")).collect();
+        let text = format!(
+            "![a {hidden}](/tmp/outer.png)\n\n{notes}See [^used].\n\n\
+             [^used]: [Noted](/tmp/noted.png)\n\n[![In link](/tmp/inner.png)](/tmp/linked.png)\n\n\
+             [Proof](/tmp/proof.png)"
+        );
+        assert_eq!(
+            local_image_sources(&text),
+            ["/tmp/outer.png", "/tmp/noted.png", "/tmp/linked.png", "/tmp/inner.png", "/tmp/proof.png"]
+        );
+    }
+
+    #[test]
+    fn a_note_referenced_after_the_candidate_bound_still_counts() {
+        let others: String = (0..70).map(|i| format!("[{i}](/tmp/{i}.png) [again](/tmp/{i}.png)\n")).collect();
+        let text = format!("[^n]: [Noted](/tmp/noted.png)\n\n{others}\nSee [^n].");
+        let sources = local_image_sources(&text);
+        assert_eq!(sources.len(), MAX_RETAINED_PER_REPLY);
+        assert_eq!(sources[0], "/tmp/noted.png");
+        assert_eq!(sources[1], "/tmp/0.png");
+    }
+
+    #[test]
+    fn extensions_match_the_transcripts_test() {
+        assert_eq!(
+            local_image_sources("[a](/tmp/.png) [b](/tmp/a.png/) [c](/tmp/C.JPEG)"),
+            ["/tmp/.png", "/tmp/C.JPEG"]
+        );
+    }
+
+    #[test]
+    fn deeply_nested_replies_are_not_parsed() {
+        let n = 10_000;
+        let text = format!("{}x\n{}[Proof](/tmp/proof.png)", "- ".repeat(n), "\n".repeat(n));
+        let started = std::time::Instant::now();
+        assert!(local_image_sources(&text).is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        // Ordinary nesting still scans.
+        let nested = "> - 1. item\n>    - [Proof](/tmp/proof.png)";
+        assert_eq!(local_image_sources(nested), ["/tmp/proof.png"]);
+        assert_eq!(container_depth("> - 1. item"), 3);
+        assert_eq!(container_depth("        - item"), 5);
+        assert_eq!(container_depth("-x *** 1.5"), 0);
     }
 
     #[test]

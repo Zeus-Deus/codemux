@@ -428,7 +428,7 @@ describe("ChatMarkdown local image links", () => {
   });
 
   // Parity cases for the backend's copy planner (`reply_images.rs`): it must
-  // keep exactly the images rendered here.
+  // keep every image rendered here (it may keep a few that are not).
   const renderedCaptions = (markdown: string) => {
     const { container } = render(
       <TooltipProvider>

@@ -113,11 +113,38 @@ function basename(path: string): string {
   return parts[parts.length - 1] ?? path;
 }
 
+/** `path` with every run of valid percent escapes decoded. The backend
+ *  names a kept copy by the link as it decoded it, and the transcript decodes
+ *  malformed escapes differently, so both sides compare in this form. */
+export function comparablePath(path: string): string {
+  return path.replace(/(?:%[0-9a-fA-F]{2})+/g, (run) => {
+    try {
+      return decodeURIComponent(run);
+    } catch {
+      return run;
+    }
+  });
+}
+
 /** Conversation-owned copies of a reply's linked images, by the path the
  *  reply wrote. */
-const RetainedImagesContext = createContext<ReadonlyMap<string, string> | null>(
-  null,
-);
+const RetainedImagesContext = createContext<KeptCopyLookup | null>(null);
+
+/** The kept copy for a rendered link path, if one is unambiguously its. */
+type KeptCopyLookup = (path: string) => string | undefined;
+
+/** Match a link to its kept copy by the exact source first. Only when that
+ *  fails, fall back to the escape-insensitive form, and only if exactly one
+ *  kept source has it: two different files never share a copy. */
+function keptCopyIndex(images: readonly RetainedReplyImage[]): KeptCopyLookup {
+  const exact = new Map(images.map((image) => [image.source, image.path]));
+  const loose = new Map<string, string | null>();
+  for (const image of images) {
+    const key = comparablePath(image.source);
+    loose.set(key, loose.has(key) ? null : image.path);
+  }
+  return (path) => exact.get(path) ?? loose.get(comparablePath(path)) ?? undefined;
+}
 
 /** Let the local-image cards inside one reply load its kept copies. */
 export function RetainedImagesProvider({
@@ -127,13 +154,7 @@ export function RetainedImagesProvider({
   images: readonly RetainedReplyImage[] | undefined;
   children: ReactNode;
 }) {
-  const retained = useMemo(
-    () =>
-      images?.length
-        ? new Map(images.map((image) => [image.source, image.path]))
-        : null,
-    [images],
-  );
+  const retained = useMemo(() => (images?.length ? keptCopyIndex(images) : null), [images]);
   return (
     <RetainedImagesContext.Provider value={retained}>
       {children}
@@ -144,7 +165,7 @@ export function RetainedImagesProvider({
 /** Where `path` may load from: the reply's kept copy first (it outlives the
  *  original, but may still be landing), then the path the reply wrote. */
 function useImageCandidates(path: string): readonly ImageCandidate[] {
-  const retained = useContext(RetainedImagesContext)?.get(path);
+  const retained = useContext(RetainedImagesContext)?.(path);
   return useMemo(
     () => [
       ...(retained ? [{ path: retained, read: readChatImage, kept: true }] : []),
