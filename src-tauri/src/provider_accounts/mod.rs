@@ -371,9 +371,12 @@ fn start_resolution(
         return resolve(db, provider, Some(&input.thread_id.0), None, input.workspace_id.as_deref(), has_history);
     }
     // Reopening another persisted chat: its account has the transcript, and
-    // stays the chat's account even if a stale cursor was dropped.
+    // stays the chat's account even if a stale cursor was dropped. Without
+    // one (a removal took it), it resolves like a new chat, unless it still
+    // offers native history, which predates accounts and lives with the
+    // CLI's own sign-in (as [`rebuild_env`] does).
     if let Some(from) = extra(FROM_THREAD_EXTRA_KEY) {
-        return resolve(db, provider, Some(&from), None, None, true);
+        return resolve(db, provider, Some(&from), None, input.workspace_id.as_deref(), has_history);
     }
     resolve(db, provider, None, explicit.as_deref(), input.workspace_id.as_deref(), has_history)
 }
@@ -384,10 +387,29 @@ fn prepare_start_with(
     input: &mut StartSessionInput,
 ) -> Result<(), String> {
     let mut removed = removed();
+    let removed = removed.get_or_insert_with(Default::default);
+    let thread_id = input.thread_id.0.clone();
+    // A history pick resumes another chat's session under this thread: that
+    // chat may be the one a removal unbound.
+    let from = input
+        .extra
+        .get(FROM_THREAD_EXTRA_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|from| *from != thread_id)
+        .map(str::to_string);
     let refused = input.resume_cursor.as_ref().is_some_and(|cursor| {
-        removed
-            .get_or_insert_with(Default::default)
-            .refuses_cursor(db, provider, &input.thread_id.0, cursor)
+        let refused_here = removed.refuses_cursor(db, provider, &thread_id, cursor);
+        let refused_from = from
+            .as_deref()
+            .is_some_and(|from| removed.refuses_cursor(db, provider, from, cursor));
+        if refused_from {
+            // The reopen merges the old chat into this thread, native id
+            // included; this thread mustn't resume it later either.
+            if let Some(native) = crate::commands::agent_chat::extract_sdk_session_id(cursor) {
+                removed.refuse(&thread_id, native);
+            }
+        }
+        refused_here || refused_from
     });
     if refused {
         input.resume_cursor = None;
@@ -906,6 +928,37 @@ mod tests {
         db.upsert_agent_chat_session("rm-legacy", "ws", Some("/repo"), "claude").unwrap();
         assert_eq!(rebuilt(&app, "rm-legacy", "ws", "native-2"), (None, Some("native-2".into())));
         assert_eq!(db.provider_account_binding("rm-legacy", "claude").unwrap().as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn reopening_a_chat_whose_account_was_removed_starts_fresh_on_the_next_default() {
+        let db = db_with(&[("ro-work", "codex"), ("ro-personal", "codex")]);
+        db.set_provider_account_default("", "codex", Some("ro-personal")).unwrap();
+        db.upsert_agent_chat_session("ro-old", "ws", Some("/repo"), "codex").unwrap();
+        db.set_agent_chat_sdk_session_id("ro-old", "native-1").unwrap();
+        db.set_provider_account_binding("ro-old", "codex", "ro-work").unwrap();
+        delete_account(&db, "ro-work").unwrap();
+        let app = app_with(db);
+        let db = app.state::<DatabaseStore>();
+
+        // The history pick offers the old chat's cursor under a fresh thread.
+        let mut start = input("ro-new", true, serde_json::json!({ FROM_THREAD_EXTRA_KEY: "ro-old" }));
+        prepare_start(app.handle(), ProviderKind::Codex, &mut start, false);
+        assert_eq!(start.resume_cursor, None, "the removed account's session is not resumed");
+        assert_eq!(db.provider_account_binding("ro-new", "codex").unwrap().as_deref(), Some("ro-personal"));
+        let account = start.env.as_ref().and_then(|env| env.get(SESSION_ACCOUNT_ENV)).cloned();
+        assert_eq!(account.as_deref(), Some("ro-personal"));
+        // The reopen merges the old row in, its native id included: a later
+        // rebuild of the reopened chat doesn't resume that session either.
+        let rebuild = rebuild_env(app.handle(), ProviderKind::Codex, "ro-new", Some("ws"), Some("native-1"), None, false);
+        assert_eq!(rebuild.native, None);
+
+        // A chat from before accounts still resumes on the CLI's own sign-in.
+        db.upsert_agent_chat_session("ro-legacy", "ws", Some("/repo"), "codex").unwrap();
+        let mut legacy = input("ro-legacy-new", true, serde_json::json!({ FROM_THREAD_EXTRA_KEY: "ro-legacy" }));
+        prepare_start(app.handle(), ProviderKind::Codex, &mut legacy, false);
+        assert!(legacy.resume_cursor.is_some());
+        assert_eq!(db.provider_account_binding("ro-legacy-new", "codex").unwrap().as_deref(), Some("default"));
     }
 
     #[test]
