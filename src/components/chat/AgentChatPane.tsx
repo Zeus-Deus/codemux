@@ -1,4 +1,5 @@
 import { DeliveryAttention } from "./DeliveryAttention";
+import { useDurableTasks } from "@/lib/agent-chat/durable-tasks";
 import { SERVICE_TIER_FALLBACK_PREFIX } from "@/lib/agent-chat/runtime-notice";
 import { resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
@@ -192,6 +193,7 @@ import {
   queuedMessages,
   sessionErrorOccupant,
   useDelegationOccupant,
+  childInputOccupant,
   useMonitoringOccupant,
   useSubagentOccupant,
   useUsageLimitOccupant,
@@ -767,7 +769,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   // A new pane binding is published before startup persists its canonical
   // session. Existing/hydrating threads keep their task subscription intact.
-  // The web remote refuses every delegation command, so a browser client
+  // SSH grant administration requires the desktop app. Local task state
+  // is read through the remotely dispatchable delegation_local_context. A browser client
   // never subscribes rather than surfacing that refusal as an error.
   const delegationAvailable = !isRemoteClient();
   const remoteParentReady = delegationAvailable && conversationWritable && !(starting && startupThreadRef.current === threadId);
@@ -3982,6 +3985,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // monitoring, delegated tasks, running / just-finished subagents, queued
   // follow-ups. The strip picks the lead occupant; these only describe what
   // exists.
+  const durableTasks = useDurableTasks(threadId);
   const delegationOccupant = useDelegationOccupant({
     messages,
     threadId,
@@ -4169,6 +4173,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     queueEditor.begin(last);
     return true;
   }, [queued, conversationWritable, queueEditor]);
+  const childInput = childInputOccupant(durableTasks.tasks, !!pendingUserInput || !!pendingApprovalOccupant, openDelegatedChat, openRemoteTask);
   const remoteTasksRow = conversationWritable &&
     remoteTasksOccupant(remoteTasks, () => void remoteTasks.retrySubscription());
   // A subagent drill-in keeps only the remote-task failure: the design shows
@@ -4186,6 +4191,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         errorOccupant,
         usageOccupant,
         monitoringOccupant,
+        childInput,
         delegationOccupant,
         subagentOccupant,
         remoteTasksRow,

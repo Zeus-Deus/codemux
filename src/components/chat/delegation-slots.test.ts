@@ -188,14 +188,14 @@ describe("delegation slots", () => {
   });
 
   it("keeps a row that lands before its call (Codex) on the call's entry", () => {
-    const pending = row("c1", "pending");
+    const pending = {...row("c1", "pending"),parentItemId: "tu-2"};
     const slots = buildTranscriptSlots([user(0), card(1, [pending]), delegateCall(2, null)], true);
     expect(delegationSlots(slots)).toEqual([[{ key: "tc-2", call: expect.anything(), view: pending }]]);
   });
 
   it("shows parallel calls still in flight once each, joined to their rows", () => {
-    const codex = row("c1", "pending");
-    const claude = row("c2", "pending", "claude");
+    const codex = {...row("c1", "pending"),parentItemId: "tu-1"};
+    const claude = {...row("c2", "pending", "claude"),parentItemId: "tu-2"};
     const groups = delegationSlots(
       buildTranscriptSlots(
         [user(0), delegateCall(1, null), delegateCall(2, null, "claude"), card(3, [codex, claude])],
@@ -215,7 +215,7 @@ describe("delegation slots", () => {
       status: "error",
       result_content: [{ type: "text", text: "Delegation is off." }],
     };
-    const started = row("c1", "pending");
+    const started = {...row("c1", "pending"),parentItemId: "tu-2"};
     const [group] = delegationSlots(
       buildTranscriptSlots([user(0), refused, delegateCall(2, null), card(3, [started])], true),
     );

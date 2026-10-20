@@ -1,4 +1,3 @@
-import { isDelegationResultsMessage } from "@/lib/agent-chat/message-provenance";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { useContributions } from "@/contrib/react/use-contributions";
 import { TOOL_RENDERER_AREA } from "@/sdk/areas";
@@ -53,7 +52,8 @@ import { AssistantMessage } from "./AssistantMessage";
 import { ChatForkMarker } from "./ChatFork";
 import { DelegationCard } from "./DelegationCard";
 import { SuggestedTasksCard } from "./SuggestedTasksCard";
-import { DelegationResultsDivider } from "./DelegationResultsDivider";
+import { SubagentNotificationRow } from "./SubagentNotificationRow";
+import { ChildOriginMarker } from "./ChildOriginMarker";
 import { ProviderSwitchDivider } from "./ProviderSwitchDivider";
 import { MessageTrail } from "./MessageTrail";
 import { PermissionRequestBlock } from "./PermissionRequestBlock";
@@ -1394,6 +1394,7 @@ export const MessageList = memo(function MessageList({
             "calc(30px + var(--composer-overlay-height, 0px))",
         }}
       >
+        <ChildOriginMarker />
         <ChatForkMarker messages={ordered} />
         {showStalled && (
           <div className="mt-[13px]">
@@ -1943,9 +1944,9 @@ function ItemRow({
   if (
     item.kind === "user_message" &&
     !item.queued &&
-    isDelegationResultsMessage(item)
+    item.notification != null && ["delegated_task", "remote_task", "subagent"].includes(item.notification.source.kind)
   ) {
-    return <DelegationResultsDivider text={item.text} notification={item.notification} />;
+    return <SubagentNotificationRow notification={item.notification!} timestamp={item.created_at} />;
   }
 
   if (item.kind === "provider_switch") {

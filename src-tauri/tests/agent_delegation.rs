@@ -33,9 +33,8 @@ use codemux_lib::agent_provider::{
 use codemux_lib::commands::agent_chat::{
     agent_chat_interrupt_turn, agent_chat_respond_to_request, agent_chat_start_session,
     agent_chat_stop_session, forward_event, send_turn_with_origin, shutdown_agent_chat_threads,
-    AgentChatChannelRegistry,
-    GrokUsageLedgerBridge, ProviderRegistry, RunActivityTracker, SendTurnCommandInput,
-    SubagentTracker, TurnOrigin,
+    AgentChatChannelRegistry, GrokUsageLedgerBridge, ProviderRegistry, RunActivityTracker,
+    SendTurnCommandInput, SubagentTracker, TurnOrigin,
 };
 use codemux_lib::commands::async_questions::{agent_chat_answer_question, QuestionAction};
 use codemux_lib::commands::delegation::{
@@ -57,7 +56,7 @@ const DELEGATE_TOOL: &str = "mcp__codemux__delegate_task";
 const FULL: Option<&str> = Some("bypassPermissions");
 const TASK: &str = "Add slugify(text) to src/lib/strings.ts: lowercase, fold accents, collapse non-alphanumerics into one hyphen. Add table tests in src/lib/strings.test.ts.";
 /// Appended to the task as the child's first message, verbatim.
-const CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: another coding agent handed you this task and will read your final message. Work on your own: do not ask questions or wait for input; if something is unclear, pick the safest reasonable option and say so. End with a short report: what you changed (files), how you checked it, and anything left undone.";
+const CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: another coding agent handed you this task and will read your final message. Work independently. Ask a question if truly blocked; it reaches the coordinator. Otherwise choose a safe option and explain it. End with a short report: what you changed (files), how you checked it, and anything left undone.";
 const STOPPED_WITH_PARENT: &str = "Stopped together with this chat.";
 const STOPPED_BY_USER: &str =
     "The user stopped this task. Partial changes may be in the working tree.";
@@ -189,6 +188,7 @@ impl Harness {
         app.manage(AppStateStore::default());
         app.manage(observability());
         app.manage(DelegationState::default());
+        app.manage(codemux_lib::agent_control::NativeControlState::default());
         let claude = Arc::new(MockAgentProvider::new(ProviderKind::Claude));
         let mut codex = MockAgentProvider::new(ProviderKind::Codex);
         codex.async_questions = true;
@@ -475,12 +475,11 @@ mod delegation {
                 "model": "gpt-6.1-codex",
                 "effort": "high",
                 "thread": child,
+                "task_id": started["task_id"],
+                "child_thread_id": child,
             })
         );
-        assert!(started["note"]
-            .as_str()
-            .unwrap()
-            .starts_with("Codex is working in a background tab."));
+        assert!(started["note"].as_str().unwrap().contains("durable"));
 
         // Its own tab, right after the parent's, titled; focus stays put.
         let after = state.find_workspace(&h.workspace).unwrap();
@@ -568,12 +567,12 @@ mod delegation {
         assert!(is_delegated_child(&h.handle, &child));
         assert!(!is_delegated_child(&h.handle, &h.parent));
         assert!(h.wakes().is_empty());
-        let journal = db.drain_delegated_open_tasks().unwrap();
-        assert_eq!(journal.len(), 1);
-        assert_eq!(journal[0].child_thread_id, child);
-        assert_eq!(journal[0].parent_thread_id, h.parent);
-        assert_eq!(journal[0].provider, "codex");
-        assert_eq!(journal[0].title, "Add slugify helper");
+        let durable = db.delegation_task_for_child(&child).unwrap().unwrap();
+        assert_eq!(durable.child_thread_id.as_deref(), Some(child.as_str()));
+        assert_ne!(durable.task_id, child);
+        assert_eq!(durable.parent_thread_id, h.parent);
+        assert_eq!(durable.provider, "codex");
+        assert_eq!(durable.title, "Add slugify helper");
     }
 
     #[tokio::test]
@@ -582,152 +581,72 @@ mod delegation {
         let child = h
             .delegate_and_dispatch(args("codex", "Add slugify helper"))
             .await;
-        let report =
-            "Added slugify and 9 table tests.\nChecked: npm run test -- src/lib/strings.test.ts.";
-
-        // No direct settle here: the child's turn end is the trigger.
-        h.child_reports(&child, report);
-        wait_for("the results message", || h.wakes().len() == 1).await;
-
-        let wake = &h.wakes()[0];
-        assert!(wake.starts_with(&format!("{DELEGATION_RESULTS_PREFIX}\n")));
-        assert!(wake.contains(&format!(
-            "<task provider=\"codex\" model=\"default\" status=\"completed\" title=\"Add slugify helper\" duration=\""
-        )));
-        assert!(wake.contains(&format!("thread=\"{child}\">")));
-        assert!(!wake.contains("effort="), "no effort was asked for");
-        assert!(wake.contains(&format!("<brief>{TASK}</brief>")));
-        assert!(wake.contains(&format!("<report>\n{report}\n</report>")));
-        assert!(!wake.contains("A task failed"));
-        assert!(wake.ends_with("No delegated tasks are still running."));
-
-        // The transcript shows the report; the model retains the wake framing.
-        wait_for("the results message in the transcript", || {
-            !h.parent_user_messages().is_empty()
-        })
-        .await;
-        assert_eq!(h.parent_user_messages(), vec![format!("Add slugify helper\n{report}")]);
+        h.child_reports(&child, "Added slugify and checked 9 tests.");
+        h.settle(&child).await;
+        let wakes = h.wait_for_wakes(1).await;
+        assert!(wakes[0].starts_with(DELEGATION_RESULTS_PREFIX));
+        assert!(wakes[0].contains("Added slugify and checked 9 tests."));
+        let task = h.db().delegation_task_for_child(&child).unwrap().unwrap();
+        assert!(wakes[0].contains(&task.task_id));
+        assert_eq!(
+            task.result.unwrap().text,
+            "Added slugify and checked 9 tests."
+        );
+        assert_eq!(
+            h.parent_user_messages(),
+            vec!["Add slugify helper\nAdded slugify and checked 9 tests.".to_string()]
+        );
         let row: Value = h.db().list_agent_chat_messages(&h.parent).into_iter()
             .filter_map(|row| serde_json::from_str::<Value>(&row).ok())
             .find(|row| row["type"] == "user_message").unwrap();
-        assert_eq!(row["agent_text"], *wake);
-
-        let card = h.card(&child);
-        assert_eq!(card.status, SubagentStatus::Completed);
-        assert_eq!(card.activity.as_deref(), Some("Finished"));
-        assert_eq!(card.result_text.as_deref(), Some(report));
-        assert!(card.duration_ms.is_some());
-
-        // Every later trigger finds nothing left to post.
-        h.settle(&child).await;
-        h.deliver().await;
-        sweep_pass(&h.handle).await;
-        h.turn_ends(&h.parent, TurnStatus::Success);
-        h.deliver().await;
+        assert_eq!(row["agent_text"], wakes[0]);
+        for _ in 0..3 {
+            h.deliver().await;
+            h.settle(&child).await;
+            sweep_pass(&h.handle).await;
+        }
         assert_eq!(h.wakes().len(), 1);
         assert_eq!(h.parent_user_messages().len(), 1);
-        assert!(h.db().drain_delegated_open_tasks().unwrap().is_empty());
+        assert_eq!(h.card(&child).status, SubagentStatus::Completed);
+        assert!(h.db().delegation_task_for_child(&child).unwrap().is_some());
     }
 
     #[tokio::test]
-    async fn no_results_post_while_the_parent_is_busy_paused_or_without_a_session() {
+    async fn auto_delivery_never_interrupts_a_busy_parent() {
         let h = Harness::new().await;
         let child = h
             .delegate_and_dispatch(args("codex", "Add slugify helper"))
             .await;
-
-        // The parent is mid-turn when the child finishes.
         h.claude.set_turn_active(&h.parent, true);
         h.child_reports(&child, "Done: slugify added.");
         h.settle(&child).await;
-        assert_eq!(h.card(&child).status, SubagentStatus::Completed);
-        assert!(h.wakes().is_empty(), "never into an active turn");
+        let task = h.db().delegation_task_for_child(&child).unwrap().unwrap();
+        assert!(task.result.is_some());
+        assert!(task.delivery_id.is_some());
+        assert!(!h.interrupted(ProviderKind::Claude, &h.parent));
+        assert_eq!(h.wakes().len(), 1);
         h.claude.set_turn_active(&h.parent, false);
-
-        // The parent itself waits on a usage-limit resume.
-        let db = h.db();
-        db.upsert_agent_chat_usage_resume(&h.parent, "claude", Some(now_ms() + 3_600_000))
-            .unwrap();
         h.deliver().await;
-        sweep_pass(&h.handle).await;
-        assert!(h.wakes().is_empty(), "not while a usage resume is armed");
-        db.delete_agent_chat_usage_resume(&h.parent).unwrap();
-
-        // The parent has no live session.
-        h.claude
-            .stop_session(ThreadId(h.parent.clone()))
-            .await
-            .unwrap();
-        h.deliver().await;
-        sweep_pass(&h.handle).await;
-        assert!(h.wakes().is_empty(), "not without a live session");
-        h.claude
-            .start_session(start_input(&h.parent, &h.cwd))
-            .await
-            .unwrap();
-
-        // The parent's own turn end is a delivery trigger.
-        h.turn_ends(&h.parent, TurnStatus::Success);
-        wait_for("the report after the parent's turn ends", || {
-            h.wakes().len() == 1
-        })
-        .await;
-        assert!(h.wakes()[0].contains("status=\"completed\""));
+        assert_eq!(h.wakes().len(), 1);
     }
 
     #[tokio::test]
-    async fn a_round_of_two_posts_one_message() {
+    async fn completed_siblings_publish_independently() {
         let h = Harness::new().await;
-        let codex = h
-            .delegate_and_dispatch(args("codex", "Add slugify helper"))
+        let a = h.delegate_and_dispatch(args("codex", "First review")).await;
+        let b = h
+            .delegate_and_dispatch(args("claude", "Second review"))
             .await;
-        let claude = h
-            .delegate_and_dispatch(json!({
-                "provider": "claude",
-                "title": "Review the parser",
-                "task": "Review src/lib/parser.ts for edge cases and report findings with file:line references.",
-                "model": "claude-opus-4-7",
-                "effort": "max",
-            }))
-            .await;
-
-        // Their tabs follow the parent's in the order they were started.
-        let state = h.app_state();
-        let workspace = state.find_workspace(&h.workspace).unwrap();
-        let parent_tab = tab_index(&state, &workspace, &h.parent);
-        assert_eq!(tab_index(&state, &workspace, &codex), parent_tab + 1);
-        assert_eq!(tab_index(&state, &workspace, &claude), parent_tab + 2);
-
-        // Same-provider children are fine; Claude's full mode is its own.
-        let claude_start = h
-            .claude
-            .start_inputs()
-            .into_iter()
-            .find(|input| input.thread_id.0 == claude)
-            .expect("the Claude child started");
-        assert_eq!(
-            claude_start.permission_mode.as_deref(),
-            Some("bypassPermissions")
-        );
-        assert_eq!(claude_start.model.as_deref(), Some("claude-opus-4-7"));
-        assert_eq!(claude_start.effort.as_deref(), Some("max"));
-
-        h.child_reports(&codex, "Codex report: slugify added.");
-        h.settle(&codex).await;
-        assert_eq!(h.card(&codex).status, SubagentStatus::Completed);
-        assert!(h.wakes().is_empty(), "a finished task waits for its round");
-
-        h.child_reports(&claude, "Claude report: two edge cases found.");
-        h.settle(&claude).await;
+        h.child_reports(&a, "First independent result");
+        h.settle(&a).await;
         let wakes = h.wait_for_wakes(1).await;
-        let wake = &wakes[0];
-        assert_eq!(wake.matches("<task ").count(), 2);
-        assert!(wake.contains("Codex report: slugify added."));
-        assert!(wake.contains(
-            "<task provider=\"claude\" model=\"claude-opus-4-7\" effort=\"max\" status=\"completed\" title=\"Review the parser\""
-        ));
-        assert!(wake.contains("Claude report: two edge cases found."));
-        assert!(wake.ends_with("No delegated tasks are still running."));
+        assert!(wakes[0].contains("First independent result"));
+        assert_eq!(h.card(&b).status, SubagentStatus::Running);
+        h.child_reports(&b, "Second independent result");
+        h.settle(&b).await;
+        let wakes = h.wait_for_wakes(2).await;
+        assert!(wakes[1].contains("Second independent result"));
+        assert!(!wakes[1].contains("First independent result"));
     }
 
     #[tokio::test]
@@ -745,15 +664,12 @@ mod delegation {
 
         wait_for("the failure to post at once", || h.wakes().len() == 1).await;
         let wake = &h.wakes()[0];
-        assert!(wake.contains("status=\"failed\" title=\"Add slugify helper\""));
+        assert!(wake.contains("Status: Failed"));
         assert!(
             wake.contains("It could not start: not signed in: Run `codex login` and try again.")
         );
-        assert!(wake.contains("A task failed: do not retry it on your own"));
-        assert!(wake.ends_with(
-            "Still running: \"Review the parser\" (claude). Its report will arrive the same way."
-        ));
-        assert_eq!(wake.matches("<task ").count(), 1);
+        assert_eq!(h.codex.start_inputs().len(), 1);
+        assert!(!wake.contains("<task "));
 
         let card = h.card(&codex);
         assert_eq!(card.status, SubagentStatus::Failed);
@@ -792,31 +708,23 @@ mod delegation {
         );
         h.settle(&claude).await;
         let wakes = h.wait_for_wakes(2).await;
-        assert!(wakes[1].contains("status=\"failed\" title=\"Review the parser\""));
-        assert!(wakes[1].contains("<report>\nInvalid API key · Please run /login\n</report>"));
+        assert!(wakes[1].contains("Status: Failed"));
+        assert!(wakes[1].contains("Invalid API key · Please run /login"));
         assert!(!wakes[1].contains("Add slugify helper"), "posted once only");
-        assert!(wakes[1].ends_with("No delegated tasks are still running."));
     }
 
     // ── Stop, close and restart ──
 
     #[tokio::test]
-    async fn stopping_the_parent_stops_its_tasks_and_posts_nothing() {
+    async fn parent_stop_keeps_published_results_and_disposes_future_wakes() {
         let h = Harness::new().await;
-        let codex = h
-            .delegate_and_dispatch(args("codex", "Add slugify helper"))
+        let a = h.delegate_and_dispatch(args("codex", "First review")).await;
+        let b = h
+            .delegate_and_dispatch(args("claude", "Second review"))
             .await;
-        let claude = h
-            .delegate_and_dispatch(args("claude", "Review the parser"))
-            .await;
-        h.child_reports(&codex, "Codex report.");
-        h.settle(&codex).await;
-        assert_eq!(h.card(&codex).status, SubagentStatus::Completed);
-        // A usage resume armed on the running child must not outlive the Stop.
-        h.db()
-            .upsert_agent_chat_usage_resume(&claude, "claude", Some(now_ms() + 3_600_000))
-            .unwrap();
-
+        h.child_reports(&a, "Published before Stop");
+        h.settle(&a).await;
+        h.wait_for_wakes(1).await;
         agent_chat_interrupt_turn(
             h.handle.clone(),
             ProviderKind::Claude,
@@ -825,78 +733,67 @@ mod delegation {
         )
         .await
         .unwrap();
-
-        let card = h.card(&claude);
-        assert_eq!(card.status, SubagentStatus::Stopped);
-        assert_eq!(card.result_text.as_deref(), Some(STOPPED_WITH_PARENT));
-        assert!(card.duration_ms.is_some());
-        assert_eq!(h.card(&codex).status, SubagentStatus::Completed);
-        assert!(h.interrupted(ProviderKind::Claude, &h.parent));
-        wait_for("the running child to be interrupted", || {
-            h.interrupted(ProviderKind::Claude, &claude)
+        wait_for("child stop acknowledgement", || {
+            h.card(&b).status == SubagentStatus::Stopped
         })
         .await;
-        assert!(h.db().get_agent_chat_usage_resume(&claude).is_none());
-        assert!(
-            !h.interrupted(ProviderKind::Codex, &codex),
-            "a finished child is left alone"
+        for child in [&a, &b] {
+            assert_eq!(
+                h.db()
+                    .delegation_task_for_child(child)
+                    .unwrap()
+                    .unwrap()
+                    .completion_delivery,
+                "disposed_by_stop"
+            );
+        }
+        assert_eq!(
+            h.db()
+                .delegation_task_for_child(&a)
+                .unwrap()
+                .unwrap()
+                .result
+                .unwrap()
+                .text,
+            "Published before Stop"
         );
-
-        // The finished report is dropped along with the rest: Stop is quiet.
         h.deliver().await;
         sweep_pass(&h.handle).await;
-        h.turn_ends(&h.parent, TurnStatus::Success);
-        h.deliver().await;
-        assert!(h.wakes().is_empty());
+        assert_eq!(h.wakes().len(), 1);
+        assert!(h.interrupted(ProviderKind::Claude, &b));
     }
 
     #[tokio::test]
-    async fn stopping_one_task_rides_along_without_a_message_of_its_own() {
+    async fn stopping_one_child_publishes_its_own_cancelled_result() {
         let h = Harness::new().await;
-        let codex = h
-            .delegate_and_dispatch(args("codex", "Add slugify helper"))
+        let a = h.delegate_and_dispatch(args("codex", "First review")).await;
+        let b = h
+            .delegate_and_dispatch(args("claude", "Second review"))
             .await;
-        let claude = h
-            .delegate_and_dispatch(args("claude", "Review the parser"))
-            .await;
-
-        // The strip's Stop on one row.
         agent_chat_interrupt_turn(
             h.handle.clone(),
             ProviderKind::Codex,
-            ThreadId(codex.clone()),
+            ThreadId(a.clone()),
             None,
         )
         .await
         .unwrap();
-        let card = h.card(&codex);
-        assert_eq!(card.status, SubagentStatus::Stopped);
-        assert_eq!(card.result_text.as_deref(), Some(STOPPED_BY_USER));
-        assert!(h.interrupted(ProviderKind::Codex, &codex));
-        assert!(
-            !is_delegated_child(&h.handle, &codex),
-            "its tab is the user's again, so its own pushes are not muted"
-        );
-        assert!(is_delegated_child(&h.handle, &claude));
         h.deliver().await;
-        assert!(h.wakes().is_empty(), "a stopped task posts nothing alone");
-        assert_eq!(h.card(&claude).status, SubagentStatus::Running);
-
-        h.child_reports(&claude, "Claude report.");
-        h.settle(&claude).await;
         let wakes = h.wait_for_wakes(1).await;
-        assert!(wakes[0].contains("status=\"completed\" title=\"Review the parser\""));
-        assert!(wakes[0].contains("status=\"stopped\" title=\"Add slugify helper\""));
-        assert!(wakes[0].contains(&format!("{STOPPED_BY_USER}\n</task>")));
+        assert!(wakes[0].contains(STOPPED_BY_USER));
+        assert_eq!(h.card(&b).status, SubagentStatus::Running);
+        h.child_reports(&b, "Second result");
+        h.settle(&b).await;
+        let wakes = h.wait_for_wakes(2).await;
+        assert!(wakes[1].contains("Second result"));
     }
 
     #[tokio::test]
-    async fn restarting_a_child_in_its_own_tab_stops_its_task_quietly() {
+    async fn provider_restart_preserves_task_ownership_without_stop_disposition() {
         let h = Harness::new().await;
         let child = h
-            .delegate_and_dispatch(args("codex", "Add slugify helper"))
+            .delegate_and_dispatch(args("codex", "Review parser"))
             .await;
-
         agent_chat_stop_session(
             h.handle.clone(),
             ProviderKind::Codex,
@@ -904,65 +801,40 @@ mod delegation {
         )
         .await
         .unwrap();
-
-        let card = h.card(&child);
-        assert_eq!(card.status, SubagentStatus::Stopped);
-        assert_eq!(
-            card.result_text.as_deref(),
-            Some("Its chat was restarted or replaced in its tab before it finished; partial work is in the tab.")
-        );
-        assert!(h
-            .codex
-            .calls
-            .snapshot()
-            .contains(&MockCall::StopSession(ThreadId(child.clone()))));
-
-        // A round of only stopped tasks posts nothing, and a late turn end
-        // from the replaced session changes nothing.
-        h.deliver().await;
-        assert!(!is_delegated_child(&h.handle, &child));
-        h.child_reports(&child, "late report");
-        h.settle(&child).await;
-        sweep_pass(&h.handle).await;
-        assert_eq!(h.card(&child).status, SubagentStatus::Stopped);
+        let task = h.db().delegation_task_for_child(&child).unwrap().unwrap();
+        assert_eq!(task.cancellation_generation, 0);
+        assert_ne!(task.completion_delivery, "disposed_by_stop");
+        assert_eq!(h.db().delivery_generation(&child).unwrap(), (0, false));
         assert!(h.wakes().is_empty());
+        assert!(task.result.is_none());
     }
 
     #[tokio::test]
-    async fn closing_a_childs_tab_stops_its_task_quietly() {
+    async fn closing_a_child_waits_for_confirmation_then_reports_to_parent() {
         let h = Harness::new().await;
-        let codex = h
-            .delegate_and_dispatch(args("codex", "Add slugify helper"))
+        let child = h
+            .delegate_and_dispatch(args("codex", "Review parser"))
             .await;
-        let claude = h
-            .delegate_and_dispatch(args("claude", "Review the parser"))
-            .await;
-
-        // What closing the child's pane, tab or workspace runs.
-        shutdown_agent_chat_threads(&h.handle, vec![(ProviderKind::Codex, codex.clone())]);
-
-        let card = h.card(&codex);
-        assert_eq!(card.status, SubagentStatus::Stopped);
-        assert_eq!(
-            card.result_text.as_deref(),
-            Some("The user closed its tab. Partial changes may be in the working tree.")
-        );
-        wait_for("the closed child's session to stop", || {
-            h.codex
-                .calls
-                .snapshot()
-                .contains(&MockCall::StopSession(ThreadId(codex.clone())))
+        shutdown_agent_chat_threads(&h.handle, vec![(ProviderKind::Codex, child.clone())]);
+        wait_for("child close confirmation", || {
+            h.card(&child).status == SubagentStatus::Stopped
         })
         .await;
+        assert!(
+            h.interrupted(ProviderKind::Codex, &child)
+                || h.codex
+                    .calls
+                    .snapshot()
+                    .contains(&MockCall::StopSession(ThreadId(child.clone())))
+        );
         h.deliver().await;
-        assert!(h.wakes().is_empty());
-        assert_eq!(h.card(&claude).status, SubagentStatus::Running);
-
-        h.child_reports(&claude, "Claude report.");
-        h.settle(&claude).await;
-        let wakes = h.wait_for_wakes(1).await;
-        assert!(wakes[0].contains("status=\"stopped\" title=\"Add slugify helper\""));
-        assert!(wakes[0].contains("status=\"completed\" title=\"Review the parser\""));
+        assert!(h
+            .db()
+            .delegation_task_for_child(&child)
+            .unwrap()
+            .unwrap()
+            .result
+            .is_some());
     }
 
     #[tokio::test]
@@ -999,6 +871,10 @@ mod delegation {
             Some((ProviderKind::Claude, fresh.clone()))
         );
 
+        wait_for("rebound child stop confirmation", || {
+            h.card(&child).status == SubagentStatus::Stopped
+        })
+        .await;
         let card = h.card(&child);
         assert_eq!(card.status, SubagentStatus::Stopped);
         assert_eq!(card.result_text.as_deref(), Some(STOPPED_WITH_PARENT));
@@ -1033,8 +909,8 @@ mod delegation {
             ThreadId(child.clone()),
             None,
         ));
-        wait_for("the card to read Stopped at once", || {
-            h.card(&child).status == SubagentStatus::Stopped
+        wait_for("durable stopping state before acknowledgement", || {
+            h.card(&child).activity.as_deref() == Some("Stopping; provider confirmation pending")
         })
         .await;
         release.notify_one();
@@ -1044,7 +920,7 @@ mod delegation {
         assert!(h.sent(ProviderKind::Codex, &child).is_empty());
         assert_eq!(h.card(&child).result_text.as_deref(), Some(STOPPED_BY_USER));
         h.deliver().await;
-        assert!(h.wakes().is_empty());
+        assert_eq!(h.wait_for_wakes(1).await.len(), 1);
     }
 
     // ── Backstops ──
@@ -1119,22 +995,34 @@ mod delegation {
         )
         .await
         .unwrap();
-        assert!(h.codex.calls.snapshot().contains(&MockCall::RespondToRequest(
-            ThreadId(child.clone()),
-            RequestId("req-1".into())
-        )));
+        assert!(h
+            .codex
+            .calls
+            .snapshot()
+            .contains(&MockCall::RespondToRequest(
+                ThreadId(child.clone()),
+                RequestId("req-1".into())
+            )));
         assert_eq!(
             h.card(&child).activity.as_deref(),
             Some("Working in its tab")
         );
 
-        // A request whose answer Codemux never saw closes with the turn.
+        // Only an explicit answer resolves an approval.
         request("req-2");
+        forward_event(
+            &h.handle,
+            ProviderRuntimeEvent::RequestResolved {
+                thread_id: ThreadId(child.clone()),
+                request_id: RequestId("req-2".into()),
+                decision: ApprovalDecision::Cancel,
+            },
+        );
         h.child_reports(&child, "Added slugify after the approval.");
         h.settle(&child).await;
         assert_eq!(h.card(&child).status, SubagentStatus::Completed);
         let wakes = h.wait_for_wakes(1).await;
-        assert!(wakes[0].contains("<report>\nAdded slugify after the approval.\n</report>"));
+        assert!(wakes[0].contains("Added slugify after the approval."));
     }
 
     #[tokio::test]
@@ -1186,7 +1074,7 @@ mod delegation {
             Some("Codex crashed mid-task")
         );
         let wakes = h.wait_for_wakes(1).await;
-        assert!(wakes[0].contains("status=\"failed\" title=\"Add slugify helper\""));
+        assert!(wakes[0].contains("Status: Failed"));
 
         // The session dies with a question open and no turn end at all.
         let dead = h
@@ -1209,7 +1097,7 @@ mod delegation {
             Some("Its session ended while it was waiting for your answer.")
         );
         let wakes = h.wait_for_wakes(2).await;
-        assert!(wakes[1].contains("status=\"failed\" title=\"Review the parser\""));
+        assert!(wakes[1].contains("Status: Failed"));
 
         // A successful turn that left its question open is a real wait, until
         // the session dies: then nobody can answer into this task any more.
@@ -1240,7 +1128,7 @@ mod delegation {
             Some("Its session ended while it was waiting for your answer.")
         );
         let wakes = h.wait_for_wakes(3).await;
-        assert!(wakes[2].contains("status=\"failed\" title=\"Pick a storage engine\""));
+        assert!(wakes[2].contains("Status: Failed"));
 
         // A session that dies mid-turn with nothing asked fails plainly.
         let crashed = h
@@ -1361,31 +1249,31 @@ mod delegation {
         );
         let wakes = h.wakes();
         assert_eq!(wakes.len(), 1, "the sweep delivers too");
-        assert!(wakes[0].contains("status=\"failed\" title=\"Add slugify helper\""));
+        assert!(wakes[0].contains("Status: Failed"));
         assert!(wakes[0].contains("its last message: Halfway through the parser."));
     }
 
     #[tokio::test]
-    async fn the_sweep_closes_tasks_of_a_parent_that_lost_its_pane() {
+    async fn missing_parent_pane_holds_result_without_implicit_stop() {
         let h = Harness::new().await;
         let child = h
-            .delegate_and_dispatch(args("codex", "Add slugify helper"))
+            .delegate_and_dispatch(args("codex", "Review parser"))
             .await;
         h.codex.set_turn_active(&child, true);
-
-        // The pane went away without the close hook (a missed path).
         h.app_state().set_agent_chat_thread_id(&h.parent_pane, None);
         sweep_pass(&h.handle).await;
-        assert_eq!(h.card(&child).status, SubagentStatus::Running);
         sweep_pass(&h.handle).await;
-
-        let card = h.card(&child);
-        assert_eq!(card.status, SubagentStatus::Stopped);
-        assert_eq!(card.result_text.as_deref(), Some(STOPPED_WITH_PARENT));
-        wait_for("the child to be interrupted", || {
-            h.interrupted(ProviderKind::Codex, &child)
-        })
-        .await;
+        assert_eq!(h.card(&child).status, SubagentStatus::Running);
+        assert!(!h.interrupted(ProviderKind::Codex, &child));
+        h.codex.set_turn_active(&child, false);
+        h.child_reports(&child, "Retained result for an unbound parent");
+        h.settle(&child).await;
+        let task = h.db().delegation_task_for_child(&child).unwrap().unwrap();
+        assert_eq!(
+            task.result.unwrap().text,
+            "Retained result for an unbound parent"
+        );
+        assert_eq!(task.completion_delivery, "held");
         assert!(h.wakes().is_empty());
     }
 
@@ -1465,7 +1353,7 @@ mod delegation {
 
         assert_eq!(h.card(&child).status, SubagentStatus::Completed);
         let wakes = h.wait_for_wakes(1).await;
-        assert!(wakes[0].contains("<report>\nFinished after the reset.\n</report>"));
+        assert!(wakes[0].contains("Finished after the reset."));
         assert!(
             db.get_agent_chat_usage_resume(&child).is_none(),
             "nothing left to restart the child later"
@@ -1527,7 +1415,7 @@ mod delegation {
 
         assert_eq!(h.card(&child).status, SubagentStatus::Completed);
         let wakes = h.wait_for_wakes(1).await;
-        assert!(wakes[0].contains("<report>\nFinished after resuming.\n</report>"));
+        assert!(wakes[0].contains("Finished after resuming."));
     }
 
     #[tokio::test]
@@ -1558,7 +1446,7 @@ mod delegation {
             .as_deref()
             .is_some_and(|reason| reason.starts_with("usage limit reached (resets ")));
         wait_for("the failure to post at once", || h.wakes().len() == 1).await;
-        assert!(h.wakes()[0].contains("status=\"failed\""));
+        assert!(h.wakes()[0].contains("Status: Failed"));
         assert!(h.db().get_agent_chat_usage_resume(&child).is_none());
     }
 
@@ -1615,16 +1503,14 @@ mod delegation {
             "how long it ran is unknown; the time Codemux was closed is not it"
         );
         assert!(db.get_agent_chat_usage_resume(&child).is_none());
-        assert!(db.drain_delegated_open_tasks().unwrap().is_empty());
+        assert_eq!(db.list_delegated_open_tasks().unwrap().len(), 1);
 
         // Nothing starts and nothing is posted.
         sweep_pass(&h.handle).await;
         h.deliver().await;
         assert!(h.codex.calls.snapshot().is_empty());
-        assert_eq!(
-            h.claude.calls.snapshot(),
-            vec![MockCall::StartSession(ThreadId(h.parent.clone()))]
-        );
+        assert_eq!(h.wakes().len(), 1);
+        assert!(h.wakes()[0].contains("Codemux closed before this task finished."));
     }
 
     // ── The parent's own status ──
@@ -1900,4 +1786,389 @@ mod delegation {
         .unwrap();
         h.delegate_and_dispatch(args("codex", "Task 6")).await;
     }
+}
+
+async fn delegation_delivery_ready(h: &Harness, child: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while h
+            .cards(child)
+            .last()
+            .is_none_or(|card| card.status != SubagentStatus::Running)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn delegation_delivery_real_mock_barrier_holds_ambiguous_ack_and_keeps_one_result() {
+    let h = Harness::new().await;
+    let child = h.delegate(args("codex", "Review parser"));
+    delegation_delivery_ready(&h, &child).await;
+    let (entered, release) = h.claude.hold_next_send();
+    h.claude
+        .fail_next_send_after_accept(ProviderError::ValidationError {
+            message: "ACK lost".into(),
+        });
+    h.child_reports(&child, "Final stable report");
+    let owned = h.handle.clone();
+    let child_copy = child.clone();
+    let completion = tokio::spawn(async move {
+        settle(&owned, &child_copy).await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "result not dispatched: {:?}",
+                h.db().delegation_tasks(Some(&h.parent))
+            )
+        });
+    let task = h.db().delegation_task_for_child(&child).unwrap().unwrap();
+    assert_eq!(task.result.as_ref().unwrap().text, "Final stable report");
+    assert!(task.delivery_id.is_some());
+    release.notify_one();
+    completion.await.unwrap();
+    let id = task.delivery_id.unwrap();
+    assert_eq!(
+        h.db().message_delivery(&id).unwrap().unwrap().state,
+        "held_unknown"
+    );
+    for _ in 0..3 {
+        h.deliver().await;
+    }
+    assert_eq!(h.sent(ProviderKind::Claude, &h.parent).len(), 1);
+    assert_eq!(
+        h.db()
+            .delegation_task(&task.task_id)
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap()
+            .text,
+        "Final stable report"
+    );
+}
+
+#[tokio::test]
+async fn delegation_delivery_local_retry_returns_same_task_child_and_launch() {
+    let h = Harness::new().await;
+    let input = json!({"provider":"codex","title":"Review parser","task":TASK,"client_request_id":"review-1"});
+    let first = h.call(FULL, input.clone()).unwrap();
+    let retry = h.call(FULL, input.clone()).unwrap();
+    assert_eq!(first["task_id"], retry["task_id"]);
+    assert_eq!(first["child_thread_id"], retry["child_thread_id"]);
+    assert_ne!(first["task_id"], first["child_thread_id"]);
+    let child = first["child_thread_id"].as_str().unwrap();
+    delegation_delivery_ready(&h, child).await;
+    assert_eq!(h.codex.start_inputs().len(), 1);
+    assert_eq!(h.sent(ProviderKind::Codex, child).len(), 1);
+    let mut changed = input;
+    changed["task"] = json!("A materially different complete task brief");
+    assert!(h.call(FULL, changed).unwrap_err().contains("conflict"));
+}
+
+#[tokio::test]
+async fn delegation_delivery_blocked_question_is_persisted_while_finished_sibling_reaches_parent() {
+    let h = Harness::new().await;
+    let blocked = h.delegate(args("codex", "Needs clarification"));
+    delegation_delivery_ready(&h, &blocked).await;
+    let finished = h.delegate(args("codex", "Independent review"));
+    delegation_delivery_ready(&h, &finished).await;
+    forward_event(
+        &h.handle,
+        ProviderRuntimeEvent::RequestOpened {
+            thread_id: ThreadId(blocked.clone()),
+            turn_id: TurnId("question-run".into()),
+            request_id: RequestId("question-1".into()),
+            request_kind: "user-input".into(),
+            payload: json!({"question":"Which parser?"}),
+            tool_use_id: None,
+            subagent_id: None,
+        },
+    );
+    h.child_reports(&finished, "Independent final result");
+    h.settle(&finished).await;
+    assert_eq!(
+        h.db()
+            .delegation_task_for_child(&blocked)
+            .unwrap()
+            .unwrap()
+            .pending_request
+            .unwrap()
+            .id,
+        "question-1"
+    );
+    assert!(h
+        .sent(ProviderKind::Claude, &h.parent)
+        .iter()
+        .any(|text| text.contains("Independent final result")));
+    assert!(h
+        .db()
+        .delegation_task_for_child(&blocked)
+        .unwrap()
+        .unwrap()
+        .result
+        .is_none());
+}
+
+#[tokio::test]
+async fn delegation_delivery_bounded_wait_timeout_does_not_cancel_and_status_requires_owner() {
+    let h = Harness::new().await;
+    let caller = h.caller(FULL);
+    let args = json!({"provider":"codex","title":"Review parser","task":TASK,"mode":"wait","wait_ms":0,"client_request_id":"wait-1"});
+    let reply = h
+        .host
+        .call_async(
+            &caller,
+            DELEGATE_TOOL,
+            &args,
+            Some("call-1"),
+            Some("parent-run"),
+        )
+        .await
+        .unwrap();
+    let receipt: Value =
+        serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(receipt["wait_timed_out"], true);
+    let child = receipt["child_thread_id"].as_str().unwrap();
+    let id = receipt["task_id"].as_str().unwrap();
+    delegation_delivery_ready(&h, child).await;
+    assert!(!h
+        .db()
+        .delegation_task(id)
+        .unwrap()
+        .unwrap()
+        .status
+        .terminal());
+    assert!(h
+        .db()
+        .acknowledge_delegation_result("not-parent", id)
+        .is_err());
+    h.child_reports(child, "Final after timeout");
+    h.settle(child).await;
+    assert_eq!(
+        h.db()
+            .acknowledge_delegation_result(&h.parent, id)
+            .unwrap()
+            .result
+            .unwrap()
+            .text,
+        "Final after timeout"
+    );
+}
+
+#[tokio::test]
+async fn delegation_delivery_stop_during_provider_start_is_confirmed_without_child_send() {
+    let h = Harness::new().await;
+    let (entered, release) = h.codex.hold_next_start();
+    let child = h.delegate(args("codex", "Review parser"));
+    entered.notified().await;
+    agent_chat_interrupt_turn(
+        h.handle.clone(),
+        ProviderKind::Claude,
+        ThreadId(h.parent.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    let task = h.db().delegation_task_for_child(&child).unwrap().unwrap();
+    assert_eq!(task.completion_delivery, "disposed_by_stop");
+    assert!(
+        task.result.is_none(),
+        "an unconfirmed stop cannot fabricate a terminal result"
+    );
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if h.db()
+                .delegation_task(&task.task_id)
+                .unwrap()
+                .unwrap()
+                .result
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(h.sent(ProviderKind::Codex, &child).is_empty());
+    assert!(h.sent(ProviderKind::Claude, &h.parent).is_empty());
+    assert_eq!(
+        h.db()
+            .delegation_task(&task.task_id)
+            .unwrap()
+            .unwrap()
+            .completion_delivery,
+        "disposed_by_stop"
+    );
+}
+
+#[tokio::test]
+async fn delegation_delivery_wait_releases_on_parent_completion_or_disconnection_without_ack() {
+    for parent_completes in [true, false] {
+        let h = Harness::new().await;
+        let caller = h.caller(FULL);
+        let input = json!({"provider":"codex","title":"Review parser","task":TASK,"mode":"wait","wait_ms":20000,"client_request_id":"wait-release"});
+        let mut waiting = h.host.call_async(
+            &caller,
+            DELEGATE_TOOL,
+            &input,
+            Some("call-wait"),
+            Some("parent-run"),
+        );
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        let task = h
+            .db()
+            .delegation_tasks(Some(&h.parent))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let child = task.child_thread_id.as_ref().unwrap();
+        delegation_delivery_ready(&h, child).await;
+        if parent_completes {
+            h.turn_ends(&h.parent, TurnStatus::Success);
+            let response = tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+            let receipt: Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(receipt["wait_released"], true);
+            assert!(receipt["result"].is_null());
+        } else {
+            drop(waiting);
+        }
+        assert!(h
+            .db()
+            .delegation_task(&task.task_id)
+            .unwrap()
+            .unwrap()
+            .wait_until
+            .is_none());
+        h.child_reports(child, "Final after wait release");
+        h.settle(child).await;
+        assert_eq!(h.sent(ProviderKind::Claude, &h.parent).len(), 1);
+        assert_eq!(
+            h.db()
+                .delegation_task(&task.task_id)
+                .unwrap()
+                .unwrap()
+                .completion_delivery,
+            "delivered"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delegation_delivery_legacy_terminal_import_reuses_receipt_or_holds_unknown() {
+    for prior_receipt in [true, false] {
+        let h = Harness::new().await;
+        let child = unique("legacy-terminal");
+        h.db()
+            .upsert_agent_chat_session(&child, &h.workspace, Some(&h.cwd), "codex")
+            .unwrap();
+        h.db()
+            .insert_delegated_open_task(&DelegatedOpenTask {
+                child_thread_id: child.clone(),
+                parent_thread_id: h.parent.clone(),
+                provider: "codex".into(),
+                title: "Legacy review".into(),
+                created_at_ms: 1,
+            })
+            .unwrap();
+        h.child_reports(&child, "Durable legacy report");
+        if prior_receipt {
+            let payload = json!({"origin":"delegation","provenance":{"notification":{"source":{"kind":"delegated_task","task_ids":[child]},"outcome":"completed"}}});
+            h.db()
+                .admit_message_delivery(
+                    "legacy-receipt",
+                    &h.parent,
+                    "legacy-message",
+                    &payload,
+                    "prior-boot",
+                    0,
+                    None,
+                    false,
+                )
+                .unwrap();
+            h.db()
+                .finish_message_delivery("legacy-receipt", "accepted", None, None)
+                .unwrap();
+        }
+        drain_journal(&h.handle);
+        let task = h.db().delegation_task_for_child(&child).unwrap().unwrap();
+        assert_eq!(task.result.unwrap().text, "Durable legacy report");
+        assert_eq!(
+            task.completion_delivery,
+            if prior_receipt {
+                "delivered"
+            } else {
+                "held_unknown"
+            }
+        );
+        assert_eq!(
+            task.delivery_id.as_deref(),
+            if prior_receipt {
+                Some("legacy-receipt")
+            } else {
+                None
+            }
+        );
+        h.deliver().await;
+        assert!(
+            h.sent(ProviderKind::Claude, &h.parent).is_empty(),
+            "legacy import must not manufacture a second parent submission"
+        );
+        assert!(h.db().pending_message_deliveries().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn delegation_delivery_parent_stop_targets_later_run_current_provider() {
+    let h = Harness::new().await;
+    let child = h.delegate(args("codex", "Review parser"));
+    delegation_delivery_ready(&h, &child).await;
+    h.child_reports(&child, "Original immutable result");
+    h.settle(&child).await;
+    h.db()
+        .upsert_agent_chat_session(&child, &h.workspace, Some(&h.cwd), "claude")
+        .unwrap();
+    forward_event(
+        &h.handle,
+        ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: ThreadId(child.clone()),
+            status: SessionStatus::Running {
+                active_turn: TurnId("later-claude-run".into()),
+            },
+        },
+    );
+    agent_chat_interrupt_turn(
+        h.handle.clone(),
+        ProviderKind::Claude,
+        ThreadId(h.parent.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !h.interrupted(ProviderKind::Claude, &child) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!h.interrupted(ProviderKind::Codex, &child));
+    let task = h.db().delegation_task_for_child(&child).unwrap().unwrap();
+    assert_eq!(
+        task.provider, "codex",
+        "original resolved selection is retained"
+    );
+    assert_eq!(task.result.unwrap().text, "Original immutable result");
+    assert_eq!(task.completion_delivery, "disposed_by_stop");
 }

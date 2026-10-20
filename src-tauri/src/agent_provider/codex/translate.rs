@@ -639,6 +639,7 @@ pub fn translate_turn_completed(
 /// clobbers a previously-known value.
 fn subagent_snapshot(subagent_id: &str, status: SubagentStatus) -> SubagentSnapshot {
     SubagentSnapshot {
+        task_id: None,
         subagent_id: subagent_id.to_string(),
         parent_item_id: None,
         name: None,

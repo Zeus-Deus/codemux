@@ -6,7 +6,8 @@
 pub(super) fn allowed(cmd: &str) -> bool {
     matches!(
         cmd,
-        "delegation_host_info" | "delegation_grants" | "delegation_authorize" | "delegation_revoke" | "delegate_task" | "delegation_list" | "delegation_read" | "delegation_cancel" | "delegation_respond" | "delegation_deliver"
+        "delegation_local_context"
+            | "delegation_host_info" | "delegation_grants" | "delegation_authorize" | "delegation_revoke" | "delegate_task" | "delegation_list" | "delegation_read" | "delegation_cancel" | "delegation_respond" | "delegation_deliver"
             | "reply_to_pr_thread"
             | "set_pr_thread_resolved"
             | "submit_pr_review"
@@ -481,5 +482,14 @@ mod tests {
         ] {
             assert!(!allowed(cmd), "{cmd}");
         }
+    }
+}
+
+#[cfg(test)]
+mod durable_task_tests {
+    #[test]
+    fn delegation_delivery_local_state_is_allowed_and_dispatchable() {
+        assert!(super::allowed("delegation_local_context"));
+        assert!(!crate::delegation::commands::is_command("delegation_local_context"));
     }
 }

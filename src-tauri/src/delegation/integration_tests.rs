@@ -156,7 +156,7 @@ async fn final_dispatch_unsupported_parent_fails_before_provider_or_app_side_eff
     assert!(result.unwrap_err().contains("unsupported"));
 }
 #[tokio::test]
-async fn final_dispatch_checkpoint_held_send_stop_revoke_rebind_user_dominate() {
+async fn final_dispatch_checkpoint_stop_revoke_rebind_and_human_preserves_wake() {
     for kind in [ProviderKind::Codex, ProviderKind::Claude] {
         for action in ["stop", "revoke", "rebind", "user"] {
             checkpoint_case(kind, action).await;
@@ -312,6 +312,8 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
         app.manage(db);
         app.manage(journal.clone());
         app.manage(crate::commands::agent_chat::ProviderRegistry::new());
+        app.manage(crate::agent_control::NativeControlState::default());
+        app.manage(crate::commands::agent_chat::RunActivityTracker::default());
         app.manage(crate::commands::agent_chat::SubagentTracker::default());
         app.manage(crate::commands::agent_chat::RunActivityTracker::default());
         app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
@@ -455,7 +457,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
             "user" => {
                 let h = app.handle().clone();
                 let t = thread.clone();
-                user_sending = Some(tokio::spawn(async move {
+                let mut user = Box::pin(async move {
                     let input = crate::commands::agent_chat::SendTurnCommandInput {
                         input_source: None,
                         thread_id: ThreadId(t),
@@ -478,17 +480,15 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
                         crate::commands::agent_chat::TurnOrigin::User,
                     )
                     .await
-                }));
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while journal.task(&task.id).unwrap().wake_state != WakeState::Suppressed {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .unwrap();
+                });
+                // Poll through human-activity invalidation to the native
+                // dispatch gate held by the result; no timing-based race.
+                assert!(futures_util::poll!(&mut user).is_pending());
+                assert_ne!(journal.task(&task.id).unwrap().wake_state, WakeState::Suppressed);
+                user_sending = Some(tokio::spawn(user));
             }
             "accepted" | "unknown" | "pending" | "partial" | "partial-drop" => {
-                app::user_activity(app.handle(), &thread, false).unwrap();
+                app::user_activity(app.handle(), &thread, action == "pending").unwrap();
             }
             "revoke" | "pending-revoke" => {
                 grant.enabled = false;
@@ -531,10 +531,12 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
             let _ = stop.await.unwrap();
         }
         if let Some(user) = user_sending {
-            assert!(
-                user.await.unwrap().unwrap().queued_id.is_none(),
-                "ordinary user send was blocked by phantom result turn"
-            );
+            let sent = user.await.unwrap().unwrap();
+            assert!(sent.queued_id.is_some(), "human message must queue behind the accepted result turn");
+            let db = app.state::<crate::database::DatabaseStore>();
+            let queued = db.message_delivery_for_message(&thread,"normal-user").unwrap().unwrap();
+            assert_eq!(queued.state,"queued");
+            assert_eq!(queued.payload["input"]["text"],"normal user wins");
         }
         let explicit = if matches!(action, "accepted" | "unknown" | "empty" | "partial" | "partial-drop") {
             Some(
@@ -722,8 +724,8 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
             );
             if action == "user" {
                 assert!(
-                    trace.contains("normal user wins") && !trace.contains("[Remote task result"),
-                    "ordinary user send did not dominate guarded dispatch"
+                    trace.contains("[Remote task result"),
+                    "ordinary human activity suppressed an accepted remote task's result"
                 );
             } else {
                 assert!(ready, "cancelled guarded send left parent busy");
@@ -1161,6 +1163,8 @@ async fn control_launch_lost_reply_restart_follow_and_normal_idle_native_parent_
     handle.manage(journal.clone());
     handle.manage(transport.clone() as Arc<dyn TaskTransport>);
     handle.manage(crate::commands::agent_chat::ProviderRegistry::new());
+    handle.manage(crate::agent_control::NativeControlState::default());
+    handle.manage(crate::commands::agent_chat::RunActivityTracker::default());
     handle.manage(crate::commands::agent_chat::SubagentTracker::default());
     handle.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
     handle.manage(crate::observability::ObservabilityStore::default());
@@ -1588,6 +1592,8 @@ async fn claude_callback_authority_ends_with_turn_and_callback_job_ends_with_run
         let journal = Arc::new(Journal::open(&root.join("local-journal")).unwrap());
         app.manage(journal.clone());
         app.manage(crate::commands::agent_chat::ProviderRegistry::new());
+        app.manage(crate::agent_control::NativeControlState::default());
+        app.manage(crate::commands::agent_chat::RunActivityTracker::default());
         let registry = crate::mcp::registry::McpRegistry::new();
         registry.insert_native_delegation_tools_for_test().await;
         let entered = Arc::new(Notify::new());
@@ -2067,6 +2073,8 @@ async fn codex_delayed_native_admission_is_denied_after_completed_stop() {
     handle.manage(journal.clone());
     handle.manage(transport.clone() as Arc<dyn TaskTransport>);
     handle.manage(crate::commands::agent_chat::ProviderRegistry::new());
+    handle.manage(crate::agent_control::NativeControlState::default());
+    handle.manage(crate::commands::agent_chat::RunActivityTracker::default());
     handle.manage(crate::commands::agent_chat::SubagentTracker::default());
     handle.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
     handle.manage(crate::observability::ObservabilityStore::default());

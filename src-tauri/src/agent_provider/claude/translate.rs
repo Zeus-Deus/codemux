@@ -1164,6 +1164,7 @@ fn snapshot_from_launch(tool_use_id: &str, input: &serde_json::Value) -> Subagen
     };
     let name = get("name").or_else(|| get("subagent_type")).or_else(|| get("description"));
     SubagentSnapshot {
+        task_id: None,
         subagent_id: tool_use_id.to_string(),
         parent_item_id: Some(tool_use_id.to_string()),
         name,
@@ -1376,6 +1377,7 @@ fn stringify_content_truncated(content: &serde_json::Value, max_chars: usize) ->
 /// event actually reports; the frontend merges non-`None` fields.
 fn base_snapshot(subagent_id: &str) -> SubagentSnapshot {
     SubagentSnapshot {
+        task_id: None,
         subagent_id: subagent_id.to_string(),
         parent_item_id: Some(subagent_id.to_string()),
         name: None,

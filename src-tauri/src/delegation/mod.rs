@@ -17,3 +17,5 @@ mod ownership_tests;
 
 #[cfg(all(test, unix))]
 mod selected_interrupt_tests;
+
+mod canonical;

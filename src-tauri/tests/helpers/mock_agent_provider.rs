@@ -164,8 +164,8 @@ impl MockAgentProvider {
         *self.send_error.lock().unwrap() = Some(error);
     }
 
-    pub fn fail_next_send_after_accept(&self,error:ProviderError) {
-        *self.send_error_after_accept.lock().unwrap()=Some(error);
+    pub fn fail_next_send_after_accept(&self, error: ProviderError) {
+        *self.send_error_after_accept.lock().unwrap() = Some(error);
     }
 
     /// Convenience: emit a runtime event via the broadcaster, the
@@ -223,7 +223,8 @@ impl AgentProvider for MockAgentProvider {
             entered.notify_one();
             release.notified().await;
         }
-        self.calls.push(MockCall::StartSession(input.thread_id.clone()));
+        self.calls
+            .push(MockCall::StartSession(input.thread_id.clone()));
         self.start_inputs.lock().unwrap().push(input.clone());
         if let Some(error) = self.start_error.lock().unwrap().take() {
             return Err(error);
@@ -259,7 +260,9 @@ impl AgentProvider for MockAgentProvider {
             .push(MockCall::SendTurn(input.thread_id.clone(), input.text));
         let after_accept = self.send_error_after_accept.lock().unwrap().take();
         if let Some(error) = after_accept {
-            if let Some(checkpoint) = checkpoint.as_ref() { checkpoint.abort().await; }
+            if let Some(checkpoint) = checkpoint.as_ref() {
+                checkpoint.abort().await;
+            }
             return Err(error);
         }
         if let Some(checkpoint) = checkpoint.as_ref() {
@@ -287,7 +290,8 @@ impl AgentProvider for MockAgentProvider {
         request_id: RequestId,
         _decision: ApprovalDecision,
     ) -> Result<(), ProviderError> {
-        self.calls.push(MockCall::RespondToRequest(thread_id, request_id));
+        self.calls
+            .push(MockCall::RespondToRequest(thread_id, request_id));
         Ok(())
     }
 
@@ -296,7 +300,11 @@ impl AgentProvider for MockAgentProvider {
         Ok(())
     }
 
-    async fn set_fast_mode(&self, thread_id: ThreadId, fast_mode: bool) -> Result<(), ProviderError> {
+    async fn set_fast_mode(
+        &self,
+        thread_id: ThreadId,
+        fast_mode: bool,
+    ) -> Result<(), ProviderError> {
         self.calls.push(MockCall::SetFastMode(thread_id, fast_mode));
         match self.fast_mode_error.lock().unwrap().take() {
             Some(error) => Err(error),
@@ -330,7 +338,8 @@ impl AgentProvider for MockAgentProvider {
         thread_id: ThreadId,
         mode: String,
     ) -> Result<(), ProviderError> {
-        self.calls.push(MockCall::SetPermissionMode(thread_id, mode));
+        self.calls
+            .push(MockCall::SetPermissionMode(thread_id, mode));
         Ok(())
     }
 

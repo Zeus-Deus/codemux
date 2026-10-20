@@ -1,3 +1,4 @@
+use serde_json::Value;
 // MCP runtime registry.
 //
 // Holds the live `McpServerHandle`s plus the disabled-id set the
@@ -129,9 +130,13 @@ pub struct HostCaller {
 pub trait HostTools: Send + Sync {
     /// Tools to offer `caller`, already prefixed like registry tools.
     fn tools_for(&self, caller: &HostCaller) -> Vec<McpTool>;
+    fn call_async<'a>(&'a self, caller: &'a HostCaller, name: &'a str, args: &'a Value, call_id: Option<&'a str>, run_id: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output=Option<Value>> + Send + 'a>> {
+        let _=(call_id,run_id);
+        Box::pin(async move {self.call(caller,name,args)})
+    }
     /// Answer a call as an MCP `tools/call` result (`content` + `isError`),
-    /// or `None` when `prefixed_name` is not a host tool. Codex answers its
-    /// tool requests inline, so this must never wait on a provider.
+    /// or `None` when `prefixed_name` is not a host tool. This synchronous
+    /// fallback must never wait on a provider; native adapters use `call_async`.
     fn call(
         &self,
         caller: &HostCaller,
@@ -151,6 +156,9 @@ impl HostTools for CompositeHostTools {
             .collect()
     }
 
+    fn call_async<'a>(&'a self,caller:&'a HostCaller,name:&'a str,args:&'a Value,call_id:Option<&'a str>,run_id:Option<&'a str>)->std::pin::Pin<Box<dyn std::future::Future<Output=Option<Value>> + Send + 'a>> {
+        Box::pin(async move {for host in &self.0 {if let Some(result)=host.call_async(caller,name,args,call_id,run_id).await {return Some(result);}} None})
+    }
     fn call(
         &self,
         caller: &HostCaller,
@@ -371,6 +379,10 @@ impl McpRegistry {
         arguments: &serde_json::Value,
     ) -> Option<serde_json::Value> {
         self.host.get()?.call(caller, prefixed_name, arguments)
+    }
+
+    pub async fn host_call_async(&self,caller:&HostCaller,name:&str,args:&Value,call_id:Option<&str>,run_id:Option<&str>)->Option<Value> {
+        self.host.get()?.call_async(caller,name,args,call_id,run_id).await
     }
 
     /// Tell live sessions to re-collect their tool lists because the host

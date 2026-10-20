@@ -2852,6 +2852,9 @@ fn spawn_incoming_requests_task(
                                 permit: session.native_authority.capture_for_turn(turn.unwrap()),
                             })
                         };
+                        let owned_session=session.clone();let owned_child=child.clone();let owned_registry=mcp_registry.clone();let owned_events=event_tx.clone();
+                        tokio::spawn(async move {
+                            let session=owned_session;let child=owned_child;let mcp_registry=owned_registry;let event_tx=owned_events;
                         if let Some(actor) = &actor {
                             let _ = actor.permit.wait_ready().await;
                         }
@@ -2870,6 +2873,7 @@ fn spawn_incoming_requests_task(
                                 original_payload: None,
                             });
                         }
+                        });
                         continue;
                     }
                     let request_id = mint_request_id();
@@ -2927,7 +2931,11 @@ async fn dynamic_tool_specs(
             .list_tools_for_workspace(&[crate::mcp::McpConfigSource::CodexUser], host_caller.workspace_id.as_deref())
             .await
     };
-    tools.extend(registry.host_tools(host_caller));
+    let host_tools=registry.host_tools(host_caller);
+    // App-owned task tools also serve local IDs; replace the SSH-only schema
+    // rather than publishing duplicate names to the native provider.
+    tools.retain(|tool|!host_tools.iter().any(|host|host.prefixed_name==tool.prefixed_name));
+    tools.extend(host_tools);
     tools.extend(crate::mcp::registry::plugin_bridge_tools());
     Some(
         tools
@@ -2985,22 +2993,10 @@ async fn handle_dynamic_tool_call_native(
             // as the root chat, so a call from another thread (a native
             // subagent that inherited the dynamic tools) is refused rather
             // than handed the root's identity and permission mode.
-            let host = host.and_then(|(caller, root_thread)| {
-                if call.thread_id == root_thread {
-                    registry.host_call(caller, &name, &call.arguments)
-                } else {
-                    registry
-                        .host_tools(caller)
-                        .iter()
-                        .any(|tool| tool.prefixed_name == name)
-                        .then(|| {
-                            json!({
-                                "content": [{ "type": "text", "text": "This tool is only available in the main conversation, not from a subagent." }],
-                                "isError": true,
-                            })
-                        })
-                }
-            });
+            let host = if let Some((caller, root_thread))=host {
+                if call.thread_id==root_thread {registry.host_call_async(caller,&name,&call.arguments,Some(&call.call_id),Some(&call.turn_id)).await}
+                else {registry.host_tools(caller).iter().any(|tool|tool.prefixed_name==name).then(||json!({"content":[{"type":"text","text":"This tool requires the app-owned root conversation"}],"isError":true}))}
+            } else {None};
             let bridge = registry.call_plugin_bridge(&name, call.arguments.clone(), workspace_id, direct_tools).await;
             match host {
                 _ if bridge.is_some() => bridge.unwrap(),

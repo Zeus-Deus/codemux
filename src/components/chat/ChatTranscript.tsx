@@ -1,3 +1,5 @@
+import { useDurableTasks } from "@/lib/agent-chat/durable-tasks";
+import { DurableTasksContext } from "./durable-task-context";
 import { memo, useContext, useEffect, useMemo, useRef } from "react";
 import { isInteractionTraceEnabled, markPaneReady } from "@/lib/perf/interaction-trace";
 import { observeTranscriptReady } from "@/lib/perf/transcript-ready";
@@ -161,7 +163,9 @@ export const ChatTranscript = memo(function ChatTranscript({
     [messages, streaming],
   );
 
+  const durableTasks = useDurableTasks(threadKey);
   const list = (
+    <DurableTasksContext.Provider value={durableTasks}>
     <ChatMarkdownPassiveContext.Provider value={passive}>
       <RemoteTaskContext.Provider value={remoteTaskScope}>
       <AsyncQuestionThreadContext.Provider value={passive ? null : (threadKey ?? null)}>
@@ -203,6 +207,7 @@ export const ChatTranscript = memo(function ChatTranscript({
       </AsyncQuestionThreadContext.Provider>
       </RemoteTaskContext.Provider>
     </ChatMarkdownPassiveContext.Provider>
+    </DurableTasksContext.Provider>
   );
   // Portals follow React ancestry, not the physical slot's ancestry. The
   // sole pane is already active; reproduce only AgentChatPane's runtime-intent

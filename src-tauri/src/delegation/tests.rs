@@ -721,3 +721,24 @@ fn oversized_receiver_event_reference_reconciles_in_portable_parent_journal() {
     assert!(!store.tail_pending(&task.id).unwrap());
     assert_eq!(store.follow_intent(&task.id).unwrap().1, 2);
 }
+
+#[test]
+fn delegation_delivery_human_messages_before_during_after_remote_completion_do_not_suppress() {
+    for timing in ["before","during","after"] {
+        let dir=tempfile::tempdir().unwrap();let store=Journal::open(dir.path()).unwrap();let (parent,grant,input)=fixture();store.put_grant(&parent.workspace_id,&grant).unwrap();let task=store.admit(&parent,&grant,"checkout",&input).unwrap();
+        if timing=="before" {store.suppress_parent(&parent.thread_id,false).unwrap();}
+        store.apply_remote(&task.id,&remote(&task,TaskStatus::Running)).unwrap();
+        if timing=="during" {store.suppress_parent(&parent.thread_id,false).unwrap();}
+        // Use a fresh tail sequence to prove result ingestion after new human activity.
+        let mut result=remote(&task,TaskStatus::Completed);result.events[0].sequence=2;result.next_cursor=2;store.apply_remote_after(&task.id,&result,1).unwrap();
+        if timing=="after" {store.suppress_parent(&parent.thread_id,false).unwrap();}
+        drop(store);let store=Journal::open(dir.path()).unwrap();store.recover_deliveries().unwrap();assert_eq!(store.task(&task.id).unwrap().wake_state,WakeState::Pending);assert!(!store.task(&task.id).unwrap().cancel_requested);assert!(store.task(&task.id).unwrap().remote.unwrap().result.is_some());
+    }
+}
+
+#[test]
+fn delegation_delivery_legacy_suppressed_without_witness_is_held_unknown() {
+    let dir=tempfile::tempdir().unwrap();let store=Journal::open(dir.path()).unwrap();let (parent,grant,input)=fixture();store.put_grant(&parent.workspace_id,&grant).unwrap();let task=store.admit(&parent,&grant,"checkout",&input).unwrap();
+    store.update(&task.id,|t|t.wake_state=WakeState::Suppressed).unwrap();store.conn.lock().unwrap().execute("DELETE FROM delivery_outcomes WHERE task=?1",[&task.id]).unwrap();drop(store);
+    let store=Journal::open(dir.path()).unwrap();store.recover_deliveries().unwrap();assert_eq!(store.delivery_outcome(&task.id).unwrap(),DeliveryOutcome::Unknown);assert_eq!(store.task(&task.id).unwrap().wake_state,WakeState::Suppressed);
+}

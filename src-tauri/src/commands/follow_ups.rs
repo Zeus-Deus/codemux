@@ -31,7 +31,6 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use crate::agent_provider::ProviderKind;
-use crate::database::delegated_tasks::DelegatedOpenTask;
 use crate::database::follow_ups::FollowUpTaskRow;
 use crate::database::{AgentChatSessionConfig, DatabaseStore};
 use crate::mcp::registry::HostCaller;
@@ -930,6 +929,11 @@ pub async fn follow_up_start<R: Runtime>(
     db.insert_follow_up_task(&row)
         .map_err(|_| "This task was already started.".to_string())?;
     emit_changed(&app, parent);
+    // Persist ownership before setup can await. A parent Stop must fence a
+    // worktree child even before its workspace or provider session exists.
+    let mut intent=crate::database::delegation_tasks::TaskRecord::new(format!("local:{}",uuid::Uuid::new_v4()),parent.into(),Some(child.clone()),provider_id(provider).into(),suggestion.title.clone(),suggestion.task.clone(),row.created_at_ms);
+    intent.parent_title=db.get_agent_chat_title(parent);intent.workspace_id=workspace.workspace_id.0.clone();intent.cwd=repo_path.display().to_string();intent.isolation="worktree".into();intent.preparation_state="preparing".into();intent.tool_call_id=Some(row.tool_call_id.clone());
+    db.admit_delegation_task(&intent,None,&json!({"suggestion":row.tool_call_id,"index":row.index,"child":child}))?;
 
     let created = super::workspace::create_worktree_workspace_impl_with_selection(
         app.clone(),
@@ -956,11 +960,13 @@ pub async fn follow_up_start<R: Runtime>(
     let created = match created {
         Ok(created) if !created.adopted => created,
         Ok(_) => {
+            super::delegation::preparation_failed(&app,&intent.task_id,&format!("A workspace for branch {branch} is already open."));
             let _ = db.delete_follow_up_task(&child);
             emit_changed(&app, parent);
             return Err(format!("A workspace for branch {branch} is already open."));
         }
         Err(error) => {
+            super::delegation::preparation_failed(&app,&intent.task_id,&format!("Codemux could not create its worktree: {}",readable_error(&error)));
             let _ = db.delete_follow_up_task(&child);
             emit_changed(&app, parent);
             return Err(format!(
@@ -1009,6 +1015,7 @@ pub async fn follow_up_start<R: Runtime>(
     crate::state::emit_app_state(&app);
     let pane_id = app_state.agent_chat_pane_id_for_thread(&child);
     let (Ok(()), Some(pane_id)) = (rows, pane_id) else {
+        super::delegation::preparation_failed(&app,&intent.task_id,"Codemux created the workspace but could not open its chat.");
         let _ = db.set_follow_up_outcome(&child, "failed");
         emit_changed(&app, parent);
         return Err("Codemux created the workspace but could not open its chat.".into());
@@ -1021,19 +1028,19 @@ pub async fn follow_up_start<R: Runtime>(
         &suggestion.task,
         row.created_at_ms,
     )
+    .with_identity(intent.task_id.clone())
     .with_model(model, effort)
     .in_worktree(placement_of(&row));
     let state = app.state::<DelegationState>();
-    state.reserve_worktree(&child, task);
-    let journal = DelegatedOpenTask {
-        child_thread_id: child.clone(),
-        parent_thread_id: parent.to_string(),
-        provider: provider_id(provider).to_string(),
-        title: suggestion.title.clone(),
-        created_at_ms: row.created_at_ms,
-    };
-    if let Err(error) = db.insert_delegated_open_task(&journal) {
-        eprintln!("[codemux::follow_ups] {error}");
+    state.reserve_worktree(&child, task.clone());
+    let mut durable=super::delegation::record_of(&child,&task);
+    durable.workspace_id=workspace_id.clone();durable.cwd=worktree_path.clone();
+    durable.permission_mode=fallback_permission_mode(provider).map(str::to_string);
+    db.update_delegation_task(&intent.task_id,|t|{t.workspace_id=durable.workspace_id.clone();t.cwd=durable.cwd.clone();t.model=durable.model.clone();t.effort=durable.effort.clone();t.permission_mode=durable.permission_mode.clone();t.worktree=Some(json!({"path":worktree_path,"branch":row.branch,"base_ref":row.base_sha}));})?;
+    if db.delegation_task(&intent.task_id)?.is_some_and(|t|t.cancellation_generation>0) {
+        super::delegation::on_thread_stopped(&app,&child,super::delegation::StopKind::Stop);
+        super::delegation::stop_confirmed(&app,&child);
+        return Err("Task stopped during worktree preparation; its workspace is retained".into());
     }
     state.emit_card(&app, &child);
     emit_changed(&app, parent);
@@ -1638,7 +1645,7 @@ mod tests {
         );
         assert_eq!(
             names(&caller(ProviderKind::Claude, Some("plan"))),
-            vec!["delegate_task", "suggest_tasks"]
+            vec!["delegate_task", "task_status", "task_cancel", "suggest_tasks"]
         );
         assert!(names(&caller(ProviderKind::Cursor, None)).is_empty());
 

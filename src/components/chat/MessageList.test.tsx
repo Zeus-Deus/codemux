@@ -1443,12 +1443,12 @@ describe("MessageList usage limit", () => {
     expect(screen.getByTestId("auto-resume-divider-text")).toHaveTextContent(text);
   });
 
-  it("renders the delegated-results turn as its divider, not a user bubble", () => {
+  it("renders persisted delegated-result metadata as a result row", () => {
     const text =
       '[Codemux: delegated task results]\nCodemux posted this message, not the user.\n\n<task provider="codex" status="completed" title="Add slugify helper" duration="6m 12s" thread="c1">\n<report>Done.</report>\n</task>';
-    renderList([userTurn, { kind: "user_message", id: "um-2", seq: 1, text }]);
-    expect(screen.getByTestId("delegation-results-divider")).toHaveTextContent(
-      "Delegated results · Codex · Add slugify helper · completed",
+    renderList([userTurn, { kind: "user_message", id: "um-2", seq: 1, text, notification: {source:{kind:"delegated_task",task_ids:["local:task"],child_thread_id:"c1"},outcome:"completed",summary:"Add slugify helper"} }]);
+    expect(screen.getByTestId("subagent-notification-row")).toHaveTextContent(
+      "Add slugify helperFinished",
     );
     expect(screen.queryByText(/Codemux posted this message/)).toBeNull();
   });

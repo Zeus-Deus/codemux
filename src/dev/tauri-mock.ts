@@ -58,6 +58,7 @@ import { automationMockHandlers } from "./automations-mock";
 import {
   delegationScenarioFromSearch,
   mockDelegatedChild,
+  mockDurableContext,
   mockDelegatedChildParent,
   mockDelegatedChildTranscript,
   stopMockDelegatedChild,
@@ -3789,7 +3790,7 @@ function streamMockDelegatedTask(
   threadId: string = activeMockChatThreadId(),
 ) {
   return streamDelegatedTask(
-    { emit: emitChatEvent, openChildTab: openMockDelegatedTab },
+    { emit: (thread, event) => {emitChatEvent(thread, event); emitEvent("delegation-changed", {parent_thread_id: thread});}, openChildTab: openMockDelegatedTab },
     threadId,
     opts,
   );
@@ -8379,6 +8380,7 @@ const handlers: Record<string, Handler> = {
       cwd: record.cwd ?? "",
     };
   },
+  delegation_local_context: (a) => mockDurableContext(a.threadId as string),
   agent_chat_fork_origin: (a) => mockForkOrigins.get(a.threadId as string) ?? null,
   agent_chat_delivery_attention: (a) => new URLSearchParams(window.location.search).get("mockScenario") === "message-provenance" && a.threadId === MOCK_CHAT_THREAD_ID
     ? [{id:"mock-unknown-delivery",message_id:"mock-unknown",state:"held_unknown",reason:"Provider acceptance could not be confirmed after restart. Automatic resend is held.",display_text:"Review the parser changes.",can_retry:false},

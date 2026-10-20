@@ -6,6 +6,7 @@ import type { ChatViewItem, SubagentRunItem, SubagentView } from "@/lib/agent-ch
 
 import { ComposerStrip } from "./ComposerStrip";
 import {
+  childInputOccupant,
   useDelegationOccupant,
   useSubagentOccupant,
 } from "./use-composer-strip-occupants";
@@ -65,14 +66,14 @@ function Harness({
 const rows = () => screen.queryAllByTestId("composer-strip-row");
 
 describe("delegation occupant", () => {
-  it("reads 'Continues when Codex finishes' while the parent is idle", () => {
+  it("reads 'Waiting on subagent' while the parent is idle", () => {
     render(<Harness messages={[card("c1", [delegated("child-1")])]} />);
     const [row] = rows();
     expect(row).toHaveAttribute("data-kind", "delegation");
-    expect(row).toHaveTextContent("Continues when Codex finishes");
+    expect(row).toHaveTextContent("Waiting on subagent");
     expect(row).toHaveTextContent("Add slugify helper · Working in its tab");
     expect(row).toHaveTextContent("2m 14s");
-    expect(within(row).getByTestId("composer-strip-delegation-open")).toHaveTextContent("Open");
+    expect(within(row).getByRole("button", {name: "Open subagent Add slugify helper"})).toHaveTextContent("Add slugify helper");
     expect(within(row).getByTestId("composer-strip-delegation-stop")).toHaveTextContent("Stop");
   });
 
@@ -86,7 +87,7 @@ describe("delegation occupant", () => {
   it("only notes that reports post here while the parent streams", () => {
     render(<Harness streaming messages={[card("c1", [delegated("child-1"), claude()])]} />);
     const [row] = rows();
-    expect(row).toHaveTextContent("2 delegated tasks running");
+    expect(row).toHaveTextContent("Waiting on 2 subagents");
     expect(row).toHaveTextContent("reports post here");
   });
 
@@ -95,7 +96,7 @@ describe("delegation occupant", () => {
     const onStop = vi.fn();
     const messages = [card("c1", [delegated("child-1")])];
     const { rerender } = render(<Harness messages={messages} onOpen={onOpen} onStop={onStop} />);
-    fireEvent.click(screen.getByTestId("composer-strip-delegation-open"));
+    fireEvent.click(screen.getByRole("button", {name: "Open subagent Add slugify helper"}));
     expect(onOpen).toHaveBeenCalledWith("child-1");
     fireEvent.click(screen.getByTestId("composer-strip-delegation-stop"));
     expect(onStop).toHaveBeenCalledWith("codex", "child-1");
@@ -135,8 +136,8 @@ describe("delegation occupant", () => {
       />,
     );
     const [lead] = rows();
-    expect(lead).toHaveTextContent("Continues when 2 agents finish");
-    expect(lead).toHaveTextContent("1 working · 1 waiting for you");
+    expect(lead).toHaveTextContent("Waiting on 2 subagents");
+    expect(lead).toHaveTextContent("1 working · 1 waiting");
     expect(within(lead).getByTestId("composer-strip-delegation-stop-all")).toHaveTextContent(
       "Stop all",
     );
@@ -148,7 +149,7 @@ describe("delegation occupant", () => {
       "delegation:delegate:child-2",
     ]);
     expect(within(open[0]).getByTestId("composer-strip-delegation-stop-all")).toBeInTheDocument();
-    expect(open[2]).toHaveTextContent("Claude");
+    expect(open[2]).toHaveTextContent("Review the parser");
     expect(open[2]).toHaveTextContent("Review the parser · Waiting for your answer in its tab");
 
     fireEvent.click(within(open[0]).getByTestId("composer-strip-delegation-stop-all"));
@@ -197,4 +198,25 @@ describe("delegation occupant", () => {
     expect(kinds).toEqual(["delegation", "running"]);
     expect(rows()[1]).toHaveTextContent("Explore");
   });
+});
+
+it("surfaces a child's pending question or approval above background waiting", () => {
+  const onOpen=vi.fn();
+  const task: import("@/lib/agent-chat/durable-tasks").DurableTask={task_id:"task",backend:"local",parent_thread_id:"parent",child_thread_id:"child",title:"Review parser",provider:"codex",status:"waiting",created_at:1,pending_request:{id:"question",kind:"user_input",created_at:2}};
+  render(<ComposerStrip occupants={[childInputOccupant([task],false,onOpen)]}/>);
+  expect(screen.getByText("Subagent needs input")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button",{name:"Open subagent Review parser"}));expect(onOpen).toHaveBeenCalledWith("child");
+  fireEvent.click(screen.getByRole("button",{name:"Open question"}));expect(onOpen).toHaveBeenCalledTimes(2);
+  expect(childInputOccupant([task],true,onOpen)).toBeNull();
+  expect(childInputOccupant([{...task,status:"completed"}],false,onOpen)).toBeNull();
+});
+
+it("opens an SSH question in remote task details", () => {
+  const local = vi.fn();
+  const remote = vi.fn();
+  const task: import("@/lib/agent-chat/durable-tasks").DurableTask = {task_id:"ssh:remote",backend:"ssh",parent_thread_id:"parent",child_thread_id:"remote-child",remote_task_id:"remote",title:"Remote review",provider:"codex",status:"waiting",created_at:1,pending_request:{id:"approval",kind:"approval",created_at:2}};
+  render(<ComposerStrip occupants={[childInputOccupant([task],false,local,remote)]} />);
+  fireEvent.click(screen.getByRole("button",{name:"Open question"}));
+  expect(remote).toHaveBeenCalledWith("remote");
+  expect(local).not.toHaveBeenCalled();
 });

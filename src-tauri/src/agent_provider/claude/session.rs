@@ -2367,7 +2367,11 @@ async fn collect_shared_tools_for_claude(
             caller.workspace_id.as_deref(),
         )
         .await;
-    tools.extend(registry.host_tools(caller));
+    let host_tools=registry.host_tools(caller);
+    // App-owned task tools also serve local IDs; replace the SSH-only schema
+    // rather than publishing duplicate names to the native provider.
+    tools.retain(|tool|!host_tools.iter().any(|host|host.prefixed_name==tool.prefixed_name));
+    tools.extend(host_tools);
     // These stay callable while native catalog replacement waits for a safe
     // turn boundary (for example, an Editor connecting during this turn).
     if registry
@@ -2495,7 +2499,7 @@ async fn run_mcp_tool_call(
 
     // Host tools precede child dispatch. The caller carries the LIVE permission mode, so a
     // Plan/Ask pill flipped after the session started is honoured.
-    if let Some(result) = registry.host_call(caller, prefixed_name, &arguments) {
+    if let Some(result) = registry.host_call_async(caller, prefixed_name, &arguments, None, None).await {
         return (result, None);
     }
 

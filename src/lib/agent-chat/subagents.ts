@@ -112,6 +112,7 @@ export function mergeSnapshot(
   // back to "real subagent" (the same additive-merge rule as every other
   // field — a snapshot never clobbers a known value with an absent one).
   if (snap.background_task) next.backgroundTask = true;
+  if (snap.task_id != null) next.taskId = snap.task_id;
   if (snap.parent_item_id != null) next.parentItemId = snap.parent_item_id;
   if (snap.name != null) next.name = snap.name;
   if (snap.agent_type != null) next.agentType = snap.agent_type;

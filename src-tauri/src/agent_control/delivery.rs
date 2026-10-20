@@ -191,6 +191,17 @@ pub(crate) async fn dispatch_admitted<R: Runtime>(
             return;
         }
     };
+    let binding=db.get_agent_chat_session(&row.thread_id);
+    let bound=binding.as_ref().is_some_and(|record|record.imported_from.is_none()) && app.try_state::<crate::state::AppStateStore>().is_none_or(|state|binding.as_ref().is_some_and(|record|state.find_workspace(&record.workspace_id).is_some() && state.agent_chat_pane_id_for_thread(&row.thread_id).is_some()));
+    if !bound && matches!(payload.origin,TurnOrigin::Delegation|TurnOrigin::RemoteDelegation) {
+        let reason="Target is unavailable, archived or unbound; result retained";
+        let _=db.finish_message_delivery(&row.id,"held",None,Some(reason));warn_held(app,&row.thread_id,reason);crate::delegation::app::completion_delivery_changed(app,&row.id);return;
+    }
+    if payload.origin==TurnOrigin::RemoteDelegation {
+        if let Err(error)=crate::delegation::app::guard_wake(app,&row.thread_id,payload.input.client_nonce.as_deref()) {
+            let _=db.finish_message_delivery(&row.id,"held",None,Some(&error));warn_held(app,&row.thread_id,&error);crate::delegation::app::completion_delivery_changed(app,&row.id);return;
+        }
+    }
     let control = admitted_control.or_else(|| payload.caller.map(|caller| {
         NativeControlGuard {
             caller,
@@ -252,6 +263,7 @@ pub(crate) async fn dispatch_admitted<R: Runtime>(
             log::warn!("Message delivery {}: {error}", row.id);
         }
     }
+    crate::delegation::app::completion_delivery_changed(app,&row.id);
 }
 
 struct DeliveryChange<'a, R: Runtime> { app: &'a AppHandle<R>, thread: &'a str }
@@ -356,6 +368,7 @@ impl<R: Runtime> DeliveryCheckpoint<R> {
 pub(crate) fn warn_held<R: Runtime>(app: &AppHandle<R>, thread: &str, error: &str) {
     changed(app, thread);
     if app.state::<DatabaseStore>().thread_message_delivery_attention(thread).is_ok_and(|rows| rows.is_empty()) { return; }
+    if app.try_state::<agent_chat::SubagentTracker>().is_none() {log::warn!("Message delivery for {thread} needs attention: {error}");return;}
     agent_chat::forward_event(
         app,
         crate::agent_provider::ProviderRuntimeEvent::RuntimeWarning {

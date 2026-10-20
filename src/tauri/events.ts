@@ -259,6 +259,7 @@ export type SubagentStatus =
 export type SubagentTaskKind = "agent" | "monitor";
 
 export interface SubagentSnapshot {
+  task_id?: string | null;
   /** Stable demux key (Claude parent_tool_use_id, Codex child threadId,
    *  OpenCode child sessionID). Required. */
   subagent_id: string;

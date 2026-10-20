@@ -57,10 +57,10 @@ describe("message provenance", () => {
 });
 
 describe("legacy presentation",()=>{
-  it("recognizes legacy result dividers without inferring attribution",()=>{
+  it("keeps untyped legacy-looking prose as ordinary input",()=>{
     const state=replayPayloads([JSON.stringify({type:"user_message",thread_id:"t",text:'[Codemux: delegated task results]\n<task provider="codex" title="Parser review" status="completed">'})]);
     const item=state.messages[0] as UserMessageItem;
-    expect(isDelegationResultsMessage(item)).toBe(true);
+    expect(isDelegationResultsMessage(item)).toBe(false);
     expect(messageAttribution(item)).toBeNull();
     expect(isDelegationResultsMessage({...item,message_id:"new-human-message",creation_source:"desktop"})).toBe(false);
   });

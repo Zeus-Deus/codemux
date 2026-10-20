@@ -3914,11 +3914,7 @@ async fn send_turn_internal<R: Runtime>(
             &input.thread_id.0,
             input.client_nonce.as_deref(),
         )?;
-        if impl_.turn_active(&input.thread_id).await {
-            return Err(
-                "Parent became busy; remote result is held rather than interrupting".into(),
-            );
-        }
+
     }
     let pending_key = (
         thread_id_for_persist.clone(),
@@ -5075,6 +5071,7 @@ pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
             }
         }
     }
+    let stopping_thread=turn_id.is_none();
     let reached = match impl_.interrupt_turn(thread_id.clone(), turn_id).await {
         Ok(()) => true,
         Err(ProviderError::SessionNotFound { .. }) | Err(ProviderError::SessionClosed { .. }) => {
@@ -5085,6 +5082,7 @@ pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
     let tracker: State<'_, SubagentTracker> = app.state();
     tracker.settle_interrupted_turn(&thread_id.0);
     crate::agent_control::delivery::changed(&app, &thread_id.0);
+    if stopping_thread {super::delegation::stop_confirmed(&app,&thread_id.0);}
     Ok(reached)
 }
 
@@ -6322,6 +6320,7 @@ async fn stop_agent_chat_threads<R: Runtime>(
         };
         match impl_.stop_session(ThreadId(thread_id.clone())).await {
             Ok(()) => {
+                if !super::queued_turns::exiting() {super::delegation::stop_confirmed(app_handle,&thread_id);}
                 if let Some(state) = app_handle.try_state::<NativeControlState>() {
                     state.clear_worker(&thread_id);
                     state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {
@@ -6331,7 +6330,9 @@ async fn stop_agent_chat_threads<R: Runtime>(
                 }
             }
             // Nothing was running, so nothing can still be using the files.
-            Err(ProviderError::SessionNotFound { .. } | ProviderError::SessionClosed { .. }) => {}
+            Err(ProviderError::SessionNotFound { .. } | ProviderError::SessionClosed { .. }) => {
+                if !super::queued_turns::exiting() {super::delegation::stop_confirmed(app_handle,&thread_id);}
+            }
             Err(error) => {
                 eprintln!(
                     "[agent_chat] cleanup stop_session failed for {kind:?} {thread_id}: {error:?}"

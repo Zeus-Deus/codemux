@@ -20,15 +20,14 @@ import type {
  * - the `delegate_task` tool call (input + a JSON "started" result),
  * - a `subagent_updated` row whose id is `delegate:<child thread id>`,
  *   re-emitted by the backend on every status change,
- * - one results turn per round, starting with
- *   {@link DELEGATION_RESULTS_PREFIX}, holding one `<task …>` block per task.
+ * - persisted notification metadata for each published result. Agent-facing
+ *   framing never determines how a message renders.
  *
  * Pure and side-effect-free so every parser is unit-testable. Must not
  * import `subagents.ts`, which imports this module.
  */
 
-/** First line of the turn Codemux posts into the parent when a round of
- *  delegated tasks reports back. Mirrors the backend's wake header. */
+/** Agent-facing wake header, also used by development fixtures. */
 export const DELEGATION_RESULTS_PREFIX = "[Codemux: delegated task results]";
 
 /** `subagent_id` prefix of a delegated row — the one marker both sides use. */
@@ -153,7 +152,7 @@ export function delegateCallInput(
 /** What a `delegate_task` call returned: the child thread it started (the
  *  live row carries everything else), or the refusal sentence. */
 export type DelegateResult =
-  | { kind: "started"; thread: string | null }
+  | { kind: "started"; thread: string | null; taskId?: string | null }
   | { kind: "error"; message: string };
 
 /** Text of a tool result in any shape the adapters produce: a plain
@@ -179,7 +178,8 @@ function resultText(content: unknown): string | null {
 
 function startedFrom(value: unknown): DelegateResult | null {
   if (!isRecord(value) || !isRecord(value.started)) return null;
-  return { kind: "started", thread: nonEmpty(value.started.thread) };
+  const taskId=nonEmpty(value.task_id) ?? nonEmpty(value.started.task_id);
+  return { kind: "started", thread: nonEmpty(value.child_thread_id) ?? nonEmpty(value.started.child_thread_id) ?? nonEmpty(value.started.thread), ...(taskId ? {taskId} : {}) };
 }
 
 /**
@@ -244,15 +244,8 @@ export interface DelegationLinks {
   claimed: Set<string>;
 }
 
-/**
- * Pair every `delegate_task` call with its delegated row, so the transcript
- * shows each delegation exactly once. A call's result names its child
- * thread. The backend reports the row before it returns that result, so
- * until the result lands a call still in flight takes the first unclaimed
- * row of its provider in the same turn — the backend handles one call at a
- * time, in order, though on Codex the row can land just before its call.
- * A refused call started nothing and claims nothing.
- */
+/** Link by task, child or tool-call identity. An in-flight call without an
+ * exact identity stays separate until its result arrives. */
 export function linkDelegations(messages: readonly ChatViewItem[]): DelegationLinks {
   const viewByCallId = new Map<string, SubagentView>();
   const claimed = new Set<string>();
@@ -279,24 +272,13 @@ export function linkDelegations(messages: readonly ChatViewItem[]): DelegationLi
     claimed.add(view.id);
   };
   const byId = new Map(rows.map(({ view }) => [view.id, view]));
-  const inflight: typeof calls = [];
-  for (const entry of calls) {
-    const result = delegateCallInfo(entry.call)?.result;
-    if (result?.kind === "started" && result.thread) {
-      link(entry.call, byId.get(delegatedSubagentId(result.thread)));
-    } else if (result == null && entry.call.status !== "error") {
-      inflight.push(entry);
-    }
-  }
-  for (const { call, turn } of inflight) {
-    const provider = delegateCallInfo(call)?.input.provider.toLowerCase();
-    const row = rows.find(
-      ({ view, turn: rowTurn }) =>
-        rowTurn === turn &&
-        !claimed.has(view.id) &&
-        view.agentType?.toLowerCase() === provider,
-    );
-    link(call, row?.view);
+  const byTaskId = new Map(rows.flatMap(({view}) => view.taskId ? [[view.taskId, view] as const] : []));
+  const byCallId = new Map(rows.flatMap(({view}) => view.parentItemId ? [[view.parentItemId, view] as const] : []));
+  for (const {call} of calls) {
+    const result=delegateCallInfo(call)?.result;
+    if (result?.kind === "error") continue;
+    const exact=byCallId.get(call.tool_use_id) ?? byCallId.get(call.id) ?? (result?.kind === "started" ? (result.taskId ? byTaskId.get(result.taskId) : undefined) ?? (result.thread ? byId.get(delegatedSubagentId(result.thread)) : undefined) : undefined);
+    link(call,exact);
   }
   return { viewByCallId, claimed };
 }
@@ -305,11 +287,11 @@ export function linkDelegations(messages: readonly ChatViewItem[]): DelegationLi
 
 /** Pill labels, in the order a group summary lists them. */
 export const DELEGATION_PHASE_LABEL = {
-  starting: "Starting",
-  working: "Working",
-  waiting: "Waiting for you",
-  paused: "Paused",
-  done: "Done",
+  starting: "Queued",
+  working: "Running",
+  waiting: "Waiting",
+  paused: "Waiting",
+  done: "Completed",
   failed: "Failed",
   stopped: "Stopped",
 };
@@ -457,88 +439,14 @@ export function modelEffortLabel(row: {
 /** "1 working · 1 waiting for you · 1 done", in phase order. A task still
  *  starting counts as working. */
 export function delegationPhaseSummary(rows: readonly DelegationRow[]): string {
-  const counts = new Map(Object.values(DELEGATION_PHASE_LABEL).map((label) => [label, 0]));
+  const labels = {starting: "working",working: "working",waiting: "waiting",paused: "waiting",done: "done",failed: "failed",stopped: "stopped"};
+  const counts = new Map(["working","waiting","done","failed","stopped"].map(label => [label,0]));
   for (const { phase } of rows) {
-    const label = DELEGATION_PHASE_LABEL[phase === "starting" ? "working" : phase];
+    const label = labels[phase];
     counts.set(label, (counts.get(label) ?? 0) + 1);
   }
   return [...counts]
     .filter(([, count]) => count > 0)
     .map(([label, count]) => `${count} ${label.toLowerCase()}`)
     .join(" · ");
-}
-
-// ── The results turn ("wake") ──
-
-export function isDelegationResultsText(text: string): boolean {
-  return text.startsWith(DELEGATION_RESULTS_PREFIX);
-}
-
-export interface WakeTask {
-  provider: string;
-  status: string;
-  title: string;
-  model: string | null;
-  effort: string | null;
-  thread: string | null;
-}
-
-function unescapeAttribute(value: string): string {
-  return value
-    .replace(/&quot;/g, '"')
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&");
-}
-
-/** Every `<task …>` block's attributes, in order. Unknown attributes are
- *  ignored; a block without a provider is skipped. */
-export function parseWake(text: string): WakeTask[] {
-  if (!isDelegationResultsText(text)) return [];
-  // Only attributes are escaped: a block's brief (the parent's words) and
-  // report (the child's) arrive raw. So a tag counts only at the start of
-  // a line, where the backend writes it, and each block's brief + report
-  // is skipped whole, up to the `</report>` that closes its task — a quoted
-  // `<task …>` line inside them is never read as a task.
-  const tag = /^<task\s+([^>]*)>/gm;
-  const body = /\s*(?:<brief>[\s\S]*?<\/brief>\s*)?<report>[\s\S]*?<\/report>\s*<\/task>/y;
-  const tasks: WakeTask[] = [];
-  for (let block = tag.exec(text); block; block = tag.exec(text)) {
-    body.lastIndex = tag.lastIndex;
-    if (body.test(text)) tag.lastIndex = body.lastIndex;
-    const attrs = new Map<string, string>();
-    for (const match of block[1].matchAll(/([\w-]+)="([^"]*)"/g)) {
-      attrs.set(match[1], unescapeAttribute(match[2]));
-    }
-    const attr = (name: string) => nonEmpty(attrs.get(name));
-    const provider = attr("provider");
-    if (!provider) continue;
-    tasks.push({
-      provider,
-      status: attr("status")?.toLowerCase() ?? "completed",
-      title: attr("title") ?? "",
-      model: attr("model"),
-      effort: attr("effort"),
-      thread: attr("thread"),
-    });
-  }
-  return tasks;
-}
-
-/** The results divider's label, "Delegated results · Codex, Claude ·
- *  completed": provider logos and names in first-seen order, and the
- *  outcome ("completed", or "1 completed · 1 failed"; null when no task
- *  block could be read). */
-export function wakeSummary(tasks: readonly WakeTask[]) {
-  const providers = [...new Set(tasks.flatMap((task) => providerKindOf(task.provider) ?? []))];
-  const names = [...new Set(tasks.map((task) => sessionProviderLabel(task.provider)))].join(", ");
-  const count = (status: string) => tasks.filter((task) => task.status === status).length;
-  const breakdown = ["completed", "failed", "stopped"]
-    .filter((status) => count(status) > 0)
-    .map((status) => `${count(status)} ${status}`)
-    .join(" · ");
-  const outcome =
-    tasks.length === 0 ? null : count("completed") === tasks.length ? "completed" : breakdown;
-  const label = ["Delegated results", names, outcome].filter(Boolean).join(" · ");
-  return { providers, names, outcome, label, failed: count("failed") > 0 };
 }

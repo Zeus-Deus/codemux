@@ -1,3 +1,4 @@
+import { InlineButton } from "@/components/ui/button";
 import {
   Bot,
   Check,
@@ -8,6 +9,7 @@ import {
   Clock,
   EllipsisVertical,
   Hourglass,
+  MessageCircleQuestion,
 } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 
@@ -39,6 +41,7 @@ export const STRIP_PRIORITY = {
   approval: 0,
   error: 1,
   usage: 2,
+  childInput: 2.5,
   monitoring: 3,
   delegation: 4,
   running: 5,
@@ -54,6 +57,8 @@ export type StripMark =
   /** Who is doing the work: one provider mark, or up to two overlapping. */
   | { kind: "providers"; providers: AgentChatProviderKind[] }
   | { kind: "monitoring" }
+  | { kind: "waiting" }
+  | { kind: "input" }
   | { kind: "finished" }
   | { kind: "queued" }
   | { kind: "error" }
@@ -79,6 +84,8 @@ export interface StripRow {
   id: string;
   mark: StripMark;
   label: string;
+  labelLink?: {label: string; onClick: () => void};
+  detailLinks?: Array<{label: string; onClick: () => void}>;
   detail?: string | null;
   /** Explanation that must stay readable instead of truncating with detail. */
   note?: string | null;
@@ -465,7 +472,7 @@ function StripRowView({
           <StripMarkView mark={row.mark} />
         </span>
         <span className="max-w-[40%] shrink-0 truncate whitespace-nowrap text-body-sm font-semibold text-foreground/80">
-          {row.label}
+          {row.label}{row.labelLink && <> <InlineButton aria-label={`Open subagent ${row.labelLink.label}`} onClick={row.labelLink.onClick}>{row.labelLink.label}</InlineButton></>}
         </span>
         {row.liveDetail ? (
           <TickingText
@@ -479,7 +486,7 @@ function StripRowView({
             className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground"
             title={row.detail ?? undefined}
           >
-            {row.detail}
+            {row.detailLinks ? row.detailLinks.map((link, i) => <span key={i}>{i > 0 && ", "}<InlineButton aria-label={`Open subagent ${link.label}`} onClick={link.onClick}>{link.label}</InlineButton></span>) : row.detail}
           </span>
         )}
         {row.meta && (
@@ -908,6 +915,8 @@ function StripMarkView({ mark }: { mark: StripMark }) {
         </span>
       );
     }
+    case "input": return <MessageCircleQuestion className="size-3.5 text-status-working" aria-hidden />;
+    case "waiting": return <span className="size-1.5 rounded-full bg-status-working motion-safe:animate-pulse" aria-hidden />;
     case "monitoring":
       // Calm background presence: a still dot, never a pulse.
       return (

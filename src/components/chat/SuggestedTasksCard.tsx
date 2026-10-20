@@ -1,3 +1,4 @@
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { ArrowUpRight, Check, GitMerge, ListPlus } from "lucide-react";
 import { memo, useContext, useMemo, useState } from "react";
 
@@ -191,7 +192,7 @@ export const SuggestedTasksCard = memo(function SuggestedTasksCard({
   };
   const started = (index: number) => rowsByIndex.has(index) || views[index] != null;
   const notStarted = tasks.map((_, index) => index).filter((index) => !started(index));
-  const writable = threadId != null;
+  const writable = threadId != null && !isRemoteClient();
 
   const start = async (index: number): Promise<boolean> => {
     if (!threadId || busy.has(index) || started(index)) return false;

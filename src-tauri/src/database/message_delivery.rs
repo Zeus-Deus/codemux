@@ -291,63 +291,9 @@ impl DatabaseStore {
     ) -> Result<(String, bool), String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        if let Some(op) = &operation {
-            let prior: Option<(String,String,String)> = tx.query_row(
-                "SELECT id,tool,payload_hash FROM agent_control_operations WHERE principal=?1 AND request_key=?2",
-                params![op.principal,op.key], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
-            if let Some((id, tool, hash)) = prior {
-                if tool != "thread_send" || hash != op.hash {
-                    return Err("request_key_conflict: retry arguments must be unchanged".into());
-                }
-                return Ok((id, false));
-            }
-        }
-        let prior: Option<(String,String)> = tx.query_row(
-            "SELECT id,payload FROM agent_message_deliveries WHERE thread_id=?1 AND message_id=?2",
-            params![thread,message], |r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
-        if let Some((id, prior)) = prior {
-            if serde_json::from_str::<Value>(&prior).ok().as_ref() != Some(payload) {
-                return Err("message_identity_conflict: message payload changed".into());
-            }
-            return Ok((id, false));
-        }
-        let (principal, operation_id) = match &operation {
-            Some(op) => {
-                tx.execute("INSERT INTO agent_control_operations (id,principal,request_key,tool,payload_hash,epoch,state,workspace_id,thread_id,admitted_payload,dispatch_disposition,delivery_id)
-                    VALUES (?1,?2,?3,'thread_send',?4,?5,'accepted',?6,?7,?8,'pending',?1)",
-                    params![id,op.principal,op.key,op.hash,epoch,op.workspace,thread,payload.to_string()]).map_err(|e|e.to_string())?;
-                (Some(op.principal), Some(id))
-            }
-            None => (None, None),
-        };
-        tx.execute("INSERT INTO agent_message_deliveries (id,thread_id,message_id,payload,epoch,generation,attempt_id,principal,operation_id,state,attempt_count,dispatch_owned)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",params![id,thread,message,payload.to_string(),epoch,generation,id,principal,operation_id,if claim_immediately {"preparing"}else{"pending"},u32::from(claim_immediately)]).map_err(|e|e.to_string())?;
-        let source = &payload["provenance"]["notification"]["source"];
-        let terminal = payload["provenance"]["notification"]["outcome"]
-            .as_str()
-            .is_some_and(|outcome| outcome != "updated");
-        if terminal
-            && source["kind"]
-                .as_str()
-                .is_some_and(|kind| matches!(kind, "delegated_task" | "remote_task" | "subagent"))
-        {
-            // Existing terminal task reports have one immutable version. PR2's
-            // task publisher can supply later canonical result versions here.
-            let version = payload["provenance"]["notification"]["result_version"]
-                .as_u64()
-                .unwrap_or(1);
-            for task in source["task_ids"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-            {
-                tx.execute("INSERT INTO agent_message_delivery_results (delivery_id,task_id,result_version,target_thread_id) VALUES (?1,?2,?3,?4)",params![id,task,version,thread])
-                    .map_err(|e|format!("result_already_admitted: terminal result delivery is already owned: {e}"))?;
-            }
-        }
+        let admitted = admit_in_transaction(&tx, id, thread, message, payload, epoch, generation, operation, claim_immediately)?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok((id.into(), true))
+        Ok(admitted)
     }
     pub fn message_delivery(&self, id: &str) -> Result<Option<DeliveryRecord>, String> {
         self.conn
@@ -402,6 +348,13 @@ impl DatabaseStore {
         }
         Ok(())
     }
+    /// Adapter-owned exact-byte evidence can narrow the generic pre-send
+    /// claim. Never infer this from an error string or missing acknowledgement.
+    pub(crate) fn confirm_message_delivery_before_send(&self, id: &str) -> Result<(), String> {
+        let n = self.conn.lock().unwrap().execute("UPDATE agent_message_deliveries SET attempted=0,state='held',error='Native writer confirmed no bytes were sent' WHERE id=?1 AND state IN ('preparing','submitting','held','held_unknown','pending')",[id]).map_err(|e|e.to_string())?;
+        if n > 0 { self.finish_message_delivery(id,"held",None,Some("Native writer confirmed no bytes were sent"))?; }
+        Ok(())
+    }
     pub fn finish_message_delivery(
         &self,
         id: &str,
@@ -426,6 +379,7 @@ impl DatabaseStore {
             error=CASE WHEN (SELECT error FROM agent_message_deliveries WHERE id=?1) IS NULL THEN NULL ELSE json_object('code',(SELECT state FROM agent_message_deliveries WHERE id=?1),'message',(SELECT error FROM agent_message_deliveries WHERE id=?1)) END,
             updated_at=datetime('now') WHERE delivery_id=?1",
             params![id]).map_err(|e|e.to_string())?;
+        tx.execute("UPDATE agent_delegation_tasks SET record=json_set(record,'$.completion_delivery',CASE (SELECT state FROM agent_message_deliveries WHERE id=?1) WHEN 'accepted' THEN 'delivered' ELSE (SELECT state FROM agent_message_deliveries WHERE id=?1) END,'$.delivered_at',CASE WHEN (SELECT state FROM agent_message_deliveries WHERE id=?1)='accepted' THEN COALESCE(json_extract(record,'$.delivered_at'),CAST(unixepoch('subsec')*1000 AS INTEGER)) ELSE json_extract(record,'$.delivered_at') END) WHERE task_id IN (SELECT task_id FROM agent_message_delivery_results WHERE delivery_id=?1) AND json_extract(record,'$.completion_delivery') NOT IN ('acknowledged','disposed_by_stop')",[id]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
     pub fn confirm_message_delivery_turn(&self, thread: &str, turn: &str) -> Result<(), String> {
@@ -525,6 +479,69 @@ fn retire_automatic_queues(conn: &Connection, thread: Option<&str>) -> Result<()
             AND json_extract(m.payload,'$.queued_id')=d.queued_id AND json_extract(m.payload,'$.disposition') IN ('dispatched','cancelled'))", [thread]).map_err(|e|e.to_string())?;
     conn.execute("DELETE FROM agent_chat_queued_turns WHERE EXISTS (SELECT 1 FROM agent_message_deliveries d WHERE d.thread_id=agent_chat_queued_turns.thread_id AND d.queued_id=agent_chat_queued_turns.queued_id AND d.state IN ('pending','cancelled') AND json_extract(d.payload,'$.origin') NOT IN ('user','controller') AND (?1 IS NULL OR d.thread_id=?1))", [thread]).map_err(|e|e.to_string())?;
     Ok(())
+}
+
+pub(super) fn admit_in_transaction(
+    tx: &Connection, id: &str, thread: &str, message: &str, payload: &Value,
+    epoch: &str, generation: u64, operation: Option<DeliveryOperation<'_>>,
+    claim_immediately: bool,
+) -> Result<(String, bool), String> {
+        if let Some(op) = &operation {
+            let prior: Option<(String,String,String)> = tx.query_row(
+                "SELECT id,tool,payload_hash FROM agent_control_operations WHERE principal=?1 AND request_key=?2",
+                params![op.principal,op.key], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
+            if let Some((id, tool, hash)) = prior {
+                if tool != "thread_send" || hash != op.hash {
+                    return Err("request_key_conflict: retry arguments must be unchanged".into());
+                }
+                return Ok((id, false));
+            }
+        }
+        let prior: Option<(String,String)> = tx.query_row(
+            "SELECT id,payload FROM agent_message_deliveries WHERE thread_id=?1 AND message_id=?2",
+            params![thread,message], |r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+        if let Some((id, prior)) = prior {
+            if serde_json::from_str::<Value>(&prior).ok().as_ref() != Some(payload) {
+                return Err("message_identity_conflict: message payload changed".into());
+            }
+            return Ok((id, false));
+        }
+        let (principal, operation_id) = match &operation {
+            Some(op) => {
+                tx.execute("INSERT INTO agent_control_operations (id,principal,request_key,tool,payload_hash,epoch,state,workspace_id,thread_id,admitted_payload,dispatch_disposition,delivery_id)
+                    VALUES (?1,?2,?3,'thread_send',?4,?5,'accepted',?6,?7,?8,'pending',?1)",
+                    params![id,op.principal,op.key,op.hash,epoch,op.workspace,thread,payload.to_string()]).map_err(|e|e.to_string())?;
+                (Some(op.principal), Some(id))
+            }
+            None => (None, None),
+        };
+        tx.execute("INSERT INTO agent_message_deliveries (id,thread_id,message_id,payload,epoch,generation,attempt_id,principal,operation_id,state,attempt_count,dispatch_owned)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",params![id,thread,message,payload.to_string(),epoch,generation,id,principal,operation_id,if claim_immediately {"preparing"}else{"pending"},u32::from(claim_immediately)]).map_err(|e|e.to_string())?;
+        let source = &payload["provenance"]["notification"]["source"];
+        let terminal = payload["provenance"]["notification"]["outcome"]
+            .as_str()
+            .is_some_and(|outcome| outcome != "updated");
+        if terminal
+            && source["kind"]
+                .as_str()
+                .is_some_and(|kind| matches!(kind, "delegated_task" | "remote_task" | "subagent"))
+        {
+            // Existing terminal task reports have one immutable version. PR2's
+            // task publisher can supply later canonical result versions here.
+            let version = payload["provenance"]["notification"]["result_version"]
+                .as_u64()
+                .unwrap_or(1);
+            for task in source["task_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                tx.execute("INSERT INTO agent_message_delivery_results (delivery_id,task_id,result_version,target_thread_id) VALUES (?1,?2,?3,?4)",params![id,task,version,thread])
+                    .map_err(|e|format!("result_already_admitted: terminal result delivery is already owned: {e}"))?;
+            }
+        }
+    Ok((id.into(), true))
 }
 
 #[cfg(test)]
