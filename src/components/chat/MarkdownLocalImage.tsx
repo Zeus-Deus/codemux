@@ -61,6 +61,7 @@ const undecodableBlobs = new Set<string>();
 const BLOB_CACHE_MAX = 64;
 
 function revokeBlobUrl(url: string) {
+  undecodableBlobs.delete(url);
   if (typeof URL.revokeObjectURL === "function") URL.revokeObjectURL(url);
 }
 
@@ -208,8 +209,11 @@ function useLocalImageSource(candidates: readonly ImageCandidate[]) {
       );
     };
     if (state.blob) {
-      // The bytes arrived but the browser could not decode them.
-      undecodableBlobs.add(state.blob);
+      // The bytes arrived but the browser could not decode them. A blob the
+      // cache already evicted (and revoked) is not marked.
+      if (blobUrlCache.get(candidate.path) === state.blob) {
+        undecodableBlobs.add(state.blob);
+      }
       advance();
       return;
     }
