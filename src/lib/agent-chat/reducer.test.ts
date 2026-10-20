@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type {
-  ContextUsageSnapshot,
-  ProviderRuntimeEvent,
+import {
+  withRetainedImages,
+  type ContextUsageSnapshot,
+  type ProviderRuntimeEvent,
 } from "@/tauri/events";
 
 import { replayPayloads } from "./hydrate";
@@ -277,6 +278,49 @@ describe("agent-chat reducer", () => {
     expect(assistants).toHaveLength(1);
     expect(assistants[0].text).toBe("Hello, world");
     expect(assistants[0].streaming).toBe(false);
+  });
+
+  it("keeps a reply's image copies whether it arrives live or replays", () => {
+    const kept = [{ source: "/tmp/f1.png", path: "/cfg/images/t1/k.png" }];
+    const text = "Mockup: [f1](/tmp/f1.png)";
+    const assistant = (state: ChatThreadState) =>
+      state.messages.find(
+        (m): m is AssistantMessageItem => m.kind === "assistant_message",
+      );
+
+    // Live: the copies ride beside the event and seal onto the streamed row.
+    const live = runEvents([
+      {
+        type: "content_delta",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        delta: { kind: "text", text },
+      },
+      withRetainedImages({
+        thread_id: "t1",
+        event: {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: { kind: "assistant_text", text },
+        },
+        persisted_id: 7,
+        retained_images: kept,
+      }),
+    ]);
+    expect(assistant(live)?.retained_images).toEqual(kept);
+
+    // Replay: the stored row carries them on its item.
+    const replayed = replayPayloads([
+      JSON.stringify({
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: { kind: "assistant_text", text, retained_images: kept },
+      }),
+    ]);
+    expect(assistant(replayed)?.retained_images).toEqual(kept);
+    expect(assistant(replayed)?.text).toBe(text);
   });
 
   it("attaches a tool_result that arrives before its tool_use", () => {

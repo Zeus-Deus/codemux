@@ -724,6 +724,16 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_thread
             ON agent_chat_messages(thread_id, id ASC);
 
+        -- Replies whose linked local images are still being copied into the
+        -- conversation (see commands::reply_images). Written with the reply's
+        -- row, removed once its copies are recorded, so a copy cut short by a
+        -- quit resumes on the next launch. Cascade keeps a job from outliving
+        -- its row.
+        CREATE TABLE IF NOT EXISTS agent_chat_reply_image_jobs (
+            row_id INTEGER PRIMARY KEY
+                REFERENCES agent_chat_messages(id) ON DELETE CASCADE
+        );
+
         -- Numeric affinity matches the row-id comparison, including legacy
         -- numeric JSON strings. Accept JSON5 TEXT like json_extract while
         -- excluding malformed input from this derived index.
@@ -4867,6 +4877,123 @@ impl DatabaseStore {
         }
     }
 
+    /// [`Self::append_agent_chat_message`] for an assistant reply whose
+    /// linked images still need copying: the row and its copy job commit
+    /// together, so no reply can name copies nothing will make.
+    pub fn append_agent_chat_reply_with_image_job(
+        &self,
+        thread_id: &str,
+        payload_json: &str,
+    ) -> Result<Option<i64>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        match tx.execute(
+            "INSERT INTO agent_chat_messages (thread_id, payload, created_at)
+             VALUES (?1, ?2, strftime('%Y-%m-%d %H:%M:%f', 'now'))",
+            params![thread_id, payload_json],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
+            {
+                // The session was deleted; see `append_agent_chat_message`.
+                return Ok(None);
+            }
+            Err(e) => return Err(format!("Failed to append agent_chat_message: {e}")),
+        }
+        let row_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO agent_chat_reply_image_jobs (row_id) VALUES (?1)",
+            params![row_id],
+        )
+        .map_err(|e| format!("Failed to queue reply image copies: {e}"))?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(Some(row_id))
+    }
+
+    /// Rows whose reply image copies have not been recorded yet, in one
+    /// thread or in all of them.
+    pub fn list_reply_image_jobs(&self, thread_id: Option<&str>) -> Vec<i64> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT job.row_id FROM agent_chat_reply_image_jobs job
+             JOIN agent_chat_messages message ON message.id = job.row_id
+             WHERE ?1 IS NULL OR message.thread_id = ?1
+             ORDER BY job.row_id",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![thread_id], |row| row.get(0))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether row `id` still waits for its reply image copies.
+    pub fn has_reply_image_job(&self, id: i64) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT 1 FROM agent_chat_reply_image_jobs WHERE row_id = ?1",
+            params![id],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    /// Drop `thread_id`'s pending reply image jobs, returning their rows.
+    pub fn take_reply_image_jobs(&self, thread_id: &str) -> Vec<i64> {
+        let rows = self.list_reply_image_jobs(Some(thread_id));
+        let conn = self.conn.lock().unwrap();
+        for row_id in &rows {
+            let _ = conn.execute(
+                "DELETE FROM agent_chat_reply_image_jobs WHERE row_id = ?1",
+                params![row_id],
+            );
+        }
+        rows
+    }
+
+    /// The stored payload of one message row, if it still exists.
+    pub fn get_agent_chat_message_payload(&self, id: i64) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT payload FROM agent_chat_messages WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    /// Record the image copies that landed for the reply in row `id` (see
+    /// `commands::reply_images`), dropping the entry when none did, and
+    /// retire its copy job. `Ok(false)` means the row no longer exists, so
+    /// the copies are unowned.
+    pub fn finish_reply_image_job<T: serde::Serialize>(
+        &self,
+        id: i64,
+        images: &[T],
+    ) -> Result<bool, String> {
+        let images = serde_json::to_string(images).map_err(|e| e.to_string())?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let changed = tx
+            .execute(
+                "UPDATE agent_chat_messages
+                 SET payload = CASE json_array_length(?2)
+                     WHEN 0 THEN json_remove(payload, '$.item.retained_images')
+                     ELSE json_set(payload, '$.item.retained_images', json(?2)) END
+                 WHERE id = ?1 AND json_valid(payload)",
+                params![id, images],
+            )
+            .map_err(|e| format!("Failed to record retained reply images: {e}"))?;
+        tx.execute(
+            "DELETE FROM agent_chat_reply_image_jobs WHERE row_id = ?1",
+            params![id],
+        )
+        .map_err(|e| format!("Failed to retire the reply image job: {e}"))?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed > 0)
+    }
+
     /// Return every persisted message for a thread, ordered by
     /// insertion time (the autoincrement `id`). Each element is the
     /// raw JSON payload — the frontend parses and dispatches it.
@@ -5591,8 +5718,9 @@ impl DatabaseStore {
                 .collect::<Vec<_>>();
             refs
         };
-        // Attachment payloads on both sides of the cutoff. Restricted to rows
-        // that actually carry an `images` array so a long transcript is never
+        // Image payloads on both sides of the cutoff: attachments, and the
+        // copies kept for a reply's linked images. Restricted to rows that
+        // actually carry such an array so a long transcript is never
         // materialized; the caller diffs them to find files nothing
         // references any more.
         let image_payloads = |cutoff_clause: &str| -> Result<Vec<String>, String> {
@@ -5600,7 +5728,8 @@ impl DatabaseStore {
                 .prepare(&format!(
                     "SELECT payload FROM agent_chat_messages
                      WHERE thread_id = ?1 AND id {cutoff_clause} ?2
-                       AND payload LIKE '%\"images\":[%'"
+                       AND (payload LIKE '%\"images\":[%'
+                            OR payload LIKE '%\"retained_images\":[%')"
                 ))
                 .map_err(|error| format!("Failed to list reverted attachments: {error}"))?;
             let payloads = statement
@@ -6026,6 +6155,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(second.transcript_cutoff_id, user_2 - 1);
+        db.append_agent_chat_message(
+            thread_id,
+            r#"{"type":"item_completed","item":{"kind":"assistant_text","text":"[a](/tmp/a.png)","retained_images":[{"source":"/tmp/a.png","path":"/tmp/kept-a.png"}]}}"#,
+        )
+        .unwrap();
         db.append_agent_chat_message(thread_id, r#"{"type":"turn_completed"}"#)
             .unwrap();
 
@@ -6083,8 +6217,10 @@ mod tests {
         );
         // Attachment payloads are partitioned across the cutoff so the
         // command layer can unlink only the files nothing references now.
-        assert_eq!(removed.removed_image_payloads.len(), 1);
+        // A reverted reply's kept image copies are among them.
+        assert_eq!(removed.removed_image_payloads.len(), 2);
         assert!(removed.removed_image_payloads[0].contains("/tmp/two.png"));
+        assert!(removed.removed_image_payloads[1].contains("/tmp/kept-a.png"));
         assert_eq!(removed.retained_image_payloads.len(), 1);
         assert!(removed.retained_image_payloads[0].contains("/tmp/one.png"));
         assert_eq!(db.list_agent_chat_messages(thread_id).len(), 2);

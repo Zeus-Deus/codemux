@@ -25,6 +25,7 @@ import { textReferencePaths } from "@/lib/agent-chat/reference-cwd";
 import { rehypeSelectionSafeText } from "@/lib/agent-chat/selection-safe-text";
 import { cn } from "@/lib/utils";
 import { selectChatCodeWrap, useSettingsStore } from "@/stores/settings-store";
+import type { RetainedReplyImage } from "@/tauri/events";
 import { ChatMarkdownStreamingContext } from "./chat-markdown-streaming";
 import { useChatMarkdownPassive } from "./chat-markdown-passive";
 import {
@@ -33,7 +34,7 @@ import {
 } from "./ChatCodeBlock";
 import { ChatMarkdownLink } from "./ChatMarkdownLink";
 import { MarkdownLinkFavicon } from "./MarkdownLinkFavicon";
-import { MarkdownLocalImage } from "./MarkdownLocalImage";
+import { MarkdownLocalImage, RetainedImagesProvider } from "./MarkdownLocalImage";
 import { MarkdownFileLink } from "./MarkdownFileLink";
 import {
   ChatFileLinkContext,
@@ -246,6 +247,7 @@ export function ChatMarkdown({
   cwd,
   workspaceCwd,
   referencePaths,
+  retainedImages,
 }: {
   children: string;
   streaming?: boolean;
@@ -253,6 +255,8 @@ export function ChatMarkdown({
   cwd?: string | null;
   workspaceCwd?: string | null;
   referencePaths?: readonly string[];
+  /** Kept copies of the local images this text links to. */
+  retainedImages?: readonly RetainedReplyImage[];
 }) {
   const passive = useChatMarkdownPassive();
   const code = useChatCodePlugin();
@@ -296,17 +300,19 @@ export function ChatMarkdown({
       <ChatMarkdownStreamingContext.Provider value={streaming}>
         <div className={cn("chat-markdown conversation-text", proseClasses)}>
           <ChatCodeRendererProvider defaultWrap={wrap} highlighter={code}>
-            <Streamdown
-              parseIncompleteMarkdown
-              remarkPlugins={remarkPlugins}
-              rehypePlugins={passive ? passiveRehypePlugins : rehypePlugins}
-              plugins={plugins}
-              components={passive ? passiveMarkdownComponents : markdownComponents}
-              controls={controls}
-              lineNumbers={false}
-            >
-              {children}
-            </Streamdown>
+            <RetainedImagesProvider images={retainedImages}>
+              <Streamdown
+                parseIncompleteMarkdown
+                remarkPlugins={remarkPlugins}
+                rehypePlugins={passive ? passiveRehypePlugins : rehypePlugins}
+                plugins={plugins}
+                components={passive ? passiveMarkdownComponents : markdownComponents}
+                controls={controls}
+                lineNumbers={false}
+              >
+                {children}
+              </Streamdown>
+            </RetainedImagesProvider>
           </ChatCodeRendererProvider>
         </div>
       </ChatMarkdownStreamingContext.Provider>

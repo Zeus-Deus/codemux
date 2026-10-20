@@ -208,8 +208,24 @@ export type ContentDelta =
   | { kind: "thinking"; text: string }
   | { kind: "tool_input"; tool_name: string; partial_json: string };
 
+/** A conversation-owned copy of a local image an assistant reply links to.
+ *  The copy may still be landing (or have failed) when a live reply names
+ *  it, so readers fall back to `source`. */
+export interface RetainedReplyImage {
+  /** The local path as the reply wrote it, matched against rendered links. */
+  source: string;
+  /** The copy under the thread's chat-image folder. */
+  path: string;
+}
+
 export type CompletedItem =
-  | { kind: "assistant_text"; text: string }
+  | {
+      kind: "assistant_text";
+      text: string;
+      /** Stored replies carry their kept image copies here; live payloads
+       *  carry them beside the event (see `withRetainedImages`). */
+      retained_images?: RetainedReplyImage[];
+    }
   | { kind: "assistant_thinking"; text: string }
   | { kind: "tool_use"; tool_name: string; input: unknown; tool_use_id: string }
   | {
@@ -686,7 +702,32 @@ export interface AgentChatEventPayload {
    *  store dedups a resume tail against the live stream on this id — see
    *  `ChatThreadSlice.lastPersistedEventId`. */
   persisted_id?: number | null;
+  /** Kept image copies for a top-level reply's linked local images. */
+  retained_images?: RetainedReplyImage[];
 }
+
+/** The payload's event with any live `retained_images` folded onto the
+ *  reply item, the shape the stored row has, so live and replayed replies
+ *  reduce identically. */
+export function withRetainedImages(
+  payload: AgentChatEventPayload,
+): ProviderRuntimeEvent {
+  const { event, retained_images } = payload;
+  if (
+    !retained_images?.length ||
+    event.type !== "item_completed" ||
+    event.item.kind !== "assistant_text"
+  ) {
+    return event;
+  }
+  return { ...event, item: { ...event.item, retained_images } };
+}
+
+/** Paths of reply image copies that just landed (see `RetainedReplyImage`). */
+export const onAgentChatReplyImagesKept = (
+  cb: EventCallback<string[]>,
+): Promise<UnlistenFn> =>
+  listen<string[]>("agent_chat_reply_images_kept", (e) => cb(e.payload));
 
 /** Low-frequency thread-less warnings; transcript traffic uses Channels. */
 export const onAgentChatGlobalEvent = (

@@ -1,4 +1,8 @@
-import type { UserQuestionSet, QuestionResolution } from "@/tauri/events";
+import type {
+  QuestionResolution,
+  RetainedReplyImage,
+  UserQuestionSet,
+} from "@/tauri/events";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import type { GoalSnapshot } from "./goal";
 import type { LocalTask } from "@/lib/delegation";
@@ -115,6 +119,8 @@ export interface AssistantMessageItem {
   created_at?: number;
   /** Durable source row for conversation-search deep links. */
   source_event_id?: number;
+  /** Conversation-owned copies of the local images this reply links to. */
+  retained_images?: RetainedReplyImage[];
 }
 
 /**

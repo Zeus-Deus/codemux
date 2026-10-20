@@ -57,6 +57,7 @@ export const AssistantMessage = memo(function AssistantMessage({
         cwd={referenceCwd ?? cwd}
         workspaceCwd={cwd}
         referencePaths={referencePaths}
+        retainedImages={item.retained_images}
       >
         {item.text}
       </ChatMarkdown>
