@@ -322,7 +322,7 @@ fn install_store<R: Runtime>(handle: &AppHandle<R>, store: Arc<Journal>) -> Resu
 }
 fn restore_tasks<R: Runtime>(handle: &AppHandle<R>, store: &Journal) -> Result<(), String> {
     for task in store.tasks()? {
-        if let Err(error) = super::canonical::ingest(handle,&store,&task) {
+        if let Err(error) = super::canonical::recover(handle,&store,&task) {
             log::error!("SSH task {} import failed; journal retained for repair: {error}", task.id);
         }
         if !task.status.is_terminal()

@@ -737,6 +737,31 @@ impl Journal {
         let state:Option<String>=conn.query_row("SELECT state FROM delivery_outcomes WHERE task=?1",[id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         state.map(|s|serde_json::from_value(serde_json::Value::String(s)).map_err(|e|e.to_string())).unwrap_or(Ok(DeliveryOutcome::NotAttempted))
     }
+    /// Only the common outbox's stable attempt can refine its delivery
+    /// disposition. Legacy/random attempts cannot prove this row's outcome.
+    pub(crate) fn outbox_delivery_outcome(
+        &self,
+        id: &str,
+        delivery: &str,
+    ) -> Result<Option<DeliveryOutcome>, String> {
+        let state: Option<String> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM delivery_outcomes WHERE task=?1 AND attempt=?2",
+                params![id, delivery],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        state
+            .map(|state| {
+                serde_json::from_value(serde_json::Value::String(state)).map_err(|e| e.to_string())
+            })
+            .transpose()
+    }
+
     pub(crate) fn claim_delivery(&self, id: &str) -> Result<Option<String>, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn

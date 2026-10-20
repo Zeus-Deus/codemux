@@ -9,6 +9,40 @@ use crate::{
 use serde_json::json;
 use tauri::{AppHandle, Manager, Runtime};
 
+/// Startup owns this reconciliation: a live BeforeSend witness is still
+/// allowed to enter its native writer and must not be held by an idle read.
+pub(super) fn recover<R: Runtime>(
+    app: &AppHandle<R>,
+    store: &Journal,
+    task: &LocalTask,
+) -> Result<String, String> {
+    let db = app
+        .try_state::<DatabaseStore>()
+        .ok_or("Task database is unavailable")?;
+    if let Some(record) = db.delegation_task(&format!("ssh:{}", task.id))? {
+        // The SSH writer's exact witness can be stronger than the common
+        // pre-send claim left by a crash. Reconcile before acknowledging import,
+        // even when this task already owns its immutable result and outbox row.
+        if let Some(delivery) = &record.delivery_id {
+            if !matches!(
+                record.completion_delivery.as_str(),
+                "disposed_by_stop" | "disposed_by_close" | "acknowledged"
+            ) {
+                match store.outbox_delivery_outcome(&task.id, delivery)? {
+                    Some(DeliveryOutcome::BeforeSend) => {
+                        db.confirm_message_delivery_before_send(delivery)?
+                    }
+                    Some(DeliveryOutcome::Accepted) => {
+                        db.finish_message_delivery(delivery, "accepted", None, None)?
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    ingest(app, store, task)
+}
+
 pub(super) fn ingest<R: Runtime>(
     app: &AppHandle<R>,
     store: &Journal,
@@ -209,6 +243,128 @@ pub(super) fn ingest<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delegation_delivery_remote_existing_outbox_recovers_before_send() {
+        recover_existing_outbox(false);
+    }
+
+    #[test]
+    fn delegation_delivery_remote_existing_outbox_recovers_acceptance() {
+        recover_existing_outbox(true);
+    }
+
+    fn recover_existing_outbox(accepted: bool) {
+        for generic_first in [false, true] {
+            for disposition in [
+                "pending",
+                "acknowledged",
+                "disposed_by_stop",
+                "disposed_by_close",
+            ] {
+                let app = tauri::test::mock_app();
+                let db = DatabaseStore::new_in_memory();
+                let (parent, grant, input) = crate::delegation::tests::fixture();
+                db.upsert_agent_chat_session(&parent.thread_id, &parent.workspace_id, None, "codex")
+                    .unwrap();
+                app.manage(db);
+                let dir = tempfile::tempdir().unwrap();
+                let store = Journal::open(dir.path()).unwrap();
+                store.put_grant(&parent.workspace_id, &grant).unwrap();
+                let task = store.admit(&parent, &grant, "checkout", &input).unwrap();
+                store
+                    .apply_remote(
+                        &task.id,
+                        &crate::delegation::tests::remote(
+                            &task,
+                            crate::remote_task_protocol::TaskStatus::Completed,
+                        ),
+                    )
+                    .unwrap();
+                let id = ingest(app.handle(), &store, &store.task(&task.id).unwrap()).unwrap();
+                let db = app.state::<DatabaseStore>();
+                let delivery = db
+                    .delegation_task(&id)
+                    .unwrap()
+                    .unwrap()
+                    .delivery_id
+                    .unwrap();
+                assert!(db.claim_message_delivery(&delivery).unwrap());
+                db.message_delivery_submitting(&delivery).unwrap();
+                let attempt = store.claim_outbox_delivery(&task.id).unwrap();
+                assert_eq!(
+                    attempt, delivery,
+                    "SSH witness must correlate to this common result"
+                );
+                if accepted {
+                    let mut write = || crate::json_rpc_child::dispatch::WritePoll::Ready(Ok(1));
+                    assert!(matches!(
+                        store
+                            .poll_wake(&task.id, &attempt, |_, _| Ok(()), &mut write)
+                            .unwrap(),
+                        std::task::Poll::Ready(Ok(1))
+                    ));
+                    store.accept_delivery(&task.id, &attempt).unwrap();
+                }
+                match disposition {
+                    "acknowledged" => {
+                        db.acknowledge_delegation_result(&parent.thread_id, &id)
+                            .unwrap();
+                    }
+                    "disposed_by_stop" => {
+                        db.dispose_delegation_task(&parent.thread_id, &id).unwrap();
+                    }
+                    "disposed_by_close" => {
+                        db.dispose_delegation_task_for_close(&parent.thread_id, &id)
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+                let before_live_ingestion = db.message_delivery(&delivery).unwrap().unwrap().state;
+                ingest(app.handle(), &store, &store.task(&task.id).unwrap()).unwrap();
+                assert_eq!(
+                    db.message_delivery(&delivery).unwrap().unwrap().state,
+                    before_live_ingestion,
+                    "live ingestion must not revoke the native writer"
+                );
+                drop(store);
+                if generic_first {
+                    db.recover_message_deliveries("restart-epoch").unwrap();
+                }
+                let store = Journal::open(dir.path()).unwrap();
+                store.recover_deliveries().unwrap();
+                recover(app.handle(), &store, &store.task(&task.id).unwrap()).unwrap();
+                if !generic_first {
+                    db.recover_message_deliveries("restart-epoch").unwrap();
+                }
+                let recovered = db.delegation_task(&id).unwrap().unwrap();
+                let outbox = db.message_delivery(&delivery).unwrap().unwrap();
+                if disposition == "pending" {
+                    assert_eq!(outbox.state, if accepted { "accepted" } else { "held" });
+                    assert_eq!(outbox.attempted, accepted);
+                    assert_eq!(
+                        recovered.completion_delivery,
+                        if accepted { "delivered" } else { "held" }
+                    );
+                    if !accepted {
+                        db.retry_delegation_delivery(&id).unwrap();
+                        assert_eq!(
+                            db.delegation_task(&id)
+                                .unwrap()
+                                .unwrap()
+                                .delivery_id
+                                .as_deref(),
+                            Some(delivery.as_str())
+                        );
+                    }
+                } else {
+                    assert_eq!(recovered.completion_delivery, disposition);
+                    assert_eq!(outbox.state, "held_unknown");
+                    assert!(db.retry_delegation_delivery(&id).is_err());
+                }
+            }
+        }
+    }
+
     #[test]
     fn delegation_delivery_remote_cursor_import_replays_once_after_journal_reopen() {
         let app = tauri::test::mock_app();
