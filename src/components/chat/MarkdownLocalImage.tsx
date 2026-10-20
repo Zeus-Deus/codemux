@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -25,7 +26,13 @@ type ImageReader = typeof readLocalChatImage;
 interface ImageCandidate {
   path: string;
   read: ImageReader;
+  /** The reply's kept copy, which may still be landing. */
+  kept?: boolean;
 }
+
+/** When a card found nothing while its kept copy may still have been
+ *  landing, read the copy again after these delays. */
+const KEPT_COPY_RETRY_DELAYS_MS = [1_000, 4_000];
 
 const blobUrlCache = new Map<string, string>();
 const blobRequestCache = new Map<string, Promise<string>>();
@@ -110,7 +117,7 @@ function useImageCandidates(path: string): readonly ImageCandidate[] {
   const retained = useContext(RetainedImagesContext)?.get(path);
   return useMemo(
     () => [
-      ...(retained ? [{ path: retained, read: readChatImage }] : []),
+      ...(retained ? [{ path: retained, read: readChatImage, kept: true }] : []),
       { path, read: readLocalChatImage },
     ],
     [path, retained],
@@ -122,6 +129,8 @@ interface SourceState {
   index: number;
   blob: string | null;
   failed: boolean;
+  /** Kept-copy reads retried after everything failed. */
+  retries: number;
 }
 
 function firstSource(
@@ -134,6 +143,7 @@ function firstSource(
     index: 0,
     blob: first ? (blobUrlCache.get(first.path) ?? null) : null,
     failed: !first,
+    retries: 0,
   };
 }
 
@@ -159,10 +169,9 @@ function useLocalImageSource(candidates: readonly ImageCandidate[]) {
       setStored(
         next
           ? {
-              key,
+              ...state,
               index,
               blob: blobUrlCache.get(next.path) ?? null,
-              failed: false,
             }
           : { ...state, failed: true },
       );
@@ -179,6 +188,28 @@ function useLocalImageSource(candidates: readonly ImageCandidate[]) {
         if (currentKey.current === key) advance();
       });
   }, [candidate, candidates, key, state]);
+
+  // Every source failed, but the kept copy may only have been landing (its
+  // background copy can hold the bytes after the original is gone): read it
+  // again a bounded number of times before settling on "unavailable".
+  useEffect(() => {
+    const kept = candidates[0];
+    const delay = KEPT_COPY_RETRY_DELAYS_MS[state.retries];
+    if (!state.failed || !kept?.kept || delay === undefined) return;
+    const timer = setTimeout(() => {
+      const retries = state.retries + 1;
+      requestBlobUrl(kept)
+        .then((url) => {
+          if (currentKey.current === key) {
+            setStored({ key, index: 0, blob: url, failed: false, retries });
+          }
+        })
+        .catch(() => {
+          if (currentKey.current === key) setStored({ ...state, retries });
+        });
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [candidates, key, state]);
 
   return {
     src:

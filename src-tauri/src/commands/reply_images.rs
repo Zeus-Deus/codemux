@@ -98,7 +98,9 @@ pub(super) async fn settle_thread<R: Runtime>(app: &AppHandle<R>, thread_id: &st
 pub(super) async fn abandon_thread<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
     let rows = app.state::<DatabaseStore>().take_reply_image_jobs(thread_id);
     for row_id in rows {
-        drop(row_lock(row_id).lock().await);
+        let lock = row_lock(row_id);
+        drop(lock.lock().await);
+        drop(lock);
         forget_row_lock(row_id);
     }
 }
@@ -109,8 +111,13 @@ fn row_lock(row_id: i64) -> Arc<tokio::sync::Mutex<()>> {
     row_locks().lock().unwrap().entry(row_id).or_default().clone()
 }
 
+/// Drop row `row_id`'s lock once nobody holds or awaits it, so a later run
+/// can never get a second lock while an earlier one is still in use.
 fn forget_row_lock(row_id: i64) {
-    row_locks().lock().unwrap().remove(&row_id);
+    let mut locks = row_locks().lock().unwrap();
+    if locks.get(&row_id).is_some_and(|lock| Arc::strong_count(lock) == 1) {
+        locks.remove(&row_id);
+    }
 }
 
 fn row_locks() -> &'static Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>> {
@@ -120,19 +127,21 @@ fn row_locks() -> &'static Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>> {
 
 async fn run_job<R: Runtime>(app: &AppHandle<R>, row_id: i64) {
     let lock = row_lock(row_id);
-    let _guard = lock.lock().await;
-    // Taken before the row is read, so queued jobs hold no payloads.
-    let Ok(_permit) = COPY_PERMITS.acquire().await else {
-        return;
-    };
-    let db = app.state::<DatabaseStore>();
-    // Retired by another run, or abandoned with its chat (a gone row took
-    // its job with it).
-    if db.has_reply_image_job(row_id) {
-        if let Some(payload) = db.get_agent_chat_message_payload(row_id) {
-            retain_row(&db, row_id, planned_in_payload(&payload)).await;
+    {
+        let _guard = lock.lock().await;
+        // Taken before the row is read, so queued jobs hold no payloads.
+        if let Ok(_permit) = COPY_PERMITS.acquire().await {
+            let db = app.state::<DatabaseStore>();
+            // Retired by another run, or abandoned with its chat (a gone row
+            // took its job with it).
+            if db.has_reply_image_job(row_id) {
+                if let Some(payload) = db.get_agent_chat_message_payload(row_id) {
+                    retain_row(&db, row_id, planned_in_payload(&payload)).await;
+                }
+            }
         }
     }
+    drop(lock);
     forget_row_lock(row_id);
 }
 
@@ -254,9 +263,14 @@ fn remove_copies(root: &std::path::Path, kept: &[RetainedReplyImage]) {
 /// `src/lib/agent-chat/local-image-links.ts`.
 pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
     let mut sources: Vec<String> = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
+    // An open fence: its marker, length, and the quote depth it opened at.
+    let mut fence: Option<(char, usize, usize)> = None;
     for line in markdown.lines() {
-        let body = without_quote_markers(line);
+        let (depth, body) = without_quote_markers(line);
+        // A fence ends with the block quote that holds it.
+        if fence.is_some_and(|(_, _, opened)| depth < opened) {
+            fence = None;
+        }
         let trimmed = body.trim_start_matches(' ');
         if body.len() - trimmed.len() <= 3 {
             if let Some(marker) = trimmed.chars().next().filter(|c| *c == '`' || *c == '~') {
@@ -265,10 +279,10 @@ pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
                 if run >= 3 {
                     match fence {
                         None => {
-                            fence = Some((marker, run));
+                            fence = Some((marker, run, depth));
                             continue;
                         }
-                        Some((open, len))
+                        Some((open, len, _))
                             if open == marker && run >= len && trimmed[run..].trim().is_empty() =>
                         {
                             fence = None;
@@ -297,17 +311,22 @@ pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
     sources
 }
 
-/// `line` without its block-quote markers (`> > text` → `text`).
-fn without_quote_markers(line: &str) -> &str {
+/// `line`'s block-quote depth and its text without the markers
+/// (`> > text` → `(2, "text")`).
+fn without_quote_markers(line: &str) -> (usize, &str) {
+    let mut depth = 0;
     let mut rest = line;
     loop {
         let trimmed = rest.trim_start_matches(' ');
         if rest.len() - trimmed.len() > 3 {
-            return rest;
+            return (depth, rest);
         }
         match trimmed.strip_prefix('>') {
-            Some(after) => rest = after.strip_prefix(' ').unwrap_or(after),
-            None => return rest,
+            Some(after) => {
+                depth += 1;
+                rest = after.strip_prefix(' ').unwrap_or(after);
+            }
+            None => return (depth, rest),
         }
     }
 }
@@ -390,8 +409,18 @@ fn link_destinations(line: &str) -> Vec<String> {
 
 /// Parse one link destination, returning it (when well formed, with
 /// backslash escapes and character references resolved) and how many bytes
-/// of `input` it spans.
+/// of `input` it spans. A destination using a named reference this parser
+/// does not know is skipped: the renderer would resolve it to a different
+/// path, so a copy kept under the written one would never be found.
 fn parse_destination(input: &str) -> (Option<String>, usize) {
+    let (destination, consumed) = parse_destination_text(input);
+    (destination.filter(|text| !text.contains(UNRESOLVED_REFERENCE)), consumed)
+}
+
+/// Stands in for a named reference [`character_reference`] cannot resolve.
+const UNRESOLVED_REFERENCE: char = '\u{FFFF}';
+
+fn parse_destination_text(input: &str) -> (Option<String>, usize) {
     let mut out = String::new();
     let mut chars = input.char_indices().peekable();
     let angled = input.starts_with('<');
@@ -425,6 +454,7 @@ fn parse_destination(input: &str) -> (Option<String>, usize) {
                         chars.next();
                     }
                 }
+                None if named_reference(&input[at..]) => out.push(UNRESOLVED_REFERENCE),
                 None => out.push('&'),
             },
             _ => out.push(c),
@@ -459,6 +489,16 @@ fn character_reference(input: &str) -> Option<(char, usize)> {
         }
     };
     Some((decoded, end + 1))
+}
+
+/// Whether `input` starts with something shaped like a named character
+/// reference (`&copy;`), which the renderer may resolve.
+fn named_reference(input: &str) -> bool {
+    let name = input[1..].split(';').next().unwrap_or("");
+    input[1..].contains(';')
+        && (2..=31).contains(&name.len())
+        && name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && name.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// The native absolute path a Markdown destination names, when it is a
@@ -618,6 +658,24 @@ mod tests {
     }
 
     #[test]
+    fn a_row_keeps_one_lock_while_anyone_holds_or_awaits_it() {
+        // Run A holds the lock while run B waits on it.
+        let row = -7001;
+        let a = row_lock(row);
+        let b = row_lock(row);
+        // A finishes; its cleanup must not drop the lock B is waiting on.
+        drop(a);
+        forget_row_lock(row);
+        let c = row_lock(row);
+        assert!(Arc::ptr_eq(&b, &c), "a later run C shares B's lock");
+        // Once nobody uses it, the entry goes.
+        drop(b);
+        drop(c);
+        forget_row_lock(row);
+        assert!(!row_locks().lock().unwrap().contains_key(&row));
+    }
+
+    #[test]
     fn copies_land_only_at_plain_paths_inside_the_root() {
         let root = std::path::Path::new("/cfg/images");
         assert_eq!(
@@ -645,10 +703,19 @@ mod tests {
     }
 
     #[test]
+    fn a_fence_ends_with_the_quote_that_holds_it() {
+        let text = "> ~~~\n> [example](/tmp/a.png)\n\n[proof](/tmp/proof.png)";
+        assert_eq!(local_image_sources(text), ["/tmp/proof.png"]);
+    }
+
+    #[test]
     fn destinations_resolve_character_references_like_the_renderer() {
         assert_eq!(
-            local_image_sources("[a](/tmp/a&amp;b.png) [c](/tmp/c&#x41;.png) [d](/tmp/&bogus;.png)"),
-            ["/tmp/a&b.png", "/tmp/cA.png", "/tmp/&bogus;.png"]
+            local_image_sources(
+                "[a](/tmp/a&amp;b.png) [c](/tmp/c&#x41;.png) [d](/tmp/&copy;.png) [e](/tmp/e&f.png)"
+            ),
+            // `&copy;` may resolve to another path when rendered: not kept.
+            ["/tmp/a&b.png", "/tmp/cA.png", "/tmp/e&f.png"]
         );
     }
 

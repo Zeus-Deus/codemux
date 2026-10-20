@@ -181,6 +181,37 @@ describe("MarkdownLocalImage", () => {
       expect(readLocalChatImageMock).toHaveBeenCalledWith("/tmp/proof.png");
     });
 
+    it("reads a copy that lands after every source failed", async () => {
+      const originalCreateObjectUrl = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+      Object.defineProperty(URL, "createObjectURL", {
+        configurable: true,
+        value: vi.fn(() => "blob:landed-copy"),
+      });
+      // Still copying on the first read; the original is already gone.
+      readChatImageMock
+        .mockRejectedValueOnce(new Error("not yet"))
+        .mockResolvedValue({ bytes: new Uint8Array([137, 80, 78, 71]), media_type: "image/png" });
+      readLocalChatImageMock.mockRejectedValue(new Error("gone"));
+      const { container, findByText } = renderKept();
+
+      fireEvent.error(container.querySelector("img")!);
+      await waitFor(() => {
+        expect(container.querySelector("img")).toHaveAttribute("src", "mock-asset:/tmp/proof.png");
+      });
+      fireEvent.error(container.querySelector("img")!);
+      expect(await findByText("Image unavailable")).toBeInTheDocument();
+
+      await waitFor(
+        () => expect(container.querySelector("img")).toHaveAttribute("src", "blob:landed-copy"),
+        { timeout: 2_500 },
+      );
+      if (originalCreateObjectUrl) {
+        Object.defineProperty(URL, "createObjectURL", originalCreateObjectUrl);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+    });
+
     it("ignores copies kept for other links", () => {
       const { container } = render(
         <RetainedImagesProvider images={kept}>

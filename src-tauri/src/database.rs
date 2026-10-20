@@ -5718,8 +5718,9 @@ impl DatabaseStore {
                 .collect::<Vec<_>>();
             refs
         };
-        // Attachment payloads on both sides of the cutoff. Restricted to rows
-        // that actually carry an `images` array so a long transcript is never
+        // Image payloads on both sides of the cutoff: attachments, and the
+        // copies kept for a reply's linked images. Restricted to rows that
+        // actually carry such an array so a long transcript is never
         // materialized; the caller diffs them to find files nothing
         // references any more.
         let image_payloads = |cutoff_clause: &str| -> Result<Vec<String>, String> {
@@ -5727,7 +5728,8 @@ impl DatabaseStore {
                 .prepare(&format!(
                     "SELECT payload FROM agent_chat_messages
                      WHERE thread_id = ?1 AND id {cutoff_clause} ?2
-                       AND payload LIKE '%\"images\":[%'"
+                       AND (payload LIKE '%\"images\":[%'
+                            OR payload LIKE '%\"retained_images\":[%')"
                 ))
                 .map_err(|error| format!("Failed to list reverted attachments: {error}"))?;
             let payloads = statement
@@ -6153,6 +6155,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(second.transcript_cutoff_id, user_2 - 1);
+        db.append_agent_chat_message(
+            thread_id,
+            r#"{"type":"item_completed","item":{"kind":"assistant_text","text":"[a](/tmp/a.png)","retained_images":[{"source":"/tmp/a.png","path":"/tmp/kept-a.png"}]}}"#,
+        )
+        .unwrap();
         db.append_agent_chat_message(thread_id, r#"{"type":"turn_completed"}"#)
             .unwrap();
 
@@ -6210,8 +6217,10 @@ mod tests {
         );
         // Attachment payloads are partitioned across the cutoff so the
         // command layer can unlink only the files nothing references now.
-        assert_eq!(removed.removed_image_payloads.len(), 1);
+        // A reverted reply's kept image copies are among them.
+        assert_eq!(removed.removed_image_payloads.len(), 2);
         assert!(removed.removed_image_payloads[0].contains("/tmp/two.png"));
+        assert!(removed.removed_image_payloads[1].contains("/tmp/kept-a.png"));
         assert_eq!(removed.retained_image_payloads.len(), 1);
         assert!(removed.retained_image_payloads[0].contains("/tmp/one.png"));
         assert_eq!(db.list_agent_chat_messages(thread_id).len(), 2);
