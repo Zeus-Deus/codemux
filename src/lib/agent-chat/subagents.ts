@@ -3,7 +3,6 @@ import type { SubagentSnapshot, SubagentStatus } from "@/tauri/events";
 import {
   formatDelegationElapsed,
   isDelegatedRow,
-  isDelegationResultsText,
 } from "./delegation";
 import { toolPresentation } from "./native-tool-call";
 import type {
@@ -954,7 +953,7 @@ export function subagentWaves(messages: ChatViewItem[]): SubagentWave[] {
     if (item.kind === "user_message") {
       if (item.queued || item.inflight) continue;
       // The results turn reads as the trail and divider name it.
-      const line = isDelegationResultsText(item.text)
+      const line = item.notification?.source.kind === "delegated_task"
         ? "Delegated results"
         : firstLine(item.text);
       prompt = line.length > 0 ? line : null;

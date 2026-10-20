@@ -85,3 +85,8 @@ function Button({
 }
 
 export { Button, buttonVariants }
+
+/** A text action that keeps surrounding typography and keyboard focus visible. */
+export function InlineButton({ className, tone, type = "button", ...props }: React.ComponentProps<"button"> & { tone?: "muted" }) {
+  return <button type={type} className={cn("inline-flex items-center gap-0.5 font-medium underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-ring", tone === "muted" && "text-muted-foreground hover:text-foreground", className)} {...props} />
+}

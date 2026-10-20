@@ -681,6 +681,8 @@ pub enum ProviderRuntimeEvent {
     /// permanently. The sending client already has the bubble and drops
     /// this copy by `client_nonce`.
     UserMessage {
+        #[serde(default, flatten)]
+        provenance: super::message::MessageProvenance,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         steered_turn_id: Option<TurnId>,
         thread_id: ThreadId,
@@ -707,6 +709,8 @@ pub enum ProviderRuntimeEvent {
     /// turn text so a remounted pane (which never saw the optimistic
     /// append) can still reconstruct the queued bubble.
     TurnQueued {
+        #[serde(default, flatten)]
+        provenance: super::message::MessageProvenance,
         thread_id: ThreadId,
         queued_id: String,
         #[serde(default)]

@@ -107,6 +107,13 @@ pub(crate) fn rewrite_forked_payload(
     let Some(object) = value.as_object_mut() else {
         return payload.to_string();
     };
+    if object.get("type").and_then(serde_json::Value::as_str)==Some("user_message") && object.get("message_id").is_some() {
+        if let Some(source)=object.get("thread_id").cloned() {object.insert("source_thread_id".into(),source);}
+        if let Some(source)=object.get("message_id").cloned() {object.insert("source_message_id".into(),source);}
+        // Forked history retains attribution, but is not a delivery into this
+        // thread and must never consult the source's outbox acceptance.
+        object.remove("delivery_id");
+    }
     if object.get("thread_id").is_some_and(serde_json::Value::is_string) {
         object.insert("thread_id".into(), fork_thread_id.into());
     }

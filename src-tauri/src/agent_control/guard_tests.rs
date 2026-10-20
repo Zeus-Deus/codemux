@@ -839,6 +839,7 @@ fn terminal_runtime_events_cannot_replace_a_fresh_completion_or_reopen_dead_call
     });
     state.observe_event(&request("event-order", "late-callback"));
     state.observe_event(&ProviderRuntimeEvent::TurnQueued {
+        provenance: Default::default(),
         thread_id: ThreadId("event-order".into()),
         queued_id: "dead-queue".into(),
         client_nonce: None,

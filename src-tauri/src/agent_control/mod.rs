@@ -4,6 +4,7 @@ mod types;
 mod state;
 pub(crate) mod service;
 mod guard;
+pub mod delivery;
 pub use guard::NativeControlGuard;
 pub(crate) use guard::GuardedTurnCheckpoint;
 pub(crate) use guard::NativeStartCancellation;

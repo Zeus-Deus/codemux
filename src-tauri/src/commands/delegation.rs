@@ -57,7 +57,7 @@ use crate::state::AppStateStore;
 
 use super::agent_chat::{
     agent_chat_interrupt_turn, agent_chat_start_session, fallback_permission_mode, forward_event,
-    resolve_start_permission_mode, send_turn_with_origin, thread_id_for_event, ProviderRegistry,
+    resolve_start_permission_mode, send_turn_with_context, thread_id_for_event, ProviderRegistry,
     TurnOrigin,
 };
 use super::usage_resume::{self, now_ms, queued_turn};
@@ -65,8 +65,7 @@ use super::usage_resume::{self, now_ms, queued_turn};
 /// Settings key for the off switch. Absent or anything but `"false"` means
 /// enabled — the tool only acts when the user asks for another agent.
 pub const DELEGATION_SETTING_KEY: &str = "agents.cross_provider_delegation";
-/// First line of every results message. The frontend renders turns that
-/// start with it as a divider, so changing it breaks that.
+/// Agent-facing header. Presentation uses structured notification metadata.
 pub const DELEGATION_RESULTS_PREFIX: &str = "[Codemux: delegated task results]";
 /// Marks a parent's card row as a delegated task (`delegate:<child thread>`).
 pub const DELEGATED_ROW_PREFIX: &str = "delegate:";
@@ -99,9 +98,9 @@ pub(super) const CANDIDATES: [ProviderKind; 5] = [
 const STOPPED_MEANWHILE: &str = "This chat was stopped before the task started.";
 
 /// Appended to the task as the child's first message. Visible in its tab.
-const CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: another coding agent handed you this task and will read your final message. Work on your own: do not ask questions or wait for input; if something is unclear, pick the safest reasonable option and say so. End with a short report: what you changed (files), how you checked it, and anything left undone.";
+const CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: another coding agent handed you this task and will read your final message. Work independently. Ask a question when missing information blocks the task; otherwise choose a safe option and explain it. End with a short report: what you changed (files), how you checked it, and anything left undone.";
 /// The footer for a started suggested task, which runs on its own branch.
-pub(crate) const WORKTREE_CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: the user started this task from another chat's suggestions; that chat will read your final message. You are in your own git worktree on a new branch made from that chat's latest commit (its uncommitted edits are not here). Work on your own: do not ask questions or wait for input; if something is unclear, pick the safest reasonable option and say so. When done, COMMIT all of your work on this branch (do not push, do not switch branches) so it can be merged back; leave nothing uncommitted. End with a short report: what you changed (files), the commit(s), how you checked it, and anything left undone.";
+pub(crate) const WORKTREE_CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: the user started this task from another chat's suggestions; that chat will read your final message. You are in your own git worktree on a new branch made from that chat's latest commit (its uncommitted edits are not here). Work independently. Ask a question when missing information blocks the task; otherwise choose a safe option and explain it. When done, COMMIT all of your work on this branch (do not push, do not switch branches) so it can be merged back; leave nothing uncommitted. End with a short report: what you changed (files), the commit(s), how you checked it, and anything left undone.";
 
 const TOOL_DESCRIPTION: &str = "Hand one task to another coding agent installed in Codemux, such as Codex or Claude. It runs as its own chat in a background tab of this workspace, in the same folder, with full access, and its final report is posted back here automatically. Use it when the user asks for another agent, or wants an implementation or independent review by a different vendor. For helpers on your own provider, use your built-in subagent tool; use workspace_launch for separate top-level workspaces whose results do not come back here. Call it only from the main conversation, never from a subagent.
 
@@ -1302,8 +1301,15 @@ pub(crate) async fn run_starter<R: Runtime>(
             } else {
                 WORKTREE_CHILD_FOOTER
             };
-            let turn = queued_turn(ThreadId(child.clone()), format!("{}{footer}", task.brief));
-            send_turn_with_origin(app.clone(), provider, turn, TurnOrigin::Delegation)
+            let mut turn = queued_turn(ThreadId(child.clone()), format!("{}{footer}", task.brief));
+            turn.display_text = Some(task.brief.clone());
+            turn.client_nonce = Some(format!("delegated-task:{child}"));
+            let mut context = crate::agent_control::delivery::SendContext::new(TurnOrigin::Delegation);
+            context.provenance.created_by = crate::agent_provider::message::CreatedBy::Agent;
+            context.provenance.creation_source = crate::agent_provider::message::CreationSource::Provider;
+            context.provenance.sender_thread_id = Some(task.parent.clone());
+            context.provenance.sender_title = app.state::<DatabaseStore>().get_agent_chat_title(&task.parent);
+            send_turn_with_context(app.clone(), provider, turn, context)
                 .await
                 .err()
                 .map(|error| {
@@ -1713,16 +1719,70 @@ pub async fn deliver<R: Runtime>(app: &AppHandle<R>, parent: &str) {
     let Some((posted, text)) = state.take_report(parent) else {
         return;
     };
-    let turn = queued_turn(thread.clone(), text);
-    let sent = send_turn_with_origin(app.clone(), provider, turn, TurnOrigin::Delegation).await;
-    let exhausted = state.record_send(parent, &posted, sent.is_ok());
+    let (display, failed) = {
+        let inner = state.lock();
+        let mut reports = Vec::new();
+        let mut failed = false;
+        for id in &posted {
+            if let Some(task) = inner.tasks.get(id) {
+                let body = match &task.phase {
+                    Phase::Completed(report) => report.clone(),
+                    Phase::Failed(report) => {
+                        failed = true;
+                        report.clone()
+                    }
+                    Phase::Stopped(reason) => reason.note().into(),
+                    _ => continue,
+                };
+                reports.push(format!("{}\n{}", task.title, body));
+            }
+        }
+        (reports.join("\n\n"), failed)
+    };
+    let mut ids = posted.clone();
+    ids.sort();
+    use sha2::{Digest, Sha256};
+    let message_id = format!(
+        "delegated-results:{:x}",
+        Sha256::digest(ids.join("\n").as_bytes())
+    );
+    let mut turn = queued_turn(thread.clone(), text);
+    turn.client_nonce = Some(message_id.clone());
+    turn.display_text = Some(display.clone());
+    let mut context = crate::agent_control::delivery::SendContext::new(TurnOrigin::Delegation);
+    context.provenance.notification = Some(crate::agent_provider::message::MessageNotification {
+        source: crate::agent_provider::message::NotificationSource {
+            kind: crate::agent_provider::message::NotificationKind::DelegatedTask,
+            task_ids: ids,
+            child_thread_id: if posted.len() == 1 {
+                posted.first().cloned()
+            } else {
+                None
+            },
+        },
+        outcome: if failed {
+            crate::agent_provider::message::NotificationOutcome::Failed
+        } else {
+            crate::agent_provider::message::NotificationOutcome::Completed
+        },
+        summary: display.lines().next().unwrap_or("Delegated results").into(),
+    });
+    let sent = send_turn_with_context(app.clone(), provider, turn, context).await;
+    // Once admitted, the persisted delivery owns retries and uncertainty. The
+    // old report sweep must never re-coalesce these results into another send.
+    let admitted = db
+        .message_delivery_for_message(parent, &message_id)
+        .ok()
+        .flatten()
+        .is_some();
+    let exhausted = state.record_send(parent, &posted, sent.is_ok() || admitted);
     if let (Err(error), true) = (sent, exhausted) {
         forward_event(
             app,
             ProviderRuntimeEvent::RuntimeWarning {
                 thread_id: Some(thread),
                 message: format!(
-                    "Codemux could not post the delegated task results here ({}). It will try again after your next message.",
+                    "Codemux could not post the delegated task results here ({}). Inspect message delivery attention before retrying.",
                     readable_error(&error)
                 ),
                 original_payload: None,

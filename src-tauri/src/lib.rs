@@ -1531,6 +1531,7 @@ fn build_core_app<R: tauri::Runtime>(
                         // fresh Tokio task each.
                         commands::agent_chat::spawn_event_bridge(registry_handle.clone())
                             .await;
+                        agent_control::delivery::spawn(registry_handle.clone());
                         // Detect silently-dead runs: a periodic sweep that
                         // flags mid-turn threads gone quiet past the stall
                         // threshold (issue #154). Advisory only — it never

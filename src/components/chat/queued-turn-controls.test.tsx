@@ -74,6 +74,13 @@ function list(overrides: Partial<QueuedTurnsListProps> = {}) {
 const rows = () => screen.queryAllByTestId("queued-turn-row");
 
 describe("QueuedTurnsList", () => {
+  it("shows an agent sender in the preview tooltip", async () => {
+    list({queued:[{...item("agent"),created_by:"agent",sender_title:"Review agent",message_id:"message"}]});
+    const preview=screen.getByText("text agent");
+    fireEvent.focus(preview.closest("button") ?? preview);
+    fireEvent.pointerMove(preview,{pointerType:"mouse"});
+    expect((await screen.findAllByText("Sent by another agent · Review agent")).length).toBeGreaterThan(0);
+  });
   it("lists the queue under a header that collapses it", () => {
     list();
     const header = screen.getByRole("button", { name: "Collapse queued messages" });

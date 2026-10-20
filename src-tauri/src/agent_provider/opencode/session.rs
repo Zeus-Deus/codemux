@@ -679,6 +679,7 @@ impl OpenCodeSession {
         } else {
             queue.push_back((id.clone(), input));
             let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
+                provenance: Default::default(),
                 thread_id: self.thread_id.clone(),
                 queued_id: id.clone(),
                 client_nonce,

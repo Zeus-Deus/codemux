@@ -1133,6 +1133,7 @@ impl ClaudeSession {
                     state.queued_turns.push_back(queued);
                 }
                 let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
+                    provenance: Default::default(),
                     thread_id: self.thread_id.clone(),
                     queued_id: queued_id.clone(),
                     client_nonce,

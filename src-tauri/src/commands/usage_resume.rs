@@ -408,6 +408,7 @@ async fn dispatch_resume<R: Runtime>(
 /// (`display_text: None`), so the transcript shows exactly what was sent.
 pub(super) fn queued_turn(thread_id: ThreadId, text: String) -> SendTurnCommandInput {
     SendTurnCommandInput {
+        input_source: None,
         thread_id,
         text,
         display_text: None,

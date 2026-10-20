@@ -561,6 +561,7 @@ async fn a_claude_chat_resumes_only_while_its_conversation_file_exists() {
 
 fn typed(thread: &str, text: &str) -> SendTurnCommandInput {
     SendTurnCommandInput {
+        input_source: None,
         delivery: MessageDelivery::Queue,
         thread_id: ThreadId(thread.into()),
         text: text.into(),

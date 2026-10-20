@@ -132,6 +132,7 @@ async fn contract_manual_deliver_shutdown_owns_native_effect_and_caller_drop() {
 async fn final_dispatch_unsupported_parent_fails_before_provider_or_app_side_effects() {
     let app = tauri::test::mock_app();
     let input = crate::commands::agent_chat::SendTurnCommandInput {
+        input_source: None,
         thread_id: ThreadId("unsupported-parent".into()),
         text: "must not dispatch".into(),
         display_text: None,
@@ -455,6 +456,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
                 let t = thread.clone();
                 user_sending = Some(tokio::spawn(async move {
                     let input = crate::commands::agent_chat::SendTurnCommandInput {
+                        input_source: None,
                         thread_id: ThreadId(t),
                         text: "normal user wins".into(),
                         display_text: None,
@@ -570,6 +572,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
             let user_sent = crate::commands::agent_chat::send_turn_with_origin(
                 app.handle().clone(), kind,
                 crate::commands::agent_chat::SendTurnCommandInput {
+                    input_source: None,
                     thread_id: ThreadId(thread.clone()), text: user_prose.into(), display_text: None,
                     skill_ids: vec![], skill_text: None, include_plugins: false, images: vec![],
                     model_override: None, effort_override: None, permission_mode_override: None,

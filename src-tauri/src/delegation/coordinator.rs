@@ -7,7 +7,7 @@ use super::{
 use crate::{
     agent_provider::{SessionStatus, ThreadId},
     commands::agent_chat::{
-        lookup_provider, send_turn_with_origin, ProviderRegistry, SendTurnCommandInput,
+        lookup_provider, send_turn_with_context, ProviderRegistry, SendTurnCommandInput,
         SubagentTracker, TurnOrigin,
     },
     remote_task_protocol::TaskRead as RemoteRead,
@@ -416,9 +416,10 @@ pub(super) async fn wake_open<R: Runtime>(handle: &AppHandle<R>, id: &str) -> Re
         } else { "" },
     );
     let input = SendTurnCommandInput {
+        input_source: None,
         thread_id: ThreadId(parent.thread_id.clone()),
         text,
-        display_text: Some(display_text),
+        display_text: Some(display_text.clone()),
         skill_ids: vec![],
         skill_text: None,
         include_plugins: false,
@@ -429,11 +430,16 @@ pub(super) async fn wake_open<R: Runtime>(handle: &AppHandle<R>, id: &str) -> Re
         client_nonce: Some(format!("delegation:{id}")),
         delivery: crate::agent_provider::types::MessageDelivery::Queue,
     };
-    let sent = send_turn_with_origin(
-        handle.clone(),
-        parent.provider,
-        input,
-        TurnOrigin::RemoteDelegation,
+    let mut context = crate::agent_control::delivery::SendContext::new(TurnOrigin::RemoteDelegation);
+    context.provenance.notification = Some(crate::agent_provider::message::MessageNotification {
+        source:crate::agent_provider::message::NotificationSource {kind:crate::agent_provider::message::NotificationKind::RemoteTask,task_ids:vec![id.into()],child_thread_id:None},
+        outcome:match remote.status {crate::remote_task_protocol::TaskStatus::Completed => crate::agent_provider::message::NotificationOutcome::Completed,
+            crate::remote_task_protocol::TaskStatus::Failed => crate::agent_provider::message::NotificationOutcome::Failed,
+            crate::remote_task_protocol::TaskStatus::Cancelled => crate::agent_provider::message::NotificationOutcome::Cancelled,
+            _ => crate::agent_provider::message::NotificationOutcome::Unknown},summary:display_text,
+    });
+    let sent = send_turn_with_context(
+        handle.clone(), parent.provider, input, context,
     )
     .await;
     store.finish_delivery(id, &attempt)?;

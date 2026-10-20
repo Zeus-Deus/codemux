@@ -10,7 +10,7 @@ import {
 } from "./message-trail";
 import { buildTranscriptSlots } from "./transcript-slots";
 
-function userMsg(seq: number, text = "hi"): ChatViewItem {
+function userMsg(seq: number, text = "hi"): import("@/lib/agent-chat/types").UserMessageItem {
   return { kind: "user_message", id: `um-${seq}`, seq, text };
 }
 
@@ -101,7 +101,7 @@ describe("buildTrailEntries", () => {
     const entries = buildTrailEntries(
       buildTranscriptSlots([
         userMsg(0, "have Codex do it"),
-        userMsg(1, results),
+        { ...userMsg(1, results), notification: {source:{kind:"delegated_task",task_ids:["task"]},outcome:"completed",summary:"Delegated results"} },
         assistantMsg(2, "Codex added slugify."),
       ]),
     );

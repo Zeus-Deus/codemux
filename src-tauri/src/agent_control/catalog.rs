@@ -47,7 +47,7 @@ fn mutation() -> Value {
 pub fn native_tools() -> Vec<ToolDefinition> {
     let mut send = mutation();
     send["message"] = json!({"type": "string", "minLength": 1, "maxLength": 65536});
-    send["delivery"] = json!({"type": "string", "enum": ["queue", "steer", "interrupt"], "default": "queue"});
+    send["delivery"] = json!({"type": "string", "enum": ["auto", "queue", "steer", "interrupt"], "default": "queue"});
     let mut read = target();
     read["cursor"] = json!({"type": "integer", "minimum": 0});
     read["limit"] = json!({"type": "integer", "minimum": 1, "maximum": 100, "default": 20});
@@ -82,7 +82,7 @@ pub fn native_tools() -> Vec<ToolDefinition> {
             "message": {"type": "string", "minLength": 1, "maxLength": 65536},
             "select": {"type": "boolean", "default": false},
         }), &["workspace_id", "client_request_id", "provider", "permission_mode"], false),
-        tool("thread_send", "Send a follow-up to a native thread through CodeMux's normal intake. Delivery is queue, safe steer, or explicit interrupt-and-send. A queued receipt is not completion. Reuse client_request_id unchanged on retry.", send, &["workspace_id", "thread_id", "client_request_id", "message"], false),
+        tool("thread_send", "Send a follow-up to a native thread through CodeMux's normal intake. Auto delivery starts idle threads, safely steers ready active threads, and otherwise queues without interrupting. Explicit queue, steer, and interrupt remain available. A queued receipt is not completion. Reuse client_request_id unchanged on retry.", send, &["workspace_id", "thread_id", "client_request_id", "message"], false),
         tool("thread_read", "Read cursor-addressable safe-visible user and top-level assistant prose. Hidden reasoning, raw tool payloads and subagent internals are excluded. Does not resume a provider.", read, &["workspace_id", "thread_id"], true),
         tool("thread_status", "Read live/terminal/unknown status and current pending approval IDs. A missing runtime after restart is not proof of completion. Does not resume providers.", target(), &["workspace_id", "thread_id"], true),
         tool("thread_wait", "Wait at most 20 seconds for the selected native run to settle. A timeout does not cancel work; read status or wait again. Specify turn_id to avoid following a newer run.", wait, &["workspace_id", "thread_id"], true),

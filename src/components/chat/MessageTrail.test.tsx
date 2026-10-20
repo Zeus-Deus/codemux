@@ -40,7 +40,7 @@ afterEach(() => {
   resizeObservers.length = 0;
 });
 
-function userMsg(seq: number, text: string): ChatViewItem {
+function userMsg(seq: number, text: string): import("@/lib/agent-chat/types").UserMessageItem {
   return { kind: "user_message", id: `um-${seq}`, seq, text };
 }
 
@@ -137,7 +137,7 @@ describe("MessageTrail", () => {
   it("lists the delegated results turn as 'Delegated results', not its raw text", () => {
     renderTrail([
       ...turns(2),
-      userMsg(4, `${DELEGATION_RESULTS_PREFIX}\nCodemux posted this message, not the user.`),
+      { ...userMsg(4, `${DELEGATION_RESULTS_PREFIX}\nCodemux posted this message, not the user.`), notification: {source:{kind:"delegated_task",task_ids:["task"]},outcome:"completed",summary:"Delegated results"} },
       assistantMsg(5, "Codex finished."),
     ]);
     const button = screen.getByRole("button", { name: "Jump to turn 3: Delegated results" });

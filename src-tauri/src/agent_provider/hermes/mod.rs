@@ -1268,6 +1268,7 @@ impl AgentProvider for HermesProvider {
         let mut queue = runtime.queue.lock().await;
         let idle = chat.state.lock().await.active.is_none();
         self.inner.emit(ProviderRuntimeEvent::TurnQueued {
+            provenance: Default::default(),
             thread_id: input.thread_id.clone(),
             queued_id: id.clone(),
             client_nonce: input.client_nonce.clone(),

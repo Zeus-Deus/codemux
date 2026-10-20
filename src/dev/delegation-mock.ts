@@ -357,7 +357,11 @@ function deliver(run: RunState): void {
     emit({
       type: "user_message",
       thread_id: run.parentThreadId,
-      text: wakeText(tasks, stillRunning),
+      text: tasks.map((child) => `${child.plan.title}\n${child.resultText ?? ""}`).join("\n\n"),
+      agent_text: wakeText(tasks, stillRunning),
+      message_id: `mock-results-${tasks.map((child) => child.plan.threadId).join("-")}`,
+      created_by: "system", creation_source: "codemux", input_intent: "turn_start",
+      notification: {source:{kind:"delegated_task",task_ids:tasks.map((child)=>child.plan.threadId)},outcome:tasks.some((child)=>child.status === "failed") ? "failed" : "completed",summary:"Delegated results"},
     }),
   );
   streamReply(run, replyFor(tasks), 420);
@@ -617,7 +621,8 @@ export function mockDelegatedChildTranscript(threadId: string): string[] | null 
   if (!child) return null;
   const turnId = `mock-delegation-child-${threadId}`;
   const out: unknown[] = [
-    { type: "user_message", thread_id: threadId, text: child.plan.task + CHILD_FOOTER },
+    { type: "user_message", thread_id: threadId, text: child.plan.task, agent_text: child.plan.task + CHILD_FOOTER,
+      message_id:`mock-task-${threadId}`,created_by:"agent",creation_source:"provider",sender_thread_id:child.run.parentThreadId,sender_title:"Parent agent",input_intent:"turn_start" },
   ];
   if (child.status === "completed" || child.status === "failed") {
     out.push({

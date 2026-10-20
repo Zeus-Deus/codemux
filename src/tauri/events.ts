@@ -425,6 +425,30 @@ export type QuestionResolution =
       message: string;
     };
 
+export interface MessageNotification {
+  source: {
+    kind: "delegated_task" | "remote_task" | "subagent" | "automation" | "system";
+    task_ids: string[];
+    child_thread_id?: string;
+  };
+  outcome: "completed" | "failed" | "cancelled" | "updated" | "unknown";
+  summary: string;
+}
+
+/** Optional only for historical rows and optimistic composer input. */
+export interface MessageProvenance {
+  message_id?: string;
+  created_by?: "user" | "agent" | "system";
+  creation_source?: "unknown" | "desktop" | "web" | "phone" | "mcp" | "provider" | "codemux";
+  sender_thread_id?: string;
+  sender_title?: string;
+  input_intent?: "turn_start" | "queued_turn" | "steer" | "promoted_queued_to_steer";
+  notification?: MessageNotification;
+  automation_id?: string;
+  automation_run_id?: string;
+  delivery_id?: string;
+}
+
 export type ProviderRuntimeEvent =
   | {
       type: "context_compaction_changed";
@@ -588,7 +612,7 @@ export type ProviderRuntimeEvent =
   // that row on every `id > cursor` tail read thereafter. The sending
   // client already painted the bubble and drops this copy by
   // `client_nonce`.
-  | {
+  | (MessageProvenance & {
       type: "user_message";
       steered_turn_id?: string;
       thread_id: string;
@@ -600,11 +624,11 @@ export type ProviderRuntimeEvent =
       /** The composer's correlation token for the optimistic bubble this
        *  turn was sent as. Absent when the sender supplied none. */
       client_nonce?: string;
-    }
+    })
   // Follow-up queueing (mirrors `ProviderRuntimeEvent` in
   // src-tauri/src/agent_provider/events.rs). A send that arrives while a
   // turn is in flight is queued instead of rejected.
-  | {
+  | (MessageProvenance & {
       type: "turn_queued";
       thread_id: string;
       queued_id: string;
@@ -613,7 +637,7 @@ export type ProviderRuntimeEvent =
        *  `null` for older callers / a remounted pane. */
       client_nonce: string | null;
       text: string;
-    }
+    })
   | {
       type: "queued_turn_dispatched";
       steered?: boolean;

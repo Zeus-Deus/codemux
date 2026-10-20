@@ -1,5 +1,8 @@
-import { memo, useCallback, useState } from "react";
-import { CornerDownLeft, ImageOff, Undo2, X } from "lucide-react";
+import { InlineButton } from "@/components/ui/button";
+import { messageAttribution } from "@/lib/agent-chat/message-provenance";
+import { openDelegatedChat } from "./delegation-actions";
+import { memo, useCallback, useEffect, useState } from "react";
+import { CornerDownLeft, ImageOff, Redo2, Undo2, X } from "lucide-react";
 
 import {
   ImageLightbox,
@@ -13,7 +16,7 @@ import {
   MESSAGE_GROUP_CLASS,
 } from "@/components/chat/message-action";
 import { isAbsoluteFsPath, resolveAssetSrc } from "@/lib/asset-url";
-import { readChatImage } from "@/tauri/commands";
+import { agentChatGetSession, readChatImage } from "@/tauri/commands";
 import type { UserMessageImage, UserMessageItem } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 
@@ -121,6 +124,18 @@ export const UserMessage = memo(function UserMessage({
   reverting?: boolean;
 }) {
   const queued = item.queued;
+  const attribution = messageAttribution(item);
+  const [senderExists, setSenderExists] = useState<boolean | null>(null);
+  useEffect(() => {
+    setSenderExists(null);
+    if (attribution !== "agent" || !item.sender_thread_id) return;
+    let current = true;
+    void agentChatGetSession(item.sender_thread_id).then((sender) => {
+      if (current) setSenderExists(sender !== null);
+    }).catch(() => { if (current) setSenderExists(false); });
+    return () => { current = false; };
+  }, [attribution, item.sender_thread_id]);
+  const steer = item.input_intent === "steer" || item.input_intent === "promoted_queued_to_steer";
   const images = item.images ?? [];
   // Index of the image currently shown in the lightbox, or `null` when
   // it's closed. Tracked here (not per-thumbnail) so the same dialog
@@ -136,6 +151,16 @@ export const UserMessage = memo(function UserMessage({
     // its own.
     <div className={cn(MESSAGE_GROUP_CLASS, "group flex justify-end")}>
       <div className="flex max-w-[82%] flex-col items-end gap-1">
+        {attribution && <p className="me-1 text-caption text-muted-foreground/70" data-user-message-attribution={attribution}>
+          {attribution === "agent" ? (item.sender_thread_id && senderExists === true
+            ? <InlineButton tone="muted" aria-label="Open sending chat" title={item.sender_title} onClick={() => { if (item.sender_thread_id) void openDelegatedChat(item.sender_thread_id); }}>Sent by another agent</InlineButton>
+            : <span title={item.sender_title}>Sent by another agent{item.sender_title ? ` · ${item.sender_title}` : ""}</span>)
+            : attribution === "automation" ? "Sent by automation" : "Sent by Codemux"}
+        </p>}
+        {!queued && (steer || item.input_intent === "queued_turn") && <span className="me-1 flex items-center justify-end gap-1 text-label leading-none text-muted-foreground"
+          title={item.input_intent === "promoted_queued_to_steer" ? "Originally queued, then promoted to steer the active turn" : steer ? "Steered the active turn" : "Queued behind the active turn"}>
+          {steer && <Redo2 className="size-3" aria-hidden />}{steer ? "Steer" : "Queued"}
+        </span>}
         <div
           className={cn(
             "conversation-text flex flex-col gap-2 rounded-[14px_14px_5px_14px] border px-[15px] py-[11px] leading-relaxed",
@@ -192,8 +217,6 @@ export const UserMessage = memo(function UserMessage({
               Queued
             </span>
           </div>
-        ) : item.inflight && !item.in_reply_to ? (
-          <span className="text-caption text-muted-foreground" title="Guidance accepted within the current turn">Steered</span>
         ) : item.text || onRevert ? (
           // Shared footer strip. Revert stays anchored to the bubble's right
           // edge where it has always been, and Copy takes the slot to its

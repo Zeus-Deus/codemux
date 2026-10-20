@@ -1,3 +1,4 @@
+import type { MessageProvenance } from "./events";
 import { containsPane, projectRemotePanes, rememberRemotePane } from "@/remote/pane-selection";
 import type { MessageDelivery } from "@/lib/agent-chat/message-delivery";
 import { invoke, Channel } from "@tauri-apps/api/core";
@@ -1700,6 +1701,7 @@ export interface AgentChatStartSessionInput {
 }
 
 export interface AgentChatSendTurnInput {
+  input_source?: "desktop" | "web" | "phone";
   delivery?: MessageDelivery;
   thread_id: string;
   text: string;
@@ -1829,7 +1831,10 @@ export const agentChatStartSession = async (
 export const agentChatSendTurn = (
   provider: AgentChatProviderKind,
   input: AgentChatSendTurnInput,
-) => invoke<TurnStartResult>("agent_chat_send_turn", { provider, input });
+) => invoke<TurnStartResult>("agent_chat_send_turn", {
+  provider,
+  input: { ...input, input_source: input.input_source ?? (isRemoteClient() ? (window.matchMedia("(max-width: 767px)").matches ? "phone" : "web") : "desktop") },
+});
 
 /** Stage a pasted/attached image's raw bytes to a backend staging file,
  *  moving the (potentially multi-MB) upload off the send path. The bytes
@@ -4030,7 +4035,7 @@ export const webRemotePushDevices = () =>
 // for the user. See src-tauri/src/commands/queued_turns.rs.
 
 /** One queued turn, in dispatch order. */
-export interface QueuedTurnView {
+export interface QueuedTurnView extends MessageProvenance {
   queued_id: string;
   text: string;
   /** Queued before this app run; no provider holds it. */

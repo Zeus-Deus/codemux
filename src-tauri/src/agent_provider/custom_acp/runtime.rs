@@ -1661,6 +1661,7 @@ impl Session {
             }
             let id = format!("acp-queued-{}", Uuid::new_v4());
             self.emit(ProviderRuntimeEvent::TurnQueued {
+                provenance: Default::default(),
                 thread_id: self.thread.clone(),
                 queued_id: id.clone(),
                 client_nonce: input.client_nonce.clone(),
@@ -1806,7 +1807,8 @@ impl Session {
                     json!({"sessionId":native,"prompt":prompt}),
                     Duration::from_secs(24 * 60 * 60),
                     || async {
-                        let allowed = self.turn_admitted(&turn).await;
+                        let allowed = self.turn_admitted(&turn).await
+                            && input.turn_checkpoint.as_ref().is_none_or(|checkpoint| checkpoint.authorize_dispatch().is_ok());
                         // Set only under the acquired writer, on successful
                         // exact-turn admission. A revoked unsent prompt needs
                         // neither a frame nor a session/cancel notification.

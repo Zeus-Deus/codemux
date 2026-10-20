@@ -5,8 +5,12 @@ import type { UserMessageItem } from "@/lib/agent-chat/types";
 
 // The IPC read fallback the hydrated fs-path images lean on.
 const readChatImageMock = vi.fn();
+const getSessionMock = vi.fn();
+const openChatMock = vi.fn();
+vi.mock("./delegation-actions", () => ({openDelegatedChat:(...args:unknown[])=>openChatMock(...args)}));
 vi.mock("@/tauri/commands", () => ({
   readChatImage: (...args: unknown[]) => readChatImageMock(...args),
+  agentChatGetSession: (...args: unknown[]) => getSessionMock(...args),
 }));
 
 // Force `resolveAssetSrc` to hand an absolute fs path straight to the
@@ -139,5 +143,37 @@ describe("queued message delivery actions", () => {
     const { queryByRole, getByRole } = render(<UserMessage item={queued} onSendQueuedNow={vi.fn()} />);
     expect(queryByRole("button", { name: "Steer with queued message" })).toBeNull();
     expect(getByRole("button", { name: "Interrupt and send queued message" })).toBeTruthy();
+  });
+});
+
+
+describe("UserMessage provenance", () => {
+  it("opens the sending chat through the attribution action", async () => {
+    getSessionMock.mockResolvedValue({thread_id:"sender",title:"Review agent"});
+    const {getByRole,container}=render(<UserMessage item={{...makeItem([]),created_by:"agent",creation_source:"provider",sender_thread_id:"sender",sender_title:"Review agent"}} />);
+    const button=await waitFor(()=>getByRole("button",{name:"Open sending chat"}));
+    fireEvent.click(button);
+    expect(openChatMock).toHaveBeenCalledWith("sender");
+    expect(container.querySelector('[data-user-message-attribution="agent"]')?.textContent).toBe("Sent by another agent");
+  });
+  it("keeps the title snapshot as plain text for a deleted sender", async () => {
+    getSessionMock.mockResolvedValue(null);
+    const {queryByRole,getByText}=render(<UserMessage item={{...makeItem([]),created_by:"agent",sender_thread_id:"deleted",sender_title:"Previous reviewer"}} />);
+    await waitFor(()=>expect(getSessionMock).toHaveBeenCalledWith("deleted"));
+    expect(getByText("Sent by another agent · Previous reviewer")).toBeTruthy();
+    expect(queryByRole("button",{name:"Open sending chat"})).toBeNull();
+  });
+  it("attributes app-authored input to Codemux", () => {
+    const {getByText}=render(<UserMessage item={{...makeItem([]),created_by:"system",creation_source:"codemux"}} />);
+    expect(getByText("Sent by Codemux")).toBeTruthy();
+  });
+  it.each([ ["queued_turn","Queued","Queued behind the active turn"], ["steer","Steer","Steered the active turn"], ["promoted_queued_to_steer","Steer","Originally queued, then promoted to steer the active turn"] ] as const)("renders persisted %s intent after completion", (input_intent,label,title) => {
+    const {getByText}=render(<UserMessage item={{...makeItem([]),input_intent,inflight:false}} />);
+    expect(getByText(label).getAttribute("title")).toBe(title);
+  });
+  it("does not guess intent from a legacy inflight flag", () => {
+    const {queryByText}=render(<UserMessage item={{...makeItem([]),inflight:true}} />);
+    expect(queryByText("Steer")).toBeNull();
+    expect(queryByText("Steered")).toBeNull();
   });
 });

@@ -113,6 +113,7 @@ fn start_input(thread_id: &str, cwd: &str) -> StartSessionInput {
 
 fn queued(thread_id: &str, text: &str) -> SendTurnCommandInput {
     SendTurnCommandInput {
+        input_source: None,
         delivery: MessageDelivery::Queue,
         thread_id: ThreadId(thread_id.into()),
         text: text.into(),

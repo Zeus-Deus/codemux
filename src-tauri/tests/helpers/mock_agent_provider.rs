@@ -78,6 +78,7 @@ pub struct MockAgentProvider {
     /// runs turns itself, so tests set this to stand in for one.
     active_turns: Mutex<HashSet<ThreadId>>,
     send_error: Mutex<Option<ProviderError>>,
+    send_error_after_accept: Mutex<Option<ProviderError>>,
     /// Every `StartSessionInput` received, in order, so tests can assert
     /// on what the command layer actually handed the provider (workspace
     /// id, env overlay, resume cursor) rather than only that it was called.
@@ -100,6 +101,7 @@ impl MockAgentProvider {
             start_gate: Mutex::new(None),
             active_turns: Mutex::new(HashSet::new()),
             send_error: Mutex::new(None),
+            send_error_after_accept: Mutex::new(None),
             start_inputs: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -160,6 +162,10 @@ impl MockAgentProvider {
     #[allow(dead_code)]
     pub fn fail_next_send(&self, error: ProviderError) {
         *self.send_error.lock().unwrap() = Some(error);
+    }
+
+    pub fn fail_next_send_after_accept(&self,error:ProviderError) {
+        *self.send_error_after_accept.lock().unwrap()=Some(error);
     }
 
     /// Convenience: emit a runtime event via the broadcaster, the
@@ -244,9 +250,11 @@ impl AgentProvider for MockAgentProvider {
         let checkpoint = input.turn_checkpoint.clone();
         if let Some(checkpoint) = checkpoint.as_ref() {
             checkpoint.prepare().await;
+            checkpoint.authorize_dispatch()?;
         }
         self.calls
             .push(MockCall::SendTurn(input.thread_id.clone(), input.text));
+        if let Some(error)=self.send_error_after_accept.lock().unwrap().take() { return Err(error); }
         if let Some(checkpoint) = checkpoint.as_ref() {
             checkpoint.commit().await;
         }

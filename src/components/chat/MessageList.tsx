@@ -37,7 +37,6 @@ import {
   type ChatViewItem,
   type PermissionRequestItem,
 } from "@/lib/agent-chat/types";
-import { isDelegationResultsText } from "@/lib/agent-chat/delegation";
 import { isRestartResumeText } from "@/lib/agent-chat/restart-resume";
 import {
   isAutoResumeText,
@@ -1943,9 +1942,9 @@ function ItemRow({
   if (
     item.kind === "user_message" &&
     !item.queued &&
-    isDelegationResultsText(item.text)
+    item.notification?.source.kind === "delegated_task"
   ) {
-    return <DelegationResultsDivider text={item.text} />;
+    return <DelegationResultsDivider text={item.text} notification={item.notification} />;
   }
 
   if (item.kind === "provider_switch") {

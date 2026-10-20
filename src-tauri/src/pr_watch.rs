@@ -852,6 +852,7 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
         Decision::Wake(report) => {
             let (text, display_text) = render_wake(&next, &view, report, &excerpts);
             let input = SendTurnCommandInput {
+                input_source: None,
                 thread_id: ThreadId(next.thread_id.clone()),
                 text,
                 display_text: Some(display_text),
@@ -876,7 +877,11 @@ async fn sweep_one<R: Runtime>(app: &AppHandle<R>, watch: &PrWatchRecord) -> Res
                 // same nonce. Once dispatch was attempted the turn may have
                 // landed, and a duplicate wake is worse than a missed one
                 // the UI reports, so that is not retried.
-                let unmark: &[String] = if reached {
+                // A durable outbox admission owns retries even when the
+                // first attempt failed before bytes. Never coalesce those
+                // same events into another wake while it is pending/held.
+                let admitted=db.message_delivery_for_message(&next.thread_id,&wake_nonce(&next,&evaluation.delivered)).ok().flatten().is_some();
+                let unmark: &[String] = if reached || admitted {
                     &[]
                 } else {
                     refund_wake(&mut next, watch, report);

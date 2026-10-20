@@ -590,14 +590,16 @@ async fn review5479417968_immediate_envelope_and_late_steering_remain_one_comple
     // real command must still correlate its late visible envelope by ID.
     agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::TurnCompleted {thread_id:ThreadId(thread.into()),turn_id:TurnId("mock-turn".into()),status:TurnStatus::Success,usage:None});
     release.notify_one();let result=send.await.unwrap();assert_eq!(result.turn_id.0,"mock-turn");
-    agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::TurnQueued {thread_id:ThreadId(thread.into()),queued_id:"cancel-me".into(),text:"must not replay".into(),client_nonce:None});
+    agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::TurnQueued {provenance: Default::default(),thread_id:ThreadId(thread.into()),queued_id:"cancel-me".into(),text:"must not replay".into(),client_nonce:None});
     agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::QueuedTurnCancelled {thread_id:ThreadId(thread.into()),queued_id:"cancel-me".into()});
     agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::QueuedTurnDispatched {thread_id:ThreadId(thread.into()),queued_id:"late-steer".into(),turn_id:TurnId("mock-turn".into()),text:"late guidance".into(),steered:true});
     let snapshot=std::env::var_os("CODEMUX_MARIO_RECEIPT").map(std::path::PathBuf::from).map(|p|p.with_file_name("review-immediate-steered.sqlite")).unwrap_or_else(||root.path().join("snapshot.sqlite"));
     let db=app.state::<crate::database::DatabaseStore>().control_fixture_snapshot(&snapshot);
     let rows:Vec<serde_json::Value>=db.list_agent_chat_messages(thread).iter().map(|p|serde_json::from_str(p).unwrap()).collect();
     let user=rows.iter().find(|r|r["type"]=="user_message" && r["client_nonce"]=="immediate-nonce").unwrap();
-    assert_eq!(user,&json!({"type":"user_message","thread_id":thread,"text":"immediate visible","client_nonce":"immediate-nonce"}),"ordinary user envelope fields are unchanged");
+    for (field,expected) in [("type",json!("user_message")),("thread_id",json!(thread)),("text",json!("immediate visible")),("client_nonce",json!("immediate-nonce")),("message_id",json!("immediate-nonce")),("created_by",json!("user")),("creation_source",json!("desktop"))] {
+        assert_eq!(user[field],expected,"Envelope {field} must preserve its meaning");
+    }
     let steer=rows.iter().find(|r|r["type"]=="user_message" && r["text"]=="late guidance").unwrap();
     assert_eq!(steer["steered_turn_id"],"mock-turn");
     for journal in rows.iter().filter(|r|r["type"]=="native_user_control") {
@@ -832,7 +834,7 @@ async fn settle_operation(app: &tauri::App<tauri::test::MockRuntime>, receipt: &
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn follow_up_send_uses_native_intake_once_and_persists_visible_user_message() {
+async fn orchestration_message_controller_retries_and_persists_caller_provenance() {
     let (app, provider, _root, workspace) = fixture().await;
     let launched = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
         "workspace_id":workspace,"client_request_id":"launch-send","provider":"claude","permission_mode":"default",
@@ -840,15 +842,28 @@ async fn follow_up_send_uses_native_intake_once_and_persists_visible_user_messag
     let launched = settle_operation(&app,&launched).await;
     assert_eq!(launched["state"], "succeeded");
     let thread = launched["thread_id"].as_str().unwrap();
+    app.state::<crate::database::DatabaseStore>().upsert_agent_chat_usage_resume(thread,"claude",Some(9999999999999)).unwrap();
     let args = json!({"workspace_id":workspace,"thread_id":thread,"client_request_id":"send-a","message":"Synthetic follow-up","delivery":"queue"});
     let receipt = execute(app.handle(), &ControlCaller::trusted(), "thread_send", args.clone()).await.unwrap();
     let delivered = settle_operation(&app,&receipt).await;
     assert_eq!(delivered["state"], "succeeded", "{delivered}");
-    let retry = execute(app.handle(), &ControlCaller::trusted(), "thread_send", args).await.unwrap();
+    let retry = execute(app.handle(), &ControlCaller::trusted(), "thread_send", args.clone()).await.unwrap();
     assert_eq!(retry["operation_id"], receipt["operation_id"]);
     let transcript = execute(app.handle(), &ControlCaller::trusted(), "thread_read", json!({"workspace_id":workspace,"thread_id":thread})).await.unwrap();
     assert_eq!(transcript["messages"][0]["content"], "Synthetic follow-up");
     assert_eq!(provider.calls.snapshot().iter().filter(|call| matches!(call,mock_agent_provider::MockCall::SendTurn(_, _))).count(),1);
+    let mut changed=args.clone(); changed["message"]=json!("different payload");
+    assert_eq!(execute(app.handle(),&ControlCaller::trusted(),"thread_send",changed).await.unwrap_err().code,"request_key_conflict");
+    let db=app.state::<crate::database::DatabaseStore>();
+    let messages:Vec<serde_json::Value>=db.list_agent_chat_messages(thread).iter().map(|p|serde_json::from_str(p).unwrap()).filter(|p:&serde_json::Value|p["type"]=="user_message").collect();
+    assert_eq!(messages.len(),1);
+    assert_eq!(messages[0]["created_by"],"user");
+    assert_eq!(messages[0]["creation_source"],"mcp");
+    assert_eq!(messages[0]["input_intent"],"turn_start");
+    assert!(messages[0]["message_id"].is_string());
+
+    assert!(db.get_agent_chat_usage_resume(thread).is_some(),"Controller input must not reset human activity or resume budgets");
+
 }
 
 #[tokio::test]
@@ -1017,7 +1032,7 @@ async fn workspace_chat_launch_shares_native_start_without_selecting_workspace()
     std::fs::create_dir(root.path().join("worktree")).unwrap();
     let target = app.state::<crate::state::AppStateStore>().create_empty_workspace_at_path(root.path().join("worktree"));
     app.state::<crate::state::AppStateStore>().activate_workspace(&parent);
-    let caller = ControlCaller { principal: "thread:parent".into(), access: ControlAccess::FullAccess, grant_id: None };
+    let caller = ControlCaller { created_by: crate::agent_provider::message::CreatedBy::Agent, principal: "thread:parent".into(), access: ControlAccess::FullAccess, grant_id: None };
     let prepared = service::PreparedWorkspaceChat::prepare(app.handle(), &caller,
         crate::agent_provider::ProviderKind::Claude, "Fix sidebar tests".into(), "Self-contained fixture brief".into(), None, None,
     ).await.unwrap();
@@ -1063,4 +1078,125 @@ async fn workspace_chat_permission_changes_refresh_the_host_tool_catalog() {
         crate::agent_provider::ProviderKind::Claude, crate::agent_provider::ThreadId("parent".into()), "default".into(),
     ).await.unwrap();
     assert_eq!(updates.try_recv().unwrap().id, "codemux-host");
+}
+
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_accept_then_lost_ack_does_not_dispatch_again() {
+    let (app,provider,_root,workspace)=fixture().await;
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"fault-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let launched=settle_operation(&app,&receipt).await;
+    let thread=launched["thread_id"].as_str().unwrap();
+    provider.fail_next_send_after_accept(crate::agent_provider::ProviderError::RpcError {message:"fixture: accepted bytes, ACK dropped".into()});
+    let args=json!({"workspace_id":workspace,"thread_id":thread,"client_request_id":"fault-send","message":"Review the fixture"});
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_send",args.clone()).await.unwrap();
+    let outcome=settle_operation(&app,&receipt).await;
+    assert_eq!(outcome["state"],"needs_attention","{outcome}");
+    assert_eq!(outcome["dispatch_disposition"],"held_unknown");
+    let retry=execute(app.handle(),&ControlCaller::trusted(),"thread_send",args).await.unwrap();
+    assert_eq!(retry["operation_id"],receipt["operation_id"]);
+    let db=app.state::<crate::database::DatabaseStore>();
+    let row=db.message_delivery(receipt["delivery_id"].as_str().unwrap()).unwrap().unwrap();
+    super::delivery::dispatch(app.handle(),row).await;
+    assert_eq!(provider.calls.snapshot().iter().filter(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(_, _))).count(),1);
+    let status=execute(app.handle(),&ControlCaller::trusted(),"thread_status",json!({"workspace_id":workspace,"thread_id":thread})).await.unwrap();
+    assert_eq!(status["phase"],"needs_attention");
+    assert!(!status["deliveries_needing_attention"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_pre_send_failure_retries_original_identity() {
+    let (app,provider,_root,workspace)=fixture().await;
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"retry-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let launched=settle_operation(&app,&receipt).await;
+    let thread=launched["thread_id"].as_str().unwrap();
+    provider.fail_next_send(crate::agent_provider::ProviderError::ValidationError {message:"fixture: definitely before bytes".into()});
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_send",json!({"workspace_id":workspace,"thread_id":thread,"client_request_id":"retry-send","message":"Review the fixture"})).await.unwrap();
+    let id=receipt["delivery_id"].as_str().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5),async {
+        loop {
+            let row=app.state::<crate::database::DatabaseStore>().message_delivery(id).unwrap().unwrap();
+            if row.state=="pending" && row.error.is_some() { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let row=app.state::<crate::database::DatabaseStore>().message_delivery(id).unwrap().unwrap();
+    let message_id=row.message_id.clone(); let attempt=row.attempt_id.clone();
+    super::delivery::dispatch(app.handle(),row).await;
+    let delivered=settle_operation(&app,&receipt).await;
+    assert_eq!(delivered["state"],"succeeded","{delivered}");
+    let row=app.state::<crate::database::DatabaseStore>().message_delivery(id).unwrap().unwrap();
+    assert_eq!(row.message_id,message_id);assert_eq!(row.attempt_id,attempt);
+    assert_eq!(provider.calls.snapshot().iter().filter(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(_, _))).count(),1);
+}
+
+#[tokio::test]
+async fn orchestration_message_queue_edit_promotion_preserves_live_and_persisted_provenance() {
+    use crate::agent_provider::{message::*,ProviderRuntimeEvent,ThreadId,TurnId};
+    let (app,_provider,_root,workspace)=fixture().await;
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_session("receiver",&workspace,None,"claude").unwrap();
+    let events=mario_channel(app.handle(),"receiver");
+    let provenance=MessageProvenance {message_id:Some("stable-queued".into()),created_by:CreatedBy::Agent,
+        creation_source:CreationSource::Provider,sender_thread_id:Some("sender".into()),sender_title:Some("Review agent".into()),..Default::default()};
+    crate::commands::agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::TurnQueued {
+        provenance,thread_id:ThreadId("receiver".into()),queued_id:"queue".into(),client_nonce:Some("nonce".into()),text:"Review".into(),
+    });
+    crate::commands::agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::QueuedTurnEdited {
+        thread_id:ThreadId("receiver".into()),queued_id:"queue".into(),text:"Edited review".into(),
+    });
+    assert_eq!(db.get_queued_turn("receiver","queue").unwrap().provenance.created_by,CreatedBy::Agent);
+    crate::commands::agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::QueuedTurnDispatched {
+        thread_id:ThreadId("receiver".into()),queued_id:"queue".into(),turn_id:TurnId("active".into()),text:"Edited review".into(),steered:true,
+    });
+    let rows:Vec<serde_json::Value>=db.list_agent_chat_messages("receiver").iter().map(|p|serde_json::from_str(p).unwrap()).filter(|p:&serde_json::Value|p["type"]=="user_message").collect();
+    assert_eq!(rows.len(),1);let row=&rows[0];
+    assert_eq!(row["message_id"],"stable-queued");assert_eq!(row["sender_title"],"Review agent");
+    assert_eq!(row["created_by"],"agent");assert_eq!(row["input_intent"],"promoted_queued_to_steer");
+    assert_eq!(row["text"],"Edited review");
+    let live=events.lock().unwrap();let live=live.iter().find(|event|event["event"]["type"]=="user_message").unwrap();
+    for field in ["message_id","created_by","creation_source","sender_thread_id","sender_title","input_intent","text"] {
+        assert_eq!(live["event"][field],row[field],"Live and persisted {field} must agree");
+    }
+    assert!(db.list_queued_turns("receiver").is_empty());
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_saved_resend_keeps_agent_identity_and_text_split() {
+    use crate::agent_provider::message::*;
+    let (app,provider,_root,workspace)=fixture().await;
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"saved-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let launched=settle_operation(&app,&receipt).await;let thread=launched["thread_id"].as_str().unwrap();
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_usage_resume(thread,"claude",Some(9999999999999)).unwrap();
+    db.insert_queued_turn(&crate::database::queued_turns::QueuedTurnRecord {
+        provenance:MessageProvenance {message_id:Some("saved-agent-message".into()),created_by:CreatedBy::Agent,creation_source:CreationSource::Provider,
+            sender_thread_id:Some("sender".into()),sender_title:Some("Review agent".into()),origin:Some(crate::commands::agent_chat::TurnOrigin::Delegation),..Default::default()},
+        thread_id:thread.into(),queued_id:"saved".into(),position:0,text:"Visible brief".into(),prompt:Some("Visible brief\nAgent-only footer".into()),
+        skill_ids:vec![],skill_text:None,include_plugins:false,images:vec![],client_nonce:Some("original-nonce".into()),
+        model_override:None,effort_override:None,permission_mode_override:None,epoch:"previous-run".into(),
+    }).unwrap();
+    crate::commands::queued_turns::agent_chat_send_saved_queued_turn(app.handle().clone(),crate::agent_provider::ProviderKind::Claude,crate::agent_provider::ThreadId(thread.into()),"saved".into(),crate::agent_provider::types::MessageDelivery::Queue).await.unwrap();
+    let rows:Vec<serde_json::Value>=db.list_agent_chat_messages(thread).iter().map(|p|serde_json::from_str(p).unwrap()).filter(|p:&serde_json::Value|p["type"]=="user_message").collect();
+    assert_eq!(rows.len(),1);assert_eq!(rows[0]["message_id"],"saved-agent-message");assert_eq!(rows[0]["created_by"],"agent");
+    assert_eq!(rows[0]["input_intent"],"queued_turn");assert_eq!(rows[0]["text"],"Visible brief");assert_eq!(rows[0]["agent_text"],"Visible brief\nAgent-only footer");
+    assert!(db.get_agent_chat_usage_resume(thread).is_some());assert!(db.list_queued_turns(thread).is_empty());
+    assert!(provider.calls.snapshot().iter().any(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(_,text) if text=="Visible brief\nAgent-only footer")));
+}
+
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn orchestration_message_only_interactive_sources_reset_human_activity() {
+    let (app,_provider,_root,workspace)=fixture().await;
+    let receipt=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"source-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let launched=settle_operation(&app,&receipt).await;let thread=launched["thread_id"].as_str().unwrap();
+    let db=app.state::<crate::database::DatabaseStore>();
+    for source in ["desktop","web","phone"] {
+        db.upsert_agent_chat_usage_resume(thread,"claude",Some(9999999999999)).unwrap();
+        let command=serde_json::from_value(json!({"thread_id":thread,"text":format!("Human {source}"),"client_nonce":format!("human-{source}"),"input_source":source})).unwrap();
+        crate::commands::agent_chat::agent_chat_send_turn(app.handle().clone(),crate::agent_provider::ProviderKind::Claude,command).await.unwrap();
+        assert!(db.get_agent_chat_usage_resume(thread).is_none());
+        let row=db.list_agent_chat_messages(thread).into_iter().filter_map(|p|serde_json::from_str::<serde_json::Value>(&p).ok()).find(|p|p["message_id"]==format!("human-{source}")).unwrap();
+        assert_eq!(row["created_by"],"user");assert_eq!(row["creation_source"],source);
+    }
 }

@@ -1,3 +1,4 @@
+import { messageProvenance } from "./message-provenance";
 import type {
   ApprovalDecision,
   CompletedItem,
@@ -1199,6 +1200,7 @@ function appendUserMessageLocal(
   now: Clock,
   clientNonce?: string,
   images?: UserMessageImage[],
+  provenance?: import("@/tauri/events").MessageProvenance,
 ): ChatThreadState {
   let sealed = sealTrailingReasoning(state, now);
   // A new user turn while nothing is streaming is a fresh boundary —
@@ -1224,6 +1226,7 @@ function appendUserMessageLocal(
   }
   const { seq, next } = takeSeq(sealed);
   const item: UserMessageItem = {
+    ...provenance,
     kind: "user_message",
     id: nextId("user"),
     seq,
@@ -1579,20 +1582,21 @@ function applyEventInner(
     case "user_message": {
       if (event.steered_turn_id) {
         const index = state.messages.findIndex((item) =>
-          item.kind === "user_message" && !!event.client_nonce &&
-          item.clientNonce === event.client_nonce,
+          item.kind === "user_message" && ((!!event.message_id && item.message_id === event.message_id) ||
+          (!!event.client_nonce && item.clientNonce === event.client_nonce)),
         );
         const existing = state.messages[index];
         const previous = existing?.kind === "user_message" ? existing : undefined;
         const needsSequence = !previous || !!previous.queued;
         const item: UserMessageItem = {
           ...previous,
+          ...messageProvenance(event),
           kind: "user_message",
           id: previous?.id ?? nextId("user"),
           seq: needsSequence ? state.nextSeq : previous.seq,
           text: event.text,
           clientNonce: event.client_nonce,
-          created_at: previous?.inflight ? previous.created_at : now(),
+          created_at: previous?.created_at ?? now(),
           queued: undefined,
           inflight: true,
           turn_id: event.steered_turn_id,
@@ -1621,18 +1625,21 @@ function applyEventInner(
       // sender appended, on the greyed bubble `turn_queued` reconstructs,
       // and on this envelope — so whoever already has the turn on screen
       // skips it, and whoever does not inserts it in row order.
-      if (event.client_nonce) {
+      if (event.message_id || event.client_nonce) {
         const existingIdx = state.messages.findIndex(
           (m) =>
             m.kind === "user_message" &&
-            m.clientNonce === event.client_nonce,
+            ((!!event.message_id && m.message_id === event.message_id) ||
+             (!!event.client_nonce && m.clientNonce === event.client_nonce)),
         );
         if (existingIdx >= 0) {
           // A queued turn's user-message envelope is only persisted when
           // that turn dispatches. Therefore a matching durable row is also
           // an authoritative dispatch signal when the pane missed the
           // live-only `queued_turn_dispatched` event while detached.
-          return promoteQueuedUserMessage(state, existingIdx, now);
+          const next = promoteQueuedUserMessage(state, existingIdx, now);
+          const existing = next.messages[existingIdx] as UserMessageItem;
+          return { ...next, messages: replaceItem(next.messages, existingIdx, { ...existing, ...messageProvenance(event), text: event.text }) };
         }
       }
       // Persisted `images` carry absolute paths; the bubble's display
@@ -1647,6 +1654,7 @@ function applyEventInner(
         now,
         event.client_nonce,
         images,
+        messageProvenance(event),
       );
     }
 
@@ -2289,17 +2297,16 @@ function applyEventInner(
       // re-seq it into the QUEUED band so it pins to the bottom below
       // the streaming turn.
       const nonce = event.client_nonce;
-      const existingIdx =
-        nonce != null
-          ? state.messages.findIndex(
-              (m) => m.kind === "user_message" && m.clientNonce === nonce,
-            )
-          : -1;
+      const existingIdx = state.messages.findIndex(
+        (m) => m.kind === "user_message" && ((!!event.message_id && m.message_id === event.message_id) || (!!nonce && m.clientNonce === nonce)),
+      );
       if (existingIdx >= 0) {
         const existing = state.messages[existingIdx] as UserMessageItem;
         const { seq, next } = takeSeq(state);
         const updated: UserMessageItem = {
           ...existing,
+          ...messageProvenance(event),
+          input_intent: "queued_turn",
           queued: { queuedId: event.queued_id },
           seq: QUEUED_SEQ_BASE + seq,
         };
@@ -2310,6 +2317,8 @@ function applyEventInner(
       const { seq, next } = takeSeq(state);
       const item: UserMessageItem = {
         kind: "user_message",
+        ...messageProvenance(event),
+        input_intent: "queued_turn",
         id: nextId("queued"),
         seq: QUEUED_SEQ_BASE + seq,
         text: event.text,
@@ -2335,6 +2344,7 @@ function applyEventInner(
         nextSeq: state.nextSeq + 1,
         messages: replaceItem(state.messages, idx, {
           ...rest,
+          input_intent: "promoted_queued_to_steer",
           seq: state.nextSeq,
           created_at: now(),
           inflight: true,
