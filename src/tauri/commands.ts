@@ -2370,6 +2370,10 @@ export const agentChatListMessagesBefore = (
 export const agentChatGetToolResult = (rowId: number) =>
   invoke<string>("agent_chat_get_tool_result", { rowId });
 
+/** Resolve one validated image without transferring the rest of the result. */
+export const agentChatGetToolResultImage = (rowId: number, pointer: string, inline = false) =>
+  invoke<{ src: string; local: boolean }>("agent_chat_get_tool_result_image", { rowId, pointer, inline });
+
 /** A filesystem baseline captured immediately before one accepted user turn.
  *  The nonce binds it to the rendered user bubble; the cutoff is the durable
  *  transcript row that remains after a true revert. */

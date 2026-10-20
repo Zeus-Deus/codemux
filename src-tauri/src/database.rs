@@ -1501,6 +1501,13 @@ fn conversation_fts_query(query: &str) -> Option<String> {
 }
 
 impl DatabaseStore {
+    #[cfg(test)]
+    pub(crate) fn test_file(path: &std::path::Path) -> Self {
+        let conn = open_connection(path).unwrap();
+        create_schema(&conn).unwrap();
+        Self { conn: Mutex::new(conn) }
+    }
+
     /// Create an in-memory database (fallback if file DB fails, and for tests).
     pub fn new_in_memory() -> Self {
         let conn = Connection::open_in_memory().expect("Failed to open in-memory database");
@@ -5176,6 +5183,41 @@ impl DatabaseStore {
             |row| row.get::<_, String>(0),
         )
         .ok()
+    }
+
+    /// The owning session comes from SQLite, not the provider envelope (forks
+    /// and merges may copy that envelope verbatim).
+    pub fn get_agent_chat_message_with_thread(&self, row_id: i64) -> Option<(String, String)> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT thread_id, payload FROM agent_chat_messages WHERE id = ?1",
+            params![row_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()
+    }
+
+    /// Rare cache cleanup must preserve durable image references even when
+    /// their original session has already merged away. Keep large tool rows
+    /// out of Rust unless they carry an ownership field. The text gate avoids
+    /// parsing ordinary base64 tool rows; escaped keys still take the JSON path.
+    pub(crate) fn list_agent_chat_image_payloads(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            r#"SELECT payload FROM agent_chat_messages
+               WHERE CASE
+                 WHEN instr(payload, '"images"') = 0
+                  AND instr(payload, '"retained_images"') = 0
+                  AND instr(payload, '\u') = 0 THEN 0
+                 ELSE json_type(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END, '$.images') IS NOT NULL
+                   OR json_type(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END, '$.item.retained_images') IS NOT NULL
+               END"#
+        ).map_err(|error| format!("Failed to list image references: {error}"))?;
+        let rows = statement
+            .query_map([], |row| row.get(0))
+            .map_err(|error| format!("Failed to read image references: {error}"))?;
+        rows.collect::<Result<Vec<String>, _>>()
+            .map_err(|error| format!("Failed to read image reference: {error}"))
     }
 
     /// Drop every persisted message for a thread without touching the
@@ -9558,6 +9600,117 @@ mod tests {
         assert_eq!(
             rows,
             vec![r#"{"i":1}"#.to_string(), r#"{"i":2}"#.to_string()]
+        );
+    }
+
+    #[test]
+    fn tool_result_image_reference_payloads_handle_escaped_keys_and_malformed_rows() {
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("images", "ws", None, "claude")
+            .unwrap();
+        let attachment = r#"{"type":"user_message","\u0069mages":[{"path":"/img/a.png"}]}"#;
+        let retained =
+            r#"{"type":"item_completed","item":{"retained_images":[{"path":"/img/b.png"}]}}"#;
+        let duplicate = r#"{"type":"user_message","images":null,"images":[{"path":"/img/c.png"}]}"#;
+        let nonarray = r#"{"images":"text"}"#;
+        for payload in [
+            attachment,
+            retained,
+            duplicate,
+            nonarray,
+            "malformed",
+            r#"{"images":["#,
+            r#"{"item":{"content":[{"type":"image","data":"AAAA"}]}}"#,
+        ] {
+            db.append_agent_chat_message("images", payload).unwrap();
+        }
+        let mut found = db.list_agent_chat_image_payloads().unwrap();
+        found.sort();
+        let mut expected = vec![
+            attachment.to_string(),
+            retained.to_string(),
+            duplicate.to_string(),
+            nonarray.to_string(),
+        ];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn tool_result_images_survive_restart_fork_and_reopened_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool-images.db");
+        let open = || {
+            let conn = open_connection(&path).unwrap();
+            create_schema(&conn).unwrap();
+            DatabaseStore {
+                conn: Mutex::new(conn),
+            }
+        };
+        let db = open();
+        db.upsert_agent_chat_session("source", "ws", Some("/repo"), "claude")
+            .unwrap();
+        db.upsert_agent_chat_session("reopened", "ws", Some("/repo"), "claude")
+            .unwrap();
+        // The opaque provider envelope can retain an older thread id. The
+        // reader must derive image ownership from SQLite instead.
+        let payload = serde_json::json!({"type":"item_completed", "thread_id":"old-provider-id", "turn_id":"turn",
+            "item":{"kind":"tool_result", "tool_use_id":"tool", "is_error":false,
+                "content":[{"type":"text","text":"synthetic evidence"},
+                    {"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":"A".repeat(40_000)}}]}}).to_string();
+        let source_row = db
+            .append_agent_chat_message("source", &payload)
+            .unwrap()
+            .unwrap();
+        let source = db.get_agent_chat_session("source").unwrap();
+        db.create_agent_chat_fork(&chat_fork::NewChatFork {
+            thread_id: "fork",
+            source: &source,
+            sdk_session_id: "fork-native",
+            workspace_id: "ws",
+            cwd: "/repo",
+            title: "fork",
+            cut_before: None,
+            image_dirs: None,
+        })
+        .unwrap();
+        let fork_row = db.list_agent_chat_messages_after("fork", None).unwrap()[0].0;
+        assert_ne!(source_row, fork_row);
+        let fork_payload = db.get_agent_chat_message(fork_row).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fork_payload).unwrap()["item"],
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap()["item"]
+        );
+        db.merge_reopened_agent_chat_session("source", "reopened")
+            .unwrap();
+        drop(db);
+
+        let reopened = open();
+        assert_eq!(
+            reopened.get_agent_chat_message(source_row).unwrap(),
+            payload
+        );
+        assert_eq!(
+            reopened.get_agent_chat_message_with_thread(source_row),
+            Some(("reopened".into(), payload))
+        );
+        assert_eq!(
+            reopened.get_agent_chat_message_with_thread(fork_row),
+            Some(("fork".into(), fork_payload))
+        );
+        assert_eq!(
+            reopened
+                .list_agent_chat_messages_after("reopened", None)
+                .unwrap()[0]
+                .0,
+            source_row
+        );
+        assert_eq!(
+            reopened
+                .list_agent_chat_messages_after("fork", None)
+                .unwrap()[0]
+                .0,
+            fork_row
         );
     }
 

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   formatLazyBytes,
@@ -16,15 +16,17 @@ import { resolveChatFileLink } from "@/lib/agent-chat/file-links";
 import {
   extractToolResultImages,
   isRenderableImageBlock,
+  withoutToolResultImages,
 } from "@/lib/agent-chat/tool-result-images";
 import { cn } from "@/lib/utils";
+import { copyToClipboard } from "@/lib/clipboard";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { agentChatGetToolResult } from "@/tauri/commands";
 
 import { DiffView } from "./DiffView";
 import { MessageCopyButton } from "./MessageCopyButton";
 import { ToolCallBlock } from "./ToolCallBlock";
-import { ToolResultImages } from "./ToolResultImages";
+import { LazyToolResultImages, ToolResultImages } from "./ToolResultImages";
 import { MarkdownFileLink } from "./MarkdownFileLink";
 import { useChatFileLinkContext } from "./chat-file-link-context";
 
@@ -47,14 +49,19 @@ export function ToolCallBody({ item }: { item: ToolCallItem }) {
   // the user actually asks for it.
   const stub = lazyToolResultStub(item.result_content);
   if (stub) return <LazyToolResultBody stub={stub} />;
-  const body = renderToolBody(item, input);
+  const images = extractToolResultImages(item.result_content);
+  const body = renderToolBody(
+    images.length > 0
+      ? { ...item, result_content: withoutToolResultImages(item.result_content) }
+      : item,
+    input,
+  );
 
   // Images returned in the tool result (a screenshot from `Read` on a
   // PNG, a browser/screenshot tool, …) render as thumbnails below the
   // per-tool body instead of being stringified into a base64 dump. The
   // per-tool `contentToString` skips image blocks, so the text body and
   // the image row never double-render the same payload.
-  const images = extractToolResultImages(item.result_content);
   if (images.length === 0) return body;
 
   return (
@@ -529,22 +536,45 @@ function editDiffInput(
 function LazyToolResultBody({ stub }: { stub: LazyToolResultStub }) {
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1200);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
 
-  const load = () => {
+  const load = (copy = false) => {
     setLoading(true);
-    setFailed(false);
+    if (copy) {
+      setCopied(false);
+      setCopyFailed(false);
+    } else {
+      setFailed(false);
+    }
     agentChatGetToolResult(stub.row_id)
-      .then((payload) => {
+      .then(async (payload) => {
         const content = toolResultContentFromPayload(payload);
         if (content == null) {
-          setFailed(true);
+          if (copy) setCopyFailed(true);
+          else setFailed(true);
           return;
         }
-        useAgentChatStore.getState().resolveLazyToolResult(stub.row_id, content);
+        if (copy) {
+          const text = typeof content === "string"
+            ? content
+            : JSON.stringify(content, null, 2);
+          const ok = await copyToClipboard(text);
+          setCopied(ok);
+          setCopyFailed(!ok);
+        } else {
+          useAgentChatStore.getState().resolveLazyToolResult(stub.row_id, content);
+        }
       })
       .catch((err) => {
         console.warn("[agent-chat] tool-result fetch failed:", err);
-        setFailed(true);
+        if (copy) setCopyFailed(true);
+        else setFailed(true);
       })
       .finally(() => setLoading(false));
   };
@@ -552,23 +582,46 @@ function LazyToolResultBody({ stub }: { stub: LazyToolResultStub }) {
   const hidden = Math.max(stub.line_count - previewLineCount(stub.preview), 0);
 
   return (
-    <div className="code-surface select-text rounded-md bg-muted/40 text-foreground whitespace-pre-wrap break-words">
-      <div className="px-3 py-2">
-        {stub.preview}
-        <span className="text-muted-foreground/60">{"\n"}…</span>
+    <div className="space-y-2.5">
+      {stub.has_images && <LazyToolResultImages stub={stub} />}
+      <div className="code-surface select-text rounded-md bg-muted/40 text-foreground whitespace-pre-wrap break-words">
+        {stub.preview && (
+          <div className="px-3 py-2">
+            {stub.preview}
+            {(!stub.has_images || hidden > 0) && (
+              <span className="text-muted-foreground/60">{"\n"}…</span>
+            )}
+          </div>
+        )}
+        <button
+          type="button"
+          onClick={() => load()}
+          disabled={loading}
+          className="block w-full border-t border-border/40 px-3 py-1.5 text-left text-label text-muted-foreground hover:text-foreground disabled:opacity-60"
+        >
+          {loading
+            ? "Loading…"
+            : failed
+              ? "Couldn't load the full output — retry"
+              : stub.has_images
+                ? `Load full output (${formatLazyBytes(stub.bytes)})`
+                : `Show ${hidden} more line${hidden === 1 ? "" : "s"} (${formatLazyBytes(stub.bytes)})`}
+        </button>
+        {stub.has_images && (
+          <button
+            type="button"
+            onClick={() => load(true)}
+            disabled={loading}
+            className="block w-full border-t border-border/40 px-3 py-1.5 text-left text-label text-muted-foreground hover:text-foreground disabled:opacity-60"
+          >
+            {copied
+              ? "Copied full result"
+              : copyFailed
+                ? "Couldn't copy the full result — retry"
+                : "Copy full result"}
+          </button>
+        )}
       </div>
-      <button
-        type="button"
-        onClick={load}
-        disabled={loading}
-        className="block w-full border-t border-border/40 px-3 py-1.5 text-left text-label text-muted-foreground hover:text-foreground disabled:opacity-60"
-      >
-        {loading
-          ? "Loading…"
-          : failed
-            ? "Couldn't load the full output — retry"
-            : `Show ${hidden} more line${hidden === 1 ? "" : "s"} (${formatLazyBytes(stub.bytes)})`}
-      </button>
     </div>
   );
 }

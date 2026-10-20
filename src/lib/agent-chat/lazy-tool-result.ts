@@ -8,12 +8,9 @@
  * below: enough metadata to render the collapsed card exactly as before,
  * plus the row id needed to fetch the real body on expand or copy.
  *
- * Stored rows are never rewritten — this is read-path shaping only, and
- * LIVE events always carry full content (they arrive over the channel,
- * not through a list read).
- *
- * Image-bearing results are never stubbed, so the thumbnail grid and the
- * auto-expand-on-image behaviour keep reading real content.
+ * Stored rows are never rewritten. Persisted live events use the same shaping;
+ * events whose persistence failed keep the original content.
+ * Image handles load separately from the original row when the body is shown.
  */
 
 /** Marker key. Mirrors `LAZY_TOOL_RESULT_KEY` in `commands/agent_chat.rs`. */
@@ -30,6 +27,8 @@ export interface LazyToolResultStub {
   /** Line count of the FULL body, so "Show N more lines" stays honest. */
   line_count: number;
   has_images: boolean;
+  /** JSON pointers to image blocks inside the original content. */
+  images?: { pointer: string; src?: string }[];
 }
 
 /** The wire shape of a stubbed `result_content`. */
@@ -48,7 +47,18 @@ export function isLazyToolResultStub(
   if (!isRecord(content)) return false;
   const stub = content[LAZY_TOOL_RESULT_KEY];
   if (!isRecord(stub)) return false;
+  const imagesValid = stub.images === undefined || (
+    Array.isArray(stub.images) && stub.images.every((image) =>
+      isRecord(image) && typeof image.pointer === "string" && (
+        image.src === undefined || (
+          typeof image.src === "string" && /^(data:image\/|https?:\/\/)/i.test(image.src)
+        )
+      ),
+    )
+  );
   return (
+    imagesValid &&
+    typeof stub.has_images === "boolean" &&
     typeof stub.row_id === "number" &&
     typeof stub.bytes === "number" &&
     typeof stub.preview === "string" &&

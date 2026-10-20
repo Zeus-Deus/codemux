@@ -104,6 +104,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "agent_chat_get_session"
             | "agent_chat_get_session_context"
             | "agent_chat_get_tool_result"
+            | "agent_chat_get_tool_result_image"
             | "agent_chat_interrupt_turn"
             | "agent_chat_list_messages"
             | "agent_chat_list_messages_after"
