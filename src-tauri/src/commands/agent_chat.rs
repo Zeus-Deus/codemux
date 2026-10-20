@@ -2273,12 +2273,17 @@ fn delete_orphaned_chat_images(removed_payloads: &[String], retained_payloads: &
     }
 }
 
-/// Delete the chat images `payloads` point at, then any thread folder that
-/// leaves empty. Only paths inside the chat-image root are touched.
-fn delete_referenced_chat_images(payloads: &[String]) {
-    if let Some(root) = chat_images_root() {
-        delete_referenced_chat_images_in(&root, payloads);
+/// Delete `thread_id`'s images: its own folder, and the images its
+/// transcript points at elsewhere (a chat reopened from history keeps the
+/// merged-away thread's images where they were). Only while the chat
+/// exists: a stale delete of a thread a reopen merged away must not take
+/// the folder the survivor now uses.
+fn delete_chat_images_in(root: &std::path::Path, db: &DatabaseStore, thread_id: &str) {
+    if !db.has_agent_chat_session(thread_id).unwrap_or(false) {
+        return;
     }
+    let _ = std::fs::remove_dir_all(root.join(thread_id));
+    delete_referenced_chat_images_in(root, &db.list_agent_chat_messages(thread_id));
 }
 
 fn delete_referenced_chat_images_in(root: &std::path::Path, payloads: &[String]) {
@@ -6774,16 +6779,13 @@ pub async fn agent_chat_delete_session<R: Runtime>(
                 .map_err(|e| e.to_string())?;
         }
     }
-    // Best-effort: drop the thread's on-disk image directory alongside the
-    // DB rows. The messages cascade via FK, but the image files live
-    // outside SQLite, so nothing else would ever reclaim them. A failure
-    // here (missing dir is the common case) must not fail the delete.
-    if let Some(dir) = chat_images_dir(&thread_id) {
-        let _ = std::fs::remove_dir_all(&dir);
+    // Best-effort: drop the chat's images alongside the DB rows. The
+    // messages cascade via FK, but the image files live outside SQLite, so
+    // nothing else would ever reclaim them. A failure here (missing dir is
+    // the common case) must not fail the delete.
+    if let Some(root) = chat_images_root() {
+        delete_chat_images_in(&root, &db, &thread_id);
     }
-    // A chat reopened from history keeps the merged-away thread's images
-    // where they were, so also delete what the transcript points at.
-    delete_referenced_chat_images(&db.list_agent_chat_messages(&thread_id));
     // SQLite cascades remove checkpoint bookkeeping, but Git refs live
     // outside the database and would otherwise retain snapshot objects
     // forever. Gather their locations before deleting the parent row, then
@@ -9930,6 +9932,25 @@ mod tests {
         assert!(fork_dir.join("img.png").exists(), "the fork has its own copy");
         delete_referenced_chat_images_in(root.path(), &db.list_agent_chat_messages("c"));
         assert!(!fork_dir.exists());
+    }
+
+    #[test]
+    fn deleting_a_merged_away_thread_keeps_the_survivors_images() {
+        // "old" was reopened as "new": its row is gone, its folder now holds
+        // images "new" points at. A stale delete of "old" leaves them.
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("a.png"), b"png").unwrap();
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("new", "ws", Some("/repo"), "claude").unwrap();
+        let message = serde_json::json!({"type": "user_message", "images": [{"path": old.join("a.png")}]});
+        db.append_agent_chat_message("new", &message.to_string()).unwrap();
+
+        delete_chat_images_in(root.path(), &db, "old");
+        assert!(old.join("a.png").exists());
+        delete_chat_images_in(root.path(), &db, "new");
+        assert!(!old.exists());
     }
 
     #[test]
