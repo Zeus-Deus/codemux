@@ -1615,16 +1615,21 @@ mod tests {
             let remote = reg
                 .list_all_tools_excluding_source(McpConfigSource::CodexUser)
                 .await;
-            let names: HashSet<_> = local
-                .iter()
-                .chain(&remote)
-                .map(|tool| tool.prefixed_name.as_str())
-                .collect();
-            assert_eq!(
-                names.len(),
-                local.len() + remote.len(),
-                "combined native catalog must have unique names"
-            );
+            let local_names: HashSet<_> = local.iter().map(|tool| tool.prefixed_name.as_str()).collect();
+            let remote_names: HashSet<_> = remote.iter().map(|tool| tool.prefixed_name.as_str()).collect();
+            // Task control is canonical for local and SSH tasks; the native
+            // adapters prefer these host schemas over the SSH-only versions.
+            let shared: HashSet<_> = local_names.intersection(&remote_names).copied().collect();
+            let expected_shared = if enabled {
+                HashSet::from(["mcp__codemux__task_status", "mcp__codemux__task_cancel"])
+            } else {
+                HashSet::new()
+            };
+            assert_eq!(shared, expected_shared);
+            for name in shared {
+                let canonical = local.iter().find(|tool| tool.prefixed_name == name).unwrap();
+                assert!(canonical.input_schema["properties"].get("task_id").is_some());
+            }
             let launch = remote
                 .iter()
                 .find(|tool| tool.name == crate::mcp_server::REMOTE_DELEGATE_TOOL)
