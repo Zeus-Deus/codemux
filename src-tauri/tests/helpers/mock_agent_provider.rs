@@ -255,6 +255,13 @@ impl AgentProvider for MockAgentProvider {
                 return Err(error);
             }
         }
+        if let Some(guard) = &input.dispatch_guard {
+            let mut wire = Vec::new();
+            let poll=guard.poll_first(&mut || std::task::Poll::Ready(std::io::Write::write(&mut wire,b"prompt")))
+                .map_err(|message|ProviderError::ValidationError {message})?;
+            assert!(matches!(poll,std::task::Poll::Ready(Ok(_))));
+            guard.accepted().map_err(|message|ProviderError::ValidationError {message})?;
+        }
         self.calls
             .push(MockCall::SendTurn(input.thread_id.clone(), input.text));
         let after_accept = self.send_error_after_accept.lock().unwrap().take();

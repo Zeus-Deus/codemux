@@ -3521,7 +3521,17 @@ async fn send_turn_context_reporting<R: Runtime>(
     }
     let machine = !context.is_human();
     let mut resumed_ids = Vec::new();
-    let result = send_turn_internal(app.clone(), provider, input.clone(), context, reached, &mut resumed_ids).await;
+    let wake = if context.origin == TurnOrigin::RemoteDelegation {
+        crate::delegation::app::begin_wake_delivery(&app,&input.thread_id.0,input.client_nonce.as_deref()).map(Some)
+    } else { Ok(None) };
+    let result = match wake {
+        Ok(wake) => {
+            let result = send_turn_internal(app.clone(), provider, input.clone(), context, reached, &mut resumed_ids).await;
+            if let Some(wake) = wake { wake.finish(result.is_ok(),result.as_ref().err().map(String::as_str))?; }
+            result
+        }
+        Err(error) => Err(error),
+    };
     if result.is_err() { db.rehold_message_deliveries(&resumed_ids)?; }
     match &result {
         Ok(result) => {

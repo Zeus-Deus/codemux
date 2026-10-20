@@ -243,6 +243,51 @@ pub fn guard_wake<R: Runtime>(
     validate_grant(app, &parent, &store.grant_for_task(id)?)
 }
 
+/// One common-outbox dispatch owns one SSH byte/ACK attempt, including
+/// cleanup if asynchronous preparation is cancelled before reaching stdin.
+pub(crate) struct WakeDelivery<R: Runtime> {
+    app: AppHandle<R>, store: Arc<Journal>, id: String, attempt: String, settled: bool,
+}
+impl<R: Runtime> WakeDelivery<R> {
+    fn settle(&self, delivered: bool, error: Option<&str>) -> Result<(), String> {
+        self.store.finish_delivery(&self.id,&self.attempt)?;
+        self.store.update(&self.id,|task| {
+            if task.wake_state == WakeState::Delivering {
+                task.wake_state = if delivered { WakeState::Delivered } else { WakeState::Held };
+                task.wake_error = error.map(str::to_owned);
+            }
+        })?;
+        changed(&self.app,&self.store.task(&self.id)?.parent_thread_id);
+        Ok(())
+    }
+    pub(crate) fn finish(mut self, delivered: bool, error: Option<&str>) -> Result<(), String> {
+        self.settle(delivered,error)?;
+        self.settled = true;
+        Ok(())
+    }
+}
+impl<R: Runtime> Drop for WakeDelivery<R> {
+    fn drop(&mut self) {
+        if !self.settled {
+            if let Err(error) = self.settle(false,Some("Result dispatch ended before acceptance was confirmed")) {
+                log::error!("Could not settle remote-result delivery: {error}");
+            }
+        }
+    }
+}
+pub(crate) fn begin_wake_delivery<R: Runtime>(app: &AppHandle<R>, thread: &str, nonce: Option<&str>) -> Result<WakeDelivery<R>,String> {
+    let id=nonce.and_then(|n|n.strip_prefix("delegation:")).ok_or("Missing stable delegation delivery correlation")?;
+    let store=journal(app)?;
+    let parent=parent_for_thread(app,thread)?;
+    let task=owned(&store,&parent,id)?;
+    if !task.status.is_terminal() || task.remote.is_none() || store.tail_pending(id)? {
+        return Err("Remote result is not ready for delivery".into());
+    }
+    validate_grant(app,&parent,&store.grant_for_task(id)?)?;
+    let attempt=store.claim_outbox_delivery(id)?.ok_or("Delegation delivery was stopped or superseded")?;
+    Ok(WakeDelivery {app:app.clone(),store,id:id.into(),attempt,settled:false})
+}
+
 struct WakeDispatch<R: Runtime> {
     app: AppHandle<R>,
     store: Arc<Journal>,

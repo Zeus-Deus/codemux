@@ -730,13 +730,22 @@ impl Journal {
         let state:Option<String>=conn.query_row("SELECT state FROM delivery_outcomes WHERE task=?1",[id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         state.map(|s|serde_json::from_value(serde_json::Value::String(s)).map_err(|e|e.to_string())).unwrap_or(Ok(DeliveryOutcome::NotAttempted))
     }
+    #[cfg(test)]
     pub(crate) fn claim_delivery(&self, id: &str) -> Result<Option<String>, String> {
+        self.claim_delivery_inner(id, false)
+    }
+    /// The common outbox retries the same admitted result identity. Only a
+    /// definite-no-send Held attempt can be reacquired automatically.
+    pub(crate) fn claim_outbox_delivery(&self, id: &str) -> Result<Option<String>, String> {
+        self.claim_delivery_inner(id, true)
+    }
+    fn claim_delivery_inner(&self, id: &str, retry_held: bool) -> Result<Option<String>, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         let mut task = read_task(&tx, id)?;
-        if task.cancel_requested || task.wake_state != WakeState::Pending {
+        if task.cancel_requested || !(task.wake_state == WakeState::Pending || (retry_held && task.wake_state == WakeState::Held)) {
             return Ok(None);
         }
         let prior: Option<String> = tx

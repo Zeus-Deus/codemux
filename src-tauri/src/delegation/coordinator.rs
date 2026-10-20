@@ -392,9 +392,6 @@ pub(super) async fn wake_open<R: Runtime>(handle: &AppHandle<R>, id: &str) -> Re
     {
         return Ok(());
     }
-    let Some(attempt) = store.claim_delivery(id)? else {
-        return Ok(());
-    };
     let task = store.task(id)?;
     app::changed(handle, &parent.thread_id);
     let remote = task.remote.as_ref().ok_or("Remote result is missing")?;
@@ -438,13 +435,9 @@ pub(super) async fn wake_open<R: Runtime>(handle: &AppHandle<R>, id: &str) -> Re
             crate::remote_task_protocol::TaskStatus::Cancelled => crate::agent_provider::message::NotificationOutcome::Cancelled,
             _ => crate::agent_provider::message::NotificationOutcome::Unknown},summary:display_text,tasks:vec![],
     });
-    let sent = send_turn_with_context(
+    let _sent = send_turn_with_context(
         handle.clone(), parent.provider, input, context,
     )
     .await;
-    store.finish_delivery(id, &attempt)?;
-    store.update(id,|t|{if t.wake_state==WakeState::Delivering {
-        match sent {Ok(_)=>{t.wake_state=WakeState::Delivered;t.wake_error=None;},Err(error)=>{t.wake_state=WakeState::Held;t.wake_error=Some(format!("Delivery did not confirm; only a durable definitely-before-send outcome allows explicit retry: {error}"));}}
-    }})?;
     Ok(())
 }

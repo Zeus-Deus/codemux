@@ -3,6 +3,67 @@ use std::{sync::Arc, time::Duration};
 use tauri::Manager;
 use crate::{agent_provider::ProviderKind, database::DatabaseStore, state::AppStateStore};
 
+#[allow(dead_code)]
+#[path = "../../tests/helpers/mock_agent_provider.rs"]
+mod mock_agent_provider;
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn review_r1_remote_result_outbox_reacquires_before_send_attempt() {
+    use crate::agent_provider::AgentProvider;
+    let root=tempfile::tempdir().unwrap();
+    let (app,store,task,_pane,_grant,_host)=setup(root.path(),"review-r1-remote-retry");
+    let _authority=authority::NativeAuthority::new(&task.parent_thread_id);
+    store.apply_remote(&task.id,&tests::remote(&task,crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
+    let provider=Arc::new(mock_agent_provider::MockAgentProvider::new(ProviderKind::Codex));
+    provider.start_session(serde_json::from_value(serde_json::json!({"thread_id":task.parent_thread_id,"cwd":root.path(),"additional_directories":[]})).unwrap()).await.unwrap();
+    let registry=crate::commands::agent_chat::ProviderRegistry::new();
+    registry.set_codex(provider.clone()).await;
+    app.manage(registry);
+    let observability=crate::observability::ObservabilityStore::default();
+    let mut flags=observability.feature_flags(); flags.enable_agent_chat=true; observability.set_feature_flags(flags);
+    app.manage(observability);
+    app.manage(crate::agent_control::NativeControlState::default());
+    app.manage(crate::commands::agent_chat::SubagentTracker::default());
+    app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+    app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+    provider.fail_next_send(crate::agent_provider::ProviderError::ValidationError {message:"temporary fault before bytes".into()});
+    coordinator::wake_open(app.handle(),&task.id).await.unwrap();
+    let db=app.state::<DatabaseStore>();
+    let row=db.message_delivery_for_message(&task.parent_thread_id,&format!("delegation:{}",task.id)).unwrap().unwrap();
+    assert_eq!(row.state,"pending"); assert!(!row.attempted);
+    assert_eq!(store.delivery_outcome(&task.id).unwrap(),DeliveryOutcome::BeforeSend);
+    crate::agent_control::delivery::dispatch(app.handle(),row.clone()).await;
+    assert_eq!(db.message_delivery(&row.id).unwrap().unwrap().state,"accepted");
+    assert_eq!(store.task(&task.id).unwrap().wake_state,WakeState::Delivered);
+    assert_eq!(store.delivery_outcome(&task.id).unwrap(),DeliveryOutcome::Accepted);
+    let sends=provider.calls.snapshot().into_iter().filter(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(..))).count();
+    assert_eq!(sends,1);
+}
+
+#[test]
+fn review_r1_remote_outbox_retry_rechecks_grant_stop_cancellation_and_uncertainty() {
+    for action in ["grant","stop","cancel","unknown","accepted"] {
+        let root=tempfile::tempdir().unwrap();
+        let (app,store,task,_,mut grant,_)=setup(root.path(),&format!("review-r1-remote-{action}"));
+        store.apply_remote(&task.id,&tests::remote(&task,crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
+        let attempt=store.claim_delivery(&task.id).unwrap().unwrap();
+        if matches!(action,"unknown"|"accepted") {
+            assert!(matches!(store.poll_wake(&task.id,&attempt,|_,_|Ok(()),&mut ||std::task::Poll::Ready(Ok(1))).unwrap(),std::task::Poll::Ready(Ok(1))));
+            if action=="accepted" { store.accept_delivery(&task.id,&attempt).unwrap(); }
+        }
+        store.finish_delivery(&task.id,&attempt).unwrap();
+        store.update(&task.id,|task|task.wake_state=WakeState::Held).unwrap();
+        match action {
+            "grant"=>{grant.enabled=false;store.put_grant(&task.parent_workspace_id,&grant).unwrap();},
+            "stop"=>store.suppress_parent(&task.parent_thread_id,true).unwrap(),
+            "cancel"=>{store.cancel(&task.id).unwrap();},
+            _=>{},
+        }
+        assert!(app::begin_wake_delivery(app.handle(),&task.parent_thread_id,Some(&format!("delegation:{}",task.id))).is_err(),"{action}");
+        assert_eq!(store.delivery_outcome(&task.id).unwrap(),match action {"unknown"=>DeliveryOutcome::Unknown,"accepted"=>DeliveryOutcome::Accepted,_=>DeliveryOutcome::BeforeSend});
+    }
+}
+
 fn setup(root: &std::path::Path, name: &str) -> (tauri::App<tauri::test::MockRuntime>, Arc<journal::Journal>, LocalTask, String, Grant, i64) {
     let app = tauri::test::mock_app();
     let state = AppStateStore::default();
