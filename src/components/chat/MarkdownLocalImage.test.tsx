@@ -23,7 +23,6 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 import {
-  comparablePath,
   MarkdownLocalImage,
   RetainedImagesProvider,
   resetLocalImageBlobCache,
@@ -353,20 +352,18 @@ describe("MarkdownLocalImage", () => {
       );
     });
 
-    it("finds a copy kept under a differently escaped spelling of the link", () => {
-      // The transcript leaves a path with a malformed escape undecoded; the
-      // backend decoded its valid escapes.
+    it("never takes a copy kept under another spelling of the path", () => {
       const { container } = render(
         <RetainedImagesProvider
-          images={[{ source: "/tmp/a%zz b.png", path: "/cfg/images/t/k.png" }]}
+          images={[{ source: "/tmp/a b.png", path: "/cfg/images/t/k.png" }]}
         >
-          <MarkdownLocalImage path="/tmp/a%zz%20b.png" caption="Proof" />
+          <MarkdownLocalImage path="/tmp/a%20b.png" caption="Proof" />
         </RetainedImagesProvider>,
       );
 
       expect(container.querySelector("img")).toHaveAttribute(
         "src",
-        "mock-asset:/cfg/images/t/k.png",
+        "mock-asset:/tmp/a%20b.png",
       );
     });
 
@@ -388,27 +385,7 @@ describe("MarkdownLocalImage", () => {
 
       expect(srcFor("/tmp/a b.png")).toBe("mock-asset:/cfg/images/t/space.png");
       expect(srcFor("/tmp/a%20b.png")).toBe("mock-asset:/cfg/images/t/literal.png");
-      // Not exact, and both sources match it loosely: no copy is guessed.
       expect(srcFor("/tmp/a%20%62.png")).toBe("mock-asset:/tmp/a%20%62.png");
-    });
-
-    it("guesses no copy when the escape-insensitive form is ambiguous", () => {
-      const { container } = render(
-        <RetainedImagesProvider
-          images={[
-            { source: "/tmp/a%zz b.png", path: "/cfg/images/t/one.png" },
-            { source: "/tmp/a%zz%20b.png", path: "/cfg/images/t/two.png" },
-          ]}
-        >
-          <MarkdownLocalImage path="/tmp/a%zz%20%62.png" caption="Proof" />
-        </RetainedImagesProvider>,
-      );
-
-      // Both kept sources read as "/tmp/a%zz b.png" once unescaped.
-      expect(container.querySelector("img")).toHaveAttribute(
-        "src",
-        "mock-asset:/tmp/a%zz%20%62.png",
-      );
     });
 
     it("ignores copies kept for other links", () => {
@@ -423,14 +400,5 @@ describe("MarkdownLocalImage", () => {
         "mock-asset:/tmp/other.png",
       );
     });
-  });
-});
-
-describe("comparablePath", () => {
-  it("decodes valid escape runs and leaves malformed ones", () => {
-    expect(comparablePath("/tmp/a%zz%20b.png")).toBe("/tmp/a%zz b.png");
-    expect(comparablePath("/tmp/caf%C3%A9.png")).toBe("/tmp/café.png");
-    expect(comparablePath("/tmp/a%FF.png")).toBe("/tmp/a%FF.png");
-    expect(comparablePath("/tmp/plain.png")).toBe("/tmp/plain.png");
   });
 });

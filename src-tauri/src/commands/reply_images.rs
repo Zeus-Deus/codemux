@@ -273,33 +273,37 @@ fn remove_copies(root: &std::path::Path, kept: &[RetainedReplyImage]) {
 /// URL ending in a supported image extension, as the transcript turns them
 /// into image cards (`src/lib/agent-chat/local-image-links.ts`). Code is not
 /// scanned, an image's alt text is not, and a footnote counts only once it
-/// is referenced. Reference-style links are kept even though the
-/// transcript can leave them as text: an unused copy is cheap, a missing
-/// one is the loss this module exists to prevent.
+/// is referenced. Reference-style links are kept too, though the transcript
+/// can leave them as text: an unused copy is cheap, a missing one is the
+/// loss this module exists to prevent. They only take slots that links
+/// known to render leave free.
 pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
     use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
+    use unicase::UniCase;
 
-    if markdown.lines().any(|line| container_depth(line) > MAX_CONTAINER_DEPTH) {
-        eprintln!("[codemux::reply_images] not scanning a reply nested this deeply");
-        return Vec::new();
-    }
+    let markdown = bounded_for_scan(markdown);
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES;
-    // Candidates with the footnote they sit in, if any.
-    let mut found: Vec<(Option<String>, String)> = Vec::new();
+    // Candidates, each list bounded on its own: links the transcript always
+    // renders; reference links it may leave as text; and links inside
+    // footnotes, which render only when the footnote is referenced.
+    let mut rendered: Vec<String> = Vec::new();
+    let mut referenced_links: Vec<String> = Vec::new();
+    let mut in_footnotes: Vec<(UniCase<String>, bool, String)> = Vec::new();
+    // Footnote labels match like the parser matches them: case-folded.
     let mut referenced = std::collections::HashSet::new();
-    let mut footnote: Option<String> = None;
+    let mut footnote: Option<UniCase<String>> = None;
     let mut inside_image = 0usize;
-    for event in Parser::new_ext(markdown, options) {
-        let destination = match event {
+    for event in Parser::new_ext(&markdown, options) {
+        let (link_type, dest_url) = match event {
             Event::FootnoteReference(label) => {
-                referenced.insert(label.to_lowercase());
+                referenced.insert(UniCase::new(label.to_string()));
                 continue;
             }
             Event::Start(Tag::FootnoteDefinition(label)) => {
-                footnote = Some(label.to_lowercase());
+                footnote = Some(UniCase::new(label.to_string()));
                 continue;
             }
             Event::End(TagEnd::FootnoteDefinition) => {
@@ -323,76 +327,178 @@ pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
             }
             _ => continue,
         };
-        let (link_type, dest_url) = destination;
         if link_type == LinkType::Email {
             continue;
         }
-        // Past the bound the scan keeps going only to see which footnotes
-        // are referenced, so a note defined early still counts.
-        if found.len() == MAX_SCANNED_CANDIDATES {
+        let renders = matches!(link_type, LinkType::Inline | LinkType::Autolink);
+        // Past a list's bound the scan keeps going, storing nothing more
+        // there, so footnotes referenced late are still seen.
+        let full = match &footnote {
+            Some(_) => in_footnotes.len() == MAX_SCANNED_CANDIDATES,
+            None if renders => rendered.len() == MAX_SCANNED_CANDIDATES,
+            None => referenced_links.len() == MAX_SCANNED_CANDIDATES,
+        };
+        if full {
             continue;
         }
-        if let Some(path) = local_image_path(&dest_url) {
-            let candidate = (footnote.clone(), path);
-            if !found.contains(&candidate) {
-                found.push(candidate);
+        let Some(path) = local_image_path(&dest_url) else {
+            continue;
+        };
+        match &footnote {
+            Some(label) => {
+                let candidate = (label.clone(), renders, path);
+                if !in_footnotes.contains(&candidate) {
+                    in_footnotes.push(candidate);
+                }
+            }
+            None if renders => {
+                if !rendered.contains(&path) {
+                    rendered.push(path);
+                }
+            }
+            None => {
+                if !referenced_links.contains(&path) {
+                    referenced_links.push(path);
+                }
             }
         }
     }
+    // Links known to render come first; reference links only take slots
+    // those leave free, so a speculative copy never displaces a visible one.
+    let (noted_rendering, noted_references): (Vec<_>, Vec<_>) = in_footnotes
+        .into_iter()
+        .filter(|(label, _, _)| referenced.contains(label))
+        .partition(|(_, renders, _)| *renders);
     let mut sources: Vec<String> = Vec::new();
-    for (note, path) in found {
-        if note.is_some_and(|label| !referenced.contains(&label)) || sources.contains(&path) {
-            continue;
-        }
-        sources.push(path);
-        if sources.len() == MAX_RETAINED_PER_REPLY {
-            break;
+    let ordered = rendered
+        .into_iter()
+        .chain(noted_rendering.into_iter().map(|(_, _, path)| path))
+        .chain(referenced_links)
+        .chain(noted_references.into_iter().map(|(_, _, path)| path));
+    for path in ordered {
+        if !sources.contains(&path) {
+            sources.push(path);
+            if sources.len() == MAX_RETAINED_PER_REPLY {
+                break;
+            }
         }
     }
     sources
 }
 
-/// Most lists and block quotes a line may sit inside before the reply is
-/// too odd to scan: the parser walks every open container on every line.
-const MAX_CONTAINER_DEPTH: usize = 32;
-/// Most distinct candidate links one scan keeps while footnotes resolve.
+/// Most leading list, block-quote and footnote markers a line keeps for the
+/// scan.
+const MAX_LINE_MARKERS: usize = 32;
+/// Most leading indentation, in columns, a line keeps for the scan.
+const MAX_LINE_INDENT: usize = 64;
+/// Most distinct candidate links of each kind one scan keeps while
+/// footnotes resolve.
 const MAX_SCANNED_CANDIDATES: usize = 64;
 
-/// An upper bound on how many lists and block quotes `line` opens or sits
-/// in: its leading block-quote and list markers plus half its indentation.
-/// A container is only ever opened on a line that shows it this way.
-fn container_depth(line: &str) -> usize {
-    let mut depth = 0;
+/// `markdown` with `\n` line endings and every line's leading container
+/// markers and indentation cut to the bounds above.
+///
+/// The parser walks every open list, block quote and footnote on every line,
+/// so thousands of nested containers held open across blank lines make it
+/// quadratic. A container opens only on a line that shows it: through its
+/// own marker, or through indentation deep enough to nest. With both bounded
+/// per line, so is the nesting, and the scan stays linear. Lines within the
+/// bounds (all ordinary text and code) keep their content; a cut line only
+/// loses nesting, and code is never scanned for links anyway. Bare `\r`
+/// endings become `\n`, as the transcript reads them: the parser can let a
+/// line after indented code run on across a bare `\r`.
+fn bounded_for_scan(markdown: &str) -> std::borrow::Cow<'_, str> {
+    let within = |line: &str| {
+        let prefix = line_prefix(line);
+        prefix.markers.len() <= MAX_LINE_MARKERS && prefix.indent <= MAX_LINE_INDENT
+    };
+    if !markdown.contains('\r') && markdown_lines(markdown).all(|(line, _)| within(line)) {
+        return std::borrow::Cow::Borrowed(markdown);
+    }
+    let mut out = String::with_capacity(markdown.len());
+    for (line, ending) in markdown_lines(markdown) {
+        if within(line) {
+            out.push_str(line);
+        } else {
+            let prefix = line_prefix(line);
+            out.extend(std::iter::repeat(' ').take(prefix.indent.min(MAX_LINE_INDENT)));
+            for marker in prefix.markers.iter().take(MAX_LINE_MARKERS) {
+                out.push_str(marker);
+                out.push(' ');
+            }
+            out.push_str(&line[prefix.content..]);
+        }
+        if !ending.is_empty() {
+            out.push('\n');
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// `markdown`'s lines with their endings, split at `\n`, `\r\n` and a bare
+/// `\r`, as the parser splits them.
+fn markdown_lines(markdown: &str) -> impl Iterator<Item = (&str, &str)> {
+    let mut rest = markdown;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let (line, ending, next) = match rest.find(['\n', '\r']) {
+            Some(at) if rest[at..].starts_with("\r\n") => (&rest[..at], &rest[at..at + 2], at + 2),
+            Some(at) => (&rest[..at], &rest[at..at + 1], at + 1),
+            None => (rest, "", rest.len()),
+        };
+        rest = &rest[next..];
+        Some((line, ending))
+    })
+}
+
+/// A line's leading container markers (`>`, list markers, `[^label]:`), the
+/// indentation around them in columns (a marker's own following space
+/// excluded), and the byte offset where its content starts.
+struct LinePrefix<'a> {
+    markers: Vec<&'a str>,
+    indent: usize,
+    content: usize,
+}
+
+fn line_prefix(line: &str) -> LinePrefix<'_> {
+    let mut markers = Vec::new();
     let mut indent = 0;
-    let mut rest = line;
+    let mut at = 0;
     loop {
+        let rest = &line[at..];
         let trimmed = rest.trim_start_matches([' ', '\t']);
         indent += rest[..rest.len() - trimmed.len()]
             .chars()
             .map(|c| if c == '\t' { 4 } else { 1 })
             .sum::<usize>();
-        rest = trimmed;
-        let marker = if rest.starts_with('>') {
+        at = line.len() - trimmed.len();
+        let marker = if trimmed.starts_with('>') {
             1
-        } else if rest.starts_with(['-', '*', '+']) {
+        } else if trimmed.starts_with(['-', '*', '+']) {
             1
+        } else if let Some(label) = trimmed.strip_prefix("[^") {
+            label.find("]:").map_or(0, |end| end + 4)
         } else {
-            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-            if (1..=9).contains(&digits) && rest[digits..].starts_with(['.', ')']) {
+            let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+            if (1..=9).contains(&digits) && trimmed[digits..].starts_with(['.', ')']) {
                 digits + 1
             } else {
                 0
             }
         };
-        let after = &rest[marker..];
+        let after = &trimmed[marker..];
         let opens = marker > 0
-            && (rest.starts_with('>') || after.is_empty() || after.starts_with([' ', '\t']));
+            && (trimmed.starts_with(['>', '['])
+                || after.is_empty()
+                || after.starts_with([' ', '\t']));
         if !opens {
-            return depth + indent / 2;
+            return LinePrefix { markers, indent, content: at };
         }
-        depth += 1;
+        markers.push(&trimmed[..marker]);
         // The one space after a marker belongs to it, not to indentation.
-        rest = after.strip_prefix([' ', '\t']).unwrap_or(after);
+        at += marker + usize::from(after.starts_with([' ', '\t']));
     }
 }
 
@@ -407,7 +513,8 @@ fn local_image_path(destination: &str) -> Option<String> {
         if url.scheme() != "file" || url.host_str().is_some_and(|host| host != "localhost") {
             return None;
         }
-        let path = percent_decode(url.path(), "");
+        // `decodeURIComponent`: a path that will not decode is no image.
+        let path = decode_uri(url.path(), "")?;
         // file:///C:/foo.png is the standard Windows file-URL spelling.
         let bytes = path.as_bytes();
         if bytes.len() > 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' && bytes[3] == b'/' {
@@ -416,8 +523,9 @@ fn local_image_path(destination: &str) -> Option<String> {
             path
         }
     } else {
-        // `decodeURI` leaves reserved characters encoded.
-        percent_decode(destination, ";/?:@&=+$,#")
+        // `decodeURI`, which leaves reserved characters encoded; the
+        // transcript keeps a path it cannot decode as written.
+        decode_uri(destination, ";/?:@&=+$,#").unwrap_or_else(|| destination.to_string())
     };
     let bytes = path.as_bytes();
     let absolute = path.starts_with('/')
@@ -433,28 +541,30 @@ fn local_image_path(destination: &str) -> Option<String> {
     (absolute && supported).then_some(path)
 }
 
-/// Decode `%XX` escapes except those producing a character in `keep`. Input
-/// that does not decode to UTF-8 is returned unchanged, as `decodeURI`
-/// callers in the frontend fall back to the raw text.
-fn percent_decode(input: &str, keep: &str) -> String {
+/// JavaScript's `decodeURI` (or `decodeURIComponent`, with `keep` empty):
+/// `%XX` escapes decoded, except those of a character in `keep`, or `None`
+/// when any escape is malformed or the result is not UTF-8. The transcript
+/// decodes link paths this way, so both sides name a path alike.
+fn decode_uri(input: &str, keep: &str) -> Option<String> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-            if let Some(value) = hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
-                if !(value.is_ascii() && keep.as_bytes().contains(&value)) {
-                    out.push(value);
-                    i += 3;
-                    continue;
-                }
-            }
+        if bytes[i] != b'%' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
         }
-        out.push(bytes[i]);
-        i += 1;
+        let hex = bytes.get(i + 1..i + 3).filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))?;
+        let value = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+        if value.is_ascii() && keep.as_bytes().contains(&value) {
+            out.extend_from_slice(&bytes[i..i + 3]);
+        } else {
+            out.push(value);
+        }
+        i += 3;
     }
-    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+    String::from_utf8(out).ok()
 }
 
 #[cfg(test)]
@@ -632,18 +742,23 @@ mod tests {
         );
         assert_eq!(
             local_image_sources(&text),
-            ["/tmp/outer.png", "/tmp/noted.png", "/tmp/linked.png", "/tmp/inner.png", "/tmp/proof.png"]
+            // Footnotes render after the body, so their images come last.
+            ["/tmp/outer.png", "/tmp/linked.png", "/tmp/inner.png", "/tmp/proof.png", "/tmp/noted.png"]
         );
     }
 
     #[test]
-    fn a_note_referenced_after_the_candidate_bound_still_counts() {
-        let others: String = (0..70).map(|i| format!("[{i}](/tmp/{i}.png) [again](/tmp/{i}.png)\n")).collect();
-        let text = format!("[^n]: [Noted](/tmp/noted.png)\n\n{others}\nSee [^n].");
-        let sources = local_image_sources(&text);
-        assert_eq!(sources.len(), MAX_RETAINED_PER_REPLY);
-        assert_eq!(sources[0], "/tmp/noted.png");
-        assert_eq!(sources[1], "/tmp/0.png");
+    fn notes_referenced_after_the_candidate_bound_still_count() {
+        // More footnote images than the scan stores, all referenced only at
+        // the end: the first stored ones still count.
+        let notes: String = (0..70).map(|i| format!("[^n{i}]: [N{i}](/tmp/n{i}.png)\n\n")).collect();
+        let references: String = (0..70).map(|i| format!("[^n{i}] ")).collect();
+        let text = format!("{notes}[Proof](/tmp/proof.png)\n\nSee {references}.");
+        assert_eq!(
+            local_image_sources(&text),
+            ["/tmp/proof.png", "/tmp/n0.png", "/tmp/n1.png", "/tmp/n2.png", "/tmp/n3.png",
+             "/tmp/n4.png", "/tmp/n5.png", "/tmp/n6.png"]
+        );
     }
 
     #[test]
@@ -655,18 +770,82 @@ mod tests {
     }
 
     #[test]
-    fn deeply_nested_replies_are_not_parsed() {
+    fn deep_nesting_is_cut_so_the_scan_stays_linear_and_still_finds_links() {
         let n = 10_000;
-        let text = format!("{}x\n{}[Proof](/tmp/proof.png)", "- ".repeat(n), "\n".repeat(n));
-        let started = std::time::Instant::now();
-        assert!(local_image_sources(&text).is_empty());
-        assert!(started.elapsed() < std::time::Duration::from_millis(500));
-        // Ordinary nesting still scans.
+        for opener in [
+            "- ".repeat(n),
+            format!("[^n]: {}", "- ".repeat(n)),
+            "> ".repeat(n),
+            format!("{}- ", " ".repeat(4 * n)),
+        ] {
+            for ending in ["\n", "\r", "\r\n"] {
+                let text = format!("{opener}x{}{ending}[Proof](/tmp/proof.png)", ending.repeat(n));
+                let started = std::time::Instant::now();
+                assert_eq!(local_image_sources(&text), ["/tmp/proof.png"], "{ending:?}");
+                assert!(started.elapsed() < std::time::Duration::from_millis(500), "{ending:?}");
+            }
+        }
+        // Ordinary nesting is left alone.
         let nested = "> - 1. item\n>    - [Proof](/tmp/proof.png)";
+        assert!(matches!(bounded_for_scan(nested), std::borrow::Cow::Borrowed(_)));
         assert_eq!(local_image_sources(nested), ["/tmp/proof.png"]);
-        assert_eq!(container_depth("> - 1. item"), 3);
-        assert_eq!(container_depth("        - item"), 5);
-        assert_eq!(container_depth("-x *** 1.5"), 0);
+        let prefix = line_prefix("> - 1. [^a]: item");
+        assert_eq!((prefix.markers, prefix.indent), (vec![">", "-", "1.", "[^a]:"], 0));
+        assert_eq!(line_prefix("        - item").indent, 8);
+        assert!(line_prefix("-x *** 1.5").markers.is_empty());
+    }
+
+    #[test]
+    fn code_never_stops_a_reply_from_being_scanned() {
+        let code = format!(
+            "```text\n{}deeply indented\n{}\n{}- yaml\n```\n\n[Proof](/tmp/proof.png)",
+            " ".repeat(4 * MAX_LINE_INDENT),
+            "> ".repeat(MAX_LINE_MARKERS + 5),
+            " ".repeat(2 * MAX_LINE_INDENT),
+        );
+        assert_eq!(local_image_sources(&code), ["/tmp/proof.png"]);
+        let indented = format!(
+            "{}code line\n\n{}\n\n[Proof](/tmp/proof.png)",
+            " ".repeat(400),
+            "- ".repeat(MAX_LINE_MARKERS + 5)
+        );
+        assert_eq!(local_image_sources(&indented), ["/tmp/proof.png"]);
+    }
+
+    #[test]
+    fn footnotes_match_like_the_parser_and_unused_ones_crowd_out_nothing() {
+        assert_eq!(
+            local_image_sources("> See [^SS].\n>\n> [^ß]: [Proof](/tmp/proof.png)"),
+            ["/tmp/proof.png"]
+        );
+        let unused: String = (0..70).map(|i| format!("> [^u{i}]: [hidden](/tmp/u{i}.png)\n>\n")).collect();
+        assert_eq!(
+            local_image_sources(&format!("{unused}> [Proof](/tmp/proof.png)")),
+            ["/tmp/proof.png"]
+        );
+    }
+
+    #[test]
+    fn paths_decode_like_the_transcripts_decode_uri() {
+        assert_eq!(
+            local_image_sources(
+                "[a](/tmp/a%zz%20b.png) [b](/tmp/c%2Fd%20e.png) [c](/tmp/f%+1.png) \
+                 [d](file:///tmp/g%FF.png) [e](file:///tmp/h%zz.png) [f](file:///tmp/i%20j.png)"
+            ),
+            ["/tmp/a%zz%20b.png", "/tmp/c%2Fd e.png", "/tmp/f%+1.png", "/tmp/i j.png"]
+        );
+    }
+
+    #[test]
+    fn reference_links_only_take_slots_rendered_links_leave() {
+        let uses: String = (0..8).map(|i| format!("[r{i}][r{i}] ")).collect();
+        let definitions: String = (0..8).map(|i| format!("[r{i}]: /tmp/r{i}.png\n")).collect();
+        let text = format!("See {uses}.\n\n[Proof](/tmp/proof.png)\n\n{definitions}");
+        let sources = local_image_sources(&text);
+        assert_eq!(sources.len(), MAX_RETAINED_PER_REPLY);
+        assert_eq!(sources[0], "/tmp/proof.png");
+        assert_eq!(sources[1..], ["/tmp/r0.png", "/tmp/r1.png", "/tmp/r2.png", "/tmp/r3.png",
+            "/tmp/r4.png", "/tmp/r5.png", "/tmp/r6.png"]);
     }
 
     #[test]

@@ -466,6 +466,68 @@ describe("ChatMarkdown local image links", () => {
     ).toEqual(["Open file:///tmp/auto.png", "Open cell", "Open h"]);
   });
 
+  it("renders only the inline image when reference links point at other blocks", () => {
+    const uses = Array.from({ length: 8 }, (_, i) => `[r${i}][r${i}]`).join(" ");
+    const definitions = Array.from({ length: 8 }, (_, i) => `[r${i}]: /tmp/r${i}.png`).join("\n");
+    expect(
+      renderedCaptions(`See ${uses}.\n\n[Proof](/tmp/proof.png)\n\n${definitions}`),
+    ).toEqual(["Open Proof"]);
+  });
+
+  it("renders an image after a code block holding deep indentation and markers", () => {
+    expect(
+      renderedCaptions(
+        "```text\n" + " ".repeat(100) + "deeply indented\n" + "> ".repeat(20) + "\n```\n\n[Proof](/tmp/proof.png)",
+      ),
+    ).toEqual(["Open Proof"]);
+  });
+
+  const renderedPaths = (markdown: string) => {
+    const { container } = render(
+      <TooltipProvider>
+        <ChatMarkdown>{markdown}</ChatMarkdown>
+      </TooltipProvider>,
+    );
+    return [...container.querySelectorAll("[data-chat-local-image] img")].map((image) =>
+      image.getAttribute("src"),
+    );
+  };
+
+  it("renders an image after code full of markers and indentation", () => {
+    expect(
+      renderedCaptions(
+        "```text\n" + " ".repeat(256) + "x\n" + "> ".repeat(40) + "\n" + " ".repeat(128) + "- yaml\n```\n\n[Proof](/tmp/proof.png)",
+      ),
+    ).toEqual(["Open Proof"]);
+  });
+
+  it("reads a bare carriage return as a line ending", () => {
+    expect(
+      renderedCaptions(" ".repeat(64) + "- x\r\r[Proof](/tmp/proof.png)"),
+    ).toEqual(["Open Proof"]);
+  });
+
+  it("renders an image after deeply nested lists", () => {
+    expect(
+      renderedCaptions("- ".repeat(40) + "x\n\n\n[Proof](/tmp/proof.png)"),
+    ).toEqual(["Open Proof"]);
+  });
+
+  it("renders a footnote image whose reference differs only in case folding", () => {
+    expect(
+      renderedCaptions("> See [^SS].\n>\n> [^ß]: [Proof](/tmp/proof.png)"),
+    ).toEqual(["Open Proof"]);
+  });
+
+  it("names image paths as decodeURI does, keeping undecodable ones as written", () => {
+    expect(
+      renderedPaths(
+        "[a](/tmp/a%zz%20b.png) [b](/tmp/c%2Fd%20e.png) [c](/tmp/f%+1.png) " +
+          "[d](file:///tmp/g%FF.png) [e](file:///tmp/h%zz.png) [f](file:///tmp/i%20j.png)",
+      ),
+    ).toEqual(["/tmp/a%zz%20b.png", "/tmp/c%2Fd e.png", "/tmp/f%+1.png", "/tmp/i j.png"]);
+  });
+
   it("keeps a local file reference inert when no workspace root is available", () => {
     const { container } = render(
       <ChatMarkdown>{"[implementation](/home/me/src/app.tsx)"}</ChatMarkdown>,
