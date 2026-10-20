@@ -164,7 +164,6 @@ impl Harness {
                 effort_override: None,
                 permission_mode_override: None,
                 epoch: "an-earlier-run".into(),
-                provenance: Default::default(),
             })
             .unwrap();
     }
