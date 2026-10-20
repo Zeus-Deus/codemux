@@ -1,5 +1,5 @@
 import { PanelRightOpen, X } from "lucide-react";
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 
 import { selectBackgroundBrowserSession } from "@/components/browser/background-browser-indicator";
 import { BrowserPane, type BrowserStreamStatus } from "@/components/browser/BrowserPane";
@@ -42,6 +42,34 @@ const DESKTOP_PEEK_VIEWPORT = { width: 1280, height: 800 };
 /** Matches the `duration-250` (overlay) exit animation below. */
 const EXIT_MS = 250;
 
+/** The peek's inset from its container's edges (`right-3.5` / `bottom-3.5`). */
+const PEEK_INSET_PX = 14;
+/** Air the peek keeps above a composer it would otherwise cover. */
+const COMPOSER_GAP_PX = 12;
+
+/**
+ * Bottom offset that keeps a bottom-right peek of `width` × `height` off
+ * every composer (`[data-composer-dock]`) it would overlap horizontally,
+ * so the send button and the queue stay usable while the peek is up. When
+ * there is not enough height to clear one, the peek stays at its corner
+ * and overlaps rather than leaving its container.
+ */
+export function peekBottomOffset(
+  container: { right: number; top: number; bottom: number },
+  docks: ReadonlyArray<{ left: number; right: number; top: number }>,
+  size: PeekSize,
+): number {
+  const right = container.right - PEEK_INSET_PX;
+  const left = right - size.width;
+  let bottom = PEEK_INSET_PX;
+  for (const dock of docks) {
+    if (dock.right <= left || dock.left >= right) continue;
+    bottom = Math.max(bottom, container.bottom - dock.top + COMPOSER_GAP_PX);
+  }
+  const roomAbove = container.bottom - container.top - PEEK_INSET_PX - size.height;
+  return bottom <= roomAbove ? bottom : PEEK_INSET_PX;
+}
+
 const STATUS_DOT: Record<BrowserStreamStatus, { className: string; label: string }> = {
   live: { className: "bg-status-open", label: "Live" },
   starting: { className: "bg-muted-foreground/60 motion-safe:animate-pulse", label: "Connecting" },
@@ -67,8 +95,9 @@ function windowSize(): PeekSize {
  * Floating "peek" overlay for a GUI-mode background browser session: clicking the
  * inline chat chip or terminal-header indicator opens this instead of
  * splitting the chat into a pane. Renders the live browser stream as a
- * top-right floating panel absolutely positioned over the chat surface — it
- * never resizes or reflows the chat. "Open in side panel" graduates the
+ * bottom-right floating panel absolutely positioned over the chat surface —
+ * it never resizes or reflows the chat, and it stays clear of the Workspace
+ * details card pinned in the top-right corner. "Open in side panel" graduates the
  * session into the right-panel deck's `browser` pane via
  * `dock_browser_in_right_panel` — the deck is the one persistent home for a
  * browser, so the peek stays a transient look rather than a second place a
@@ -98,6 +127,7 @@ export function BrowserPeekOverlay() {
   const pinnedViewport =
     parseViewportString(defaultViewportRaw) ?? DESKTOP_PEEK_VIEWPORT;
   const panelRef = useRef<HTMLDivElement>(null);
+  const [bottom, setBottom] = useState(PEEK_INSET_PX);
   const [streamStatus, setStreamStatus] = useState<BrowserStreamStatus>("starting");
   const storedSize = useBrowserPeekStore((s) => s.size);
   const setStoredSize = useBrowserPeekStore((s) => s.setSize);
@@ -176,17 +206,61 @@ export function BrowserPeekOverlay() {
     return () => document.removeEventListener("pointerdown", onPointerDown);
   }, [open, activeWorkspaceId, close]);
 
+  // Lift the peek over any composer under its corner, following the
+  // composer as it grows with a draft or a queue, and picking up composers
+  // that mount while the peek is open (a keyboard tab switch, a new split).
+  const liveSize = clampPeekSize(dragSize ?? storedSize, winSize);
+  const { width: liveWidth, height: liveHeight } = liveSize;
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    const container = panel?.offsetParent ?? panel?.parentElement;
+    if (!open || !panel || !container) return;
+    const resize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => schedule());
+    let observed = new Set<HTMLElement>();
+    const sync = () => {
+      const docks = new Set(container.querySelectorAll<HTMLElement>("[data-composer-dock]"));
+      for (const dock of docks) if (!observed.has(dock)) resize?.observe(dock);
+      for (const dock of observed) if (!docks.has(dock)) resize?.unobserve(dock);
+      observed = docks;
+      setBottom(
+        peekBottomOffset(
+          container.getBoundingClientRect(),
+          Array.from(docks, (dock) => dock.getBoundingClientRect()),
+          { width: liveWidth, height: liveHeight },
+        ),
+      );
+    };
+    // Coalesce bursts (a streaming transcript mutates every frame).
+    let frame = 0;
+    const schedule = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        sync();
+      });
+    };
+    sync();
+    resize?.observe(container);
+    const mutations = new MutationObserver(schedule);
+    mutations.observe(container, { childList: true, subtree: true });
+    return () => {
+      cancelAnimationFrame(frame);
+      mutations.disconnect();
+      resize?.disconnect();
+    };
+  }, [open, liveWidth, liveHeight]);
+
   const last = lastShownRef.current;
   const exiting = !current && !exitDone && last !== null && !prefersReducedMotion();
   const shown = current ?? (exiting ? last : null);
   if (!shown) return null;
   const closing = !open;
   const workspaceId = shown.workspaceId;
-  const size = clampPeekSize(dragSize ?? storedSize, winSize);
+  const size = liveSize;
   const dot = STATUS_DOT[streamStatus];
 
-  // Anchored top-right, so the handle sits bottom-left and the peek
-  // grows toward the chat it floats over.
+  // Anchored bottom-right, so the handle sits top-left and the peek
+  // grows up and toward the chat it floats over.
   const startResize = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
     e.preventDefault();
@@ -202,7 +276,7 @@ export function BrowserPeekOverlay() {
       latest = clampPeekSize(
         {
           width: origin.width + (origin.x - ev.clientX),
-          height: origin.height + (ev.clientY - origin.y),
+          height: origin.height + (origin.y - ev.clientY),
         },
         windowSize(),
       );
@@ -252,13 +326,14 @@ export function BrowserPeekOverlay() {
         {
           "--peek-w": `${size.width}px`,
           "--peek-h": `${size.height}px`,
+          bottom,
         } as CSSProperties
       }
       className={cn(
-        "absolute right-3.5 top-3.5 z-30 flex h-(--peek-h) w-(--peek-w) flex-col overflow-hidden",
+        "absolute right-3.5 z-30 flex h-(--peek-h) w-(--peek-w) flex-col overflow-hidden",
         "rounded-lg border border-border bg-popover shadow-2xl",
-        "animate-in fade-in slide-in-from-top-1 duration-250 ease-out motion-reduce:animate-none",
-        "data-[state=closed]:pointer-events-none data-[state=closed]:animate-out data-[state=closed]:fade-out data-[state=closed]:slide-out-to-top-1 data-[state=closed]:fill-mode-forwards",
+        "animate-in fade-in slide-in-from-bottom-1 duration-250 ease-out motion-reduce:animate-none",
+        "data-[state=closed]:pointer-events-none data-[state=closed]:animate-out data-[state=closed]:fade-out data-[state=closed]:slide-out-to-bottom-1 data-[state=closed]:fill-mode-forwards",
       )}
     >
       <PanelHeader>
@@ -311,7 +386,7 @@ export function BrowserPeekOverlay() {
         aria-hidden
         title="Drag to resize"
         onPointerDown={startResize}
-        className="absolute bottom-0 left-0 z-20 size-3 cursor-nesw-resize"
+        className="absolute left-0 top-0 z-20 size-3 cursor-nwse-resize"
       />
     </div>
   );

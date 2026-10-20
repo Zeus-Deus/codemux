@@ -7,11 +7,13 @@ const MENU_MARGINS_PX = 16;
 /** Below this a menu is too short to use; let it clip instead. */
 const MIN_ROOM_PX = 120;
 
+const TITLE_BAR_SELECTOR = '[data-testid="floating-titlebar"]';
+
 /**
  * Height available to a menu that rises from `bottom-full` of its anchor
  * (the composer card) before a clipping ancestor — the chat's scroll area
- * under the header — or the visible viewport cuts it off. `undefined`
- * without layout (jsdom), so callers keep their CSS caps.
+ * under the header — the visible viewport or the floating title bar cuts it
+ * off. `undefined` without layout (jsdom), so callers keep their CSS caps.
  */
 export function roomAbove(menu: HTMLElement): number | undefined {
   const anchor = menu.offsetParent ?? menu.parentElement;
@@ -24,6 +26,11 @@ export function roomAbove(menu: HTMLElement): number | undefined {
       clipTop = Math.max(clipTop, el.getBoundingClientRect().top);
     }
   }
+  // The floating title bar overlays the window's top edge instead of
+  // clipping it — a new chat's pane starts at 0 underneath it — so no
+  // ancestor reports it. Stop the menu at its bottom.
+  const titleBar = document.querySelector(TITLE_BAR_SELECTOR);
+  if (titleBar) clipTop = Math.max(clipTop, titleBar.getBoundingClientRect().bottom);
   return Math.max(MIN_ROOM_PX, Math.floor(rect.top - clipTop - MENU_MARGINS_PX));
 }
 

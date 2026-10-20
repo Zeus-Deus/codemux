@@ -32,6 +32,7 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::agent_provider::side_chat::provider_label;
 use crate::agent_provider::{ProviderKind, ProviderRuntimeEvent, StartSessionInput, ThreadId};
+use crate::database::provider_switch::{history_ref, retarget_seed};
 use crate::database::DatabaseStore;
 use crate::observability::ObservabilityStore;
 use crate::utility_ai::UtilityModelSelection;
@@ -39,12 +40,11 @@ use crate::utility_ai::UtilityModelSelection;
 use super::agent_chat::{
     agent_chat_start_session, agent_chat_stop_session, feature_flag_on, fork_dispatch_guard,
     fork_timeline_guard, forward_event, lookup_provider, session_context,
-    AgentChatSessionContext, ProviderRegistry, AGENT_CHAT_TURN_CHECKPOINTS_INVALIDATED_EVENT,
+    AgentChatSessionContext, ProviderRegistry, SubagentTracker,
+    AGENT_CHAT_TURN_CHECKPOINTS_INVALIDATED_EVENT,
 };
 use super::chat_fork::source_busy;
 
-const BUSY: &str =
-    "Wait for the current turn and any queued messages to finish, then switch providers.";
 /// Prefixes an error returned before anything changed: the old provider
 /// still runs, so the caller must not restart it.
 const REFUSED: &str = "provider_switch_refused: ";
@@ -58,7 +58,7 @@ fn switching() -> &'static Mutex<HashSet<String>> {
 }
 
 /// Marks a thread as switching until dropped.
-struct SwitchMark(String);
+pub(crate) struct SwitchMark(String);
 
 impl SwitchMark {
     fn claim(thread_id: &str) -> Result<Self, String> {
@@ -81,6 +81,20 @@ fn slug(provider: ProviderKind) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_default()
+}
+
+/// Hold `thread_id` still for removing an account: no provider switch can
+/// start or run on it until the mark drops, so the provider it runs on can't
+/// change between removal checking it and stopping that provider's session.
+/// Sends are refused meanwhile, as during a switch. Waits for a switch in
+/// flight to end: it may be landing on the account being removed.
+pub(crate) async fn hold_still(thread_id: &str) -> SwitchMark {
+    loop {
+        if let Ok(mark) = SwitchMark::claim(thread_id) {
+            return mark;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Refuse what would change or copy the chat mid-switch: a turn revert
@@ -192,18 +206,6 @@ pub(crate) fn carry_into_fork(db: &DatabaseStore, source: &str, fork: &str) {
     }
 }
 
-/// `seed` with its history pointer moved from `source` to `fork`. Only the
-/// header Codemux wrote is touched, never the conversation in the body.
-fn retarget_seed(seed: &str, source: &str, fork: &str) -> String {
-    let (header, body) = seed.split_once("\n\n").unwrap_or((seed, ""));
-    let header = header.replacen(&history_ref(source), &history_ref(fork), 1);
-    if body.is_empty() {
-        header
-    } else {
-        format!("{header}\n\n{body}")
-    }
-}
-
 /// Tells a forked session where its own full history lives.
 fn fork_correction(fork: &str) -> String {
     format!(
@@ -225,11 +227,6 @@ pub(crate) fn seed_delivered(
             eprintln!("[codemux::provider_switch] {error}");
         }
     }
-}
-
-/// How a seed names the chat whose full history it points at.
-fn history_ref(thread_id: &str) -> String {
-    format!("conversation_id `{thread_id}`")
 }
 
 /// The handoff block the new provider reads before the user's next message.
@@ -305,8 +302,9 @@ async fn plan_switch<R: Runtime>(
     // hold the session's outbound lock while it waits for the timeline.
     let session_live = live.has_session(&ThreadId(thread_id.to_string())).await;
     let timeline = fork_timeline_guard(thread_id).await;
-    if source_busy(&*live, session_live, &db, thread_id).await? {
-        return Err(BUSY.into());
+    let subagents: State<'_, SubagentTracker> = app.state();
+    if let Some(busy) = source_busy(&*live, session_live, &db, &subagents, thread_id).await? {
+        return Err(busy.refusal("switch providers"));
     }
     let from_model = record.model.clone();
     let context = match session_context(&db, record, utility_selection).await {
@@ -529,6 +527,32 @@ mod tests {
     }
 
     #[test]
+    fn a_reopened_chat_tells_its_provider_where_the_history_went() {
+        // The handoff was answered under "t"; reopening the chat from history
+        // merges it into "t2" and deletes "t", which the provider's handoff
+        // still names. The next turn carries a short correction, once.
+        let db = store();
+        db.put_provider_switch_seed("t", "codex", "SEED conversation_id `t`", 0).unwrap();
+        let (_, seed) = seed_turn(&db, "t", ProviderKind::Codex, "n1", "go".into());
+        seed_delivered(&db, "t", ProviderKind::Codex, "n1", seed);
+        user_message(&db, "n1");
+        db.append_agent_chat_message("t", r#"{"type":"item_completed"}"#).unwrap();
+        db.upsert_agent_chat_session("t2", "ws", Some("/repo"), "codex").unwrap();
+        db.merge_reopened_agent_chat_session("t", "t2").unwrap();
+
+        let (text, seed) = seed_turn(&db, "t2", ProviderKind::Codex, "n2", "next".into());
+        assert!(text.contains("reopened under a new id"), "{text}");
+        assert!(text.contains(&history_ref("t2")) && !text.contains(&history_ref("t")));
+        assert!(text.ends_with("\n\nnext"));
+        seed_delivered(&db, "t2", ProviderKind::Codex, "n2", seed);
+        let reply = serde_json::json!({"type": "user_message", "text": "next", "client_nonce": "n2"});
+        db.append_agent_chat_message("t2", &reply.to_string()).unwrap();
+        db.append_agent_chat_message("t2", r#"{"type":"item_completed"}"#).unwrap();
+        let (after, none) = seed_turn(&db, "t2", ProviderKind::Codex, "n3", "more".into());
+        assert_eq!((after.as_str(), none), ("more", None));
+    }
+
+    #[test]
     fn a_reverted_seeded_turn_hands_the_seed_to_the_next_one() {
         let db = store();
         db.put_provider_switch_seed("t", "codex", "SEED", 0).unwrap();
@@ -601,6 +625,19 @@ mod tests {
         assert_eq!(refuse_stale_send(&db, ProviderKind::Codex, "t").unwrap_err(), SWITCHING);
         drop(mark);
         assert!(refuse_stale_send(&db, ProviderKind::Codex, "t").is_ok());
+    }
+
+    #[tokio::test]
+    async fn holding_a_chat_still_waits_for_its_switch_and_blocks_the_next() {
+        let switch = SwitchMark::claim("still-t").unwrap();
+        let held = tokio::spawn(hold_still("still-t"));
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert!(!held.is_finished(), "a switch in flight keeps it");
+        drop(switch);
+        let still = held.await.unwrap();
+        assert!(SwitchMark::claim("still-t").is_err(), "no switch starts while held");
+        drop(still);
+        assert!(SwitchMark::claim("still-t").is_ok());
     }
 
     #[test]

@@ -76,7 +76,6 @@ it("makes an account the default and adds a new one", async () => {
     expect(invoke).toHaveBeenCalledWith("provider_account_set_default", {
       provider: "claude",
       accountId: "claude-work-1",
-      workspaceId: null,
     }),
   );
 
@@ -144,10 +143,10 @@ it("a draft on an account last seen signed out asks again before it is refused",
       return { ...state, accounts: state.accounts.map((a) => (a.id === "claude-work-1" ? { ...a, identity: signedIn } : a)) };
     }
     if (cmd === "provider_account_thread") {
-      return { account_id: "claude-work-1", bound: false, workspace_id: null, workspace_default: null };
+      return { account_id: "claude-work-1", bound: false };
     }
     return null;
   });
-  expect(await startsOnSignedInAccount("claude", "draft-2", null)).toBe(true);
+  expect(await startsOnSignedInAccount("claude", "draft-2")).toBe(true);
   expect(invoke.mock.calls.some(([cmd]) => cmd === "provider_accounts_refresh")).toBe(true);
 });

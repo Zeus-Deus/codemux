@@ -30,7 +30,10 @@ import {
 import { defaultPermissionModeForProvider } from "./capability-defaults";
 import { launchAgentChatPane } from "./launch-pane";
 import { applyAllPrefixes } from "./mode-prefix";
-import { normalizeChatModeForProvider } from "./mode-compatibility";
+import {
+  codexTurnPermissionOverride,
+  normalizeChatModeForProvider,
+} from "./mode-compatibility";
 import { formatProviderError } from "./provider-error";
 import type { UserMessageImage } from "./types";
 import type { ResolvedSkillSelection } from "./skill-tokens";
@@ -447,7 +450,7 @@ export async function materializeAndSend(
       images,
       model_override: null,
       effort_override: draft.effort,
-      permission_mode_override: null,
+      permission_mode_override: draftTurnPermissionOverride(draft),
     });
   } catch (err) {
     const message = errorMessage(err);
@@ -696,7 +699,7 @@ export async function materializeWithPreset(
           include_plugins: actions.getIncludePlugins?.() ?? true,
           model_override: null,
           effort_override: draft.effort,
-          permission_mode_override: null,
+          permission_mode_override: draftTurnPermissionOverride(draft),
         });
       } catch (err) {
         const message = errorMessage(err);
@@ -800,9 +803,20 @@ function seedSliceFromDraft(
  *  is active. Debug remains a state-only flip until Stage 6. */
 export function effectivePermissionMode(draft: ChatDraft): string | null {
   const mode = normalizeChatModeForProvider(draft.provider, draft.mode);
-  if (mode === "plan" || mode === "ask") return "plan";
+  // Codex plans per turn (see `draftTurnPermissionOverride`), not per session.
+  if ((mode === "plan" || mode === "ask") && draft.provider !== "codex") {
+    return "plan";
+  }
   return (
     draft.permissionMode ?? defaultPermissionModeForProvider(draft.provider)
+  );
+}
+
+function draftTurnPermissionOverride(draft: ChatDraft): string | null {
+  return codexTurnPermissionOverride(
+    draft.provider,
+    normalizeChatModeForProvider(draft.provider, draft.mode),
+    effectivePermissionMode(draft),
   );
 }
 

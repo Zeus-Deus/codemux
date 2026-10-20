@@ -624,7 +624,7 @@ fn merge_branches_with(
 
 // ── App glue ─────────────────────────────────────────────────────────
 
-fn emit_changed<R: Runtime>(app: &AppHandle<R>, parent_thread_id: &str) {
+pub(crate) fn emit_changed<R: Runtime>(app: &AppHandle<R>, parent_thread_id: &str) {
     let _ = app.emit(
         FOLLOW_UP_CHANGED_EVENT,
         json!({ "parent_thread_id": parent_thread_id }),

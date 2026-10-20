@@ -210,6 +210,10 @@ pub enum ThreadStartResponse {
         /// own config when the request names none.
         #[serde(default)]
         model: Option<String>,
+        /// The thread's effective collaboration mode: on `thread/resume`, the
+        /// mode its last turn ran in. Absent from older servers.
+        #[serde(default, rename = "collaborationMode")]
+        collaboration_mode: Option<ReportedCollaborationMode>,
     },
     /// Legacy shape: flat `threadId` string.
     Flat {
@@ -236,6 +240,22 @@ impl ThreadStartResponse {
             Self::Flat { .. } => None,
         }
     }
+
+    /// Whether the thread's last turn ran in Codex's `plan` collaboration
+    /// mode, as reported when it is resumed. `None` when the server does not
+    /// say (fresh threads, and older servers).
+    pub fn plan_mode(&self) -> Option<bool> {
+        match self {
+            Self::Nested { collaboration_mode: Some(mode), .. } => Some(mode.mode == "plan"),
+            _ => None,
+        }
+    }
+}
+
+/// The part of a reported collaboration mode Codemux reads.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReportedCollaborationMode {
+    pub mode: String,
 }
 
 /// Nested thread info inside [`ThreadStartResponse::Nested`].
@@ -287,7 +307,9 @@ pub struct CollaborationMode {
 pub struct CollaborationModeSettings {
     pub model: String,
     pub reasoning_effort: Option<String>,
-    pub developer_instructions: String,
+    /// Serialized even when `None`: `null` selects Codex's built-in
+    /// instructions for the mode.
+    pub developer_instructions: Option<String>,
 }
 
 /// A single item in [`TurnStartParams::input`].
@@ -1631,7 +1653,7 @@ mod tests {
                 settings: CollaborationModeSettings {
                     model: "gpt-5.6-sol".into(),
                     reasoning_effort: Some("high".into()),
-                    developer_instructions: "runtime identity".into(),
+                    developer_instructions: Some("runtime identity".into()),
                 },
             }),
         };

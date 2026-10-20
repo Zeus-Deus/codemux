@@ -251,6 +251,7 @@ fn request(relay: &str, device: &MobilePushDevice, notice: &Notice) -> (String, 
     // tap knows which machine the workspace lives on.
     data.insert("sessionId".into(), Value::String(device.session_id.clone()));
     let url = format!("{relay}/v1/devices/{}/notifications", device.device_id);
+    // The relay counts these limits in code points too (`chars`, not UTF-16).
     let body = json!({
         "title": notice.title.chars().take(120).collect::<String>(),
         "body": notice.body.chars().take(400).collect::<String>(),
@@ -607,6 +608,20 @@ mod tests {
         assert_eq!(body["data"], json!({"workspaceId": "ws", "sessionId": "sess"}));
         // The capability travels only in the Authorization header.
         assert!(!body.to_string().contains(&device().send_key));
+    }
+
+    #[test]
+    fn request_clips_text_by_code_point() {
+        let notice = Notice {
+            kind: Kind::Complete,
+            title: "😀".repeat(200),
+            body: "😀".repeat(500),
+            collapse_key: "c".into(),
+            data: BTreeMap::new(),
+        };
+        let (_, body) = request("https://relay.test/api/push", &device(), &notice);
+        assert_eq!(body["title"].as_str().unwrap().chars().count(), 120);
+        assert_eq!(body["body"].as_str().unwrap().chars().count(), 400);
     }
 
     #[test]

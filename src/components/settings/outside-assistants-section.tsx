@@ -1,14 +1,13 @@
 import { NativeSelect } from "@/components/ui/native-select";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Copy } from "lucide-react";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
-import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
 import { useUIStore } from "@/stores/ui-store";
 import { onWebRemoteStateChanged } from "@/remote/web-remote-events";
+import { CopyButton } from "./remote-access-section";
 import {
   agentConnectorApprove, agentConnectorDeny, agentConnectorRevoke,
   agentConnectorSetConfig, agentConnectorStatus,
@@ -301,20 +300,10 @@ function isHttpsOrigin(value: string): boolean {
 }
 
 function CopySetup({ value, label }: { value: string; label: string }) {
-  const [feedback, setFeedback] = useState<string | null>(null);
-  const [copying, setCopying] = useState(false);
   return (
-    <div>
-      <div className="flex items-center gap-2">
-        <code className="min-w-0 flex-1 select-text break-all rounded-md bg-muted/40 px-2 py-1.5 font-mono text-label">{value}</code>
-        <Button variant="ghost" size="icon-sm" aria-label={label} disabled={copying} onClick={async () => {
-          setCopying(true);
-          try { setFeedback(await copyToClipboard(value) ? "Copied" : COPY_FAILED_MESSAGE); }
-          catch { setFeedback(COPY_FAILED_MESSAGE); }
-          finally { setCopying(false); }
-        }}><Copy className="size-3.5" aria-hidden /></Button>
-      </div>
-      {feedback && <p role="status" className="mt-1 text-label text-muted-foreground">{feedback}</p>}
+    <div className="flex items-center gap-2">
+      <code className="min-w-0 flex-1 select-text break-all rounded-md bg-muted/40 px-2 py-1.5 font-mono text-label">{value}</code>
+      <CopyButton text={value} label={label} />
     </div>
   );
 }

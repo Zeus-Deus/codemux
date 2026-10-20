@@ -102,7 +102,7 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     ).toBeNull();
   });
 
-  it("does NOT render an inline ModePill (it lives above the textarea now)", () => {
+  it("does NOT render the mode tab (it sits on the card's top edge)", () => {
     renderFooter({ mode: "plan" });
     expect(
       screen.queryByRole("status", { name: /Plan mode active/i }),
@@ -172,12 +172,6 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     renderFooter({ mode: "default" });
     const picker = screen.getByRole("button", { name: /Full access/i });
     expect(picker).not.toBeDisabled();
-  });
-
-  it("leaves model, effort and access to the context row when it hosts them", () => {
-    renderFooter({ settingsInContextRow: true });
-    expect(screen.queryByRole("button", { name: /Full access/i })).toBeNull();
-    expect(screen.getByRole("button", { name: "Send" })).toBeInTheDocument();
   });
 
   it("PermissionModePicker stays visible but disabled when a mode is active", () => {

@@ -170,6 +170,14 @@ pub(crate) fn on_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEv
             }
             SessionStatus::Starting => return,
         },
+        // A late end of an older turn: Claude clears its turn before it
+        // publishes the end, so a send can start the next turn first. The
+        // newer turn's own end settles the run.
+        ProviderRuntimeEvent::TurnCompleted { thread_id, turn_id, .. }
+            if db.restart_turn_is_other(&thread_id.0, &turn_id.0).unwrap_or(false) =>
+        {
+            return;
+        }
         // A provider can end its turn while work it delegated still runs
         // (Claude yields to wait on its subagents): the run goes on, so it
         // stays resumable and a resumed one has not finished yet. The real
@@ -227,9 +235,13 @@ pub(crate) fn on_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEv
             }
             return;
         }
-        ProviderRuntimeEvent::TurnCompleted { thread_id, status, .. } => {
+        ProviderRuntimeEvent::TurnCompleted { thread_id, turn_id, status, .. } => {
+            let result = match db.end_restart_turn(&thread_id.0, &turn_id.0) {
+                // A newer turn started since the check above.
+                Ok(false) => return,
+                ended => ended.map(drop),
+            };
             live().yielded.remove(&thread_id.0);
-            let result = db.clear_restart_turn(&thread_id.0).map(drop);
             let drain = {
                 let mut live = live();
                 let resumed = live.resuming.remove(&thread_id.0);

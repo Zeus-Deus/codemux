@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render as rtlRender, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Tooltips need the provider `main.tsx` mounts around the whole app.
@@ -469,6 +470,26 @@ describe("AgentLauncher", () => {
 // GUI draft chrome — the `+` launcher rendered in the titlebar's draft
 // variant. Picking a preset materialises the draft (shared
 // `launchDraftWithPreset` path with the legacy draft PresetBar).
+it.each(["workspace", "draft"] as const)("keeps the %s launcher's tooltip closed after a pointer pick and returns focus on Escape", async (kind) => {
+  const user = userEvent.setup();
+  render(kind === "workspace"
+    ? <AgentLauncher workspace={makeWorkspace()} />
+    : <DraftAgentLauncher draft={makeDraft()} />);
+  const trigger = screen.getByRole("button", { name: "Launch an agent" });
+  await user.click(trigger);
+  expect(trigger).toHaveAttribute("data-state", "open");
+  await user.click(screen.getByText("Claude Code"));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(trigger).not.toHaveFocus();
+  expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  await user.click(trigger);
+  // A pointer interaction inside the menu must not suppress a later Escape.
+  await user.click(screen.getByRole("combobox"));
+  await user.keyboard("{Escape}");
+  await waitFor(() => expect(trigger).toHaveFocus());
+  expect(trigger).toHaveAttribute("data-state", "closed");
+});
+
 describe("DraftAgentLauncher", () => {
   function openDraftLauncher() {
     const trigger = screen.getByTestId("draft-agent-launcher-trigger");

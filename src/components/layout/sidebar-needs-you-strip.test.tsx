@@ -203,12 +203,12 @@ describe("SidebarNeedsYouStrip", () => {
 
     // Count reflects only the two permission workspaces.
     expect(screen.getByText(/NEEDS YOU · 2/)).toBeInTheDocument();
-    // One jump-link per blocked workspace, each with the blocker fallback.
+    // One jump-link per blocked workspace, named with its title and blocker.
     const links = screen.getAllByRole("button", { name: /waiting for your input/i });
     expect(links).toHaveLength(2);
   });
 
-  it("renders the blocker summary fallback and the age since the block", () => {
+  it("shows the workspace title, with its blocker in the tooltip and accessible name", () => {
     useSidebarDensityStore.setState({
       statusSince: {
         "ws-perm": { status: "permission", at: Date.now() - 12 * 60_000 },
@@ -229,7 +229,14 @@ describe("SidebarNeedsYouStrip", () => {
     const { container } = render(
       <SidebarNeedsYouStrip projectGroups={groups} />,
     );
-    expect(container.textContent).toContain("Waiting for your input");
+    const link = screen.getByRole("button", {
+      name: "Jump to Alpha work — waiting for your input",
+    });
+    expect(link).toHaveTextContent("Alpha work");
+    expect(link).toHaveAttribute("title", "Waiting for your input");
+    expect(container.textContent).not.toContain("Waiting for your input");
+    expect(screen.getByRole("region", { name: "Workspaces needing you" }))
+      .toHaveClass("border-border", "bg-surface-2");
     // Age derived from the density store's coarse status timestamp.
     expect(container.textContent).toContain("12m");
   });
