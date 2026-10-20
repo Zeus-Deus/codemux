@@ -531,6 +531,22 @@ describe("inbox drag commits", () => {
     expect(useSidebarInboxStore.getState().settled).toEqual([]);
   });
 
+  it.each(["active", "wrapping"] as const)("restores the previous shelf after a rejected %s drop despite a timestamp-only observation", async (destination) => {
+    const settled = destination === "active" ? [{ id: "a", at: 1 }] : [];
+    const snoozed = destination === "wrapping" ? [{ id: "a", at: 1, until: 10 }] : [];
+    const keepActive: Record<string, true> = destination === "active" ? {} : { a: true };
+    useSidebarInboxStore.setState({ settled, snoozed, keepActive, activity: { a: 100 } });
+    mockSetWorkspacePinned.mockImplementation(async () => {
+      // A visit updates the observation stamp without changing lifecycle intent.
+      useSidebarInboxStore.getState().noteActivity("a", 100_000);
+      throw new Error("offline");
+    });
+    await expect(useSidebarInboxStore.getState().applyDrop({ ...unpin, destination }, true)).rejects.toThrow("offline");
+    expect(useSidebarInboxStore.getState()).toMatchObject({ settled, snoozed, keepActive, activity: { a: 100_000 } });
+    expect(useSidebarInboxStore.getState().keepActive).toEqual(keepActive);
+    expect(lastPersistedBlob()).toMatchObject({ settled, snoozed, keepActive: Object.keys(keepActive), keepWrapping: [], activity: { a: 100_000 } });
+  });
+
   it("keeps pin overrides until the snapshot acknowledges them", async () => {
     await useSidebarInboxStore.getState().applyDrop(unpin, true);
     useSidebarInboxStore.getState().reconcilePins([{ workspace_id: "a", pinned_at: 100 }]);

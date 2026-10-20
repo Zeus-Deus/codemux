@@ -353,8 +353,10 @@ export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
       const current = get();
       const pinOverrides = { ...current.pinOverrides };
       delete pinOverrides[id];
+      // Visits may update activity without changing the shelf decision. Only
+      // lifecycle changes (which clear the exemption or add a shelf) revoke it.
       const canRestoreShelves = wasPinned && !pinned &&
-        current.keepActive[id] === nextKeepActive[id] && current.activity[id] === before.activity[id] &&
+        current.keepActive[id] === nextKeepActive[id] &&
         !current.settled.some((entry) => entry.id === id) &&
         !current.snoozed.some((entry) => entry.id === id);
       const keepActive = { ...current.keepActive };
