@@ -292,10 +292,14 @@ pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
     // holds a part of the reply at most once, so they stay linear in it.
     let mut rendered = Candidates::default();
     let mut referenced_links = Candidates::default();
-    let mut in_footnotes: Candidates<(UniCase<String>, bool, String)> = Candidates::default();
+    let mut in_footnotes: Candidates<(usize, bool, String)> = Candidates::default();
     // Footnote labels match like the parser matches them: case-folded.
     let mut referenced = std::collections::HashSet::new();
-    let mut footnote: Option<UniCase<String>> = None;
+    // Each defined label once, so candidates carry a small id, not the label.
+    let mut labels: Vec<UniCase<String>> = Vec::new();
+    let mut label_ids: std::collections::HashMap<UniCase<String>, usize> =
+        std::collections::HashMap::new();
+    let mut footnote: Option<usize> = None;
     let mut inside_image = 0usize;
     for event in Parser::new_ext(&markdown, options) {
         let (link_type, dest_url) = match event {
@@ -304,7 +308,13 @@ pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
                 continue;
             }
             Event::Start(Tag::FootnoteDefinition(label)) => {
-                footnote = Some(UniCase::new(label.to_string()));
+                let label = UniCase::new(label.to_string());
+                let next = labels.len();
+                let id = *label_ids.entry(label.clone()).or_insert(next);
+                if id == next {
+                    labels.push(label);
+                }
+                footnote = Some(id);
                 continue;
             }
             Event::End(TagEnd::FootnoteDefinition) => {
@@ -336,17 +346,19 @@ pub(super) fn local_image_sources(markdown: &str) -> Vec<String> {
             continue;
         };
         match &footnote {
-            Some(label) => in_footnotes.add((label.clone(), renders, path)),
+            Some(id) => in_footnotes.add((*id, renders, path)),
             None if renders => rendered.add(path),
             None => referenced_links.add(path),
         }
     }
     // Links known to render come first; reference links only take slots
     // those leave free, so a speculative copy never displaces a visible one.
+    // Whether each label is referenced, looked up once per label.
+    let label_used: Vec<bool> = labels.iter().map(|label| referenced.contains(label)).collect();
     let (noted_rendering, noted_references): (Vec<_>, Vec<_>) = in_footnotes
         .order
         .into_iter()
-        .filter(|(label, _, _)| referenced.contains(label))
+        .filter(|(id, _, _)| label_used[*id])
         .partition(|(_, renders, _)| *renders);
     let mut sources: Vec<String> = Vec::new();
     let ordered = rendered
@@ -497,6 +509,10 @@ enum PrefixPart<'a> {
     Marker(&'a str, usize),
 }
 
+/// Whitespace the parser skips around container markers: besides spaces and
+/// tabs, a vertical tab or form feed after a footnote marker.
+const PREFIX_SPACE: [char; 4] = [' ', '\t', '\u{0B}', '\u{0C}'];
+
 fn line_prefix(line: &str) -> LinePrefix<'_> {
     let mut parts = Vec::new();
     let mut markers = 0;
@@ -504,7 +520,7 @@ fn line_prefix(line: &str) -> LinePrefix<'_> {
     let mut at = 0;
     loop {
         let rest = &line[at..];
-        let trimmed = rest.trim_start_matches([' ', '\t']);
+        let trimmed = rest.trim_start_matches(PREFIX_SPACE);
         let columns = rest[..rest.len() - trimmed.len()]
             .chars()
             .map(|c| if c == '\t' { 4 } else { 1 })
@@ -532,14 +548,14 @@ fn line_prefix(line: &str) -> LinePrefix<'_> {
         let opens = marker > 0
             && (trimmed.starts_with(['>', '['])
                 || after.is_empty()
-                || after.starts_with([' ', '\t']));
+                || after.starts_with(PREFIX_SPACE));
         if !opens {
             return LinePrefix { parts, markers, indent, content: at };
         }
         parts.push(PrefixPart::Marker(&trimmed[..marker], markers));
         markers += 1;
         // The one space after a marker belongs to it, not to indentation.
-        at += marker + usize::from(after.starts_with([' ', '\t']));
+        at += marker + usize::from(after.starts_with(PREFIX_SPACE));
     }
 }
 
@@ -946,6 +962,29 @@ mod tests {
             ["/tmp/a%zz%20b.png", "/tmp/c% d.png", "/tmp/e%2 f.png", "/tmp/g%zz%20%C3%A9.png"]
         );
         assert_eq!(local_image_sources("[a](<file:///tmp/a.png >)"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn odd_whitespace_after_a_footnote_marker_is_still_bounded() {
+        let n = 10_000;
+        for space in ['\u{0B}', '\u{0C}'] {
+            let text = format!("[^a]:{space}{}x{}[Proof](/tmp/proof.png)", "- ".repeat(n), "\n".repeat(n));
+            let started = std::time::Instant::now();
+            assert_eq!(local_image_sources(&text), ["/tmp/proof.png"]);
+            assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        }
+    }
+
+    #[test]
+    fn a_long_footnote_label_is_stored_once() {
+        let n = 10_000;
+        let links: String = (0..n).map(|i| format!("[x](/tmp/{i}.png) [x](/tmp/0.png) ")).collect();
+        let text = format!("See [^{label}].\n\n[^{label}]: {links}", label = "a".repeat(n));
+        let started = std::time::Instant::now();
+        let sources = local_image_sources(&text);
+        assert!(started.elapsed() < std::time::Duration::from_millis(1_000));
+        assert_eq!(sources.len(), MAX_RETAINED_PER_REPLY);
+        assert_eq!(sources[0], "/tmp/0.png");
     }
 
     #[test]
