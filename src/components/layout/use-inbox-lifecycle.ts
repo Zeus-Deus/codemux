@@ -60,6 +60,7 @@ export function useInboxLifecycle(): void {
   const settled = useSidebarInboxStore((s) => s.settled);
   const snoozed = useSidebarInboxStore((s) => s.snoozed);
   const keepActive = useSidebarInboxStore((s) => s.keepActive);
+  const pinOverrides = useSidebarInboxStore((s) => s.pinOverrides);
   const activity = useSidebarInboxStore((s) => s.activity);
   const prune = useSidebarInboxStore((s) => s.prune);
 
@@ -262,9 +263,9 @@ export function useInboxLifecycle(): void {
     const snoozedSet = new Set(snoozed.map((e) => e.id));
     for (const ws of allWorkspaces) {
       const id = ws.workspace_id;
-      if (ws.pinned_at != null) continue;
+      if (pinOverrides[id] ?? (ws.pinned_at != null)) continue;
       if (settledSet.has(id) || snoozedSet.has(id)) continue;
-      if (keepActive[id]) continue;
+      if (keepActive[id] === true) continue;
       const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
       // Aggregate state: the workspace settles when the *set* is finished,
       // not when its primary happens to merge. Settling a nine-PR stack
@@ -279,7 +280,9 @@ export function useInboxLifecycle(): void {
           status,
           stamp,
           now,
-          autoSettleDays,
+          // Preserve an explicit shelf drop even for old work, while still
+          // applying the merged/closed completion rule above the idle fallback.
+          keepActive[id] === "wrapping" ? null : autoSettleDays,
           prsDescribeThisCheckout(prs, ws.git_branch),
         )
       ) {
@@ -294,6 +297,7 @@ export function useInboxLifecycle(): void {
     settled,
     snoozed,
     keepActive,
+    pinOverrides,
     activity,
     autoSettleDays,
     now,

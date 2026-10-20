@@ -1,4 +1,5 @@
 import { useEffect, useMemo } from "react";
+import { orderInboxWorkspaces } from "./sidebar-inbox-order";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { WorkspaceHoverCard } from "./workspace-hover-card";
 import {
@@ -10,7 +11,7 @@ import {
 import { useHosts } from "@/stores/hosts-store";
 import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
-import { compareNewestFirst, isWorkspaceUnread } from "./sidebar-inbox";
+import { isWorkspaceUnread } from "./sidebar-inbox";
 import { workspaceDeviceName } from "./sidebar-inbox-card";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import {
@@ -242,6 +243,10 @@ export function SidebarRailWorkspaces() {
   const loaded = useSidebarInboxStore((s) => s.loaded);
   const settled = useSidebarInboxStore((s) => s.settled);
   const snoozed = useSidebarInboxStore((s) => s.snoozed);
+  const inboxOrder = useSidebarInboxStore((s) => s.order);
+  const pinOverrides = useSidebarInboxStore((s) => s.pinOverrides);
+  const reconcilePins = useSidebarInboxStore((s) => s.reconcilePins);
+  useEffect(() => { if (appStateLoaded) reconcilePins(allWorkspaces); }, [allWorkspaces, appStateLoaded, reconcilePins, pinOverrides]);
   const prune = useSidebarInboxStore((s) => s.prune);
 
   useEffect(() => {
@@ -289,23 +294,21 @@ export function SidebarRailWorkspaces() {
   // dropping it would leave the rail claiming the user is nowhere.
   //
   // Order: the pinned block leads (mirroring the expanded inbox's pinned cards
-  // above the hairline), and within each block the same newest-first,
-  // otherwise status-blind order as the expanded inbox (the shared
-  // `compareNewestFirst`), so collapsing the sidebar never re-shuffles the
-  // workspaces the user just memorized positions for.
-  const railWorkspaces = allWorkspaces
-    .map((ws, storedIndex) => ({ ws, storedIndex }))
+  // above the hairline), then the shared presentation ranks and newest-first
+  // fallback. The rail continues to omit Activity's Wrapping up partition.
+  const ranked = orderInboxWorkspaces(allWorkspaces.map((ws) => {
+    const pinned = pinOverrides[ws.workspace_id];
+    return pinned === undefined || pinned === (ws.pinned_at != null) ? ws
+      : { ...ws, pinned_at: pinned ? 0 : null };
+  }), inboxOrder);
+  const railWorkspaces = ranked
     .filter(
-      ({ ws }) =>
+      (ws) =>
         ws.pinned_at != null ||
         !parkedIds.has(ws.workspace_id) ||
         ws.workspace_id === activeWorkspaceId,
     )
-    .sort((a, b) => {
-      const pinPriority = Number(b.ws.pinned_at != null) - Number(a.ws.pinned_at != null);
-      return pinPriority || compareNewestFirst(a, b);
-    })
-    .map(({ ws }) => ws)
+    .sort((a, b) => Number(b.pinned_at != null) - Number(a.pinned_at != null))
     .filter((ws) => repoByWorkspace.has(ws.workspace_id));
 
   // While collapsed, the rail is what Alt+1..9 count through: publish its

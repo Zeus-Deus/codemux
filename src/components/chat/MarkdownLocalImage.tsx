@@ -1,4 +1,13 @@
-import { useCallback, useRef, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { ImageIcon, ImageOff, Maximize2 } from "lucide-react";
 
 import {
@@ -7,13 +16,52 @@ import {
   IMAGE_LIGHTBOX_MEDIA_CLASS,
 } from "@/components/chat/ImageLightbox";
 import { resolveAssetSrc } from "@/lib/asset-url";
-import { readLocalChatImage } from "@/tauri/commands";
+import { readChatImage, readLocalChatImage } from "@/tauri/commands";
+import {
+  onAgentChatReplyImagesKept,
+  type RetainedReplyImage,
+} from "@/tauri/events";
+
+type ImageReader = typeof readLocalChatImage;
+
+/** One place an image may load from, with the IPC reader that serves it
+ *  where the asset protocol cannot. */
+interface ImageCandidate {
+  path: string;
+  read: ImageReader;
+  /** The reply's kept copy, which may still be landing. */
+  kept?: boolean;
+}
+
+/** Cards waiting for a kept copy to land, by the copy's path. */
+const keptCopyWaiters = new Map<string, Set<() => void>>();
+let keptCopyListener: Promise<unknown> | null = null;
+
+/** Call `onLanded` when the backend records the copy at `path`. One
+ *  app-wide listener serves every waiting card. */
+function whenKeptCopyLands(path: string, onLanded: () => void): () => void {
+  keptCopyListener ??= onAgentChatReplyImagesKept((paths) => {
+    for (const landed of paths) {
+      for (const notify of keptCopyWaiters.get(landed) ?? []) notify();
+    }
+  }).catch(() => null);
+  const waiters = keptCopyWaiters.get(path) ?? new Set();
+  waiters.add(onLanded);
+  keptCopyWaiters.set(path, waiters);
+  return () => {
+    waiters.delete(onLanded);
+    if (!waiters.size) keptCopyWaiters.delete(path);
+  };
+}
 
 const blobUrlCache = new Map<string, string>();
 const blobRequestCache = new Map<string, Promise<string>>();
+/** Blob URLs whose bytes the browser failed to decode. */
+const undecodableBlobs = new Set<string>();
 const BLOB_CACHE_MAX = 64;
 
 function revokeBlobUrl(url: string) {
+  undecodableBlobs.delete(url);
   if (typeof URL.revokeObjectURL === "function") URL.revokeObjectURL(url);
 }
 
@@ -33,14 +81,14 @@ function cacheBlobUrl(path: string, url: string) {
   }
 }
 
-function requestBlobUrl(path: string): Promise<string> {
+function requestBlobUrl({ path, read }: ImageCandidate): Promise<string> {
   const cached = blobUrlCache.get(path);
   if (cached) return Promise.resolve(cached);
 
   const pending = blobRequestCache.get(path);
   if (pending) return pending;
 
-  const request = readLocalChatImage(path)
+  const request = read(path)
     .then(({ bytes, media_type }) => {
       const url = URL.createObjectURL(new Blob([bytes], { type: media_type }));
       cacheBlobUrl(path, url);
@@ -53,50 +101,172 @@ function requestBlobUrl(path: string): Promise<string> {
   return request;
 }
 
+/** A read that starts after any read already in flight settles, so a copy
+ *  announced mid-read is not judged by that earlier attempt. */
+async function settledBlobUrl(candidate: ImageCandidate): Promise<string> {
+  await blobRequestCache.get(candidate.path)?.catch(() => undefined);
+  return requestBlobUrl(candidate);
+}
+
 function basename(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] ?? path;
 }
 
+/** Conversation-owned copies of a reply's linked images, by the path the
+ *  reply wrote. */
+const RetainedImagesContext = createContext<ReadonlyMap<string, string> | null>(
+  null,
+);
+
+/** Let the local-image cards inside one reply load its kept copies. */
+export function RetainedImagesProvider({
+  images,
+  children,
+}: {
+  images: readonly RetainedReplyImage[] | undefined;
+  children: ReactNode;
+}) {
+  // Matched by the exact path only: the backend decodes a link's path the
+  // way the transcript does, and two spellings may name two different
+  // files, so a near match is never taken for the same image.
+  const retained = useMemo(
+    () =>
+      images?.length
+        ? new Map(images.map((image) => [image.source, image.path]))
+        : null,
+    [images],
+  );
+  return (
+    <RetainedImagesContext.Provider value={retained}>
+      {children}
+    </RetainedImagesContext.Provider>
+  );
+}
+
+/** Where `path` may load from: the reply's kept copy first (it outlives the
+ *  original, but may still be landing), then the path the reply wrote. */
+function useImageCandidates(path: string): readonly ImageCandidate[] {
+  const retained = useContext(RetainedImagesContext)?.get(path);
+  return useMemo(
+    () => [
+      ...(retained ? [{ path: retained, read: readChatImage, kept: true }] : []),
+      { path, read: readLocalChatImage },
+    ],
+    [path, retained],
+  );
+}
+
+interface SourceState {
+  key: string;
+  index: number;
+  blob: string | null;
+  failed: boolean;
+  /** The one immediate kept-copy read after a failure has been made. */
+  caughtUp: boolean;
+}
+
+function firstSource(
+  key: string,
+  candidates: readonly ImageCandidate[],
+): SourceState {
+  const first = candidates[0];
+  return {
+    key,
+    index: 0,
+    blob: first ? (blobUrlCache.get(first.path) ?? null) : null,
+    failed: !first,
+    caughtUp: false,
+  };
+}
+
 /**
  * Desktop WebKit can load a converted asset URL directly. Browser/dev-mock
  * clients cannot reach the host filesystem through that protocol, so a failed
- * load falls back to a bounded IPC read and a blob URL.
+ * load falls back to a bounded IPC read and a blob URL. Each candidate gets
+ * both attempts before the next one is tried.
  */
-function useLocalImageSource(path: string) {
-  const currentPath = useRef(path);
-  currentPath.current = path;
-  const [blobState, setBlobState] = useState<{ path: string; src: string | null }>(
-    () => ({ path, src: blobUrlCache.get(path) ?? null }),
-  );
-  const [failedPath, setFailedPath] = useState<string | null>(null);
-  const blobSrc =
-    blobState.path === path ? blobState.src : (blobUrlCache.get(path) ?? null);
-  const failed = failedPath === path;
+function useLocalImageSource(candidates: readonly ImageCandidate[]) {
+  // Unambiguous for any paths, NUL included.
+  const key = JSON.stringify(candidates.map((candidate) => candidate.path));
+  const currentKey = useRef(key);
+  currentKey.current = key;
+  const [stored, setStored] = useState(() => firstSource(key, candidates));
+  // A new source list starts over rather than inheriting another's outcome.
+  if (stored.key !== key) setStored(firstSource(key, candidates));
+  const state = stored.key === key ? stored : firstSource(key, candidates);
+  const candidate = candidates[state.index];
 
   const onError = useCallback(() => {
-    if (blobSrc) {
-      setFailedPath(path);
+    if (!candidate || state.failed) return;
+    const advance = () => {
+      const index = state.index + 1;
+      const next = candidates[index];
+      setStored(
+        next
+          ? {
+              ...state,
+              index,
+              blob: blobUrlCache.get(next.path) ?? null,
+            }
+          : { ...state, failed: true },
+      );
+    };
+    if (state.blob) {
+      // The bytes arrived but the browser could not decode them. A blob the
+      // cache already evicted (and revoked) is not marked.
+      if (blobUrlCache.get(candidate.path) === state.blob) {
+        undecodableBlobs.add(state.blob);
+      }
+      advance();
       return;
     }
-    const cached = blobUrlCache.get(path);
-    if (cached) {
-      setBlobState({ path, src: cached });
-      return;
-    }
-    void requestBlobUrl(path)
+    void requestBlobUrl(candidate)
       .then((url) => {
-        if (currentPath.current === path) {
-          setBlobState({ path, src: url });
-          setFailedPath(null);
-        }
+        if (currentKey.current === key) setStored({ ...state, blob: url });
       })
       .catch(() => {
-        if (currentPath.current === path) setFailedPath(path);
+        if (currentKey.current === key) advance();
       });
-  }, [blobSrc, path]);
+  }, [candidate, candidates, key, state]);
 
-  return { src: blobSrc ?? resolveAssetSrc(path, null), failed, onError };
+  // Every source failed, but the kept copy may only have been landing (its
+  // background copy can hold the bytes after the original is gone): load it
+  // when the backend records it, and read it once more right away in case
+  // it landed before this card started waiting. A blob another view of the
+  // same copy already holds is reused, unless the browser rejected it.
+  useEffect(() => {
+    const kept = candidates[0];
+    if (!state.failed || !kept?.kept) return;
+    const load = () => {
+      const cached = blobUrlCache.get(kept.path);
+      if (cached && undecodableBlobs.has(cached)) return;
+      (cached ? Promise.resolve(cached) : settledBlobUrl(kept))
+        .then((url) => {
+          if (currentKey.current === key) {
+            setStored({ key, index: 0, blob: url, failed: false, caughtUp: true });
+          }
+        })
+        .catch(() => {});
+    };
+    const stop = whenKeptCopyLands(kept.path, load);
+    if (!state.caughtUp) {
+      setStored((current) =>
+        current.key === key ? { ...current, caughtUp: true } : current,
+      );
+      load();
+    }
+    return stop;
+  }, [candidates, key, state.failed, state.caughtUp]);
+
+  return {
+    src:
+      state.failed || !candidate
+        ? null
+        : (state.blob ?? resolveAssetSrc(candidate.path, null)),
+    failed: state.failed,
+    onError,
+  };
 }
 
 /** Test seam for the module-level blob cache. */
@@ -104,6 +274,7 @@ export function resetLocalImageBlobCache() {
   for (const url of blobUrlCache.values()) revokeBlobUrl(url);
   blobUrlCache.clear();
   blobRequestCache.clear();
+  undecodableBlobs.clear();
 }
 
 /**
@@ -122,7 +293,8 @@ export function MarkdownLocalImage({
       ? rawCaption.trim()
       : basename(path);
   const [open, setOpen] = useState(false);
-  const thumbnail = useLocalImageSource(path);
+  const candidates = useImageCandidates(path);
+  const thumbnail = useLocalImageSource(candidates);
 
   if (!path) return null;
 
@@ -171,14 +343,20 @@ export function MarkdownLocalImage({
         title={caption}
         description={`Full-size preview of ${caption}`}
       >
-        <ExpandedImage path={path} caption={caption} />
+        <ExpandedImage candidates={candidates} caption={caption} />
       </ImageLightbox>
     </span>
   );
 }
 
-function ExpandedImage({ path, caption }: { path: string; caption: string }) {
-  const image = useLocalImageSource(path);
+function ExpandedImage({
+  candidates,
+  caption,
+}: {
+  candidates: readonly ImageCandidate[];
+  caption: string;
+}) {
+  const image = useLocalImageSource(candidates);
 
   if (image.failed || !image.src) {
     return (

@@ -839,6 +839,8 @@ fn build_core_app<R: tauri::Runtime>(
             tauri::async_runtime::spawn(
                 commands::agent_chat::sweep_stale_staged_images(),
             );
+            // Finish copying reply images a quit cut short.
+            commands::reply_images::resume_pending(app.handle());
 
             #[cfg(debug_assertions)]
             {
@@ -1416,6 +1418,7 @@ fn build_core_app<R: tauri::Runtime>(
                             mcp::registry::CompositeHostTools(vec![
                                 std::sync::Arc::new(commands::delegation::DelegationHost::new(registry_handle.clone())),
                                 std::sync::Arc::new(commands::workspace_launch::WorkspaceLaunchHost::new(registry_handle.clone())),
+                                std::sync::Arc::new(commands::pr_watch::PrWatchHost::new(registry_handle.clone())),
                             ]),
                         ));
 

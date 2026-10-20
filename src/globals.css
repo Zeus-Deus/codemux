@@ -20,6 +20,14 @@
 
 @custom-variant dark (&:is(.dark *));
 
+.inbox-dragging [data-inbox-card-motion] {
+  content-visibility: visible;
+  animation: none;
+}
+.inbox-dragging .row-in {
+  animation: none;
+}
+
 @keyframes rename-field-shake {
   0%, 100% { transform: translateX(0); }
   25% { transform: translateX(-3px); }

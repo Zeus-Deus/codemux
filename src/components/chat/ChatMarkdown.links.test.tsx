@@ -427,6 +427,133 @@ describe("ChatMarkdown local image links", () => {
     ).toBeInTheDocument();
   });
 
+  // Parity cases for the backend's copy planner (`reply_images.rs`): it must
+  // keep every image rendered here (it may keep a few that are not).
+  const renderedCaptions = (markdown: string) => {
+    const { container } = render(
+      <TooltipProvider>
+        <ChatMarkdown>{markdown}</ChatMarkdown>
+      </TooltipProvider>,
+    );
+    return [...container.querySelectorAll("[data-chat-local-image] button")].map(
+      (button) => button.getAttribute("aria-label"),
+    );
+  };
+
+  it("renders only the image outside a code block opened in a list item", () => {
+    expect(
+      renderedCaptions(
+        "- ```markdown\n  [Example](/tmp/example.png)\n  ```\n\n[Actual proof](/tmp/actual.png)",
+      ),
+    ).toEqual(["Open Actual proof"]);
+  });
+
+  it("renders links and images whose destination is on its own line", () => {
+    expect(
+      renderedCaptions("[Proof](\n/tmp/proof.png\n) and ![Shot](\n/tmp/shot.png\n)"),
+    ).toEqual(["Open Proof", "Open Shot"]);
+  });
+
+  it("renders autolinks, table cells and headings, but not reference links or raw HTML", () => {
+    expect(
+      renderedCaptions(
+        "Shot: <file:///tmp/auto.png>\n\n" +
+          "| a | b |\n| - | - |\n| [cell](/tmp/cell.png) | x |\n\n" +
+          "# Title [h](/tmp/h.png)\n\n" +
+          "See [the mockup][m].\n\n[m]: /tmp/mockup.png\n\n" +
+          '<a href="/tmp/html.png">h</a>',
+      ),
+    ).toEqual(["Open file:///tmp/auto.png", "Open cell", "Open h"]);
+  });
+
+  it("renders only the inline image when reference links point at other blocks", () => {
+    const uses = Array.from({ length: 8 }, (_, i) => `[r${i}][r${i}]`).join(" ");
+    const definitions = Array.from({ length: 8 }, (_, i) => `[r${i}]: /tmp/r${i}.png`).join("\n");
+    expect(
+      renderedCaptions(`See ${uses}.\n\n[Proof](/tmp/proof.png)\n\n${definitions}`),
+    ).toEqual(["Open Proof"]);
+  });
+
+  it("renders an image after a code block holding deep indentation and markers", () => {
+    expect(
+      renderedCaptions(
+        "```text\n" + " ".repeat(100) + "deeply indented\n" + "> ".repeat(20) + "\n```\n\n[Proof](/tmp/proof.png)",
+      ),
+    ).toEqual(["Open Proof"]);
+  });
+
+  const renderedPaths = (markdown: string) => {
+    const { container } = render(
+      <TooltipProvider>
+        <ChatMarkdown>{markdown}</ChatMarkdown>
+      </TooltipProvider>,
+    );
+    return [...container.querySelectorAll("[data-chat-local-image] img")].map((image) =>
+      image.getAttribute("src"),
+    );
+  };
+
+  it("renders an image after code full of markers and indentation", () => {
+    expect(
+      renderedCaptions(
+        "```text\n" + " ".repeat(256) + "x\n" + "> ".repeat(40) + "\n" + " ".repeat(128) + "- yaml\n```\n\n[Proof](/tmp/proof.png)",
+      ),
+    ).toEqual(["Open Proof"]);
+  });
+
+  it("renders an image after a quoted code block with a deeply indented line", () => {
+    expect(
+      renderedCaptions(
+        "> ```text\n> " + " ".repeat(100) + "example\n> ```\n>\n> [Proof](/tmp/proof.png)",
+      ),
+    ).toEqual(["Open Proof"]);
+  });
+
+  it("renders only the used footnote image among many unused ones", () => {
+    const unused = Array.from(
+      { length: 70 },
+      (_, i) => `> [^u${i}]: [hidden](/tmp/u${i}.png)\n>\n`,
+    ).join("");
+    expect(
+      renderedCaptions(`> See [^used].\n>\n${unused}> [^used]: [Proof](/tmp/proof.png)`),
+    ).toEqual(["Open Proof"]);
+  });
+
+  it("reads a bare carriage return as a line ending", () => {
+    expect(
+      renderedCaptions(" ".repeat(64) + "- x\r\r[Proof](/tmp/proof.png)"),
+    ).toEqual(["Open Proof"]);
+  });
+
+  it("renders an image after deeply nested lists", () => {
+    expect(
+      renderedCaptions("- ".repeat(40) + "x\n\n\n[Proof](/tmp/proof.png)"),
+    ).toEqual(["Open Proof"]);
+  });
+
+  it("renders a footnote image whose reference differs only in case folding", () => {
+    expect(
+      renderedCaptions("> See [^SS].\n>\n> [^ß]: [Proof](/tmp/proof.png)"),
+    ).toEqual(["Open Proof"]);
+  });
+
+  it("names image paths as decodeURI does, keeping undecodable ones as written", () => {
+    expect(
+      renderedPaths(
+        "[a](/tmp/a%zz%20b.png) [b](/tmp/c%2Fd%20e.png) [c](/tmp/f%+1.png) " +
+          "[d](file:///tmp/g%FF.png) [e](file:///tmp/h%zz.png) [f](file:///tmp/i%20j.png)",
+      ),
+    ).toEqual(["/tmp/a%zz%20b.png", "/tmp/c%2Fd e.png", "/tmp/f%+1.png", "/tmp/i j.png"]);
+  });
+
+  it("normalizes a path before decoding it, keeping the normalized form when that fails", () => {
+    expect(
+      renderedPaths(
+        "[a](</tmp/a%zz b.png>) [b](/tmp/c%%20d.png) [c](/tmp/e%2%20f.png) [d](</tmp/g%zz é.png>)",
+      ),
+    ).toEqual(["/tmp/a%zz%20b.png", "/tmp/c% d.png", "/tmp/e%2 f.png", "/tmp/g%zz%20%C3%A9.png"]);
+  });
+
   it("keeps a local file reference inert when no workspace root is available", () => {
     const { container } = render(
       <ChatMarkdown>{"[implementation](/home/me/src/app.tsx)"}</ChatMarkdown>,

@@ -74,6 +74,8 @@ import {
   MOCK_DIRTY_ARCHIVE_ID,
   MOCK_HOME_DIR,
   MOCK_USER,
+  MOCK_CHAT_IMAGES_ROOT,
+  MOCK_REMOVED_LOCAL_IMAGES,
   MOCK_USER_IMAGE_DATA_URL,
   MOCK_WEB_REMOTE_PORT,
   MOCK_MONITORING_THREAD_ID,
@@ -130,6 +132,7 @@ import {
   workflowRunningEnvelopes,
 } from "./mock-fixtures";
 import { HTML_RENDER_FIXTURE_HTML, HTML_RENDER_FIXTURE_TITLE } from "./html-render-fixture";
+import { codexNativeToolEnvelopes } from "./codex-native-tools-fixture";
 import {
   STRESS_THREAD_PREFIX,
   getStressFixture,
@@ -2384,6 +2387,10 @@ function mockChatTranscript(threadId = MOCK_CHAT_THREAD_ID): string[] {
     });
   }
 
+  if (new URLSearchParams(location.search).get("nativeTools") === "1") {
+    for (const envelope of codexNativeToolEnvelopes(T, "seed-native-tools")) push(envelope);
+  }
+
   mockChatTranscriptCache.set(threadId, out);
   return out;
 }
@@ -4275,6 +4282,15 @@ type Handler = (args: Args) => unknown;
 /** Per-project scripts saved through `set_project_scripts`, keyed by path. */
 const mockProjectScripts = new Map<string, ProjectScripts>();
 
+/** The seeded preview PNG as an image-read response. */
+function mockPreviewImageBytes() {
+  const encoded = MOCK_USER_IMAGE_DATA_URL.split(",")[1] ?? "";
+  return {
+    bytes: Array.from(Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0))),
+    media_type: "image/png",
+  };
+}
+
 /** In-memory staging store for `agent_chat_stage_image` (keyed by the
  *  fake absolute path returned to the frontend). Serves `agent_chat_read_image`
  *  so the IPC-read image fallback works end-to-end in `npm run dev`. */
@@ -5638,6 +5654,11 @@ const handlers: Record<string, Handler> = {
   // identity → the `<img>` 404s) still resolves an image end-to-end.
   agent_chat_read_image: (a) => {
     const entry = stagedImages.get(String(a.path));
+    // Seeded conversation-owned copies (kept reply images) read back as the
+    // preview PNG, like a staged upload.
+    if (!entry && String(a.path).startsWith(`${MOCK_CHAT_IMAGES_ROOT}/`)) {
+      return mockPreviewImageBytes();
+    }
     if (!entry) throw new Error(`[dev mock] no staged image at ${a.path}`);
     return {
       bytes: Array.from(entry.bytes),
@@ -5648,14 +5669,11 @@ const handlers: Record<string, Handler> = {
   // attachments. The mock returns its seeded preview PNG for any accepted
   // path so the real card + lightbox can be visually exercised without host
   // filesystem access from the browser origin.
-  agent_chat_read_local_image: () => {
-    const encoded = MOCK_USER_IMAGE_DATA_URL.split(",")[1] ?? "";
-    return {
-      bytes: Array.from(
-        Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0)),
-      ),
-      media_type: "image/png",
-    };
+  agent_chat_read_local_image: (a) => {
+    if (MOCK_REMOVED_LOCAL_IMAGES.has(String(a.path))) {
+      throw new Error(`failed to resolve local image: ${a.path} was removed`);
+    }
+    return mockPreviewImageBytes();
   },
   agent_chat_discard_staged_image: (a) => {
     stagedImages.delete(String(a.path));
@@ -8131,12 +8149,11 @@ const handlers: Record<string, Handler> = {
   },
   set_workspace_pinned: (a) => {
     const ws = findWorkspace(a.workspaceId);
-    if (ws) {
-      const pinned = Boolean(a.pinned);
-      if (pinned && ws.pinned_at == null) ws.pinned_at = Date.now();
-      if (!pinned) ws.pinned_at = null;
-      emitAppState();
-    }
+    if (!ws) return Promise.reject(new Error(`No workspace found for ${String(a.workspaceId)}`));
+    const pinned = Boolean(a.pinned);
+    if (pinned === (ws.pinned_at != null)) return undefined;
+    replaceWorkspace(ws.workspace_id, () => ({ pinned_at: pinned ? Date.now() : null }));
+    emitAppState();
     return undefined;
   },
   close_workspace: (a) => removeWorkspace(a.workspaceId),

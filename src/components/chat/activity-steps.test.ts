@@ -203,3 +203,51 @@ describe("ActivityStep type import is exercised", () => {
     expect(steps).toHaveLength(2);
   });
 });
+
+describe("Codex native items", () => {
+  const command = tool("commandExecution", {
+    input: { type: "commandExecution", id: "exec-1", command: "/usr/bin/bash -lc 'cargo check'" },
+    result_content: "Finished",
+  });
+  const fileChange = tool("fileChange", {
+    input: {
+      type: "fileChange",
+      id: "call-1",
+      changes: [
+        { path: "/repo/a.ts", kind: { type: "update" }, diff: "@@ -1,1 +1,2 @@\n-a\n+b\n+c\n" },
+        { path: "/repo/b.ts", kind: { type: "add" }, diff: "x\n" },
+      ],
+    },
+  });
+  const dynamic = tool("dynamicToolCall", {
+    input: {
+      type: "dynamicToolCall",
+      id: "exec-dyn",
+      tool: "codemux_mcp__codemux__browser_navigate",
+      arguments: { url: "http://localhost:1420" },
+    },
+  });
+
+  it("describes a command as a run step", () => {
+    expect(toStepView(command)).toMatchObject({ verb: "run", summary: "cargo check", meta: "ok" });
+    expect(traceStepTitle(command)).toEqual({ verb: "Ran", target: "cargo check", argument: null });
+  });
+
+  it("describes a file change as an edit with summed counts", () => {
+    expect(editCounts(fileChange)).toEqual({ added: 3, removed: 1 });
+    expect(toStepView(fileChange)).toMatchObject({ verb: "edit", summary: "/repo/a.ts and 1 more file", meta: "+3 −1" });
+    expect(traceStepTitle(fileChange).verb).toBe("Edited");
+  });
+
+  it("names a dynamic tool call by the tool, with its argument, never the envelope id", () => {
+    const title = traceStepTitle(dynamic);
+    expect(title.verb).toBe("Called codemux_mcp__codemux__browser_navigate");
+    expect(title.target).toBe("http://localhost:1420");
+    expect(toStepView(dynamic).summary).not.toContain("exec-dyn");
+  });
+
+  it("summarises native runs by family", () => {
+    expect(deriveActivitySummary([command])).toBe("Ran commands");
+    expect(deriveActivitySummary([fileChange])).toBe("Edited files");
+  });
+});

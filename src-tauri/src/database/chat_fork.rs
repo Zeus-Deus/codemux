@@ -91,9 +91,9 @@ pub struct ChatForkOrigin {
 
 /// Rewrite one copied transcript row for the fork: the envelope's
 /// `thread_id` names the fork, a user-turn journal row points at the fork's
-/// copy of its user message, and a user message's images inside the
-/// chat-image root move into the fork's folder by file name (unique per
-/// image), recorded in `images`.
+/// copy of its user message, and a user message's images (or a reply's kept
+/// image copies) inside the chat-image root move into the fork's folder by
+/// file name (unique per image), recorded in `images`.
 pub(crate) fn rewrite_forked_payload(
     payload: &str,
     fork_thread_id: &str,
@@ -116,9 +116,17 @@ pub(crate) fn rewrite_forked_payload(
             object.insert("user_message_id".into(), (*copied).into());
         }
     }
+    // A user message's attachments, or the copies kept for a reply's images.
+    let list = if object.contains_key("images") {
+        object.get_mut("images")
+    } else {
+        object
+            .get_mut("item")
+            .and_then(|item| item.get_mut("retained_images"))
+    };
     if let (Some((roots, fork_dir)), Some(list)) = (
         image_dirs,
-        object.get_mut("images").and_then(serde_json::Value::as_array_mut),
+        list.and_then(serde_json::Value::as_array_mut),
     ) {
         for image in list {
             let Some(path) = image.get("path").and_then(serde_json::Value::as_str) else {
@@ -272,6 +280,16 @@ impl DatabaseStore {
             )
             .map_err(|e| format!("Failed to copy the transcript: {e}"))?;
             let copied = tx.last_insert_rowid();
+            // A reply still copying its linked images: the fork's copy names
+            // destinations in the fork's folder that the source's job never
+            // writes, so the fork gets a job of its own.
+            tx.execute(
+                "INSERT INTO agent_chat_reply_image_jobs (row_id)
+                 SELECT ?2 WHERE EXISTS
+                     (SELECT 1 FROM agent_chat_reply_image_jobs WHERE row_id = ?1)",
+                params![id, copied],
+            )
+            .map_err(|e| format!("Failed to copy a pending image job: {e}"))?;
             copied_ids.insert(id, copied);
             boundary = Some(copied);
         }
@@ -443,6 +461,70 @@ mod tests {
                 (PathBuf::from("/real/img/old/c.png"), fork("c.png")),
             ]
         );
+    }
+
+    #[test]
+    fn rewrite_moves_a_replys_kept_image_copies_into_the_forks_folder() {
+        let mut images = Vec::new();
+        let roots = vec![PathBuf::from("/img")];
+        let row = rewrite_forked_payload(
+            r#"{"type":"item_completed","thread_id":"src","item":{"kind":"assistant_text","text":"[a](/tmp/a.png)","retained_images":[{"source":"/tmp/a.png","path":"/img/src/k.png"}]}}"#,
+            "fork",
+            &HashMap::new(),
+            Some((roots.as_slice(), Path::new("/img/fork"))),
+            &mut images,
+        );
+        let row: serde_json::Value = serde_json::from_str(&row).unwrap();
+        let fork_copy = Path::new("/img/fork").join("k.png");
+        let kept = &row["item"]["retained_images"][0];
+        assert_eq!(kept["path"], fork_copy.to_string_lossy().as_ref());
+        assert_eq!(kept["source"], "/tmp/a.png", "the link the reply wrote stays as written");
+        assert_eq!(images, vec![(PathBuf::from("/img/src/k.png"), fork_copy)]);
+    }
+
+    #[test]
+    fn a_fork_inherits_the_copy_jobs_of_replies_still_copying() {
+        let db = store_with_source();
+        let reply = |path: &str| {
+            serde_json::json!({"type":"item_completed","thread_id":"src","turn_id":"u",
+                "item":{"kind":"assistant_text","text":"[a](/tmp/a.png)",
+                        "retained_images":[{"source":"/tmp/a.png","path":path}]}})
+            .to_string()
+        };
+        let done = db.append_agent_chat_message("src", &reply("/img/src/done.png")).unwrap().unwrap();
+        let pending = db
+            .append_agent_chat_reply_with_image_job("src", &reply("/img/src/pending.png"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.list_reply_image_jobs(None), vec![pending]);
+        let source = db.get_agent_chat_session("src").unwrap();
+        let roots = vec![PathBuf::from("/img")];
+        db.create_agent_chat_fork(&NewChatFork {
+            thread_id: "fork",
+            source: &source,
+            sdk_session_id: "native-fork",
+            workspace_id: "ws",
+            cwd: "/repo",
+            title: "fork",
+            cut_before: None,
+            image_dirs: Some((roots.as_slice(), Path::new("/img/fork"))),
+        })
+        .unwrap();
+
+        let jobs = db.list_reply_image_jobs(None);
+        assert_eq!(jobs.len(), 2, "only the pending reply's copy gets a job");
+        assert_eq!(jobs[0], pending);
+        assert!(jobs[1] > done);
+        // The fork's job is for its own copy of the pending reply.
+        let forked: serde_json::Value =
+            serde_json::from_str(&db.get_agent_chat_message_payload(jobs[1]).unwrap()).unwrap();
+        assert_eq!(forked["thread_id"], "fork");
+        let kept = &forked["item"]["retained_images"][0];
+        assert_eq!(
+            kept["path"],
+            Path::new("/img/fork").join("pending.png").to_string_lossy().as_ref()
+        );
+        assert_eq!(kept["source"], "/tmp/a.png");
     }
 
     #[test]

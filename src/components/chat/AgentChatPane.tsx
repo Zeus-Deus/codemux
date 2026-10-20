@@ -142,6 +142,7 @@ import { autoNameWorkspace } from "@/lib/agent-chat/materialize";
 import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import {
   onAgentChatTurnCheckpointReverted,
+  withRetainedImages,
   type AgentChatEventPayload,
   type AgentChatTurnCheckpointRevertedPayload,
   type ApprovalDecision,
@@ -1275,7 +1276,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     }
     enqueueAgentChatEvent(
       payload.thread_id,
-      payload.event,
+      withRetainedImages(payload),
       payload.persisted_id ?? null,
     );
   }, []);

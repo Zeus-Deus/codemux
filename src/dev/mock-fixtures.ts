@@ -136,6 +136,17 @@ function terminalSurface(label: string, cwd: string): PaneRefs {
 export const MOCK_CHAT_THREAD_ID = "thread-mock-chat";
 export const MOCK_SECOND_CHAT_THREAD_ID = "thread-mock-chat-second";
 
+/** Where the dev mock pretends conversation-owned chat images live. */
+export const MOCK_CHAT_IMAGES_ROOT = "/home/mock/.config/codemux/agent-chat/images";
+
+/** Agent-linked temp files the dev mock treats as cleaned up: reading the
+ *  original path fails, as it does once a real temp folder is removed. */
+export const MOCK_REMOVED_LOCAL_IMAGES = new Set([
+  "/tmp/wf-mockups/f1.png",
+  "/tmp/wf-mockups/f2.png",
+  "/tmp/wf-mockups/f3.png",
+]);
+
 /** Inline data-URL PNG (200×120, teal field + magenta band + border)
  *  used to seed a user turn's attached image in the dev mock. A
  *  self-contained data URL is what an optimistic send produces at
@@ -1641,7 +1652,18 @@ export function richChatTurnEnvelopes(
           "coverage in [`tests/test_traceback.py:88`](tests/test_traceback.py:88). " +
           "The regression test passes, and the " +
           "[exception-chain notes](https://docs.python.org/3/library/exceptions.html) are ready.\n\n" +
-          "[Dashboard screenshot](/tmp/codemux-dashboard-proof.png)",
+          "[Dashboard screenshot](/tmp/codemux-dashboard-proof.png)\n\n" +
+          // Workflow mockups whose temp files were cleaned up afterwards
+          // (`MOCK_REMOVED_LOCAL_IMAGES`): the first two kept conversation
+          // copies when the reply landed; the third was already gone.
+          "Workflow mockups for review:\n\n" +
+          "[Option A, sidebar](/tmp/wf-mockups/f1.png)\n\n" +
+          "[Option B, tabs](/tmp/wf-mockups/f2.png)\n\n" +
+          "[Option C, split](/tmp/wf-mockups/f3.png)",
+        retained_images: ["f1", "f2"].map((name) => ({
+          source: `/tmp/wf-mockups/${name}.png`,
+          path: `${MOCK_CHAT_IMAGES_ROOT}/${threadId}/${name}-kept.png`,
+        })),
       },
     }),
   ];

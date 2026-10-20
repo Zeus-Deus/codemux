@@ -6,6 +6,11 @@ import {
   toolResultContentFromPayload,
   type LazyToolResultStub,
 } from "@/lib/agent-chat/lazy-tool-result";
+import {
+  nativeToolCall,
+  type NativeFileChange,
+  type NativeToolCall,
+} from "@/lib/agent-chat/native-tool-call";
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 import { resolveChatFileLink } from "@/lib/agent-chat/file-links";
 import {
@@ -64,6 +69,27 @@ function renderToolBody(
   item: ToolCallItem,
   input: Record<string, unknown> | null,
 ) {
+  // Codex native items carry the real command / files / tool one level
+  // down; render them like their Claude equivalents instead of as raw JSON.
+  const native = nativeToolCall(item);
+  if (native) {
+    switch (native.kind) {
+      case "command":
+        return (
+          <BashToolBody
+            item={item}
+            input={{ command: native.command }}
+            output={native.output ?? ""}
+            exitCode={native.exitCode}
+          />
+        );
+      case "file_change":
+        if (native.changes.length > 0) return <NativeFileChangeBody changes={native.changes} />;
+        break;
+      case "tool":
+        return <NativeToolBody item={item} call={native} />;
+    }
+  }
   switch (item.tool_name) {
     case "Bash":
       return <BashToolBody item={item} input={input} />;
@@ -87,11 +113,22 @@ interface BodyProps {
   input: Record<string, unknown> | null;
 }
 
-export function BashToolBody({ item, input }: BodyProps) {
+export function BashToolBody({
+  item,
+  input,
+  output,
+  exitCode: reportedExitCode,
+}: BodyProps & {
+  /** Output already extracted from a provider envelope; defaults to the
+   *  stringified `result_content`. */
+  output?: string;
+  /** Exit code the provider reported, when it reported one. */
+  exitCode?: number | null;
+}) {
   const command = input ? stringField(input, "command") : null;
   const description = input ? stringField(input, "description") : null;
-  const result = contentToString(item.result_content);
-  const exitCode = parseExitCode(result, item.status);
+  const result = output ?? contentToString(item.result_content);
+  const exitCode = reportedExitCode ?? parseExitCode(result, item.status);
   const [showAll, setShowAll] = useState(false);
   const totalLines = countLines(result);
   const tailHidden = totalLines - BASH_TAIL_LINES;
@@ -341,6 +378,92 @@ export function EditToolBody({ item, input }: BodyProps) {
       {result && <ToolCallBlock content={result} />}
     </div>
   );
+}
+
+/** One diff card per file a Codex `fileChange` touched. An add or delete
+ *  carries the whole file, an update a unified diff. */
+function NativeFileChangeBody({ changes }: { changes: NativeFileChange[] }) {
+  return (
+    <div className="space-y-2">
+      {changes.map((change, i) => (
+        <div key={`${change.path}:${i}`} className="space-y-1">
+          {change.movePath && (
+            <div className="select-text font-mono text-body-sm text-muted-foreground">
+              Moved to <ToolSourcePath path={change.movePath} />
+            </div>
+          )}
+          {change.diff === "" ? (
+            <div className="select-text font-mono text-body-sm text-foreground">
+              <ToolSourcePath path={change.path} />
+            </div>
+          ) : (
+            <DiffView
+              filename={change.path}
+              patch={change.kind === "update" ? change.diff : wholeFilePatch(change)}
+              copyText={change.diff}
+            />
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** An added or deleted file arrives as its whole content. As a one-hunk
+ *  patch every line, even a lone empty one, renders as its own row; the
+ *  final newline ends the last line rather than starting another. */
+function wholeFilePatch(change: NativeFileChange): string {
+  const lines = change.diff.replace(/\r?\n$/, "").split(/\r?\n/);
+  const sign = change.kind === "add" ? "+" : "-";
+  const range = change.kind === "add" ? `-0,0 +1,${lines.length}` : `-1,${lines.length} +0,0`;
+  return [`@@ ${range} @@`, ...lines.map((line) => sign + line)].join("\n");
+}
+
+/** A Codex MCP or dynamic tool call: its arguments, then its result blocks
+ *  (or the provider's error) instead of the whole item envelope. Image
+ *  blocks are skipped here; the shared wrapper renders those. */
+function NativeToolBody({
+  item,
+  call,
+}: {
+  item: ToolCallItem;
+  call: Extract<NativeToolCall, { kind: "tool" }>;
+}) {
+  const args = hasArgs(call.args) ? safeStringify(call.args) : null;
+  const output = call.output ? nativeOutputText(call.output) : "";
+  return (
+    <div className="space-y-2">
+      {args && <ToolCallBlock content={null} text={args} />}
+      {call.error && <ToolCallBlock content={null} text={call.error} error />}
+      {output && <ToolCallBlock content={null} text={output} error={item.status === "error"} />}
+    </div>
+  );
+}
+
+/** Text blocks read as their text; any other block shows in full, so an
+ *  unknown block with a `text` field keeps the rest of its payload. */
+function nativeOutputText(blocks: unknown[]): string {
+  return blocks
+    .filter((block) => !isRenderableImageBlock(block))
+    .map((block) => {
+      if (typeof block === "string") return block;
+      if (
+        isRecord(block) &&
+        (block.type === "text" || block.type === "inputText") &&
+        typeof block.text === "string"
+      ) {
+        return block.text;
+      }
+      return safeStringify(block);
+    })
+    .join("\n");
+}
+
+function hasArgs(args: unknown): boolean {
+  if (args == null) return false;
+  if (isRecord(args)) return Object.keys(args).length > 0;
+  if (Array.isArray(args)) return args.length > 0;
+  return typeof args !== "string" || args.length > 0;
 }
 
 interface EditDiffInput {

@@ -626,6 +626,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // workspace gets no context menu: every entry acts on a local workspace.
   const card = (
       <div
+        data-inbox-card-motion
         className={cn(
           "overflow-hidden transition-[max-height,opacity] duration-250 ease-out",
           // Off-screen cards stop costing layout and paint. At 50+ workspaces

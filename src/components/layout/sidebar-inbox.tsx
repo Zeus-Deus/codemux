@@ -21,7 +21,6 @@ import {
 import { useHosts } from "@/stores/hosts-store";
 import { useUIStore } from "@/stores/ui-store";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
-import { setWorkspacePinned } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
 import {
   useSidebarInboxStore,
@@ -92,6 +91,8 @@ import { Eyebrow } from "@/components/ui/eyebrow";
 import { useRemoteWorkspaces } from "@/environments/remote-workspaces";
 import { SidebarEmptyState } from "./sidebar-empty-state";
 import { SidebarHeaderActions } from "./sidebar-action-row";
+import { InboxDragList, SortableInboxCard } from "./sidebar-inbox-drag";
+import { orderInboxWorkspaces } from "./sidebar-inbox-order";
 import {
   SidebarProjectFilter,
   computeProjectCounts,
@@ -136,8 +137,8 @@ export function clampTimerDelay(ms: number): number {
  *  index puts the thing the user just started at the top of the inbox, where
  *  they are already looking.
  *
- *  Crucially this order is **static**: it is derived only from creation order,
- *  never from status, activity, or notification counts. A row therefore holds
+ *  This is the fallback for cards without a saved manual rank. It is static:
+ *  never derived from status, activity, or notification counts. A row holds
  *  its position from the moment it opens until it settles or snoozes, so the
  *  list moves only at lifecycle transitions the user caused. That is what makes
  *  `Alt+1..9` a muscle-memory shortcut rather than a lottery, and what stops
@@ -885,6 +886,15 @@ export function SidebarInbox() {
   const load = useSidebarInboxStore((s) => s.load);
   const settled = useSidebarInboxStore((s) => s.settled);
   const snoozed = useSidebarInboxStore((s) => s.snoozed);
+  const inboxOrder = useSidebarInboxStore((s) => s.order);
+  const pinOverrides = useSidebarInboxStore((s) => s.pinOverrides);
+  const reconcilePins = useSidebarInboxStore((s) => s.reconcilePins);
+  const presentedWorkspaces = useMemo(() => allWorkspaces.map((ws) => {
+    const pinned = pinOverrides[ws.workspace_id];
+    return pinned === undefined || pinned === (ws.pinned_at != null) ? ws
+      : { ...ws, pinned_at: pinned ? 0 : null };
+  }), [allWorkspaces, pinOverrides]);
+  useEffect(() => { if (appStateLoaded) reconcilePins(allWorkspaces); }, [allWorkspaces, appStateLoaded, reconcilePins, pinOverrides]);
   const filter = useSidebarInboxStore((s) => s.filter);
   const setFilter = useSidebarInboxStore((s) => s.setFilter);
   const frozenActiveDraftRow = useFrozenActiveDraftRow(
@@ -910,6 +920,8 @@ export function SidebarInbox() {
   const [leavingId, setLeavingId] = useState<string | null>(null);
   const [justSettledId, setJustSettledId] = useState<string | null>(null);
   const [justUnsettledId, setJustUnsettledId] = useState<string | null>(null);
+  const [wrappingPreviewId, setWrappingPreviewId] = useState<string | null>(null);
+  const inboxRef = useRef<HTMLDivElement>(null);
 
   // Shelf disclosure. Settled starts closed: it is finished history that
   // grows without bound, so an open shelf buries the live work above it. The
@@ -1161,9 +1173,9 @@ export function SidebarInbox() {
 
   const workspaceById = useMemo(() => {
     const map = new Map<string, WorkspaceSnapshot>();
-    for (const ws of allWorkspaces) map.set(ws.workspace_id, ws);
+    for (const ws of presentedWorkspaces) map.set(ws.workspace_id, ws);
     return map;
-  }, [allWorkspaces]);
+  }, [presentedWorkspaces]);
 
   const matchesFilter = (ws: WorkspaceSnapshot) =>
     !filter || repoByWorkspace.get(ws.workspace_id)?.path === filter;
@@ -1183,31 +1195,21 @@ export function SidebarInbox() {
       : null;
   };
 
-  // A pin overrides both parking lifecycles without erasing either persisted
-  // shelf entry. Unpinning therefore returns the workspace to the exact shelf
-  // it would otherwise occupy. Pinned cards keep the inbox's static creation
-  // order rather than reordering by pin time, so pinning never shuffles the
-  // list out from under the positions the user has memorized.
-  const pinnedCards = allWorkspaces
-    .map((ws, storedIndex) => ({ ws, storedIndex }))
-    .filter(({ ws }) => ws.pinned_at != null && matchesFilter(ws))
-    .sort(compareNewestFirst)
-    .map(({ ws }) => ws);
+  // Pins mask parked state. Ordinary Unpin restores that state; an explicit
+  // drop into Active instead clears it and records the user's keep-active decision.
+  const rankedWorkspaces = orderInboxWorkspaces(presentedWorkspaces, inboxOrder);
+  const allPinnedCards = rankedWorkspaces.filter((ws) => ws.pinned_at != null);
+  const pinnedCards = allPinnedCards.filter(matchesFilter);
 
-  // Active cards: newest workspace on top, and the order never moves for any
-  // reason short of a lifecycle transition (see `compareNewestFirst`). The
-  // repo filter scopes every list.
-  const activeCards = allWorkspaces
-    .map((ws, storedIndex) => ({ ws, storedIndex }))
-    .filter(
-      ({ ws }) =>
+  // Manual ranks apply within the ordinary active tier. New cards retain the
+  // newest-first fallback; project filters never discard hidden ranks.
+  const allActiveCards = rankedWorkspaces.filter(
+      (ws) =>
         ws.pinned_at == null &&
         !settledIds.has(ws.workspace_id) &&
-        !snoozedIds.has(ws.workspace_id) &&
-        matchesFilter(ws),
-    )
-    .sort(compareNewestFirst)
-    .map(({ ws }) => ws);
+        !snoozedIds.has(ws.workspace_id),
+    );
+  const activeCards = allActiveCards.filter(matchesFilter);
 
   /** The workspace you are looking at is never unread, whatever the backend
    *  stamps say — the visit is happening right now. Shared by the card and by
@@ -1220,10 +1222,16 @@ export function SidebarInbox() {
       ws.last_visited_at,
       manualUnread.has(ws.workspace_id),
     );
+  const wouldWrap = (ws: WorkspaceSnapshot) => {
+    const prs = workspacePrs(ws);
+    return isWrappingUp(prSetSummary(prs).state, statusOf(ws), isUnread(ws),
+      prsDescribeThisCheckout(prs, ws.git_branch));
+  };
+  const wrappingIds = new Set(presentedWorkspaces.filter(wouldWrap).map((ws) => ws.workspace_id));
 
   // Two tiers, one list. Both are ordinary active cards with every gesture
   // intact; the split only decides who gets the top of the sidebar. Each tier
-  // keeps `activeCards`' newest-first order because we partition the sorted
+  // keeps `activeCards`' presentation order because we partition the sorted
   // list rather than re-sorting, so within a tier nothing moves either.
   const topTier: WorkspaceSnapshot[] = [];
   const wrappingUpTier: WorkspaceSnapshot[] = [];
@@ -1243,6 +1251,13 @@ export function SidebarInbox() {
       : topTier;
     tier.push(ws);
   }
+  // Wrapping up retains its automatic creation order, independent of ranks.
+  const storedIndexes = new Map(allWorkspaces.map((ws, index) => [ws.workspace_id, index]));
+  wrappingUpTier.sort((a, b) => (storedIndexes.get(b.workspace_id) ?? 0) - (storedIndexes.get(a.workspace_id) ?? 0));
+  const wrappingPreview = wrappingPreviewId ? workspaceById.get(wrappingPreviewId) : undefined;
+  const previewWrappingUp = wrappingPreview
+    ? [...wrappingUpTier, wrappingPreview].sort((a, b) => (storedIndexes.get(b.workspace_id) ?? 0) - (storedIndexes.get(a.workspace_id) ?? 0))
+    : null;
   // A collapsed Wrapping up section still shows the open workspace — its
   // highlight is the user's "you are here", same rule as the shelves below.
   const visibleWrappingUp = wrappingUpCollapsed
@@ -1440,7 +1455,7 @@ export function SidebarInbox() {
   );
 
   const handleUnpin = useCallback((workspaceId: string) => {
-    void setWorkspacePinned(workspaceId, false).catch((err) => {
+    void useSidebarInboxStore.getState().setPinned(workspaceId, false).catch((err) => {
       toast.error("Unpin failed", {
         description: err instanceof Error ? err.message : String(err),
       });
@@ -1452,7 +1467,7 @@ export function SidebarInbox() {
    *  where a card lives, so a user has to discover it before the list will
    *  hold still for them. */
   const handlePin = useCallback((workspaceId: string) => {
-    void setWorkspacePinned(workspaceId, true).catch((err) => {
+    void useSidebarInboxStore.getState().setPinned(workspaceId, true).catch((err) => {
       toast.error("Pin failed", {
         description: err instanceof Error ? err.message : String(err),
       });
@@ -1640,11 +1655,11 @@ export function SidebarInbox() {
    *  position in `orderedActiveCards`, i.e. counted straight through the
    *  divider, so the badge a user sees while holding the jump modifier is the
    *  digit that actually activates that card. */
-  const renderCard = (ws: WorkspaceSnapshot, visualIndex: number) => {
+  const renderCard = (ws: WorkspaceSnapshot, visualIndex: number, sortable = false) => {
     const repo = repoByWorkspace.get(ws.workspace_id);
     if (!repo) return null;
     const id = ws.workspace_id;
-    return (
+    const card = (
       <SidebarInboxCard
         key={id}
         workspace={ws}
@@ -1681,10 +1696,11 @@ export function SidebarInbox() {
         }
       />
     );
+    return sortable ? <SortableInboxCard key={id} id={id} title={ws.title}>{card}</SortableInboxCard> : card;
   };
 
   return (
-    <div className="flex flex-1 flex-col">
+    <div ref={inboxRef} className="flex flex-1 flex-col">
       {/* Sticky header block: the single header row (project menu, search,
           new agent) plus the "needs you" strip.
           Both stay put while the card list scrolls beneath them, so blocked
@@ -1731,33 +1747,27 @@ export function SidebarInbox() {
             <SidebarEmptyState filterName={filterName ?? null} />
           )}
 
-        {pinnedCards.map((ws, index) => renderCard(ws, index))}
-
-        {/* Separator, not a section footer: it only earns its pixel row when
-            there is actually something on the other side of it. An all-pinned
-            list (or a filter that leaves only pinned cards) would otherwise
-            trail a hairline under the last card, promising more list and then
-            ending. */}
-        {pinnedCards.length > 0 && hasContentBelowPinned && (
-          <div
-            aria-hidden="true"
-            data-pinned-divider
-            className="mx-1 my-1.5 h-px bg-border/60"
-          />
-        )}
-
-        {/* Newest-first, so a workspace being created lands at the top of
-            the active cards — the stand-in holds exactly that slot. */}
-        {visibleCreating.map(({ draft, project }) => (
-          <SidebarCreatingCard
-            key={draft.draftId}
-            draft={draft}
-            projectName={project.name}
-            projectPath={project.path}
-          />
-        ))}
-
-        {topTier.map((ws, index) => renderCard(ws, pinnedCards.length + index))}
+        <InboxDragList
+          pinned={pinnedCards.map((ws) => ws.workspace_id)}
+          active={topTier.map((ws) => ws.workspace_id)}
+          allPinned={allPinnedCards.map((ws) => ws.workspace_id)}
+          allActive={allActiveCards.filter((ws) => !wouldWrap(ws)).map((ws) => ws.workspace_id)}
+          allIds={allWorkspaces.map((ws) => ws.workspace_id)}
+          wraps={wrappingIds} filter={filter} hasContentBelow={hasContentBelowPinned}
+          activeLeading={visibleCreating.map(({ draft, project }) => <SidebarCreatingCard key={draft.draftId}
+            draft={draft} projectName={project.name} projectPath={project.path} />)}
+          renderCard={(id, index, sortable) => {
+            const ws = workspaceById.get(id);
+            return ws ? renderCard(ws, index, sortable) : null;
+          }}
+          onWrappingPreview={setWrappingPreviewId}
+          onWrappingDrop={(id, keyboard) => {
+            setWrappingUpCollapsed(false);
+            if (keyboard) requestAnimationFrame(() => {
+              inboxRef.current?.querySelector<HTMLElement>(`[data-inbox-card="${CSS.escape(id)}"]`)?.focus();
+            });
+          }}
+        />
 
         {visibleRemote.map((r) => (
           <SidebarInboxCard
@@ -1792,7 +1802,7 @@ export function SidebarInbox() {
             everything waiting on someone else reads as a separate drawer.
             Once the list outgrows the viewport the margin collapses to zero
             and everything scrolls as one column. */}
-        {(wrappingUpTier.length > 0 ||
+        {(wrappingUpTier.length > 0 || wrappingPreview ||
           snoozedRows.length > 0 ||
           settledRows.length > 0) && (
           <div data-parked-shelves className="mt-auto flex flex-col">
@@ -1801,19 +1811,19 @@ export function SidebarInbox() {
                 holds. No header at all when nothing qualifies: an empty
                 section header would imply a category the list isn't
                 currently using. */}
-            {wrappingUpTier.length > 0 && (
+            {(wrappingUpTier.length > 0 || wrappingPreview) && (
               <>
                 <ShelfHeader
                   label="Wrapping up"
-                  count={wrappingUpTier.length}
-                  showCount={wrappingUpCollapsed}
-                  collapsed={wrappingUpCollapsed}
+                  count={previewWrappingUp?.length ?? wrappingUpTier.length}
+                  showCount={wrappingUpCollapsed && !wrappingPreview}
+                  collapsed={wrappingUpCollapsed && !wrappingPreview}
                   onToggle={() => setWrappingUpCollapsed((c) => !c)}
                   marker="data-wrapping-up-divider"
                 />
-                {visibleWrappingUp.map((ws, index) =>
-                  renderCard(ws, pinnedCards.length + topTier.length + index),
-                )}
+                {(previewWrappingUp ?? visibleWrappingUp).map((ws, index) => ws.workspace_id === wrappingPreviewId
+                  ? <div key="wrapping-drop-preview" data-inbox-wrapping-preview className="mb-1.5 flex min-h-[88px] items-center justify-center rounded-lg border border-dashed border-foreground/25 text-label text-muted-foreground">Unpin into Wrapping up</div>
+                  : renderCard(ws, pinnedCards.length + topTier.length + index))}
               </>
             )}
 

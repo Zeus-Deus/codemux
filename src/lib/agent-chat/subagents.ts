@@ -5,6 +5,7 @@ import {
   isDelegatedRow,
   isDelegationResultsText,
 } from "./delegation";
+import { toolPresentation } from "./native-tool-call";
 import type {
   ChatViewItem,
   SubagentRunItem,
@@ -294,8 +295,9 @@ export function describeToolCall(item: ToolCallItem): {
   target: string;
   meta: string;
 } {
-  const verb = VERB_BY_TOOL[item.tool_name] ?? item.tool_name.toLowerCase();
-  const input = (item.input ?? {}) as Record<string, unknown>;
+  const presented = toolPresentation(item);
+  const verb = VERB_BY_TOOL[presented.name] ?? presented.name.toLowerCase();
+  const input = (presented.input ?? {}) as Record<string, unknown>;
   const target =
     firstString(
       input.file_path,
