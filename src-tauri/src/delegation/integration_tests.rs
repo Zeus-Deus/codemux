@@ -724,7 +724,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
                 assert!(ready && !active && !authority_live, "empty native acknowledgement created phantom turn/authority");
             }
         } else {
-            if let Some(result) = dispatch_result { assert!(result.is_err(), "{kind:?}/{action}: dispatch refusal was hidden"); }
+            if let Some(result) = dispatch_result { assert_eq!(result.is_err(), action != "user", "{kind:?}/{action}: caller must observe the actual dispatch outcome"); }
             assert_eq!(
                 count,
                 usize::from(action == "user"),

@@ -406,9 +406,8 @@ async fn conflicting_pane_and_rebound_parent_cannot_borrow_original_grant() {
     store
         .update(&task.id, |t| t.wake_state = WakeState::Pending)
         .unwrap();
-    super::coordinator::wake(app.handle(), &task.id)
-        .await
-        .unwrap();
+    let error = super::coordinator::wake(app.handle(), &task.id).await.unwrap_err();
+    assert!(error.contains("Task belongs to another parent thread"), "{error}");
     assert_eq!(store.task(&task.id).unwrap().wake_state, WakeState::Held);
 }
 

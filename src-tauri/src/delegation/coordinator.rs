@@ -390,7 +390,18 @@ pub(super) async fn wake_open<R: Runtime>(handle: &AppHandle<R>, id: &str) -> Re
     let canonical=super::canonical::ingest(handle,&store,&task)?;
     let db=handle.state::<crate::database::DatabaseStore>();
     if let Some(row)=db.message_delivery(&format!("task-result:{canonical}:1"))? {
-        if row.state=="pending" {crate::agent_control::delivery::dispatch_result(handle,row).await?;}
+        if row.state=="pending" {
+            if let Err(error) = crate::agent_control::delivery::dispatch_result(handle,row).await {
+                store.update(id, |task| {
+                    if matches!(task.wake_state, WakeState::Pending | WakeState::Delivering) {
+                        task.wake_state = WakeState::Held;
+                        task.wake_error = Some(error.clone());
+                    }
+                })?;
+                app::changed(handle,&task.parent_thread_id);
+                return Err(error);
+            }
+        }
     }
     app::changed(handle,&task.parent_thread_id);Ok(())
 }
