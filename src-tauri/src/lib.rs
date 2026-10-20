@@ -789,11 +789,19 @@ fn build_core_app<R: tauri::Runtime>(
                     webview_recovery::release_page_subscribers(webview.app_handle());
                     // The old page's plugin chat listeners are gone too.
                     plugins::tap::set_enabled(false);
+                    let app = webview.app_handle().clone();
+                    let registry = app.state::<mcp::registry::McpRegistry>().inner().clone();
+                    registry.invalidate_plugin_page();
+                    tauri::async_runtime::spawn(async move { registry.clear_stale_plugin_servers(Some(&app)).await; });
                 }
                 return;
             }
             webview_tuning::apply_to_webview(webview);
             if mode == AppMode::Gui && webview.label() == "main" {
+                // Bind registrations to this document, not to the time its
+                // queued IPC happens to reach the native command handler.
+                let epoch = webview.app_handle().state::<mcp::registry::McpRegistry>().plugin_page_epoch();
+                let _ = webview.eval(format!("window.__CODEMUX_PLUGIN_PAGE_EPOCH__ = {epoch}; window.dispatchEvent(new Event('codemux-plugin-page-ready'));"));
                 diagnostics::record_startup_milestone("startup.main-page-loaded");
                 webview_tuning::mark_startup_successful();
             }
@@ -803,8 +811,9 @@ fn build_core_app<R: tauri::Runtime>(
             diagnostics::record_startup_milestone("startup.setup-enter");
             // Configuration and explicit connection probes remain available
             // when chat is disabled. Constructing the aggregate starts no CLI.
-            let acp = std::sync::Arc::new(agent_provider::custom_acp::GenericAcpProvider::new(
+            let acp = std::sync::Arc::new(agent_provider::custom_acp::GenericAcpProvider::new_with_mcp_registry(
                 std::sync::Arc::new(commands::custom_acp::AppAcpStore(app.handle().clone())),
+                Some(app.state::<mcp::registry::McpRegistry>().inner().clone()),
             ));
             let mut catalogs = acp.catalog_updates();
             let catalog_handle = app.handle().clone();
@@ -1449,7 +1458,10 @@ fn build_core_app<R: tauri::Runtime>(
                         > = registry_handle.state();
                         let cursor =
                             agent_provider::cursor::CursorAgentProvider::new_with_slash_command_cache(
-                                agent_provider::cursor::CursorProviderConfig::default(),
+                                agent_provider::cursor::CursorProviderConfig {
+                                    mcp_registry: Some(mcp_registry.clone()),
+                                    ..Default::default()
+                                },
                                 acp_slash_commands.inner().clone(),
                             );
                         registry
@@ -1460,15 +1472,19 @@ fn build_core_app<R: tauri::Runtime>(
                         // spawned lazily per chat session.
                         let grok =
                             agent_provider::grok::GrokAgentProvider::new_with_slash_command_cache(
-                                agent_provider::grok::GrokProviderConfig::default(),
+                                agent_provider::grok::GrokProviderConfig {
+                                    mcp_registry: Some(mcp_registry.clone()),
+                                    ..Default::default()
+                                },
                                 acp_slash_commands.inner().clone(),
                             );
                         registry
                             .set_grok(std::sync::Arc::new(grok) as _)
                             .await;
 
-                        let hermes = std::sync::Arc::new(agent_provider::hermes::HermesProvider::new(
+                        let hermes = std::sync::Arc::new(agent_provider::hermes::HermesProvider::new_with_mcp_registry(
                             std::sync::Arc::new(agent_provider::hermes::binding::AppBindingStore(registry_handle.clone())),
+                            Some(mcp_registry.clone()),
                         ));
                         registry_handle.manage(hermes.clone());
                         registry.set_hermes(hermes).await;
@@ -2683,6 +2699,11 @@ fn build_core_app<R: tauri::Runtime>(
             plugins::commands::plugins_startup_checkpoint,
             plugins::commands::plugins_resume,
             plugins::commands::plugins_set_event_tap,
+            plugins::mcp::plugins_mcp_register,
+            plugins::mcp::plugins_mcp_unregister,
+            plugins::mcp::plugins_mcp_list_tools,
+            plugins::mcp::plugins_mcp_call_tool,
+            plugins::mcp::plugins_mcp_status,
             plugins::commands::plugins_chat_status,
             plugins::commands::plugins_chat_request_compaction,
             plugins::commands::plugins_catalog,

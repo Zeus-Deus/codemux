@@ -6,6 +6,7 @@
 // the results in the read-only Settings UI. No spawn or runtime here —
 // Stage 2 will wire `JsonRpcChild` against the discovered specs.
 
+pub mod bridge;
 pub mod codemux_self;
 pub mod gateway;
 pub mod http_client;
@@ -31,6 +32,8 @@ pub const WORKSPACE_META_KEY: &str = "codemux/workspace_id";
 pub enum McpConfigSource {
     /// Codemux's own hardcoded MCP server (always-on, not user-toggleable).
     Codemux,
+    /// A server contributed by a live desktop plugin.
+    Plugin,
     /// `~/.codemux/mcp.json` — the canonical Codemux-managed MCPs.
     CodemuxUser,
     /// `<project>/.codemux/mcp.json`
@@ -91,6 +94,63 @@ pub struct McpServerConfig {
 }
 
 impl McpServerConfig {
+    /// Listing is informational. Runtime credentials remain native-only.
+    pub fn redacted(mut self) -> Self {
+        if !self.args.is_empty() {
+            self.args = vec!["…".into()];
+        }
+        let redact_url = |value: &str| -> String {
+            let Ok(mut url) = url::Url::parse(value) else {
+                return "[redacted URL]".into();
+            };
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        };
+        if self.transport == McpTransport::Http {
+            self.command = redact_url(&self.command);
+        }
+        for value in self.env.values_mut() {
+            *value = "[redacted]".into();
+        }
+        if let Some(raw) = self.raw.as_object_mut() {
+            raw.remove("pluginRegistrationToken");
+            raw.remove("runtimeGeneration");
+            if raw
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|args| !args.is_empty())
+            {
+                raw.insert("args".into(), serde_json::json!(["…"]));
+            }
+            for key in ["url", "serverUrl"] {
+                if let Some(value) = raw.get_mut(key) {
+                    if let Some(url) = value.as_str() {
+                        *value = serde_json::json!(redact_url(url));
+                    }
+                }
+            }
+            if self.transport == McpTransport::Http && raw.contains_key("command") {
+                raw.insert("command".into(), serde_json::json!(self.command));
+            }
+            for key in ["env", "headers", "http_headers"] {
+                if let Some(serde_json::Value::Object(values)) = raw.get_mut(key) {
+                    for value in values.values_mut() {
+                        *value = serde_json::json!("[redacted]");
+                    }
+                }
+            }
+            for key in ["bearer_token", "bearerToken"] {
+                if let Some(value) = raw.get_mut(key) {
+                    *value = serde_json::json!("[redacted]");
+                }
+            }
+        }
+        self
+    }
+
     /// Lowest-rank (most canonical) source for this entry. After dedupe
     /// `sources[0]` is always the canonical one because we sort before
     /// merging.
@@ -117,6 +177,7 @@ pub fn mcp_server_id(config_path: &str, server_name: &str) -> String {
 pub fn source_rank(s: McpConfigSource) -> u8 {
     match s {
         McpConfigSource::Codemux => 0,
+        McpConfigSource::Plugin => 11,
         McpConfigSource::CodemuxUser => 1,
         McpConfigSource::CodemuxProject => 2,
         McpConfigSource::ClaudeUser => 3,

@@ -3,6 +3,7 @@
  * here are the supported surface. `host.invoke` / `host.listen` are the raw
  * Tauri door and are UNSTABLE: commands may change between releases.
  */
+import { createMcpHost } from "@/contrib/mcp";
 import type { ComponentType, ReactNode } from "react";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
@@ -207,6 +208,7 @@ export function createHost(bound: Owner | null) {
   };
 
   const api = {
+    mcp: createMcpHost(ownerNow, subscription),
     theme: {
       get: (): ThemeDefinition => getActiveTheme(),
       subscribe: (fn: (theme: ThemeDefinition) => void) =>

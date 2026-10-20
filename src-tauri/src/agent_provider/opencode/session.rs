@@ -243,6 +243,7 @@ impl OpenCodeSession {
         // starts fresh. See `OpenCodeAgentProvider::usage_states`.
         carried_usage: Option<Arc<Mutex<OpenCodeUsageState>>>,
         directory: Option<std::path::PathBuf>,
+        workspace_id: Option<String>,
     ) -> Result<Arc<Self>, ProviderError> {
         let server_handle = manager.ensure_running().await.map_err(|err| {
             if err == "opencode_not_installed" {
@@ -286,7 +287,7 @@ impl OpenCodeSession {
         // Failures surface as a RuntimeWarning instead of killing the session.
         if let Some(registry) = mcp_registry.as_ref() {
             if let Err(error) =
-                attach_mcp_gateway_scoped(&http, &server_handle, registry, directory.as_deref())
+                attach_mcp_gateway_scoped(&http, &server_handle, registry, directory.as_deref(), workspace_id.as_deref())
                     .await
             {
                 eprintln!("[codemux::opencode] shared MCP gateway attach failed: {error}");
@@ -2339,7 +2340,7 @@ async fn attach_mcp_gateway(
     server: &OpenCodeServerHandle,
     registry: &McpRegistry,
 ) -> Result<(), ProviderError> {
-    attach_mcp_gateway_scoped(http, server, registry, None).await
+    attach_mcp_gateway_scoped(http, server, registry, None, None).await
 }
 
 async fn attach_mcp_gateway_scoped(
@@ -2347,15 +2348,38 @@ async fn attach_mcp_gateway_scoped(
     server: &OpenCodeServerHandle,
     registry: &McpRegistry,
     directory: Option<&std::path::Path>,
+    workspace_id: Option<&str>,
 ) -> Result<(), ProviderError> {
-    let connection =
-        registry
-            .gateway_connection()
-            .await
-            .map_err(|message| ProviderError::ProcessError {
-                message: "failed to start Codemux MCP gateway".into(),
-                source: Some(message),
-            })?;
+    // A V2 registration is one `codemux` entry per directory, shared by every
+    // chat there, so its token is per directory too. It acts for the
+    // directory's workspace only while just one workspace uses it: in a
+    // directory shared by several workspaces (e.g. two on the same checkout)
+    // OpenCode chats get globally scoped plugin tools only. See
+    // `GatewayDirectoryWorkspaces`. The V1 registration is instance-global
+    // and keeps the shared token, which has no workspace.
+    let connection = match directory.filter(|_| server.api == super::api::OpenCodeApi::V2) {
+        Some(directory) => {
+            let key = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+            let token_key = format!("opencode-directory:{}", key.display());
+            registry.gateway_runtime().await.map(|gateway| {
+                server.gateway_workspaces.record_and_publish(&key, workspace_id, |authority| {
+                    gateway.chat_connection(
+                        &token_key,
+                        crate::mcp::gateway::GatewayCaller {
+                            workspace_id: authority,
+                            native_sources: crate::mcp::gateway::OPENCODE_NATIVE_SOURCES.to_vec(),
+                            flat_tool_names: false,
+                        },
+                    )
+                })
+            })
+        }
+        None => registry.gateway_connection().await,
+    }
+    .map_err(|message| ProviderError::ProcessError {
+        message: "failed to start Codemux MCP gateway".into(),
+        source: Some(message),
+    })?;
     if server.api == super::api::OpenCodeApi::V2 {
         let mut request = http.put(format!(
             "{}/api/experimental/mcp/codemux",
@@ -2935,6 +2959,7 @@ pub(crate) mod tests {
             base_url: server.url(),
             server_password: "pw".into(),
             api: super::super::api::OpenCodeApi::Legacy,
+            gateway_workspaces: Default::default(),
         };
         attach_mcp_gateway(&reqwest::Client::new(), &handle, &McpRegistry::new())
             .await
@@ -2988,6 +3013,7 @@ pub(crate) mod tests {
             tx,
             None,
             None,
+            None,
         )
         .await;
 
@@ -3032,6 +3058,7 @@ pub(crate) mod tests {
             tx,
             None,
             Some(directory.path().to_path_buf()),
+            None,
         )
         .await
         .expect("OpenCode session should start");
@@ -3123,6 +3150,7 @@ pub(crate) mod tests {
             tx,
             None,
             None,
+            None,
         )
         .await
         .expect("OpenCode session should start with shared MCP gateway");
@@ -3200,6 +3228,7 @@ pub(crate) mod tests {
             base_url,
             server_password: password,
             api,
+            gateway_workspaces: Default::default(),
         };
         // Build the session directly — bypasses
         // OpenCodeServerManager so we can mock the HTTP layer.
@@ -3305,7 +3334,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn v2_gateway_registration_is_scoped_and_verified_connected() {
+    async fn v2_gateway_url_carries_no_workspace_and_verifies_connection() {
         let mut server = Server::new_async().await;
         let directory = tempfile::tempdir().unwrap();
         let query = mockito::Matcher::UrlEncoded(
@@ -3315,9 +3344,10 @@ pub(crate) mod tests {
         let put = server
             .mock("PUT", "/api/experimental/mcp/codemux")
             .match_query(query.clone())
-            .match_body(mockito::Matcher::PartialJson(
-                serde_json::json!({"config":{"type":"remote","disabled":false,"oauth":false}}),
-            ))
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJson(serde_json::json!({"config":{"type":"remote","disabled":false,"oauth":false}})),
+                mockito::Matcher::Regex(r#""url":"http://127\.0\.0\.1:[0-9]+/mcp""#.into()),
+            ]))
             .with_status(204)
             .create_async()
             .await;
@@ -3332,17 +3362,237 @@ pub(crate) mod tests {
             base_url: server.url(),
             server_password: "fixture".into(),
             api: super::super::api::OpenCodeApi::V2,
+            gateway_workspaces: Default::default(),
         };
         attach_mcp_gateway_scoped(
             &reqwest::Client::new(),
             &server,
             &McpRegistry::new(),
             Some(directory.path()),
+            Some("workspace-fixture"),
         )
         .await
         .unwrap();
         put.assert_async().await;
         get.assert_async().await;
+    }
+
+    /// Two workspaces' chats in one directory share OpenCode's single
+    /// `codemux` entry: the token stays per directory, and once the second
+    /// workspace attaches it no longer acts for the first, so a plugin server
+    /// scoped to the first disappears for both instead of leaking across.
+    #[tokio::test]
+    async fn v2_gateway_token_is_per_directory_and_drops_a_shared_workspace() {
+        let registry = McpRegistry::new();
+        let fixture: crate::mcp::registry::PluginMcpServer = serde_json::from_value(serde_json::json!({
+            "id": "fixture", "name": "Fixture", "toolPrefix": "fixture",
+            "scope": {"workspaceIds": ["workspace-a"]},
+            "transport": "stdio", "command": "python3",
+            "args": [format!("{}/tests/fixtures/plugin_mcp.py", env!("CARGO_MANIFEST_DIR"))],
+        }))
+        .unwrap();
+        registry
+            .register_plugin_server::<tauri::Wry>(None, "demo", "token-1".into(), fixture)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while registry.list_tools_for_workspace(&[], Some("workspace-a")).await.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fixture tools load");
+
+        let mut server = Server::new_async().await;
+        let directory = tempfile::tempdir().unwrap();
+        let registrations = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let seen = registrations.clone();
+        let put = server
+            .mock("PUT", "/api/experimental/mcp/codemux")
+            .match_query(mockito::Matcher::Any)
+            .with_status(204)
+            .with_body_from_request(move |request| {
+                let body: serde_json::Value = serde_json::from_slice(request.body().unwrap()).unwrap();
+                seen.lock().unwrap().push(body["config"].clone());
+                Vec::new()
+            })
+            .expect(2)
+            .create_async()
+            .await;
+        let _get = server
+            .mock("GET", "/api/mcp")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"name":"codemux","status":{"status":"connected"}}]}"#)
+            .create_async()
+            .await;
+        let server = OpenCodeServerHandle {
+            base_url: server.url(),
+            server_password: "fixture".into(),
+            api: super::super::api::OpenCodeApi::V2,
+            gateway_workspaces: Default::default(),
+        };
+        let listed = |config: serde_json::Value| async move {
+            let body: serde_json::Value = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .post(config["url"].as_str().unwrap())
+                .header("authorization", config["headers"]["Authorization"].as_str().unwrap())
+                .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            body["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let http = reqwest::Client::new();
+        let attach = |workspace: &'static str| {
+            attach_mcp_gateway_scoped(
+                &http,
+                &server,
+                &registry,
+                Some(directory.path()),
+                Some(workspace),
+            )
+        };
+        attach("workspace-a").await.unwrap();
+        let first = registrations.lock().unwrap()[0].clone();
+        assert!(listed(first.clone()).await.iter().any(|name| name == "fixture__echo"));
+
+        attach("workspace-b").await.unwrap();
+        let second = registrations.lock().unwrap()[1].clone();
+        assert_eq!(first["headers"], second["headers"], "one token per directory");
+        let names = listed(first).await;
+        assert!(!names.iter().any(|name| name.starts_with("fixture__")), "{names:?}");
+        put.assert_async().await;
+    }
+
+    /// Two chats start in one directory at once. Chat A pauses after
+    /// recording itself as the directory's only member and before publishing
+    /// its gateway authority, while chat B attaches. However they interleave,
+    /// the directory token must end up acting for no workspace, so neither
+    /// chat can list or call tools scoped to workspace A.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v2_concurrent_shared_directory_attaches_never_publish_a_stale_workspace() {
+        let registry = McpRegistry::new();
+        let fixture: crate::mcp::registry::PluginMcpServer = serde_json::from_value(serde_json::json!({
+            "id": "fixture", "name": "Fixture", "toolPrefix": "fixture",
+            "scope": {"workspaceIds": ["workspace-a"]},
+            "transport": "stdio", "command": "python3",
+            "args": [format!("{}/tests/fixtures/plugin_mcp.py", env!("CARGO_MANIFEST_DIR"))],
+        }))
+        .unwrap();
+        registry
+            .register_plugin_server::<tauri::Wry>(None, "demo", "token-1".into(), fixture)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while registry.list_tools_for_workspace(&[], Some("workspace-a")).await.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fixture tools load");
+
+        let mut mock = Server::new_async().await;
+        let registrations = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let seen = registrations.clone();
+        let _put = mock
+            .mock("PUT", "/api/experimental/mcp/codemux")
+            .match_query(mockito::Matcher::Any)
+            .with_status(204)
+            .with_body_from_request(move |request| {
+                let body: serde_json::Value = serde_json::from_slice(request.body().unwrap()).unwrap();
+                seen.lock().unwrap().push(body["config"].clone());
+                Vec::new()
+            })
+            .expect(2)
+            .create_async()
+            .await;
+        let _get = mock
+            .mock("GET", "/api/mcp")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"data":[{"name":"codemux","status":{"status":"connected"}}]}"#)
+            .create_async()
+            .await;
+        let server = OpenCodeServerHandle {
+            base_url: mock.url(),
+            server_password: "fixture".into(),
+            api: super::super::api::OpenCodeApi::V2,
+            gateway_workspaces: Default::default(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        *server.gateway_workspaces.after_record.lock().unwrap() = Some(Box::new(move || {
+            reached_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        }));
+        let attach = |workspace: &'static str| {
+            let (server, registry, directory) =
+                (server.clone(), registry.clone(), directory.path().to_path_buf());
+            tokio::spawn(async move {
+                attach_mcp_gateway_scoped(
+                    &reqwest::Client::new(),
+                    &server,
+                    &registry,
+                    Some(&directory),
+                    Some(workspace),
+                )
+                .await
+            })
+        };
+
+        let a = attach("workspace-a");
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .expect("chat A recorded its membership");
+        let b = attach("workspace-b");
+        // Room for B to finish first if nothing orders the two publications.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        release_tx.send(()).unwrap();
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+
+        let config = registrations.lock().unwrap()[0].clone();
+        let call = |body: serde_json::Value| {
+            let config = config.clone();
+            async move {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap()
+                    .post(config["url"].as_str().unwrap())
+                    .header("authorization", config["headers"]["Authorization"].as_str().unwrap())
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap()
+            }
+        };
+        let listed = call(serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
+        assert!(
+            !listed.to_string().contains("fixture__"),
+            "the shared directory token lists workspace A's tools: {listed}"
+        );
+        let called = call(serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "fixture__echo", "arguments": {}}}))
+        .await;
+        assert_eq!(called["result"]["isError"], true, "{called}");
     }
 
     #[tokio::test]
@@ -5725,6 +5975,7 @@ pub(crate) mod tests {
             None,
             Some("ses_keep".into()),
             tx,
+            None,
             None,
             None,
         )

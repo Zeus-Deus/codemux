@@ -807,7 +807,7 @@ impl ClaudeSession {
             Ok(ack) if ack.get("started").and_then(Value::as_bool) == Some(true) => None,
             Ok(ack) => Some(match ack.get("reason").and_then(Value::as_str) {
                 Some("closed") => Refusal::Closed,
-                Some("query_dead") => Refusal::NotReady,
+                Some("query_dead" | "mcp_refresh") => Refusal::NotReady,
                 _ => Refusal::Failed,
             }),
             // The sidecar never ran the method: nothing was queued.
@@ -2333,13 +2333,24 @@ async fn collect_shared_tools_for_claude(
     caller: &crate::mcp::registry::HostCaller,
 ) -> Vec<crate::mcp::runtime::McpTool> {
     let mut tools = registry
-        .list_all_tools_excluding_sources(&[
-            crate::mcp::McpConfigSource::ClaudeUser,
-            crate::mcp::McpConfigSource::ClaudeLocal,
-            crate::mcp::McpConfigSource::ClaudeProject,
-        ])
+        .list_tools_for_workspace(
+            &[
+                crate::mcp::McpConfigSource::ClaudeUser,
+                crate::mcp::McpConfigSource::ClaudeLocal,
+                crate::mcp::McpConfigSource::ClaudeProject,
+            ],
+            caller.workspace_id.as_deref(),
+        )
         .await;
     tools.extend(registry.host_tools(caller));
+    // These stay callable while native catalog replacement waits for a safe
+    // turn boundary (for example, an Editor connecting during this turn).
+    if registry
+        .has_visible_plugin_servers(caller.workspace_id.as_deref())
+        .await
+    {
+        tools.extend(crate::mcp::registry::plugin_bridge_tools());
+    }
     tools
 }
 
@@ -2397,6 +2408,7 @@ async fn handle_mcp_tool_call(
         &prefixed_name,
         arguments,
         Some(actor),
+        &plugin_direct_tool_names(&params),
     )
     .await;
     if let Some(message) = failure {
@@ -2409,6 +2421,21 @@ async fn handle_mcp_tool_call(
     let _ = session.sidecar.respond(req.id, Ok(payload)).await;
 }
 
+/// Sidecar-supplied snapshot metadata, never model arguments. It only labels
+/// discovery results; visibility and dispatch still use the registry scope.
+fn plugin_direct_tool_names(params: &Value) -> Vec<String> {
+    params
+        .get("directPluginTools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(512)
+        .filter_map(Value::as_str)
+        .filter(|name| name.len() <= 64)
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Run one `mcp-tool-call` and build the tool result for the SDK, plus the
 /// dispatch failure worth a runtime warning, if any.
 async fn run_mcp_tool_call(
@@ -2418,6 +2445,7 @@ async fn run_mcp_tool_call(
     prefixed_name: &str,
     arguments: Value,
     actor: Option<crate::delegation::app::NativeActor>,
+    direct_tools: &[String],
 ) -> (Value, Option<String>) {
     // No registry: a session on a device (which must not reach this
     // computer's tools whatever name it sends), or a provider built without
@@ -2430,7 +2458,17 @@ async fn run_mcp_tool_call(
         );
     };
 
-    // Host tools first. The caller carries the LIVE permission mode, so a
+    if let Some(result) = registry
+        .call_plugin_bridge(prefixed_name, arguments.clone(), workspace_id, direct_tools)
+        .await
+    {
+        return match result {
+            Ok(payload) => (payload, None),
+            Err(error) => (tool_result_text(error.clone(), true), Some(error)),
+        };
+    }
+
+    // Host tools precede child dispatch. The caller carries the LIVE permission mode, so a
     // Plan/Ask pill flipped after the session started is honoured.
     if let Some(result) = registry.host_call(caller, prefixed_name, &arguments) {
         return (result, None);
@@ -2796,11 +2834,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_mcp_claude_payload_has_guidance_and_hides_private_servers() {
+        for scope in ["all", "plugin"] {
+            let registry = crate::mcp::registry::test_support::plugin_fixture(scope).await;
+            let tools = collect_mcp_tools(Some(&registry), &test_caller()).await;
+            if scope == "plugin" {
+                assert!(!tools
+                    .iter()
+                    .any(|tool| tool.server_id.starts_with("plugin:")));
+            } else {
+                let tool = tools.iter().find(|t| t.name == "new_tool").unwrap();
+                assert_eq!(
+                    tool.description.as_deref(),
+                    Some("Use structured tools first.\n\nAlways use background delivery.")
+                );
+            }
+            registry.shutdown_all().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_claude_has_no_bridge_without_a_visible_plugin_server() {
+        let registry = crate::mcp::registry::McpRegistry::new();
+        let tools = collect_mcp_tools(Some(&registry), &test_caller()).await;
+        assert!(!tools
+            .iter()
+            .any(|tool| tool.server_id == "codemux-plugin-bridge"));
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_claude_preserves_structured_results_for_native_and_bridge() {
+        let registry = crate::mcp::registry::test_support::plugin_fixture("all").await;
+        let expected = registry
+            .plugin_call("plugin:test-plugin:fixture", "image", json!({}))
+            .await
+            .unwrap();
+        for (name, arguments) in [
+            ("fixture__image", json!({})),
+            (
+                "codemux_call_plugin_tool",
+                json!({"name":"fixture__image","arguments":{}}),
+            ),
+        ] {
+            let (result, failure) = run_mcp_tool_call(
+                Some(&registry),
+                &test_caller(),
+                Some("ws-42"),
+                name,
+                arguments,
+                None,
+                &[],
+            )
+            .await;
+            assert!(failure.is_none());
+            assert_eq!(result, expected);
+            assert_eq!(result.to_string().matches("STRUCTURED-581").count(), 1);
+        }
+        registry.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn plugin_mcp_claude_bridge_lists_and_calls_live_tools_with_scope() {
+        for scope in ["all", "plugin"] {
+            let registry = crate::mcp::registry::test_support::plugin_fixture(scope).await;
+            let tools = collect_mcp_tools(Some(&registry), &test_caller()).await;
+            assert_eq!(
+                tools
+                    .iter()
+                    .any(|tool| tool.prefixed_name == "codemux_list_plugin_tools"),
+                scope == "all"
+            );
+            let (list, failure) = run_mcp_tool_call(
+                Some(&registry),
+                &test_caller(),
+                Some("ws-42"),
+                "codemux_list_plugin_tools",
+                json!({}),
+                None,
+                &["fixture__new_tool".into()],
+            )
+            .await;
+            assert!(failure.is_none());
+            if scope == "all" {
+                assert!(list["structuredContent"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "fixture__new_tool"
+                        && tool["directlyCallable"] == true));
+            } else {
+                assert_eq!(list["structuredContent"]["tools"], json!([]));
+            }
+            let (result, _) = run_mcp_tool_call(
+                Some(&registry),
+                &test_caller(),
+                Some("ws-42"),
+                "codemux_call_plugin_tool",
+                json!({"name":"fixture__new_tool","arguments":{}}),
+                None,
+                &[],
+            )
+            .await;
+            if scope == "all" {
+                assert_eq!(result["content"][0]["text"], "ORCHID-742");
+            } else {
+                assert_eq!(result["isError"], true);
+            }
+            registry.shutdown_all().await;
+        }
+        let names = plugin_direct_tool_names(&json!({"directPluginTools":vec!["x"; 700]}));
+        assert_eq!(names.len(), 512);
+    }
+
+    #[tokio::test]
     async fn local_session_publishes_and_runs_shared_tools() {
-        let (_server, registry, call) =
+        let (mut server, registry, call) =
             crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
         let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
-        assert_eq!(collect_mcp_tools(local.as_ref(), &test_caller()).await.len(), 1);
+        assert_eq!(
+            collect_mcp_tools(local.as_ref(), &test_caller())
+                .await
+                .len(),
+            1
+        );
+        // An empty visible registration must add both bridge tools before an
+        // external app connects, without changing the existing native tool.
+        server
+            .mock("POST", "/empty")
+            .match_body(mockito::Matcher::PartialJson(json!({"method":"initialize"})))
+            .with_body(json!({
+                "jsonrpc":"2.0", "id":1,
+                "result":{"protocolVersion":"2025-06-18","capabilities":{}}
+            }).to_string())
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/empty")
+            .match_body(mockito::Matcher::PartialJson(
+                json!({"method":"notifications/initialized"}),
+            ))
+            .with_status(202)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/empty")
+            .match_body(mockito::Matcher::PartialJson(
+                json!({"method":"tools/list"}),
+            ))
+            .with_body(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[]}}).to_string())
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/empty")
+            .with_status(405)
+            .create_async()
+            .await;
+        registry
+            .register_plugin_server::<tauri::Wry>(
+                None, "empty", "token".into(),
+                serde_json::from_value(json!({
+                    "id":"empty", "name":"Empty", "toolPrefix":"empty",
+                    "scope":"all", "transport":"http", "url":format!("{}/empty",server.url())
+                })).unwrap(),
+            )
+            .await
+            .unwrap();
+        let tools = collect_mcp_tools(local.as_ref(), &test_caller()).await;
+        assert_eq!(tools.len(), 3);
+        assert!(tools
+            .iter()
+            .any(|tool| tool.prefixed_name == "codemux_list_plugin_tools"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool.prefixed_name == "codemux_call_plugin_tool"));
         let (payload, failure) = run_mcp_tool_call(
             local.as_ref(),
             &test_caller(),
@@ -2808,11 +3014,13 @@ mod tests {
             "mcp__codemux-remote__echo",
             json!({"text": "hi"}),
             None,
+            &[],
         )
         .await;
         assert_eq!(payload["content"][0]["text"], "routed");
         assert!(failure.is_none());
         call.assert_async().await;
+        registry.shutdown_all().await;
     }
 
     #[tokio::test]
@@ -2838,6 +3046,7 @@ mod tests {
             "mcp__codemux-remote__echo",
             json!({"text": "hi"}),
             None,
+            &[],
         )
         .await;
         assert_eq!(payload["isError"], true);

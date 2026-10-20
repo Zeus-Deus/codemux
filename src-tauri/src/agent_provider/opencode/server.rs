@@ -98,6 +98,8 @@ pub struct OpenCodeServer {
     /// this specific child. Bound to the server's lifetime: when the
     /// server dies the password becomes meaningless.
     server_password: String,
+    /// See [`super::manager::GatewayDirectoryWorkspaces`].
+    gateway_workspaces: std::sync::Arc<super::manager::GatewayDirectoryWorkspaces>,
 }
 
 // Task-scoped scheduling gate. It delays actual cleanup without replacing
@@ -192,6 +194,7 @@ impl OpenCodeServer {
             base_url,
             api,
             server_password,
+            gateway_workspaces: Default::default(),
         })
     }
 
@@ -211,6 +214,10 @@ impl OpenCodeServer {
     /// spawn time.
     pub fn server_password(&self) -> &str {
         &self.server_password
+    }
+
+    pub fn gateway_workspaces(&self) -> std::sync::Arc<super::manager::GatewayDirectoryWorkspaces> {
+        self.gateway_workspaces.clone()
     }
 
     /// Best-effort PID of the running child. `None` after the child
@@ -570,6 +577,7 @@ mod tests {
             base_url: "http://127.0.0.1:1".into(),
             api: super::super::api::OpenCodeApi::Legacy,
             server_password: "synthetic".into(),
+            gateway_workspaces: Default::default(),
         };
         assert!(server.pid().is_some());
         server.shutdown().await.unwrap();

@@ -6,6 +6,7 @@
 //! here so those protocol-critical paths (queueing, cancellation, permission
 //! requests, and stream ordering) stay identical across both drivers.
 
+pub mod mcp;
 pub mod protocol;
 pub mod session;
 pub mod slash_commands;

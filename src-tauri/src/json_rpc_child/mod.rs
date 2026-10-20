@@ -399,7 +399,7 @@ struct OwnedRpcProcess {
 
 impl Drop for OwnedRpcProcess {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(group) = self.managed_group {
             if self.inner.id() == Some(group) {
                 let _ = signal_owned_managed_group(group);
@@ -451,23 +451,29 @@ impl JsonRpcChild {
     /// Fails with [`RpcChildError::SpawnFailed`] if the executable cannot start.
     /// An unexpected pipe-capture failure after spawn is a protocol error.
     pub async fn spawn(config: SpawnConfig) -> Result<Self, RpcChildError> {
-        Self::spawn_mode(config, false, false, false, None).await
+        Self::spawn_mode(config, false, false, false, None, false).await
     }
 
     /// Standards-driven peers fail closed on malformed framing or callback
     /// loss. Existing native adapters retain their tolerant transport mode.
     pub async fn spawn_strict(config: SpawnConfig) -> Result<Self, RpcChildError> {
-        Self::spawn_mode(config, true, false, false, None).await
+        Self::spawn_mode(config, true, false, false, None, false).await
     }
 
     pub async fn spawn_managed(config: SpawnConfig) -> Result<Self, RpcChildError> {
-        Self::spawn_mode(config, false, true, false, None).await
+        Self::spawn_mode(config, false, true, false, None, false).await
+    }
+
+    /// Skip EOF grace on stop. Linux and macOS contain the peer in an owned
+    /// process group; other platforms immediately terminate the owned child.
+    pub async fn spawn_immediate(config: SpawnConfig) -> Result<Self, RpcChildError> {
+        Self::spawn_mode(config, false, cfg!(target_os = "linux"), false, None, true).await
     }
 
     /// App-owned bearer credentials require a minimal inherited environment.
     /// Existing adapters retain their ordinary overlay semantics.
     pub async fn spawn_isolated(config: SpawnConfig) -> Result<Self, RpcChildError> {
-        Self::spawn_mode(config, false, false, true, None).await
+        Self::spawn_mode(config, false, false, true, None, false).await
     }
 
     pub(crate) async fn spawn_owned(
@@ -475,7 +481,7 @@ impl JsonRpcChild {
         isolated: bool,
         lease: Arc<std::fs::File>,
     ) -> Result<Self, RpcChildError> {
-        Self::spawn_mode(config, false, false, isolated, Some(lease)).await
+        Self::spawn_mode(config, false, false, isolated, Some(lease), false).await
     }
 
     pub(crate) async fn spawn_managed_owned(
@@ -483,7 +489,7 @@ impl JsonRpcChild {
         isolated: bool,
         lease: Arc<std::fs::File>,
     ) -> Result<Self, RpcChildError> {
-        Self::spawn_mode(config, false, true, isolated, Some(lease)).await
+        Self::spawn_mode(config, false, true, isolated, Some(lease), false).await
     }
 
     async fn spawn_mode(
@@ -492,7 +498,10 @@ impl JsonRpcChild {
         managed: bool,
         isolated: bool,
         owner_lease: Option<Arc<std::fs::File>>,
+        immediate: bool,
     ) -> Result<Self, RpcChildError> {
+        #[cfg(target_os = "linux")]
+        let _ = immediate;
         let mut cmd = Command::new(&config.program);
         cmd.args(&config.args)
             .stdin(std::process::Stdio::piped())
@@ -500,7 +509,7 @@ impl JsonRpcChild {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         #[cfg(unix)]
-        if managed {
+        if managed || (immediate && cfg!(target_os = "macos")) {
             cmd.process_group(0);
         }
         #[cfg(not(target_os = "linux"))]
@@ -537,7 +546,7 @@ impl JsonRpcChild {
         }
 
         let child = cmd.spawn().map_err(RpcChildError::SpawnFailed)?;
-        let managed_group = if managed { child.id() } else { None };
+        let managed_group = if managed || (immediate && cfg!(target_os = "macos")) { child.id() } else { None };
         let mut child = OwnedRpcProcess { inner: child, managed_group };
         let stdin = child.inner.stdin.take().ok_or_else(|| {
             RpcChildError::ProtocolError("spawned child stdin pipe not captured".into())
@@ -670,7 +679,7 @@ impl JsonRpcChild {
             let _incoming_keepalive = incoming_tx;
             tokio::spawn(async move {
                 let exit_status = {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     if let Some(group) = managed_group {
                         wait_managed_child(&mut child, group, shutdown_rx).await
                     } else {
@@ -693,11 +702,15 @@ impl JsonRpcChild {
                             }
                         }
                     }
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                     {
                         tokio::select! {
                             status = child.inner.wait() => status,
                             _ = shutdown_rx => {
+                                if immediate {
+                                    let _ = child.inner.start_kill();
+                                    child.inner.wait().await
+                                } else {
                                 // The total grace budget includes acquiring stdin: a
                                 // blocked write must not delay the owned kill timer.
                                 // This cleanup outlives cancellation of any caller.
@@ -710,6 +723,7 @@ impl JsonRpcChild {
                                         let _ = child.inner.kill().await;
                                         child.inner.wait().await
                                     }
+                                }
                                 }
                             }
                         }
@@ -1348,7 +1362,7 @@ fn bound_managed_response(response: Value) -> Result<Value, RpcChildError> {
     Ok(error)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn managed_leader_exited(pid: u32) -> std::io::Result<bool> {
     loop {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -1357,7 +1371,11 @@ fn managed_leader_exited(pid: u32) -> std::io::Result<bool> {
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
         };
         if result == 0 {
-            return Ok(unsafe { info.si_pid() } == pid as i32);
+            #[cfg(target_os = "linux")]
+            let exited_pid = unsafe { info.si_pid() };
+            #[cfg(target_os = "macos")]
+            let exited_pid = info.si_pid;
+            return Ok(exited_pid == pid as i32);
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::Interrupted {
@@ -1366,7 +1384,7 @@ fn managed_leader_exited(pid: u32) -> std::io::Result<bool> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn wait_managed_child(
     child: &mut OwnedRpcProcess,
     group: u32,
@@ -1391,7 +1409,7 @@ async fn wait_managed_child(
     status
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn signal_owned_managed_group(group: u32) -> std::io::Result<()> {
     managed_leader_exited(group)?;
     let result = unsafe { libc::kill(-(group as i32), libc::SIGKILL) };

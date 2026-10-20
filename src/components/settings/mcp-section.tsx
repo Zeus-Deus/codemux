@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { listen } from "@tauri-apps/api/event";
 import { Info, RotateCw, Server } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -111,6 +112,16 @@ function OutboundMcpSection({ projectRoot }: Props) {
     void load();
   }, [load]);
 
+  useEffect(() => {
+    let ended = false;
+    let unlisten: (() => void) | undefined;
+    void listen<McpServerRuntime>("mcp-status-changed", (event) => {
+      if (!event.payload.id.startsWith("plugin:")) return;
+      void listMcpServers(projectRoot).then((rows) => { if (!ended) setServers(rows); }).catch((error) => console.warn("[mcp] refresh plugin servers failed", error));
+    }).then((stop) => { if (ended) stop(); else unlisten = stop; }).catch(() => {});
+    return () => { ended = true; unlisten?.(); };
+  }, [projectRoot]);
+
   const groups = useMemo(() => groupByPrimarySource(servers), [servers]);
   const collidingNames = useMemo(() => collidingNameSet(servers), [servers]);
 
@@ -131,7 +142,7 @@ function OutboundMcpSection({ projectRoot }: Props) {
     <div>
       <SectionHeader
         title="MCP Servers"
-        description="Model Context Protocol servers expose tools to your agent. Servers spawn lazily on first chat session start; toggle a row off to stop it. Codemux's own MCP is always on."
+        description="Model Context Protocol servers expose tools to your agent. Configured servers start when needed; plugin servers start when their plugin registers them. Toggle a row off to stop it. Codemux's own MCP is always on."
         action={
           <Button
             variant="outline"
@@ -337,6 +348,9 @@ function ServerRow({
           >
             {server.name}
           </span>
+          {server.sources.includes("plugin") && (
+            <Badge variant="outline" className="text-caption">Plugin: {server.id.split(":")[1]}</Badge>
+          )}
           {showSourceDisambiguator && (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -448,7 +462,7 @@ function McpStatusBadge({
     );
   }
 
-  if (runtime.status.kind === "starting") {
+  if (runtime.status.kind === "starting" || runtime.status.kind === "stopping") {
     const startedAt = runtime.startedAtMs ?? Date.now();
     const elapsedMs = Date.now() - startedAt;
     const slow = elapsedMs > SLOW_START_THRESHOLD_MS;
@@ -456,10 +470,10 @@ function McpStatusBadge({
       <span
         className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-muted-foreground"
         data-testid={`mcp-row-${server.id}-status`}
-        data-status={slow ? "starting-slow" : "starting"}
+        data-status={runtime.status.kind === "stopping" ? "stopping" : slow ? "starting-slow" : "starting"}
       >
         <Spinner className="size-3" aria-hidden />
-        {slow ? "slow start — taking longer than usual" : "starting…"}
+        {runtime.status.kind === "stopping" ? "stopping…" : slow ? "slow start — taking longer than usual" : "starting…"}
       </span>
     );
   }
@@ -520,6 +534,8 @@ function commandPreview(server: McpServerConfig): string {
 
 function sourceHeading(source: McpConfigSource): string {
   switch (source) {
+    case "plugin":
+      return "Plugins";
     case "codemux":
       return "Codemux";
     case "codemuxUser":
@@ -546,6 +562,7 @@ function sourceHeading(source: McpConfigSource): string {
 }
 
 const SOURCE_ORDER: McpConfigSource[] = [
+  "plugin",
   "codemux",
   "codemuxUser",
   "codemuxProject",

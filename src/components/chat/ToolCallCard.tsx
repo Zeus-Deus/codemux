@@ -82,6 +82,24 @@ export const ToolCallCard = memo(function ToolCallCard({
   approval,
   onDecide,
 }: Props) {
+  const payload = approval?.payload;
+  const bridgeName =
+    item.tool_name === "mcp__codemux__codemux_call_plugin_tool" ||
+    item.tool_name === "codemux_call_plugin_tool";
+  const target =
+    bridgeName &&
+    typeof payload === "object" &&
+    payload !== null &&
+    "plugin_bridge_target" in payload &&
+    payload.plugin_bridge_target === true &&
+    "tool_name" in payload &&
+    typeof payload.tool_name === "string" &&
+    "tool_input" in payload
+      ? { name: payload.tool_name, input: payload.tool_input }
+      : null;
+  const displayItem = target
+    ? { ...item, tool_name: target.name, input: target.input }
+    : item;
   const resolution = approval?.resolution;
   const isPendingApproval = resolution?.state === "pending";
   const isResponding = resolution?.state === "responding";
@@ -133,7 +151,9 @@ export const ToolCallCard = memo(function ToolCallCard({
     if (launchFailed) setExpanded(true);
   }, [launchFailed]);
 
-  const visualName = isWorkspaceLaunch ? "workspace_launch" : item.tool_name;
+  const visualName = isWorkspaceLaunch
+    ? "workspace_launch"
+    : displayItem.tool_name;
   const Icon = toolIcon(visualName);
   const glyph = glyphForState({
     isPendingApproval,
@@ -145,8 +165,8 @@ export const ToolCallCard = memo(function ToolCallCard({
   });
 
   const hasResultBody = hasRenderableContent(item.result_content);
-  const inputText = hasRenderableInput(item.input)
-    ? safeStringify(item.input)
+  const inputText = hasRenderableInput(displayItem.input)
+    ? safeStringify(displayItem.input)
     : null;
   const canExpand = hasResultBody || inputText !== null;
   // The approval states own the card's body slot, so only a settled or
@@ -181,7 +201,7 @@ export const ToolCallCard = memo(function ToolCallCard({
           isDenied && "line-through text-muted-foreground/60",
         )}
       >
-        <ToolCallStatus item={item} />
+        <ToolCallStatus item={displayItem} />
         {item.status === "unconfirmed" && <span className="ml-2 text-label text-muted-foreground">Outcome unconfirmed · no completion was reported</span>}
       </span>
       {isExecuting && turnLive ? (
@@ -244,16 +264,24 @@ export const ToolCallCard = memo(function ToolCallCard({
           a fresh approval (different request_id) remounts the footer
           and clears the deny textarea / dropdown state — otherwise
           stale text from a prior denial leaks into the next prompt. */}
-      {isPendingApproval && approval && (isHermesPermission(approval.payload) ? <HermesPermissionOptions key={approval.request_id} payload={approval.payload} onDecide={onDecide} /> : (
-        <ApprovalFooter
-          key={approval.request_id}
-          requestId={approval.request_id}
-          inputText={inputText}
-          onDecide={onDecide}
-          toolName={item.tool_name}
-          toolInput={item.input}
-        />
-      ))}
+      {isPendingApproval &&
+        approval &&
+        (isHermesPermission(approval.payload) ? (
+          <HermesPermissionOptions
+            key={approval.request_id}
+            payload={approval.payload}
+            onDecide={onDecide}
+          />
+        ) : (
+          <ApprovalFooter
+            key={approval.request_id}
+            requestId={approval.request_id}
+            inputText={inputText}
+            onDecide={onDecide}
+            toolName={displayItem.tool_name}
+            toolInput={displayItem.input}
+          />
+        ))}
 
       {/* In-flight decision marker */}
       {isResponding && (

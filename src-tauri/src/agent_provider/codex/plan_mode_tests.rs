@@ -169,6 +169,72 @@ async fn the_plan_pill_on_each_send_picks_the_turns_collaboration_mode() {
 }
 
 #[tokio::test]
+async fn a_late_plugin_catalog_notice_preserves_plan_mode_and_is_sent_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = crate::mcp::registry::McpRegistry::new();
+    let provider = CodexAgentProvider::new(CodexProviderConfig {
+        codex_binary: fixture_binary(dir.path()),
+        mcp_registry: Some(registry.clone()),
+        ..Default::default()
+    });
+    let thread = ThreadId("plan-with-late-tools".into());
+    provider
+        .start_session(start_input(dir.path(), &thread))
+        .await
+        .unwrap();
+    registry
+        .register_plugin_server::<tauri::Wry>(
+            None,
+            "plan-fixture",
+            "token".into(),
+            serde_json::from_value(json!({
+                "id":"fixture", "name":"Fixture", "toolPrefix":"fixture", "scope":"all",
+                "transport":"stdio", "command":"python3",
+                "args":[format!("{}/tests/fixtures/plugin_mcp.py",env!("CARGO_MANIFEST_DIR"))]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while registry.plugin_catalog(None).await.len() != 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    send(&provider, &thread, Some("plan")).await;
+    send(&provider, &thread, None).await;
+    let turns: Vec<Value> = std::fs::read_to_string(dir.path().join("wire.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|message| message["method"] == "turn/start")
+        .collect();
+    assert_eq!(turns.len(), 2);
+    for turn in &turns {
+        assert_eq!(turn["params"]["collaborationMode"]["mode"], "plan");
+        assert_eq!(
+            turn["params"]["collaborationMode"]["settings"].get("developer_instructions"),
+            Some(&Value::Null)
+        );
+    }
+    let input = turns[0]["params"]["input"].as_array().unwrap();
+    assert_eq!(input.len(), 2);
+    let notice = input[0]["text"].as_str().unwrap();
+    assert!(notice.starts_with("<codemux_plugin_tools_notice>"));
+    assert!(notice.contains("fixture__image"));
+    assert_eq!(input[1]["text"], "hi");
+    assert_eq!(
+        turns[1]["params"]["input"],
+        json!([{"type":"text","text":"hi","text_elements":[]}])
+    );
+    provider.stop_session(thread).await.unwrap();
+    registry.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn a_resumed_plan_thread_continues_in_plan_until_a_send_names_a_mode() {
     let dir = tempfile::tempdir().unwrap();
     let provider = CodexAgentProvider::new(CodexProviderConfig {

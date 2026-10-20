@@ -196,3 +196,154 @@ The app itself ships plugins in `src/plugins/<id>/`:
 
 Choices the spec left open are recorded one per line in
 [`DECISIONS.md`](./DECISIONS.md), each with how to revert it.
+
+## MCP servers and live tools
+
+A desktop plugin can register stdio or Streamable HTTP servers. Await registration
+before using `ctx.host.mcp`. It installs the registration immediately; the MCP
+stdio child starts immediately in the background (not on the first chat or call). Register only workspaces you need. The handshake also runs in the background. Inspect `getStatus` or `onStatus` for readiness.
+
+```ts
+const dispose = await ctx.registerMcpServer({
+  id: "editor-project-a",             // unique within this plugin
+  name: "Unity Editor",              // Settings → MCP label
+  toolPrefix: "unity",                // defaults to the plugin id
+  scope: { workspaceIds: [workspaceId] }, // or "all", or "plugin" for UI only
+  toolDescriptions: { manage_scene: { append: "Use structured Unity tools first." } },
+  shutdown: "graceful",               // or "immediate" for input drivers
+  transport: "stdio",
+  command: "unity", args: ["mcp", "--project-path", projectPath],
+  cwd: projectPath,                   // optional absolute path
+  env: {},
+});
+// HTTP alternative: transport: "http", url: "http://localhost:1234/mcp",
+// headers: { Authorization: "Bearer …" }.
+const stop = ctx.host.mcp.onStatus("editor-project-a", (status) => {
+  // status is null after removal; otherwise { id, name, status, toolsCount,
+  // errorMessage, stderrTail, startedAtMs }. status.kind is discovered,
+  // starting, running, errored, stopping or stopped (running has toolCount).
+});
+const tools = await ctx.host.mcp.listTools("editor-project-a");
+const result = await ctx.host.mcp.callTool("editor-project-a", "screenshot", {});
+// result.content includes original text/image/resource blocks; base64 image
+// data, mimeType, structuredContent and result extension fields are preserved.
+```
+
+Registrations and subscriptions are owned by that loaded plugin incarnation.
+Turning it off, removing it or reloading it removes its servers and tools, and
+cancels in-flight calls. `await dispose()` is safe to call manually and resolves
+only after the stdio child has exited and in-flight calls have ended. Status
+moves through `stopping`, then `stopped` only after confirmed exit. Default
+`shutdown: "graceful"` closes stdin and permits two seconds before killing the
+child. `shutdown: "immediate"` skips that grace: on Linux and macOS it immediately kills
+the owned process group. Windows currently terminates only the direct child;
+wrapper descendants are not contained. Linux is live-tested; macOS and Windows are not. Cleanup
+still runs if the plugin unloads before `registerMcpServer` resolves. Registrations
+are ephemeral; server disable switches use stable plugin + local-server ids and
+survive reloads and app restarts. Settings → MCP labels each server with its plugin
+and retains the usual tool list, restart and disable controls.
+
+Both tool discovery and dispatch enforce workspace scope. A scoped server is
+hidden from chats without a matching workspace, including calls to a previously
+known tool name. Plugins can inspect and call only their own registered servers
+through the supported API, outside any chat. Plugin code remains unsandboxed;
+this API is a typed lifecycle route, not a new security boundary. Remote/SSH
+provider sessions receive no local registry tools. `scope: "plugin"` makes a
+server available exclusively through its owner's `host.mcp` API: agents,
+bridges and the gateway neither list nor dispatch it. An empty `workspaceIds`
+array is rejected.
+
+`toolDescriptions` is a per-raw-tool-name map of `{replace?: string, append?: string}`.
+Replace runs first, then append adds a blank line and the supplied text. All
+provider schemas, live lists and plugin UI lists see the same description.
+Limits: 128 entries, 2,000 UTF-8 bytes per append/replace, and 16 KiB total for
+keys plus text. Prefer short instructions for the specific tools that need them.
+
+`toolPrefix` has 1–32 ASCII letters, digits, underscores or dashes. `mcp` and prefixes starting with `codemux` are reserved (case-insensitive). Registrations
+may share it when their workspace scopes are disjoint. Models see
+`<toolPrefix>__<rawToolName>` (Claude adds `mcp__codemux__`). Registry names
+are bounded to 50 ASCII letters, digits, underscores or dashes, reserving 14
+characters for that observed Claude envelope so full provider names fit 64.
+If replacement or truncation is necessary, the name is truncated to 37 characters and suffixed with `_` plus 12 SHA-256 hex characters
+of the complete original name. A collision visible in one workspace is refused.
+HTTP URLs require HTTPS outside loopback, without embedded credentials or fragments. Loopback bypasses environment proxies; MCP HTTP clients do not follow redirects. Settings listings redact environment/header values, stdio arguments, URL queries and embedded URL credentials.
+Commands/args are argv, never shell text. `cwd` must be absolute. Env/headers are
+bounded to 128 entries and 64 KiB total (16 KiB per value).
+
+For a live indicator, subscribe to activity:
+
+```ts
+ctx.host.mcp.onActivity("editor-project-a", (event) => {
+  // {phase: "start" | "end", callId, toolName, prefixedName, workspaceId,
+  //  isError?, durationMs?}. Exactly one end follows each start, including
+  // errors, timeouts and disposal. Arguments and images are never copied.
+});
+```
+
+The runtime follows all `tools/list` pages and re-lists on
+`notifications/tools/list_changed`. Claude refreshes its live SDK server; the
+HTTP gateway emits the same notification to connected clients. Claude catalog
+swaps wait until the current turn ends, preserving in-flight tool results.
+Claude also receives `codemux_list_plugin_tools` and `codemux_call_plugin_tool`:
+use them when an Editor or another integration connects during the current turn,
+while its newly added tools are absent from ToolSearch. Native refresh remains
+available at the next safe boundary. Claude receives the two catalog tools only
+when a plugin registration is visible to that workspace, even if its tool list
+is still empty. Register the MCP server before its external app connects, even when the server
+initially advertises zero tools. This puts the bridge in place for same-turn
+flows. A first plugin loaded during a turn becomes available at the next safe
+boundary. A hung refresh times out after five seconds; the next turn
+resumes the conversation with the pending catalog. The list marks tools already in this
+session's native snapshot with `directlyCallable`. Plugins loaded
+after a chat starts use those same paths. OpenCode chats see only globally scoped plugin tools in this PR; workspace scoping for OpenCode follows in the gateway-identity PR.
+
+**Codex:** its installed 0.162.1 app-server fixed dynamic schemas at thread start
+in our probe. HTTP MCP notification/reload attempts did not update that running
+thread's model tools. Codemux therefore offers initial plugin tools directly,
+with their schemas, plus two stable tools in every local Codex chat:
+`codemux_list_plugin_tools` and `codemux_call_plugin_tool`. They discover and call
+the current workspace's tools, including ones that appear after an Editor
+connects. The list includes `directlyCallable` for the initial snapshot. When the
+visible plugin catalog changes, Codemux adds one bounded reminder to the next
+provider turn, so models know to check the live catalog. It does not change the
+user's message in the app transcript, queues, forks or provider handoffs. A new
+chat is unnecessary for late tools. Older resumed Codex threads whose saved
+snapshot predates these bridge tools need a new chat to acquire the bridge.
+
+See [`examples/mcp-tools/`](./examples/mcp-tools/) for a worked plugin.
+
+Claude bridge approvals use the target tool's native name and arguments. A deny
+rule on that name also denies bridge calls; an allow for X does not allow Y.
+Denied targets are omitted from the Claude list tool. The in-process call handler
+requires a one-shot permission ticket for the exact call and arguments. If bare
+mode, policy or workspace trust skips the hook, bridge calls fail closed with
+a clear message to use the native tool or enable hooks. Bridge permission checks
+accept at most 1 MiB of JSON input. Managed workflow
+sessions exclude these two plugin tools.
+The guard reads the CLI's effective permission rules through the installed SDK's
+`getSettings()` control method. This runtime method is pinned by a compatibility
+test; if it is unavailable or its response changes, calls fail closed with a
+visible explanation to call the tool directly or update Codemux, including when
+the permission object is absent. An empty session settings layer keeps that
+object present on a clean CLI without replacing existing user/project rules.
+The hook uses the CLI-reported current permission mode. Managed-only
+permission state that the settings view cannot expose also fails closed.
+
+Codex's registry tools, both native `dynamicTools` and bridge calls, use the
+app-server's `item/tool/call` path. That path has no Claude-style per-tool
+allow/deny rules or approval dialog in Codemux. Codex shell/file approval and
+sandbox settings do not add per-tool approval to these app-hosted tools. The
+bridge uses the same workspace visibility and dispatch checks as native tools.
+MCP results can carry `structuredContent` alongside text and images. Codex's
+dynamic-tool protocol has no structured-result field, so Codemux appends one
+JSON text block when the server has not already included an equivalent JSON
+text block. This generated block is limited to 64 KiB of UTF-8, including a
+clear truncation marker when needed; original text and image blocks are kept.
+Claude's SDK server and the gateway forward the full MCP result unchanged.
+
+The catalog tools stay present in every local Codex chat because its dynamic
+schemas cannot add them later.
+
+Plugin stdio servers on Linux and macOS use a 2 MiB limit per JSON-RPC frame,
+including image results. Windows and macOS shutdown behavior remains untested
+live.

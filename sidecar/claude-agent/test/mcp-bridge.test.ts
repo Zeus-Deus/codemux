@@ -30,6 +30,159 @@ import {
   type RegisteredMcpTool,
 } from "../src/mcp-bridge.ts";
 import { z } from "zod";
+import { createPluginPermissions } from "../src/plugin-permissions.ts";
+
+import { callSdk } from "./sdk-mcp-client.ts";
+const bridgeTool: RegisteredMcpTool = {
+  name: "codemux_call_plugin_tool",
+  prefixedName: "codemux_call_plugin_tool",
+  serverId: "codemux-plugin-bridge",
+  description: "Call plugin",
+  inputSchema: {
+    type: "object",
+    properties: { name: { type: "string" }, arguments: { type: "object" } },
+    required: ["name"],
+  },
+};
+
+test("round 4: in-process bridge refuses missing hooks, even with a stale bridge allow", async () => {
+  for (const allow of [
+    [],
+    ["mcp__codemux__codemux_call_plugin_tool"],
+    ["mcp__codemux"],
+    ["mcp__codemux__*"],
+  ]) {
+    const dispatched: string[] = [];
+    setMcpBridgeWriter((line) => {
+      dispatched.push(line);
+      const request = JSON.parse(line);
+      queueMicrotask(() =>
+        dispatchResponse({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { content: [] },
+        }),
+      );
+    });
+    const gate = createPluginPermissions({
+      threadId: "test",
+      getQuery: () => ({
+        getSettings: async () => ({ effective: { permissions: { allow } } }),
+      }),
+      getMode: () => "bypassPermissions",
+      canUseTool: async () => ({ behavior: "allow" }),
+      canUseTarget: async () => ({ behavior: "allow" }),
+    });
+    const response = await callSdk(
+      buildCodemuxMcpServer([bridgeTool], gate),
+      bridgeTool.name,
+      { name: "fixture__x", arguments: {} },
+    );
+    expect(response).toMatchObject({
+      result: {
+        isError: true,
+        content: [{ text: expect.stringContaining("permission check") }],
+      },
+    });
+    expect(dispatched).toEqual([]);
+  }
+});
+
+test("round 4: the SDK handler consumes the exact hook ticket and rejects replay", async () => {
+  const gate = createPluginPermissions({
+    threadId: "test",
+    getQuery: () => ({
+      getSettings: async () => ({ effective: { permissions: {} } }),
+    }),
+    getMode: () => "bypassPermissions",
+    canUseTool: async () => ({ behavior: "allow" }),
+    canUseTarget: async () => ({ behavior: "allow" }),
+  });
+  const args = { name: "fixture__x", arguments: { value: 7 } };
+  const calls: string[] = [];
+  setMcpBridgeWriter((line) => {
+    calls.push(line);
+    const request = JSON.parse(line);
+    queueMicrotask(() =>
+      dispatchResponse({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { content: [{ type: "text", text: "executed" }] },
+      }),
+    );
+  });
+  await gate.hook(
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "mcp__codemux__codemux_call_plugin_tool",
+      tool_input: args,
+      tool_use_id: "call",
+      session_id: "test",
+      transcript_path: "/fixture",
+      cwd: "/fixture",
+    },
+    "call",
+    { signal: new AbortController().signal },
+  );
+  expect(
+    await callSdk(
+      buildCodemuxMcpServer([bridgeTool], gate),
+      bridgeTool.name,
+      args,
+    ),
+  ).toMatchObject({ result: { content: [{ text: "executed" }] } });
+  expect(
+    await callSdk(
+      buildCodemuxMcpServer([bridgeTool], gate),
+      bridgeTool.name,
+      args,
+    ),
+  ).toMatchObject({ result: { isError: true } });
+  expect(calls).toHaveLength(1);
+});
+
+test("round 4: the SDK list response cannot expose denied targets", async () => {
+  const gate = createPluginPermissions({
+    threadId: "test",
+    getQuery: () => ({
+      getSettings: async () => ({
+        effective: { permissions: { deny: ["mcp__codemux__fixture__x"] } },
+      }),
+    }),
+    getMode: () => "default",
+    canUseTool: async () => ({ behavior: "allow" }),
+    canUseTarget: async () => ({ behavior: "allow" }),
+  });
+  const tools = { tools: [{ name: "fixture__x" }, { name: "fixture__y" }] };
+  setMcpBridgeWriter((line) => {
+    const request = JSON.parse(line);
+    queueMicrotask(() =>
+      dispatchResponse({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          content: [{ type: "text", text: JSON.stringify(tools) }],
+          structuredContent: tools,
+        },
+      }),
+    );
+  });
+  const tool = {
+    ...bridgeTool,
+    name: "codemux_list_plugin_tools",
+    prefixedName: "codemux_list_plugin_tools",
+    inputSchema: { type: "object" },
+  };
+  const response = await callSdk(
+    buildCodemuxMcpServer([tool], gate),
+    tool.name,
+    {},
+  );
+  expect(response).toMatchObject({
+    result: { structuredContent: { tools: [{ name: "fixture__y" }] } },
+  });
+  expect(JSON.stringify(response)).not.toContain("fixture__x");
+});
 
 afterEach(() => {
   _resetUpstreamRpcForTests();
@@ -246,6 +399,39 @@ describe("buildCodemuxMcpServer", () => {
       error: { code: -32603, message: "child crashed" },
     });
     await expect(promise).rejects.toThrow(/child crashed/);
+  });
+
+  test("live catalog call carries a bounded snapshot of native plugin tools", async () => {
+    const pluginTools: RegisteredMcpTool[] = Array.from({ length: 700 }, (_, index) => ({
+      name: `t${index}`, prefixedName: `fixture__t${index}`, description: "fixture",
+      inputSchema: { type: "object" }, serverId: "plugin:fixture:editor",
+    }));
+    const server = buildCodemuxMcpServer([...pluginTools, {
+      name: "codemux_list_plugin_tools", prefixedName: "codemux_list_plugin_tools",
+      description: "live list", inputSchema: { type: "object" }, serverId: "codemux-plugin-bridge",
+    }]);
+    let names: string[] = [];
+    setMcpBridgeWriter(line => {
+      const request = JSON.parse(line);
+      names = request.params.directPluginTools;
+      queueMicrotask(() => dispatchResponse({ jsonrpc: "2.0", id: request.id, result: { content: [] } }));
+    });
+    let complete!: () => void;
+    const completed = new Promise<void>(resolve => { complete = resolve; });
+    const transport: Parameters<typeof server.instance.connect>[0] = {
+      start: async () => {}, close: async () => {},
+      send: async message => { if ("id" in message && message.id === 2) complete(); },
+    };
+    await server.instance.connect(transport);
+    transport.onmessage!({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1" } } });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    transport.onmessage!({ jsonrpc: "2.0", method: "notifications/initialized" });
+    transport.onmessage!({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "codemux_list_plugin_tools", arguments: {} } });
+    await completed;
+    expect(names).toHaveLength(512);
+    expect(names[0]).toBe("fixture__t0");
+    expect(names.at(-1)).toBe("fixture__t511");
+    await server.instance.close();
   });
 
   test("empty tool list still produces a valid server config", () => {

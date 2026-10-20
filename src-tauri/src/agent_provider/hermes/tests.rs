@@ -16,7 +16,7 @@ async fn review_l3_native_stop_wakes_cold_hermes_profile_operation_wait() {
         .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
     assert!(binary.is_file(), "synthetic ACP fixture required, never a real Hermes CLI");
     let placeholder = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(
-        crate::agent_provider::cursor::CursorProviderConfig {binary:binary.clone(), event_channel_capacity:128},
+        crate::agent_provider::cursor::CursorProviderConfig {binary:binary.clone(), event_channel_capacity:128, mcp_registry: None },
     ));
     let (app, root, workspace, pane) = crate::agent_control::guard_tests::fixture(placeholder, "cold-hermes-b").await;
     let provider = Arc::new(HermesProvider::new(Arc::new(binding::AppBindingStore(app.handle().clone()))));
@@ -103,7 +103,7 @@ async fn review_pump_fixture() -> (tempfile::TempDir, HermesProvider, Arc<Runtim
         routes:Mutex::new(HashMap::new()), commands:Mutex::new(HashMap::new()), queue:Mutex::new(Queue::default()), barrier});
     let mut binding = test_binding(root.path()); binding.profile=profile; binding.acp_session_id=Some("review-session".into());
     binding.current_native_id=Some("existing-native".into());
-    let chat = Arc::new(Chat {binding:Mutex::new(binding), runtime:runtime.clone(), state:Mutex::new(ChatState::default()), finished:Notify::new()});
+    let chat = Arc::new(Chat {binding:Mutex::new(binding), runtime:runtime.clone(), mcp_servers:json!([]), state:Mutex::new(ChatState::default()), finished:Notify::new()});
     provider.inner.chats.lock().await.insert(ThreadId("thread".into()), chat.clone());
     runtime.routes.lock().await.insert("review-session".into(), Arc::downgrade(&chat));
     let inner = provider.inner.clone(); let r = runtime.clone();

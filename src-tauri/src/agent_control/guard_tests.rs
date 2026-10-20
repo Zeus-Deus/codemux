@@ -938,7 +938,7 @@ async fn review_s5_native_cursor_override_cannot_mutate_session_mode_behind_witn
         });
     assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
     let provider = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(
-        crate::agent_provider::cursor::CursorProviderConfig { binary,event_channel_capacity:128 },
+        crate::agent_provider::cursor::CursorProviderConfig { binary,event_channel_capacity:128, mcp_registry: None },
     ));
     let (app, root, workspace, pane) = fixture(provider.clone(), "cursor-override").await;
     app.state::<ProviderRegistry>().set_cursor(provider.clone()).await;
@@ -961,7 +961,7 @@ async fn review_s2_actual_acp_queue_drain_revalidates_native_worker_ceiling() {
         .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
     assert!(binary.is_file(), "build fake_cursor_acp first");
     let provider = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(
-        crate::agent_provider::cursor::CursorProviderConfig { binary,event_channel_capacity:128 },
+        crate::agent_provider::cursor::CursorProviderConfig { binary,event_channel_capacity:128, mcp_registry: None },
     ));
     let (app, root, workspace, pane) = fixture(provider.clone(), "guarded-queue").await;
     app.state::<ProviderRegistry>().set_cursor(provider.clone()).await;
@@ -1011,7 +1011,7 @@ async fn review_acp_fixture(thread: &str) -> (
         .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
     assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
     let provider = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(
-        crate::agent_provider::cursor::CursorProviderConfig { binary, event_channel_capacity: 256 },
+        crate::agent_provider::cursor::CursorProviderConfig { binary, event_channel_capacity: 256, mcp_registry: None },
     ));
     let (app, root, workspace, pane) = fixture_with_root(provider.clone(), thread, root).await;
     app.state::<ProviderRegistry>().set_cursor(provider.clone()).await;

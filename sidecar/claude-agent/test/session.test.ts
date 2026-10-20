@@ -8,11 +8,16 @@ import type { EventEmitter } from "../src/session.ts";
 import {
   ClaudeSession,
   resetInterruptExitTimeoutForTests,
+  resetMcpRefreshTimeoutForTests,
+  setMcpRefreshTimeoutForTests,
   resetQueryFactoryForTests,
   setInterruptExitTimeoutForTests,
   setQueryFactoryForTests,
   type SessionStartInput,
 } from "../src/session.ts";
+import { callSdk } from "./sdk-mcp-client.ts";
+import { setMcpBridgeWriter } from "../src/mcp-bridge.ts";
+import { dispatchResponse, _resetUpstreamRpcForTests } from "../src/upstream-rpc.ts";
 import { asQuery, FakeQuery } from "./fake-query.ts";
 import { buildMethods, _resetSessionsForTests } from "../src/methods/index.ts";
 
@@ -107,6 +112,7 @@ beforeEach(() => {
 afterEach(() => {
   resetQueryFactoryForTests();
   resetInterruptExitTimeoutForTests();
+  resetMcpRefreshTimeoutForTests();
 });
 
 test("session starts with minimal options and emits session-configured", () => {
@@ -322,6 +328,7 @@ test("fast mode is scoped to the current session and wins over raw settings", ()
     emit,
   );
   expect(fake.capturedOptions?.settings).toEqual({
+    permissions: {},
     fastMode: true,
     fastModePerSessionOptIn: true,
     theme: "dark",
@@ -862,8 +869,8 @@ test("effort option is passed through opaquely even for future values", () => {
     emit,
   );
   expect((fake.capturedOptions as { effort?: string })?.effort).toBe("xhigh");
-  // A plain xhigh selection is exactly that — no workflow setting.
-  expect(fake.capturedOptions?.settings).toBeUndefined();
+  // A plain xhigh selection adds no workflow setting.
+  expect(fake.capturedOptions?.settings).toEqual({ permissions: {} });
   void session;
 });
 
@@ -873,7 +880,10 @@ test("ultracode normalizes to xhigh effort plus the ultracode setting", () => {
   const { emit } = recordingEmitter();
   new ClaudeSession(minimalInput({ effort: "ultracode" }), emit);
   expect((fake.capturedOptions as { effort?: string })?.effort).toBe("xhigh");
-  expect(fake.capturedOptions?.settings).toEqual({ ultracode: true });
+  expect(fake.capturedOptions?.settings).toEqual({
+    permissions: {},
+    ultracode: true,
+  });
 });
 
 test("ultracode composes with fast mode and caller-supplied settings", () => {
@@ -888,6 +898,7 @@ test("ultracode composes with fast mode and caller-supplied settings", () => {
   );
   expect((fake.capturedOptions as { effort?: string })?.effort).toBe("xhigh");
   expect(fake.capturedOptions?.settings).toEqual({
+    permissions: {},
     theme: "dark",
     fastMode: true,
     fastModePerSessionOptIn: true,
@@ -1308,4 +1319,557 @@ test("compact-idle RPC routes to the thread's session", async () => {
   expect(await methods["compact-idle"]!({ threadId: "t-1" })).toEqual({ started: true });
   await methods["stop-session"]!({ threadId: "t-1" });
   _resetSessionsForTests();
+});
+
+
+test("MCP replacement waits for result, coalesces changes and preserves session settings", async () => {
+  const {emit,events}=recordingEmitter();
+  const session=new ClaudeSession(minimalInput({model:"claude-sonnet",permissionMode:"bypassPermissions"}),emit);
+  const tool=(name:string)=>({name,prefixedName:name,description:name,inputSchema:{type:"object"},serverId:"fixture"});
+  await session.sendTurn({text:"run the long tool"});
+  await session.updateMcpTools([tool("first")]);
+  await session.updateMcpTools([tool("last")]);
+  expect(fake.setMcpServersCalls).toEqual([]);
+  fake.emit({type:"result",subtype:"success",session_id:"same-session",uuid:"result-1",result:"LONG-CALL-COMPLETED"} as unknown as SDKMessage);
+  await new Promise(resolve=>setTimeout(resolve,0));
+  expect(fake.setMcpServersCalls).toEqual([[],["codemux"]]);
+  expect(fake.setModelCalls).toEqual([]);
+  expect(fake.setPermissionModeCalls).toEqual([]);
+  expect(fake.capturedOptions?.model).toBe("claude-sonnet");
+  expect(fake.capturedOptions?.permissionMode).toBe("bypassPermissions");
+  expect(events.filter(e=>e.method==="sdk-message")).toHaveLength(1);
+  expect(fake.capturedPrompts.map(x=>x.message.content)).toEqual(["run the long tool"]);
+  await session.close();
+});
+
+
+test("MCP review: pending steer owns the next CLI turn until its result", async () => {
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  await session.sendTurn({ text: "first" });
+  await session.steerTurn({ text: "late guidance", uuid: "late-steer" });
+  await session.updateMcpTools([{ name: "new", prefixedName: "fixture__new", description: "new", inputSchema: { type: "object" }, serverId: "fixture" }]);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  fake.emit(mkSuccessResult());
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(events.filter(event => event.method === "sdk-message")).toHaveLength(1);
+  expect(fake.setMcpServersCalls).toEqual([]);
+  fake.emit({ ...mkSuccessResult(), parent_tool_use_id: "subagent", user_message_uuids: ["late-steer"] } as unknown as SDKMessage);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(fake.setMcpServersCalls).toEqual([]);
+  fake.emit({ ...mkSuccessResult(), user_message_uuids: ["late-steer"] } as unknown as SDKMessage);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(fake.setMcpServersCalls).toEqual([[], ["codemux"]]);
+  await session.close();
+});
+
+test("MCP review: control refresh cannot hold the result notification", async () => {
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  await session.sendTurn({ text: "first" });
+  await session.updateMcpTools([]);
+  let release!: () => void;
+  fake.setMcpServers = () => new Promise(resolve => { release = () => resolve({ added: [], removed: [], errors: {} }); });
+  fake.emit(mkSuccessResult());
+  await new Promise(resolve => setTimeout(resolve, 0));
+  try {
+    expect(events.some(event => event.method === "sdk-message")).toBe(true);
+  } finally {
+    release();
+    fake.setMcpServers = async () => ({ added: [], removed: [], errors: {} });
+    await session.close();
+  }
+});
+
+test("MCP review: a subagent result does not end the enclosing turn", async () => {
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  await session.sendTurn({ text: "first" });
+  await session.updateMcpTools([]);
+  fake.emit({ ...mkSuccessResult(), parent_tool_use_id: "subagent" } as unknown as SDKMessage);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(fake.setMcpServersCalls).toEqual([]);
+  fake.emit(mkSuccessResult());
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(fake.setMcpServersCalls).toEqual([[], []]);
+  await session.close();
+});
+
+test("MCP round 3: a steer at the result boundary waits for the swap and runs next", async () => {
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  await session.sendTurn({ text: "first" });
+  await session.updateMcpTools([]);
+  let finish!: () => void;
+  fake.setMcpServers = () =>
+    new Promise((resolve) => {
+      finish = () => resolve({ added: [], removed: [], errors: {} });
+    });
+  fake.emit(mkSuccessResult());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const steered = session.steerTurn({
+    text: "boundary guidance",
+    uuid: "boundary-steer",
+  });
+  void steered.catch(() => {});
+  try {
+    expect(fake.capturedPrompts).toHaveLength(1);
+    fake.setMcpServers = async () => ({ added: [], removed: [], errors: {} });
+    finish();
+    await expect(steered).resolves.toBeUndefined();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fake.capturedPrompts[1]?.uuid as string).toBe("boundary-steer");
+  } finally {
+    finish?.();
+    await session.close();
+  }
+});
+
+test("MCP round 3: bridge permissions are checked before an allowed bridge can run", async () => {
+  const session = new ClaudeSession(
+    minimalInput({
+      mcpTools: [
+        {
+          name: "codemux_call_plugin_tool",
+          prefixedName: "codemux_call_plugin_tool",
+          description: "call",
+          serverId: "codemux-plugin-bridge",
+          inputSchema: { type: "object" },
+        },
+      ],
+    }),
+    recordingEmitter().emit,
+  );
+  expect(fake.capturedOptions?.hooks?.PreToolUse?.length).toBeGreaterThan(0);
+  await session.close();
+});
+
+test("MCP round 3: a stalled swap cannot hold the next user turn", async () => {
+  setMcpRefreshTimeoutForTests(20);
+  const session = new ClaudeSession(minimalInput(), recordingEmitter().emit);
+  await session.sendTurn({ text: "first" });
+  await session.updateMcpTools([]);
+  fake.setMcpServers = () => new Promise(() => {});
+  fake.emit(mkSuccessResult());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  let sent = false;
+  const send = session.sendTurn({ text: "next" }).then(() => {
+    sent = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  // The production bound has a short test override below once implemented.
+  expect(sent).toBe(true);
+  await session.close();
+  void send;
+});
+
+test("MCP round 3: real CLI error-result UUID shape settles a separate steer turn", async () => {
+  const session = new ClaudeSession(minimalInput(), recordingEmitter().emit);
+  await session.sendTurn({ text: "first" });
+  await session.steerTurn({ text: "next", uuid: "error-steer" });
+  await session.updateMcpTools([]);
+  // Observed on Claude Code 2.1.299: error_max_turns still identifies the
+  // user prompt consumed by each error result, including the separate steer.
+  fake.emit({
+    ...mkSuccessResult(),
+    subtype: "error_max_turns",
+    is_error: true,
+    user_message_uuids: ["original-prompt"],
+  } as unknown as SDKMessage);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(fake.setMcpServersCalls).toEqual([]);
+  fake.emit({
+    ...mkSuccessResult(),
+    subtype: "error_max_turns",
+    is_error: true,
+    user_message_uuids: ["error-steer"],
+  } as unknown as SDKMessage);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(fake.setMcpServersCalls).toEqual([[], []]);
+  await session.close();
+});
+
+test("MCP round 3: an old swap timeout cannot retire the replacement query", async () => {
+  setMcpRefreshTimeoutForTests(40);
+  const session = new ClaudeSession(minimalInput(), recordingEmitter().emit);
+  const old = fake;
+  let release!: () => void;
+  old.setMcpServers = () =>
+    new Promise((resolve) => {
+      release = () => resolve({ added: [], removed: [], errors: {} });
+    });
+  const refresh = session.updateMcpTools([]);
+  old.interruptError = abortLikeError();
+  await session.interrupt();
+  const send = session.sendTurn({ text: "replacement" });
+  const replacement = fake;
+  try {
+    expect(replacement).not.toBe(old);
+    await refresh;
+    await send;
+    expect(replacement.capturedOptions?.abortController?.signal.aborted).toBe(
+      false,
+    );
+    expect(fake).toBe(replacement);
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(replacement.setMcpServersCalls).toEqual([]);
+    expect(
+      replacement.capturedPrompts.map((prompt) => prompt.message.content),
+    ).toEqual(["replacement"]);
+  } finally {
+    release?.();
+    await session.close();
+  }
+});
+
+test("MCP round 4: a turn model override applies to the query after a swap timeout", async () => {
+  setMcpRefreshTimeoutForTests(20);
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(
+    minimalInput({ model: "session-default" }),
+    emit,
+  );
+  await session.sendTurn({ text: "first" });
+  await session.updateMcpTools([]);
+  fake.setMcpServers = () => new Promise(() => {});
+  fake.emit(mkSuccessResult());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await session.sendTurn({ text: "next", modelOverride: "turn-override" });
+  expect(fake.capturedOptions?.model).toBe("turn-override");
+  fake.emit(mkAssistant("rebuilt-session"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(events).toContainEqual({
+    method: "sdk-session-id",
+    params: { threadId: "t-1", sessionId: "rebuilt-session" },
+  });
+  await session.close();
+});
+
+test("MCP round 4: idle compaction does not overlap a pending swap", async () => {
+  const session = new ClaudeSession(minimalInput(), recordingEmitter().emit);
+  let release!: () => void;
+  fake.setMcpServers = () =>
+    new Promise((resolve) => {
+      release = () => resolve({ added: [], removed: [], errors: {} });
+    });
+  const refresh = session.updateMcpTools([]);
+  try {
+    expect(session.compactIdle()).toEqual({
+      started: false,
+      reason: "mcp_refresh",
+    });
+    expect(fake.capturedPrompts).toEqual([]);
+  } finally {
+    fake.setMcpServers = async () => ({ added: [], removed: [], errors: {} });
+    release();
+    await refresh;
+    await session.close();
+  }
+});
+
+test("MCP round 4: managed sessions exclude plugin bridge names", async () => {
+  const bridgeNames = ["codemux_call_plugin_tool", "codemux_list_plugin_tools"];
+  const session = new ClaudeSession(
+    minimalInput({
+      managed: true,
+      mcpTools: bridgeNames.map((name) => ({
+        name,
+        prefixedName: name,
+        serverId: "codemux-plugin-bridge",
+        description: name,
+        inputSchema: { type: "object" },
+      })),
+    }),
+    recordingEmitter().emit,
+  );
+  expect(fake.capturedOptions?.mcpServers).toBeUndefined();
+  expect(fake.capturedOptions?.allowedTools).toEqual([]);
+  await session.close();
+});
+
+test("MCP round 3: query rebuild forgets CLI session-only target permissions", async () => {
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  const name = "mcp__codemux__fixture__x";
+  const approved = fake.capturedOptions!.canUseTool!(
+    name,
+    {},
+    canUseToolOptions(),
+  );
+  const opened = events.find((event) => event.method === "request-opened")!;
+  await session.respondToRequest(
+    (opened.params as { requestId: string }).requestId,
+    {
+      behavior: "allow",
+      updatedPermissions: [
+        {
+          type: "addRules",
+          behavior: "allow",
+          destination: "session",
+          rules: [{ toolName: name }],
+        },
+      ],
+    },
+  );
+  await approved;
+  fake.interruptError = abortLikeError();
+  await session.interrupt();
+  await session.sendTurn({ text: "resumed" });
+  Object.assign(fake, {
+    getSettings: async () => ({ effective: { permissions: {} } }),
+  });
+  const hook = fake.capturedOptions!.hooks!.PreToolUse![0]!.hooks[0]!;
+  const result = await hook(
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "mcp__codemux__codemux_call_plugin_tool",
+      tool_input: { name: "fixture__x", arguments: {} },
+      tool_use_id: "call",
+      session_id: "session",
+      transcript_path: "/fixture",
+      cwd: "/fixture",
+    },
+    "call",
+    { signal: new AbortController().signal },
+  );
+  expect(result).toMatchObject({
+    hookSpecificOutput: { permissionDecision: "ask" },
+  });
+  await session.close();
+});
+
+test("background bridge approval survives the parent result and defers the catalog swap", async () => {
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(
+    minimalInput({
+      mcpTools: [
+        {
+          name: "codemux_call_plugin_tool",
+          prefixedName: "codemux_call_plugin_tool",
+          description: "call",
+          serverId: "codemux-plugin-bridge",
+          inputSchema: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              arguments: { type: "object" },
+            },
+            required: ["name"],
+          },
+        },
+      ],
+    }),
+    emit,
+  );
+  const query = fake;
+  const options = query.capturedOptions!;
+  const hook = options.hooks!.PreToolUse![0]!.hooks[0]!;
+  const bridge = "mcp__codemux__codemux_call_plugin_tool";
+  const args = { name: "fixture__x", arguments: { value: 7 } };
+  const signal = new AbortController().signal;
+  // FakeQuery exposes the same undocumented contract pinned against the SDK.
+  Object.assign(query, {
+    getSettings: async () => ({ effective: { permissions: {} } }),
+  });
+  await session.sendTurn({ text: "start background work" });
+  await hook(
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: bridge,
+      tool_input: args,
+      tool_use_id: "background-call",
+      session_id: "s",
+      transcript_path: "/fixture",
+      cwd: "/fixture",
+    },
+    "background-call",
+    { signal },
+  );
+  const approval = options.canUseTool!(bridge, args, {
+    signal,
+    toolUseID: "background-call",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await session.updateMcpTools([]);
+  query.emit(mkSuccessResult());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const swapsBeforeApproval = [...query.setMcpServersCalls];
+  const request = events.find((event) => event.method === "request-opened")!
+    .params as { requestId: string };
+  session.respondToRequest(request.requestId, { behavior: "allow" });
+  const decision = await approval;
+  try {
+    expect(decision.behavior).toBe("allow");
+    expect(swapsBeforeApproval).toEqual([]);
+    // Approval does not create a gap where a replacement can retire the server
+    // before the SDK dispatches the approved background call.
+    expect(query.setMcpServersCalls).toEqual([]);
+    const server = options.mcpServers!.codemux!;
+    if (!("instance" in server)) throw new Error("expected an SDK MCP server");
+    let complete!: () => void;
+    let dispatched!: () => void;
+    const started = new Promise<void>((resolve) => {
+      dispatched = resolve;
+    });
+    setMcpBridgeWriter((line) => {
+      const request = JSON.parse(line);
+      complete = () =>
+        dispatchResponse({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { content: [{ type: "text", text: "BACKGROUND-COMPLETED" }] },
+        });
+      dispatched();
+    });
+    const call = callSdk(
+      server,
+      "codemux_call_plugin_tool",
+      args,
+      "background-call",
+      () => {
+        expect(query.setMcpServersCalls).toEqual([]);
+      },
+    );
+    await started;
+    expect(query.setMcpServersCalls).toEqual([]);
+    complete();
+    expect(await call).toMatchObject({
+      result: { content: [{ text: "BACKGROUND-COMPLETED" }] },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(query.setMcpServersCalls).toEqual([[], []]);
+  } finally {
+    _resetUpstreamRpcForTests();
+    await session.close();
+  }
+});
+
+test("background task lifetime and a slow permission hook both defer native refresh", async () => {
+  const session = new ClaudeSession(
+    minimalInput({ permissionMode: "bypassPermissions" }),
+    recordingEmitter().emit,
+  );
+  const query = fake;
+  const options = query.capturedOptions!;
+  let settings!: (value: unknown) => void;
+  Object.assign(query, {
+    getSettings: () =>
+      new Promise((resolve) => {
+        settings = resolve;
+      }),
+  });
+  await session.sendTurn({ text: "start background task" });
+  const hook = options.hooks!.PreToolUse![0]!.hooks[0]!;
+  const checking = hook(
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "mcp__codemux__codemux_call_plugin_tool",
+      tool_input: { name: "fixture__x" },
+      tool_use_id: "checking",
+      session_id: "s",
+      transcript_path: "/fixture",
+      cwd: "/fixture",
+    },
+    "checking",
+    { signal: new AbortController().signal },
+  );
+  await session.updateMcpTools([]);
+  query.emit(mkSuccessResult());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(query.setMcpServersCalls).toEqual([]);
+  settings({ effective: { permissions: {} } });
+  expect(await checking).toMatchObject({
+    hookSpecificOutput: { permissionDecision: "allow" },
+  });
+  query.emit({
+    type: "system",
+    subtype: "task_started",
+    task_id: "background",
+    task_type: "local_agent",
+  } as SDKMessage);
+  // A tool error/cancellation clears this call's ticket, not other tasks'.
+  query.emit({
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "checking",
+          content: "cancelled",
+          is_error: true,
+        },
+      ],
+    },
+  } as SDKMessage);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(query.setMcpServersCalls).toEqual([]);
+  query.emit({
+    type: "system",
+    subtype: "task_notification",
+    task_id: "background",
+    status: "completed",
+  } as SDKMessage);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(query.setMcpServersCalls).toEqual([[], []]);
+  await session.close();
+});
+
+test("a background native MCP result is delivered before its server can be replaced", async () => {
+  const tool = {
+    name: "echo",
+    prefixedName: "fixture__echo",
+    serverId: "fixture",
+    description: "echo",
+    inputSchema: { type: "object" },
+  };
+  const session = new ClaudeSession(
+    minimalInput({ mcpTools: [tool] }),
+    recordingEmitter().emit,
+  );
+  const query = fake;
+  const server = query.capturedOptions!.mcpServers!.codemux!;
+  if (!("instance" in server)) throw new Error("expected SDK MCP server");
+  let finish!: () => void;
+  let dispatched!: () => void;
+  const started = new Promise<void>((resolve) => {
+    dispatched = resolve;
+  });
+  setMcpBridgeWriter((line) => {
+    const request = JSON.parse(line);
+    finish = () =>
+      dispatchResponse({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { content: [{ type: "text", text: "NATIVE-COMPLETED" }] },
+      });
+    dispatched();
+  });
+  await session.sendTurn({ text: "background native tool" });
+  const call = callSdk(
+    server,
+    tool.prefixedName,
+    {},
+    "native-background",
+    () => {
+      expect(query.setMcpServersCalls).toEqual([]);
+    },
+  );
+  try {
+    await started;
+    await session.updateMcpTools([]);
+    query.emit(mkSuccessResult());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(query.setMcpServersCalls).toEqual([]);
+    finish();
+    expect(await call).toMatchObject({
+      result: { content: [{ text: "NATIVE-COMPLETED" }] },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(query.setMcpServersCalls).toEqual([[], []]);
+  } finally {
+    _resetUpstreamRpcForTests();
+    await session.close();
+  }
 });
