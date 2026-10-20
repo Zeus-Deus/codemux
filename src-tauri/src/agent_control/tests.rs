@@ -1469,6 +1469,8 @@ async fn orchestration_message_disposed_wake_emits_no_warning_or_draft_restorati
     assert!(!events.iter().any(|e|matches!(e["event"]["type"].as_str(),Some("runtime_warning"|"queued_turn_cancelled"))));
 }
 
+// The peer is a Python script made executable with Unix permissions.
+#[cfg(unix)]
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn orchestration_message_real_acp_machine_send_cannot_release_stopped_explicit_queue() {
     use crate::agent_provider::{AgentProvider,ProviderKind,StartSessionInput,ThreadId};

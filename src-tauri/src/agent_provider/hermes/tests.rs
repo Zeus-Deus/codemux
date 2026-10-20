@@ -174,6 +174,8 @@ async fn review_r2_transport_failure_remains_chat_fatal_and_cancels_followup() {
     runtime.child.shutdown().await.unwrap(); task.abort(); let _=task.await;
 }
 
+// The peer is a Python script made executable with Unix permissions.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn orchestration_message_hermes_stop_holds_queue_but_allows_fresh_native_work() {
     use std::os::unix::fs::PermissionsExt;
