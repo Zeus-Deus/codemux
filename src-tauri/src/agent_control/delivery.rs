@@ -301,6 +301,11 @@ impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
     fn verify_dispatch(&self) -> Result<(), crate::agent_provider::ProviderError> {
         self.verify_authority()
     }
+    fn queued(&self, queued_id: &str) -> Result<(), crate::agent_provider::ProviderError> {
+        self.app.state::<DatabaseStore>().finish_message_delivery(
+            &self.id, "queued", Some(&serde_json::json!({"queued_id":queued_id})), None,
+        ).map_err(|message| crate::agent_provider::ProviderError::ValidationError {message})
+    }
     async fn prepare(&self) {
         if let Some(inner) = &self.inner { inner.prepare().await; }
     }

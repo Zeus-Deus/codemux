@@ -119,6 +119,8 @@ pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
     /// Only an explicit human action releases the provider queue hold.
     fn releases_queue_hold(&self) -> bool { true }
     fn queued_delivery_state(&self) -> QueuedDeliveryState { QueuedDeliveryState::Ready }
+    /// Persist queue ownership before an adapter can select the input.
+    fn queued(&self, _queued_id: &str) -> Result<(), super::ProviderError> { Ok(()) }
     async fn prepare(&self);
     async fn commit(&self);
     async fn abort(&self);
