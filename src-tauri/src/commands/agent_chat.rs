@@ -7222,7 +7222,7 @@ fn shape_persisted_payload(row_id: i64, payload: &str) -> String {
         return payload.to_string();
     }
     let text = stringify_tool_content(content);
-    let stub = serde_json::json!({
+    let mut stub = serde_json::json!({
         LAZY_TOOL_RESULT_KEY: {
             "row_id": row_id,
             "bytes": serialized.len(),
@@ -7233,6 +7233,9 @@ fn shape_persisted_payload(row_id: i64, payload: &str) -> String {
             "has_images": false,
         }
     });
+    if !crate::agent_provider::codex::tool_outcome::preserve_outcome_in_stub(content, &mut stub) {
+        return payload.to_string();
+    }
     item.insert("content".to_string(), stub);
     serde_json::to_string(&value).unwrap_or_else(|_| payload.to_string())
 }
@@ -10244,6 +10247,51 @@ mod tests {
     #[test]
     fn shape_leaves_small_tool_results_untouched() {
         let payload = tool_result_payload(json!("just a little output"));
+        assert_eq!(shape_persisted_payload(7, &payload), payload);
+    }
+
+    #[test]
+    fn codex_tool_outcomes_survive_lazy_history_shaping() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../agent_provider/codex/fixtures/tool-outcomes.json"
+        ))
+        .unwrap();
+        for case in cases.as_array().unwrap() {
+            let mut native = case["item"].clone();
+            native["outputForShapingTest"] = json!("X".repeat(LAZY_TOOL_RESULT_THRESHOLD_BYTES + 1));
+            let mut envelope: serde_json::Value =
+                serde_json::from_str(&tool_result_payload(native.clone())).unwrap();
+            envelope["item"]["tool_use_id"] = native["id"].clone();
+            let payload = serde_json::to_string(&envelope).unwrap();
+            let shaped: serde_json::Value =
+                serde_json::from_str(&shape_persisted_payload(7, &payload)).unwrap();
+            let content = &shaped["item"]["content"];
+            assert!(
+                content.get(LAZY_TOOL_RESULT_KEY).is_some(),
+                "{}",
+                case["name"]
+            );
+            let expected = match case["outcome"].as_str().unwrap() {
+                "success" => "done",
+                other => other,
+            };
+            assert_eq!(
+                content["__codemux_codex_tool_outcome"],
+                json!({
+                    "tool_use_id": native["id"], "status": expected,
+                }),
+                "{}",
+                case["name"]
+            );
+            assert!(serde_json::to_string(content).unwrap().len() < 4_000);
+        }
+    }
+
+    #[test]
+    fn codex_tool_outcomes_keep_unbounded_ids_in_the_original_body() {
+        let native = json!({"type": "dynamicToolCall", "id": "X".repeat(257), "success": false,
+            "contentItems": [{"type": "inputText", "text": big_text(LAZY_TOOL_RESULT_THRESHOLD_BYTES)}]});
+        let payload = tool_result_payload(native);
         assert_eq!(shape_persisted_payload(7, &payload), payload);
     }
 

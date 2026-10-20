@@ -9,6 +9,7 @@ import type {
 } from "@/tauri/events";
 
 import { isDelegatedId, isDelegatedRow } from "./delegation";
+import { toolResultStatus } from "./codex-tool-outcome";
 import {
   runtimeNoticeFromWarning,
   isIdleCompactionWarning,
@@ -531,7 +532,7 @@ function applyCompletedItemToList(
       if (found) {
         const next: ToolCallItem = {
           ...found.item,
-          status: item.is_error ? "error" : "done",
+          status: toolResultStatus(item),
           result_content: item.content,
           completed_at: now(),
         };
@@ -561,7 +562,7 @@ function applyCompletedItemToList(
         tool_use_id: item.tool_use_id,
         tool_name: "(pending)",
         input: null,
-        status: item.is_error ? "error" : "done",
+        status: toolResultStatus(item),
         result_content: item.content,
         approval_request_id: null,
         completed_at: now(),
@@ -1828,17 +1829,20 @@ function applyEventInner(
       // settlement here (revivable by a later real `running` snapshot for
       // Claude background tasks).
       if (item.kind === "tool_result") {
-        messages = settleSubagentsForToolResult(
-          messages,
-          item.tool_use_id,
-          item.is_error,
-          now(),
-        );
-        messages = settleWorkflowForToolResult(
-          messages,
-          item.tool_use_id,
-          item.is_error,
-        );
+        const status = toolResultStatus(item);
+        if (status !== "unconfirmed") {
+          messages = settleSubagentsForToolResult(
+            messages,
+            item.tool_use_id,
+            status === "error",
+            now(),
+          );
+          messages = settleWorkflowForToolResult(
+            messages,
+            item.tool_use_id,
+            status === "error",
+          );
+        }
       }
       // A reopened (or still-interim) turn is streaming again even before
       // the next delta — including after a cold hydrate during the wait.

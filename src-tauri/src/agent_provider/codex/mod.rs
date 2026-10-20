@@ -31,6 +31,7 @@ pub mod slash_commands;
 pub mod hooks;
 pub(crate) mod session;
 pub mod translate;
+pub(crate) mod tool_outcome;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
