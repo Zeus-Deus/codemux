@@ -828,6 +828,10 @@ async fn invoke_open<R: Runtime>(app: &AppHandle<R>, cmd: &str, args: Value) -> 
                 return Err("This result is not available for explicit delivery".into());
             }
             store.explicit_delivery(&id)?;
+            if let Err(error) = app.state::<DatabaseStore>().rearm_remote_result_delivery(&parent.thread_id, &id) {
+                store.update(&id, |task| { task.wake_state=WakeState::Held; task.wake_error=Some(error.clone()); })?;
+                return Err(error);
+            }
             super::coordinator::wake_open(app, &id).await?;
             value(store.task(&id)?)
         }

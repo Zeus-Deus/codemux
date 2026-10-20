@@ -27,7 +27,7 @@ async fn review_r1_remote_result_outbox_reacquires_before_send_attempt() {
     app.manage(crate::commands::agent_chat::RunActivityTracker::default());
     app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
     provider.fail_next_send(crate::agent_provider::ProviderError::ValidationError {message:"temporary fault before bytes".into()});
-    coordinator::wake_open(app.handle(),&task.id).await.unwrap();
+    assert!(coordinator::wake_open(app.handle(),&task.id).await.unwrap_err().contains("temporary fault before bytes"));
     let db=app.state::<DatabaseStore>();
     let row=db.message_delivery_for_message(&task.parent_thread_id,&format!("delegation:{}",task.id)).unwrap().unwrap();
     assert_eq!(row.state,"pending"); assert!(!row.attempted);
@@ -38,6 +38,117 @@ async fn review_r1_remote_result_outbox_reacquires_before_send_attempt() {
     assert_eq!(store.delivery_outcome(&task.id).unwrap(),DeliveryOutcome::Accepted);
     let sends=provider.calls.snapshot().into_iter().filter(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(..))).count();
     assert_eq!(sends,1);
+}
+
+async fn result_provider(app: &tauri::App<tauri::test::MockRuntime>, task: &LocalTask, root: &std::path::Path) -> Arc<mock_agent_provider::MockAgentProvider> {
+    use crate::agent_provider::AgentProvider;
+    let provider=Arc::new(mock_agent_provider::MockAgentProvider::new(ProviderKind::Codex));
+    provider.start_session(serde_json::from_value(serde_json::json!({"thread_id":task.parent_thread_id,"cwd":root,"additional_directories":[]})).unwrap()).await.unwrap();
+    let registry=crate::commands::agent_chat::ProviderRegistry::new();
+    registry.set_codex(provider.clone()).await;
+    app.manage(registry);
+    let observability=crate::observability::ObservabilityStore::default();
+    let mut flags=observability.feature_flags();flags.enable_agent_chat=true;observability.set_feature_flags(flags);
+    app.manage(observability);
+    app.manage(crate::agent_control::NativeControlState::default());
+    app.manage(crate::commands::agent_chat::SubagentTracker::default());
+    app.manage(crate::commands::agent_chat::RunActivityTracker::default());
+    app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
+    provider
+}
+
+async fn explicit_remote_delivery_rearms_outbox(stopped: bool) {
+    {
+        let root=tempfile::tempdir().unwrap();
+        let (app,store,task,pane,_grant,_host)=setup(root.path(),&format!("review-r2-explicit-{stopped}"));
+        let _authority=authority::NativeAuthority::new(&task.parent_thread_id);
+        store.apply_remote(&task.id,&tests::remote(&task,crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
+        let provider=result_provider(&app,&task,root.path()).await;
+        let db=app.state::<DatabaseStore>();
+        provider.fail_next_send(crate::agent_provider::ProviderError::ValidationError {message:"before bytes".into()});
+        let _ = coordinator::wake_open(app.handle(),&task.id).await;
+        let row=db.message_delivery_for_message(&task.parent_thread_id,&format!("delegation:{}",task.id)).unwrap().unwrap();
+        if stopped {
+            db.stop_message_deliveries(&task.parent_thread_id).unwrap();
+            store.suppress_parent(&task.parent_thread_id,true).unwrap();
+        } else {
+            for _ in 0..2 {
+                provider.fail_next_send(crate::agent_provider::ProviderError::ValidationError {message:"before bytes".into()});
+                crate::agent_control::delivery::dispatch(app.handle(),db.message_delivery(&row.id).unwrap().unwrap()).await;
+            }
+        }
+        let held=db.message_delivery(&row.id).unwrap().unwrap();
+        assert_eq!(held.state,if stopped {"cancelled"} else {"rejected"});
+        assert!(!held.attempted);
+        assert_eq!(store.delivery_outcome(&task.id).unwrap(),DeliveryOutcome::BeforeSend);
+        // Neither maintenance nor an old pending snapshot can undo Stop/exhaustion.
+        coordinator::wake_open(app.handle(),&task.id).await.unwrap();
+        crate::agent_control::delivery::dispatch(app.handle(),row.clone()).await;
+        assert_eq!(db.message_delivery(&row.id).unwrap().unwrap().state,held.state);
+        let output=app::invoke(app.handle(),"delegation_deliver",serde_json::json!({"paneId":pane,"taskId":task.id})).await.unwrap();
+        assert_eq!(output["wake_state"],"delivered");
+        let sent=db.message_delivery(&row.id).unwrap().unwrap();
+        assert_eq!(sent.state,"accepted");
+        assert_eq!(sent.message_id,row.message_id);
+        assert_eq!(sent.payload,row.payload);
+        assert_eq!(store.delivery_outcome(&task.id).unwrap(),DeliveryOutcome::Accepted);
+        assert_eq!(provider.calls.snapshot().iter().filter(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(..))).count(),1);
+    }
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn review_r2_explicit_remote_delivery_rearms_exhausted_outbox() {
+    explicit_remote_delivery_rearms_outbox(false).await;
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn review_r2_explicit_remote_delivery_rearms_stopped_outbox() {
+    explicit_remote_delivery_rearms_outbox(true).await;
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn review_r2_remote_dispatch_refusal_reaches_explicit_caller() {
+    let root=tempfile::tempdir().unwrap();
+    let (app,store,task,pane,_grant,_host)=setup(root.path(),"review-r2-dispatch-refusal");
+    let _authority=authority::NativeAuthority::new(&task.parent_thread_id);
+    store.apply_remote(&task.id,&tests::remote(&task,crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
+    let provider=result_provider(&app,&task,root.path()).await;
+    provider.fail_next_send(crate::agent_provider::ProviderError::ValidationError {message:"explicit dispatch refused before bytes".into()});
+    let result=app::invoke(app.handle(),"delegation_deliver",serde_json::json!({"paneId":pane,"taskId":task.id})).await;
+    assert!(result.as_ref().err().is_some_and(|error|error.contains("explicit dispatch refused before bytes")),"{result:?}");
+    assert_eq!(store.task(&task.id).unwrap().wake_state,WakeState::Held);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn review_r2_explicit_remote_delivery_refuses_uncertainty_and_revoked_authority() {
+    for revoke in [false,true] {
+        let root=tempfile::tempdir().unwrap();
+        let (app,store,task,pane,_grant,_host)=setup(root.path(),&format!("review-r2-refuse-{revoke}"));
+        let _authority=authority::NativeAuthority::new(&task.parent_thread_id);
+        store.apply_remote(&task.id,&tests::remote(&task,crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
+        let provider=result_provider(&app,&task,root.path()).await;
+        provider.fail_next_send(crate::agent_provider::ProviderError::ValidationError {message:"before bytes".into()});
+        let _=coordinator::wake_open(app.handle(),&task.id).await;
+        let db=app.state::<DatabaseStore>();
+        let row=db.message_delivery_for_message(&task.parent_thread_id,&format!("delegation:{}",task.id)).unwrap().unwrap();
+        if revoke {
+            store.disable_grant(&task.parent_workspace_id,&store.grant_for_task(&task.id).unwrap().id).unwrap();
+        } else {
+            // Independent common-journal evidence must also forbid a resend.
+            assert!(db.claim_message_delivery(&row.id).unwrap());
+            db.message_delivery_submitting(&row.id).unwrap();
+            db.fail_message_delivery(&row.id,"acceptance unknown").unwrap();
+        }
+        let before=db.message_delivery(&row.id).unwrap().unwrap();
+        let result=app::invoke(app.handle(),"delegation_deliver",serde_json::json!({"paneId":pane,"taskId":task.id})).await;
+        assert!(result.is_err(),"{result:?}");
+        let after=db.message_delivery(&row.id).unwrap().unwrap();
+        assert_eq!(after.state,before.state);
+        assert_eq!(after.attempt_count,before.attempt_count);
+        assert_eq!(after.generation,before.generation);
+        assert_eq!(after.payload,before.payload);
+        assert!(!provider.calls.snapshot().iter().any(|call|matches!(call,mock_agent_provider::MockCall::SendTurn(..))));
+    }
 }
 
 #[test]

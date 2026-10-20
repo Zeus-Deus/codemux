@@ -276,6 +276,26 @@ impl DatabaseStore {
         if n==0 { return Err("Delivery may already have reached the provider; automatic replay is held".into()); }
         Ok(())
     }
+    /// Only the explicit remote-result action calls this, after checking the
+    /// delegation ledger and live authority. Stop never automatically rearms it.
+    pub(crate) fn rearm_remote_result_delivery(&self, thread: &str, task: &str) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let message = format!("delegation:{task}");
+        let row = tx.query_row(&format!("SELECT {COLUMNS} FROM agent_message_deliveries WHERE thread_id=?1 AND message_id=?2"), params![thread,message], read).optional().map_err(|e|e.to_string())?;
+        if let Some(row) = row {
+            if row.attempted || row.queued_id.is_some() || row.payload["origin"] != "remote_delegation"
+                || !matches!(row.state.as_str(), "pending" | "held" | "rejected" | "cancelled")
+                || (row.state == "cancelled" && row.hold_reason.as_deref() != Some("stop"))
+            {
+                return Err("Remote result may already have reached the provider or no longer owns this delivery".into());
+            }
+            tx.execute("UPDATE agent_message_deliveries SET state='pending',dispatch_owned=0,attempt_count=0,retry_at=NULL,error=NULL,hold_reason=NULL,attention_acknowledged=0,
+                generation=COALESCE((SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?2),0),updated_at=datetime('now') WHERE id=?1",params![row.id,thread]).map_err(|e|e.to_string())?;
+        }
+        tx.commit().map_err(|e|e.to_string())
+    }
+
     pub fn stop_message_deliveries(&self, thread: &str) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
