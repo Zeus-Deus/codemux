@@ -223,32 +223,142 @@ fn write(conn: &Connection, task: &TaskRecord) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct RootContext { pub root_id:String, pub depth:usize, pub hop:u32, pub causation_id:String }
-pub(super) fn admit_agent_message(tx:&Connection,sender:&str,target:&str,id:&str)->Result<(),String>{
+pub(crate) struct RootContext {
+    pub root_id: String,
+    pub depth: usize,
+    pub hop: u32,
+    pub causation_id: String,
+}
+pub(super) fn admit_agent_message(
+    tx: &Connection,
+    sender: &str,
+    target: &str,
+    id: &str,
+) -> Result<(), String> {
     tx.execute("INSERT OR IGNORE INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,0,0,?2)",params![sender,uuid::Uuid::new_v4().to_string()]).map_err(|e|e.to_string())?;
     let context=tx.query_row("SELECT root_id,depth,hop,causation_id FROM agent_orchestration_context WHERE thread_id=?1",[sender],|r|Ok(RootContext{root_id:r.get(0)?,depth:r.get(1)?,hop:r.get(2)?,causation_id:r.get(3)?})).map_err(|e|e.to_string())?;
-    let count:u32=tx.query_row("SELECT COUNT(*) FROM agent_orchestration_admissions WHERE root_id=?1",[&context.root_id],|r|r.get(0)).map_err(|e|e.to_string())?;
-    if count>=6 || context.hop>=8 {return Err("resource_limit: agent message causation budget reached".into());}
-    tx.execute("INSERT INTO agent_orchestration_admissions(id,root_id,kind) VALUES (?1,?2,'message')",params![id,context.root_id]).map_err(|e|e.to_string())?;
+    let count: u32 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM agent_orchestration_admissions WHERE root_id=?1",
+            [&context.root_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if count >= 6 || context.hop >= 8 {
+        return Err("resource_limit: agent message causation budget reached".into());
+    }
+    tx.execute(
+        "INSERT INTO agent_orchestration_admissions(id,root_id,kind) VALUES (?1,?2,'message')",
+        params![id, context.root_id],
+    )
+    .map_err(|e| e.to_string())?;
     tx.execute("INSERT INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(thread_id) DO UPDATE SET root_id=excluded.root_id,depth=excluded.depth,hop=excluded.hop,causation_id=excluded.causation_id",params![target,context.root_id,context.depth,context.hop+1,id]).map_err(|e|e.to_string())?;
     Ok(())
 }
+/// A direct-owner follow-up has a fresh result identity in the existing child.
+/// This is part of the message transaction, so retries cannot create tasks twice.
+pub(super) fn admit_followup(
+    tx: &Connection,
+    parent: &str,
+    child: &str,
+    delivery: &str,
+    payload: &Value,
+) -> Result<(), String> {
+    let prior:Option<String>=tx.query_row("SELECT record FROM agent_delegation_tasks WHERE parent_thread_id=?1 AND child_thread_id=?2 AND backend='local' ORDER BY rowid DESC LIMIT 1",params![parent,child],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+    let Some(prior) = prior
+        .map(decode)
+        .transpose()?
+        .filter(|t| t.result.is_some())
+    else {
+        return Ok(());
+    };
+    let id = format!("local:followup:{delivery}");
+    let mut task = TaskRecord::new(
+        id.clone(),
+        parent.into(),
+        Some(child.into()),
+        prior.provider,
+        prior.title,
+        payload["input"]["text"].as_str().unwrap_or_default().into(),
+        chrono::Utc::now().timestamp_millis(),
+    );
+    let binding = super::agent_chat_session(tx, child).ok_or("Follow-up target missing")?;
+    task.provider = binding.provider;
+    task.workspace_id = binding.workspace_id;
+    task.cwd = binding.cwd.unwrap_or(prior.cwd);
+    task.model = binding.model;
+    task.effort = binding.effort;
+    task.permission_mode = binding.permission_mode;
+    task.isolation = prior.isolation;
+    task.worktree = prior.worktree;
+    let root: String = tx
+        .query_row(
+            "SELECT root_id FROM agent_orchestration_context WHERE thread_id=?1",
+            [parent],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    task.budget_root_id = Some(root.clone());
+    task.status = TaskStatus::Queued;
+    task.has_pending_child_runs = true;
+    let ancestor:Option<String>=tx.query_row("SELECT record FROM agent_delegation_tasks WHERE child_thread_id=?1 AND backend='local' ORDER BY rowid DESC LIMIT 1",[parent],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+    if let Some(ancestor) = ancestor.map(decode).transpose()? {
+        task.lineage = ancestor.lineage;
+        task.lineage.push(ancestor.task_id);
+        task.root_task_id = ancestor.root_task_id;
+    }
+    if task.lineage.len() >= 4 {
+        return Err("resource_limit: nested task depth limit reached".into());
+    }
+    let executing:u32=tx.query_row("SELECT COUNT(*) FROM agent_delegation_tasks WHERE json_extract(record,'$.budget_root_id')=?1 AND json_extract(record,'$.status') IN ('queued','running','waiting') AND json_extract(record,'$.workState')<>'waiting_for_children'",[&root],|r|r.get(0)).map_err(|e|e.to_string())?;
+    if executing >= 3 {
+        return Err("resource_limit: executing task budget reached".into());
+    }
+    tx.execute(
+        "UPDATE agent_orchestration_admissions SET kind='followup' WHERE id=?1",
+        [delivery],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute("INSERT INTO agent_delegation_tasks(task_id,parent_thread_id,child_thread_id,backend,admission_payload,record) VALUES (?1,?2,?3,'local',?4,?5)",params![id,parent,child,payload.to_string(),serde_json::to_string(&task).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+    Ok(())
+}
 impl DatabaseStore {
-    pub(crate) fn delegation_read_coverage(&self,parent:&str,id:&str,start:usize,end:usize,total:usize)->Result<bool,String>{
-        let conn=self.conn.lock().unwrap();let task=read(&conn,id)?.ok_or("Unknown task")?;
-        if task.parent_thread_id!=parent {return Err("Task is not owned by this parent".into());}
+    pub(crate) fn delegation_read_coverage(
+        &self,
+        parent: &str,
+        id: &str,
+        start: usize,
+        end: usize,
+        total: usize,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let task = read(&conn, id)?.ok_or("Unknown task")?;
+        if task.parent_thread_id != parent {
+            return Err("Task is not owned by this parent".into());
+        }
         conn.execute("INSERT OR IGNORE INTO agent_delegation_read_coverage(parent_thread_id,task_id,start_offset,end_offset) VALUES (?1,?2,?3,?4)",params![parent,id,start,end]).map_err(|e|e.to_string())?;
         let mut statement=conn.prepare("SELECT start_offset,end_offset FROM agent_delegation_read_coverage WHERE parent_thread_id=?1 AND task_id=?2 ORDER BY start_offset").map_err(|e|e.to_string())?;
-        let ranges=statement.query_map(params![parent,id],|r|Ok((r.get::<_,usize>(0)?,r.get::<_,usize>(1)?))).map_err(|e|e.to_string())?;
-        let mut covered=0;for range in ranges{let (start,end)=range.map_err(|e|e.to_string())?;if start>covered{break;}covered=covered.max(end);}
-        Ok(covered>=total)
+        let ranges = statement
+            .query_map(params![parent, id], |r| {
+                Ok((r.get::<_, usize>(0)?, r.get::<_, usize>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut covered = 0;
+        for range in ranges {
+            let (start, end) = range.map_err(|e| e.to_string())?;
+            if start > covered {
+                break;
+            }
+            covered = covered.max(end);
+        }
+        Ok(covered >= total)
     }
-    pub(crate) fn orchestration_human_root(&self, thread:&str)->Result<(),String>{
-        let id=uuid::Uuid::new_v4().to_string();
+    pub(crate) fn orchestration_human_root(&self, thread: &str) -> Result<(), String> {
+        let id = uuid::Uuid::new_v4().to_string();
         self.conn.lock().unwrap().execute("INSERT INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,0,0,?2) ON CONFLICT(thread_id) DO UPDATE SET root_id=excluded.root_id,depth=0,hop=0,causation_id=excluded.causation_id",params![thread,id]).map(drop).map_err(|e|e.to_string())
     }
-    pub(crate) fn orchestration_context(&self,thread:&str)->Result<RootContext,String>{
-        let conn=self.conn.lock().unwrap();
+    pub(crate) fn orchestration_context(&self, thread: &str) -> Result<RootContext, String> {
+        let conn = self.conn.lock().unwrap();
         conn.execute("INSERT OR IGNORE INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,0,0,?2)",params![thread,uuid::Uuid::new_v4().to_string()]).map_err(|e|e.to_string())?;
         conn.query_row("SELECT root_id,depth,hop,causation_id FROM agent_orchestration_context WHERE thread_id=?1",[thread],|r|Ok(RootContext{root_id:r.get(0)?,depth:r.get(1)?,hop:r.get(2)?,causation_id:r.get(3)?})).map_err(|e|e.to_string())
     }
@@ -399,6 +509,17 @@ impl DatabaseStore {
         key: Option<&str>,
         payload: &Value,
     ) -> Result<(TaskRecord, bool), String> {
+        if task.child_thread_id.as_deref() == Some(&task.parent_thread_id)
+            || task.lineage.contains(&task.task_id)
+            || task
+                .lineage
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != task.lineage.len()
+        {
+            return Err("invalid_task_lineage: tasks must be acyclic".into());
+        }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         if let Some(prior) = read(&tx, &task.task_id)? {
@@ -423,21 +544,64 @@ impl DatabaseStore {
         let mut task = task.clone();
         task.admission_generation = Some(generation);
         if let Some(root) = &task.budget_root_id {
-            let all:Vec<TaskRecord> = { let mut statement=tx.prepare("SELECT record FROM agent_delegation_tasks").map_err(|e|e.to_string())?;
-                let rows=statement.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
-                rows.into_iter().map(decode).collect::<Result<_,_>>()? };
-            let active:Vec<_>=all.iter().filter(|t|t.budget_root_id.as_ref()==Some(root) && !t.status.terminal()
-                && t.work_state != WorkState::WaitingForChildren && t.child_thread_id.as_deref()!=Some(&task.parent_thread_id)).map(|t|t.task_id.clone()).collect();
-            if active.len()>=3 || task.lineage.len()>=4 {return Err(format!("resource_limit: depth 4, 3 executing per root; active task IDs: {}",active.join(", ")));}
-            let admitted:u32=tx.query_row("SELECT COUNT(*) FROM agent_orchestration_admissions WHERE root_id=?1",[root],|r|r.get(0)).map_err(|e|e.to_string())?;
-            if admitted>=6 {return Err(format!("resource_limit: 6 admissions per human root; active task IDs: {}",active.join(", ")));}
-            tx.execute("INSERT INTO agent_orchestration_admissions(id,root_id,kind) VALUES (?1,?2,'task')",params![task.task_id,root]).map_err(|e|e.to_string())?;
-            if let Some(child)=&task.child_thread_id {
+            let all: Vec<TaskRecord> = {
+                let mut statement = tx
+                    .prepare("SELECT record FROM agent_delegation_tasks")
+                    .map_err(|e| e.to_string())?;
+                let rows = statement
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                rows.into_iter().map(decode).collect::<Result<_, _>>()?
+            };
+            let active: Vec<_> = all
+                .iter()
+                .filter(|t| {
+                    t.budget_root_id.as_ref() == Some(root)
+                        && !t.status.terminal()
+                        && t.work_state != WorkState::WaitingForChildren
+                        && !(payload["mode"] == "wait"
+                            && t.child_thread_id.as_deref() == Some(&task.parent_thread_id))
+                })
+                .map(|t| t.task_id.clone())
+                .collect();
+            if active.len() >= 3 || task.lineage.len() >= 4 {
+                return Err(format!(
+                    "resource_limit: depth 4, 3 executing per root; active task IDs: {}",
+                    active.join(", ")
+                ));
+            }
+            let admitted: u32 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_orchestration_admissions WHERE root_id=?1",
+                    [root],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if admitted >= 6 {
+                return Err(format!(
+                    "resource_limit: 6 admissions per human root; active task IDs: {}",
+                    active.join(", ")
+                ));
+            }
+            tx.execute(
+                "INSERT INTO agent_orchestration_admissions(id,root_id,kind) VALUES (?1,?2,'task')",
+                params![task.task_id, root],
+            )
+            .map_err(|e| e.to_string())?;
+            if let Some(child) = &task.child_thread_id {
                 tx.execute("INSERT INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,?3,?3,?4)",params![child,root,task.lineage.len()+1,task.task_id]).map_err(|e|e.to_string())?;
             }
             // Waiting ancestors yield execution capacity to their own leaves.
-            if let Some(parent)=all.iter().find(|t|t.child_thread_id.as_deref()==Some(&task.parent_thread_id) && !t.status.terminal()) {
-                let mut parent=parent.clone();parent.work_state=WorkState::WaitingForChildren;write(&tx,&parent)?;
+            if let Some(parent) = all.iter().find(|t| {
+                payload["mode"] == "wait"
+                    && t.child_thread_id.as_deref() == Some(&task.parent_thread_id)
+                    && !t.status.terminal()
+            }) {
+                let mut parent = parent.clone();
+                parent.work_state = WorkState::WaitingForChildren;
+                write(&tx, &parent)?;
             }
         }
         if task.backend == TaskBackend::Local {
@@ -1039,47 +1203,173 @@ mod tests {
 #[cfg(test)]
 mod native_budget_tests {
     use super::*;
-    fn record(db:&DatabaseStore,parent:&str,child:&str,id:&str,lineage:Vec<String>)->TaskRecord{
-        let root=db.orchestration_context(parent).unwrap();
-        let mut task=TaskRecord::new(id.into(),parent.into(),Some(child.into()),"claude".into(),id.into(),"A self-contained complete brief".into(),1);
-        task.budget_root_id=Some(root.root_id);task.lineage=lineage;task
+    fn record(
+        db: &DatabaseStore,
+        parent: &str,
+        child: &str,
+        id: &str,
+        lineage: Vec<String>,
+    ) -> TaskRecord {
+        let root = db.orchestration_context(parent).unwrap();
+        let mut task = TaskRecord::new(
+            id.into(),
+            parent.into(),
+            Some(child.into()),
+            "claude".into(),
+            id.into(),
+            "A self-contained complete brief".into(),
+            1,
+        );
+        task.budget_root_id = Some(root.root_id);
+        task.lineage = lineage;
+        task
     }
     #[test]
-    fn native_budgets_survive_agent_sends_and_database_reopen(){
-        let db=DatabaseStore::new_in_memory();db.orchestration_human_root("parent").unwrap();
-        let root=db.orchestration_context("parent").unwrap().root_id;
-        for i in 0..6 {let id=format!("task-{i}");let child=format!("child-{i}");let task=record(&db,"parent",&child,&id,vec![]);db.admit_delegation_task(&task,Some(&id),&serde_json::json!({"id":id})).unwrap();db.update_delegation_task(&id,|t|t.status=TaskStatus::Completed).unwrap();}
-        let next=record(&db,"parent","extra-child","extra",vec![]);
-        assert!(db.admit_delegation_task(&next,None,&Value::Null).unwrap_err().contains("resource_limit"));
-        let dir=tempfile::tempdir().unwrap();let db=db.control_fixture_snapshot(&dir.path().join("root.sqlite"));
-        assert_eq!(db.orchestration_context("parent").unwrap().root_id,root);
-        assert!(db.admit_delegation_task(&next,None,&Value::Null).unwrap_err().contains("resource_limit"));
-        db.orchestration_human_root("parent").unwrap();assert_ne!(db.orchestration_context("parent").unwrap().root_id,root);
+    fn native_budgets_survive_agent_sends_and_database_reopen() {
+        let db = DatabaseStore::new_in_memory();
+        db.orchestration_human_root("parent").unwrap();
+        let root = db.orchestration_context("parent").unwrap().root_id;
+        for i in 0..6 {
+            let id = format!("task-{i}");
+            let child = format!("child-{i}");
+            let task = record(&db, "parent", &child, &id, vec![]);
+            db.admit_delegation_task(&task, Some(&id), &serde_json::json!({"id":id}))
+                .unwrap();
+            db.update_delegation_task(&id, |t| t.status = TaskStatus::Completed)
+                .unwrap();
+        }
+        let next = record(&db, "parent", "extra-child", "extra", vec![]);
+        assert!(db
+            .admit_delegation_task(&next, None, &Value::Null)
+            .unwrap_err()
+            .contains("resource_limit"));
+        let dir = tempfile::tempdir().unwrap();
+        let db = db.control_fixture_snapshot(&dir.path().join("root.sqlite"));
+        assert_eq!(db.orchestration_context("parent").unwrap().root_id, root);
+        assert!(db
+            .admit_delegation_task(&next, None, &Value::Null)
+            .unwrap_err()
+            .contains("resource_limit"));
+        db.orchestration_human_root("parent").unwrap();
+        assert_ne!(db.orchestration_context("parent").unwrap().root_id, root);
     }
     #[test]
-    fn native_nested_depth_is_acyclic_and_execution_capacity_is_shared(){
-        let db=DatabaseStore::new_in_memory();db.orchestration_human_root("root").unwrap();
-        let mut parent="root".to_string();let mut lineage=vec![];
-        for depth in 0..4 {let child=format!("nested-{depth}");let id=format!("task-{depth}");let task=record(&db,&parent,&child,&id,lineage.clone());db.admit_delegation_task(&task,None,&Value::Null).unwrap();lineage.push(id);parent=child;}
-        let next=record(&db,&parent,"too-deep","too-deep-task",lineage);
-        assert!(db.admit_delegation_task(&next,None,&Value::Null).unwrap_err().contains("resource_limit"));
-        let stopped=db.stop_delegation_tree("root").unwrap();assert_eq!(stopped.len(),4);
+    fn native_nested_depth_is_acyclic_and_execution_capacity_is_shared() {
+        let db = DatabaseStore::new_in_memory();
+        db.orchestration_human_root("root").unwrap();
+        let mut parent = "root".to_string();
+        let mut lineage = vec![];
+        for depth in 0..4 {
+            let child = format!("nested-{depth}");
+            let id = format!("task-{depth}");
+            let task = record(&db, &parent, &child, &id, lineage.clone());
+            db.admit_delegation_task(&task, None, &serde_json::json!({"mode":"wait"}))
+                .unwrap();
+            lineage.push(id);
+            parent = child;
+        }
+        let next = record(&db, &parent, "too-deep", "too-deep-task", lineage);
+        assert!(db
+            .admit_delegation_task(&next, None, &Value::Null)
+            .unwrap_err()
+            .contains("resource_limit"));
+        let stopped = db.stop_delegation_tree("root").unwrap();
+        assert_eq!(stopped.len(), 4);
     }
     #[test]
-    fn native_read_ack_requires_contiguous_complete_owned_coverage(){
-        let db=DatabaseStore::new_in_memory();let task=record(&db,"parent","child","read-task",vec![]);db.admit_delegation_task(&task,None,&Value::Null).unwrap();
-        assert!(!db.delegation_read_coverage("parent","read-task",0,4,10).unwrap());
-        assert!(!db.delegation_read_coverage("parent","read-task",7,10,10).unwrap());
-        assert!(db.delegation_read_coverage("parent","read-task",4,7,10).unwrap());
-        assert!(db.delegation_read_coverage("unrelated","read-task",0,10,10).is_err());
+    fn native_followup_admission_keeps_original_result_and_deduplicates() {
+        let db = DatabaseStore::new_in_memory();
+        db.orchestration_human_root("parent").unwrap();
+        let task = record(&db, "parent", "child", "original", vec![]);
+        db.admit_delegation_task(&task, None, &Value::Null).unwrap();
+        db.update_delegation_task("original", |task| {
+            task.status = TaskStatus::Completed;
+            task.result = Some(PublishedResult {
+                version: 1,
+                run_id: Some("original-run".into()),
+                text: "Original final result".into(),
+                status: TaskStatus::Completed,
+                published_at: 2,
+            });
+        })
+        .unwrap();
+        let payload = serde_json::json!({"origin":"controller","caller":{"identity":{"kind":"thread","thread_id":"parent"}},"provenance":{"created_by":"agent"},"input":{"text":"Follow up with another complete task"}});
+        assert!(
+            db.admit_message_delivery(
+                "followup",
+                "child",
+                "followup-message",
+                &payload,
+                "epoch",
+                0,
+                None,
+                false
+            )
+            .unwrap()
+            .1
+        );
+        assert!(
+            !db.admit_message_delivery(
+                "followup",
+                "child",
+                "followup-message",
+                &payload,
+                "epoch",
+                0,
+                None,
+                false
+            )
+            .unwrap()
+            .1
+        );
+        let original = db.delegation_task("original").unwrap().unwrap();
+        assert_eq!(original.result.unwrap().text, "Original final result");
+        let followup = db
+            .delegation_task("local:followup:followup")
+            .unwrap()
+            .unwrap();
+        assert!(followup.result.is_none());
+        assert_eq!(followup.child_thread_id.as_deref(), Some("child"));
+        assert_eq!(db.delegation_tasks(Some("parent")).unwrap().len(), 2);
     }
     #[test]
-    fn native_agent_message_retries_are_atomic_and_do_not_mint_budget_roots(){
-        let db=DatabaseStore::new_in_memory();db.orchestration_human_root("a").unwrap();
-        let root=db.orchestration_context("a").unwrap().root_id;
-        let payload=serde_json::json!({"origin":"controller","caller":{"identity":{"kind":"thread","thread_id":"a"}},"provenance":{"created_by":"agent"}});
-        for i in 0..6 {let id=format!("send-{i}");db.admit_message_delivery(&id,"b",&id,&payload,"epoch",0,None,false).unwrap();assert!(!db.admit_message_delivery(&id,"b",&id,&payload,"epoch",0,None,false).unwrap().1);}
-        assert_eq!(db.orchestration_context("b").unwrap().root_id,root);
-        assert!(db.admit_message_delivery("extra","b","extra",&payload,"epoch",0,None,false).unwrap_err().contains("resource_limit"));
+    fn native_read_ack_requires_contiguous_complete_owned_coverage() {
+        let db = DatabaseStore::new_in_memory();
+        let task = record(&db, "parent", "child", "read-task", vec![]);
+        db.admit_delegation_task(&task, None, &Value::Null).unwrap();
+        assert!(!db
+            .delegation_read_coverage("parent", "read-task", 0, 4, 10)
+            .unwrap());
+        assert!(!db
+            .delegation_read_coverage("parent", "read-task", 7, 10, 10)
+            .unwrap());
+        assert!(db
+            .delegation_read_coverage("parent", "read-task", 4, 7, 10)
+            .unwrap());
+        assert!(db
+            .delegation_read_coverage("unrelated", "read-task", 0, 10, 10)
+            .is_err());
+    }
+    #[test]
+    fn native_agent_message_retries_are_atomic_and_do_not_mint_budget_roots() {
+        let db = DatabaseStore::new_in_memory();
+        db.orchestration_human_root("a").unwrap();
+        let root = db.orchestration_context("a").unwrap().root_id;
+        let payload = serde_json::json!({"origin":"controller","caller":{"identity":{"kind":"thread","thread_id":"a"}},"provenance":{"created_by":"agent"}});
+        for i in 0..6 {
+            let id = format!("send-{i}");
+            db.admit_message_delivery(&id, "b", &id, &payload, "epoch", 0, None, false)
+                .unwrap();
+            assert!(
+                !db.admit_message_delivery(&id, "b", &id, &payload, "epoch", 0, None, false)
+                    .unwrap()
+                    .1
+            );
+        }
+        assert_eq!(db.orchestration_context("b").unwrap().root_id, root);
+        assert!(db
+            .admit_message_delivery("extra", "b", "extra", &payload, "epoch", 0, None, false)
+            .unwrap_err()
+            .contains("resource_limit"));
     }
 }

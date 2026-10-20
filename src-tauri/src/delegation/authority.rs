@@ -40,16 +40,15 @@ pub struct AuthorityIdentity {
     pub run_id: Option<String>,
 }
 impl AuthorityIdentity {
-    pub fn verify(&self, thread: &str) -> Result<(), String> {
-        let owner = RUNTIMES.lock().unwrap().get(thread).and_then(Weak::upgrade)
-            .ok_or("stale_caller: native session is unavailable")?;
-        let state = owner.state.lock().unwrap();
-        if owner.session_key != self.session_key || !state.live || !state.tools_live
-            || state.generation != self.generation || state.activity != self.activity
-            || state.turn.is_none() || state.turn != self.run_id {
-            return Err("stale_caller: native session or run authority changed".into());
-        }
-        Ok(())
+    pub fn verify(&self,thread:&str)->Result<(),String>{self.admit(thread,||Ok(()))}
+    /// Revocation and synchronous admission share a fence. No provider wait
+    /// or async work is allowed while this closure owns the caller permit.
+    pub fn admit<T>(&self,thread:&str,work:impl FnOnce()->Result<T,String>)->Result<T,String>{
+        let owner=RUNTIMES.lock().unwrap().get(thread).and_then(Weak::upgrade).ok_or("stale_caller: native session is unavailable")?;
+        let state=owner.state.lock().unwrap();
+        if owner.session_key!=self.session_key || !state.live || !state.tools_live || state.generation!=self.generation
+            || state.activity!=self.activity || state.turn.is_none() || state.turn!=self.run_id {return Err("stale_caller: native session or run authority changed".into());}
+        work()
     }
 }
 impl NativeAuthority {

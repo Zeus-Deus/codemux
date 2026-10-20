@@ -415,7 +415,7 @@ async fn native_wait_tool_does_not_block_codex_approval_reader() {
     let entered=Arc::new(tokio::sync::Notify::new());let release=Arc::new(tokio::sync::Semaphore::new(0));
     let start=entered.clone();let gate=release.clone();
     registry.set_native_delegation_handler(Arc::new(move |actor,name,_args|{let start=start.clone();let gate=gate.clone();Box::pin(async move {
-        assert_eq!(name,"thread_wait");actor.permit.admit()?;start.notify_one();gate.acquire().await.unwrap().forget();Ok(json!({"settled":false}))
+        assert_eq!(name,"thread_wait");drop(actor.permit.admit()?);start.notify_one();gate.acquire().await.unwrap().forget();Ok(json!({"settled":false}))
     })}));
     let provider=CodexAgentProvider::new(CodexProviderConfig {codex_binary:fixture_binary(dir.path()),mcp_registry:Some(registry),..Default::default()});
     let thread=ThreadId("native-wait-reader".into());let mut events=provider.event_tx.subscribe();

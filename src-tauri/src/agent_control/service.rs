@@ -143,10 +143,10 @@ pub(crate) async fn launch<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
     let epoch = app.state::<NativeControlState>().epoch.clone();
     let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&args).map_err(|e|ControlError::new("invalid_arguments",e.to_string()))?));
     let thread = uuid::Uuid::new_v4().to_string();
-    let admitted = app.state::<DatabaseStore>().admit_control_operation(
+    let admitted = caller.admit(||app.state::<DatabaseStore>().admit_control_operation(
         &caller.principal, &input.client_request_id, "thread_launch", &fingerprint, &epoch,
         Some(&workspace.workspace_id.0), Some(&thread),
-    ).map_err(|e| ControlError::new(if e.starts_with("request_key_conflict") { "request_key_conflict" } else { "operation_admission_failed" }, e))?;
+    )).map_err(|e| ControlError::new(if e.starts_with("request_key_conflict") { "request_key_conflict" } else { "operation_admission_failed" }, e))?;
     let receipt = serde_json::to_value(&admitted.receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
     if !admitted.newly_admitted { return Ok(receipt); }
     let app = app.clone();
@@ -478,8 +478,7 @@ pub(crate) async fn thread_send<R: Runtime>(
     let epoch = app.state::<NativeControlState>().epoch.clone();
     let db = app.state::<DatabaseStore>();
     let generation = db.delivery_generation(&input.thread_id)?.0;
-    let (id, new) = db
-        .admit_message_delivery(
+    let (id, new) = caller.admit(|| db.admit_message_delivery(
             &id,
             &input.thread_id,
             &id,
@@ -493,7 +492,7 @@ pub(crate) async fn thread_send<R: Runtime>(
                 workspace: &input.workspace_id,
             }),
             true,
-        )
+        ))
         .map_err(|e| {
             ControlError::new(
                 if e.starts_with("request_key_conflict") {
@@ -528,8 +527,9 @@ pub(crate) async fn thread_send<R: Runtime>(
         });
         super::delivery::notify();
     }
-    serde_json::to_value(receipt)
-        .map_err(|e| ControlError::new("serialization_failed", e.to_string()))
+    let mut result=serde_json::to_value(receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
+    if let Some(task)=db.delegation_task(&format!("local:followup:{id}"))? {result["task_id"]=json!(task.task_id);}
+    Ok(result)
 }
 
 fn retry_receipt<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, tool: &str, args: &Value) -> Result<Option<Value>, ControlError> {
@@ -553,7 +553,7 @@ fn admit_mutation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, tool: 
     identifier(key,"client_request_id",128)?;
     let hash = format!("{:x}",Sha256::digest(serde_json::to_vec(args).map_err(|e|ControlError::new("invalid_arguments",e.to_string()))?));
     let epoch = app.state::<NativeControlState>().epoch.clone();
-    app.state::<DatabaseStore>().admit_control_operation(&caller.principal,key,tool,&hash,&epoch,Some(&target.workspace_id),Some(&target.thread_id))
+    caller.admit(||app.state::<DatabaseStore>().admit_control_operation(&caller.principal,key,tool,&hash,&epoch,Some(&target.workspace_id),Some(&target.thread_id)))
         .map_err(|e|ControlError::new(if e.starts_with("request_key_conflict") {"request_key_conflict"} else {"operation_admission_failed"},e))
 }
 

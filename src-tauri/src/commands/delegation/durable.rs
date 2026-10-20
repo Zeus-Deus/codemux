@@ -44,6 +44,7 @@ pub(super) fn persist_live<R: Runtime>(app: &AppHandle<R>, child: &str) {
     let Some(task) = task else {
         return;
     };
+    let nested=db.delegation_tasks(Some(child)).is_ok_and(|tasks|tasks.iter().any(|task|!task.status.terminal() || matches!(task.completion_delivery.as_str(),"pending"|"preparing"|"queued"|"submitting")));
     if let Err(error) = db.update_delegation_task(&task.task_id, |record| {
         if record.result.is_some() {
             return;
@@ -58,7 +59,9 @@ pub(super) fn persist_live<R: Runtime>(app: &AppHandle<R>, child: &str) {
             "ready"
         }
         .into();
-        record.has_pending_child_runs = !task.phase.is_terminal();
+        record.has_pending_child_runs = !task.phase.is_terminal() && task.last_status.is_none();
+        if task.last_status.is_some() && nested {record.work_state=WorkState::WaitingForChildren;}
+        else if task.last_status.is_none() {record.work_state=WorkState::Working;}
         // Native callbacks are ephemeral; these IDs describe current attention,
         // never restored permission-grant authority.
         if !task.awaits_user() {

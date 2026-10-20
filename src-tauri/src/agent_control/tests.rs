@@ -1985,3 +1985,21 @@ async fn native_callers_catalog_is_mode_independent_and_toggle_controls_new_sess
     app.state::<crate::database::DatabaseStore>().set_setting("agents.cross_provider_delegation","false").unwrap();
     assert!(host.tools_for(&caller).is_empty());
 }
+
+#[tokio::test]
+async fn native_callers_project_inventory_bounded_reads_and_idle_wait_use_canonical_context(){
+    let (app,_,_root,workspace,thread,_authority,actor)=native_caller_fixture("bypassPermissions").await;
+    let db=app.state::<crate::database::DatabaseStore>();
+    db.set_agent_chat_title(&thread,"Native coordinator fixture").unwrap();
+    db.append_agent_chat_message(&thread,&json!({"type":"user_message","thread_id":thread,"text":"Visible bounded message"}).to_string()).unwrap();
+    let list=super::native::call(app.handle().clone(),actor.clone(),"thread_list".into(),json!({})).await.unwrap();
+    assert!(list["threads"].as_array().unwrap().iter().any(|t|t["thread_id"]==thread&&t["workspace_id"]==workspace));
+    let search=super::native::call(app.handle().clone(),actor.clone(),"thread_search".into(),json!({"query":"Native coordinator"})).await.unwrap();
+    assert!(search["matches"].as_array().unwrap().iter().any(|t|t["thread_id"]==thread));
+    let first=super::native::call(app.handle().clone(),actor.clone(),"thread_read".into(),json!({"thread_id":thread,"max_chars":7})).await.unwrap();
+    assert_eq!(first["messages"][0]["content"],"Visible");assert_eq!(first["messages"][0]["truncated"],true);
+    let second=super::native::call(app.handle().clone(),actor.clone(),"thread_read".into(),json!({"thread_id":thread,"cursor":first["next_cursor"],"text_offset":first["next_text_offset"]})).await.unwrap();
+    assert_eq!(second["messages"][0]["content"]," bounded message");
+    let wait=super::native::call(app.handle().clone(),actor,"thread_wait".into(),json!({"thread_id":thread,"timeout_ms":1})).await.unwrap();
+    assert_eq!(wait["timed_out"],false);assert_eq!(wait["settled"],true);
+}

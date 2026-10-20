@@ -46,6 +46,19 @@ pub struct ControlCaller {
 }
 
 impl ControlCaller {
+    pub(crate) fn admit<T>(&self, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        match (&self.identity, &self.admitted) {
+            (
+                CallerPrincipal::Thread {
+                    thread_id,
+                    authority,
+                    ..
+                },
+                None,
+            ) => authority.admit(thread_id, work),
+            _ => work(),
+        }
+    }
     pub fn thread_id(&self) -> Option<&str> {
         match &self.identity {
             CallerPrincipal::Thread { thread_id, .. } => Some(thread_id),

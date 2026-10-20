@@ -238,12 +238,22 @@ pub(crate) async fn call<R: Runtime>(
             args["workspace_id"] = json!(target.workspace_id);
         }
     } else if name != "operation_status" && args.get("workspace_id").is_none() {
-        args["workspace_id"] = json!(
-            app.state::<DatabaseStore>()
-                .get_agent_chat_session(&actor.thread_id)
-                .ok_or("Calling chat missing")?
-                .workspace_id
-        );
+        let record = app
+            .state::<DatabaseStore>()
+            .get_agent_chat_session(&actor.thread_id)
+            .ok_or("Calling chat missing")?;
+        let workspace =
+            service::workspace(&app, &record.workspace_id, false).map_err(|e| e.to_string())?;
+        let default = if name == "thread_launch" {
+            let root =
+                std::path::Path::new(workspace.project_root.as_deref().unwrap_or(&workspace.cwd))
+                    .canonicalize()
+                    .map_err(|e| e.to_string())?;
+            app.state::<AppStateStore>().snapshot().workspaces.into_iter().find(|w|std::path::Path::new(&w.cwd).canonicalize().is_ok_and(|cwd|cwd==root)).map(|w|w.workspace_id.0).ok_or("workspace_not_found: open the caller's project-root checkout, or select an existing workspace explicitly")?
+        } else {
+            record.workspace_id
+        };
+        args["workspace_id"] = json!(default);
     }
     let result = match name.as_str() {
         "orchestrator_capabilities" => {
@@ -254,8 +264,22 @@ pub(crate) async fn call<R: Runtime>(
                 for provider in providers {
                     provider["provider_instance_id"] = provider["provider"].clone();
                     provider["models"] = provider["capabilities"]["models"].clone();
-                    if provider["provider"]=="claude" { if let Some(modes)=provider["capabilities"]["permission_modes"].as_array_mut() {modes.push(json!({"value":"plan","label":"Plan","description":"Read and plan without executing changes","is_default":false}));} }
-                    provider["inherited_permission_mode"] = serde_json::from_value::<ProviderKind>(provider["provider"].clone()).ok().and_then(|kind|caller.ceiling().and_then(|ceiling|ceiling.inherited(kind).ok())).map_or(Value::Null,Value::String);
+                    if provider["provider"] == "claude" {
+                        if let Some(modes) =
+                            provider["capabilities"]["permission_modes"].as_array_mut()
+                        {
+                            modes.push(json!({"value":"plan","label":"Plan","description":"Read and plan without executing changes","is_default":false}));
+                        }
+                    }
+                    provider["inherited_permission_mode"] =
+                        serde_json::from_value::<ProviderKind>(provider["provider"].clone())
+                            .ok()
+                            .and_then(|kind| {
+                                caller
+                                    .ceiling()
+                                    .and_then(|ceiling| ceiling.inherited(kind).ok())
+                            })
+                            .map_or(Value::Null, Value::String);
                     provider["native_orchestration"] = json!(matches!(
                         provider["provider"].as_str(),
                         Some("claude" | "codex")
@@ -393,33 +417,18 @@ fn project_inventory<R: Runtime>(
             .collect();
         return Ok(json!({"matches":db.search_agent_chat(&query,&ids,limit)?}));
     }
-    let mut threads = vec![];
-    for workspace in workspaces {
-        let page = service::thread_list(
-            app,
-            json!({"workspace_id":workspace.workspace_id.0,"limit":100}),
-        )?;
-        threads.extend(page["threads"].as_array().cloned().unwrap_or_default());
-    }
-    threads.sort_by(|a, b| {
-        b["last_active_at"]
-            .as_str()
-            .cmp(&a["last_active_at"].as_str())
-            .then_with(|| b["thread_id"].as_str().cmp(&a["thread_id"].as_str()))
-    });
-    if let Some(cursor) = input.cursor {
-        let offset = threads
-            .iter()
-            .position(|t| t["thread_id"] == cursor)
-            .ok_or_else(|| ControlError::new("invalid_cursor", "Cursor not found in project"))?;
-        threads.drain(..=offset);
-    }
-    let more = threads.len() > limit as usize;
-    threads.truncate(limit as usize);
-    Ok(
-        json!({"next_cursor":if more{threads.last().map(|t|t["thread_id"].clone())}else{None},"has_more":more,"threads":threads}),
-    )
+    let workspaces: Vec<_> = workspaces
+        .iter()
+        .map(|w| w.workspace_id.0.clone())
+        .collect();
+    let mut ids = db.control_project_thread_ids(&workspaces, input.cursor.as_deref(), limit + 1)?;
+    let more = ids.len() > limit as usize;
+    ids.truncate(limit as usize);
+    let next = if more { ids.last().cloned() } else { None };
+    let threads:Vec<_>=ids.iter().filter_map(|id|db.get_agent_chat_session(id)).map(|record|json!({"thread_id":record.thread_id,"workspace_id":record.workspace_id,"provider":record.provider,"title":record.title,"last_active_at":record.last_active_at,"permission_mode":record.permission_mode})).collect();
+    Ok(json!({"threads":threads,"has_more":more,"next_cursor":next}))
 }
+
 fn project_key(workspace: &crate::state::WorkspaceSnapshot) -> std::path::PathBuf {
     let root = std::path::Path::new(workspace.project_root.as_deref().unwrap_or(&workspace.cwd));
     crate::git::git_canonical_root(root)
@@ -512,12 +521,16 @@ fn read_bounded<R: Runtime>(
             for task in &tasks {
                 if task.child_thread_id.as_deref() == Some(&child)
                     && task.result.as_ref().is_some_and(|published| {
-                        let matching_run=published.run_id.as_ref().is_none_or(|run|db.get_agent_chat_message(message["message_id"].as_i64().unwrap_or(-1)).and_then(|raw|serde_json::from_str::<Value>(&raw).ok()).is_some_and(|raw|raw["turn_id"].as_str()==Some(run.as_str())));
+                        let matching_run = published.run_id.as_ref().is_none_or(|run| {
+                            db.get_agent_chat_message(message["message_id"].as_i64().unwrap_or(-1))
+                                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                                .is_some_and(|raw| raw["turn_id"].as_str() == Some(run.as_str()))
+                        });
                         matching_run && published.text == text && message["role"] == "assistant"
                     })
                 {
                     if db.delegation_read_coverage(parent, &task.task_id, start, end, length)? {
-                        db.acknowledge_delegation_result(parent, &task.task_id)?;
+                        caller.admit(|| db.acknowledge_delegation_result(parent, &task.task_id))?;
                     }
                 }
             }

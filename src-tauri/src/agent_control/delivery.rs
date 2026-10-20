@@ -260,6 +260,7 @@ async fn dispatch_with_control<R: Runtime>(
             return Err(error);
         }
     }
+    crate::commands::delegation::resume_followup(app,&row.id);
     let _activity = if payload.origin != TurnOrigin::Controller {
         Some(
             agent_chat::delegation_activity_lock(&row.thread_id)

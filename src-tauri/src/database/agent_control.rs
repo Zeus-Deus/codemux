@@ -46,6 +46,20 @@ pub struct Admission {
 }
 
 impl DatabaseStore {
+    pub(crate) fn control_project_thread_ids(&self,workspaces:&[String],cursor:Option<&str>,limit:u32)->Result<Vec<String>,String>{
+        if workspaces.is_empty(){return Ok(vec![]);}
+        let conn=self.conn.lock().unwrap();
+        let cut=cursor.map(|id|super::agent_chat_session(&conn,id).filter(|r|workspaces.contains(&r.workspace_id)).ok_or("invalid_cursor: cursor is outside this project")).transpose()?;
+        let slots=std::iter::repeat_n("?",workspaces.len()).collect::<Vec<_>>().join(",");
+        let mut values:Vec<rusqlite::types::Value>=workspaces.iter().cloned().map(Into::into).collect();
+        let condition=if let Some(cut)=cut {values.push(cut.last_active_at.clone().into());values.push(cut.last_active_at.into());values.push(cut.thread_id.into());" AND (last_active_at<? OR (last_active_at=? AND thread_id<?))"} else {""};
+        values.push((limit as i64).into());
+        let sql=format!("SELECT thread_id FROM agent_chat_sessions WHERE workspace_id IN ({slots}){condition} ORDER BY last_active_at DESC,thread_id DESC LIMIT ?");
+        let mut statement=conn.prepare(&sql).map_err(|e|e.to_string())?;
+        let rows=statement.query_map(rusqlite::params_from_iter(values),|r|r.get(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+        Ok(rows)
+    }
+
     /// Snapshot real bridge-written SQLite state at a deterministic crash
     /// boundary. Restart reads open the file, never re-seed event fixtures.
     #[cfg(test)]

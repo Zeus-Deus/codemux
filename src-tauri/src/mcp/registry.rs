@@ -112,7 +112,7 @@ pub struct McpRegistry {
 /// tool can trust it for permission and ownership checks.
 #[derive(Debug, Clone)]
 pub struct HostCaller {
-    pub(crate) control: Option<crate::agent_control::ControlCaller>,
+    pub control: Option<crate::agent_control::ControlCaller>,
     pub thread_id: String,
     pub provider: crate::agent_provider::ProviderKind,
     /// Owning workspace of the session's chat pane, when it has one.

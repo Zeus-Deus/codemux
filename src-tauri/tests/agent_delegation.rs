@@ -1722,10 +1722,7 @@ mod delegation {
                     .await,
             );
         }
-        assert_eq!(
-            h.call(FULL, args("codex", "Task 3")).unwrap_err(),
-            "This chat already has 3 delegated tasks running. Wait for their reports."
-        );
+        assert!(h.call(FULL,args("codex","Task 3")).unwrap_err().starts_with("resource_limit:"));
 
         // At most 6 per user message, however many have stopped meanwhile.
         for child in first {
@@ -1741,10 +1738,7 @@ mod delegation {
         for child in second {
             stop(child).await.unwrap();
         }
-        assert_eq!(
-            h.call(FULL, args("codex", "Task 6")).unwrap_err(),
-            "Delegation limit for this request reached (6 tasks). Ask the user before delegating more."
-        );
+        assert!(h.call(FULL,args("codex","Task 6")).unwrap_err().starts_with("resource_limit:"));
 
         // The user's next message starts a new round with a fresh budget;
         // a results message does not.

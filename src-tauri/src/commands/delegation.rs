@@ -948,8 +948,9 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                     .as_str()
                     .ok_or_else(|| "task_id required".to_string())
                     .and_then(|id| {
-                        local_task_call(&self.app, &caller.thread_id, id, name == "task_cancel")
-                            .and_then(|r| {
+                        let work=||local_task_call(&self.app,&caller.thread_id,id,name=="task_cancel");
+                        let result=if let Some(control)=&caller.control {control.admit(work)}else{work()};
+                        result.and_then(|r| {
                                 r.ok_or_else(|| {
                                     "Use the remote task adapter for SSH task IDs".into()
                                 })
@@ -1150,8 +1151,8 @@ fn delegate_with_call<R: Runtime>(
     record.caller = caller.control.clone().map(|mut caller|{caller.admitted=Some(crate::agent_control::AdmittedAuthority::Task {task_id:record.task_id.clone()});caller});
     record.admission_generation = Some(admission_generation);
     record.wait_until = wait_until;
-    let (record, new) =
-        db.admit_delegation_task(&record, args.client_request_id.as_deref(), &payload)?;
+    let admit=||db.admit_delegation_task(&record,args.client_request_id.as_deref(),&payload);
+    let (record,new)=if let Some(control)=&caller.control {control.admit(admit)?}else{admit()?};
     if !new {
         return Ok(task_receipt(&record));
     }
@@ -1191,6 +1192,17 @@ fn delegate_with_call<R: Runtime>(
     state.emit_card(app, &child);
     tauri::async_runtime::spawn(run_starter(app.clone(), child, pane_id, cwd.into()));
     Ok(task_receipt(&record))
+}
+
+pub(crate) fn resume_followup<R:Runtime>(app:&AppHandle<R>,delivery:&str){
+    let (Some(db),Some(state))=(app.try_state::<DatabaseStore>(),app.try_state::<DelegationState>()) else{return;};
+    let Ok(Some(record))=db.delegation_task(&format!("local:followup:{delivery}")) else{return;};
+    let (Some(child),Some(provider))=(record.child_thread_id.clone(),parse_provider(&record.provider)) else{return;};
+    let mut inner=state.lock();
+    if inner.tasks.get(&child).is_some_and(|t|t.task_id==record.task_id){return;}
+    let mut task=Task::new(&record.parent_thread_id,provider,&record.title,&record.brief,record.created_at).with_identity(record.task_id);
+    task.phase=Phase::Running;task.model=record.model;task.effort=record.effort;task.refresh_activity();inner.tasks.insert(child.clone(),task);drop(inner);
+    state.emit_card(app,&child);
 }
 
 impl DelegationState {

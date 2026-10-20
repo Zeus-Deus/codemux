@@ -3003,6 +3003,9 @@ async fn handle_dynamic_tool_call_native(
     let dispatched = match (registry, parsed) {
         (Some(registry), Ok(call)) => {
             let name = registry_tool_name(&call.tool);
+            if host.is_some() && actor.is_none() {
+                return json!({"success":false,"contentItems":[{"type":"inputText","text":"stale_caller: injected tools require the app-owned live session and run; provider-native children cannot borrow its identity"}]});
+            }
             // Host tools answer synchronously (no provider waits), which
             // matters here: this request loop handles approvals too. They act
             // as the root chat, so a call from another thread (a native
