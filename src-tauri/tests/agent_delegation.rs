@@ -2217,11 +2217,15 @@ async fn delegation_delivery_agent_cancel_has_distinct_result_wording() {
 
 #[tokio::test]
 async fn delegation_delivery_wait_uses_one_deadline_including_admission_work() {
-    let h = Harness::with_install_check(|_| { std::thread::sleep(Duration::from_millis(80)); true }).await;
+    static INSTALL_ENTERED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let h = Harness::with_install_check(|_| {
+        INSTALL_ENTERED.store(now_ms(), std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(80));
+        true
+    }).await;
     let input = json!({"provider":"codex","title":"Bounded wait","task":TASK,"mode":"wait","wait_ms":20});
-    let before = now_ms();
     let receipt = h.call(FULL, input).unwrap();
     let task = h.db().delegation_task(receipt["task_id"].as_str().unwrap()).unwrap().unwrap();
-    assert!(task.wait_until.unwrap() <= before + 20, "admission must not extend the wait budget");
+    assert!(task.wait_until.unwrap() <= INSTALL_ENTERED.load(std::sync::atomic::Ordering::SeqCst) + 20, "admission must not extend the wait budget");
     assert_eq!(receipt["wait_until"].as_i64(), task.wait_until);
 }
