@@ -298,6 +298,9 @@ impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
         self.app.state::<DatabaseStore>().message_delivery_submitting(&self.id)
             .map_err(|message| crate::agent_provider::ProviderError::ValidationError { message })
     }
+    fn verify_dispatch(&self) -> Result<(), crate::agent_provider::ProviderError> {
+        self.verify_authority()
+    }
     async fn prepare(&self) {
         if let Some(inner) = &self.inner { inner.prepare().await; }
     }
@@ -313,6 +316,9 @@ impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
             warn_held(&self.app, &self.thread, reason);
         }
         if let Some(inner) = &self.inner { inner.abort().await; }
+    }
+    async fn defer(&self) {
+        if let Some(inner) = &self.inner { inner.defer().await; }
     }
 }
 impl<R: Runtime> DeliveryCheckpoint<R> {

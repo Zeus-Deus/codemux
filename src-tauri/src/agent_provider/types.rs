@@ -102,6 +102,9 @@ pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
     /// Plain Git snapshots have no caller; the native owner wraps controlled
     /// inputs with a live authority check regardless of checkpoint settings.
     fn authorize_dispatch(&self) -> Result<(), super::ProviderError> { Ok(()) }
+    /// Check authority before asynchronous preparation without recording a
+    /// submission attempt. The adapter still authorizes at the wire boundary.
+    fn verify_dispatch(&self) -> Result<(), super::ProviderError> { self.authorize_dispatch() }
     /// Check a human queue promotion before it can interrupt another turn.
     /// This must not record a provider submission.
     fn authorize_queue_promotion(&self) -> Result<(), super::ProviderError> {
@@ -119,6 +122,8 @@ pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
     async fn prepare(&self);
     async fn commit(&self);
     async fn abort(&self);
+    /// Normal scheduling deferral: roll back preparation, retaining delivery.
+    async fn defer(&self) { self.abort().await; }
 }
 
 #[async_trait]
