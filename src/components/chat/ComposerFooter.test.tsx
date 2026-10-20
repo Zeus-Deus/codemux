@@ -102,7 +102,7 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     ).toBeNull();
   });
 
-  it("does NOT render an inline ModePill (it lives above the textarea now)", () => {
+  it("does NOT render the mode tab (it sits on the card's top edge)", () => {
     renderFooter({ mode: "plan" });
     expect(
       screen.queryByRole("status", { name: /Plan mode active/i }),

@@ -189,7 +189,7 @@ describe("Composer pill collapse", () => {
         { id: "i", kind: "image", ref: "image:1", metadata: { label: "a.png" } },
       ],
     }],
-    ["an active mode pill", { mode: "plan" }],
+    ["an active mode", { mode: "plan" }],
   ])("expands for %s", (_name, props) => {
     const { wrapper } = renderComposer(props);
     expect(wrapper()).toHaveAttribute("data-expanded");

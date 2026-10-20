@@ -16,7 +16,7 @@ import type { ChatMode } from "@/stores/agent-chat-store";
 import type { ProviderSlashCommand } from "@/tauri/commands";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { sessionProviderLabel } from "./session-mentions";
-import type { ActivePillMode } from "@/components/chat/pickers/ModePill";
+import type { ActivePillMode } from "@/components/chat/pickers/ModeTab";
 
 import { type GoalSubcommandWord } from "./goal";
 

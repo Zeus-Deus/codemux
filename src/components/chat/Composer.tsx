@@ -123,7 +123,7 @@ import { ProviderCommandsDialog } from "./ProviderCommandsDialog";
 import { useUIStore } from "@/stores/ui-store";
 import { ComposerCommandMenu } from "./ComposerCommandMenu";
 import { ComposerFooter } from "./ComposerFooter";
-import { ModePill, type ActivePillMode } from "./pickers/ModePill";
+import { ModeTab, type ActivePillMode } from "./pickers/ModeTab";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
 import { StoreSlashCommandPopup } from "./SlashCommandPopup";
@@ -1944,7 +1944,7 @@ export function Composer({
       const mainRows: SlashCommandItem[] = [
         // MODES — design tones (sky / amber / violet) on the icon
         // chips; the lucide icons stay in sync with MODE_CONFIG /
-        // ModePill so the picked mode's pill shows the same glyph.
+        // ModeTab so the picked mode's tab shows the same glyph.
         {
           id: "mode:plan",
           label: "Plan",
@@ -3231,6 +3231,12 @@ export function Composer({
             {cwd}
           </div>
         ) : null}
+        {/* The active mode's tab rides the top edge of whatever is
+            docked above the card, so the stack reads tab → strip → card. */}
+        <ModeTab
+          mode={mode === "default" ? null : (mode as ActivePillMode)}
+          onRemove={onModeRemove}
+        />
         {stripSlot ?? null}
         <div
           ref={wrapperRef}
@@ -3443,15 +3449,12 @@ export function Composer({
               {unsupportedAcpImages && <p role="alert" className="px-3 pt-2 text-body-sm text-muted-foreground">This custom agent does not advertise image support. Remove image attachments to send a text prompt.</p>}
               {provider === "acp" && !customAgentsAllowed && <p role="alert" className="px-3 pt-2 text-body-sm text-muted-foreground">Custom agents are local-workspace only. Create a local chat to use this harness.</p>}
               {provider === "acp" && (acp.error || acp.loading || acp.warning) && <p role={acp.error ? "alert" : "status"} className="px-3 pt-2 text-body-sm text-muted-foreground">{acp.error ?? acp.warning ?? "Restoring custom agent identity…"}</p>}
-              {/* Step 8 Stage 3 refactor — strip above textarea hosts
-                  the active mode pill + image attachment chips. File /
-                  folder chips render INSIDE the textarea via the mirror
-                  overlay below; images can't live inline as text so they
-                  stay here. The mode pill moved out of the footer when
-                  the `+ Mode` dropdown was retired in favour of the
-                  unified `+` popup. */}
-              {(mode !== "default" ||
-                pendingCommand !== null ||
+              {/* Strip above the textarea hosts image / PR / session
+                  attachment chips. File / folder chips render INSIDE the
+                  textarea via the mirror overlay below; images can't live
+                  inline as text so they stay here. The active mode is a
+                  tab on the card's top edge (`ModeTab`), not a chip. */}
+              {(pendingCommand !== null ||
                 stagedAttachments.some(
                   (a) =>
                     a.kind === "image" ||
@@ -3503,8 +3506,8 @@ export function Composer({
                     </span>
                   )}
                   {/* Dead-run recovery (issue #154): a one-click chip that
-                      resumes the interrupted run. Amber-tinted, mirroring
-                      ModePill's shape. */}
+                      resumes the interrupted run. Amber-tinted, in the
+                      attachment chips' shape. */}
                   {interrupted && !streaming && !sending && onContinueRun && (
                     <button
                       type="button"
@@ -3515,12 +3518,6 @@ export function Composer({
                       <RotateCw className="size-3" aria-hidden />
                       <span>Continue run</span>
                     </button>
-                  )}
-                  {mode !== "default" && (
-                    <ModePill
-                      mode={mode as ActivePillMode}
-                      onRemove={onModeRemove}
-                    />
                   )}
                   {stagedAttachments
                     .filter(

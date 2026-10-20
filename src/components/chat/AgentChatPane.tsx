@@ -208,7 +208,7 @@ import {
 import { questionAnswerText } from "./QuestionForm";
 import type { SendAnchorRequest } from "./send-scroll-state";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
-import type { ActivePillMode } from "./pickers/ModePill";
+import type { ActivePillMode } from "./pickers/ModeTab";
 import { ComposerContextRow } from "./ComposerContextRow";
 import { MobileComposerChips } from "@/components/mobile/mobile-composer-chips";
 import { RevertTurnDialog } from "./revert-turn-dialog";
