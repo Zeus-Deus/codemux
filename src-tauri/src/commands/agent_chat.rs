@@ -6836,14 +6836,42 @@ pub async fn agent_chat_delete_session<R: Runtime>(
 
 /// Resume creates a fresh DB row (new thread_id) carrying the same
 /// sdk_session_id as the original. Collapse the duplicates so the dropdown
-/// doesn't grow unboundedly, unless a pull-request wake already committed
-/// for one of the rows that would go is about to send to it.
-fn collapse_resumed_duplicates<R: Runtime>(app: &AppHandle<R>, db: &DatabaseStore, sdk_session_id: &str) {
+/// doesn't grow unboundedly, but only while the rows that would go are idle,
+/// as for a reopen ([`merge_reopened_chat`]): open in no pane, not
+/// dispatching (their dispatch locks are held, without waiting, through the
+/// collapse), with no live session and no pull-request wake on its way.
+async fn collapse_resumed_duplicates<R: Runtime>(app: &AppHandle<R>, sdk_session_id: &str) {
+    let db = app.state::<DatabaseStore>();
+    let state = app.state::<AppStateStore>();
+    let registry = app.state::<ProviderRegistry>();
+    let mut busy = std::collections::HashSet::new();
+    let mut held = Vec::new();
+    for (thread, provider) in db.agent_chat_threads_for_sdk_session(sdk_session_id) {
+        let gate = native_thread_gate(app, &thread);
+        let Ok(guard) = gate.dispatch.clone().try_lock_owned() else {
+            busy.insert(thread);
+            continue;
+        };
+        let live = match serde_json::from_value::<ProviderKind>(serde_json::json!(provider)) {
+            Ok(kind) => match lookup_provider(&registry, kind).await {
+                Ok(provider) => provider.has_session(&ThreadId(thread.clone())).await,
+                Err(_) => true,
+            },
+            Err(_) => false,
+        };
+        if live || state.agent_chat_pane_id_for_thread(&thread).is_some() {
+            busy.insert(thread);
+        } else {
+            held.push(guard);
+        }
+    }
     let collapsed = crate::pr_watch::unless_any_waking(|waking| {
-        db.collapse_duplicate_agent_chat_sessions_sparing(sdk_session_id, waking)
+        busy.extend(waking.iter().cloned());
+        db.collapse_duplicate_agent_chat_sessions_sparing(sdk_session_id, &busy)
     });
+    drop(held);
     match collapsed {
-        Ok(cleanup) => agent_chat_sessions_merged(app, db, cleanup),
+        Ok(cleanup) => agent_chat_sessions_merged(app, &db, cleanup),
         Err(error) => eprintln!("[codemux::agent_chat] failed to collapse duplicates: {error}"),
     }
 }
@@ -7630,7 +7658,11 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             if let Err(error) = db.set_agent_chat_sdk_session_id(&thread_id.0, &sdk_session_id) {
                 eprintln!("[codemux::agent_chat] failed to persist sdk_session_id: {error}");
             }
-            collapse_resumed_duplicates(app, &db, &sdk_session_id);
+            let app = app.clone();
+            let sdk_session_id = sdk_session_id.clone();
+            tauri::async_runtime::spawn(async move {
+                collapse_resumed_duplicates(&app, &sdk_session_id).await;
+            });
         } else if resume_cursor.is_null() {
             // A JSON-null cursor is the stale-session recovery signal (the
             // sidecar rebuilt a fresh query because the persisted id's
@@ -11388,18 +11420,29 @@ mod tests {
         let waking = crate::pr_watch::tests_claim_waking("old");
         merge().await;
         assert!(db.get_agent_chat_session("old").is_some(), "a committed PR wake is on its way");
-        // Nor does a matching provider session id collapse it meanwhile
-        // (both rows are marked: they share a timestamp, so either could be
-        // the survivor; database tests pin which rows are spared).
-        let also_waking = crate::pr_watch::tests_claim_waking("reopened");
-        db.set_agent_chat_sdk_session_id("old", "native-1").unwrap();
-        db.set_agent_chat_sdk_session_id("reopened", "native-1").unwrap();
-        collapse_resumed_duplicates(&handle, &db, "native-1");
-        assert!(db.get_agent_chat_session("old").is_some());
-        assert!(db.get_agent_chat_session("reopened").is_some());
-        drop((waking, also_waking));
+        drop(waking);
 
-        merge().await;
+        // The collapse a matching provider session id triggers holds back
+        // the same way. "reopened" reports the id a second later, so it is
+        // the newest row: the survivor.
+        db.set_agent_chat_sdk_session_id("old", "native-1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        db.set_agent_chat_sdk_session_id("reopened", "native-1").unwrap();
+        provider.live.lock().unwrap().insert("old".into());
+        collapse_resumed_duplicates(&handle, "native-1").await;
+        assert!(db.get_agent_chat_session("old").is_some(), "its session still runs");
+        provider.live.lock().unwrap().clear();
+        let busy = gate.dispatch.clone().lock_owned().await;
+        collapse_resumed_duplicates(&handle, "native-1").await;
+        assert!(db.get_agent_chat_session("old").is_some(), "something is dispatching to it");
+        drop(busy);
+        let waking = crate::pr_watch::tests_claim_waking("old");
+        collapse_resumed_duplicates(&handle, "native-1").await;
+        assert!(db.get_agent_chat_session("old").is_some(), "a committed PR wake is on its way");
+        drop(waking);
+        // The survivor's own pane and session don't hold it back.
+        provider.live.lock().unwrap().insert("reopened".into());
+        collapse_resumed_duplicates(&handle, "native-1").await;
         assert!(db.get_agent_chat_session("old").is_none());
         assert!(db.get_agent_chat_session("reopened").is_some());
     }

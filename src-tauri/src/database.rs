@@ -4651,6 +4651,20 @@ impl DatabaseStore {
         self.collapse_duplicate_agent_chat_sessions_sparing(sdk_session_id, &HashSet::new())
     }
 
+    /// `(thread_id, provider)` of every chat on native session `sdk_session_id`.
+    pub fn agent_chat_threads_for_sdk_session(&self, sdk_session_id: &str) -> Vec<(String, String)> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut statement) = conn.prepare(
+            "SELECT thread_id, provider FROM agent_chat_sessions WHERE sdk_session_id = ?1",
+        ) else {
+            return Vec::new();
+        };
+        statement
+            .query_map(params![sdk_session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .and_then(|rows| rows.collect())
+            .unwrap_or_default()
+    }
+
     /// [`Self::collapse_duplicate_agent_chat_sessions`], skipped while any
     /// row that would be merged away is in `spared`.
     pub fn collapse_duplicate_agent_chat_sessions_sparing(
