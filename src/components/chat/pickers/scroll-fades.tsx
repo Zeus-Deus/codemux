@@ -25,11 +25,19 @@ export function useScrollEdges<T extends HTMLElement>(): [(node: T | null) => vo
     };
     sync();
     node.addEventListener("scroll", sync, { passive: true });
+    // The scroller's own box is fixed; its content is what grows, as rows
+    // come and go or a refreshed label wraps.
     const resize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(sync);
-    resize?.observe(node);
-    // Filtering swaps rows without changing the scroller's own box.
-    const mutation = new MutationObserver(sync);
-    mutation.observe(node, { childList: true, subtree: true });
+    const observeContent = () => {
+      resize?.observe(node);
+      for (const child of node.children) resize?.observe(child);
+    };
+    observeContent();
+    const mutation = new MutationObserver(() => {
+      observeContent();
+      sync();
+    });
+    mutation.observe(node, { childList: true, subtree: true, characterData: true });
     return () => {
       node.removeEventListener("scroll", sync);
       resize?.disconnect();
