@@ -562,6 +562,7 @@ impl ClaudeSession {
                     collect_mcp_tools(
                         mcp_registry.as_ref(),
                         &crate::mcp::registry::HostCaller {
+                            control: None,
                             thread_id: thread_id.0.clone(),
                             provider: crate::agent_provider::ProviderKind::Claude,
                             workspace_id: input.workspace_id.clone(),
@@ -1556,6 +1557,7 @@ impl ClaudeSession {
     /// This session as a host-tool caller, with its current permission mode.
     async fn host_caller(&self) -> crate::mcp::registry::HostCaller {
         crate::mcp::registry::HostCaller {
+            control: None,
             thread_id: self.thread_id.0.clone(),
             provider: crate::agent_provider::ProviderKind::Claude,
             workspace_id: self.workspace_id.clone(),
@@ -1683,6 +1685,7 @@ impl ClaudeSession {
                 message: "managed workflow tool permissions cannot be relaxed".into(),
             });
         }
+        if self.state.lock().await.permission_mode.as_deref() != Some(&mode) { self.native_authority.invalidate(); }
         let params = SetPermissionModeParams {
             thread_id: self.thread_id.0.clone(),
             mode: mode.clone(),
@@ -2378,6 +2381,7 @@ async fn collect_shared_tools_for_claude(
             caller.workspace_id.as_deref(),
         )
         .await;
+    tools.retain(crate::mcp::registry::native_tool_visible);
     let host_tools=registry.host_tools(caller);
     // App-owned task tools also serve local IDs; replace the SSH-only schema
     // rather than publishing duplicate names to the native provider.
@@ -2857,6 +2861,7 @@ mod tests {
 
     fn test_caller() -> crate::mcp::registry::HostCaller {
         crate::mcp::registry::HostCaller {
+            control: None,
             thread_id: "thread".into(),
             provider: crate::agent_provider::ProviderKind::Claude,
             workspace_id: Some("ws-42".into()),

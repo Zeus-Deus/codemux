@@ -585,6 +585,7 @@ impl CodexSession {
         }
 
         let host_caller = crate::mcp::registry::HostCaller {
+            control: None,
             thread_id: thread_id.0.clone(),
             provider: crate::agent_provider::ProviderKind::Codex,
             workspace_id: workspace_id.clone(),
@@ -2848,7 +2849,7 @@ fn spawn_incoming_requests_task(
                             owned.then(|| crate::delegation::app::NativeActor {
                                 thread_id: session.thread_id.0.clone(), provider: crate::agent_provider::ProviderKind::Codex,
                                 workspace_id: session.workspace_id.clone(), session_id: session.provider_session_id.0.clone(),
-                                permission_mode: state.permission_mode.clone(),
+                                permission_mode: if session.plan_mode.load(Ordering::SeqCst) { Some("plan".into()) } else { state.permission_mode.clone() },
                                 permit: session.native_authority.capture_for_turn(turn.unwrap()),
                             })
                         };
@@ -2944,6 +2945,7 @@ async fn dynamic_tool_specs(
             .list_tools_for_workspace(&[crate::mcp::McpConfigSource::CodexUser], host_caller.workspace_id.as_deref())
             .await
     };
+    tools.retain(crate::mcp::registry::native_tool_visible);
     let host_tools=registry.host_tools(host_caller);
     // App-owned task tools also serve local IDs; replace the SSH-only schema
     // rather than publishing duplicate names to the native provider.
@@ -3010,6 +3012,9 @@ async fn handle_dynamic_tool_call_native(
                 if call.thread_id==root_thread {registry.host_call_native(caller,&name,&call.arguments,Some(&call.call_id),Some(&call.turn_id),actor.as_ref().map(|actor| &actor.permit)).await}
                 else {registry.host_tools(caller).iter().any(|tool|tool.prefixed_name==name).then(||json!({"content":[{"type":"text","text":"This tool requires the app-owned root conversation"}],"isError":true}))}
             } else {None};
+            if actor.is_none() && crate::agent_control::native::tool_name(&name).is_some() {
+                return json!({"success":false,"contentItems":[{"type":"inputText","text":"stale_caller: orchestration requires an app-owned live thread; provider-native child sessions cannot borrow its identity"}]});
+            }
             let bridge = registry.call_plugin_bridge(&name, call.arguments.clone(), workspace_id, direct_tools).await;
             match host {
                 _ if bridge.is_some() => bridge.unwrap(),
@@ -3786,10 +3791,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_tools_answer_only_the_root_thread() {
+    async fn unqualified_and_provider_native_children_cannot_borrow_host_identity() {
         let registry = McpRegistry::new();
         registry.set_host_tools(Arc::new(HandOffHost));
         let caller = crate::mcp::registry::HostCaller {
+            control: None,
             thread_id: "codemux-chat".into(),
             provider: crate::agent_provider::ProviderKind::Codex,
             workspace_id: None,
@@ -3817,8 +3823,8 @@ mod tests {
             Some(actor), &[],
         )
         .await;
-        assert_eq!(root["success"], true, "{root}");
-        assert_eq!(root["contentItems"][0]["text"], "as codemux-chat");
+        assert_eq!(root["success"], false, "a root id alone is not authenticated authority: {root}");
+        assert!(root["contentItems"][0]["text"].as_str().unwrap().contains("stale_caller"));
 
         // A native subagent that inherited the dynamic tools has its own
         // thread id and must not act as the root chat.
@@ -3877,7 +3883,7 @@ mod tests {
 
     #[tokio::test]
     async fn plugin_mcp_codex_payload_has_guidance_and_hides_private_servers() {
-        let caller=crate::mcp::registry::HostCaller {thread_id:"thread".into(),provider:crate::agent_provider::ProviderKind::Codex,workspace_id:Some("ws".into()),permission_mode:None};
+        let caller=crate::mcp::registry::HostCaller {control: None,thread_id:"thread".into(),provider:crate::agent_provider::ProviderKind::Codex,workspace_id:Some("ws".into()),permission_mode:None};
         for scope in ["all","plugin"] {
             let registry=crate::mcp::registry::test_support::plugin_fixture(scope).await;
             let tools=dynamic_tool_specs(Some(&registry),false,&caller).await.unwrap();
@@ -3893,6 +3899,7 @@ mod tests {
         let (_server, registry, call) =
             crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
         let caller = crate::mcp::registry::HostCaller {
+            control: None,
             thread_id: "codemux-chat".into(),
             provider: crate::agent_provider::ProviderKind::Codex,
             workspace_id: Some("ws-42".into()),

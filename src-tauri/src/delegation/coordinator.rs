@@ -314,7 +314,7 @@ fn install_store<R: Runtime>(handle: &AppHandle<R>, store: Arc<Journal>) -> Resu
         .state::<crate::mcp::registry::McpRegistry>()
         .set_native_delegation_handler(Arc::new(move |actor, name, args| {
             let handle = callback_handle.clone();
-            Box::pin(async move { app::native_call(handle, actor, name, args).await })
+            Box::pin(async move { crate::agent_control::native::call(handle, actor, name, args).await })
         }));
     restore_tasks(handle, &store)?;
     handle.state::<Coordinator>().start_maintenance(handle.clone())?;

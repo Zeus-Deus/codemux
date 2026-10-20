@@ -595,6 +595,10 @@ pub(super) fn admit_in_transaction(
             }
             return Ok((id, false));
         }
+        if payload["caller"]["identity"]["kind"] == "thread" && payload["provenance"]["created_by"] == "agent" {
+            let sender=payload["caller"]["identity"]["thread_id"].as_str().ok_or("Missing agent sender")?;
+            super::delegation_tasks::admit_agent_message(tx,sender,thread,id)?;
+        }
         let (principal, operation_id) = match &operation {
             Some(op) => {
                 tx.execute("INSERT INTO agent_control_operations (id,principal,request_key,tool,payload_hash,epoch,state,workspace_id,thread_id,admitted_payload,dispatch_disposition,delivery_id)

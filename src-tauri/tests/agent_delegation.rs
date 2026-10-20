@@ -269,6 +269,7 @@ impl Harness {
 
     fn caller(&self, mode: Option<&str>) -> HostCaller {
         HostCaller {
+            control: None,
             thread_id: self.parent.clone(),
             provider: ProviderKind::Claude,
             workspace_id: Some(self.workspace.clone()),
@@ -1590,29 +1591,9 @@ mod delegation {
             .tabs
             .len();
 
-        // The Plan/Ask pills switch Claude's live mode to plan.
-        assert_eq!(
-            h.call(Some("plan"), args("codex", "Add slugify helper"))
-                .unwrap_err(),
-            "Delegation needs this chat in Full access; it is in Plan mode. Switch to Full access to delegate."
-        );
-        // Accepting a plan leaves Claude in its default (Supervised) mode.
-        assert_eq!(
-            h.call(Some("default"), args("codex", "Add slugify helper"))
-                .unwrap_err(),
-            "Delegation needs this chat in Full access; it is in Supervised. Switch to Full access to delegate."
-        );
-        // A Codex chat started outside Full access.
-        let codex_parent = HostCaller {
-            provider: ProviderKind::Codex,
-            permission_mode: Some("workspace-write".into()),
-            ..h.caller(None)
-        };
-        assert_eq!(
-            h.call_as(&codex_parent, args("claude", "Review the parser"))
-                .unwrap_err(),
-            "Delegation needs this chat in Full access; it is in Workspace write. Switch to Full access to delegate."
-        );
+        // Explicit escalation is rejected even though tools are visible in Plan.
+        let mut escalation=args("codex", "Add slugify helper");escalation["permission_mode"]=json!("danger-full-access");
+        assert!(h.call(Some("plan"),escalation).unwrap_err().contains("permission_ceiling"));
         assert_eq!(
             h.call(FULL, args("cursor", "Add slugify helper"))
                 .unwrap_err(),
@@ -1631,6 +1612,7 @@ mod delegation {
             "Write a complete, self-contained task (at least 20 characters)."
         );
         let homeless = HostCaller {
+            control: None,
             thread_id: unique("no-pane"),
             workspace_id: None,
             ..h.caller(FULL)
@@ -1675,7 +1657,7 @@ mod delegation {
     }
 
     #[tokio::test]
-    async fn the_tool_is_listed_for_full_access_parents_only() {
+    async fn the_tool_is_listed_in_all_modes_and_for_app_owned_children() {
         let h = Harness::with_install_check(|kind| kind != ProviderKind::Cursor).await;
         let listed = |caller: &HostCaller| {
             h.host
@@ -1694,14 +1676,16 @@ mod delegation {
         );
         // Codex decides once, from the mode its session started in.
         let codex = |mode: &str| HostCaller {
+            control: None,
             provider: ProviderKind::Codex,
             permission_mode: Some(mode.into()),
             ..h.caller(None)
         };
         assert_eq!(listed(&codex("danger-full-access")).len(), 1);
-        assert!(listed(&codex("workspace-write")).is_empty());
+        assert_eq!(listed(&codex("workspace-write")).len(),1);
         // Other providers never orchestrate.
         let cursor = HostCaller {
+            control: None,
             provider: ProviderKind::Cursor,
             ..h.caller(None)
         };
@@ -1712,17 +1696,15 @@ mod delegation {
             .delegate_and_dispatch(args("codex", "Add slugify helper"))
             .await;
         let child_caller = HostCaller {
+            control: None,
             thread_id: child.clone(),
             provider: ProviderKind::Codex,
             workspace_id: Some(h.workspace.clone()),
             permission_mode: Some("danger-full-access".into()),
         };
-        assert!(listed(&child_caller).is_empty());
-        assert_eq!(
-            h.call_as(&child_caller, args("claude", "Review the parser"))
-                .unwrap_err(),
-            "A delegated task cannot delegate further."
-        );
+        assert_eq!(listed(&child_caller).len(),1);
+        let nested=h.call_as(&child_caller,args("claude","Review the parser")).unwrap();
+        assert!(nested["task_id"].is_string());
     }
 
     #[tokio::test]

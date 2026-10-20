@@ -37,6 +37,11 @@ pub(crate) fn workspace<R: Runtime>(app: &AppHandle<R>, id: &str, mutation: bool
 /// The connector owns authentication; these checks own the worker ceiling.
 /// Unknown provider mode semantics fail closed for supervised credentials.
 pub(crate) fn permission_ceiling(caller: &ControlCaller, provider: ProviderKind, mode: Option<&str>) -> Result<(), ControlError> {
+    if let Some(ceiling) = caller.ceiling() {
+        return if super::permissions::Ceiling::for_mode(provider, mode).is_some_and(|target| ceiling.permits(target)) {
+            Ok(())
+        } else { Err(ControlError::new("permission_ceiling", "Target mode exceeds this chat's effective native policy")) };
+    }
     if caller.access == ControlAccess::ReadOnly {
         return Err(ControlError::new("permission_denied", "This connection has read-only access"));
     }
@@ -53,6 +58,36 @@ pub(crate) fn permission_ceiling(caller: &ControlCaller, provider: ProviderKind,
 }
 
 pub(crate) fn authorize<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller) -> Result<(), ControlError> {
+    if let super::CallerPrincipal::Thread { thread_id, provider, authority, ceiling, .. } = &caller.identity {
+        let db = app.state::<DatabaseStore>();
+        match &caller.admitted {
+            None => authority.verify(thread_id).map_err(|e| ControlError::new("stale_caller", e))?,
+            Some(super::AdmittedAuthority::Operation {operation_id}) => {
+                let receipt=db.control_operation(&caller.principal,operation_id,&app.state::<NativeControlState>().epoch)?.ok_or_else(||ControlError::new("stale_operation","Accepted operation missing"))?;
+                if receipt.tool!="thread_launch" || !matches!(receipt.state.as_str(),"accepted"|"running") {return Err(ControlError::new("stale_operation","Accepted launch ended or was revoked"));}
+            }
+            Some(super::AdmittedAuthority::Task {task_id}) => {
+                let task=db.delegation_task(task_id)?.ok_or_else(||ControlError::new("stale_task","Accepted task missing"))?;
+                if task.parent_thread_id!=*thread_id || task.cancellation_generation>0 || task.status.terminal() {return Err(ControlError::new("stale_task","Accepted task was stopped or ended"));}
+            }
+            Some(super::AdmittedAuthority::Delivery {delivery_id}) => {
+                let row=db.message_delivery(delivery_id)?.ok_or_else(||ControlError::new("stale_delivery","Accepted message missing"))?;
+                if row.payload["caller"]["principal"]!=caller.principal || matches!(row.state.as_str(),"disposed"|"held"|"held_unknown"|"rejected") {return Err(ControlError::new("stale_delivery","Accepted message authority was revoked"));}
+            }
+        }
+        if !crate::commands::delegation::setting_on(&db) { return Err(ControlError::new("orchestration_disabled", "Agent collaboration is off in Settings")); }
+        let record = db.get_agent_chat_session(thread_id).ok_or_else(|| ControlError::new("stale_caller", "Calling chat no longer exists"))?;
+        let bound = app.state::<AppStateStore>().agent_chat_pane_id_for_thread(thread_id)
+            .and_then(|pane| app.state::<AppStateStore>().agent_chat_pane_thread(&pane));
+        if bound != Some((*provider, thread_id.clone())) || record.provider != crate::commands::delegation::provider_id(*provider) || record.imported_from.is_some() {
+            return Err(ControlError::new("stale_caller", "Calling chat binding changed"));
+        }
+        let canonical = super::permissions::Ceiling::for_mode(*provider, record.permission_mode.as_deref())
+            .ok_or_else(|| ControlError::new("unsupported_permission_ceiling", "Canonical chat mode is unknown"))?;
+        if !canonical.permits(*ceiling) { return Err(ControlError::new("permission_ceiling", "Calling chat policy was narrowed after admission")); }
+        workspace(app, &record.workspace_id, true)?;
+        return Ok(());
+    }
     crate::mcp_connector::validate_caller(app,caller)
 }
 
@@ -115,8 +150,9 @@ pub(crate) async fn launch<R: Runtime>(app: &AppHandle<R>, caller: &ControlCalle
     let receipt = serde_json::to_value(&admitted.receipt).map_err(|e|ControlError::new("serialization_failed",e.to_string()))?;
     if !admitted.newly_admitted { return Ok(receipt); }
     let app = app.clone();
-    let caller = caller.clone();
+    let mut caller = caller.clone();
     let operation = admitted.receipt.operation_id;
+    if caller.thread_id().is_some(){caller.admitted=Some(super::AdmittedAuthority::Operation{operation_id:operation.clone()});}
     tauri::async_runtime::spawn(async move {
         let db = app.state::<DatabaseStore>();
         if db.update_control_operation(&caller.principal, &operation, &epoch, "running", None, None, None, None).is_err() { return; }
@@ -139,7 +175,8 @@ async fn validate_worker<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller,
         return Err(ControlError::new("provider_not_configured", "The selected provider is not configured in CodeMux"));
     }
     let caps = capabilities(app, input.provider).await?;
-    if !(caps.permission_modes.is_empty() && input.permission_mode.is_none())
+    let native_plan = input.provider==ProviderKind::Claude && input.permission_mode.as_deref()==Some("plan");
+    if !native_plan && !(caps.permission_modes.is_empty() && input.permission_mode.is_none())
         && !caps.permission_modes.iter().any(|option| Some(&option.value) == input.permission_mode.as_ref()) {
         return Err(ControlError::new("unsupported_permission_mode", "Select an exact mode from agent_capabilities"));
     }
@@ -175,7 +212,7 @@ impl PreparedWorkspaceChat {
     ) -> Result<Self, ControlError> {
         let input = Launch {
             workspace_id: String::new(), client_request_id: uuid::Uuid::new_v4().to_string(),
-            provider, permission_mode: crate::commands::agent_chat::fallback_permission_mode(provider).map(str::to_string),
+            provider, permission_mode: if let Some(ceiling)=caller.ceiling() {Some(ceiling.inherited(provider)?)} else if caller.access==ControlAccess::FullAccess {crate::commands::agent_chat::fallback_permission_mode(provider).map(str::to_string)} else {return Err(ControlError::new("unsupported_permission_ceiling","Explicit reviewed worker policy required"));},
             title: Some(title), message: Some(message), model, effort,
             context_window: None, fast_mode: false, select: false, worktree: None,
         };
@@ -224,9 +261,12 @@ async fn materialize<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, inp
     let turn = if let Some(message) = input.message {
         let command: SendTurnCommandInput = serde_json::from_value(json!({
             "thread_id": thread, "text": message, "delivery":"queue", "model_override":null,
+            "permission_mode_override": if input.provider == ProviderKind::Codex && caller.ceiling().is_some_and(|c| c.plan) {Some("plan")} else {None},
             "client_nonce": input.client_request_id,
         })).map_err(|e| ControlError::new("invalid_arguments", e.to_string()))?;
-        Some(agent_chat::send_turn_with_control(app.clone(), input.provider, command, Some(control)).await?)
+        let mut context = super::delivery::SendContext::controller(caller);
+        context.control = Some(control);
+        Some(agent_chat::send_turn_with_context(app.clone(), input.provider, command, context).await?)
     } else { None };
     Ok(json!({"workspace_id":input.workspace_id,"thread_id":thread,"pane_id":pane,"turn":turn}))
 }
@@ -269,11 +309,11 @@ pub(crate) fn thread_list<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result
     Ok(json!({"threads":threads,"has_more":has_more,"next_cursor":next_cursor}))
 }
 
-pub(crate) fn thread_read<R: Runtime>(app: &AppHandle<R>, args: Value) -> Result<Value, ControlError> {
+pub(crate) fn thread_read<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     #[derive(Deserialize)] #[serde(deny_unknown_fields)]
     struct Args { workspace_id: String, thread_id: String, cursor: Option<i64>, limit: Option<u32> }
     let args: Args = parse(args)?;
-    workspace(app, &args.workspace_id, false)?;
+    if caller.thread_id().is_none() { workspace(app, &args.workspace_id, false)?; }
     identifier(&args.thread_id, "thread_id", 256)?;
     let limit = args.limit.unwrap_or(20);
     if !(1..=100).contains(&limit) || args.cursor.is_some_and(|cursor| cursor < 0) {
@@ -411,6 +451,7 @@ pub(crate) async fn thread_send<R: Runtime>(
     permission_ceiling(caller, provider, record.permission_mode.as_deref())?;
     let id = uuid::Uuid::new_v4().to_string();
     let mut context = super::delivery::SendContext::controller(caller);
+    context.provenance.sender_title=caller.thread_id().and_then(|thread|app.state::<DatabaseStore>().get_agent_chat_title(thread));
     context.provenance.message_id = Some(id.clone());
     let control = NativeControlGuard { caller:caller.clone(),workspace_id:input.workspace_id.clone(),thread_id:input.thread_id.clone(),provider,admission:None }.retain_admission(app);
     let command: SendTurnCommandInput = serde_json::from_value(json!({
@@ -634,7 +675,12 @@ pub(crate) async fn thread_stop<R: Runtime>(app: &AppHandle<R>, caller: &Control
 pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     #[derive(Deserialize)] #[serde(deny_unknown_fields)]
     struct Args { workspace_id: String, thread_id: String, turn_id: Option<String>, timeout_ms: Option<u64> }
-    let args: Args = parse(args)?;
+    let mut args: Args = parse(args)?;
+    if args.turn_id.is_none() {
+        let initial=thread_status(app,json!({"workspace_id":args.workspace_id,"thread_id":args.thread_id})).await?;
+        if initial["settled"]==true {return Ok(json!({"timed_out":false,"settled":true,"status":initial}));}
+        args.turn_id=initial["turn_id"].as_str().map(str::to_string);
+    }
     let timeout = args.timeout_ms.unwrap_or(1000);
     if !(1..=20000).contains(&timeout) { return Err(ControlError::new("invalid_arguments","timeout_ms must be between 1 and 20000")); }
     if let Some(turn) = &args.turn_id { identifier(turn,"turn_id",256)?; }
@@ -666,6 +712,7 @@ pub(crate) async fn thread_respond<R: Runtime>(app: &AppHandle<R>, caller: &Cont
     enum Decision { AllowOnce, AllowAlways, Deny }
     #[derive(Deserialize)] #[serde(deny_unknown_fields)]
     struct Args { workspace_id: String, thread_id: String, client_request_id: String, request_id: String, decision: Decision }
+    if caller.thread_id().is_some() { return Err(ControlError::new("permission_denied","Agents cannot grant permission approvals")); }
     let input: Args = parse(args.clone())?;
     identifier(&input.client_request_id,"client_request_id",128)?;
     identifier(&input.request_id,"request_id",256)?;

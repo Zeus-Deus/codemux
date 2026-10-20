@@ -278,7 +278,7 @@ pub(crate) fn restoration_held<R: Runtime>(app: &AppHandle<R>, child: &str, reas
 }
 
 pub(super) fn task_receipt(record: &TaskRecord) -> Value {
-    json!({"task_id":record.task_id,"child_thread_id":record.child_thread_id,"status":record.status,"result":record.result,
+    json!({"task_id":record.task_id,"child_thread_id":record.child_thread_id,"chat_url":record.child_thread_id.as_ref().map(|id|format!("codemux-chat://v1/{id}")),"status":record.status,"result":record.result,
         "started":{"task_id":record.task_id,"child_thread_id":record.child_thread_id,"thread":record.child_thread_id,"title":record.title,"provider":record.provider,"model":record.model,"effort":record.effort},
         "wait_until":record.wait_until,"preparation_state":record.preparation_state,"note":"This task is durable. Each finished result is delivered independently. For another round use a fresh delegation key and a complete brief."})
 }

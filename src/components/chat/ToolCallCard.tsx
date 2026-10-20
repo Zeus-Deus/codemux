@@ -1,3 +1,5 @@
+import { launchedChatId } from "@/lib/agent-chat/codemux-tool-presentation";
+import { openDelegatedChat } from "./delegation-actions";
 import { isWorkspaceLaunchCall, workspaceLaunchFailed } from "@/lib/agent-chat/workspace-launch";
 import { Kbd } from "@/components/ui/kbd";
 import { HermesPermissionOptions, isHermesPermission, hermesPermissionAllowed } from "./HermesPermissionOptions";
@@ -164,6 +166,7 @@ export const ToolCallCard = memo(function ToolCallCard({
     isError,
   });
 
+  const launchedThread = displayItem.tool_name.split("__").pop() === "thread_launch" && item.status === "done" ? launchedChatId(item.result_content) : null;
   const hasResultBody = hasRenderableContent(item.result_content);
   const inputText = hasRenderableInput(displayItem.input)
     ? safeStringify(displayItem.input)
@@ -260,6 +263,7 @@ export const ToolCallCard = memo(function ToolCallCard({
         <div className={headerClass}>{headerContent}</div>
       )}
 
+      {launchedThread && <div className="flex items-center justify-between gap-3 border-t border-border/60 p-3 text-body-sm"><span>Started chat{typeof (displayItem.input as Record<string, unknown> | null)?.title === "string" ? ` · ${(displayItem.input as Record<string, unknown>).title}` : ""}</span><Button variant="outline" size="xs" onClick={() => void openDelegatedChat(launchedThread)}>Open chat</Button></div>}
       {/* Approval footer (pending). Keyed on the approval request id so
           a fresh approval (different request_id) remounts the footer
           and clears the deny textarea / dropdown state — otherwise

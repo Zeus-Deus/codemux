@@ -33,7 +33,10 @@ for line in sys.stdin:
  if method=='turn/start':
   turn={'id':'turn-'+str(count),'status':'completed'}
   output({'method':'turn/started','params':{'threadId':'fixture-thread','turn':turn}})
-  output({'method':'turn/completed','params':{'threadId':'fixture-thread','turn':turn}})
+  if (root/'waiting-tools').exists():
+   output({'id':701,'method':'item/tool/call','params':{'threadId':'fixture-thread','turnId':turn['id'],'callId':'wait-call','tool':'codemux_mcp__codemux__thread_wait','arguments':{'thread_id':'target'}}})
+   output({'id':702,'method':'item/commandExecution/requestApproval','params':{'threadId':'fixture-thread','turnId':turn['id'],'itemId':'approval-item','command':'fixture command','cwd':str(root)}})
+  else: output({'method':'turn/completed','params':{'threadId':'fixture-thread','turn':turn}})
 "#;
     let source = source.replace(
         "__ROOT__",
@@ -403,4 +406,25 @@ fn turn_modes_answer_plan_whenever_a_turns_mode_is_uncertain() {
     }
     assert!(modes.is_plan(Some("t0")));
     assert!(!modes.is_plan(Some(&format!("t{RECENT_TURN_MODES}"))));
+}
+
+#[tokio::test]
+async fn native_wait_tool_does_not_block_codex_approval_reader() {
+    let dir=tempfile::tempdir().unwrap();std::fs::write(dir.path().join("waiting-tools"),"").unwrap();
+    let registry=crate::mcp::registry::McpRegistry::new();
+    let entered=Arc::new(tokio::sync::Notify::new());let release=Arc::new(tokio::sync::Semaphore::new(0));
+    let start=entered.clone();let gate=release.clone();
+    registry.set_native_delegation_handler(Arc::new(move |actor,name,_args|{let start=start.clone();let gate=gate.clone();Box::pin(async move {
+        assert_eq!(name,"thread_wait");actor.permit.admit()?;start.notify_one();gate.acquire().await.unwrap().forget();Ok(json!({"settled":false}))
+    })}));
+    let provider=CodexAgentProvider::new(CodexProviderConfig {codex_binary:fixture_binary(dir.path()),mcp_registry:Some(registry),..Default::default()});
+    let thread=ThreadId("native-wait-reader".into());let mut events=provider.event_tx.subscribe();
+    provider.start_session(start_input(dir.path(),&thread)).await.unwrap();
+    let mut input=super::tests::queued("read").input;input.thread_id=thread.clone();
+    provider.send_turn(input).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5),entered.notified()).await.unwrap();
+    let approval=tokio::time::timeout(Duration::from_secs(5),async{loop{if let Ok(ProviderRuntimeEvent::RequestOpened{request_kind,..})=events.recv().await {break request_kind;}}}).await;
+    release.add_permits(1);
+    provider.stop_session(thread).await.unwrap();
+    assert_eq!(approval.unwrap(),"command");
 }

@@ -1,6 +1,8 @@
 //! Typed control of application-owned native threads.
 pub mod catalog;
 mod types;
+pub(crate) mod permissions;
+pub(crate) mod native;
 mod state;
 pub(crate) mod service;
 mod guard;
@@ -10,7 +12,8 @@ pub(crate) use guard::GuardedTurnCheckpoint;
 pub(crate) use guard::NativeStartCancellation;
 pub use state::{NativeControlState, PendingApproval, ThreadRuntimeView};
 pub(crate) use state::ThreadGate;
-pub use types::{ControlAccess, ControlCaller, ControlError};
+pub(crate) use types::AdmittedAuthority;
+pub use types::{CallerPrincipal,ControlAccess, ControlCaller, ControlError};
 pub use catalog::{is_native_tool, is_read_only, native_tools, remote_tools, INSTRUCTIONS};
 
 pub async fn execute<R: tauri::Runtime>(
@@ -25,7 +28,7 @@ pub async fn execute<R: tauri::Runtime>(
         "thread_launch" => return service::launch(app, caller, args).await,
         "operation_status" => return service::operation_status(app, caller, args),
         "thread_list" => return service::thread_list(app, args),
-        "thread_read" => return service::thread_read(app, args),
+        "thread_read" => return service::thread_read(app, caller, args),
         "thread_status" => return service::thread_status(app, args).await,
         "thread_send" => return service::thread_send(app, caller, args).await,
         "agent_capabilities" => return service::agent_capabilities(app, caller, args).await,

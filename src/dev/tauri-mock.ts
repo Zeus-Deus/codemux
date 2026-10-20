@@ -1956,6 +1956,14 @@ const mockDeliveryAcknowledged = new Set<string>();
 
 /** The raw persisted payloads a thread would hold. */
 function mockThreadPayloads(threadId: string): string[] {
+  if (new URLSearchParams(window.location.search).get("mockScenario") === "native-callers" && threadId === MOCK_CHAT_THREAD_ID) {
+    return [
+      {type:"user_message",thread_id:threadId,message_id:"native-agent-send",created_by:"agent",creation_source:"provider",sender_thread_id:MOCK_SECOND_CHAT_THREAD_ID,sender_title:"Parser review",input_intent:"turn_start",text:"The parser review is complete. The focused checks passed."},
+      {type:"item_completed",thread_id:threadId,turn_id:"native-report",item_id:"native-answer",item:{kind:"assistant_text",text:`I received the report from [the review chat](codemux-chat://v1/${MOCK_SECOND_CHAT_THREAD_ID}). The parser checks passed.\n\nThe [previous chat](codemux-chat://v1/deleted-review-chat) is no longer available.`},subagent_id:null},
+      {type:"turn_completed",thread_id:threadId,turn_id:"native-report",status:{kind:"success"},usage:null},
+    ].map((message)=>JSON.stringify(message));
+  }
+
   if (new URLSearchParams(window.location.search).get("mockScenario") === "message-provenance" && threadId === MOCK_CHAT_THREAD_ID) {
     return [
       {message_id:"provenance-agent",created_by:"agent",creation_source:"provider",sender_thread_id:MOCK_SECOND_CHAT_THREAD_ID,sender_title:"Parser review",input_intent:"turn_start",text:"Review the parser changes and run the focused checks."},

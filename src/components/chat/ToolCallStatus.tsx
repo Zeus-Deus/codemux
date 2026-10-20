@@ -1,3 +1,4 @@
+import { orchestrationSummary } from "@/lib/agent-chat/codemux-tool-presentation";
 import { workspaceLaunchBranch, workspaceLaunchFailed, workspaceLaunchInput } from "@/lib/agent-chat/workspace-launch";
 import { hermesLearningLabel } from "@/lib/agent-chat/hermes-learning";
 import { nativeToolCall, toolPresentation } from "@/lib/agent-chat/native-tool-call";
@@ -55,6 +56,8 @@ const VERB_MAP: Record<string, string> = {
 };
 
 export function describeToolCall(item: ToolCallItem): ToolDescription {
+  const orchestration = orchestrationSummary(item);
+  if (orchestration) return { ...orchestration, targetMono: false, argument: null };
   const launch = workspaceLaunchInput(item.tool_name, item.input);
   if (launch) {
     return {

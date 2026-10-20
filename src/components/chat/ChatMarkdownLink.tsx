@@ -18,6 +18,9 @@ import { openExternalUrl, routeForUrl, type LinkGesture } from "@/lib/open-url";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
+import { chatLinkId } from "@/lib/agent-chat/chat-links";
+import { ChatLink } from "./ChatLink";
+
 const INCOMPLETE_LINK = "streamdown:incomplete-link";
 
 type ChatMarkdownLinkProps = ComponentProps<"a"> & {
@@ -56,6 +59,8 @@ export function ChatMarkdownLink({
   ...props
 }: ChatMarkdownLinkProps) {
   const [confirmationOpen, setConfirmationOpen] = useState(false);
+  const threadId = chatLinkId(href);
+  if (threadId) return <ChatLink {...props} threadId={threadId} className={className} onClick={onClick} onAuxClick={onAuxClick}>{children}</ChatLink>;
   const incomplete = href === INCOMPLETE_LINK;
   const externalHref =
     !incomplete && typeof href === "string" && externalWebLinkHost(href) !== null

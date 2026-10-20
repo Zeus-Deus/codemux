@@ -63,6 +63,7 @@ impl MockAgentCalls {
 /// returns so the ProviderRegistry routes to the right mock.
 pub struct MockAgentProvider {
     kind: ProviderKind,
+    report_sessions: std::sync::atomic::AtomicBool,
     pub async_questions: bool,
     pub calls: MockAgentCalls,
     pub event_tx: broadcast::Sender<ProviderRuntimeEvent>,
@@ -87,10 +88,12 @@ pub struct MockAgentProvider {
 }
 
 impl MockAgentProvider {
+    pub fn enable_session_listing(&self){self.report_sessions.store(true,std::sync::atomic::Ordering::SeqCst);}
     pub fn new(kind: ProviderKind) -> Self {
         let (event_tx, _rx) = broadcast::channel(64);
         Self {
             kind,
+            report_sessions: std::sync::atomic::AtomicBool::new(false),
             async_questions: false,
             calls: MockAgentCalls::new(),
             event_tx,
@@ -398,6 +401,9 @@ impl AgentProvider for MockAgentProvider {
 
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {
         self.calls.push(MockCall::ListSessions);
+        if self.report_sessions.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(self.live.lock().unwrap().iter().map(|thread|ProviderSession {thread_id:thread.clone(),provider:self.kind,session_id:ProviderSessionId(format!("mock-{}",thread.0)),status:SessionStatus::Ready,resume_cursor:None}).collect());
+        }
         Ok(vec![])
     }
 

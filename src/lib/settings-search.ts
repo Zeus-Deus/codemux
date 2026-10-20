@@ -87,7 +87,7 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
   // Agent
   { section: "agent", label: "Default model", keywords: "new chat provider effort", agentChatOnly: true },
   { section: "agent", label: "Utility agent", keywords: "handoff model haiku luna cheap" },
-  { section: "agent", label: "Delegate to other agents", keywords: "delegation handoff tasks", agentChatOnly: true },
+  { section: "agent", label: "Let agents work with other chats", keywords: "delegation handoff tasks collaboration messages permissions", agentChatOnly: true },
   { section: "agent", label: "Auto-configure MCP for workspaces", keywords: ".mcp.json mcp config" },
   { section: "agent", label: "Per-turn revert checkpoints", keywords: "checkpoints undo rewind snapshot", agentChatOnly: true },
   { section: "agent", label: "Resume automatically after usage limits reset", keywords: "auto resume rate limit", agentChatOnly: true },

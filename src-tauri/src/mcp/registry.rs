@@ -112,6 +112,7 @@ pub struct McpRegistry {
 /// tool can trust it for permission and ownership checks.
 #[derive(Debug, Clone)]
 pub struct HostCaller {
+    pub(crate) control: Option<crate::agent_control::ControlCaller>,
     pub thread_id: String,
     pub provider: crate::agent_provider::ProviderKind,
     /// Owning workspace of the session's chat pane, when it has one.
@@ -240,6 +241,19 @@ impl Default for McpRegistry {
     }
 }
 
+/// Legacy self-server mutations cannot borrow local-controller authority.
+/// Provider adapters apply the same predicate to discovery and dispatch.
+pub(crate) fn native_relay_allowed(raw:&str)->bool {
+    raw.starts_with("browser_") || matches!(raw,
+        "html_render" | "notify" | "app_status" | "pane_list" | "port_list" |
+        "conversation_read" | "conversation_search" | "workspace_list" | "workspace_info" | "workspace_archive_list" |
+        "automation_list" | "automation_get" | "automation_runs" | "git_status" | "git_diff" | "terminal_read" |
+        "issue_list" | "issue_get" | "preset_list" | "delegation_targets" | "delegate_remote_task")
+}
+pub(crate) fn native_tool_visible(tool:&McpTool)->bool {
+    !tool.prefixed_name.starts_with("mcp__codemux__") || native_relay_allowed(&tool.name)
+}
+
 pub(crate) type NativeDelegationHandler = Arc<
     dyn Fn(
             crate::delegation::app::NativeActor,
@@ -260,6 +274,12 @@ impl McpRegistry {
         arguments: serde_json::Value,
         actor: crate::delegation::app::NativeActor,
     ) -> Result<serde_json::Value, String> {
+        if let Some(raw) = crate::agent_control::native::tool_name(name) {
+            let handler = self.native_delegation.lock().unwrap().clone()
+                .ok_or("Native orchestration service is unavailable")?;
+            let value = handler(actor, raw.into(), arguments).await?;
+            return Ok(if value.get("content").is_some() { value } else {serde_json::json!({"content":[{"type":"text","text":value.to_string()}]})});
+        }
         let raw = {
             let inner = self.inner.lock().await;
             inner
@@ -291,16 +311,14 @@ impl McpRegistry {
                 .ok_or("Native delegation coordinator is unavailable")?;
             // Keep the coordinator/Tauri command stable while giving remote MCP
             // launch a distinct identity from the local delegate_task host tool.
-            let command = if raw == crate::mcp_server::REMOTE_DELEGATE_TOOL {
-                "delegate_task"
-            } else {
-                raw.as_str()
-            };
+            let command = raw.as_str();
             let value = handler(actor, command.into(), arguments).await?;
             return Ok(serde_json::json!({"content":[{"type":"text","text":value.to_string()}]}));
         }
-        self.dispatch_tool_call(name, arguments, actor.workspace_id.as_deref())
-            .await
+        if name.starts_with("mcp__codemux__") && !native_relay_allowed(name.strip_prefix("mcp__codemux__").unwrap_or_default()) {
+            return Err("provider_control_denied: this legacy mutation has no thread permission policy".into());
+        }
+        self.dispatch_tool_call(name, arguments, actor.workspace_id.as_deref()).await
     }
     pub fn set_activity_emitter(&self, emit: Arc<dyn Fn(PluginMcpActivity) + Send + Sync>) {
         let _ = self.activity.set(emit);
@@ -363,6 +381,7 @@ impl McpRegistry {
 
     fn collision_host_tools(&self) -> Vec<McpTool> {
         self.host_tools(&HostCaller {
+            control: None,
             thread_id: String::new(),
             provider: crate::agent_provider::ProviderKind::Claude,
             workspace_id: None,
@@ -1558,6 +1577,7 @@ mod tests {
         )));
         reg.insert_native_delegation_tools_for_test().await;
         let caller = HostCaller {
+            control: None,
             thread_id: "catalog-routing-parent".into(),
             provider: ProviderKind::Codex,
             workspace_id: Some("workspace".into()),
@@ -1584,8 +1604,8 @@ mod tests {
             Box::pin(async move {
                 let _admission = actor.permit.admit()?;
                 assert_eq!(
-                    command, "delegate_task",
-                    "MCP rename must preserve the coordinator command"
+                    command, "delegate_remote_task",
+                    "remote task selection stays distinct from local task admission"
                 );
                 assert_eq!(
                     arguments, expected,
@@ -1671,6 +1691,7 @@ mod tests {
     async fn host_tools_are_served_per_caller_and_never_reach_shared_surfaces() {
         let reg = McpRegistry::new();
         let caller = HostCaller {
+            control: None,
             thread_id: "thread-1".into(),
             provider: crate::agent_provider::ProviderKind::Claude,
             workspace_id: None,
@@ -2224,5 +2245,18 @@ mod tests {
         let rows = reg.list_runtime().await;
         let row = rows.iter().find(|r| r.id == "x").unwrap();
         assert!(matches!(row.status, McpServerStatus::Stopped));
+    }
+}
+
+#[cfg(test)]
+mod native_visibility_tests {
+    use super::*;
+    #[test]
+    fn native_listing_and_legacy_dispatch_use_the_same_policy(){
+        for name in ["automation_create","workspace_create","worktree_create","thread_respond","git_push","terminal_write"] {
+            let tool=McpTool{name:name.into(),prefixed_name:format!("mcp__codemux__{name}"),description:None,input_schema:serde_json::json!({}),server_id:"codemux-self".into()};
+            assert!(!native_tool_visible(&tool));assert!(!native_relay_allowed(name));
+        }
+        for name in ["conversation_read","workspace_info","browser_snapshot"]{assert!(native_relay_allowed(name));}
     }
 }

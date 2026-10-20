@@ -1,3 +1,4 @@
+import { orchestrationSummary } from "./codemux-tool-presentation";
 import { isDelegationResultsMessage } from "@/lib/agent-chat/message-provenance";
 import type { SubagentSnapshot, SubagentStatus } from "@/tauri/events";
 
@@ -296,6 +297,8 @@ export function describeToolCall(item: ToolCallItem): {
   target: string;
   meta: string;
 } {
+  const orchestration = orchestrationSummary(item);
+  if (orchestration) return { ...orchestration, meta: item.status === "error" ? "error" : "" };
   const presented = toolPresentation(item);
   const verb = VERB_BY_TOOL[presented.name] ?? presented.name.toLowerCase();
   const input = (presented.input ?? {}) as Record<string, unknown>;

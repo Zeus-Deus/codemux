@@ -1130,6 +1130,7 @@ pub(crate) mod tests {
 
     fn caller(provider: ProviderKind, mode: Option<&str>) -> HostCaller {
         HostCaller {
+            control: None,
             thread_id: "parent".into(),
             provider,
             workspace_id: Some("ws".into()),

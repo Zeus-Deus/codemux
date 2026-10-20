@@ -52,6 +52,11 @@ impl SendContext {
         let mut context = Self::new(TurnOrigin::Controller);
         context.provenance.created_by = caller.created_by;
         context.provenance.creation_source = CreationSource::Mcp;
+        if let Some(thread) = caller.thread_id() {
+            context.provenance.created_by = CreatedBy::Agent;
+            context.provenance.creation_source = CreationSource::Provider;
+            context.provenance.sender_thread_id = Some(thread.into());
+        }
         context
     }
     pub fn is_human(&self) -> bool {
@@ -222,7 +227,8 @@ async fn dispatch_with_control<R: Runtime>(
             let _=db.finish_message_delivery(&row.id,"held",None,Some(&error));warn_held(app,&row.thread_id,&error);crate::delegation::app::completion_delivery_changed(app,&row.id);return Err(error);
         }
     }
-    let control = admitted_control.or_else(|| payload.caller.map(|caller| {
+    let control = admitted_control.or_else(|| payload.caller.map(|mut caller| {
+        if caller.thread_id().is_some() { caller.admitted=Some(super::AdmittedAuthority::Delivery { delivery_id:row.id.clone() }); }
         NativeControlGuard {
             caller,
             workspace_id: db

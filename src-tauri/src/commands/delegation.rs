@@ -64,7 +64,7 @@ const CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: another coding agent handed y
 /// The footer for a started suggested task, which runs on its own branch.
 pub(crate) const WORKTREE_CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: the user started this task from another chat's suggestions; that chat will read your final message. You are in your own git worktree on a new branch made from that chat's latest commit (its uncommitted edits are not here). Work independently. Ask a question if truly blocked; it reaches the coordinator. Otherwise choose a safe option and explain it. When done, COMMIT all of your work on this branch (do not push, do not switch branches) so it can be merged back; leave nothing uncommitted. End with a short report: what you changed (files), the commit(s), how you checked it, and anything left undone.";
 
-const TOOL_DESCRIPTION: &str = "Delegate a self-contained task to another installed coding agent in a background chat. The child sees only the brief. Results arrive independently through durable automatic delivery. Use client_request_id for retries: the same key and unchanged task arguments return the same task and child; async/wait controls may change on a retry. mode defaults to async; wait waits at most 20 seconds without cancelling on timeout. Use task_status/task_cancel with task_id; child_thread_id is a different identity. Read a complete terminal result with task_status to acknowledge its automatic delivery. Chat links use codemux-chat://v1/<threadId>. For another independent review round, delegate again with a fresh key and complete brief.";
+const TOOL_DESCRIPTION: &str = "Delegate a self-contained task to another installed coding agent in a background chat. The child sees only the brief. Results arrive independently through durable automatic delivery. Use client_request_id for retries: the same key and unchanged task arguments return the same task and child; async/wait controls may change on a retry. mode defaults to async; wait waits at most 20 seconds without cancelling on timeout. Use task_status/task_cancel with task_id; child_thread_id is a different identity. Read a complete terminal result with task_status to acknowledge its automatic delivery. Chat links use codemux-chat://v1/<threadId>. For another independent review round, delegate again with a fresh key and complete brief. End your turn after async delegation; do not poll. If the brief asks you to report to a coordinator, use thread_send to that chat.";
 
 mod durable;
 pub(crate) use durable::{
@@ -606,12 +606,8 @@ pub(crate) fn offered_agents(
     caller_is_child: bool,
     is_installed: impl Fn(ProviderKind) -> bool,
 ) -> Vec<ProviderKind> {
-    // Claude's live mode is checked on each call instead.
-    let orchestrator = caller.provider == ProviderKind::Claude
-        || parent_is_full(caller.provider, caller.permission_mode.as_deref());
-    if caller_is_child || !orchestrator {
-        return Vec::new();
-    }
+    let _ = caller_is_child;
+    if !matches!(caller.provider, ProviderKind::Claude | ProviderKind::Codex) { return Vec::new(); }
     CANDIDATES
         .into_iter()
         .filter(|kind| is_installed(*kind))
@@ -623,9 +619,10 @@ pub(crate) fn offered_agents(
 fn child_input(
     child_thread_id: &str,
     cwd: PathBuf,
-    provider: ProviderKind,
+    _provider: ProviderKind,
     model: Option<String>,
     effort: Option<String>,
+    permission_mode: Option<String>,
 ) -> StartSessionInput {
     StartSessionInput {
         thread_id: ThreadId(child_thread_id.to_string()),
@@ -633,7 +630,7 @@ fn child_input(
         model,
         resume_cursor: None,
         fresh_session: true,
-        permission_mode: fallback_permission_mode(provider).map(str::to_string),
+        permission_mode,
         effort,
         context_window: None,
         fast_mode: false,
@@ -803,6 +800,7 @@ fn delegate_tool(agents: &[ProviderKind]) -> McpTool {
                 "mode": { "type": "string", "enum": ["async", "wait"], "default": "async" },
                 "wait_ms": { "type": "integer", "minimum": 0, "maximum": 20000 },
                 "role": { "type": "string" },
+                "permission_mode": { "type": "string", "description":"Optional exact native mode, bounded by the calling chat. Omit to inherit safely." },
                 "effort": {
                     "type": "string",
                     "description": "Effort/reasoning level, only if the user named one. Omit for that agent's default."
@@ -816,7 +814,7 @@ fn delegate_tool(agents: &[ProviderKind]) -> McpTool {
 
 // ── The host tool ────────────────────────────────────────────────────
 
-pub(super) fn setting_on(db: &DatabaseStore) -> bool {
+pub(crate) fn setting_on(db: &DatabaseStore) -> bool {
     db.get_setting(DELEGATION_SETTING_KEY).as_deref() != Some("false")
 }
 
@@ -990,6 +988,7 @@ struct DelegateArgs {
     mode: Option<String>,
     wait_ms: Option<u64>,
     role: Option<String>,
+    permission_mode: Option<String>,
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -1068,15 +1067,12 @@ fn delegate_with_call<R: Runtime>(
     if !setting_on(&db) {
         return Err("Cross-provider delegation is off (Settings → Agents → Models & behavior).".into());
     }
-    if state.is_running_child(parent) {
-        return Err("A delegated task cannot delegate further.".into());
-    }
-    if !parent_is_full(caller.provider, caller.permission_mode.as_deref()) {
-        return Err(format!(
-            "Delegation needs this chat in Full access; it is in {}. Switch to Full access to delegate.",
-            mode_label(caller.permission_mode.as_deref())
-        ));
-    }
+    let ceiling = if let Some(control) = &caller.control {
+        crate::agent_control::service::authorize(app, control).map_err(|e|e.to_string())?;
+        control.ceiling().ok_or("unsupported_permission_ceiling")?
+    } else {
+        crate::agent_control::permissions::Ceiling::for_mode(caller.provider, caller.permission_mode.as_deref()).ok_or("unsupported_permission_ceiling")?
+    };
     let args: DelegateArgs =
         serde_json::from_value(arguments.clone()).map_err(|e| e.to_string())?;
     if args
@@ -1096,13 +1092,14 @@ fn delegate_with_call<R: Runtime>(
     }
     let mut task = requested_task(parent, arguments, |_| true)?;
     task.tool_call_id = tool_call_id.map(str::to_string);
-    let payload = json!({"provider":provider_id(task.provider),"title":task.title,"task":task.brief,"model":task.model,"effort":task.effort,"role":task.role,"mode":args.mode.as_deref().unwrap_or("async"),"wait_ms":args.wait_ms.unwrap_or(20000)});
+    let payload = json!({"provider":provider_id(task.provider),"title":task.title,"task":task.brief,"model":task.model,"effort":task.effort,"role":task.role,"mode":args.mode.as_deref().unwrap_or("async"),"wait_ms":args.wait_ms.unwrap_or(20000),"permission_mode":args.permission_mode});
     if let Some(key) = &args.client_request_id {
         if let Some(prior) = db.delegation_retry(parent, key, &payload)? {
             return Ok(task_receipt(&prior));
         }
     }
     let provider = task.provider;
+    if caller.control.is_some() && !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {return Err("unsupported_provider: native child injection for this provider comes in a later layer".into());}
     if !is_installed(provider) {
         return Err(format!(
             "{} is not installed on this machine.",
@@ -1131,23 +1128,6 @@ fn delegate_with_call<R: Runtime>(
             return Ok(task_receipt(&prior));
         }
     }
-    let running = inner
-        .tasks
-        .values()
-        .filter(|t| t.parent == parent && !t.phase.is_terminal())
-        .count();
-    if running >= MAX_RUNNING_PER_PARENT {
-        return Err(
-            "This chat already has 3 delegated tasks running. Wait for their reports.".into(),
-        );
-    }
-    if inner
-        .parents
-        .get(parent)
-        .is_some_and(|p| p.started_this_round >= MAX_PER_ROUND)
-    {
-        return Err("Delegation limit for this request reached (6 tasks). Ask the user before delegating more.".into());
-    }
     let mut record = record_of(&child, &task);
     record.workspace_id = workspace_id.clone();
     record.cwd = cwd.clone();
@@ -1156,8 +1136,18 @@ fn delegate_with_call<R: Runtime>(
             .and_then(|state| state.thread_runtime(parent))
             .and_then(|runtime| runtime.turn_id)
     });
+    let root = db.orchestration_context(parent)?;
+    record.budget_root_id = Some(root.root_id);
+    if let Some(ancestor) = db.delegation_task_for_child(parent)? {
+        record.lineage = ancestor.lineage.clone(); record.lineage.push(ancestor.task_id.clone());
+        record.root_task_id = ancestor.root_task_id;
+    }
     record.parent_title = db.get_agent_chat_title(parent);
-    record.permission_mode = fallback_permission_mode(provider).map(str::to_string);
+    let mode = args.permission_mode.clone().map(Ok).unwrap_or_else(|| ceiling.inherited(provider).map_err(|e|e.to_string()))?;
+    let target = crate::agent_control::permissions::Ceiling::for_mode(provider,Some(&mode)).ok_or("unsupported_permission_ceiling")?;
+    if !ceiling.permits(target) { return Err("permission_ceiling: child mode exceeds this chat".into()); }
+    record.permission_mode = Some(mode);
+    record.caller = caller.control.clone().map(|mut caller|{caller.admitted=Some(crate::agent_control::AdmittedAuthority::Task {task_id:record.task_id.clone()});caller});
     record.admission_generation = Some(admission_generation);
     record.wait_until = wait_until;
     let (record, new) =
@@ -1264,8 +1254,10 @@ pub(crate) async fn run_starter<R: Runtime>(
         return;
     }
     let provider = task.provider;
-    let input = child_input(&child, cwd, provider, task.model, task.effort);
-    let start = agent_chat_start_session(app.clone(), pane_id, provider, input, None);
+    let record = match app.state::<DatabaseStore>().delegation_task_for_child(&child) { Ok(Some(record)) => record, _ => return };
+    let input = child_input(&child, cwd, provider, task.model, task.effort, record.permission_mode.clone());
+    let control = record.caller.clone().map(|caller| crate::agent_control::NativeControlGuard { caller, workspace_id:record.workspace_id.clone(),thread_id:child.clone(),provider,admission:None }.retain_admission(&app));
+    let start = super::agent_chat::agent_chat_start_session_guarded(app.clone(), pane_id, provider, input, None, control.clone());
     let failure = match tokio::time::timeout(START_TIMEOUT, start).await {
         Ok(Ok(_)) if !state.is_starting(&child) => return,
         Ok(Ok(_)) => {
@@ -1285,10 +1277,12 @@ pub(crate) async fn run_starter<R: Runtime>(
                     task.brief
                 ),
             );
+            if provider == ProviderKind::Codex && record.permission_mode.as_deref() == Some("read-only") { turn.permission_mode_override = Some("plan".into()); }
             turn.display_text = Some(task.brief.clone());
             turn.client_nonce = Some(format!("delegated-task:{child}"));
             let mut context =
                 crate::agent_control::delivery::SendContext::new(TurnOrigin::Delegation);
+            context.control = control;
             context.provenance.created_by = crate::agent_provider::message::CreatedBy::Agent;
             context.provenance.creation_source =
                 crate::agent_provider::message::CreationSource::Provider;
@@ -1525,6 +1519,7 @@ pub(crate) fn on_user_turn<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
         return;
     };
     let mut inner = state.lock();
+    if let Some(db) = app.try_state::<DatabaseStore>() { let _ = db.orchestration_human_root(thread_id); }
     if let Some(parent) = inner.parents.get_mut(thread_id) {
         parent.round += 1;
         parent.started_this_round = 0;
@@ -1696,6 +1691,7 @@ async fn child_busy<R: Runtime>(
     // an open question does not.
     let turn_failed = state.task_matches(child, Task::turn_failed);
     dispatching
+        || app.try_state::<DatabaseStore>().is_some_and(|db| db.delegation_tasks(Some(child)).is_ok_and(|tasks|tasks.iter().any(|task|!task.status.terminal() || matches!(task.completion_delivery.as_str(),"pending"|"preparing"|"queued"|"submitting"))))
         || state.task_matches(child, |t| t.stopping)
         || state.task_matches(child, Task::awaits_user)
         || app.try_state::<DatabaseStore>().is_some_and(|db| {
@@ -1843,6 +1839,7 @@ mod tests {
 
     fn caller(provider: ProviderKind, mode: Option<&str>) -> HostCaller {
         HostCaller {
+            control: None,
             thread_id: "parent".into(),
             provider,
             workspace_id: Some("ws".into()),
@@ -1920,10 +1917,7 @@ mod tests {
             vec![ProviderKind::Claude, ProviderKind::Codex],
             "own provider allowed, Hermes never, candidate order kept"
         );
-        assert!(
-            offered_agents(&claude, true, installed).is_empty(),
-            "running child"
-        );
+        assert_eq!(offered_agents(&claude, true, installed).len(),2,"app-owned children may delegate within the durable root budget");
         assert!(
             offered_agents(&claude, false, |_| false).is_empty(),
             "nothing installed"
@@ -1932,7 +1926,7 @@ mod tests {
         let codex_full = caller(ProviderKind::Codex, Some("danger-full-access"));
         assert_eq!(offered_agents(&codex_full, false, installed).len(), 2);
         let codex_ask = caller(ProviderKind::Codex, Some("workspace-write"));
-        assert!(offered_agents(&codex_ask, false, installed).is_empty());
+        assert_eq!(offered_agents(&codex_ask, false, installed).len(),2);
         let cursor = caller(ProviderKind::Cursor, Some("agent"));
         assert!(offered_agents(&cursor, false, installed).is_empty());
     }
@@ -1945,6 +1939,7 @@ mod tests {
             ProviderKind::Codex,
             Some("gpt-6.1-codex".into()),
             Some("high".into()),
+            Some("danger-full-access".into()),
         );
         assert_eq!(input.thread_id.0, "child");
         assert_eq!(input.cwd, PathBuf::from("/repo"));
@@ -1966,7 +1961,7 @@ mod tests {
             (ProviderKind::Grok, Some("agent")),
             (ProviderKind::OpenCode, None),
         ] {
-            let input = child_input("c", PathBuf::from("/r"), provider, None, None);
+            let input = child_input("c", PathBuf::from("/r"), provider, None, None, mode.map(str::to_string));
             assert_eq!(input.permission_mode.as_deref(), mode, "{provider:?}");
         }
     }

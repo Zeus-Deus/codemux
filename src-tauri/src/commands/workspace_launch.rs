@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, Runtime};
 
-use crate::agent_control::{service, ControlAccess, ControlCaller};
+use crate::agent_control::{service};
 use crate::agent_provider::ProviderKind;
 use crate::mcp::registry::{HostCaller, HostTools};
 use crate::mcp::runtime::{prefix_tool_name, McpTool};
@@ -291,12 +291,7 @@ async fn start<R: Runtime>(
 ) -> Result<(), String> {
     let title = input.title.clone();
     let outcome: Result<(), String> = async {
-        let control = ControlCaller {
-            created_by: crate::agent_provider::message::CreatedBy::Agent,
-            principal: format!("thread:{}", caller.thread_id),
-            access: ControlAccess::FullAccess,
-            grant_id: None,
-        };
+        let control = caller.control.clone().ok_or("stale_caller: workspace launch requires authenticated chat authority")?;
         let prepared = service::PreparedWorkspaceChat::prepare(
             app,
             &control,
@@ -431,6 +426,7 @@ mod tests {
         let mut workspace = state.find_workspace(&id.0).unwrap();
         workspace.is_git = true;
         let mut caller = HostCaller {
+            control: None,
             thread_id: "parent".into(),
             provider: ProviderKind::Claude,
             workspace_id: Some(id.0),
@@ -561,6 +557,7 @@ mod tests {
             .unwrap();
         app.manage(db);
         let caller = HostCaller {
+            control: None,
             thread_id: "parent".into(),
             provider: ProviderKind::Claude,
             workspace_id: Some(id.0),
@@ -641,6 +638,7 @@ mod tests {
             is_installed: |_| true,
         };
         let caller = HostCaller {
+            control: None,
             thread_id: "parent".into(),
             provider: ProviderKind::Claude,
             workspace_id: Some(id.0.clone()),

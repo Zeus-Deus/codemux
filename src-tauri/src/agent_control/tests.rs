@@ -1282,7 +1282,7 @@ async fn workspace_chat_launch_shares_native_start_without_selecting_workspace()
     std::fs::create_dir(root.path().join("worktree")).unwrap();
     let target = app.state::<crate::state::AppStateStore>().create_empty_workspace_at_path(root.path().join("worktree"));
     app.state::<crate::state::AppStateStore>().activate_workspace(&parent);
-    let caller = ControlCaller { created_by: crate::agent_provider::message::CreatedBy::Agent, principal: "thread:parent".into(), access: ControlAccess::FullAccess, grant_id: None };
+    let caller = ControlCaller { admitted: None, identity: super::CallerPrincipal::LocalController, created_by: crate::agent_provider::message::CreatedBy::Agent, principal: "thread:parent".into(), access: ControlAccess::FullAccess, grant_id: None };
     let prepared = service::PreparedWorkspaceChat::prepare(app.handle(), &caller,
         crate::agent_provider::ProviderKind::Claude, "Fix sidebar tests".into(), "Self-contained fixture brief".into(), None, None,
     ).await.unwrap();
@@ -1314,7 +1314,7 @@ async fn workspace_chat_launch_validates_models_and_keeps_permission_ceiling() {
     let denied = service::PreparedWorkspaceChat::prepare(app.handle(), &supervised,
         crate::agent_provider::ProviderKind::Claude, "Fixture".into(), "Brief".into(), None, None,
     ).await.err().unwrap();
-    assert_eq!(denied.code, "permission_ceiling");
+    assert_eq!(denied.code, "unsupported_permission_ceiling");
     assert!(provider.calls.snapshot().is_empty());
 }
 
@@ -1922,4 +1922,66 @@ async fn orchestration_message_queue_promotion_checks_authority_before_recording
     }
     checkpoint.authorize_dispatch().unwrap();
     assert!(db.message_delivery("B").unwrap().unwrap().attempted);
+}
+
+async fn native_caller_fixture(mode:&str)->(tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_provider::MockAgentProvider>, tempfile::TempDir, String, String, Arc<crate::delegation::authority::NativeAuthority>, crate::delegation::app::NativeActor) {
+    let (app,provider,root,workspace)=fixture().await;
+    app.manage(crate::commands::delegation::DelegationState::default());
+    provider.enable_session_listing();
+    let launched=execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"native-caller-launch","provider":"claude","permission_mode":mode})).await.unwrap();
+    let receipt=settle_operation(&app,&launched).await;
+    assert_eq!(receipt["state"],"succeeded","{receipt}");
+    let thread=receipt["thread_id"].as_str().unwrap().to_string();
+    let authority=crate::delegation::authority::NativeAuthority::new(&thread);
+    let generation=authority.begin();assert!(authority.bind(generation,"native-run"));
+    let actor=crate::delegation::app::NativeActor {thread_id:thread.clone(),provider:crate::agent_provider::ProviderKind::Claude,workspace_id:Some(workspace.clone()),session_id:format!("mock-{thread}"),permission_mode:Some(mode.into()),permit:authority.capture()};
+    (app,provider,root,workspace,thread,authority,actor)
+}
+
+#[tokio::test]
+async fn native_callers_reject_spoofed_arguments_and_replaced_session(){
+    let (app,_provider,_root,_workspace,thread,authority,actor)=native_caller_fixture("default").await;
+    for field in ["caller","_meta","sender_thread_id","authority_generation"]{
+        let mut args=json!({"thread_id":thread,"message":"hello from this authenticated chat","client_request_id":format!("spoof-{field}")});
+        args[field]=json!({"thread_id":"someone-else","access":"full_access"});
+        let error=super::native::call(app.handle().clone(),actor.clone(),"thread_send".into(),args).await.unwrap_err();
+        assert!(error.contains("unknown field"),"{error}");
+    }
+    let caller=super::native::qualify(app.handle(),&actor).await.unwrap();
+    let _replacement=crate::delegation::authority::NativeAuthority::new(&thread);
+    assert!(service::authorize(app.handle(),&caller).is_err());
+    assert!(actor.permit.admit().is_err());
+    authority.revoke();
+}
+
+#[tokio::test]
+async fn native_callers_plan_ceiling_and_dispatch_downgrade(){
+    use crate::agent_provider::ProviderKind;
+    let (app,_provider,_root,_workspace,thread,_authority,actor)=native_caller_fixture("plan").await;
+    let caller=super::native::qualify(app.handle(),&actor).await.unwrap();
+    assert!(service::permission_ceiling(&caller,ProviderKind::Claude,Some("bypassPermissions")).is_err());
+    assert!(service::permission_ceiling(&caller,ProviderKind::Codex,Some("danger-full-access")).is_err());
+    assert_eq!(caller.ceiling().unwrap().inherited(ProviderKind::Claude).unwrap(),"plan");
+    assert_eq!(caller.ceiling().unwrap().inherited(ProviderKind::Codex).unwrap(),"read-only");
+    let error=super::native::call(app.handle().clone(),actor.clone(),"thread_launch".into(),json!({"provider":"claude","permission_mode":"bypassPermissions","title":"Escalation"})).await.unwrap_err();
+    assert!(error.contains("permission_ceiling"),"{error}");
+    let error=super::native::call(app.handle().clone(),actor.clone(),"thread_launch".into(),json!({"provider":"claude","worktree":{"strategy":"new"}})).await.unwrap_err();
+    assert!(error.contains("unsupported_operation"),"{error}");
+    assert!(service::thread_respond(app.handle(),&caller,json!({})).await.unwrap_err().to_string().contains("cannot grant"));
+    let (app,_,_root,workspace,thread,_authority,actor)=native_caller_fixture("bypassPermissions").await;
+    let caller=super::native::qualify(app.handle(),&actor).await.unwrap();
+    let guard=NativeControlGuard {caller,workspace_id:workspace,thread_id:thread.clone(),provider:ProviderKind::Claude,admission:None}.retain_admission(app.handle());
+    app.state::<crate::database::DatabaseStore>().update_agent_chat_session_config(&thread,&crate::database::AgentChatSessionConfig{permission_mode:Some(Some("plan".into())),..Default::default()}).unwrap();
+    assert!(guard.verify(app.handle()).unwrap_err().contains("permission_ceiling"));
+}
+
+#[tokio::test]
+async fn native_callers_catalog_is_mode_independent_and_toggle_controls_new_sessions(){
+    use crate::mcp::registry::{HostCaller,HostTools};
+    let (app,_,_root,workspace,thread,_authority,_actor)=native_caller_fixture("plan").await;
+    let host=super::native::OrchestrationHost(app.handle().clone());
+    let mut caller=HostCaller{control:None,thread_id:thread,provider:crate::agent_provider::ProviderKind::Claude,workspace_id:Some(workspace),permission_mode:Some("plan".into())};
+    for provider in [crate::agent_provider::ProviderKind::Claude,crate::agent_provider::ProviderKind::Codex]{caller.provider=provider;for mode in ["plan","read-only","workspace-write","danger-full-access"]{caller.permission_mode=Some(mode.into());let tools=host.tools_for(&caller);assert!(tools.iter().any(|t|t.name=="thread_send"));assert!(tools.iter().any(|t|t.name=="thread_wait"));assert!(!tools.iter().any(|t|t.name=="thread_respond"));}}
+    app.state::<crate::database::DatabaseStore>().set_setting("agents.cross_provider_delegation","false").unwrap();
+    assert!(host.tools_for(&caller).is_empty());
 }

@@ -10,6 +10,7 @@ static RUNTIMES: LazyLock<Mutex<HashMap<String, Weak<NativeAuthority>>>> =
 
 #[derive(Debug)]
 pub(crate) struct NativeAuthority {
+    session_key: String,
     state: Mutex<State>,
     changed: tokio::sync::Notify,
 }
@@ -31,9 +32,30 @@ pub(crate) struct NativePermit {
     turn: Option<String>,
     pending: bool,
 }
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AuthorityIdentity {
+    session_key: String,
+    generation: u64,
+    activity: u64,
+    pub run_id: Option<String>,
+}
+impl AuthorityIdentity {
+    pub fn verify(&self, thread: &str) -> Result<(), String> {
+        let owner = RUNTIMES.lock().unwrap().get(thread).and_then(Weak::upgrade)
+            .ok_or("stale_caller: native session is unavailable")?;
+        let state = owner.state.lock().unwrap();
+        if owner.session_key != self.session_key || !state.live || !state.tools_live
+            || state.generation != self.generation || state.activity != self.activity
+            || state.turn.is_none() || state.turn != self.run_id {
+            return Err("stale_caller: native session or run authority changed".into());
+        }
+        Ok(())
+    }
+}
 impl NativeAuthority {
     pub fn new(thread: &str) -> Arc<Self> {
         let owner = Arc::new(Self {
+            session_key: uuid::Uuid::new_v4().to_string(),
             changed: tokio::sync::Notify::new(),
             state: Mutex::new(State {
                 live: true,
@@ -225,6 +247,11 @@ impl DispatchPermit {
     }
 }
 impl NativePermit {
+    pub fn identity(&self) -> Result<AuthorityIdentity, String> {
+        let state = self.admit()?;
+        Ok(AuthorityIdentity { session_key: self.owner.session_key.clone(), generation: self.generation, activity: self.activity, run_id: state.turn.clone() })
+    }
+
     pub async fn wait_ready(&self) -> Result<(), String> {
         loop {
             let changed = self.owner.changed.notified();
