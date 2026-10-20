@@ -1,4 +1,12 @@
-import { useCallback, useRef, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { ImageIcon, ImageOff, Maximize2 } from "lucide-react";
 
 import {
@@ -7,7 +15,17 @@ import {
   IMAGE_LIGHTBOX_MEDIA_CLASS,
 } from "@/components/chat/ImageLightbox";
 import { resolveAssetSrc } from "@/lib/asset-url";
-import { readLocalChatImage } from "@/tauri/commands";
+import { readChatImage, readLocalChatImage } from "@/tauri/commands";
+import type { RetainedReplyImage } from "@/tauri/events";
+
+type ImageReader = typeof readLocalChatImage;
+
+/** One place an image may load from, with the IPC reader that serves it
+ *  where the asset protocol cannot. */
+interface ImageCandidate {
+  path: string;
+  read: ImageReader;
+}
 
 const blobUrlCache = new Map<string, string>();
 const blobRequestCache = new Map<string, Promise<string>>();
@@ -33,14 +51,14 @@ function cacheBlobUrl(path: string, url: string) {
   }
 }
 
-function requestBlobUrl(path: string): Promise<string> {
+function requestBlobUrl({ path, read }: ImageCandidate): Promise<string> {
   const cached = blobUrlCache.get(path);
   if (cached) return Promise.resolve(cached);
 
   const pending = blobRequestCache.get(path);
   if (pending) return pending;
 
-  const request = readLocalChatImage(path)
+  const request = read(path)
     .then(({ bytes, media_type }) => {
       const url = URL.createObjectURL(new Blob([bytes], { type: media_type }));
       cacheBlobUrl(path, url);
@@ -58,45 +76,118 @@ function basename(path: string): string {
   return parts[parts.length - 1] ?? path;
 }
 
+/** Conversation-owned copies of a reply's linked images, by the path the
+ *  reply wrote. */
+const RetainedImagesContext = createContext<ReadonlyMap<string, string> | null>(
+  null,
+);
+
+/** Let the local-image cards inside one reply load its kept copies. */
+export function RetainedImagesProvider({
+  images,
+  children,
+}: {
+  images: readonly RetainedReplyImage[] | undefined;
+  children: ReactNode;
+}) {
+  const retained = useMemo(
+    () =>
+      images?.length
+        ? new Map(images.map((image) => [image.source, image.path]))
+        : null,
+    [images],
+  );
+  return (
+    <RetainedImagesContext.Provider value={retained}>
+      {children}
+    </RetainedImagesContext.Provider>
+  );
+}
+
+/** Where `path` may load from: the reply's kept copy first (it outlives the
+ *  original, but may still be landing), then the path the reply wrote. */
+function useImageCandidates(path: string): readonly ImageCandidate[] {
+  const retained = useContext(RetainedImagesContext)?.get(path);
+  return useMemo(
+    () => [
+      ...(retained ? [{ path: retained, read: readChatImage }] : []),
+      { path, read: readLocalChatImage },
+    ],
+    [path, retained],
+  );
+}
+
+interface SourceState {
+  key: string;
+  index: number;
+  blob: string | null;
+  failed: boolean;
+}
+
+function firstSource(
+  key: string,
+  candidates: readonly ImageCandidate[],
+): SourceState {
+  const first = candidates[0];
+  return {
+    key,
+    index: 0,
+    blob: first ? (blobUrlCache.get(first.path) ?? null) : null,
+    failed: !first,
+  };
+}
+
 /**
  * Desktop WebKit can load a converted asset URL directly. Browser/dev-mock
  * clients cannot reach the host filesystem through that protocol, so a failed
- * load falls back to a bounded IPC read and a blob URL.
+ * load falls back to a bounded IPC read and a blob URL. Each candidate gets
+ * both attempts before the next one is tried.
  */
-function useLocalImageSource(path: string) {
-  const currentPath = useRef(path);
-  currentPath.current = path;
-  const [blobState, setBlobState] = useState<{ path: string; src: string | null }>(
-    () => ({ path, src: blobUrlCache.get(path) ?? null }),
-  );
-  const [failedPath, setFailedPath] = useState<string | null>(null);
-  const blobSrc =
-    blobState.path === path ? blobState.src : (blobUrlCache.get(path) ?? null);
-  const failed = failedPath === path;
+function useLocalImageSource(candidates: readonly ImageCandidate[]) {
+  const key = candidates.map((candidate) => candidate.path).join("\0");
+  const currentKey = useRef(key);
+  currentKey.current = key;
+  const [stored, setStored] = useState(() => firstSource(key, candidates));
+  const state = stored.key === key ? stored : firstSource(key, candidates);
+  const candidate = candidates[state.index];
 
   const onError = useCallback(() => {
-    if (blobSrc) {
-      setFailedPath(path);
+    if (!candidate || state.failed) return;
+    const advance = () => {
+      const index = state.index + 1;
+      const next = candidates[index];
+      setStored(
+        next
+          ? {
+              key,
+              index,
+              blob: blobUrlCache.get(next.path) ?? null,
+              failed: false,
+            }
+          : { ...state, failed: true },
+      );
+    };
+    if (state.blob) {
+      advance();
       return;
     }
-    const cached = blobUrlCache.get(path);
-    if (cached) {
-      setBlobState({ path, src: cached });
-      return;
-    }
-    void requestBlobUrl(path)
+    void requestBlobUrl(candidate)
       .then((url) => {
-        if (currentPath.current === path) {
-          setBlobState({ path, src: url });
-          setFailedPath(null);
-        }
+        if (currentKey.current === key) setStored({ ...state, blob: url });
       })
       .catch(() => {
-        if (currentPath.current === path) setFailedPath(path);
+        if (currentKey.current === key) advance();
       });
-  }, [blobSrc, path]);
+  }, [candidate, candidates, key, state]);
 
-  return { src: blobSrc ?? resolveAssetSrc(path, null), failed, onError };
+  return {
+    src:
+      state.failed || !candidate
+        ? null
+        : (state.blob ?? resolveAssetSrc(candidate.path, null)),
+    failed: state.failed,
+    onError,
+  };
 }
 
 /** Test seam for the module-level blob cache. */
@@ -122,7 +213,8 @@ export function MarkdownLocalImage({
       ? rawCaption.trim()
       : basename(path);
   const [open, setOpen] = useState(false);
-  const thumbnail = useLocalImageSource(path);
+  const candidates = useImageCandidates(path);
+  const thumbnail = useLocalImageSource(candidates);
 
   if (!path) return null;
 
@@ -171,14 +263,20 @@ export function MarkdownLocalImage({
         title={caption}
         description={`Full-size preview of ${caption}`}
       >
-        <ExpandedImage path={path} caption={caption} />
+        <ExpandedImage candidates={candidates} caption={caption} />
       </ImageLightbox>
     </span>
   );
 }
 
-function ExpandedImage({ path, caption }: { path: string; caption: string }) {
-  const image = useLocalImageSource(path);
+function ExpandedImage({
+  candidates,
+  caption,
+}: {
+  candidates: readonly ImageCandidate[];
+  caption: string;
+}) {
+  const image = useLocalImageSource(candidates);
 
   if (image.failed || !image.src) {
     return (

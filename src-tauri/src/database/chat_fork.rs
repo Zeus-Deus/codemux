@@ -91,9 +91,9 @@ pub struct ChatForkOrigin {
 
 /// Rewrite one copied transcript row for the fork: the envelope's
 /// `thread_id` names the fork, a user-turn journal row points at the fork's
-/// copy of its user message, and a user message's images inside the
-/// chat-image root move into the fork's folder by file name (unique per
-/// image), recorded in `images`.
+/// copy of its user message, and a user message's images (or a reply's kept
+/// image copies) inside the chat-image root move into the fork's folder by
+/// file name (unique per image), recorded in `images`.
 pub(crate) fn rewrite_forked_payload(
     payload: &str,
     fork_thread_id: &str,
@@ -116,9 +116,17 @@ pub(crate) fn rewrite_forked_payload(
             object.insert("user_message_id".into(), (*copied).into());
         }
     }
+    // A user message's attachments, or the copies kept for a reply's images.
+    let list = if object.contains_key("images") {
+        object.get_mut("images")
+    } else {
+        object
+            .get_mut("item")
+            .and_then(|item| item.get_mut("retained_images"))
+    };
     if let (Some((roots, fork_dir)), Some(list)) = (
         image_dirs,
-        object.get_mut("images").and_then(serde_json::Value::as_array_mut),
+        list.and_then(serde_json::Value::as_array_mut),
     ) {
         for image in list {
             let Some(path) = image.get("path").and_then(serde_json::Value::as_str) else {
@@ -442,6 +450,27 @@ mod tests {
                 (PathBuf::from("/img/src/a.png"), fork("a.png")),
                 (PathBuf::from("/real/img/old/c.png"), fork("c.png")),
             ]
+        );
+    }
+
+    #[test]
+    fn rewrite_moves_a_replys_kept_image_copies_into_the_forks_folder() {
+        let mut images = Vec::new();
+        let roots = vec![PathBuf::from("/img")];
+        let row = rewrite_forked_payload(
+            r#"{"type":"item_completed","thread_id":"src","item":{"kind":"assistant_text","text":"[a](/tmp/a.png)","retained_images":[{"source":"/tmp/a.png","path":"/img/src/k.png"}]}}"#,
+            "fork",
+            &HashMap::new(),
+            Some((roots.as_slice(), Path::new("/img/fork"))),
+            &mut images,
+        );
+        let row: serde_json::Value = serde_json::from_str(&row).unwrap();
+        let kept = &row["item"]["retained_images"][0];
+        assert_eq!(kept["path"], "/img/fork/k.png");
+        assert_eq!(kept["source"], "/tmp/a.png", "the link the reply wrote stays as written");
+        assert_eq!(
+            images,
+            vec![(PathBuf::from("/img/src/k.png"), PathBuf::from("/img/fork/k.png"))]
         );
     }
 

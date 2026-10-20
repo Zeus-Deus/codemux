@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 const readLocalChatImageMock = vi.fn();
+const readChatImageMock = vi.fn();
 
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (path: string) => `mock-asset:${path}`,
@@ -10,16 +11,19 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 vi.mock("@/tauri/commands", () => ({
   readLocalChatImage: (...args: unknown[]) => readLocalChatImageMock(...args),
+  readChatImage: (...args: unknown[]) => readChatImageMock(...args),
 }));
 
 import {
   MarkdownLocalImage,
+  RetainedImagesProvider,
   resetLocalImageBlobCache,
 } from "./MarkdownLocalImage";
 
 beforeEach(() => {
   resetLocalImageBlobCache();
   readLocalChatImageMock.mockReset();
+  readChatImageMock.mockReset();
 });
 afterEach(() => cleanup());
 
@@ -121,5 +125,73 @@ describe("MarkdownLocalImage", () => {
 
     expect(await findByText("Image unavailable")).toBeInTheDocument();
     expect(container.querySelector("img")).toBeNull();
+  });
+
+  describe("with a kept copy", () => {
+    const kept = [{ source: "/tmp/proof.png", path: "/cfg/images/t/k.png" }];
+    const renderKept = () =>
+      render(
+        <RetainedImagesProvider images={kept}>
+          <MarkdownLocalImage path="/tmp/proof.png" caption="Proof" />
+        </RetainedImagesProvider>,
+      );
+
+    it("loads the conversation's copy instead of the original path", () => {
+      const { container, getByText } = renderKept();
+
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "mock-asset:/cfg/images/t/k.png",
+      );
+      // The card still names what the reply linked to.
+      expect(getByText("Proof")).toBeInTheDocument();
+    });
+
+    it("reads the copy over IPC, then falls back to the original", async () => {
+      readChatImageMock.mockRejectedValue(new Error("still copying"));
+      const { container } = renderKept();
+
+      fireEvent.error(container.querySelector("img")!);
+
+      await waitFor(() => {
+        expect(container.querySelector("img")).toHaveAttribute(
+          "src",
+          "mock-asset:/tmp/proof.png",
+        );
+      });
+      expect(readChatImageMock).toHaveBeenCalledWith("/cfg/images/t/k.png");
+      expect(readLocalChatImageMock).not.toHaveBeenCalled();
+    });
+
+    it("is unavailable only when the copy and the original both fail", async () => {
+      readChatImageMock.mockRejectedValue(new Error("gone"));
+      readLocalChatImageMock.mockRejectedValue(new Error("gone"));
+      const { container, findByText } = renderKept();
+
+      fireEvent.error(container.querySelector("img")!);
+      await waitFor(() => {
+        expect(container.querySelector("img")).toHaveAttribute(
+          "src",
+          "mock-asset:/tmp/proof.png",
+        );
+      });
+      fireEvent.error(container.querySelector("img")!);
+
+      expect(await findByText("Image unavailable")).toBeInTheDocument();
+      expect(readLocalChatImageMock).toHaveBeenCalledWith("/tmp/proof.png");
+    });
+
+    it("ignores copies kept for other links", () => {
+      const { container } = render(
+        <RetainedImagesProvider images={kept}>
+          <MarkdownLocalImage path="/tmp/other.png" caption="Other" />
+        </RetainedImagesProvider>,
+      );
+
+      expect(container.querySelector("img")).toHaveAttribute(
+        "src",
+        "mock-asset:/tmp/other.png",
+      );
+    });
   });
 });

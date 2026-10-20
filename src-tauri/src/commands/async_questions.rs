@@ -69,6 +69,7 @@ fn publish<R: Runtime>(
             thread_id: thread_id.clone(),
             event,
             persisted_id: Some(row_id),
+            retained_images: Vec::new(),
         },
     );
 }

@@ -78,6 +78,11 @@ pub struct AgentChatEventPayload {
     /// bubble this event materializes.
     #[serde(default)]
     pub persisted_id: Option<i64>,
+    /// Conversation-owned copies of the local images a top-level reply
+    /// links to; the stored row carries the same list on its `item`. A copy
+    /// may still be landing, so readers fall back to the original path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_images: Vec<super::reply_images::RetainedReplyImage>,
 }
 
 /// Error string returned when a command runs with
@@ -2212,18 +2217,20 @@ fn compensate_failed_provider_rollback(
     )
 }
 
-/// Attachment paths stamped on a `{"type":"user_message"}` transcript
-/// envelope (see [`persist_user_message`]). Any other row shape yields
-/// nothing.
+/// Image paths a transcript row owns: the attachments stamped on a
+/// `{"type":"user_message"}` envelope (see [`persist_user_message`]) and the
+/// copies kept for a reply's linked images (see `reply_images`). Any other
+/// row shape yields nothing.
 fn chat_image_paths_in_payload(payload: &str) -> Vec<String> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
         return Vec::new();
     };
-    if value.get("type").and_then(|kind| kind.as_str()) != Some("user_message") {
-        return Vec::new();
-    }
-    value
-        .get("images")
+    let images = match value.get("type").and_then(|kind| kind.as_str()) {
+        Some("user_message") => value.get("images"),
+        Some("item_completed") => value.pointer("/item/retained_images"),
+        _ => None,
+    };
+    images
         .and_then(|images| images.as_array())
         .map(|images| {
             images
@@ -3917,6 +3924,7 @@ async fn send_turn_internal<R: Runtime>(
                         original_payload: None,
                     },
                     persisted_id: None,
+                    retained_images: Vec::new(),
                 };
                 fan_out_to_thread_channels(&app, &input.thread_id, &payload);
                 let _ = app.emit(AGENT_CHAT_EVENT, payload);
@@ -4012,7 +4020,7 @@ struct PersistedChatImage {
 /// fallback so an unknown/garbage MIME still round-trips to disk rather
 /// than being dropped. Case-insensitive because clients are inconsistent
 /// about MIME casing (mirrors `files::clipboard_image_extension`).
-fn chat_image_extension(media_type: &str) -> &'static str {
+pub(super) fn chat_image_extension(media_type: &str) -> &'static str {
     match media_type.to_ascii_lowercase().as_str() {
         "image/png" => "png",
         "image/jpeg" | "image/jpg" => "jpg",
@@ -4033,7 +4041,7 @@ fn chat_image_extension(media_type: &str) -> &'static str {
 /// [`chat_images_staging_dir`] hang off this single root so the containment
 /// checks in the stage / discard / read / finalize paths all reason about
 /// one canonical prefix.
-fn chat_images_root() -> Option<std::path::PathBuf> {
+pub(super) fn chat_images_root() -> Option<std::path::PathBuf> {
     Some(
         dirs::config_dir()?
             .join(crate::APP_DIR_NAME)
@@ -4045,7 +4053,7 @@ fn chat_images_root() -> Option<std::path::PathBuf> {
 /// Resolve a thread's chat-image directory:
 /// `<config>/<APP_DIR_NAME>/agent-chat/images/<thread_id>/`. Finalized
 /// attachments for a turn land here.
-fn chat_images_dir(thread_id: &str) -> Option<std::path::PathBuf> {
+pub(super) fn chat_images_dir(thread_id: &str) -> Option<std::path::PathBuf> {
     Some(chat_images_root()?.join(thread_id))
 }
 
@@ -4132,7 +4140,7 @@ fn validate_chat_image_mime(media_type: &str) -> Result<String, String> {
 /// file's extension. Used by the image readers so the fallback
 /// loader can label the bytes it returns. Unknown extensions fall back to
 /// the generic binary type rather than guessing.
-fn media_type_from_extension(path: &std::path::Path) -> String {
+pub(super) fn media_type_from_extension(path: &std::path::Path) -> String {
     match path
         .extension()
         .and_then(|e| e.to_str())
@@ -4346,6 +4354,108 @@ async fn finalize_chat_images(
     Ok((records, inputs))
 }
 
+/// Store image bytes Codemux already owns in `thread_id`'s chat-image folder
+/// as `<file_stem>.<ext>`, returning the path and the media type read from
+/// the bytes themselves (PNG/JPEG/GIF/WebP only, at most the attachment cap).
+///
+/// The write goes through a temp file and a rename, so a reader never sees a
+/// half-written image. An existing file under the same name is reused, which
+/// lets a caller with a deterministic stem materialize the same image once.
+/// `thread_id` and `file_stem` must each be one plain path component.
+pub(crate) async fn write_thread_chat_image(
+    thread_id: &str,
+    file_stem: &str,
+    bytes: &[u8],
+) -> Result<(std::path::PathBuf, String), String> {
+    let plain = |part: &str| {
+        let mut components = std::path::Path::new(part).components();
+        matches!(components.next(), Some(std::path::Component::Normal(name)) if name == part)
+            && components.next().is_none()
+    };
+    if !plain(thread_id) || !plain(file_stem) {
+        return Err("validation_error: chat image name must be a plain file name".to_string());
+    }
+    let max_bytes = crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "validation_error: image exceeds {} MB limit",
+            max_bytes / (1024 * 1024),
+        ));
+    }
+    let media_type = media_type_from_image_bytes(bytes)?;
+    let dir = chat_images_dir(thread_id).ok_or_else(|| "config_dir_unavailable".to_string())?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|error| format!("failed to create chat image dir: {error}"))?;
+    let path = dir.join(format!("{file_stem}.{}", chat_image_extension(&media_type)));
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Ok((path, media_type));
+    }
+    let temp = dir.join(format!(".{file_stem}.{}.tmp", uuid::Uuid::new_v4()));
+    let written = match tokio::fs::write(&temp, bytes).await {
+        Ok(()) => tokio::fs::rename(&temp, &path).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = written {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(format!("failed to write chat image: {error}"));
+    }
+    Ok((path, media_type))
+}
+
+/// Read an absolute local image path with the same bounds as
+/// [`agent_chat_read_local_image`]: an existing regular file with an image
+/// extension, at most the attachment cap even if it grows mid-read, and
+/// image content by magic bytes.
+pub(super) async fn read_bounded_local_image(path: &str) -> Result<ChatImageBytes, String> {
+    let candidate = std::path::Path::new(path);
+    if !candidate.is_absolute() {
+        return Err("validation_error: local image path must be absolute".to_string());
+    }
+
+    let resolved = tokio::fs::canonicalize(candidate)
+        .await
+        .map_err(|error| format!("failed to resolve local image: {error}"))?;
+    let metadata = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(|error| format!("failed to inspect local image: {error}"))?;
+    if !metadata.is_file() {
+        return Err("validation_error: local image path is not a file".to_string());
+    }
+    if metadata.len() > crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES as u64 {
+        return Err(format!(
+            "validation_error: local image exceeds {} MB limit",
+            crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES / (1024 * 1024),
+        ));
+    }
+
+    let extension_media_type = media_type_from_extension(&resolved);
+    if !ACCEPTED_CHAT_IMAGE_MIME.contains(&extension_media_type.as_str()) {
+        return Err("validation_error: unsupported local image type".to_string());
+    }
+
+    // Limit the reader itself, not only the pre-read metadata check: the file
+    // can change between stat and read, and must never make this allocation
+    // grow beyond the advertised ceiling.
+    let file = tokio::fs::File::open(&resolved)
+        .await
+        .map_err(|error| format!("failed to read local image: {error}"))?;
+    let max_bytes = crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES;
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(max_bytes));
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| format!("failed to read local image: {error}"))?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "validation_error: local image exceeds {} MB limit",
+            max_bytes / (1024 * 1024),
+        ));
+    }
+    let media_type = media_type_from_image_bytes(&bytes)?;
+    Ok(ChatImageBytes { bytes, media_type })
+}
+
 /// JSON fallback body for [`agent_chat_stage_image`] on transports that
 /// cannot carry a raw invoke payload. The web-remote bridge serializes
 /// every invoke as JSON (`dispatch_invoke` synthesizes `InvokeBody::Json`)
@@ -4537,53 +4647,7 @@ pub async fn agent_chat_read_local_image<R: Runtime>(
 ) -> Result<ChatImageBytes, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
-
-    let candidate = std::path::Path::new(&path);
-    if !candidate.is_absolute() {
-        return Err("validation_error: local image path must be absolute".to_string());
-    }
-
-    let resolved = tokio::fs::canonicalize(candidate)
-        .await
-        .map_err(|error| format!("failed to resolve local image: {error}"))?;
-    let metadata = tokio::fs::metadata(&resolved)
-        .await
-        .map_err(|error| format!("failed to inspect local image: {error}"))?;
-    if !metadata.is_file() {
-        return Err("validation_error: local image path is not a file".to_string());
-    }
-    if metadata.len() > crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES as u64 {
-        return Err(format!(
-            "validation_error: local image exceeds {} MB limit",
-            crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES / (1024 * 1024),
-        ));
-    }
-
-    let extension_media_type = media_type_from_extension(&resolved);
-    if !ACCEPTED_CHAT_IMAGE_MIME.contains(&extension_media_type.as_str()) {
-        return Err("validation_error: unsupported local image type".to_string());
-    }
-
-    // Limit the reader itself, not only the pre-read metadata check: the file
-    // can change between stat and read, and must never make this allocation
-    // grow beyond the advertised ceiling.
-    let file = tokio::fs::File::open(&resolved)
-        .await
-        .map_err(|error| format!("failed to read local image: {error}"))?;
-    let max_bytes = crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES;
-    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(max_bytes));
-    file.take(max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|error| format!("failed to read local image: {error}"))?;
-    if bytes.len() > max_bytes {
-        return Err(format!(
-            "validation_error: local image exceeds {} MB limit",
-            max_bytes / (1024 * 1024),
-        ));
-    }
-    let media_type = media_type_from_image_bytes(&bytes)?;
-    Ok(ChatImageBytes { bytes, media_type })
+    read_bounded_local_image(&path).await
 }
 
 /// Warm MCP servers eagerly, before the first turn.
@@ -7902,13 +7966,28 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     //   - session_state_changed / session_configured: lifecycle only
     //   - runtime_warning: transient diagnostics (except the Hermes restriction)
     //   - resume_cursor_updated: already persisted above
+    // Local images a top-level reply links to get conversation-owned copies;
+    // the live payload names them once the row that owns them exists.
+    let mut retained_images = Vec::new();
     if should_persist_event(&event) {
         if let Some(thread_id) = thread_id_for_event(&event) {
             if !thread_id.0.is_empty() {
-                if let Ok(payload) = serde_json::to_string(&event) {
+                let planned = plan_reply_images(app, &event);
+                if let Ok(payload) = persisted_event_payload(&event, &planned) {
                     let db: State<'_, DatabaseStore> = app.state();
                     match db.append_agent_chat_message(&thread_id.0, &payload) {
-                        Ok(row_id) => persisted_id = row_id,
+                        Ok(row_id) => {
+                            persisted_id = row_id;
+                            if let (Some(row_id), false) = (row_id, planned.is_empty()) {
+                                super::reply_images::spawn_copies(
+                                    app,
+                                    row_id,
+                                    thread_id.0.clone(),
+                                    planned.clone(),
+                                );
+                                retained_images = planned;
+                            }
+                        }
                         Err(error) => {
                             eprintln!("[codemux::agent_chat] failed to persist message: {error}");
                             // The live pane still renders this event, so the
@@ -7930,6 +8009,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                                     })),
                                 },
                                 persisted_id: None,
+                                retained_images: Vec::new(),
                             };
                             let _ = app.emit(AGENT_CHAT_EVENT, warning);
                         }
@@ -7978,6 +8058,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         thread_id: thread_id.clone(),
         event,
         persisted_id,
+        retained_images,
     };
     if thread_id.0.is_empty() {
         // Thread-less lifecycle/warning traffic is low-frequency; the
@@ -7988,6 +8069,46 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         return;
     }
     fan_out_to_thread_channels(app, &thread_id, &payload);
+}
+
+/// Copies to keep for a top-level reply's linked local images. A device
+/// thread's paths name files on that device, not here.
+fn plan_reply_images<R: Runtime>(
+    app: &AppHandle<R>,
+    event: &ProviderRuntimeEvent,
+) -> Vec<super::reply_images::RetainedReplyImage> {
+    let ProviderRuntimeEvent::ItemCompleted {
+        thread_id,
+        item: crate::agent_provider::CompletedItem::AssistantText { text },
+        subagent_id: None,
+        ..
+    } = event
+    else {
+        return Vec::new();
+    };
+    let planned = super::reply_images::plan(&thread_id.0, text);
+    if planned.is_empty() || thread_runs_on_device(app, &thread_id.0) {
+        return Vec::new();
+    }
+    planned
+}
+
+/// The stored row for `event`; a reply's planned copies ride on its item.
+fn persisted_event_payload(
+    event: &ProviderRuntimeEvent,
+    retained_images: &[super::reply_images::RetainedReplyImage],
+) -> serde_json::Result<String> {
+    if retained_images.is_empty() {
+        return serde_json::to_string(event);
+    }
+    let mut value = serde_json::to_value(event)?;
+    if let Some(item) = value.get_mut("item").and_then(serde_json::Value::as_object_mut) {
+        item.insert(
+            "retained_images".into(),
+            serde_json::to_value(retained_images)?,
+        );
+    }
+    serde_json::to_string(&value)
 }
 
 /// Deliver one already-persisted payload to every channel attached to
@@ -8076,6 +8197,7 @@ fn fan_out_user_message<R: Runtime>(
             client_nonce: client_nonce.filter(|n| !n.is_empty()).map(str::to_string),
         },
         persisted_id,
+        retained_images: Vec::new(),
     };
     fan_out_to_thread_channels(app, &thread, &payload);
 }
@@ -9969,7 +10091,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_image_paths_read_only_user_message_attachments() {
+    fn chat_image_paths_read_user_attachments_and_kept_reply_images() {
         let user = r#"{"type":"user_message","text":"hi","images":[
             {"path":"/img/a.png","media_type":"image/png"},
             {"path":"/img/b.png","media_type":"image/png"}]}"#;
@@ -9985,6 +10107,9 @@ mod tests {
         )
         .is_empty());
         assert!(chat_image_paths_in_payload("not json").is_empty());
+        let reply = r#"{"type":"item_completed","item":{"kind":"assistant_text","text":"x",
+            "retained_images":[{"source":"/tmp/d.png","path":"/img/d.png"}]}}"#;
+        assert_eq!(chat_image_paths_in_payload(reply), vec!["/img/d.png".to_string()]);
     }
 
     #[test]
@@ -12556,6 +12681,7 @@ mod tests {
                 subagent_id: None,
             },
             persisted_id: None,
+            retained_images: Vec::new(),
         }
     }
 

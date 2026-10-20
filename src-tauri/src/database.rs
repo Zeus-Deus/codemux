@@ -4867,6 +4867,28 @@ impl DatabaseStore {
         }
     }
 
+    /// Record the image copies that landed for the assistant reply in row
+    /// `id` (see `commands::reply_images`), dropping the entry when none did.
+    /// `Ok(false)` means the row no longer exists, so the copies are unowned.
+    pub fn set_agent_chat_message_retained_images<T: serde::Serialize>(
+        &self,
+        id: i64,
+        images: &[T],
+    ) -> Result<bool, String> {
+        let images = serde_json::to_string(images).map_err(|e| e.to_string())?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_chat_messages
+             SET payload = CASE json_array_length(?2)
+                 WHEN 0 THEN json_remove(payload, '$.item.retained_images')
+                 ELSE json_set(payload, '$.item.retained_images', json(?2)) END
+             WHERE id = ?1 AND json_valid(payload)",
+            params![id, images],
+        )
+        .map(|changed| changed > 0)
+        .map_err(|e| format!("Failed to record retained reply images: {e}"))
+    }
+
     /// Return every persisted message for a thread, ordered by
     /// insertion time (the autoincrement `id`). Each element is the
     /// raw JSON payload — the frontend parses and dispatches it.

@@ -422,6 +422,9 @@ function applyCompletedItemToList(
           turn_id: turnId,
           text: item.text,
           streaming: false,
+          ...(item.retained_images?.length
+            ? { retained_images: item.retained_images }
+            : {}),
         };
         return {
           messages: replaceItem(messages, existing.index, next),
@@ -445,6 +448,9 @@ function applyCompletedItemToList(
         text: item.text,
         streaming: false,
         created_at: now(),
+        ...(item.retained_images?.length
+          ? { retained_images: item.retained_images }
+          : {}),
       };
       return { messages: appendItem(c2.messages, newAssistant), nextSeq: c2.nextSeq };
     }

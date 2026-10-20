@@ -45,6 +45,7 @@ pub mod chat_fork;
 pub mod queued_turns;
 pub mod provider_switch;
 pub mod restart_resume;
+pub mod reply_images;
 
 pub use agent_chat::*;
 pub use ai::*;
