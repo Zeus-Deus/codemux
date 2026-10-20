@@ -47,7 +47,7 @@ vi.mock("@/tauri/commands", () => ({
     mocks.dockBrowserInRightPanel(...a),
 }));
 
-import { BrowserPeekOverlay } from "./BrowserPeekOverlay";
+import { BrowserPeekOverlay, peekBottomOffset } from "./BrowserPeekOverlay";
 
 function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSnapshot {
   return {
@@ -142,6 +142,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   useAppStore.setState({ appState: null });
 });
 
@@ -276,6 +277,60 @@ describe("BrowserPeekOverlay", () => {
     expect(dialog.style.getPropertyValue("--peek-h")).toBe("320px");
   });
 
+  it("docks bottom-right and grows up and left from its top-left handle", () => {
+    const original = { width: window.innerWidth, height: window.innerHeight };
+    Object.defineProperty(window, "innerWidth", { value: 1920, configurable: true });
+    Object.defineProperty(window, "innerHeight", { value: 1080, configurable: true });
+    try {
+      setAppState([makeSession()]);
+      useBrowserPeekStore.getState().open("ws-1");
+      const { container } = renderOverlay();
+      const dialog = screen.getByRole("dialog");
+      // Clear of the Workspace details card pinned top-right.
+      expect(dialog).toHaveClass("right-3.5");
+      expect(dialog).not.toHaveClass("top-3.5");
+      expect(dialog.style.bottom).toBe("14px");
+
+      const handle = container.querySelector<HTMLElement>("[data-peek-resize]")!;
+      expect(handle).toHaveClass("left-0", "top-0");
+      fireEvent.pointerDown(handle, { button: 0, clientX: 1000, clientY: 700 });
+      fireEvent.pointerMove(handle, { clientX: 940, clientY: 660 });
+      fireEvent.pointerUp(handle);
+      expect(useBrowserPeekStore.getState().size).toEqual({ width: 500, height: 340 });
+    } finally {
+      Object.defineProperty(window, "innerWidth", { value: original.width, configurable: true });
+      Object.defineProperty(window, "innerHeight", { value: original.height, configurable: true });
+    }
+  });
+
+  it("lifts above a composer that mounts while it is open", async () => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.hasAttribute("data-composer-dock")) return new DOMRect(1000, 980, 484, 86);
+      if (this.querySelector(":scope > [role=dialog]")) return new DOMRect(0, 0, 1920, 1080);
+      return new DOMRect(0, 0, 0, 0);
+    });
+    setAppState([makeSession()]);
+    useBrowserPeekStore.getState().open("ws-1");
+    renderOverlay();
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.style.bottom).toBe("14px");
+
+    // A tab switch mounts the chat's composer under the peek's corner.
+    const dock = document.createElement("div");
+    dock.setAttribute("data-composer-dock", "");
+    await act(async () => {
+      dialog.parentElement!.appendChild(dock);
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    });
+    expect(dialog.style.bottom).toBe("112px");
+
+    await act(async () => {
+      dock.remove();
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    });
+    expect(dialog.style.bottom).toBe("14px");
+  });
+
   it("shrinks to the 60% cap when the window gets smaller", () => {
     const original = { width: window.innerWidth, height: window.innerHeight };
     const setWindow = (width: number, height: number) => {
@@ -317,5 +372,22 @@ describe("BrowserPeekOverlay", () => {
       );
     });
     expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(true);
+  });
+});
+
+describe("peekBottomOffset", () => {
+  const container = { top: 40, right: 1920, bottom: 1080 };
+  const size = { width: 440, height: 300 };
+
+  it("sits in the corner when no composer is under it", () => {
+    expect(peekBottomOffset(container, [{ left: 700, right: 1400, top: 980 }], size)).toBe(14);
+  });
+
+  it("lifts above a composer it would cover", () => {
+    expect(peekBottomOffset(container, [{ left: 1000, right: 1484, top: 980 }], size)).toBe(112);
+  });
+
+  it("stays in the corner when lifting would push it out of its container", () => {
+    expect(peekBottomOffset(container, [{ left: 1000, right: 1484, top: 300 }], size)).toBe(14);
   });
 });

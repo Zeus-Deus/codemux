@@ -4,7 +4,7 @@ import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { parseMessageDelivery, STEERING_UNAVAILABLE } from "@/lib/agent-chat/message-delivery";
 import { AsyncQuestionPanel } from "./AsyncQuestionPanel";
 import { useNativeCapabilities } from "./use-native-capabilities";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
 import { useRemoteReconnectEpoch } from "@/remote/remote-connection-store";
@@ -3845,20 +3845,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // root) keeps the Composer's default cwd label as before.
   const zone1Override = workspaceProjectRoot ? null : undefined;
 
-  // Context Row under the composer: project/branch, the composer's
-  // pickers, and git/PR status. Rendered at every message count, so the
-  // strip never changes shape across the first send.
-  const renderContextRow = workspaceProjectRoot
-    ? (settings: ReactNode) => (
-        <ComposerContextRow
-          projectRoot={workspaceProjectRoot}
-          isHomeWorkspace={isHomeWorkspace}
-          branch={paneWorkspaceBranch ?? null}
-          settings={settings}
-          threadId={threadId}
-        />
-      )
-    : undefined;
+  // Context Row under a new chat's composer: where the first message
+  // runs, plus the branch's PR. It leaves once the chat starts; from then
+  // on the title bar's Workspace details card carries the workspace state
+  // and the pickers stay in the composer's controls row.
+  const contextRow =
+    workspaceProjectRoot && messages.length === 0 && !hydrating ? (
+      <ComposerContextRow
+        projectRoot={workspaceProjectRoot}
+        isHomeWorkspace={isHomeWorkspace}
+        branch={paneWorkspaceBranch ?? null}
+      />
+    ) : undefined;
 
   // A workspace-bound pane sends into a workspace that already exists, so
   // nothing else titles it: without this it keeps the backend default
@@ -4357,7 +4355,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       }
       hasActiveGoal={hasGoal}
       zone1Override={zone1Override}
-      renderContextRow={mobile ? undefined : renderContextRow}
+      belowComposerSlot={mobile ? undefined : contextRow}
       onSteerNextQueued={steerNextQueued}
       onEditLastQueued={editLastQueued}
       submitHint={queueEditor.editingId ? "Enter to save the queued message · Esc to cancel" : null}

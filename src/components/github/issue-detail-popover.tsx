@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, type ReactElement } from "react";
 import { cn } from "@/lib/utils";
 import { resolveProvider } from "@/lib/source-control";
 import {
@@ -29,6 +29,9 @@ interface Props {
   /** Hosting product of the issue's repo, for the "Open on …" label.
    *  Absent means GitHub, matching the rest of the app. */
   providerKind?: string | null;
+  /** Replaces the built-in trigger, e.g. a Workspace details card row.
+   *  Must be a single element that forwards props and ref. */
+  trigger?: ReactElement;
 }
 
 export function IssueDetailPopover({
@@ -38,6 +41,7 @@ export function IssueDetailPopover({
   side = "right",
   align = "start",
   providerKind = null,
+  trigger,
 }: Props) {
   const provider = resolveProvider(providerKind);
   const [open, setOpen] = useState(false);
@@ -62,31 +66,33 @@ export function IssueDetailPopover({
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <button
-          type="button"
-          className={cn(
-            variant === "chip"
-              ? "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-label font-semibold text-foreground/80 transition-colors duration-150 hover:bg-surface-2"
-              : "inline-flex items-center gap-1 shrink-0 hover:text-foreground transition-colors duration-150",
-          )}
-          onClick={(e) => e.stopPropagation()}
-          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") e.stopPropagation(); }}
-        >
-          <span
+        {trigger ?? (
+          <button
+            type="button"
             className={cn(
-              "size-1.5 rounded-full",
-              issue.state === "Open" ? "bg-success" : "bg-muted-foreground",
+              variant === "chip"
+                ? "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-label font-semibold text-foreground/80 transition-colors duration-150 hover:bg-surface-2"
+                : "inline-flex items-center gap-1 shrink-0 hover:text-foreground transition-colors duration-150",
             )}
-          />
-          <span
-            className={cn(
-              "tabular-nums",
-              variant === "chip" ? "text-label" : "text-caption",
-            )}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") e.stopPropagation(); }}
           >
-            {variant === "chip" ? `Issue #${issue.number}` : `#${issue.number}`}
-          </span>
-        </button>
+            <span
+              className={cn(
+                "size-1.5 rounded-full",
+                issue.state === "Open" ? "bg-success" : "bg-muted-foreground",
+              )}
+            />
+            <span
+              className={cn(
+                "tabular-nums",
+                variant === "chip" ? "text-label" : "text-caption",
+              )}
+            >
+              {variant === "chip" ? `Issue #${issue.number}` : `#${issue.number}`}
+            </span>
+          </button>
+        )}
       </PopoverTrigger>
       <PopoverContent
         side={side}

@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -149,21 +149,11 @@ describe("Composer pill collapse", () => {
     expect(getByTestId("composer-gap")).toHaveTextContent("Enter to queue");
   });
 
-  it("rests with only attach, prompt and Stop while a turn streams", () => {
-    const { queryByRole, getByRole, getByTestId } = renderComposer({
-      streaming: true,
-      permissionModes: [
-        { value: "bypassPermissions", label: "Full access", description: "", is_default: true },
-      ],
-      renderContextRow: (settings) => <div data-testid="context-row">{settings}</div>,
-    });
+  it("offers Stop but no delivery choice while a turn streams without a draft", () => {
+    const { queryByRole, getByRole } = renderComposer({ streaming: true });
     // Queue / steer only appears once there is something to send.
     expect(queryByRole("button", { name: /Message delivery/ })).toBeNull();
     expect(getByRole("button", { name: "Stop" })).toBeInTheDocument();
-    // Model and access live in the context row, not the pill.
-    const access = getByRole("button", { name: "Access: Full access" });
-    expect(getByTestId("context-row")).toContainElement(access);
-    expect(getByTestId("composer-controls-row")).not.toContainElement(access);
   });
 
   it("offers queue / steer once there is a draft to send mid-turn", () => {
@@ -171,7 +161,7 @@ describe("Composer pill collapse", () => {
     expect(getByRole("button", { name: "Message delivery: Queue" })).toBeInTheDocument();
   });
 
-  it("keeps model and access in the pill when there is no context row", () => {
+  it("keeps model and access in the pill", () => {
     const { getByRole, getByTestId } = renderComposer({
       permissionModes: [
         { value: "bypassPermissions", label: "Full access", description: "", is_default: true },
@@ -388,5 +378,33 @@ describe("footerMinGapFor", () => {
     // Desktop reserves 50px for the context ring; a phone only has padding.
     expect(footerMinGapFor(358, 50)).toBe(54);
     expect(footerMinGapFor(358, 8)).toBe(12);
+  });
+});
+
+describe("Composer /permissions", () => {
+  it("opens the access picker from the + menu once the row has moved it there", async () => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.dataset.testid === "composer-wrapper") return new DOMRect(0, 0, 300, 100);
+      return new DOMRect(0, 0, 0, 0);
+    });
+    const result = renderComposer({
+      draft: "/permissions",
+      permissionModes: [
+        { value: "default", label: "Ask", description: "", is_default: true },
+        { value: "bypassPermissions", label: "Full access", description: "", is_default: false },
+      ],
+    });
+    // The row gave up its last step: access lives in the + menu.
+    const row = within(result.getByTestId("composer-controls-row"));
+    expect(row.queryByRole("button", { name: /Ask/ })).toBeNull();
+    const textarea = result.textarea();
+    fireEvent.focus(textarea);
+    await act(async () => {});
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    });
+    const menu = within(result.getByTestId("composer-command-menu"));
+    expect(menu.getByRole("button", { name: /Ask/ })).toHaveAttribute("data-state", "open");
   });
 });

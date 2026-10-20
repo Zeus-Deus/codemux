@@ -262,7 +262,6 @@ vi.mock("./Composer", async (importOriginal) => {
   const StubComposer = ({
     zone1Override,
     belowComposerSlot,
-    renderContextRow,
     stripSlot,
     onSubmit,
     onStop,
@@ -288,7 +287,6 @@ vi.mock("./Composer", async (importOriginal) => {
   }: {
     zone1Override?: React.ReactNode;
     belowComposerSlot?: React.ReactNode;
-    renderContextRow?: (settings: React.ReactNode) => React.ReactNode;
     stripSlot?: React.ReactNode;
     onSubmit: () => void;
     onStop: () => void;
@@ -342,11 +340,7 @@ vi.mock("./Composer", async (importOriginal) => {
           be observable. */}
       <div data-testid="composer-top-strip">{stripSlot}</div>
       <div data-testid="zone1">{zone1Override}</div>
-      <div data-testid="below-composer">
-        {renderContextRow
-          ? renderContextRow(<span data-testid="composer-settings-stub" />)
-          : belowComposerSlot}
-      </div>
+      <div data-testid="below-composer">{belowComposerSlot}</div>
       <button data-testid="composer-submit" onClick={() => onSubmit()} />
       <button data-testid="composer-stop" onClick={() => onStop()} />
       <button
@@ -461,15 +455,6 @@ vi.mock("./pickers/ThreadScopeRow", () => ({
       />
     );
   },
-}));
-
-// Status cluster — its own store subscriptions / Tauri round-trips are
-// covered by WorkspaceStatusCluster.test.tsx; these tests only need to
-// see WHERE it's rendered (Context Row vs. the empty-state scope row).
-vi.mock("./WorkspaceStatusCluster", () => ({
-  WorkspaceStatusCluster: () => (
-    <div data-testid="workspace-status-cluster-stub" />
-  ),
 }));
 
 vi.mock("@/stores/ui-store", () => ({
@@ -2612,22 +2597,18 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
     // Zone 1 stays empty — scope lives below the composer.
     const zone1 = container.querySelector('[data-testid="zone1"]');
     expect(zone1!.childElementCount).toBe(0);
-    const below = container.querySelector('[data-testid="below-composer"]');
-    expect(
-      below!.querySelector('[data-testid="workspace-status-cluster-stub"]'),
-    ).not.toBeNull();
+    expect(strip(container)).not.toBeNull();
   });
 
-  it("keeps the SAME strip once the conversation has messages (scope never appears to change on first send)", async () => {
+  it("drops the strip once the conversation has messages — the details card carries the workspace from then on", async () => {
     const projectPane = seedProjectWorkspace({ git_branch: "feat/login" });
-    const empty = render(<AgentChatPane pane={projectPane} />);
-    await act(async () => {});
-    const beforeSend = strip(empty.container)!.innerHTML;
-    cleanup();
     currentMessages = [{ kind: "user_message", id: "m1" }];
-    const withMessages = render(<AgentChatPane pane={projectPane} />);
+    const { container } = render(<AgentChatPane pane={projectPane} />);
     await act(async () => {});
-    expect(strip(withMessages.container)!.innerHTML).toBe(beforeSend);
+    expect(strip(container)).toBeNull();
+    expect(
+      container.querySelector('[data-testid="below-composer"]')!.childElementCount,
+    ).toBe(0);
   });
 
   it("a worktree-backed workspace's extra chat tab gets the same read-only strip (the reported bug)", async () => {
