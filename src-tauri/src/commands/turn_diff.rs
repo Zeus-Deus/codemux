@@ -485,6 +485,9 @@ pub(crate) fn wrap_dispatch_checkpoint<R: Runtime>(
 
 #[async_trait::async_trait]
 impl<R: Runtime> TurnDispatchCheckpoint for TurnDiffCapture<R> {
+    async fn accepted(&self, turn: &crate::agent_provider::TurnId) {
+        if let Some(inner) = &self.inner { inner.accepted(turn).await; }
+    }
     fn authorize_dispatch(&self) -> Result<(), ProviderError> {
         match &self.inner {
             Some(inner) => inner.authorize_dispatch(),

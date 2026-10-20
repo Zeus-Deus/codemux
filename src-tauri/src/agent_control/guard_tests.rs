@@ -1096,6 +1096,7 @@ struct Fr1HeldCheckpoint {
 }
 #[async_trait::async_trait]
 impl crate::agent_provider::types::TurnDispatchCheckpoint for Fr1HeldCheckpoint {
+    async fn accepted(&self, turn: &crate::agent_provider::TurnId) { self.inner.accepted(turn).await; }
     fn authorize_dispatch(&self) -> Result<(), ProviderError> {
         let result = self.inner.authorize_dispatch();
         if let Err(error) = &result {
@@ -1202,6 +1203,7 @@ struct C1ScheduledCheckpoint {
 #[async_trait::async_trait]
 impl crate::agent_provider::types::TurnDispatchCheckpoint for C1ScheduledCheckpoint {
     fn authorize_dispatch(&self) -> Result<(), ProviderError> { self.inner.authorize_dispatch() }
+    async fn accepted(&self, turn: &crate::agent_provider::TurnId) { self.inner.accepted(turn).await; }
     async fn prepare(&self) {
         self.inner.prepare().await;
         self.schedule.prepares.fetch_add(1, Ordering::SeqCst);

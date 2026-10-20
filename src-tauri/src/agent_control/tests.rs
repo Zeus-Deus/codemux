@@ -283,6 +283,7 @@ struct MarioQueueCheckpoint {
 #[async_trait::async_trait]
 impl crate::agent_provider::types::TurnDispatchCheckpoint for MarioQueueCheckpoint {
     fn authorize_dispatch(&self) -> Result<(), crate::agent_provider::ProviderError> { self.inner.authorize_dispatch() }
+    async fn accepted(&self, turn: &crate::agent_provider::TurnId) { self.inner.accepted(turn).await; }
     async fn prepare(&self) {
         self.inner.prepare().await;
         self.gate.entered.notify_one();
