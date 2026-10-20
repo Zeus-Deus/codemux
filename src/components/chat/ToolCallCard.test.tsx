@@ -3,6 +3,9 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
+const { openChat } = vi.hoisted(() => ({ openChat: vi.fn() }));
+vi.mock("./delegation-actions", () => ({ openDelegatedChat: openChat }));
+
 vi.mock("@/lib/toast", () => ({
   toast: {
     success: vi.fn(),
@@ -778,5 +781,15 @@ it("plugin bridge approval displays and allows the target tool, not the bridge",
         destination: "session",
       },
     ],
+  });
+});
+
+describe("native chat launch result", () => {
+  it.each(["thread_launch", "mcp__codemux__thread_launch"])("opens a chat from %s through app navigation", (toolName) => {
+    openChat.mockClear();
+    render(<ToolCallCard item={makeTool({tool_name:toolName,status:"done",input:{title:"Parser review"},result_content:[{type:"text",text:JSON.stringify({state:"accepted",thread_id:"launched-chat"})}]})} approval={null} onDecide={vi.fn()} />);
+    expect(screen.getByText("Started chat · Parser review")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button",{name:"Open chat"}));
+    expect(openChat).toHaveBeenCalledWith("launched-chat");
   });
 });
