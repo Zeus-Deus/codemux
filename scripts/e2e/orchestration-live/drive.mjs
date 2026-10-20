@@ -15,10 +15,10 @@ import { execFile } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
-const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 export const DESKTOP = { width: 1440, height: 900 };
 export const PHONE = { width: 390, height: 844 };
@@ -42,9 +42,11 @@ export function loadEnv(rootArg = process.env.ORCH_LIVE_ROOT) {
   return env;
 }
 
-/** `codemux json <cmd> <args>` against the isolated instance (see lib.sh cmx). */
-export async function codemux(env, cmd, args = {}) {
+/** `codemux json <cmd> <args>` against the isolated instance (see lib.sh cmx).
+ *  An aborted `signal` kills the call. */
+export async function codemux(env, cmd, args = {}, { signal } = {}) {
   const { stdout } = await run(env.BIN, ["json", cmd, JSON.stringify(args)], {
+    signal,
     env: {
       HOME: process.env.HOME,
       PATH: "/usr/bin:/bin",
@@ -67,14 +69,18 @@ export class Driver {
     this.session = env.BROWSER_SESSION;
     this.shotsDir = join(env.ROOT, "shots");
     this.viewport = null;
+    /** When set and aborted, in-flight browser calls are killed and every
+     *  wait stops (run.mjs sets one per scenario for its time budget). */
+    this.signal = null;
   }
 
   async ab(args, { json = true } = {}) {
     const argv = ["--session", this.session, ...(json ? ["--json"] : []), ...args];
     let stdout;
     try {
-      ({ stdout } = await run("agent-browser", argv, { maxBuffer: 64 << 20, timeout: 120_000 }));
+      ({ stdout } = await run("agent-browser", argv, { maxBuffer: 64 << 20, timeout: 120_000, signal: this.signal ?? undefined }));
     } catch (error) {
+      this.signal?.throwIfAborted();
       stdout = error.stdout;
       if (!stdout) throw new Error(`agent-browser ${args[0]} failed: ${error.message}`);
     }
@@ -139,16 +145,18 @@ export class Driver {
     const deadline = Date.now() + timeout;
     let last;
     for (;;) {
+      this.signal?.throwIfAborted();
       try {
         last = typeof check === "function" ? await check() : await this.eval(check);
         if (last) return last;
       } catch (error) {
+        this.signal?.throwIfAborted();
         last = error.message;
       }
       if (Date.now() > deadline) {
         throw new Error(`timed out after ${timeout} ms waiting for ${label ?? check} (last: ${JSON.stringify(last)})`);
       }
-      await sleep(interval);
+      await sleep(interval, undefined, { signal: this.signal ?? undefined });
     }
   }
 
@@ -160,10 +168,10 @@ export class Driver {
     const paths = {};
     for (const [kind, size] of [["desktop", DESKTOP], ["mobile", PHONE]]) {
       await this.setViewport(size);
-      await sleep(600); // let layout settle after the resize
+      await sleep(600, undefined, { signal: this.signal ?? undefined }); // let layout settle after the resize
       if (kind === "mobile" && phone) {
         await phone(this);
-        await sleep(600);
+        await sleep(600, undefined, { signal: this.signal ?? undefined });
       }
       paths[kind] = join(this.shotsDir, `${name}-${kind}.png`);
       await this.ab(["screenshot", paths[kind]]);
