@@ -10,6 +10,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 import { invoke } from "@tauri-apps/api/core";
 import {
   activateWorkspace,
+  agentChatOpenSearchResult,
   archiveWorkspace,
   closeWorkspace,
   closeWorkspaceWithWorktree,
@@ -74,6 +75,42 @@ describe("workspace removal commands", () => {
 });
 
 describe("remote activation", () => {
+  it("opens a chat in this client's pane selection after hydrating its tab", async () => {
+    const { useAppStore } = await import("@/stores/app-store");
+    const { setRemoteViewHost } = await import("@/remote/client-view");
+    const remoteWindow = window as Window & { __CODEMUX_REMOTE__?: boolean };
+    remoteWindow.__CODEMUX_REMOTE__ = true;
+    setRemoteViewHost("native-chat-navigation");
+    const previous = useAppStore.getState();
+    const snapshot = {
+      active_workspace_id: "w",
+      workspaces: [{
+        workspace_id: "w", active_tab_id: "receiver", active_surface_id: "receiver-surface",
+        tabs: [{ tab_id: "receiver", surface_id: "receiver-surface" }],
+        surfaces: [{ surface_id: "receiver-surface", active_pane_id: "receiver-pane", root: { kind: "agent_chat", pane_id: "receiver-pane" } }],
+      }],
+    } as import("./types").AppStateSnapshot;
+    try {
+      useAppStore.setState({ appState: null, remoteActiveWorkspaceId: null });
+      useAppStore.getState().setAppState(snapshot);
+      const hydrated = structuredClone(snapshot);
+      hydrated.workspaces[0].tabs.push({ tab_id: "sender", surface_id: "sender-surface", kind: "terminal", title: "Sender", browser_id: null, icon: null });
+      hydrated.workspaces[0].surfaces.push({ surface_id: "sender-surface", title: "Sender", active_pane_id: "sender-pane", root: { kind: "agent_chat", pane_id: "sender-pane", provider: "codex", thread_id: "sender-thread", cwd: "/repo", title: "Sender" } });
+      mockInvoke.mockResolvedValueOnce({ workspace_id: "w", pane_id: "sender-pane" }).mockResolvedValueOnce(hydrated);
+      await agentChatOpenSearchResult("sender-thread");
+      expect(mockInvoke).toHaveBeenCalledWith("agent_chat_open_search_result", { threadId: "sender-thread" });
+      expect(mockInvoke).toHaveBeenCalledWith("get_app_state");
+      expect(useAppStore.getState().appState?.workspaces[0].active_tab_id).toBe("sender");
+      // A later desktop selection must not undo the link navigation here.
+      useAppStore.getState().setAppState(hydrated);
+      expect(useAppStore.getState().appState?.workspaces[0].active_tab_id).toBe("sender");
+    } finally {
+      delete remoteWindow.__CODEMUX_REMOTE__;
+      useAppStore.setState(previous, true);
+      localStorage.clear();
+    }
+  });
+
   it("touches without invoking desktop activation and persists only the newest successful selection", async () => {
     const { useAppStore, selectActiveWorkspaceId } = await import("@/stores/app-store");
     const remoteWindow = window as Window & { __CODEMUX_REMOTE__?: boolean };

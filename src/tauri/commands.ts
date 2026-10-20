@@ -2254,10 +2254,15 @@ export const agentChatImportLocalSessions = async (sourceIds: string[]) => {
   return invoke<LocalChatImportResult>("agent_chat_import_local_sessions", { sourceIds });
 };
 
-export const agentChatOpenSearchResult = (threadId: string) =>
-  invoke<OpenAgentChatSearchResult>("agent_chat_open_search_result", {
+export const agentChatOpenSearchResult = async (threadId: string) => {
+  const opened = await invoke<OpenAgentChatSearchResult>("agent_chat_open_search_result", {
     threadId,
   });
+  if (isRemoteClient()) {
+    await refreshRemoteWorkspaceView(opened.workspace_id, undefined, opened.pane_id);
+  }
+  return opened;
+};
 
 export const agentChatRenameSession = (threadId: string, title: string) =>
   invoke<void>("agent_chat_rename_session", { threadId, title });
