@@ -60,6 +60,14 @@ let accounts: MockAccount[] = [
     login_command: `CODEX_HOME='${ROOT}/codex/codex-side-project-8b2e40' codex login`,
   },
 ];
+// `?fixture=codex-cli-signed-out`: the CLI's own Codex sign-in is signed out.
+if (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("fixture") === "codex-cli-signed-out") {
+  accounts = accounts.map((a) =>
+    a.provider === "codex" && a.id === "default"
+      ? { ...a, identity: { signed_in: false, email: null, organization: null, plan: null } }
+      : a,
+  );
+}
 const defaults: Record<string, string> = { claude: "claude-work-3f9a1c", codex: "codex-work-5c1d22" };
 const workspaceDefaults = new Map<string, Record<string, string>>();
 const bindings = new Map<string, string>();

@@ -63,6 +63,7 @@ import { Eyebrow } from "@/components/ui/eyebrow";
 import { useDisabledProviders } from "@/lib/agent-chat/provider-enablement";
 import { accountName, useProviderAccounts } from "@/stores/provider-accounts-store";
 import type { ProviderAccount } from "@/tauri/commands";
+import { useNativeCapabilities } from "../use-native-capabilities";
 import { accountSummary, useThreadAccount, type ThreadAccountView } from "../use-thread-account";
 import { AccountBadge, AccountFooter, AccountListHeader } from "./provider-account-parts";
 
@@ -383,8 +384,18 @@ export function MultiProviderModelPicker({
     const profile = hermesThreadId ? s.selections[hermesThreadId] : undefined;
     return profile ? s.catalogs[hermesProfileKey(profile)]?.value?.session.models?.availableModels.find(m => m.modelId === model)?.name : undefined;
   });
+  // An extra Codex account signs in on its own, so it lists its own models
+  // (and its own sign-in errors), refreshed whenever it becomes the choice.
+  const codexCatalog = useNativeCapabilities("codex", hermesThreadId);
+  const codexAccountId = codexCatalog.accountId;
+  useEffect(() => {
+    if (open && codexAccountId) void useProviderCapabilities.getState().refreshAccount("codex", codexAccountId);
+  }, [open, codexAccountId]);
   const claudeCaps = allCaps.claude;
-  const codexCaps = allCaps.codex;
+  const codexCaps = codexCatalog.caps;
+  const codexError = codexCatalog.error;
+  const railError = (kind: RailKey): string | null =>
+    kind === "grok" ? grokAvailabilityError : kind === "codex" ? codexError : errorForRail(kind, allCaps);
   const cursorCaps = allCaps.cursor;
   const grokCaps = allCaps.grok;
   const opencodeCaps = allCaps.opencode;
@@ -533,7 +544,7 @@ export function MultiProviderModelPicker({
   // out by the backend — resolves to the concrete `models[0]` row.
   // The trigger label/subtitle/tooltip and the active-row highlight
   // all derive from this one resolution so they can't disagree.
-  const capsForCurrentProvider = selectCapabilities(allCaps, provider);
+  const capsForCurrentProvider = provider === "codex" ? codexCaps : selectCapabilities(allCaps, provider);
   const resolvedModel = useMemo(
     () => selectModel(capsForCurrentProvider, model),
     [capsForCurrentProvider, model],
@@ -712,11 +723,7 @@ export function MultiProviderModelPicker({
             }}
             favoritesCount={visibleFavoritesCount}
             getCount={(kind) => rowsByProvider[kind]?.length ?? 0}
-            getError={(kind) =>
-              kind === "grok"
-                ? grokAvailabilityError
-                : selectError(allCaps, kind)
-            }
+            getError={railError}
             onSelect={(next) => {
               setRailKey(next);
               setQuery("");
@@ -770,11 +777,7 @@ export function MultiProviderModelPicker({
                       grokCaps,
                       opencodeCaps,
                     )}
-                    error={
-                      railKey === "grok"
-                        ? grokAvailabilityError
-                        : errorForRail(railKey, allCaps)
-                    }
+                    error={railError(railKey)}
                   />
                 </CommandEmpty>
                 {visibleRows.length === 0 ? (
@@ -788,11 +791,7 @@ export function MultiProviderModelPicker({
                       grokCaps,
                       opencodeCaps,
                     )}
-                    error={
-                      railKey === "grok"
-                        ? grokAvailabilityError
-                        : errorForRail(railKey, allCaps)
-                    }
+                    error={railError(railKey)}
                     query={query}
                   />
                 ) : (
@@ -1072,10 +1071,13 @@ function AccountRailEntry({
   onChoose: () => void;
 }) {
   const isCurrent = account.id === view.current?.id;
-  // Moving needs a signed-in account and an idle chat.
+  // Nothing is chosen before the chat's binding is known: a started chat
+  // must move rather than record a pick. Moving needs a signed-in account
+  // and an idle chat.
   const blocked =
-    !isCurrent &&
-    (account.identity.signed_in === false || (view.bound && (view.busy || view.switching !== null)));
+    !view.ready ||
+    (!isCurrent &&
+      (account.identity.signed_in === false || (view.bound && (view.busy || view.switching !== null))));
   const name = accountName(account);
   return (
     <div className="relative shrink-0">

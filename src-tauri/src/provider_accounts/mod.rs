@@ -559,6 +559,24 @@ pub fn probe_targets(
     targets
 }
 
+/// Extra account `account_id`'s CLI home, ready to use, with its id.
+/// `None` for the CLI's own sign-in.
+pub fn account_home(
+    db: &DatabaseStore,
+    provider: ProviderKind,
+    account_id: Option<&str>,
+) -> Result<Option<(String, PathBuf)>, String> {
+    let Some(id) = account_id.filter(|id| *id != DEFAULT_ACCOUNT_ID) else {
+        return Ok(None);
+    };
+    let account = lookup(db, provider_slug(provider), id)?
+        .flatten()
+        .ok_or_else(|| "That account no longer exists.".to_string())?;
+    let home = PathBuf::from(&account.home);
+    homes::prepare_home(provider, &home).map_err(|e| format!("Could not prepare the account folder: {e}"))?;
+    Ok(Some((account.id, home)))
+}
+
 /// The home a thread's account lives in.
 fn home_of(provider: ProviderKind, account: Option<&ProviderAccountRow>) -> Option<PathBuf> {
     match account {
@@ -914,6 +932,27 @@ mod tests {
         assert!(!still_on_account(&db, ProviderKind::Codex, "mv-t", "mv-work"));
         assert!(still_on_account(&db, ProviderKind::Codex, "mv-stay", "mv-work"));
         assert!(!still_on_account(&db, ProviderKind::Codex, "mv-stay", "other"));
+    }
+
+    #[test]
+    fn model_discovery_finds_the_extra_accounts_own_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = DatabaseStore::new_in_memory();
+        db.insert_provider_account(&ProviderAccountRow {
+            id: "work".into(),
+            provider: "codex".into(),
+            label: "Work".into(),
+            home: tmp.path().join("work").to_string_lossy().into_owned(),
+            created_at_ms: 0,
+        })
+        .unwrap();
+        assert_eq!(account_home(&db, ProviderKind::Codex, None).unwrap(), None);
+        assert_eq!(account_home(&db, ProviderKind::Codex, Some("default")).unwrap(), None);
+        let (id, home) = account_home(&db, ProviderKind::Codex, Some("work")).unwrap().unwrap();
+        assert_eq!((id.as_str(), home.as_path()), ("work", tmp.path().join("work").as_path()));
+        assert!(home.is_dir());
+        assert!(account_home(&db, ProviderKind::Codex, Some("gone")).is_err());
+        assert!(account_home(&db, ProviderKind::Claude, Some("work")).is_err());
     }
 
     #[test]

@@ -5427,6 +5427,7 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
     force: Option<bool>,
+    account_id: Option<String>,
     codex_cache: tauri::State<
         '_,
         std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>,
@@ -5450,11 +5451,7 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
 ) -> Result<ProviderChatCapabilities, String> {
     // Note: `feature_flag_on(&observability)?;` was deliberately
     // removed when settings began consuming capabilities. See the
-    // function-level comment for the rationale. The `app` handle is
-    // still in the signature because removing it would be a public
-    // API break; downstream consumers may add it back if they grow a
-    // need for app-handle-scoped state.
-    let _ = app;
+    // function-level comment for the rationale.
     let mut capabilities = match provider {
         ProviderKind::Claude => {
             // Cache + cascade: sidecar `list-models` (SDK
@@ -5486,13 +5483,27 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
                 }
                 .to_command_string()
             })?;
-            if force.unwrap_or(false) {
-                codex_cache.invalidate().await;
+            // An extra account signs in on its own: list what that login
+            // offers, never the CLI sign-in's catalog or its auth error.
+            let account = match app.try_state::<DatabaseStore>() {
+                Some(db) => crate::provider_accounts::account_home(&db, provider, account_id.as_deref())?,
+                None => None,
+            };
+            match account {
+                Some((id, home)) => codex_cache
+                    .get_or_harvest_account(&binary_path, &id, &home, force.unwrap_or(false))
+                    .await
+                    .map_err(|err| err.to_command_string()),
+                None => {
+                    if force.unwrap_or(false) {
+                        codex_cache.invalidate().await;
+                    }
+                    codex_cache
+                        .get_or_harvest_owned(&binary_path, &crate::agent_provider::codex::chatgpt::owner())
+                        .await
+                        .map_err(|err| err.to_command_string())
+                }
             }
-            codex_cache
-                .get_or_harvest_owned(&binary_path, &crate::agent_provider::codex::chatgpt::owner())
-                .await
-                .map_err(|err| err.to_command_string())
         }
         ProviderKind::Cursor => {
             let binary_path = which::which("cursor-agent").map_err(|_| {

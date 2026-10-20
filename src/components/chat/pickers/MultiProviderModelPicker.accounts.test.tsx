@@ -24,10 +24,10 @@ vi.mock("@/tauri/custom-acp", async (importOriginal) => ({
   acpAgents: vi.fn(() => new Promise(() => {})),
 }));
 
-import type { ProviderAccount } from "@/tauri/commands";
+import { listChatProviderCapabilities, type ProviderAccount } from "@/tauri/commands";
 import type { ChatModelInfo } from "@/tauri/types";
 import type { UsageLimitState } from "@/lib/agent-chat/types";
-import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
+import { resetProviderCapabilities, useProviderCapabilities } from "@/stores/provider-capabilities-store";
 import { pickKey, useProviderAccounts } from "@/stores/provider-accounts-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { MultiProviderModelPicker } from "./MultiProviderModelPicker";
@@ -83,6 +83,8 @@ function setStreaming(streaming: boolean) {
 }
 
 beforeEach(() => {
+  vi.mocked(listChatProviderCapabilities).mockReset().mockImplementation(() => new Promise(() => {}));
+  resetProviderCapabilities();
   setStreaming(false);
   thread.current = { account_id: "codex-work", bound: false, workspace_id: "ws-1", workspace_default: null };
   switchThread.mockClear();
@@ -152,6 +154,25 @@ it("on a started chat, choosing another account moves it, but not while a turn r
   renderPicker();
   fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
   expect(await screen.findByTestId("provider-rail-codex-default")).toBeDisabled();
+});
+
+it("an extra account lists the models its own sign-in offers", async () => {
+  // The CLI login is signed out; Work is signed in.
+  const notSignedIn = "codex_not_authenticated: Codex is not signed in";
+  const workCaps = { ...useProviderCapabilities.getState().codex!, models: [model("gpt-work", "GPT Work")] };
+  vi.mocked(listChatProviderCapabilities).mockImplementation(async (provider, _force, accountId) => {
+    if (provider !== "codex") return new Promise(() => {});
+    if (accountId === "codex-work") return workCaps;
+    throw new Error(notSignedIn);
+  });
+  useProviderCapabilities.setState({ codex: null, codexError: notSignedIn } as never);
+  thread.current = { ...thread.current, bound: true };
+  renderPicker();
+  fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
+
+  expect(await screen.findByText("GPT Work")).toBeInTheDocument();
+  expect(screen.queryByText(/not signed in/i)).toBeNull();
+  expect(listChatProviderCapabilities).toHaveBeenCalledWith("codex", false, "codex-work");
 });
 
 it("a single account adds nothing", async () => {
