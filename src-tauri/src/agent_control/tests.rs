@@ -311,7 +311,7 @@ async fn mario_r3_queue_boundary(mode: &str) {
     std::fs::write(&binary, include_str!("../../tests/helpers/agent_control_acp_peer.py")).unwrap();
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
     let rig = peer_root.path().join("rig");std::fs::create_dir(&rig).unwrap();
-    let inner = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(crate::agent_provider::cursor::CursorProviderConfig {binary,event_channel_capacity:256}));
+    let inner = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(crate::agent_provider::cursor::CursorProviderConfig {binary,event_channel_capacity:256, mcp_registry: None }));
     let gate = Arc::new(MarioQueueGate {entered:Default::default(),release:tokio::sync::Semaphore::new(0)});
     let provider = Arc::new(MarioQueuedCursor {inner,gate:gate.clone(),starts:Default::default()});
     let thread_name = format!("mario-queue-{mode}");

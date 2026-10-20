@@ -165,6 +165,10 @@ pub enum CommandSet {
     Capabilities,
     /// Start MCP server (JSON-RPC over stdio)
     Mcp,
+    /// Relay a stdio MCP client to the desktop app's MCP gateway. Codemux
+    /// starts this for agents that only take stdio MCP servers.
+    #[command(hide = true)]
+    McpBridge,
     /// Run as the persistent PTY daemon (internal subcommand spawned by the
     /// Tauri app; long-lived process that owns agent PTYs so they survive
     /// the app being closed).
@@ -1012,6 +1016,10 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
         }
         Some(CommandSet::Mcp) => {
             crate::mcp_server::run_mcp_server().await?;
+            Ok(true)
+        }
+        Some(CommandSet::McpBridge) => {
+            crate::mcp::bridge::run().await?;
             Ok(true)
         }
         Some(CommandSet::PtyDaemon { socket }) => {

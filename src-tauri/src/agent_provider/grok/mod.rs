@@ -21,6 +21,8 @@ use crate::agent_provider::{
 pub struct GrokProviderConfig {
     pub binary: PathBuf,
     pub event_channel_capacity: usize,
+    /// Registry whose tools local chats receive through the MCP gateway.
+    pub mcp_registry: Option<crate::mcp::registry::McpRegistry>,
 }
 
 impl Default for GrokProviderConfig {
@@ -28,6 +30,7 @@ impl Default for GrokProviderConfig {
         Self {
             binary: PathBuf::from("grok"),
             event_channel_capacity: 1024,
+            mcp_registry: None,
         }
     }
 }
@@ -148,6 +151,8 @@ impl AgentProvider for GrokAgentProvider {
                 dialect: AcpDialect::Grok,
                 slash_command_cache: Arc::clone(&self.slash_command_cache),
                 remote: input.remote,
+                mcp_registry: self.config.mcp_registry.clone(),
+                workspace_id: input.workspace_id,
             },
             self.event_tx.clone(),
         )

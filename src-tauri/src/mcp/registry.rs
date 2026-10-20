@@ -304,15 +304,37 @@ impl McpRegistry {
 
     /// Return the process-wide authenticated MCP gateway, starting it on an
     /// ephemeral loopback port on first use.
-    pub async fn gateway_connection(&self) -> Result<super::gateway::McpGatewayConnection, String> {
+    pub async fn gateway_connection(
+        &self,
+    ) -> Result<super::gateway::McpGatewayConnection, String> {
+        Ok(self.gateway().await?.connection())
+    }
+
+    /// The gateway connection for one chat (`key` is its thread id): a token
+    /// of its own that tells the gateway the chat's workspace and which
+    /// sources its agent already loads.
+    pub async fn gateway_chat_connection(
+        &self,
+        key: &str,
+        caller: super::gateway::GatewayCaller,
+    ) -> Result<super::gateway::McpGatewayConnection, String> {
+        Ok(self.gateway().await?.chat_connection(key, caller))
+    }
+
+    /// The process-wide gateway, started on first use. For callers that must
+    /// issue a chat connection synchronously, inside their own critical
+    /// section.
+    pub async fn gateway_runtime(&self) -> Result<Arc<super::gateway::McpGatewayRuntime>, String> {
+        self.gateway().await.cloned()
+    }
+
+    async fn gateway(&self) -> Result<&Arc<super::gateway::McpGatewayRuntime>, String> {
         let registry = self.clone();
-        let runtime = self
-            .gateway
+        self.gateway
             .get_or_try_init(|| async move {
                 super::gateway::start_gateway(registry).await.map(Arc::new)
             })
-            .await?;
-        Ok(runtime.connection())
+            .await
     }
 
     /// Install the process-wide host tools. Only the first call wins; every
