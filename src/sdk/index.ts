@@ -36,6 +36,7 @@ export type {
   LandingBackdropProps,
   NotifyKind,
   PaletteCommandData,
+  PluginWorkspace,
   RightPaneData,
   ThreadSnapshot,
   ToolCallView,
@@ -50,3 +51,12 @@ export function definePlugin<T extends import("@/contrib/plugin").CodemuxPlugin>
 }
 
 export type { PluginMcpScope, PluginMcpServer, PluginMcpTool, PluginMcpStatus, PluginMcpContent, PluginMcpCallResult, PluginMcpActivity } from "@/contrib/mcp";
+
+export type {
+  PluginLocalContext,
+  PluginProcessInput,
+  PluginProcessResult,
+  PluginDirectoryEntry,
+  PluginReadTextOptions,
+  PluginOsInfo,
+} from "@/contrib/host-native";

@@ -4,6 +4,7 @@
  * Tauri door and are UNSTABLE: commands may change between releases.
  */
 import { createMcpHost } from "@/contrib/mcp";
+import { createNativeHost } from "@/contrib/host-native";
 import type { ComponentType, ReactNode } from "react";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
@@ -135,6 +136,21 @@ function currentWorkspace(): WorkspaceSnapshot | null {
   return state.appState?.workspaces.find((w) => w.workspace_id === id) ?? null;
 }
 
+export interface PluginWorkspace {
+  id: string;
+  name: string;
+  path: string;
+  remote: boolean;
+}
+function listWorkspaces(): PluginWorkspace[] {
+  return (useAppStore.getState().appState?.workspaces ?? []).map((ws) => ({
+    id: ws.workspace_id,
+    name: ws.title,
+    path: ws.remote_cwd ?? ws.cwd,
+    remote: ws.host_id != null || ws.remote_cwd != null,
+  }));
+}
+
 const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
 
 function osReducedMotion(): MediaQueryList | null {
@@ -209,6 +225,7 @@ export function createHost(bound: Owner | null) {
 
   const api = {
     mcp: createMcpHost(ownerNow, subscription),
+    ...createNativeHost(ownerNow),
     theme: {
       get: (): ThemeDefinition => getActiveTheme(),
       subscribe: (fn: (theme: ThemeDefinition) => void) =>
@@ -242,6 +259,30 @@ export function createHost(bound: Owner | null) {
     },
 
     workspace: {
+      /** Open workspaces, independent of the active selection. */
+      list: listWorkspaces,
+      onListChange: (fn: (workspaces: PluginWorkspace[]) => void) =>
+        subscription(fn, (run) => {
+          let last = listWorkspaces();
+          return useAppStore.subscribe(() => {
+            const next = listWorkspaces();
+            if (
+              next.length !== last.length ||
+              next.some((ws, i) => {
+                const before = last[i];
+                return (
+                  ws.id !== before.id ||
+                  ws.name !== before.name ||
+                  ws.path !== before.path ||
+                  ws.remote !== before.remote
+                );
+              })
+            ) {
+              last = next;
+              run(next);
+            }
+          });
+        }),
       current: currentWorkspace,
       subscribe: (fn: (ws: WorkspaceSnapshot | null) => void) =>
         subscription(fn, (run) => {
