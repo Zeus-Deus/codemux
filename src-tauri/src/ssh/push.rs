@@ -429,9 +429,11 @@ async fn run_with_timeout(
     cmd: &mut Command,
     deadline: Duration,
 ) -> Result<(), String> {
+    // Timeout and caller cancellation must not leave the SSH step running.
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let out = timeout(deadline, async { cmd.output().await })
         .await
         .map_err(|_| "operation timed out".to_string())?
@@ -451,9 +453,11 @@ async fn run_capture_with_timeout(
     cmd: &mut Command,
     deadline: Duration,
 ) -> Result<String, String> {
+    // In particular, a timed-out rsync --delete must stop before a retry.
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let out = timeout(deadline, async { cmd.output().await })
         .await
         .map_err(|_| "operation timed out".to_string())?
@@ -512,6 +516,127 @@ pub use crate::workspace_paths::{
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    struct SleepingChild {
+        dir: tempfile::TempDir,
+    }
+
+    impl SleepingChild {
+        fn new() -> Self {
+            Self {
+                dir: tempfile::tempdir().unwrap(),
+            }
+        }
+
+        fn command(&self) -> Command {
+            let mut cmd = Command::new("sh");
+            // exec keeps the recorded PID attached to the child under test.
+            cmd.arg("-c")
+                .arg("echo $$ > \"$1\"; exec sleep 30")
+                .arg("codemux-transfer-test")
+                .arg(self.dir.path().join("pid"));
+            cmd
+        }
+
+        async fn pid(&self) -> libc::pid_t {
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(contents) = std::fs::read_to_string(self.dir.path().join("pid")) {
+                        if let Ok(pid) = contents.trim().parse() {
+                            return pid;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("test child did not record its PID")
+        }
+
+        async fn assert_terminated(&self, pid: libc::pid_t) {
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    if unsafe { libc::kill(pid, 0) } == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("transfer child is still alive after its runner was dropped");
+        }
+    }
+
+    impl Drop for SleepingChild {
+        fn drop(&mut self) {
+            // Clean up only this fixture's child, including on a failing RED run.
+            if let Ok(contents) = std::fs::read_to_string(self.dir.path().join("pid")) {
+                if let Ok(pid) = contents.trim().parse::<libc::pid_t>() {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+
+    async fn assert_timeout_terminates_child(capture: bool) {
+        let child = SleepingChild::new();
+        let mut cmd = child.command();
+        let run = async {
+            let deadline = Duration::from_millis(200);
+            if capture {
+                run_capture_with_timeout(&mut cmd, deadline).await.map(|_| ())
+            } else {
+                run_with_timeout(&mut cmd, deadline).await
+            }
+        };
+        let (result, pid) = tokio::join!(run, child.pid());
+        assert_eq!(result, Err("operation timed out".to_string()));
+        child.assert_terminated(pid).await;
+    }
+
+    async fn assert_cancellation_terminates_child(capture: bool) {
+        let child = SleepingChild::new();
+        let mut cmd = child.command();
+        let pid = {
+            let run = async {
+                let deadline = Duration::from_secs(10);
+                if capture {
+                    run_capture_with_timeout(&mut cmd, deadline).await.map(|_| ())
+                } else {
+                    run_with_timeout(&mut cmd, deadline).await
+                }
+            };
+            tokio::pin!(run);
+            tokio::select! {
+                pid = child.pid() => pid,
+                result = &mut run => panic!("test child exited before cancellation: {result:?}"),
+            }
+            // Leaving this scope cancels the pending output future.
+        };
+        child.assert_terminated(pid).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_ssh_timeout_terminates_child() {
+        assert_timeout_terminates_child(false).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_rsync_timeout_terminates_child() {
+        assert_timeout_terminates_child(true).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_ssh_cancellation_terminates_child() {
+        assert_cancellation_terminates_child(false).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_rsync_cancellation_terminates_child() {
+        assert_cancellation_terminates_child(true).await;
+    }
 
     #[test]
     fn claude_project_dir_name_matches_observed_encoding() {
