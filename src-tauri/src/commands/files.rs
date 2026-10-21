@@ -157,11 +157,17 @@ fn git_ignored_set(
         .stderr(std::process::Stdio::null())
         .spawn()
         .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(&stdin_data);
-            }
-            child.wait_with_output()
+            // Drain stdout while feeding stdin: a large ignored directory can
+            // fill both pipes, making sequential write-then-read deadlock.
+            std::thread::scope(|scope| {
+                if let Some(mut stdin) = child.stdin.take() {
+                    scope.spawn(move || {
+                        use std::io::Write;
+                        let _ = stdin.write_all(&stdin_data);
+                    });
+                }
+                child.wait_with_output()
+            })
         });
 
     if let Ok(output) = output {
@@ -1516,6 +1522,86 @@ mod tests {
             .find(|e| e.name == "kept.txt")
             .expect("kept.txt should be listed");
         assert!(!kept.is_gitignored, "kept.txt must not be flagged");
+    }
+
+    #[test]
+    fn git_ignored_set_handles_input_and_output_larger_than_pipe_buffers() {
+        const CHILD_REPO: &str = "CODEMUX_GIT_IGNORE_PIPE_TEST_REPO";
+        if let Some(repo) = std::env::var_os(CHILD_REPO) {
+            let dir = std::path::PathBuf::from(repo);
+            let init = std::process::Command::new("git")
+                .arg("init")
+                .current_dir(&dir)
+                .output()
+                .expect("git must be installed for this test");
+            assert!(init.status.success(), "git init failed");
+            fs::write(dir.join(".gitignore"), "ignored-*\n").unwrap();
+
+            // Git accepts nonexistent paths, so exercise backpressure without
+            // creating thousands of files. Include names requiring NUL framing.
+            let special = if cfg!(unix) {
+                "tschüss\t\n"
+            } else {
+                "tschüss space"
+            };
+            let entries: Vec<_> = (0..10_000)
+                .map(|i| {
+                    let name = format!("ignored-{i:05}-{special}{}", "x".repeat(100));
+                    let path = dir.join(&name);
+                    (name, path, i % 2 == 0, Some(0))
+                })
+                .collect();
+            let ignored = super::git_ignored_set(&dir, &entries);
+            assert_eq!(ignored.len(), entries.len());
+            assert!(entries.iter().all(|(name, _, _, _)| ignored.contains(name)));
+            fs::write(dir.join("completed"), b"ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (_, test_name) = concat!(
+            module_path!(),
+            "::git_ignored_set_handles_input_and_output_larger_than_pipe_buffers"
+        )
+        .split_once("::")
+        .unwrap();
+
+        // Isolate a possible deadlock so the test can kill/reap it rather than
+        // leave CI hanging. The parent owns the fixture even if the child hangs.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_REPO, dir.path())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn pipe regression subprocess");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(
+                        status.success(),
+                        "pipe regression subprocess failed: {status}"
+                    );
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("poll pipe regression subprocess: {error}");
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                child.wait().expect("reap pipe regression subprocess");
+                panic!("git check-ignore deadlocked on 10,000 ignored paths");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            dir.path().join("completed").is_file(),
+            "worker test did not run"
+        );
     }
 
     /// Same as above, but the directory is reached through a symlink —
