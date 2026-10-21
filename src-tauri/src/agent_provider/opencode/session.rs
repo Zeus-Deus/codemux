@@ -1147,11 +1147,26 @@ impl OpenCodeSession {
             // A rejected switch must leave the previous selection in force.
             if self.server_handle.api == super::api::OpenCodeApi::V2 {
                 self.switch_native_agent(agent).await?;
+                // A running turn continues in the new agent, so its Codemux
+                // calls take the new policy now: calls admitted under the old
+                // one end. OpenCode 1 chats carry no Codemux tools.
+                if let Some(mcp) = &self.mcp {
+                    mcp.session.set_mode(Some(Self::gateway_mode(agent).into()));
+                }
             }
             *self.agent.lock().await = Some(agent);
             Ok(())
         })
         .await
+    }
+
+    /// The Codemux gateway policy mode an OpenCode agent runs under.
+    fn gateway_mode(agent: &str) -> &'static str {
+        if agent == "plan" {
+            "plan"
+        } else {
+            "default"
+        }
     }
 
     /// Switch the native agent unless it is already applied. Returns whether
@@ -1596,14 +1611,8 @@ impl OpenCodeSession {
             }
             if !steer {
                 if let Some(mcp) = &self.mcp {
-                    mcp.session.set_mode(Some(
-                        if *self.agent.lock().await == Some("plan") {
-                            "plan"
-                        } else {
-                            "default"
-                        }
-                        .into(),
-                    ));
+                    let agent = (*self.agent.lock().await).unwrap_or("build");
+                    mcp.session.set_mode(Some(Self::gateway_mode(agent).into()));
                     mcp.session.begin(&ctx.turn_id.0, checkpoint.as_ref())?;
                 }
             }
@@ -3649,6 +3658,22 @@ pub(crate) mod tests {
         broadcast::Receiver<ProviderRuntimeEvent>,
         tokio::sync::watch::Sender<bool>,
     ) {
+        mock_session_with_mcp(base_url, password, session_id, api, "t1", None).await
+    }
+
+    async fn mock_session_with_mcp(
+        base_url: String,
+        password: String,
+        session_id: &str,
+        api: super::super::api::OpenCodeApi,
+        thread: &str,
+        mcp: Option<crate::agent_provider::acp::mcp::ChatMcp>,
+    ) -> (
+        Arc<OpenCodeSession>,
+        broadcast::Sender<ProviderRuntimeEvent>,
+        broadcast::Receiver<ProviderRuntimeEvent>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
         let (tx, rx) = broadcast::channel(64);
         let (ready_sender, ready) = tokio::sync::watch::channel(true);
         let handle = OpenCodeServerHandle {
@@ -3662,7 +3687,7 @@ pub(crate) mod tests {
         let provider_session_id = ProviderSessionId(session_id.to_string());
         let initial_turn = TurnId("turn_init".into());
         let event_ctx = Arc::new(Mutex::new(EventContext {
-            thread_id: ThreadId("t1".into()),
+            thread_id: ThreadId(thread.into()),
             turn_id: initial_turn,
             provider_session_id: provider_session_id.clone(),
             turn_active: false,
@@ -3670,7 +3695,7 @@ pub(crate) mod tests {
             model_cost: None,
         }));
         let session = Arc::new(OpenCodeSession {
-            thread_id: ThreadId("t1".into()),
+            thread_id: ThreadId(thread.into()),
             provider_session_id: provider_session_id.clone(),
             current_model: Mutex::new(Some("openai/gpt-5".into())),
             current_variant: Mutex::new(None),
@@ -3678,7 +3703,7 @@ pub(crate) mod tests {
             applied_agent: Mutex::new(None),
             reminder_pending: AtomicBool::new(false),
             server_handle: handle,
-            mcp: None,
+            mcp,
             directory: None,
             http,
             event_ctx,
@@ -3976,6 +4001,66 @@ pub(crate) mod tests {
         assert_eq!(*session.applied_agent.lock().await, Some("plan"));
         // The steered wire delivery still opens a new Codemux turn.
         assert!(session.turn_active().await);
+    }
+
+    /// A live switch moves a running turn's Codemux calls to the new agent's
+    /// policy at once; a refused switch keeps the old one.
+    #[tokio::test]
+    async fn a_live_agent_switch_moves_codemux_calls_to_the_new_policy() {
+        let mut server = Server::new_async().await;
+        let _agents = server
+            .mock("GET", "/api/agent")
+            .with_status(200)
+            .with_body(r#"{"data":[]}"#)
+            .create_async()
+            .await;
+        let switched = server
+            .mock("POST", "/api/session/s/agent")
+            .match_body(mockito::Matcher::Json(serde_json::json!({"agent":"plan"})))
+            .with_status(204)
+            .create_async()
+            .await;
+        let refused = server
+            .mock("POST", "/api/session/s/agent")
+            .match_body(mockito::Matcher::Json(serde_json::json!({"agent":"build"})))
+            .with_status(500)
+            .create_async()
+            .await;
+        let thread = "opencode-live-agent-switch";
+        let mcp = crate::agent_provider::acp::mcp::ChatMcp::new(
+            McpRegistry::default(),
+            thread,
+            ProviderKind::OpenCode,
+            None,
+            Some("default".into()),
+            "codemux_switch".into(),
+            None,
+            vec![],
+            false,
+        );
+        let gateway = mcp.session.clone();
+        let (session, _, _, _) = mock_session_with_mcp(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+            thread,
+            Some(mcp),
+        )
+        .await;
+        // A running Build turn has a Codemux call in flight.
+        gateway.begin("turn-build", None).unwrap();
+        let permit = gateway.authority.capture();
+        let call = tokio::spawn(std::future::pending::<()>());
+        gateway.authority.track(&permit, call.abort_handle());
+        session.select_agent("plan").await.unwrap();
+        switched.assert_async().await;
+        assert_eq!(gateway.caller().permission_mode.as_deref(), Some("plan"));
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), call).await;
+        assert!(ended.expect("the Build call kept running").unwrap_err().is_cancelled());
+        assert!(session.select_agent("build").await.is_err());
+        refused.assert_async().await;
+        assert_eq!(gateway.caller().permission_mode.as_deref(), Some("plan"));
     }
 
     #[tokio::test]

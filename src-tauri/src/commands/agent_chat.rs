@@ -1021,9 +1021,8 @@ pub async fn agent_chat_start_session_guarded<R: Runtime>(
     )?;
     if let Some(tier) = input.service_tier.as_deref() {
         input.fast_mode = match tier {
-            "default" => false,
-            "fast" => true,
-            _ if provider == ProviderKind::Codex => false,
+            "default" | "fast" => crate::database::legacy_fast_mode(tier),
+            _ if provider == ProviderKind::Codex => crate::database::legacy_fast_mode(tier),
             _ => {
                 return Err("validation_error: provider does not support this service tier".into())
             }

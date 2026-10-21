@@ -3000,3 +3000,131 @@ async fn all_provider_workspace_launch_carries_hermes_profiles() {
     assert_eq!(input.permission_mode.as_deref(), Some("dont_ask"));
     cleanup(&input);
 }
+
+/// A Codex model advertising efforts and the premium service tiers.
+fn premium_codex_capabilities() -> crate::agent_provider::ProviderChatCapabilities {
+    let entry: crate::agent_provider::codex::protocol::ModelEntry = serde_json::from_value(json!({
+        "id": "premium-model", "model": "premium-model", "displayName": "Premium", "isDefault": true,
+        "defaultReasoningEffort": "medium",
+        "supportedReasoningEfforts": [
+            {"reasoningEffort": "low", "description": ""},
+            {"reasoningEffort": "high", "description": ""},
+        ],
+        "serviceTiers": [
+            {"id": "priority", "name": "Fast", "description": "Premium speed"},
+            {"id": "ultrafast", "name": "Ultrafast", "description": "Higher usage"},
+        ],
+    }))
+    .unwrap();
+    crate::agent_provider::codex::capabilities::build_capabilities(vec![entry])
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_provider_premium_codex_tiers_start_through_the_guard() {
+    use crate::agent_provider::ProviderKind;
+    let (app, provider, _root, workspace, _thread, _authority, _actor) =
+        native_caller_provider_fixture(ProviderKind::Codex, "danger-full-access").await;
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap()
+        .insert(ProviderKind::Codex, premium_codex_capabilities());
+    for tier in ["priority", "ultrafast"] {
+        let receipt = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
+            "workspace_id": workspace, "client_request_id": format!("premium-{tier}"),
+            "provider": "codex", "permission_mode": "workspace-write",
+            "target": {"instance_id": "codex", "model": "premium-model", "options": {"service_tier": tier}},
+        })).await.unwrap();
+        let settled = settle_operation(&app, &receipt).await;
+        assert_eq!(settled["state"], "succeeded", "{tier}: {settled}");
+        let thread = settled["thread_id"].as_str().unwrap();
+        let record = app.state::<crate::database::DatabaseStore>().get_agent_chat_session(thread).unwrap();
+        assert_eq!(record.service_tier, tier);
+        assert!(provider.start_inputs().iter().any(|input| input.thread_id.0 == thread
+            && input.service_tier.as_deref() == Some(tier)));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_provider_inherited_launch_keeps_explicit_options() {
+    use crate::agent_provider::ProviderKind;
+    let (app, _provider, _root, _workspace, thread, _authority, actor) =
+        native_caller_provider_fixture(ProviderKind::Codex, "danger-full-access").await;
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap()
+        .insert(ProviderKind::Codex, premium_codex_capabilities());
+    let db = app.state::<crate::database::DatabaseStore>();
+    db.update_agent_chat_session_config(&thread, &crate::database::AgentChatSessionConfig {
+        model: Some(Some("premium-model".into())), effort: Some(Some("high".into())),
+        service_tier: Some("priority".into()), ..Default::default()
+    }).unwrap();
+    let launch = |args: serde_json::Value| {
+        let (app, actor) = (app.handle().clone(), actor.clone());
+        async move {
+            let receipt = native::call(app.clone(), actor.clone(), "thread_launch".into(), args).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let status = native::call(app.clone(), actor.clone(), "operation_status".into(), json!({"operation_id": receipt["operation_id"]})).await.unwrap();
+                    if !matches!(status["state"].as_str(), Some("accepted" | "running")) { break status; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.unwrap()
+        }
+    };
+    // Same model, nothing named: the caller's effort and tier carry over.
+    let inherited = launch(json!({"title": "Inherited options"})).await;
+    assert_eq!(inherited["state"], "succeeded", "{inherited}");
+    let record = db.get_agent_chat_session(inherited["thread_id"].as_str().unwrap()).unwrap();
+    assert_eq!((record.effort.as_deref(), record.service_tier.as_str()), (Some("high"), "priority"));
+    // Named options win over the caller's.
+    let explicit = launch(json!({"title": "Explicit options", "effort": "low", "service_tier": "ultrafast"})).await;
+    assert_eq!(explicit["state"], "succeeded", "{explicit}");
+    let record = db.get_agent_chat_session(explicit["thread_id"].as_str().unwrap()).unwrap();
+    assert_eq!((record.effort.as_deref(), record.service_tier.as_str()), (Some("low"), "ultrafast"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_provider_opencode_plan_child_starts_in_the_plan_agent() {
+    use crate::agent_provider::ProviderKind;
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, _, _root, workspace, thread, _authority, actor) = native_caller_fixture("bypassPermissions").await;
+    let opencode = Arc::new(mock_agent_provider::MockAgentProvider::new(ProviderKind::OpenCode));
+    app.state::<crate::commands::agent_chat::ProviderRegistry>().set_opencode(opencode.clone()).await;
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap().insert(
+        ProviderKind::OpenCode,
+        crate::agent_provider::opencode::capabilities::opencode_stage1_placeholder(),
+    );
+    let caller = HostCaller { control: Some(native::qualify(app.handle(), &actor).await.unwrap()), thread_id: thread, provider: ProviderKind::Claude, workspace_id: Some(workspace), permission_mode: Some("bypassPermissions".into()) };
+    let host = crate::commands::delegation::DelegationHost::with_install_check(app.handle().clone(), |_| true);
+    let result = host.call_async(&caller, "mcp__codemux__delegate_task", &json!({"target":{"instance_id":"opencode"},"permission_mode":"plan","title":"Plan child","task":"Plan the parser refactor without editing any files."}), None, None).await.unwrap();
+    assert_ne!(result["isError"], true, "{result}");
+    let calls = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let calls = opencode.calls.snapshot();
+            if calls.iter().any(|call| matches!(call, mock_agent_provider::MockCall::StartSession(_))) { break calls; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("the OpenCode child started");
+    let plan = calls.iter().position(|call| matches!(call, mock_agent_provider::MockCall::SetPermissionMode(_, mode) if mode == "plan"));
+    let start = calls.iter().position(|call| matches!(call, mock_agent_provider::MockCall::StartSession(_)));
+    assert!(plan.is_some() && plan < start, "plan is selected before the session starts: {calls:?}");
+}
+
+#[tokio::test]
+async fn all_provider_hermes_only_machine_still_offers_delegation() {
+    use crate::mcp::registry::{HostCaller, HostTools};
+    let (app, _, root, workspace) = fixture().await;
+    app.manage(crate::commands::delegation::DelegationState::default());
+    let db = app.state::<crate::database::DatabaseStore>();
+    db.set_setting("hermes.root", &root.path().join("missing").to_string_lossy()).unwrap();
+    let host = crate::commands::delegation::DelegationHost::with_install_check(app.handle().clone(), |_| false);
+    let caller = HostCaller { control: None, thread_id: "hermes-only".into(), provider: crate::agent_provider::ProviderKind::Hermes, workspace_id: Some(workspace), permission_mode: Some("dont_ask".into()) };
+    let names = |host: &crate::commands::delegation::DelegationHost<tauri::test::MockRuntime>| host.tools_for(&caller).into_iter().map(|t| t.name).collect::<Vec<_>>();
+    assert!(!names(&host).contains(&"delegate_task".to_string()), "nothing configured, nothing offered");
+    // A configured Hermes profile is reachable through `target`.
+    let hermes_root = tempfile::tempdir().unwrap();
+    db.set_setting("hermes.root", &hermes_root.path().to_string_lossy()).unwrap();
+    db.set_setting("hermes.installation", &std::env::current_exe().unwrap().to_string_lossy()).unwrap();
+    let names = names(&host);
+    for tool in ["delegate_task", "task_status", "task_cancel"] {
+        assert!(names.contains(&tool.to_string()), "{tool} missing: {names:?}");
+    }
+    let delegate = host.tools_for(&caller).into_iter().find(|t| t.name == "delegate_task").unwrap();
+    assert!(delegate.input_schema["properties"]["provider"].get("enum").is_none(), "no empty provider enum");
+}

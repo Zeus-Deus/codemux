@@ -437,18 +437,24 @@ fn inherit_selection<R: Runtime>(
             .cloned()
             .unwrap_or_else(|| json!(record.model));
         let mut options = json!({});
+        // An option the launch names itself is never replaced by the
+        // caller's. Tier and fast mode are one choice, so either opts out of
+        // inheriting both.
+        let explicit = |key: &str| args.get(key).is_some_and(|v| !v.is_null());
         if model == json!(record.model) {
-            if let Some(effort) = record.effort {
+            if let Some(effort) = record.effort.filter(|_| !explicit("effort")) {
                 options["effort"] = json!(effort);
             }
-            if let Some(window) = record.context_window {
+            if let Some(window) = record.context_window.filter(|_| !explicit("context_window")) {
                 options["context_window"] = json!(window);
             }
-            if !record.service_tier.is_empty() && record.service_tier != "default" {
-                options["service_tier"] = json!(record.service_tier);
-            }
-            if record.fast_mode {
-                options["fast_mode"] = json!(true);
+            if !explicit("service_tier") && !explicit("fast_mode") {
+                // The stored flag is derived from the tier, which wins.
+                if !record.service_tier.is_empty() && record.service_tier != "default" {
+                    options["service_tier"] = json!(record.service_tier);
+                } else if record.fast_mode {
+                    options["fast_mode"] = json!(true);
+                }
             }
         }
         args["target"] = json!({"instance_id":instance,"model":model,"options":options});

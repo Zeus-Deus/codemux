@@ -617,6 +617,13 @@ pub(crate) fn offered_agents(
         .collect()
 }
 
+/// Hermes profiles and custom ACP agents run as configured instances rather
+/// than a CLI on PATH; a `target` reaches them even with no CLI installed.
+fn profile_instances_configured(db: &DatabaseStore) -> bool {
+    db.acp_agents().is_ok_and(|agents| agents.iter().any(|agent| agent.enabled))
+        || crate::agent_control::selection::profiles(db).is_ok_and(|profiles| !profiles.is_empty())
+}
+
 /// The child's start input, from an explicit allowlist: nothing is copied
 /// from the parent's session.
 fn child_input(
@@ -775,6 +782,12 @@ fn snapshot(child_thread_id: &str, task: &Task) -> SubagentSnapshot {
 }
 
 fn delegate_tool(agents: &[ProviderKind]) -> McpTool {
+    let mut provider = json!({"type": "string", "description": "Agent that runs the task."});
+    // With only configured instances (Hermes, custom ACP) a `target` names
+    // the agent; an empty enum would admit no value at all.
+    if !agents.is_empty() {
+        provider["enum"] = json!(agents.iter().map(|kind| provider_id(*kind)).collect::<Vec<_>>());
+    }
     McpTool {
         name: TOOL_NAME.to_string(),
         prefixed_name: prefix_tool_name("codemux", TOOL_NAME),
@@ -783,11 +796,7 @@ fn delegate_tool(agents: &[ProviderKind]) -> McpTool {
             "type": "object",
             "properties": {
                 "target": crate::agent_control::selection::schema(),
-                "provider": {
-                    "type": "string",
-                    "enum": agents.iter().map(|kind| provider_id(*kind)).collect::<Vec<_>>(),
-                    "description": "Agent that runs the task."
-                },
+                "provider": provider,
                 "title": {
                     "type": "string",
                     "description": "3-8 word label shown to the user (max 60 characters)."
@@ -855,7 +864,7 @@ impl<R: Runtime> DelegationHost<R> {
         }
         let is_child = state.is_running_child(&caller.thread_id);
         let agents = offered_agents(caller, is_child, self.is_installed);
-        if agents.is_empty() {
+        if agents.is_empty() && !profile_instances_configured(&db) {
             Vec::new()
         } else {
             vec![
@@ -891,7 +900,13 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
             let requested_deadline = now_ms() + args["wait_ms"].as_u64().unwrap_or(20_000).min(20_000) as i64;
             let mut arguments = args.clone();
             let validation = async {
-                let input: DelegateArgs = serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+                let mut input: DelegateArgs = serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+                if let Some(target) = input.target.as_mut() {
+                    // A top-level model or effort selects within the target,
+                    // so admission, retries and the child all see one choice.
+                    merge_into_target(target, input.model.as_deref(), input.effort.as_deref())?;
+                    arguments["target"] = json!(target);
+                }
                 if input
                     .mode
                     .as_deref()
@@ -904,7 +919,7 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                     if key.trim().is_empty() || key.len() > 256 {
                         return Err("client_request_id must contain 1-256 bytes".into());
                     }
-                    let mut retry = args.clone();
+                    let mut retry = arguments.clone();
                     if let Some(target) = &input.target {
                         let provider = parse_provider(
                             target.instance_id.split(':').next().unwrap_or_default(),
@@ -1091,6 +1106,36 @@ struct DelegateArgs {
     wait_ms: Option<u64>,
     role: Option<String>,
     permission_mode: Option<String>,
+}
+
+/// Fold a top-level `model`/`effort` into a delegate `target`, refusing a
+/// value that disagrees with the target's own.
+fn merge_into_target(
+    target: &mut crate::agent_control::selection::ProviderSelection,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<(), String> {
+    if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
+        match &target.model {
+            Some(selected) if selected != model => {
+                return Err("invalid_arguments: model and target.model disagree".into())
+            }
+            Some(_) => {}
+            None => target.model = Some(model.into()),
+        }
+    }
+    if let Some(effort) = effort.filter(|e| !e.trim().is_empty()) {
+        match target.options.get("effort") {
+            Some(selected) if selected != &json!(effort) => {
+                return Err("invalid_arguments: effort and target.options.effort disagree".into())
+            }
+            Some(_) => {}
+            None => {
+                target.options.insert("effort".into(), json!(effort));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn admission_payload(task: &Task, args: &DelegateArgs) -> Value {
@@ -1376,6 +1421,23 @@ pub(super) fn readable_error(raw: &str) -> String {
     }
 }
 
+/// Select OpenCode's plan agent for a child that has no session yet. The
+/// adapter remembers it for the session the child starts next.
+async fn select_opencode_plan<R: Runtime>(app: &AppHandle<R>, child: &str) -> Result<(), String> {
+    let opencode = app
+        .state::<super::agent_chat::ProviderRegistry>()
+        .get(ProviderKind::OpenCode)
+        .await
+        .ok_or("OpenCode is not configured")?;
+    match opencode
+        .set_permission_mode(ThreadId(child.into()), "plan".into())
+        .await
+    {
+        Ok(()) | Err(crate::agent_provider::ProviderError::SessionNotFound { .. }) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// Start the child's session and send it the task. Holds the child's
 /// activity lock throughout, so a Stop that lands meanwhile interrupts the
 /// child only after the task text is in.
@@ -1435,6 +1497,14 @@ pub(crate) async fn run_starter<R: Runtime>(
             .get("fast_mode")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+    }
+    // OpenCode starts in its default agent whatever the launch mode says, so
+    // a Plan child selects the plan agent before its session and task start.
+    if provider == ProviderKind::OpenCode && record.permission_mode.as_deref() == Some("plan") {
+        if let Err(error) = select_opencode_plan(&app, &child).await {
+            state.finish(&app, &child, Phase::Failed(error));
+            return;
+        }
     }
     let control = record.caller.clone().map(|caller| {
         crate::agent_control::NativeControlGuard { caller, workspace_id:record.workspace_id.clone(),thread_id:child.clone(),provider,admission:None }.retain_admission(&app)
@@ -2355,5 +2425,19 @@ mod all_provider_opaque_selector_tests {
         let task=requested_task("parent",&json!({"provider":"acp","target":{"instance_id":"acp:fixture","model":" model with spaces ","options":{"effort":" exact effort "}},"title":"Opaque selector","task":"Review the exact configured provider selector values","model":" model with spaces ","effort":" exact effort "}),|_|true).unwrap();
         assert_eq!(task.model.as_deref(), Some(" model with spaces "));
         assert_eq!(task.effort.as_deref(), Some(" exact effort "));
+    }
+
+    #[test]
+    fn all_provider_instance_only_target_keeps_the_explicit_model() {
+        let mut target: crate::agent_control::selection::ProviderSelection =
+            serde_json::from_value(json!({"instance_id":"codex:work"})).unwrap();
+        merge_into_target(&mut target, Some("gpt-5"), Some("high")).unwrap();
+        assert_eq!(target.model.as_deref(), Some("gpt-5"));
+        assert_eq!(target.options["effort"], json!("high"));
+        // Agreeing values are fine; disagreeing ones are refused, not dropped.
+        merge_into_target(&mut target, Some("gpt-5"), Some("high")).unwrap();
+        assert!(merge_into_target(&mut target, Some("gpt-4"), None).is_err());
+        assert!(merge_into_target(&mut target, None, Some("low")).is_err());
+        assert_eq!(target.model.as_deref(), Some("gpt-5"));
     }
 }

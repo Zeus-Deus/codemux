@@ -81,9 +81,36 @@ mod orphans {
         #[cfg(test)]
         return std::env::temp_dir().join(format!("codemux-opencode-test-{}", std::process::id()));
         #[cfg(not(test))]
-        dirs::runtime_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("codemux-opencode")
+        match dirs::runtime_dir() {
+            Some(runtime) => runtime.join("codemux-opencode"),
+            // The shared temp dir needs a per-user name; `private` refuses a
+            // directory another user created first.
+            None => std::env::temp_dir()
+                .join(format!("codemux-opencode-{}", unsafe { libc::getuid() })),
+        }
+    }
+
+    /// Records are trusted only from a real directory this user owns that
+    /// nobody else can write, and from regular files this user owns: a forged
+    /// record would make Codemux kill an unrelated process group.
+    fn private(path: &std::path::Path, directory: bool) -> bool {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        std::fs::symlink_metadata(path).is_ok_and(|meta| {
+            let kind = if directory { meta.is_dir() } else { meta.is_file() };
+            kind && meta.uid() == unsafe { libc::getuid() }
+                && meta.permissions().mode() & 0o022 == 0
+        })
+    }
+
+    /// The record directory, created private when missing.
+    fn ensure_dir() -> Option<PathBuf> {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = dir();
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir);
+        private(&dir, true).then_some(dir)
     }
 
     /// `starttime` from `/proc/<pid>/stat`: field 22, the 20th after `comm`.
@@ -99,9 +126,16 @@ mod orphans {
             return;
         };
         let record = Record { server, server_start, owner, owner_start };
-        let _ = std::fs::create_dir_all(dir());
-        if let Ok(json) = serde_json::to_vec(&record) {
-            let _ = std::fs::write(dir().join(format!("{server}.json")), json);
+        let (Some(dir), Ok(json)) = (ensure_dir(), serde_json::to_vec(&record)) else {
+            return;
+        };
+        // Written whole, then renamed into place: `reap` never reads half a
+        // record.
+        let staging = dir.join(format!(".{server}.json.tmp"));
+        if std::fs::write(&staging, json).is_ok()
+            && std::fs::rename(&staging, dir.join(format!("{server}.json"))).is_err()
+        {
+            let _ = std::fs::remove_file(&staging);
         }
     }
 
@@ -110,10 +144,23 @@ mod orphans {
     }
 
     pub(super) fn reap() {
-        let Ok(entries) = std::fs::read_dir(dir()) else {
+        reap_in(&dir());
+    }
+
+    fn reap_in(dir: &std::path::Path) {
+        if !private(dir, true) {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for path in entries.flatten().map(|entry| entry.path()) {
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            if !private(&path, false) {
+                continue;
+            }
             let Some(record) = std::fs::read(&path)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
@@ -174,6 +221,49 @@ mod orphans {
             forget(owned.id());
             let _ = owned.kill();
             let _ = owned.wait();
+        }
+
+        #[test]
+        fn ignores_records_another_user_could_have_planted() {
+            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::process::CommandExt;
+            // A group leader, so a trusted record naming it would kill it.
+            let mut victim = std::process::Command::new("/bin/sleep")
+                .arg("600")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let forged = serde_json::to_vec(&Record {
+                server: victim.id(),
+                server_start: start_ticks(victim.id()).unwrap(),
+                owner: u32::MAX,
+                owner_start: 0,
+            })
+            .unwrap();
+            let scratch = tempfile::tempdir().unwrap();
+            // A shared, writable directory another user could have created.
+            let shared = scratch.path().join("shared");
+            std::fs::create_dir(&shared).unwrap();
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+            std::fs::write(shared.join("1.json"), &forged).unwrap();
+            reap_in(&shared);
+            assert!(shared.join("1.json").exists(), "an untrusted directory is not read");
+            // A symlink to a private directory is not trusted either.
+            let real = scratch.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            std::fs::write(real.join("1.json"), &forged).unwrap();
+            let link = scratch.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            reap_in(&link);
+            assert!(real.join("1.json").exists(), "a symlinked directory is not read");
+            // A record file another user can write is skipped.
+            std::fs::set_permissions(real.join("1.json"), std::fs::Permissions::from_mode(0o666))
+                .unwrap();
+            reap_in(&real);
+            assert!(real.join("1.json").exists(), "a writable record is not trusted");
+            assert!(victim.try_wait().unwrap().is_none(), "the victim survives");
+            let _ = victim.kill();
+            let _ = victim.wait();
         }
     }
 }
