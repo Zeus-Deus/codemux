@@ -59,6 +59,53 @@ describe("useSkillsSyncStatus", () => {
     vi.restoreAllMocks();
   });
 
+  it("reads current status after a delayed listener registration", async () => {
+    const registration = deferred<() => void>();
+    vi.mocked(listen).mockReturnValueOnce(registration.promise);
+    vi.mocked(skillsSyncStatus).mockResolvedValue({
+      state: "syncing", startedAtMillis: 100,
+    });
+    const { result } = renderHook(() => useSkillsSyncStatus());
+    await act(async () => {});
+
+    // The background sync finishes while its events have no listener yet.
+    vi.mocked(skillsSyncStatus).mockResolvedValue(idle);
+    await act(async () => { registration.resolve(() => {}); });
+
+    expect(result.current.status?.state).toBe("idle");
+    expect(result.current.isSyncing).toBe(false);
+  });
+
+  it("preserves a background syncing start before the engine leaves idle", async () => {
+    const { result } = renderHook(() => useSkillsSyncStatus());
+    await act(async () => {});
+
+    // The wrapper announces syncing before path enumeration and before
+    // the engine changes its snapshot. The status command still returns idle.
+    emitStatus({ state: "syncing", startedAtMillis: 100 });
+    await act(async () => {});
+
+    expect(result.current.status?.state).toBe("syncing");
+    expect(result.current.isSyncing).toBe(true);
+    expect(skillsSyncStatus).toHaveBeenCalledTimes(1);
+
+    emitStatus({ state: "idle", lastSyncAtMillis: 200 });
+    expect(result.current.isSyncing).toBe(false);
+  });
+
+  it("preserves a background start received before registration finishes", async () => {
+    const registration = deferred<() => void>();
+    vi.mocked(listen).mockReturnValueOnce(registration.promise);
+    const { result } = renderHook(() => useSkillsSyncStatus());
+
+    emitStatus({ state: "syncing", startedAtMillis: 100 });
+    await act(async () => { registration.resolve(() => {}); });
+
+    expect(result.current.status?.state).toBe("syncing");
+    expect(result.current.isSyncing).toBe(true);
+    expect(skillsSyncStatus).not.toHaveBeenCalled();
+  });
+
   it("clears optimism when sync rejects without a completion event", async () => {
     const pending = deferred<Awaited<ReturnType<typeof skillsSyncNow>>>();
     const reconciliation = deferred<SkillsSyncStateSnapshot>();
@@ -144,8 +191,11 @@ describe("useSkillsSyncStatus", () => {
     const initial = deferred<SkillsSyncStateSnapshot>();
     vi.mocked(skillsSyncStatus).mockReturnValueOnce(initial.promise);
     const { result } = renderHook(() => useSkillsSyncStatus());
+    await act(async () => {});
 
-    emitStatus({ state: "syncing", startedAtMillis: 100 });
+    const live: SkillsSyncStateSnapshot = { state: "syncing", startedAtMillis: 100 };
+    vi.mocked(skillsSyncStatus).mockResolvedValue(live);
+    emitStatus(live);
     await act(async () => { initial.resolve(idle); });
 
     expect(result.current.status?.startedAt).toEqual(new Date(100));
@@ -195,6 +245,7 @@ describe("useSkillsSyncStatus", () => {
     let syncing!: Promise<void>;
     await act(async () => { syncing = result.current.syncNow(); });
     expect(skillsSyncStatus).toHaveBeenCalledTimes(2);
+    vi.mocked(skillsSyncStatus).mockResolvedValue(live);
     emitStatus(live);
     const liveStatus = result.current.status;
     await act(async () => {
@@ -252,12 +303,20 @@ describe("useSkillsSyncStatus", () => {
     expect(result.current.status?.state).toBe("idle");
   });
 
-  it("tracks all overlapping manual commands until each settles", async () => {
+  it.each([
+    { firstToFinish: 0, rejects: false },
+    { firstToFinish: 0, rejects: true },
+    { firstToFinish: 1, rejects: false },
+    { firstToFinish: 1, rejects: true },
+  ])("tracks overlapping commands with command $firstToFinish finishing first (rejects: $rejects)", async ({ firstToFinish, rejects }) => {
     const first = deferred<Awaited<ReturnType<typeof skillsSyncNow>>>();
     const second = deferred<Awaited<ReturnType<typeof skillsSyncNow>>>();
+    const earlier = deferred<SkillsSyncStateSnapshot>();
+    const later = deferred<SkillsSyncStateSnapshot>();
     vi.mocked(skillsSyncNow).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     const { result } = renderHook(() => useSkillsSyncStatus());
     await act(async () => {});
+    vi.mocked(skillsSyncStatus).mockReturnValueOnce(earlier.promise).mockReturnValueOnce(later.promise);
 
     let firstSync!: Promise<void>;
     let secondSync!: Promise<void>;
@@ -265,16 +324,25 @@ describe("useSkillsSyncStatus", () => {
       firstSync = result.current.syncNow();
       secondSync = result.current.syncNow();
     });
+    const commands = [first, second];
+    const syncs = [firstSync, secondSync];
     await act(async () => {
-      first.resolve(completed);
-      await firstSync;
+      if (rejects) commands[firstToFinish].reject(new Error("IPC unavailable"));
+      else commands[firstToFinish].resolve(completed);
     });
     expect(result.current.isSyncing).toBe(true);
 
+    await act(async () => { commands[1 - firstToFinish].resolve(completed); });
+    expect(result.current.isSyncing).toBe(false);
     await act(async () => {
-      second.resolve(completed);
-      await secondSync;
+      later.resolve({ state: "idle", lastSyncAtMillis: 300 });
+      await syncs[1 - firstToFinish];
     });
+    await act(async () => {
+      earlier.resolve({ state: "syncing", startedAtMillis: 100 });
+      await syncs[firstToFinish];
+    });
+    expect(result.current.status?.lastSyncAt).toEqual(new Date(300));
     expect(result.current.isSyncing).toBe(false);
   });
 
@@ -295,21 +363,55 @@ describe("useSkillsSyncStatus", () => {
     expect(skillsSyncStatus).toHaveBeenCalledTimes(1);
   });
 
-  it("ignores an initial fetch from the previous Strict Mode lifecycle", async () => {
-    const previous = deferred<SkillsSyncStateSnapshot>();
-    const current = deferred<SkillsSyncStateSnapshot>();
-    vi.mocked(skillsSyncStatus).mockReturnValueOnce(previous.promise).mockReturnValueOnce(current.promise);
+  it("ignores listener registration and events from the previous Strict Mode lifecycle", async () => {
+    const previous = deferred<() => void>();
+    const current = deferred<() => void>();
+    const previousUnlisten = vi.fn();
+    vi.mocked(listen).mockReturnValueOnce(previous.promise).mockReturnValueOnce(current.promise);
     const { result } = renderHook(() => useSkillsSyncStatus(), { wrapper: StrictMode });
-    expect(skillsSyncStatus).toHaveBeenCalledTimes(2);
+    const previousCallback = vi.mocked(listen).mock.calls[0][1];
 
     await act(async () => {
-      previous.resolve({ state: "syncing", startedAtMillis: 100 });
+      previous.resolve(previousUnlisten);
     });
+    expect(previousUnlisten).toHaveBeenCalledTimes(1);
+    expect(skillsSyncStatus).not.toHaveBeenCalled();
     expect(result.current.status).toBeNull();
 
-    await act(async () => { current.resolve(idle); });
+    await act(async () => { current.resolve(() => {}); });
+    const staleEvent: Event<SkillsSyncStateSnapshot> = {
+      event: "skills-sync-state-changed", id: 1,
+      payload: { state: "syncing", startedAtMillis: 100 },
+    };
+    act(() => { previousCallback(staleEvent); });
+    expect(skillsSyncStatus).toHaveBeenCalledTimes(1);
     expect(result.current.status?.state).toBe("idle");
     expect(result.current.isSyncing).toBe(false);
+  });
+
+  it("unlistens without reading when registration finishes after unmount", async () => {
+    const registration = deferred<() => void>();
+    const unlisten = vi.fn();
+    vi.mocked(listen).mockReturnValueOnce(registration.promise);
+    const { unmount } = renderHook(() => useSkillsSyncStatus());
+    unmount();
+
+    await act(async () => { registration.resolve(unlisten); });
+
+    expect(unlisten).toHaveBeenCalledTimes(1);
+    expect(skillsSyncStatus).not.toHaveBeenCalled();
+  });
+
+  it("still reads status when listener registration fails", async () => {
+    vi.mocked(listen).mockRejectedValueOnce(new Error("Events unavailable"));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { result } = renderHook(() => useSkillsSyncStatus());
+    await act(async () => {});
+
+    expect(result.current.status?.state).toBe("idle");
+    await act(async () => { await result.current.syncNow(); });
+    expect(result.current.isSyncing).toBe(false);
+    expect(skillsSyncStatus).toHaveBeenCalledTimes(2);
   });
 
   it("ignores pending commands from the previous Strict Mode lifecycle", async () => {
@@ -325,11 +427,11 @@ describe("useSkillsSyncStatus", () => {
     expect(skillsSyncNow).toHaveBeenCalledTimes(2);
 
     await act(async () => { previous.resolve(completed); });
-    expect(skillsSyncStatus).toHaveBeenCalledTimes(2);
+    expect(skillsSyncStatus).toHaveBeenCalledTimes(1);
     expect(result.current.isSyncing).toBe(true);
 
     await act(async () => { current.resolve(completed); });
-    expect(skillsSyncStatus).toHaveBeenCalledTimes(3);
+    expect(skillsSyncStatus).toHaveBeenCalledTimes(2);
     expect(result.current.isSyncing).toBe(false);
   });
 });

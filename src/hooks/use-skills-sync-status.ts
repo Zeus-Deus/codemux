@@ -7,7 +7,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@/tauri/events";
 
-import { useTauriEvent } from "./use-tauri-event";
 import {
   skillsSyncNow,
   skillsSyncStatus,
@@ -98,24 +97,35 @@ export function useSkillsSyncStatus(): {
   }, []);
 
   useEffect(() => {
-    lifecycleRef.current = { revision: 0 };
+    const lifecycle = { revision: 0 };
+    lifecycleRef.current = lifecycle;
     setPendingSyncs(0);
-    void refreshStatus();
-    return () => {
-      lifecycleRef.current = null;
-    };
-  }, [refreshStatus]);
-
-  useTauriEvent(
-    onSkillsSyncStateChanged,
-    (payload) => {
-      const lifecycle = lifecycleRef.current;
-      if (!lifecycle) return;
+    let unlisten: UnlistenFn | null = null;
+    let hasLiveStatus = false;
+    void onSkillsSyncStateChanged((payload) => {
+      if (lifecycleRef.current !== lifecycle) return;
+      hasLiveStatus = true;
       lifecycle.revision += 1;
       setStatus(snapshotToUi(payload));
-    },
-    [],
-  );
+    }).then((fn) => {
+      if (lifecycleRef.current !== lifecycle) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+      // Subscribe before reading so a completion cannot fall in the gap.
+      // A live event already received during registration takes precedence.
+      if (!hasLiveStatus) void refreshStatus();
+    }).catch((err) => {
+      if (lifecycleRef.current !== lifecycle) return;
+      console.error("[skills_sync] listener registration failed:", err);
+      void refreshStatus();
+    });
+    return () => {
+      lifecycleRef.current = null;
+      unlisten?.();
+    };
+  }, [refreshStatus]);
 
   const syncNow = useCallback(async () => {
     const lifecycle = lifecycleRef.current;
