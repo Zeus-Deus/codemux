@@ -1,8 +1,9 @@
 import { AgentQuestionBadge } from "./agent-question-badge";
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useId, useState } from "react";
 import {
   AlarmClock,
   Check,
+  ChevronRight,
   CircleDotDashed,
   CornerDownRight,
   Layers,
@@ -52,6 +53,16 @@ import {
   prSetSummary,
   workspacePrs,
 } from "@/lib/workspace-prs";
+
+/** A delegated follow-up folded into its parent's card. */
+export interface DelegatedChild {
+  id: string;
+  title: string;
+  status: ActivePaneStatus | null;
+  /** Waiting on the user: a permission request or an unanswered question.
+   *  Such a child also renders as its own card. */
+  needsUser: boolean;
+}
 
 export interface InboxRepo {
   name: string;
@@ -169,6 +180,9 @@ interface Props {
    *  than the parent snapshot so the parent's own ticks never re-render this
    *  card. */
   parentTitle?: string | null;
+  /** Delegated follow-ups folded into this card instead of rendering as cards
+   *  of their own. Shown as a chip that expands into one row per child. */
+  delegated?: readonly DelegatedChild[];
   /** Set for a workspace that lives on another of the account's machines. It
    *  renders like any other card, marked with a machine glyph that names it
    *  on hover. Lifecycle actions stay off until they can be routed to the
@@ -213,6 +227,156 @@ function ParentLink({
   );
 }
 
+const DELEGATED_DOT_CLASS: Record<ActivePaneStatus, string> = {
+  working: "bg-status-working",
+  permission: "bg-status-attention",
+  monitoring: "bg-status-monitoring",
+  review: "bg-status-open",
+};
+
+const DELEGATED_STATUS: Record<ActivePaneStatus, { label: string; className: string }> = {
+  working: { label: "Working", className: "text-status-working" },
+  permission: { label: "Needs you", className: "text-status-attention" },
+  monitoring: { label: "Monitoring", className: "text-status-monitoring" },
+  review: { label: "Done", className: "text-status-open" },
+};
+
+function delegatedDotClass(c: DelegatedChild): string {
+  if (c.needsUser) return DELEGATED_DOT_CLASS.permission;
+  return c.status ? DELEGATED_DOT_CLASS[c.status] : "bg-muted-foreground/40";
+}
+
+/** Most status dots the chip draws before the count has to speak alone. */
+const DELEGATED_MAX_DOTS = 5;
+
+/** "3 delegated · 1 needs you" toggle on a parent card. Names the one count
+ *  worth acting on: a child that needs the user, else finished ones. */
+function DelegatedChip({
+  items,
+  expanded,
+  listId,
+  onToggle,
+}: {
+  items: readonly DelegatedChild[];
+  expanded: boolean;
+  listId: string;
+  onToggle: () => void;
+}) {
+  const needs = items.filter((c) => c.needsUser).length;
+  const done = items.filter((c) => c.status === "review").length;
+  const detail = needs > 0 ? `${needs} needs you` : done > 0 ? `${done} done` : null;
+  return (
+    <button
+      type="button"
+      data-delegated-chip
+      aria-expanded={expanded}
+      aria-controls={listId}
+      onClick={(e) => {
+        // The card root activates the parent on click/Enter; this only
+        // discloses the list.
+        e.stopPropagation();
+        onToggle();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+      }}
+      className={cn(
+        "mt-1 inline-flex max-w-full items-center gap-1.5 rounded-full px-1.5 py-px text-label font-medium",
+        "transition-colors duration-150",
+        needs > 0
+          ? "bg-status-attention/12 text-status-attention hover:bg-status-attention/20"
+          : "bg-surface-3 text-muted-foreground hover:text-foreground",
+      )}
+    >
+      <span aria-hidden className="flex shrink-0 items-center gap-0.5">
+        {items.slice(0, DELEGATED_MAX_DOTS).map((c) => (
+          <span
+            key={c.id}
+            className={cn(
+              "size-1.5 rounded-full",
+              delegatedDotClass(c),
+            )}
+          />
+        ))}
+      </span>
+      <span className="truncate">
+        {items.length} delegated{detail && ` · ${detail}`}
+      </span>
+      <ChevronRight
+        aria-hidden
+        className={cn(
+          "size-3 shrink-0 transition-transform duration-150",
+          expanded && "rotate-90",
+        )}
+      />
+    </button>
+  );
+}
+
+/** One row per folded child, inside its parent's card between the chip and
+ *  the meta line. A row opens that workspace, which then shows as its own
+ *  card while it is open. */
+function DelegatedList({
+  id,
+  items,
+  onOpen,
+}: {
+  id: string;
+  items: readonly DelegatedChild[];
+  onOpen: (workspaceId: string) => void;
+}) {
+  return (
+    <ul
+      id={id}
+      data-delegated-list
+      aria-label="Delegated workspaces"
+      className="mt-1 flex flex-col"
+    >
+      {items.map((c) => {
+        const status = c.needsUser
+          ? DELEGATED_STATUS.permission
+          : c.status
+            ? DELEGATED_STATUS[c.status]
+            : null;
+        return (
+          <li key={c.id}>
+            <button
+              type="button"
+              data-delegated-row={c.id}
+              onClick={(e) => {
+                // The card root would otherwise activate the parent too.
+                e.stopPropagation();
+                onOpen(c.id);
+              }}
+              onContextMenu={(e) => {
+                // The enclosing menu acts on the parent; none of its actions
+                // may be offered from a child's row.
+                e.preventDefault();
+                e.stopPropagation();
+              }}
+              className="flex w-full min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-left text-label text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
+            >
+              <span
+                aria-hidden
+                className={cn(
+                  "size-1.5 shrink-0 rounded-full",
+                  delegatedDotClass(c),
+                )}
+              />
+              <span className="min-w-0 flex-1 truncate">{c.title}</span>
+              {status && (
+                <span className={cn("shrink-0 font-medium", status.className)}>
+                  {status.label}
+                </span>
+              )}
+            </button>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 /** One active-workspace card in the flat sidebar inbox: repo eyebrow, work
  *  title + issue chip, optional blocker line (needs-you only), and a mono
  *  meta line, left-to-right: branch · ↑ahead · +/− — then, right-aligned,
@@ -253,6 +417,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   onSelect,
   onMarkUnread,
   parentTitle = null,
+  delegated,
   machine = null,
 }: Props) {
   const appearance = useProjectAppearance(repo.path);
@@ -277,6 +442,9 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // and Radix would close the menu it is anchored to. Tracking the open state
   // lets us pin the action cluster on for exactly as long as the menu lives.
   const [snoozeMenuOpen, setSnoozeMenuOpen] = useState(false);
+  const [delegatedOpen, setDelegatedOpen] = useState(false);
+  const delegatedListId = useId();
+  const showDelegatedList = delegatedOpen && delegated !== undefined;
 
   // Wake times are resolved the moment the menu opens, never while the list
   // renders. Sharing the inbox's coarse (~30s) clock made "In 1 hour" mean "an
@@ -649,7 +817,12 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
           // replaces it with the row's true size once it has been rendered
           // once.
           "[content-visibility:auto] [contain-intrinsic-size:auto_88px]",
-          leaving ? "max-h-0 opacity-0" : "max-h-40 opacity-100",
+          leaving
+            ? "max-h-0 opacity-0"
+            : // An open delegated list grows with its parent's child count.
+              showDelegatedList
+              ? "max-h-none opacity-100"
+              : "max-h-40 opacity-100",
           justUnsettled && "rise-in",
           arrival === "grow" && "card-in",
           arrival === "handoff" && "rise-in",
@@ -926,6 +1099,26 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 <ParentLink
                   parentWorkspaceId={workspace.parent_workspace_id}
                   parentTitle={parentTitle}
+                />
+              )}
+
+              {delegated && (
+                <DelegatedChip
+                  items={delegated}
+                  expanded={showDelegatedList}
+                  listId={delegatedListId}
+                  onToggle={() => setDelegatedOpen((open) => !open)}
+                />
+              )}
+              {showDelegatedList && (
+                <DelegatedList
+                  id={delegatedListId}
+                  items={delegated}
+                  onOpen={(childId) => {
+                    // Same as opening any card: navigation ends a multi-select.
+                    onSelect(childId, "single");
+                    activateWorkspaceInteraction(childId).catch(console.error);
+                  }}
                 />
               )}
 

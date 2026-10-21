@@ -20,6 +20,7 @@ import {
 } from "@/stores/app-store";
 import { useHosts } from "@/stores/hosts-store";
 import { useUIStore } from "@/stores/ui-store";
+import { useQuestionAttention } from "@/stores/async-question-attention-store";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { toast } from "@/lib/toast";
 import {
@@ -38,6 +39,7 @@ import { useProjectAppearance } from "./use-project-appearance";
 import {
   SidebarInboxCard,
   metaClusterWidth,
+  type DelegatedChild,
   type InboxRepo,
 } from "./sidebar-inbox-card";
 import { SidebarNeedsYouStrip } from "./sidebar-needs-you-strip";
@@ -841,6 +843,9 @@ export function SidebarInbox() {
   // delta path, these three keep their identity unless their own domain moved.
   const workspaces = useAppStore((s) => s.appState?.workspaces);
   const paneStatuses = useAppStore((s) => s.appState?.pane_statuses);
+  // Unanswered agent questions per workspace. Independent of pane status: an
+  // agent can be working, done or idle while a question waits for the user.
+  const questionCounts = useQuestionAttention((s) => s.workspaces);
   // Only "has the first snapshot landed" — a boolean, so the guards below stop
   // dragging the whole snapshot into their dependency arrays.
   const appStateLoaded = useAppStore((s) => s.appState !== null);
@@ -1162,6 +1167,10 @@ export function SidebarInbox() {
     return map;
   }, [projectGroups]);
 
+  const delegatedIntern = useRef(
+    new Map<string, { sig: string; list: readonly DelegatedChild[] }>(),
+  );
+
   const settledIds = useMemo(
     () => new Set(settled.map((e) => e.id)),
     [settled],
@@ -1209,7 +1218,79 @@ export function SidebarInbox() {
         !settledIds.has(ws.workspace_id) &&
         !snoozedIds.has(ws.workspace_id),
     );
-  const activeCards = allActiveCards.filter(matchesFilter);
+  const unfoldedActiveCards = allActiveCards.filter(matchesFilter);
+
+  // Delegated follow-ups fold into their parent's card. Their parent agent
+  // watches them and reads their results, so a full card each would bury the
+  // work that is actually waiting on the user. A child stands alone again
+  // while it needs the user, while it is the open workspace (the "you are
+  // here" rule the shelves follow), when it is pinned, or when its parent is
+  // not an active card to fold into. A child waiting on the user means a
+  // permission request or an unanswered question.
+  const childNeedsUser = (ws: WorkspaceSnapshot) =>
+    statusOf(ws) === "permission" || (questionCounts[ws.workspace_id] ?? 0) > 0;
+  const hostIds = new Set(
+    [...pinnedCards, ...unfoldedActiveCards].map((ws) => ws.workspace_id),
+  );
+  const foldedIds = new Set<string>();
+  for (const ws of unfoldedActiveCards) {
+    const parentId = ws.parent_workspace_id;
+    if (
+      parentId &&
+      hostIds.has(parentId) &&
+      ws.workspace_id !== activeWorkspaceId &&
+      !childNeedsUser(ws)
+    ) {
+      foldedIds.add(ws.workspace_id);
+    }
+  }
+  /** Nearest ancestor that renders as its own card, so a follow-up of a
+   *  folded follow-up lists under the card the user can actually see. */
+  const foldHostOf = (ws: WorkspaceSnapshot): string | null => {
+    let id = ws.parent_workspace_id ?? null;
+    const seen = new Set<string>();
+    while (id && foldedIds.has(id) && !seen.has(id)) {
+      seen.add(id);
+      id = workspaceById.get(id)?.parent_workspace_id ?? null;
+    }
+    return id && hostIds.has(id) && !foldedIds.has(id) ? id : null;
+  };
+  // Escalated children stay in their parent's list too, so the chip's count
+  // never changes just because one of them asked for something.
+  const delegatedByHost = new Map<string, WorkspaceSnapshot[]>();
+  for (const ws of unfoldedActiveCards) {
+    if (!ws.parent_workspace_id || !hostIds.has(ws.parent_workspace_id)) continue;
+    const host = foldHostOf(ws);
+    if (!host) continue;
+    const list = delegatedByHost.get(host);
+    if (list) list.push(ws);
+    else delegatedByHost.set(host, [ws]);
+  }
+  /** Interned per host so an unchanged list keeps its identity across ticks
+   *  and the parent card's memo boundary holds. */
+  const delegatedOf = (hostId: string): readonly DelegatedChild[] | undefined => {
+    const children = delegatedByHost.get(hostId);
+    if (!children) {
+      delegatedIntern.current.delete(hostId);
+      return undefined;
+    }
+    const list = children.map((ws) => ({
+      id: ws.workspace_id,
+      title: ws.title,
+      status: statusOf(ws),
+      needsUser: childNeedsUser(ws),
+    }));
+    const sig = list
+      .map((c) => `${c.id}\u0000${c.title}\u0000${c.status}\u0000${c.needsUser}`)
+      .join("\u0001");
+    const cached = delegatedIntern.current.get(hostId);
+    if (cached?.sig === sig) return cached.list;
+    delegatedIntern.current.set(hostId, { sig, list });
+    return list;
+  };
+  const activeCards = unfoldedActiveCards.filter(
+    (ws) => !foldedIds.has(ws.workspace_id),
+  );
 
   /** The workspace you are looking at is never unread, whatever the backend
    *  stamps say — the visit is happening right now. Shared by the card and by
@@ -1581,6 +1662,8 @@ export function SidebarInbox() {
   const handleListContextMenuCapture = (e: React.MouseEvent) => {
     if (selection.length < 2) return;
     const target = e.target as HTMLElement | null;
+    // A delegated row names a child, not the card that encloses it.
+    if (target?.closest?.("[data-delegated-row]")) return;
     const row = target?.closest?.(
       "[data-inbox-card],[data-snoozed-row],[data-settled-row]",
     );
@@ -1689,6 +1772,7 @@ export function SidebarInbox() {
         selected={selectedIds.has(id)}
         onSelect={handleSelect}
         onMarkUnread={handleMarkUnread}
+        delegated={delegatedOf(id)}
         parentTitle={
           ws.parent_workspace_id
             ? workspaceById.get(ws.parent_workspace_id)?.title ?? null

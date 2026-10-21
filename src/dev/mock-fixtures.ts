@@ -898,7 +898,7 @@ const wsCodemuxWorkflowComplete = (() => {
 // Follow-up children: workspaces a parent chat started for out-of-scope
 // work (`parent_workspace_id`). They hang off `chat-streaming` so the
 // Projects view shows them nested under that row and the Activity view
-// shows each as its own card with a "from chat-streaming" link. Each gets
+// folds them into its card's "delegated" chip. Each gets
 // its own worktree and an unbound chat pane (no shared transcript).
 
 /** Build a follow-up child of `parentId` in the codemux project. */
