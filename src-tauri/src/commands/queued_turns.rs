@@ -105,7 +105,7 @@ fn mirror(db: &DatabaseStore, event: &ProviderRuntimeEvent, queued: Option<Queue
             let replay = queued.replay;
             let mut provenance = queued.provenance.cloned().unwrap_or_else(||provenance_from_event.clone());
             provenance.input_intent = provenance_from_event.input_intent;
-            db.insert_queued_turn(&QueuedTurnRecord {
+            db.admit_queued_turn(&QueuedTurnRecord {
                 provenance,
                 thread_id: thread_id.0.clone(),
                 queued_id: queued_id.clone(),
@@ -483,9 +483,12 @@ pub(crate) async fn send_saved_queued_turn<R: Runtime>(
     let Some(_claim) = Claim::take(&thread_id.0, &queued_id) else {
         return Err(BEING_SENT.into());
     };
-    let Some(row) = saved_row(&db, &thread_id.0, &queued_id) else {
+    let Some(mut row) = saved_row(&db, &thread_id.0, &queued_id) else {
         return Err("This message is no longer saved.".into());
     };
+    // The saved message has waited, even if its original idle admission
+    // only used a scheduling token. Both the send and ACK settlement keep it.
+    row.provenance.input_intent = crate::agent_provider::message::InputIntent::QueuedTurn;
     let input = SendTurnCommandInput {
         input_source: None,
         delivery,
@@ -511,7 +514,6 @@ pub(crate) async fn send_saved_queued_turn<R: Runtime>(
     let mut context = crate::agent_control::delivery::SendContext::new(if row.provenance.created_by == crate::agent_provider::message::CreatedBy::User && row.provenance.creation_source != crate::agent_provider::message::CreationSource::Mcp {TurnOrigin::User} else {TurnOrigin::Controller});
     context.origin = row.provenance.origin.unwrap_or(context.origin);
     context.provenance = row.provenance.clone();
-    context.provenance.input_intent = crate::agent_provider::message::InputIntent::QueuedTurn;
     context.delivery_id = context.provenance.delivery_id.clone();
     if let Some(id) = &context.delivery_id {
         let record = db.message_delivery(id)?.ok_or("Saved message delivery is missing")?;
@@ -610,6 +612,101 @@ mod tests {
         db.list_queued_turns("t").into_iter().map(|r| r.queued_id).collect()
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orchestration_message_saved_resend_ack_settlement_precedes_admission() {
+        use crate::agent_provider::{message::*, AgentProvider};
+        use futures_util::StreamExt;
+        use std::{sync::Arc, time::Duration};
+
+        let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap()
+            .join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX));
+        assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
+        let provider = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(
+            crate::agent_provider::cursor::CursorProviderConfig {
+                binary, event_channel_capacity: 128, mcp_registry: None,
+            },
+        ));
+        let thread = format!("saved-resend-{}", uuid::Uuid::new_v4());
+        let (app, root, workspace, pane) =
+            crate::agent_control::guard_tests::fixture(provider.clone(), &thread).await;
+        app.state::<ProviderRegistry>().set_cursor(provider.clone()).await;
+        app.state::<crate::state::AppStateStore>().claim_agent_chat_pane_checked(
+            &pane, ProviderKind::Cursor, &thread, Some(&thread), |_| Ok(()),
+        ).unwrap();
+        let db = app.state::<DatabaseStore>();
+        db.upsert_agent_chat_session(&thread, &workspace, Some(root.path().to_str().unwrap()), "cursor").unwrap();
+        db.update_agent_chat_session_config(&thread, &crate::database::AgentChatSessionConfig {
+            permission_mode: Some(Some("ask".into())), ..Default::default()
+        }).unwrap();
+        // Subscribe without a bridge so the ACK must settle in SQLite first.
+        let mut events = provider.event_stream();
+        provider.start_session(serde_json::from_value(serde_json::json!({
+            "thread_id": thread, "cwd": root.path(), "permission_mode": "ask",
+            "additional_directories": [],
+        })).unwrap()).await.unwrap();
+        let busy = super::super::agent_chat::send_desktop_turn(
+            app.handle().clone(), ProviderKind::Cursor,
+            serde_json::from_value(serde_json::json!({
+                "thread_id": thread, "text": "await-cancel", "client_nonce": "busy",
+            })).unwrap(),
+        ).await.unwrap();
+        assert!(provider.turn_active(&ThreadId(thread.clone())).await);
+        // An idle Hermes scheduling admission saved before exit can carry TurnStart.
+        let original = QueuedTurnRecord {
+            provenance: MessageProvenance {
+                message_id: Some("saved-message".into()), created_by: CreatedBy::Agent,
+                creation_source: CreationSource::Provider, sender_thread_id: Some("sender".into()),
+                sender_title: Some("Review agent".into()), input_intent: InputIntent::TurnStart,
+                origin: Some(TurnOrigin::Delegation), ..Default::default()
+            },
+            thread_id: thread.clone(), queued_id: "saved".into(), position: 0,
+            text: "Visible brief".into(), prompt: Some("Visible brief\nAgent-only footer".into()),
+            skill_ids: vec![], skill_text: None, include_plugins: false, images: vec![],
+            client_nonce: Some("saved-nonce".into()), model_override: None, effort_override: None,
+            permission_mode_override: None, epoch: "previous-run".into(),
+        };
+        db.insert_queued_turn(&original).unwrap();
+        let result = send_saved_queued_turn(
+            app.handle().clone(), ProviderKind::Cursor, ThreadId(thread.clone()),
+            "saved".into(), MessageDelivery::Queue, true,
+        ).await.unwrap();
+        let queued_id = result.queued_id.unwrap();
+        assert!(db.get_queued_turn(&thread, "saved").is_none());
+        let ack_row = db.get_queued_turn(&thread, &queued_id).expect("ACK saved a live row");
+        assert_eq!(ack_row.epoch, epoch());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(event) = events.next().await {
+                let admitted = matches!(&event, ProviderRuntimeEvent::TurnQueued { queued_id: id, .. } if id == &queued_id);
+                forward_event(app.handle(), event);
+                if admitted { return; }
+            }
+            panic!("provider stream closed before admission");
+        }).await.unwrap();
+        provider.interrupt_turn(ThreadId(thread.clone()), Some(busy.turn_id)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(event) = events.next().await {
+                let dispatched = matches!(&event, ProviderRuntimeEvent::QueuedTurnDispatched { queued_id: id, .. } if id == &queued_id);
+                forward_event(app.handle(), event);
+                if dispatched { return; }
+            }
+            panic!("provider stream closed before dispatch");
+        }).await.unwrap();
+        provider.stop_session(ThreadId(thread.clone())).await.unwrap();
+        let row: serde_json::Value = db.list_agent_chat_messages(&thread).iter()
+            .filter_map(|row| serde_json::from_str::<serde_json::Value>(row).ok())
+            .find(|row| row["type"] == "user_message" && row["message_id"] == "saved-message").unwrap();
+        assert_eq!(row["input_intent"], "queued_turn");
+        assert_eq!(ack_row.provenance.input_intent, InputIntent::QueuedTurn);
+        assert_eq!(row["created_by"], "agent");
+        assert_eq!(row["creation_source"], "provider");
+        assert_eq!(row["sender_thread_id"], "sender");
+        assert_eq!(row["sender_title"], "Review agent");
+        assert_eq!(row["client_nonce"], "saved-nonce");
+        assert_eq!(row["text"], original.text);
+        assert_eq!(row["agent_text"], original.prompt.unwrap());
+        assert!(db.get_queued_turn(&thread, &queued_id).is_none());
+    }
+
     #[test]
     fn the_saved_queue_mirrors_queue_events() {
         let db = crate::database::init_test_database();
@@ -651,6 +748,45 @@ mod tests {
         assert_eq!(ids(&db), ["a", "b"]);
         mirror(&db, &cancelled("a"), None, false);
         assert_eq!(ids(&db), ["b"]);
+    }
+
+    #[test]
+    fn orchestration_message_queue_admission_reconciles_existing_intent_only() {
+        use crate::agent_provider::message::*;
+        for admitted_intent in [InputIntent::QueuedTurn, InputIntent::TurnStart] {
+            let db = crate::database::init_test_database();
+            db.upsert_agent_chat_session("t", "w", None, "hermes").unwrap();
+            queued(&db, "live", "Visible brief", "Visible brief\nAgent-only footer");
+            let mut expected = db.take_queued_turn("t", "live").unwrap().unwrap();
+            expected.provenance = MessageProvenance {
+                message_id: Some("original-message".into()), delivery_id: Some("delivery".into()),
+                created_by: CreatedBy::Agent, creation_source: CreationSource::Provider,
+                sender_thread_id: Some("sender".into()), sender_title: Some("Review agent".into()),
+                origin: Some(TurnOrigin::Delegation), automation_id: Some("automation".into()),
+                input_intent: if admitted_intent == InputIntent::QueuedTurn {
+                    InputIntent::TurnStart
+                } else {
+                    InputIntent::QueuedTurn
+                },
+                ..Default::default()
+            };
+            db.restore_queued_turn(&expected).unwrap();
+            let settled = expected.clone();
+            // A sparse late provider event is authoritative about scheduling,
+            // but cannot replace the richer record already saved by the caller.
+            let admission = ProviderRuntimeEvent::TurnQueued {
+                thread_id: t(), queued_id: "live".into(), client_nonce: Some("nonce-live".into()),
+                text: "Provider prompt".into(),
+                provenance: MessageProvenance { input_intent: admitted_intent, ..Default::default() },
+            };
+            mirror(&db, &admission, None, false);
+            expected.provenance.input_intent = admitted_intent;
+            assert_eq!(db.get_queued_turn("t", "live").unwrap(), expected);
+            // Event-first ordering must also survive a later stale ACK.
+            assert!(!db.replace_queued_turn(Some("saved"), &settled).unwrap());
+            mirror(&db, &admission, None, false);
+            assert_eq!(db.get_queued_turn("t", "live").unwrap(), expected);
+        }
     }
 
     #[test]
