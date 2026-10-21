@@ -96,7 +96,7 @@ export function SortableInboxCard({
     <div
       ref={setNodeRef}
       data-inbox-sortable={id}
-      className="group/inbox-sortable relative"
+      className="relative"
       style={{
         transform: CSS.Transform.toString(transform),
         transition,
@@ -112,7 +112,7 @@ export function SortableInboxCard({
         {...listeners}
         data-inbox-drag-handle
         aria-label={`Move "${title}"`}
-        className="absolute -left-2 top-1/2 z-[1] flex h-7 w-4 -translate-y-1/2 touch-none items-center justify-center rounded-sm bg-sidebar text-muted-foreground opacity-0 hover:text-foreground focus-visible:opacity-100 group-hover/inbox-sortable:opacity-100 pointer-coarse:opacity-60"
+        className="absolute -left-2 top-1/2 z-[1] flex h-7 w-4 -translate-y-1/2 touch-none items-center justify-center rounded-sm bg-sidebar text-muted-foreground opacity-0 focus-visible:opacity-100 pointer-coarse:opacity-60"
       >
         <GripVertical className="size-3" />
       </button>
