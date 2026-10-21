@@ -111,6 +111,11 @@ fi
 # Where cargo will put the artifact for this profile. Mirrors cargo's own
 # layout rules: CARGO_TARGET_DIR (if set) or <manifest dir>/target, plus a
 # <triple>/ level only when CARGO_BUILD_TARGET forces a cross build.
+# Known limitation: only CARGO_TARGET_DIR and src-tauri/target are honored.
+# Tauri's hook environment does not expose a target dir forwarded to cargo
+# (`tauri build -- --target-dir X`), so that is unsupported: --stage-tauri-build
+# would miss X's artifact and could stage an older one from src-tauri/target.
+# Use CARGO_TARGET_DIR instead. Release CI never forwards --target-dir.
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/src-tauri/target}"
 if [ -n "${CARGO_BUILD_TARGET:-}" ]; then
   OUT_DIR="$TARGET_DIR/$CARGO_BUILD_TARGET/$PROFILE"

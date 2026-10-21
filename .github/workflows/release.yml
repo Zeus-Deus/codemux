@@ -175,6 +175,8 @@ jobs:
       # file is non-empty, byte-identical to target/release/codemux-remote, and
       # its provenance stamp says `profile=release` with matching bytes. On
       # Windows the binary is a #[cfg(not(unix))] stub, staged the same way.
+      # The hook looks only in CARGO_TARGET_DIR or src-tauri/target, so never
+      # forward `-- --target-dir` to tauri build here.
       # Only the host triple ships; ARM64 Linux and macOS remotes would need
       # extra rustup targets (and a macOS runner) and are deferred until demand.
 
