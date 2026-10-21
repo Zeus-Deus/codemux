@@ -271,6 +271,14 @@ struct CallLease {
     calls: Arc<Mutex<HashMap<CallKey, tokio::sync::watch::Sender<bool>>>>,
     key: CallKey,
 }
+/// Ends a tracked invocation when its request is cancelled or dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl Drop for CallLease {
     fn drop(&mut self) {
         self.calls.lock().unwrap().remove(&self.key);
@@ -486,52 +494,54 @@ async fn handle_post(
                 key: key.clone(),
             };
             let invocation = async {
-                let result = if let Some(name) = resolved {
-                    if let Some(binding) = &caller.native {
-                        let actor = binding.session.actor();
-                        match actor.permit.wait_ready().await {
-                            Err(error) => Err(error),
-                            Ok(()) if !binding.current() => {
-                                Err("stale_caller: gateway credential was revoked".into())
-                            }
-                            Ok(()) => match state
-                .registry
-                .call_plugin_bridge(&name, arguments.clone(), workspace_id, &[])
-                .await
-                            {
-                                Some(result) => result,
-                                None => {
-                                    state
-                                        .registry
-                                        .dispatch_native_tool_call_with_id(
-                                            &name,
-                                            arguments,
-                                            actor,
-                                            Some(id.to_string()),
-                                        )
-                                        .await
-                                }
-                            },
-                        }
-                    } else {
-                        match state
-                            .registry
-                            .call_plugin_bridge(&name, arguments.clone(), workspace_id, &[])
-                            .await
-                        {
-                Some(result) => result,
-                None => {
-                    state
-                        .registry
-                        .dispatch_tool_call(&name, arguments, workspace_id)
-                        .await
-                }
-            }
-                    }
-                } else {
-                    Err("provider_control_denied: tool is unavailable to this chat".into())
+                let Some(name) = resolved else {
+                    return Err("provider_control_denied: tool is unavailable to this chat".into());
                 };
-                result
+                let Some(binding) = &caller.native else {
+                    return match state
+                        .registry
+                        .call_plugin_bridge(&name, arguments.clone(), workspace_id, &[])
+                        .await
+                    {
+                        Some(result) => result,
+                        None => {
+                            state
+                                .registry
+                                .dispatch_tool_call(&name, arguments, workspace_id)
+                                .await
+                        }
+                    };
+                };
+                // The call runs as a callback of the chat's authority, so Stop
+                // and permission transitions end it like any native callback.
+                let actor = binding.session.actor();
+                let permit = actor.permit.clone();
+                let registry = state.registry.clone();
+                let workspace = workspace_id.map(str::to_owned);
+                let current = binding.clone();
+                let call_id = id.to_string();
+                let job = tokio::spawn(async move {
+                    actor.permit.wait_ready().await?;
+                    if !current.current() {
+                        return Err("stale_caller: gateway credential was revoked".into());
+                    }
+                    match registry
+                        .call_plugin_bridge(&name, arguments.clone(), workspace.as_deref(), &[])
+                        .await
+                    {
+                        Some(result) => result,
+                        None => {
+                            registry
+                                .dispatch_native_tool_call_with_id(&name, arguments, actor, Some(call_id))
+                                .await
+                        }
+                    }
+                });
+                binding.session.authority.track(&permit, job.abort_handle());
+                let _abort = AbortOnDrop(job.abort_handle());
+                job.await.unwrap_or_else(|_| {
+                    Err("request_cancelled: Stop or a permission change revoked this chat's authority; the tool call ended".into())
+                })
             };
             let result = tokio::select! {
                 biased;
@@ -1460,6 +1470,65 @@ mod all_provider_cancel_tests {
             .unwrap();
         assert_eq!(reply["result"]["isError"], true);
         assert!(reply.to_string().contains("request_cancelled"));
+    }
+    /// A slow call runs under the chat's authority: Stop and a permission
+    /// transition answer it as cancelled at once, and never deliver its result.
+    #[tokio::test]
+    async fn all_provider_revocation_ends_in_flight_gateway_calls() {
+        let registry = McpRegistry::new();
+        registry.set_host_tools(Arc::new(Host));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (signal, gate) = (entered.clone(), release.clone());
+        registry.set_native_delegation_handler(Arc::new(move |_, _, args, _| {
+            let (signal, gate) = (signal.clone(), gate.clone());
+            Box::pin(async move {
+                if args["slow"] == true {
+                    signal.notify_one();
+                    gate.notified().await;
+                }
+                Ok(json!({"delivered": true}))
+            })
+        }));
+        let gateway = start_gateway(registry).await.unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for ending in ["stop", "permission", "none"] {
+            let thread = format!("revoke-in-flight-{ending}");
+            let session = GatewaySession::new(&thread, ProviderKind::OpenCode, None, Some("default".into()));
+            session.bind_session("ses");
+            session.begin("turn", None).unwrap();
+            let connection = gateway.chat_connection(
+                &thread,
+                GatewayCaller {
+                    native: Some(GatewayBinding::new(session.clone())),
+                    ..Default::default()
+                },
+            );
+            let call = {
+                let (client, connection) = (client.clone(), connection.clone());
+                tokio::spawn(async move {
+                    client.post(connection.url).bearer_auth(connection.bearer_token).json(&json!({"id":7,"method":"tools/call","params":{"name":"thread_wait","arguments":{"slow":true},"_meta":{"ai.opencode/sessionID":"ses"}}})).send().await.unwrap().json::<Value>().await.unwrap()
+                })
+            };
+            entered.notified().await;
+            match ending {
+                "stop" => session.authority.invalidate(),
+                "permission" => session.set_mode(Some("plan".into())),
+                _ => release.notify_one(),
+            }
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+                .await
+                .expect("the client was left waiting")
+                .unwrap();
+            if ending == "none" {
+                assert_ne!(reply["result"]["isError"], true, "{reply}");
+                assert!(reply.to_string().contains("delivered"), "{reply}");
+                continue;
+            }
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            assert!(reply.to_string().contains("request_cancelled"), "{reply}");
+            assert!(!reply.to_string().contains("delivered"), "{reply}");
+        }
     }
 }
 
