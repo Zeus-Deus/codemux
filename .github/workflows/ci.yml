@@ -19,6 +19,7 @@ on:
   pull_request:
     branches:
       - main
+      - ci-test/path-filters-base
 
 # Cancel in-flight runs for the same branch when a new commit is pushed.
 concurrency:
