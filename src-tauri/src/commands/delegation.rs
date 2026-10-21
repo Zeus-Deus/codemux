@@ -1678,7 +1678,7 @@ pub fn on_thread_stopped<R: Runtime>(app: &AppHandle<R>, thread_id: &str, kind: 
 
 /// A chat left its pane: tab close, New Chat, or its workspace closed.
 /// Returns the stops of the delegated chats that closed with it.
-pub(crate) fn on_thread_closed<R: Runtime>(app: &AppHandle<R>, thread: &str) -> super::agent_chat::EarlierStops {
+pub(crate) fn on_thread_closed<R: Runtime>(app: &AppHandle<R>, thread: &str) -> crate::checkout_claims::Stops {
     if super::queued_turns::exiting() {
         return Default::default();
     }
@@ -1688,7 +1688,7 @@ pub(crate) fn on_thread_closed<R: Runtime>(app: &AppHandle<R>, thread: &str) -> 
 /// Closing a parent retains independent worktree work. Only its direct
 /// shared children follow the old tab lifecycle: they stop, and their own
 /// workspaces close (closing theirs in turn). Ordinary Stop keeps them.
-fn close_tasks<R: Runtime>(app: &AppHandle<R>, thread: &str) -> super::agent_chat::EarlierStops {
+fn close_tasks<R: Runtime>(app: &AppHandle<R>, thread: &str) -> crate::checkout_claims::Stops {
     // SSH tasks follow the parent's existing New Chat / pane rebind lifecycle.
     if let Err(error) = crate::delegation::app::user_activity(app, thread, true) {
         log::warn!("Could not cancel closed chat's SSH tasks: {error}");
@@ -1697,7 +1697,7 @@ fn close_tasks<R: Runtime>(app: &AppHandle<R>, thread: &str) -> super::agent_cha
         stop_closed_tasks(app, &state, thread);
     }
     // From the durable records, so children from before a restart close too.
-    let mut stops = super::agent_chat::EarlierStops::default();
+    let mut stops = crate::checkout_claims::Stops::default();
     if let (Some(app_state), Some(db)) = (app.try_state::<AppStateStore>(), app.try_state::<DatabaseStore>()) {
         let children = super::workspace::delegated_child_workspaces(&app_state.snapshot(), &db, &[thread.to_string()]);
         for workspace in children {

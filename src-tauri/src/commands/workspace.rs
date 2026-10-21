@@ -1356,22 +1356,23 @@ fn refuse_checkout_in_use(
 /// not yet told to stop.
 struct Detached {
     closing: Option<crate::state::WorkspaceSnapshot>,
-    hold: Option<crate::worktree_cleanup::RetireHold>,
+    /// Keeps its folders claimed until its chats stopped.
+    claim: Option<crate::checkout_claims::CloseClaim>,
     fallback: String,
     /// Stops of chats closed before the workspace.
-    earlier: crate::commands::agent_chat::EarlierStops,
+    earlier: crate::checkout_claims::Stops,
     threads: Vec<(crate::agent_provider::ProviderKind, String)>,
 }
 
 impl Detached {
     /// Stop its chats, keeping its files. Cleanup may offer the checkout
     /// once every stop is acknowledged.
-    fn retire<R: tauri::Runtime>(self, app: &tauri::AppHandle<R>) -> crate::commands::agent_chat::EarlierStops {
+    fn retire<R: tauri::Runtime>(self, app: &tauri::AppHandle<R>) -> crate::checkout_claims::Stops {
         let issued = crate::commands::agent_chat::shutdown_agent_chat_threads(app, self.threads);
         let mut stops = self.earlier.clone();
         stops.extend(issued.clone());
-        if let (Some(ws), Some(hold)) = (self.closing.as_ref(), self.hold) {
-            crate::worktree_cleanup::retire_workspace(app, hold, ws, self.earlier, issued, true);
+        if let (Some(ws), Some(claim)) = (self.closing.as_ref(), self.claim) {
+            crate::worktree_cleanup::retire_workspace(app, claim, ws, self.earlier, issued, true);
         }
         stops
     }
@@ -1388,15 +1389,15 @@ fn detach_workspace<R: tauri::Runtime>(
     workspace_id: &str,
 ) -> Result<Detached, String> {
     let closing = state.find_workspace(workspace_id);
-    // Before the workspace leaves state, so cleanup never sees its checkout
-    // unclaimed while sessions still run in it.
-    let hold = closing.as_ref().map(crate::worktree_cleanup::hold_checkout);
+    // Before the workspace leaves state, so no deletion or cleanup sees its
+    // folders unclaimed while its chats may still run in them.
+    let claim = closing.as_ref().map(crate::checkout_claims::claim_checkout);
     let result = state
         .close_workspace(workspace_id)
         .map_err(|e| format!("Failed to close workspace: {e}"))?;
     // Before any await: a chat closed just before this may still be
     // stopping, and its result must not be lost if it finishes meanwhile.
-    let earlier = crate::commands::agent_chat::snapshot_pending_stops(workspace_id);
+    let earlier = crate::checkout_claims::stops_of_workspace(workspace_id);
 
     // Reconcile only after the state mutation succeeds. A duplicate workspace
     // at the same checkout still owns the shared path-level config; deleting
@@ -1453,11 +1454,38 @@ fn detach_workspace<R: tauri::Runtime>(
 
     Ok(Detached {
         closing,
-        hold,
+        claim,
         fallback: result.fallback.0,
         earlier,
         threads: result.removed_agent_chat_threads,
     })
+}
+
+/// Test-only pause in a close, after the workspace left app state and
+/// before its chats are told to stop, where a real close awaits SSH
+/// teardown and account sync.
+#[cfg(test)]
+pub(crate) mod close_pause {
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    type Pause = (String, Arc<Notify>, Arc<Notify>);
+    static PAUSE: Mutex<Option<Pause>> = Mutex::new(None);
+
+    /// Pause the next close of `workspace_id`. Returns (reached, release).
+    pub(crate) fn pause(workspace_id: &str) -> (Arc<Notify>, Arc<Notify>) {
+        let (reached, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        *PAUSE.lock().unwrap() = Some((workspace_id.into(), reached.clone(), release.clone()));
+        (reached, release)
+    }
+
+    pub(crate) async fn reached(workspace_id: &str) {
+        let pause = PAUSE.lock().unwrap().take_if(|(id, ..)| id == workspace_id);
+        if let Some((_, reached, release)) = pause {
+            reached.notify_one();
+            release.notified().await;
+        }
+    }
 }
 
 /// The slow tail of a close, after [`detach_workspace`].
@@ -1497,7 +1525,7 @@ async fn finish_detach<R: tauri::Runtime>(app: &tauri::AppHandle<R>, workspace_i
 pub(crate) fn close_delegated_child_workspace<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     workspace_id: &str,
-) -> crate::commands::agent_chat::EarlierStops {
+) -> crate::checkout_claims::Stops {
     let (Some(state), Some(db)) = (
         app.try_state::<AppStateStore>(),
         app.try_state::<crate::database::DatabaseStore>(),
@@ -1580,7 +1608,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
                         Path::new(path),
                         &workspace_with_delegated_children(&snapshot, db, &workspace_id),
                     )?;
-                    crate::commands::agent_chat::refuse_unconfirmed_stop_in(Path::new(path))?;
+                    crate::checkout_claims::refuse_failed_in(Path::new(path))?;
                 }
             }
         }
@@ -1650,14 +1678,8 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     }
 
     let detached = detach_workspace(&app, state, db, &workspace_id)?;
-    // Before any await, like the workspace's own earlier stops: chats that
-    // worked in the checkout from a workspace closed before this one (a
-    // chat child closed before its parent) may still be stopping.
-    let stopping_in_checkout = worktree_path
-        .as_deref()
-        .filter(|_| remove_worktree)
-        .map(|path| crate::commands::agent_chat::snapshot_pending_stops_in(Path::new(path)))
-        .unwrap_or_default();
+    #[cfg(test)]
+    close_pause::reached(&workspace_id).await;
     finish_detach(&app, &workspace_id, ws_host_id).await;
     let fallback = detached.fallback.clone();
 
@@ -1673,13 +1695,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // its chats closes the workspaces of the tasks they delegated (see
     // `delegation::close_tasks`), and their stops are awaited too. A stop
     // that was not acknowledged keeps the files.
-    let Detached { mut hold, mut earlier, threads, .. } = detached;
-    earlier.extend(stopping_in_checkout);
-    let keep_files = |hold: &mut Option<crate::worktree_cleanup::RetireHold>| {
-        if let Some(hold) = hold.take() {
-            hold.keep();
-        }
-    };
+    let Detached { claim, earlier, threads, .. } = detached;
     if let Err(error) = crate::commands::agent_chat::shutdown_agent_chat_threads_and_wait(
         &app,
         &workspace_id,
@@ -1688,9 +1704,21 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     )
     .await
     {
-        keep_files(&mut hold);
+        if let Some(claim) = claim {
+            claim.failed(error.clone());
+        }
         return Err(format!("Agent session did not stop ({error}); worktree files retained."));
     }
+    // Its own chats stopped, so another deletion waiting on this one can go
+    // on. Then wait for everything else that worked in the checkout and
+    // left app state before or meanwhile: a chat workspace closed before
+    // this one, or still closing.
+    if let Some(claim) = &claim {
+        claim.stopped();
+    }
+    crate::checkout_claims::wait_for(crate::checkout_claims::claims_in(Path::new(&wt_path), claim.as_ref()))
+        .await
+        .map_err(|error| format!("Agent session did not stop ({error}); worktree files retained."))?;
 
     let branch_to_delete = if delete_branch.unwrap_or(false) {
         branch
@@ -1711,16 +1739,10 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // Checked again now this workspace and its delegated chats are gone:
     // a workspace opened in the checkout meanwhile, or an agent that
     // worked there and is still stopping, keeps the files.
-    let _fence = match state.fence_checkout_removal(Path::new(&wt_path), |snapshot| {
+    let _fence = state.fence_checkout_removal(Path::new(&wt_path), |snapshot| {
         refuse_checkout_in_use(snapshot, Path::new(&wt_path), &[])?;
-        crate::commands::agent_chat::refuse_unstopped_agents_in(Path::new(&wt_path))
-    }) {
-        Ok(fence) => fence,
-        Err(error) => {
-            keep_files(&mut hold);
-            return Err(error);
-        }
-    };
+        crate::checkout_claims::refuse_in(Path::new(&wt_path), claim.as_ref())
+    })?;
     // The slow part: `git worktree remove` recursively deletes
     // the working tree directory. On a project with thousands of
     // commits / a heavy `node_modules` this can take many seconds.
@@ -2194,11 +2216,12 @@ pub(crate) async fn delete_archived_workspace_impl<R: tauri::Runtime>(
 ) -> Result<(), String> {
     if delete_worktree {
         // The archived workspace's chats were told to stop when it closed,
-        // and a chat child closed earlier may still be stopping in the same
-        // checkout. Its files stay until they have; waited before any lock.
+        // and a workspace that worked in the same checkout may still be
+        // closing or stopping its chats. Its files stay until they have;
+        // waited before any lock.
         if let Some(path) = state.find_archived_workspace(&archive_id).and_then(|e| e.worktree_path) {
-            let stopping = crate::commands::agent_chat::snapshot_pending_stops_in(Path::new(&path));
-            crate::commands::agent_chat::wait_for_stops(stopping)
+            let stopping = crate::checkout_claims::claims_in(Path::new(&path), None);
+            crate::checkout_claims::wait_for(stopping)
                 .await
                 .map_err(|error| format!("Agent session did not stop ({error}); worktree files retained."))?;
         }
@@ -2246,7 +2269,7 @@ pub(crate) async fn delete_archived_workspace_impl<R: tauri::Runtime>(
         // fence keeps new chat workspaces out while they go.
         let _fence = state.fence_checkout_removal(Path::new(&wt_path), |snapshot| {
             refuse_checkout_in_use(snapshot, Path::new(&wt_path), &[])?;
-            crate::commands::agent_chat::refuse_unstopped_agents_in(Path::new(&wt_path))
+            crate::checkout_claims::refuse_in(Path::new(&wt_path), None)
         })?;
         // Recursive directory delete — blocking pool, same rationale as
         // the close path. Errors (including the dirty/unpushed guard

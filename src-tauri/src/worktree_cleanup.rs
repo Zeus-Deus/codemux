@@ -137,11 +137,6 @@ static KICK: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::
 /// from its final check through the delete, so a workspace can't adopt a
 /// checkout that is being deleted (see [`opening_guard`]).
 static OPENING: LazyLock<tokio::sync::RwLock<()>> = LazyLock::new(|| tokio::sync::RwLock::new(()));
-/// Checkouts whose workspace's chats haven't confirmed they stopped, with a
-/// count per close (see [`RetireHold`]). A failed stop is never released
-/// (until restart, which ends every session Codemux started).
-static STOPPING: LazyLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
-    LazyLock::new(Default::default);
 
 /// Held by every path that opens a workspace on an existing checkout, from
 /// before it looks at the directory until the workspace is in app state.
@@ -199,93 +194,39 @@ fn is_disposable(ws: &WorkspaceSnapshot) -> bool {
         && crate::commands::workspace::archive_refusal_reason(ws).is_none()
 }
 
-/// Workspaces with a chat stop that failed: their checkouts stay out of
-/// cleanup until restart.
-static FAILED_STOPS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
-
-/// Called when stopping chats of `workspace_ids` failed.
-pub(crate) fn note_failed_stop(workspace_ids: &[String]) {
-    FAILED_STOPS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .extend(workspace_ids.iter().cloned());
-}
-
-/// Keeps one checkout out of cleanup while its workspace's sessions stop.
-/// Dropping it releases the hold; [`RetireHold::keep`] makes it permanent.
-pub(crate) struct RetireHold(Option<PathBuf>);
-
-impl RetireHold {
-    pub(crate) fn keep(mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for RetireHold {
-    fn drop(&mut self) {
-        let Some(key) = self.0.take() else { return };
-        let mut stopping = STOPPING.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = stopping.get_mut(&key) {
-            *count -= 1;
-            if *count == 0 {
-                stopping.remove(&key);
-            }
-        }
-    }
-}
-
-/// Take before a workspace leaves app state: from then on nothing else
-/// marks its checkout as in use. Covers a worktree workspace and a plain
-/// one opened inside Codemux's worktree directory. Synchronous.
-pub(crate) fn hold_checkout(ws: &WorkspaceSnapshot) -> RetireHold {
-    let path = ws.worktree_path.as_deref().unwrap_or(&ws.cwd);
-    let key = path_key(Path::new(path));
-    if !managed_root().is_some_and(|root| key.starts_with(root)) {
-        return RetireHold(None);
-    }
-    *STOPPING.lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_default() += 1;
-    RetireHold(Some(key))
-}
-
 /// The workspace left app state with its checkout on disk and its chats
 /// told to stop (`issued`, plus `earlier` stops of chats closed before).
 /// Once every stop is acknowledged, a plain close is recorded so a later
-/// sweep can offer the worktree when stale, and then the hold is released.
-/// Any failed stop, now or earlier in the workspace, keeps the hold.
+/// sweep can offer the worktree when stale, and then the claim is released.
+/// Any failed stop, now or earlier in the workspace, keeps the claim.
 pub(crate) fn retire_workspace<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    hold: RetireHold,
+    claim: crate::checkout_claims::CloseClaim,
     ws: &WorkspaceSnapshot,
-    earlier: crate::commands::agent_chat::EarlierStops,
-    issued: crate::commands::agent_chat::EarlierStops,
+    mut earlier: crate::checkout_claims::Stops,
+    issued: crate::checkout_claims::Stops,
     record_close: bool,
 ) {
-    let pending = crate::commands::agent_chat::snapshot_pending_stops(&ws.workspace_id.0);
+    earlier.extend(issued);
+    earlier.extend(crate::checkout_claims::stops_of_workspace(&ws.workspace_id.0));
     let app = app.clone();
     let ws = ws.clone();
     tauri::async_runtime::spawn(async move {
-        let mut stopped = Ok(());
-        for stops in [earlier, issued, pending] {
-            stopped = stopped.and(crate::commands::agent_chat::wait_for_stops(stops).await);
-        }
-        let failed_before = FAILED_STOPS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&ws.workspace_id.0);
-        if stopped.is_err() || failed_before {
+        if let Err(error) = crate::checkout_claims::wait_for(earlier).await {
             eprintln!(
                 "[worktree-cleanup] keeping {} out of cleanup: a chat did not stop",
                 ws.worktree_path.as_deref().unwrap_or(&ws.cwd),
             );
-            hold.keep();
+            claim.failed(error);
             return;
         }
+        claim.stopped();
         if record_close && is_disposable(&ws) {
             remember_closed(&app.state::<crate::database::DatabaseStore>(), &ws);
         }
         // Released only after the close is recorded, so a sweep never sees
-        // the checkout without either the hold or its fresh close time.
-        drop(hold);
+        // the checkout without either the claim or its fresh close time.
+        drop(claim);
     });
 }
 
@@ -733,15 +674,9 @@ fn is_busy(path: &Path, cwds: &[PathBuf]) -> bool {
 
 /// What still runs in `path`, if anything Codemux can see.
 fn activity(path: &Path, cwds: &[PathBuf]) -> Option<&'static str> {
-    // A plain workspace may run from a folder inside the worktree, so a
-    // hold anywhere under it counts.
-    let key = path_key(path);
-    let stopping = STOPPING
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .keys()
-        .any(|held| held.starts_with(&key));
-    if stopping {
+    // A workspace or chat may have run from a folder inside the worktree,
+    // so a claim anywhere under it counts.
+    if crate::checkout_claims::held_in(path) {
         Some("A chat that ran in it hasn't confirmed it stopped")
     } else if is_busy(path, cwds) {
         Some("A process is running inside it")
@@ -1383,35 +1318,13 @@ mod tests {
     #[test]
     fn an_unconfirmed_chat_stop_holds_the_worktree() {
         let dir = tempfile::tempdir().unwrap();
-        let key = path_key(dir.path());
-        let nested = key.join("src");
-        STOPPING.lock().unwrap().insert(key.clone(), 1);
+        let cwd = Some(dir.path().join("src").display().to_string());
+        // A chat that ran from a folder inside the worktree, still stopping.
+        let (mut batch, _) = crate::checkout_claims::begin_stops(vec![("cleanup-held".into(), None, cwd)]);
         let held = activity(dir.path(), &[]);
-        STOPPING.lock().unwrap().remove(&key);
         assert!(held.is_some_and(|reason| reason.contains("chat")));
+        batch.settle("cleanup-held", Ok(()));
         assert_eq!(activity(dir.path(), &[]), None);
-
-        // A workspace that ran from a folder inside the worktree.
-        STOPPING.lock().unwrap().insert(nested.clone(), 1);
-        let held = activity(dir.path(), &[]);
-        STOPPING.lock().unwrap().remove(&nested);
-        assert!(held.is_some());
-    }
-
-    #[test]
-    fn a_retire_hold_releases_on_drop_unless_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        let (released, kept) = (path_key(dir.path()).join("a"), path_key(dir.path()).join("b"));
-        for key in [&released, &kept] {
-            *STOPPING.lock().unwrap().entry(key.clone()).or_default() += 1;
-        }
-        drop(RetireHold(Some(released.clone())));
-        RetireHold(Some(kept.clone())).keep();
-        let stopping = STOPPING.lock().unwrap();
-        assert!(!stopping.contains_key(&released));
-        assert!(stopping.contains_key(&kept));
-        drop(stopping);
-        STOPPING.lock().unwrap().remove(&kept);
     }
 
     #[test]

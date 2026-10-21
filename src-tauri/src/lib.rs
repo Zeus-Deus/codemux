@@ -28,6 +28,7 @@ pub mod mcp_connector;
 pub mod agent_browser;
 pub mod browser_viewport;
 pub mod cli;
+pub mod checkout_claims;
 pub mod commands;
 pub mod database;
 pub mod delegation;
