@@ -975,7 +975,8 @@ describe("SidebarInboxCard — working duration", () => {
     renderCard({ status: "working", now: 12 * 60_000 });
 
     expect(screen.getByRole("status")).toHaveTextContent("Working");
-    expect(screen.getByText("12m")).toHaveClass("font-mono", "tabular-nums");
+    expect(screen.getByText("12m")).toHaveClass("tabular-nums");
+    expect(screen.getByText("12m")).not.toHaveClass("font-mono");
     expect(screen.getByText("12m")).toHaveAttribute("aria-hidden", "true");
   });
 

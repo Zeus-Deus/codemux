@@ -42,7 +42,8 @@ import { toolIcon } from "./tool-visuals";
 /** The opened history shows this many recent entries before "Show earlier". */
 export const WORK_LOG_HISTORY_WINDOW = 10;
 
-const META_CLASS = "font-mono text-caption";
+/** Durations, counts and outcome notes: data, but not code, so sans. */
+const META_CLASS = "text-label tabular-nums";
 
 type OrbActivity = ReturnType<typeof turnOrbActivity>;
 
@@ -279,7 +280,7 @@ function CollapsedLine({
         )}
         <TraceTitle>
           {status === "running" ? "Running subagents" : "Ran subagents"}{" "}
-          <span className="font-mono text-label">{subagentPreview(entry.subagents)}</span>
+          <span className="opacity-60">{subagentPreview(entry.subagents)}</span>
         </TraceTitle>
         <TotalsLabel totals={totals} />
       </TraceLine>
@@ -417,7 +418,7 @@ function SubagentRunLine({
         )}
         <TraceTitle>
           {status === "running" ? "Running" : "Ran"} {count} subagent{count === 1 ? "" : "s"}{" "}
-          <span className="font-mono text-label">{subagentPreview(run.subagents)}</span>
+          <span className="opacity-60">{subagentPreview(run.subagents)}</span>
         </TraceTitle>
         <TickingText
           active={status === "running"}

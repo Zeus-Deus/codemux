@@ -369,7 +369,7 @@ function TypographySurfaceCard({
             <div className="flex flex-wrap items-center gap-2">
               <p className="text-body font-semibold text-foreground">{title}</p>
               {linkedLabel ? (
-                <span className="rounded-full border border-hairline bg-surface-1 px-2 py-0.5 font-mono text-micro text-muted-foreground/75">
+                <span className="rounded-full border border-hairline bg-surface-1 px-2 py-0.5 text-caption text-muted-foreground/75">
                   {linkedLabel}
                 </span>
               ) : null}

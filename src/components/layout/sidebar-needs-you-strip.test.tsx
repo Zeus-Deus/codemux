@@ -154,7 +154,7 @@ describe("SidebarNeedsYouStrip", () => {
       <SidebarNeedsYouStrip projectGroups={groups} />,
     );
     expect(container).toBeEmptyDOMElement();
-    expect(screen.queryByText(/NEEDS YOU/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Needs you/)).not.toBeInTheDocument();
   });
 
   it("renders nothing when there is no app state yet", () => {
@@ -202,7 +202,7 @@ describe("SidebarNeedsYouStrip", () => {
     render(<SidebarNeedsYouStrip projectGroups={groups} />);
 
     // Count reflects only the two permission workspaces.
-    expect(screen.getByText(/NEEDS YOU · 2/)).toBeInTheDocument();
+    expect(screen.getByText(/Needs you · 2/)).toBeInTheDocument();
     // One jump-link per blocked workspace, named with its title and blocker.
     const links = screen.getAllByRole("button", { name: /waiting for your input/i });
     expect(links).toHaveLength(2);
@@ -374,7 +374,7 @@ describe("SidebarNeedsYouStrip", () => {
     render(<SidebarNeedsYouStrip projectGroups={groups} />);
 
     // Header count reports all five blockers…
-    expect(screen.getByText(/NEEDS YOU · 5/)).toBeInTheDocument();
+    expect(screen.getByText(/Needs you · 5/)).toBeInTheDocument();
     // …the visible rows run oldest-blocked-first…
     const links = screen.getAllByRole("button", {
       name: /waiting for your input/i,

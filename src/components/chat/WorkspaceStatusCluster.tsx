@@ -200,7 +200,7 @@ export function WorkspaceStatusCluster({
           disabled={initializing}
           aria-label="Initialize a git repository in this project folder"
           title="This project is not a git repository — worktrees, diffs, and checkpoints are unavailable until one is initialized"
-          className="inline-flex h-6 shrink-0 items-center rounded-md border px-2 font-mono text-label font-semibold text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+          className="inline-flex h-6 shrink-0 items-center rounded-md border px-2 text-label font-semibold text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
         >
           {initializing ? "Initializing…" : "Initialize Git"}
         </button>
@@ -308,7 +308,7 @@ export function WorkspaceStatusCluster({
                 <div className="truncate text-body font-bold text-foreground">
                   {workspace.title}
                 </div>
-                <div className="mt-0.5 truncate font-mono text-label text-muted-foreground">
+                <div className="mt-0.5 truncate text-label text-muted-foreground">
                   {projectName} · {deviceLabel}
                 </div>
               </div>

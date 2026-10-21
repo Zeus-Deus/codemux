@@ -196,7 +196,7 @@ const GOAL_RESUME = cn(
   GOAL_FOCUS,
 );
 const GOAL_META =
-  "shrink-0 whitespace-nowrap font-mono text-label tabular-nums text-muted-foreground";
+  "shrink-0 whitespace-nowrap text-label tabular-nums text-muted-foreground";
 const GOAL_LINK = cn(
   "inline-flex shrink-0 items-center gap-[5px] rounded-sm transition-colors duration-150 hover:text-foreground",
   GOAL_FOCUS,
@@ -307,7 +307,7 @@ export function ComposerStrip({
         aria-label={open ? "Collapse pending activity" : `Show ${rest} more`}
         title={open ? "Collapse" : `Show ${rest} more`}
         onClick={() => setOpen((cur) => !cur)}
-        className={cn(STRIP_CHIP, "min-w-[26px] px-1.5 font-mono")}
+        className={cn(STRIP_CHIP, "min-w-[26px] px-1.5 tabular-nums")}
       >
         {open ? (
           <ChevronDown className="size-3" aria-hidden />
@@ -477,26 +477,26 @@ function StripRowView({
         {row.liveDetail ? (
           <TickingText
             testId={row.liveDetail.testId}
-            className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground tabular-nums"
+            className="min-w-0 flex-1 truncate text-label text-muted-foreground tabular-nums"
             compute={row.liveDetail.compute}
             intervalMs={row.liveDetail.intervalMs}
           />
         ) : (
           <span
-            className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground"
+            className="min-w-0 flex-1 truncate text-label text-muted-foreground"
             title={row.detail ?? undefined}
           >
             {row.detailLinks ? row.detailLinks.map((link, i) => <span key={i}>{i > 0 && ", "}<InlineButton aria-label={`Open subagent ${link.label}`} onClick={link.onClick}>{link.label}</InlineButton></span>) : row.detail}
           </span>
         )}
         {row.meta && (
-          <span className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground tabular-nums">
+          <span className="shrink-0 whitespace-nowrap text-label text-muted-foreground tabular-nums">
             {row.meta}
           </span>
         )}
         {row.elapsed && (
           <TickingText
-            className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground"
+            className="shrink-0 whitespace-nowrap text-label text-muted-foreground tabular-nums"
             compute={row.elapsed}
           />
         )}
@@ -712,7 +712,7 @@ function GoalRowView({
                 onClick={onToggle}
                 className={GOAL_CHIP_FILLED}
               >
-                <span className="font-mono">+{others}</span>
+                <span className="tabular-nums">+{others}</span>
                 <ChevronUp
                   className="size-[9px] opacity-60"
                   aria-hidden
@@ -761,7 +761,7 @@ function GoalRowView({
                 type="button"
                 onClick={strip.onEditResume}
                 className={cn(
-                  "shrink-0 rounded-sm font-mono text-label text-muted-foreground transition-colors duration-150 hover:text-foreground",
+                  "shrink-0 rounded-sm text-label text-muted-foreground transition-colors duration-150 hover:text-foreground",
                   GOAL_FOCUS,
                 )}
               >
@@ -770,7 +770,7 @@ function GoalRowView({
             </div>
           )}
           {(jump || note || summary) && (
-            <div className="flex min-w-0 items-center gap-2.5 font-mono text-label text-muted-foreground">
+            <div className="flex min-w-0 items-center gap-2.5 text-label text-muted-foreground">
               {jump && (
                 <button type="button" onClick={jump.onClick} className={GOAL_LINK}>
                   {jump.label}

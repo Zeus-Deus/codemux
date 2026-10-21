@@ -105,17 +105,17 @@ export function TasksPanel({
           <span
             data-testid="tasks-status-badge"
             className={cn(
-              "inline-flex items-center rounded-sm px-1.5 py-px font-mono text-caption font-semibold uppercase tracking-[0.09em]",
+              "inline-flex items-center rounded-sm px-1.5 py-px text-label font-semibold",
               BADGE_TONE[runState],
             )}
           >
             {RUN_STATE_LABEL[runState]}
           </span>
-          <span className="min-w-0 flex-1 font-mono text-label tabular-nums text-muted-foreground">
+          <span className="min-w-0 flex-1 text-label tabular-nums text-muted-foreground">
             {completed}/{total} done
           </span>
           {updatedAt != null && (
-            <span className="shrink-0 font-mono text-label tabular-nums text-muted-foreground">
+            <span className="shrink-0 text-label tabular-nums text-muted-foreground">
               {new Date(updatedAt).toLocaleTimeString(
                 [],
                 withTimeFormat({
@@ -172,7 +172,7 @@ export function TasksPanel({
                   <span className="mt-[3px] flex size-4 shrink-0 items-center justify-center">
                     <StatusGlyph task={task} />
                   </span>
-                  <span className="mt-0.5 w-4 shrink-0 text-right font-mono text-caption tabular-nums leading-4 text-muted-foreground/70">
+                  <span className="mt-0.5 w-4 shrink-0 text-right text-caption tabular-nums leading-4 text-muted-foreground/70">
                     {index + 1}
                   </span>
                   <div className="min-w-0 flex-1">

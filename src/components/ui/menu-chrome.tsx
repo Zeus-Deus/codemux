@@ -49,11 +49,11 @@ export const MENU_SEPARATOR = "mx-[5px] my-1.5 h-px bg-border";
  * navigation skips it.
  */
 export const MENU_SECTION_LABEL =
-  "flex h-6 items-center px-[9px] font-mono text-micro font-normal uppercase tracking-[0.16em] text-muted-foreground/55";
+  "flex h-6 items-center px-[9px] text-label font-medium text-muted-foreground/80";
 
-/** Trailing mono metadata on a row (a username, a device state, a hint). */
+/** Trailing metadata on a row (a username, a device state, a hint). */
 export const MENU_ROW_META =
-  "ml-auto shrink-0 font-mono text-caption text-muted-foreground/60";
+  "ml-auto shrink-0 text-label text-muted-foreground/70";
 
 const IS_MAC =
   typeof navigator !== "undefined" && /mac/i.test(navigator.platform);

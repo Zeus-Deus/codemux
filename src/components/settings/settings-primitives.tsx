@@ -19,7 +19,6 @@ import {
 } from "react";
 import { Monitor } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { Eyebrow } from "@/components/ui/eyebrow";
 import { Input } from "@/components/ui/input";
 import { Select, SelectTrigger } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
@@ -217,9 +216,11 @@ export function SubsectionHeader({
   return (
     <div data-settings-row className={cn("mb-3 flex items-end justify-between gap-4", className)}>
       <div className="min-w-0">
-        <Eyebrow>
+        {/* A step up from an eyebrow: it heads a described block, so it has
+            to hold its own above the muted description. */}
+        <h3 className="text-body-sm font-medium text-foreground/85">
           {title}
-        </Eyebrow>
+        </h3>
         {description && (
           <p className="text-body-sm text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">
             {description}
