@@ -154,6 +154,19 @@ pub(crate) async fn capabilities_for_account<R: Runtime>(
     ).await.map_err(ControlError::from)
 }
 
+/// The composer's cached catalog for `provider`, if any. Never spawns.
+pub(crate) async fn cached_capabilities<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: ProviderKind,
+    account_id: Option<String>,
+) -> Result<Option<ProviderChatCapabilities>, ControlError> {
+    #[cfg(test)]
+    if let Some(state) = app.try_state::<NativeControlState>() {
+        if let Some(caps) = state.fixture_capabilities.lock().unwrap().get(&provider).cloned() { return Ok(Some(caps)); }
+    }
+    agent_chat::cached_chat_provider_capabilities(app, provider, account_id).await.map_err(ControlError::from)
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Launch {
@@ -779,6 +792,15 @@ fn spawn_operation<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, recei
     });
 }
 
+/// Why chats of `kind` cannot use Codemux's collaboration tools, when known
+/// without starting anything: OpenCode 1 never names the calling session.
+fn collaboration_unavailable<R: Runtime>(app: &AppHandle<R>, kind: ProviderKind) -> Option<&'static str> {
+    let manager = app.try_state::<std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>>()?;
+    (kind == ProviderKind::OpenCode
+        && manager.cached_catalog()?.0 == crate::agent_provider::opencode::api::OpenCodeApi::Legacy)
+        .then_some(crate::agent_provider::opencode::session::LEGACY_COLLABORATION)
+}
+
 pub(crate) async fn agent_capabilities<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, args: Value) -> Result<Value, ControlError> {
     #[derive(Deserialize)] #[serde(deny_unknown_fields)]
     struct Args { workspace_id: String, provider: Option<ProviderKind> }
@@ -841,7 +863,7 @@ pub(crate) async fn agent_capabilities<R: Runtime>(app: &AppHandle<R>, caller: &
                 let allowed_modes: Vec<_> = capabilities.permission_modes.iter()
                     .filter(|mode|permission_ceiling(caller,kind,Some(&mode.value)).is_ok())
                     .map(|m|m.value.clone()).collect();
-                providers.push(json!({"provider":kind,"provider_instance_id":instance,"selection":resolved,"configured":true,"capabilities":capabilities,"options":options,"operations":operations,"allowed_permission_modes":allowed_modes,"discovery_error":null}));
+                providers.push(json!({"provider":kind,"provider_instance_id":instance,"selection":resolved,"configured":true,"capabilities":capabilities,"options":options,"operations":operations,"allowed_permission_modes":allowed_modes,"discovery_error":null,"collaboration_unavailable":collaboration_unavailable(app,kind)}));
             }
             Err(error) => providers.push(json!({"provider":kind,"provider_instance_id":instance,"configured":true,"capabilities":null,"operations":operations,"allowed_permission_modes":[],"discovery_error":error})),
         }

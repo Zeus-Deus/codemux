@@ -80,6 +80,13 @@ impl CursorCapabilityCache {
         Ok(fresh)
     }
 
+    /// The last harvested catalog, whatever its age. Never harvests, and
+    /// reads nothing while a harvest holds the cache.
+    pub fn cached(&self) -> Option<ProviderChatCapabilities> {
+        let cached = self.inner.try_lock().ok()?;
+        cached.as_ref().map(|entry| entry.capabilities.clone())
+    }
+
     pub async fn invalidate(&self) {
         *self.inner.lock().await = None;
     }

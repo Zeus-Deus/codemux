@@ -5973,6 +5973,48 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
     Ok(capabilities)
 }
 
+/// The catalog [`list_chat_provider_capabilities`] last harvested, read from
+/// its caches only: never spawns a CLI, a server or a sidecar. `None` when
+/// nothing usable is cached.
+pub(crate) async fn cached_chat_provider_capabilities<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: ProviderKind,
+    account_id: Option<String>,
+) -> Result<Option<ProviderChatCapabilities>, String> {
+    use std::sync::Arc;
+    let mut capabilities = match provider {
+        ProviderKind::Claude => match app.try_state::<Arc<crate::agent_provider::claude::capabilities::ClaudeCapabilityCache>>() {
+            Some(cache) => cache.cached().await,
+            None => None,
+        },
+        ProviderKind::Codex => match app.try_state::<Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>>() {
+            Some(cache) => match account_id.filter(|id| id != crate::provider_accounts::DEFAULT_ACCOUNT_ID) {
+                Some(id) => match app.state::<DatabaseStore>().provider_account(&id)? {
+                    Some(account) => cache.cached_account(&account.id, std::path::Path::new(&account.home)).await,
+                    None => None,
+                },
+                None => cache.cached_owned(&crate::agent_provider::codex::chatgpt::owner()).await,
+            },
+            None => None,
+        },
+        ProviderKind::Cursor => app
+            .try_state::<Arc<crate::agent_provider::cursor::capabilities::CursorCapabilityCache>>()
+            .and_then(|cache| cache.cached()),
+        ProviderKind::Grok => app
+            .try_state::<Arc<crate::agent_provider::grok::capabilities::GrokCapabilityCache>>()
+            .and_then(|cache| cache.cached()),
+        ProviderKind::OpenCode => app
+            .try_state::<Arc<crate::agent_provider::opencode::OpenCodeServerManager>>()
+            .and_then(|manager| manager.cached_catalog())
+            .map(|(_, capabilities)| capabilities),
+        ProviderKind::Hermes | ProviderKind::Acp => None,
+    };
+    if let Some(capabilities) = capabilities.as_mut() {
+        capabilities.supports_steering = provider.supports_steering();
+    }
+    Ok(capabilities)
+}
+
 /// Probe the health of a chat provider's local runtime (binary present,
 /// runnable, authenticated) so the chat UI can surface a status banner
 /// BEFORE the user burns minutes on a session that can never work.

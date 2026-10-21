@@ -82,8 +82,9 @@ pub(crate) fn current_instance(
 }
 
 /// Resolve an instance through its composer catalog. `discover` lets a
-/// targeted launch probe an instance once when nothing is cached; listing
-/// passes `false` and never spawns agents or opens provider sessions.
+/// targeted launch probe an instance and refresh a stale catalog; listing
+/// passes `false` and reads caches only: it never runs a health check,
+/// spawns an agent or server, or opens a provider session.
 pub(crate) async fn resolve<R: Runtime>(
     app: &AppHandle<R>,
     requested: ProviderSelection,
@@ -227,11 +228,22 @@ pub(crate) async fn resolve<R: Runtime>(
             } else {
                 json!({})
             };
-            readiness(app, kind).await?;
-            let caps = if let Some(account) = account {
-                service::capabilities_for_account(app, kind, Some(account.to_string())).await?
+            let caps = if discover {
+                readiness(app, kind).await?;
+                if let Some(account) = account {
+                    service::capabilities_for_account(app, kind, Some(account.to_string())).await?
+                } else {
+                    service::capabilities(app, kind).await?
+                }
             } else {
-                service::capabilities(app, kind).await?
+                // Listing: a recent health verdict and the composer's cached
+                // catalog only. Health checks and harvests run CLIs.
+                if let Some(verdict) = recent_readiness(kind) {
+                    verdict?;
+                }
+                service::cached_capabilities(app, kind, account.map(str::to_string))
+                    .await?
+                    .ok_or_else(not_discovered)?
             };
             (kind, extra, None, caps, vec![])
         };
@@ -402,7 +414,7 @@ mod all_provider_selection_tests {
 fn not_discovered() -> ControlError {
     ControlError::new(
         "catalog_not_discovered",
-        "This instance has not been opened yet; target it directly to discover its catalog",
+        "This instance's catalog has not been discovered yet; target it directly to discover it",
     )
 }
 
@@ -411,6 +423,16 @@ const READINESS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 static READINESS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<ProviderKind, (std::time::Instant, Result<(), ControlError>)>>,
 > = std::sync::LazyLock::new(Default::default);
+
+/// A health verdict from the last [`READINESS_TTL`], without running one.
+fn recent_readiness(provider: ProviderKind) -> Option<Result<(), ControlError>> {
+    READINESS
+        .lock()
+        .unwrap()
+        .get(&provider)
+        .filter(|(at, _)| at.elapsed() < READINESS_TTL)
+        .map(|(_, verdict)| verdict.clone())
+}
 
 pub(crate) async fn readiness<R: Runtime>(
     app: &AppHandle<R>,

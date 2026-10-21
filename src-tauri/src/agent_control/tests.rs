@@ -1121,6 +1121,48 @@ async fn capabilities_discover_provider_owned_models_and_operations() {
     assert!(provider.calls.snapshot().is_empty(), "metadata must not launch a coding session");
 }
 
+/// Listing reads caches only. With every catalog cold it reports each
+/// built-in instance undiscovered and starts nothing: no OpenCode server, no
+/// CLI health check, no catalog harvest. A cached catalog is listed as is.
+#[tokio::test]
+async fn all_provider_listing_with_cold_caches_starts_nothing() {
+    use crate::agent_provider::ProviderKind::{self, *};
+    let (app, _provider, _root, workspace) = fixture().await;
+    app.state::<NativeControlState>().fixture_capabilities.lock().unwrap().clear();
+    let registry = app.state::<crate::commands::agent_chat::ProviderRegistry>();
+    let mock = |kind: ProviderKind| Arc::new(mock_agent_provider::MockAgentProvider::new(kind));
+    registry.set_codex(mock(Codex)).await;
+    registry.set_cursor(mock(Cursor)).await;
+    registry.set_grok(mock(Grok)).await;
+    registry.set_opencode(mock(OpenCode)).await;
+    let opencode = Arc::new(crate::agent_provider::opencode::OpenCodeServerManager::new());
+    app.manage(opencode.clone());
+    app.manage(Arc::new(crate::agent_provider::claude::capabilities::ClaudeCapabilityCache::new()));
+    app.manage(Arc::new(crate::agent_provider::codex::capabilities::CodexCapabilityCache::new()));
+    app.manage(Arc::new(crate::agent_provider::cursor::capabilities::CursorCapabilityCache::new()));
+    app.manage(Arc::new(crate::agent_provider::grok::capabilities::GrokCapabilityCache::new()));
+    let trusted = ControlCaller::trusted();
+    let list = || execute(app.handle(), &trusted, "agent_capabilities", json!({"workspace_id":workspace}));
+
+    let cold = list().await.unwrap();
+    let providers = cold["providers"].as_array().unwrap();
+    assert_eq!(providers.len(), 5, "{cold}");
+    for entry in providers {
+        assert_eq!(entry["discovery_error"]["code"], "catalog_not_discovered", "{entry}");
+    }
+    assert!(!opencode.is_running_for_tests().await, "listing started an OpenCode server");
+
+    // An OpenCode 1 catalog the composer read earlier: listed, with the reason
+    // its chats cannot collaborate, still without a server.
+    let catalog = crate::agent_provider::opencode::capabilities::build_capabilities(vec![]);
+    opencode.remember_catalog(crate::agent_provider::opencode::api::OpenCodeApi::Legacy, catalog);
+    let warm = list().await.unwrap();
+    let entry = warm["providers"].as_array().unwrap().iter().find(|p| p["provider"] == "opencode").unwrap();
+    assert_eq!(entry["discovery_error"], serde_json::Value::Null, "{entry}");
+    assert_eq!(entry["collaboration_unavailable"], crate::agent_provider::opencode::session::LEGACY_COLLABORATION);
+    assert!(!opencode.is_running_for_tests().await);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupt_reaches_native_provider_without_deleting_thread_or_pane() {
     use crate::agent_provider::{ProviderRuntimeEvent, SessionStatus, ThreadId};

@@ -101,6 +101,9 @@ pub struct OpenCodeServerManager {
     /// lock. Unlike restartable Stop, app shutdown must never admit a spawn.
     closing: AtomicBool,
     shutdown_lock_timeout: Duration,
+    /// The last model catalog read from a server, with that server's API, so
+    /// orchestration listings can report it without starting one.
+    catalog: std::sync::Mutex<Option<(super::api::OpenCodeApi, crate::agent_provider::ProviderChatCapabilities)>>,
 }
 
 impl OpenCodeServerManager {
@@ -112,7 +115,23 @@ impl OpenCodeServerManager {
             server: Mutex::new(None),
             closing: AtomicBool::new(false),
             shutdown_lock_timeout: SHUTDOWN_LOCK_TIMEOUT,
+            catalog: Default::default(),
         }
+    }
+
+    pub(crate) fn remember_catalog(
+        &self,
+        api: super::api::OpenCodeApi,
+        capabilities: crate::agent_provider::ProviderChatCapabilities,
+    ) {
+        *self.catalog.lock().unwrap_or_else(|p| p.into_inner()) = Some((api, capabilities));
+    }
+
+    /// The last catalog read, without starting a server.
+    pub(crate) fn cached_catalog(
+        &self,
+    ) -> Option<(super::api::OpenCodeApi, crate::agent_provider::ProviderChatCapabilities)> {
+        self.catalog.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Return a handle to the running server, spawning it on demand
