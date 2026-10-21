@@ -73,6 +73,7 @@ pub struct MockAgentProvider {
     fast_mode_error: Mutex<Option<ProviderError>>,
     start_error: Mutex<Option<ProviderError>>,
     send_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    accepted_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     start_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Threads `turn_active` reports as running a turn. The mock never
     /// runs turns itself, so tests set this to stand in for one.
@@ -99,6 +100,7 @@ impl MockAgentProvider {
             start_error: Mutex::new(None),
             send_gate: Mutex::new(None),
             start_gate: Mutex::new(None),
+            accepted_gate: Mutex::new(None),
             active_turns: Mutex::new(HashSet::new()),
             send_error: Mutex::new(None),
             send_error_after_accept: Mutex::new(None),
@@ -138,6 +140,15 @@ impl MockAgentProvider {
         (entered, release)
     }
 
+    /// Barrier after the provider has accepted the request, before its ACK.
+    #[allow(dead_code)]
+    pub fn hold_next_ack(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.accepted_gate.lock().unwrap() = Some((accepted.clone(), release.clone()));
+        (accepted, release)
+    }
+
     /// Report a turn in flight (or not) on `thread` from `turn_active`.
     #[allow(dead_code)]
     pub fn set_turn_active(&self, thread: &str, active: bool) {
@@ -164,8 +175,8 @@ impl MockAgentProvider {
         *self.send_error.lock().unwrap() = Some(error);
     }
 
-    pub fn fail_next_send_after_accept(&self,error:ProviderError) {
-        *self.send_error_after_accept.lock().unwrap()=Some(error);
+    pub fn fail_next_send_after_accept(&self, error: ProviderError) {
+        *self.send_error_after_accept.lock().unwrap() = Some(error);
     }
 
     /// Convenience: emit a runtime event via the broadcaster, the
@@ -223,7 +234,8 @@ impl AgentProvider for MockAgentProvider {
             entered.notify_one();
             release.notified().await;
         }
-        self.calls.push(MockCall::StartSession(input.thread_id.clone()));
+        self.calls
+            .push(MockCall::StartSession(input.thread_id.clone()));
         self.start_inputs.lock().unwrap().push(input.clone());
         if let Some(error) = self.start_error.lock().unwrap().take() {
             return Err(error);
@@ -264,9 +276,16 @@ impl AgentProvider for MockAgentProvider {
         }
         self.calls
             .push(MockCall::SendTurn(input.thread_id.clone(), input.text));
+        let accepted_gate = self.accepted_gate.lock().unwrap().take();
+        if let Some((accepted, release)) = accepted_gate {
+            accepted.notify_one();
+            release.notified().await;
+        }
         let after_accept = self.send_error_after_accept.lock().unwrap().take();
         if let Some(error) = after_accept {
-            if let Some(checkpoint) = checkpoint.as_ref() { checkpoint.abort().await; }
+            if let Some(checkpoint) = checkpoint.as_ref() {
+                checkpoint.abort().await;
+            }
             return Err(error);
         }
         if let Some(checkpoint) = checkpoint.as_ref() {
@@ -297,7 +316,8 @@ impl AgentProvider for MockAgentProvider {
         request_id: RequestId,
         _decision: ApprovalDecision,
     ) -> Result<(), ProviderError> {
-        self.calls.push(MockCall::RespondToRequest(thread_id, request_id));
+        self.calls
+            .push(MockCall::RespondToRequest(thread_id, request_id));
         Ok(())
     }
 
@@ -306,7 +326,11 @@ impl AgentProvider for MockAgentProvider {
         Ok(())
     }
 
-    async fn set_fast_mode(&self, thread_id: ThreadId, fast_mode: bool) -> Result<(), ProviderError> {
+    async fn set_fast_mode(
+        &self,
+        thread_id: ThreadId,
+        fast_mode: bool,
+    ) -> Result<(), ProviderError> {
         self.calls.push(MockCall::SetFastMode(thread_id, fast_mode));
         match self.fast_mode_error.lock().unwrap().take() {
             Some(error) => Err(error),
@@ -340,7 +364,8 @@ impl AgentProvider for MockAgentProvider {
         thread_id: ThreadId,
         mode: String,
     ) -> Result<(), ProviderError> {
-        self.calls.push(MockCall::SetPermissionMode(thread_id, mode));
+        self.calls
+            .push(MockCall::SetPermissionMode(thread_id, mode));
         Ok(())
     }
 

@@ -22,7 +22,12 @@ def finish():
  while not (root/'finish').exists(): time.sleep(.01)
  output({'method':'turn/completed','params':{'threadId':'fixture-thread','turn':{'id':'turn-1','status':'completed'}}})
 for line in sys.stdin:
- m=json.loads(line);method=m.get('method');record({'rpc':method,'params':m.get('params'),'pid':os.getpid()})
+ m=json.loads(line);method=m.get('method');record({'rpc':method,'params':m.get('params'),'pid':os.getpid(),'id':m.get('id'),'result':m.get('result')})
+ if method is None:
+  if (root/'host-tool-followup').exists():
+   if m.get('id')==9876: output({'id':9877,'method':'item/tool/call','params':{'threadId':'fixture-thread','turnId':'turn-1','callId':'second-delegate','tool':'codemux_mcp__codemux__delegate_task','arguments':{}}})
+   if m.get('id')==9877: output({'method':'turn/completed','params':{'threadId':'fixture-thread','turn':{'id':'turn-1','status':'completed'}}})
+  continue
  if 'id' not in m: continue
  if method=='initialize':
   if os.environ.get('ACCESS_TOKEN')=='synthetic-runtime-b' and (root/'renewal-block').exists():
@@ -51,6 +56,10 @@ for line in sys.stdin:
    while not (root/'queued-response-release').exists(): time.sleep(.01)
  else: result={}
  output({'id':m['id'],'result':result})
+ if method=='turn/start' and count==1 and (root/'host-tool').exists():
+  output({'id':9876,'method':'item/tool/call','params':{'threadId':'fixture-thread','turnId':'turn-1','callId':'waiting-delegate','namespace':None,'tool':'codemux_mcp__codemux__delegate_task','arguments':{'mode':'wait'}}})
+ if method=='turn/interrupt' and (root/'host-tool-late').exists():
+  output({'id':9878,'method':'item/tool/call','params':{'threadId':'fixture-thread','turnId':'turn-1','callId':'late-delegate','tool':'codemux_mcp__codemux__delegate_task','arguments':{}}})
  if method=='turn/start' and (root/'close-stdout-live').exists():
   os.close(1);time.sleep(30)
  if method=='turn/start' and os.environ.get('ACCESS_TOKEN')=='synthetic-runtime-a': threading.Thread(target=finish,daemon=True).start()
@@ -991,4 +1000,91 @@ async fn orchestration_message_codex_machine_send_keeps_provider_hold_and_held_i
     assert_eq!(session.state.lock().await.queued_turns.len(),1);
     assert_eq!(wire(root.path()).iter().filter(|v|v["rpc"]=="turn/start").count(),1);
     session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn delegation_delivery_codex_stop_aborts_waiting_dynamic_host_call() {
+    struct WaitingHost { entered: Arc<tokio::sync::Notify>, dropped: Arc<std::sync::atomic::AtomicBool> }
+    struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Dropped { fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::SeqCst); } }
+    impl crate::mcp::registry::HostTools for WaitingHost {
+        fn tools_for(&self, _caller: &crate::mcp::registry::HostCaller) -> Vec<crate::mcp::runtime::McpTool> {
+            vec![crate::mcp::runtime::McpTool {name:"delegate_task".into(),prefixed_name:"mcp__codemux__delegate_task".into(),description:None,input_schema:json!({}),server_id:"host".into()}]
+        }
+        fn call(&self, _: &crate::mcp::registry::HostCaller, _: &str, _: &Value) -> Option<Value> { None }
+        fn call_async<'a>(&'a self, _: &'a crate::mcp::registry::HostCaller, _: &'a str, _: &'a Value, _: Option<&'a str>, _: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output=Option<Value>> + Send + 'a>> {
+            Box::pin(async move { let _lease = Dropped(self.dropped.clone()); self.entered.notify_one(); std::future::pending().await })
+        }
+    }
+    let root = tempfile::tempdir().unwrap(); std::fs::write(root.path().join("host-tool"), "yes").unwrap();
+    std::fs::write(root.path().join("host-tool-late"), "yes").unwrap();
+    let host = Arc::new(WaitingHost {entered:Default::default(),dropped:Default::default()});
+    let registry = McpRegistry::new(); registry.set_host_tools(host.clone());
+    let (tx, _) = broadcast::channel(128);
+    let session = CodexSession::spawn_and_initialize(
+        ThreadId("waiting-host".into()), root.path().into(), None, Some("danger-full-access".into()), None, "default".into(), None, None, None,
+        CodexSpawnConfig {codex_binary:fixture_binary(root.path()),chatgpt_owner:None,codex_home:None,remote:None,
+            client_info:ClientInfo {name:"fixture".into(),title:"fixture".into(),version:"fixture".into()},mcp_registry:Some(registry)},tx,None,
+    ).await.unwrap();
+    session.enqueue_or_send(super::tests::queued("first").input).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), host.entered.notified()).await.unwrap();
+    session.interrupt_turn(None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !host.dropped.load(std::sync::atomic::Ordering::SeqCst) { tokio::task::yield_now().await; }
+    }).await.expect("Stop must drop the waiting host call and release its wait lease");
+    let answered = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let responses = wire(root.path());
+            if [9876, 9878].iter().all(|id| responses.iter().any(|r| r["id"] == *id && r["result"]["success"] == false)) { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await;
+    session.shutdown().await.unwrap();
+    answered.expect("cancelled and rejected callbacks must both receive an error response");
+}
+
+#[tokio::test]
+async fn delegation_delivery_round2_queued_human_keeps_dynamic_callbacks_and_drains_queue() {
+    struct Host { entered: tokio::sync::Notify, release: tokio::sync::Notify, calls: std::sync::atomic::AtomicUsize }
+    impl crate::mcp::registry::HostTools for Host {
+        fn tools_for(&self, _: &crate::mcp::registry::HostCaller) -> Vec<crate::mcp::runtime::McpTool> {
+            vec![crate::mcp::runtime::McpTool { name:"delegate_task".into(), prefixed_name:"mcp__codemux__delegate_task".into(), description:None, input_schema:json!({}), server_id:"host".into() }]
+        }
+        fn call(&self, _: &crate::mcp::registry::HostCaller, _: &str, _: &Value) -> Option<Value> { None }
+        fn call_async<'a>(&'a self, _: &'a crate::mcp::registry::HostCaller, _: &'a str, _: &'a Value, _: Option<&'a str>, _: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output=Option<Value>> + Send + 'a>> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 { self.entered.notify_one(); self.release.notified().await; }
+                Some(json!({"content":[{"type":"text","text":"dynamic result"}]}))
+            })
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    for marker in ["host-tool", "host-tool-followup"] { std::fs::write(root.path().join(marker), "yes").unwrap(); }
+    let host = Arc::new(Host { entered:Default::default(), release:Default::default(), calls:Default::default() });
+    let registry = McpRegistry::new(); registry.set_host_tools(host.clone());
+    let (tx, _) = broadcast::channel(128);
+    let session = CodexSession::spawn_and_initialize(
+        ThreadId("queued-human-dynamic".into()), root.path().into(), None, Some("danger-full-access".into()), None, "default".into(), None, None, None,
+        CodexSpawnConfig { codex_binary:fixture_binary(root.path()), chatgpt_owner:None, codex_home:None, remote:None,
+            client_info:ClientInfo { name:"fixture".into(), title:"fixture".into(), version:"fixture".into() }, mcp_registry:Some(registry) }, tx, None,
+    ).await.unwrap();
+    session.enqueue_or_send(super::tests::queued("first").input).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), host.entered.notified()).await.unwrap();
+    let app = tauri::test::mock_app();
+    crate::delegation::app::user_activity(app.handle(), "queued-human-dynamic", false).unwrap();
+    session.enqueue_or_send(super::tests::queued("follow-up").input).await.unwrap();
+    host.release.notify_one();
+    let completed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = wire(root.path());
+            if rows.iter().filter(|r| r["rpc"] == "turn/start").count() == 2 {
+                for id in [9876, 9877] { assert!(rows.iter().any(|r| r["id"] == id && r["result"]["success"] == true)); }
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await;
+    session.shutdown().await.unwrap();
+    completed.expect("queued human activity must preserve the active tool, later tools and queue drain");
+    assert_eq!(host.calls.load(Ordering::SeqCst), 2);
 }

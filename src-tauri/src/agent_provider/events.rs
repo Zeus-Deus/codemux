@@ -107,6 +107,8 @@ pub fn classify_task_kind(task_type: Option<&str>) -> SubagentTaskKind {
 /// later) still deserialises.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SubagentSnapshot {
+    #[serde(default)]
+    pub task_id: Option<String>,
     /// Stable demux key. Provider-specific: Claude uses the spawning
     /// `parent_tool_use_id`, Codex the child `threadId`, OpenCode the
     /// child `sessionID`.
@@ -1056,6 +1058,7 @@ mod tests {
 
     fn full_snapshot() -> SubagentSnapshot {
         SubagentSnapshot {
+            task_id: None,
             subagent_id: "toolu_root".into(),
             parent_item_id: Some("toolu_root".into()),
             name: Some("Explore".into()),

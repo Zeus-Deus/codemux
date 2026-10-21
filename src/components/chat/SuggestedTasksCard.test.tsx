@@ -15,6 +15,9 @@ import { SuggestedTasksCard } from "./SuggestedTasksCard";
 import { buildTranscriptSlots } from "./transcript-slots";
 import { useFollowUpStore } from "./follow-up-store";
 
+const remote = vi.hoisted(() => ({value:false}));
+vi.mock("@/components/remote/is-remote-client", () => ({isRemoteClient: () => remote.value}));
+
 vi.mock("@/assets/preset-icons/claude.svg", () => ({ default: "/mock/claude.svg" }));
 vi.mock("@/assets/preset-icons/codex.svg", () => ({ default: "/mock/codex.svg" }));
 
@@ -130,6 +133,7 @@ function renderCard(views: Array<SubagentView | null> = [null, null], thread: st
 }
 
 beforeEach(() => {
+  remote.value=false;
   useFollowUpStore.setState({ rows: {}, providers: null });
   useProviderCapabilities.setState({ claude: CLAUDE, codex: CODEX });
   // The parent chat runs Opus 5.5 on High.
@@ -273,7 +277,7 @@ describe("SuggestedTasksCard", () => {
     await waitFor(() => expect(screen.getByTestId("suggested-task-status")).toBeInTheDocument());
     const rows = screen.getAllByTestId("suggested-task-row");
     expect(rows[1]).toHaveAttribute("data-state", "working");
-    expect(within(rows[1]).getByText("Working")).toBeInTheDocument();
+    expect(within(rows[1]).getByText("Running")).toBeInTheDocument();
     expect(within(rows[1]).getByTestId("suggested-task-open")).toBeInTheDocument();
     // Which model ran it.
     expect(within(rows[1]).getByTestId("suggested-task-model")).toHaveTextContent("GPT-6 · High");
@@ -347,4 +351,11 @@ describe("transcript slots", () => {
     if (card.body.kind !== "suggested_tasks") throw new Error("unreachable");
     expect(card.body.views).toEqual([null, started]);
   });
+});
+
+it("hides unsupported worktree Start controls on web remote", () => {
+  remote.value=true;
+  renderCard();
+  expect(screen.queryByTestId("suggested-task-start")).toBeNull();
+  expect(commands.followUpStart).not.toHaveBeenCalled();
 });

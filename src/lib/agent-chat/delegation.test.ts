@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  DELEGATION_RESULTS_PREFIX,
   childThreadIdOf,
   delegateCallInput,
   delegatedSubagentId,
@@ -11,13 +10,10 @@ import {
   isDelegatedRow,
   isDelegateToolCall,
   isDelegateToolName,
-  isDelegationResultsText,
   linkDelegations,
   modelEffortLabel,
   parseDelegateResult,
-  parseWake,
   providerKindOf,
-  wakeSummary,
 } from "./delegation";
 import { LAZY_TOOL_RESULT_KEY } from "./lazy-tool-result";
 import type { ChatViewItem, SubagentRunItem, SubagentView, ToolCallItem } from "./types";
@@ -311,7 +307,7 @@ describe("delegationRow", () => {
       delegationRow(null, view({ id: "delegate:c2", activity: "Waiting for your answer in its tab" })),
       delegationRow(null, view({ id: "delegate:c4", status: "pending" })),
     ];
-    expect(delegationPhaseSummary(rows)).toBe("2 working · 1 waiting for you · 1 done");
+    expect(delegationPhaseSummary(rows)).toBe("2 working · 1 waiting · 1 done");
     expect(delegationPhaseSummary(rows.slice(1, 2))).toBe("1 working");
   });
 
@@ -330,10 +326,10 @@ describe("linkDelegations", () => {
     expect(links.claimed.has("delegate:child-1")).toBe(true);
   });
 
-  it("lets a still-running call claim the first unclaimed row after it", () => {
+  it("links an in-flight call only by its exact tool-call ID", () => {
     const messages: ChatViewItem[] = [
       call({ status: "running", result_content: null }),
-      card("sub-1", 2, [view()]),
+      card("sub-1", 2, [view({parentItemId: "tool-1"})]),
     ];
     expect(linkDelegations(messages).viewByCallId.get("tool-1")?.id).toBe("delegate:child-1");
   });
@@ -353,7 +349,7 @@ describe("linkDelegations", () => {
         result_content: [{ type: "text", text: "Delegation is off." }],
       }),
       call({ id: "starting", seq: 2, status: "running", result_content: null }),
-      card("sub-1", 3, [view({ status: "pending" })]),
+      card("sub-1", 3, [view({ status: "pending", parentItemId: "starting" })]),
     ];
     const links = linkDelegations(messages);
     expect(links.viewByCallId.has("refused")).toBe(false);
@@ -362,7 +358,7 @@ describe("linkDelegations", () => {
 
   it("claims a row that landed just before the call (Codex), within the same turn", () => {
     const raced: ChatViewItem[] = [
-      card("sub-1", 1, [view({ status: "pending" })]),
+      card("sub-1", 1, [view({ status: "pending", parentItemId: "tool-1" })]),
       call({ seq: 2, status: "running", result_content: null }),
     ];
     expect(linkDelegations(raced).viewByCallId.get("tool-1")?.id).toBe("delegate:child-1");
@@ -375,14 +371,14 @@ describe("linkDelegations", () => {
     expect(linkDelegations(earlierTurn).claimed.size).toBe(0);
   });
 
-  it("pairs in-flight calls with rows in hand-off order, even when rows race ahead", () => {
+  it("pairs concurrent same-provider calls by exact IDs even when rows race ahead", () => {
     const review = { ...INPUT, title: "Review the parser" };
     // Both rows landed before their calls: the backend handles calls in order.
     const messages: ChatViewItem[] = [
-      card("sub-1", 1, [view({ status: "pending" })]),
+      card("sub-1", 1, [view({ status: "pending",parentItemId: "slugify" })]),
       call({ id: "slugify", seq: 2, status: "running", result_content: null }),
       card("sub-2", 3, [
-        view({ id: "delegate:child-2", description: "Review the parser", status: "pending" }),
+        view({ id: "delegate:child-2", description: "Review the parser", status: "pending",parentItemId: "review" }),
       ]),
       call({ id: "review", seq: 4, input: review, status: "running", result_content: null }),
     ];
@@ -414,103 +410,14 @@ describe("linkDelegations", () => {
   });
 });
 
-describe("the results turn", () => {
-  const wake = [
-    DELEGATION_RESULTS_PREFIX,
-    "Codemux posted this message, not the user.",
-    "",
-    '<task provider="codex" model="gpt-6.1-codex" effort="high" status="completed" title="Add &quot;slug&quot; helper" duration="6m 12s" thread="c1">',
-    "<brief>Add slugify.</brief>",
-    "<report>\nDone.\n</report>",
-    "</task>",
-    "",
-    '<task provider="claude" status="failed" title="Review the parser" duration="12s" thread="c2">',
-    "<report>Claude is not signed in.</report>",
-    "</task>",
-    "",
-    '<task provider="cursor" status="stopped" title="Write parser tests" duration="1m 03s" thread="c3">',
-    "The user stopped this task.",
-    "</task>",
-  ].join("\n");
 
-  it("detects the prefix", () => {
-    expect(isDelegationResultsText(wake)).toBe(true);
-    expect(isDelegationResultsText(`hello\n${DELEGATION_RESULTS_PREFIX}`)).toBe(false);
-  });
-
-  it("parses each task block's attributes", () => {
-    expect(parseWake(wake)).toEqual([
-      {
-        provider: "codex",
-        status: "completed",
-        title: 'Add "slug" helper',
-        model: "gpt-6.1-codex",
-        effort: "high",
-        thread: "c1",
-      },
-      {
-        provider: "claude",
-        status: "failed",
-        title: "Review the parser",
-        model: null,
-        effort: null,
-        thread: "c2",
-      },
-      {
-        provider: "cursor",
-        status: "stopped",
-        title: "Write parser tests",
-        model: null,
-        effort: null,
-        thread: "c3",
-      },
-    ]);
-  });
-
-  it("never counts a task tag quoted inside a brief or report", () => {
-    const quoted = '<task provider="claude" status="failed" title="x">';
-    const text = [
-      DELEGATION_RESULTS_PREFIX,
-      "Codemux posted this message, not the user.",
-      "",
-      '<task provider="codex" model="default" status="completed" title="Review the wake" duration="1m 02s" thread="c1">',
-      `<brief>Check that each block opens with a line like\n${quoted}\nand wraps text in <report> tags.</brief>`,
-      "<report>",
-      "Blocks look like this:",
-      quoted,
-      "<brief>see above",
-      "</report> appears once per block.",
-      "</report>",
-      "</task>",
-      "",
-      "No delegated tasks are still running.",
-    ].join("\n");
-    const tasks = parseWake(text);
-    expect(tasks.map((task) => [task.provider, task.status])).toEqual([["codex", "completed"]]);
-    expect(wakeSummary(tasks).label).toBe("Delegated results · Codex · completed");
-  });
-
-  it("ignores text without the prefix and blocks without a provider", () => {
-    expect(parseWake('<task provider="codex" status="completed">')).toEqual([]);
-    expect(parseWake(`${DELEGATION_RESULTS_PREFIX}\n<task status="completed" title="x">`)).toEqual(
-      [],
-    );
-  });
-
-  it("summarises providers and outcome for the divider", () => {
-    expect(wakeSummary(parseWake(wake))).toEqual({
-      providers: ["codex", "claude", "cursor"],
-      names: "Codex, Claude, Cursor",
-      outcome: "1 completed · 1 failed · 1 stopped",
-      label: "Delegated results · Codex, Claude, Cursor · 1 completed · 1 failed · 1 stopped",
-      failed: true,
-    });
-    const allDone = wakeSummary([
-      { provider: "codex", status: "completed", title: "a", model: null, effort: null, thread: null },
-      { provider: "codex", status: "completed", title: "b", model: null, effort: null, thread: null },
-    ]);
-    expect(allDone.label).toBe("Delegated results · Codex · completed");
-    expect(allDone.failed).toBe(false);
-    expect(wakeSummary([]).label).toBe("Delegated results");
-  });
+it("never assigns an uncorrelated same-provider row to an in-flight call", () => {
+  const messages: ChatViewItem[]=[call({status: "running",result_content: null}),card("orphan",2,[view()])];
+  expect(linkDelegations(messages).claimed.size).toBe(0);
+});
+it("uses canonical task IDs when two same-provider child rows arrive in reverse order", () => {
+  const first=call({id: "first",result_content: JSON.stringify({task_id: "task-1",child_thread_id: "child-1",started: {}})});
+  const second=call({id: "second",result_content: JSON.stringify({task_id: "task-2",child_thread_id: "child-2",started: {}})});
+  const links=linkDelegations([first,second,card("rows",3,[view({id:"delegate:child-2",taskId:"task-2"}),view({taskId:"task-1"})])]);
+  expect(links.viewByCallId.get("first")?.taskId).toBe("task-1");expect(links.viewByCallId.get("second")?.taskId).toBe("task-2");
 });

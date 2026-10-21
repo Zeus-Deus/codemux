@@ -3604,17 +3604,7 @@ async fn send_turn_context_reporting<R: Runtime>(
     }
     let machine = !context.is_human();
     let mut resumed_ids = Vec::new();
-    let wake = if context.origin == TurnOrigin::RemoteDelegation {
-        crate::delegation::app::begin_wake_delivery(&app,&input.thread_id.0,input.client_nonce.as_deref()).map(Some)
-    } else { Ok(None) };
-    let result = match wake {
-        Ok(wake) => {
-            let result = send_turn_internal(app.clone(), provider, input.clone(), context, reached, &mut resumed_ids).await;
-            if let Some(wake) = wake { wake.finish(result.is_ok(),result.as_ref().err().map(String::as_str))?; }
-            result
-        }
-        Err(error) => Err(error),
-    };
+    let result = send_turn_internal(app.clone(), provider, input.clone(), context, reached, &mut resumed_ids).await;
     if result.is_err() { db.rehold_message_deliveries(&resumed_ids)?; }
     match &result {
         Ok(result) => {
@@ -4000,11 +3990,7 @@ async fn send_turn_internal<R: Runtime>(
             &input.thread_id.0,
             input.client_nonce.as_deref(),
         )?;
-        if impl_.turn_active(&input.thread_id).await {
-            return Err(
-                "Parent became busy; remote result is held rather than interrupting".into(),
-            );
-        }
+
     }
     let pending_key = (
         thread_id_for_persist.clone(),
@@ -5112,6 +5098,21 @@ pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
     turn_id: Option<TurnId>,
     control: Option<NativeControlGuard>,
 ) -> Result<bool, String> {
+    interrupt_turn_inner(app, provider, thread_id, turn_id, control, true).await
+}
+
+/// Lifecycle callers have already persisted cancellation, or are only closing
+/// a tab. Do not turn their provider interrupt into a second recursive Stop.
+pub(crate) async fn interrupt_stopped_thread<R: Runtime>(
+    app: AppHandle<R>, provider: ProviderKind, thread_id: ThreadId,
+) -> Result<bool, String> {
+    interrupt_turn_inner(app, provider, thread_id, None, None, false).await
+}
+
+async fn interrupt_turn_inner<R: Runtime>(
+    app: AppHandle<R>, provider: ProviderKind, thread_id: ThreadId,
+    turn_id: Option<TurnId>, control: Option<NativeControlGuard>, recursive_stop: bool,
+) -> Result<bool, String> {
     if let Some(control) = &control {
         control.verify_target(provider, &thread_id.0)?;
         control.verify(&app)?;
@@ -5122,13 +5123,17 @@ pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
     // A selected interrupt applies only to an already-running turn. The
     // provider must first match that identity; it is not a blanket Stop of
     // newer admitted sends, usage resumes or delegated tasks.
-    if turn_id.is_none() {
+    if turn_id.is_none() && recursive_stop {
         crate::delegation::app::user_activity(&app, &thread_id.0, true)?;
         native_gate.cancel();
         app.state::<DatabaseStore>().stop_message_deliveries(&thread_id.0)?;
         // Before the lock: a delegated child's starter holds it while it starts,
         // and the task must read Stopped at once rather than after the start.
         super::delegation::on_thread_stopped(&app, &thread_id.0, super::delegation::StopKind::Stop);
+        super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
+    }
+    if turn_id.is_none() && !recursive_stop {
+        native_gate.cancel();
         super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
     }
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
@@ -5161,6 +5166,7 @@ pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
             }
         }
     }
+    let stopping_thread=turn_id.is_none();
     let reached = match impl_.interrupt_turn(thread_id.clone(), turn_id).await {
         Ok(()) => true,
         Err(ProviderError::SessionNotFound { .. }) | Err(ProviderError::SessionClosed { .. }) => {
@@ -5171,6 +5177,7 @@ pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
     let tracker: State<'_, SubagentTracker> = app.state();
     tracker.settle_interrupted_turn(&thread_id.0);
     crate::agent_control::delivery::changed(&app, &thread_id.0);
+    if stopping_thread {super::delegation::stop_confirmed(&app,&thread_id.0);}
     Ok(reached)
 }
 
@@ -6408,6 +6415,7 @@ async fn stop_agent_chat_threads<R: Runtime>(
         };
         match impl_.stop_session(ThreadId(thread_id.clone())).await {
             Ok(()) => {
+                if !super::queued_turns::exiting() {super::delegation::stop_confirmed(app_handle,&thread_id);}
                 if let Some(state) = app_handle.try_state::<NativeControlState>() {
                     state.clear_worker(&thread_id);
                     state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {
@@ -6417,7 +6425,9 @@ async fn stop_agent_chat_threads<R: Runtime>(
                 }
             }
             // Nothing was running, so nothing can still be using the files.
-            Err(ProviderError::SessionNotFound { .. } | ProviderError::SessionClosed { .. }) => {}
+            Err(ProviderError::SessionNotFound { .. } | ProviderError::SessionClosed { .. }) => {
+                if !super::queued_turns::exiting() {super::delegation::stop_confirmed(app_handle,&thread_id);}
+            }
             Err(error) => {
                 eprintln!(
                     "[agent_chat] cleanup stop_session failed for {kind:?} {thread_id}: {error:?}"

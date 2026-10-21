@@ -2184,10 +2184,21 @@ fn spawn_incoming_requests_task(
                         let job = tokio::spawn(async move {
                             // The SDK can call tools before send-turn acknowledges.
                             // Wait only for this captured generation to bind.
-                            let _ = actor.permit.wait_ready().await;
-                            handle_mcp_tool_call(session_for_task, event_tx_for_task, req, actor).await;
+                            if let Err(error) = actor.permit.wait_ready().await {
+                                return Ok(tool_result_text(error, true));
+                            }
+                            handle_mcp_tool_call(session_for_task, event_tx_for_task, req.params, actor).await
                         });
                         session.native_authority.track(job.abort_handle());
+                        // Stop cancels tool work, never the obligation to answer
+                        // the sidecar's RPC, including immediate track rejection.
+                        let sidecar = session.sidecar.clone();
+                        tokio::spawn(async move {
+                            let response = job.await.unwrap_or_else(|error| {
+                                Ok(tool_result_text(format!("MCP tool call cancelled: {error}"), true))
+                            });
+                            let _ = sidecar.respond(req.id, response).await;
+                        });
                         continue;
                     }
 
@@ -2367,7 +2378,11 @@ async fn collect_shared_tools_for_claude(
             caller.workspace_id.as_deref(),
         )
         .await;
-    tools.extend(registry.host_tools(caller));
+    let host_tools=registry.host_tools(caller);
+    // App-owned task tools also serve local IDs; replace the SSH-only schema
+    // rather than publishing duplicate names to the native provider.
+    tools.retain(|tool|!host_tools.iter().any(|host|host.prefixed_name==tool.prefixed_name));
+    tools.extend(host_tools);
     // These stay callable while native catalog replacement waits for a safe
     // turn boundary (for example, an Editor connecting during this turn).
     if registry
@@ -2392,26 +2407,18 @@ fn tool_result_text(text: impl Into<String>, is_error: bool) -> Value {
 async fn handle_mcp_tool_call(
     session: Arc<ClaudeSession>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
-    req: crate::json_rpc_child::IncomingRequest,
+    params: Value,
     actor: crate::delegation::app::NativeActor,
-) {
+) -> Result<Value, crate::json_rpc_child::RpcError> {
     // Validate params shape.
-    let params = req.params.clone();
     let prefixed_name = match params.get("name").and_then(Value::as_str) {
         Some(n) => n.to_string(),
         None => {
-            let _ = session
-                .sidecar
-                .respond(
-                    req.id,
-                    Err(crate::json_rpc_child::RpcError {
-                        code: -32602,
-                        message: "mcp-tool-call requires a string `name`".into(),
-                        data: None,
-                    }),
-                )
-                .await;
-            return;
+            return Err(crate::json_rpc_child::RpcError {
+                code: -32602,
+                message: "mcp-tool-call requires a string `name`".into(),
+                data: None,
+            })
         }
     };
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -2421,8 +2428,7 @@ async fn handle_mcp_tool_call(
             Ok(value) => tool_result_text(value.to_string(), false),
             Err(error) => tool_result_text(error, true),
         };
-        let _ = session.sidecar.respond(req.id, Ok(payload)).await;
-        return;
+        return Ok(payload);
     }
 
     let caller = session.host_caller().await;
@@ -2443,7 +2449,7 @@ async fn handle_mcp_tool_call(
             original_payload: None,
         });
     }
-    let _ = session.sidecar.respond(req.id, Ok(payload)).await;
+    Ok(payload)
 }
 
 /// Sidecar-supplied snapshot metadata, never model arguments. It only labels
@@ -2495,7 +2501,7 @@ async fn run_mcp_tool_call(
 
     // Host tools precede child dispatch. The caller carries the LIVE permission mode, so a
     // Plan/Ask pill flipped after the session started is honoured.
-    if let Some(result) = registry.host_call(caller, prefixed_name, &arguments) {
+    if let Some(result) = registry.host_call_native(caller, prefixed_name, &arguments, None, None, actor.as_ref().map(|actor| &actor.permit)).await {
         return (result, None);
     }
 
@@ -2855,6 +2861,30 @@ mod tests {
             provider: crate::agent_provider::ProviderKind::Claude,
             workspace_id: Some("ws-42".into()),
             permission_mode: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_delivery_round2_claude_late_host_delegate_cannot_cross_stop() {
+        struct Host;
+        impl crate::mcp::registry::HostTools for Host {
+            fn tools_for(&self, _: &crate::mcp::registry::HostCaller) -> Vec<crate::mcp::runtime::McpTool> {
+                vec![crate::mcp::runtime::McpTool { name:"delegate_task".into(), prefixed_name:"mcp__codemux__delegate_task".into(), description:None, input_schema:json!({}), server_id:"host".into() }]
+            }
+            fn call(&self, _: &crate::mcp::registry::HostCaller, _: &str, _: &Value) -> Option<Value> { Some(tool_result_text("must not be admitted", false)) }
+        }
+        for stop_before_capture in [false, true] {
+            let registry = crate::mcp::registry::McpRegistry::new(); registry.set_host_tools(Arc::new(Host));
+            let mut caller = test_caller(); caller.thread_id = format!("claude-late-host-{stop_before_capture}");
+            let owner = crate::delegation::authority::NativeAuthority::new(&caller.thread_id);
+            let generation = owner.begin(); assert!(owner.bind(generation, "turn"));
+            let db = crate::database::DatabaseStore::new_in_memory();
+            if stop_before_capture { owner.invalidate(); db.stop_message_deliveries(&caller.thread_id).unwrap(); }
+            let actor = crate::delegation::app::NativeActor { thread_id:caller.thread_id.clone(), provider:caller.provider, workspace_id:caller.workspace_id.clone(), session_id:"session".into(), permission_mode:caller.permission_mode.clone(), permit:owner.capture() };
+            if !stop_before_capture { owner.invalidate(); db.stop_message_deliveries(&caller.thread_id).unwrap(); }
+            let (response, _) = run_mcp_tool_call(Some(&registry), &caller, caller.workspace_id.as_deref(), "mcp__codemux__delegate_task", json!({}), Some(actor), &[]).await;
+            assert_eq!(response["isError"], true, "a late host call must not acquire the post-Stop generation: {response}");
+            assert!(response["content"][0]["text"].as_str().unwrap().contains("revoked"));
         }
     }
 

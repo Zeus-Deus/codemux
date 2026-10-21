@@ -412,7 +412,7 @@ async fn dispatch_resume<R: Runtime>(
 
 /// A plain queued turn whose full text is persisted as the user message
 /// (`display_text: None`), so the transcript shows exactly what was sent.
-pub(super) fn queued_turn(thread_id: ThreadId, text: String) -> SendTurnCommandInput {
+pub(crate) fn queued_turn(thread_id: ThreadId, text: String) -> SendTurnCommandInput {
     SendTurnCommandInput {
         input_source: None,
         thread_id,

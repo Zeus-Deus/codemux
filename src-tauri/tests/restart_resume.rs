@@ -579,14 +579,14 @@ fn typed(thread: &str, text: &str) -> SendTurnCommandInput {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stop_during_the_drain_keeps_the_rest_saved() {
+async fn a_stop_before_drain_submission_keeps_every_unsent_message_saved() {
     let h = harness().await;
     h.chat("rr-drain-stop");
     h.saved("rr-drain-stop", "q-1", "first saved");
     h.saved("rr-drain-stop", "q-2", "second saved");
     h.running("rr-drain-stop", "turn-1");
     resume_after_restart_for_test(&h.handle(), "launch-2").await;
-    // Hold the first saved send, then Stop while it is in flight.
+    // Hold the first saved message before the mock authorizes submission.
     let (entered, release) = h.provider.hold_next_send();
     h.running("rr-drain-stop", "turn-resume");
     h.completed("rr-drain-stop", "turn-resume", TurnStatus::Success);
@@ -597,11 +597,15 @@ async fn a_stop_during_the_drain_keeps_the_rest_saved() {
         ThreadId("rr-drain-stop".into()),
         None,
     ));
-    // The Stop has cancelled the drain before it waits for the send.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait for durable Stop fencing, rather than assuming the spawned Stop
+    // won a scheduling race. The held send has written no provider bytes.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.db().delivery_generation("rr-drain-stop").unwrap().0 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
     release.notify_one();
     stop.await.unwrap().unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
     let sent = h.sent("rr-drain-stop");
     assert!(sent[1..].is_empty(), "Stop before submission must hold the selected saved input: {sent:?}");
     let left: Vec<_> = h
@@ -615,9 +619,23 @@ async fn a_stop_during_the_drain_keeps_the_rest_saved() {
     assert_eq!(held.state, "held");
     assert_eq!(held.hold_reason.as_deref(), Some("stop"));
     assert!(!held.attempted);
-    codemux_lib::commands::queued_turns::agent_chat_send_saved_queued_turn(
-        h.handle(), ProviderKind::Codex, ThreadId("rr-drain-stop".into()), "q-1".into(), MessageDelivery::Queue,
-    ).await.unwrap();
+    // Stop waits for the native send lock, but the cancelled drain can still
+    // hold the saved-row claim while it retains the delivery for retry.
+    // Wait for that claim, without hiding any other failure or resending an
+    // accepted message.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let result = codemux_lib::commands::queued_turns::agent_chat_send_saved_queued_turn(
+                h.handle(), ProviderKind::Codex, ThreadId("rr-drain-stop".into()), "q-1".into(), MessageDelivery::Queue,
+            ).await;
+            match result {
+                Err(error) if error == "This message is being sent or changed. Try again in a moment." => {
+                    tokio::task::yield_now().await;
+                }
+                result => break result,
+            }
+        }
+    }).await.expect("the cancelled drain releases its saved-row claim").unwrap();
     assert_eq!(&h.sent("rr-drain-stop")[1..], ["first saved"]);
     assert_eq!(h.db().list_queued_turns("rr-drain-stop").iter().map(|row| row.queued_id.as_str()).collect::<Vec<_>>(), ["q-2"]);
 }

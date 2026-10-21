@@ -245,6 +245,7 @@ export interface TurnEndedItem {
  * shape — distinct from the snake_case wire `SubagentSnapshot`.
  */
 export interface SubagentView {
+  taskId?: string;
   /** Demux key (the wire `subagent_id`). Stable React key + lookup id. */
   id: string;
   name?: string;

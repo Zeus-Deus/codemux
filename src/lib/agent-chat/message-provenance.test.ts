@@ -57,7 +57,7 @@ describe("message provenance", () => {
 });
 
 describe("legacy presentation",()=>{
-  it("recognizes legacy result dividers without inferring attribution",()=>{
+  it("compacts untyped legacy results without inferring a sender",()=>{
     const state=replayPayloads([JSON.stringify({type:"user_message",thread_id:"t",text:'[Codemux: delegated task results]\n<task provider="codex" title="Parser review" status="completed">'})]);
     const item=state.messages[0] as UserMessageItem;
     expect(isDelegationResultsMessage(item)).toBe(true);

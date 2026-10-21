@@ -382,7 +382,10 @@ fn agent_event<R: Runtime>(app: &AppHandle<R>, source: &str, category: &'static 
     if workspace.notifications_muted {
         return;
     }
-    let payload = json!({"category":category, "title": match category {"attention" => "Codemux needs you", "failure" => "Agent failed", _ => "Ready for review"}, "body":workspace.title.chars().take(160).collect::<String>(), "workspace_id":workspace.workspace_id.0, "pane_id":pane, "tag":format!("codemux-{}-{source}-{category}", workspace.workspace_id.0)});
+    let child_attention=if category=="attention" {app.try_state::<crate::database::DatabaseStore>().and_then(|db|db.delegation_task_for_child(source).ok().flatten())}else{None};
+    let title=child_attention.as_ref().map(|task|format!("{}: subagent needs input",task.parent_title.as_deref().unwrap_or("Parent chat"))).unwrap_or_else(||match category {"attention"=>"Codemux needs you","failure"=>"Agent failed",_=>"Ready for review"}.into());
+    let body=child_attention.as_ref().map(|task|task.title.clone()).unwrap_or_else(||workspace.title.chars().take(160).collect());
+    let payload = json!({"category":category,"title":title,"body":body,"workspace_id":workspace.workspace_id.0,"pane_id":pane,"tag":format!("codemux-{}-{source}-{category}",workspace.workspace_id.0)});
     if let Some(kind) = super::native_push::Kind::from_web_category(category) {
         super::native_push::deliver(
             app,

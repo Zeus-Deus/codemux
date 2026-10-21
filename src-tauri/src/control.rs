@@ -527,6 +527,10 @@ pub async fn send_control_request(request: ControlRequest) -> Result<ControlResp
 
 pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlRequest) -> ControlResponse {
     let result = match request.command.as_str() {
+        "delegation_local_context" => match request.params.get("threadId").or_else(||request.params.get("thread_id")).and_then(Value::as_str) {
+            Some(thread)=>crate::commands::delegation::delegation_local_context(app.clone(),thread.into()).await,
+            None=>Err("threadId is required".into()),
+        },
         "delegation_host_info" | "delegation_grants" | "delegation_authorize" | "delegation_revoke" | "delegate_task" | "delegation_list" | "delegation_read" | "delegation_cancel" | "delegation_respond" | "delegation_deliver" => crate::delegation::app::invoke(app, &request.command, request.params).await,
         name if crate::agent_control::is_native_tool(name) => {
             crate::agent_control::execute(app,&crate::agent_control::ControlCaller::trusted(),name,request.params.clone())

@@ -227,7 +227,11 @@ fn main() {
             }
         };
         if msg.method.is_none() {
-            // Response to a server-initiated request — unused here.
+            // Capture the actual response frame so tests can prove callback
+            // cancellation answers the sidecar instead of abandoning its RPC.
+            if let Ok(response) = serde_json::from_str::<Value>(trimmed) {
+                capture_params("server-response", &response);
+            }
             continue;
         }
         let method = msg.method.as_deref().unwrap_or("");

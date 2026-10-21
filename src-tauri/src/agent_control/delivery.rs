@@ -152,24 +152,44 @@ pub(crate) async fn dispatch<R: Runtime>(
 pub(crate) async fn dispatch_admitted<R: Runtime>(
     app: &AppHandle<R>,
     row: crate::database::message_delivery::DeliveryRecord,
-    mut admitted_control: Option<NativeControlGuard>,
+    admitted_control: Option<NativeControlGuard>,
 ) {
+    let id = row.id.clone();
+    if let Err(error) = dispatch_with_control(app, row, admitted_control).await {
+        if app.state::<DatabaseStore>().message_delivery(&id).ok().flatten().is_some_and(|row| row.state == "cancelled") {
+            log::debug!("Disposed message delivery {id}: {error}");
+        } else {
+            log::warn!("Message delivery {id}: {error}");
+        }
+    }
+}
+
+/// Explicit delivery callers need the dispatch refusal as well as its durable row.
+pub(crate) async fn dispatch_result<R: Runtime>(
+    app: &AppHandle<R>,
+    row: crate::database::message_delivery::DeliveryRecord,
+) -> Result<(), String> {
+    dispatch_with_control(app, row, None).await
+}
+
+async fn dispatch_with_control<R: Runtime>(
+    app: &AppHandle<R>,
+    row: crate::database::message_delivery::DeliveryRecord,
+    mut admitted_control: Option<NativeControlGuard>,
+) -> Result<(), String> {
     let db = app.state::<DatabaseStore>();
     let admitted_generation = row.generation;
     // The initial controller dispatch already owns its admission. Publishing
     // it as pending would let the repair worker discard its native fence.
-    if admitted_control.is_none() && !db.claim_message_delivery(&row.id).unwrap_or(false) {
-        return;
+    if admitted_control.is_none() && !db.claim_message_delivery(&row.id)? {
+        return Ok(());
     }
     let _changed = DeliveryChange { app, thread: &row.thread_id };
-    let row = match db.message_delivery(&row.id) {
-        Ok(Some(row)) => row,
-        _ => return,
-    };
+    let Some(row) = db.message_delivery(&row.id)? else { return Ok(()); };
     if admitted_control.is_some() {
         if row.state != "preparing" {
             let _ = db.fail_message_delivery(&row.id, "Delivery held before initial dispatch");
-            return;
+            return Ok(());
         }
         // Only a durable human release advances the admitted Stop fence.
         // Session replacement alone cannot authorize an old operation.
@@ -188,9 +208,20 @@ pub(crate) async fn dispatch_admitted<R: Runtime>(
                 None,
                 Some(&format!("Invalid admitted payload: {error}")),
             );
-            return;
+            return Err(error.to_string());
         }
     };
+    let binding=db.get_agent_chat_session(&row.thread_id);
+    let bound=binding.as_ref().is_some_and(|record|record.imported_from.is_none()) && app.try_state::<crate::state::AppStateStore>().is_none_or(|state|binding.as_ref().is_some_and(|record|state.find_workspace(&record.workspace_id).is_some() && state.agent_chat_pane_id_for_thread(&row.thread_id).is_some()));
+    if !bound && matches!(payload.origin,TurnOrigin::Delegation|TurnOrigin::RemoteDelegation) {
+        let reason="Target is unavailable, archived or unbound; result retained";
+        let _=db.finish_message_delivery(&row.id,"held",None,Some(reason));warn_held(app,&row.thread_id,reason);crate::delegation::app::completion_delivery_changed(app,&row.id);return Err(reason.into());
+    }
+    if payload.origin==TurnOrigin::RemoteDelegation {
+        if let Err(error)=crate::delegation::app::guard_wake(app,&row.thread_id,payload.input.client_nonce.as_deref()) {
+            let _=db.finish_message_delivery(&row.id,"held",None,Some(&error));warn_held(app,&row.thread_id,&error);crate::delegation::app::completion_delivery_changed(app,&row.id);return Err(error);
+        }
+    }
     let control = admitted_control.or_else(|| payload.caller.map(|caller| {
         NativeControlGuard {
             caller,
@@ -220,7 +251,7 @@ pub(crate) async fn dispatch_admitted<R: Runtime>(
             if state.ok().as_deref() == Some("rejected") {
                 warn_held(app, &row.thread_id, &error);
             }
-            return;
+            return Err(error);
         }
     }
     let _activity = if payload.origin != TurnOrigin::Controller {
@@ -242,16 +273,9 @@ pub(crate) async fn dispatch_admitted<R: Runtime>(
         release_queue: false,
         pr_watch: payload.pr_watch,
     };
-    if let Err(error) =
-        agent_chat::send_turn_with_context(app.clone(), payload.provider, payload.input, context)
-            .await
-    {
-        if db.message_delivery(&row.id).ok().flatten().is_some_and(|row|row.state == "cancelled") {
-            log::debug!("Disposed message delivery {}: {error}", row.id);
-        } else {
-            log::warn!("Message delivery {}: {error}", row.id);
-        }
-    }
+    let result = agent_chat::send_turn_with_context(app.clone(), payload.provider, payload.input, context).await;
+    crate::delegation::app::completion_delivery_changed(app,&row.id);
+    result.map(|_| ())
 }
 
 struct DeliveryChange<'a, R: Runtime> { app: &'a AppHandle<R>, thread: &'a str }
@@ -374,6 +398,7 @@ impl<R: Runtime> DeliveryCheckpoint<R> {
 pub(crate) fn warn_held<R: Runtime>(app: &AppHandle<R>, thread: &str, error: &str) {
     changed(app, thread);
     if app.state::<DatabaseStore>().thread_message_delivery_attention(thread).is_ok_and(|rows| rows.is_empty()) { return; }
+    if app.try_state::<agent_chat::SubagentTracker>().is_none() {log::warn!("Message delivery for {thread} needs attention: {error}");return;}
     agent_chat::forward_event(
         app,
         crate::agent_provider::ProviderRuntimeEvent::RuntimeWarning {

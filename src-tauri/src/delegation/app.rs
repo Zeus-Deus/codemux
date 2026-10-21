@@ -187,6 +187,8 @@ pub(crate) async fn native_call<R: Runtime>(
                 return Err("Unexpected native task tool fields".into());
             }
             let id = string(&args, "task_id")?;
+            if let Some(value)=crate::commands::delegation::local_task_call(&app,&parent.thread_id,&id,name=="task_cancel")? {return Ok(value);}
+            let id=id.strip_prefix("ssh:").unwrap_or(&id).to_string();
             owned(&store, &parent, &id)?;
             if name == "task_cancel" {
                 let task = store.cancel(&id)?;
@@ -195,6 +197,10 @@ pub(crate) async fn native_call<R: Runtime>(
             } else {
                 let mut read=store.read(&id,args.get("cursor").and_then(Value::as_i64).unwrap_or(0))?;
                 read.task=project_task(&app,&store,&parent,read.task)?;
+                if !read.has_more && read.task.status.is_terminal() {
+                    let canonical=format!("ssh:{id}");
+                    if app.state::<DatabaseStore>().delegation_task(&canonical)?.is_some() {app.state::<DatabaseStore>().acknowledge_delegation_result(&parent.thread_id,&canonical)?;}
+                }
                 value(read)
             }
         }
@@ -206,7 +212,7 @@ pub fn user_activity<R: Runtime>(
     thread: &str,
     stop: bool,
 ) -> Result<(), String> {
-    super::authority::NativeAuthority::invalidate_thread(thread);
+    super::authority::NativeAuthority::user_activity_thread(thread, stop);
     if let Some(store) = app.try_state::<Arc<Journal>>() {
         let _notice = store.tasks()?.iter().find(|task|task.parent_thread_id==thread)
             .map(|task|MutationNotice::for_task(app,task)).transpose()?;
@@ -232,60 +238,13 @@ pub fn guard_wake<R: Runtime>(
         .ok_or("Missing stable delegation delivery correlation")?;
     let store = journal(app)?;
     let task = store.task(id)?;
-    if task.parent_thread_id != thread
-        || task.cancel_requested
-        || task.wake_state != WakeState::Delivering
-    {
-        return Err("Delegation delivery was stopped or superseded".into());
+    let canonical=app.state::<DatabaseStore>().delegation_task(&format!("ssh:{id}"))?;
+    if task.parent_thread_id != thread || task.cancel_requested || canonical.as_ref().is_some_and(|t|matches!(t.completion_delivery.as_str(),"disposed_by_stop"|"disposed_by_close"|"acknowledged")) {
+        return Err("Delegation delivery was stopped or acknowledged".into());
     }
     let parent = parent_for_thread(app, thread)?;
     owned(&store, &parent, id)?;
     validate_grant(app, &parent, &store.grant_for_task(id)?)
-}
-
-/// One common-outbox dispatch owns one SSH byte/ACK attempt, including
-/// cleanup if asynchronous preparation is cancelled before reaching stdin.
-pub(crate) struct WakeDelivery<R: Runtime> {
-    app: AppHandle<R>, store: Arc<Journal>, id: String, attempt: String, settled: bool,
-}
-impl<R: Runtime> WakeDelivery<R> {
-    fn settle(&self, delivered: bool, error: Option<&str>) -> Result<(), String> {
-        self.store.finish_delivery(&self.id,&self.attempt)?;
-        self.store.update(&self.id,|task| {
-            if task.wake_state == WakeState::Delivering {
-                task.wake_state = if delivered { WakeState::Delivered } else { WakeState::Held };
-                task.wake_error = error.map(str::to_owned);
-            }
-        })?;
-        changed(&self.app,&self.store.task(&self.id)?.parent_thread_id);
-        Ok(())
-    }
-    pub(crate) fn finish(mut self, delivered: bool, error: Option<&str>) -> Result<(), String> {
-        self.settle(delivered,error)?;
-        self.settled = true;
-        Ok(())
-    }
-}
-impl<R: Runtime> Drop for WakeDelivery<R> {
-    fn drop(&mut self) {
-        if !self.settled {
-            if let Err(error) = self.settle(false,Some("Result dispatch ended before acceptance was confirmed")) {
-                log::error!("Could not settle remote-result delivery: {error}");
-            }
-        }
-    }
-}
-pub(crate) fn begin_wake_delivery<R: Runtime>(app: &AppHandle<R>, thread: &str, nonce: Option<&str>) -> Result<WakeDelivery<R>,String> {
-    let id=nonce.and_then(|n|n.strip_prefix("delegation:")).ok_or("Missing stable delegation delivery correlation")?;
-    let store=journal(app)?;
-    let parent=parent_for_thread(app,thread)?;
-    let task=owned(&store,&parent,id)?;
-    if !task.status.is_terminal() || task.remote.is_none() || store.tail_pending(id)? {
-        return Err("Remote result is not ready for delivery".into());
-    }
-    validate_grant(app,&parent,&store.grant_for_task(id)?)?;
-    let attempt=store.claim_outbox_delivery(id)?.ok_or("Delegation delivery was stopped or superseded")?;
-    Ok(WakeDelivery {app:app.clone(),store,id:id.into(),attempt,settled:false})
 }
 
 struct WakeDispatch<R: Runtime> {
@@ -293,7 +252,28 @@ struct WakeDispatch<R: Runtime> {
     store: Arc<Journal>,
     id: String,
     attempt: String,
-    permit: super::authority::DispatchPermit,
+    waker: Arc<futures_util::task::AtomicWaker>,
+}
+impl<R: Runtime> Drop for WakeDispatch<R> {
+    fn drop(&mut self) {
+        // This guard owns the exact SSH native-byte witness. Only an attempt
+        // that never wrote bytes can release the common conservative claim.
+        let _ = self.store.finish_delivery(&self.id, &self.attempt);
+        if self.store.delivery_outcome(&self.id).ok() == Some(DeliveryOutcome::BeforeSend) {
+            if let Some(db) = self.app.try_state::<DatabaseStore>() {
+                let delivery = format!("task-result:ssh:{}:1", self.id);
+                if db.message_delivery(&delivery).ok().flatten().is_some_and(|row| row.attempted) {
+                    let _ = db.confirm_message_delivery_before_send(&delivery);
+                }
+            }
+        }
+        let _ = self.store.update(&self.id, |task| {
+            if task.wake_state == WakeState::Delivering {
+                task.wake_state = WakeState::Held;
+                task.wake_error = Some("Result dispatch ended before acceptance was confirmed".into());
+            }
+        });
+    }
 }
 impl<R: Runtime> std::fmt::Debug for WakeDispatch<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -304,13 +284,13 @@ impl<R: Runtime> std::fmt::Debug for WakeDispatch<R> {
 }
 impl<R: Runtime> crate::json_rpc_child::dispatch::DispatchGuard for WakeDispatch<R> {
     fn register(&self, waker: &std::task::Waker) {
-        self.permit.waker.register(waker);
+        self.waker.register(waker);
     }
     fn poll_first(
         &self,
         write: &mut dyn FnMut() -> crate::json_rpc_child::dispatch::WritePoll,
     ) -> Result<crate::json_rpc_child::dispatch::WritePoll, String> {
-        let _activity = self.permit.admit()?;
+
         with_parent_admission(&self.app, &self.store.task(&self.id)?.parent_thread_id, |parent,host| {
             self.store.poll_wake(&self.id,&self.attempt, |task,grant| {
                 if parent.workspace_id!=task.parent_workspace_id || parent.provider!=task.parent_provider { return Err("Canonical parent ownership changed at native dispatch".into()); }
@@ -319,7 +299,8 @@ impl<R: Runtime> crate::json_rpc_child::dispatch::DispatchGuard for WakeDispatch
         })
     }
     fn accepted(&self) -> Result<(), String> {
-        self.store.accept_delivery(&self.id, &self.attempt)
+        self.store.accept_delivery(&self.id, &self.attempt)?;
+        self.store.update(&self.id,|t|t.wake_state=WakeState::Delivered).map(drop)
     }
 }
 pub(crate) fn dispatch_guard<R: Runtime>(
@@ -333,15 +314,14 @@ pub(crate) fn dispatch_guard<R: Runtime>(
         .unwrap()
         .to_owned();
     let store = journal(app)?;
-    let attempt = store.delivery_attempt(&id)?;
-    let permit = super::authority::DispatchPermit::capture(thread)?;
-    store.register_dispatch(&permit.waker);
+    let attempt = store.claim_outbox_delivery(&id)?;
+    let waker=Arc::new(futures_util::task::AtomicWaker::new());store.register_dispatch(&waker);
     Ok(Arc::new(WakeDispatch {
         app: app.clone(),
         store,
         id,
         attempt,
-        permit,
+        waker,
     }))
 }
 
@@ -419,6 +399,9 @@ fn host<R: Runtime>(app: &AppHandle<R>, id: i64) -> Result<crate::database::Host
         .ok_or("Configured SSH host is missing or deleted".into())
 }
 pub fn changed<R: Runtime>(app: &AppHandle<R>, parent: &str) {
+    if let Ok(store)=journal(app) {if let Ok(tasks)=store.tasks() {
+        for task in tasks.into_iter().filter(|task|task.parent_thread_id==parent) {if let Err(error)=super::canonical::ingest(app,&store,&task) {log::warn!("SSH task ingestion retained for repair: {error}");}}
+    }}
     let _ = app.emit("delegation-changed", json!({"parent_thread_id":parent}));
 }
 /// Notify on durable visible changes, including partial mutations on errors.
@@ -447,7 +430,16 @@ impl<R: Runtime> Drop for MutationNotice<R> {
     }
 }
 fn project_task<R:Runtime>(app:&AppHandle<R>,store:&Journal,parent:&Parent,mut task:LocalTask)->Result<LocalTask,String> {
-    let outcome=store.delivery_outcome(&task.id)?;
+    let mut outcome=store.delivery_outcome(&task.id)?;
+    if let Some(db)=app.try_state::<DatabaseStore>() {if let Some(record)=db.delegation_task(&format!("ssh:{}",task.id))? {
+        match record.completion_delivery.as_str() {
+            "delivered"|"acknowledged"=>{outcome=DeliveryOutcome::Accepted;task.wake_state=WakeState::Delivered;},
+            "held_unknown"=>{outcome=DeliveryOutcome::Unknown;task.wake_state=WakeState::Held;},
+            "queued"|"preparing"|"submitting"=>{outcome=DeliveryOutcome::InFlight;task.wake_state=WakeState::Delivering;},
+            "held"=>{task.wake_state=WakeState::Held;},
+            "disposed_by_stop"=>{task.wake_state=WakeState::Suppressed;},_=>{}
+        }
+    }}
     let reason=match outcome {
         DeliveryOutcome::Accepted=>Some(DeliveryReason::Accepted),
         DeliveryOutcome::Unknown=>Some(DeliveryReason::Unknown),
@@ -889,4 +881,13 @@ impl<R:Runtime> crate::json_rpc_child::dispatch::DispatchGuard for RemoteDispatc
 pub(crate) fn remote_dispatch_guard<R:Runtime>(app:&AppHandle<R>,store:&Arc<Journal>,task:&LocalTask,response:Option<crate::remote_task_protocol::RespondRequest>)->Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard> {
     let waker=Arc::new(futures_util::task::AtomicWaker::new());store.register_dispatch(&waker);
     Arc::new(RemoteDispatch {app:app.clone(),store:store.clone(),id:task.id.clone(),thread:task.parent_thread_id.clone(),response,waker})
+}
+
+pub(crate) fn completion_delivery_changed<R:Runtime>(app:&AppHandle<R>,delivery:&str) {
+    let Some(db)=app.try_state::<DatabaseStore>() else {return;};
+    let Ok(Some(row))=db.message_delivery(delivery) else {return;};
+    let Some(task_id)=row.payload["provenance"]["notification"]["source"]["task_ids"].as_array().and_then(|ids|ids.first()).and_then(Value::as_str).and_then(|id|id.strip_prefix("ssh:")) else {return;};
+    let Ok(store)=journal(app) else {return;};
+    let _=store.update(task_id,|task| {task.wake_state=match row.state.as_str() {"accepted"=>WakeState::Delivered,"queued"|"submitting"|"preparing"=>WakeState::Delivering,"held"|"held_unknown"=>WakeState::Held,_=>task.wake_state};task.wake_error=row.error.clone();});
+    changed(app,&row.thread_id);
 }

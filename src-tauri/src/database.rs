@@ -4,6 +4,7 @@ pub mod agent_control;
 pub mod message_delivery;
 pub mod mcp_connector;
 pub mod delegated_tasks;
+pub mod delegation_tasks;
 pub mod follow_ups;
 pub mod hermes;
 pub mod custom_acp;
@@ -263,7 +264,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 22;
+const SCHEMA_VERSION: u32 = 23;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -1397,6 +1398,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 
     async_questions::create_schema(conn)?;
     delegated_tasks::create_schema(conn)?;
+    delegation_tasks::create_schema(conn)?;
     follow_ups::create_schema(conn)?;
     pr_watch::create_schema(conn)?;
     automation_triggers::create_schema(conn)?;

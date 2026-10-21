@@ -24,6 +24,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 export interface DelegatedTaskOptions {
   /** Add a second child: Claude reviewing the parser, finishing later. */
   parallel?: boolean;
+  needsInput?: boolean;
   /** One child fails fast with a reason (the second one when parallel). */
   fail?: boolean;
   /** Stop before any child finishes, to look at the running state. */
@@ -40,6 +41,7 @@ export const DELEGATION_SCENARIOS: Record<string, DelegatedTaskOptions> = {
   "delegation-parallel": { parallel: true },
   "delegation-fail": { fail: true },
   "delegation-running": { hold: true },
+  "delegation-input": { hold: true, needsInput: true },
   "delegation-running-parallel": { hold: true, parallel: true },
 };
 
@@ -157,6 +159,7 @@ function plans(runId: number, opts: DelegatedTaskOptions): ChildPlan[] {
     effort: "high",
     toolUseId: `toolu_delegate_codex_${runId}`,
     outcome: opts.hold ? "hold" : opts.fail && !opts.parallel ? "failed" : "completed",
+    heldActivity: opts.needsInput ? "Waiting for your answer in its tab" : undefined,
     finishAt: opts.fail && !opts.parallel ? 2_700 : opts.parallel ? 3_300 : 3_500,
     report:
       opts.fail && !opts.parallel
@@ -183,9 +186,9 @@ function plans(runId: number, opts: DelegatedTaskOptions): ChildPlan[] {
       ? "Claude stopped with an API error: credit balance is too low."
       : [
           "No blocking bugs. Two notes:",
-          "- delegation.ts:198 — an unescaped `\"` in a title would end the attribute early; the backend escapes it, so this holds today.",
-          "- delegation.ts:241 — `parseWake` skips blocks without a provider, which is the safe direction.",
-          "Checked by reading the parsers against the wake format; no files changed.",
+          "- Concurrent same-provider calls remain linked by their task IDs.",
+          "- Result rows use persisted notification metadata and retain the child link.",
+          "Checked the task records and transcript projections; no files changed.",
         ].join("\n"),
     heldActivity: "Waiting for your answer in its tab",
   };
@@ -199,7 +202,8 @@ function snapshot(child: ChildState) {
     thread_id: child.parentThreadId,
     subagent: {
       subagent_id: delegatedSubagentId(plan.threadId),
-      parent_item_id: null,
+      parent_item_id: plan.toolUseId,
+      task_id: `local:${plan.threadId}`,
       name: plan.label,
       agent_type: plan.provider,
       description: plan.title,
@@ -342,12 +346,7 @@ function deliver(run: RunState): void {
     child.status === "completed" ||
     child.status === "failed" ||
     child.status === "stopped";
-  const failedNow = unreported.some((child) => child.status === "failed");
-  const allSettled = run.children.every(terminal);
-  const anyReport = unreported.some(
-    (child) => child.status === "completed" || child.status === "failed",
-  );
-  if (!failedNow && !(allSettled && anyReport)) return;
+  if (!unreported.some(terminal)) return;
   const tasks = unreported.filter(terminal);
   for (const child of tasks) child.reported = true;
   const stillRunning = run.children.filter((child) => !terminal(child));
@@ -361,7 +360,7 @@ function deliver(run: RunState): void {
       agent_text: wakeText(tasks, stillRunning),
       message_id: `mock-results-${tasks.map((child) => child.plan.threadId).join("-")}`,
       created_by: "system", creation_source: "codemux", input_intent: "turn_start",
-      notification: {source:{kind:"delegated_task",task_ids:tasks.map((child)=>child.plan.threadId)},outcome:tasks.some((child)=>child.status === "failed") ? "failed" : "completed",summary:"Delegated results"},
+      notification: {source:{kind:"delegated_task",task_ids:tasks.map((child)=>`local:${child.plan.threadId}`),child_thread_id:tasks.length === 1 ? tasks[0].plan.threadId : undefined},outcome:tasks.some((child)=>child.status === "failed") ? "failed" : "completed",summary:tasks.map(child=>child.plan.title).join(", ")},
     }),
   );
   streamReply(run, replyFor(tasks), 420);
@@ -516,6 +515,7 @@ export function streamDelegatedTask(
             {
               type: "text",
               text: JSON.stringify({
+                task_id: `local:${plan.threadId}`, child_thread_id: plan.threadId,
                 started: {
                   title: plan.title,
                   provider: plan.provider,
@@ -523,7 +523,7 @@ export function streamDelegatedTask(
                   effort: plan.effort,
                   thread: plan.threadId,
                 },
-                note: `${plan.label} is working in a background tab. This round's reports will be posted here as one message. Give the user a one-line status and end your turn now; do not poll or wait.`,
+                note: `${plan.label} is working in a background tab. Its result will arrive independently.`,
               }),
             },
           ],
@@ -545,7 +545,7 @@ export function streamDelegatedTask(
         schedule(
           base + 1_900,
           () => {
-            child.activity = activity;
+            child.activity = opts.needsInput ? "Waiting for your answer in its tab" : activity;
             emit(snapshot(child));
           },
           plan.threadId,
@@ -654,4 +654,17 @@ export function mockDelegatedChild(threadId: string): MockDelegatedChild | null 
 /** The parent chat a delegated child reports to, else null. */
 export function mockDelegatedChildParent(threadId: string): string | null {
   return childrenByThread.get(threadId)?.parentThreadId ?? null;
+}
+
+export function mockDurableContext(threadId: string) {
+  const child = childrenByThread.get(threadId);
+  return {tasks: [...childrenByThread.values()].filter(child => child.parentThreadId === threadId).map(child => ({
+    task_id: `local:${child.plan.threadId}`, backend: "local", parent_thread_id: child.parentThreadId,
+    child_thread_id: child.plan.threadId, title: child.plan.title, provider: child.plan.provider,
+    model: child.plan.model, effort: child.plan.effort,
+    status: child.status === "pending" ? "queued" : child.status === "stopped" ? "cancelled" : child.activity.includes("Waiting for your answer") ? "waiting" : child.status,
+    progress: child.activity, result: child.resultText ? {version: 1, text: child.resultText} : null,
+    pending_request: child.activity.includes("Waiting for your answer") ? {id: "mock-child-question",kind: "user_input",created_at: child.startedAt} : null,
+    tool_call_id: child.plan.toolUseId,created_at: child.startedAt,completed_at: child.durationMs == null ? null : child.startedAt + child.durationMs,
+  })), origin: child ? {relationship: "subagent", parent_thread_id: child.parentThreadId,parent_title: "Delegation coordinator",parent_exists: true,task_id: `local:${threadId}`} : null};
 }

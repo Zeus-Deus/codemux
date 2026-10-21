@@ -1,4 +1,3 @@
-import { isDelegationResultsText } from "./delegation";
 import type { MessageProvenance } from "@/tauri/events";
 
 /** Only structured metadata identifies a sender; prompt text is never evidence. */
@@ -30,11 +29,11 @@ export function messageAttribution(item: MessageProvenance): "agent" | "codemux"
   return null;
 }
 
-/** Legacy compatibility affects presentation only, never sender attribution. */
+/** Legacy text changes presentation only; attribution still requires metadata. */
 export function isDelegationResultsMessage(item: MessageProvenance & {text: string}): boolean {
   return item.notification?.source.kind === "delegated_task" || (
     !item.message_id && (!item.creation_source || item.creation_source === "unknown")
     && (!item.created_by || item.created_by === "user") && !item.notification
-    && isDelegationResultsText(item.text)
+    && item.text.startsWith("[Codemux: delegated task results]")
   );
 }

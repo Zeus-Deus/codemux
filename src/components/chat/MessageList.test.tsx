@@ -1443,14 +1443,46 @@ describe("MessageList usage limit", () => {
     expect(screen.getByTestId("auto-resume-divider-text")).toHaveTextContent(text);
   });
 
-  it("renders the delegated-results turn as its divider, not a user bubble", () => {
+  it("renders persisted delegated-result metadata as a result row", () => {
     const text =
       '[Codemux: delegated task results]\nCodemux posted this message, not the user.\n\n<task provider="codex" status="completed" title="Add slugify helper" duration="6m 12s" thread="c1">\n<report>Done.</report>\n</task>';
-    renderList([userTurn, { kind: "user_message", id: "um-2", seq: 1, text }]);
-    expect(screen.getByTestId("delegation-results-divider")).toHaveTextContent(
-      "Delegated results · Codex · Add slugify helper · completed",
+    renderList([userTurn, { kind: "user_message", id: "um-2", seq: 1, text, notification: {source:{kind:"delegated_task",task_ids:["local:task"],child_thread_id:"c1"},outcome:"completed",summary:"Add slugify helper"} }]);
+    expect(screen.getByTestId("subagent-notification-row")).toHaveTextContent(
+      "Add slugify helperFinished",
     );
     expect(screen.queryByText(/Codemux posted this message/)).toBeNull();
+  });
+
+  it("compacts legacy results without disclosing agent framing or inventing attribution", () => {
+    const text = '[Codemux: delegated task results]\nCodemux posted this message, not the user.\n<task provider="codex"><brief>private brief</brief><report>raw report</report></task>';
+    renderList([userTurn, { kind: "user_message", id: "legacy", seq: 1, text }]);
+    expect(screen.getByTestId("legacy-delegation-result-row")).toHaveTextContent("Delegated results");
+    expect(screen.queryByText(/Codemux posted|private brief|raw report|Sent by Codemux/)).toBeNull();
+    const row = screen.getByTestId("legacy-delegation-result-row");
+    fireEvent.click(screen.getByRole("button", { name: "Delegated results" }));
+    expect(row).toHaveTextContent("raw report");
+    expect(row).not.toHaveTextContent(/Codemux posted|private brief|<task|<report|Sent by Codemux/);
+    expect(row.querySelector('[data-testid="legacy-delegation-report"]')).toHaveClass("max-h-80", "overflow-y-auto");
+    fireEvent.click(screen.getByRole("button", { name: "Delegated results" }));
+    expect(screen.queryByText("raw report")).toBeNull();
+  });
+
+  it("discloses each legacy task report with its saved title and plain fallback text", () => {
+    const text = '[Codemux: delegated task results]\nCodemux posted this message, not the user.\n<task title="Review &amp; test"><report>First report.\nSecond line.</report></task>\n<task title="Build"><report>Build passed.</report></task>';
+    renderList([userTurn, { kind: "user_message", id: "legacy", seq: 1, text }]);
+    fireEvent.click(screen.getByRole("button", { name: "Delegated results" }));
+    const report = screen.getByTestId("legacy-delegation-report");
+    expect(report).toHaveTextContent("Review & test");
+    expect(report).toHaveTextContent("First report. Second line.");
+    expect(report).toHaveTextContent("BuildBuild passed.");
+    expect(report).not.toHaveTextContent(/Codemux posted|<task|Sent by/);
+  });
+
+  it("keeps an unparseable legacy result readable as bounded plain text", () => {
+    renderList([userTurn, { kind: "user_message", id: "legacy", seq: 1, text: '[Codemux: delegated task results]\nAn old plain report\nwith details.' }]);
+    fireEvent.click(screen.getByRole("button", { name: "Delegated results" }));
+    expect(screen.getByTestId("legacy-delegation-report")).toHaveTextContent("An old plain report with details.");
+    expect(screen.getByTestId("legacy-delegation-report")).not.toHaveTextContent("[Codemux:");
   });
 
   it("renders a delegate_task call as the delegation card, not a tool row", () => {

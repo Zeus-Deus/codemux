@@ -1,3 +1,4 @@
+use serde_json::Value;
 // MCP runtime registry.
 //
 // Holds the live `McpServerHandle`s plus the disabled-id set the
@@ -129,9 +130,13 @@ pub struct HostCaller {
 pub trait HostTools: Send + Sync {
     /// Tools to offer `caller`, already prefixed like registry tools.
     fn tools_for(&self, caller: &HostCaller) -> Vec<McpTool>;
+    fn call_async<'a>(&'a self, caller: &'a HostCaller, name: &'a str, args: &'a Value, call_id: Option<&'a str>, run_id: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output=Option<Value>> + Send + 'a>> {
+        let _=(call_id,run_id);
+        Box::pin(async move {self.call(caller,name,args)})
+    }
     /// Answer a call as an MCP `tools/call` result (`content` + `isError`),
-    /// or `None` when `prefixed_name` is not a host tool. Codex answers its
-    /// tool requests inline, so this must never wait on a provider.
+    /// or `None` when `prefixed_name` is not a host tool. This synchronous
+    /// fallback must never wait on a provider; native adapters use `call_async`.
     fn call(
         &self,
         caller: &HostCaller,
@@ -151,6 +156,9 @@ impl HostTools for CompositeHostTools {
             .collect()
     }
 
+    fn call_async<'a>(&'a self,caller:&'a HostCaller,name:&'a str,args:&'a Value,call_id:Option<&'a str>,run_id:Option<&'a str>)->std::pin::Pin<Box<dyn std::future::Future<Output=Option<Value>> + Send + 'a>> {
+        Box::pin(async move {for host in &self.0 {if let Some(result)=host.call_async(caller,name,args,call_id,run_id).await {return Some(result);}} None})
+    }
     fn call(
         &self,
         caller: &HostCaller,
@@ -371,6 +379,38 @@ impl McpRegistry {
         arguments: &serde_json::Value,
     ) -> Option<serde_json::Value> {
         self.host.get()?.call(caller, prefixed_name, arguments)
+    }
+
+    pub async fn host_call_async(&self,caller:&HostCaller,name:&str,args:&Value,call_id:Option<&str>,run_id:Option<&str>)->Option<Value> {
+        self.host.get()?.call_async(caller,name,args,call_id,run_id).await
+    }
+
+    pub(crate) async fn host_call_native(
+        &self, caller: &HostCaller, name: &str, args: &Value,
+        call_id: Option<&str>, run_id: Option<&str>,
+        permit: Option<&crate::delegation::authority::NativePermit>,
+    ) -> Option<Value> {
+        let host = self.host.get()?;
+        if name != "mcp__codemux__delegate_task" {
+            return host.call_async(caller, name, args, call_id, run_id).await;
+        }
+        let mut call = host.call_async(caller, name, args, call_id, run_id);
+        let mut admitted = false;
+        futures_util::future::poll_fn(|cx| {
+            if admitted { return call.as_mut().poll(cx); }
+            let guard = match permit.ok_or_else(|| "Native caller runtime/turn authority was revoked".to_string())
+                .and_then(|permit| permit.admit()) {
+                Ok(guard) => guard,
+                Err(error) => return std::task::Poll::Ready(Some(serde_json::json!({"content":[{"type":"text","text":error}],"isError":true}))),
+            };
+            // delegate_task persists admission in its first synchronous poll.
+            // Stop uses this same fence before advancing the database generation.
+            // Release the guard before any asynchronous wait for its result.
+            let result = call.as_mut().poll(cx);
+            drop(guard);
+            admitted = true;
+            result
+        }).await
     }
 
     /// Tell live sessions to re-collect their tool lists because the host
@@ -1575,16 +1615,21 @@ mod tests {
             let remote = reg
                 .list_all_tools_excluding_source(McpConfigSource::CodexUser)
                 .await;
-            let names: HashSet<_> = local
-                .iter()
-                .chain(&remote)
-                .map(|tool| tool.prefixed_name.as_str())
-                .collect();
-            assert_eq!(
-                names.len(),
-                local.len() + remote.len(),
-                "combined native catalog must have unique names"
-            );
+            let local_names: HashSet<_> = local.iter().map(|tool| tool.prefixed_name.as_str()).collect();
+            let remote_names: HashSet<_> = remote.iter().map(|tool| tool.prefixed_name.as_str()).collect();
+            // Task control is canonical for local and SSH tasks; the native
+            // adapters prefer these host schemas over the SSH-only versions.
+            let shared: HashSet<_> = local_names.intersection(&remote_names).copied().collect();
+            let expected_shared = if enabled {
+                HashSet::from(["mcp__codemux__task_status", "mcp__codemux__task_cancel"])
+            } else {
+                HashSet::new()
+            };
+            assert_eq!(shared, expected_shared);
+            for name in shared {
+                let canonical = local.iter().find(|tool| tool.prefixed_name == name).unwrap();
+                assert!(canonical.input_schema["properties"].get("task_id").is_some());
+            }
             let launch = remote
                 .iter()
                 .find(|tool| tool.name == crate::mcp_server::REMOTE_DELEGATE_TOOL)

@@ -15,7 +15,7 @@
 //! * **Checked, then sent.** A chat waiting on an approval or question is
 //!   surfaced for the user instead. A stopped chat has no row (stopping
 //!   clears it). Closed workspaces, missing worktrees, chats on another
-//!   device, delegated children and chats already running are skipped, as
+//!   device, untracked native children and chats already running are skipped, as
 //!   are chats whose conversation can't be reopened as it was: only Claude
 //!   and Codex refuse a lost conversation instead of starting a fresh one,
 //!   so the other providers keep the manual Continue. Resumes in a row
@@ -502,7 +502,7 @@ async fn gather_facts<R: Runtime>(
             .unwrap_or(workspace.cwd.clone());
         facts.worktree_exists = std::path::Path::new(&dir).is_dir();
     }
-    facts.delegated_child = super::delegation::is_delegated_child(app, &row.thread_id);
+    facts.delegated_child = super::delegation::is_delegated_child(app, &row.thread_id) && db.delegation_task_for_child(&row.thread_id).ok().flatten().is_none();
     if let Some(provider) = provider {
         let registry: State<'_, ProviderRegistry> = app.state();
         // Only providers that refuse, rather than quietly replace, a
@@ -618,6 +618,7 @@ async fn resume_one<R: Runtime>(app: &AppHandle<R>, row: RestartResumeRecord) ->
                 row.thread_id
             );
             if let Err(error) = dispatch(app, provider, &row).await {
+                super::delegation::restoration_held(app, &row.thread_id, &error);
                 eprintln!(
                     "[codemux::restart_resume] resume failed for thread={}: {error}",
                     row.thread_id
@@ -657,7 +658,13 @@ async fn resume_after_restart<R: Runtime>(
     let mut decisions = Vec::with_capacity(rows.len());
     for row in rows {
         let thread_id = row.thread_id.clone();
-        decisions.push((thread_id, resume_one(app, row).await));
+        let decision = resume_one(app, row).await;
+        if let ResumeDecision::Skip(reason) = decision {
+            if !matches!(reason, SkipReason::Busy | SkipReason::UserTookOver) {
+                super::delegation::restoration_held(app, &thread_id, &format!("Automatic restoration is held: {reason:?}. Open the child chat to inspect it."));
+            }
+        }
+        decisions.push((thread_id, decision));
     }
     decisions
 }

@@ -427,6 +427,7 @@ pub fn v2_update_to_runtime(
             vec![subagent_event(
                 ctx,
                 SubagentSnapshot {
+        task_id: None,
                     subagent_id: id.into(),
                     provider_ref: Some(id.into()),
                     status,
@@ -486,6 +487,7 @@ pub fn v2_update_to_runtime(
         U::Child { id, status, detail } => vec![subagent_event(
             ctx,
             SubagentSnapshot {
+        task_id: None,
                 subagent_id: id.clone(),
                 provider_ref: Some(id),
                 parent_item_id: detail["id"].as_str().map(str::to_string),
@@ -592,6 +594,7 @@ fn translate_known(
                 return vec![subagent_event(
                     ctx,
                     SubagentSnapshot {
+        task_id: None,
                         subagent_id: id.to_string(),
                         status: SubagentStatus::Failed,
                         result_text: Some(activity),
@@ -834,6 +837,7 @@ fn translate_task_part(
             vec![subagent_event(
                 ctx,
                 SubagentSnapshot {
+        task_id: None,
                     subagent_id: child.clone(),
                     parent_item_id: Some(tool.call_id),
                     name: task_name(title.as_deref(), &input),
@@ -870,6 +874,7 @@ fn translate_task_part(
             vec![subagent_event(
                 ctx,
                 SubagentSnapshot {
+        task_id: None,
                     subagent_id: child.clone(),
                     parent_item_id: Some(tool.call_id),
                     name: task_name(title.as_deref(), &input),
@@ -905,6 +910,7 @@ fn translate_task_part(
             vec![subagent_event(
                 ctx,
                 SubagentSnapshot {
+        task_id: None,
                     subagent_id: child.clone(),
                     parent_item_id: Some(tool.call_id),
                     agent_type: string_field(&input, "subagent_type"),
@@ -984,6 +990,7 @@ fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
 /// snapshot.
 fn empty_snapshot(id: &str) -> SubagentSnapshot {
     SubagentSnapshot {
+        task_id: None,
         subagent_id: id.to_string(),
         parent_item_id: None,
         name: None,
@@ -1031,6 +1038,7 @@ fn translate_session_status(
             S::Busy => vec![subagent_event(
                 ctx,
                 SubagentSnapshot {
+        task_id: None,
                     subagent_id: id.to_string(),
                     status: SubagentStatus::Running,
                     provider_ref: Some(id.to_string()),
@@ -1079,6 +1087,7 @@ fn translate_message_updated(
             return vec![subagent_event(
                 ctx,
                 SubagentSnapshot {
+        task_id: None,
                     subagent_id: id.to_string(),
                     status: SubagentStatus::Failed,
                     result_text: Some(message),
@@ -1134,6 +1143,7 @@ fn translate_message_tokens(
                 events.push(subagent_event(
                     ctx,
                     SubagentSnapshot {
+        task_id: None,
                         subagent_id: id.to_string(),
                         model: Some(model),
                         status: SubagentStatus::Running,

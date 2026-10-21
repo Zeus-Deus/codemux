@@ -29,7 +29,7 @@ async fn review_r1_remote_result_outbox_reacquires_before_send_attempt() {
     provider.fail_next_send(crate::agent_provider::ProviderError::ValidationError {message:"temporary fault before bytes".into()});
     assert!(coordinator::wake_open(app.handle(),&task.id).await.unwrap_err().contains("temporary fault before bytes"));
     let db=app.state::<DatabaseStore>();
-    let row=db.message_delivery_for_message(&task.parent_thread_id,&format!("delegation:{}",task.id)).unwrap().unwrap();
+    let row=db.message_delivery(&format!("task-result:ssh:{}:1",task.id)).unwrap().unwrap();
     assert_eq!(row.state,"pending"); assert!(!row.attempted);
     assert_eq!(store.delivery_outcome(&task.id).unwrap(),DeliveryOutcome::BeforeSend);
     crate::agent_control::delivery::dispatch(app.handle(),row.clone()).await;
@@ -67,9 +67,10 @@ async fn explicit_remote_delivery_rearms_outbox(stopped: bool) {
         let db=app.state::<DatabaseStore>();
         provider.fail_next_send(crate::agent_provider::ProviderError::ValidationError {message:"before bytes".into()});
         let _ = coordinator::wake_open(app.handle(),&task.id).await;
-        let row=db.message_delivery_for_message(&task.parent_thread_id,&format!("delegation:{}",task.id)).unwrap().unwrap();
+        let row=db.message_delivery(&format!("task-result:ssh:{}:1",task.id)).unwrap().unwrap();
         if stopped {
             db.stop_message_deliveries(&task.parent_thread_id).unwrap();
+            db.dispose_delegation_task(&task.parent_thread_id, &format!("ssh:{}", task.id)).unwrap();
             store.suppress_parent(&task.parent_thread_id,true).unwrap();
         } else {
             for _ in 0..2 {
@@ -130,7 +131,7 @@ async fn review_r2_explicit_remote_delivery_refuses_uncertainty_and_revoked_auth
         provider.fail_next_send(crate::agent_provider::ProviderError::ValidationError {message:"before bytes".into()});
         let _=coordinator::wake_open(app.handle(),&task.id).await;
         let db=app.state::<DatabaseStore>();
-        let row=db.message_delivery_for_message(&task.parent_thread_id,&format!("delegation:{}",task.id)).unwrap().unwrap();
+        let row=db.message_delivery(&format!("task-result:ssh:{}:1",task.id)).unwrap().unwrap();
         if revoke {
             store.disable_grant(&task.parent_workspace_id,&store.grant_for_task(&task.id).unwrap().id).unwrap();
         } else {
@@ -171,7 +172,7 @@ fn review_r1_remote_outbox_retry_rechecks_grant_stop_cancellation_and_uncertaint
             "missing"=>{store.conn.lock().unwrap().execute("DELETE FROM delivery_outcomes WHERE task=?1",[&task.id]).unwrap();},
             _=>{},
         }
-        assert!(app::begin_wake_delivery(app.handle(),&task.parent_thread_id,Some(&format!("delegation:{}",task.id))).is_err(),"{action}");
+        assert!(app::dispatch_guard(app.handle(),&task.parent_thread_id,Some(&format!("delegation:{}",task.id))).is_err(),"{action}");
         assert_eq!(store.delivery_outcome(&task.id).unwrap(),match action {"unknown"=>DeliveryOutcome::Unknown,"accepted"=>DeliveryOutcome::Accepted,"missing"=>DeliveryOutcome::NotAttempted,_=>DeliveryOutcome::BeforeSend});
     }
 }
@@ -420,7 +421,6 @@ fn s4_native_canonical_mutation_is_fenced_through_actual_write_syscall() {
         let (app,store,task,pane,_grant,host_id)=setup(dir.path(),&thread);
         let _authority=authority::NativeAuthority::new(&thread);
         store.apply_remote(&task.id,&tests::remote(&task,crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
-        store.claim_delivery(&task.id).unwrap().unwrap();
         let guard=app::dispatch_guard(app.handle(),&thread,Some(&format!("delegation:{}",task.id))).unwrap();
         let (start_tx,start_rx)=std::sync::mpsc::channel();
         let (done_tx,done_rx)=std::sync::mpsc::channel();
@@ -737,7 +737,6 @@ async fn s4_actual_native_and_transport_stdin_keep_canonical_leases_through_posi
             let _authority=authority::NativeAuthority::new(&thread);
             let inner=if native {
                 store.apply_remote(&task.id,&tests::remote(&task,crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
-                store.claim_delivery(&task.id).unwrap().unwrap();
                 app::dispatch_guard(app.handle(),&thread,Some(&format!("delegation:{}",task.id))).unwrap()
             } else {
                 store.mark_attempted(&task.id).unwrap();
@@ -797,4 +796,72 @@ fn new_chat_list_is_empty_until_its_session_is_persisted() {
     assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst),0,"reads and rejected mutations invalidated the renderer");
     app.state::<DatabaseStore>().upsert_agent_chat_session("new-chat",&ws,Some("/synthetic/parent"),"codex").unwrap();
     assert_eq!(list().unwrap(),serde_json::json!([]));
+}
+
+#[test]
+fn delegation_delivery_ssh_queued_result_survives_restart_before_provider_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, store, task, _, _, _) = setup(dir.path(), "queued-parent");
+    store.apply_remote(&task.id, &tests::remote(&task, crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
+    let canonical = canonical::ingest(app.handle(), &store, &store.task(&task.id).unwrap()).unwrap();
+    let db = app.state::<DatabaseStore>();
+    let delivery = db.delegation_task(&canonical).unwrap().unwrap().delivery_id.unwrap();
+    assert!(db.claim_message_delivery(&delivery).unwrap());
+    // Building the input happens before the busy-parent queue decision.
+    let queued_guard = app::dispatch_guard(app.handle(), &task.parent_thread_id, Some(&format!("delegation:{}", task.id))).unwrap();
+    db.finish_message_delivery(&delivery, "queued", Some(&serde_json::json!({"queued_id":"old-queue","turn_id":"","steered":false})), None).unwrap();
+    let recovered = journal::Journal::open(dir.path()).unwrap();
+    recovered.recover_deliveries().unwrap();
+    db.recover_message_deliveries("new-process").unwrap();
+    assert_eq!(db.message_delivery(&delivery).unwrap().unwrap().state, "pending");
+    assert_eq!(recovered.delivery_outcome(&task.id).unwrap(), DeliveryOutcome::BeforeSend);
+    assert!(!db.message_delivery(&delivery).unwrap().unwrap().attempted);
+    // The same stable result can now acquire its first real write.
+    let guard = app::dispatch_guard(app.handle(), &task.parent_thread_id, Some(&format!("delegation:{}", task.id))).unwrap();
+    let mut writes = 0;
+    assert!(guard.poll_first(&mut || { writes += 1; std::task::Poll::Ready(Ok(1)) }).unwrap().is_ready());
+    guard.accepted().unwrap();
+    assert_eq!(writes, 1);
+    assert_eq!(recovered.delivery_outcome(&task.id).unwrap(), DeliveryOutcome::Accepted);
+    drop(queued_guard);
+    assert_eq!(recovered.delivery_outcome(&task.id).unwrap(), DeliveryOutcome::Accepted);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn delegation_delivery_ssh_recovered_witness_explicit_delivery_uses_one_outbox() {
+    for generic_first in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (app, store, task, pane, _, _) = setup(root.path(), &format!("recovered-explicit-{generic_first}"));
+        let _authority = authority::NativeAuthority::new(&task.parent_thread_id);
+        store.apply_remote(&task.id, &tests::remote(&task, crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
+        let provider = result_provider(&app, &task, root.path()).await;
+        let canonical = canonical::ingest(app.handle(), &store, &store.task(&task.id).unwrap()).unwrap();
+        let db = app.state::<DatabaseStore>();
+        let original = db.delegation_task(&canonical).unwrap().unwrap();
+        let delivery = original.delivery_id.clone().unwrap();
+        assert!(db.claim_message_delivery(&delivery).unwrap());
+        db.message_delivery_submitting(&delivery).unwrap();
+        assert_eq!(store.claim_outbox_delivery(&task.id).unwrap(), delivery);
+        assert!(store.claim_outbox_delivery(&task.id).is_err(), "only one native writer may own the result");
+        // Simulate startup before bytes, with either common/SSH recovery order.
+        if generic_first { db.recover_message_deliveries("recovered-epoch").unwrap(); }
+        store.recover_deliveries().unwrap();
+        canonical::recover(app.handle(), &store, &store.task(&task.id).unwrap()).unwrap();
+        if !generic_first { db.recover_message_deliveries("recovered-epoch").unwrap(); }
+        let held = db.message_delivery(&delivery).unwrap().unwrap();
+        assert_eq!(held.state, "held");
+        assert!(!held.attempted);
+        let output = app::invoke(app.handle(), "delegation_deliver", serde_json::json!({"paneId":pane,"taskId":task.id})).await.unwrap();
+        assert_eq!(output["wake_state"], "delivered");
+        let delivered = db.delegation_task(&canonical).unwrap().unwrap();
+        assert_eq!(delivered.delivery_id, original.delivery_id);
+        assert_eq!(delivered.result, original.result);
+        assert_eq!(db.message_delivery(&delivery).unwrap().unwrap().state, "accepted");
+        assert_eq!(store.outbox_delivery_outcome(&task.id, &delivery).unwrap(), Some(DeliveryOutcome::Accepted));
+        store.recover_deliveries().unwrap();
+        canonical::recover(app.handle(), &store, &store.task(&task.id).unwrap()).unwrap();
+        coordinator::wake_open(app.handle(), &task.id).await.unwrap();
+        assert!(app::invoke(app.handle(), "delegation_deliver", serde_json::json!({"paneId":pane,"taskId":task.id})).await.is_err());
+        assert_eq!(provider.calls.snapshot().iter().filter(|call| matches!(call, mock_agent_provider::MockCall::SendTurn(..))).count(), 1);
+    }
 }

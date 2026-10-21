@@ -208,6 +208,15 @@ export function useSubagentOccupant({
  * not until the command returns. "Stop all" rides on the first row, so it
  * survives opening the strip.
  */
+export function childInputOccupant(tasks: import("@/lib/agent-chat/durable-tasks").DurableTask[], ownPending: boolean, onOpen: (threadId: string) => void, onOpenRemote?: (taskId: string) => void): StripOccupant | null {
+  if (ownPending) return null;
+  const pending = tasks.filter(task => task.pending_request && (task.backend === "ssh" ? task.remote_task_id && onOpenRemote : task.child_thread_id) && !["completed","failed","cancelled","interrupted"].includes(task.status));
+  if (!pending.length) return null;
+  const links = pending.map(task => ({label: task.title, onClick: () => task.backend === "ssh" ? onOpenRemote?.(task.remote_task_id!) : onOpen(task.child_thread_id!)}));
+  const row: StripRow = {id: "child-input",mark: {kind: "input"},label: pending.length === 1 ? "Subagent needs input" : `${pending.length} subagents need input`,detailLinks: links,action: {label: "Open question",onClick: links[0].onClick,tone: "quiet"},announce: true};
+  return {kind: "childInput",summary: row,rows: [row]};
+}
+
 export function useDelegationOccupant({
   messages,
   threadId,
@@ -243,11 +252,8 @@ export function useDelegationOccupant({
     }
   };
   const count = models.length;
-  const label = streaming
-    ? `${count} delegated task${count === 1 ? "" : "s"} running`
-    : count === 1
-      ? `Continues when ${models[0].row.providerLabel} finishes`
-      : `Continues when ${count} agents finish`;
+  const label = count === 1 ? "Waiting on subagent" : `Waiting on ${count} subagents`;
+
 
   const taskRow = (model: (typeof models)[number], solo: boolean): StripRow => {
     const { view, row } = model;
@@ -255,8 +261,9 @@ export function useDelegationOccupant({
     const thread = row.childThreadId;
     return {
       id: `delegation:${view.id}`,
-      mark: { kind: "providers", providers: row.provider ? [row.provider] : [] },
-      label: solo ? label : row.providerLabel,
+      mark: streaming ? {kind: "providers", providers: row.provider ? [row.provider] : []} : {kind: "waiting"},
+      label: solo ? label : "Subagent",
+      labelLink: thread ? {label: row.title, onClick: () => onOpen(thread)} : undefined,
       detail: `${row.title} · ${solo && streaming ? "reports post here" : row.line}`,
       elapsed: (now) => delegationElapsedLabel([view], now),
       secondaryAction: {
@@ -267,14 +274,7 @@ export function useDelegationOccupant({
         disabled: pending,
         onClick: () => stop([model]),
       },
-      action: thread
-        ? {
-            label: "Open",
-            title: `Open the ${row.providerLabel} chat`,
-            testId: "composer-strip-delegation-open",
-            onClick: () => onOpen(thread),
-          }
-        : null,
+      action: null,
     };
   };
 

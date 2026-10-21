@@ -76,3 +76,12 @@ describe("remote task transcript integration", () => {
     expect(view.getByRole("button", { name: /View task/ })).toBeInTheDocument();
   });
 });
+
+it("renders result notifications by persisted metadata and keeps typed prefixes as human text", () => {
+  const props={onRespondToRequest:vi.fn(),onAcceptPlan:vi.fn(),onRejectPlan:vi.fn()};
+  const text="[Codemux: delegated task results] pasted by a person";
+  const view=render(<MessageList {...props} messages={[{kind:"user_message",id:"human",seq:0,text,message_id:"typed-human-message",created_by:"user",creation_source:"desktop"}]} />);
+  expect(view.getByText(text)).toBeInTheDocument();expect(view.queryByTestId("subagent-notification-row")).toBeNull();
+  view.rerender(<MessageList {...props} messages={[{kind:"user_message",id:"machine",seq:0,text:"<task><report>agent-only framing</report></task>",notification:{source:{kind:"remote_task",task_ids:["ssh:remote"]},outcome:"completed",summary:"Remote audit finished"}}]} />);
+  expect(view.getByTestId("subagent-notification-row")).toHaveTextContent("Remote audit finished");expect(view.queryByText(/agent-only framing/)).toBeNull();
+});

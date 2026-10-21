@@ -32,6 +32,7 @@ impl Journal {
           CREATE TABLE IF NOT EXISTS attempts(task TEXT PRIMARY KEY);
           CREATE TABLE IF NOT EXISTS launch_outcomes(task TEXT PRIMARY KEY, state TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS delivery_outcomes(task TEXT PRIMARY KEY, attempt TEXT NOT NULL, state TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS canonical_result_imports(task TEXT PRIMARY KEY, cursor INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS remote_pages(task TEXT PRIMARY KEY, pending INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS ceilings(task TEXT PRIMARY KEY, mode TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS response_outcomes(task TEXT NOT NULL, request TEXT NOT NULL, decision TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(task,request));
@@ -148,7 +149,7 @@ impl Journal {
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if state.as_deref() != Some("in_flight") {
+        if !matches!(state.as_deref(), Some("in_flight" | "before_send")) {
             return Err("Result delivery attempt is not admissible".into());
         }
         // Commit Unknown BEFORE a syscall can accept any bytes. A crash in
@@ -162,8 +163,8 @@ impl Journal {
         let poll = write();
         if poll.is_pending() {
             conn.execute(
-                "UPDATE delivery_outcomes SET state='in_flight' WHERE task=?1 AND attempt=?2",
-                params![id, attempt],
+                "UPDATE delivery_outcomes SET state=?3 WHERE task=?1 AND attempt=?2",
+                params![id, attempt, state],
             )
             .map_err(|e| e.to_string())?;
         }
@@ -725,27 +726,48 @@ impl Journal {
         let legacy:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM responses WHERE task=?1 AND request=?2)",params![id,request],|r|r.get(0)).map_err(|e|e.to_string())?;
         Ok((if legacy {DeliveryOutcome::Unknown} else {DeliveryOutcome::NotAttempted},None,None))
     }
+    pub(crate) fn acknowledge_canonical_import(&self,id:&str,cursor:i64)->Result<(),String> {
+        self.conn.lock().unwrap().execute("INSERT INTO canonical_result_imports(task,cursor) VALUES (?1,?2) ON CONFLICT(task) DO UPDATE SET cursor=MAX(cursor,excluded.cursor)",params![id,cursor]).map(drop).map_err(|e|e.to_string())
+    }
+    pub(crate) fn canonical_imported(&self,id:&str)->Result<bool,String> {
+        self.conn.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM canonical_result_imports i JOIN tasks t ON t.id=i.task WHERE i.task=?1 AND i.cursor>=t.cursor)",[id],|r|r.get(0)).map_err(|e|e.to_string())
+    }
     pub(crate) fn delivery_outcome(&self, id:&str)->Result<DeliveryOutcome,String> {
         let conn=self.conn.lock().unwrap();
         let state:Option<String>=conn.query_row("SELECT state FROM delivery_outcomes WHERE task=?1",[id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         state.map(|s|serde_json::from_value(serde_json::Value::String(s)).map_err(|e|e.to_string())).unwrap_or(Ok(DeliveryOutcome::NotAttempted))
     }
+    /// Only the common outbox's stable attempt can refine its delivery
+    /// disposition. Legacy/random attempts cannot prove this row's outcome.
+    pub(crate) fn outbox_delivery_outcome(
+        &self,
+        id: &str,
+        delivery: &str,
+    ) -> Result<Option<DeliveryOutcome>, String> {
+        let state: Option<String> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM delivery_outcomes WHERE task=?1 AND attempt=?2",
+                params![id, delivery],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        state
+            .map(|state| {
+                serde_json::from_value(serde_json::Value::String(state)).map_err(|e| e.to_string())
+            })
+            .transpose()
+    }
+
     #[cfg(test)]
     pub(crate) fn claim_delivery(&self, id: &str) -> Result<Option<String>, String> {
-        self.claim_delivery_inner(id, false)
-    }
-    /// The common outbox retries the same admitted result identity. Only a
-    /// definite-no-send Held attempt can be reacquired automatically.
-    pub(crate) fn claim_outbox_delivery(&self, id: &str) -> Result<Option<String>, String> {
-        self.claim_delivery_inner(id, true)
-    }
-    fn claim_delivery_inner(&self, id: &str, retry_held: bool) -> Result<Option<String>, String> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         let mut task = read_task(&tx, id)?;
-        if task.cancel_requested || !(task.wake_state == WakeState::Pending || (retry_held && task.wake_state == WakeState::Held)) {
+        if task.cancel_requested || task.wake_error.as_deref() == Some("disposed_by_stop") || task.wake_state != WakeState::Pending {
             return Ok(None);
         }
         let prior: Option<String> = tx
@@ -756,9 +778,6 @@ impl Journal {
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if retry_held && task.wake_state == WakeState::Held && prior.is_none() {
-            return Err("Held result has no definite-no-send delivery evidence".into());
-        }
         if prior.as_deref().is_some_and(|s| !matches!(s, "before_send" | "not_attempted")) {
             return Err(
                 "Result was accepted or may have been submitted; explicit resend is forbidden"
@@ -776,6 +795,25 @@ impl Journal {
         tx.commit().map_err(|e| e.to_string())?;
         Ok(Some(attempt))
     }
+    /// Common outbox owns retries. Keep the original SSH byte witness and
+    /// immutable grant checks, while using one stable attempt per result.
+    pub(crate) fn claim_outbox_delivery(&self,id:&str)->Result<String,String> {
+        let mut conn=self.conn.lock().unwrap();let tx=conn.transaction().map_err(|e|e.to_string())?;
+        let mut task=read_task(&tx,id)?;
+        if task.cancel_requested || task.wake_error.as_deref() == Some("disposed_by_stop") {return Err("Task cancelled".into());}
+        let prior:Option<(String,String)>=tx.query_row("SELECT attempt,state FROM delivery_outcomes WHERE task=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+        if !(task.wake_state == WakeState::Pending || (task.wake_state == WakeState::Held && prior.as_ref().is_some_and(|(_, state)| state == "before_send"))) {
+            return Err("Result is held or already delivered; explicit release is required".into());
+        }
+        let attempt=match prior {
+            Some((_,state)) if !matches!(state.as_str(),"before_send"|"not_attempted")=>return Err("SSH acceptance may have occurred; automatic resend held".into()),
+            _=>format!("task-result:ssh:{id}:1"),
+        };
+        tx.execute("INSERT INTO delivery_outcomes(task,attempt,state) VALUES (?1,?2,'before_send') ON CONFLICT(task) DO UPDATE SET attempt=excluded.attempt,state='before_send'",params![id,attempt]).map_err(|e|e.to_string())?;
+        task.wake_state=WakeState::Delivering;tx.execute("UPDATE tasks SET data=?2 WHERE id=?1",params![id,encode(&task)?]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e|e.to_string())?;Ok(attempt)
+    }
+    #[cfg(test)]
     pub(crate) fn delivery_attempt(&self, id: &str) -> Result<String, String> {
         self.conn
             .lock()
@@ -836,6 +874,9 @@ impl Journal {
         tx.commit().map_err(|e| e.to_string())
     }
     pub fn recover_deliveries(&self) -> Result<(), String> {
+        self.recover_deliveries_with_stop_evidence(|_| Ok(false))
+    }
+    pub(crate) fn recover_deliveries_with_stop_evidence(&self, stopped_after: impl Fn(&LocalTask) -> Result<bool, String>) -> Result<(), String> {
         self.conn
             .lock()
             .unwrap()
@@ -845,6 +886,32 @@ impl Journal {
             )
             .map_err(|e| e.to_string())?;
         for task in self.tasks()? {
+            let outcome = self.delivery_outcome(&task.id)?;
+            let stopped = task.cancel_requested || task.wake_error.as_deref() == Some("disposed_by_stop")
+                || task.wake_state == WakeState::Suppressed && match stopped_after(&task) {
+                    Ok(stopped) => stopped,
+                    Err(error) => {
+                        log::error!("SSH task {} recovery evidence unavailable; result held: {error}", task.id);
+                        self.update(&task.id, |t| { t.wake_state = WakeState::Held; t.wake_error = Some(format!("Recovery evidence unavailable; result retained: {error}")); })?;
+                        continue;
+                    }
+                };
+            if !stopped && task.wake_state == WakeState::Delivering && outcome == DeliveryOutcome::BeforeSend {
+                self.update(&task.id, |t| { t.wake_state = WakeState::Pending; t.wake_error = None; })?;
+                continue;
+            }
+            if stopped {
+                self.update(&task.id, |t| { t.wake_state = WakeState::Suppressed; t.wake_error = Some("disposed_by_stop".into()); })?;
+                continue;
+            }
+            if task.wake_state == WakeState::Suppressed {
+                // Historical suppression is user intent to retain the report,
+                // never permission to wake after upgrade. Preserve byte/ack
+                // evidence so only a provably unsent result can be released.
+                self.conn.lock().unwrap().execute("INSERT OR IGNORE INTO delivery_outcomes(task,attempt,state) VALUES(?1,?2,'not_attempted')", params![task.id,uuid::Uuid::new_v4().to_string()]).map_err(|e|e.to_string())?;
+                self.update(&task.id, |t| { t.wake_state = WakeState::Held; t.wake_error = Some("Legacy result retained; deliver explicitly to continue".into()); })?;
+                continue;
+            }
             if matches!(
                 task.wake_state,
                 WakeState::Delivering | WakeState::Held | WakeState::Suppressed
@@ -874,6 +941,7 @@ impl Journal {
         Ok(task)
     }
     pub fn suppress_parent(&self, parent: &str, stop: bool) -> Result<(), String> {
+        if !stop {return Ok(());}
         for task in self
             .tasks()?
             .into_iter()
@@ -882,13 +950,14 @@ impl Journal {
             self.update(&task.id, |t| {
                 t.wake_state = WakeState::Suppressed;
                 t.wake_error =
-                    Some("Parent user activity superseded automatic result delivery".into());
+                    Some("disposed_by_stop".into());
                 if stop && !t.status.is_terminal() {
                     t.cancel_requested = true;
                     t.status = crate::remote_task_protocol::TaskStatus::Stopping;
                 }
             })?;
         }
+        self.wake_dispatches();
         Ok(())
     }
 }

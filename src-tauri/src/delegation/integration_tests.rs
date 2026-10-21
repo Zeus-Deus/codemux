@@ -156,7 +156,7 @@ async fn final_dispatch_unsupported_parent_fails_before_provider_or_app_side_eff
     assert!(result.unwrap_err().contains("unsupported"));
 }
 #[tokio::test]
-async fn final_dispatch_checkpoint_held_send_stop_revoke_rebind_user_dominate() {
+async fn final_dispatch_checkpoint_stop_revoke_rebind_and_human_preserves_wake() {
     for kind in [ProviderKind::Codex, ProviderKind::Claude] {
         for action in ["stop", "revoke", "rebind", "user"] {
             checkpoint_case(kind, action).await;
@@ -312,6 +312,8 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
         app.manage(db);
         app.manage(journal.clone());
         app.manage(crate::commands::agent_chat::ProviderRegistry::new());
+        app.manage(crate::agent_control::NativeControlState::default());
+        app.manage(crate::commands::agent_chat::RunActivityTracker::default());
         app.manage(crate::commands::agent_chat::SubagentTracker::default());
         app.manage(crate::commands::agent_chat::RunActivityTracker::default());
         app.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
@@ -455,7 +457,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
             "user" => {
                 let h = app.handle().clone();
                 let t = thread.clone();
-                user_sending = Some(tokio::spawn(async move {
+                let mut user = Box::pin(async move {
                     let input = crate::commands::agent_chat::SendTurnCommandInput {
                         input_source: None,
                         thread_id: ThreadId(t),
@@ -478,17 +480,15 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
                         crate::commands::agent_chat::TurnOrigin::User,
                     )
                     .await
-                }));
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while journal.task(&task.id).unwrap().wake_state != WakeState::Suppressed {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .unwrap();
+                });
+                // Poll through human-activity invalidation to the native
+                // dispatch gate held by the result; no timing-based race.
+                assert!(futures_util::poll!(&mut user).is_pending());
+                assert_ne!(journal.task(&task.id).unwrap().wake_state, WakeState::Suppressed);
+                user_sending = Some(tokio::spawn(user));
             }
             "accepted" | "unknown" | "pending" | "partial" | "partial-drop" => {
-                app::user_activity(app.handle(), &thread, false).unwrap();
+                app::user_activity(app.handle(), &thread, action == "pending").unwrap();
             }
             "revoke" | "pending-revoke" => {
                 grant.enabled = false;
@@ -532,10 +532,12 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
             let _ = stop.await.unwrap();
         }
         if let Some(user) = user_sending {
-            assert!(
-                user.await.unwrap().unwrap().queued_id.is_none(),
-                "ordinary user send was blocked by phantom result turn"
-            );
+            let sent = user.await.unwrap().unwrap();
+            assert!(sent.queued_id.is_some(), "human message must queue behind the accepted result turn");
+            let db = app.state::<crate::database::DatabaseStore>();
+            let queued = db.message_delivery_for_message(&thread,"normal-user").unwrap().unwrap();
+            assert_eq!(queued.state,"queued");
+            assert_eq!(queued.payload["input"]["text"],"normal user wins");
         }
         let explicit = if matches!(action, "accepted" | "unknown" | "empty" | "partial" | "partial-drop") {
             Some(
@@ -722,7 +724,7 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
                 assert!(ready && !active && !authority_live, "empty native acknowledgement created phantom turn/authority");
             }
         } else {
-            if let Some(result) = dispatch_result { assert!(result.is_err(), "{kind:?}/{action}: dispatch refusal was hidden"); }
+            if let Some(result) = dispatch_result { assert_eq!(result.is_err(), action != "user", "{kind:?}/{action}: caller must observe the actual dispatch outcome"); }
             assert_eq!(
                 count,
                 usize::from(action == "user"),
@@ -730,8 +732,8 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
             );
             if action == "user" {
                 assert!(
-                    trace.contains("normal user wins") && !trace.contains("[Remote task result"),
-                    "ordinary user send did not dominate guarded dispatch"
+                    trace.contains("[Remote task result"),
+                    "ordinary human activity suppressed an accepted remote task's result"
                 );
             } else {
                 assert!(ready, "cancelled guarded send left parent busy");
@@ -896,7 +898,7 @@ async fn completion_before_ack(kind: ProviderKind, mode: &str) {
         let first = send.await.unwrap().unwrap();
         assert!(provider.turn_active(&ThreadId(thread.clone())).await,
             "acknowledged ordinary execution lost its lifecycle after concurrent user activity");
-        assert!(super::authority::NativeAuthority::current_permit(&thread).admit().is_err());
+        assert_eq!(super::authority::NativeAuthority::current_permit(&thread).admit().is_ok(), mode == "activity-queue", "only Stop revokes the active turn tools");
         if mode == "activity-queue" {
             let second = provider.send_turn(serde_json::from_value(
                 json!({"thread_id":thread,"text":"second","images":[]})
@@ -1169,6 +1171,8 @@ async fn control_launch_lost_reply_restart_follow_and_normal_idle_native_parent_
     handle.manage(journal.clone());
     handle.manage(transport.clone() as Arc<dyn TaskTransport>);
     handle.manage(crate::commands::agent_chat::ProviderRegistry::new());
+    handle.manage(crate::agent_control::NativeControlState::default());
+    handle.manage(crate::commands::agent_chat::RunActivityTracker::default());
     handle.manage(crate::commands::agent_chat::SubagentTracker::default());
     handle.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
     handle.manage(crate::observability::ObservabilityStore::default());
@@ -1538,7 +1542,7 @@ async fn claude_callback_authority_ends_with_turn_and_callback_job_ends_with_run
     use futures_util::StreamExt;
     use std::os::unix::fs::PermissionsExt;
     use tokio::sync::{oneshot, Notify};
-    for (replacement, early_result) in [(false, false), (false, true), (true, false)] {
+    for (replacement, early_result, stop_callback, reject_callback) in [(false, false, false, false), (false, true, false, false), (true, false, false, false), (false, false, true, false), (false, false, false, true)] {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
         let thread = if replacement {
@@ -1555,7 +1559,10 @@ async fn claude_callback_authority_ends_with_turn_and_callback_job_ends_with_run
             json!({"after":"send-turn","delay_ms":100,"emit":"server_request","method":"mcp-tool-call",
             "params":{"name":"mcp__codemux__delegation_targets","arguments":{}}}),
         ];
-        if !replacement {
+        if reject_callback {
+            script[0]["wait_for"] = json!(root.join("release-callback"));
+        }
+        if !replacement && !stop_callback && !reject_callback {
             script.push(json!({"after":"send-turn","delay_ms":100,"emit":"notification","method":"sdk-message",
                 "params":{"threadId":thread,"message":{"type":"result","subtype":"success","result":"fixture completed","is_error":false,"usage":{}}}}));
         }
@@ -1567,6 +1574,8 @@ async fn claude_callback_authority_ends_with_turn_and_callback_job_ends_with_run
             ""
         };
         std::fs::write(&sidecar, format!("#!/bin/sh\nexport HOME='{}'\nexport XDG_CONFIG_HOME='{}'\nexport XDG_DATA_HOME='{}'\nexport FAKE_CLAUDE_SIDECAR_SCRIPT='{}'\n{}exec '{}' \"$@\"\n", root.display(),root.join("config").display(),root.join("data").display(),script_path.display(),early_ack,helper.display())).unwrap();
+        let wrapper = std::fs::read_to_string(&sidecar).unwrap();
+        std::fs::write(&sidecar, wrapper.replace("#!/bin/sh\n", &format!("#!/bin/sh\nexport FAKE_CLAUDE_SIDECAR_CAPTURE='{}'\n", root.join("trace.jsonl").display()))).unwrap();
         std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o700)).unwrap();
         let app = tauri::test::mock_app();
         let state = crate::state::AppStateStore::default();
@@ -1596,6 +1605,8 @@ async fn claude_callback_authority_ends_with_turn_and_callback_job_ends_with_run
         let journal = Arc::new(Journal::open(&root.join("local-journal")).unwrap());
         app.manage(journal.clone());
         app.manage(crate::commands::agent_chat::ProviderRegistry::new());
+        app.manage(crate::agent_control::NativeControlState::default());
+        app.manage(crate::commands::agent_chat::RunActivityTracker::default());
         let registry = crate::mcp::registry::McpRegistry::new();
         registry.insert_native_delegation_tools_for_test().await;
         let entered = Arc::new(Notify::new());
@@ -1645,10 +1656,35 @@ async fn claude_callback_authority_ends_with_turn_and_callback_job_ends_with_run
         )
         .unwrap();
         provider.send_turn(send).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), entered.notified())
-            .await
-            .unwrap();
-        if replacement {
+        if reject_callback {
+            // Tools are revoked after the send ACK but before the delayed
+            // incoming callback is tracked.
+            super::authority::NativeAuthority::user_activity_thread(thread, true);
+            std::fs::write(root.join("release-callback"), "ready").unwrap();
+        }
+        if !reject_callback {
+            tokio::time::timeout(Duration::from_secs(10), entered.notified()).await.unwrap();
+        }
+        if stop_callback || reject_callback {
+            if stop_callback {
+                super::authority::NativeAuthority::user_activity_thread(thread, true);
+                assert!(tokio::time::timeout(Duration::from_secs(2), rx).await.unwrap().is_err(), "Stop must cancel the tool worker");
+            }
+            let response = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let trace = std::fs::read_to_string(root.join("trace.jsonl")).unwrap_or_default();
+                    if let Some(response) = trace.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .find(|row| row["method"] == "server-response" && row["params"]["id"] == "fixture-mcp-call") {
+                        break response["params"].clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("cancelled/rejected callback must answer its outstanding RPC");
+            provider.stop_session(ThreadId(thread.into())).await.unwrap();
+            assert_eq!(response["result"]["isError"], true);
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("cancelled") || (reject_callback && text.contains("revoked")), "{response}");
+        } else if replacement {
             provider
                 .stop_session(ThreadId(thread.into()))
                 .await
@@ -2075,6 +2111,8 @@ async fn codex_delayed_native_admission_is_denied_after_completed_stop() {
     handle.manage(journal.clone());
     handle.manage(transport.clone() as Arc<dyn TaskTransport>);
     handle.manage(crate::commands::agent_chat::ProviderRegistry::new());
+    handle.manage(crate::agent_control::NativeControlState::default());
+    handle.manage(crate::commands::agent_chat::RunActivityTracker::default());
     handle.manage(crate::commands::agent_chat::SubagentTracker::default());
     handle.manage(crate::commands::agent_chat::AgentChatChannelRegistry::default());
     handle.manage(crate::observability::ObservabilityStore::default());
@@ -2115,14 +2153,14 @@ async fn codex_delayed_native_admission_is_denied_after_completed_stop() {
         let handle = callback_handle.clone();
         let entered = callback_entered.clone();
         let release = callback_release.clone();
-        let tx = result_tx.clone();
+        let tx = result_tx.lock().unwrap().take();
         Box::pin(async move {
             // This barrier is after actor construction inside the actual Codex
             // incoming-request pump and MCP registry route, before admission.
             entered.notify_one();
             release.notified().await;
             let result = app::native_call(handle, actor, name, args).await;
-            if let Some(tx) = tx.lock().unwrap().take() {
+            if let Some(tx) = tx {
                 let _ = tx.send(result.clone());
             }
             result
@@ -2174,7 +2212,6 @@ async fn codex_delayed_native_admission_is_denied_after_completed_stop() {
     release.notify_one();
     let result = tokio::time::timeout(Duration::from_secs(10), result_rx)
         .await
-        .unwrap()
         .unwrap();
     // Cleanup precedes the regression assertion even in RED, so the fake
     // adapter subprocess/request-pump does not survive an assertion panic.
@@ -2183,8 +2220,8 @@ async fn codex_delayed_native_admission_is_denied_after_completed_stop() {
         .await
         .unwrap();
     assert!(
-        result.is_err(),
-        "stopped-turn callback retained native authority: {result:?}"
+        !matches!(result.as_ref(), Ok(Ok(_))),
+        "stopped-turn callback must be cancelled or denied: {result:?}"
     );
     assert!(
         journal.tasks().unwrap().is_empty(),

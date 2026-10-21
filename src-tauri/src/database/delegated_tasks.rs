@@ -32,6 +32,11 @@ pub struct DelegatedOpenTask {
 }
 
 impl DatabaseStore {
+    pub fn list_delegated_open_tasks(&self) -> Result<Vec<DelegatedOpenTask>,String> {
+        let conn=self.conn.lock().unwrap();let mut s=conn.prepare("SELECT child_thread_id,parent_thread_id,provider,title,created_at_ms FROM agent_delegated_open_tasks ORDER BY created_at_ms").map_err(|e|e.to_string())?;
+        let rows=s.query_map([],|r|Ok(DelegatedOpenTask {child_thread_id:r.get(0)?,parent_thread_id:r.get(1)?,provider:r.get(2)?,title:r.get(3)?,created_at_ms:r.get(4)?})).map_err(|e|e.to_string())?.collect::<Result<_,_>>().map_err(|e|e.to_string());
+        rows
+    }
     pub fn insert_delegated_open_task(&self, task: &DelegatedOpenTask) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
