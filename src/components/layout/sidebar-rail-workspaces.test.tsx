@@ -353,7 +353,7 @@ describe("SidebarRailWorkspaces", () => {
     ).toBeNull();
   });
 
-  it("marks the active workspace's button with the neutral selection fill", async () => {
+  it("marks the active workspace's button with the theme's sidebar highlight", async () => {
     workspaces = [
       makeWorkspace({ title: "Alpha" }),
       makeWorkspace({ title: "Beta" }),
@@ -364,9 +364,11 @@ describe("SidebarRailWorkspaces", () => {
     const active = container.querySelector('[data-rail-ws="ws-2"]')!;
     const inactive = container.querySelector('[data-rail-ws="ws-1"]')!;
     expect(active).toHaveAttribute("data-active", "true");
-    expect(active).toHaveClass("border-border");
+    expect(active).toHaveClass("border-transparent", "bg-sidebar-accent");
     expect(inactive).not.toHaveAttribute("data-active");
-    // Selection is neutral now — no ember on any rail button.
+    expect(inactive).not.toHaveClass("bg-sidebar-accent");
+    // The highlight comes from the theme's sidebar accent — no ember on any
+    // rail button.
     for (const btn of container.querySelectorAll("[data-rail-ws]")) {
       expect(btn.className).not.toMatch(/accent-ember/);
     }
