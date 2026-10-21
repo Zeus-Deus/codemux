@@ -1749,6 +1749,35 @@ mod docker_parser_tests {
         assert!(parse_docker_ps_output(&stdout, &HashMap::new()).is_empty());
     }
 
+    /// Chat child workspaces open in their parent's folder. They must not
+    /// take the parent's Compose ports: the folder's owner keeps them, and a
+    /// child only gets them once no owner is open, the same child each scan.
+    #[test]
+    fn chat_children_do_not_take_their_parents_compose_ports() {
+        use crate::state::AppStateStore;
+        let store = AppStateStore::default();
+        let parent = store.create_empty_workspace_at_path(WT.into()).0;
+        store.set_workspace_worktree(&parent, WT.to_string(), "Parent".into());
+        let children: Vec<String> = ["Child A", "Child B"]
+            .into_iter()
+            .map(|title| {
+                let id = AppStateStore::reserve_workspace_id();
+                store.create_chat_child_workspace(&id, &parent, WT, title).unwrap();
+                id.0
+            })
+            .collect();
+        let stdout = line("proj-web-1", WT, "web", "0.0.0.0:8099->8000/tcp");
+        for _ in 0..2 {
+            let ports = parse_docker_ps_output(&stdout, &store.all_workspace_paths());
+            assert_eq!(ports[0].workspace_id.as_deref(), Some(parent.as_str()));
+        }
+        store.close_workspace(&parent).unwrap();
+        for _ in 0..2 {
+            let ports = parse_docker_ps_output(&stdout, &store.all_workspace_paths());
+            assert_eq!(ports[0].workspace_id.as_deref(), Some(children[0].as_str()));
+        }
+    }
+
     /// Ensures the field constants stay aligned with what we construct: a
     /// `PortInfo` from this parser always has `source = Some("docker")`.
     #[test]

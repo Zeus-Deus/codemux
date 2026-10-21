@@ -4243,21 +4243,30 @@ impl AppStateStore {
     /// direction of `all_workspace_cwds` (path is the key) because Docker
     /// container matching looks up by the compose `working_dir` path. Paths
     /// are stored with any trailing slash trimmed so lookups normalize.
+    ///
+    /// A chat child workspace only borrows its parent's folder, so the
+    /// workspace that owns a folder keeps it; children get a folder only
+    /// when no owner is open, and then the earliest child does.
     pub fn all_workspace_paths(&self) -> std::collections::HashMap<String, String> {
         let snapshot = self.inner.lock().unwrap();
         let mut map = std::collections::HashMap::new();
+        let mut borrowed = std::collections::HashMap::new();
         for w in &snapshot.workspaces {
             let id = w.workspace_id.0.clone();
-            let cwd = w.cwd.trim_end_matches('/');
-            if !cwd.is_empty() {
-                map.insert(cwd.to_string(), id.clone());
-            }
-            if let Some(worktree_path) = &w.worktree_path {
-                let wt = worktree_path.trim_end_matches('/');
-                if !wt.is_empty() {
-                    map.insert(wt.to_string(), id.clone());
+            let paths = std::iter::once(w.cwd.as_str())
+                .chain(w.worktree_path.as_deref())
+                .map(|path| path.trim_end_matches('/'))
+                .filter(|path| !path.is_empty());
+            for path in paths {
+                if w.is_chat_child() {
+                    borrowed.entry(path.to_string()).or_insert_with(|| id.clone());
+                } else {
+                    map.insert(path.to_string(), id.clone());
                 }
             }
+        }
+        for (path, id) in borrowed {
+            map.entry(path).or_insert(id);
         }
         map
     }
