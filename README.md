@@ -82,3 +82,5 @@ npm run tauri:build
 ## License
 
 Elastic License 2.0 — see [LICENSE.md](LICENSE.md).
+
+<!-- ci path filter test -->
