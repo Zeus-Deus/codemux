@@ -293,7 +293,7 @@ export function SkillsSection({ projectRoot }: Props) {
                 aria-label="Filter skills"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                className="h-8 pl-9 text-body"
+                className="pl-9 text-body"
               />
             </div>
             {sources.length > 1 && (
