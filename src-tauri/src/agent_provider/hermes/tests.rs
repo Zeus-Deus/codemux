@@ -1328,11 +1328,12 @@ fn a_chat_response_never_becomes_the_profile_default() {
     let chat = json!({
         "sessionId": "s",
         "modes": {"currentModeId": "dont_ask", "availableModes": [{"id": "default"}, {"id": "dont_ask"}]},
-        "models": {"currentModelId": "chat-override", "availableModels": [{"modelId": "chat-override"}]}
+        "models": {"currentModelId": "openai:gpt-5", "availableModels": [{"modelId": "openai:gpt-5"}]}
     });
     let catalog = profile_catalog(&chat);
     assert!(catalog.pointer("/modes/currentModeId").is_none());
-    assert!(catalog.pointer("/models/currentModelId").is_none());
+    // Launch validation still sees the effective, durable model.
+    durable_catalog(&catalog).unwrap();
     assert_eq!(catalog["modes"]["availableModes"], chat["modes"]["availableModes"]);
     assert_eq!(catalog["models"]["availableModels"], chat["models"]["availableModels"]);
 }

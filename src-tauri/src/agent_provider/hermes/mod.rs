@@ -230,14 +230,13 @@ struct Inner {
     mcp_registry: Option<crate::mcp::registry::McpRegistry>,
     catalogs: Mutex<HashMap<String, Value>>,
 }
-/// A chat's new/load response as a profile catalog: the chat's own mode and
-/// model are not the profile's defaults.
+/// A chat's new/load response as a profile catalog: the chat's own mode is not
+/// the profile's default. The effective model stays: launch validation needs
+/// it to prove the profile's routing is durable.
 fn profile_catalog(response: &Value) -> Value {
     let mut catalog = response.clone();
-    for (section, current) in [("modes", "currentModeId"), ("models", "currentModelId")] {
-        if let Some(section) = catalog.get_mut(section).and_then(Value::as_object_mut) {
-            section.remove(current);
-        }
+    if let Some(modes) = catalog.get_mut("modes").and_then(Value::as_object_mut) {
+        modes.remove("currentModeId");
     }
     catalog
 }
