@@ -2336,7 +2336,16 @@ async fn native_callers_round2_stop_revokes_live_descendants_before_interrupts()
 #[tokio::test]
 async fn native_callers_round2_close_revokes_tab_child_before_interrupt() {
     use crate::commands::delegation::{on_thread_stopped, DelegationState, StopKind, Task};
-    let (app, _, _root, _workspace, child, _authority, actor) = native_caller_fixture("default").await;
+    let (app, _, _root, workspace, child, _authority, actor) = native_caller_fixture("default").await;
+    use crate::delegation::{journal::Journal, DelegateTaskInput, Grant, Parent};
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(dir.path()).unwrap());
+    let parent = Parent { thread_id:child.clone(), workspace_id:workspace, provider:crate::agent_provider::ProviderKind::Claude, label:"Tab child".into(), permission_mode:"default".into(), event_id:None };
+    let grant: Grant = serde_json::from_value(json!({"id":"grant","host_id":4,"host_name":"Fixture host","ssh_target":"fixture-host","workspace_path":"/fixture/checkout","workspace_name":"Checkout","provider":"codex","permission_mode":"danger-full-access","enabled":true,"created_at":"fixture"})).unwrap();
+    let input = DelegateTaskInput { target_id:grant.id.clone(), prompt:"Existing SSH task".into(), title:None, model:None, effort:None, client_request_id:"ssh-child-close".into() };
+    journal.put_grant(&parent.workspace_id, &grant).unwrap();
+    let task = journal.admit(&parent, &grant, "checkout", &input).unwrap();
+    app.manage(journal.clone());
     app.state::<DelegationState>().reserve_worktree(&child, Task::new("closed-parent", crate::agent_provider::ProviderKind::Claude, "Tab child", "A tab child task", 1));
     let gate = app.state::<NativeControlState>().thread_gate(&child);
     let generation = gate.generation();
@@ -2347,6 +2356,10 @@ async fn native_callers_round2_close_revokes_tab_child_before_interrupt() {
     let error = native::call(app.handle().clone(), actor, "thread_launch".into(), json!({"client_request_id":"closed-launch"})).await.unwrap_err();
     assert!(error.contains("stale_caller"), "{error}");
     assert!(gate.verify(generation).is_err());
+    let retained = journal.task(&task.id).unwrap();
+    assert!(!retained.cancel_requested, "Close must leave the tab child's SSH work running");
+    assert_eq!(retained.status, task.status);
+    assert_eq!(retained.wake_state, task.wake_state);
 }
 
 #[tokio::test]
