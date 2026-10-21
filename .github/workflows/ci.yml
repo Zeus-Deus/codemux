@@ -388,7 +388,9 @@ jobs:
       - name: Build frontend
         # `frontendDist: "../dist"` in tauri.conf.json means tauri-build
         # wants `dist/` to exist at compile time — build the frontend first.
-        run: npm run build
+        # Plain `vite build` rather than `npm run build`: web-checks already
+        # typechecks, so repeating `tsc -b` here only lengthens this job.
+        run: npx vite build
 
       - name: Configure git identity and line endings for tests
         # Several tests in src-tauri/src/git.rs spin up a fixture repo and
@@ -470,7 +472,27 @@ jobs:
         shell: bash
         env:
           CODEMUX_OPENCODE_EVIDENCE: opencode-native-evidence
-        run: node scripts/e2e/opencode-native-smoke.mjs
+        run: |
+          # Hand the runner the test executable `cargo test` already built
+          # (on Windows it also has the Common Controls manifest from above).
+          # Letting the runner invoke cargo itself under its scrubbed
+          # environment recompiled the whole crate (~4 min on Windows).
+          # This `--no-run` is a fresh no-op that only reports the path.
+          CODEMUX_TEST_OPENCODE_TEST_EXECUTABLE=$(
+            cargo test --manifest-path src-tauri/Cargo.toml --test opencode_native_protocol --no-run --message-format=json |
+              node -e '
+                let input = "";
+                process.stdin.setEncoding("utf8").on("data", chunk => { input += chunk; }).on("end", () => {
+                  const artifact = input.split("\n").filter(Boolean).map(line => JSON.parse(line)).find(message =>
+                    message.reason === "compiler-artifact" && message.target?.name === "opencode_native_protocol" && message.executable);
+                  if (!artifact) throw Error("cargo reported no opencode_native_protocol test executable");
+                  console.log(artifact.executable);
+                });
+              '
+          )
+          export CODEMUX_TEST_OPENCODE_TEST_EXECUTABLE
+          echo "[ci] OpenCode test executable: $CODEMUX_TEST_OPENCODE_TEST_EXECUTABLE"
+          node scripts/e2e/opencode-native-smoke.mjs
 
       - uses: actions/upload-artifact@v4
         if: always() && !inputs.claude_install_only
@@ -488,10 +510,14 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Dependency binaries are already staged above. Avoid rebuilding them
-          # in release mode; this disposable installer tests the current app.
-          @{ build = @{ beforeBuildCommand = 'npm run build' }; bundle = @{ createUpdaterArtifacts = $false } } |
-            ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 ci-tauri-config.json
+          # Dependency binaries and dist/ are already built above, so skip the
+          # release beforeBuildCommand entirely. This installer is disposable:
+          # skip LZMA compression too (~2.5 min in makensis).
+          if (-not (Test-Path dist/index.html)) { throw 'dist/index.html missing; the frontend build step must run first' }
+          @{
+            build = @{ beforeBuildCommand = '' }
+            bundle = @{ createUpdaterArtifacts = $false; windows = @{ nsis = @{ compression = 'none' } } }
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 ci-tauri-config.json
           npm run tauri -- build --debug --bundles nsis --config ci-tauri-config.json
           if ($LASTEXITCODE -ne 0) { throw 'Windows acceptance installer build failed' }
 
