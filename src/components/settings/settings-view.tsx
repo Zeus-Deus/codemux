@@ -3211,7 +3211,7 @@ export function SettingsView() {
           <nav
             ref={navRef}
             style={{ width: navWidth }}
-            className="relative flex shrink-0 flex-col border-r border-border bg-background pt-4"
+            className="relative flex shrink-0 flex-col border-r border-border bg-sidebar pt-4"
           >
             <SettingsNavSearch
               agentChatEnabled={enableAgentChat}
@@ -3250,7 +3250,7 @@ export function SettingsView() {
         )}
 
         {/* Content */}
-        <ScrollArea ref={contentScrollRef} className="flex-1 bg-card">
+        <ScrollArea ref={contentScrollRef} className="flex-1 bg-background">
           {/* The container query shows "On this page" only where it fits
               beside the reading measure. */}
           <div className="@container">

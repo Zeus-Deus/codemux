@@ -247,7 +247,7 @@ export function SettingsCard({
     <div
       role={role}
       className={cn(
-        "rounded-md border border-hairline bg-surface-1 p-4",
+        "rounded-md border border-hairline bg-card/40 p-4",
         className,
       )}
     >

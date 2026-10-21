@@ -152,7 +152,7 @@ export function ProvidersSection() {
         }
       />
       <div className="@container">
-        <div className="grid min-h-[520px] grid-cols-1 overflow-hidden rounded-lg border border-border bg-background @2xl:grid-cols-[240px_minmax(0,1fr)]">
+        <div className="grid min-h-[520px] grid-cols-1 overflow-hidden rounded-lg border border-border bg-card/40 @2xl:grid-cols-[240px_minmax(0,1fr)]">
           <nav aria-label="Providers" className="flex flex-col gap-px border-b border-border p-1.5 @2xl:border-r @2xl:border-b-0">
             {BUILT_IN.map((p) => (
               <ProviderListRow
