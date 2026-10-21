@@ -290,9 +290,10 @@ impl OpenCodeSession {
         // in it. OpenCode 1 never names the session, so it gets no server.
         let mcp = match mcp_registry {
             Some(_) if server_handle.api == super::api::OpenCodeApi::Legacy => {
+                // The prefix makes the transcript show it (runtime-notice.ts).
                 let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                     thread_id: Some(thread_id.clone()),
-                    message: format!("Codemux tools are unavailable in this OpenCode session: {LEGACY_COLLABORATION}."),
+                    message: format!("collaboration-unavailable: This chat runs without Codemux tools. {LEGACY_COLLABORATION}."),
                     original_payload: None,
                 });
                 None
@@ -3342,8 +3343,8 @@ pub(crate) mod tests {
             }
         }
         assert!(
-            reasons.iter().any(|m| m.contains(LEGACY_COLLABORATION)),
-            "{reasons:?}"
+            reasons.iter().any(|m| m.starts_with("collaboration-unavailable: ") && m.contains(LEGACY_COLLABORATION)),
+            "the transcript shows why: {reasons:?}"
         );
         let _ = session.shutdown().await;
     }
