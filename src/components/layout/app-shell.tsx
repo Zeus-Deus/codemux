@@ -319,12 +319,13 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   if (utilityPage && (mobile || !shellAvailable)) {
     return (
       <UtilityPageStandaloneContext.Provider value={true}>
-        <LazyBoundary
-          label={utilityPageLabel(utilityPage)}
-          className={cn("h-screen", UTILITY_PAGE_ENTER)}
-        >
-          <UtilityPageContent page={utilityPage} />
-        </LazyBoundary>
+        {/* LazyBoundary's className only styles its loading and error
+            states, so the entrance lives on a wrapper around the page. */}
+        <div className={cn("h-screen", UTILITY_PAGE_ENTER)}>
+          <LazyBoundary label={utilityPageLabel(utilityPage)} className="h-full">
+            <UtilityPageContent page={utilityPage} />
+          </LazyBoundary>
+        </div>
       </UtilityPageStandaloneContext.Provider>
     );
   }

@@ -105,7 +105,9 @@ export function Collapse({
     >
       <div
         className={cn(
-          "min-h-0",
+          // min-w-0: a grid item's automatic minimum is its content width,
+          // so long rows would otherwise widen the whole column.
+          "min-h-0 min-w-0",
           phase === "open" ? "overflow-visible" : "overflow-hidden",
           className,
         )}
