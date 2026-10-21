@@ -570,7 +570,7 @@ export function buildWorkflowCommand({
     id: "workflow",
     label: "Workflow",
     description: available
-      ? "Split a task across agents working in parallel"
+      ? "Run a task on parallel agents"
       : "Needs a local workspace on this device",
     command: "/workflow",
     icon: Workflow,
@@ -600,7 +600,7 @@ export function buildSideChatCommand({
     id: "btw",
     label: "Side question",
     description: supported
-      ? "Ask about this chat without adding to it"
+      ? "Ask without adding to this chat"
       : `Not available for ${providerLabel} yet`,
     searchDescription: "btw side chat question aside by the way",
     command: "/btw",

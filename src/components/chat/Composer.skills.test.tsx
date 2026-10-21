@@ -528,7 +528,7 @@ describe("Composer · /workflow slash entry", () => {
     // precedent in Composer.attach.test.tsx).
     const attr = row.getAttribute("data-disabled");
     expect(attr === null || attr === "false").toBe(true);
-    expect(getByText("Split a task across agents working in parallel")).toBeInTheDocument();
+    expect(getByText("Run a task on parallel agents")).toBeInTheDocument();
   });
 
   it("clicking /workflow expands the typed query into a literal /workflow token", async () => {

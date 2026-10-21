@@ -2096,7 +2096,7 @@ export function Composer({
         ...(onDelegateTask ? [{
           id: "delegate:host",
           label: "Run on host…",
-          description: "Delegate a coding task to another machine",
+          description: "Delegate a task to another machine",
           command: "",
           icon: Server,
           group: "INTEGRATIONS",
