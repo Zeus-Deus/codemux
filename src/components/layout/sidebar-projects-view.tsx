@@ -653,7 +653,10 @@ export function SidebarProjectsView() {
   const renderProject = (project: ProjectsSection) => {
     const quiet = project.rows.length === 0;
     const open = quiet ? openQuiet.has(project.path) : folded[project.path] !== true;
-    const pending = pendingByProject.get(project.path) ?? [];
+    // A create in flight (or its failed row) is live work: it shows even
+    // while a quiet project's history is closed.
+    const pending =
+      open || quiet ? (pendingByProject.get(project.path) ?? []) : [];
     const parked = inlineParked(project, open);
     return (
       <SidebarMenuItem key={project.path} data-project-group={project.path}>
@@ -670,15 +673,14 @@ export function SidebarProjectsView() {
           needsYou={!open && hasNeedsYou(project.rows)}
           onToggle={quiet ? setQuietOpen : setFolded}
         />
-        {(open || parked.length > 0) && (
+        {(open || parked.length > 0 || pending.length > 0) && (
           <SidebarMenu className="pb-1">
             {open && renderRows(project.rows)}
-            {open &&
-              pending.map((pw) => (
-                <SidebarMenuItem key={pw.id}>
-                  <PendingWorkspaceRow pending={pw} className="gap-2 px-2 py-2" />
-                </SidebarMenuItem>
-              ))}
+            {pending.map((pw) => (
+              <SidebarMenuItem key={pw.id}>
+                <PendingWorkspaceRow pending={pw} className="gap-2 px-2 py-2" />
+              </SidebarMenuItem>
+            ))}
             {parked.map(renderParkedRow)}
           </SidebarMenu>
         )}

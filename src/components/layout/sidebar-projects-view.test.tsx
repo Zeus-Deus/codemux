@@ -129,6 +129,7 @@ import {
 } from "./sidebar-view-store";
 import { activateWorkspace, dbSetUiState } from "@/tauri/commands";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { getJumpTarget } from "./sidebar-inbox-jump";
 
@@ -380,6 +381,44 @@ describe("SidebarProjectsView", () => {
     expect(screen.getByText("old lib work")).toBeInTheDocument();
     // A session-only fold: nothing persisted for a project with no live rows.
     expect(useSidebarViewStore.getState().folded).toEqual({});
+  });
+
+  it("shows a pending and then failed create in a settled-only project without opening its history", async () => {
+    workspaces = [makeWorkspace({ title: "old lib work", cwd: LIB, project_root: LIB })];
+    persistedSettled = JSON.stringify({
+      settled: [{ id: "ws-1", at: 1 }],
+      snoozed: [],
+      keepActive: [],
+      activity: {},
+    });
+    useUIStore.setState({
+      pendingWorkspaces: [
+        { id: "pw-1", name: "new-branch", projectPath: LIB, status: "creating" },
+      ],
+    });
+    try {
+      const { container, rerender } = await renderView();
+      const group = container.querySelector(`[data-project-group="${LIB}"]`) as HTMLElement;
+      expect(group).not.toBeNull();
+      expect(within(group).getByRole("button", { name: "lib" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      expect(within(group).getByText("new-branch")).toBeInTheDocument();
+      expect(within(group).queryByText("old lib work")).toBeNull();
+
+      act(() => {
+        useUIStore.getState().failPendingWorkspace("pw-1", "branch already exists");
+      });
+      rerender(
+        <TooltipProvider>
+          <SidebarProjectsView />
+        </TooltipProvider>,
+      );
+      expect(within(group).getByText("branch already exists")).toBeInTheDocument();
+    } finally {
+      useUIStore.setState({ pendingWorkspaces: [] });
+    }
   });
 
   it("keeps a recently active project with nothing live, showing its age instead of 0", async () => {
