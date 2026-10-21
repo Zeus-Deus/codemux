@@ -1339,6 +1339,39 @@ async fn a_changed_hermes_configuration_refreshes_the_cached_catalog() {
     assert_eq!(relisted, Some(discovered));
 }
 
+/// A Hermes chat's tool runs inside its turn, which holds the profile
+/// operation. Refreshing a stale catalog then must fail fast, not wait on it.
+#[tokio::test]
+async fn a_stale_catalog_never_waits_on_the_profile_turn() {
+    let (root, provider, runtime, _chat, task) = review_pump_fixture().await;
+    provider
+        .inner
+        .runtimes
+        .lock()
+        .await
+        .insert(runtime_key(&runtime.profile), runtime.clone());
+    let stale = json!({"models":{"currentModelId":"openai:old","availableModels":[]}});
+    provider.inner.remember_catalog(&runtime.profile, stale).await;
+    std::fs::write(root.path().join("config.yaml"), "model: {provider: custom, default: edited}\n").unwrap();
+    let held = runtime.operation.lock().await;
+    let refreshed = tokio::time::timeout(
+        Duration::from_secs(2),
+        provider.orchestration_catalog(runtime.profile.clone(), true),
+    )
+    .await;
+    drop(held);
+    // A token refresh alone keeps the catalog.
+    provider.inner.remember_catalog(&runtime.profile, json!({"kept":true})).await;
+    std::fs::write(root.path().join("auth.json"), "{}").unwrap();
+    let after_refresh = provider.orchestration_catalog(runtime.profile.clone(), false).await.unwrap();
+    runtime.child.shutdown().await.unwrap();
+    task.abort();
+    let _ = task.await;
+    let error = refreshed.expect("must not wait on the turn's profile operation").unwrap_err();
+    assert!(error.to_string().contains("busy"), "{error}");
+    assert_eq!(after_refresh, Some(json!({"kept":true})));
+}
+
 #[tokio::test]
 async fn a_replaced_hermes_profile_or_installation_never_reuses_its_catalog() {
     let root = tempfile::tempdir().unwrap();

@@ -322,10 +322,21 @@ impl HermesProvider {
     /// Discovery creates an unprompted native session through the same owned runtime.
     /// Hermes has no standalone model-catalog RPC. It is not imported as a Codemux chat.
     pub async fn catalog(&self, profile: Profile) -> Result<Value, ProviderError> {
+        self.read_catalog(profile, true).await
+    }
+    /// [`Self::catalog`]; without `wait`, a profile busy with a turn is refused
+    /// instead of waited for: the caller may be a tool inside that very turn.
+    async fn read_catalog(&self, profile: Profile, wait: bool) -> Result<Value, ProviderError> {
         profile.validate().map_err(invalid)?;
         durable_profile(&profile)?;
         let runtime = self.inner.runtime(profile).await?;
-        let _guard = runtime.operation.lock().await;
+        let _guard = if wait {
+            runtime.operation.lock().await
+        } else {
+            runtime.operation.try_lock().map_err(|_| {
+                invalid("busy: this Hermes profile's configuration changed while it is running a turn; retry once the turn ends")
+            })?
+        };
         let catalog = runtime
             .child
             .request(
@@ -340,8 +351,9 @@ impl HermesProvider {
     /// The profile catalog for orchestration. A native tool runs while its
     /// chat owns runtime.operation, so reuse the acknowledged catalog while
     /// the profile, installation and configuration are unchanged. Without a
-    /// fresh one, `probe` discovers it through [`Self::catalog`]; listing
-    /// passes `false` and never starts a runtime or creates a Hermes session.
+    /// fresh one, `probe` reads it again, never waiting on a busy profile;
+    /// listing passes `false` and never starts a runtime or creates a Hermes
+    /// session.
     pub(crate) async fn orchestration_catalog(
         &self,
         profile: Profile,
@@ -364,7 +376,7 @@ impl HermesProvider {
         };
         match cached {
             Some(catalog) => Ok(Some(catalog)),
-            None if probe => self.catalog(profile).await.map(Some),
+            None if probe => self.read_catalog(profile, false).await.map(Some),
             None => Ok(None),
         }
     }
@@ -398,9 +410,10 @@ impl HermesProvider {
 }
 /// What a profile catalog depends on: the profile directory's identity, the
 /// installation's size and mtime, and the size and mtime of the profile's
-/// configuration files. Contents (which hold secrets) are never read.
+/// configuration files. Contents (which hold secrets) are never read, and
+/// auth.json is left out: token refreshes rewrite it constantly.
 fn catalog_freshness(profile: &Profile) -> Result<String, ProviderError> {
-    let config: Vec<String> = ["config.yaml", ".env", "auth.json"]
+    let config: Vec<String> = ["config.yaml", ".env"]
         .iter()
         .map(|name| match std::fs::metadata(profile.home.join(name)) {
             Ok(m) => format!("{}:{:?}", m.len(), m.modified().ok()),
