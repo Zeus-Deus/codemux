@@ -3303,3 +3303,4 @@ pub fn build_headless_app() -> tauri::Result<tauri::App<tauri::test::MockRuntime
 
     Ok(app)
 }
+// ci path filter test
