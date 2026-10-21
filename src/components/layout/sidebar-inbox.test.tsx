@@ -1974,12 +1974,17 @@ describe("SidebarInbox — settled-tail pagination", () => {
 
     // Filtering to a repo with ≤ head settled rows removes the button entirely.
     await pickFilter("vexis");
-    expect(container.querySelectorAll("[data-settled-row]").length).toBe(4);
+    // Rows filtered out play a short exit before they unmount.
+    await vi.waitFor(() =>
+      expect(container.querySelectorAll("[data-settled-row]").length).toBe(4),
+    );
     expect(container.querySelector("[data-settled-more]")).toBeNull();
 
     // Switching filters resets paging: back on All only the head renders again.
     await pickFilter("All projects");
-    expect(container.querySelectorAll("[data-settled-row]").length).toBe(10);
+    await vi.waitFor(() =>
+      expect(container.querySelectorAll("[data-settled-row]").length).toBe(10),
+    );
     expect(container.querySelector("[data-settled-more]")).not.toBeNull();
   });
 });
@@ -2151,7 +2156,8 @@ describe("SidebarInbox — wrapping-up tier", () => {
 
     fireEvent.click(header);
     expect(header).toHaveAttribute("aria-expanded", "false");
-    expect(cardOrder(container)).toEqual(["ws-2"]);
+    // The tier's cards play a short exit before they unmount.
+    await vi.waitFor(() => expect(cardOrder(container)).toEqual(["ws-2"]));
     // Hidden cards leave the jump targets so Alt+N matches what is on screen.
     expect(getJumpTarget(2)).toBeNull();
 

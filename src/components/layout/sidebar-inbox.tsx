@@ -90,6 +90,7 @@ import {
   useVisibleSidebarDraftCount,
 } from "./sidebar-draft-block";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { PresenceList, PresenceRow } from "@/components/ui/presence";
 import { useRemoteWorkspaces } from "@/environments/remote-workspaces";
 import { SidebarEmptyState } from "./sidebar-empty-state";
 import { SidebarHeaderActions } from "./sidebar-action-row";
@@ -378,7 +379,7 @@ function ShelfHeader({
       <ChevronRight
         aria-hidden="true"
         className={cn(
-          "size-3 shrink-0 text-muted-foreground/70 transition-transform duration-150",
+          "size-3 shrink-0 text-muted-foreground/70 transition-transform duration-150 ease-drawer",
           !collapsed && "rotate-90",
         )}
       />
@@ -889,6 +890,9 @@ export function SidebarInbox() {
   const showGitStats = useSettingsStore(selectSidebarShowGitStats);
 
   const load = useSidebarInboxStore((s) => s.load);
+  // Rows only animate once the stored settled/snoozed lists have loaded, so
+  // hydration never plays as a burst of rows opening and closing at boot.
+  const rowMotion = useSidebarInboxStore((s) => s.loaded);
   const settled = useSidebarInboxStore((s) => s.settled);
   const snoozed = useSidebarInboxStore((s) => s.snoozed);
   const inboxOrder = useSidebarInboxStore((s) => s.order);
@@ -1905,9 +1909,11 @@ export function SidebarInbox() {
                   onToggle={() => setWrappingUpCollapsed((c) => !c)}
                   marker="data-wrapping-up-divider"
                 />
-                {(previewWrappingUp ?? visibleWrappingUp).map((ws, index) => ws.workspace_id === wrappingPreviewId
-                  ? <div key="wrapping-drop-preview" data-inbox-wrapping-preview className="mb-1.5 flex min-h-[88px] items-center justify-center rounded-lg border border-dashed border-foreground/25 text-label text-muted-foreground">Unpin into Wrapping up</div>
-                  : renderCard(ws, pinnedCards.length + topTier.length + index))}
+                <PresenceList animate={rowMotion}>
+                  {(previewWrappingUp ?? visibleWrappingUp).map((ws, index) => ws.workspace_id === wrappingPreviewId
+                    ? <div key="wrapping-drop-preview" data-inbox-wrapping-preview className="mb-1.5 flex min-h-[88px] items-center justify-center rounded-lg border border-dashed border-foreground/25 text-label text-muted-foreground">Unpin into Wrapping up</div>
+                    : <PresenceRow key={ws.workspace_id}>{renderCard(ws, pinnedCards.length + topTier.length + index)}</PresenceRow>)}
+                </PresenceList>
               </>
             )}
 
@@ -1920,24 +1926,27 @@ export function SidebarInbox() {
                   collapsed={snoozeCollapsed}
                   onToggle={() => setSnoozeCollapsed((c) => !c)}
                 />
-                {visibleSnoozed.map(({ entry, workspace }) => {
-                  const repo = repoByWorkspace.get(workspace.workspace_id);
-                  if (!repo) return null;
-                  return (
-                    <SnoozeRow
-                      key={workspace.workspace_id}
-                      workspace={workspace}
-                      repo={repo}
-                      isActive={workspace.workspace_id === activeWorkspaceId}
-                      selected={selectedIds.has(workspace.workspace_id)}
-                      status={statusOf(workspace)}
-                      timeUntil={formatTimeUntil(entry.until - now)}
-                      onWake={handleWake}
-                      onSelect={handleSelect}
-                      onMarkUnread={handleMarkUnread}
-                    />
-                  );
-                })}
+                <PresenceList animate={rowMotion}>
+                  {visibleSnoozed.map(({ entry, workspace }) => {
+                    const repo = repoByWorkspace.get(workspace.workspace_id);
+                    if (!repo) return null;
+                    return (
+                      <PresenceRow key={workspace.workspace_id}>
+                        <SnoozeRow
+                          workspace={workspace}
+                          repo={repo}
+                          isActive={workspace.workspace_id === activeWorkspaceId}
+                          selected={selectedIds.has(workspace.workspace_id)}
+                          status={statusOf(workspace)}
+                          timeUntil={formatTimeUntil(entry.until - now)}
+                          onWake={handleWake}
+                          onSelect={handleSelect}
+                          onMarkUnread={handleMarkUnread}
+                        />
+                      </PresenceRow>
+                    );
+                  })}
+                </PresenceList>
               </>
             )}
 
@@ -1950,26 +1959,29 @@ export function SidebarInbox() {
                   collapsed={settledCollapsed}
                   onToggle={() => setSettledCollapsed((c) => !c)}
                 />
-                {visibleSettled.map(({ entry, workspace }) => {
-                  const repo = repoByWorkspace.get(workspace.workspace_id);
-                  if (!repo) return null;
-                  return (
-                    <SettledRow
-                      key={workspace.workspace_id}
-                      workspace={workspace}
-                      repo={repo}
-                      isActive={workspace.workspace_id === activeWorkspaceId}
-                      selected={selectedIds.has(workspace.workspace_id)}
-                      status={statusOf(workspace)}
-                      time={formatElapsed(now - resolveSettledTimestamp(entry))}
-                      unread={isUnread(workspace)}
-                      justSettled={justSettledId === workspace.workspace_id}
-                      onUnsettle={handleUnsettle}
-                      onSelect={handleSelect}
-                      onMarkUnread={handleMarkUnread}
-                    />
-                  );
-                })}
+                <PresenceList animate={rowMotion}>
+                  {visibleSettled.map(({ entry, workspace }) => {
+                    const repo = repoByWorkspace.get(workspace.workspace_id);
+                    if (!repo) return null;
+                    return (
+                      <PresenceRow key={workspace.workspace_id}>
+                        <SettledRow
+                          workspace={workspace}
+                          repo={repo}
+                          isActive={workspace.workspace_id === activeWorkspaceId}
+                          selected={selectedIds.has(workspace.workspace_id)}
+                          status={statusOf(workspace)}
+                          time={formatElapsed(now - resolveSettledTimestamp(entry))}
+                          unread={isUnread(workspace)}
+                          justSettled={justSettledId === workspace.workspace_id}
+                          onUnsettle={handleUnsettle}
+                          onSelect={handleSelect}
+                          onMarkUnread={handleMarkUnread}
+                        />
+                      </PresenceRow>
+                    );
+                  })}
+                </PresenceList>
                 {!settledCollapsed &&
                   settledHidden > 0 &&
                   (() => {
