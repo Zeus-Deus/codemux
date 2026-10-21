@@ -49,9 +49,11 @@ async function stop(child) {
   await exited;
 }
 
+// Cargo settings that feed build fingerprints must pass through, or the
+// cargo fallback below recompiles the crate the outer job already built.
 function isolatedEnvironment(runDir) {
   const env = { [pathKey]: process.env[pathKey], HOME: join(runDir, 'home'), USERPROFILE: join(runDir, 'home'), USER: 'tester', LANG: 'C.UTF-8', CARGO_HOME: hostCargoHome, RUSTUP_HOME: hostRustupHome };
-  for (const key of ['SystemRoot', 'SYSTEMROOT', 'WINDIR', 'ComSpec', 'COMSPEC', 'PATHEXT', 'RUSTUP_HOME', 'CARGO_BUILD_TARGET', 'CARGO_PROFILE_DEV_DEBUG', 'CARGO_PROFILE_TEST_DEBUG']) if (process.env[key]) env[key] = process.env[key];
+  for (const key of ['SystemRoot', 'SYSTEMROOT', 'WINDIR', 'ComSpec', 'COMSPEC', 'PATHEXT', 'RUSTUP_HOME', 'CARGO_BUILD_TARGET', 'CARGO_INCREMENTAL', 'CARGO_TERM_COLOR', 'CARGO_PROFILE_DEV_DEBUG', 'CARGO_PROFILE_TEST_DEBUG']) if (process.env[key]) env[key] = process.env[key];
   for (const kind of ['CONFIG', 'DATA', 'CACHE', 'STATE']) env[`XDG_${kind}_HOME`] = join(runDir, kind.toLowerCase());
   env.APPDATA = join(runDir, 'appdata'); env.LOCALAPPDATA = join(runDir, 'localappdata');
   env.TMPDIR = env.TEMP = env.TMP = join(runDir, 'tmp');
