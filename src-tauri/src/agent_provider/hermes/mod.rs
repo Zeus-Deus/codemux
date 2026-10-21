@@ -228,7 +228,9 @@ struct Inner {
     store: Arc<dyn BindingStore>,
     events: broadcast::Sender<ProviderRuntimeEvent>,
     mcp_registry: Option<crate::mcp::registry::McpRegistry>,
-    catalogs: Mutex<HashMap<String, Value>>,
+    /// Profile catalogs by runtime key, each with the [`catalog_freshness`]
+    /// it was read under.
+    catalogs: Mutex<HashMap<String, (String, Value)>>,
 }
 /// A chat's new/load response as a profile catalog: the chat's own mode is not
 /// the profile's default. The effective model stays: launch validation needs
@@ -332,17 +334,14 @@ impl HermesProvider {
             )
             .await
             .map_err(rpc)?;
-        self.inner
-            .catalogs
-            .lock()
-            .await
-            .insert(runtime_key(&runtime.profile), catalog.clone());
+        self.inner.remember_catalog(&runtime.profile, catalog.clone()).await;
         Ok(catalog)
     }
     /// The profile catalog for orchestration. A native tool runs while its
-    /// chat owns runtime.operation, so reuse the acknowledged catalog. Without
-    /// one, `probe` discovers it through [`Self::catalog`]; listing passes
-    /// `false` and never starts a runtime or creates a Hermes session.
+    /// chat owns runtime.operation, so reuse the acknowledged catalog while
+    /// the profile, installation and configuration are unchanged. Without a
+    /// fresh one, `probe` discovers it through [`Self::catalog`]; listing
+    /// passes `false` and never starts a runtime or creates a Hermes session.
     pub(crate) async fn orchestration_catalog(
         &self,
         profile: Profile,
@@ -350,13 +349,19 @@ impl HermesProvider {
     ) -> Result<Option<Value>, ProviderError> {
         profile.validate().map_err(invalid)?;
         durable_profile(&profile)?;
-        let cached = self
-            .inner
-            .catalogs
-            .lock()
-            .await
-            .get(&runtime_key(&profile))
-            .cloned();
+        let freshness = catalog_freshness(&profile)?;
+        let cached = {
+            let mut catalogs = self.inner.catalogs.lock().await;
+            let key = runtime_key(&profile);
+            match catalogs.get(&key) {
+                Some((read_under, catalog)) if *read_under == freshness => Some(catalog.clone()),
+                Some(_) => {
+                    catalogs.remove(&key);
+                    None
+                }
+                None => None,
+            }
+        };
         match cached {
             Some(catalog) => Ok(Some(catalog)),
             None if probe => self.catalog(profile).await.map(Some),
@@ -391,6 +396,24 @@ impl HermesProvider {
         Ok(())
     }
 }
+/// What a profile catalog depends on: the profile directory's identity, the
+/// installation's size and mtime, and the size and mtime of the profile's
+/// configuration files. Contents (which hold secrets) are never read.
+fn catalog_freshness(profile: &Profile) -> Result<String, ProviderError> {
+    let config: Vec<String> = ["config.yaml", ".env", "auth.json"]
+        .iter()
+        .map(|name| match std::fs::metadata(profile.home.join(name)) {
+            Ok(m) => format!("{}:{:?}", m.len(), m.modified().ok()),
+            Err(_) => "-".into(),
+        })
+        .collect();
+    Ok(format!(
+        "{}\0{}\0{}",
+        profile.identity,
+        installation_stamp(profile)?,
+        config.join(",")
+    ))
+}
 fn runtime_key(p: &Profile) -> String {
     format!(
         "{}\0{}\0{}",
@@ -402,6 +425,15 @@ fn runtime_key(p: &Profile) -> String {
 impl Inner {
     fn emit(&self, event: ProviderRuntimeEvent) {
         let _ = self.events.send(event);
+    }
+    async fn remember_catalog(&self, profile: &Profile, catalog: Value) {
+        let Ok(freshness) = catalog_freshness(profile) else {
+            return;
+        };
+        self.catalogs
+            .lock()
+            .await
+            .insert(runtime_key(profile), (freshness, catalog));
     }
     async fn runtime(self: &Arc<Self>, profile: Profile) -> Result<Arc<Runtime>, ProviderError> {
         let key = runtime_key(&profile);
@@ -1330,10 +1362,8 @@ impl AgentProvider for HermesProvider {
                 }));
         }
         self.inner
-            .catalogs
-            .lock()
-            .await
-            .insert(runtime_key(&binding.profile), profile_catalog(&res));
+            .remember_catalog(&binding.profile, profile_catalog(&res))
+            .await;
         let models: HashSet<String> = res
             .pointer("/models/availableModels")
             .and_then(Value::as_array)
@@ -1733,10 +1763,8 @@ impl AgentProvider for HermesProvider {
             ));
         }
         self.inner
-            .catalogs
-            .lock()
-            .await
-            .insert(runtime_key(&chat.runtime.profile), profile_catalog(&response));
+            .remember_catalog(&chat.runtime.profile, profile_catalog(&response))
+            .await;
         let mut b = chat.binding.lock().await;
         b.model_override = Some(model.clone());
         b.resolved_model = Some(model);
@@ -1798,10 +1826,8 @@ impl AgentProvider for HermesProvider {
         }
         if let Ok(catalog) = &checked {
             self.inner
-                .catalogs
-                .lock()
-                .await
-                .insert(runtime_key(&b.profile), profile_catalog(catalog));
+                .remember_catalog(&b.profile, profile_catalog(catalog))
+                .await;
         }
         b.permission_mode = Some(mode);
         *chat.binding.lock().await = b.clone();

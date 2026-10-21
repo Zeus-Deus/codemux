@@ -1282,14 +1282,12 @@ async fn all_provider_hermes_capabilities_do_not_reacquire_the_active_profile_op
         .runtimes
         .lock()
         .await
-        .insert(key.clone(), runtime.clone());
+        .insert(key, runtime.clone());
     let acknowledged = json!({"models":{"currentModelId":"openai:fixture-model","availableModels":[{"modelId":"openai:fixture-model","name":"Fixture"}]}});
     provider
         .inner
-        .catalogs
-        .lock()
-        .await
-        .insert(key, acknowledged.clone());
+        .remember_catalog(&runtime.profile, acknowledged.clone())
+        .await;
     let held = runtime.operation.lock().await;
     let result = tokio::time::timeout(
         Duration::from_secs(1),
@@ -1306,6 +1304,67 @@ async fn all_provider_hermes_capabilities_do_not_reacquire_the_active_profile_op
             .unwrap(),
         Some(acknowledged)
     );
+}
+
+/// A cached profile catalog is reused only while the profile's configuration
+/// is unchanged. Listing then reports it undiscovered; a targeted discovery
+/// reads the new catalog from the runtime.
+#[tokio::test]
+async fn a_changed_hermes_configuration_refreshes_the_cached_catalog() {
+    let (root, provider, runtime, _chat, task) = review_pump_fixture().await;
+    provider
+        .inner
+        .runtimes
+        .lock()
+        .await
+        .insert(runtime_key(&runtime.profile), runtime.clone());
+    let stale = json!({"sessionId":"before-edit","models":{"currentModelId":"openai:old","availableModels":[{"modelId":"openai:old","name":"Old"}]}});
+    provider.inner.remember_catalog(&runtime.profile, stale.clone()).await;
+    let listed = provider.orchestration_catalog(runtime.profile.clone(), false).await.unwrap();
+    std::fs::write(
+        root.path().join("config.yaml"),
+        "model: {provider: custom, default: another-model}\n",
+    )
+    .unwrap();
+    let after_edit = provider.orchestration_catalog(runtime.profile.clone(), false).await.unwrap();
+    let discovered = provider.orchestration_catalog(runtime.profile.clone(), true).await.unwrap();
+    let relisted = provider.orchestration_catalog(runtime.profile.clone(), false).await.unwrap();
+    runtime.child.shutdown().await.unwrap();
+    task.abort();
+    let _ = task.await;
+    assert_eq!(listed, Some(stale.clone()), "an unchanged profile reuses its catalog");
+    assert_eq!(after_edit, None, "listing never serves a catalog read under the old configuration");
+    let discovered = discovered.expect("targeted discovery refreshes the catalog");
+    assert_ne!(discovered, stale, "the catalog was read again from the runtime");
+    assert_eq!(relisted, Some(discovered));
+}
+
+#[tokio::test]
+async fn a_replaced_hermes_profile_or_installation_never_reuses_its_catalog() {
+    let root = tempfile::tempdir().unwrap();
+    let installation = root.path().join("hermes");
+    std::fs::write(&installation, "#!/bin/sh\n").unwrap();
+    let home = root.path().join("profiles/coder");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.yaml"), "model: {provider: custom}\n").unwrap();
+    let provider = HermesProvider::new(Arc::new(crate::database::init_test_database()));
+    let profile = profile::resolve(&installation, root.path(), "coder").unwrap();
+    let catalog = json!({"models":{"currentModelId":"openai:old","availableModels":[]}});
+    provider.inner.remember_catalog(&profile, catalog.clone()).await;
+    assert_eq!(provider.orchestration_catalog(profile.clone(), false).await.unwrap(), Some(catalog.clone()));
+
+    // Same pathname, different profile directory.
+    std::fs::rename(&home, root.path().join("profiles/coder-old")).unwrap();
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("config.yaml"), "model: {provider: custom}\n").unwrap();
+    let replaced = profile::resolve(&installation, root.path(), "coder").unwrap();
+    assert_ne!(replaced.identity, profile.identity);
+    assert_eq!(provider.orchestration_catalog(replaced.clone(), false).await.unwrap(), None);
+
+    // Same profile, reinstalled executable.
+    provider.inner.remember_catalog(&replaced, catalog.clone()).await;
+    std::fs::write(&installation, "#!/bin/sh\n# upgraded\n").unwrap();
+    assert_eq!(provider.orchestration_catalog(replaced, false).await.unwrap(), None);
 }
 
 #[tokio::test]
