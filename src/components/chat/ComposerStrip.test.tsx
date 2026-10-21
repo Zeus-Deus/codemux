@@ -118,10 +118,7 @@ function Harness({
 }
 
 const rows = () => screen.queryAllByTestId("composer-strip-row");
-const orbStates = () =>
-  [...document.querySelectorAll("canvas[data-orb-state]")].map((c) =>
-    c.getAttribute("data-orb-state"),
-  );
+const spinners = () => document.querySelectorAll('[data-slot="spinner"]');
 
 describe("ComposerStrip — shell", () => {
   it("renders nothing with no occupants", () => {
@@ -306,7 +303,7 @@ describe("ComposerStrip — subagents", () => {
     });
   });
 
-  it("single running: summary row with the activity kind and a Jump chip", () => {
+  it("single running: summary row with a Jump chip", () => {
     const onJump = vi.fn();
     render(
       <Harness
@@ -315,7 +312,6 @@ describe("ComposerStrip — subagents", () => {
       />,
     );
     expect(screen.getByText("1 subagent running")).toBeInTheDocument();
-    expect(screen.getByText("working")).toBeInTheDocument();
     expect(screen.queryByTestId("composer-strip-toggle")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Jump" }));
     expect(onJump).toHaveBeenCalledWith("run-1");
@@ -347,7 +343,7 @@ describe("ComposerStrip — subagents", () => {
 
     expect(rows()[0]).toHaveAttribute("data-kind", "finished");
     expect(screen.getByText("Subagents finished")).toBeInTheDocument();
-    expect(orbStates()).toHaveLength(0);
+    expect(spinners()).toHaveLength(0);
     fireEvent.click(screen.getByRole("button", { name: "Jump" }));
     expect(onJump).toHaveBeenCalledWith("run-1");
 
@@ -379,7 +375,7 @@ describe("ComposerStrip — subagents", () => {
     expect(screen.queryByText("1 subagent running")).toBeNull();
   });
 
-  it("keeps the summary orb neutral and gives each opened row its own", () => {
+  it("marks the summary with one spinner and gives each opened row its own", () => {
     function tool(name: string, input: unknown = {}) {
       return {
         kind: "tool_call" as const,
@@ -406,9 +402,9 @@ describe("ComposerStrip — subagents", () => {
         ]}
       />,
     );
-    expect(orbStates()).toEqual(["working"]);
+    expect(spinners()).toHaveLength(1);
     fireEvent.click(screen.getByTestId("composer-strip-toggle"));
-    expect(orbStates()).toEqual(["searching", "connecting"]);
+    expect(spinners()).toHaveLength(2);
   });
 });
 
@@ -963,7 +959,8 @@ describe("ComposerStrip — pending approval", () => {
     expect(lead).toHaveAttribute("data-kind", "approval");
     expect(within(lead).getByText("Needs approval")).toBeInTheDocument();
     expect(within(lead).getByText("Bash · npm test")).toBeInTheDocument();
-    expect(orbStates()).toEqual(["listening"]);
+    // Waiting on a human is not running work.
+    expect(spinners()).toHaveLength(0);
 
     fireEvent.click(screen.getByTestId("composer-strip-approval-allow"));
     expect(h.onRespond).toHaveBeenCalledWith("r1", { decision: "allow" });

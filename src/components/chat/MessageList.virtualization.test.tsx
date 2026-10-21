@@ -265,7 +265,7 @@ describe("MessageList anchored new-turn contract (windowed list)", () => {
     // The new prompt is mounted and the live tail marker sits below it in
     // the reserved space — not stranded off-screen at index 500.
     expect(screen.getByText("the prompt I just sent")).toBeInTheDocument();
-    expect(screen.getByText(/Working|Writing|Thinking/)).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Agent is working" })).toBeInTheDocument();
     // Nothing about this is a reader navigating away.
     expect(screen.queryByText("Jump to latest")).toBeNull();
   });

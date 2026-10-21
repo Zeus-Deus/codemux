@@ -78,7 +78,6 @@ vi.mock("@/stores/settings-store", () => {
     "appearance.density": "comfortable",
     "sidebar.show_git_stats": "true",
     "sidebar.auto_settle_days": "3",
-    "agents.orb_match_activity": "true",
     "agents.auto_resume_usage_limit": "true",
     "agents.auto_resume_after_restart": "true",
     "agents.cross_provider_delegation": "true",
@@ -110,7 +109,6 @@ vi.mock("@/stores/settings-store", () => {
     selectChatCodeWrap: () => false,
     selectReduceMotion: () => false,
     selectSidebarAutoSettleDays: () => 3,
-    selectOrbMatchActivity: () => true,
     selectAutoResumeUsageLimit: () => true,
     selectAutoResumeAfterRestart: () => true,
     selectCrossProviderDelegation: () => false,
@@ -525,13 +523,6 @@ describe("SettingsPanel — Git section model pickers", () => {
   });
 });
 
-// ── Appearance → Agents section ──
-//
-// The "Agents" subsection now holds exactly one control: whether the agent
-// orb's animation follows the current activity. The working-indicator tile
-// picker and the indicator-color swatches were deleted outright when the
-// orb replaced them — there is nothing left to pick.
-
 describe("SettingsPanel — Git section diff defaults", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -607,16 +598,9 @@ describe("SettingsPanel — Appearance Agents section", () => {
     fireEvent.click(appearanceButtons[0]);
   }
 
-  it("renders the Agents subsection with the match-activity toggle", () => {
+  it("no longer offers the retired activity-indicator controls", () => {
     openAppearance();
-    expect(screen.getAllByText("Agents").length).toBeGreaterThan(0);
-    expect(
-      screen.getAllByText("Match the orb to the activity").length,
-    ).toBeGreaterThan(0);
-  });
-
-  it("no longer offers the retired working-indicator or color pickers", () => {
-    openAppearance();
+    expect(screen.queryByText("Match the orb to the activity")).toBeNull();
     expect(screen.queryByText("Working indicator")).toBeNull();
     expect(screen.queryByText("Indicator color")).toBeNull();
     expect(
@@ -656,17 +640,6 @@ describe("SettingsPanel — Appearance Agents section", () => {
     expect(mockSettingsSet).toHaveBeenCalledWith("appearance.time_format", "24h");
   });
 
-  it("toggling Match the orb to the activity writes agents.orb_match_activity", () => {
-    openAppearance();
-    fireEvent.click(
-      screen.getAllByRole("switch", { name: "Match the orb to the activity" })[0],
-    );
-    expect(mockSettingsSet).toHaveBeenCalledWith(
-      "agents.orb_match_activity",
-      "false",
-    );
-  });
-
   it("toggling Reduce motion writes appearance.reduce_motion", () => {
     openAppearance();
     fireEvent.click(screen.getAllByRole("switch", { name: "Reduce motion" })[0]);
@@ -693,7 +666,6 @@ describe("SettingsPanel — Appearance Agents section", () => {
       "Wrap code in chat",
       "Show git stats",
       "Auto-settle idle work",
-      "Match the orb to the activity",
     ]) {
       expect(screen.getAllByText(label).length).toBeGreaterThan(0);
     }
@@ -1301,11 +1273,11 @@ describe("Settings search", () => {
 
   it("lists matching rows by page and opens the page on Enter", async () => {
     const view = render(<SettingsView />);
-    fireEvent.change(searchField(view), { target: { value: "orb" } });
+    fireEvent.change(searchField(view), { target: { value: "ahead" } });
 
     const results = view.getByRole("listbox", { name: "Settings search results" });
     expect(within(results).getByRole("group", { name: "Appearance" })).toBeInTheDocument();
-    expect(within(results).getByRole("option", { name: /Match the orb to the activity/ }))
+    expect(within(results).getByRole("option", { name: /Show git stats/ }))
       .toHaveAttribute("aria-selected", "true");
     // The nav is replaced while searching.
     expect(within(view.container.querySelector("nav")!).queryByRole("button", { name: "General" })).toBeNull();
@@ -1317,7 +1289,7 @@ describe("Settings search", () => {
     // The row search named is lit once the page has painted.
     await waitFor(() =>
       expect(
-        view.getByText("Match the orb to the activity").closest("[data-settings-row]"),
+        view.getByText("Show git stats").closest("[data-settings-row]"),
       ).toHaveAttribute("data-settings-flash"),
     );
     view.unmount();

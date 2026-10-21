@@ -37,6 +37,7 @@ import {
   AlarmClockOff,
   Archive,
   Check,
+  CircleDotDashed,
   Clock,
   Copy,
   Laptop,
@@ -116,7 +117,6 @@ import {
 } from "@/components/ui/hover-card";
 import { useCoarseClock } from "@/lib/use-coarse-clock";
 import { StatusIndicator } from "@/components/ui/status-indicator";
-import { AgentOrb } from "@/components/ui/agent-orb";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import { toast } from "@/lib/toast";
@@ -1297,9 +1297,13 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                 PR-state-colored button that opens the PR URL on click. */}
             <div className="relative size-5 flex items-center justify-center shrink-0 mr-2">
               {workspaceStatus === "working" ? (
-                // Neutral state: this row reads `pane_statuses`, which
-                // carries no tool name. See sidebar-inbox-card.tsx.
-                <AgentOrb size={20} aria-label="Agent working" />
+                // Static, like the inbox card's working mark: navigation
+                // reports lifecycle, not the agent's current action.
+                <CircleDotDashed
+                  role="img"
+                  aria-label="Agent working"
+                  className="size-3.5 text-status-working"
+                />
               ) : (
                 <>
                   {showWorkspaceIconAsPr ? (

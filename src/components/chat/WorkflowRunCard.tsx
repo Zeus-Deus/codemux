@@ -10,7 +10,7 @@ import {
   XCircle,
 } from "lucide-react";
 
-import { AgentOrb } from "@/components/ui/agent-orb";
+import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -334,10 +334,8 @@ function WorkflowRunningRow({
       className="cursor-pointer overflow-hidden rounded-lg border border-border bg-surface-1 hover:border-muted-foreground/60"
     >
       <div className="flex items-center gap-2.5 px-3.5 py-2.5">
-        {/* Stands for the whole run, like the Subagents card header, so it
-            stays neutral — the per-agent orbs live in the phase drill-in. */}
         <span className="flex size-5 shrink-0 items-center justify-center">
-          <AgentOrb size={20} aria-hidden />
+          <Spinner className="text-muted-foreground" role="presentation" aria-hidden />
         </span>
         <span className="shrink-0 text-body font-bold text-foreground">
           Workflow running

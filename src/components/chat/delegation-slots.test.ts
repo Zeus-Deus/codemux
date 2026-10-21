@@ -185,8 +185,8 @@ describe("delegation slots", () => {
       [user(0), delegateCall(1, "c1"), readTool(2), card(3, [row("c1")]), readTool(4)],
       true,
     );
-    expect(slots.map((slot) => slot.body.kind)).toEqual(["item", "delegation", "activity"]);
-    const activity = slots[2].body;
+    expect(slots.map((slot) => slot.body.kind)).toEqual(["item", "turn_fold", "delegation", "activity"]);
+    const activity = slots[3].body;
     expect(activity.kind === "activity" && activity.items.map((item) => item.id)).toEqual([
       "tc-2",
       "tc-4",
@@ -246,8 +246,8 @@ describe("delegation slots", () => {
       resolution: { state: "pending" },
     };
     const slots = buildTranscriptSlots([user(0), gated, request], true);
-    expect(slots.map((slot) => slot.body.kind)).toEqual(["item", "delegation", "item"]);
-    const last = slots[2].body;
+    expect(slots.map((slot) => slot.body.kind)).toEqual(["item", "turn_fold", "delegation", "item"]);
+    const last = slots[3].body;
     expect(last.kind === "item" && last.item.id).toBe("pr-2");
   });
 
@@ -260,7 +260,7 @@ describe("delegation slots", () => {
   it("leaves native subagents in the work log", () => {
     const native: SubagentView = { id: "explore", status: "running", items: [], toneIndex: 0 };
     const slots = buildTranscriptSlots([user(0), card(1, [native])], true);
-    expect(slots.map((slot) => slot.body.kind)).toEqual(["item", "activity"]);
+    expect(slots.map((slot) => slot.body.kind)).toEqual(["item", "turn_fold", "activity"]);
   });
 
   it("keeps an untouched card's slot identity across rebuilds", () => {

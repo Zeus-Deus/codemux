@@ -13,7 +13,7 @@
  * Two rules keep the live list from being a surface that erases itself:
  *
  * - **Completions linger.** A row that finishes while you are watching does
- *   not vanish mid-glance. Its orb becomes a green check, the activity line
+ *   not vanish mid-glance. Its spinner becomes a green check, the activity line
  *   becomes the first line of its report, the timer freezes, and it holds
  *   its place for 8s before collapsing out. Hovering it pauses the hold,
  *   because "wait, what did that one say?" is the exact moment the row must
@@ -41,14 +41,13 @@ import {
 import { openDelegatedChat } from "@/components/chat/delegation-actions";
 import { ProviderLogo } from "@/components/chat/provider-logo";
 import { TickingText } from "@/components/chat/TickingText";
-import { AgentOrb } from "@/components/ui/agent-orb";
+import { Spinner } from "@/components/ui/spinner";
 import {
   childThreadIdOf,
   isDelegatedRow,
   modelEffortLabel,
   providerKindOf,
 } from "@/lib/agent-chat/delegation";
-import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import {
   formatElapsed,
   formatSettledAgo,
@@ -404,7 +403,7 @@ function RowGlyph({ view }: { view: SubagentView }) {
         data-row-glyph="running"
         className="flex size-5 shrink-0 items-center justify-center"
       >
-        <AgentOrb size={20} {...subagentOrbActivity(view)} aria-hidden />
+        <Spinner className="size-3.5 text-muted-foreground" role="presentation" aria-hidden />
       </span>
     );
   }

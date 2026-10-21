@@ -99,11 +99,13 @@ import {
   type SendAnchorRequest,
   type SendScrollMode,
 } from "./send-scroll-state";
-import type {
-  WorkEntry,
-  SlotBody,
-  TranscriptSlot,
+import {
+  formatWorkedDuration,
+  type WorkEntry,
+  type SlotBody,
+  type TranscriptSlot,
 } from "./transcript-slots";
+import { TickingText } from "./TickingText";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { withTimeFormat } from "@/lib/time-format";
 
@@ -2250,7 +2252,9 @@ function TurnFoldRow({
   label,
   expanded,
   failedCount,
+  hiddenCount,
   changes,
+  liveSince,
   workspaceId,
   cwd,
   onShowTurnDiff,
@@ -2261,12 +2265,43 @@ function TurnFoldRow({
   label: string;
   expanded: boolean;
   failedCount: number;
+  hiddenCount: number;
   changes?: TurnChangeSummary;
+  liveSince?: number | null;
   workspaceId?: string | null;
   cwd?: string | null;
   onShowTurnDiff?: (turnId: string, trigger: HTMLElement) => void;
   onToggleTurnFold: (turnId: string, pinnedBy: readonly string[]) => void;
 }) {
+  const changesChip = changes ? (
+    <TurnChangesChip
+      changes={changes}
+      workspaceId={workspaceId}
+      cwd={cwd}
+      onShowDiff={
+        onShowTurnDiff ? (trigger) => onShowTurnDiff(turnId, trigger) : undefined
+      }
+    />
+  ) : null;
+  if (liveSince !== undefined || hiddenCount === 0) {
+    // Nothing to fold: the running turn's ticking header (the thread's one
+    // clock), or a settled turn whose answer is all it has. Plain text in
+    // the fold's place rather than a toggle.
+    return (
+      <div className="flex items-center justify-between gap-3 border-b border-border/60 pb-2 pt-1">
+        <span className="flex items-center gap-1 px-1 text-body tabular-nums text-muted-foreground">
+          {liveSince == null ? (
+            label
+          ) : (
+            <TickingText
+              compute={(now) => `${label} for ${formatWorkedDuration(now - liveSince)}`}
+            />
+          )}
+        </span>
+        {changesChip}
+      </div>
+    );
+  }
   const Icon = expanded ? ChevronDown : ChevronRight;
   return (
     <div className="flex items-center justify-between gap-3 border-b border-border/60 pb-2 pt-1">
@@ -2274,7 +2309,7 @@ function TurnFoldRow({
         type="button"
         aria-expanded={expanded}
         onClick={() => onToggleTurnFold(turnId, pinnedBy)}
-        className="flex items-center gap-1 rounded-md px-1 text-label tabular-nums text-muted-foreground transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+        className="flex items-center gap-1 rounded-md px-1 text-body tabular-nums text-muted-foreground transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
       >
         <span>{label}</span>
         {failedCount > 0 ? (
@@ -2284,16 +2319,7 @@ function TurnFoldRow({
         ) : null}
         <Icon className="size-3.5" aria-hidden />
       </button>
-      {changes ? (
-        <TurnChangesChip
-          changes={changes}
-          workspaceId={workspaceId}
-          cwd={cwd}
-          onShowDiff={
-            onShowTurnDiff ? (trigger) => onShowTurnDiff(turnId, trigger) : undefined
-          }
-        />
-      ) : null}
+      {changesChip}
     </div>
   );
 }
@@ -2396,7 +2422,9 @@ function SlotRow({
           label={slot.body.label}
           expanded={slot.body.expanded}
           failedCount={slot.body.failedCount}
+          hiddenCount={slot.body.hiddenCount}
           changes={slot.body.changes}
+          liveSince={slot.body.liveSince}
           workspaceId={workspaceId}
           cwd={cwd}
           onShowTurnDiff={onShowTurnDiff}

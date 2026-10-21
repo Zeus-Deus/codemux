@@ -21,16 +21,19 @@ function reasoning(overrides: Partial<ReasoningItem> = {}): ReasoningItem {
 }
 
 describe("ReasoningBlock", () => {
-  it("shows a shimmering 'Thinking…' header and streams the body while streaming", () => {
+  it("shows a shimmering 'Thinking…' line and keeps the streaming thought folded", () => {
     const { container } = render(
       <ReasoningBlock item={reasoning({ streaming: true })} />,
     );
     expect(screen.getByText("Thinking…")).toBeInTheDocument();
-    expect(container.querySelector("[data-orb-state]")).toBeInTheDocument();
-    // Auto-open while streaming → the body text is visible.
-    expect(
-      screen.getByText(/Line numbers rarely survive/),
-    ).toBeInTheDocument();
+    expect(container.querySelector('[data-slot="trace-line"]')).toHaveAttribute(
+      "data-status",
+      "running",
+    );
+    // The transcript holds still: the text only shows once opened.
+    expect(screen.queryByText(/Line numbers rarely survive/)).toBeNull();
+    fireEvent.click(screen.getByText("Thinking…"));
+    expect(screen.getByText(/Line numbers rarely survive/)).toBeInTheDocument();
   });
 
   it("shows 'Thought for Ns' once sealed and collapses the body by default", () => {
@@ -38,8 +41,9 @@ describe("ReasoningBlock", () => {
       <ReasoningBlock item={reasoning({ duration_ms: 6000 })} />,
     );
     expect(screen.getByText("Thought for 6s")).toBeInTheDocument();
-    // Settled thoughts keep their recognizable lightbulb, not a live orb.
-    expect(container.querySelector("[data-orb-state]")).toBeNull();
+    expect(container.querySelector('[data-slot="trace-line"]')).not.toHaveAttribute(
+      "data-status",
+    );
     // Collapsed by default once sealed.
     expect(screen.queryByText(/Line numbers rarely survive/)).toBeNull();
     // Toggling reveals the body.
@@ -47,14 +51,6 @@ describe("ReasoningBlock", () => {
     expect(
       screen.getByText(/Line numbers rarely survive/),
     ).toBeInTheDocument();
-  });
-
-  it("keeps the settled glyph while streaming when another surface owns the orb", () => {
-    const { container } = render(
-      <ReasoningBlock item={reasoning({ streaming: true })} live={false} />,
-    );
-    expect(screen.getByText("Thinking…")).toBeInTheDocument();
-    expect(container.querySelector("[data-orb-state]")).toBeNull();
   });
 
   it("falls back to 'Thought' when no duration was captured", () => {

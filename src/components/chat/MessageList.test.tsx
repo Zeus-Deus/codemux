@@ -873,7 +873,8 @@ describe("MessageList activity blocks", () => {
     const view = render(
       <MessageList messages={running.slice(0, 3)} streaming {...noopHandlers} />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /\/b/ }));
+    // Between steps the live line reads Thinking… rather than the last call.
+    fireEvent.click(screen.getByRole("button", { name: /Thinking…/ }));
     expect(screen.getByText("/a")).toBeInTheDocument();
     view.rerender(<MessageList messages={running} streaming {...noopHandlers} />);
     fireEvent.click(screen.getByRole("button", { name: /\/d/ }));
@@ -916,7 +917,7 @@ describe("MessageList activity blocks", () => {
     expect(screen.queryByText("/only")).toBeNull();
   });
 
-  it("shows one live orb beside the newest streaming action", () => {
+  it("names the newest running action on the live line", () => {
     const messages: ChatViewItem[] = [
       readCall(0, "/a"),
       {
@@ -935,9 +936,10 @@ describe("MessageList activity blocks", () => {
       streaming: true,
       showThinking: false,
     });
-    expect(container.querySelector('canvas[data-orb-state="working"]')).not.toBeNull();
+    expect(
+      container.querySelector('[data-slot="trace-line"][data-status="running"]'),
+    ).toHaveTextContent("Running cargo test");
     expect(screen.getByRole("button", { name: /Running cargo test/ })).toBeInTheDocument();
-    expect(screen.getByText("2 tools")).toBeInTheDocument();
   });
 
   it("a non-tool row breaks the run into two independent activity blocks", () => {
@@ -1084,7 +1086,7 @@ describe("MessageList chrome", () => {
       { showThinking: true },
     );
     expect(screen.getByRole("status", { name: "Agent is working" })).toBeInTheDocument();
-    expect(screen.getByText("Working…")).toBeInTheDocument();
+    expect(screen.getByText("Thinking…")).toBeInTheDocument();
   });
 
   it("does not render the streaming marker when showThinking is unset", () => {

@@ -1,5 +1,4 @@
-import { AgentOrb } from "@/components/ui/agent-orb";
-import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
+import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { basename } from "@/lib/path";
@@ -93,8 +92,7 @@ export function WorkflowAgentDetail({
       >
         {running ? (
           <span className="flex size-5 shrink-0 items-center justify-center">
-            {/* One agent, so this orb can carry its actual activity. */}
-            <AgentOrb size={20} {...subagentOrbActivity(agent)} aria-hidden />
+            <Spinner className="text-muted-foreground" role="presentation" aria-hidden />
           </span>
         ) : (
           <TerminalStatusIcon

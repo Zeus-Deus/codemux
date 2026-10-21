@@ -83,7 +83,12 @@ describe("workspace launch visuals", () => {
     for (const streaming of [true, false]) {
       const slots = buildTranscriptSlots(messages, streaming);
       expect(slots.some(({ body }) => body.kind === "item" && body.item === item)).toBe(true);
-      expect(slots.some(({ body }) => body.kind === "activity" || body.kind === "turn_fold")).toBe(false);
+      // The turn keeps its duration row, but nothing is folded away.
+      expect(
+        slots.some(
+          ({ body }) => body.kind === "activity" || (body.kind === "turn_fold" && body.hiddenCount > 0),
+        ),
+      ).toBe(false);
     }
   });
 });

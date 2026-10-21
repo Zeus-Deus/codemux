@@ -3,7 +3,6 @@ import { ContribBoundary, ContribRender } from "@/contrib/react/boundary";
 import { usePluginToolRenderer } from "@/contrib/tool-renderers";
 import { memo, useState } from "react";
 
-import { AgentOrb } from "@/components/ui/agent-orb";
 import {
   Trace,
   TraceCollapsible,
@@ -15,14 +14,12 @@ import {
   TraceTitle,
   type TraceStatus,
 } from "@/components/ui/trace";
-import { turnOrbActivity } from "@/lib/agent-chat/orb-activity";
 import { presentationToolName } from "@/lib/agent-chat/native-tool-call";
 import type { SubagentRunItem } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 import { useUIStore } from "@/stores/ui-store";
 
 import type { ActivityStep, WorkEntry } from "./transcript-slots";
-import { StepElapsed } from "./StepElapsed";
 import { TickingText } from "./TickingText";
 import { ToolCallBody } from "./ToolCallBodies";
 import {
@@ -37,6 +34,7 @@ import {
   type StepStatus,
   type WorkLogTotals,
 } from "./activity-steps";
+import { StepElapsed } from "./StepElapsed";
 import { toolIcon } from "./tool-visuals";
 
 /** The opened history shows this many recent entries before "Show earlier". */
@@ -44,13 +42,12 @@ export const WORK_LOG_HISTORY_WINDOW = 10;
 
 const META_CLASS = "font-mono text-caption";
 
-type OrbActivity = ReturnType<typeof turnOrbActivity>;
-
 /**
  * One line for one uninterrupted stretch of mechanical work: tool calls,
- * thoughts and subagent runs alike, drawn with shadcn's Trace. Collapsed, the
- * line is the newest entry plus stretch totals; pressing it opens the
- * chronological history as nested Trace lines. There is deliberately no
+ * thoughts and subagent runs alike, drawn with shadcn's Trace. Collapsed and
+ * live, the line names the running tool or reads "Thinking…"; settled, it is
+ * the newest entry plus stretch totals. Pressing it opens the chronological
+ * history as nested Trace lines. There is deliberately no
  * surrounding card, status banner or settled header—the turn fold owns
  * completion and the final assistant answer owns the hierarchy.
  *
@@ -91,16 +88,17 @@ export const ActivityBlock = memo(function ActivityBlock({
   };
 
   const runs = items.filter(isSubagentRun);
-  const orbActivity = working ? turnOrbActivity(items) : undefined;
 
-  const renderEntry = (entry: WorkEntry) => {
-    const live = working && entry.id === latest.id;
+  // `inHistory`: the entry is a row of the opened log rather than the
+  // block's one collapsed line. The live line stays quiet; the history the
+  // user opened shows each running step's own clock.
+  const renderEntry = (entry: WorkEntry, inHistory = false) => {
+    const live = working && !inHistory && entry.id === latest.id;
     if (isSubagentRun(entry)) {
       return (
         <SubagentRunLine
           key={entry.id}
           run={entry}
-          live={live}
           workspaceId={workspaceId}
         />
       );
@@ -110,8 +108,8 @@ export const ActivityBlock = memo(function ActivityBlock({
         key={entry.id}
         step={entry}
         live={live}
-        ticking={working || turnLive}
-        orbActivity={live ? orbActivity : undefined}
+        turnLive={working || turnLive}
+        inHistory={inHistory}
         expanded={expandedStepId === entry.id}
         onToggle={(expanding) => {
           setExpandedStepId(expanding ? entry.id : null);
@@ -151,12 +149,7 @@ export const ActivityBlock = memo(function ActivityBlock({
               <TotalsLabel totals={totals} />
             </TraceLine>
           ) : (
-            <CollapsedLine
-              entry={latest}
-              live={working}
-              orbActivity={orbActivity}
-              totals={totals}
-            />
+            <CollapsedLine entry={latest} live={working} totals={totals} />
           )}
         </TraceCollapsibleTrigger>
         <TraceCollapsibleContent>
@@ -168,7 +161,7 @@ export const ActivityBlock = memo(function ActivityBlock({
                 </TraceLine>
               </button>
             )}
-            {items.slice(hiddenCount).map(renderEntry)}
+            {items.slice(hiddenCount).map((entry) => renderEntry(entry, true))}
           </Trace>
         </TraceCollapsibleContent>
       </TraceCollapsible>
@@ -196,24 +189,8 @@ function traceStatus(status: StepStatus): TraceStatus | undefined {
   return undefined;
 }
 
-/** Icon slot for a step: the turn's one live orb on the live line, the
- *  tool's own glyph everywhere else. */
-function StepIcon({
-  step,
-  live,
-  orbActivity,
-}: {
-  step: ActivityStep;
-  live: boolean;
-  orbActivity?: OrbActivity;
-}) {
-  if (live) {
-    return (
-      <TraceIcon className="size-5 -mx-0.5">
-        <AgentOrb size={20} {...(orbActivity ?? {})} aria-hidden />
-      </TraceIcon>
-    );
-  }
+/** Icon slot for a step: the tool's own glyph, a bulb for a thought. */
+function StepIcon({ step }: { step: ActivityStep }) {
   if (step.kind !== "reasoning" && step.status === "unconfirmed") {
     return (
       <TraceIcon title="No completion result was reported">
@@ -226,6 +203,26 @@ function StepIcon({
     <TraceIcon>
       <Icon />
     </TraceIcon>
+  );
+}
+
+/**
+ * The live line names a tool only while that tool runs. A thought, or the
+ * gap after a step settles, reads as one steady "Thinking…" instead of
+ * streaming the thought's text or flashing the last call's past tense.
+ */
+function isLiveThinking(step: ActivityStep, live: boolean): boolean {
+  return live && (step.kind === "reasoning" || stepStatus(step) !== "running");
+}
+
+function ThinkingLine() {
+  return (
+    <TraceLine status="running">
+      <TraceIcon>
+        <Lightbulb />
+      </TraceIcon>
+      <TraceTitle>Thinking…</TraceTitle>
+    </TraceLine>
   );
 }
 
@@ -256,46 +253,39 @@ function StepTitle({ step }: { step: ActivityStep }) {
 function CollapsedLine({
   entry,
   live,
-  orbActivity,
   totals,
 }: {
   entry: WorkEntry;
   live: boolean;
-  orbActivity?: OrbActivity;
   totals: WorkLogTotals;
 }) {
+  // The stretch totals count up with every call, so they wait for the
+  // stretch to settle.
+  const settledTotals = live ? null : <TotalsLabel totals={totals} />;
   if (isSubagentRun(entry)) {
     const status = subagentRunStatus(entry);
     return (
       <TraceLine status={traceStatus(status)}>
-        {live ? (
-          <TraceIcon className="size-5 -mx-0.5">
-            <AgentOrb size={20} {...(orbActivity ?? {})} aria-hidden />
-          </TraceIcon>
-        ) : (
-          <TraceIcon>
-            <Bot />
-          </TraceIcon>
-        )}
+        <TraceIcon>
+          <Bot />
+        </TraceIcon>
         <TraceTitle>
           {status === "running" ? "Running subagents" : "Ran subagents"}{" "}
           <span className="font-mono text-label">{subagentPreview(entry.subagents)}</span>
         </TraceTitle>
-        <TotalsLabel totals={totals} />
+        {settledTotals}
       </TraceLine>
     );
   }
+  if (isLiveThinking(entry, live)) return <ThinkingLine />;
   return (
     <TraceLine status={traceStatus(stepStatus(entry))}>
-      <StepIcon step={entry} live={live} orbActivity={orbActivity} />
+      <StepIcon step={entry} />
       <StepTitle step={entry} />
       {stepStatus(entry) === "unconfirmed" ? (
         <TraceDescription className={META_CLASS}>outcome unconfirmed</TraceDescription>
       ) : null}
-      {live ? (
-        <StepElapsed step={entry} className={cn(META_CLASS, "text-muted-foreground/60")} separated />
-      ) : null}
-      <TotalsLabel totals={totals} />
+      {settledTotals}
     </TraceLine>
   );
 }
@@ -318,8 +308,8 @@ function TotalsLabel({ totals }: { totals: WorkLogTotals }) {
 function StepLine({
   step,
   live,
-  ticking,
-  orbActivity,
+  turnLive,
+  inHistory,
   expanded,
   onToggle,
 }: {
@@ -329,26 +319,32 @@ function StepLine({
    *  settled transcript can hold a call that never reported back (crash,
    *  quit); its start time is no longer meaningful, so it keeps the static
    *  meta instead of counting forever. */
-  ticking: boolean;
-  orbActivity?: OrbActivity;
+  turnLive: boolean;
+  /** A row of the opened log, where a running step shows its elapsed time. */
+  inHistory: boolean;
   expanded: boolean;
   onToggle: (expanding: boolean) => void;
 }) {
   const status = stepStatus(step);
   const description = traceStepDescription(step);
-  const tickingNow = ticking && status === "running" && step.started_at != null;
+  const runningLive = turnLive && status === "running";
+  const ticking = inHistory && runningLive && step.started_at != null;
   return (
     <TraceCollapsible open={expanded} onOpenChange={onToggle}>
       <TraceCollapsibleTrigger>
-        <TraceLine status={traceStatus(status)}>
-          <StepIcon step={step} live={live} orbActivity={orbActivity} />
-          <StepTitle step={step} />
-          {tickingNow ? (
-            <StepElapsed step={step} className={cn(META_CLASS, "text-muted-foreground/60")} />
-          ) : description && !live ? (
-            <TraceDescription className={META_CLASS}>{description}</TraceDescription>
-          ) : null}
-        </TraceLine>
+        {isLiveThinking(step, live) ? (
+          <ThinkingLine />
+        ) : (
+          <TraceLine status={traceStatus(status)}>
+            <StepIcon step={step} />
+            <StepTitle step={step} />
+            {ticking ? (
+              <StepElapsed step={step} className={cn(META_CLASS, "text-muted-foreground/60")} />
+            ) : description && !runningLive ? (
+              <TraceDescription className={META_CLASS}>{description}</TraceDescription>
+            ) : null}
+          </TraceLine>
+        )}
       </TraceCollapsibleTrigger>
       <TraceCollapsibleContent>
         {step.kind === "reasoning" ? (
@@ -381,11 +377,9 @@ function StepBody({ step }: { step: Extract<ActivityStep, { kind: "tool_call" }>
  *  panel, so the line opens that panel instead of expanding inline. */
 function SubagentRunLine({
   run,
-  live,
   workspaceId,
 }: {
   run: SubagentRunItem;
-  live: boolean;
   workspaceId?: string | null;
 }) {
   const selected = useUIStore((state) =>
@@ -406,15 +400,9 @@ function SubagentRunLine({
       className={cn("group/subagents disabled:cursor-default", selected && "text-foreground")}
     >
       <TraceLine status={traceStatus(status)} className={cn(selected && "text-foreground")}>
-        {live ? (
-          <TraceIcon className="size-5 -mx-0.5">
-            <AgentOrb size={20} aria-hidden />
-          </TraceIcon>
-        ) : (
-          <TraceIcon>
-            <Bot />
-          </TraceIcon>
-        )}
+        <TraceIcon>
+          <Bot />
+        </TraceIcon>
         <TraceTitle>
           {status === "running" ? "Running" : "Ran"} {count} subagent{count === 1 ? "" : "s"}{" "}
           <span className="font-mono text-label">{subagentPreview(run.subagents)}</span>

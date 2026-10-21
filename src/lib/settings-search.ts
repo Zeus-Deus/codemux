@@ -72,7 +72,6 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
   { section: "appearance", label: "Sidebar", keywords: "workspace cards inbox" },
   { section: "appearance", label: "Show git stats", keywords: "ahead diff numbers branch" },
   { section: "appearance", label: "Auto-settle idle work", keywords: "settled sweep idle inbox" },
-  { section: "appearance", label: "Match the orb to the activity", keywords: "orb animation indicator working agents" },
 
   // Notifications
   { section: "notifications", label: "Notification sounds", keywords: "sound audio chime" },
@@ -199,7 +198,7 @@ function escapeRegExp(text: string): string {
  *
  * A result matches when every word of the query appears in its label, its
  * keywords, or its page's name and keywords — so "git stats" and "appearance
- * orb" both narrow the way they read. Pages hidden by the current flags never
+ * density" both narrow the way they read. Pages hidden by the current flags never
  * appear, and row visibility follows the same feature, account and remote
  * conditions as the rendered controls. Pages are ordered by their strongest result, then nav order, so the
  * first result is the one the query most plausibly names.
