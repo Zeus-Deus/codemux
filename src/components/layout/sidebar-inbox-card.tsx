@@ -354,7 +354,7 @@ function DelegatedList({
                 e.preventDefault();
                 e.stopPropagation();
               }}
-              className="flex w-full min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-left text-label text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground"
+              className="flex w-full min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-left text-label text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
             >
               <span
                 aria-hidden
