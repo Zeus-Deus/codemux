@@ -66,7 +66,7 @@ function view(overrides: Partial<SubagentView> = {}): SubagentView {
     model: "gpt-6.1-codex",
     effort: "high",
     status: "running",
-    activity: "Working in its tab",
+    activity: "Working in its workspace",
     items: [],
     toneIndex: 0,
     startedAt: Date.now() - 134_000,

@@ -25,7 +25,7 @@ function delegated(thread: string, overrides: Partial<SubagentView> = {}): Subag
     agentType: "codex",
     description: "Add slugify helper",
     status: "running",
-    activity: "Working in its tab",
+    activity: "Working in its workspace",
     items: [],
     toneIndex: 0,
     startedAt: Date.now() - 134_000,
@@ -71,7 +71,7 @@ describe("delegation occupant", () => {
     const [row] = rows();
     expect(row).toHaveAttribute("data-kind", "delegation");
     expect(row).toHaveTextContent("Waiting on subagent");
-    expect(row).toHaveTextContent("Add slugify helper · Working in its tab");
+    expect(row).toHaveTextContent("Add slugify helper · Working in its workspace");
     expect(row).toHaveTextContent("2m 14s");
     expect(within(row).getByRole("button", {name: "Open subagent Add slugify helper"})).toHaveTextContent("Add slugify helper");
     expect(within(row).getByTestId("composer-strip-delegation-stop")).toHaveTextContent("Stop");
@@ -130,7 +130,7 @@ describe("delegation occupant", () => {
       <Harness
         messages={[
           card("c1", [delegated("child-1")]),
-          card("c2", [claude({ activity: "Waiting for your answer in its tab" })]),
+          card("c2", [claude({ activity: "Waiting for your answer in its workspace" })]),
         ]}
         onStop={onStop}
       />,
@@ -150,7 +150,7 @@ describe("delegation occupant", () => {
     ]);
     expect(within(open[0]).getByTestId("composer-strip-delegation-stop-all")).toBeInTheDocument();
     expect(open[2]).toHaveTextContent("Review the parser");
-    expect(open[2]).toHaveTextContent("Review the parser · Waiting for your answer in its tab");
+    expect(open[2]).toHaveTextContent("Review the parser · Waiting for your answer in its workspace");
 
     fireEvent.click(within(open[0]).getByTestId("composer-strip-delegation-stop-all"));
     expect(onStop.mock.calls).toEqual([
@@ -165,6 +165,14 @@ describe("delegation occupant", () => {
         "Stopping…",
       );
     }
+  });
+
+  it("says the running children work in their own workspaces", () => {
+    render(<Harness messages={[card("c1", [delegated("child-1")]), card("c2", [claude()])]} />);
+    const [lead] = rows();
+    expect(lead).toHaveTextContent("Waiting on 2 subagents");
+    expect(lead).toHaveTextContent("working in their workspaces");
+    expect(lead).not.toHaveTextContent("tabs");
   });
 
   it("never counts the Stop all header as a pending item", () => {

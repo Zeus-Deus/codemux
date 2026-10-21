@@ -1522,7 +1522,7 @@ describe("MessageList usage limit", () => {
             agentType: "codex",
             description: "Add slugify helper",
             status: "running",
-            activity: "Working in its tab",
+            activity: "Working in its workspace",
             items: [],
             toneIndex: 0,
           },
@@ -1532,7 +1532,7 @@ describe("MessageList usage limit", () => {
     const cards = screen.getAllByTestId("delegation-card");
     expect(cards).toHaveLength(1);
     expect(screen.getAllByTestId("delegation-row")).toHaveLength(1);
-    expect(screen.getByTestId("delegation-row-line")).toHaveTextContent("Working in its tab");
+    expect(screen.getByTestId("delegation-row-line")).toHaveTextContent("Working in its workspace");
     expect(screen.queryByText("mcp__codemux__delegate_task")).toBeNull();
   });
 });
