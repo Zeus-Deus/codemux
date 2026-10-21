@@ -31,16 +31,20 @@ impl Ceiling {
         let (filesystem, approvals, plan) = match (provider, mode) {
             (Claude, "plan") | (Codex, "plan" | "read-only") => (0, 0, true),
             (Cursor | Grok, "ask") => (0, 0, false),
-            (Cursor | Grok | OpenCode, "plan") => (0, 0, true),
+            (Cursor | Grok, "plan") => (0, 0, true),
             (Claude, "default") => (1, 0, false),
             (Claude, "acceptEdits") | (Codex, "workspace-write") => (1, 1, false),
             (Claude, "bypassPermissions")
             | (Codex, "danger-full-access")
             | (Cursor | Grok, "agent") => (2, 2, false),
-            (Hermes, "default") => (1, 0, false),
-            (Hermes, "accept_edits") => (1, 1, false),
-            (Hermes, "dont_ask") => (2, 2, false),
-            (OpenCode, "default") => (1, 0, false),
+            // Hermes modes only choose file-edit approval; its terminal runs
+            // any command not on its dangerous-pattern list in every mode.
+            (Hermes, "default" | "accept_edits" | "dont_ask") => (2, 2, false),
+            // OpenCode agents allow every tool by default and Codemux applies
+            // no restriction of its own. Plan only denies edit tools; its
+            // shell can still write, so plan keeps full reach plus intent.
+            (OpenCode, "default") => (2, 2, false),
+            (OpenCode, "plan") => (2, 2, true),
             _ => return None,
         };
         Some(Self {
@@ -130,10 +134,9 @@ impl Ceiling {
             Cursor | Grok if self.plan => "plan",
             Cursor | Grok if self.filesystem == 2 && self.approvals == 2 => "agent",
             Cursor | Grok => "ask",
-            Hermes if !self.plan && self.filesystem >= 2 && self.approvals >= 2 => "dont_ask",
-            Hermes if !self.plan && self.filesystem >= 1 && self.approvals >= 1 => "accept_edits",
-            Hermes if !self.plan && self.filesystem >= 1 => "default",
-            OpenCode if !self.plan && self.filesystem >= 1 => "default",
+            Hermes if self.full_access() => "dont_ask",
+            OpenCode if self.full_access() => "default",
+            OpenCode if self.filesystem == 2 && self.approvals == 2 => "plan",
             _ => {
                 return Err(ControlError::new(
                     "unsupported_permission_ceiling",
@@ -237,5 +240,82 @@ mod all_provider_policy_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_reach_tests {
+    use super::*;
+    use ProviderKind::*;
+
+    fn mode(provider: ProviderKind, mode: &str) -> Ceiling {
+        Ceiling::for_mode(provider, Some(mode)).unwrap()
+    }
+
+    // OpenCode 2.0.29 gives every agent `{"*": allow}` and its plan agent adds
+    // only `edit: deny`, so the shell is open in both modes Codemux uses.
+    // Hermes's ACP modes choose file-edit approval only; its terminal asks
+    // just for dangerous-pattern commands (acp_adapter/server.py `_MODES`).
+    const UNRESTRICTED_SHELL: [(ProviderKind, &str); 5] = [
+        (OpenCode, "default"),
+        (OpenCode, "plan"),
+        (Hermes, "default"),
+        (Hermes, "accept_edits"),
+        (Hermes, "dont_ask"),
+    ];
+
+    #[test]
+    fn restricted_callers_cannot_start_an_unrestricted_shell() {
+        for (provider, parent) in [
+            (Claude, "default"),
+            (Claude, "acceptEdits"),
+            (Claude, "plan"),
+            (Codex, "read-only"),
+            (Codex, "workspace-write"),
+            (Cursor, "ask"),
+            (Cursor, "plan"),
+            (Grok, "ask"),
+        ] {
+            let caller = mode(provider, parent);
+            for (target, target_mode) in UNRESTRICTED_SHELL {
+                assert!(
+                    !caller.permits(mode(target, target_mode)),
+                    "{provider:?} {parent} must not start {target:?} {target_mode}"
+                );
+            }
+            assert!(caller.inherited(OpenCode).is_err(), "{provider:?} {parent}");
+            assert!(caller.inherited(Hermes).is_err(), "{provider:?} {parent}");
+        }
+    }
+
+    #[test]
+    fn full_access_callers_reach_every_unrestricted_shell() {
+        for (provider, parent) in [
+            (Claude, "bypassPermissions"),
+            (Codex, "danger-full-access"),
+            (Cursor, "agent"),
+            (Grok, "agent"),
+            (OpenCode, "default"),
+            (Hermes, "default"),
+        ] {
+            let caller = mode(provider, parent);
+            assert!(caller.full_access(), "{provider:?} {parent}");
+            for (target, target_mode) in UNRESTRICTED_SHELL {
+                assert!(caller.permits(mode(target, target_mode)));
+            }
+            assert_eq!(caller.inherited(OpenCode).unwrap(), "default");
+            assert_eq!(caller.inherited(Hermes).unwrap(), "dont_ask");
+        }
+    }
+
+    #[test]
+    fn opencode_plan_keeps_planning_intent_without_understating_its_shell() {
+        let plan = mode(OpenCode, "plan");
+        assert!(!plan.full_access());
+        assert_eq!(plan.inherited(OpenCode).unwrap(), "plan");
+        assert_eq!(plan.inherited(Claude).unwrap(), "plan");
+        assert!(plan.inherited(Hermes).is_err(), "Hermes has no plan mode");
+        assert!(!plan.permits(mode(OpenCode, "default")));
+        assert!(!mode(Claude, "plan").permits(plan));
     }
 }
