@@ -99,8 +99,14 @@ BINDIR="$REPO_ROOT/src-tauri/binaries"
 
 mkdir -p "$BINDIR"
 
-# Detect target triple. Honors CARGO_BUILD_TARGET when cross-compiling.
-TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
+# Detect target triple. Honors CARGO_BUILD_TARGET when cross-compiling. The
+# `tauri build` hooks use tauri's own triple so the stub and the staged binary
+# share one name; otherwise the bundle glob would also ship a stale stub.
+if [ "$MODE" = "build" ]; then
+  TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
+else
+  TARGET="${CARGO_BUILD_TARGET:-${TAURI_ENV_TARGET_TRIPLE:-$(rustc -vV | grep host | cut -d' ' -f2)}}"
+fi
 
 # Where cargo will put the artifact for this profile. Mirrors cargo's own
 # layout rules: CARGO_TARGET_DIR (if set) or <manifest dir>/target, plus a
@@ -118,6 +124,18 @@ case "$TARGET" in
 esac
 
 SRC="$OUT_DIR/codemux-remote$EXE"
+
+# `tauri build --target <triple>` passes --target to cargo, which then writes
+# target/<triple>/<profile> instead of target/<profile>, and the hook
+# environment does not say which one happened. Tauri's cargo pass has just
+# linked (or confirmed up to date) the one it built, so take the newer of the
+# two rather than a leftover from an earlier build.
+if [ "$MODE" = "stage" ] && [ -z "${CARGO_BUILD_TARGET:-}" ]; then
+  TRIPLE_SRC="$TARGET_DIR/$TARGET/$PROFILE/codemux-remote$EXE"
+  if [ -f "$TRIPLE_SRC" ] && { [ ! -f "$SRC" ] || [ "$TRIPLE_SRC" -nt "$SRC" ]; }; then
+    SRC="$TRIPLE_SRC"
+  fi
+fi
 DST="$BINDIR/codemux-remote-$TARGET$EXE"
 STAMP="$BINDIR/.codemux-remote-$TARGET.profile"
 

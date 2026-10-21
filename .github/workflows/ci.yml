@@ -168,6 +168,11 @@ jobs:
         shell: bash
         run: python3 -m unittest discover -s sidecar/managed-workflow -p test_hermes.py
 
+      - name: codemux-remote staging tests
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/build-codemux-remote.test.sh
+
       - name: TypeScript typecheck
         run: npm run check
 
