@@ -2692,6 +2692,15 @@ fn record_session_host(thread_id: &str, host_id: Option<i64>) {
         .insert(thread_id.to_string(), host_id);
 }
 
+/// Whether this process started `thread_id`'s session on a device.
+fn session_runs_on_device(thread_id: &str) -> bool {
+    session_hosts()
+        .lock()
+        .unwrap()
+        .get(thread_id)
+        .is_some_and(Option::is_some)
+}
+
 /// Whether the live session of `thread_id` runs somewhere other than
 /// `host_now`, the machine its workspace runs on now. A session this
 /// process never recorded is left alone.
@@ -6268,14 +6277,15 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
         return delegated;
     }
     // Claimed before the spawn so a worktree deletion that starts right
-    // after this call still finds the stop and waits for it.
+    // after this call still finds the stop and waits for it. A session that
+    // runs on a device works in the device's folder, so it claims none here.
     let db = app.try_state::<DatabaseStore>();
     let sessions = threads
         .iter()
         .map(|(_, id, _)| {
             let session = db.as_ref().and_then(|db| db.get_agent_chat_session(id));
             let (workspace_id, cwd) = session.map_or((None, None), |s| (Some(s.workspace_id), s.cwd));
-            (id.clone(), workspace_id, cwd)
+            (id.clone(), workspace_id, cwd.filter(|_| !session_runs_on_device(id)))
         })
         .collect();
     let (batch, stops) = crate::checkout_claims::begin_stops(sessions);
@@ -12986,6 +12996,36 @@ mod tests {
         assert!(waited, "workspace deletion completed before its agent stopped");
         assert!(retained_while_stopping, "worktree must exist while the agent is stopping");
         assert!(!worktree.exists(), "worktree should be removed after shutdown");
+    }
+
+    /// A session started on a device works in the device's folder: its
+    /// unconfirmed stop claims no local folder spelled the same, while a
+    /// local session's does.
+    #[tokio::test]
+    async fn a_device_sessions_unconfirmed_stop_claims_no_local_folder() {
+        if worktree_close_fixture_child("a_device_sessions_unconfirmed_stop_claims_no_local_folder") {
+            return;
+        }
+        let provider = Arc::new(PlacementProvider { fail_stop: true, ..Default::default() });
+        let (_repo, app, workspace, worktree) = worktree_close_app("local-chat", provider.clone()).await;
+        let handle = app.handle().clone();
+        let db = handle.state::<DatabaseStore>();
+        let cwd = worktree.display().to_string();
+        for thread in ["local-chat", "device-chat"] {
+            db.upsert_agent_chat_session(thread, &workspace, Some(&cwd), "codex").unwrap();
+            provider.live.lock().unwrap().insert(thread.into());
+        }
+        record_session_host("device-chat", Some(3));
+
+        let stops = shutdown_agent_chat_threads(&handle, vec![(ProviderKind::Codex, "device-chat".into())]);
+        assert!(crate::checkout_claims::wait_for(stops).await.is_err(), "its stop was not confirmed");
+        assert!(!crate::checkout_claims::held_in(&worktree));
+        assert_eq!(crate::checkout_claims::refuse_in(&worktree, None), Ok(()));
+
+        let stops = shutdown_agent_chat_threads(&handle, vec![(ProviderKind::Codex, "local-chat".into())]);
+        assert!(crate::checkout_claims::wait_for(stops).await.is_err());
+        assert!(crate::checkout_claims::held_in(&worktree));
+        session_hosts().lock().unwrap().remove("device-chat");
     }
 
     /// A chat child workspace under `parent_ws` in `cwd`, with a live chat

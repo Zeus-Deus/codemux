@@ -707,6 +707,13 @@ impl WorkspaceSnapshot {
         self.parent_workspace_id.is_some() && self.worktree_path.is_none()
     }
 
+    /// Operated in place on a remote host: its folders are host paths, so
+    /// they say nothing about this computer's files, even when spelled like
+    /// a local checkout.
+    pub fn is_remote_only(&self) -> bool {
+        self.attach_only && !self.is_local_import_snapshot_only()
+    }
+
     /// Legacy import shells were the only attach-only workspaces without a
     /// host id or remote cwd. Remote attach-in-place shells retain remote_cwd
     /// even on host reassignment. New layouts use explicit provenance so host

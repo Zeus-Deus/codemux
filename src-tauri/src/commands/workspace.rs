@@ -1321,7 +1321,8 @@ fn workspace_with_delegated_children(
 
 /// Refuse to delete the files at `root` while a live workspace other than
 /// `closing` still works inside them. The one guard for every file
-/// deletion, live or archived.
+/// deletion, live or archived. A remote-only workspace works on its host's
+/// files, whatever its paths look like.
 fn refuse_checkout_in_use(
     snapshot: &crate::state::AppStateSnapshot,
     root: &Path,
@@ -1330,7 +1331,7 @@ fn refuse_checkout_in_use(
     let users: Vec<&str> = snapshot
         .workspaces
         .iter()
-        .filter(|w| !closing.contains(&w.workspace_id.0))
+        .filter(|w| !closing.contains(&w.workspace_id.0) && !w.is_remote_only())
         .filter(|w| {
             crate::workspace_paths::path_within(Path::new(&w.cwd), root)
                 || w.worktree_path
@@ -4479,6 +4480,38 @@ mod archive_guard_tests {
             .unwrap();
         assert!(!std::path::Path::new(&worktree).exists());
         assert!(state.find_archived_workspace(&archive).is_none());
+    }
+
+    /// A workspace attached in place on a remote host names the host's
+    /// folders: it neither blocks deleting a local checkout spelled the same
+    /// nor claims that checkout while it closes. A local import shell is
+    /// attach-only too, but its folder is here, so it still counts.
+    #[test]
+    fn remote_only_workspaces_never_hold_a_local_checkout() {
+        let checkout = tempfile::tempdir().unwrap();
+        let path = checkout.path().display().to_string();
+        let store = AppStateStore::default();
+        let remote = store
+            .create_remote_attach_workspace("On host".into(), 7, path.clone(), None, None, None, None)
+            .0;
+        let child = AppStateStore::reserve_workspace_id();
+        store.create_chat_child_workspace(&child, &remote, &path, "Host review").unwrap();
+        assert!(store.find_workspace(&child.0).unwrap().is_remote_only(), "its chat inherits the host");
+        let snapshot = store.snapshot();
+        assert_eq!(refuse_checkout_in_use(&snapshot, checkout.path(), &[]), Ok(()));
+        let claim = crate::checkout_claims::claim_checkout(&store.find_workspace(&remote).unwrap());
+        assert!(!crate::checkout_claims::held_in(checkout.path()), "nothing local is claimed");
+        claim.release();
+
+        let mut import = store.find_workspace(&remote).unwrap();
+        (import.host_id, import.remote_cwd, import.imported_snapshot_only) = (None, None, Some(true));
+        assert!(!import.is_remote_only());
+        let claim = crate::checkout_claims::claim_checkout(&import);
+        assert!(crate::checkout_claims::held_in(checkout.path()));
+        claim.release();
+        let mut snapshot = store.snapshot();
+        snapshot.workspaces.push(import);
+        assert!(refuse_checkout_in_use(&snapshot, checkout.path(), &[]).is_err());
     }
 
     /// A chat child workspace borrows its parent's folder: closing it, by

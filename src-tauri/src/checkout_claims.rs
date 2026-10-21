@@ -78,9 +78,13 @@ pub(crate) struct CloseClaim {
     done: watch::Sender<Outcome>,
 }
 
+/// A remote-only workspace claims no folder here: its paths are its host's.
 pub(crate) fn claim_checkout(ws: &WorkspaceSnapshot) -> CloseClaim {
-    let mut paths = vec![PathBuf::from(&ws.cwd)];
-    paths.extend(ws.worktree_path.as_ref().map(PathBuf::from));
+    let mut paths = Vec::new();
+    if !ws.is_remote_only() {
+        paths.push(PathBuf::from(&ws.cwd));
+        paths.extend(ws.worktree_path.as_ref().map(PathBuf::from));
+    }
     claim_paths(paths)
 }
 
