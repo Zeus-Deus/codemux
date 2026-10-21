@@ -139,6 +139,27 @@
     --text-title: 1.3125rem;  /* 21px — the title of a whole page */
 }
 
+/*
+ * Motion. One decelerating curve for anything that opens, slides or pops
+ * (`ease-drawer`), on the 100 / 150 / 250ms ladder the UI token contract
+ * already enforces:
+ *   quick  100ms  exits, hover chrome
+ *   base   150ms  popovers, menus, disclosures, list rows
+ *   slow   250ms  dialogs and sheets
+ * Prefer transform and opacity. Height only animates for disclosures and
+ * never for longer than `base`: every frame of it is a layout pass, and
+ * WebKitGTK pays more for those than Chromium does. The TypeScript mirror
+ * for `motion/react` lives in `src/lib/motion.ts`.
+ */
+@theme {
+    --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+}
+:root {
+  --motion-quick: 100ms;
+  --motion-base: 150ms;
+  --motion-slow: 250ms;
+}
+
 :root {
     /* Keep the runtime choices one level below Tailwind's theme names.
      * `@theme inline` then compiles font-sans/font-mono utilities against
@@ -1368,30 +1389,15 @@ body.pane-resizing iframe {
  * other floating surfaces (popovers, hover cards, select lists): the theme
  * radius, one hairline border and the shared `--popup-shadow` elevation (see
  * "Control craft"). Rows inside use a 4px inset and a radius 4px tighter
- * than the surface, so the highlight sits concentric with the corner. */
-@keyframes cm-menu-in {
-  from {
-    opacity: 0;
-    transform: translateY(-4px) scale(0.985);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
-
+ * than the surface, so the highlight sits concentric with the corner.
+ *
+ * Enter/exit motion is not set here: the menu primitives carry the shared
+ * `POP_MOTION` classes (src/lib/motion.ts), so menus open and close exactly
+ * like popovers and tooltips. */
 .cm-menu-surface,
 .cm-menu-surface-sub {
   border-radius: var(--radius);
   box-shadow: var(--popup-shadow);
-  animation: cm-menu-in 0.14s ease-out;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .cm-menu-surface,
-  .cm-menu-surface-sub {
-    animation: none;
-  }
 }
 
 /* A lone chat's transcript scrolls under the floating titlebar, but text

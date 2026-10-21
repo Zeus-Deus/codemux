@@ -1,6 +1,7 @@
 import * as React from "react"
 import { DropdownMenu as DropdownMenuPrimitive } from "radix-ui"
 
+import { POP_MOTION } from "@/lib/motion"
 import { cn } from "@/lib/utils"
 import { CheckIcon, ChevronRightIcon } from "lucide-react"
 
@@ -45,7 +46,7 @@ function DropdownMenuContent({
         sideOffset={sideOffset}
         align={align}
         collisionPadding={collisionPadding}
-        className={cn("cm-menu-surface thin-scrollbar z-50 max-h-(--radix-dropdown-menu-content-available-height) max-w-(--radix-dropdown-menu-content-available-width) w-(--radix-dropdown-menu-trigger-width) min-w-32 origin-(--radix-dropdown-menu-content-transform-origin) overflow-x-hidden overflow-y-auto border border-border p-1 text-popover-foreground data-[state=closed]:overflow-hidden bg-popover **:data-[slot$=-item]:focus:bg-surface-2 **:data-[slot$=-item]:data-highlighted:bg-surface-3 **:data-[slot$=-trigger]:focus:bg-surface-2 **:data-[slot$=-trigger]:aria-expanded:bg-surface-3! **:data-[variant=destructive]:focus:bg-surface-2! **:data-[variant=destructive]:text-accent-foreground! **:data-[variant=destructive]:**:text-accent-foreground!", className )}
+        className={cn(POP_MOTION, "cm-menu-surface thin-scrollbar z-50 max-h-(--radix-dropdown-menu-content-available-height) max-w-(--radix-dropdown-menu-content-available-width) w-(--radix-dropdown-menu-trigger-width) min-w-32 origin-(--radix-dropdown-menu-content-transform-origin) overflow-x-hidden overflow-y-auto border border-border p-1 text-popover-foreground data-[state=closed]:overflow-hidden bg-popover **:data-[slot$=-item]:focus:bg-surface-2 **:data-[slot$=-item]:data-highlighted:bg-surface-3 **:data-[slot$=-trigger]:focus:bg-surface-2 **:data-[slot$=-trigger]:aria-expanded:bg-surface-3! **:data-[variant=destructive]:focus:bg-surface-2! **:data-[variant=destructive]:text-accent-foreground! **:data-[variant=destructive]:**:text-accent-foreground!", className )}
         {...props}
       />
     </DropdownMenuPrimitive.Portal>
@@ -248,7 +249,7 @@ function DropdownMenuSubContent({
     <DropdownMenuPrimitive.SubContent
       data-slot="dropdown-menu-sub-content"
       collisionPadding={collisionPadding}
-      className={cn("cm-menu-surface-sub thin-scrollbar z-50 max-h-(--radix-dropdown-menu-content-available-height) max-w-(--radix-dropdown-menu-content-available-width) min-w-[96px] origin-(--radix-dropdown-menu-content-transform-origin) overflow-x-hidden overflow-y-auto border border-border p-1 text-popover-foreground bg-popover **:data-[slot$=-item]:focus:bg-surface-2 **:data-[slot$=-item]:data-highlighted:bg-surface-3 **:data-[slot$=-trigger]:focus:bg-surface-2 **:data-[slot$=-trigger]:aria-expanded:bg-surface-3! **:data-[variant=destructive]:focus:bg-surface-2! **:data-[variant=destructive]:text-accent-foreground! **:data-[variant=destructive]:**:text-accent-foreground!", className )}
+      className={cn(POP_MOTION, "cm-menu-surface-sub thin-scrollbar z-50 max-h-(--radix-dropdown-menu-content-available-height) max-w-(--radix-dropdown-menu-content-available-width) min-w-[96px] origin-(--radix-dropdown-menu-content-transform-origin) overflow-x-hidden overflow-y-auto border border-border p-1 text-popover-foreground bg-popover **:data-[slot$=-item]:focus:bg-surface-2 **:data-[slot$=-item]:data-highlighted:bg-surface-3 **:data-[slot$=-trigger]:focus:bg-surface-2 **:data-[slot$=-trigger]:aria-expanded:bg-surface-3! **:data-[variant=destructive]:focus:bg-surface-2! **:data-[variant=destructive]:text-accent-foreground! **:data-[variant=destructive]:**:text-accent-foreground!", className )}
       {...props}
     />
   )

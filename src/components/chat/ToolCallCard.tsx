@@ -11,6 +11,7 @@ import {
   X,
 } from "lucide-react";
 
+import { Collapse } from "@/components/ui/collapse";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import {
@@ -42,7 +43,6 @@ import type { ApprovalDecision } from "@/tauri/events";
 
 import { formatActivityDuration, stepDurationMs } from "./activity-steps";
 import { useChatProvider } from "./chat-provider-context";
-import { Reveal } from "./Reveal";
 import { StepElapsed } from "./StepElapsed";
 import { ToolCallBlock } from "./ToolCallBlock";
 import { ToolCallBody } from "./ToolCallBodies";
@@ -254,7 +254,7 @@ export const ToolCallCard = memo(function ToolCallCard({
         <button
           type="button"
           aria-expanded={expanded}
-          // Reveal mounts the body on first open; point at it only then.
+          // Collapse mounts the body on first open; point at it only then.
           aria-controls={expanded ? bodyId : undefined}
           onClick={() => setExpanded((v) => !v)}
           className={cn(
@@ -314,11 +314,11 @@ export const ToolCallCard = memo(function ToolCallCard({
 
       {/* Result body when expanded — known tools get a polished
           renderer, unknown tools fall back to the raw JSON dump. */}
-      <Reveal open={showBody} id={bodyId}>
+      <Collapse open={showBody} id={bodyId} keepMounted>
         <div className="border-t border-border/60 px-3 py-2.5">
           <ToolCallBody item={item} />
         </div>
-      </Reveal>
+      </Collapse>
     </div>
   );
 });

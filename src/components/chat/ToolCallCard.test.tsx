@@ -58,7 +58,7 @@ function makePendingApproval(
   };
 }
 
-/** The `data-state` each Reveal held before it changed while `run` ran. A
+/** The `data-state` each Collapse held before it changed while `run` ran. A
  *  body mounted already open never changes, so it records nothing. */
 function revealStatesBefore(run: () => void): (string | null)[] {
   const observer = new MutationObserver(() => {});
@@ -87,7 +87,7 @@ describe("ToolCallCard", () => {
       />,
     );
     const toggle = screen.getByRole("button", { expanded: false });
-    // Reveal commits a freshly opened body collapsed, then flips it open,
+    // Collapse commits a freshly opened body collapsed, then flips it open,
     // so the height eases in instead of landing in one frame.
     expect(revealStatesBefore(() => fireEvent.click(toggle))).toEqual(["closed"]);
     const body = document.getElementById(toggle.getAttribute("aria-controls") ?? "");

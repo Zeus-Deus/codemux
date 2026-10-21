@@ -1,6 +1,7 @@
 import * as React from "react"
 import { ContextMenu as ContextMenuPrimitive } from "radix-ui"
 
+import { POP_MOTION } from "@/lib/motion"
 import { cn } from "@/lib/utils"
 import { ChevronRightIcon, CheckIcon } from "lucide-react"
 
@@ -70,7 +71,7 @@ function ContextMenuContent({
       <ContextMenuPrimitive.Content
         data-slot="context-menu-content"
         collisionPadding={collisionPadding}
-        className={cn("cm-menu-surface thin-scrollbar z-50 max-h-(--radix-context-menu-content-available-height) max-w-(--radix-context-menu-content-available-width) min-w-36 origin-(--radix-context-menu-content-transform-origin) overflow-x-hidden overflow-y-auto border border-border p-1 text-popover-foreground bg-popover **:data-[slot$=-item]:focus:bg-surface-2 **:data-[slot$=-item]:data-highlighted:bg-surface-3 **:data-[slot$=-trigger]:focus:bg-surface-2 **:data-[slot$=-trigger]:aria-expanded:bg-surface-3! **:data-[variant=destructive]:focus:bg-surface-2! **:data-[variant=destructive]:text-accent-foreground! **:data-[variant=destructive]:**:text-accent-foreground!", className )}
+        className={cn(POP_MOTION, "cm-menu-surface thin-scrollbar z-50 max-h-(--radix-context-menu-content-available-height) max-w-(--radix-context-menu-content-available-width) min-w-36 origin-(--radix-context-menu-content-transform-origin) overflow-x-hidden overflow-y-auto border border-border p-1 text-popover-foreground bg-popover **:data-[slot$=-item]:focus:bg-surface-2 **:data-[slot$=-item]:data-highlighted:bg-surface-3 **:data-[slot$=-trigger]:focus:bg-surface-2 **:data-[slot$=-trigger]:aria-expanded:bg-surface-3! **:data-[variant=destructive]:focus:bg-surface-2! **:data-[variant=destructive]:text-accent-foreground! **:data-[variant=destructive]:**:text-accent-foreground!", className )}
         {...props}
       />
     </ContextMenuPrimitive.Portal>
@@ -133,7 +134,7 @@ function ContextMenuSubContent({
     <ContextMenuPrimitive.SubContent
       data-slot="context-menu-sub-content"
       collisionPadding={collisionPadding}
-      className={cn("cm-menu-surface-sub thin-scrollbar z-50 max-h-(--radix-context-menu-content-available-height) max-w-(--radix-context-menu-content-available-width) min-w-32 origin-(--radix-context-menu-content-transform-origin) overflow-x-hidden overflow-y-auto border border-border p-1 text-popover-foreground bg-popover **:data-[slot$=-item]:focus:bg-surface-2 **:data-[slot$=-item]:data-highlighted:bg-surface-3 **:data-[slot$=-trigger]:focus:bg-surface-2 **:data-[slot$=-trigger]:aria-expanded:bg-surface-3! **:data-[variant=destructive]:focus:bg-surface-2! **:data-[variant=destructive]:text-accent-foreground! **:data-[variant=destructive]:**:text-accent-foreground!", className )}
+      className={cn(POP_MOTION, "cm-menu-surface-sub thin-scrollbar z-50 max-h-(--radix-context-menu-content-available-height) max-w-(--radix-context-menu-content-available-width) min-w-32 origin-(--radix-context-menu-content-transform-origin) overflow-x-hidden overflow-y-auto border border-border p-1 text-popover-foreground bg-popover **:data-[slot$=-item]:focus:bg-surface-2 **:data-[slot$=-item]:data-highlighted:bg-surface-3 **:data-[slot$=-trigger]:focus:bg-surface-2 **:data-[slot$=-trigger]:aria-expanded:bg-surface-3! **:data-[variant=destructive]:focus:bg-surface-2! **:data-[variant=destructive]:text-accent-foreground! **:data-[variant=destructive]:**:text-accent-foreground!", className )}
       {...props}
     />
   )
