@@ -120,6 +120,11 @@ export async function run(ctx) {
     ctx.check(`child "${title}": coordinator's folder, no worktree, same project`,
       child.cwd === coordinator.cwd && child.worktree_path == null && child.project_root === coordinator.project_root,
       { cwd: child.cwd, worktree_path: child.worktree_path, project_root: child.project_root });
+    // Opening it must show its chat, not the empty-workspace screen.
+    const tab = child.tabs.find((t) => t.tab_id === child.active_tab_id);
+    ctx.check(`child "${title}": its chat is selected inside it`,
+      !!tab && tab.surface_id === child.active_surface_id && child.surfaces.some((s) => s.surface_id === child.active_surface_id),
+      { active_tab_id: child.active_tab_id, active_surface_id: child.active_surface_id });
     ctx.observe(`child ${title}`, { id: child.workspace_id, tabs: child.tabs.map((t) => t.title) });
   }
   const launched = children.filter((w) => w.title !== TITLES.delegated);

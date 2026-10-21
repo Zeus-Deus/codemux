@@ -2561,6 +2561,10 @@ async fn native_launch_without_workspace_gets_its_own_titled_child_workspace() {
         assert_eq!(ws.tabs.len(), 1);
         assert_eq!(ws.tabs[0].title, title);
         assert_eq!(ws.surfaces[0].title, title);
+        // Its chat is selected inside it, so opening it shows the chat.
+        assert_eq!(ws.active_tab_id, ws.tabs[0].tab_id);
+        assert_eq!(ws.active_surface_id, ws.surfaces[0].surface_id);
+        assert_eq!(ws.tabs[0].surface_id.as_ref(), Some(&ws.active_surface_id));
         let thread = outcome["thread_id"].as_str().unwrap();
         let record = app.state::<crate::database::DatabaseStore>().get_agent_chat_session(thread).unwrap();
         assert_eq!(record.workspace_id, child);

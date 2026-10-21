@@ -506,6 +506,11 @@ mod delegation {
         assert_eq!(ws.project_root, after.project_root);
         assert_eq!(ws.tabs.len(), 1);
         assert_eq!(ws.tabs[tab_index(&state, &ws, &child)].title, "Codex · Add slugify helper");
+        // Its first chat is selected inside it, so opening it shows the chat.
+        let child_surface = ws.surfaces.iter().find(|s| s.active_pane_id.0 == child_pane).unwrap();
+        assert_eq!(ws.active_surface_id, child_surface.surface_id);
+        assert_eq!(ws.active_tab_id, ws.tabs[0].tab_id);
+        assert_eq!(ws.tabs[0].surface_id.as_ref(), Some(&ws.active_surface_id));
         assert_eq!(
             state.agent_chat_pane_thread(&child_pane),
             Some((ProviderKind::Codex, child.clone()))

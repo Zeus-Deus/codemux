@@ -3220,7 +3220,16 @@ impl AppStateStore {
         )?;
         snapshot.active_workspace_id = active_workspace_id;
         let workspace = &mut snapshot.workspaces[index];
-        (workspace.active_tab_id, workspace.active_surface_id) = focus;
+        // Keep the workspace's own selection too, unless it had none: the
+        // first chat in an empty workspace stays selected, or opening the
+        // workspace would show nothing.
+        let (tab, surface) = focus;
+        if workspace.tabs.iter().any(|t| t.tab_id == tab) {
+            workspace.active_tab_id = tab;
+        }
+        if workspace.surfaces.iter().any(|s| s.surface_id == surface) {
+            workspace.active_surface_id = surface;
+        }
         if !created {
             return Ok(pane_id);
         }
@@ -10571,6 +10580,28 @@ mod tests {
             .unwrap();
         assert_eq!(active_tab.surface_id.as_ref(), Some(&bound_surface));
         assert_eq!(snapshot.active_workspace_id.0, workspace_id.0);
+    }
+
+    #[test]
+    fn create_background_chat_tab_selects_the_first_chat_of_an_empty_workspace() {
+        use crate::agent_provider::ProviderKind;
+
+        let store = AppStateStore::default();
+        let desktop = store.snapshot().active_workspace_id.clone();
+        let child = AppStateStore::reserve_workspace_id();
+        store
+            .create_chat_child_workspace(&child, &desktop.0, "/repo", "Add slugify helper")
+            .unwrap();
+        let pane = store
+            .create_background_chat_tab(&child.0, ProviderKind::Codex, Some("/repo".into()), "child-thread", "parent-thread", &[], "Codex · Add slugify helper")
+            .unwrap();
+
+        assert_eq!(store.snapshot().active_workspace_id, desktop, "the desktop stays where it was");
+        let ws = store.find_workspace(&child.0).unwrap();
+        let surface = ws.surfaces.iter().find(|s| s.active_pane_id == pane).unwrap();
+        assert_eq!(ws.active_surface_id, surface.surface_id);
+        let tab = ws.tabs.iter().find(|t| t.tab_id == ws.active_tab_id).unwrap();
+        assert_eq!(tab.surface_id.as_ref(), Some(&surface.surface_id));
     }
 
     /// A delegated chat opens as its own tab right after the chat that
