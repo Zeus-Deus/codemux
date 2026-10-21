@@ -471,7 +471,14 @@ export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
             // previous-width bookkeeping.
             style={maximized ? undefined : { width: effectiveRightPanelWidth }}
           >
-            <LazyBoundary label="right panel" className="h-full">
+            {/* The column takes its width in one frame (tweening it would
+                reflow the transcript and refit every terminal on each
+                frame), so only the panel's content eases in, clipped by
+                the column. */}
+            <LazyBoundary
+              label="right panel"
+              className="h-full animate-in fade-in-0 slide-in-from-right-2 duration-150 ease-drawer"
+            >
               <RightPanel
                 workspace={activeWorkspace}
                 activeTab={rightPanelTab}
