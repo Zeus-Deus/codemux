@@ -4,18 +4,23 @@
 // titled with the task, while the populated, protected main checkout stays
 // as it was. Then the coordinator's checkout cannot be deleted while the
 // launched chats use it, and closing the coordinator closes the delegated
-// chat's workspace but not the launched ones.
+// chat's workspace but not the launched ones. Last, with the checkout
+// reopened as its own workspace and both launched agents busy in it, their
+// workspaces close first and the checkout is deleted at once: the delete
+// must wait for those agents to stop (or refuse), never remove the files
+// under them.
 //
 // Run it on a restarted root (up.sh, down.sh, up.sh <root>): the seeded
 // checkout is stamped protected by the boot-time backfill.
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 
 export const name = "child-workspaces";
 export const description =
   "A worktree coordinator calls thread_launch twice without a workspace and delegate_task once; " +
   "assert three titled child workspaces nested under it and an unchanged protected main checkout; " +
-  "deleting the coordinator's checkout refuses, and closing it closes only the delegated child.";
+  "deleting the coordinator's checkout refuses, and closing it closes only the delegated child; " +
+  "deleting the checkout right after busy launched chats closed waits for their agents.";
 
 const CLAUDE_MODEL = process.env.ORCH_LIVE_CLAUDE_MODEL ?? "claude-haiku-4-5";
 const CODEX_MODEL = process.env.ORCH_LIVE_CODEX_MODEL ?? "gpt-6-luna";
@@ -53,6 +58,23 @@ async function startChat(ctx, { workspaceId, cwd, provider, model, effort = null
   return { threadId, paneId };
 }
 
+const BRANCH = "optimize-ci-threads";
+// A unique duration, so only these agents' commands match.
+const SLEEP = "time.sleep(240.0137)";
+
+/** Pids of this scenario's long-running agent commands, from /proc. */
+function sleepers() {
+  return readdirSync("/proc").filter((pid) => {
+    if (!/^\d+$/.test(pid)) return false;
+    try {
+      const args = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+      return /python/.test(args[0]) && args.some((arg) => arg.includes(SLEEP));
+    } catch {
+      return false;
+    }
+  });
+}
+
 const workspaces = async (ctx) => (await ctx.codemux("get_app_state", {})).workspaces;
 const layoutOf = (ws) => JSON.stringify({ tabs: ws.tabs, surfaces: ws.surfaces, title: ws.title });
 
@@ -61,7 +83,7 @@ export async function run(ctx) {
   // The main checkout already holds an unrelated chat.
   await startChat(ctx, { workspaceId: rootId, cwd: ctx.env.REPO, provider: "claude", model: CLAUDE_MODEL });
   const created = await ctx.codemux("create_worktree_workspace", {
-    repo_path: ctx.env.REPO, branch: "optimize-ci-threads", new_branch: true, base: "main",
+    repo_path: ctx.env.REPO, branch: BRANCH, new_branch: true, base: "main",
   });
   const coordinatorId = created?.data?.workspace_id ?? created?.workspace_id;
   const coordinator = (await workspaces(ctx)).find((w) => w.workspace_id === coordinatorId);
@@ -153,4 +175,64 @@ export async function run(ctx) {
     layoutOf(remaining.find((w) => w.workspace_id === rootId)) === rootBefore);
   await ctx.driver.clickSelector('[aria-label="Projects view"]').catch(() => {});
   await ctx.shot("child-workspaces-after-parent-close");
+
+  // A chat child workspace closed first can still be stopping its agent
+  // when the checkout's own workspace deletes the files.
+  const launchedSessions = sessions.filter((s) => launched.some((w) => w.workspace_id === s.workspace_id));
+  // From the store: conversation_read only reaches the harness workspace.
+  for (const s of launchedSessions) {
+    await ctx.waitFor(async () => (await ctx.assert.sql(
+      `SELECT 1 FROM agent_chat_search WHERE thread_id = '${s.thread_id}' AND role = 'assistant' AND content LIKE '%READY%'`,
+    )).length > 0 || null, { timeout: 300_000, label: `${s.provider} launched chat replied` });
+  }
+  const reopened = await ctx.codemux("create_worktree_workspace", {
+    repo_path: ctx.env.REPO, branch: BRANCH, new_branch: false,
+  });
+  const ownerId = reopened?.data?.workspace_id ?? reopened?.workspace_id;
+  const owner = (await workspaces(ctx)).find((w) => w.workspace_id === ownerId);
+  ctx.check("the checkout reopened as its own workspace",
+    owner?.worktree_path === coordinator.worktree_path && owner.parent_workspace_id == null,
+    owner && { id: ownerId, worktree_path: owner.worktree_path, parent: owner.parent_workspace_id });
+  const busy = `Run this exact shell command with your shell tool and wait for it to finish: python3 -c 'import time; ${SLEEP}'. Then reply DONE.`;
+  for (const s of launchedSessions) {
+    await ctx.driver.invoke("agent_chat_send_turn", {
+      provider: s.provider,
+      input: {
+        thread_id: s.thread_id, text: busy, display_text: busy, skill_ids: [],
+        skill_text: null, include_plugins: true, images: [], model_override: null,
+        effort_override: s.provider === "codex" ? "low" : null, permission_mode_override: null,
+      },
+    });
+  }
+  await ctx.waitFor(() => (sleepers().length >= launchedSessions.length ? true : null),
+    { timeout: 240_000, interval: 2_000, label: "both launched agents running their command" });
+  const busyPids = sleepers();
+
+  const closing = Date.now();
+  for (const w of launched) {
+    await ctx.driver.invoke("close_workspace", { workspaceId: w.workspace_id, forceDelete: false });
+  }
+  const closedMs = Date.now() - closing;
+  const runningAtDelete = sleepers();
+  const deleting = Date.now();
+  const deleted = await ctx.codemux("close_workspace", {
+    workspace_id: ownerId, delete_worktree: true, force_delete: true,
+  }).then(() => ({ ok: true }), (error) => ({ ok: false, error: error.message }));
+  const deleteMs = Date.now() - deleting;
+  const left = sleepers();
+  ctx.observe("closed-first delete", {
+    busyPids, closedMs, runningAtDelete, deleteMs, deleted, commandsLeftAfterDelete: left,
+  });
+  const gone = (await workspaces(ctx))
+    .filter((w) => [ownerId, ...launched.map((l) => l.workspace_id)].includes(w.workspace_id));
+  ctx.check("the closed chats' and the checkout's workspaces are gone", gone.length === 0, gone.map((w) => w.title));
+  if (deleted.ok) {
+    ctx.check("the delete removed the files", !existsSync(onHost), { deleteMs });
+    ctx.check("no closed chat's command still runs in the deleted checkout", left.length === 0, left);
+  } else {
+    ctx.check("the delete refused for an agent still stopping and kept the files",
+      /still stopping|did not confirm|did not stop/.test(deleted.error) && existsSync(onHost), deleted);
+  }
+  await ctx.driver.clickSelector('[aria-label="Projects view"]').catch(() => {});
+  await ctx.shot("child-workspaces-after-closed-first-delete");
 }
