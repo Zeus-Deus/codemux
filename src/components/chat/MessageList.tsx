@@ -1774,7 +1774,7 @@ function LegacyDelegationResult({ text }: { text: string }) {
     <div data-testid="legacy-delegation-result-row" className="px-2 py-1.5 text-caption text-muted-foreground">
       <button type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)} className="inline-flex items-center gap-1.5 rounded-sm hover:text-foreground focus-visible:outline-ring">
         Delegated results
-        <ChevronDown className={cn("size-3 transition-transform", open && "rotate-180")} aria-hidden />
+        <ChevronDown className={cn("size-3 transition-transform duration-150", open && "rotate-180")} aria-hidden />
       </button>
       {open && <div data-testid="legacy-delegation-report" className="mt-2 max-h-80 overflow-y-auto select-text whitespace-pre-wrap break-words text-body-sm">
         {tasks.length ? <ul className="space-y-3">{tasks.map((task, index) => <li key={index}>

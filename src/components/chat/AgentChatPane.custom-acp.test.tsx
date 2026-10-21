@@ -9,6 +9,7 @@ import { useCustomAcp } from "@/stores/custom-acp-store";
 import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
 import type { AcpCatalog } from "@/tauri/custom-acp";
 import type { AgentChatSessionRecord } from "@/tauri/commands";
+import type { DurableTaskContext } from "@/lib/agent-chat/durable-tasks";
 import { materializeAndSend, materializeWithPreset, type MaterializeActions } from "@/lib/agent-chat/materialize";
 import type { ChatDraft } from "@/stores/chat-draft-store";
 import type { TerminalPreset } from "@/tauri/types";
@@ -66,6 +67,8 @@ beforeEach(() => {
         startedDraft = true; return args!.input.thread_id;
       }
       case "agent_chat_get_session": return record;
+      case "delegation_local_context": return { tasks: [], origin: null } satisfies DurableTaskContext;
+      case "agent_chat_list_queued_turns": return [];
       case "agent_chat_list_messages_tail": return { rows: [], total_rows: 0, complete: true };
       case "agent_chat_thread_head_id": return null;
       case "agent_chat_turn_active": return false;
@@ -80,6 +83,22 @@ beforeEach(() => {
   });
 });
 afterEach(cleanup);
+it("keeps the ACP composer usable when optional task and saved queue commands are unavailable", async () => {
+  const fallback = invoke.getMockImplementation()!;
+  invoke.mockImplementation(async (cmd: string, args?: Record<string, any>) => {
+    if (cmd === "delegation_local_context" || cmd === "agent_chat_list_queued_turns") {
+      throw new Error(`Unavailable command: ${cmd}`);
+    }
+    return fallback(cmd, args);
+  });
+  useAgentChatStore.getState().ensureThread(record.thread_id);
+  useAgentChatStore.getState().setInputDraft(record.thread_id, "Retain draft without optional context");
+  render(<TooltipProvider><AgentChatPane pane={pane} /></TooltipProvider>);
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("delegation_local_context", { threadId: record.thread_id }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("agent_chat_list_queued_turns", { threadId: record.thread_id }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+  expect(screen.getByRole("textbox")).toHaveValue("Retain draft without optional context");
+});
 it.each(["ultrathink", null])("sends unchanged ACP text and attachments after native-contract history restores effort %s", async effort => {
   // Null is valid startup intent; native readback still reports the harness's
   // accepted thought-level default in its history row and catalog.
