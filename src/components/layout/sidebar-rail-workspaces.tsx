@@ -130,7 +130,7 @@ function RailWorkspaceItem({
             "relative flex size-7 items-center justify-center rounded-lg border duration-150",
             "transition-[color,background-color,border-color,opacity] duration-150",
             isActive
-              ? "border-border bg-surface-3"
+              ? "border-transparent bg-sidebar-accent"
               : "border-transparent hover:bg-surface-2",
             // The status dot inherits the dim along with the avatar, which is
             // the point: a quietly-working button should read as quieter as a

@@ -261,7 +261,7 @@ const ProjectRow = memo(function ProjectRow({
               "group/row flex h-8 min-w-0 cursor-pointer items-center gap-2 rounded-lg px-2",
               "[content-visibility:auto] [contain-intrinsic-size:auto_32px]",
               "outline-none transition-colors duration-150 hover:bg-surface-2 focus-visible:bg-surface-2",
-              isActive && "bg-surface-3",
+              isActive && "bg-sidebar-accent",
             )}
           >
             <StatusGlyph status={status} snoozed={parked === "snoozed"} />

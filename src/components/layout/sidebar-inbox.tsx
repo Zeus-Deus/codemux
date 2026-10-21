@@ -537,7 +537,7 @@ const SettledRow = memo(function SettledRow({
         // scroll position can't drift as rows are realised.
         "[content-visibility:auto] [contain-intrinsic-size:auto_30px]",
         "outline-none transition-colors duration-150 hover:bg-surface-2 focus-visible:bg-surface-2",
-        isActive && "bg-surface-3",
+        isActive && "bg-sidebar-accent",
         selected && "bg-surface-3 ring-1 ring-inset ring-border",
         justSettled && "rise-in",
       )}
@@ -773,7 +773,7 @@ const SnoozeRow = memo(function SnoozeRow({
           // hint — 30px exactly, no margin.
           "[content-visibility:auto] [contain-intrinsic-size:auto_30px]",
           "outline-none transition-colors duration-150 hover:bg-surface-2 focus-visible:bg-surface-2",
-          isActive && "bg-surface-3",
+          isActive && "bg-sidebar-accent",
           selected && "bg-surface-3 ring-1 ring-inset ring-border",
         )}
       >
