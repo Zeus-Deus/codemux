@@ -562,6 +562,7 @@ impl ClaudeSession {
                     collect_mcp_tools(
                         mcp_registry.as_ref(),
                         &crate::mcp::registry::HostCaller {
+                            control: None,
                             thread_id: thread_id.0.clone(),
                             provider: crate::agent_provider::ProviderKind::Claude,
                             workspace_id: input.workspace_id.clone(),
@@ -663,7 +664,7 @@ impl ClaudeSession {
                 mcp_registry
             },
             workspace_id: input.workspace_id.clone(),
-            native_authority: crate::delegation::authority::NativeAuthority::new(&thread_id.0),
+            native_authority: crate::delegation::authority::NativeAuthority::with_policy(&thread_id.0,crate::agent_provider::ProviderKind::Claude,input.permission_mode.as_deref()),
             managed_diagnostics: input
                 .extra
                 .get("managedDiagnostics")
@@ -1489,7 +1490,8 @@ impl ClaudeSession {
             images: encoded_images,
         };
         if let Some(checkpoint) = &checkpoint { checkpoint.authorize_dispatch()?; }
-        let generation = self.native_authority.begin();
+        let stop_generation = checkpoint.as_ref().map(|c| c.native_stop_generation()).transpose()?.unwrap_or(0);
+        let generation = self.native_authority.begin(stop_generation);
         let turn_id = TurnId(format!("claude-turn-{}", uuid::Uuid::new_v4()));
         {
             let mut state = self.state.lock().await;
@@ -1556,6 +1558,7 @@ impl ClaudeSession {
     /// This session as a host-tool caller, with its current permission mode.
     async fn host_caller(&self) -> crate::mcp::registry::HostCaller {
         crate::mcp::registry::HostCaller {
+            control: None,
             thread_id: self.thread_id.0.clone(),
             provider: crate::agent_provider::ProviderKind::Claude,
             workspace_id: self.workspace_id.clone(),
@@ -1683,6 +1686,8 @@ impl ClaudeSession {
                 message: "managed workflow tool permissions cannot be relaxed".into(),
             });
         }
+        let _transition = (self.state.lock().await.permission_mode.as_deref() != Some(&mode))
+            .then(|| self.native_authority.policy_transition());
         let params = SetPermissionModeParams {
             thread_id: self.thread_id.0.clone(),
             mode: mode.clone(),
@@ -1697,6 +1702,7 @@ impl ClaudeSession {
                 message: format!("set-permission-mode RPC failed: {e}"),
             })?;
         let mut state = self.state.lock().await;
+        self.native_authority.set_policy(crate::agent_provider::ProviderKind::Claude, Some(&mode));
         state.permission_mode = Some(mode);
         Ok(())
     }
@@ -2181,6 +2187,7 @@ fn spawn_incoming_requests_task(
                                 permit: session.native_authority.capture(),
                             }
                         };
+                        let callback_permit = actor.permit.clone();
                         let job = tokio::spawn(async move {
                             // The SDK can call tools before send-turn acknowledges.
                             // Wait only for this captured generation to bind.
@@ -2189,7 +2196,7 @@ fn spawn_incoming_requests_task(
                             }
                             handle_mcp_tool_call(session_for_task, event_tx_for_task, req.params, actor).await
                         });
-                        session.native_authority.track(job.abort_handle());
+                        session.native_authority.track(&callback_permit, job.abort_handle());
                         // Stop cancels tool work, never the obligation to answer
                         // the sidecar's RPC, including immediate track rejection.
                         let sidecar = session.sidecar.clone();
@@ -2378,6 +2385,7 @@ async fn collect_shared_tools_for_claude(
             caller.workspace_id.as_deref(),
         )
         .await;
+    tools.retain(|tool| crate::mcp::registry::native_tool_visible(tool, caller));
     let host_tools=registry.host_tools(caller);
     // App-owned task tools also serve local IDs; replace the SSH-only schema
     // rather than publishing duplicate names to the native provider.
@@ -2501,7 +2509,7 @@ async fn run_mcp_tool_call(
 
     // Host tools precede child dispatch. The caller carries the LIVE permission mode, so a
     // Plan/Ask pill flipped after the session started is honoured.
-    if let Some(result) = registry.host_call_native(caller, prefixed_name, &arguments, None, None, actor.as_ref().map(|actor| &actor.permit)).await {
+    if let Some(result) = registry.host_call_native(caller, prefixed_name, &arguments, None, None, actor.as_ref()).await {
         return (result, None);
     }
 
@@ -2710,6 +2718,43 @@ async fn mutate_state_from_notification(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn review600_mid_turn_permission_change_allows_new_mcp_callbacks() {
+        let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("fake_claude_sidecar");
+        assert!(binary.exists(), "build the fake_claude_sidecar test fixture first");
+        for mode in ["bypassPermissions", "plan"] {
+            let thread = ThreadId(format!("review600-mode-{mode}"));
+            let (tx, _) = broadcast::channel(128);
+            let input = serde_json::from_value(json!({"thread_id":thread,"cwd":std::env::temp_dir(),"permission_mode":"default","additional_directories":[]})).unwrap();
+            let session = ClaudeSession::spawn_and_initialize(thread.clone(), input, ClaudeSpawnConfig {sidecar_binary:binary.clone(),claude_binary:"claude".into(),mcp_registry:None}, tx).await.unwrap();
+            let generation = session.native_authority.begin(9);
+            assert!(session.native_authority.bind(generation, "active-turn"));
+            let old = session.native_authority.capture();
+            let old_identity = old.identity().unwrap();
+            session.set_permission_mode(mode.into()).await.unwrap();
+            let new = session.native_authority.capture();
+            let ready = new.wait_ready().await;
+            let old_revoked = old.admit().is_err() && old_identity.verify(&thread.0).is_err();
+            let tools = async {
+                ready?;
+                let (_server, registry, call) = crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
+                let actor = crate::delegation::app::NativeActor {thread_id:thread.0.clone(),provider:crate::agent_provider::ProviderKind::Claude,workspace_id:Some("ws-42".into()),session_id:"session".into(),permission_mode:Some(mode.into()),permit:new};
+                let caller = session.host_caller().await;
+                let callback_permit = actor.permit.clone();
+                let job = tokio::spawn(async move { run_mcp_tool_call(Some(&registry), &caller, Some("ws-42"), "mcp__codemux-remote__echo", json!({"text":"hi"}), Some(actor), &[]).await });
+                session.native_authority.track(&callback_permit, job.abort_handle());
+                let result = job.await.map_err(|e|e.to_string())?.0;
+                call.assert_async().await;
+                Ok::<_, String>(result)
+            }.await;
+            session.shutdown().await.unwrap();
+            assert!(old_revoked, "pre-change callback authority must be revoked");
+            let result = tools.unwrap();
+            assert_eq!(result["content"][0]["text"], "routed", "{result}");
+        }
+    }
+
     #[test]
     fn managed_claude_budget_and_turn_caps_are_optional_and_bounded() {
         assert_eq!(optional_positive_budget(&Value::Null).unwrap(), None);
@@ -2857,6 +2902,7 @@ mod tests {
 
     fn test_caller() -> crate::mcp::registry::HostCaller {
         crate::mcp::registry::HostCaller {
+            control: None,
             thread_id: "thread".into(),
             provider: crate::agent_provider::ProviderKind::Claude,
             workspace_id: Some("ws-42".into()),
@@ -2877,7 +2923,7 @@ mod tests {
             let registry = crate::mcp::registry::McpRegistry::new(); registry.set_host_tools(Arc::new(Host));
             let mut caller = test_caller(); caller.thread_id = format!("claude-late-host-{stop_before_capture}");
             let owner = crate::delegation::authority::NativeAuthority::new(&caller.thread_id);
-            let generation = owner.begin(); assert!(owner.bind(generation, "turn"));
+            let generation = owner.begin(0); assert!(owner.bind(generation, "turn"));
             let db = crate::database::DatabaseStore::new_in_memory();
             if stop_before_capture { owner.invalidate(); db.stop_message_deliveries(&caller.thread_id).unwrap(); }
             let actor = crate::delegation::app::NativeActor { thread_id:caller.thread_id.clone(), provider:caller.provider, workspace_id:caller.workspace_id.clone(), session_id:"session".into(), permission_mode:caller.permission_mode.clone(), permit:owner.capture() };

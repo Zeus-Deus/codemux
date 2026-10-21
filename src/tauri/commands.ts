@@ -1,3 +1,4 @@
+import { beginRemoteNavigation, isCurrentRemoteNavigation } from "@/remote/navigation";
 import type { MessageProvenance } from "./events";
 import { containsPane, projectRemotePanes, rememberRemotePane } from "@/remote/pane-selection";
 import type { MessageDelivery } from "@/lib/agent-chat/message-delivery";
@@ -455,18 +456,18 @@ export const createWorkspaceWithPreset = (cwd: string, presetId: string) =>
 
 /** Navigate this client. Desktop activation owns the shared selection; remote
  * clients commit their local selection after hydration succeeds. */
-let remoteActivationSequence = 0;
+
 
 export const activateWorkspace = async (workspaceId: string) => {
+  const sequence = beginRemoteNavigation();
   noteLocalWorkspaceActivation(workspaceId);
   if (!isRemoteClient()) return invoke("activate_workspace", { workspaceId });
-  const sequence = ++remoteActivationSequence;
   await invoke("touch_workspace", { workspaceId });
   const { useAppStore } = await import("@/stores/app-store");
   if (!useAppStore.getState().appState?.workspaces.some((w) => w.workspace_id === workspaceId)) {
     useAppStore.getState().setAppState(await getAppState());
   }
-  if (sequence === remoteActivationSequence) {
+  if (isCurrentRemoteNavigation(sequence)) {
     useAppStore.getState().setRemoteActiveWorkspace(workspaceId);
     useAppStore.getState().clearPendingActivation(workspaceId);
   }
@@ -501,8 +502,10 @@ export const splitPane = (paneId: string, direction: "horizontal" | "vertical") 
   invoke<string>("split_pane", { paneId, direction });
 
 export const activatePane = async (paneId: string) => {
+  const sequence = beginRemoteNavigation();
   if (!isRemoteClient()) return invoke("activate_pane", { paneId });
   const { useAppStore } = await import("@/stores/app-store");
+  if (!isCurrentRemoteNavigation(sequence)) return;
   const snapshot = useAppStore.getState().appState;
   for (const workspace of snapshot?.workspaces ?? []) {
     const surface = workspace.surfaces.find(s => containsPane(s.root, paneId));
@@ -554,18 +557,20 @@ export const undockBrowserFromRightPanel = (
 ) => invoke("undock_browser_from_right_panel", { workspaceId, dismissed });
 
 export const createTab = async (workspaceId: string, kind: TabKind) => {
+  const sequence = beginRemoteNavigation();
   const id = await invoke<string>("create_tab", { workspaceId, kind });
-  if (isRemoteClient()) { await refreshRemoteWorkspaceView(workspaceId, id); }
+  if (isRemoteClient()) { await refreshRemoteWorkspaceView(workspaceId, id, undefined, sequence); }
   return id;
 };
 
-async function refreshRemoteWorkspaceView(workspaceId: string, tabId?: string, paneId?: string) {
+async function refreshRemoteWorkspaceView(workspaceId: string, tabId: string | undefined, paneId: string | undefined, sequence: number) {
   const snapshot = await getAppState();
   const workspace = snapshot.workspaces.find(w => w.workspace_id === workspaceId);
   if (!workspace) return;
   const tab = paneId ? workspace.tabs.find(t => workspace.surfaces.some(s => s.surface_id === t.surface_id && containsPane(s.root, paneId))) : undefined;
-  rememberRemotePane(workspaceId, tabId ?? tab?.tab_id ?? workspace.active_tab_id, paneId);
   const { useAppStore } = await import("@/stores/app-store");
+  if (!isCurrentRemoteNavigation(sequence)) return;
+  rememberRemotePane(workspaceId, tabId ?? tab?.tab_id ?? workspace.active_tab_id, paneId);
   useAppStore.getState().setAppState(snapshot);
   // An event may already have applied this revision; still publish the view selection.
   useAppStore.setState(s => s.appState ? { appState: projectRemotePanes(s.appState) } : {});
@@ -575,8 +580,10 @@ export const closeTab = (workspaceId: string, tabId: string) =>
   invoke("close_tab", { workspaceId, tabId });
 
 export const activateTab = async (workspaceId: string, tabId: string) => {
+  const sequence = beginRemoteNavigation();
   if (!isRemoteClient()) return invoke("activate_tab", { workspaceId, tabId });
   const { useAppStore } = await import("@/stores/app-store");
+  if (!isCurrentRemoteNavigation(sequence)) return;
   rememberRemotePane(workspaceId, tabId);
   useAppStore.setState(s => s.appState ? { appState: projectRemotePanes(s.appState) } : {});
 };
@@ -1400,6 +1407,7 @@ export const applyPreset = async (
   initialPrompt?: string | null,
   modelSelection?: ModelSelection | null,
 ) => {
+  const sequence = beginRemoteNavigation();
   await invoke("apply_preset", {
     workspaceId,
     presetId,
@@ -1407,7 +1415,7 @@ export const applyPreset = async (
     initialPrompt,
     modelSelection: modelSelection ?? null,
   });
-  if (isRemoteClient()) await refreshRemoteWorkspaceView(workspaceId);
+  if (isRemoteClient()) await refreshRemoteWorkspaceView(workspaceId, undefined, undefined, sequence);
 };
 
 export const setPresetBarVisible = (visible: boolean) =>
@@ -1761,6 +1769,7 @@ export const agentChatCreatePane = async (
   threadId: string | null = null,
   select?: boolean,
 ) => {
+  const sequence = select !== false ? beginRemoteNavigation() : undefined;
   const id = await invoke<string>("agent_chat_create_pane", {
     workspaceId,
     provider,
@@ -1769,7 +1778,7 @@ export const agentChatCreatePane = async (
     threadId,
     ...(select !== undefined ? { select } : {}),
   });
-  if (isRemoteClient() && select !== false) await refreshRemoteWorkspaceView(workspaceId, undefined, id);
+  if (isRemoteClient() && sequence !== undefined) await refreshRemoteWorkspaceView(workspaceId, undefined, id, sequence);
   return id;
 };
 
@@ -2254,10 +2263,15 @@ export const agentChatImportLocalSessions = async (sourceIds: string[]) => {
   return invoke<LocalChatImportResult>("agent_chat_import_local_sessions", { sourceIds });
 };
 
-export const agentChatOpenSearchResult = (threadId: string) =>
-  invoke<OpenAgentChatSearchResult>("agent_chat_open_search_result", {
+export const agentChatOpenSearchResult = async (threadId: string, sequence = beginRemoteNavigation()) => {
+  const opened = await invoke<OpenAgentChatSearchResult>("agent_chat_open_search_result", {
     threadId,
   });
+  if (isRemoteClient()) {
+    await refreshRemoteWorkspaceView(opened.workspace_id, undefined, opened.pane_id, sequence);
+  }
+  return opened;
+};
 
 export const agentChatRenameSession = (threadId: string, title: string) =>
   invoke<void>("agent_chat_rename_session", { threadId, title });

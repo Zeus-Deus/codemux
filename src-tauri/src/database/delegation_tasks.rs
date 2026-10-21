@@ -11,7 +11,14 @@ fn same_admission_payload(saved: &str, requested: &Value) -> bool {
     // Waiting changes only the receipt, never the admitted work. Strip these
     // controls on both sides so pre-upgrade payloads remain retryable.
     for value in [&mut saved, &mut requested] {
-        if let Some(object) = value.as_object_mut() { object.remove("mode"); object.remove("wait_ms"); }
+        if let Some(object) = value.as_object_mut() {
+            object.remove("mode");
+            object.remove("wait_ms");
+            // Older admissions omitted this optional field entirely.
+            if object.get("permission_mode").is_some_and(Value::is_null) {
+                object.remove("permission_mode");
+            }
+        }
     }
     saved == requested
 }
@@ -24,6 +31,26 @@ pub(super) fn create_schema(conn: &Connection) -> Result<(), String> {
         UNIQUE(parent_thread_id, client_request_id));
         CREATE INDEX IF NOT EXISTS delegation_task_child ON agent_delegation_tasks(child_thread_id);
         CREATE INDEX IF NOT EXISTS delegation_task_parent ON agent_delegation_tasks(parent_thread_id);
+        CREATE TABLE IF NOT EXISTS agent_delegation_read_coverage (
+            parent_thread_id TEXT NOT NULL, task_id TEXT NOT NULL, start_offset INTEGER NOT NULL, end_offset INTEGER NOT NULL,
+            PRIMARY KEY(parent_thread_id,task_id,start_offset,end_offset));
+        CREATE TABLE IF NOT EXISTS agent_orchestration_context (
+            thread_id TEXT PRIMARY KEY, root_id TEXT NOT NULL, depth INTEGER NOT NULL,
+            hop INTEGER NOT NULL, causation_id TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS agent_orchestration_admissions (
+            id TEXT PRIMARY KEY, root_id TEXT NOT NULL, kind TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS orchestration_admission_root ON agent_orchestration_admissions(root_id);
+        CREATE INDEX IF NOT EXISTS delegation_task_budget ON agent_delegation_tasks(json_extract(record,'$.budget_root_id'),json_extract(record,'$.status'),json_extract(record,'$.workState'));
+        CREATE TABLE IF NOT EXISTS agent_orchestration_launches (
+            id TEXT PRIMARY KEY, thread_id TEXT UNIQUE NOT NULL, root_id TEXT NOT NULL,
+            executing INTEGER NOT NULL DEFAULT 1);
+        CREATE INDEX IF NOT EXISTS orchestration_launch_root ON agent_orchestration_launches(root_id,executing);
+        CREATE TABLE IF NOT EXISTS agent_message_causation (
+            id TEXT PRIMARY KEY, sender TEXT NOT NULL, target TEXT NOT NULL, root_id TEXT NOT NULL,
+            hop INTEGER NOT NULL, causation_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            UNIQUE(sender,target,causation_id,fingerprint));
+        CREATE TABLE IF NOT EXISTS agent_message_active_causation (
+            thread_id TEXT PRIMARY KEY, root_id TEXT NOT NULL, hop INTEGER NOT NULL, causation_id TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS agent_delegation_imports (
             source_id TEXT NOT NULL, source_version INTEGER NOT NULL, task_id TEXT NOT NULL,
             PRIMARY KEY(source_id, source_version));")
@@ -80,6 +107,10 @@ pub struct PublishedResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskRecord {
     pub task_id: String,
+    #[serde(default)]
+    pub caller: Option<crate::agent_control::ControlCaller>,
+    #[serde(default)]
+    pub budget_root_id: Option<String>,
     pub backend: TaskBackend,
     pub parent_thread_id: String,
     pub parent_run_id: Option<String>,
@@ -96,6 +127,8 @@ pub struct TaskRecord {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub plan_mode: bool,
     pub role: Option<String>,
     pub title: String,
     pub brief: String,
@@ -137,6 +170,8 @@ impl TaskRecord {
         now: i64,
     ) -> Self {
         Self {
+            caller: None,
+            budget_root_id: None,
             root_task_id: task_id.clone(),
             task_id,
             backend: TaskBackend::Local,
@@ -153,6 +188,7 @@ impl TaskRecord {
             model: None,
             effort: None,
             permission_mode: None,
+            plan_mode: false,
             role: None,
             title,
             brief,
@@ -207,7 +243,209 @@ fn write(conn: &Connection, task: &TaskRecord) -> Result<(), String> {
     .map(drop)
     .map_err(|e| e.to_string())
 }
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RootContext {
+    pub root_id: String,
+    pub depth: usize,
+    pub hop: u32,
+    pub causation_id: String,
+}
+/// The initial task message spends the task's existing reservation. It must
+/// preserve the child's lineage context rather than treating it as a new send.
+pub(super) fn admitted_task_start(
+    tx: &Connection,
+    sender: &str,
+    target: &str,
+    payload: &Value,
+) -> Result<bool, String> {
+    if payload["origin"] != "delegation" || payload["caller"]["admitted"]["kind"] != "task" {
+        return Ok(false);
+    }
+    let Some(id) = payload["caller"]["admitted"]["task_id"].as_str() else {
+        return Ok(false);
+    };
+    Ok(read(tx, id)?.is_some_and(|task| {
+        task.parent_thread_id == sender && task.child_thread_id.as_deref() == Some(target)
+    }))
+}
+pub(super) fn verify_admission_generation(conn: &Connection, sender: &str, admitted: u64) -> Result<(), String> {
+    let current: u64 = conn.query_row("SELECT generation FROM agent_thread_delivery_state WHERE thread_id=?1", [sender], |r| r.get(0))
+        .optional().map_err(|e| e.to_string())?.unwrap_or(0);
+    if admitted != current { return Err("stale_caller: caller was stopped before admission".into()); }
+    Ok(())
+}
+pub(super) fn admit_agent_message(tx: &Connection, sender: &str, target: &str, id: &str, payload: &Value) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    verify_admission_generation(tx, sender, payload["caller"]["identity"]["authority"]["stop_generation"].as_u64().unwrap_or(0))?;
+    let context = message_context(tx, sender)?;
+    if context.hop >= 24 {
+        return Err("resource_limit: automatic agent message chain reached 24 hops; a human message is required to start a new chain".into());
+    }
+    let fingerprint = format!("{:x}", Sha256::digest(payload["input"]["text"].as_str().unwrap_or_default().as_bytes()));
+    let inserted = tx.execute("INSERT OR IGNORE INTO agent_message_causation(id,sender,target,root_id,hop,causation_id,fingerprint) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![id,sender,target,context.root_id,context.hop+1,context.causation_id,fingerprint]).map_err(|e|e.to_string())?;
+    if inserted == 0 { return Err("duplicate_causation: identical agent message already admitted for this cause".into()); }
+    // Messages carry causation separately. They never replace a recipient's
+    // human work root or reserve a new-work admission.
+    Ok(())
+}
+fn root_context(conn: &Connection, thread: &str) -> Result<RootContext, String> {
+    conn.execute("INSERT OR IGNORE INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,0,0,?2)",params![thread,uuid::Uuid::new_v4().to_string()]).map_err(|e|e.to_string())?;
+    conn.query_row("SELECT root_id,depth,hop,causation_id FROM agent_orchestration_context WHERE thread_id=?1",[thread],|r|Ok(RootContext{root_id:r.get(0)?,depth:r.get(1)?,hop:r.get(2)?,causation_id:r.get(3)?})).map_err(|e|e.to_string())
+}
+fn message_context(conn: &Connection, thread: &str) -> Result<RootContext, String> {
+    conn.query_row("SELECT root_id,hop,causation_id FROM agent_message_active_causation WHERE thread_id=?1",[thread],|r|Ok(RootContext{root_id:r.get(0)?,depth:0,hop:r.get(1)?,causation_id:r.get(2)?})).optional().map_err(|e|e.to_string())?.map(Ok).unwrap_or_else(||root_context(conn,thread))
+}
+pub(super) fn activate_message_causation(conn: &Connection, id: &str) -> Result<(), String> {
+    conn.execute("INSERT INTO agent_message_active_causation(thread_id,root_id,hop,causation_id) SELECT target,root_id,hop,id FROM agent_message_causation WHERE id=?1 ON CONFLICT(thread_id) DO UPDATE SET root_id=excluded.root_id,hop=excluded.hop,causation_id=excluded.causation_id",[id]).map(drop).map_err(|e|e.to_string())
+}
+fn waiting_on_children(conn: &Connection, parent: &str) -> Result<bool, String> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM agent_delegation_tasks WHERE parent_thread_id=?1 AND json_extract(record,'$.wait_until')>?2)",params![parent,chrono::Utc::now().timestamp_millis()],|r|r.get(0)).map_err(|e|e.to_string())
+}
+fn refresh_waiting(conn: &Connection, parent: &str) -> Result<(), String> {
+    let waiting = waiting_on_children(conn, parent)?;
+    let data:Option<String> = conn.query_row("SELECT record FROM agent_delegation_tasks WHERE child_thread_id=?1 AND backend='local' ORDER BY rowid DESC LIMIT 1",[parent],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+    if let Some(mut task) = data.map(decode).transpose()? {
+        if !task.status.terminal() {
+            task.work_state = if waiting {WorkState::WaitingForChildren} else {WorkState::Working};
+            write(conn, &task)?;
+        }
+    }
+    Ok(())
+}
+fn active_work(conn: &Connection, root: &str, yielding: Option<&str>) -> Result<Vec<String>, String> {
+    // Both halves are root-indexed. Message follow-ups have no new-work
+    // reservation and therefore do not consume execution slots.
+    let mut statement = conn.prepare("SELECT task_id FROM agent_delegation_tasks t
+        WHERE json_extract(record,'$.budget_root_id')=?1
+        AND task_id IN (SELECT id FROM agent_orchestration_admissions WHERE root_id=?1 AND kind='task')
+        AND json_extract(record,'$.status') IN ('queued','running','waiting')
+        AND (json_extract(record,'$.workState')<>'waiting_for_children'
+            OR (EXISTS(SELECT 1 FROM agent_delegation_tasks c WHERE c.parent_thread_id=t.child_thread_id AND json_extract(c.record,'$.wait_until') IS NOT NULL)
+                AND NOT EXISTS(SELECT 1 FROM agent_delegation_tasks c WHERE c.parent_thread_id=t.child_thread_id AND json_extract(c.record,'$.wait_until')>?3)))
+        AND (?2 IS NULL OR child_thread_id IS NULL OR child_thread_id<>?2)
+        UNION ALL SELECT id FROM agent_orchestration_launches l
+        WHERE root_id=?1 AND executing=1 AND (?2 IS NULL OR thread_id<>?2)
+        AND NOT EXISTS(SELECT 1 FROM agent_delegation_tasks c WHERE c.parent_thread_id=l.thread_id AND json_extract(c.record,'$.wait_until')>?3)").map_err(|e|e.to_string())?;
+    let rows = statement.query_map(params![root,yielding,chrono::Utc::now().timestamp_millis()],|r|r.get(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<String>,_>>().map_err(|e|e.to_string())?;
+    Ok(rows)
+}
+fn reserve_work(conn: &Connection, root: &str, depth: usize, id: &str, kind: &str, yielding: Option<&str>) -> Result<(), String> {
+    let active = active_work(conn,root,yielding)?;
+    if depth > 4 || active.len() >= 3 { return Err(format!("resource_limit: depth 4, 3 executing per root; active work IDs: {}",active.join(", "))); }
+    let count:u32 = conn.query_row("SELECT COUNT(*) FROM agent_orchestration_admissions WHERE root_id=?1 AND kind IN ('task','launch')",[root],|r|r.get(0)).map_err(|e|e.to_string())?;
+    if count >= 6 { return Err("resource_limit: 6 new-work admissions per human root".into()); }
+    conn.execute("INSERT INTO agent_orchestration_admissions(id,root_id,kind) VALUES (?1,?2,?3)",params![id,root,kind]).map(drop).map_err(|e|e.to_string())
+}
+pub(super) fn admit_launch(conn: &Connection, sender: &str, target: &str, id: &str, generation: u64) -> Result<(), String> {
+    verify_admission_generation(conn, sender, generation)?;
+    let context = root_context(conn,sender)?;
+    reserve_work(conn,&context.root_id,context.depth+1,id,"launch",None)?;
+    conn.execute("INSERT INTO agent_orchestration_launches(id,thread_id,root_id) VALUES (?1,?2,?3)",params![id,target,context.root_id]).map_err(|e|e.to_string())?;
+    conn.execute("INSERT INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,?3,0,?4)",params![target,context.root_id,context.depth+1,id]).map(drop).map_err(|e|e.to_string())
+}
+/// A direct-owner follow-up has a fresh result identity in the existing child.
+/// This is part of the message transaction, so retries cannot create tasks twice.
+pub(super) fn admit_followup(
+    tx: &Connection,
+    parent: &str,
+    child: &str,
+    delivery: &str,
+    payload: &Value,
+) -> Result<(), String> {
+    let prior:Option<String>=tx.query_row("SELECT record FROM agent_delegation_tasks WHERE parent_thread_id=?1 AND child_thread_id=?2 AND backend='local' ORDER BY rowid DESC LIMIT 1",params![parent,child],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+    let Some(prior) = prior
+        .map(decode)
+        .transpose()?
+        .filter(|t| t.result.is_some())
+    else {
+        return Ok(());
+    };
+    let id = format!("local:followup:{delivery}");
+    let mut task = TaskRecord::new(
+        id.clone(),
+        parent.into(),
+        Some(child.into()),
+        prior.provider,
+        prior.title,
+        payload["input"]["text"].as_str().unwrap_or_default().into(),
+        chrono::Utc::now().timestamp_millis(),
+    );
+    let binding = super::agent_chat_session(tx, child).ok_or("Follow-up target missing")?;
+    task.provider = binding.provider;
+    task.workspace_id = binding.workspace_id;
+    task.cwd = binding.cwd.unwrap_or(prior.cwd);
+    task.model = binding.model;
+    task.effort = binding.effort;
+    task.permission_mode = binding.permission_mode;
+    task.isolation = prior.isolation;
+    task.worktree = prior.worktree;
+    let root: String = tx
+        .query_row(
+            "SELECT root_id FROM agent_orchestration_context WHERE thread_id=?1",
+            [parent],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    task.budget_root_id = Some(root.clone());
+    task.status = TaskStatus::Queued;
+    task.has_pending_child_runs = true;
+    let ancestor:Option<String>=tx.query_row("SELECT record FROM agent_delegation_tasks WHERE child_thread_id=?1 AND backend='local' ORDER BY rowid DESC LIMIT 1",[parent],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+    if let Some(ancestor) = ancestor.map(decode).transpose()? {
+        task.lineage = ancestor.lineage;
+        task.lineage.push(ancestor.task_id);
+        task.root_task_id = ancestor.root_task_id;
+    }
+    tx.execute("INSERT INTO agent_delegation_tasks(task_id,parent_thread_id,child_thread_id,backend,admission_payload,record) VALUES (?1,?2,?3,'local',?4,?5)",params![id,parent,child,payload.to_string(),serde_json::to_string(&task).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+    Ok(())
+}
 impl DatabaseStore {
+    pub(crate) fn delegation_read_coverage(
+        &self,
+        parent: &str,
+        id: &str,
+        start: usize,
+        end: usize,
+        total: usize,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let task = read(&conn, id)?.ok_or("Unknown task")?;
+        if task.parent_thread_id != parent {
+            return Err("Task is not owned by this parent".into());
+        }
+        conn.execute("INSERT OR IGNORE INTO agent_delegation_read_coverage(parent_thread_id,task_id,start_offset,end_offset) VALUES (?1,?2,?3,?4)",params![parent,id,start,end]).map_err(|e|e.to_string())?;
+        let mut statement=conn.prepare("SELECT start_offset,end_offset FROM agent_delegation_read_coverage WHERE parent_thread_id=?1 AND task_id=?2 ORDER BY start_offset").map_err(|e|e.to_string())?;
+        let ranges = statement
+            .query_map(params![parent, id], |r| {
+                Ok((r.get::<_, usize>(0)?, r.get::<_, usize>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut covered = 0;
+        for range in ranges {
+            let (start, end) = range.map_err(|e| e.to_string())?;
+            if start > covered {
+                break;
+            }
+            covered = covered.max(end);
+        }
+        Ok(covered >= total)
+    }
+    pub(crate) fn orchestration_human_root(&self, thread: &str) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e|e.to_string())?;
+        let id = uuid::Uuid::new_v4().to_string();
+        tx.execute("DELETE FROM agent_message_active_causation WHERE thread_id=?1",[thread]).map_err(|e|e.to_string())?;
+        tx.execute("INSERT INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,0,0,?2) ON CONFLICT(thread_id) DO UPDATE SET root_id=excluded.root_id,depth=0,hop=0,causation_id=excluded.causation_id",params![thread,id]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e|e.to_string())
+    }
+    pub(crate) fn orchestration_context(&self, thread: &str) -> Result<RootContext, String> {
+        root_context(&self.conn.lock().unwrap(),thread)
+    }
+    pub(crate) fn orchestration_launch_finished(&self, thread: &str) -> Result<(), String> {
+        self.conn.lock().unwrap().execute("UPDATE agent_orchestration_launches SET executing=0 WHERE thread_id=?1",[thread]).map(drop).map_err(|e|e.to_string())
+    }
+    pub(crate) fn delegation_waiting_on_children(&self, parent: &str) -> bool {
+        waiting_on_children(&self.conn.lock().unwrap(),parent).unwrap_or(false)
+    }
     /// PR1 result memberships used child IDs. Reuse their acceptance evidence
     /// when importing an old open-task row into the canonical task table.
     pub(crate) fn legacy_delegation_delivery(
@@ -254,6 +492,7 @@ impl DatabaseStore {
                 .map_err(|e| e.to_string())?;
             }
             write(&conn, &task)?;
+            refresh_waiting(&conn, &task.parent_thread_id)?;
         }
         Ok(())
     }
@@ -355,6 +594,17 @@ impl DatabaseStore {
         key: Option<&str>,
         payload: &Value,
     ) -> Result<(TaskRecord, bool), String> {
+        if task.child_thread_id.as_deref() == Some(&task.parent_thread_id)
+            || task.lineage.contains(&task.task_id)
+            || task
+                .lineage
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != task.lineage.len()
+        {
+            return Err("invalid_task_lineage: tasks must be acyclic".into());
+        }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         if let Some(prior) = read(&tx, &task.task_id)? {
@@ -374,16 +624,25 @@ impl DatabaseStore {
             [&task.parent_thread_id], |r| r.get(0),
         ).optional().map_err(|e| e.to_string())?.unwrap_or(0);
         if task.admission_generation.is_some_and(|admitted| admitted != generation) {
-            return Err("Parent was stopped before task admission".into());
+            return Err("stale_caller: Parent was stopped before task admission".into());
         }
         let mut task = task.clone();
         task.admission_generation = Some(generation);
+        if let Some(root) = &task.budget_root_id {
+            let context = root_context(&tx,&task.parent_thread_id)?;
+            let yielding = (payload["mode"] == "wait").then_some(task.parent_thread_id.as_str());
+            reserve_work(&tx,root,context.depth+1,&task.task_id,"task",yielding)?;
+            if let Some(child) = &task.child_thread_id {
+                tx.execute("INSERT INTO agent_orchestration_context(thread_id,root_id,depth,hop,causation_id) VALUES (?1,?2,?3,0,?4)",params![child,root,context.depth+1,task.task_id]).map_err(|e|e.to_string())?;
+            }
+        }
         if task.backend == TaskBackend::Local {
             if let Some(child) = &task.child_thread_id {
                 tx.execute("INSERT INTO agent_chat_sessions (thread_id,workspace_id,cwd,provider,title,model,effort,permission_mode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(thread_id) DO NOTHING",params![child,task.workspace_id,task.cwd,task.provider,task.title,task.model,task.effort,task.permission_mode]).map_err(|e|e.to_string())?;
             }
         }
         tx.execute("INSERT INTO agent_delegation_tasks (task_id,parent_thread_id,child_thread_id,backend,client_request_id,admission_payload,record) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![task.task_id,task.parent_thread_id,task.child_thread_id,if task.backend==TaskBackend::Local {"local"}else{"ssh"},key,payload.to_string(),serde_json::to_string(&task).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        refresh_waiting(&tx, &task.parent_thread_id)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok((task.clone(), true))
     }
@@ -631,6 +890,27 @@ mod tests {
         )
         .unwrap();
     }
+    #[test]
+    fn review600_legacy_permission_mode_retry_preserves_identity() {
+        let db = DatabaseStore::new_in_memory();
+        let task = TaskRecord::new("legacy-task".into(), "parent".into(), Some("child".into()), "codex".into(), "Review".into(), "Review the saved task".into(), 1);
+        // Exact pre-permission-mode payload shape, including the old wait controls.
+        let old = serde_json::json!({"provider":"codex","title":"Review","task":"Review the saved task","model":null,"effort":null,"role":null,"mode":"async","wait_ms":20000});
+        db.admit_delegation_task(&task, Some("upgrade-key"), &old).unwrap();
+        let mut retry = old.clone();
+        retry["permission_mode"] = Value::Null;
+        retry["mode"] = serde_json::json!("wait");
+        assert_eq!(db.delegation_retry("parent", "upgrade-key", &retry).unwrap().unwrap().task_id, task.task_id);
+        let replacement = TaskRecord { task_id: "replacement".into(), ..task.clone() };
+        let (receipt, fresh) = db.admit_delegation_task(&replacement, Some("upgrade-key"), &retry).unwrap();
+        assert!(!fresh);
+        assert_eq!(receipt.task_id, task.task_id);
+        for mode in ["plan", "danger-full-access"] {
+            retry["permission_mode"] = serde_json::json!(mode);
+            assert!(db.delegation_retry("parent", "upgrade-key", &retry).unwrap_err().contains("client_request_id_conflict"));
+        }
+    }
+
     #[test]
     fn delegation_delivery_legacy_parent_stop_marker_uses_completion_timestamp() {
         let db = DatabaseStore::new_in_memory();
@@ -972,4 +1252,286 @@ mod tests {
         publish(&db, "a", "Final");
         assert!(db.pending_message_deliveries().unwrap().is_empty());
     }
+}
+
+#[cfg(test)]
+mod native_budget_tests {
+    use super::*;
+    #[test]
+    fn native_workspace_launch_inherits_root_depth_and_shared_admissions() {
+        let db = DatabaseStore::new_in_memory();
+        db.orchestration_human_root("A").unwrap();
+        let root = db.orchestration_context("A").unwrap().root_id;
+        db.admit_control_operation_for_thread("thread:A", "B", "thread_launch", "B", "epoch", Some("workspace"), Some("B"), Some(("A", 0))).unwrap();
+        db.admit_control_operation_for_thread("thread:B", "C", "workspace_launch", "C", "epoch", Some("workspace"), Some("C"), Some(("B", 0))).unwrap();
+        let context = db.orchestration_context("C").unwrap();
+        assert_eq!(context.root_id, root);
+        assert_eq!(context.depth, 2);
+        db.orchestration_launch_finished("B").unwrap();
+        db.orchestration_launch_finished("C").unwrap();
+        for i in 2..6 {
+            let child = format!("child-{i}");
+            db.admit_control_operation_for_thread("thread:C", &child, "workspace_launch", &child, "epoch", Some("workspace"), Some(&child), Some(("C", 0))).unwrap();
+            db.orchestration_launch_finished(&child).unwrap();
+        }
+        let error = db.admit_control_operation_for_thread("thread:C", "seventh", "workspace_launch", "seventh", "epoch", Some("workspace"), Some("seventh"), Some(("C", 0))).err().unwrap();
+        assert!(error.contains("6 new-work admissions"), "{error}");
+        assert!(db.control_operation_by_key("thread:C", "seventh", "workspace_launch", "seventh", "epoch").unwrap().is_none());
+    }
+
+    fn record(
+        db: &DatabaseStore,
+        parent: &str,
+        child: &str,
+        id: &str,
+        lineage: Vec<String>,
+    ) -> TaskRecord {
+        let root = db.orchestration_context(parent).unwrap();
+        let mut task = TaskRecord::new(
+            id.into(),
+            parent.into(),
+            Some(child.into()),
+            "claude".into(),
+            id.into(),
+            "A self-contained complete brief".into(),
+            1,
+        );
+        task.budget_root_id = Some(root.root_id);
+        task.lineage = lineage;
+        task
+    }
+    #[test]
+    fn native_budgets_survive_agent_sends_and_database_reopen() {
+        let db = DatabaseStore::new_in_memory();
+        db.orchestration_human_root("parent").unwrap();
+        let root = db.orchestration_context("parent").unwrap().root_id;
+        for i in 0..6 {
+            let id = format!("task-{i}");
+            let child = format!("child-{i}");
+            let task = record(&db, "parent", &child, &id, vec![]);
+            db.admit_delegation_task(&task, Some(&id), &serde_json::json!({"id":id}))
+                .unwrap();
+            db.update_delegation_task(&id, |t| t.status = TaskStatus::Completed)
+                .unwrap();
+        }
+        let next = record(&db, "parent", "extra-child", "extra", vec![]);
+        assert!(db
+            .admit_delegation_task(&next, None, &Value::Null)
+            .unwrap_err()
+            .contains("resource_limit"));
+        let dir = tempfile::tempdir().unwrap();
+        let db = db.control_fixture_snapshot(&dir.path().join("root.sqlite"));
+        assert_eq!(db.orchestration_context("parent").unwrap().root_id, root);
+        assert!(db
+            .admit_delegation_task(&next, None, &Value::Null)
+            .unwrap_err()
+            .contains("resource_limit"));
+        db.orchestration_human_root("parent").unwrap();
+        assert_ne!(db.orchestration_context("parent").unwrap().root_id, root);
+    }
+    #[test]
+    fn native_nested_depth_is_acyclic_and_execution_capacity_is_shared() {
+        let db = DatabaseStore::new_in_memory();
+        db.orchestration_human_root("root").unwrap();
+        let mut parent = "root".to_string();
+        let mut lineage = vec![];
+        for depth in 0..4 {
+            let child = format!("nested-{depth}");
+            let id = format!("task-{depth}");
+            let mut task = record(&db, &parent, &child, &id, lineage.clone());
+            task.wait_until=Some(chrono::Utc::now().timestamp_millis()+20_000);
+            db.admit_delegation_task(&task, None, &serde_json::json!({"mode":"wait"}))
+                .unwrap();
+            lineage.push(id);
+            parent = child;
+        }
+        let next = record(&db, &parent, "too-deep", "too-deep-task", lineage);
+        assert!(db
+            .admit_delegation_task(&next, None, &Value::Null)
+            .unwrap_err()
+            .contains("resource_limit"));
+        let stopped = db.stop_delegation_tree("root").unwrap();
+        assert_eq!(stopped.len(), 4);
+    }
+    #[test]
+    fn native_followup_admission_keeps_original_result_and_deduplicates() {
+        let db = DatabaseStore::new_in_memory();
+        db.orchestration_human_root("parent").unwrap();
+        let task = record(&db, "parent", "child", "original", vec![]);
+        db.admit_delegation_task(&task, None, &Value::Null).unwrap();
+        db.update_delegation_task("original", |task| {
+            task.status = TaskStatus::Completed;
+            task.result = Some(PublishedResult {
+                version: 1,
+                run_id: Some("original-run".into()),
+                text: "Original final result".into(),
+                status: TaskStatus::Completed,
+                published_at: 2,
+            });
+        })
+        .unwrap();
+        let payload = serde_json::json!({"origin":"controller","caller":{"identity":{"kind":"thread","thread_id":"parent"}},"provenance":{"created_by":"agent"},"input":{"text":"Follow up with another complete task"}});
+        assert!(
+            db.admit_message_delivery(
+                "followup",
+                "child",
+                "followup-message",
+                &payload,
+                "epoch",
+                0,
+                None,
+                false
+            )
+            .unwrap()
+            .1
+        );
+        assert!(
+            !db.admit_message_delivery(
+                "followup",
+                "child",
+                "followup-message",
+                &payload,
+                "epoch",
+                0,
+                None,
+                false
+            )
+            .unwrap()
+            .1
+        );
+        let original = db.delegation_task("original").unwrap().unwrap();
+        assert_eq!(original.result.unwrap().text, "Original final result");
+        let followup = db
+            .delegation_task("local:followup:followup")
+            .unwrap()
+            .unwrap();
+        assert!(followup.result.is_none());
+        assert_eq!(followup.child_thread_id.as_deref(), Some("child"));
+        assert_eq!(db.delegation_tasks(Some("parent")).unwrap().len(), 2);
+    }
+    #[test]
+    fn native_read_ack_requires_contiguous_complete_owned_coverage() {
+        let db = DatabaseStore::new_in_memory();
+        let task = record(&db, "parent", "child", "read-task", vec![]);
+        db.admit_delegation_task(&task, None, &Value::Null).unwrap();
+        assert!(!db
+            .delegation_read_coverage("parent", "read-task", 0, 4, 10)
+            .unwrap());
+        assert!(!db
+            .delegation_read_coverage("parent", "read-task", 7, 10, 10)
+            .unwrap());
+        assert!(db
+            .delegation_read_coverage("parent", "read-task", 4, 7, 10)
+            .unwrap());
+        assert!(db
+            .delegation_read_coverage("unrelated", "read-task", 0, 10, 10)
+            .is_err());
+    }
+    #[test]
+    fn native_agent_message_retries_do_not_spend_work_or_replace_recipient_root() {
+        let db = DatabaseStore::new_in_memory();
+        db.orchestration_human_root("a").unwrap();
+        db.orchestration_human_root("b").unwrap();
+        let root = db.orchestration_context("b").unwrap().root_id;
+        for i in 0..30 {
+            let id = format!("send-{i}");
+            let payload = serde_json::json!({"origin":"controller","input":{"text":id},"caller":{"identity":{"kind":"thread","thread_id":"a"}},"provenance":{"created_by":"agent"}});
+            assert!(db.admit_message_delivery(&id,"b",&id,&payload,"epoch",0,None,false).unwrap().1);
+            assert!(!db.admit_message_delivery(&id,"b",&id,&payload,"epoch",0,None,false).unwrap().1);
+            assert!(db.admit_message_delivery(&format!("duplicate-{i}"),"b",&format!("duplicate-{i}"),&payload,"epoch",0,None,false).unwrap_err().contains("duplicate_causation"));
+        }
+        assert_eq!(db.orchestration_context("b").unwrap().root_id,root);
+        let conn=db.conn.lock().unwrap();
+        let count:u32=conn.query_row("SELECT COUNT(*) FROM agent_orchestration_admissions",[],|r|r.get(0)).unwrap();
+        assert_eq!(count,0);
+    }
+    #[test]
+    fn native_waiting_ancestors_yield_and_release_their_execution_slots() {
+        let db=DatabaseStore::new_in_memory();
+        let mut parent="root".to_string();
+        for i in 0..4 {
+            let id=format!("wait-{i}");let child=format!("child-{i}");
+            let mut task=record(&db,&parent,&child,&id,vec![]);
+            task.wait_until=Some(chrono::Utc::now().timestamp_millis()+20_000);
+            db.admit_delegation_task(&task,None,&serde_json::json!({"mode":"wait"})).unwrap();
+            parent=child;
+        }
+        assert_eq!(db.delegation_task("wait-0").unwrap().unwrap().work_state,WorkState::WaitingForChildren);
+        db.release_delegation_wait("wait-1").unwrap();
+        assert_eq!(db.delegation_task("wait-0").unwrap().unwrap().work_state,WorkState::Working);
+        let conn=db.conn.lock().unwrap();
+        let plan:String=conn.query_row("EXPLAIN QUERY PLAN SELECT task_id FROM agent_delegation_tasks WHERE json_extract(record,'$.budget_root_id')='root' AND json_extract(record,'$.status')='running'",[],|r|r.get(3)).unwrap();
+        assert!(plan.contains("delegation_task_budget"),"{plan}");
+    }
+    #[test]
+    fn native_batch_launches_reports_and_later_human_rounds_keep_separate_budgets() {
+        let db=DatabaseStore::new_in_memory();
+        db.orchestration_human_root("coordinator").unwrap();
+        let original=db.orchestration_context("coordinator").unwrap().root_id;
+        for i in 0..3 {
+            let child=format!("launch-{i}");
+            db.admit_control_operation_for_thread("thread:coordinator",&child,"thread_launch",&child,"epoch",Some("workspace"),Some(&child),Some(("coordinator", 0))).unwrap();
+            db.orchestration_launch_finished(&child).unwrap();
+        }
+        for i in 0..3 {
+            let id=format!("report-{i}");let child=format!("launch-{i}");
+            let payload=serde_json::json!({"origin":"controller","input":{"text":id},"caller":{"identity":{"kind":"thread","thread_id":child}},"provenance":{"created_by":"agent"}});
+            db.admit_message_delivery(&id,"coordinator",&id,&payload,"epoch",0,None,false).unwrap();
+        }
+        for i in 3..6 {
+            let child=format!("launch-{i}");
+            db.admit_control_operation_for_thread("thread:coordinator",&child,"thread_launch",&child,"epoch",Some("workspace"),Some(&child),Some(("coordinator", 0))).unwrap();
+            db.orchestration_launch_finished(&child).unwrap();
+        }
+        assert!(db.admit_control_operation_for_thread("thread:coordinator","seventh","thread_launch","seventh","epoch",Some("workspace"),Some("seventh"),Some(("coordinator", 0))).err().unwrap().contains("resource_limit"));
+        db.orchestration_human_root("coordinator").unwrap();
+        let new_root=db.orchestration_context("coordinator").unwrap().root_id;
+        let payload=serde_json::json!({"origin":"controller","input":{"text":"Late result from earlier round"},"caller":{"identity":{"kind":"thread","thread_id":"launch-0"}},"provenance":{"created_by":"agent"}});
+        db.admit_message_delivery("late","coordinator","late",&payload,"epoch",0,None,false).unwrap();
+        assert_eq!(db.orchestration_context("coordinator").unwrap().root_id,new_root);
+        assert_ne!(new_root,original);
+    }
+    #[test]
+    fn native_task_start_uses_reserved_budget_and_preserves_child_context() {
+        let db = DatabaseStore::new_in_memory();
+        db.orchestration_human_root("parent").unwrap();
+        let root = db.orchestration_context("parent").unwrap().root_id;
+        for i in 0..6 {
+            let child = format!("child-{i}");
+            let id = format!("task-{i}");
+            let task = record(&db, "parent", &child, &id, vec![]);
+            db.admit_delegation_task(&task, None, &Value::Null).unwrap();
+            let payload = serde_json::json!({"origin":"delegation","caller":{"identity":{"kind":"thread","thread_id":"parent"},"admitted":{"kind":"task","task_id":id}},"provenance":{"created_by":"agent"}});
+            db.admit_message_delivery(&format!("delivery-{i}"), &child, &format!("message-{i}"), &payload, "epoch", 0, None, false).unwrap();
+            let context = db.orchestration_context(&child).unwrap();
+            assert_eq!(context.root_id, root);
+            assert_eq!(context.depth, 1);
+            assert_eq!(context.causation_id, id);
+            db.update_delegation_task(&id, |task| task.status = TaskStatus::Completed).unwrap();
+        }
+        let extra = record(&db, "parent", "extra", "extra", vec![]);
+        assert!(db.admit_delegation_task(&extra, None, &Value::Null).unwrap_err().contains("resource_limit"));
+        let wrong_target = serde_json::json!({"origin":"delegation","caller":{"identity":{"kind":"thread","thread_id":"parent"},"admitted":{"kind":"task","task_id":"task-0"}},"provenance":{"created_by":"agent"}});
+        assert!(db.admit_message_delivery("spoof", "other", "spoof", &wrong_target, "epoch", 0, None, false).unwrap().1);
+        assert!(db.orchestration_context("other").unwrap().root_id != root);
+    }
+    #[test]
+    fn native_stop_generation_rejects_new_rows_atomically_after_rearm() {
+        let db=DatabaseStore::new_in_memory();
+        let generation=db.delivery_generation("sender").unwrap().0;
+        db.stop_message_deliveries("sender").unwrap();
+        db.resume_message_delivery_thread("sender").unwrap();
+        let mut task=record(&db,"sender","child","stale-task",vec![]);
+        task.admission_generation=Some(generation);
+        assert!(db.admit_delegation_task(&task,None,&Value::Null).unwrap_err().contains("stale_caller"));
+        assert!(db.admit_control_operation_for_thread("thread:sender","stale-launch","thread_launch","hash","epoch",Some("workspace"),Some("chat"),Some(("sender",generation))).err().unwrap().contains("stale_caller"));
+        let payload=serde_json::json!({"origin":"controller","input":{"text":"Late report"},"caller":{"identity":{"kind":"thread","thread_id":"sender","authority":{"stop_generation":generation}}},"provenance":{"created_by":"agent"}});
+        assert!(db.admit_message_delivery("stale-send","target","stale-message",&payload,"epoch",0,None,false).unwrap_err().contains("stale_caller"));
+        let conn=db.conn.lock().unwrap();
+        for table in ["agent_delegation_tasks","agent_control_operations","agent_message_deliveries","agent_message_causation","agent_orchestration_admissions","agent_orchestration_launches"] {
+            let count:u32=conn.query_row(&format!("SELECT COUNT(*) FROM {table}"),[],|r|r.get(0)).unwrap();
+            assert_eq!(count,0,"{table}");
+        }
+    }
+
 }

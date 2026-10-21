@@ -485,6 +485,12 @@ pub(crate) fn wrap_dispatch_checkpoint<R: Runtime>(
 
 #[async_trait::async_trait]
 impl<R: Runtime> TurnDispatchCheckpoint for TurnDiffCapture<R> {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> {
+        self.inner.as_ref().ok_or_else(|| crate::agent_provider::ProviderError::ValidationError {
+            message: "Dispatch checkpoint has no admitted Stop generation".into(),
+        })?.native_stop_generation()
+    }
+
     async fn accepted(&self, turn: &crate::agent_provider::TurnId) {
         if let Some(inner) = &self.inner { inner.accepted(turn).await; }
     }

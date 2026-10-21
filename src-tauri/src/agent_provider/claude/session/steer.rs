@@ -358,7 +358,7 @@ impl ClaudeSession {
             return;
         }
         let turn = TurnId(format!("claude-turn-{}", uuid::Uuid::new_v4()));
-        let generation = self.native_authority.begin();
+        let Some(generation) = self.native_authority.begin_continuation() else { return; };
         self.native_authority.bind(generation, &turn.0);
         state.active_turn = Some(turn.clone());
         state.status = SessionStatus::Running {

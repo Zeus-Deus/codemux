@@ -1096,6 +1096,8 @@ struct Fr1HeldCheckpoint {
 }
 #[async_trait::async_trait]
 impl crate::agent_provider::types::TurnDispatchCheckpoint for Fr1HeldCheckpoint {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
     async fn accepted(&self, turn: &crate::agent_provider::TurnId) { self.inner.accepted(turn).await; }
     fn authorize_dispatch(&self) -> Result<(), ProviderError> {
         let result = self.inner.authorize_dispatch();
@@ -1202,6 +1204,8 @@ struct C1ScheduledCheckpoint {
 }
 #[async_trait::async_trait]
 impl crate::agent_provider::types::TurnDispatchCheckpoint for C1ScheduledCheckpoint {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
     fn authorize_dispatch(&self) -> Result<(), ProviderError> { self.inner.authorize_dispatch() }
     async fn accepted(&self, turn: &crate::agent_provider::TurnId) { self.inner.accepted(turn).await; }
     async fn prepare(&self) {

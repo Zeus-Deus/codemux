@@ -1436,3 +1436,16 @@ describe("Settings search", () => {
     view.unmount();
   });
 });
+
+describe("agent collaboration setting", () => {
+  it("describes chat tools and inherited permissions", async () => {
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    useFeatureFlags.setState({ enableAgentChat: true });
+    requestedSection = "agent";
+    render(<SettingsView />);
+    expect(await screen.findByText("Let agents work with other chats")).toBeInTheDocument();
+    expect(screen.getByText(/within the current chat’s permissions/)).toBeInTheDocument();
+    expect(screen.queryByText("Delegate to other agents")).not.toBeInTheDocument();
+    requestedSection = null;
+  });
+});

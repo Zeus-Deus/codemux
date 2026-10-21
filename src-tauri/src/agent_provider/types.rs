@@ -105,6 +105,10 @@ pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
     /// Check authority before asynchronous preparation without recording a
     /// submission attempt. The adapter still authorizes at the wire boundary.
     fn verify_dispatch(&self) -> Result<(), super::ProviderError> { self.authorize_dispatch() }
+    /// The dispatching input's durable Stop fence, retained for native tools
+    /// throughout this turn. Wrappers must forward it; standalone provider
+    /// fixtures explicitly opt into generation zero.
+    fn native_stop_generation(&self) -> Result<u64, super::ProviderError>;
     /// Check a human queue promotion before it can interrupt another turn.
     /// This must not record a provider submission.
     fn authorize_queue_promotion(&self) -> Result<(), super::ProviderError> {

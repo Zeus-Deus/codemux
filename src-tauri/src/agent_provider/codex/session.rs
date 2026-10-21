@@ -585,6 +585,7 @@ impl CodexSession {
         }
 
         let host_caller = crate::mcp::registry::HostCaller {
+            control: None,
             thread_id: thread_id.0.clone(),
             provider: crate::agent_provider::ProviderKind::Codex,
             workspace_id: workspace_id.clone(),
@@ -792,7 +793,8 @@ impl CodexSession {
                             permission_mode.as_deref(),
                         ) {
                             Some((ap, sb)) => (Some(ap), Some(sb)),
-                            None => (None, None),
+                            None if permission_mode.is_none() => (None, None),
+            None => return Err(ProviderError::ValidationError { message: "Unsupported explicit Codex permission mode".into() }),
                         };
                         let params = ThreadResumeParams {
                             thread_id: rid.clone(),
@@ -923,7 +925,7 @@ impl CodexSession {
             tasks: Mutex::new(Vec::new()),
             dead: Arc::new(AtomicBool::new(false)),
             workspace_id,
-            native_authority: crate::delegation::authority::NativeAuthority::new(&thread_id.0),
+            native_authority: crate::delegation::authority::NativeAuthority::with_policy(&thread_id.0,crate::agent_provider::ProviderKind::Codex,if resumed_plan==Some(true){Some("plan")}else{permission_mode.as_deref()}),
             managed: managed.clone(),
             host_caller,
             guidance: dynamic_tools.as_deref().and_then(developer_guidance),
@@ -933,9 +935,9 @@ impl CodexSession {
             // A resumed thread continues in its last turn's mode until a
             // composer send names one, so restart auto-resume, and answers
             // given right after a rebuild, keep an interrupted Plan task in Plan.
-            plan_mode: AtomicBool::new(resumed_plan.unwrap_or(false)),
+            plan_mode: AtomicBool::new(resumed_plan.unwrap_or(false) || permission_mode.as_deref() == Some("plan")),
             turn_modes: std::sync::Mutex::new(TurnModes {
-                inherited: resumed_plan.unwrap_or(false),
+                inherited: resumed_plan.unwrap_or(false) || permission_mode.as_deref() == Some("plan"),
                 ..Default::default()
             }),
             mode_reported: resumed_plan.is_some(),
@@ -1688,14 +1690,14 @@ impl CodexSession {
         if let Some(id) = client_id {
             params_value["clientUserMessageId"] = json!(id);
         }
-        if let Some(checkpoint) = &checkpoint {
-            checkpoint.authorize_dispatch().map_err(|error| TurnStartError::Rpc(
+        let stop_generation = if let Some(checkpoint) = &checkpoint {
+            checkpoint.authorize_dispatch().and_then(|()| checkpoint.native_stop_generation()).map_err(|error| TurnStartError::Rpc(
                 crate::json_rpc_child::RpcChildError::RpcError(crate::json_rpc_child::RpcError {code:-32001,message:error.to_string(),data:None})
-            ))?;
-        }
+            ))?
+        } else { 0 };
         let generation = {
             let mut state = self.state.lock().await;
-            let generation = self.native_authority.begin();
+            let generation = self.native_authority.begin(stop_generation);
             state.pending_turn_start = Some(PendingTurnStart::default());
             generation
         };
@@ -1801,6 +1803,7 @@ impl CodexSession {
         if !self.mode_reported {
             self.plan_mode.store(mode == "plan", Ordering::SeqCst);
             self.turn_modes().inherited = mode == "plan";
+            self.native_authority.set_policy(crate::agent_provider::ProviderKind::Codex,if mode=="plan" {Some("plan")}else{self.host_caller.permission_mode.as_deref()});
         }
     }
 
@@ -1814,6 +1817,7 @@ impl CodexSession {
         if let Some(mode) = permission_mode_override {
             self.plan_mode.store(mode == "plan", Ordering::SeqCst);
         }
+        self.native_authority.set_policy(crate::agent_provider::ProviderKind::Codex,if self.plan_mode.load(Ordering::SeqCst){Some("plan")}else{self.host_caller.permission_mode.as_deref()});
     }
 
     /// Whether a send is between leaving the queue (or the send button)
@@ -2576,7 +2580,7 @@ impl Drop for CodexSession {
 pub(crate) fn codex_permission_mode_to_policy_pair(mode: Option<&str>) -> Option<(String, String)> {
     match mode? {
         "managed-read-only" => Some(("never".into(), "read-only".into())),
-        "read-only" => Some(("untrusted".into(), "read-only".into())),
+        "read-only" | "plan" => Some(("untrusted".into(), "read-only".into())),
         "workspace-write" => Some(("on-request".into(), "workspace-write".into())),
         "danger-full-access" => Some(("never".into(), "danger-full-access".into())),
         _ => None,
@@ -2628,7 +2632,8 @@ async fn start_fresh_thread(
     let (approval_policy, sandbox) =
         match codex_permission_mode_to_policy_pair(permission_mode.as_deref()) {
             Some((ap, sb)) => (Some(ap), Some(sb)),
-            None => (None, None),
+            None if permission_mode.is_none() => (None, None),
+            None => return Err(ProviderError::ValidationError { message: "Unsupported explicit Codex permission mode".into() }),
         };
     let params = ThreadStartParams {
         model,
@@ -2848,10 +2853,12 @@ fn spawn_incoming_requests_task(
                             owned.then(|| crate::delegation::app::NativeActor {
                                 thread_id: session.thread_id.0.clone(), provider: crate::agent_provider::ProviderKind::Codex,
                                 workspace_id: session.workspace_id.clone(), session_id: session.provider_session_id.0.clone(),
-                                permission_mode: state.permission_mode.clone(),
+                                permission_mode: if session.plan_mode.load(Ordering::SeqCst) { Some("plan".into()) } else { state.permission_mode.clone() },
                                 permit: session.native_authority.capture_for_turn(turn.unwrap()),
                             })
                         };
+                        let callback_permit = actor.as_ref().map(|actor| actor.permit.clone())
+                            .unwrap_or_else(|| session.native_authority.capture());
                         let owned_session = session.clone();
                         let owned_registry = mcp_registry.clone();
                         let job = tokio::spawn(async move {
@@ -2869,7 +2876,7 @@ fn spawn_incoming_requests_task(
                                 params, actor, &session.direct_tool_names,
                             ).await
                         });
-                        session.native_authority.track(job.abort_handle());
+                        session.native_authority.track(&callback_permit, job.abort_handle());
                         // Revocation cancels the work, never the obligation to
                         // answer the server request (including track rejection).
                         let child = child.clone();
@@ -2944,6 +2951,7 @@ async fn dynamic_tool_specs(
             .list_tools_for_workspace(&[crate::mcp::McpConfigSource::CodexUser], host_caller.workspace_id.as_deref())
             .await
     };
+    tools.retain(|tool| crate::mcp::registry::native_tool_visible(tool, host_caller));
     let host_tools=registry.host_tools(host_caller);
     // App-owned task tools also serve local IDs; replace the SSH-only schema
     // rather than publishing duplicate names to the native provider.
@@ -3001,15 +3009,18 @@ async fn handle_dynamic_tool_call_native(
     let dispatched = match (registry, parsed) {
         (Some(registry), Ok(call)) => {
             let name = registry_tool_name(&call.tool);
-            // Host tools answer synchronously (no provider waits), which
-            // matters here: this request loop handles approvals too. They act
-            // as the root chat, so a call from another thread (a native
-            // subagent that inherited the dynamic tools) is refused rather
-            // than handed the root's identity and permission mode.
+            if host.is_some() && actor.is_none() && crate::agent_control::native::tool_name(&name).is_some() {
+                return json!({"success":false,"contentItems":[{"type":"inputText","text":"stale_caller: injected tools require the app-owned live session and run; provider-native children cannot borrow its identity"}]});
+            }
+            // Only the adapter's app-owned session/run may invoke host tools.
+            // Waits run in tracked tasks outside the approval reader.
             let host = if let Some((caller, root_thread))=host {
-                if call.thread_id==root_thread {registry.host_call_native(caller,&name,&call.arguments,Some(&call.call_id),Some(&call.turn_id),actor.as_ref().map(|actor| &actor.permit)).await}
+                if call.thread_id==root_thread {registry.host_call_native(caller,&name,&call.arguments,Some(&call.call_id),Some(&call.turn_id),actor.as_ref()).await}
                 else {registry.host_tools(caller).iter().any(|tool|tool.prefixed_name==name).then(||json!({"content":[{"type":"text","text":"This tool requires the app-owned root conversation"}],"isError":true}))}
             } else {None};
+            if actor.is_none() && crate::agent_control::native::tool_name(&name).is_some() {
+                return json!({"success":false,"contentItems":[{"type":"inputText","text":"stale_caller: orchestration requires an app-owned live thread; provider-native child sessions cannot borrow its identity"}]});
+            }
             let bridge = registry.call_plugin_bridge(&name, call.arguments.clone(), workspace_id, direct_tools).await;
             match host {
                 _ if bridge.is_some() => bridge.unwrap(),
@@ -3772,9 +3783,9 @@ mod tests {
         for stop_before_capture in [false, true] {
             let registry = McpRegistry::new();
             registry.set_host_tools(Arc::new(HandOffHost));
-            let caller = crate::mcp::registry::HostCaller { thread_id: format!("codex-late-host-{stop_before_capture}"), provider: crate::agent_provider::ProviderKind::Codex, workspace_id: None, permission_mode: Some("danger-full-access".into()) };
+            let caller = crate::mcp::registry::HostCaller { control:None, thread_id: format!("codex-late-host-{stop_before_capture}"), provider: crate::agent_provider::ProviderKind::Codex, workspace_id: None, permission_mode: Some("danger-full-access".into()) };
             let owner = crate::delegation::authority::NativeAuthority::new(&caller.thread_id);
-            let generation = owner.begin(); assert!(owner.bind(generation, "turn"));
+            let generation = owner.begin(0); assert!(owner.bind(generation, "turn"));
             let db = crate::database::DatabaseStore::new_in_memory();
             if stop_before_capture { owner.invalidate(); db.stop_message_deliveries(&caller.thread_id).unwrap(); }
             let actor = crate::delegation::app::NativeActor { thread_id:caller.thread_id.clone(), provider:caller.provider, workspace_id:None, session_id:"session".into(), permission_mode:caller.permission_mode.clone(), permit:owner.capture_for_turn("turn") };
@@ -3786,10 +3797,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_tools_answer_only_the_root_thread() {
+    async fn unqualified_and_provider_native_children_cannot_borrow_host_identity() {
         let registry = McpRegistry::new();
         registry.set_host_tools(Arc::new(HandOffHost));
         let caller = crate::mcp::registry::HostCaller {
+            control: None,
             thread_id: "codemux-chat".into(),
             provider: crate::agent_provider::ProviderKind::Codex,
             workspace_id: None,
@@ -3806,19 +3818,16 @@ mod tests {
             })
         };
 
-        let owner = crate::delegation::authority::NativeAuthority::new(&caller.thread_id);
-        let generation = owner.begin(); assert!(owner.bind(generation, "turn"));
-        let actor = crate::delegation::app::NativeActor { thread_id:caller.thread_id.clone(), provider:caller.provider, workspace_id:None, session_id:"session".into(), permission_mode:caller.permission_mode.clone(), permit:owner.capture_for_turn("turn") };
         let root = handle_dynamic_tool_call_native(
             Some(&registry),
             None,
             Some((&caller, "codex-root")),
             request("codex-root"),
-            Some(actor), &[],
+            None, &[],
         )
         .await;
-        assert_eq!(root["success"], true, "{root}");
-        assert_eq!(root["contentItems"][0]["text"], "as codemux-chat");
+        assert_eq!(root["success"], false, "a root id alone is not authenticated authority: {root}");
+        assert!(root["contentItems"][0]["text"].as_str().unwrap().contains("stale_caller"));
 
         // A native subagent that inherited the dynamic tools has its own
         // thread id and must not act as the root chat.
@@ -3833,7 +3842,19 @@ mod tests {
         assert!(native_child["contentItems"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("app-owned root conversation"));
+            .contains("stale_caller"));
+    }
+
+    #[tokio::test]
+    async fn unqualified_and_provider_native_children_keep_plugin_tools_and_bridges() {
+        let registry=crate::mcp::registry::test_support::plugin_fixture("all").await;
+        let caller=crate::mcp::registry::HostCaller {control:None,thread_id:"app-root".into(),provider:crate::agent_provider::ProviderKind::Codex,workspace_id:Some("ws-42".into()),permission_mode:Some("danger-full-access".into())};
+        for bridge in [false,true] {
+            let response=handle_dynamic_tool_call(Some(&registry),Some("ws-42"),Some((&caller,"native-root")),json!({"threadId":"provider-native-child","turnId":"turn","callId":"call","tool":if bridge {"codemux_call_plugin_tool"} else {"fixture__new_tool"},"arguments":if bridge {json!({"name":"fixture__new_tool","arguments":{}})} else {json!({})}})).await;
+            assert_eq!(response["success"],true,"{response}");
+            assert!(response.to_string().contains("ORCHID-742"));
+        }
+        registry.shutdown_all().await;
     }
 
     #[tokio::test]
@@ -3877,7 +3898,7 @@ mod tests {
 
     #[tokio::test]
     async fn plugin_mcp_codex_payload_has_guidance_and_hides_private_servers() {
-        let caller=crate::mcp::registry::HostCaller {thread_id:"thread".into(),provider:crate::agent_provider::ProviderKind::Codex,workspace_id:Some("ws".into()),permission_mode:None};
+        let caller=crate::mcp::registry::HostCaller {control: None,thread_id:"thread".into(),provider:crate::agent_provider::ProviderKind::Codex,workspace_id:Some("ws".into()),permission_mode:None};
         for scope in ["all","plugin"] {
             let registry=crate::mcp::registry::test_support::plugin_fixture(scope).await;
             let tools=dynamic_tool_specs(Some(&registry),false,&caller).await.unwrap();
@@ -3893,6 +3914,7 @@ mod tests {
         let (_server, registry, call) =
             crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
         let caller = crate::mcp::registry::HostCaller {
+            control: None,
             thread_id: "codemux-chat".into(),
             provider: crate::agent_provider::ProviderKind::Codex,
             workspace_id: Some("ws-42".into()),

@@ -18,6 +18,9 @@ import { openExternalUrl, routeForUrl, type LinkGesture } from "@/lib/open-url";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
+import { chatLinkId } from "@/lib/agent-chat/chat-links";
+import { ChatLink } from "./ChatLink";
+
 const INCOMPLETE_LINK = "streamdown:incomplete-link";
 
 type ChatMarkdownLinkProps = ComponentProps<"a"> & {
@@ -36,8 +39,8 @@ type ChatMarkdownLinkProps = ComponentProps<"a"> & {
  * The webview never performs a link's navigation itself. Chat markdown is
  * agent-relayed text, and `ChatMarkdown` passes its own `rehypePlugins`, which
  * REPLACES Streamdown's sanitize/harden chain — so an href reaches this
- * component exactly as written. Only an absolute `http(s)` URL is treated as a
- * destination, and only through the confirmation dialog plus Tauri's system
+ * component exactly as written. Versioned chat links open through the app.
+ * An absolute `http(s)` URL opens through the confirmation dialog and system
  * browser opener. Every other href (script schemes, `file:`, `mailto:`,
  * absolute paths, relative paths, fragments) renders without a live `href`:
  * following one in place would either execute in the app origin with IPC reach
@@ -56,6 +59,8 @@ export function ChatMarkdownLink({
   ...props
 }: ChatMarkdownLinkProps) {
   const [confirmationOpen, setConfirmationOpen] = useState(false);
+  const threadId = chatLinkId(href);
+  if (threadId) return <ChatLink {...props} threadId={threadId} className={className} onClick={onClick} onAuxClick={onAuxClick}>{children}</ChatLink>;
   const incomplete = href === INCOMPLETE_LINK;
   const externalHref =
     !incomplete && typeof href === "string" && externalWebLinkHost(href) !== null

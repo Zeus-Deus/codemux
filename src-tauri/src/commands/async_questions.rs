@@ -89,6 +89,40 @@ fn change<R: Runtime>(
     Ok(row_id)
 }
 
+/// A question answer can start a turn without a message-delivery row. Its
+/// authority must be captured before resume and retained through preparation.
+struct AnswerCheckpoint<R: Runtime> {
+    app: AppHandle<R>,
+    thread: String,
+    generation: u64,
+    inner: Option<Arc<dyn TurnDispatchCheckpoint>>,
+}
+impl<R: Runtime> std::fmt::Debug for AnswerCheckpoint<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("AnswerCheckpoint") }
+}
+#[async_trait::async_trait]
+impl<R: Runtime> TurnDispatchCheckpoint for AnswerCheckpoint<R> {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> {
+        self.verify_dispatch()?;
+        Ok(self.generation)
+    }
+    fn verify_dispatch(&self) -> Result<(), crate::agent_provider::ProviderError> {
+        self.app.state::<DatabaseStore>().verify_delivery_generation(&self.thread, self.generation)
+            .map_err(|message| crate::agent_provider::ProviderError::ValidationError { message })?;
+        if let Some(inner) = &self.inner { inner.verify_dispatch()?; }
+        Ok(())
+    }
+    fn authorize_dispatch(&self) -> Result<(), crate::agent_provider::ProviderError> {
+        self.verify_dispatch()?;
+        if let Some(inner) = &self.inner { inner.authorize_dispatch()?; }
+        Ok(())
+    }
+    async fn prepare(&self) { if let Some(inner) = &self.inner { inner.prepare().await; } }
+    async fn commit(&self) { if let Some(inner) = &self.inner { inner.commit().await; } }
+    async fn abort(&self) { if let Some(inner) = &self.inner { inner.abort().await; } }
+    async fn accepted(&self, turn: &crate::agent_provider::TurnId) { if let Some(inner) = &self.inner { inner.accepted(turn).await; } }
+}
+
 #[tauri::command]
 pub async fn agent_chat_answer_question<R: Runtime>(
     app: AppHandle<R>,
@@ -104,6 +138,7 @@ pub async fn agent_chat_answer_question<R: Runtime>(
         .ok_or("Conversation no longer exists.")?;
     let provider_kind: ProviderKind = serde_json::from_value(serde_json::json!(record.provider))
         .map_err(|_| "Unknown conversation provider.")?;
+    let generation = db.delivery_generation(&thread_id.0)?.0;
     let registry: State<'_, ProviderRegistry> = app.state();
     let provider = lookup_provider(&registry, provider_kind).await?;
     if !provider.supports_async_questions() {
@@ -182,6 +217,7 @@ pub async fn agent_chat_answer_question<R: Runtime>(
             let checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = if run_checkpoints_enabled() && provider.capabilities().supports_conversation_rollback {
                 record.cwd.clone().map(|cwd| Arc::new(GitTurnDispatchCheckpoint::new(app.clone(), thread_id.0.clone(), record.workspace_id, cwd, Some(submission_id.clone()))) as Arc<dyn TurnDispatchCheckpoint>)
             } else { None };
+            let checkpoint = Some(Arc::new(AnswerCheckpoint {app:app.clone(),thread:thread_id.0.clone(),generation,inner:checkpoint}) as Arc<dyn TurnDispatchCheckpoint>);
             let checkpoint = super::turn_diff::wrap_dispatch_checkpoint(&app, &thread_id.0, record.cwd, Some(&submission_id), checkpoint);
             let delivered = provider.answer_question(AnswerQuestionInput { thread_id: thread_id.clone(), question, answers: answers.clone(), submission_id: submission_id.clone(), checkpoint, permission_mode_override }).await;
             if let Ok(QuestionDelivery::NewTurn { turn_id }) = &delivered {
@@ -219,4 +255,65 @@ pub async fn agent_chat_answer_question<R: Runtime>(
     // Binding to this late acknowledgment would retain output from the turn
     // being reverted. Its client nonce already associates the reply bubble.
     Ok(db.async_question(&thread_id.0, &question_id)?.1)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::agent_provider::{AgentProvider, UserQuestion, UserQuestionSet};
+
+    #[test]
+    fn review600_async_questions_dispatch_wrappers_reject_stop_after_admission() {
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        let db = app.state::<DatabaseStore>();
+        db.stop_message_deliveries("answer").unwrap();
+        db.resume_message_delivery_thread("answer").unwrap();
+        let generation = db.delivery_generation("answer").unwrap().0;
+        let answer = Arc::new(AnswerCheckpoint {app:app.handle().clone(),thread:"answer".into(),generation,inner:None});
+        let wrapped = super::super::turn_diff::wrap_dispatch_checkpoint(app.handle(), "answer", Some("/not-a-repo".into()), Some("answer-nonce"), Some(answer)).unwrap();
+        assert_eq!(wrapped.native_stop_generation().unwrap(), generation);
+        db.stop_message_deliveries("answer").unwrap();
+        db.resume_message_delivery_thread("answer").unwrap();
+        assert!(wrapped.authorize_dispatch().is_err());
+        assert!(wrapped.native_stop_generation().is_err());
+    }
+
+    #[tokio::test]
+    async fn review600_async_questions_idle_answer_after_stop_resume_keeps_durable_generation() {
+        let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("fake_codex_app_server");
+        assert!(binary.exists(), "build the fake_codex_app_server test fixture first");
+        for capture_diff in [false, true] {
+            let app = tauri::test::mock_app();
+            let root = tempfile::tempdir().unwrap();
+            let thread = format!("review600-answer-{capture_diff}");
+            let db = DatabaseStore::new_in_memory();
+            let cwd = capture_diff.then(|| root.path().to_string_lossy().to_string());
+            db.upsert_agent_chat_session(&thread, "workspace", cwd.as_deref(), "codex").unwrap();
+            let question = UserQuestionSet { id:"q".into(),target:"c-1".into(),source_item_id:"q-1".into(),source_turn_id:"old-turn".into(),text:String::new(),subagent_id:None,questions:vec![UserQuestion {title:"Which storage?".into(),options:vec![]}] };
+            db.record_async_question(&thread, &question).unwrap();
+            db.stop_message_deliveries(&thread).unwrap();
+            db.resume_message_delivery_thread(&thread).unwrap();
+            let expected_generation = db.delivery_generation(&thread).unwrap().0;
+            assert!(expected_generation > 0);
+            let provider = Arc::new(crate::agent_provider::codex::CodexAgentProvider::new(crate::agent_provider::codex::CodexProviderConfig {codex_binary:binary.clone(), ..Default::default()}));
+            let input = serde_json::from_value(serde_json::json!({"thread_id":thread,"cwd":root.path(),"permission_mode":"danger-full-access","additional_directories":[],"env":{"FAKE_CODEX_ASYNC_MODE":"idle"}})).unwrap();
+            provider.start_session(input).await.unwrap();
+            let registry = ProviderRegistry::new();
+            registry.set_codex(provider.clone()).await;
+            app.manage(registry);
+            app.manage(db);
+            let observability = ObservabilityStore::default();
+            let mut flags = observability.feature_flags(); flags.enable_agent_chat = true; observability.set_feature_flags(flags);
+            app.manage(observability);
+            app.manage(super::super::agent_chat::AgentChatChannelRegistry::default());
+            let result = agent_chat_answer_question(app.handle().clone(), ThreadId(thread.clone()), "q".into(), QuestionAction::Answer {answers:vec!["SQLite".into()],submission_id:uuid::Uuid::new_v4().to_string(),retry_unknown:false,permission_mode_override:None}).await.unwrap();
+            let identity = crate::delegation::authority::NativeAuthority::current_permit(&thread).identity();
+            provider.stop_session(ThreadId(thread.clone())).await.unwrap();
+            assert!(matches!(result, QuestionResolution::Answered {delivery:QuestionDelivery::NewTurn {..},..}), "{result:?}");
+            let identity = identity.unwrap();
+            assert_eq!(identity.stop_generation, expected_generation, "the answer must retain admission's durable Stop generation");
+            app.state::<DatabaseStore>().verify_delivery_generation(&thread, identity.stop_generation).unwrap();
+        }
+    }
 }

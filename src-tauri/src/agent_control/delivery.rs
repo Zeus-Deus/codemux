@@ -52,6 +52,11 @@ impl SendContext {
         let mut context = Self::new(TurnOrigin::Controller);
         context.provenance.created_by = caller.created_by;
         context.provenance.creation_source = CreationSource::Mcp;
+        if let Some(thread) = caller.thread_id() {
+            context.provenance.created_by = CreatedBy::Agent;
+            context.provenance.creation_source = CreationSource::Provider;
+            context.provenance.sender_thread_id = Some(thread.into());
+        }
         context
     }
     pub fn is_human(&self) -> bool {
@@ -222,7 +227,8 @@ async fn dispatch_with_control<R: Runtime>(
             let _=db.finish_message_delivery(&row.id,"held",None,Some(&error));warn_held(app,&row.thread_id,&error);crate::delegation::app::completion_delivery_changed(app,&row.id);return Err(error);
         }
     }
-    let control = admitted_control.or_else(|| payload.caller.map(|caller| {
+    let mut control = admitted_control.or_else(|| payload.caller.map(|mut caller| {
+        if caller.thread_id().is_some() { caller.admitted=Some(super::AdmittedAuthority::Delivery { delivery_id:row.id.clone() }); }
         NativeControlGuard {
             caller,
             workspace_id: db
@@ -235,6 +241,11 @@ async fn dispatch_with_control<R: Runtime>(
         }
         .retain_admission(app)
     }));
+    if let Some(control) = &mut control {
+        if control.caller.thread_id().is_some() {
+            control.caller.admitted = Some(super::AdmittedAuthority::Delivery { delivery_id: row.id.clone() });
+        }
+    }
     if let Some(control) = &control {
         if let Err(error) = control.verify(app) {
             // A definite refusal or cancellation settles this unqueued operation.
@@ -254,6 +265,7 @@ async fn dispatch_with_control<R: Runtime>(
             return Err(error);
         }
     }
+    crate::commands::delegation::resume_followup(app,&row.id);
     let _activity = if payload.origin != TurnOrigin::Controller {
         Some(
             agent_chat::delegation_activity_lock(&row.thread_id)
@@ -300,6 +312,12 @@ impl<R: Runtime> std::fmt::Debug for DeliveryCheckpoint<R> {
 }
 #[async_trait::async_trait]
 impl<R: Runtime> TurnDispatchCheckpoint for DeliveryCheckpoint<R> {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> {
+        self.app.state::<DatabaseStore>().message_delivery(&self.id)
+            .map_err(|message| crate::agent_provider::ProviderError::ValidationError { message })?
+            .map(|row| row.generation)
+            .ok_or_else(|| crate::agent_provider::ProviderError::ValidationError { message: "Missing dispatch delivery".into() })
+    }
     fn releases_queue_hold(&self) -> bool { self.release_queue }
     fn queued_delivery_state(&self) -> crate::agent_provider::types::QueuedDeliveryState {
         use crate::agent_provider::types::QueuedDeliveryState::*;

@@ -500,6 +500,8 @@ struct DispatchTimelineFixture {
 
 #[async_trait::async_trait]
 impl crate::agent_provider::TurnDispatchCheckpoint for DispatchTimelineFixture {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
     async fn prepare(&self) {
         self.entered.store(true, Ordering::SeqCst);
         let guard = self.timeline.clone().lock_owned().await;
@@ -1002,6 +1004,22 @@ async fn orchestration_message_codex_machine_send_keeps_provider_hold_and_held_i
     session.shutdown().await.unwrap();
 }
 
+// These adapter tests exercise callback lifetime with a controllable host.
+// Native orchestration now enters through the authenticated dispatcher.
+fn native_host_registry(host: Arc<dyn crate::mcp::registry::HostTools>) -> McpRegistry {
+    let registry=McpRegistry::new();registry.set_host_tools(host.clone());
+    registry.set_native_delegation_handler(Arc::new(move|actor,name,args,call_id|{
+        let host=host.clone();
+        Box::pin(async move{
+            actor.permit.wait_ready().await?;
+            let run_id=actor.permit.identity()?.run_id;
+            let caller=crate::mcp::registry::HostCaller{control:None,thread_id:actor.thread_id,provider:actor.provider,workspace_id:actor.workspace_id,permission_mode:actor.permission_mode};
+            host.call_async(&caller,&format!("mcp__codemux__{name}"),&args,call_id.as_deref(),run_id.as_deref()).await.ok_or("Fixture native host did not handle the call".into())
+        })
+    }));
+    registry
+}
+
 #[tokio::test]
 async fn delegation_delivery_codex_stop_aborts_waiting_dynamic_host_call() {
     struct WaitingHost { entered: Arc<tokio::sync::Notify>, dropped: Arc<std::sync::atomic::AtomicBool> }
@@ -1019,7 +1037,7 @@ async fn delegation_delivery_codex_stop_aborts_waiting_dynamic_host_call() {
     let root = tempfile::tempdir().unwrap(); std::fs::write(root.path().join("host-tool"), "yes").unwrap();
     std::fs::write(root.path().join("host-tool-late"), "yes").unwrap();
     let host = Arc::new(WaitingHost {entered:Default::default(),dropped:Default::default()});
-    let registry = McpRegistry::new(); registry.set_host_tools(host.clone());
+    let registry = native_host_registry(host.clone());
     let (tx, _) = broadcast::channel(128);
     let session = CodexSession::spawn_and_initialize(
         ThreadId("waiting-host".into()), root.path().into(), None, Some("danger-full-access".into()), None, "default".into(), None, None, None,
@@ -1061,7 +1079,7 @@ async fn delegation_delivery_round2_queued_human_keeps_dynamic_callbacks_and_dra
     let root = tempfile::tempdir().unwrap();
     for marker in ["host-tool", "host-tool-followup"] { std::fs::write(root.path().join(marker), "yes").unwrap(); }
     let host = Arc::new(Host { entered:Default::default(), release:Default::default(), calls:Default::default() });
-    let registry = McpRegistry::new(); registry.set_host_tools(host.clone());
+    let registry = native_host_registry(host.clone());
     let (tx, _) = broadcast::channel(128);
     let session = CodexSession::spawn_and_initialize(
         ThreadId("queued-human-dynamic".into()), root.path().into(), None, Some("danger-full-access".into()), None, "default".into(), None, None, None,

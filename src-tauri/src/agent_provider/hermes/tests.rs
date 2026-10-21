@@ -72,6 +72,8 @@ struct ReviewDispatchAuthority {
 }
 #[async_trait]
 impl crate::agent_provider::types::TurnDispatchCheckpoint for ReviewDispatchAuthority {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
     fn authorize_dispatch(&self) -> Result<(), ProviderError> {
         if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
             Err(invalid("grant_revoked: synthetic Q1 authority revoked"))

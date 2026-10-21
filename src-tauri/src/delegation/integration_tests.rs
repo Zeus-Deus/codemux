@@ -105,6 +105,8 @@ struct HeldCheckpoint {
 }
 #[async_trait::async_trait]
 impl crate::agent_provider::TurnDispatchCheckpoint for HeldCheckpoint {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
     async fn prepare(&self) {
         if self.phase == "prepare" {
             self.entered.notify_one();
@@ -1341,7 +1343,7 @@ async fn control_launch_lost_reply_restart_follow_and_normal_idle_native_parent_
     let called = Arc::new(AtomicBool::new(false));
     let callback_handle = handle.clone();
     let called_copy = called.clone();
-    mcp.set_native_delegation_handler(Arc::new(move |actor, name, args| {
+    mcp.set_native_delegation_handler(Arc::new(move |actor, name, args, _call_id| {
         let handle = callback_handle.clone();
         let called = called_copy.clone();
         Box::pin(async move {
@@ -1616,7 +1618,7 @@ async fn claude_callback_authority_ends_with_turn_and_callback_job_ends_with_run
         let handle = app.handle().clone();
         let e = entered.clone();
         let r = release.clone();
-        registry.set_native_delegation_handler(Arc::new(move |actor, name, args| {
+        registry.set_native_delegation_handler(Arc::new(move |actor, name, args, _call_id| {
             let handle = handle.clone();
             let e = e.clone();
             let r = r.clone();
@@ -2149,7 +2151,7 @@ async fn codex_delayed_native_admission_is_denied_after_completed_stop() {
     let callback_handle = handle.clone();
     let callback_entered = entered.clone();
     let callback_release = release.clone();
-    mcp.set_native_delegation_handler(Arc::new(move |actor, name, args| {
+    mcp.set_native_delegation_handler(Arc::new(move |actor, name, args, _call_id| {
         let handle = callback_handle.clone();
         let entered = callback_entered.clone();
         let release = callback_release.clone();
@@ -2273,7 +2275,7 @@ async fn native_callbacks_before_ack_keep_the_original_turn_authority() {
         registry.insert_native_delegation_tools_for_test().await;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let tx = Arc::new(Mutex::new(Some(tx)));
-        registry.set_native_delegation_handler(Arc::new(move |actor, _, _| {
+        registry.set_native_delegation_handler(Arc::new(move |actor, _, _, _call_id| {
             let tx = tx.clone();
             Box::pin(async move {
                 let result = actor.permit.admit().map(|_| json!({"qualified":true}));

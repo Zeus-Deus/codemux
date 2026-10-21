@@ -138,6 +138,9 @@ describe("delegate_task call input", () => {
 
   it("recognises delegate calls among tool calls", () => {
     expect(isDelegateToolCall(call())).toBe(true);
+    expect(isDelegateToolCall(call({status:"error",result_content:[{type:"text",text:"permission_ceiling: refused"}]}))).toBe(false);
+    expect(isDelegateToolCall(call({result_content:{success:false,contentItems:[{type:"inputText",text:"Refused"}]}}))).toBe(false);
+    expect(isDelegateToolName("mcp__another__delegate_task")).toBe(false);
     expect(isDelegateToolCall(call({ tool_name: "Bash", input: { command: "ls" } }))).toBe(false);
   });
 });

@@ -1,3 +1,4 @@
+import { codemuxToolPresentation } from "@/lib/agent-chat/codemux-tool-presentation";
 import {
   BookOpen,
   Bot,
@@ -56,7 +57,7 @@ export function toolCategory(toolName: string): ToolCategory {
   // `delegate_task` hands work to another agent. It normally renders as the
   // delegation card; anywhere it shows up as a plain tool row (whatever the
   // adapter's prefix), it is an agent hand-off.
-  if (isDelegateToolName(toolName) || isSuggestToolName(toolName) || isWorkspaceLaunchToolName(toolName)) return "agent";
+  if (codemuxToolPresentation(toolName) || isDelegateToolName(toolName) || isSuggestToolName(toolName) || isWorkspaceLaunchToolName(toolName)) return "agent";
   return CATEGORY_BY_TOOL[toolName] ?? "other";
 }
 
@@ -77,6 +78,8 @@ const ICON_BY_TOOL: Record<string, LucideIcon> = {
 };
 
 export function toolIcon(toolName: string): LucideIcon {
+  const presentation = codemuxToolPresentation(toolName);
+  if (presentation) return presentation.icon;
   if (isWorkspaceLaunchToolName(toolName)) return GitBranch;
   if (isDelegateToolName(toolName)) return Bot;
   if (isSuggestToolName(toolName)) return ListPlus;

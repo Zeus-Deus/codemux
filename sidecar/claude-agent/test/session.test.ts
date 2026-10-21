@@ -157,7 +157,7 @@ test("start-session RPC appends Codemux instructions to Claude Code's prompt", a
   }
 });
 
-test("suggest_tasks runs without an approval prompt; other host tools still ask", async () => {
+test("authenticated orchestration callbacks are available in supervised and plan modes", async () => {
   const { emit } = recordingEmitter();
   const tool = (prefixedName: string) => ({
     name: prefixedName.split("__").pop()!,
@@ -170,11 +170,11 @@ test("suggest_tasks runs without an approval prompt; other host tools still ask"
     permissionMode: "default",
     mcpTools: [tool("mcp__codemux__suggest_tasks"), tool("mcp__codemux__delegate_task")],
   }), emit);
-  expect(fake.capturedOptions?.allowedTools).toEqual(["mcp__codemux__mcp__codemux__suggest_tasks"]);
+  expect(fake.capturedOptions?.allowedTools).toEqual(["mcp__codemux__mcp__codemux__suggest_tasks", "mcp__codemux__mcp__codemux__delegate_task"]);
   await session.close();
 
-  const plain = new ClaudeSession(minimalInput({ mcpTools: [tool("mcp__codemux__delegate_task")] }), emit);
-  expect(fake.capturedOptions?.allowedTools).toBeUndefined();
+  const plain = new ClaudeSession(minimalInput({ permissionMode: "plan", mcpTools: [tool("mcp__codemux__delegate_task"), tool("mcp__codemux__thread_send"), tool("mcp__codemux__thread_respond")] }), emit);
+  expect(fake.capturedOptions?.allowedTools).toEqual(["mcp__codemux__mcp__codemux__delegate_task", "mcp__codemux__mcp__codemux__thread_send"]);
   await plain.close();
 });
 

@@ -23,7 +23,7 @@ use crate::mcp::runtime::{prefix_tool_name, McpTool};
 use crate::state::AppStateStore;
 
 use super::agent_chat::{
-    agent_chat_start_session, fallback_permission_mode, forward_event,
+    fallback_permission_mode, forward_event,
     resolve_start_permission_mode, send_turn_with_context, thread_id_for_event, TurnOrigin,
 };
 use super::usage_resume::{self, now_ms, queued_turn};
@@ -64,9 +64,11 @@ const CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: another coding agent handed y
 /// The footer for a started suggested task, which runs on its own branch.
 pub(crate) const WORKTREE_CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: the user started this task from another chat's suggestions; that chat will read your final message. You are in your own git worktree on a new branch made from that chat's latest commit (its uncommitted edits are not here). Work independently. Ask a question if truly blocked; it reaches the coordinator. Otherwise choose a safe option and explain it. When done, COMMIT all of your work on this branch (do not push, do not switch branches) so it can be merged back; leave nothing uncommitted. End with a short report: what you changed (files), the commit(s), how you checked it, and anything left undone.";
 
-const TOOL_DESCRIPTION: &str = "Delegate a self-contained task to another installed coding agent in a background chat. The child sees only the brief. Results arrive independently through durable automatic delivery. Use client_request_id for retries: the same key and unchanged task arguments return the same task and child; async/wait controls may change on a retry. mode defaults to async; wait waits at most 20 seconds without cancelling on timeout. Use task_status/task_cancel with task_id; child_thread_id is a different identity. Read a complete terminal result with task_status to acknowledge its automatic delivery. Chat links use codemux-chat://v1/<threadId>. For another independent review round, delegate again with a fresh key and complete brief.";
+const TOOL_DESCRIPTION: &str = "Delegate a self-contained task to another installed coding agent in a background chat. The child sees only the brief. Results arrive independently through durable automatic delivery. Use client_request_id for retries: the same key and unchanged task arguments return the same task and child; async/wait controls may change on a retry. mode defaults to async; wait waits at most 20 seconds without cancelling on timeout. Use task_status/task_cancel with task_id; child_thread_id is a different identity. Read a complete terminal result with task_status to acknowledge its automatic delivery. Chat links use codemux-chat://v1/<threadId>. For another independent review round, delegate again with a fresh key and complete brief. End your turn after async delegation; do not poll. If the brief asks you to report to a coordinator, use thread_send to that chat.";
 
 mod durable;
+#[cfg(test)]
+mod cancellation_tests;
 pub(crate) use durable::{
     local_task_call, preparation_failed, record_of, restoration_held, stop_confirmed,
 };
@@ -415,6 +417,13 @@ impl DelegationState {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn admit<T>(&self, control: Option<&crate::agent_control::ControlCaller>, work: impl FnOnce(&mut Inner) -> Result<T, String>) -> Result<T, String> {
+        // Always take caller authority before live delegation state. Drop both
+        // before recursive revocation or asynchronous provider work.
+        let admission = || work(&mut self.lock());
+        match control { Some(control) => control.admit(admission), None => admission() }
+    }
+
     fn task_matches(&self, child: &str, test: impl FnOnce(&Task) -> bool) -> bool {
         self.lock().tasks.get(child).is_some_and(test)
     }
@@ -606,12 +615,8 @@ pub(crate) fn offered_agents(
     caller_is_child: bool,
     is_installed: impl Fn(ProviderKind) -> bool,
 ) -> Vec<ProviderKind> {
-    // Claude's live mode is checked on each call instead.
-    let orchestrator = caller.provider == ProviderKind::Claude
-        || parent_is_full(caller.provider, caller.permission_mode.as_deref());
-    if caller_is_child || !orchestrator {
-        return Vec::new();
-    }
+    let _ = caller_is_child;
+    if !matches!(caller.provider, ProviderKind::Claude | ProviderKind::Codex) { return Vec::new(); }
     CANDIDATES
         .into_iter()
         .filter(|kind| is_installed(*kind))
@@ -623,9 +628,10 @@ pub(crate) fn offered_agents(
 fn child_input(
     child_thread_id: &str,
     cwd: PathBuf,
-    provider: ProviderKind,
+    _provider: ProviderKind,
     model: Option<String>,
     effort: Option<String>,
+    permission_mode: Option<String>,
 ) -> StartSessionInput {
     StartSessionInput {
         thread_id: ThreadId(child_thread_id.to_string()),
@@ -633,7 +639,7 @@ fn child_input(
         model,
         resume_cursor: None,
         fresh_session: true,
-        permission_mode: fallback_permission_mode(provider).map(str::to_string),
+        permission_mode,
         effort,
         context_window: None,
         fast_mode: false,
@@ -803,6 +809,7 @@ fn delegate_tool(agents: &[ProviderKind]) -> McpTool {
                 "mode": { "type": "string", "enum": ["async", "wait"], "default": "async" },
                 "wait_ms": { "type": "integer", "minimum": 0, "maximum": 20000 },
                 "role": { "type": "string" },
+                "permission_mode": { "type": "string", "description":"Optional exact native mode, bounded by the calling chat. Omit to inherit safely." },
                 "effort": {
                     "type": "string",
                     "description": "Effort/reasoning level, only if the user named one. Omit for that agent's default."
@@ -816,7 +823,7 @@ fn delegate_tool(agents: &[ProviderKind]) -> McpTool {
 
 // ── The host tool ────────────────────────────────────────────────────
 
-pub(super) fn setting_on(db: &DatabaseStore) -> bool {
+pub(crate) fn setting_on(db: &DatabaseStore) -> bool {
     db.get_setting(DELEGATION_SETTING_KEY).as_deref() != Some("false")
 }
 
@@ -887,8 +894,16 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                 return self.call(caller, name, args);
             }
             let requested_deadline = now_ms() + args["wait_ms"].as_u64().unwrap_or(20_000).min(20_000) as i64;
-            let result =
-                delegate_with_call(&self.app, caller, args, self.is_installed, call_id, run_id);
+            let validation = async {
+                let input: DelegateArgs = serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+                let provider = parse_provider(&input.provider).ok_or("unsupported_provider")?;
+                if let Some(mode) = input.permission_mode.as_deref() {
+                    let caps = crate::agent_control::service::capabilities(&self.app, provider).await.map_err(|e| e.to_string())?;
+                    crate::agent_control::service::validate_permission_mode(provider, Some(mode), &caps).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }.await;
+            let result = validation.and_then(|()| delegate_with_call(&self.app, caller, args, self.is_installed, call_id, run_id, true));
             let result = match result {
                 Ok(mut receipt) => {
                     if args["mode"] == "wait" {
@@ -903,6 +918,9 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                         let remaining = until.saturating_sub(now_ms()).max(0) as u64;
                         let deadline = tokio::time::Instant::now() + Duration::from_millis(remaining);
                         loop {
+                            if let Some(control)=&caller.control {
+                                if let Err(error)=crate::agent_control::service::authorize(&self.app,control){return Some(mcp_result(Err(error.to_string())));}
+                            }
                             // Register before reading to avoid losing a completion.
                             let notified = task_changes().notified();
                             tokio::pin!(notified);
@@ -916,19 +934,18 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                                     break;
                                 }
                                 if task.result.is_some() {
-                                    if let Ok(task) = self
-                                        .app
-                                        .state::<DatabaseStore>()
-                                        .acknowledge_delegation_result(&caller.thread_id, &id)
-                                    {
-                                        receipt = task_receipt(&task);
-                                    }
+                                    let acknowledge=||self.app.state::<DatabaseStore>().acknowledge_delegation_result(&caller.thread_id,&id);
+                                    let acknowledged=if let Some(control)=&caller.control {control.admit(acknowledge)}else{acknowledge()};
+                                    match acknowledged {Ok(task)=>receipt=task_receipt(&task),Err(error)=>return Some(mcp_result(Err(error)))}
                                     break;
                                 }
                             }
-                            if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                                receipt["wait_timed_out"] = json!(true);
-                                break;
+                            let revoked=async {if let Some(control)=&caller.control {control.revoked().await;}else{std::future::pending::<()>().await;}};
+                            tokio::select! {
+                                biased;
+                                _=revoked=>return Some(mcp_result(Err("stale_caller: wait released; accepted task and result delivery remain available".into()))),
+                                _=tokio::time::sleep_until(deadline)=>{receipt["wait_timed_out"]=json!(true);break;},
+                                _=notified=>{},
                             }
                         }
                     }
@@ -950,12 +967,14 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                     .as_str()
                     .ok_or_else(|| "task_id required".to_string())
                     .and_then(|id| {
-                        local_task_call(&self.app, &caller.thread_id, id, name == "task_cancel")
-                            .and_then(|r| {
-                                r.ok_or_else(|| {
-                                    "Use the remote task adapter for SSH task IDs".into()
-                                })
-                            })
+                        let work = || local_task_call(&self.app, &caller.thread_id, id, name == "task_cancel");
+                        let admitted = if let Some(control) = &caller.control {
+                            control.admit(work)
+                        } else {
+                            work()
+                        }?;
+                        let call = admitted.ok_or_else(|| "Use the remote task adapter for SSH task IDs".to_string())?;
+                        call.finish(&self.app)
                     });
                 if result
                     .as_ref()
@@ -990,6 +1009,7 @@ struct DelegateArgs {
     mode: Option<String>,
     wait_ms: Option<u64>,
     role: Option<String>,
+    permission_mode: Option<String>,
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -1047,7 +1067,7 @@ fn delegate<R: Runtime>(
     arguments: &Value,
     is_installed: fn(ProviderKind) -> bool,
 ) -> Result<Value, String> {
-    delegate_with_call(app, caller, arguments, is_installed, None, None)
+    delegate_with_call(app, caller, arguments, is_installed, None, None, false)
 }
 fn delegate_with_call<R: Runtime>(
     app: &AppHandle<R>,
@@ -1056,27 +1076,26 @@ fn delegate_with_call<R: Runtime>(
     is_installed: fn(ProviderKind) -> bool,
     tool_call_id: Option<&str>,
     run_id: Option<&str>,
+    validated_mode: bool,
 ) -> Result<Value, String> {
     let unavailable = || "Delegation is unavailable in this Codemux build.".to_string();
     let db = app.try_state::<DatabaseStore>().ok_or_else(unavailable)?;
     let state = app.try_state::<DelegationState>().ok_or_else(unavailable)?;
     let app_state = app.try_state::<AppStateStore>().ok_or_else(unavailable)?;
     let parent = caller.thread_id.as_str();
-    let admission_generation = db.delivery_generation(parent)?.0;
+    let admission_generation = caller.control.as_ref().and_then(|c| c.admission_generation())
+        .map(Ok).unwrap_or_else(|| db.delivery_generation(parent).map(|g| g.0))?;
     let wait_until = (arguments["mode"] == "wait").then(|| now_ms() + arguments["wait_ms"].as_u64().unwrap_or(20_000).min(20_000) as i64);
 
     if !setting_on(&db) {
         return Err("Cross-provider delegation is off (Settings → Agents → Models & behavior).".into());
     }
-    if state.is_running_child(parent) {
-        return Err("A delegated task cannot delegate further.".into());
-    }
-    if !parent_is_full(caller.provider, caller.permission_mode.as_deref()) {
-        return Err(format!(
-            "Delegation needs this chat in Full access; it is in {}. Switch to Full access to delegate.",
-            mode_label(caller.permission_mode.as_deref())
-        ));
-    }
+    let ceiling = if let Some(control) = &caller.control {
+        crate::agent_control::service::authorize(app, control).map_err(|e|e.to_string())?;
+        control.ceiling().ok_or("unsupported_permission_ceiling")?
+    } else {
+        crate::agent_control::permissions::Ceiling::for_mode(caller.provider, caller.permission_mode.as_deref()).ok_or("unsupported_permission_ceiling")?
+    };
     let args: DelegateArgs =
         serde_json::from_value(arguments.clone()).map_err(|e| e.to_string())?;
     if args
@@ -1096,13 +1115,14 @@ fn delegate_with_call<R: Runtime>(
     }
     let mut task = requested_task(parent, arguments, |_| true)?;
     task.tool_call_id = tool_call_id.map(str::to_string);
-    let payload = json!({"provider":provider_id(task.provider),"title":task.title,"task":task.brief,"model":task.model,"effort":task.effort,"role":task.role,"mode":args.mode.as_deref().unwrap_or("async"),"wait_ms":args.wait_ms.unwrap_or(20000)});
+    let payload = json!({"provider":provider_id(task.provider),"title":task.title,"task":task.brief,"model":task.model,"effort":task.effort,"role":task.role,"mode":args.mode.as_deref().unwrap_or("async"),"wait_ms":args.wait_ms.unwrap_or(20000),"permission_mode":args.permission_mode});
     if let Some(key) = &args.client_request_id {
         if let Some(prior) = db.delegation_retry(parent, key, &payload)? {
             return Ok(task_receipt(&prior));
         }
     }
     let provider = task.provider;
+    if caller.control.is_some() && !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {return Err("unsupported_provider: native child injection for this provider comes in a later layer".into());}
     if !is_installed(provider) {
         return Err(format!(
             "{} is not installed on this machine.",
@@ -1125,54 +1145,52 @@ fn delegate_with_call<R: Runtime>(
 
     let child = uuid::Uuid::new_v4().to_string();
     // Serialize capacity reservation and durable admission for concurrent calls.
-    let mut inner = state.lock();
-    if let Some(key) = &args.client_request_id {
-        if let Some(prior) = db.delegation_retry(parent, key, &payload)? {
-            return Ok(task_receipt(&prior));
+    let (record, siblings) = state.admit(caller.control.as_ref(), |inner| {
+        if let Some(key) = &args.client_request_id {
+            if let Some(prior) = db.delegation_retry(parent, key, &payload)? {
+                return Ok((prior, None));
+            }
         }
-    }
-    let running = inner
-        .tasks
-        .values()
-        .filter(|t| t.parent == parent && !t.phase.is_terminal())
-        .count();
-    if running >= MAX_RUNNING_PER_PARENT {
-        return Err(
-            "This chat already has 3 delegated tasks running. Wait for their reports.".into(),
-        );
-    }
-    if inner
-        .parents
-        .get(parent)
-        .is_some_and(|p| p.started_this_round >= MAX_PER_ROUND)
-    {
-        return Err("Delegation limit for this request reached (6 tasks). Ask the user before delegating more.".into());
-    }
-    let mut record = record_of(&child, &task);
-    record.workspace_id = workspace_id.clone();
-    record.cwd = cwd.clone();
-    record.parent_run_id = run_id.map(str::to_string).or_else(|| {
-        app.try_state::<crate::agent_control::NativeControlState>()
-            .and_then(|state| state.thread_runtime(parent))
-            .and_then(|runtime| runtime.turn_id)
-    });
-    record.parent_title = db.get_agent_chat_title(parent);
-    record.permission_mode = fallback_permission_mode(provider).map(str::to_string);
-    record.admission_generation = Some(admission_generation);
-    record.wait_until = wait_until;
-    let (record, new) =
-        db.admit_delegation_task(&record, args.client_request_id.as_deref(), &payload)?;
-    if !new {
-        return Ok(task_receipt(&record));
-    }
-    let parent_state = inner.parents.entry(parent.into()).or_default();
-    parent_state.started_this_round += 1;
-    let siblings = parent_state.children.clone();
-    parent_state.children.push(child.clone());
-    task.round = parent_state.round;
-    task.refresh_activity();
-    inner.tasks.insert(child.clone(), task.clone());
-    drop(inner);
+        let mut record = record_of(&child, &task);
+        record.workspace_id = workspace_id.clone();
+        record.cwd = cwd.clone();
+        record.parent_run_id = run_id.map(str::to_string).or_else(|| {
+            app.try_state::<crate::agent_control::NativeControlState>()
+                .and_then(|state| state.thread_runtime(parent))
+                .and_then(|runtime| runtime.turn_id)
+        });
+        let root = db.orchestration_context(parent)?;
+        record.budget_root_id = Some(root.root_id);
+        if let Some(ancestor) = db.delegation_task_for_child(parent)? {
+            record.lineage = ancestor.lineage.clone(); record.lineage.push(ancestor.task_id.clone());
+            record.root_task_id = ancestor.root_task_id;
+        }
+        record.parent_title = db.get_agent_chat_title(parent);
+        let mode = args.permission_mode.clone().map(Ok).unwrap_or_else(|| ceiling.inherited(provider).map_err(|e|e.to_string()))?;
+        let target = crate::agent_control::permissions::Ceiling::for_mode(provider,Some(&mode)).ok_or("unsupported_permission_ceiling")?;
+        if !ceiling.permits(target) { return Err("permission_ceiling: child mode exceeds this chat".into()); }
+        if args.permission_mode.is_some() && !validated_mode {
+            return Err("unsupported_permission_mode: explicit delegate modes require async catalog validation".into());
+        }
+        record.plan_mode = provider == ProviderKind::Codex && (mode == "plan" || (args.permission_mode.is_none() && ceiling.plan));
+        record.permission_mode = Some(if provider == ProviderKind::Codex && mode == "plan" { "read-only".into() } else { mode });
+        record.caller = caller.control.clone().map(|mut caller|{caller.admitted=Some(crate::agent_control::AdmittedAuthority::Task {task_id:record.task_id.clone()});caller});
+        record.admission_generation = Some(admission_generation);
+        record.wait_until = wait_until;
+        let (record, new) = db.admit_delegation_task(&record, args.client_request_id.as_deref(), &payload)?;
+        if !new {
+            return Ok((record, None));
+        }
+        let parent_state = inner.parents.entry(parent.into()).or_default();
+        parent_state.started_this_round += 1;
+        let siblings = parent_state.children.clone();
+        parent_state.children.push(child.clone());
+        task.round = parent_state.round;
+        task.refresh_activity();
+        inner.tasks.insert(child.clone(), task.clone());
+        Ok((record, Some(siblings)))
+    })?;
+    let Some(siblings) = siblings else { return Ok(task_receipt(&record)); };
     let tab_title = format!("{} · {}", provider_label(provider), task.title);
     let pane = app_state.create_background_chat_tab(
         &workspace_id,
@@ -1201,6 +1219,18 @@ fn delegate_with_call<R: Runtime>(
     state.emit_card(app, &child);
     tauri::async_runtime::spawn(run_starter(app.clone(), child, pane_id, cwd.into()));
     Ok(task_receipt(&record))
+}
+
+pub(crate) fn resume_followup<R:Runtime>(app:&AppHandle<R>,delivery:&str){
+    let (Some(db),Some(state))=(app.try_state::<DatabaseStore>(),app.try_state::<DelegationState>()) else{return;};
+    let Ok(Some(record))=db.delegation_task(&format!("local:followup:{delivery}")) else{return;};
+    let (Some(child),Some(provider))=(record.child_thread_id.clone(),parse_provider(&record.provider)) else{return;};
+    let mut inner=state.lock();
+    if inner.tasks.get(&child).is_some_and(|t|t.task_id==record.task_id){return;}
+    let mut task=Task::new(&record.parent_thread_id,provider,&record.title,&record.brief,record.created_at).with_identity(record.task_id);
+    task.placement=durable::placement_for_child(&db,&child);
+    task.phase=Phase::Running;task.model=record.model;task.effort=record.effort;task.refresh_activity();inner.tasks.insert(child.clone(),task);drop(inner);
+    state.emit_card(app,&child);
 }
 
 impl DelegationState {
@@ -1264,8 +1294,10 @@ pub(crate) async fn run_starter<R: Runtime>(
         return;
     }
     let provider = task.provider;
-    let input = child_input(&child, cwd, provider, task.model, task.effort);
-    let start = agent_chat_start_session(app.clone(), pane_id, provider, input, None);
+    let record = match app.state::<DatabaseStore>().delegation_task_for_child(&child) { Ok(Some(record)) => record, _ => return };
+    let input = child_input(&child, cwd, provider, task.model, task.effort, record.permission_mode.clone());
+    let control = record.caller.clone().map(|caller| crate::agent_control::NativeControlGuard { caller, workspace_id:record.workspace_id.clone(),thread_id:child.clone(),provider,admission:None }.retain_admission(&app));
+    let start = super::agent_chat::agent_chat_start_session_guarded(app.clone(), pane_id, provider, input, None, control.clone());
     let failure = match tokio::time::timeout(START_TIMEOUT, start).await {
         Ok(Ok(_)) if !state.is_starting(&child) => return,
         Ok(Ok(_)) => {
@@ -1285,10 +1317,12 @@ pub(crate) async fn run_starter<R: Runtime>(
                     task.brief
                 ),
             );
+            if provider == ProviderKind::Codex && record.plan_mode { turn.permission_mode_override = Some("plan".into()); }
             turn.display_text = Some(task.brief.clone());
             turn.client_nonce = Some(format!("delegated-task:{child}"));
             let mut context =
                 crate::agent_control::delivery::SendContext::new(TurnOrigin::Delegation);
+            context.control = control;
             context.provenance.created_by = crate::agent_provider::message::CreatedBy::Agent;
             context.provenance.creation_source =
                 crate::agent_provider::message::CreationSource::Provider;
@@ -1525,6 +1559,7 @@ pub(crate) fn on_user_turn<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
         return;
     };
     let mut inner = state.lock();
+    if let Some(db) = app.try_state::<DatabaseStore>() { let _ = db.orchestration_human_root(thread_id); }
     if let Some(parent) = inner.parents.get_mut(thread_id) {
         parent.round += 1;
         parent.started_this_round = 0;
@@ -1587,6 +1622,12 @@ pub fn on_thread_stopped<R: Runtime>(app: &AppHandle<R>, thread_id: &str, kind: 
             }
             continue;
         }
+        if let Some(child) = &task.child_thread_id {
+            if let Err(error) = crate::delegation::app::user_activity(app, child, true) {
+                log::warn!("Could not revoke stopped descendant authority: {error}");
+            }
+            super::agent_chat::native_thread_gate(app, child).cancel();
+        }
         if task.status.terminal() && !task.has_pending_child_runs {
             continue;
         }
@@ -1644,6 +1685,8 @@ fn close_tasks<R: Runtime>(app: &AppHandle<R>, thread: &str) {
         .filter(|(_, task)| task.parent == thread && task.placement.is_tab())
         .map(|(child, task)| (child.clone(), task.clone())).collect();
     for (child, task) in children {
+        crate::delegation::authority::NativeAuthority::user_activity_thread(&child, true);
+        super::agent_chat::native_thread_gate(app, &child).cancel();
         if let Some(db) = app.try_state::<DatabaseStore>() {
             let _ = db.dispose_delegation_task_for_close(thread, &task.task_id);
         }
@@ -1696,6 +1739,7 @@ async fn child_busy<R: Runtime>(
     // an open question does not.
     let turn_failed = state.task_matches(child, Task::turn_failed);
     dispatching
+        || app.try_state::<DatabaseStore>().is_some_and(|db| db.delegation_tasks(Some(child)).is_ok_and(|tasks|tasks.iter().any(|task|!task.status.terminal() || matches!(task.completion_delivery.as_str(),"pending"|"preparing"|"queued"|"submitting"))))
         || state.task_matches(child, |t| t.stopping)
         || state.task_matches(child, Task::awaits_user)
         || app.try_state::<DatabaseStore>().is_some_and(|db| {
@@ -1843,6 +1887,7 @@ mod tests {
 
     fn caller(provider: ProviderKind, mode: Option<&str>) -> HostCaller {
         HostCaller {
+            control: None,
             thread_id: "parent".into(),
             provider,
             workspace_id: Some("ws".into()),
@@ -1862,6 +1907,49 @@ mod tests {
         task.finished_at_ms = phase.is_terminal().then_some(373_000);
         task.phase = phase;
         task
+    }
+
+    #[test]
+    fn review600_concurrent_admission_and_cancel_share_authority_first_lock_order() {
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+        let thread = "review600-lock-order";
+        let authority = crate::delegation::authority::NativeAuthority::new(thread);
+        let generation = authority.begin(0);
+        assert!(authority.bind(generation, "turn"));
+        let identity = authority.capture().identity().unwrap();
+        let control = crate::agent_control::ControlCaller {
+            identity: crate::agent_control::CallerPrincipal::Thread {
+                thread_id: thread.into(), provider: ProviderKind::Claude, provider_instance_id: "claude".into(), session_id: "session".into(),
+                authority: identity.clone(), ceiling: crate::agent_control::permissions::Ceiling::for_mode(ProviderKind::Claude, Some("default")).unwrap(),
+            }, ..crate::agent_control::ControlCaller::trusted()
+        };
+        let state = Arc::new(DelegationState::default());
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut worker = None;
+        let available = identity.admit(thread, || {
+            let worker_state = state.clone();
+            worker = Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                worker_state.admit(Some(&control), |inner| {
+                    inner.parents.entry(thread.into()).or_default().started_this_round += 1;
+                    Ok(())
+                })
+            }));
+            started_rx.recv().unwrap();
+            // Cancellation owns authority and must be able to take live state.
+            // Probe instead of blocking so an inverted order fails without hanging CI.
+            let until = Instant::now() + Duration::from_millis(150);
+            while Instant::now() < until {
+                if state.inner.try_lock().is_err() { return Ok(false); }
+                std::thread::yield_now();
+            }
+            state.lock().parents.entry(thread.into()).or_default().children.clear();
+            Ok(true)
+        }).unwrap();
+        worker.unwrap().join().unwrap().unwrap();
+        assert!(available, "admission held delegation state while waiting for cancellation's authority");
+        assert_eq!(state.lock().parents[thread].started_this_round, 1);
     }
 
     #[test]
@@ -1920,10 +2008,7 @@ mod tests {
             vec![ProviderKind::Claude, ProviderKind::Codex],
             "own provider allowed, Hermes never, candidate order kept"
         );
-        assert!(
-            offered_agents(&claude, true, installed).is_empty(),
-            "running child"
-        );
+        assert_eq!(offered_agents(&claude, true, installed).len(),2,"app-owned children may delegate within the durable root budget");
         assert!(
             offered_agents(&claude, false, |_| false).is_empty(),
             "nothing installed"
@@ -1932,7 +2017,7 @@ mod tests {
         let codex_full = caller(ProviderKind::Codex, Some("danger-full-access"));
         assert_eq!(offered_agents(&codex_full, false, installed).len(), 2);
         let codex_ask = caller(ProviderKind::Codex, Some("workspace-write"));
-        assert!(offered_agents(&codex_ask, false, installed).is_empty());
+        assert_eq!(offered_agents(&codex_ask, false, installed).len(),2);
         let cursor = caller(ProviderKind::Cursor, Some("agent"));
         assert!(offered_agents(&cursor, false, installed).is_empty());
     }
@@ -1945,6 +2030,7 @@ mod tests {
             ProviderKind::Codex,
             Some("gpt-6.1-codex".into()),
             Some("high".into()),
+            Some("danger-full-access".into()),
         );
         assert_eq!(input.thread_id.0, "child");
         assert_eq!(input.cwd, PathBuf::from("/repo"));
@@ -1966,7 +2052,7 @@ mod tests {
             (ProviderKind::Grok, Some("agent")),
             (ProviderKind::OpenCode, None),
         ] {
-            let input = child_input("c", PathBuf::from("/r"), provider, None, None);
+            let input = child_input("c", PathBuf::from("/r"), provider, None, None, mode.map(str::to_string));
             assert_eq!(input.permission_mode.as_deref(), mode, "{provider:?}");
         }
     }

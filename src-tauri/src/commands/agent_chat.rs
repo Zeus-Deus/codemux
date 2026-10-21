@@ -1980,6 +1980,10 @@ impl<R: Runtime> GitTurnDispatchCheckpoint<R> {
 
 #[async_trait::async_trait]
 impl<R: Runtime> TurnDispatchCheckpoint for GitTurnDispatchCheckpoint<R> {
+    fn native_stop_generation(&self) -> Result<u64, ProviderError> {
+        Err(ProviderError::ValidationError { message: "Git snapshots require an admitted dispatch checkpoint".into() })
+    }
+
     async fn prepare(&self) {
         let guard = turn_checkpoint_lock_for(&self.thread_id).lock_owned().await;
         let app = self.app.clone();
@@ -2599,7 +2603,7 @@ pub(super) fn resume_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-fn native_thread_gate<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Arc<ThreadGate> {
+pub(super) fn native_thread_gate<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Arc<ThreadGate> {
     if let Some(state) = app.try_state::<NativeControlState>() {
         return state.thread_gate(thread_id);
     }
@@ -4083,6 +4087,7 @@ async fn send_turn_internal<R: Runtime>(
     if db.get_agent_chat_title(&thread_id_for_persist).is_none() {
         if let Some(title) = first_line {
             let _ = db.set_agent_chat_title(&thread_id_for_persist, &title);
+            let _ = app.emit("chat-shell-changed", serde_json::json!({"thread_ids":[thread_id_for_persist]}));
         }
     }
     // Persist the user message envelope — but ONLY for an immediate
@@ -7135,7 +7140,8 @@ pub async fn agent_chat_update_session_config<R: Runtime>(
 /// Rename a persisted chat session. Used by the dropdown's per-row
 /// "Rename" affordance.
 #[tauri::command]
-pub async fn agent_chat_rename_session(
+pub async fn agent_chat_rename_session<R: Runtime>(
+    app: AppHandle<R>,
     db: State<'_, DatabaseStore>,
     thread_id: String,
     title: String,
@@ -7144,7 +7150,9 @@ pub async fn agent_chat_rename_session(
     if trimmed.is_empty() {
         return Err("validation_error: title cannot be empty".to_string());
     }
-    db.set_agent_chat_title(&thread_id, trimmed)
+    db.set_agent_chat_title(&thread_id, trimmed)?;
+    let _ = app.emit("chat-shell-changed", serde_json::json!({"thread_ids":[thread_id]}));
+    Ok(())
 }
 
 /// Delete a persisted chat session. Idempotent. Note this does not
@@ -7222,6 +7230,7 @@ pub async fn agent_chat_delete_session<R: Runtime>(
             delete_tool_result_image_cache_in(&root, &db, &thread_id);
         }
     }
+    let _ = app.emit("chat-shell-changed", serde_json::json!({"thread_ids":[thread_id]}));
     super::async_questions::publish_attention(&app);
     // The thread is gone; its dispatch lock can never be contended again.
     forget_turn_checkpoint_lock(&thread_id);
@@ -8249,6 +8258,9 @@ fn delivery_transition(event: &ProviderRuntimeEvent) -> bool {
 /// UUID carried by `ResumeCursorUpdated` so the history dropdown can
 /// resume this session after a restart.
 pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeEvent) {
+    if let ProviderRuntimeEvent::TurnCompleted { thread_id, .. } = &event {
+        if let Some(db) = app.try_state::<DatabaseStore>() { let _ = db.orchestration_launch_finished(&thread_id.0); }
+    }
     if let ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, queued_id } = &event {
         if app.state::<DatabaseStore>().is_disposed_delivery_queue(&thread_id.0, queued_id).unwrap_or(false) {
             event = ProviderRuntimeEvent::QueuedTurnDisposed { thread_id: thread_id.clone(), queued_id: queued_id.clone() };

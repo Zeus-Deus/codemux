@@ -209,9 +209,13 @@ function isAbortLikeError(err: unknown): boolean {
   );
 }
 
-/** Registry names of Codemux host tools that need no approval. Mirrored in
- *  `src-tauri/src/commands/follow_ups.rs` (`suggest_tasks` starts nothing). */
-const AUTO_ALLOWED_HOST_TOOLS = new Set(["mcp__codemux__suggest_tasks"]);
+/** These callbacks enforce authenticated caller policy in Rust on every call.
+ * SDK mode must not hide them or grant a broader native operation. */
+const AUTO_ALLOWED_HOST_TOOLS = new Set([
+  "suggest_tasks", "orchestrator_capabilities", "delegate_task", "task_status", "task_cancel",
+  "thread_launch", "create_threads", "thread_send", "thread_read", "thread_wait", "thread_list",
+  "thread_search", "thread_interrupt", "operation_status",
+].map((name) => `mcp__codemux__${name}`));
 
 /** Build the full SDK `Options` object from our public `SessionStartInput`.
  *  Every field is set conditionally except the hardcoded infrastructure
@@ -317,9 +321,8 @@ function buildQueryOptions(
     opts.mcpServers = {
       codemux: buildCodemuxMcpServer(mcpTools, pluginGuard),
     };
-    // Host tools that only show something to the user and change nothing
-    // run without an approval prompt in every mode (Supervised, Plan):
-    // asking "may I suggest tasks?" defeats the point of suggesting them.
+    // The host rechecks the live caller and permission ceiling. Keep these
+    // schemas callable in Supervised and Plan without a second SDK grant.
     const autoAllowed = mcpTools
       .filter((tool) => AUTO_ALLOWED_HOST_TOOLS.has(tool.prefixedName))
       .map((tool) => `mcp__codemux__${tool.prefixedName}`);

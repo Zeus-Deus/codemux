@@ -425,6 +425,8 @@ struct AdmissionCheckpoint {
 }
 #[async_trait]
 impl TurnDispatchCheckpoint for AdmissionCheckpoint {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
     async fn prepare(&self) { self.preparing.notify_one(); self.release.notified().await; }
     async fn commit(&self) { self.commits.fetch_add(1, Ordering::SeqCst); }
     async fn abort(&self) { self.aborts.fetch_add(1, Ordering::SeqCst); }
@@ -1359,6 +1361,8 @@ async fn orchestration_message_custom_acp_stop_machine_send_retains_controller_q
 struct RefusedQueueItem(std::sync::atomic::AtomicBool);
 #[async_trait]
 impl TurnDispatchCheckpoint for RefusedQueueItem {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
     fn authorize_dispatch(&self)->Result<(),ProviderError> { self.0.store(true,Ordering::SeqCst);Err(invalid("grant_revoked: synthetic queued client")) }
     fn queued_delivery_state(&self)->crate::agent_provider::types::QueuedDeliveryState {
         if self.0.load(Ordering::SeqCst) { crate::agent_provider::types::QueuedDeliveryState::Blocked }
@@ -1372,6 +1376,8 @@ impl TurnDispatchCheckpoint for RefusedQueueItem {
 struct DisposedQueueItem;
 #[async_trait]
 impl TurnDispatchCheckpoint for DisposedQueueItem {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
     fn queued_delivery_state(&self)->crate::agent_provider::types::QueuedDeliveryState { crate::agent_provider::types::QueuedDeliveryState::Disposed }
     async fn prepare(&self){}
     async fn commit(&self){}

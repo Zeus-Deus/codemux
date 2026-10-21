@@ -112,6 +112,7 @@ pub struct McpRegistry {
 /// tool can trust it for permission and ownership checks.
 #[derive(Debug, Clone)]
 pub struct HostCaller {
+    pub control: Option<crate::agent_control::ControlCaller>,
     pub thread_id: String,
     pub provider: crate::agent_provider::ProviderKind,
     /// Owning workspace of the session's chat pane, when it has one.
@@ -240,11 +241,27 @@ impl Default for McpRegistry {
     }
 }
 
+/// Full-access native callers retain the base self-server catalog.
+/// Provider adapters apply the same predicate to discovery and dispatch.
+pub(crate) fn native_relay_allowed(raw:&str, full_access:bool)->bool {
+    full_access || matches!(raw,
+        "browser_snapshot" | "browser_accessibility_snapshot" | "browser_screenshot" | "browser_console_logs" | "browser_get_styles" | "browser_viewport_presets" | "browser_wait" |
+        "app_status" | "pane_list" | "port_list" |
+        "conversation_read" | "conversation_search" | "workspace_list" | "workspace_info" | "workspace_archive_list" |
+        "automation_list" | "automation_get" | "automation_runs" | "git_status" | "git_diff" | "terminal_read" |
+        "issue_list" | "issue_get" | "preset_list" | "delegation_targets" | "delegate_remote_task")
+}
+pub(crate) fn native_tool_visible(tool:&McpTool, caller:&HostCaller)->bool {
+    let full = crate::agent_control::permissions::Ceiling::for_mode(caller.provider, caller.permission_mode.as_deref()).is_some_and(|c| c.full_access());
+    !tool.prefixed_name.starts_with("mcp__codemux__") || native_relay_allowed(&tool.name, full)
+}
+
 pub(crate) type NativeDelegationHandler = Arc<
     dyn Fn(
             crate::delegation::app::NativeActor,
             String,
             serde_json::Value,
+            Option<String>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>,
         > + Send
@@ -260,6 +277,18 @@ impl McpRegistry {
         arguments: serde_json::Value,
         actor: crate::delegation::app::NativeActor,
     ) -> Result<serde_json::Value, String> {
+        self.dispatch_native_tool_call_with_id(name, arguments, actor, None).await
+    }
+    async fn dispatch_native_tool_call_with_id(
+        &self, name: &str, arguments: serde_json::Value,
+        actor: crate::delegation::app::NativeActor, call_id: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        if let Some(raw) = crate::agent_control::native::tool_name(name) {
+            let handler = self.native_delegation.lock().unwrap().clone()
+                .ok_or("Native orchestration service is unavailable")?;
+            let value = handler(actor, raw.into(), arguments, call_id).await?;
+            return Ok(if value.get("content").is_some() { value } else {serde_json::json!({"content":[{"type":"text","text":value.to_string()}]})});
+        }
         let raw = {
             let inner = self.inner.lock().await;
             inner
@@ -291,16 +320,15 @@ impl McpRegistry {
                 .ok_or("Native delegation coordinator is unavailable")?;
             // Keep the coordinator/Tauri command stable while giving remote MCP
             // launch a distinct identity from the local delegate_task host tool.
-            let command = if raw == crate::mcp_server::REMOTE_DELEGATE_TOOL {
-                "delegate_task"
-            } else {
-                raw.as_str()
-            };
-            let value = handler(actor, command.into(), arguments).await?;
+            let command = raw.as_str();
+            let value = handler(actor, command.into(), arguments, call_id).await?;
             return Ok(serde_json::json!({"content":[{"type":"text","text":value.to_string()}]}));
         }
-        self.dispatch_tool_call(name, arguments, actor.workspace_id.as_deref())
-            .await
+        if let Some(raw) = name.strip_prefix("mcp__codemux__") {
+            let handler = self.native_delegation.lock().unwrap().clone().ok_or("Native caller policy is unavailable")?;
+            return handler(actor, raw.into(), arguments, call_id).await;
+        }
+        self.dispatch_tool_call(name, arguments, actor.workspace_id.as_deref()).await
     }
     pub fn set_activity_emitter(&self, emit: Arc<dyn Fn(PluginMcpActivity) + Send + Sync>) {
         let _ = self.activity.set(emit);
@@ -363,6 +391,7 @@ impl McpRegistry {
 
     fn collision_host_tools(&self) -> Vec<McpTool> {
         self.host_tools(&HostCaller {
+            control: None,
             thread_id: String::new(),
             provider: crate::agent_provider::ProviderKind::Claude,
             workspace_id: None,
@@ -388,29 +417,25 @@ impl McpRegistry {
     pub(crate) async fn host_call_native(
         &self, caller: &HostCaller, name: &str, args: &Value,
         call_id: Option<&str>, run_id: Option<&str>,
-        permit: Option<&crate::delegation::authority::NativePermit>,
+        actor: Option<&crate::delegation::app::NativeActor>,
     ) -> Option<Value> {
-        let host = self.host.get()?;
-        if name != "mcp__codemux__delegate_task" {
-            return host.call_async(caller, name, args, call_id, run_id).await;
-        }
-        let mut call = host.call_async(caller, name, args, call_id, run_id);
-        let mut admitted = false;
-        futures_util::future::poll_fn(|cx| {
-            if admitted { return call.as_mut().poll(cx); }
-            let guard = match permit.ok_or_else(|| "Native caller runtime/turn authority was revoked".to_string())
-                .and_then(|permit| permit.admit()) {
-                Ok(guard) => guard,
-                Err(error) => return std::task::Poll::Ready(Some(serde_json::json!({"content":[{"type":"text","text":error}],"isError":true}))),
+        // Native orchestration must acquire a qualified thread principal before
+        // reaching a host tool. Admission rechecks the turn fence after any
+        // asynchronous capability lookup, in the same critical section as Stop.
+        if let Some(actor) = actor.filter(|_| crate::agent_control::native::tool_name(name).is_some()) {
+            let result = match actor.permit.identity() {
+                Ok(_) => self.dispatch_native_tool_call_with_id(name, args.clone(), actor.clone(), call_id.map(str::to_string)).await,
+                Err(error) => Err(error),
             };
-            // delegate_task persists admission in its first synchronous poll.
-            // Stop uses this same fence before advancing the database generation.
-            // Release the guard before any asynchronous wait for its result.
-            let result = call.as_mut().poll(cx);
-            drop(guard);
-            admitted = true;
-            result
-        }).await
+            return Some(match result {
+                Ok(result) => result,
+                Err(error) => serde_json::json!({"content":[{"type":"text","text":error}],"isError":true}),
+            });
+        }
+        if name == "mcp__codemux__delegate_task" {
+            return Some(serde_json::json!({"content":[{"type":"text","text":"Native caller runtime/turn authority was revoked"}],"isError":true}));
+        }
+        self.host.get()?.call_async(caller, name, args, call_id, run_id).await
     }
 
     /// Tell live sessions to re-collect their tool lists because the host
@@ -1540,6 +1565,39 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn native_callers_host_delegation_uses_native_admission_after_async_validation() {
+        let reg=McpRegistry::new();
+        reg.set_host_tools(Arc::new(EchoHost));
+        let owner=crate::delegation::authority::NativeAuthority::new("native-host-admission");
+        let generation=owner.begin(0);assert!(owner.bind(generation,"turn"));
+        let caller=HostCaller{control:None,thread_id:"native-host-admission".into(),provider:crate::agent_provider::ProviderKind::Claude,workspace_id:None,permission_mode:Some("default".into())};
+        let actor=crate::delegation::app::NativeActor{thread_id:caller.thread_id.clone(),provider:caller.provider,workspace_id:None,session_id:"session".into(),permission_mode:caller.permission_mode.clone(),permit:owner.capture_for_turn("turn")};
+        let entered=Arc::new(tokio::sync::Notify::new());
+        let release=Arc::new(tokio::sync::Semaphore::new(0));
+        let admitted=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (start,gate,count)=(entered.clone(),release.clone(),admitted.clone());
+        reg.set_native_delegation_handler(Arc::new(move|actor,name,_,call_id|{
+            let(start,gate,count)=(start.clone(),gate.clone(),count.clone());
+            Box::pin(async move{
+                assert_eq!(name,"delegate_task");
+                assert_eq!(call_id.as_deref(),Some("provider-tool-call"));
+                let identity=actor.permit.identity()?;
+                start.notify_one();gate.acquire().await.unwrap().forget();
+                identity.admit(&actor.thread_id,||{count.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Ok(serde_json::json!({"task_id":"admitted"}))})
+            })
+        }));
+        let args=serde_json::json!({"permission_mode":"plan"});
+        let call=reg.host_call_native(&caller,"mcp__codemux__delegate_task",&args,Some("provider-tool-call"),Some("turn"),Some(&actor));
+        tokio::pin!(call);
+        tokio::select!{result=&mut call=>panic!("admitted before validation: {result:?}"),_=entered.notified()=>{}}
+        owner.invalidate();release.add_permits(1);
+        let result=call.await.unwrap();
+        assert_eq!(result["isError"],true,"{result}");
+        assert!(result.to_string().contains("stale_caller"));
+        assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst),0);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn local_and_remote_delegation_keep_distinct_real_prefixes_when_local_is_disabled() {
@@ -1558,13 +1616,14 @@ mod tests {
         )));
         reg.insert_native_delegation_tools_for_test().await;
         let caller = HostCaller {
+            control: None,
             thread_id: "catalog-routing-parent".into(),
             provider: ProviderKind::Codex,
             workspace_id: Some("workspace".into()),
             permission_mode: Some("danger-full-access".into()),
         };
         let owner = crate::delegation::authority::NativeAuthority::new(&caller.thread_id);
-        let generation = owner.begin();
+        let generation = owner.begin(0);
         assert!(owner.bind(generation, "turn"));
         let actor = crate::delegation::app::NativeActor {
             thread_id: caller.thread_id.clone(),
@@ -1578,14 +1637,14 @@ mod tests {
         let expected = input.clone();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = calls.clone();
-        reg.set_native_delegation_handler(Arc::new(move |actor, command, arguments| {
+        reg.set_native_delegation_handler(Arc::new(move |actor, command, arguments, _call_id| {
             let expected = expected.clone();
             let count = count.clone();
             Box::pin(async move {
                 let _admission = actor.permit.admit()?;
                 assert_eq!(
-                    command, "delegate_task",
-                    "MCP rename must preserve the coordinator command"
+                    command, "delegate_remote_task",
+                    "remote task selection stays distinct from local task admission"
                 );
                 assert_eq!(
                     arguments, expected,
@@ -1671,6 +1730,7 @@ mod tests {
     async fn host_tools_are_served_per_caller_and_never_reach_shared_surfaces() {
         let reg = McpRegistry::new();
         let caller = HostCaller {
+            control: None,
             thread_id: "thread-1".into(),
             provider: crate::agent_provider::ProviderKind::Claude,
             workspace_id: None,
@@ -2224,5 +2284,27 @@ mod tests {
         let rows = reg.list_runtime().await;
         let row = rows.iter().find(|r| r.id == "x").unwrap();
         assert!(matches!(row.status, McpServerStatus::Stopped));
+    }
+}
+
+#[cfg(test)]
+mod native_visibility_tests {
+    use super::*;
+    #[test]
+    fn native_listing_and_legacy_dispatch_use_the_same_policy() {
+        for (provider, full_mode, low_mode) in [(crate::agent_provider::ProviderKind::Claude,"bypassPermissions","plan"),(crate::agent_provider::ProviderKind::Codex,"danger-full-access","read-only")] {
+            let mut caller=HostCaller {control:None,thread_id:"caller".into(),provider,workspace_id:None,permission_mode:None};
+            for (mode,full) in [(full_mode,true),(low_mode,false)] {
+                caller.permission_mode=Some(mode.into());
+                for name in ["automation_create","workspace_create","worktree_create","git_commit","git_stage","git_push","terminal_write","pane_close","preset_apply","issue_link_workspace","browser_navigate","html_render"] {
+                    let tool=McpTool{name:name.into(),prefixed_name:format!("mcp__codemux__{name}"),description:None,input_schema:serde_json::json!({}),server_id:"codemux-self".into()};
+                    assert_eq!(native_tool_visible(&tool,&caller),full,"{name} {mode}");
+                    assert_eq!(native_relay_allowed(name,full),full);
+                }
+                for name in ["conversation_read","workspace_info","browser_snapshot","git_status","terminal_read"] {assert!(native_relay_allowed(name,full));}
+                let plugin=McpTool{name:"write".into(),prefixed_name:"mcp__plugin__write".into(),description:None,input_schema:serde_json::json!({}),server_id:"plugin".into()};
+                assert!(native_tool_visible(&plugin,&caller));
+            }
+        }
     }
 }

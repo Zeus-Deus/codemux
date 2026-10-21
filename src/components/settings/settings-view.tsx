@@ -2699,8 +2699,8 @@ export function SettingsView() {
                     </SettingRow>
                     <Separator />
                     <SettingRow
-                      label="Delegate to other agents"
-                      description="When you ask, a Full-access Claude or Codex chat can hand a task to another agent. It opens as a tab next to the chat."
+                      label="Let agents work with other chats"
+                      description="Claude and Codex agents can start chats, message them, and hand them tasks within the current chat’s permissions. Delegated tasks open as tabs. Turn this off to remove these tools from new sessions."
                     >
                       <Switch
                         checked={crossProviderDelegation}

@@ -44,6 +44,8 @@ pub(super) fn persist_live<R: Runtime>(app: &AppHandle<R>, child: &str) {
     let Some(task) = task else {
         return;
     };
+    let waiting = db.delegation_waiting_on_children(child);
+    let nested=db.delegation_tasks(Some(child)).is_ok_and(|tasks|tasks.iter().any(|task|!task.status.terminal() || matches!(task.completion_delivery.as_str(),"pending"|"preparing"|"queued"|"submitting")));
     if let Err(error) = db.update_delegation_task(&task.task_id, |record| {
         if record.result.is_some() {
             return;
@@ -58,7 +60,9 @@ pub(super) fn persist_live<R: Runtime>(app: &AppHandle<R>, child: &str) {
             "ready"
         }
         .into();
-        record.has_pending_child_runs = !task.phase.is_terminal();
+        record.has_pending_child_runs = !task.phase.is_terminal() && task.last_status.is_none();
+        if task.last_status.is_some() && nested {record.work_state=WorkState::WaitingForChildren;}
+        else if task.last_status.is_none() {record.work_state=if waiting {WorkState::WaitingForChildren}else{WorkState::Working};}
         // Native callbacks are ephemeral; these IDs describe current attention,
         // never restored permission-grant authority.
         if !task.awaits_user() {
@@ -278,19 +282,57 @@ pub(crate) fn restoration_held<R: Runtime>(app: &AppHandle<R>, child: &str, reas
 }
 
 pub(super) fn task_receipt(record: &TaskRecord) -> Value {
-    json!({"task_id":record.task_id,"child_thread_id":record.child_thread_id,"status":record.status,"result":record.result,
+    json!({"task_id":record.task_id,"child_thread_id":record.child_thread_id,"chat_url":record.child_thread_id.as_ref().map(|id|format!("codemux-chat://v1/{id}")),"status":record.status,"result":record.result,
         "started":{"task_id":record.task_id,"child_thread_id":record.child_thread_id,"thread":record.child_thread_id,"title":record.title,"provider":record.provider,"model":record.model,"effort":record.effort},
         "wait_until":record.wait_until,"preparation_state":record.preparation_state,"note":"This task is durable. Each finished result is delivered independently. For another round use a fresh delegation key and a complete brief."})
 }
 pub(super) fn task_tool(name: &str) -> McpTool {
     McpTool {name:name.into(),prefixed_name:prefix_tool_name("codemux",name),description:Some(if name=="task_status" {"Read a directly owned task and its complete immutable terminal result. Returning that complete result acknowledges automatic delivery. Uses task_id, not child_thread_id."}else{"Cancel a directly owned task and its descendants, retaining any published result and disposing automatic delivery. Uses task_id, not child_thread_id."}.into()),input_schema:json!({"type":"object","properties":{"task_id":{"type":"string"},"cursor":{"type":"integer","minimum":0}},"required":["task_id"],"additionalProperties":false}),server_id:"codemux-host".into()}
 }
+/// A durable task mutation admitted under the caller's authority. Live effects
+/// must run only after that authority guard has been released.
+#[must_use = "finish the admitted task call after releasing caller authority"]
+pub(crate) struct LocalTaskCall {
+    value: Value,
+    cancelled: Option<TaskRecord>,
+}
+
+impl LocalTaskCall {
+    pub(crate) fn finish<R: Runtime>(self, app: &AppHandle<R>) -> Result<Value, String> {
+        let Some(record) = self.cancelled else {
+            return Ok(self.value);
+        };
+        #[cfg(test)]
+        super::cancellation_tests::before_effects();
+        let db = app.state::<DatabaseStore>();
+        if let (Some(child), Some(provider)) = (
+            &record.child_thread_id,
+            current_child_provider(&db, &record),
+        ) {
+            let owned = app.clone();
+            let child = child.clone();
+            if let Some(state) = app.try_state::<DelegationState>() {
+                state.update(app, &child, |task| task.stop_reason = Some(StopReason::AgentCancellation));
+            }
+            if let Err(error) = crate::delegation::app::user_activity(app, &child, true) {
+                log::warn!("Could not revoke cancelled child authority: {error}");
+            }
+            super::super::agent_chat::native_thread_gate(app, &child).cancel();
+            on_thread_stopped(app, &child, StopKind::Stop);
+            tauri::async_runtime::spawn(async move {
+                let _ = super::super::agent_chat::interrupt_stopped_thread(owned, provider, ThreadId(child)).await;
+            });
+        }
+        serde_json::to_value(db.delegation_task(&record.task_id)?).map_err(|e| e.to_string())
+    }
+}
+
 pub(crate) fn local_task_call<R: Runtime>(
     app: &AppHandle<R>,
     parent: &str,
     id: &str,
     cancel: bool,
-) -> Result<Option<Value>, String> {
+) -> Result<Option<LocalTaskCall>, String> {
     let db = app.state::<DatabaseStore>();
     let Some(record) = db.delegation_task(id)? else {
         return Ok(None);
@@ -303,28 +345,16 @@ pub(crate) fn local_task_call<R: Runtime>(
     }
     if cancel {
         db.dispose_delegation_task(parent, id)?;
-        if let (Some(child), Some(provider)) = (
-            &record.child_thread_id,
-            current_child_provider(&db, &record),
-        ) {
-            let owned = app.clone();
-            let child = child.clone();
-            if let Some(state) = app.try_state::<DelegationState>() {
-                state.update(app, &child, |task| task.stop_reason = Some(StopReason::AgentCancellation));
-            }
-            db.stop_message_deliveries(&child)?;
-            on_thread_stopped(app, &child, StopKind::Stop);
-            tauri::async_runtime::spawn(async move {
-                let _ = super::super::agent_chat::interrupt_stopped_thread(owned, provider, ThreadId(child)).await;
-            });
+        if let Some(child) = &record.child_thread_id {
+            db.stop_message_deliveries(child)?;
         }
-        Ok(Some(
-            serde_json::to_value(db.delegation_task(id)?).map_err(|e| e.to_string())?,
-        ))
+        #[cfg(test)]
+        super::cancellation_tests::after_admission();
+        Ok(Some(LocalTaskCall { value: Value::Null, cancelled: Some(record) }))
     } else {
-        serde_json::to_value(db.acknowledge_delegation_result(parent, id)?)
-            .map(Some)
-            .map_err(|e| e.to_string())
+        let value = serde_json::to_value(db.acknowledge_delegation_result(parent, id)?)
+            .map_err(|e| e.to_string())?;
+        Ok(Some(LocalTaskCall { value, cancelled: None }))
     }
 }
 
@@ -356,6 +386,12 @@ fn event_child_run(event: &ProviderRuntimeEvent) -> Option<&str> {
     }
 }
 
+pub(super) fn placement_for_child(db: &DatabaseStore, child: &str) -> Placement {
+    db.get_follow_up_task(child)
+        .map(|row| Placement::Worktree(super::super::follow_ups::placement_of(&row)))
+        .unwrap_or(Placement::Tab)
+}
+
 pub(super) fn recover_tasks<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let db = app.state::<DatabaseStore>();
     let state = app.state::<DelegationState>();
@@ -377,9 +413,7 @@ pub(super) fn recover_tasks<R: Runtime>(app: &AppHandle<R>) -> Result<(), String
             "",
             row.created_at_ms,
         );
-        if let Some(f) = db.get_follow_up_task(&row.child_thread_id) {
-            task.placement = Placement::Worktree(super::super::follow_ups::placement_of(&f));
-        }
+        task.placement = placement_for_child(&db, &row.child_thread_id);
         let mut record = record_of(&row.child_thread_id, &task);
         record.preparation_state = "legacy_import".into();
         if let Some(delivery) =
@@ -421,9 +455,7 @@ pub(super) fn recover_tasks<R: Runtime>(app: &AppHandle<R>) -> Result<(), String
         task.task_id = record.task_id.clone();
         task.tool_call_id = record.tool_call_id.clone();
         task.role = record.role.clone();
-        if let Some(f) = db.get_follow_up_task(child) {
-            task.placement = Placement::Worktree(super::super::follow_ups::placement_of(&f));
-        }
+        task.placement = placement_for_child(&db, child);
         if let Some(result) = &record.result {
             task.phase = match result.status {
                 TaskStatus::Completed => Phase::Completed(result.text.clone()),
@@ -667,6 +699,28 @@ mod tests {
         };
         db.append_agent_chat_message("child", &serde_json::to_string(&event).unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn review600_worktree_followup_survives_parent_close() {
+        let app = recovery_app();
+        let row = super::super::super::follow_ups::tests::task_row("child", "parent");
+        let db = app.state::<DatabaseStore>();
+        db.insert_follow_up_task(&row).unwrap();
+        let mut record = record_of("child", &Task::new("parent", ProviderKind::Codex, "Follow up", "More work", 1));
+        record.task_id = "local:followup:next-delivery".into();
+        record.status = TaskStatus::Running;
+        db.admit_delegation_task(&record, None, &json!({})).unwrap();
+        super::super::resume_followup(app.handle(), "next-delivery");
+        on_thread_stopped(app.handle(), "parent", StopKind::Close);
+        assert!(app.state::<DelegationState>().is_running_child("child"));
+        assert!(matches!(app.state::<DelegationState>().lock().tasks["child"].placement, Placement::Worktree(_)));
+        let retained = db.delegation_task(&record.task_id).unwrap().unwrap();
+        assert!(retained.result.is_none());
+        assert_eq!(retained.completion_delivery, "pending");
+        // Completion must still use the worktree hook (outcome is persisted synchronously).
+        app.state::<DelegationState>().finish(app.handle(), "child", Phase::Completed("Follow-up done".into()));
+        assert_eq!(db.get_follow_up_task("child").unwrap().outcome, "completed");
     }
 
     #[test]

@@ -238,6 +238,8 @@ impl RecordingTurnCheckpoint {
 
 #[async_trait::async_trait]
 impl TurnDispatchCheckpoint for RecordingTurnCheckpoint {
+    fn native_stop_generation(&self) -> Result<u64, codemux_lib::agent_provider::ProviderError> { Ok(0) }
+
     async fn prepare(&self) {
         self.0.lock().unwrap().push("prepare");
     }
