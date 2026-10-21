@@ -33,6 +33,7 @@ import {
   X,
 } from "lucide-react";
 
+import { AnimatedHeight } from "@/components/ui/animated-height";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
 import { editQueuedTurn, reorderQueuedTurns } from "@/lib/agent-chat/queue-edits";
@@ -397,200 +398,202 @@ export function QueuedTurnsList({
         <span className="text-body-sm font-semibold text-foreground/80">Queued</span>
         <span className="ml-auto font-mono text-label tabular-nums text-muted-foreground">{count}</span>
         <span className="flex size-[26px] items-center justify-center text-muted-foreground" aria-hidden>
-          <ChevronDown className={cn("size-3.5 transition-transform duration-150", !expanded && "rotate-180")} />
+          <ChevronDown className={cn("size-3.5 transition-transform duration-150 ease-drawer", !expanded && "rotate-180")} />
         </span>
       </button>
-      <ol
-        id={listId}
-        aria-label="Queued messages"
-        className={cn("flex max-h-32 flex-col gap-px overflow-y-auto px-1 pb-1 thin-scrollbar", !expanded && "hidden")}
-      >
-        {queued.map((item) => {
-          const queuedId = item.queued!.queuedId;
-          const saved = !!item.queued?.saved;
-          const ids = groupOf(queued, saved);
-          const index = ids.indexOf(queuedId);
-          const editing = editor.editingId === queuedId;
-          const preview = item.text.replace(/\s+/g, " ").trim();
-          const images = item.images?.length ?? 0;
-          return (
-            <li
-              key={queuedId}
-              data-testid="queued-turn-row"
-              data-queued-id={queuedId}
-              aria-current={editing ? "true" : undefined}
-              draggable
-              onDragStart={(event) => {
-                if (armedRef.current !== queuedId) {
-                  event.preventDefault();
-                  return;
-                }
-                event.dataTransfer.setData("text/plain", preview);
-                event.dataTransfer.effectAllowed = "move";
-                setDrag({ queuedId, insertIndex: null });
-              }}
-              onDragEnd={() => {
-                armedRef.current = null;
-                setDrag(null);
-              }}
-              onDragOver={(event) => {
-                if (!drag) return;
-                const dragged = queued.find((m) => m.queued?.queuedId === drag.queuedId);
-                // A turn moves only within its own queue.
-                if (!dragged || !!dragged.queued?.saved !== saved) return;
-                event.preventDefault();
-                event.dataTransfer.dropEffect = "move";
-                const rect = event.currentTarget.getBoundingClientRect();
-                const insertIndex = event.clientY < rect.top + rect.height / 2 ? index : index + 1;
-                if (drag.insertIndex !== insertIndex) setDrag({ ...drag, insertIndex });
-              }}
-              onDrop={(event) => {
-                if (!drag) return;
-                event.preventDefault();
-                completeDrag(drag);
-              }}
-              className={cn(
-                "relative flex h-7 items-center gap-1.5 rounded-md pr-1 pl-0.5",
-                editing && "bg-surface-2",
-                drag?.queuedId === queuedId && "opacity-50",
-              )}
-            >
-              {drag && drag.insertIndex === index && drag.queuedId !== queuedId ? (
-                <span aria-hidden className="pointer-events-none absolute inset-x-1 top-0 h-0.5 rounded-sm bg-accent-ember/70" />
-              ) : null}
-              {drag && index === ids.length - 1 && drag.insertIndex === ids.length ? (
-                <span aria-hidden className="pointer-events-none absolute inset-x-1 bottom-0 h-0.5 rounded-sm bg-accent-ember/70" />
-              ) : null}
-              <button
-                type="button"
-                aria-label="Reorder queued message (drag, or press the arrow keys)"
-                title="Drag to reorder"
-                onPointerDown={() => {
-                  armedRef.current = queuedId;
-                }}
-                data-queued-grip
-                onBlur={() => {
-                  if (refocusRef.current === queuedId) refocusRef.current = null;
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "ArrowUp" && index > 0) {
+      <AnimatedHeight>
+        <ol
+          id={listId}
+          aria-label="Queued messages"
+          className={cn("flex max-h-32 flex-col gap-px overflow-y-auto px-1 pb-1 thin-scrollbar", !expanded && "hidden")}
+        >
+          {queued.map((item) => {
+            const queuedId = item.queued!.queuedId;
+            const saved = !!item.queued?.saved;
+            const ids = groupOf(queued, saved);
+            const index = ids.indexOf(queuedId);
+            const editing = editor.editingId === queuedId;
+            const preview = item.text.replace(/\s+/g, " ").trim();
+            const images = item.images?.length ?? 0;
+            return (
+              <li
+                key={queuedId}
+                data-testid="queued-turn-row"
+                data-queued-id={queuedId}
+                aria-current={editing ? "true" : undefined}
+                draggable
+                onDragStart={(event) => {
+                  if (armedRef.current !== queuedId) {
                     event.preventDefault();
-                    refocusRef.current = queuedId;
-                    move(queuedId, ids[index - 1]);
-                  } else if (event.key === "ArrowDown" && index < ids.length - 1) {
-                    event.preventDefault();
-                    refocusRef.current = queuedId;
-                    move(queuedId, ids[index + 2] ?? null);
+                    return;
                   }
+                  event.dataTransfer.setData("text/plain", preview);
+                  event.dataTransfer.effectAllowed = "move";
+                  setDrag({ queuedId, insertIndex: null });
                 }}
-                className={cn(ICON_ACTION, "cursor-grab active:cursor-grabbing")}
+                onDragEnd={() => {
+                  armedRef.current = null;
+                  setDrag(null);
+                }}
+                onDragOver={(event) => {
+                  if (!drag) return;
+                  const dragged = queued.find((m) => m.queued?.queuedId === drag.queuedId);
+                  // A turn moves only within its own queue.
+                  if (!dragged || !!dragged.queued?.saved !== saved) return;
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = "move";
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  const insertIndex = event.clientY < rect.top + rect.height / 2 ? index : index + 1;
+                  if (drag.insertIndex !== insertIndex) setDrag({ ...drag, insertIndex });
+                }}
+                onDrop={(event) => {
+                  if (!drag) return;
+                  event.preventDefault();
+                  completeDrag(drag);
+                }}
+                className={cn(
+                  "relative flex h-7 items-center gap-1.5 rounded-md pr-1 pl-0.5",
+                  editing && "bg-surface-2",
+                  drag?.queuedId === queuedId && "opacity-50",
+                )}
               >
-                <GripVertical className="size-3.5" aria-hidden />
-              </button>
-              {editing ? <span className="sr-only">Editing queued message: </span> : null}
-              {images > 0 ? (
-                <span className="inline-flex shrink-0 items-center gap-0.5 text-label text-muted-foreground" title={`${images} image${images === 1 ? "" : "s"}`}>
-                  <ImageIcon className="size-3" aria-hidden />
-                  {images > 1 ? images : null}
-                </span>
-              ) : null}
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="min-w-0 flex-1 truncate text-body-sm text-foreground/80">{preview}</span>
-                </TooltipTrigger>
-                <TooltipContent side="top" className="max-w-96 whitespace-pre-wrap break-words">
-                  {messageAttribution(item) && <div className="mb-1 text-caption text-muted-foreground">{messageAttribution(item) === "agent" ? "Sent by another agent" : messageAttribution(item) === "automation" ? "Sent by automation" : "Sent by Codemux"}{item.sender_title ? ` · ${item.sender_title}` : ""}</div>}
-                  {item.text}
-                </TooltipContent>
-              </Tooltip>
-              {saved && !editing ? (
-                <span
-                  className="shrink-0 rounded-sm bg-surface-2 px-1.5 text-label font-medium text-muted-foreground"
-                  title="Kept from before Codemux restarted. It waits until you send it."
-                >
-                  Saved
-                </span>
-              ) : null}
-              {editing ? (
+                {drag && drag.insertIndex === index && drag.queuedId !== queuedId ? (
+                  <span aria-hidden className="pointer-events-none absolute inset-x-1 top-0 h-0.5 rounded-sm bg-accent-ember/70" />
+                ) : null}
+                {drag && index === ids.length - 1 && drag.insertIndex === ids.length ? (
+                  <span aria-hidden className="pointer-events-none absolute inset-x-1 bottom-0 h-0.5 rounded-sm bg-accent-ember/70" />
+                ) : null}
                 <button
                   type="button"
-                  aria-label="Cancel editing queued message"
-                  onClick={() => {
-                    editor.cancel();
-                    focusComposerNear(rootRef.current);
+                  aria-label="Reorder queued message (drag, or press the arrow keys)"
+                  title="Drag to reorder"
+                  onPointerDown={() => {
+                    armedRef.current = queuedId;
                   }}
-                  className={ACTION}
+                  data-queued-grip
+                  onBlur={() => {
+                    if (refocusRef.current === queuedId) refocusRef.current = null;
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "ArrowUp" && index > 0) {
+                      event.preventDefault();
+                      refocusRef.current = queuedId;
+                      move(queuedId, ids[index - 1]);
+                    } else if (event.key === "ArrowDown" && index < ids.length - 1) {
+                      event.preventDefault();
+                      refocusRef.current = queuedId;
+                      move(queuedId, ids[index + 2] ?? null);
+                    }
+                  }}
+                  className={cn(ICON_ACTION, "cursor-grab active:cursor-grabbing")}
                 >
-                  Cancel
+                  <GripVertical className="size-3.5" aria-hidden />
                 </button>
-              ) : (
-                <>
+                {editing ? <span className="sr-only">Editing queued message: </span> : null}
+                {images > 0 ? (
+                  <span className="inline-flex shrink-0 items-center gap-0.5 text-label text-muted-foreground" title={`${images} image${images === 1 ? "" : "s"}`}>
+                    <ImageIcon className="size-3" aria-hidden />
+                    {images > 1 ? images : null}
+                  </span>
+                ) : null}
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="min-w-0 flex-1 truncate text-body-sm text-foreground/80">{preview}</span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top" className="max-w-96 whitespace-pre-wrap break-words">
+                    {messageAttribution(item) && <div className="mb-1 text-caption text-muted-foreground">{messageAttribution(item) === "agent" ? "Sent by another agent" : messageAttribution(item) === "automation" ? "Sent by automation" : "Sent by Codemux"}{item.sender_title ? ` · ${item.sender_title}` : ""}</div>}
+                    {item.text}
+                  </TooltipContent>
+                </Tooltip>
+                {saved && !editing ? (
+                  <span
+                    className="shrink-0 rounded-sm bg-surface-2 px-1.5 text-label font-medium text-muted-foreground"
+                    title="Kept from before Codemux restarted. It waits until you send it."
+                  >
+                    Saved
+                  </span>
+                ) : null}
+                {editing ? (
                   <button
                     type="button"
-                    aria-label="Edit queued message"
-                    title="Edit in the composer"
+                    aria-label="Cancel editing queued message"
                     onClick={() => {
-                      setExpanded(true);
-                      editor.begin(item);
+                      editor.cancel();
                       focusComposerNear(rootRef.current);
                     }}
-                    className={ICON_ACTION}
+                    className={ACTION}
                   >
-                    <Pencil className="size-3" aria-hidden />
+                    Cancel
                   </button>
-                  {saved ? (
+                ) : (
+                  <>
                     <button
                       type="button"
-                      aria-label="Send saved message"
-                      title={streaming ? "Queue behind the current task" : "Send now"}
-                      onClick={() => sendSaved(item)}
-                      className={ACTION}
+                      aria-label="Edit queued message"
+                      title="Edit in the composer"
+                      onClick={() => {
+                        setExpanded(true);
+                        editor.begin(item);
+                        focusComposerNear(rootRef.current);
+                      }}
+                      className={ICON_ACTION}
                     >
-                      <ArrowUp className="size-3" aria-hidden />
-                      Send
+                      <Pencil className="size-3" aria-hidden />
                     </button>
-                  ) : (
-                    <>
-                      {canSteer ? (
-                        <button
-                          type="button"
-                          aria-label="Steer with queued message"
-                          title={streaming ? "Guide the current task without stopping tools" : "There is no running task to steer"}
-                          disabled={!streaming}
-                          onClick={() => onSteer(queuedId)}
-                          className={ACTION}
-                        >
-                          <CornerUpRight className="size-3" aria-hidden />
-                          Steer
-                        </button>
-                      ) : null}
+                    {saved ? (
                       <button
                         type="button"
-                        aria-label={streaming ? "Interrupt and send queued message" : "Send queued message now"}
-                        title={streaming ? "Stop current work and send this message" : "Send now"}
-                        onClick={() => onInterrupt(queuedId)}
+                        aria-label="Send saved message"
+                        title={streaming ? "Queue behind the current task" : "Send now"}
+                        onClick={() => sendSaved(item)}
                         className={ACTION}
                       >
-                        <CornerDownLeft className="size-3" aria-hidden />
-                        {streaming ? "Interrupt" : "Send now"}
+                        <ArrowUp className="size-3" aria-hidden />
+                        Send
                       </button>
-                    </>
-                  )}
-                  <button
-                    type="button"
-                    aria-label="Remove queued message"
-                    title="Remove from the queue"
-                    onClick={() => remove(item)}
-                    className={cn(ICON_ACTION, "hover:bg-destructive/10 hover:text-destructive/80")}
-                  >
-                    <X className="size-3.5" aria-hidden />
-                  </button>
-                </>
-              )}
-            </li>
-          );
-        })}
-      </ol>
+                    ) : (
+                      <>
+                        {canSteer ? (
+                          <button
+                            type="button"
+                            aria-label="Steer with queued message"
+                            title={streaming ? "Guide the current task without stopping tools" : "There is no running task to steer"}
+                            disabled={!streaming}
+                            onClick={() => onSteer(queuedId)}
+                            className={ACTION}
+                          >
+                            <CornerUpRight className="size-3" aria-hidden />
+                            Steer
+                          </button>
+                        ) : null}
+                        <button
+                          type="button"
+                          aria-label={streaming ? "Interrupt and send queued message" : "Send queued message now"}
+                          title={streaming ? "Stop current work and send this message" : "Send now"}
+                          onClick={() => onInterrupt(queuedId)}
+                          className={ACTION}
+                        >
+                          <CornerDownLeft className="size-3" aria-hidden />
+                          {streaming ? "Interrupt" : "Send now"}
+                        </button>
+                      </>
+                    )}
+                    <button
+                      type="button"
+                      aria-label="Remove queued message"
+                      title="Remove from the queue"
+                      onClick={() => remove(item)}
+                      className={cn(ICON_ACTION, "hover:bg-destructive/10 hover:text-destructive/80")}
+                    >
+                      <X className="size-3.5" aria-hidden />
+                    </button>
+                  </>
+                )}
+              </li>
+            );
+          })}
+        </ol>
+      </AnimatedHeight>
     </div>
     </TooltipProvider>
   );
