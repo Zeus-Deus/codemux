@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { RotateCw } from "lucide-react";
+import { ChevronDown, ExternalLink, RotateCw, Search } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import {
-  detectConflicts,
-  groupHeadingFor,
-  groupSkillsByScope,
+  groupSkillsForSettings,
+  skillSourceLabel,
+  skillSourceLabels,
+  type SkillEntry,
 } from "@/lib/agent-chat/skill-groups";
 import { skillTokenFor } from "@/lib/agent-chat/skill-tokens";
 import { toast } from "@/lib/toast";
@@ -26,10 +29,9 @@ import {
 import { ensureEditorsDetected } from "@/stores/editor-discovery-store";
 import { listen } from "@tauri-apps/api/event";
 
-import { SkillRow } from "./skill-row";
+import { SkillRow, SourceTags } from "./skill-row";
 import { SkillViewModal } from "./skill-view-modal";
 import { SectionHeader } from "./settings-primitives";
-import { eyebrowVariants } from "@/components/ui/eyebrow";
 import { cn } from "@/lib/utils";
 import { Spinner } from "@/components/ui/spinner";
 
@@ -42,8 +44,9 @@ interface Props {
 }
 
 /**
- * Settings → Skills section. Mirrors `permissions-section.tsx` in
- * shape: header + grouped rows + hover-reveal actions. Refresh forces
+ * Settings → Skills section. One row per skill name, tagged with every
+ * provider that has it; copies whose content differs open into a list of
+ * versions under the row. Refresh forces
  * the skills store to bypass its 60s TTL and re-walk the disk; the
  * plugin toggle invalidates the cache so the next load reflects it.
  *
@@ -62,7 +65,7 @@ export function SkillsSection({ projectRoot }: Props) {
   const loadSkills = useSkillsStore((s) => s.loadSkills);
   const setIncludePlugins = useSkillsStore((s) => s.setIncludePlugins);
   const disabledIds = useSkillsStore((s) => s.disabledIds);
-  const toggleSkillDisabled = useSkillsStore((s) => s.toggleSkillDisabled);
+  const setSkillsDisabled = useSkillsStore((s) => s.setSkillsDisabled);
 
   // Settings is the authoritative refresh path: every section mount
   // forces a fresh disk walk so users always see the current state of
@@ -107,8 +110,18 @@ export function SkillsSection({ projectRoot }: Props) {
     };
   }, [projectRoot, includePlugins, loadSkills]);
 
-  const groups = useMemo(() => groupSkillsByScope(skills), [skills]);
-  const conflicts = useMemo(() => detectConflicts(skills), [skills]);
+  const entries = useMemo(() => groupSkillsForSettings(skills), [skills]);
+  const sources = useMemo(() => skillSourceLabels(skills), [skills]);
+  const differing = entries.filter((entry) => entry.versions.length > 1).length;
+  const [query, setQuery] = useState("");
+  const [sourceFilter, setSourceFilter] = useState("all");
+  // A reload can drop the selected source (e.g. plugin skills turned off);
+  // fall back to All rather than hiding every row behind a hidden control.
+  const activeSource = sources.includes(sourceFilter) ? sourceFilter : "all";
+  const shownEntries = useMemo(
+    () => filterEntries(entries, query, activeSource),
+    [entries, query, activeSource],
+  );
 
   const [pendingView, setPendingView] = useState<Skill | null>(null);
 
@@ -165,7 +178,8 @@ export function SkillsSection({ projectRoot }: Props) {
             Skills are reusable instruction sets you can select with{" "}
             <code className="font-mono text-label">/skill-name</code>. Discovered
             from your installed providers (Claude, Codex, OpenCode) and
-            Codemux's own skills folder. Provider-native automatic discovery
+            Codemux's own skills folder; a skill found in several places shows
+            once, tagged with each source. Provider-native automatic discovery
             remains controlled by each provider.
           </>
         }
@@ -207,9 +221,10 @@ export function SkillsSection({ projectRoot }: Props) {
       </div>
 
       <p className="mb-4 text-label text-muted-foreground">
-        Each row controls whether the skill is available in Codemux. Turning it
-        off does not change provider configuration, so its native provider may
-        still discover or invoke it automatically.
+        Each row controls whether the skill is available in Codemux, for every
+        source it was found in. Turning it off does not change provider
+        configuration, so its native provider may still discover or invoke it
+        automatically.
       </p>
 
       {error && (
@@ -254,25 +269,75 @@ export function SkillsSection({ projectRoot }: Props) {
           per-project equivalents.
         </p>
       ) : (
-        <div className="space-y-6">
-          {conflicts.size > 0 && (
-            <ConflictsSection
-              conflicts={conflicts}
-              onView={setPendingView}
-              onOpenFile={handleOpenFile}
-            />
+        <div>
+          {differing > 0 && (
+            <p
+              data-testid="skills-differing-note"
+              className="mb-3 rounded-md border border-status-working/30 bg-status-working/5 px-3 py-2 text-label text-muted-foreground"
+            >
+              <span className="font-medium text-status-working">
+                {differing} skill{differing === 1 ? " has" : "s have"} different
+                versions
+              </span>{" "}
+              in different folders. Open a row's versions to compare them.
+            </p>
           )}
-          {groups.map((group) => (
-            <SkillsGroupSection
-              key={group.heading}
-              heading={group.heading}
-              skills={group.skills}
-              disabledIds={disabledIds}
-              onToggleDisabled={toggleSkillDisabled}
-              onView={setPendingView}
-              onOpenFile={handleOpenFile}
-            />
-          ))}
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <div className="relative min-w-40 flex-1">
+              <Search
+                className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground/60"
+                aria-hidden
+              />
+              <Input
+                placeholder="Filter skills…"
+                aria-label="Filter skills"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                className="h-8 pl-9 text-body"
+              />
+            </div>
+            {sources.length > 1 && (
+              <ToggleGroup
+                type="single"
+                size="sm"
+                variant="outline"
+                spacing={0}
+                value={activeSource}
+                onValueChange={(next) => setSourceFilter(next || "all")}
+                aria-label="Show skills from"
+              >
+                <ToggleGroupItem value="all">All</ToggleGroupItem>
+                {sources.map((source) => (
+                  <ToggleGroupItem key={source} value={source}>
+                    {source}
+                  </ToggleGroupItem>
+                ))}
+              </ToggleGroup>
+            )}
+          </div>
+          {shownEntries.length === 0 ? (
+            <p
+              data-testid="skills-no-matches"
+              className="py-6 text-center text-body text-muted-foreground"
+            >
+              No skills match this filter.
+            </p>
+          ) : (
+            <ul className="divide-y divide-border/40 rounded-md border border-border/50">
+              {shownEntries.map((entry) => (
+                <li key={entry.name}>
+                  <SkillEntryRow
+                    entry={entry}
+                    allSkills={skills}
+                    disabledIds={disabledIds}
+                    onSetDisabled={setSkillsDisabled}
+                    onView={setPendingView}
+                    onOpenFile={handleOpenFile}
+                  />
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
 
@@ -284,156 +349,182 @@ export function SkillsSection({ projectRoot }: Props) {
   );
 }
 
-function ConflictsSection({
-  conflicts,
-  onView,
-  onOpenFile,
-}: {
-  conflicts: Map<string, Skill[]>;
-  onView: (skill: Skill) => void;
-  onOpenFile: (skill: Skill) => void;
-}) {
-  // Render in alphabetical name order so the same conflict surfaces in
-  // the same place across refreshes, even as the underlying skill list
-  // changes order.
-  const entries = [...conflicts.entries()].sort(([a], [b]) =>
-    a.toLowerCase().localeCompare(b.toLowerCase()),
-  );
-  return (
-    <section data-testid="skills-conflicts">
-      <header className="mb-2 flex items-baseline justify-between">
-        <h3 className={cn(eyebrowVariants(), "text-status-working dark:text-status-working")}>
-          Naming conflicts
-        </h3>
-        <span className="text-caption text-muted-foreground/70">
-          {entries.length} name{entries.length === 1 ? "" : "s"} clashing
-        </span>
-      </header>
-      <p className="mb-3 text-label text-muted-foreground">
-        These skill names appear in more than one source. Codemux gives each
-        definition an exact qualified command.
-      </p>
-      <div className="space-y-3">
-        {entries.map(([name, skills]) => (
-          <div
-            key={name}
-            className="rounded-md border border-status-working/30 bg-status-working/5 p-2"
-            data-testid={`conflict-group-${name}`}
-          >
-            <div className="mb-1.5 px-1 text-label font-mono text-foreground">
-              /{name}{" "}
-              <span className="text-muted-foreground">
-                ({skills.length} sources)
-              </span>
-            </div>
-            <ul className="divide-y divide-status-working/20">
-              {skills.map((skill) => (
-                <li key={skill.id}>
-                  <ConflictRow
-                    skill={skill}
-                    conflictSkills={skills}
-                    onView={() => onView(skill)}
-                    onOpenFile={() => onOpenFile(skill)}
-                  />
-                </li>
-              ))}
-            </ul>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
+function filterEntries(
+  entries: SkillEntry[],
+  query: string,
+  source: string,
+): SkillEntry[] {
+  const needle = query.trim().toLowerCase();
+  return entries.filter((entry) => {
+    const copies = entry.versions.flatMap((version) => version.copies);
+    if (source !== "all" && !copies.some((copy) => skillSourceLabel(copy) === source)) {
+      return false;
+    }
+    if (!needle) return true;
+    return copies.some(
+      (copy) =>
+        copy.name.toLowerCase().includes(needle) ||
+        (copy.description ?? "").toLowerCase().includes(needle),
+    );
+  });
 }
 
-function ConflictRow({
-  skill,
-  conflictSkills,
-  onView,
-  onOpenFile,
-}: {
-  skill: Skill;
-  conflictSkills: Skill[];
-  onView: () => void;
-  onOpenFile: () => void;
-}) {
-  // Slim variant of SkillRow that always shows the scope heading
-  // inline (no hover required) since that's the whole point here.
-  return (
-    <div className="group flex items-center gap-3 px-2 py-1.5">
-      <span className="flex-1 truncate text-label">
-        <span className="font-mono text-foreground">
-          {skillTokenFor(skill, conflictSkills)}
-        </span>
-        <span className="ml-2 text-muted-foreground">
-          {groupHeadingFor(skill)}
-        </span>
-        {skill.description && (
-          <span className="ml-2 text-muted-foreground/70">
-            {skill.description}
-          </span>
-        )}
-      </span>
-      {skill.readable !== false && <div className="flex items-center gap-1 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100">
-        <button
-          type="button"
-          onClick={onView}
-          className="rounded-sm px-2 py-0.5 text-label hover:bg-surface-2"
-        >
-          View
-        </button>
-        <button
-          type="button"
-          onClick={onOpenFile}
-          aria-label={`Open ${skill.name} in editor`}
-          className="rounded-sm px-1 py-0.5 hover:bg-surface-2"
-        >
-          ↗
-        </button>
-      </div>}
-    </div>
-  );
+/** True while any of `ids` is still enabled. The composer offers a name
+ *  as long as one copy of it is enabled, so a row only reads as off once
+ *  every copy is; switching it off then disables them all. */
+function anyEnabled(ids: string[], disabledIds: string[]): boolean {
+  return ids.some((id) => !disabledIds.includes(id));
 }
 
-function SkillsGroupSection({
-  heading,
-  skills,
+/** Preference ids that the row's switch controls. Invalid skills can't be
+ *  enabled, so they're left out. */
+function preferenceIds(copies: Skill[]): string[] {
+  return [
+    ...new Set(
+      copies
+        .filter((copy) => !copy.validationError)
+        .map((copy) => copy.preferenceId ?? copy.id),
+    ),
+  ];
+}
+
+function SkillEntryRow({
+  entry,
+  allSkills,
   disabledIds,
-  onToggleDisabled,
+  onSetDisabled,
   onView,
   onOpenFile,
 }: {
-  heading: string;
-  skills: Skill[];
+  entry: SkillEntry;
+  allSkills: Skill[];
   disabledIds: string[];
-  onToggleDisabled: (id: string) => void;
+  onSetDisabled: (ids: string[], disabled: boolean) => void;
   onView: (skill: Skill) => void;
   onOpenFile: (skill: Skill) => void;
 }) {
+  const [expanded, setExpanded] = useState(false);
+  const copies = entry.versions.flatMap((version) => version.copies);
+  const primary = copies[0];
+  const ids = preferenceIds(copies);
+  const enabled = anyEnabled(ids, disabledIds);
+  const multiple = entry.versions.length > 1;
+  const versionsId = `skill-versions-${primary.id}`;
+
   return (
-    <section>
-      <header className="mb-2 flex items-baseline justify-between">
-        <h3 className={cn(eyebrowVariants())}>
-          {heading}
-        </h3>
-        <span className="text-caption text-muted-foreground/70">
-          {skills.length} skill{skills.length === 1 ? "" : "s"}
-        </span>
-      </header>
-      <ul className="divide-y divide-border/40 rounded-md border border-border/50">
-        {skills.map((skill) => (
-          <li key={skill.id}>
-            <SkillRow
-              skill={skill}
-              enabled={!disabledIds.includes(skill.preferenceId ?? skill.id)}
-              onToggleEnabled={() =>
-                onToggleDisabled(skill.preferenceId ?? skill.id)
-              }
-              onView={() => onView(skill)}
-              onOpenFile={() => onOpenFile(skill)}
-            />
-          </li>
-        ))}
-      </ul>
-    </section>
+    <>
+      <SkillRow
+        skill={primary}
+        enabled={enabled}
+        onToggleEnabled={() => onSetDisabled(ids, enabled)}
+        onView={multiple ? undefined : () => onView(primary)}
+        onOpenFile={multiple ? undefined : () => onOpenFile(primary)}
+        sources={skillSourceLabels(copies)}
+        trailing={
+          multiple && (
+            <button
+              type="button"
+              onClick={() => setExpanded((open) => !open)}
+              aria-expanded={expanded}
+              aria-controls={versionsId}
+              className="inline-flex items-center gap-1 rounded-sm border border-status-working/40 bg-status-working/5 px-1.5 py-px text-caption text-status-working hover:bg-status-working/10"
+            >
+              {entry.versions.length} versions
+              <ChevronDown
+                className={cn(
+                  "size-3 transition-transform duration-150",
+                  expanded && "rotate-180",
+                )}
+                aria-hidden
+              />
+            </button>
+          )
+        }
+      />
+      {multiple && expanded && (
+        <ul
+          id={versionsId}
+          data-testid={`skill-versions-${entry.name}`}
+          className="divide-y divide-border/30 border-t border-border/40 bg-surface-1/50 pl-9"
+        >
+          {entry.versions.map((version) => (
+            <li key={version.copies[0].id}>
+              <SkillVersionRow
+                copies={version.copies}
+                allSkills={allSkills}
+                disabledIds={disabledIds}
+                onSetDisabled={onSetDisabled}
+                onView={onView}
+                onOpenFile={onOpenFile}
+              />
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+}
+
+function SkillVersionRow({
+  copies,
+  allSkills,
+  disabledIds,
+  onSetDisabled,
+  onView,
+  onOpenFile,
+}: {
+  copies: Skill[];
+  allSkills: Skill[];
+  disabledIds: string[];
+  onSetDisabled: (ids: string[], disabled: boolean) => void;
+  onView: (skill: Skill) => void;
+  onOpenFile: (skill: Skill) => void;
+}) {
+  const skill = copies[0];
+  const ids = preferenceIds(copies);
+  const enabled = anyEnabled(ids, disabledIds);
+  const canToggle = ids.length > 0;
+  return (
+    <div className="group flex items-center gap-3 py-1.5 pr-3">
+      <div className="min-w-0 flex-1">
+        <p className="truncate font-mono text-label text-foreground">
+          {skillTokenFor(skill, allSkills)}
+        </p>
+        <p
+          className="truncate text-caption text-muted-foreground"
+          title={skill.filePath}
+        >
+          {skill.filePath}
+        </p>
+      </div>
+      <SourceTags sources={skillSourceLabels(copies)} />
+      {skill.readable !== false && (
+        <div className="flex items-center gap-1 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100">
+          <Button variant="ghost" size="sm" onClick={() => onView(skill)}>
+            View
+          </Button>
+          {Boolean(skill.skillDir) && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => onOpenFile(skill)}
+              aria-label={`Open ${skillTokenFor(skill, allSkills)} in editor`}
+            >
+              <ExternalLink className="size-3" aria-hidden />
+            </Button>
+          )}
+        </div>
+      )}
+      <Switch
+        checked={canToggle && enabled}
+        onCheckedChange={() => onSetDisabled(ids, enabled)}
+        disabled={!canToggle}
+        aria-label={
+          enabled
+            ? `Remove ${skillTokenFor(skill, allSkills)} from Codemux`
+            : `Make ${skillTokenFor(skill, allSkills)} available in Codemux`
+        }
+      />
+    </div>
   );
 }

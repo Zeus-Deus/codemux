@@ -273,10 +273,9 @@ describe("skills-store · disable toggle (Stage 5)", () => {
     expect(useSkillsStore.getState().disabledIds).toEqual([]);
   });
 
-  it("toggleSkillDisabled adds the id and keeps the list sorted", () => {
-    useSkillsStore.getState().toggleSkillDisabled("zeta");
-    useSkillsStore.getState().toggleSkillDisabled("alpha");
-    useSkillsStore.getState().toggleSkillDisabled("mid");
+  it("setSkillsDisabled adds the ids and keeps the list sorted", () => {
+    useSkillsStore.getState().setSkillsDisabled(["zeta"], true);
+    useSkillsStore.getState().setSkillsDisabled(["alpha", "mid"], true);
     expect(useSkillsStore.getState().disabledIds).toEqual([
       "alpha",
       "mid",
@@ -284,11 +283,12 @@ describe("skills-store · disable toggle (Stage 5)", () => {
     ]);
   });
 
-  it("toggleSkillDisabled flips back when called twice on the same id", () => {
-    useSkillsStore.getState().toggleSkillDisabled("foo");
-    expect(useSkillsStore.getState().disabledIds).toEqual(["foo"]);
-    useSkillsStore.getState().toggleSkillDisabled("foo");
-    expect(useSkillsStore.getState().disabledIds).toEqual([]);
+  it("setSkillsDisabled re-enables ids and ignores ones already in the requested state", () => {
+    useSkillsStore.getState().setSkillsDisabled(["foo", "bar"], true);
+    useSkillsStore.getState().setSkillsDisabled(["foo"], true);
+    expect(useSkillsStore.getState().disabledIds).toEqual(["bar", "foo"]);
+    useSkillsStore.getState().setSkillsDisabled(["foo", "missing"], false);
+    expect(useSkillsStore.getState().disabledIds).toEqual(["bar"]);
   });
 
   it("selects cached skills for the requested cwd and respects disabled preferences", async () => {
@@ -299,7 +299,7 @@ describe("skills-store · disable toggle (Stage 5)", () => {
     await useSkillsStore.getState().loadSkills("/project-a");
     expect(selectActiveSkills(useSkillsStore.getState(), null)).toEqual([user]);
     expect(selectActiveSkills(useSkillsStore.getState(), "/project-b")).toEqual([]);
-    useSkillsStore.getState().toggleSkillDisabled(user.id);
+    useSkillsStore.getState().setSkillsDisabled([user.id], true);
     expect(selectActiveSkills(useSkillsStore.getState(), null)).toEqual([]);
     expect(selectActiveSkills(useSkillsStore.getState(), "/project-a")).toEqual([project]);
   });
@@ -353,7 +353,7 @@ describe("skills-store · disable toggle (Stage 5)", () => {
   });
 
   it("disabled state persists to localStorage and rehydrates on a fresh import", async () => {
-    useSkillsStore.getState().toggleSkillDisabled("foo");
+    useSkillsStore.getState().setSkillsDisabled(["foo"], true);
     useSkillsStore.getState().setIncludePlugins(false);
 
     // Simulate a reload by reading the persisted JSON directly. The
