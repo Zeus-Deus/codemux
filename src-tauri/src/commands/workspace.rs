@@ -626,8 +626,11 @@ pub(crate) fn find_live_workspace_for_worktree_path(
                     !claimed.is_empty()
                         && paths_equal(Path::new(claimed), worktree_path)
                 }
+                // A chat child workspace only borrows its parent's folder;
+                // it never stands for the worktree.
                 None => {
-                    !w.cwd.is_empty()
+                    w.parent_workspace_id.is_none()
+                        && !w.cwd.is_empty()
                         && w.git_branch.as_deref() == Some(branch)
                         && paths_equal(Path::new(&w.cwd), worktree_path)
                 }
@@ -4526,6 +4529,27 @@ mod worktree_adopt_tests {
             find_live_workspace_for_worktree_path(&store.snapshot(), &dir, "feature").is_none(),
             "a cwd-matched workspace with an unknown branch must not be adopted"
         );
+    }
+
+    #[test]
+    fn chat_child_workspace_is_never_adopted_for_its_parents_worktree() {
+        let tmp = TempDir::new().expect("tempdir");
+        let wt = tmp.path().join("repo-feature");
+        std::fs::create_dir_all(&wt).expect("mkdir worktree");
+        let store = AppStateStore::default();
+        let parent = worktree_workspace(&store, &wt, "feature");
+        store.update_workspace_git_info(&parent, true, Some("feature".into()), 0, 0, 0, 0, 0);
+        let child = AppStateStore::reserve_workspace_id();
+        store
+            .create_chat_child_workspace(&child, &parent, &wt.display().to_string(), "Review")
+            .unwrap();
+        // With the parent gone, its folder must not resolve to the child.
+        store.close_workspace(&parent).unwrap();
+        assert_eq!(
+            store.find_workspace(&child.0).unwrap().git_branch.as_deref(),
+            Some("feature")
+        );
+        assert!(find_live_workspace_for_worktree_path(&store.snapshot(), &wt, "feature").is_none());
     }
 
     #[test]
