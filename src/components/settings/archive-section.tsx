@@ -391,7 +391,7 @@ export function ArchiveSection() {
           aria-label="Search archived workspaces"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          className="h-9 pl-9 text-body"
+          className="pl-9 text-body"
         />
       </div>
       {shownGroups.length === 0 && (

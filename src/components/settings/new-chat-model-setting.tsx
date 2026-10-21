@@ -102,12 +102,12 @@ export function NewChatModelSetting() {
             selectedContext={null}
             defaultContext={null}
             onContextChange={() => undefined}
-            triggerClassName="h-9 rounded-md bg-muted/35"
+            triggerClassName="h-8 rounded-md bg-muted/35"
           />
         </>
       ) : (
         <div
-          className="flex h-9 min-w-[200px] items-center gap-2 rounded-md border border-border/70 bg-muted/25 px-3"
+          className="flex h-8 min-w-[200px] items-center gap-2 rounded-md border border-border/70 bg-muted/25 px-3"
           data-testid="new-chat-model-auto-resolution"
         >
           <ProviderLogo

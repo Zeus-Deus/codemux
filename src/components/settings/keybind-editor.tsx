@@ -180,7 +180,7 @@ export function KeybindEditor() {
           placeholder="Search shortcuts…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          className="h-9 pl-9 text-body"
+          className="pl-9 text-body"
         />
       </div>
 

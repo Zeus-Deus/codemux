@@ -457,7 +457,7 @@ function BaseBranchInput({ value, onCommit }: { value: string; onCommit: (v: str
         }
       }}
       placeholder="main"
-      className="w-36 h-9 font-mono"
+      className="w-36 font-mono"
     />
   );
 }
@@ -672,7 +672,7 @@ function BrowserSection() {
 // the composer's rounded-full pills. tailwind-merge lets these override the
 // pickers' built-in pill classes (rounded-full, text-label, etc.).
 const LAUNCH_FIELD_TRIGGER =
-  "h-9 w-full justify-between rounded-lg border-input bg-transparent px-3 text-body font-normal text-foreground dark:bg-input/30 dark:hover:bg-input/50";
+  "h-8 w-full justify-between rounded-lg border-input bg-transparent px-3 text-body font-normal text-foreground dark:bg-input/30 dark:hover:bg-input/50";
 
 /** Wrap a string as a double-quoted shell argument. */
 function quotePrompt(value: string): string {
@@ -1120,7 +1120,6 @@ function PresetEditorSheet({
               onChange={(e) => setName(e.target.value)}
               onBlur={() => name !== preset.name && save()}
               placeholder="e.g. Git Pull"
-              className="h-9"
             />
           </div>
 
@@ -1132,7 +1131,6 @@ function PresetEditorSheet({
               onChange={(e) => setDescription(e.target.value)}
               onBlur={() => save()}
               placeholder="Optional description"
-              className="h-9"
             />
           </div>
 
@@ -1258,7 +1256,7 @@ function PresetEditorSheet({
                       onChange={(e) => handleCommandChange(i, e.target.value)}
                       onBlur={handleCommandBlur}
                       placeholder="e.g. bun run dev"
-                      className="h-9 flex-1 font-mono text-body"
+                      className="flex-1 font-mono text-body"
                     />
                     {commands.length > 1 && (
                       <Button
