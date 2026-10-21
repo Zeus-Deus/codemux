@@ -43,7 +43,7 @@ function HoverCardContent({
         align={align}
         sideOffset={sideOffset}
         className={cn(
-          "z-50 w-64 rounded-md border bg-popover p-3 text-popover-foreground shadow-md outline-hidden data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+          "z-50 w-64 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-popup outline-hidden data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
           ENTRANCE_CLASS[entrance],
           // Set by a card that opened inside a group phase (see
           // `@/lib/hover-card-group`): it did not wait, so it must not spend
