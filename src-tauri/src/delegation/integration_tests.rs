@@ -105,6 +105,8 @@ struct HeldCheckpoint {
 }
 #[async_trait::async_trait]
 impl crate::agent_provider::TurnDispatchCheckpoint for HeldCheckpoint {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
     async fn prepare(&self) {
         if self.phase == "prepare" {
             self.entered.notify_one();

@@ -19,6 +19,8 @@ pub(crate) struct State {
     live: bool,
     policy: Option<crate::agent_control::permissions::Ceiling>,
     tools_live: bool,
+    policy_epoch: u64,
+    policy_changes: u32,
     generation: u64,
     turn: Option<String>,
     stop_generation: u64,
@@ -31,6 +33,7 @@ pub(crate) struct State {
 pub(crate) struct NativePermit {
     owner: Arc<NativeAuthority>,
     generation: u64,
+    policy_epoch: u64,
     turn: Option<String>,
     pending: bool,
 }
@@ -39,6 +42,8 @@ pub struct AuthorityIdentity {
     session_key: String,
     generation: u64,
     pub run_id: Option<String>,
+    #[serde(default)]
+    policy_epoch: u64,
     #[serde(default)]
     pub stop_generation: u64,
 }
@@ -91,6 +96,8 @@ impl AuthorityIdentity {
         if owner.session_key != self.session_key
             || !state.live
             || !state.tools_live
+            || state.policy_changes > 0
+            || state.policy_epoch != self.policy_epoch
             || state.generation != self.generation
             || state.turn.is_none()
             || state.turn != self.run_id
@@ -115,6 +122,16 @@ impl NativeAuthority {
             crate::agent_control::permissions::Ceiling::for_mode(provider, mode);
         self.changed.notify_waiters();
     }
+    /// Revoke callbacks across an in-place policy RPC without revoking the
+    /// turn lifecycle. Stop keeps its separate, one-way tools_live fence.
+    pub fn policy_transition(&self) -> PolicyTransition<'_> {
+        let mut state = self.state.lock().unwrap();
+        state.policy_epoch += 1;
+        state.policy_changes += 1;
+        for job in state.callbacks.drain(..) { job.abort(); }
+        self.changed.notify_waiters();
+        PolicyTransition { owner: self }
+    }
     pub fn effective_ceiling(
         thread: &str,
     ) -> Result<Option<crate::agent_control::permissions::Ceiling>, String> {
@@ -136,6 +153,8 @@ impl NativeAuthority {
                 live: true,
                 policy: None,
                 tools_live: false,
+                policy_epoch: 0,
+                policy_changes: 0,
                 generation: 0,
                 turn: None,
                 stop_generation: 0,
@@ -269,6 +288,7 @@ impl NativeAuthority {
         NativePermit {
             owner: self.clone(),
             generation: state.generation,
+            policy_epoch: state.policy_epoch,
             turn: state.turn.clone(),
             pending: state.pending,
         }
@@ -280,10 +300,14 @@ impl NativeAuthority {
         permit.turn = Some(turn.into());
         permit
     }
-    pub fn track(&self, job: AbortHandle) {
+    pub fn track(&self, permit: &NativePermit, job: AbortHandle) {
         let mut state = self.state.lock().unwrap();
         state.callbacks.retain(|job| !job.is_finished());
-        if state.live && state.tools_live {
+        if state.live && state.tools_live && state.policy_changes == 0
+            && std::ptr::eq(self, permit.owner.as_ref())
+            && state.generation == permit.generation
+            && state.policy_epoch == permit.policy_epoch
+        {
             state.callbacks.push(job);
         } else {
             job.abort();
@@ -300,6 +324,17 @@ impl NativeAuthority {
             .capture()
     }
 }
+pub(crate) struct PolicyTransition<'a> { owner: &'a NativeAuthority }
+impl Drop for PolicyTransition<'_> {
+    fn drop(&mut self) {
+        let mut state = self.owner.state.lock().unwrap();
+        // Requests captured while the policy was unresolved cannot revive.
+        state.policy_epoch += 1;
+        state.policy_changes -= 1;
+        self.owner.changed.notify_waiters();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DispatchPermit {
     owner: Arc<NativeAuthority>,
@@ -341,6 +376,7 @@ impl NativePermit {
         Ok(AuthorityIdentity {
             session_key: self.owner.session_key.clone(),
             generation: self.generation,
+            policy_epoch: self.policy_epoch,
             run_id: state.turn.clone(),
             stop_generation: state.stop_generation,
         })
@@ -356,6 +392,8 @@ impl NativePermit {
                 let state = self.owner.state.lock().unwrap();
                 if !state.live
                     || !state.tools_live
+                    || state.policy_changes > 0
+                    || self.policy_epoch != state.policy_epoch
                     || self.generation != state.generation
                 {
                     return Err("Native caller runtime/turn authority was revoked".into());
@@ -380,6 +418,8 @@ impl NativePermit {
         let state = self.owner.state.lock().unwrap();
         if !state.live
             || !state.tools_live
+            || state.policy_changes > 0
+            || self.policy_epoch != state.policy_epoch
             || state.turn.is_none()
             || self.generation != state.generation
             || match &self.turn {
@@ -396,6 +436,64 @@ impl NativePermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn review600_late_callback_registration_cannot_cross_policy_transition() {
+        let owner = NativeAuthority::new("review600-policy-track");
+        let generation = owner.begin(4);
+        assert!(owner.bind(generation, "turn"));
+        let old = owner.capture();
+        old.wait_ready().await.unwrap();
+        let transition = owner.policy_transition();
+        drop(transition);
+        // The task passed wait_ready before the RPC, but registration lagged it.
+        let job = tokio::spawn(std::future::pending::<()>());
+        owner.track(&old, job.abort_handle());
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), job).await.unwrap().unwrap_err().is_cancelled());
+        let new = owner.capture();
+        let job = tokio::spawn(async { "new callback" });
+        owner.track(&new, job.abort_handle());
+        assert_eq!(job.await.unwrap(), "new callback");
+    }
+
+    #[tokio::test]
+    async fn review600_policy_transition_never_rearms_stopped_callbacks() {
+        for stopped_before in [false, true] {
+            let thread = format!("review600-policy-stop-{stopped_before}");
+            let owner = NativeAuthority::with_policy(&thread, crate::agent_provider::ProviderKind::Claude, Some("default"));
+            let generation = owner.begin(4);
+            assert!(owner.bind(generation, "turn"));
+            let old = owner.capture();
+            if stopped_before { owner.invalidate(); }
+            let transition = owner.policy_transition();
+            let during = owner.capture();
+            assert!(old.wait_ready().await.is_err());
+            assert!(during.wait_ready().await.is_err());
+            if !stopped_before { owner.invalidate(); }
+            owner.set_policy(crate::agent_provider::ProviderKind::Claude, Some("bypassPermissions"));
+            drop(transition);
+            assert!(owner.capture().wait_ready().await.is_err());
+            assert!(during.wait_ready().await.is_err());
+            // The in-flight lifecycle acknowledgement remains valid.
+            assert!(owner.bind(generation, "turn"));
+        }
+    }
+
+    #[tokio::test]
+    async fn review600_failed_or_cancelled_policy_transition_restores_old_policy_only() {
+        let thread = "review600-policy-failure";
+        let owner = NativeAuthority::with_policy(thread, crate::agent_provider::ProviderKind::Claude, Some("default"));
+        let generation = owner.begin(4);
+        assert!(owner.bind(generation, "turn"));
+        let old = owner.capture();
+        let transition = owner.policy_transition();
+        let during = owner.capture();
+        drop(transition); // RPC failed/cancelled: no applied policy to publish.
+        assert!(old.wait_ready().await.is_err());
+        assert!(during.wait_ready().await.is_err());
+        owner.capture().wait_ready().await.unwrap();
+        assert_eq!(NativeAuthority::effective_ceiling(thread).unwrap(), crate::agent_control::permissions::Ceiling::for_mode(crate::agent_provider::ProviderKind::Claude, Some("default")));
+    }
 
     #[test]
     fn native_stop_generation_stays_with_turn_and_steer_continuations() {

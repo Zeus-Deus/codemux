@@ -2857,6 +2857,8 @@ fn spawn_incoming_requests_task(
                                 permit: session.native_authority.capture_for_turn(turn.unwrap()),
                             })
                         };
+                        let callback_permit = actor.as_ref().map(|actor| actor.permit.clone())
+                            .unwrap_or_else(|| session.native_authority.capture());
                         let owned_session = session.clone();
                         let owned_registry = mcp_registry.clone();
                         let job = tokio::spawn(async move {
@@ -2874,7 +2876,7 @@ fn spawn_incoming_requests_task(
                                 params, actor, &session.direct_tool_names,
                             ).await
                         });
-                        session.native_authority.track(job.abort_handle());
+                        session.native_authority.track(&callback_permit, job.abort_handle());
                         // Revocation cancels the work, never the obligation to
                         // answer the server request (including track rejection).
                         let child = child.clone();

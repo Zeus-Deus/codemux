@@ -500,6 +500,8 @@ struct DispatchTimelineFixture {
 
 #[async_trait::async_trait]
 impl crate::agent_provider::TurnDispatchCheckpoint for DispatchTimelineFixture {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
     async fn prepare(&self) {
         self.entered.store(true, Ordering::SeqCst);
         let guard = self.timeline.clone().lock_owned().await;

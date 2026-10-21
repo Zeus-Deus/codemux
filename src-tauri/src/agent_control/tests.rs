@@ -137,6 +137,8 @@ async fn review_r1_acp_local_rpc_refusal_is_not_native_acceptance() {
     struct Refusal { calls:AtomicUsize, accepted:AtomicBool }
     #[async_trait::async_trait]
     impl TurnDispatchCheckpoint for Refusal {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
         fn authorize_dispatch(&self)->Result<(),crate::agent_provider::ProviderError> {
             if self.calls.fetch_add(1,Ordering::SeqCst)==0 {Ok(())}
             else {Err(crate::agent_provider::ProviderError::ValidationError {message:"refused at final prompt boundary".into()})}
@@ -469,6 +471,8 @@ struct MarioQueueCheckpoint {
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl crate::agent_provider::types::TurnDispatchCheckpoint for MarioQueueCheckpoint {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
     fn authorize_dispatch(&self) -> Result<(), crate::agent_provider::ProviderError> { self.inner.authorize_dispatch() }
     async fn accepted(&self, turn: &crate::agent_provider::TurnId) { self.inner.accepted(turn).await; }
     async fn prepare(&self) {
@@ -1648,6 +1652,8 @@ async fn orchestration_message_mock_adapter_aborts_checkpoint_on_rejection_and_l
     struct Checkpoint { reject:bool, aborts:std::sync::atomic::AtomicUsize }
     #[async_trait::async_trait]
     impl TurnDispatchCheckpoint for Checkpoint {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
         fn authorize_dispatch(&self)->Result<(),ProviderError> {
             if self.reject { Err(ProviderError::ValidationError {message:"authorization rejected".into()}) } else { Ok(()) }
         }
@@ -1895,6 +1901,8 @@ async fn orchestration_message_queue_promotion_checks_authority_before_recording
     struct Authority(std::sync::atomic::AtomicBool);
     #[async_trait::async_trait]
     impl TurnDispatchCheckpoint for Authority {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
         fn authorize_dispatch(&self)->Result<(),crate::agent_provider::ProviderError> {
             if self.0.load(std::sync::atomic::Ordering::SeqCst) { Err(crate::agent_provider::ProviderError::ValidationError {message:"grant_revoked".into()}) } else { Ok(()) }
         }

@@ -3484,6 +3484,8 @@ async fn steer_refuses_slash_commands_and_old_sidecars() {
 struct MachineQueueCheckpoint;
 #[async_trait::async_trait]
 impl codemux_lib::agent_provider::TurnDispatchCheckpoint for MachineQueueCheckpoint {
+    fn native_stop_generation(&self) -> Result<u64, codemux_lib::agent_provider::ProviderError> { Ok(0) }
+
     fn releases_queue_hold(&self) -> bool { false }
     async fn prepare(&self) {}
     async fn commit(&self) {}
@@ -3521,6 +3523,8 @@ async fn orchestration_message_claude_machine_send_preserves_stop_queue_hold() {
 struct PromotionAuthority(std::sync::atomic::AtomicBool);
 #[async_trait::async_trait]
 impl codemux_lib::agent_provider::TurnDispatchCheckpoint for PromotionAuthority {
+    fn native_stop_generation(&self) -> Result<u64, codemux_lib::agent_provider::ProviderError> { Ok(0) }
+
     fn queued_delivery_state(&self) -> codemux_lib::agent_provider::types::QueuedDeliveryState {
         if self.0.load(std::sync::atomic::Ordering::SeqCst) { codemux_lib::agent_provider::types::QueuedDeliveryState::Blocked }
         else { codemux_lib::agent_provider::types::QueuedDeliveryState::Ready }

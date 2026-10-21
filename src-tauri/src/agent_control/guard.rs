@@ -154,6 +154,12 @@ impl<R: Runtime> std::fmt::Debug for GuardedTurnCheckpoint<R> {
 }
 #[async_trait::async_trait]
 impl<R: Runtime> crate::agent_provider::types::TurnDispatchCheckpoint for GuardedTurnCheckpoint<R> {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> {
+        self.inner.as_ref().ok_or_else(|| crate::agent_provider::ProviderError::ValidationError {
+            message: "Dispatch checkpoint has no admitted Stop generation".into(),
+        })?.native_stop_generation()
+    }
+
     fn authorize_dispatch(&self) -> Result<(), crate::agent_provider::ProviderError> {
         self.control.verify(&self.app).map_err(|message| crate::agent_provider::ProviderError::ValidationError {message})?;
         if let Some(inner) = &self.inner { inner.authorize_dispatch()?; }

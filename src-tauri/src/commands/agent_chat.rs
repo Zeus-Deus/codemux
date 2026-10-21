@@ -1980,6 +1980,10 @@ impl<R: Runtime> GitTurnDispatchCheckpoint<R> {
 
 #[async_trait::async_trait]
 impl<R: Runtime> TurnDispatchCheckpoint for GitTurnDispatchCheckpoint<R> {
+    fn native_stop_generation(&self) -> Result<u64, ProviderError> {
+        Err(ProviderError::ValidationError { message: "Git snapshots require an admitted dispatch checkpoint".into() })
+    }
+
     async fn prepare(&self) {
         let guard = turn_checkpoint_lock_for(&self.thread_id).lock_owned().await;
         let app = self.app.clone();

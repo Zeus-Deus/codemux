@@ -290,6 +290,8 @@ pub(crate) struct TestCheckpoint {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl crate::agent_provider::TurnDispatchCheckpoint for TestCheckpoint {
+    fn native_stop_generation(&self) -> Result<u64, crate::agent_provider::ProviderError> { Ok(0) }
+
     fn releases_queue_hold(&self) -> bool { self.release }
     fn queued_delivery_state(&self) -> crate::agent_provider::types::QueuedDeliveryState {
         if self.held.load(std::sync::atomic::Ordering::SeqCst) { crate::agent_provider::types::QueuedDeliveryState::Held }
