@@ -1223,18 +1223,43 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
     delete_branch: Option<bool>,
     force_delete: Option<bool>,
 ) -> Result<(), String> {
-    close_workspace_tracked(app, state, db, workspace_id, remove_worktree, delete_branch, force_delete)
-        .await
-        .map(drop)
+    close_workspace_tracked(
+        app,
+        state,
+        db,
+        workspace_id,
+        CloseRoute::Tracked,
+        remove_worktree,
+        delete_branch,
+        force_delete,
+    )
+    .await
+    .map(drop)
 }
 
-/// The folder a closing workspace's teardown scripts run in. A chat child
-/// workspace has none: it borrows its parent's folder, which stays in use.
-fn teardown_folder(ws: &crate::state::WorkspaceSnapshot) -> Option<String> {
-    if ws.is_chat_child() || ws.is_local_import_snapshot_only() {
+/// Which route a close came in by. They differ only in where teardown
+/// scripts run (see [`teardown_folder`]).
+#[derive(Clone, Copy)]
+enum CloseRoute {
+    /// The sidebar's plain close.
+    Plain,
+    /// The close dialog, archive, and the MCP / control-socket close.
+    Tracked,
+}
+
+/// The folder a closing workspace's teardown scripts run in. A plain close
+/// runs them in the workspace's folder; every other route only in a
+/// worktree the workspace owns, so archiving a root checkout never runs its
+/// teardown. A chat child workspace has none on any route: it borrows its
+/// parent's folder, which stays in use.
+fn teardown_folder(ws: &crate::state::WorkspaceSnapshot, route: CloseRoute) -> Option<String> {
+    if ws.is_chat_child() {
         return None;
     }
-    Some(ws.worktree_path.clone().unwrap_or_else(|| ws.cwd.clone()))
+    match route {
+        CloseRoute::Plain => (!ws.is_local_import_snapshot_only()).then(|| ws.cwd.clone()),
+        CloseRoute::Tracked => ws.worktree_path.clone(),
+    }
 }
 
 /// The chat child workspaces the chats of `threads` delegated tasks to.
@@ -1506,6 +1531,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     workspace_id: String,
+    route: CloseRoute,
     remove_worktree: bool,
     delete_branch: Option<bool>,
     force_delete: Option<bool>,
@@ -1554,6 +1580,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
                         Path::new(path),
                         &workspace_with_delegated_children(&snapshot, db, &workspace_id),
                     )?;
+                    crate::commands::agent_chat::refuse_unconfirmed_stop_in(Path::new(path))?;
                 }
             }
         }
@@ -1562,7 +1589,7 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
             ws.and_then(|w| w.git_branch.clone()),
             ws.map(|w| w.title.clone()).unwrap_or_default(),
             ws.and_then(|w| w.host_id),
-            ws.and_then(teardown_folder),
+            ws.and_then(|w| teardown_folder(w, route)),
         )
     };
 
@@ -1623,6 +1650,14 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     }
 
     let detached = detach_workspace(&app, state, db, &workspace_id)?;
+    // Before any await, like the workspace's own earlier stops: chats that
+    // worked in the checkout from a workspace closed before this one (a
+    // chat child closed before its parent) may still be stopping.
+    let stopping_in_checkout = worktree_path
+        .as_deref()
+        .filter(|_| remove_worktree)
+        .map(|path| crate::commands::agent_chat::snapshot_pending_stops_in(Path::new(path)))
+        .unwrap_or_default();
     finish_detach(&app, &workspace_id, ws_host_id).await;
     let fallback = detached.fallback.clone();
 
@@ -1638,7 +1673,8 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     // its chats closes the workspaces of the tasks they delegated (see
     // `delegation::close_tasks`), and their stops are awaited too. A stop
     // that was not acknowledged keeps the files.
-    let Detached { mut hold, earlier, threads, .. } = detached;
+    let Detached { mut hold, mut earlier, threads, .. } = detached;
+    earlier.extend(stopping_in_checkout);
     let keep_files = |hold: &mut Option<crate::worktree_cleanup::RetireHold>| {
         if let Some(hold) = hold.take() {
             hold.keep();
@@ -1661,6 +1697,10 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
     } else {
         None
     };
+    // No workspace opens from the final check through the delete, as for
+    // background cleanup; the fence below covers chat workspaces, which
+    // open without waiting. Taken before the Hermes lock, in cleanup's order.
+    let _opening = crate::worktree_cleanup::removal_guard().await;
     // Hermes startup commits its cleanup hold under the same lock, so
     // either the hold is visible here or the start finds the
     // directory gone. Held only for this check and the delete.
@@ -1669,10 +1709,11 @@ async fn close_workspace_tracked<R: tauri::Runtime>(
         return Err("Hermes worktree cleanup pending: files retained until background completion can be verified.".into());
     }
     // Checked again now this workspace and its delegated chats are gone:
-    // a workspace opened in the checkout meanwhile keeps the files, and
-    // the fence keeps new chat workspaces out until they are removed.
+    // a workspace opened in the checkout meanwhile, or an agent that
+    // worked there and is still stopping, keeps the files.
     let _fence = match state.fence_checkout_removal(Path::new(&wt_path), |snapshot| {
-        refuse_checkout_in_use(snapshot, Path::new(&wt_path), &[])
+        refuse_checkout_in_use(snapshot, Path::new(&wt_path), &[])?;
+        crate::commands::agent_chat::refuse_unstopped_agents_in(Path::new(&wt_path))
     }) {
         Ok(fence) => fence,
         Err(error) => {
@@ -2000,13 +2041,7 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
     }
 
     let restored_id = if chat_child {
-        if !Path::new(&entry.cwd).exists() {
-            return Err(format!(
-                "Nothing left to restore: {} no longer exists on disk.",
-                entry.cwd
-            ));
-        }
-        state.restore_chat_child_workspace(&entry, select).0
+        state.restore_chat_child_workspace(&entry, select)?.0
     } else if let Some(ref wt_path) = entry.worktree_path {
         // Per-branch worktree entry: restore through the SAME creation
         // path the branch-picker fork flow uses.
@@ -2157,6 +2192,21 @@ pub(crate) async fn delete_archived_workspace_impl<R: tauri::Runtime>(
     delete_branch: bool,
     force_delete: bool,
 ) -> Result<(), String> {
+    if delete_worktree {
+        // The archived workspace's chats were told to stop when it closed,
+        // and a chat child closed earlier may still be stopping in the same
+        // checkout. Its files stay until they have; waited before any lock.
+        if let Some(path) = state.find_archived_workspace(&archive_id).and_then(|e| e.worktree_path) {
+            let stopping = crate::commands::agent_chat::snapshot_pending_stops_in(Path::new(&path));
+            crate::commands::agent_chat::wait_for_stops(stopping)
+                .await
+                .map_err(|error| format!("Agent session did not stop ({error}); worktree files retained."))?;
+        }
+    }
+    // In cleanup's order: no workspace opens from here through the delete.
+    let _opening = if delete_worktree {
+        Some(crate::worktree_cleanup::removal_guard().await)
+    } else { None };
     let _hermes_lifecycle = if delete_worktree {
         Some(crate::agent_provider::hermes::WORKTREE_LIFECYCLE.lock().await)
     } else { None };
@@ -2191,10 +2241,12 @@ pub(crate) async fn delete_archived_workspace_impl<R: tauri::Runtime>(
             None
         };
         // A live workspace can still work in an archived checkout (a chat
-        // the archived one launched, or the checkout reopened). Its files
-        // stay, and the fence keeps new chat workspaces out while they go.
+        // the archived one launched, or the checkout reopened), or an agent
+        // that worked there may not have stopped. Its files stay, and the
+        // fence keeps new chat workspaces out while they go.
         let _fence = state.fence_checkout_removal(Path::new(&wt_path), |snapshot| {
-            refuse_checkout_in_use(snapshot, Path::new(&wt_path), &[])
+            refuse_checkout_in_use(snapshot, Path::new(&wt_path), &[])?;
+            crate::commands::agent_chat::refuse_unstopped_agents_in(Path::new(&wt_path))
         })?;
         // Recursive directory delete — blocking pool, same rationale as
         // the close path. Errors (including the dirty/unpushed guard
@@ -2489,7 +2541,7 @@ pub async fn close_workspace<R: tauri::Runtime>(
     workspace_id: String,
     force_delete: Option<bool>,
 ) -> Result<String, String> {
-    close_workspace_tracked(app, &state, &db, workspace_id, false, None, force_delete).await
+    close_workspace_tracked(app, &state, &db, workspace_id, CloseRoute::Plain, false, None, force_delete).await
 }
 
 #[tauri::command]
@@ -4422,7 +4474,7 @@ mod archive_guard_tests {
         let store = AppStateStore::default();
         let parent = store.create_empty_workspace_at_path(dir.path().to_path_buf()).0;
         store.rename_workspace(&parent, "Parent".into());
-        let children: Vec<String> = ["Plain close", "Tracked close"]
+        let children: Vec<String> = ["Plain close", "Tracked close", "Archived"]
             .into_iter()
             .map(|title| {
                 let id = AppStateStore::reserve_workspace_id();
@@ -4438,11 +4490,119 @@ mod archive_guard_tests {
         close_workspace_with_worktree_impl(app.handle().clone(), &state, &db, children[1].clone(), false, None, None)
             .await
             .unwrap();
+        archive_workspace_impl(app.handle().clone(), &state, &db, children[2].clone()).await.unwrap();
         assert!(!marker.exists(), "{:?}", std::fs::read_to_string(&marker));
 
-        // The folder's own workspace does run them.
+        // The plain close of the folder's own workspace does run them.
         close_workspace(app.handle().clone(), app.state(), app.state(), parent, None).await.unwrap();
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "Parent\n");
+    }
+
+    /// Where each close route runs teardown scripts. The sidebar's plain
+    /// close runs them in the workspace's folder; archive and the tracked
+    /// close (close dialog, MCP, control socket) only in a worktree the
+    /// workspace owns, so archiving a protected root checkout never runs
+    /// its teardown.
+    #[tokio::test]
+    async fn teardown_runs_only_where_each_close_route_runs_it() {
+        if crate::state::run_with_isolated_layout(
+            "commands::workspace::archive_guard_tests::teardown_runs_only_where_each_close_route_runs_it",
+        ) {
+            return;
+        }
+        use tauri::Manager;
+        let with_teardown = || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".codemux")).unwrap();
+            std::fs::write(
+                dir.path().join(".codemux/config.json"),
+                r#"{"teardown": ["echo \"$CODEMUX_WORKSPACE_NAME\" >> teardown-ran"]}"#,
+            )
+            .unwrap();
+            dir
+        };
+        let root = with_teardown();
+        let worktree = with_teardown();
+        let ran = |dir: &tempfile::TempDir| std::fs::read_to_string(dir.path().join("teardown-ran")).ok();
+        let store = AppStateStore::default();
+        let open_root = |store: &AppStateStore, title: &str| {
+            let id = store.create_empty_workspace_at_path(root.path().to_path_buf()).0;
+            store.rename_workspace(&id, title.into());
+            store.set_workspace_protected(&id, true);
+            id
+        };
+        let archived = open_root(&store, "Archived root");
+        let tracked = open_root(&store, "Tracked root");
+        let plain = open_root(&store, "Plain root");
+        let feature = store.create_empty_workspace_at_path(worktree.path().to_path_buf()).0;
+        store.set_workspace_worktree(&feature, worktree.path().display().to_string(), "Feature".into());
+        store.rename_workspace(&feature, "Feature".into());
+        let app = close_test_app(store);
+        let state = app.state::<AppStateStore>();
+        let db = app.state::<crate::database::DatabaseStore>();
+
+        archive_workspace_impl(app.handle().clone(), &state, &db, archived).await.unwrap();
+        close_workspace_with_worktree_impl(app.handle().clone(), &state, &db, tracked, false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(ran(&root), None, "archive and tracked close skip a root checkout");
+
+        close_workspace(app.handle().clone(), app.state(), app.state(), plain, None).await.unwrap();
+        assert_eq!(ran(&root).as_deref(), Some("Plain root\n"));
+
+        close_workspace_with_worktree_impl(app.handle().clone(), &state, &db, feature, false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(ran(&worktree).as_deref(), Some("Feature\n"), "an owned worktree runs them");
+    }
+
+    /// From a deletion's final check through the delete, nothing opens in
+    /// the checkout: restoring an archived chat child workspace is refused,
+    /// and every other opening waits for the delete to finish.
+    #[tokio::test]
+    async fn nothing_opens_in_a_checkout_after_its_deletions_final_check() {
+        if crate::state::run_with_isolated_layout(
+            "commands::workspace::archive_guard_tests::nothing_opens_in_a_checkout_after_its_deletions_final_check",
+        ) {
+            return;
+        }
+        use tauri::Manager;
+        let dir = tempfile::tempdir().unwrap();
+        let store = AppStateStore::default();
+        let parent = store.create_empty_workspace_at_path(dir.path().to_path_buf()).0;
+        let child = AppStateStore::reserve_workspace_id();
+        store
+            .create_chat_child_workspace(&child, &parent, &dir.path().display().to_string(), "Review")
+            .unwrap();
+        let app = close_test_app(store);
+        let presets = crate::presets::PresetStoreState::new(&app.state::<crate::database::DatabaseStore>());
+        let state = app.state::<AppStateStore>();
+        let db = app.state::<crate::database::DatabaseStore>();
+        let pty = app.state::<crate::terminal::PtyState>();
+        let archive = archive_workspace_impl(app.handle().clone(), &state, &db, child.0).await.unwrap();
+        let restore = || {
+            unarchive_workspace_impl_with_selection(
+                app.handle().clone(), &state, &db, &pty, &presets, archive.clone(), false,
+            )
+        };
+
+        // What a deletion holds once its final check passed.
+        let removal = crate::worktree_cleanup::removal_guard().await;
+        let fence = state.fence_checkout_removal(dir.path(), |_| Ok(())).unwrap();
+        let error = restore().await.unwrap_err();
+        assert!(error.contains("is being deleted"), "{error}");
+        assert!(state.find_archived_workspace(&archive).is_some(), "the entry stays");
+        let opening = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            crate::worktree_cleanup::opening_guard(),
+        )
+        .await;
+        assert!(opening.is_err(), "other openings wait for the delete");
+        drop(fence);
+        drop(removal);
+
+        let restored = restore().await.unwrap();
+        assert_eq!(state.find_workspace(&restored).unwrap().title, "Review");
     }
 
     #[test]

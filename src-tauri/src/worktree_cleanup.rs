@@ -150,6 +150,12 @@ pub(crate) async fn opening_guard() -> tokio::sync::RwLockReadGuard<'static, ()>
     OPENING.read().await
 }
 
+/// Held by every deletion of a checkout's files from its final check
+/// through the delete, so no workspace opens one meanwhile.
+pub(crate) async fn removal_guard() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    OPENING.write().await
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -865,7 +871,7 @@ async fn remove_locked<R: tauri::Runtime>(
         // Final check and delete: no workspace may open a checkout from
         // here on, and the close path's Hermes lock keeps a Hermes start
         // from claiming the directory.
-        let _opening = OPENING.write().await;
+        let _opening = removal_guard().await;
         let _hermes = crate::agent_provider::hermes::WORKTREE_LIFECYCLE.lock().await;
         // Gathered again: a reopen and close since the first pass leaves a
         // newer retirement time that must restart the settle period.

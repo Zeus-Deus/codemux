@@ -2089,7 +2089,7 @@ impl AppStateStore {
 
     /// Run `check` on the current state and, when it passes, fence `root`
     /// until the returned guard drops: no chat child workspace can be
-    /// created inside it meanwhile. Both happen under the state lock, so
+    /// created or restored inside it meanwhile. Both happen under the state lock, so
     /// none appears between the check and the fence.
     pub fn fence_checkout_removal(
         &self,
@@ -2103,13 +2103,22 @@ impl AppStateStore {
     }
 
     /// Restore an archived chat child workspace with its title, project
-    /// fields and parent link. Like creation, it carries no worktree.
+    /// fields and parent link. Like creation, it carries no worktree, and
+    /// refuses a folder that is gone or being deleted: both are checked
+    /// under the state lock, so a deletion either sees this workspace or
+    /// has already removed the folder.
     pub fn restore_chat_child_workspace(
         &self,
         entry: &ArchivedWorkspaceSnapshot,
         select: bool,
-    ) -> WorkspaceId {
+    ) -> Result<WorkspaceId, String> {
         let mut snapshot = self.inner.lock().unwrap();
+        if checkout_being_removed(Path::new(&entry.cwd)) {
+            return Err(format!("{} is being deleted", entry.cwd));
+        }
+        if !Path::new(&entry.cwd).exists() {
+            return Err(format!("Nothing left to restore: {} no longer exists on disk.", entry.cwd));
+        }
         let id = Self::reserve_workspace_id();
         Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
             Self::insert_chat_child_workspace_locked(
@@ -2133,7 +2142,7 @@ impl AppStateStore {
                 },
             );
         });
-        id
+        Ok(id)
     }
 
     fn insert_chat_child_workspace_locked(

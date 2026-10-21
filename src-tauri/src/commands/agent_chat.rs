@@ -6271,18 +6271,22 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
     // after this call still finds the stop and waits for it.
     let thread_ids: Vec<String> = threads.iter().map(|(_, id, _)| id.clone()).collect();
     let db = app.try_state::<DatabaseStore>();
-    let workspaces: Vec<Option<String>> = thread_ids
+    let sessions: Vec<(Option<String>, Option<String>)> = thread_ids
         .iter()
-        .map(|id| db.as_ref()?.get_agent_chat_session(id).map(|s| s.workspace_id))
+        .map(|id| {
+            db.as_ref()
+                .and_then(|db| db.get_agent_chat_session(id))
+                .map_or((None, None), |s| (Some(s.workspace_id), s.cwd))
+        })
         .collect();
     let (done, result) = tokio::sync::watch::channel(None);
-    let stopped_workspaces: Vec<String> = workspaces.iter().flatten().cloned().collect();
+    let stopped_workspaces: Vec<String> = sessions.iter().filter_map(|(id, _)| id.clone()).collect();
     {
         let mut pending = pending_stops().lock().unwrap();
-        for (thread_id, workspace_id) in thread_ids.iter().zip(workspaces) {
+        for (thread_id, (workspace_id, cwd)) in thread_ids.iter().zip(sessions) {
             pending.insert(
                 thread_id.clone(),
-                PendingStop { workspace_id, result: result.clone() },
+                PendingStop { workspace_id, cwd, result: result.clone() },
             );
         }
     }
@@ -6309,11 +6313,81 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
     handle
 }
 
-/// A fire-and-forget stop still in flight, with the workspace its session
-/// was recorded under (`None` when no session row exists).
+/// A fire-and-forget stop still in flight, with the workspace and folder
+/// its session was recorded under (`None` when unknown).
 struct PendingStop {
     workspace_id: Option<String>,
+    cwd: Option<String>,
     result: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+}
+
+/// Folders of sessions whose provider did not acknowledge a stop, by thread
+/// id: the agent may still be working there. Cleared when the thread later
+/// stops cleanly, otherwise kept until restart (which ends every session
+/// Codemux started).
+fn unstopped_sessions() -> &'static Mutex<HashMap<String, String>> {
+    static UNSTOPPED: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    UNSTOPPED.get_or_init(Default::default)
+}
+
+fn note_stop_outcome<R: Runtime>(app: &AppHandle<R>, thread_id: &str, stopped: bool) {
+    if stopped {
+        unstopped_sessions().lock().unwrap().remove(thread_id);
+        return;
+    }
+    let cwd = app
+        .try_state::<DatabaseStore>()
+        .and_then(|db| db.get_agent_chat_session(thread_id))
+        .and_then(|session| session.cwd);
+    if let Some(cwd) = cwd {
+        unstopped_sessions().lock().unwrap().insert(thread_id.to_string(), cwd);
+    }
+}
+
+/// In-flight stops of sessions that worked inside `root`, wherever their
+/// workspace went: a chat closed with an earlier workspace (a chat child
+/// closed before its parent) is found here. Stops of sessions with no
+/// recorded folder are in every [`snapshot_pending_stops`].
+pub fn snapshot_pending_stops_in(root: &std::path::Path) -> EarlierStops {
+    EarlierStops(
+        pending_stops()
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|stop| stop.cwd.as_deref().is_some_and(|cwd| session_within(cwd, root)))
+            .map(|stop| stop.result.clone())
+            .collect(),
+    )
+}
+
+fn session_within(cwd: &str, root: &std::path::Path) -> bool {
+    crate::workspace_paths::path_within(std::path::Path::new(cwd), root)
+}
+
+/// Refuses deleting the files at `root` while an agent that worked inside
+/// them never confirmed it stopped.
+pub(crate) fn refuse_unconfirmed_stop_in(root: &std::path::Path) -> Result<(), String> {
+    if unstopped_sessions().lock().unwrap().values().any(|cwd| session_within(cwd, root)) {
+        return Err("An agent that worked in this checkout did not confirm it stopped, so its \
+                    files stay until Codemux restarts. No files were deleted."
+            .to_string());
+    }
+    Ok(())
+}
+
+/// [`refuse_unconfirmed_stop_in`], and also while such an agent is still
+/// stopping.
+pub(crate) fn refuse_unstopped_agents_in(root: &std::path::Path) -> Result<(), String> {
+    refuse_unconfirmed_stop_in(root)?;
+    let stopping = pending_stops().lock().unwrap().values().any(|stop| {
+        stop.result.borrow().is_none() && stop.cwd.as_deref().is_some_and(|cwd| session_within(cwd, root))
+    });
+    if stopping {
+        return Err("An agent that worked in this checkout is still stopping. Try again in a \
+                    moment; no files were deleted."
+            .to_string());
+    }
+    Ok(())
 }
 
 /// In-flight stops by thread id. A chat closed just before its workspace is
@@ -6434,6 +6508,7 @@ async fn stop_agent_chat_threads<R: Runtime>(
         };
         match impl_.stop_session(ThreadId(thread_id.clone())).await {
             Ok(()) => {
+                note_stop_outcome(app_handle, &thread_id, true);
                 if !super::queued_turns::exiting() {super::delegation::stop_confirmed(app_handle,&thread_id);}
                 if let Some(state) = app_handle.try_state::<NativeControlState>() {
                     state.clear_worker(&thread_id);
@@ -6445,9 +6520,11 @@ async fn stop_agent_chat_threads<R: Runtime>(
             }
             // Nothing was running, so nothing can still be using the files.
             Err(ProviderError::SessionNotFound { .. } | ProviderError::SessionClosed { .. }) => {
+                note_stop_outcome(app_handle, &thread_id, true);
                 if !super::queued_turns::exiting() {super::delegation::stop_confirmed(app_handle,&thread_id);}
             }
             Err(error) => {
+                note_stop_outcome(app_handle, &thread_id, false);
                 eprintln!(
                     "[agent_chat] cleanup stop_session failed for {kind:?} {thread_id}: {error:?}"
                 );
@@ -12745,6 +12822,8 @@ mod tests {
         stop_started: tokio::sync::Notify,
         stop_release: Option<Arc<tokio::sync::Notify>>,
         fail_stop: bool,
+        /// Limits `stop_release` and `fail_stop` to this thread's stop.
+        only: Option<&'static str>,
     }
 
     #[async_trait::async_trait]
@@ -12808,11 +12887,14 @@ mod tests {
             unimplemented!()
         }
         async fn stop_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
-            self.stop_started.notify_one();
-            if let Some(release) = &self.stop_release {
+            let scoped = self.only.is_none_or(|only| only == thread_id.0);
+            if scoped {
+                self.stop_started.notify_one();
+            }
+            if let Some(release) = self.stop_release.as_ref().filter(|_| scoped) {
                 release.notified().await;
             }
-            if self.fail_stop {
+            if self.fail_stop && scoped {
                 return Err(ProviderError::ProcessError {
                     message: "test shutdown was not acknowledged".into(),
                     source: None,
@@ -13334,7 +13416,7 @@ mod tests {
         let (done, result) = tokio::sync::watch::channel(None);
         pending_stops().lock().unwrap().insert(
             "closed-chat".into(),
-            PendingStop { workspace_id: Some(workspace.clone()), result },
+            PendingStop { workspace_id: Some(workspace.clone()), cwd: None, result },
         );
         let handle = app.handle().clone();
         let earlier = snapshot_pending_stops(&workspace);
@@ -13366,7 +13448,7 @@ mod tests {
         let (done, result) = tokio::sync::watch::channel(None);
         pending_stops().lock().unwrap().insert(
             "closed-chat".into(),
-            PendingStop { workspace_id: Some(workspace.clone()), result },
+            PendingStop { workspace_id: Some(workspace.clone()), cwd: None, result },
         );
         let earlier = snapshot_pending_stops(&workspace);
         // It fails and leaves the registry during the close's awaits, before
@@ -13395,7 +13477,7 @@ mod tests {
         let (done, result) = tokio::sync::watch::channel(None);
         pending_stops().lock().unwrap().insert(
             "late-chat".into(),
-            PendingStop { workspace_id: Some(workspace.clone()), result },
+            PendingStop { workspace_id: Some(workspace.clone()), cwd: None, result },
         );
         let handle = app.handle().clone();
         let mut wait = tokio::spawn(async move {
@@ -13428,6 +13510,204 @@ mod tests {
         let error = result.expect_err("unacknowledged shutdown must refuse file deletion");
         assert!(error.contains("test shutdown was not acknowledged"), "unexpected error: {error}");
         assert!(retained, "failed agent shutdown must retain the worktree");
+    }
+
+    /// Close chat child workspace `child` the way the sidebar does, and wait
+    /// until its chat's stop is running.
+    async fn close_chat_child_first(
+        handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        provider: &PlacementProvider,
+        child: &str,
+    ) {
+        super::super::workspace::close_workspace(handle.clone(), handle.state(), handle.state(), child.into(), None)
+            .await
+            .unwrap();
+        assert!(handle.state::<AppStateStore>().find_workspace(child).is_none());
+        tokio::time::timeout(Duration::from_secs(5), provider.stop_started.notified()).await.unwrap();
+    }
+
+    fn delete_worktree_workspace(
+        handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        workspace: &str,
+    ) -> tokio::task::JoinHandle<Result<(), String>> {
+        let handle = handle.clone();
+        let workspace = workspace.to_string();
+        tokio::spawn(async move {
+            super::super::workspace::close_workspace_with_worktree_impl(
+                handle.clone(), &handle.state::<AppStateStore>(), &handle.state::<DatabaseStore>(),
+                workspace, true, Some(false), Some(true),
+            ).await
+        })
+    }
+
+    /// A chat child workspace closed before its parent leaves its chat
+    /// stopping under its own id. Deleting the parent's checkout waits for
+    /// that stop too.
+    #[tokio::test]
+    async fn worktree_deletion_waits_for_a_chat_workspace_closed_before_it() {
+        if worktree_close_fixture_child("worktree_deletion_waits_for_a_chat_workspace_closed_before_it") {
+            return;
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(PlacementProvider {
+            stop_release: Some(release.clone()),
+            only: Some("early-child"),
+            ..Default::default()
+        });
+        let (_repo, app, workspace, worktree) = worktree_close_app("early-parent", provider.clone()).await;
+        let handle = app.handle().clone();
+        let cwd = worktree.display().to_string();
+        let child = chat_child(&handle, &provider, &workspace, &cwd, "early-child", Some("early-parent"));
+        close_chat_child_first(&handle, &provider, &child).await;
+
+        let mut close = delete_worktree_workspace(&handle, &workspace);
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut close).await.is_err();
+        assert!(waited, "deletion finished while the earlier child's agent was stopping");
+        assert!(worktree.exists());
+        assert_eq!(*provider.stopped.lock().unwrap(), ["early-parent"], "only the child is left");
+        release.notify_one();
+        close.await.unwrap().unwrap();
+        assert!(!worktree.exists());
+    }
+
+    /// The earlier child's stop fails: the files stay, and stay for any
+    /// later deletion until that agent is known to have stopped.
+    #[tokio::test]
+    async fn worktree_deletion_keeps_files_when_a_chat_workspace_closed_before_it_did_not_stop() {
+        if worktree_close_fixture_child(
+            "worktree_deletion_keeps_files_when_a_chat_workspace_closed_before_it_did_not_stop",
+        ) {
+            return;
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(PlacementProvider {
+            stop_release: Some(release.clone()),
+            fail_stop: true,
+            only: Some("failed-child"),
+            ..Default::default()
+        });
+        let (_repo, app, workspace, worktree) = worktree_close_app("failed-parent", provider.clone()).await;
+        let handle = app.handle().clone();
+        let cwd = worktree.display().to_string();
+        let child = chat_child(&handle, &provider, &workspace, &cwd, "failed-child", Some("failed-parent"));
+        close_chat_child_first(&handle, &provider, &child).await;
+
+        let mut close = delete_worktree_workspace(&handle, &workspace);
+        assert!(tokio::time::timeout(Duration::from_millis(200), &mut close).await.is_err());
+        release.notify_one();
+        let error = close.await.unwrap().unwrap_err();
+        assert!(error.contains("test shutdown was not acknowledged"), "{error}");
+        assert!(worktree.exists(), "files stay when the earlier child did not stop");
+
+        // A workspace reopened on the checkout cannot delete it either, and
+        // is refused before anything closes.
+        let state = handle.state::<AppStateStore>();
+        let reopened = state.create_empty_workspace_at_path(worktree.clone()).0;
+        state.set_workspace_worktree(&reopened, cwd.clone(), "Reopened".into());
+        let error = super::super::workspace::close_workspace_with_worktree_impl(
+            handle.clone(), &state, &handle.state::<DatabaseStore>(),
+            reopened.clone(), true, Some(false), Some(true),
+        ).await.unwrap_err();
+        assert!(error.contains("did not confirm it stopped"), "{error}");
+        assert!(state.find_workspace(&reopened).is_some(), "nothing closed");
+        assert!(worktree.exists());
+        crate::git::git_remove_worktree(&worktree, None, true).unwrap();
+    }
+
+    /// Closing the coordinator's tab, or starting a New Chat in it, closes
+    /// the workspaces of the tasks it delegated while their agents are still
+    /// stopping. Deleting the coordinator's checkout then waits for them.
+    async fn deletion_waits_for_children_of_a_coordinator_that_left(test: &str, rebind: bool) {
+        if worktree_close_fixture_child(test) {
+            return;
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(PlacementProvider {
+            stop_release: Some(release.clone()),
+            only: Some("left-child"),
+            ..Default::default()
+        });
+        let (_repo, app, workspace, worktree) = worktree_close_app("left-coordinator", provider.clone()).await;
+        app.manage(RunActivityTracker::default());
+        app.manage(ObservabilityStore::default());
+        let handle = app.handle().clone();
+        let state = handle.state::<AppStateStore>();
+        let cwd = worktree.display().to_string();
+        let child = chat_child(&handle, &provider, &workspace, &cwd, "left-child", Some("left-coordinator"));
+        if rebind {
+            shutdown_agent_chat_threads(&handle, vec![(ProviderKind::Codex, "left-coordinator".into())]);
+        } else {
+            let pane = state.agent_chat_pane_id_for_thread("left-coordinator").unwrap();
+            agent_chat_close_pane(handle.clone(), handle.state(), handle.state(), pane, Some(false)).unwrap();
+        }
+        assert!(state.find_workspace(&child).is_none(), "the delegated chat's workspace closed");
+        tokio::time::timeout(Duration::from_secs(5), provider.stop_started.notified()).await.unwrap();
+
+        let mut close = delete_worktree_workspace(&handle, &workspace);
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut close).await.is_err();
+        assert!(waited, "deletion finished while the delegated chat's agent was stopping");
+        assert!(worktree.exists());
+        release.notify_one();
+        close.await.unwrap().unwrap();
+        assert!(!worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_waits_for_children_of_a_closed_coordinator_tab() {
+        deletion_waits_for_children_of_a_coordinator_that_left(
+            "worktree_deletion_waits_for_children_of_a_closed_coordinator_tab",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn worktree_deletion_waits_for_children_of_a_rebound_coordinator_tab() {
+        deletion_waits_for_children_of_a_coordinator_that_left(
+            "worktree_deletion_waits_for_children_of_a_rebound_coordinator_tab",
+            true,
+        )
+        .await;
+    }
+
+    /// Deleting an archived checkout's files waits the same way.
+    #[tokio::test]
+    async fn archived_checkout_deletion_waits_for_a_chat_workspace_closed_before_it() {
+        if worktree_close_fixture_child("archived_checkout_deletion_waits_for_a_chat_workspace_closed_before_it") {
+            return;
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(PlacementProvider {
+            stop_release: Some(release.clone()),
+            only: Some("archived-child"),
+            ..Default::default()
+        });
+        let (_repo, app, workspace, worktree) = worktree_close_app("archived-parent", provider.clone()).await;
+        let handle = app.handle().clone();
+        let cwd = worktree.display().to_string();
+        let child = chat_child(&handle, &provider, &workspace, &cwd, "archived-child", Some("archived-parent"));
+        close_chat_child_first(&handle, &provider, &child).await;
+        let state = handle.state::<AppStateStore>();
+        let archive = super::super::workspace::archive_workspace_impl(
+            handle.clone(), &state, &handle.state::<DatabaseStore>(), workspace,
+        ).await.unwrap();
+
+        let mut delete = {
+            let handle = handle.clone();
+            let archive = archive.clone();
+            tokio::spawn(async move {
+                super::super::workspace::delete_archived_workspace_impl(
+                    handle.clone(), &handle.state::<AppStateStore>(), archive, true, false, true,
+                ).await
+            })
+        };
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut delete).await.is_err();
+        assert!(waited, "archived deletion finished while the child's agent was stopping");
+        assert!(worktree.exists());
+        release.notify_one();
+        delete.await.unwrap().unwrap();
+        assert!(!worktree.exists());
+        assert!(state.find_archived_workspace(&archive).is_none());
     }
 
     /// Give `workspace` an absolute folder on its device, so a session can
