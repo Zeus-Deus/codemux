@@ -5,8 +5,37 @@ use std::{
 };
 use tokio::task::AbortHandle;
 
+// Lock order: the registry only resolves/replaces weak runtime references. Drop
+// its guard before taking NativeAuthority::state or invoking any authority method.
+// Authority admission may take delegation state / journal locks for synchronous
+// durable mutations; release it before recursive revocation or provider work.
 static RUNTIMES: LazyLock<Mutex<HashMap<String, Weak<NativeAuthority>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn runtime(thread: &str) -> Option<Arc<NativeAuthority>> {
+    let owner = RUNTIMES.lock().unwrap().get(thread).and_then(Weak::upgrade);
+    #[cfg(test)]
+    after_runtime_lookup();
+    owner
+}
+
+#[cfg(test)]
+fn after_runtime_lookup() {
+    LOOKUP_HOOK.with(|hook| {
+        let hook = hook.borrow_mut().take();
+        if let Some(hook) = hook { hook(); }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOOKUP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+}
+
+#[cfg(test)]
+pub(crate) fn on_next_runtime_lookup(hook: impl FnOnce() + 'static) {
+    LOOKUP_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
 
 #[derive(Debug)]
 pub(crate) struct NativeAuthority {
@@ -53,7 +82,7 @@ impl AuthorityIdentity {
         thread: &str,
         ceiling: crate::agent_control::permissions::Ceiling,
     ) {
-        let owner = RUNTIMES.lock().unwrap().get(thread).and_then(Weak::upgrade);
+        let owner = runtime(thread);
         let Some(owner) = owner else {
             return;
         };
@@ -79,18 +108,14 @@ impl AuthorityIdentity {
     pub fn verify(&self, thread: &str) -> Result<(), String> {
         self.admit(thread, || Ok(()))
     }
-    /// Revocation and synchronous admission share a fence. No provider wait
-    /// or async work is allowed while this closure owns the caller permit.
+    /// Revocation and synchronous durable admission share a fence. No recursive
+    /// authority calls, provider waits or async work may run inside this closure.
     pub fn admit<T>(
         &self,
         thread: &str,
         work: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        let owner = RUNTIMES
-            .lock()
-            .unwrap()
-            .get(thread)
-            .and_then(Weak::upgrade)
+        let owner = runtime(thread)
             .ok_or("stale_caller: native session is unavailable")?;
         let state = owner.state.lock().unwrap();
         if owner.session_key != self.session_key
@@ -135,7 +160,7 @@ impl NativeAuthority {
     pub fn effective_ceiling(
         thread: &str,
     ) -> Result<Option<crate::agent_control::permissions::Ceiling>, String> {
-        let owner = RUNTIMES.lock().unwrap().get(thread).and_then(Weak::upgrade);
+        let owner = runtime(thread);
         let Some(owner) = owner else {
             return Ok(None);
         };
@@ -164,19 +189,24 @@ impl NativeAuthority {
                 dispatch_wakers: Vec::new(),
             }),
         });
-        let mut runtimes = RUNTIMES.lock().unwrap();
-        runtimes.retain(|_, v| v.strong_count() > 0);
-        if let Some(old) = runtimes
-            .insert(thread.into(), Arc::downgrade(&owner))
-            .and_then(|v| v.upgrade())
-        {
+        let old = {
+            let mut runtimes = RUNTIMES.lock().unwrap();
+            runtimes.retain(|_, v| v.strong_count() > 0);
+            runtimes
+                .insert(thread.into(), Arc::downgrade(&owner))
+                .and_then(|v| v.upgrade())
+        };
+        #[cfg(test)]
+        after_runtime_lookup();
+        if let Some(old) = old {
             old.revoke();
         }
         owner
     }
     // Synchronous capability revocation precedes every asynchronous Stop wait.
     pub fn user_activity_thread(thread: &str, stop: bool) {
-        if let Some(owner) = RUNTIMES.lock().unwrap().get(thread).and_then(Weak::upgrade) {
+        let owner = runtime(thread);
+        if let Some(owner) = owner {
             if stop { owner.invalidate(); } else { owner.human_activity(); }
         }
     }
@@ -315,13 +345,7 @@ impl NativeAuthority {
     }
     #[cfg(test)]
     pub fn current_permit(thread: &str) -> NativePermit {
-        RUNTIMES
-            .lock()
-            .unwrap()
-            .get(thread)
-            .and_then(Weak::upgrade)
-            .unwrap()
-            .capture()
+        runtime(thread).unwrap().capture()
     }
 }
 pub(crate) struct PolicyTransition<'a> { owner: &'a NativeAuthority }
@@ -343,11 +367,7 @@ pub(crate) struct DispatchPermit {
 }
 impl DispatchPermit {
     pub fn capture(thread: &str) -> Result<Self, String> {
-        let owner = RUNTIMES
-            .lock()
-            .unwrap()
-            .get(thread)
-            .and_then(Weak::upgrade)
+        let owner = runtime(thread)
             .ok_or("No qualified native parent runtime")?;
         let waker = Arc::new(futures_util::task::AtomicWaker::new());
         let activity = {

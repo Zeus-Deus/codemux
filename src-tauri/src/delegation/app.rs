@@ -187,7 +187,10 @@ pub(crate) async fn native_call<R: Runtime>(
                 return Err("Unexpected native task tool fields".into());
             }
             let id = string(&args, "task_id")?;
-            if let Some(value)=crate::commands::delegation::local_task_call(&app,&parent.thread_id,&id,name=="task_cancel")? {return Ok(value);}
+            if let Some(call) = crate::commands::delegation::local_task_call(&app, &parent.thread_id, &id, name == "task_cancel")? {
+                drop(_admission);
+                return call.finish(&app);
+            }
             let id=id.strip_prefix("ssh:").unwrap_or(&id).to_string();
             owned(&store, &parent, &id)?;
             if name == "task_cancel" {

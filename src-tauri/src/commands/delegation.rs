@@ -67,6 +67,8 @@ pub(crate) const WORKTREE_CHILD_FOOTER: &str = "\n\n---\nFrom Codemux: the user 
 const TOOL_DESCRIPTION: &str = "Delegate a self-contained task to another installed coding agent in a background chat. The child sees only the brief. Results arrive independently through durable automatic delivery. Use client_request_id for retries: the same key and unchanged task arguments return the same task and child; async/wait controls may change on a retry. mode defaults to async; wait waits at most 20 seconds without cancelling on timeout. Use task_status/task_cancel with task_id; child_thread_id is a different identity. Read a complete terminal result with task_status to acknowledge its automatic delivery. Chat links use codemux-chat://v1/<threadId>. For another independent review round, delegate again with a fresh key and complete brief. End your turn after async delegation; do not poll. If the brief asks you to report to a coordinator, use thread_send to that chat.";
 
 mod durable;
+#[cfg(test)]
+mod cancellation_tests;
 pub(crate) use durable::{
     local_task_call, preparation_failed, record_of, restoration_held, stop_confirmed,
 };
@@ -416,7 +418,8 @@ impl DelegationState {
     }
 
     fn admit<T>(&self, control: Option<&crate::agent_control::ControlCaller>, work: impl FnOnce(&mut Inner) -> Result<T, String>) -> Result<T, String> {
-        // Cancellation also takes caller authority before live delegation state.
+        // Always take caller authority before live delegation state. Drop both
+        // before recursive revocation or asynchronous provider work.
         let admission = || work(&mut self.lock());
         match control { Some(control) => control.admit(admission), None => admission() }
     }
@@ -964,13 +967,14 @@ impl<R: Runtime> HostTools for DelegationHost<R> {
                     .as_str()
                     .ok_or_else(|| "task_id required".to_string())
                     .and_then(|id| {
-                        let work=||local_task_call(&self.app,&caller.thread_id,id,name=="task_cancel");
-                        let result=if let Some(control)=&caller.control {control.admit(work)}else{work()};
-                        result.and_then(|r| {
-                                r.ok_or_else(|| {
-                                    "Use the remote task adapter for SSH task IDs".into()
-                                })
-                            })
+                        let work = || local_task_call(&self.app, &caller.thread_id, id, name == "task_cancel");
+                        let admitted = if let Some(control) = &caller.control {
+                            control.admit(work)
+                        } else {
+                            work()
+                        }?;
+                        let call = admitted.ok_or_else(|| "Use the remote task adapter for SSH task IDs".to_string())?;
+                        call.finish(&self.app)
                     });
                 if result
                     .as_ref()

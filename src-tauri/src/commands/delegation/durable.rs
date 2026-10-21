@@ -289,12 +289,50 @@ pub(super) fn task_receipt(record: &TaskRecord) -> Value {
 pub(super) fn task_tool(name: &str) -> McpTool {
     McpTool {name:name.into(),prefixed_name:prefix_tool_name("codemux",name),description:Some(if name=="task_status" {"Read a directly owned task and its complete immutable terminal result. Returning that complete result acknowledges automatic delivery. Uses task_id, not child_thread_id."}else{"Cancel a directly owned task and its descendants, retaining any published result and disposing automatic delivery. Uses task_id, not child_thread_id."}.into()),input_schema:json!({"type":"object","properties":{"task_id":{"type":"string"},"cursor":{"type":"integer","minimum":0}},"required":["task_id"],"additionalProperties":false}),server_id:"codemux-host".into()}
 }
+/// A durable task mutation admitted under the caller's authority. Live effects
+/// must run only after that authority guard has been released.
+#[must_use = "finish the admitted task call after releasing caller authority"]
+pub(crate) struct LocalTaskCall {
+    value: Value,
+    cancelled: Option<TaskRecord>,
+}
+
+impl LocalTaskCall {
+    pub(crate) fn finish<R: Runtime>(self, app: &AppHandle<R>) -> Result<Value, String> {
+        let Some(record) = self.cancelled else {
+            return Ok(self.value);
+        };
+        #[cfg(test)]
+        super::cancellation_tests::before_effects();
+        let db = app.state::<DatabaseStore>();
+        if let (Some(child), Some(provider)) = (
+            &record.child_thread_id,
+            current_child_provider(&db, &record),
+        ) {
+            let owned = app.clone();
+            let child = child.clone();
+            if let Some(state) = app.try_state::<DelegationState>() {
+                state.update(app, &child, |task| task.stop_reason = Some(StopReason::AgentCancellation));
+            }
+            if let Err(error) = crate::delegation::app::user_activity(app, &child, true) {
+                log::warn!("Could not revoke cancelled child authority: {error}");
+            }
+            super::super::agent_chat::native_thread_gate(app, &child).cancel();
+            on_thread_stopped(app, &child, StopKind::Stop);
+            tauri::async_runtime::spawn(async move {
+                let _ = super::super::agent_chat::interrupt_stopped_thread(owned, provider, ThreadId(child)).await;
+            });
+        }
+        serde_json::to_value(db.delegation_task(&record.task_id)?).map_err(|e| e.to_string())
+    }
+}
+
 pub(crate) fn local_task_call<R: Runtime>(
     app: &AppHandle<R>,
     parent: &str,
     id: &str,
     cancel: bool,
-) -> Result<Option<Value>, String> {
+) -> Result<Option<LocalTaskCall>, String> {
     let db = app.state::<DatabaseStore>();
     let Some(record) = db.delegation_task(id)? else {
         return Ok(None);
@@ -307,28 +345,16 @@ pub(crate) fn local_task_call<R: Runtime>(
     }
     if cancel {
         db.dispose_delegation_task(parent, id)?;
-        if let (Some(child), Some(provider)) = (
-            &record.child_thread_id,
-            current_child_provider(&db, &record),
-        ) {
-            let owned = app.clone();
-            let child = child.clone();
-            if let Some(state) = app.try_state::<DelegationState>() {
-                state.update(app, &child, |task| task.stop_reason = Some(StopReason::AgentCancellation));
-            }
-            db.stop_message_deliveries(&child)?;
-            on_thread_stopped(app, &child, StopKind::Stop);
-            tauri::async_runtime::spawn(async move {
-                let _ = super::super::agent_chat::interrupt_stopped_thread(owned, provider, ThreadId(child)).await;
-            });
+        if let Some(child) = &record.child_thread_id {
+            db.stop_message_deliveries(child)?;
         }
-        Ok(Some(
-            serde_json::to_value(db.delegation_task(id)?).map_err(|e| e.to_string())?,
-        ))
+        #[cfg(test)]
+        super::cancellation_tests::after_admission();
+        Ok(Some(LocalTaskCall { value: Value::Null, cancelled: Some(record) }))
     } else {
-        serde_json::to_value(db.acknowledge_delegation_result(parent, id)?)
-            .map(Some)
-            .map_err(|e| e.to_string())
+        let value = serde_json::to_value(db.acknowledge_delegation_result(parent, id)?)
+            .map_err(|e| e.to_string())?;
+        Ok(Some(LocalTaskCall { value, cancelled: None }))
     }
 }
 
