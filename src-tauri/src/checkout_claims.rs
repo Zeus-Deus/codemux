@@ -72,11 +72,10 @@ pub(crate) async fn wait_for(stops: Stops) -> Result<(), String> {
 /// A closing workspace's claim on its folders. Take it before the workspace
 /// leaves app state: from then on nothing else shows they are in use.
 /// Deletion waits on it until [`CloseClaim::stopped`], cleanup until it
-/// drops; [`CloseClaim::failed`] keeps it.
+/// drops. One that fails, or drops before either, stays until restart.
 pub(crate) struct CloseClaim {
     id: u64,
     done: watch::Sender<Outcome>,
-    kept: bool,
 }
 
 pub(crate) fn claim_checkout(ws: &WorkspaceSnapshot) -> CloseClaim {
@@ -90,7 +89,7 @@ fn claim_paths(paths: Vec<PathBuf>) -> CloseClaim {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let (done, result) = watch::channel(None);
     claims().insert(Key::Close(id), Claim { workspace_id: None, paths, result });
-    CloseClaim { id, done, kept: false }
+    CloseClaim { id, done }
 }
 
 impl CloseClaim {
@@ -106,16 +105,28 @@ impl CloseClaim {
     }
 
     /// A chat did not stop: the folders stay claimed until restart.
-    pub(crate) fn failed(mut self, error: String) {
+    pub(crate) fn failed(self, error: String) {
         self.done.send_replace(Some(Err(error)));
-        self.kept = true;
+    }
+
+    /// The workspace never left app state, so nothing ran unclaimed.
+    pub(crate) fn release(self) {
+        self.stopped();
     }
 }
 
 impl Drop for CloseClaim {
     fn drop(&mut self) {
-        if !self.kept {
-            self.stopped();
+        // Dropped before its chats confirmed they stopped, by a panic or a
+        // cancelled close: they may still run, so the folders stay claimed.
+        self.done.send_if_modified(|outcome| {
+            let unset = outcome.is_none();
+            if unset {
+                *outcome = Some(Err("closing the workspace ended before its agents stopped".into()));
+            }
+            unset
+        });
+        if self.done.borrow().as_ref().is_some_and(Result::is_ok) {
             claims().remove(&Key::Close(self.id));
         }
     }
@@ -275,6 +286,46 @@ mod tests {
         assert!(held_in(&kept));
         assert!(refuse_failed_in(&kept).unwrap_err().contains("did not confirm"));
         assert!(!held_in(&dir.path().join("bc")), "only folders inside");
+
+        let never_detached = dir.path().join("c");
+        claim_paths(vec![never_detached.clone()]).release();
+        assert!(!held_in(&never_detached), "a close that removed nothing keeps nothing");
+    }
+
+    /// A close that unwinds after its workspace left app state, before its
+    /// chats confirmed they stopped: they may still run.
+    #[tokio::test]
+    async fn a_close_claim_dropped_unsettled_by_a_panic_keeps_its_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim = claim_paths(vec![dir.path().to_path_buf()]);
+        let pending_delete = claims_in(dir.path(), None);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _claim = claim;
+            panic!("after detach, before the chats were told to stop");
+        }));
+        assert!(panicked.is_err());
+        assert!(wait_for(pending_delete).await.is_err(), "a waiting deletion is refused");
+        assert!(refuse_in(dir.path(), None).unwrap_err().contains("did not confirm"));
+        assert!(held_in(dir.path()), "cleanup keeps it");
+    }
+
+    #[tokio::test]
+    async fn a_close_claim_dropped_unsettled_by_cancellation_keeps_its_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim = claim_paths(vec![dir.path().to_path_buf()]);
+        let pending_delete = claims_in(dir.path(), None);
+        let (entered, reached) = tokio::sync::oneshot::channel();
+        let close = tokio::spawn(async move {
+            let _claim = claim;
+            entered.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        reached.await.unwrap();
+        close.abort();
+        assert!(close.await.unwrap_err().is_cancelled());
+        assert!(wait_for(pending_delete).await.is_err(), "a waiting deletion is refused");
+        assert!(refuse_in(dir.path(), None).is_err());
+        assert!(held_in(dir.path()), "cleanup keeps it");
     }
 
     #[tokio::test]

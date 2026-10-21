@@ -13634,6 +13634,67 @@ mod tests {
         assert!(provider.stopped.lock().unwrap().contains(&"surviving-child".to_string()));
     }
 
+    /// A chat workspace's close that ends at that pause, before its chat
+    /// was told to stop, as by a panic, leaves the chat running: deleting
+    /// its parent's checkout keeps the files, now and later.
+    #[tokio::test]
+    async fn worktree_deletion_keeps_files_when_a_chat_workspace_close_is_abandoned() {
+        if worktree_close_fixture_child("worktree_deletion_keeps_files_when_a_chat_workspace_close_is_abandoned") {
+            return;
+        }
+        let provider = Arc::new(PlacementProvider::default());
+        let (_repo, app, workspace, worktree) = worktree_close_app("abandoned-parent", provider.clone()).await;
+        let handle = app.handle().clone();
+        let cwd = worktree.display().to_string();
+        let child = chat_child(&handle, &provider, &workspace, &cwd, "abandoned-child", None);
+        let (child_close, _release) = pause_chat_child_close(&handle, &child).await;
+
+        let mut delete = delete_worktree_workspace(&handle, &workspace);
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut delete).await.is_err();
+        assert!(waited, "deletion finished before the closing child's chat was told to stop");
+        child_close.abort();
+        assert!(child_close.await.unwrap_err().is_cancelled());
+        let error = delete.await.unwrap().unwrap_err();
+        assert!(error.contains("worktree files retained"), "{error}");
+        assert!(worktree.exists());
+        assert!(!provider.stopped.lock().unwrap().contains(&"abandoned-child".to_string()));
+        assert!(crate::checkout_claims::refuse_in(&worktree, None).is_err(), "a later deletion is refused");
+        assert!(crate::checkout_claims::held_in(&worktree), "cleanup keeps it");
+        crate::git::git_remove_worktree(&worktree, None, true).unwrap();
+    }
+
+    /// The same for an archived parent whose chat workspace outlived it.
+    #[tokio::test]
+    async fn archived_checkout_deletion_keeps_files_when_a_chat_workspace_close_is_abandoned() {
+        if worktree_close_fixture_child("archived_checkout_deletion_keeps_files_when_a_chat_workspace_close_is_abandoned") {
+            return;
+        }
+        let provider = Arc::new(PlacementProvider::default());
+        let (_repo, app, workspace, worktree) = worktree_close_app("abandoned-archived", provider.clone()).await;
+        let handle = app.handle().clone();
+        let state = handle.state::<AppStateStore>();
+        let cwd = worktree.display().to_string();
+        let child = chat_child(&handle, &provider, &workspace, &cwd, "abandoned-survivor", None);
+        let archive = super::super::workspace::archive_workspace_impl(
+            handle.clone(), &state, &handle.state::<DatabaseStore>(), workspace,
+        ).await.unwrap();
+        let (child_close, _release) = pause_chat_child_close(&handle, &child).await;
+
+        let mut delete = delete_archived_checkout(&handle, &archive);
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut delete).await.is_err();
+        assert!(waited, "archived deletion finished before the closing child's chat was told to stop");
+        child_close.abort();
+        assert!(child_close.await.unwrap_err().is_cancelled());
+        let error = delete.await.unwrap().unwrap_err();
+        assert!(error.contains("worktree files retained"), "{error}");
+        assert!(worktree.exists());
+        let again = delete_archived_checkout(&handle, &archive).await.unwrap().unwrap_err();
+        assert!(again.contains("worktree files retained"), "{again}");
+        assert!(worktree.exists());
+        assert!(state.find_archived_workspace(&archive).is_some());
+        crate::git::git_remove_worktree(&worktree, None, true).unwrap();
+    }
+
     /// A workspace reopened on an archived checkout is being deleted and
     /// waits for its own chat to stop. Deleting the archive entry meanwhile
     /// keeps the files until that chat has.

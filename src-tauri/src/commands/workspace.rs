@@ -1392,9 +1392,15 @@ fn detach_workspace<R: tauri::Runtime>(
     // Before the workspace leaves state, so no deletion or cleanup sees its
     // folders unclaimed while its chats may still run in them.
     let claim = closing.as_ref().map(crate::checkout_claims::claim_checkout);
-    let result = state
-        .close_workspace(workspace_id)
-        .map_err(|e| format!("Failed to close workspace: {e}"))?;
+    let result = match state.close_workspace(workspace_id) {
+        Ok(result) => result,
+        Err(e) => {
+            if let Some(claim) = claim {
+                claim.release();
+            }
+            return Err(format!("Failed to close workspace: {e}"));
+        }
+    };
     // Before any await: a chat closed just before this may still be
     // stopping, and its result must not be lost if it finishes meanwhile.
     let earlier = crate::checkout_claims::stops_of_workspace(workspace_id);
