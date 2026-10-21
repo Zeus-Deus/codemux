@@ -585,10 +585,12 @@ jobs:
         run: |
           # Dependency binaries and dist/ are already built above, so skip the
           # release beforeBuildCommand entirely. This installer is disposable:
-          # skip LZMA compression too (~2.5 min in makensis).
+          # skip LZMA compression too (~2.5 min in makensis). A blank
+          # beforeBundleCommand keeps the zero-byte codemux-remote placeholder
+          # instead of staging the debug build (the Windows binary is an unused stub).
           if (-not (Test-Path dist/index.html)) { throw 'dist/index.html missing; the frontend build step must run first' }
           @{
-            build = @{ beforeBuildCommand = '' }
+            build = @{ beforeBuildCommand = ''; beforeBundleCommand = '' }
             bundle = @{ createUpdaterArtifacts = $false; windows = @{ nsis = @{ compression = 'none' } } }
           } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 ci-tauri-config.json
           npm run tauri -- build --debug --bundles nsis --config ci-tauri-config.json
