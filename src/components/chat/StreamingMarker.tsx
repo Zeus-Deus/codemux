@@ -1,28 +1,25 @@
-import { ChevronRight } from "lucide-react";
-import { useEffect, useMemo, useRef } from "react";
+import { Bot, ChevronRight, Lightbulb, Minimize2, PenLine, type LucideIcon } from "lucide-react";
+import { useMemo } from "react";
 
-import { AgentOrb } from "@/components/ui/agent-orb";
-import { turnOrbActivity } from "@/lib/agent-chat/orb-activity";
+import { Trace, TraceIcon, TraceLine, TraceTitle } from "@/components/ui/trace";
 import { countRunningSubagents } from "@/lib/agent-chat/subagents";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 import { useUIStore } from "@/stores/ui-store";
 
-import { formatActivityDuration } from "./activity-steps";
+import { toolIcon } from "./tool-visuals";
 
 /**
- * Tail "working" marker (design D9) — the last row inside the scroller
- * while a turn is in flight and no approval is pending. The agent orb sits
- * in the 29px turn gutter (aligned under the assistant avatar) next to a
- * shimmering status line, followed by a live elapsed-time suffix (e.g.
- * "Writing… · 40s"). Gating lives in `shouldShowThinkingIndicator`; this
- * component derives the label, the orb's activity, and the turn start.
+ * Tail "working" marker — the last row inside the scroller while a turn is
+ * in flight and no other row shows live work (right after send, after the
+ * agent's narration, while it waits on background tasks). Drawn as one
+ * quiet Trace line so it reads like the work log it hands over to: an icon
+ * and a softly sweeping label. Gating lives in `shouldShowThinkingIndicator`.
  *
- * This is the thread's one live orb: it stands for the turn as a whole, so
- * individual tool-call rows above it stay still. There is one orb per live
- * thing.
+ * It carries no clock: the turn's live header ("Working for …") is the
+ * thread's one elapsed time.
  *
- * While the agent is waiting on background tasks, the label becomes a
+ * While the agent is waiting on background tasks, the line becomes a
  * button that opens the Subagents panel, which lists those same tasks
  * (subagents and background shell jobs). The line names the work, so it
  * links to it.
@@ -36,80 +33,52 @@ export function StreamingMarker({
   workspaceId?: string | null;
   compacting?: boolean;
 }) {
-  const { label, waiting } = useMemo(
-    () => compacting ? { label: "Summarizing context…", waiting: 0 } : deriveStreamingStatus(messages),
+  const { label, waiting, icon: Icon } = useMemo(
+    () =>
+      compacting
+        ? { label: "Summarizing context…", waiting: 0, icon: Minimize2 }
+        : deriveStreamingStatus(messages),
     [compacting, messages],
   );
-  const activity = useMemo(
-    () => compacting ? {} : turnOrbActivity(messages),
-    [compacting, messages],
-  );
-  const startedAt = useMemo(() => deriveTurnStartedAt(messages), [messages]);
-  const elapsedRef = useRef<HTMLSpanElement>(null);
 
-  // Tick the elapsed suffix once a second WITHOUT re-rendering the
-  // transcript: write `textContent` straight to the text node. React never
-  // sees the per-second change, so the memoized rows above stay untouched.
-  useEffect(() => {
-    if (startedAt == null) return;
-    const node = elapsedRef.current;
-    if (!node) return;
-    const render = () => {
-      node.textContent = `· ${formatActivityDuration(Date.now() - startedAt)}`;
-    };
-    render();
-    const id = setInterval(render, 1000);
-    return () => clearInterval(id);
-  }, [startedAt]);
+  const line = (
+    <TraceLine status="running">
+      <TraceIcon>
+        <Icon />
+      </TraceIcon>
+      <TraceTitle>{label}</TraceTitle>
+    </TraceLine>
+  );
 
   return (
     <div
-      className="flex items-center gap-[13px] pt-0.5"
+      className="py-0.5"
       role="status"
       aria-label={compacting ? "Agent is summarizing context" : "Agent is working"}
     >
-      <span className="flex w-[29px] shrink-0 justify-center">
-        {/* The row already announces itself via role="status", so the orb
-            is decorative here — its per-state label would otherwise be
-            read out as a second, competing status. */}
-        <AgentOrb size={20} {...activity} aria-hidden />
-      </span>
-      <span className="flex min-w-0 items-baseline gap-1.5">
+      <Trace>
         {waiting > 0 && workspaceId ? (
-          <WaitingLabel
-            label={label}
-            waiting={waiting}
-            workspaceId={workspaceId}
-          />
+          <WaitingLine waiting={waiting} workspaceId={workspaceId}>
+            {line}
+          </WaitingLine>
         ) : (
-          <span className="shimmer text-body font-semibold">{label}</span>
+          <div>{line}</div>
         )}
-        {startedAt != null && (
-          // Populated imperatively by the effect; render nothing when no
-          // turn start is derivable (e.g. hydrated old transcripts) so the
-          // marker never shows a bogus number.
-          <span
-            ref={elapsedRef}
-            className="font-mono text-label tabular-nums text-muted-foreground"
-            aria-hidden
-          />
-        )}
-      </span>
+      </Trace>
     </div>
   );
 }
 
-/** The "Waiting on N background tasks…" label as a link to the Subagents
- *  panel. The shimmer stays on the text so it still reads as live status.
- *  A quiet `View ›` cue beside it matches the agents row in the transcript. */
-function WaitingLabel({
-  label,
+/** The "Waiting on N background tasks…" line as a link to the Subagents
+ *  panel, with a quiet `View ›` cue like the agents row in the transcript. */
+function WaitingLine({
   waiting,
   workspaceId,
+  children,
 }: {
-  label: string;
   waiting: number;
   workspaceId: string;
+  children: React.ReactNode;
 }) {
   const selected = useUIStore(
     (state) => state.rightPanelTabs[workspaceId] === "subagents",
@@ -121,13 +90,10 @@ function WaitingLabel({
       onClick={() => setRightPanelTab(workspaceId, "subagents")}
       aria-pressed={selected}
       aria-label={`View ${waiting} background task${waiting === 1 ? "" : "s"}`}
-      className={cn(
-        "group/waiting -mx-1 flex min-w-0 items-baseline gap-1.5 rounded-md px-1 text-left transition-colors duration-150 hover:bg-surface-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70",
-        selected && "bg-surface-2",
-      )}
+      className={cn("group/waiting flex items-center gap-1.5", selected && "text-foreground")}
     >
-      <span className="shimmer truncate text-body font-semibold">{label}</span>
-      <span className="flex shrink-0 items-center gap-0.5 self-center text-caption font-medium text-muted-foreground/70 transition-colors duration-150 group-hover/waiting:text-foreground/80">
+      {children}
+      <span className="flex shrink-0 items-center gap-0.5 text-caption font-medium text-muted-foreground/70 transition-colors duration-150 group-hover/waiting:text-foreground/80">
         View
         <ChevronRight
           className="size-3 transition-transform duration-150 group-hover/waiting:translate-x-0.5"
@@ -139,72 +105,36 @@ function WaitingLabel({
 }
 
 /** Status line derived from the transcript tail. Running tool → "Running
- *  <tool>…", streaming prose → "Writing…", streaming reasoning →
- *  "Thinking…". A settled tail while background tasks (delegated
- *  subagents or background shell jobs) are still running is the agent
- *  waiting on them → "Waiting on N background tasks…"; otherwise the
- *  neutral "Working…". `waiting` is the number of background tasks being
- *  waited on, and non-zero only for a "Waiting on…" label. */
+ *  <tool>…", streaming prose → "Writing…", anything else the agent is
+ *  between steps → "Thinking…". A settled tail while background tasks
+ *  (delegated subagents or background shell jobs) are still running is the
+ *  agent waiting on them → "Waiting on N background tasks…". `waiting` is
+ *  the number of background tasks being waited on, and non-zero only for a
+ *  "Waiting on…" label. */
 export function deriveStreamingStatus(messages: ChatViewItem[]): {
   label: string;
   waiting: number;
+  icon: LucideIcon;
 } {
+  const thinking = { label: "Thinking…", waiting: 0, icon: Lightbulb };
   const last = messages[messages.length - 1];
-  if (!last) return { label: "Working…", waiting: 0 };
+  if (!last) return thinking;
   switch (last.kind) {
     case "tool_call":
       if (last.status === "running") {
-        return { label: `Running ${last.tool_name}…`, waiting: 0 };
+        return { label: `Running ${last.tool_name}…`, waiting: 0, icon: toolIcon(last.tool_name) };
       }
       break;
     case "assistant_message":
-      if (last.streaming) return { label: "Writing…", waiting: 0 };
-      break;
-    case "reasoning":
-      if (last.streaming) return { label: "Thinking…", waiting: 0 };
+      if (last.streaming) return { label: "Writing…", waiting: 0, icon: PenLine };
       break;
     default:
       break;
   }
   const waiting = countRunningSubagents(messages, true);
-  if (waiting === 1) return { label: "Waiting on a background task…", waiting };
+  if (waiting === 1) return { label: "Waiting on a background task…", waiting, icon: Bot };
   if (waiting > 1) {
-    return { label: `Waiting on ${waiting} background tasks…`, waiting };
+    return { label: `Waiting on ${waiting} background tasks…`, waiting, icon: Bot };
   }
-  return { label: "Working…", waiting: 0 };
-}
-
-/**
- * Best-effort wall-clock start of the active turn, for the elapsed-time
- * suffix. Derived purely from timestamps the reducer already stamps (via
- * its injectable `Clock`) — no new reducer state:
- *
- *  1. Find the active turn's prompt: the last NON-queued `user_message`
- *     (queued follow-ups sit at the very bottom by seq but belong to a
- *     later turn).
- *  2. Return the earliest `started_at` among the reasoning / tool_call
- *     steps of that turn (items at or after the prompt's seq).
- *
- * Returns `null` when nothing after the prompt carries a `started_at`
- * (e.g. the gap right after send before the first step, or a hydrated
- * transcript whose rows predate the timestamp fields) — the caller then
- * renders no suffix rather than a fabricated duration.
- */
-export function deriveTurnStartedAt(messages: ChatViewItem[]): number | null {
-  let promptSeq = -Infinity;
-  for (const m of messages) {
-    if (m.kind === "user_message" && !m.queued && m.seq >= promptSeq) {
-      promptSeq = m.seq;
-    }
-  }
-  let earliest: number | null = null;
-  for (const m of messages) {
-    if (m.seq < promptSeq) continue;
-    const startedAt =
-      m.kind === "reasoning" || m.kind === "tool_call" ? m.started_at : undefined;
-    if (startedAt != null && (earliest == null || startedAt < earliest)) {
-      earliest = startedAt;
-    }
-  }
-  return earliest;
+  return thinking;
 }

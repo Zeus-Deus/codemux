@@ -1,9 +1,8 @@
 import { Lock } from "lucide-react";
 import { useMemo } from "react";
 
-import { AgentOrb } from "@/components/ui/agent-orb";
+import { Spinner } from "@/components/ui/spinner";
 import { isInlineHtmlRender } from "@/lib/agent-chat/html-render";
-import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import {
   isRunning,
   statusTone,
@@ -127,11 +126,7 @@ export function SubagentView({
             className="mt-3 flex items-center gap-1.5 px-1 py-1 text-body-sm leading-5 text-muted-foreground"
           >
             <span className="flex size-5 shrink-0 items-center justify-center">
-              <AgentOrb
-                size={20}
-                {...subagentOrbActivity(subagent)}
-                aria-hidden
-              />
+              <Spinner className="size-3.5" role="presentation" aria-hidden />
             </span>
             <span className="min-w-0 truncate font-mono text-label">
               {subagentActivityLine(subagent)}
@@ -164,9 +159,9 @@ function SubItem({
     case "assistant_message":
       return <AssistantMessage item={item} workspaceId={workspaceId} cwd={cwd} />;
     case "reasoning":
-      // The live tail below owns the run's orb, so a still-streaming thought
-      // keeps its settled glyph here instead of animating a second one.
-      return <ReasoningBlock item={item} live={false} />;
+      // A still-streaming thought stays a folded line; the live tail below
+      // already shows the run is working.
+      return <ReasoningBlock item={item} />;
     case "tool_call":
       return isTaskSummaryTool(item as ToolCallItem) ? (
         <TaskSummaryCard item={item as ToolCallItem} />

@@ -1466,7 +1466,7 @@ status foot 26px   active pane's status + running token total
 ## Notes
 
 - Pane controls live in the shared bar, never in a per-pane header.
-- Badges are plain counts; the working affordance is the orb.
+- Badges are plain counts; live work shows inside the thread.
 - Colour comes from tokens only — nothing hardcodes a palette value.
 `;
 

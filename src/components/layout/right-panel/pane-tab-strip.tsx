@@ -22,8 +22,8 @@
  * bordered active chip was the single heaviest thing in the panel.
  *
  * Live activity is carried by the badge itself (a mono count, accent-tinted
- * while its pane is active) — nothing in the strip blinks; app-wide
- * "working" is an orb.
+ * while its pane is active) — nothing in the strip blinks; live work is
+ * shown inside the thread.
  *
  * **Overflow.** The deck grows: every file opened from the tree is another
  * tab, and a busy thread adds tasks, orchestration and subagents on top of

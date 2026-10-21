@@ -73,7 +73,6 @@ import {
   selectAutoResumeUsageLimit,
   selectAutoResumeAfterRestart,
   selectCrossProviderDelegation,
-  selectOrbMatchActivity,
   selectNewChatCheckout,
   selectDiffLayoutPreference,
   selectHideWhitespacePreference,
@@ -93,8 +92,6 @@ import { NewChatModelSetting } from "./new-chat-model-setting";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { NON_INTERACTIVE_CLI_PROVIDERS } from "@/lib/agent-chat/capability-defaults";
 import { CommandPalette } from "@/components/overlays/command-palette";
-import { AgentOrb } from "@/components/ui/agent-orb";
-import type { OrbActivity } from "@/lib/orb-state";
 import {
   setAiCommitMessageEnabled,
   setAiCommitMessageCli,
@@ -287,32 +284,6 @@ function FormField({
           {caption}
         </p>
       )}
-    </div>
-  );
-}
-
-/** One preview row in the Agents section: an orb doing a specific thing,
- *  next to the kind of label it sits beside in the real sidebar. Reads the
- *  live setting through AgentOrb, so toggling pins both rows to the same
- *  working orb without any extra wiring here. */
-function OrbPreviewRow({
-  activity,
-  label,
-  elapsed,
-}: {
-  activity: OrbActivity;
-  label: string;
-  elapsed: string;
-}) {
-  return (
-    <div className="flex items-center gap-2.5 rounded-md px-2.5 py-2">
-      <span className="flex size-5 shrink-0 items-center justify-center">
-        <AgentOrb size={20} {...activity} aria-hidden />
-      </span>
-      <span className="flex-1 truncate text-body font-semibold text-foreground">
-        {label}
-      </span>
-      <span className="font-mono text-label text-muted-foreground tabular-nums">{elapsed}</span>
     </div>
   );
 }
@@ -1537,7 +1508,6 @@ export function SettingsView() {
       (s.settings["sidebar.auto_settle_days"] ??
         SETTINGS_DEFAULTS["sidebar.auto_settle_days"]!) as AutoSettleDays,
   );
-  const orbMatchActivity = useSettingsStore(selectOrbMatchActivity);
   const autoResumeUsageLimit = useSettingsStore(selectAutoResumeUsageLimit);
   const autoResumeAfterRestart = useSettingsStore(selectAutoResumeAfterRestart);
   const crossProviderDelegation = useSettingsStore(selectCrossProviderDelegation);
@@ -2196,50 +2166,6 @@ export function SettingsView() {
               </div>
             </SectionGroup>
 
-            <SectionGroup>
-              <SubsectionHeader
-                title="Agents"
-                description="The orb shown wherever an agent is running — sidebar cards, thread turns, subagent rows and the composer."
-              />
-              <div className="space-y-1">
-                <SettingRow
-                  label="Match the orb to the activity"
-                  description="The orb changes with what the agent is doing — searching the repo, solving a failure, talking to GitHub. Off shows the same working orb everywhere."
-                  scope="device"
-                >
-                  <Switch
-                    checked={orbMatchActivity}
-                    onCheckedChange={(checked) =>
-                      storeSet(
-                        "agents.orb_match_activity",
-                        checked ? "true" : "false",
-                      )
-                    }
-                  />
-                </SettingRow>
-              </div>
-
-              {/* Live preview at the sidebar row's scale. Two rows doing
-                  different things, so the toggle's effect is visible: with
-                  it on they animate differently, with it off they match. */}
-              <div className="mt-4">
-                <Eyebrow className="mb-1.5">
-                  Preview
-                </Eyebrow>
-                <div className="flex max-w-[300px] flex-col gap-0.5 rounded-md border border-hairline bg-surface-1 p-1.5">
-                  <OrbPreviewRow
-                    activity={{ toolName: "Grep" }}
-                    label="Fix scroll pinning on send"
-                    elapsed="6m"
-                  />
-                  <OrbPreviewRow
-                    activity={{ toolName: "Bash", toolInput: { command: "git push" } }}
-                    label="Dim settled workspaces"
-                    elapsed="2m"
-                  />
-                </div>
-              </div>
-            </SectionGroup>
             {/* Plugin appearance options. Nothing renders without one. */}
             <Slot area={APPEARANCE_EXTRA_AREA} variant="block" />
           </div>

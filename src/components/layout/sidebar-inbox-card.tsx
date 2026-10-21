@@ -572,7 +572,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
       )}
     >
       {/* Workspace navigation reports lifecycle, not the agent's current
-          action. Keep its working mark static; the animated activity orb
+          action. Keep its working mark static; animated live activity
           belongs inside the thread where that activity has context. */}
       {isWorking && (
         <CircleDotDashed

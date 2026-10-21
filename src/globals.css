@@ -1178,35 +1178,36 @@ body.pane-resizing iframe {
 }
 
 /* Live-status text shimmer for the agent-chat streaming marker
- * ("Working…", "Running <tool>…") and the reasoning block header while
- * thinking (design D9 / D5). A soft light band sweeps across the glyphs
- * via a text-clipped gradient. Colours are theme tokens so it reads in
- * both light and dark; the installed shadcn build does not ship a
- * `shimmer` utility, so this is the local, token-driven equivalent of the
- * design's wsShimmer. Honours reduced-motion. Apply via the `shimmer`
+ * ("Thinking…", "Running <tool>…") and running trace lines. A narrow
+ * light band sweeps across muted glyphs via a text-clipped gradient, so a
+ * live line reads as alive without pulling the eye. Colours are theme
+ * tokens so it reads in both light and dark; the installed shadcn build
+ * does not ship a `shimmer` utility, so this is the local, token-driven
+ * equivalent of the design's wsShimmer. Honours reduced-motion. Apply via the `shimmer`
  * class (optionally overriding font size/weight at the call site). */
 @keyframes cm-shimmer {
+  /* With a 250% background the band (35–65%) sits fully off the line at
+   * 110% and -10%, so each sweep enters and leaves cleanly. */
   0% {
-    background-position: 200% 0;
+    background-position: 110% 0;
   }
   100% {
-    background-position: -200% 0;
+    background-position: -10% 0;
   }
 }
 .shimmer,
 [data-slot="trace-line"][data-status="running"] > [data-slot="trace-title"] {
   background: linear-gradient(
     90deg,
-    var(--muted-foreground) 20%,
-    var(--foreground) 48%,
-    var(--foreground) 52%,
-    var(--muted-foreground) 80%
+    var(--muted-foreground) 35%,
+    var(--foreground) 50%,
+    var(--muted-foreground) 65%
   );
-  background-size: 200% 100%;
+  background-size: 250% 100%;
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: cm-shimmer 2.1s linear infinite;
+  animation: cm-shimmer 2.2s linear infinite;
 }
 @media (prefers-reduced-motion: reduce) {
   .shimmer,

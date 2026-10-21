@@ -2,7 +2,6 @@ import { useState } from "react";
 import { CheckCircle2, ChevronRight, CircleMinus, XCircle } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 
-import { AgentOrb } from "@/components/ui/agent-orb";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { formatCompactTokens } from "@/components/chat/WorkflowRunCard";
 import { formatElapsed } from "@/lib/agent-chat/subagents";
@@ -124,8 +123,7 @@ function PhaseCard({
       data-status={status}
     >
       {status === "running" ? (
-        // Neutral: a phase is many agents, so it carries no single activity.
-        <AgentOrb size={20} aria-hidden />
+        <Spinner className="text-muted-foreground" role="presentation" aria-hidden />
       ) : status === "pending" ? (
         <span className="h-[9px] w-[9px] rounded-full border-[1.6px] border-muted-foreground" aria-hidden />
       ) : (

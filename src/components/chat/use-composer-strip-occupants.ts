@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
 import { delegationPhaseSummary, delegationRow } from "@/lib/agent-chat/delegation";
-import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import {
   delegationElapsedLabel,
   formatElapsed,
@@ -9,7 +8,6 @@ import {
   runningSubagentEntries,
   subagentActivityLine,
   subagentElapsedMs,
-  type RunningSubagentEntry,
 } from "@/lib/agent-chat/subagents";
 import type {
   ChatViewItem,
@@ -29,7 +27,6 @@ import {
   usageResumeExplanation,
   usageWindowLabel,
 } from "@/lib/agent-chat/usage-limit";
-import { resolveOrbState } from "@/lib/orb-state";
 import { toast } from "@/lib/toast";
 import type { DelegationTasksState } from "@/stores/delegation-store";
 import { accountName, useProviderAccounts } from "@/stores/provider-accounts-store";
@@ -163,11 +160,8 @@ export function useSubagentOccupant({
   const primary = entries[0];
   const summary: StripRow = {
     id: "subagents-running",
-    // This orb stands for the whole run, so it stays on the neutral
-    // working state; each opened row owns its own activity-matched orb.
-    mark: { kind: "orb" },
+    mark: { kind: "running" },
     label: `${count} subagent${count === 1 ? "" : "s"} running`,
-    detail: runningActivityLabel(entries),
     elapsed: (now) => elapsedLabel(primary.subagent, now),
     action: {
       label: "Jump",
@@ -179,7 +173,7 @@ export function useSubagentOccupant({
     const activity = subagentActivityLine(entry.subagent);
     return {
       id: `subagent:${entry.subagent.id}`,
-      mark: { kind: "orb", activity: subagentOrbActivity(entry.subagent) },
+      mark: { kind: "running" },
       label: entry.subagent.name ?? entry.subagent.agentType ?? "Subagent",
       detail: entry.fromLabel ? `${activity} · from ${entry.fromLabel}` : activity,
       elapsed: (now) => elapsedLabel(entry.subagent, now),
@@ -197,7 +191,7 @@ export function useSubagentOccupant({
  * Delegation occupant: tasks this chat handed to other agents that are still
  * running in their own tabs.
  *
- * Calm on purpose — no sweep, no orb. The parent is not working; it is
+ * Calm on purpose — no sweep, no spinner. The parent is not working; it is
  * waiting to continue, and the copy says exactly that ("Continues when Codex
  * finishes"). While the parent itself streams, the row only notes that
  * reports will post here. Never withheld behind the transcript card: this is
@@ -663,7 +657,7 @@ export function approvalOccupant(
           : request.request_kind;
     return {
       id: `approval:${request.request_id}`,
-      mark: { kind: "orb", activity: { awaitingUser: true } },
+      mark: { kind: "input" },
       label: "Needs approval",
       detail,
       secondaryAction: answerable
@@ -761,21 +755,6 @@ export function remoteTasksOccupant(
     },
   };
   return { kind: "error", summary: row, rows: [row] };
-}
-
-/**
- * What kind of busy the run is, e.g. "solving · connecting" — the same
- * orb-state vocabulary the rows animate, deduped and capped at three.
- * Deliberately not gated on the "Match the orb to the activity" setting:
- * that governs the animation, not what the app knows.
- */
-function runningActivityLabel(entries: RunningSubagentEntry[]): string {
-  const states = new Set<string>();
-  for (const entry of entries) {
-    states.add(resolveOrbState(subagentOrbActivity(entry.subagent)));
-    if (states.size >= 3) break;
-  }
-  return [...states].join(" · ");
 }
 
 /** Empty when nothing is derivable, so no number is fabricated. */

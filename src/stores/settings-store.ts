@@ -32,16 +32,6 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // Whether the sidebar inbox cards show the ↑ahead and +/− diff numbers on
   // their mono meta line. The branch name always shows. See sidebar-inbox.tsx.
   "sidebar.show_git_stats": "true",
-  // Whether the agent orb's animation follows what the agent is actually
-  // doing (searching / composing / connecting / …) or stays pinned to the
-  // neutral "working" orb everywhere. See src/lib/orb-state.ts.
-  //
-  // This replaced the old `sidebar.working_indicator` glyph picker and
-  // `sidebar.working_indicator_color` swatches. Those keys are simply no
-  // longer read — a settings row left over from an older build is inert
-  // (the table is free-form key/value, so nothing rejects it) and is never
-  // written back, so it ages out on its own.
-  "agents.orb_match_activity": "true",
   // How many days a workspace card may sit without agent activity before the
   // inbox sweeps it into the Settled section on its own. "off" disables the
   // idle sweep (merged/closed-PR cards still auto-settle once idle). See
@@ -294,9 +284,3 @@ export const selectTimeFormat = (s: SettingsStore): TimeFormat => {
     SETTINGS_DEFAULTS["appearance.time_format"]!;
   return value === "12h" || value === "24h" ? value : "system";
 };
-
-/** Whether agent orbs follow the current activity. Default on; off pins
- *  every orb to the neutral working state. */
-export const selectOrbMatchActivity = (s: SettingsStore): boolean =>
-  (s.settings["agents.orb_match_activity"] ??
-    SETTINGS_DEFAULTS["agents.orb_match_activity"]!) !== "false";

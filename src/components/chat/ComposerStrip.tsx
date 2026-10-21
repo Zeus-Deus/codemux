@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 
-import { AgentOrb } from "@/components/ui/agent-orb";
+import { Spinner } from "@/components/ui/spinner";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -26,7 +26,6 @@ import {
   formatGoalAge,
   type ThreadGoal,
 } from "@/lib/agent-chat/goal";
-import type { OrbActivity } from "@/lib/orb-state";
 import { cn } from "@/lib/utils";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
@@ -53,7 +52,7 @@ export type StripOccupantKind = keyof typeof STRIP_PRIORITY;
 
 /** The only coloured thing in a row. The surface itself stays neutral. */
 export type StripMark =
-  | { kind: "orb"; activity?: OrbActivity }
+  | { kind: "running" }
   /** Who is doing the work: one provider mark, or up to two overlapping. */
   | { kind: "providers"; providers: AgentChatProviderKind[] }
   | { kind: "monitoring" }
@@ -893,8 +892,8 @@ function GoalPauseGlyph({ className }: { className?: string }) {
 
 function StripMarkView({ mark }: { mark: StripMark }) {
   switch (mark.kind) {
-    case "orb":
-      return <AgentOrb size={20} {...mark.activity} aria-hidden />;
+    case "running":
+      return <Spinner className="size-3.5 text-muted-foreground" role="presentation" aria-hidden />;
     case "providers": {
       const [first, second] = mark.providers;
       if (!first) {

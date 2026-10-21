@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type {
   ReasoningItem,
@@ -91,7 +91,8 @@ describe("ActivityBlock — one-line work log", () => {
     renderBlock([read(0, "/a"), bash(1, "cargo test", { status: "running" })], true);
     // Trace lines read as a sentence in the step's tense.
     expect(screen.getByRole("button", { name: /Running cargo test/ })).toBeInTheDocument();
-    expect(screen.getByText("2 tools")).toBeInTheDocument();
+    // Totals wait for the stretch to settle (see "live line" below).
+    expect(screen.queryByText("2 tools")).toBeNull();
     expect(screen.queryByText("/a")).toBeNull();
     expect(screen.queryByText(/previous/)).toBeNull();
   });
@@ -235,24 +236,6 @@ describe("ActivityBlock — step timing", () => {
       vi.useRealTimers();
     }
   });
-
-  it("ticks elapsed time on the live line while a tool runs", () => {
-    vi.useFakeTimers();
-    try {
-      vi.setSystemTime(100_000);
-      renderBlock(
-        [read(0, "/a"), bash(1, "cargo test", { status: "running", started_at: 40_000 })],
-        true,
-      );
-      expect(screen.getByTestId("step-elapsed").textContent).toBe("1m 0s ·");
-      act(() => {
-        vi.advanceTimersByTime(5_000);
-      });
-      expect(screen.getByTestId("step-elapsed").textContent).toBe("1m 5s ·");
-    } finally {
-      vi.useRealTimers();
-    }
-  });
 });
 
 describe("ActivityBlock — subagent runs", () => {
@@ -290,7 +273,7 @@ describe("ActivityBlock — subagent runs", () => {
     expect(row).toHaveAttribute("aria-pressed", "true");
   });
 
-  it("shows a live subagent run as the newest line with one orb", () => {
+  it("shows a live subagent run as the newest line", () => {
     renderBlock(
       [
         read(0, "/a"),
@@ -301,7 +284,6 @@ describe("ActivityBlock — subagent runs", () => {
     );
     expect(screen.getByText(/Running subagents/)).toBeInTheDocument();
     expect(screen.getByText("screenshot pass")).toBeInTheDocument();
-    expect(document.querySelectorAll("canvas")).toHaveLength(1);
   });
 });
 
@@ -331,51 +313,53 @@ describe("ActivityBlock — step-row inline detail", () => {
   });
 });
 
-// ── Agent orb (the turn's one live indicator) ──
+// ── The live line ──
 //
-// While a tool is running this block owns the thread's "in progress"
-// signal — `shouldShowThinkingIndicator` stands the transcript-tail marker
-// down — so the orb here must reflect what the agent is actually doing.
+// While the turn runs, the collapsed line is the thread's one live row. It
+// names a tool only while that tool runs and otherwise reads a steady
+// "Thinking…"; nothing on it ticks or counts up.
 
-describe("ActivityBlock — agent orb", () => {
-  const orbState = () =>
-    document.querySelector("canvas")?.getAttribute("data-orb-state") ?? null;
+describe("ActivityBlock — live line", () => {
+  const liveLine = () =>
+    document.querySelector('[data-slot="trace-line"][data-status="running"]');
 
-  it("shows no orb once the run has settled", () => {
+  it("has no live line once the run has settled", () => {
     renderBlock([read(0, "/a"), read(1, "/b")], false);
-    expect(document.querySelector("canvas")).toBeNull();
+    expect(liveLine()).toBeNull();
+    expect(screen.queryByText("Thinking…")).toBeNull();
   });
 
-  it("matches the orb to the running tool", () => {
-    renderBlock([read(0, "/a", { status: "running" })], true);
-    expect(orbState()).toBe("searching");
+  it("names the running tool without a timer or running totals", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(10_000);
+      renderBlock(
+        [read(0, "/a"), bash(1, "cargo test", { status: "running", started_at: 4_000 })],
+        true,
+      );
+      expect(liveLine()).toHaveTextContent("cargo test");
+      expect(liveLine()?.textContent).not.toMatch(/\d+s|tools?\b/);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("reads a running shell's command, not just the tool name", () => {
-    renderBlock([bash(0, "git push origin HEAD", { status: "running" })], true);
-    expect(orbState()).toBe("connecting");
+  it("reads Thinking… between tools instead of the last call's past tense", () => {
+    renderBlock([read(0, "/a"), bash(1, "cargo test")], true);
+    expect(liveLine()).toHaveTextContent("Thinking…");
+    expect(screen.queryByText("cargo test")).toBeNull();
   });
 
-  it("goes neutral between tools rather than holding the last one's state", () => {
-    renderBlock([read(0, "/a")], true);
-    expect(orbState()).toBe("working");
+  it("reads Thinking… for a live thought instead of streaming its text", () => {
+    renderBlock([read(0, "/a"), think(1, "Maybe the probe calls login")], true);
+    expect(liveLine()).toHaveTextContent("Thinking…");
+    expect(screen.queryByText(/Maybe the probe/)).toBeNull();
   });
 
-  it("reads a running tool after a failed one as a retry", () => {
-    renderBlock(
-      [bash(0, "cargo test", { status: "error" }), bash(1, "cargo test", { status: "running" })],
-      true,
-    );
-    expect(orbState()).toBe("solving");
-  });
-
-  it("renders exactly one orb for the whole block, collapsed or open", () => {
-    const { container } = renderBlock(
-      [read(0, "/a"), think(1, "hmm"), read(2, "/b", { status: "running" })],
-      true,
-    );
-    expect(document.querySelectorAll("canvas")).toHaveLength(1);
-    openLog(container);
-    expect(document.querySelectorAll("canvas")).toHaveLength(1);
+  it("brings the stretch totals back once the run settles", () => {
+    const { rerender } = renderBlock([read(0, "/a"), bash(1, "cargo test")], true);
+    expect(screen.queryByText(/2 tools/)).toBeNull();
+    rerender(<ActivityBlock items={[read(0, "/a"), bash(1, "cargo test")]} working={false} />);
+    expect(screen.getByText(/2 tools/)).toBeInTheDocument();
   });
 });

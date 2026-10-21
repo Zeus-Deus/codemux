@@ -55,6 +55,11 @@ export interface TurnFoldBody {
   failedCount: number;
   /** Files the turn's edit calls wrote; absent when it wrote none. */
   changes?: TurnChangeSummary;
+  /** Set while the turn still runs: the header ticks "Working for …" from
+   *  this start time (null when the prompt carries none) and folds nothing
+   *  yet. It holds the slot the settled "Worked for …" fold takes, so the
+   *  turn's frame stays put when it ends. */
+  liveSince?: number | null;
 }
 
 /** One cross-provider delegation on a transcript card: the `delegate_task`
@@ -285,7 +290,7 @@ function itemFailed(item: ChatViewItem): boolean {
   return false;
 }
 
-function formatWorkedDuration(ms: number): string {
+export function formatWorkedDuration(ms: number): string {
   const totalSeconds = Math.max(1, Math.round(ms / 1_000));
   if (totalSeconds < 60) return `${totalSeconds}s`;
   const minutes = Math.floor(totalSeconds / 60);
@@ -307,6 +312,19 @@ function foldLabel(user: UserMessageItem | null, ended: TurnEndedItem): string {
     ended.status.kind === "error" && ended.status.subtype === "interrupted";
   if (stopped) return duration ? `You stopped after ${duration}` : "You stopped this response";
   return duration ? `Worked for ${duration}` : "Worked";
+}
+
+function liveTurnHeader(user: UserMessageItem): TurnFoldBody {
+  return {
+    kind: "turn_fold",
+    turnId: `live:${user.id}`,
+    label: "Working",
+    expanded: false,
+    pinnedBy: [],
+    hiddenCount: 0,
+    failedCount: 0,
+    liveSince: user.created_at ?? null,
+  };
 }
 
 function turnIdFor(segment: TurnSegment, ended: TurnEndedItem): string {
@@ -396,6 +414,9 @@ function buildPresentationEntries(
       for (const item of segment.items) {
         if (item.kind === "turn_ended" && silentTurnEnd(item)) continue;
         entries.push({ kind: "item", item, turnLive });
+        if (turnLive && item === segment.user) {
+          entries.push({ kind: "turn_fold", body: liveTurnHeader(segment.user) });
+        }
       }
       continue;
     }
@@ -672,6 +693,7 @@ function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
       a.pinnedBy.every((id, index) => id === b.pinnedBy[index]) &&
       a.hiddenCount === b.hiddenCount &&
       a.failedCount === b.failedCount &&
+      a.liveSince === b.liveSince &&
       turnChangesEqual(a.changes, b.changes)
     );
   }

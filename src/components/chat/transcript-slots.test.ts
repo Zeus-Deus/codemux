@@ -263,7 +263,8 @@ describe("buildTranscriptSlots — activity grouping", () => {
           ? slot.body.turnLive === true
           : null,
       );
-    expect(cardLive(true)).toEqual([null, true]);
+    // The live turn header sits between the prompt and the card.
+    expect(cardLive(true)).toEqual([null, null, true]);
     // Rehydrated or crashed: nothing settled the call, but it is not running.
     expect(cardLive(false)).toEqual([null, false]);
   });
@@ -706,13 +707,43 @@ describe("buildTranscriptSlots — turn boundaries", () => {
   });
 });
 
+describe("buildTranscriptSlots — live turn header", () => {
+  it("heads a running turn with a Working header right under the prompt", () => {
+    const slots = buildTranscriptSlots(
+      [userMsg(0, "fix it", 1_000), tool(1, { status: "running" })],
+      true,
+    );
+    expect(slots.map((slot) => slot.body.kind)).toEqual(["item", "turn_fold", "activity"]);
+    const header = slots[1].body;
+    expect(header).toMatchObject({ label: "Working", liveSince: 1_000, hiddenCount: 0 });
+  });
+
+  it("swaps to the settled Worked-for fold in the same place when the turn ends", () => {
+    const slots = buildTranscriptSlots(
+      [userMsg(0, "fix it", 1_000), tool(1), assistantMsg(2, "done"), turnEnd(3, 65_000)],
+      true,
+    );
+    const header = slots[1].body;
+    expect(header.kind).toBe("turn_fold");
+    if (header.kind === "turn_fold") {
+      expect(header.label).toBe("Worked for 1m 4s");
+      expect(header.liveSince).toBeUndefined();
+    }
+  });
+
+  it("shows no live header while nothing streams", () => {
+    const slots = buildTranscriptSlots([userMsg(0, "fix it", 1_000), tool(1)], false);
+    expect(slots.some((slot) => slot.body.kind === "turn_fold")).toBe(false);
+  });
+});
+
 describe("buildTranscriptSlots — interim turn ends (provider yielded on background work)", () => {
   const interimEnd = (seq: number, completedAt: number): ChatViewItem => ({
     ...(turnEnd(seq, completedAt) as Extract<ChatViewItem, { kind: "turn_ended" }>),
     interim: true,
   });
 
-  it("keeps the turn live across an interim boundary: no fold, tail work stays working", () => {
+  it("keeps the turn live across an interim boundary: no settled fold, tail work stays working", () => {
     const slots = buildTranscriptSlots(
       [
         userMsg(0, "fix it", 1_000),
@@ -726,12 +757,15 @@ describe("buildTranscriptSlots — interim turn ends (provider yielded on backgr
     );
     expect(slots.map((slot) => slot.body.kind)).toEqual([
       "item",
+      "turn_fold",
       "activity",
       "item",
       "activity",
     ]);
-    expect(slots.some((slot) => slot.body.kind === "turn_fold")).toBe(false);
-    const tail = slots[3].body;
+    // The only header is the live one, still ticking from the prompt.
+    const header = slots[1].body;
+    expect(header.kind === "turn_fold" && header.liveSince).toBe(1_000);
+    const tail = slots[4].body;
     if (tail.kind === "activity") expect(tail.working).toBe(true);
   });
 

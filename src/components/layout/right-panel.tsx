@@ -34,8 +34,8 @@ import { isRemoteClient } from "@/components/remote/is-remote-client";
  * are default panes, Review/Orchestration/Subagents are panes too, and
  * anything closed comes back from the `+` menu.
  *
- * Live activity in the strip is a mono badge, not a blinking dot — the
- * app's one working affordance is the orb (`src/components/ui/agent-orb`).
+ * Live activity in the strip is a mono badge, not a blinking dot — live
+ * work itself is shown inside the thread.
  */
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {

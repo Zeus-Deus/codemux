@@ -39,7 +39,6 @@ import {
   getDefaultBaseBranch,
   selectSidebarShowGitStats,
   selectSidebarAutoSettleDays,
-  selectOrbMatchActivity,
 } from "./settings-store";
 
 function stateWith(settings: Record<string, string>) {
@@ -89,11 +88,11 @@ describe("settings-store", () => {
       expect(SETTINGS_DEFAULTS["terminal.font_family"]).toBeDefined();
       expect(SETTINGS_DEFAULTS["ai_commit_message_enabled"]).toBe("true");
       expect(SETTINGS_DEFAULTS["auto_mcp_config"]).toBe("true");
-      // Sidebar / agent-orb keys present
+      // Sidebar keys present
       expect(SETTINGS_DEFAULTS["sidebar.show_git_stats"]).toBe("true");
       expect(SETTINGS_DEFAULTS["sidebar.auto_settle_days"]).toBe("3");
-      expect(SETTINGS_DEFAULTS["agents.orb_match_activity"]).toBe("true");
-      // The retired working-indicator picker keys are gone, not migrated.
+      // Retired activity-indicator keys are gone, not migrated.
+      expect(SETTINGS_DEFAULTS["agents.orb_match_activity"]).toBeUndefined();
       expect(SETTINGS_DEFAULTS["sidebar.working_indicator"]).toBeUndefined();
       expect(
         SETTINGS_DEFAULTS["sidebar.working_indicator_color"],
@@ -142,27 +141,15 @@ describe("settings-store", () => {
       ).toBe(14);
     });
 
-    it("selectOrbMatchActivity defaults to true", () => {
-      expect(selectOrbMatchActivity(stateWith({}))).toBe(true);
-    });
-
-    it("selectOrbMatchActivity reflects a stored 'false' value", () => {
-      expect(
-        selectOrbMatchActivity(
-          stateWith({ "agents.orb_match_activity": "false" }),
-        ),
-      ).toBe(false);
-    });
-
     // Migration contract: an old settings row is dropped on read, not
-    // mapped onto anything. Loading a pre-orb settings blob must neither
+    // mapped onto anything. Loading an older settings blob must neither
     // throw nor change how anything renders.
-    it("ignores retired working-indicator keys left in stored settings", () => {
+    it("ignores retired activity-indicator keys left in stored settings", () => {
       const legacy = stateWith({
         "sidebar.working_indicator": "sweep",
         "sidebar.working_indicator_color": "accent-violet",
+        "agents.orb_match_activity": "false",
       });
-      expect(selectOrbMatchActivity(legacy)).toBe(true);
       expect(selectSidebarShowGitStats(legacy)).toBe(true);
     });
   });

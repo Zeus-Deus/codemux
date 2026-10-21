@@ -53,19 +53,17 @@ function subagent(
 }
 
 describe("SubagentView", () => {
-  it("shows exactly one orb when a lone streaming thought is the whole run", () => {
+  it("shows one spinner on the live tail while a lone thought streams", () => {
     const { container } = render(
       <SubagentView
         subagent={subagent({ items: [reasoning({ streaming: true })] })}
       />,
     );
-    // The drill-in's live tail owns liveness; the reasoning row must not
-    // animate a second orb (one-orb doctrine).
-    expect(container.querySelectorAll("[data-orb-state]")).toHaveLength(1);
+    expect(container.querySelectorAll('[data-slot="spinner"]')).toHaveLength(1);
     expect(screen.getByText("Thinking…")).toBeInTheDocument();
   });
 
-  it("shows no orb once the subagent has settled", () => {
+  it("shows no spinner once the subagent has settled", () => {
     const { container } = render(
       <SubagentView
         subagent={subagent({
@@ -74,13 +72,13 @@ describe("SubagentView", () => {
         })}
       />,
     );
-    expect(container.querySelector("[data-orb-state]")).toBeNull();
+    expect(container.querySelector('[data-slot="spinner"]')).toBeNull();
     expect(screen.getByText("Thought for 4s")).toBeInTheDocument();
   });
 
-  it("ticks a running step while the subagent works", () => {
+  it("keeps the running step's line free of a ticking clock", () => {
     render(<SubagentView subagent={subagent({ items: [runningTool()] })} />);
-    expect(screen.getByTestId("step-elapsed")).toBeInTheDocument();
+    expect(screen.queryByTestId("step-elapsed")).toBeNull();
   });
 
   it("does not tick a step left running by a settled subagent", () => {
