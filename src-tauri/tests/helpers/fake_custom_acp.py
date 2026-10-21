@@ -225,7 +225,8 @@ def configs() -> list[dict[str, Any]]:
         options[1]["options"].append({"value": "requested effort", "name": "Requested"})
     return options
 
-record({"launch_argv": sys.argv[1:], "launch_env": os.environ.get("FAKE_LITERAL")})
+record({"launch_argv": sys.argv[1:], "launch_env": os.environ.get("FAKE_LITERAL"),
+        "gateway_token": os.environ.get("CODEMUX_MCP_GATEWAY_TOKEN")})
 if mode.startswith(("ownership-", "review", "renewed-", "dynamic-renewed-")):
     record({"owned_pid": os.getpid()})
 recovered = False

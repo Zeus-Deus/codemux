@@ -113,8 +113,9 @@ async fn all_provider_custom_acp_new_load_resume_inject_and_discovery_stays_unpr
         provider.start_session(start()).await.unwrap();
         provider.stop_session(thread.clone()).await.unwrap();
         provider.start_session(start()).await.unwrap();
-        let session = provider.session(&thread).await.unwrap();
-        session.gateway_authority.get().unwrap().invalidate();
+        // Stop twice through the authority path the Stop command uses.
+        crate::delegation::authority::NativeAuthority::user_activity_thread(&thread.0, true);
+        crate::delegation::authority::NativeAuthority::user_activity_thread(&thread.0, true);
         let mut events = provider.event_stream();
         let sent = provider
             .send_turn(
@@ -146,7 +147,7 @@ async fn all_provider_custom_acp_new_load_resume_inject_and_discovery_stays_unpr
         .unwrap();
         assert!(
             !completed.contains("historical replay MUST NOT duplicate"),
-            "refresh must not import native load history: {completed}"
+            "a turn after Stop must not import native load history: {completed}"
         );
         provider.stop_session(thread).await.unwrap();
         let frames: Vec<Value> = std::fs::read_to_string(log)
@@ -163,7 +164,8 @@ async fn all_provider_custom_acp_new_load_resume_inject_and_discovery_stays_unpr
                 )
             })
             .collect();
-        assert_eq!(sessions.len(), 4, "{frames:?}");
+        // Probe, first chat, reopened chat: Stop reloads nothing.
+        assert_eq!(sessions.len(), 3, "{frames:?}");
         assert_eq!(
             sessions[0]["params"]["mcpServers"],
             json!([]),
@@ -181,10 +183,13 @@ async fn all_provider_custom_acp_new_load_resume_inject_and_discovery_stays_unpr
             sessions[2]["params"]["mcpServers"][0]["env"],
             "replaced native sessions must receive new credentials"
         );
-        assert_ne!(
-            sessions[2]["params"]["mcpServers"][0]["env"],
-            sessions[3]["params"]["mcpServers"][0]["env"],
-            "Stop must rotate credentials before native resume"
-        );
+        // Each chat process carries its own session's credential for the
+        // shell fallback; the probe carries none.
+        let launches: Vec<_> = frames.iter().filter(|f| f.get("launch_argv").is_some()).collect();
+        assert_eq!(launches.len(), 3, "{frames:?}");
+        assert_eq!(launches[0]["gateway_token"], Value::Null);
+        for (launch, session) in launches[1..].iter().zip(&sessions[1..]) {
+            assert_eq!(launch["gateway_token"], session["params"]["mcpServers"][0]["env"][1]["value"]);
+        }
     }
 }

@@ -14,6 +14,8 @@ pub(crate) struct GatewaySession {
     workspace: Option<String>,
     session: Mutex<String>,
     mode: Mutex<Option<String>>,
+    /// The agent has reached the gateway with this session's credential.
+    contacted: std::sync::atomic::AtomicBool,
     pub(crate) authority: Arc<NativeAuthority>,
 }
 impl PartialEq for GatewaySession {
@@ -35,12 +37,23 @@ impl GatewaySession {
             provider,
             workspace,
             session: Mutex::new(String::new()),
+            contacted: Default::default(),
             authority: NativeAuthority::with_policy(thread, provider, mode.as_deref()),
             mode: Mutex::new(mode),
         })
     }
     pub(crate) fn bind_session(&self, session: &str) {
         *self.session.lock().unwrap() = session.into();
+    }
+    pub(crate) fn session_id(&self) -> String {
+        self.session.lock().unwrap().clone()
+    }
+    pub(crate) fn mark_contacted(&self) {
+        self.contacted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn contacted(&self) -> bool {
+        self.contacted.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub(crate) fn set_mode(&self, mode: Option<String>) {
         self.authority.set_policy(self.provider, mode.as_deref());
@@ -85,19 +98,17 @@ impl Drop for GatewaySession {
     }
 }
 
+/// A gateway credential acts for one app session. Stop leaves it valid:
+/// the authority's turn fence already refuses stopped-turn calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GatewayBinding {
     pub(crate) session: Arc<GatewaySession>,
-    pub(crate) epoch: u64,
 }
 impl GatewayBinding {
     pub(crate) fn new(session: Arc<GatewaySession>) -> Self {
-        Self {
-            epoch: session.authority.token_epoch(),
-            session,
-        }
+        Self { session }
     }
     pub(crate) fn current(&self) -> bool {
-        self.session.authority.session_live() && self.epoch == self.session.authority.token_epoch()
+        self.session.authority.session_live()
     }
 }

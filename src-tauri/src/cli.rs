@@ -169,12 +169,11 @@ pub enum CommandSet {
     /// starts this for agents that only take stdio MCP servers.
     #[command(hide = true)]
     McpBridge,
-    /// Call an injected chat MCP tool with the chat's own authority.
+    /// Call an injected chat MCP tool with the chat's own authority. Reads
+    /// the credential the agent process was started with.
     McpCall {
         tool: Option<String>,
         arguments: Option<String>,
-        #[arg(long)]
-        connection_file: Option<std::path::PathBuf>,
         #[arg(long)]
         list: bool,
     },
@@ -1034,10 +1033,9 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
         Some(CommandSet::McpCall {
             tool,
             arguments,
-            connection_file,
             list,
         }) => {
-            crate::mcp::bridge::call(tool, arguments, connection_file, list).await?;
+            crate::mcp::bridge::call(tool, arguments, list).await?;
             Ok(true)
         }
         Some(CommandSet::PtyDaemon { socket }) => {
@@ -1529,3 +1527,4 @@ mod tests {
         print_enable_result(&data);
     }
 }
+

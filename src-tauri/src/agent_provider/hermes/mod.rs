@@ -197,6 +197,27 @@ struct Runtime {
     commands: Mutex<HashMap<String, Vec<super::claude::slash_commands::ProviderSlashCommand>>>,
     queue: Mutex<Queue>,
     barrier: mpsc::UnboundedSender<oneshot::Sender<()>>,
+    /// Gateway credentials this process holds, revoked when it goes away.
+    credentials: Credentials,
+}
+/// Hermes keeps each ACP MCP connection for its process lifetime, keyed by
+/// server name. Each chat keeps one name and token per process; a reopened
+/// chat's token follows its new session instead of adding another toolset.
+struct Credentials {
+    registry: Option<crate::mcp::registry::McpRegistry>,
+    prefix: String,
+}
+impl Credentials {
+    fn key(&self, thread: &str) -> String {
+        format!("{}{thread}", self.prefix)
+    }
+}
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        if let Some(gateway) = self.registry.as_ref().and_then(|r| r.started_gateway()) {
+            gateway.revoke(&self.prefix);
+        }
+    }
 }
 struct Inner {
     runtimes: Mutex<HashMap<String, Arc<Runtime>>>,
@@ -208,6 +229,17 @@ struct Inner {
     events: broadcast::Sender<ProviderRuntimeEvent>,
     mcp_registry: Option<crate::mcp::registry::McpRegistry>,
     catalogs: Mutex<HashMap<String, Value>>,
+}
+/// A chat's new/load response as a profile catalog: the chat's own mode and
+/// model are not the profile's defaults.
+fn profile_catalog(response: &Value) -> Value {
+    let mut catalog = response.clone();
+    for (section, current) in [("modes", "currentModeId"), ("models", "currentModelId")] {
+        if let Some(section) = catalog.get_mut(section).and_then(Value::as_object_mut) {
+            section.remove(current);
+        }
+    }
+    catalog
 }
 /// Gateway server name for one chat. A Hermes process serves every chat on
 /// its profile and keeps ACP MCP servers by name, reusing a connected one, so a
@@ -308,26 +340,29 @@ impl HermesProvider {
             .insert(runtime_key(&runtime.profile), catalog.clone());
         Ok(catalog)
     }
-    /// A native tool runs while its chat owns runtime.operation. Reuse the
-    /// acknowledged composer catalog instead of probing under that same lock.
+    /// The profile catalog for orchestration. A native tool runs while its
+    /// chat owns runtime.operation, so reuse the acknowledged catalog. Without
+    /// one, `probe` discovers it through [`Self::catalog`]; listing passes
+    /// `false` and never starts a runtime or creates a Hermes session.
     pub(crate) async fn orchestration_catalog(
         &self,
         profile: Profile,
-    ) -> Result<Value, ProviderError> {
+        probe: bool,
+    ) -> Result<Option<Value>, ProviderError> {
         profile.validate().map_err(invalid)?;
         durable_profile(&profile)?;
-        let runtime = self.inner.runtime(profile.clone()).await?;
-        if let Some(catalog) = self
+        let cached = self
             .inner
             .catalogs
             .lock()
             .await
-            .get(&runtime_key(&runtime.profile))
-            .cloned()
-        {
-            return Ok(catalog);
+            .get(&runtime_key(&profile))
+            .cloned();
+        match cached {
+            Some(catalog) => Ok(Some(catalog)),
+            None if probe => self.catalog(profile).await.map(Some),
+            None => Ok(None),
         }
-        self.catalog(profile).await
     }
     pub async fn disconnect(&self, profile: Profile) -> Result<(), ProviderError> {
         let key = runtime_key(&profile);
@@ -434,6 +469,10 @@ impl Inner {
             commands: Mutex::new(HashMap::new()),
             queue: Mutex::new(Queue::default()),
             barrier,
+            credentials: Credentials {
+                registry: self.mcp_registry.clone(),
+                prefix: format!("hermes:{}:", Uuid::new_v4()),
+            },
         });
         let weak = Arc::downgrade(&runtime);
         let inner = Arc::downgrade(self);
@@ -799,13 +838,6 @@ impl Inner {
                     }
                 }
                 if let Some(mcp) = &chat.mcp {
-                    if mcp.needs_refresh() {
-                        chat.state.lock().await.replaying = true;
-                        let refreshed = runtime.child.request("session/load", json!({"sessionId":binding.acp_session_id,"cwd":binding.cwd,"mcpServers":mcp.servers().await})).await;
-                        let (tx,rx)=oneshot::channel(); let _=runtime.barrier.send(tx); let _=rx.await;
-                        chat.state.lock().await.replaying = false;
-                        refreshed.map_err(rpc)?;
-                    }
                     mcp.session.begin(&turn.0, job.input.turn_checkpoint.as_ref())?;
                 }
                 dispatched = true;
@@ -824,7 +856,7 @@ impl Inner {
                 // for provenance once history exists, suppressing its native replay.
                 if chat.binding.lock().await.current_native_id.is_none() && text(&response,"stopReason") != Some("cancelled") {
                     chat.state.lock().await.replaying=true;
-                    let metadata=runtime.child.request("session/load",json!({"sessionId":binding.acp_session_id,"cwd":binding.cwd,"mcpServers":match &chat.mcp {Some(mcp)=>mcp.servers().await,None=>chat.mcp_servers.clone()}})).await.map_err(rpc)?;
+                    let metadata=runtime.child.request("session/load",json!({"sessionId":binding.acp_session_id,"cwd":binding.cwd,"mcpServers":chat.mcp_servers})).await.map_err(rpc)?;
                     let (tx,rx)=oneshot::channel();let _=runtime.barrier.send(tx);let _=rx.await;
                     chat.state.lock().await.replaying=false;
                     let mut b=chat.binding.lock().await;
@@ -1143,11 +1175,10 @@ impl AgentProvider for HermesProvider {
             } else {
                 None
             };
-        // Hermes 0.21.5 advertises no `mcpCapabilities` but takes HTTP servers.
         let mcp = self.inner.mcp_registry.clone().map(|registry| {
             crate::agent_provider::acp::mcp::ChatMcp::new(
                 registry,
-            &input.thread_id.0,
+                &input.thread_id.0,
                 ProviderKind::Hermes,
                 input.workspace_id.clone().or_else(|| binding.workspace_id.clone()),
                 Some(
@@ -1157,13 +1188,14 @@ impl AgentProvider for HermesProvider {
                         .unwrap_or_else(|| "default".into()),
                 ),
                 mcp_server_name(&input.thread_id.0),
-            crate::agent_provider::acp::mcp::Transport::Http,
+                Some(runtime.credentials.key(&input.thread_id.0)),
                 vec![],
                 false,
             )
         });
+        // Hermes 0.21.5 advertises no `mcpCapabilities` but takes HTTP servers.
         let mcp_servers = match &mcp {
-            Some(mcp) => mcp.servers().await,
+            Some(mcp) => mcp.servers(crate::agent_provider::acp::mcp::Transport::Http).await,
             None => json!([]),
         };
         // Initialization has no worktree access. Commit the hold only immediately
@@ -1302,7 +1334,7 @@ impl AgentProvider for HermesProvider {
             .catalogs
             .lock()
             .await
-            .insert(runtime_key(&binding.profile), res.clone());
+            .insert(runtime_key(&binding.profile), profile_catalog(&res));
         let models: HashSet<String> = res
             .pointer("/models/availableModels")
             .and_then(Value::as_array)
@@ -1468,8 +1500,7 @@ impl AgentProvider for HermesProvider {
         let active = chat.state.lock().await.active.clone();
         {
             let mut queue = runtime.queue.lock().await;
-            let Some(index) = queue.jobs.iter().position(|job|job.id == queued_id && job.input.thread_id == thread_id) else { return Ok(());
-            };
+            let Some(index) = queue.jobs.iter().position(|job|job.id == queued_id && job.input.thread_id == thread_id) else { return Ok(()) };
             queue.jobs[index].input.authorize_queue_promotion()?;
             let job = queue.jobs.remove(index).unwrap();
             queue.jobs.push_front(job);
@@ -1506,8 +1537,7 @@ impl AgentProvider for HermesProvider {
         let chat = self.chat(&thread_id).await?;
         let mut q = chat.runtime.queue.lock().await;
         let moved = crate::agent_provider::queue_edit::move_before(&mut q.jobs, &thread_id, &queued_id, before.as_deref(), None)?;
-        let Some(queued_ids) = moved else { return Ok(false);
-        };
+        let Some(queued_ids) = moved else { return Ok(false) };
         self.inner.emit(ProviderRuntimeEvent::QueuedTurnsReordered { thread_id, queued_ids });
         Ok(true)
     }
@@ -1683,7 +1713,7 @@ impl AgentProvider for HermesProvider {
             .child
             .request(
                 "session/load",
-                json!({"sessionId":b.acp_session_id,"cwd":b.cwd,"mcpServers":match &chat.mcp {Some(mcp)=>mcp.servers().await,None=>chat.mcp_servers.clone()}}),
+                json!({"sessionId":b.acp_session_id,"cwd":b.cwd,"mcpServers":chat.mcp_servers}),
             )
             .await;
         // Release binding before the router barrier (provenance updates take that lock).
@@ -1707,7 +1737,7 @@ impl AgentProvider for HermesProvider {
             .catalogs
             .lock()
             .await
-            .insert(runtime_key(&chat.runtime.profile), response.clone());
+            .insert(runtime_key(&chat.runtime.profile), profile_catalog(&response));
         let mut b = chat.binding.lock().await;
         b.model_override = Some(model.clone());
         b.resolved_model = Some(model);
@@ -1745,7 +1775,7 @@ impl AgentProvider for HermesProvider {
             .child
             .request(
                 "session/load",
-                json!({"sessionId":b.acp_session_id,"cwd":b.cwd,"mcpServers":match &chat.mcp {Some(mcp)=>mcp.servers().await,None=>chat.mcp_servers.clone()}}),
+                json!({"sessionId":b.acp_session_id,"cwd":b.cwd,"mcpServers":chat.mcp_servers}),
             )
             .await;
         let (tx, rx) = oneshot::channel();
@@ -1772,7 +1802,7 @@ impl AgentProvider for HermesProvider {
                 .catalogs
                 .lock()
                 .await
-                .insert(runtime_key(&b.profile), catalog.clone());
+                .insert(runtime_key(&b.profile), profile_catalog(catalog));
         }
         b.permission_mode = Some(mode);
         *chat.binding.lock().await = b.clone();

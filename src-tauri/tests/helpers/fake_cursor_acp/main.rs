@@ -31,6 +31,9 @@
 //!         `stopReason: cancelled`. A client that never delivers the
 //!         cancel hangs, which is exactly what makes it a test of Stop.
 //!       * `mcp-servers` answers with the remembered `mcpServers` as JSON.
+//!       * `echo-prompt` answers with the exact prompt text it received.
+//!       * `mcp-env` answers with `{"token", "loads"}`: the gateway token in
+//!         this process's environment and how many `session/load`s arrived.
 //!       * anything else answers with a single chunk and `end_turn`.
 //!   - `session/cancel` (notification) → completes a held turn, else
 //!     ignored.
@@ -147,6 +150,7 @@ fn main() {
         .expect("fixture executable")
         .file_stem()
         .is_some_and(|name| name == "signed-out");
+    let mut loads = 0;
 
     loop {
         line.clear();
@@ -174,6 +178,9 @@ fn main() {
 
         if matches!(method, "session/new" | "session/load") {
             mcp_servers = params.get("mcpServers").cloned().unwrap_or(Value::Null);
+        }
+        if method == "session/load" {
+            loads += 1;
         }
         match method {
             "initialize" => {
@@ -267,6 +274,11 @@ fn main() {
                     }));
                 } else if text.contains("mcp-servers") {
                     write_line(&chunk(&session_id, &mcp_servers.to_string()));
+                } else if text.contains("echo-prompt") {
+                    write_line(&chunk(&session_id, &text));
+                } else if text.contains("mcp-env") {
+                    let token = std::env::var("CODEMUX_MCP_GATEWAY_TOKEN").ok();
+                    write_line(&chunk(&session_id, &json!({"token": token, "loads": loads}).to_string()));
                 } else {
                     let count = requested_chunk_count(&text).unwrap_or(1);
                     for index in 0..count {

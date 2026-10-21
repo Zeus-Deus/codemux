@@ -11,12 +11,15 @@
 //! provider catalogue (116 providers / ~4 354 models on the dev
 //! machine the live smoke ran against) and there is exactly one
 //! catalogue per machine — a second server is just additional
-//! background CPU + an extra port for no reason.
+//! background CPU + an extra port for no reason. Chats share it too:
+//! each registers its own `codemux_<id>` MCP server and only that chat's
+//! session is granted those tools (see `server::CONFIG_CONTENT`).
 //!
 //! # Lifetime
 //!
-//! Normal GUI quit explicitly calls [`shutdown`](OpenCodeServerManager::shutdown)
-//! to close admission and await the owned direct child's termination/reap.
+//! GUI quit and `codemux serve` shutdown explicitly call
+//! [`shutdown`](OpenCodeServerManager::shutdown) to close admission and await
+//! the owned direct child's termination/reap.
 //! Tauri process exit need not drop managed state. Drop's `kill_on_drop`
 //! remains only a fallback, not OS-crash or descendant cleanup.
 //! [`stop`](OpenCodeServerManager::stop) awaits teardown but remains restartable.
@@ -81,72 +84,6 @@ pub struct OpenCodeServerHandle {
     pub base_url: String,
     pub server_password: String,
     pub api: super::api::OpenCodeApi,
-    /// Which workspaces attached the MCP gateway in each directory of this
-    /// server process; shared by every handle to it.
-    pub gateway_workspaces: std::sync::Arc<GatewayDirectoryWorkspaces>,
-}
-
-/// Workspaces whose chats attached the Codemux MCP gateway, per directory,
-/// for the life of one `opencode serve`.
-///
-/// OpenCode v2 keys MCP entries by name and `location[directory]` only (its
-/// API has no per-session or per-prompt MCP selection), so every chat in a
-/// directory shares one `codemux` entry and one gateway token. That token
-/// may act for a workspace only while a single workspace uses the
-/// directory. Once a second one (or a chat with no workspace) attaches, it
-/// acts for none: OpenCode chats there see globally scoped plugin tools
-/// only, never another workspace's. The set only grows, so it can't fall
-/// back to a single, wrong workspace; it resets with the server, whose MCP
-/// entries go with it.
-#[derive(Default)]
-pub struct GatewayDirectoryWorkspaces {
-    members: std::sync::Mutex<
-        std::collections::HashMap<std::path::PathBuf, std::collections::BTreeSet<Option<String>>>,
-    >,
-    /// Runs after a chat's membership is recorded and before its gateway
-    /// authority is published, so tests can force concurrent orderings.
-    #[cfg(test)]
-    pub(crate) after_record: std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>,
-}
-
-impl std::fmt::Debug for GatewayDirectoryWorkspaces {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GatewayDirectoryWorkspaces").finish_non_exhaustive()
-    }
-}
-
-impl GatewayDirectoryWorkspaces {
-    #[cfg(test)]
-    pub(crate) fn run_after_record(&self) {
-        let hook = self.after_record.lock().unwrap().take();
-        if let Some(mut hook) = hook {
-            hook();
-        }
-    }
-
-    /// Record `workspace` attaching in `directory`, then `publish` the
-    /// workspace the directory's gateway token may act for: the only member,
-    /// else none. Both happen under one lock, so concurrent attaches in a
-    /// directory publish in the order they recorded and the last publication
-    /// always reflects every member; a chat that recorded while it was the
-    /// only member can't publish that stale view after a second one joined.
-    pub fn record_and_publish<R>(
-        &self,
-        directory: &std::path::Path,
-        workspace: Option<&str>,
-        publish: impl FnOnce(Option<String>) -> R,
-    ) -> R {
-        let mut map = self.members.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let members = map.entry(directory.to_path_buf()).or_default();
-        members.insert(workspace.map(str::to_owned));
-        let authority = match members.iter().collect::<Vec<_>>().as_slice() {
-            [only] => (*only).clone(),
-            _ => None,
-        };
-        #[cfg(test)]
-        self.run_after_record();
-        publish(authority)
-    }
 }
 
 /// Singleton supervisor for the OpenCode HTTP server child.
@@ -295,7 +232,6 @@ fn handle_from(server: &OpenCodeServer) -> OpenCodeServerHandle {
         base_url: server.base_url().to_string(),
         api: server.api(),
         server_password: server.server_password().to_string(),
-        gateway_workspaces: server.gateway_workspaces(),
     }
 }
 
@@ -438,30 +374,6 @@ impl DisposableHttpServer {
     pub(crate) async fn kill(self) {
         self.handle.abort();
         let _ = self.handle.await;
-    }
-}
-
-#[cfg(test)]
-mod gateway_workspace_tests {
-    use super::GatewayDirectoryWorkspaces;
-    use std::path::Path;
-
-    #[test]
-    fn a_directory_acts_for_its_only_workspace_and_for_none_once_shared() {
-        let seen = GatewayDirectoryWorkspaces::default();
-        let record = |directory: &str, workspace: Option<&str>| {
-            seen.record_and_publish(Path::new(directory), workspace, |authority| authority)
-        };
-        assert_eq!(record("/repo", Some("ws-a")).as_deref(), Some("ws-a"));
-        assert_eq!(record("/repo", Some("ws-a")).as_deref(), Some("ws-a"));
-        assert_eq!(record("/repo", Some("ws-b")), None);
-        // Never falls back to one workspace once the directory was shared.
-        assert_eq!(record("/repo", Some("ws-a")), None);
-        // Other directories are independent.
-        assert_eq!(record("/other", Some("ws-b")).as_deref(), Some("ws-b"));
-        // A chat without a workspace shares the entry too, so it counts.
-        assert_eq!(record("/worktree", None), None);
-        assert_eq!(record("/worktree", Some("ws-c")), None);
     }
 }
 

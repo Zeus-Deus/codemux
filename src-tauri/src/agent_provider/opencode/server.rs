@@ -26,8 +26,9 @@
 //!   sends TERM to the group, allows a short grace period, sends KILL, then
 //!   reaps the leader; Drop (including cancelled startup) KILLs the group.
 //!   Windows shutdown uses `taskkill /T /F`; Windows Drop still kills only
-//!   the direct child. Nothing runs on an OS crash, and descendants that
-//!   detach into their own group/session escape.
+//!   the direct child. After a crash, the next spawn kills the group of any
+//!   recorded server whose Codemux owner is gone (Linux; see `orphans`).
+//!   Descendants that detach into their own group/session escape.
 //! * **GUI sanitation**: env is sanitised through
 //!   `sanitize_gui_env_tokio` so an OpenCode binary
 //!   that inadvertently launches a GUI helper does not pop windows
@@ -51,6 +52,129 @@ use tokio::process::{Child, Command};
 
 use super::api::OpenCodeApi;
 use crate::execution::sanitize_gui_env_tokio;
+
+/// Upstream defaults plus one rule: every chat registers its Codemux tools
+/// as a `codemux_<id>` MCP server on this shared server, and only that chat's
+/// session is granted `codemux_<id>_*`. Other chats, catalog sessions and
+/// sessions with no grant see none of them.
+pub(crate) const CONFIG_CONTENT: &str = r#"{"permission":{"codemux_*":"deny"}}"#;
+
+/// Crash recovery. Each server is recorded with the Codemux process that owns
+/// it; a later spawn kills the process group of any recorded server whose
+/// owner is gone. Live owners (another Codemux, `codemux serve`) are left alone,
+/// and start times guard against PID reuse.
+#[cfg(target_os = "linux")]
+mod orphans {
+    use std::path::PathBuf;
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Record {
+        server: u32,
+        server_start: u64,
+        owner: u32,
+        owner_start: u64,
+    }
+
+    fn dir() -> PathBuf {
+        #[cfg(test)]
+        return std::env::temp_dir().join(format!("codemux-opencode-test-{}", std::process::id()));
+        #[cfg(not(test))]
+        dirs::runtime_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("codemux-opencode")
+    }
+
+    /// `starttime` from `/proc/<pid>/stat`: field 22, the 20th after `comm`.
+    fn start_ticks(pid: u32) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+    }
+
+    pub(super) fn record(server: u32) {
+        let owner = std::process::id();
+        let (Some(server_start), Some(owner_start)) = (start_ticks(server), start_ticks(owner))
+        else {
+            return;
+        };
+        let record = Record { server, server_start, owner, owner_start };
+        let _ = std::fs::create_dir_all(dir());
+        if let Ok(json) = serde_json::to_vec(&record) {
+            let _ = std::fs::write(dir().join(format!("{server}.json")), json);
+        }
+    }
+
+    pub(super) fn forget(server: u32) {
+        let _ = std::fs::remove_file(dir().join(format!("{server}.json")));
+    }
+
+    pub(super) fn reap() {
+        let Ok(entries) = std::fs::read_dir(dir()) else {
+            return;
+        };
+        for path in entries.flatten().map(|entry| entry.path()) {
+            let Some(record) = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
+            else {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            };
+            let server_alive = start_ticks(record.server) == Some(record.server_start);
+            if server_alive && start_ticks(record.owner) == Some(record.owner_start) {
+                continue;
+            }
+            if server_alive {
+                super::signal_group(record.server, libc::SIGKILL);
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn reaps_only_servers_whose_owner_is_gone() {
+            let spawn = || {
+                use std::os::unix::process::CommandExt;
+                std::process::Command::new("/bin/sleep")
+                    .arg("600")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap()
+            };
+            let (mut orphan, mut owned) = (spawn(), spawn());
+            let write = |server: u32, owner: u32, owner_start: u64| {
+                let record = Record {
+                    server,
+                    server_start: start_ticks(server).unwrap(),
+                    owner,
+                    owner_start,
+                };
+                std::fs::create_dir_all(dir()).unwrap();
+                std::fs::write(
+                    dir().join(format!("{server}.json")),
+                    serde_json::to_vec(&record).unwrap(),
+                )
+                .unwrap();
+            };
+            let me = std::process::id();
+            // An owner start time that never matches: that owner crashed.
+            write(orphan.id(), me, u64::MAX);
+            write(owned.id(), me, start_ticks(me).unwrap());
+            reap();
+            let status = orphan.wait().unwrap();
+            assert!(!status.success(), "the orphan's group was killed");
+            assert!(!dir().join(format!("{}.json", orphan.id())).exists());
+            assert!(owned.try_wait().unwrap().is_none(), "a live owner's server stays");
+            assert!(dir().join(format!("{}.json", owned.id())).exists());
+            forget(owned.id());
+            let _ = owned.kill();
+            let _ = owned.wait();
+        }
+    }
+}
 
 /// Banner prefix OpenCode emits on stdout once the HTTP server is
 /// accepting connections. Verified live against OpenCode 1.14.31
@@ -98,8 +222,6 @@ pub struct OpenCodeServer {
     /// this specific child. Bound to the server's lifetime: when the
     /// server dies the password becomes meaningless.
     server_password: String,
-    /// See [`super::manager::GatewayDirectoryWorkspaces`].
-    gateway_workspaces: std::sync::Arc<super::manager::GatewayDirectoryWorkspaces>,
 }
 
 // Task-scoped scheduling gate. It delays actual cleanup without replacing
@@ -132,6 +254,8 @@ impl OpenCodeServer {
         let server_password =
             Alphanumeric.sample_string(&mut rand::thread_rng(), SERVER_PASSWORD_LEN);
 
+        #[cfg(target_os = "linux")]
+        orphans::reap();
         // NOTE: this is a single long-lived server shared by every OpenCode
         // chat session, so per-session workspace env (CODEMUX_WORKSPACE_ID,
         // CODEMUX_PANE_ID, …) can NOT be injected here the way it is for the
@@ -151,7 +275,7 @@ impl OpenCodeServer {
         // `~/.config/opencode/config.json`, which
         // could surprise a user whose Codemux pane suddenly behaves
         // differently from their CLI.
-        cmd.env("OPENCODE_CONFIG_CONTENT", "{}");
+        cmd.env("OPENCODE_CONFIG_CONTENT", CONFIG_CONTENT);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -164,6 +288,10 @@ impl OpenCodeServer {
             .spawn()
             .map(ServerProcess)
             .map_err(|err| format!("spawn_failed: {} ({err})", binary_path.display()))?;
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = child.0.id() {
+            orphans::record(pid);
+        }
         let stdout = child
             .0
             .stdout
@@ -194,7 +322,6 @@ impl OpenCodeServer {
             base_url,
             api,
             server_password,
-            gateway_workspaces: Default::default(),
         })
     }
 
@@ -216,10 +343,6 @@ impl OpenCodeServer {
         &self.server_password
     }
 
-    pub fn gateway_workspaces(&self) -> std::sync::Arc<super::manager::GatewayDirectoryWorkspaces> {
-        self.gateway_workspaces.clone()
-    }
-
     /// Best-effort PID of the running child. `None` after the child
     /// has been reaped.
     pub fn pid(&self) -> Option<u32> {
@@ -234,10 +357,17 @@ impl OpenCodeServer {
             entered.notify_one();
             release.notified().await;
         }
+        #[cfg(target_os = "linux")]
+        let pid = self.child.0.id();
         tokio::time::timeout(SHUTDOWN_TIMEOUT, self.child.terminate())
             .await
             .map_err(|_| "opencode_shutdown_timeout".to_string())?
-            .map_err(|error| format!("opencode_shutdown_failed: {error}"))
+            .map_err(|error| format!("opencode_shutdown_failed: {error}"))?;
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = pid {
+            orphans::forget(pid);
+        }
+        Ok(())
     }
 }
 
@@ -577,7 +707,6 @@ mod tests {
             base_url: "http://127.0.0.1:1".into(),
             api: super::super::api::OpenCodeApi::Legacy,
             server_password: "synthetic".into(),
-            gateway_workspaces: Default::default(),
         };
         assert!(server.pid().is_some());
         server.shutdown().await.unwrap();

@@ -81,10 +81,14 @@ pub(crate) fn current_instance(
     })
 }
 
+/// Resolve an instance through its composer catalog. `discover` lets a
+/// targeted launch probe an instance once when nothing is cached; listing
+/// passes `false` and never spawns agents or opens provider sessions.
 pub(crate) async fn resolve<R: Runtime>(
     app: &AppHandle<R>,
     requested: ProviderSelection,
     cwd: &str,
+    discover: bool,
 ) -> Result<
     (
         ResolvedSelection,
@@ -112,10 +116,14 @@ pub(crate) async fn resolve<R: Runtime>(
                         "Custom ACP runtime is unavailable",
                     )
                 })?;
-            let catalog = runtime
-                .probe(id, cwd.into())
-                .await
-                .map_err(|e| ControlError::from(e.to_string()))?;
+            let catalog = match runtime.probed_catalog(id, &config.agent.revision) {
+                Some(catalog) => catalog,
+                None if discover => runtime
+                    .probe(id, cwd.into())
+                    .await
+                    .map_err(|e| ControlError::from(e.to_string()))?,
+                None => return Err(not_discovered()),
+            };
             let current = db.acp_launch_config(id)?;
             if current.agent.revision != config.agent.revision {
                 return Err(ControlError::new(
@@ -147,9 +155,10 @@ pub(crate) async fn resolve<R: Runtime>(
                     ControlError::new("provider_not_configured", "Hermes runtime is unavailable")
                 })?;
             let response = runtime
-                .orchestration_catalog(profile.clone())
+                .orchestration_catalog(profile.clone(), discover)
                 .await
-                .map_err(|e| ControlError::from(e.to_string()))?;
+                .map_err(|e| ControlError::from(e.to_string()))?
+                .ok_or_else(not_discovered)?;
             crate::agent_provider::hermes::durable_catalog(&response)
                 .map_err(|e| ControlError::from(e.to_string()))?;
             let mut catalog = crate::agent_provider::custom_acp::catalog::catalog_from(
@@ -390,6 +399,19 @@ mod all_provider_selection_tests {
     }
 }
 
+fn not_discovered() -> ControlError {
+    ControlError::new(
+        "catalog_not_discovered",
+        "This instance has not been opened yet; target it directly to discover its catalog",
+    )
+}
+
+/// Health checks run the provider CLI; reuse a verdict briefly.
+const READINESS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+static READINESS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<ProviderKind, (std::time::Instant, Result<(), ControlError>)>>,
+> = std::sync::LazyLock::new(Default::default);
+
 pub(crate) async fn readiness<R: Runtime>(
     app: &AppHandle<R>,
     provider: ProviderKind,
@@ -414,16 +436,27 @@ pub(crate) async fn readiness<R: Runtime>(
         return Ok(());
     }
     let _ = app;
+    if let Some((at, verdict)) = READINESS.lock().unwrap().get(&provider) {
+        if at.elapsed() < READINESS_TTL {
+            return verdict.clone();
+        }
+    }
     let health = crate::agent_provider::health::check_provider_health(provider).await;
-    if health.status != crate::agent_provider::health::ProviderHealthStatus::Ready {
-        return Err(ControlError::new(
+    let verdict = if health.status == crate::agent_provider::health::ProviderHealthStatus::Ready {
+        Ok(())
+    } else {
+        Err(ControlError::new(
             "provider_not_ready",
             health
                 .message
                 .unwrap_or_else(|| "Provider readiness is unconfirmed".into()),
-        ));
-    }
-    Ok(())
+        ))
+    };
+    READINESS
+        .lock()
+        .unwrap()
+        .insert(provider, (std::time::Instant::now(), verdict.clone()));
+    verdict
 }
 
 pub(crate) fn bind_new_thread<R: Runtime>(

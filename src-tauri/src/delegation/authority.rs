@@ -50,7 +50,6 @@ pub(crate) struct State {
     tools_live: bool,
     policy_epoch: u64,
     policy_changes: u32,
-    token_epoch: u64,
     generation: u64,
     turn: Option<String>,
     stop_generation: u64,
@@ -185,7 +184,6 @@ impl NativeAuthority {
                 tools_live: false,
                 policy_epoch: 0,
                 policy_changes: 0,
-                token_epoch: 0,
                 generation: 0,
                 turn: None,
                 stop_generation: 0,
@@ -283,14 +281,10 @@ impl NativeAuthority {
     pub(crate) fn session_live(&self) -> bool {
         self.state.lock().unwrap().live
     }
-    pub(crate) fn token_epoch(&self) -> u64 {
-        self.state.lock().unwrap().token_epoch
-    }
     pub fn invalidate(&self) {
         let mut state = self.state.lock().unwrap();
         state.activity += 1;
         state.tools_live = false;
-        state.token_epoch += 1;
         for job in state.callbacks.drain(..) { job.abort(); }
         state.dispatch_wakers.retain(|w| w.strong_count() > 0);
         for waker in state.dispatch_wakers.iter().filter_map(Weak::upgrade) {
@@ -319,7 +313,6 @@ impl NativeAuthority {
         let mut state = self.state.lock().unwrap();
         state.activity += 1;
         state.tools_live = false;
-        state.token_epoch += 1;
         state.dispatch_wakers.retain(|w| w.strong_count() > 0);
         for waker in state.dispatch_wakers.iter().filter_map(Weak::upgrade) {
             waker.wake();

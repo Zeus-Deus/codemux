@@ -156,21 +156,19 @@ async fn all_provider_one_shot_cli_uses_gateway_auth_and_never_the_control_socke
         .gateway_chat_connection("one-shot", GatewayCaller::default())
         .await
         .unwrap();
-    let mut file = tempfile::NamedTempFile::new().unwrap();
-    serde_json::to_writer(&mut file, &connection).unwrap();
-    file.flush().unwrap();
-    let path = file.path().to_owned();
-    let output = tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_codemux"))
-            .args(["mcp-call", "--connection-file"])
-            .arg(path)
-            .arg("--list")
-            .env("CODEMUX_SOCKET", "/missing/control-socket")
-            .output()
-            .unwrap()
-    })
-    .await
-    .unwrap();
+    let call = |token: String| {
+        let url = connection.url.clone();
+        tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_codemux"))
+                .args(["mcp-call", "--list"])
+                .env(BRIDGE_URL_ENV, url)
+                .env(BRIDGE_TOKEN_ENV, token)
+                .env("CODEMUX_SOCKET", "/missing/control-socket")
+                .output()
+                .unwrap()
+        })
+    };
+    let output = call(connection.bearer_token.clone()).await.unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -178,26 +176,7 @@ async fn all_provider_one_shot_cli_uses_gateway_auth_and_never_the_control_socke
     );
     let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(reply["result"]["tools"].is_array());
-    let path = file.path().to_owned();
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&McpGatewayConnection {
-            url: connection.url,
-            bearer_token: "wrong-token".into(),
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    let output = tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_codemux"))
-            .args(["mcp-call", "--connection-file"])
-            .arg(path)
-            .arg("--list")
-            .output()
-            .unwrap()
-    })
-    .await
-    .unwrap();
+    let output = call("wrong-token".into()).await.unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("401"));
 }

@@ -366,6 +366,11 @@ impl McpRegistry {
         Ok(self.gateway().await?.chat_connection(key, caller))
     }
 
+    /// The gateway if it is already running; never starts it.
+    pub fn started_gateway(&self) -> Option<Arc<super::gateway::McpGatewayRuntime>> {
+        self.gateway.get().cloned()
+    }
+
     /// The process-wide gateway, started on first use. For callers that must
     /// issue a chat connection synchronously, inside their own critical
     /// section.

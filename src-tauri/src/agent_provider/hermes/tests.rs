@@ -38,6 +38,7 @@ async fn review_l3_native_stop_wakes_cold_hermes_profile_operation_wait() {
     let runtime = Arc::new(Runtime {
         fixture_start_wait:Notify::new(),child,ownership:std::sync::Mutex::new(None),installation_stamp:installation_stamp(&profile).unwrap(),profile:profile.clone(),
         operation:Mutex::new(()),routes:Mutex::new(HashMap::new()),commands:Mutex::new(HashMap::new()),queue:Mutex::new(Queue::default()),barrier,
+        credentials:test_credentials(None),
     });
     provider.inner.runtimes.lock().await.insert(runtime_key(&profile),runtime.clone());
     // Same actual runtime.operation mutex that A's foreground approval owns.
@@ -84,6 +85,9 @@ impl crate::agent_provider::types::TurnDispatchCheckpoint for ReviewDispatchAuth
     async fn abort(&self) { self.aborted.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
 }
 
+fn test_credentials(registry: Option<crate::mcp::registry::McpRegistry>) -> Credentials {
+    Credentials { registry, prefix: format!("hermes:{}:", uuid::Uuid::new_v4()) }
+}
 async fn review_pump_fixture() -> (tempfile::TempDir, HermesProvider, Arc<Runtime>, Arc<Chat>, tokio::task::JoinHandle<()>) {
     review_pump_fixture_with_binary(None).await
 }
@@ -105,7 +109,8 @@ async fn review_pump_fixture_with_binary(binary: Option<std::path::PathBuf>) -> 
     let (barrier, mut barriers) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
     let runtime = Arc::new(Runtime {fixture_start_wait:Notify::new(), child, ownership:std::sync::Mutex::new(None),
         installation_stamp:installation_stamp(&profile).unwrap(), profile:profile.clone(), operation:Mutex::new(()),
-        routes:Mutex::new(HashMap::new()), commands:Mutex::new(HashMap::new()), queue:Mutex::new(Queue::default()), barrier});
+        routes:Mutex::new(HashMap::new()), commands:Mutex::new(HashMap::new()), queue:Mutex::new(Queue::default()), barrier,
+        credentials:test_credentials(None)});
     let mut binding = test_binding(root.path()); binding.profile=profile; binding.acp_session_id=Some("review-session".into());
     binding.current_native_id=Some("existing-native".into());
     let chat = Arc::new(Chat {binding:Mutex::new(binding), runtime:runtime.clone(), mcp_servers:json!([]),
@@ -1288,7 +1293,7 @@ async fn all_provider_hermes_capabilities_do_not_reacquire_the_active_profile_op
     let held = runtime.operation.lock().await;
     let result = tokio::time::timeout(
         Duration::from_secs(1),
-        provider.orchestration_catalog(runtime.profile.clone()),
+        provider.orchestration_catalog(runtime.profile.clone(), true),
     )
     .await;
     drop(held);
@@ -1299,6 +1304,130 @@ async fn all_provider_hermes_capabilities_do_not_reacquire_the_active_profile_op
         result
             .expect("native discovery must not wait on its own profile operation")
             .unwrap(),
-        acknowledged
+        Some(acknowledged)
     );
+}
+
+#[tokio::test]
+async fn listing_a_cold_hermes_profile_starts_no_runtime_or_session() {
+    let (_root, provider, runtime, _chat, task) = review_pump_fixture().await;
+    let listed = provider
+        .orchestration_catalog(runtime.profile.clone(), false)
+        .await
+        .unwrap();
+    let started = provider.inner.runtimes.lock().await.len();
+    runtime.child.shutdown().await.unwrap();
+    task.abort();
+    let _ = task.await;
+    assert_eq!(listed, None);
+    assert_eq!(started, 0, "listing must not start a Hermes runtime");
+}
+
+#[test]
+fn a_chat_response_never_becomes_the_profile_default() {
+    let chat = json!({
+        "sessionId": "s",
+        "modes": {"currentModeId": "dont_ask", "availableModes": [{"id": "default"}, {"id": "dont_ask"}]},
+        "models": {"currentModelId": "chat-override", "availableModels": [{"modelId": "chat-override"}]}
+    });
+    let catalog = profile_catalog(&chat);
+    assert!(catalog.pointer("/modes/currentModeId").is_none());
+    assert!(catalog.pointer("/models/currentModelId").is_none());
+    assert_eq!(catalog["modes"]["availableModes"], chat["modes"]["availableModes"]);
+    assert_eq!(catalog["models"]["availableModels"], chat["models"]["availableModels"]);
+}
+
+/// Stop leaves a Hermes chat's injected server alone: no `session/load`, so
+/// Hermes never adds a second toolset, and the one credential keeps working.
+/// Slash commands reach Hermes exactly as typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_keeps_one_hermes_toolset_and_its_credential() {
+    let (root, provider, runtime, old_chat, task) = review_pump_fixture().await;
+    // Native authorities are per thread; stay clear of other fixtures' "thread".
+    let thread = format!("hermes-stop-{}", Uuid::new_v4());
+    provider.inner.chats.lock().await.remove(&ThreadId("thread".into()));
+    let registry = crate::mcp::registry::McpRegistry::new();
+    let mcp = crate::agent_provider::acp::mcp::ChatMcp::new(
+        registry,
+        &thread,
+        ProviderKind::Hermes,
+        Some("workspace".into()),
+        Some("default".into()),
+        mcp_server_name(&thread),
+        Some(runtime.credentials.key(&thread)),
+        vec![],
+        false,
+    );
+    let servers = mcp.servers(crate::agent_provider::acp::mcp::Transport::Http).await;
+    mcp.session.bind_session("review-session");
+    let mut binding = old_chat.binding.lock().await.clone();
+    binding.thread_id = thread.clone();
+    let chat = Arc::new(Chat {
+        binding: Mutex::new(binding),
+        runtime: runtime.clone(),
+        mcp_servers: servers.clone(),
+        mcp: Some(mcp),
+        state: Mutex::new(ChatState::default()),
+        finished: Notify::new(),
+    });
+    provider.inner.chats.lock().await.insert(ThreadId(thread.clone()), chat.clone());
+    runtime.routes.lock().await.insert("review-session".into(), Arc::downgrade(&chat));
+    let mut rx = provider.inner.events.subscribe();
+    runtime.queue.lock().await.running = true;
+    provider.send_turn(turn(&thread, "review-hold")).await.unwrap();
+    let inner = provider.inner.clone();
+    let r = runtime.clone();
+    let pump = tokio::spawn(async move { inner.pump(r).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(rx.recv().await.unwrap(), ProviderRuntimeEvent::RequestOpened { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // Stop twice through the authority path the Stop command uses.
+    for _ in 0..2 {
+        crate::delegation::authority::NativeAuthority::user_activity_thread(&thread, true);
+        provider.interrupt_turn(ThreadId(thread.clone()), None).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(3), pump).await.unwrap().unwrap();
+    runtime.queue.lock().await.running = true;
+    provider.send_turn(turn(&thread, "/title Release notes")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), provider.inner.clone().pump(runtime.clone()))
+        .await
+        .unwrap();
+    let listed = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(servers[0]["url"].as_str().unwrap())
+        .header("authorization", servers[0]["headers"][0]["value"].as_str().unwrap())
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    let wire: Vec<Value> = std::fs::read_to_string(root.path().join("peer-wire.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|entry: &Value| entry["direction"] == "in")
+        .map(|entry| entry["message"].clone())
+        .collect();
+    runtime.child.shutdown().await.unwrap();
+    task.abort();
+    let _ = task.await;
+    assert!(
+        !wire.iter().any(|m| m["method"] == "session/load"),
+        "Stop must not reload Hermes MCP servers: {wire:?}"
+    );
+    let prompts: Vec<_> = wire
+        .iter()
+        .filter(|m| m["method"] == "session/prompt")
+        .map(|m| m["params"]["prompt"][0]["text"].clone())
+        .collect();
+    assert_eq!(prompts.last(), Some(&json!("/title Release notes")), "{prompts:?}");
+    assert_eq!(listed, reqwest::StatusCode::OK, "the one credential still works after Stop");
 }

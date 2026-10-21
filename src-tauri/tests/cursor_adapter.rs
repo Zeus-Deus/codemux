@@ -480,7 +480,7 @@ async fn cursor_chat_receives_the_codemux_mcp_gateway() {
     let servers = servers.as_array().expect("mcpServers array");
     assert_eq!(servers.len(), 1, "{text}");
     assert_eq!(servers[0]["type"], "http");
-    assert!(servers[0]["name"].as_str().unwrap().starts_with("codemux_"));
+    assert_eq!(servers[0]["name"], "codemux");
     assert_eq!(servers[0]["headers"][0]["name"], "Authorization");
     let url = servers[0]["url"].as_str().unwrap();
     let authorization = servers[0]["headers"][0]["value"].as_str().unwrap();

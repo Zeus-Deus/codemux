@@ -295,7 +295,7 @@ async fn prepare_selection<R: Runtime>(
     let Some(target) = input.target.clone() else {
         return Ok(());
     };
-    let (resolved, caps, _) = super::selection::resolve(app, target, cwd).await?;
+    let (resolved, caps, _) = super::selection::resolve(app, target, cwd, true).await?;
     input.selected_capabilities = Some(caps);
     if resolved.provider != input.provider {
         return Err(ControlError::new(
@@ -790,6 +790,7 @@ pub(crate) async fn agent_capabilities<R: Runtime>(app: &AppHandle<R>, caller: &
         None => registry.all().await,
     };
     let mut providers = Vec::new();
+    let mut pending = Vec::new();
     let db = app.state::<DatabaseStore>();
     let selected_workspace = workspace(app, &args.workspace_id, false)?;
     for (kind,implementation) in registered {
@@ -825,12 +826,17 @@ pub(crate) async fn agent_capabilities<R: Runtime>(app: &AppHandle<R>, caller: &
             }
             provider => vec![crate::commands::delegation::provider_id(provider).into()],
         };
-        for instance in instances {
-            let selection = super::selection::ProviderSelection {
-                instance_id: instance.clone(),
-                ..Default::default()
-            };
-            match super::selection::resolve(app,selection,&selected_workspace.cwd).await {
+        pending.extend(instances.into_iter().map(|instance| (kind, operations.clone(), instance)));
+    }
+    // Cached composer catalogs only: listing never spawns an agent or opens
+    // a provider session, so instances resolve concurrently.
+    let resolved = futures_util::future::join_all(pending.iter().map(|(_, _, instance)| {
+        let selection = super::selection::ProviderSelection { instance_id: instance.clone(), ..Default::default() };
+        super::selection::resolve(app, selection, &selected_workspace.cwd, false)
+    }))
+    .await;
+    for ((kind, operations, instance), outcome) in pending.into_iter().zip(resolved) {
+        match outcome {
             Ok((resolved,capabilities,options)) => {
                 let allowed_modes: Vec<_> = capabilities.permission_modes.iter()
                     .filter(|mode|permission_ceiling(caller,kind,Some(&mode.value)).is_ok())
@@ -838,7 +844,6 @@ pub(crate) async fn agent_capabilities<R: Runtime>(app: &AppHandle<R>, caller: &
                 providers.push(json!({"provider":kind,"provider_instance_id":instance,"selection":resolved,"configured":true,"capabilities":capabilities,"options":options,"operations":operations,"allowed_permission_modes":allowed_modes,"discovery_error":null}));
             }
             Err(error) => providers.push(json!({"provider":kind,"provider_instance_id":instance,"configured":true,"capabilities":null,"operations":operations,"allowed_permission_modes":[],"discovery_error":error})),
-            }
         }
     }
     authorize(app,caller)?;

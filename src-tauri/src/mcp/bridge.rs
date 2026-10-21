@@ -395,39 +395,13 @@ mod tests {
 }
 
 /// One-shot fallback for agents that accept MCP injection but hide its tools.
-/// This is an ordinary authenticated gateway client, never a control-socket client.
-pub async fn call(
-    tool: Option<String>,
-    arguments: Option<String>,
-    connection_file: Option<std::path::PathBuf>,
-    list: bool,
-) -> Result<(), String> {
-    let connection: super::gateway::McpGatewayConnection = match connection_file {
-        Some(path) => {
-            let file = std::fs::File::open(path)
-                .map_err(|e| format!("Chat MCP connection is unavailable: {e}"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if file
-                    .metadata()
-                    .map_err(|e| e.to_string())?
-                    .permissions()
-                    .mode()
-                    & 0o077
-                    != 0
-                {
-                    return Err("Chat MCP connection must be private to its owner".into());
-                }
-            }
-            serde_json::from_reader(file).map_err(|_| "Invalid chat MCP connection".to_string())?
-        }
-        None => super::gateway::McpGatewayConnection {
-            url: std::env::var(BRIDGE_URL_ENV)
-                .map_err(|_| "No authenticated chat MCP connection".to_string())?,
-            bearer_token: std::env::var(BRIDGE_TOKEN_ENV)
-                .map_err(|_| "No authenticated chat MCP connection".to_string())?,
-        },
+/// This is an ordinary authenticated gateway client, never a control-socket
+/// client, and uses the credential in the agent process's environment.
+pub async fn call(tool: Option<String>, arguments: Option<String>, list: bool) -> Result<(), String> {
+    let missing = || "No authenticated chat MCP connection".to_string();
+    let connection = super::gateway::McpGatewayConnection {
+        url: std::env::var(BRIDGE_URL_ENV).map_err(|_| missing())?,
+        bearer_token: std::env::var(BRIDGE_TOKEN_ENV).map_err(|_| missing())?,
     };
     let url = reqwest::Url::parse(&connection.url).map_err(|_| "Invalid chat MCP endpoint")?;
     if url.scheme() != "http"

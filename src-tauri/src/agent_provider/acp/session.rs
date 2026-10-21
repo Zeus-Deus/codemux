@@ -121,30 +121,29 @@ pub struct AcpSpawnConfig {
     pub workspace_id: Option<String>,
 }
 
-/// The `mcpServers` for a Cursor or Grok session. A session on a device gets
+/// The Codemux tools for a Cursor or Grok session. A session on a device gets
 /// none of this computer's tools.
-#[cfg(test)]
-async fn acp_mcp_servers(
+fn chat_mcp(
     dialect: AcpDialect,
     registry: Option<&crate::mcp::registry::McpRegistry>,
     remote: Option<&crate::agent_provider::types::RemoteSpawnTarget>,
     thread_id: &str,
     workspace_id: Option<String>,
-    initialized: &Value,
-) -> Value {
-    super::mcp::session_mcp_servers(
-        crate::agent_provider::local_tool_registry(registry, remote).as_ref(),
-        thread_id,
-        crate::mcp::gateway::GatewayCaller {
+    permission_mode: Option<String>,
+) -> Option<super::mcp::ChatMcp> {
+    crate::agent_provider::local_tool_registry(registry, remote).map(|registry| {
+        super::mcp::ChatMcp::new(
+            registry,
+            thread_id,
+            dialect.provider(),
             workspace_id,
-            native_sources: dialect.native_mcp_sources().to_vec(),
-            flat_tool_names: dialect.is_grok(),
-            native: None,
-        },
-        super::mcp::SERVER_NAME,
-        super::mcp::Transport::negotiated(initialized),
-    )
-    .await
+            Some(permission_mode.unwrap_or_else(|| dialect.default_permission_mode().into())),
+            super::mcp::SERVER_NAME.into(),
+            None,
+            dialect.native_mcp_sources().to_vec(),
+            dialect.is_grok(),
+        )
+    })
 }
 
 #[derive(Debug)]
@@ -397,7 +396,6 @@ pub(crate) struct AcpSession {
     pub provider_session_id: ProviderSessionId,
     pub state: Mutex<AcpSessionState>,
     mcp: Option<super::mcp::ChatMcp>,
-    metadata_replay: AtomicBool,
     cwd: PathBuf,
     /// Runs on a device over SSH; `cwd` is a path there, not on this computer.
     on_device: bool,
@@ -450,8 +448,19 @@ impl AcpSession {
     ) -> Result<Arc<Self>, ProviderError> {
         let dialect = spawn.dialect;
         let slash_command_cache = Arc::clone(&spawn.slash_command_cache);
-        let child_env = env.unwrap_or_default();
+        let mut child_env = env.unwrap_or_default();
         let remote = spawn.remote.clone();
+        let mcp = chat_mcp(
+            dialect,
+            spawn.mcp_registry.as_ref(),
+            remote.as_ref(),
+            &thread_id.0,
+            spawn.workspace_id.clone(),
+            permission_mode.clone(),
+        );
+        if let Some(mcp) = &mcp {
+            child_env.extend(mcp.env().await);
+        }
         let device = remote.as_ref().map(|remote| remote.host_name.as_str());
         let child = match remote.as_ref() {
             #[cfg(unix)]
@@ -617,14 +626,10 @@ impl AcpSession {
                 });
             }
 
-            let mcp = crate::agent_provider::local_tool_registry(spawn.mcp_registry.as_ref(),
-                remote.as_ref()).map(|registry|
-                super::mcp::ChatMcp::new(registry,
-                &thread_id.0, dialect.provider(),
-                spawn.workspace_id.clone(),
-                    Some(permission_mode.clone().unwrap_or_else(|| dialect.default_permission_mode().into())),
-                    super::mcp::SERVER_NAME.into(), super::mcp::Transport::negotiated(&initialized), dialect.native_mcp_sources().to_vec(), dialect.is_grok()));
-            let mcp_servers = match &mcp { Some(mcp) => mcp.servers().await, None => json!([]) };
+            let mcp_servers = match &mcp {
+                Some(mcp) => mcp.servers(super::mcp::Transport::negotiated(&initialized)).await,
+                None => json!([]),
+            };
             let new_session_params = || {
                 let mut params = json!({ "cwd": cwd.clone(), "mcpServers": mcp_servers.clone() });
                 if dialect.is_grok() {
@@ -683,12 +688,11 @@ impl AcpSession {
                 provider_session_id,
                 initialized,
                 startup_grok_model,
-                mcp,
             ))
         }
         .await;
 
-        let (setup, provider_session_id, initialized, startup_grok_model, mcp) = match setup {
+        let (setup, provider_session_id, initialized, startup_grok_model) = match setup {
             Ok(value) => value,
             Err(error) => {
                 let _ = child.shutdown().await;
@@ -703,7 +707,6 @@ impl AcpSession {
         let session = Arc::new(Self {
             thread_id: thread_id.clone(),
             mcp,
-            metadata_replay: AtomicBool::new(false),
             provider_session_id: ProviderSessionId(provider_session_id),
             state: Mutex::new(AcpSessionState {
                 status: SessionStatus::Ready,
@@ -1125,46 +1128,6 @@ impl AcpSession {
 
         if let Some(checkpoint) = &input.turn_checkpoint {
             if let Err(error) = checkpoint.verify_dispatch() { Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await; return Err(PrepareTurnError::Rejected(error)); }
-        }
-        if let Some(mcp) = &self.mcp {
-            if mcp.needs_refresh() {
-                let servers = mcp.servers().await;
-                self.metadata_replay.store(true, Ordering::SeqCst);
-                let loaded=self.child.request("session/load", json!({"sessionId":self.provider_session_id.0,"cwd":self.cwd,"mcpServers":servers})).await;
-                self.await_child_messages_drained().await;
-                self.metadata_replay.store(false, Ordering::SeqCst);
-                let loaded =
-                    loaded.map_err(|e| PrepareTurnError::Failed(map_rpc_error(e, self.dialect)))?;
-                if loaded
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| id != self.provider_session_id.0)
-                {
-                    return Err(PrepareTurnError::Failed(ProviderError::ValidationError {
-                        message: "Native session identity changed during MCP refresh".into(),
-                    }));
-                }
-                let mode = loaded
-                    .pointer("/modes/currentModeId")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| {
-                        config_options(&loaded)
-                            .iter()
-                            .find(|option| {
-                                option.get("id").and_then(Value::as_str) == Some("mode")
-                                    || option.get("category").and_then(Value::as_str)
-                                        == Some("mode")
-                            })
-                            .and_then(|option| option.get("currentValue"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    });
-                if let Some(mode) = mode {
-                    mcp.session.set_mode(Some(mode.clone()));
-                    self.state.lock().await.permission_mode = mode;
-                }
-            }
         }
         let turn_id = TurnId(self.opaque_id("turn"));
         {
@@ -2508,9 +2471,6 @@ impl AcpSession {
                     }
                 }
             }
-        }
-        if self.metadata_replay.load(Ordering::SeqCst) {
-            return;
         }
         let Some(turn_id) = self.state.lock().await.active_turn.clone() else {
             // Session-load replay is already persisted in Codemux. Avoid
@@ -4935,22 +4895,127 @@ mod tests {
 #[cfg(test)]
 mod mcp_delivery_tests {
     use super::*;
+    use crate::agent_provider::cursor::{CursorAgentProvider, CursorProviderConfig};
+    use crate::agent_provider::AgentProvider;
+    use futures_util::StreamExt;
+
+    struct Collaboration;
+    impl crate::mcp::registry::HostTools for Collaboration {
+        fn tools_for(&self, _: &crate::mcp::registry::HostCaller) -> Vec<crate::mcp::runtime::McpTool> {
+            vec![crate::mcp::runtime::McpTool {
+                name: "thread_send".into(),
+                prefixed_name: "mcp__codemux__thread_send".into(),
+                description: None,
+                input_schema: json!({}),
+                server_id: "codemux".into(),
+            }]
+        }
+        fn call(&self, _: &crate::mcp::registry::HostCaller, _: &str, _: &Value) -> Option<Value> {
+            None
+        }
+    }
+
+    async fn reply(
+        provider: &CursorAgentProvider,
+        events: &mut crate::agent_provider::ProviderEventStream,
+        thread: &str,
+        prompt: &str,
+    ) -> String {
+        provider
+            .send_turn(serde_json::from_value(json!({"thread_id":thread,"text":prompt})).unwrap())
+            .await
+            .expect("send turn");
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let mut text = None;
+            while let Some(event) = events.next().await {
+                match event {
+                    ProviderRuntimeEvent::ItemCompleted {
+                        item: crate::agent_provider::CompletedItem::AssistantText { text: chunk },
+                        ..
+                    } => text = Some(chunk),
+                    ProviderRuntimeEvent::TurnCompleted { .. } => return text,
+                    _ => {}
+                }
+            }
+            panic!("event stream closed before turn completion");
+        })
+        .await
+        .expect("turn timed out")
+        .expect("assistant text")
+    }
+
+    /// The chat's process carries its own credential for `codemux mcp-call`.
+    /// Prompts get a one-line hint only while the agent has not used the
+    /// injected server, never on slash commands, and Stop reloads nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cursor_shell_fallback_is_env_only_and_survives_stop() {
+        let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap()
+            .join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX));
+        assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
+        let registry = crate::mcp::registry::McpRegistry::new();
+        registry.set_host_tools(Arc::new(Collaboration));
+        let provider = CursorAgentProvider::new(CursorProviderConfig {
+            binary,
+            event_channel_capacity: 1024,
+            mcp_registry: Some(registry),
+        });
+        let mut events = provider.event_stream();
+        let thread = format!("cursor-shell-fallback-{}", uuid::Uuid::new_v4());
+        provider
+            .start_session(serde_json::from_value(json!({
+                "thread_id": thread, "cwd": std::env::current_dir().unwrap(),
+                "permission_mode": "agent", "workspace_id": "ws-1",
+                "additional_directories": [], "extra": null
+            })).unwrap())
+            .await
+            .expect("start fixture session");
+
+        let hinted = reply(&provider, &mut events, &thread, "echo-prompt").await;
+        assert!(hinted.starts_with("echo-prompt\n\n[Codemux: "), "{hinted}");
+        assert!(!hinted.contains("codemux-mcp-"), "no credential file: {hinted}");
+        let command = "/echo-prompt now";
+        assert_eq!(reply(&provider, &mut events, &thread, command).await, command);
+
+        let env: Value = serde_json::from_str(&reply(&provider, &mut events, &thread, "mcp-env").await).unwrap();
+        let servers: Value = serde_json::from_str(&reply(&provider, &mut events, &thread, "mcp-servers").await).unwrap();
+        let header = servers[0]["headers"][0]["value"].as_str().unwrap().to_string();
+        assert_eq!(format!("Bearer {}", env["token"].as_str().unwrap()), header);
+
+        // Stop twice through the authority path the Stop command uses.
+        for _ in 0..2 {
+            crate::delegation::authority::NativeAuthority::user_activity_thread(&thread, true);
+            provider.interrupt_turn(ThreadId(thread.clone()), None).await.expect("Stop");
+        }
+        let after: Value = serde_json::from_str(&reply(&provider, &mut events, &thread, "mcp-env").await).unwrap();
+        assert_eq!(after["loads"], 0, "Stop must not reload the session");
+        assert_eq!(after["token"], env["token"]);
+        // The agent reaches the gateway itself: the credential still works
+        // and the hint stops.
+        let listed: Value = reqwest::Client::builder().no_proxy().build().unwrap()
+            .post(servers[0]["url"].as_str().unwrap())
+            .header("authorization", header)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+            .send().await.unwrap().json().await.unwrap();
+        assert!(listed.to_string().contains("thread_send"), "{listed}");
+        assert_eq!(reply(&provider, &mut events, &thread, "echo-prompt").await, "echo-prompt");
+        provider.stop_session(ThreadId(thread)).await.expect("stop fixture session");
+    }
 
     #[tokio::test]
     async fn device_sessions_get_no_gateway_but_local_ones_do() {
         let registry = crate::mcp::registry::McpRegistry::new();
-        let initialized = json!({"agentCapabilities": {"mcpCapabilities": {"http": true}}});
         let device = crate::agent_provider::types::RemoteSpawnTarget {
             host_id: 7,
             ssh_target: "dev@box".into(),
             host_name: "box".into(),
         };
         for dialect in [AcpDialect::Cursor, AcpDialect::Grok] {
-            let remote = acp_mcp_servers(dialect, Some(&registry), Some(&device), "t", None, &initialized).await;
-            assert_eq!(remote, json!([]), "{dialect:?} on a device");
-            let local = acp_mcp_servers(dialect, Some(&registry), None, "t", None, &initialized).await;
-            assert_eq!(local.as_array().map(Vec::len), Some(1), "{dialect:?} locally: {local}");
-            assert_eq!(local[0]["type"], "http");
+            assert!(chat_mcp(dialect, Some(&registry), Some(&device), "t", None, None).is_none());
+            let local = chat_mcp(dialect, Some(&registry), None, "t", None, None).unwrap();
+            let servers = local.servers(super::super::mcp::Transport::Http).await;
+            assert_eq!(servers.as_array().map(Vec::len), Some(1), "{dialect:?}: {servers}");
+            assert_eq!(servers[0]["type"], "http");
+            assert!(!local.env().await.is_empty(), "{dialect:?} shell fallback");
         }
     }
 }
