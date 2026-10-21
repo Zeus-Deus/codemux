@@ -27,6 +27,59 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Changed-path detection. Each job below gates itself on these outputs with a
+  # job-level `if:` instead of a workflow-level `paths:` filter, so a skipped
+  # job still reports a status and the `ci-gate` job at the end always
+  # concludes. scripts/ci-changes.sh owns the classification (docs/screenshots
+  # skip everything, pure frontend skips desktop Rust, iroh-wasm runs only for
+  # its own inputs); manual dispatch runs everything.
+  # ---------------------------------------------------------------------------
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      rust: ${{ steps.filter.outputs.rust }}
+      iroh_wasm: ${{ steps.filter.outputs.iroh_wasm }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # A pull_request checkout is the merge commit, so HEAD^1 is the base
+          # branch tip and the diff is exactly what the PR changes.
+          fetch-depth: 2
+
+      - name: Classify changed paths
+        id: filter
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base=
+          case "$EVENT_NAME" in
+            pull_request) base=HEAD^1 ;;
+            push)
+              # New branch pushes have an all-zero `before`; a force push can
+              # make it unfetchable. Either way, fall back to running everything.
+              if [[ ! $BEFORE =~ ^0*$ ]] && git fetch --no-tags --depth=1 origin "$BEFORE"; then
+                base=$BEFORE
+              fi ;;
+          esac
+          if [ -z "$base" ]; then
+            printf 'code=true\nrust=true\niroh_wasm=true\n' | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # --no-renames lists both sides of a move, so moving a file out of a
+          # tested tree still counts as a change to that tree.
+          git diff --name-only --no-renames "$base" HEAD > "$RUNNER_TEMP/changed-paths"
+          echo "changed paths:"
+          sed 's/^/  /' "$RUNNER_TEMP/changed-paths"
+          bash scripts/ci-changes.sh < "$RUNNER_TEMP/changed-paths" | tee -a "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
   # Lightweight JS + sidecar checks. These need neither the Rust toolchain, the
   # Linux GTK/WebKit system libraries, nor the staged sidecar binaries, so they
   # run as a separate job IN PARALLEL with `rust` below. Splitting them off
@@ -36,7 +89,9 @@ jobs:
   # ubuntu + windows matrix.
   # ---------------------------------------------------------------------------
   web-checks:
-    if: github.event_name != 'workflow_dispatch' || !inputs.claude_install_only
+    # Frontend tests also read Rust sources, so any non-docs change runs these.
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || !inputs.claude_install_only)
     name: web-checks (${{ matrix.os }})
     strategy:
       # Never fail-fast — we always want to see both Linux and Windows results,
@@ -55,6 +110,11 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: bash scripts/install-sh.test.sh
+
+      - name: CI path filter tests
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/ci-changes.test.sh
 
       - name: Setup Node
         uses: actions/setup-node@v5
@@ -114,6 +174,12 @@ jobs:
       - name: Frontend tests
         run: npm run test
 
+      - name: Build frontend
+        # The rust job normally builds `dist/`. When the path filter skips it,
+        # build here so a pure frontend change still proves `vite build` works.
+        if: matrix.os == 'ubuntu-latest' && needs.changes.outputs.rust != 'true'
+        run: npm run build
+
   # ---------------------------------------------------------------------------
   # The browser relay client is a standalone Rust crate and is not part of the
   # Tauri Cargo graph. Check its real wasm32 target in parallel so changes to
@@ -121,7 +187,8 @@ jobs:
   # already-long desktop Rust critical path.
   # ---------------------------------------------------------------------------
   iroh-wasm:
-    if: github.event_name != 'workflow_dispatch' || !inputs.claude_install_only
+    needs: changes
+    if: needs.changes.outputs.iroh_wasm == 'true' && (github.event_name != 'workflow_dispatch' || !inputs.claude_install_only)
     name: iroh-wasm
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -151,8 +218,14 @@ jobs:
   # `externalBin`/`bundle.resources` at compile time, so every sidecar binary
   # must be staged and the frontend `dist/` must exist before
   # `cargo test`. That work lives here (and only here).
+  #
+  # Skipped for docs-only and pure frontend changes. Frontend files the crate
+  # embeds or reads in tests (chat-workflow.script.js, shared fixtures) still
+  # count as Rust inputs; see scripts/ci-changes.sh.
   # ---------------------------------------------------------------------------
   rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     name: rust (${{ matrix.os }})
     strategy:
       # Never fail-fast — we always want to see both Linux and Windows
@@ -536,3 +609,26 @@ jobs:
           name: windows-claude-${{ matrix.method || 'powershell' }}
           path: windows-claude-evidence/
           if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Single always-reporting status for branch protection. Path-skipped jobs
+  # conclude as "skipped" (and a skipped matrix job never expands its matrix
+  # names), so require this check rather than the individual jobs.
+  # ---------------------------------------------------------------------------
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs: [changes, web-checks, iroh-wasm, rust]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Require every job to pass or be skipped by the path filter
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e '
+            .changes.result == "success"
+            and ([.[].result] | all(. == "success" or . == "skipped"))
+          ' > /dev/null
