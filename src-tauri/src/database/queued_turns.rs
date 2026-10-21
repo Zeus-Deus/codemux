@@ -157,6 +157,12 @@ impl DatabaseStore {
         self.replace_queued_turn(None, row)
     }
 
+    /// Mirror an admission, reconciling its intent if ACK settlement already
+    /// saved the live row. Keep the saved identity, attribution and replay data.
+    pub(crate) fn admit_queued_turn(&self, row: &QueuedTurnRecord) -> Result<bool, String> {
+        self.save_queued_turn(None, row, true)
+    }
+
     /// [`insert_queued_turn`](Self::insert_queued_turn) that also removes
     /// `replaces`, in one transaction, so the message is always saved under
     /// one id or the other. When `row` has already been dispatched or
@@ -166,6 +172,15 @@ impl DatabaseStore {
         &self,
         replaces: Option<&str>,
         row: &QueuedTurnRecord,
+    ) -> Result<bool, String> {
+        self.save_queued_turn(replaces, row, false)
+    }
+
+    fn save_queued_turn(
+        &self,
+        replaces: Option<&str>,
+        row: &QueuedTurnRecord,
+        reconcile_intent: bool,
     ) -> Result<bool, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
@@ -220,7 +235,17 @@ impl DatabaseStore {
                 |r| r.get(0),
             )
             .map_err(|e| format!("Failed to read queued turn order: {e}"))?;
-        let written = insert(&tx, &QueuedTurnRecord { position, ..row.clone() })?;
+        let mut written = insert(&tx, &QueuedTurnRecord { position, ..row.clone() })?;
+        if reconcile_intent && !written {
+            written = tx.execute(
+                "UPDATE agent_chat_queued_turns
+                 SET provenance = json_set(provenance, '$.input_intent', json_extract(?3, '$.input_intent'))
+                 WHERE thread_id = ?1 AND queued_id = ?2 AND epoch = ?4
+                   AND json_extract(provenance, '$.input_intent') IS NOT json_extract(?3, '$.input_intent')",
+                params![row.thread_id, row.queued_id,
+                    serde_json::to_string(&row.provenance).map_err(|e| e.to_string())?, row.epoch],
+            ).map_err(|e| format!("Failed to reconcile queued turn intent: {e}"))? > 0;
+        }
         tx.commit()
             .map_err(|e| format!("Failed to commit queued turn save: {e}"))?;
         Ok(written)

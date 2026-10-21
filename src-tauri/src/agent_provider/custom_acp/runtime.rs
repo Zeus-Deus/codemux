@@ -1658,7 +1658,7 @@ impl Session {
             }
             let id = format!("acp-queued-{}", Uuid::new_v4());
             self.emit(ProviderRuntimeEvent::TurnQueued {
-                provenance: Default::default(),
+                provenance: crate::agent_provider::message::MessageProvenance::queued_turn(),
                 thread_id: self.thread.clone(),
                 queued_id: id.clone(),
                 client_nonce: input.client_nonce.clone(),

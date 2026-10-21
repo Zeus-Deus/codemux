@@ -99,6 +99,14 @@ pub struct MessageProvenance {
     pub delivery_id: Option<String>,
 }
 
+impl MessageProvenance {
+    /// Provider admission waited for an occupied turn slot. A transport
+    /// queue alone does not imply that the input waited behind another turn.
+    pub(crate) fn queued_turn() -> Self {
+        Self { input_intent: InputIntent::QueuedTurn, ..Self::default() }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnOrigin {

@@ -4055,8 +4055,9 @@ async fn send_turn_internal<R: Runtime>(
     }
     drop(dispatch_guard);
     let result = sent.map_err(provider_err)?;
-    provenance.input_intent = if result.queued_id.is_some() { crate::agent_provider::message::InputIntent::QueuedTurn }
-        else if result.steered {
+    // A queue id can be an internal scheduling token (Hermes). The
+    // admission event carries the actual intent for deferred persistence.
+    provenance.input_intent = if result.steered {
             if provenance.input_intent == crate::agent_provider::message::InputIntent::QueuedTurn { crate::agent_provider::message::InputIntent::PromotedQueuedToSteer }
             else { crate::agent_provider::message::InputIntent::Steer }
         } else { provenance.input_intent };
@@ -8397,8 +8398,11 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         // The RPC ACK can move the entry before the provider event arrives.
         let pending = queued_event_pending(&thread_id.0,nonce,queued_id);
         if let Some(pending) = pending {
+            let waited = provenance.input_intent == crate::agent_provider::message::InputIntent::QueuedTurn;
             *provenance = pending.provenance;
-            provenance.input_intent = crate::agent_provider::message::InputIntent::QueuedTurn;
+            if waited {
+                provenance.input_intent = crate::agent_provider::message::InputIntent::QueuedTurn;
+            }
         }
     }
     if let ProviderRuntimeEvent::TurnQueued {client_nonce,queued_id,provenance,..}=&mut event {
@@ -8429,16 +8433,18 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
         thread_id,
         client_nonce: Some(nonce),
         queued_id,
+        provenance,
         ..
     } = &event
     {
         let mut pending_sends = pending_send_images().lock().unwrap();
         let pending = pending_sends.remove(&(thread_id.0.clone(), nonce.clone()));
+        let mut queued = pending_queued_images().lock().unwrap();
         if let Some(pending) = pending {
-            pending_queued_images()
-                .lock()
-                .unwrap()
-                .insert(queued_id.clone(), pending);
+            queued.insert(queued_id.clone(), pending);
+        }
+        if let Some(pending) = queued.get_mut(queued_id) {
+            pending.provenance = provenance.clone();
         }
     }
     if matches!(&event, ProviderRuntimeEvent::TurnQueued { .. }
@@ -8500,13 +8506,18 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                 .lock()
                 .unwrap()
                 .remove(queued_id)
-                .unwrap_or_default();
+                .unwrap_or_else(|| PendingQueuedTurn {
+                    provenance: crate::agent_provider::message::MessageProvenance::queued_turn(),
+                    ..Default::default()
+                });
             // The dispatch event itself is not persisted; the bubble it
             // promotes is. The row is deliberately NOT reported as this
             // event's `persisted_id`: a pane that never saw the enqueue
             // has no queued bubble to promote, so the reducer no-ops and
             // the row must still arrive as its own message.
-            pending.provenance.input_intent = if *steered { crate::agent_provider::message::InputIntent::PromotedQueuedToSteer } else { crate::agent_provider::message::InputIntent::QueuedTurn };
+            if *steered {
+                pending.provenance.input_intent = crate::agent_provider::message::InputIntent::PromotedQueuedToSteer;
+            }
             if let Some(id) = &pending.provenance.delivery_id {
                 let result = serde_json::json!({"turn_id":turn_id,"queued_id":null,"steered":steered});
                 let provider=db.get_agent_chat_session(&thread_id.0).and_then(|row|serde_json::from_value::<ProviderKind>(serde_json::json!(row.provider)).ok());
@@ -15735,6 +15746,64 @@ mod tests {
         assert!(!delivery_transition(&ProviderRuntimeEvent::ContentDelta {thread_id:thread_id.clone(),turn_id:TurnId("turn".into()),delta:crate::agent_provider::ContentDelta::Text {text:"chunk".into()},subagent_id:None}));
         assert!(delivery_transition(&ProviderRuntimeEvent::TurnCompleted {thread_id:thread_id.clone(),turn_id:TurnId("turn".into()),status:crate::agent_provider::TurnStatus::Success,usage:None}));
         assert!(delivery_transition(&ProviderRuntimeEvent::SessionStateChanged {thread_id,status:crate::agent_provider::SessionStatus::Ready}));
+    }
+
+    #[tokio::test]
+    async fn orchestration_message_queue_intent_survives_ack_event_race_and_dispatch() {
+        use crate::agent_provider::message::{CreatedBy, InputIntent, MessageProvenance};
+        for ack_first in [false, true] {
+            for (admitted_intent, original_intent, steered, expected) in [
+                (InputIntent::TurnStart, InputIntent::TurnStart, false, InputIntent::TurnStart),
+                (InputIntent::QueuedTurn, InputIntent::TurnStart, false, InputIntent::QueuedTurn),
+                (InputIntent::TurnStart, InputIntent::QueuedTurn, false, InputIntent::QueuedTurn),
+                (InputIntent::QueuedTurn, InputIntent::TurnStart, true, InputIntent::PromotedQueuedToSteer),
+            ] {
+                let thread = format!("queue-intent-{}", uuid::Uuid::new_v4());
+                let queued_id = format!("queue-{}", uuid::Uuid::new_v4());
+                let nonce = format!("nonce-{}", uuid::Uuid::new_v4());
+                let provider = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(Default::default()));
+                let (app, _root, _, _) = crate::agent_control::guard_tests::fixture(provider, &thread).await;
+                let pending = PendingQueuedTurn {
+                    provenance: MessageProvenance {
+                        message_id: Some(nonce.clone()),
+                        created_by: CreatedBy::Agent,
+                        sender_title: Some("Reviewer".into()),
+                        input_intent: original_intent,
+                        ..Default::default()
+                    },
+                    client_nonce: Some(nonce.clone()),
+                    ..Default::default()
+                };
+                if ack_first {
+                    pending_queued_images().lock().unwrap().insert(queued_id.clone(), pending);
+                } else {
+                    pending_send_images().lock().unwrap().insert((thread.clone(), nonce.clone()), pending);
+                }
+                forward_event(app.handle(), ProviderRuntimeEvent::TurnQueued {
+                    thread_id: ThreadId(thread.clone()), queued_id: queued_id.clone(),
+                    client_nonce: Some(nonce.clone()), text: "Review".into(),
+                    provenance: MessageProvenance { input_intent: admitted_intent, ..Default::default() },
+                });
+                let db = app.state::<DatabaseStore>();
+                let saved = db.get_queued_turn(&thread, &queued_id).unwrap();
+                assert_eq!(saved.provenance.input_intent, if steered { InputIntent::QueuedTurn } else { expected });
+                forward_event(app.handle(), ProviderRuntimeEvent::QueuedTurnDispatched {
+                    thread_id: ThreadId(thread.clone()), queued_id: queued_id.clone(),
+                    turn_id: TurnId("turn".into()), text: "Review".into(), steered,
+                });
+                assert!(db.get_queued_turn(&thread, &queued_id).is_none());
+                let rows: Vec<serde_json::Value> = db.list_agent_chat_messages(&thread).iter()
+                    .map(|row| serde_json::from_str(row).unwrap())
+                    .filter(|row: &serde_json::Value| row["type"] == "user_message")
+                    .collect();
+                assert_eq!(rows.len(), 1);
+                let row = &rows[0];
+                assert_eq!(row["input_intent"], serde_json::to_value(expected).unwrap());
+                assert_eq!(row["created_by"], "agent");
+                assert_eq!(row["sender_title"], "Reviewer");
+                assert_eq!(row["message_id"], nonce);
+            }
+        }
     }
 
     #[test]
