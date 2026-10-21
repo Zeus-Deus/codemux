@@ -94,7 +94,7 @@ fn mirror(db: &DatabaseStore, event: &ProviderRuntimeEvent, queued: Option<Queue
             queued_id,
             client_nonce,
             text,
-            provenance,
+            provenance: provenance_from_event,
         } => {
             let queued = queued.unwrap_or(Queued {
                 images: Vec::new(),
@@ -103,8 +103,8 @@ fn mirror(db: &DatabaseStore, event: &ProviderRuntimeEvent, queued: Option<Queue
                 provenance: None,
             });
             let replay = queued.replay;
-            let mut provenance = queued.provenance.cloned().unwrap_or_else(||provenance.clone());
-            provenance.input_intent = crate::agent_provider::message::InputIntent::QueuedTurn;
+            let mut provenance = queued.provenance.cloned().unwrap_or_else(||provenance_from_event.clone());
+            provenance.input_intent = provenance_from_event.input_intent;
             db.insert_queued_turn(&QueuedTurnRecord {
                 provenance,
                 thread_id: thread_id.0.clone(),

@@ -90,6 +90,23 @@ describe("reconcileQueuedTurns", () => {
     expect(reconcileQueuedTurns(state, "t", rows)).toBe(state);
   });
 
+  it.each(["turn_start", "queued_turn"] as const)("preserves live %s intent when recovering or adding images", (input_intent) => {
+    for (const existing of [false, true]) {
+      const state = existing ? applyEvent(createEmptyThreadState(), {
+        type: "turn_queued", thread_id: "t", queued_id: "s1", client_nonce: "nonce-s1", text: "saved s1", input_intent,
+      }) : createEmptyThreadState();
+      const next = reconcileQueuedTurns(state, "t", [{...row("s1", false), input_intent}]);
+      expect(queuedMessages(next.messages)[0].input_intent).toBe(input_intent);
+    }
+  });
+
+  it("keeps legacy saved rows queued and marks idle scheduler rows saved after restart", () => {
+    for (const input_intent of [undefined, "turn_start"] as const) {
+      const next = reconcileQueuedTurns(createEmptyThreadState(), "t", [{...row("s1"), input_intent}]);
+      expect(queuedMessages(next.messages)[0].input_intent).toBe("queued_turn");
+    }
+  });
+
   it("gives a bubble built from another client's event its images", () => {
     const fromEvent = applyEvent(createEmptyThreadState(), {
       type: "turn_queued", thread_id: "t", queued_id: "s1", client_nonce: "nonce-s1", text: "saved s1",

@@ -29,6 +29,21 @@ describe("message provenance", () => {
     expect(state.messages[0]).toMatchObject({created_by:"agent",message_id:"stable-message",input_intent:"queued_turn"});
   });
 
+  it.each(["turn_start", "queued_turn"] as const)("keeps %s intent through scheduler dispatch and replay", (input_intent) => {
+    for (const optimistic of [false, true]) {
+      let state = optimistic
+        ? appendUserMessage(createEmptyThreadState(), message.text, undefined, "nonce")
+        : createEmptyThreadState();
+      state = applyEvent(state, {...message, type: "turn_queued", client_nonce: "nonce", queued_id: "queue", input_intent});
+      state = applyEvent(state, {type: "queued_turn_dispatched", thread_id: "receiver", queued_id: "queue", turn_id: "turn", text: message.text});
+      expect(state.messages).toHaveLength(1);
+      expect(state.messages[0]).toMatchObject({input_intent, message_id: "stable-message", created_by: "agent"});
+      expect((state.messages[0] as UserMessageItem).queued).toBeUndefined();
+      const replay = replayPayloads([JSON.stringify({...message, input_intent})]);
+      expect(replay.messages[0]).toMatchObject({input_intent});
+    }
+  });
+
   it("preserves provenance through queue editing and promotion to steer", () => {
     let state = applyEvent(createEmptyThreadState(),{...message,type:"turn_queued",client_nonce:"nonce",queued_id:"queue"});
     state = editQueuedTurn(state,{type:"queued_turn_edited",thread_id:"receiver",queued_id:"queue",text:"Edited review"});

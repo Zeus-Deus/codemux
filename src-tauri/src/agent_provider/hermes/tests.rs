@@ -124,6 +124,60 @@ async fn review_pump_fixture_with_binary(binary: Option<std::path::PathBuf>) -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn orchestration_message_hermes_idle_and_busy_scheduler_intent() {
+    use crate::agent_provider::message::InputIntent;
+    let (_root, provider, runtime, chat, task) = review_pump_fixture().await;
+    let mut events = provider.inner.events.subscribe();
+    // Freeze dispatch without marking the scheduler busy: the first send
+    // still reserves an idle slot, and the next must wait behind it.
+    let held = runtime.operation.lock().await;
+    let first = provider.send_turn(turn("thread", "immediate")).await.unwrap().queued_id.unwrap();
+    let second = provider.send_turn(turn("thread", "waiting")).await.unwrap().queued_id.unwrap();
+    let mut intents = HashMap::new();
+    while let Ok(event) = events.try_recv() {
+        if let ProviderRuntimeEvent::TurnQueued { queued_id, provenance, .. } = event {
+            intents.insert(queued_id, provenance.input_intent);
+        }
+    }
+    assert_eq!(intents[&first], InputIntent::TurnStart);
+    assert_eq!(intents[&second], InputIntent::QueuedTurn);
+    assert!(chat.state.lock().await.active.is_none(), "profile occupancy also queues an otherwise idle chat");
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut completed = 0;
+        while completed < 2 {
+            if matches!(events.recv().await.unwrap(), ProviderRuntimeEvent::TurnCompleted { .. }) {
+                completed += 1;
+            }
+        }
+    }).await.unwrap();
+    // A fresh manual send can also start immediately ahead of a stopped queue.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while runtime.queue.lock().await.running { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    let held = runtime.operation.lock().await;
+    {
+        let mut queue = runtime.queue.lock().await;
+        queue.holds.entry(ThreadId("thread".into())).or_default().hold();
+        queue.jobs.push_back(Job {
+            id: "stopped-queue".into(), cancel_epoch: chat.state.lock().await.cancel_epoch,
+            chat: chat.clone(), input: turn("thread", "held follow-up"),
+        });
+    }
+    provider.send_turn(turn("thread", "idle-again")).await.unwrap();
+    loop {
+        if let ProviderRuntimeEvent::TurnQueued { provenance, .. } = events.recv().await.unwrap() {
+            assert_eq!(provenance.input_intent, InputIntent::TurnStart);
+            break;
+        }
+    }
+    drop(held);
+    provider.stop_session(ThreadId("thread".into())).await.unwrap();
+    runtime.child.shutdown().await.unwrap();
+    task.abort(); let _ = task.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_r2_denied_hermes_job_preserves_healthy_chat_and_native_followup() {
     let (_root, provider, runtime, chat, task) = review_pump_fixture().await;
     let mut rx = provider.inner.events.subscribe();

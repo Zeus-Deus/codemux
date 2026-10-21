@@ -2306,7 +2306,7 @@ function applyEventInner(
         const updated: UserMessageItem = {
           ...existing,
           ...messageProvenance(event),
-          input_intent: "queued_turn",
+          input_intent: event.input_intent ?? "queued_turn",
           queued: { queuedId: event.queued_id },
           seq: QUEUED_SEQ_BASE + seq,
         };
@@ -2318,7 +2318,7 @@ function applyEventInner(
       const item: UserMessageItem = {
         kind: "user_message",
         ...messageProvenance(event),
-        input_intent: "queued_turn",
+        input_intent: event.input_intent ?? "queued_turn",
         id: nextId("queued"),
         seq: QUEUED_SEQ_BASE + seq,
         text: event.text,

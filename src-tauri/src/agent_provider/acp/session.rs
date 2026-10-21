@@ -916,7 +916,7 @@ impl AcpSession {
                 state.queued.push_back(queued);
             }
             let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
-                provenance: Default::default(),
+                provenance: crate::agent_provider::message::MessageProvenance::queued_turn(),
                 thread_id: self.thread_id.clone(),
                 queued_id: queued_id.clone(),
                 client_nonce: input.client_nonce,

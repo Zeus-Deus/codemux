@@ -685,7 +685,7 @@ impl OpenCodeSession {
         } else {
             queue.push_back((id.clone(), input));
             let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
-                provenance: Default::default(),
+                provenance: crate::agent_provider::message::MessageProvenance::queued_turn(),
                 thread_id: self.thread_id.clone(),
                 queued_id: id.clone(),
                 client_nonce,

@@ -23,6 +23,7 @@ vi.mock("@/lib/asset-url", async (importOriginal) => {
 });
 
 import { UserMessage } from "./UserMessage";
+import { applyEvent, createEmptyThreadState } from "@/lib/agent-chat/reducer";
 
 afterEach(cleanup);
 
@@ -170,6 +171,16 @@ describe("UserMessage provenance", () => {
   it.each([ ["queued_turn","Queued","Queued behind the active turn"], ["steer","Steer","Steered the active turn"], ["promoted_queued_to_steer","Steer","Originally queued, then promoted to steer the active turn"] ] as const)("renders persisted %s intent after completion", (input_intent,label,title) => {
     const {getByText}=render(<UserMessage item={{...makeItem([]),input_intent,inflight:false}} />);
     expect(getByText(label).getAttribute("title")).toBe(title);
+  });
+  it.each(["turn_start", "queued_turn"] as const)("renders a dispatched scheduler message with %s intent", (input_intent) => {
+    let state = applyEvent(createEmptyThreadState(), {
+      type: "turn_queued", thread_id: "thread", queued_id: "queue", client_nonce: null, text: "Hello", input_intent,
+    });
+    state = applyEvent(state, {
+      type: "queued_turn_dispatched", thread_id: "thread", queued_id: "queue", turn_id: "turn", text: "Hello",
+    });
+    const {queryByText} = render(<UserMessage item={state.messages[0] as UserMessageItem} />);
+    expect(queryByText("Queued") !== null).toBe(input_intent === "queued_turn");
   });
   it("does not guess intent from a legacy inflight flag", () => {
     const {queryByText}=render(<UserMessage item={{...makeItem([]),inflight:true}} />);

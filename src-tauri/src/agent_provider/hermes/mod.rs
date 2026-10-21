@@ -1317,9 +1317,17 @@ impl AgentProvider for HermesProvider {
         let hold = queue.holds.entry(input.thread_id.clone()).or_default();
         let release = input.releases_queue_hold() && hold.goes_first();
         if release { hold.release_with(&id); }
+        let waiting_on_hold = hold.is_held() && !release;
         let idle = chat.state.lock().await.active.is_none();
+        // Hermes always uses this profile-wide scheduler, even for the
+        // first idle send. Only an occupied slot gives the message queued intent.
+        let provenance = if queue.running || !idle || waiting_on_hold {
+            crate::agent_provider::message::MessageProvenance::queued_turn()
+        } else {
+            Default::default()
+        };
         self.inner.emit(ProviderRuntimeEvent::TurnQueued {
-            provenance: Default::default(),
+            provenance,
             thread_id: input.thread_id.clone(),
             queued_id: id.clone(),
             client_nonce: input.client_nonce.clone(),

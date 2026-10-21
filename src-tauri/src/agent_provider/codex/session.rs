@@ -1046,7 +1046,7 @@ impl CodexSession {
                 let order = first.then(|| crate::agent_provider::queue_edit::reordered(&state.queued_turns, &self.thread_id));
                 drop(state);
                 let _ = self.event_tx().send(ProviderRuntimeEvent::TurnQueued {
-                    provenance: Default::default(),
+                    provenance: crate::agent_provider::message::MessageProvenance::queued_turn(),
                     thread_id: self.thread_id.clone(),
                     queued_id: queued_id.clone(),
                     client_nonce,

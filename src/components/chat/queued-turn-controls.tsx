@@ -631,6 +631,7 @@ export function reconcileQueuedTurns(
     next = { ...next, messages: next.messages.filter((m) => !gone(m)) };
   }
   for (const row of rows) {
+    const inputIntent = row.saved ? "queued_turn" : row.input_intent ?? "queued_turn";
     const index = next.messages.findIndex(
       (m) => m.kind === "user_message" && m.queued?.queuedId === row.queued_id,
     );
@@ -654,7 +655,7 @@ export function reconcileQueuedTurns(
           messages: replaceTranscriptItem(next.messages, index, {
             ...item,
             ...messageProvenance(row),
-            input_intent: "queued_turn",
+            input_intent: inputIntent,
             queued: { queuedId: row.queued_id, ...(row.saved ? { saved: true } : {}) },
             ...(imagesMissing ? { images: imagesOf(row) } : {}),
           }),
@@ -667,6 +668,7 @@ export function reconcileQueuedTurns(
     }
     next = applyEvent(next, {
       ...messageProvenance(row),
+      input_intent: inputIntent,
       type: "turn_queued",
       thread_id: threadId,
       queued_id: row.queued_id,

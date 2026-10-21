@@ -700,8 +700,9 @@ pub enum ProviderRuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_nonce: Option<String>,
     },
-    /// A user turn arrived while a turn was already in flight, so it was
-    /// **queued** instead of rejected. The UI renders it greyed-out in
+    /// A turn was admitted to the provider scheduler. `input_intent`
+    /// distinguishes waiting behind an occupied turn from an idle send
+    /// that uses the queue only as transport. The UI renders it greyed-out in
     /// the transcript until it dispatches or is cancelled.
     ///
     /// `client_nonce` echoes the optimistic-send correlation token the

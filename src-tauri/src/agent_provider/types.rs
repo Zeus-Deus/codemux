@@ -564,11 +564,10 @@ pub struct TurnStartResult {
     /// arrives later on the [`ProviderRuntimeEvent::QueuedTurnDispatched`]
     /// event.
     pub turn_id: TurnId,
-    /// Set when the send was **queued** behind an in-flight turn instead
-    /// of starting immediately. Identifies the queued item so the UI can
-    /// render it greyed-out and cancel it. The turn dispatches (emitting
-    /// `QueuedTurnDispatched` then the normal turn-start events) once the
-    /// session next goes idle. `None` for a normal immediate start.
+    /// Identifies an input admitted to the provider scheduler, so the UI
+    /// can render it pending and cancel it until `QueuedTurnDispatched`.
+    /// Some providers also schedule idle sends this way; the admission
+    /// event's input intent records whether it waited behind another turn.
     #[serde(default)]
     pub queued_id: Option<String>,
 }
