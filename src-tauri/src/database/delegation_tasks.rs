@@ -11,7 +11,14 @@ fn same_admission_payload(saved: &str, requested: &Value) -> bool {
     // Waiting changes only the receipt, never the admitted work. Strip these
     // controls on both sides so pre-upgrade payloads remain retryable.
     for value in [&mut saved, &mut requested] {
-        if let Some(object) = value.as_object_mut() { object.remove("mode"); object.remove("wait_ms"); }
+        if let Some(object) = value.as_object_mut() {
+            object.remove("mode");
+            object.remove("wait_ms");
+            // Older admissions omitted this optional field entirely.
+            if object.get("permission_mode").is_some_and(Value::is_null) {
+                object.remove("permission_mode");
+            }
+        }
     }
     saved == requested
 }
@@ -883,6 +890,27 @@ mod tests {
         )
         .unwrap();
     }
+    #[test]
+    fn review600_legacy_permission_mode_retry_preserves_identity() {
+        let db = DatabaseStore::new_in_memory();
+        let task = TaskRecord::new("legacy-task".into(), "parent".into(), Some("child".into()), "codex".into(), "Review".into(), "Review the saved task".into(), 1);
+        // Exact pre-permission-mode payload shape, including the old wait controls.
+        let old = serde_json::json!({"provider":"codex","title":"Review","task":"Review the saved task","model":null,"effort":null,"role":null,"mode":"async","wait_ms":20000});
+        db.admit_delegation_task(&task, Some("upgrade-key"), &old).unwrap();
+        let mut retry = old.clone();
+        retry["permission_mode"] = Value::Null;
+        retry["mode"] = serde_json::json!("wait");
+        assert_eq!(db.delegation_retry("parent", "upgrade-key", &retry).unwrap().unwrap().task_id, task.task_id);
+        let replacement = TaskRecord { task_id: "replacement".into(), ..task.clone() };
+        let (receipt, fresh) = db.admit_delegation_task(&replacement, Some("upgrade-key"), &retry).unwrap();
+        assert!(!fresh);
+        assert_eq!(receipt.task_id, task.task_id);
+        for mode in ["plan", "danger-full-access"] {
+            retry["permission_mode"] = serde_json::json!(mode);
+            assert!(db.delegation_retry("parent", "upgrade-key", &retry).unwrap_err().contains("client_request_id_conflict"));
+        }
+    }
+
     #[test]
     fn delegation_delivery_legacy_parent_stop_marker_uses_completion_timestamp() {
         let db = DatabaseStore::new_in_memory();

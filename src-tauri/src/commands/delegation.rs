@@ -415,6 +415,12 @@ impl DelegationState {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn admit<T>(&self, control: Option<&crate::agent_control::ControlCaller>, work: impl FnOnce(&mut Inner) -> Result<T, String>) -> Result<T, String> {
+        // Cancellation also takes caller authority before live delegation state.
+        let admission = || work(&mut self.lock());
+        match control { Some(control) => control.admit(admission), None => admission() }
+    }
+
     fn task_matches(&self, child: &str, test: impl FnOnce(&Task) -> bool) -> bool {
         self.lock().tasks.get(child).is_some_and(test)
     }
@@ -1135,51 +1141,52 @@ fn delegate_with_call<R: Runtime>(
 
     let child = uuid::Uuid::new_v4().to_string();
     // Serialize capacity reservation and durable admission for concurrent calls.
-    let mut inner = state.lock();
-    if let Some(key) = &args.client_request_id {
-        if let Some(prior) = db.delegation_retry(parent, key, &payload)? {
-            return Ok(task_receipt(&prior));
+    let (record, siblings) = state.admit(caller.control.as_ref(), |inner| {
+        if let Some(key) = &args.client_request_id {
+            if let Some(prior) = db.delegation_retry(parent, key, &payload)? {
+                return Ok((prior, None));
+            }
         }
-    }
-    let mut record = record_of(&child, &task);
-    record.workspace_id = workspace_id.clone();
-    record.cwd = cwd.clone();
-    record.parent_run_id = run_id.map(str::to_string).or_else(|| {
-        app.try_state::<crate::agent_control::NativeControlState>()
-            .and_then(|state| state.thread_runtime(parent))
-            .and_then(|runtime| runtime.turn_id)
-    });
-    let root = db.orchestration_context(parent)?;
-    record.budget_root_id = Some(root.root_id);
-    if let Some(ancestor) = db.delegation_task_for_child(parent)? {
-        record.lineage = ancestor.lineage.clone(); record.lineage.push(ancestor.task_id.clone());
-        record.root_task_id = ancestor.root_task_id;
-    }
-    record.parent_title = db.get_agent_chat_title(parent);
-    let mode = args.permission_mode.clone().map(Ok).unwrap_or_else(|| ceiling.inherited(provider).map_err(|e|e.to_string()))?;
-    let target = crate::agent_control::permissions::Ceiling::for_mode(provider,Some(&mode)).ok_or("unsupported_permission_ceiling")?;
-    if !ceiling.permits(target) { return Err("permission_ceiling: child mode exceeds this chat".into()); }
-    if args.permission_mode.is_some() && !validated_mode {
-        return Err("unsupported_permission_mode: explicit delegate modes require async catalog validation".into());
-    }
-    record.plan_mode = provider == ProviderKind::Codex && (mode == "plan" || (args.permission_mode.is_none() && ceiling.plan));
-    record.permission_mode = Some(if provider == ProviderKind::Codex && mode == "plan" { "read-only".into() } else { mode });
-    record.caller = caller.control.clone().map(|mut caller|{caller.admitted=Some(crate::agent_control::AdmittedAuthority::Task {task_id:record.task_id.clone()});caller});
-    record.admission_generation = Some(admission_generation);
-    record.wait_until = wait_until;
-    let admit=||db.admit_delegation_task(&record,args.client_request_id.as_deref(),&payload);
-    let (record,new)=if let Some(control)=&caller.control {control.admit(admit)?}else{admit()?};
-    if !new {
-        return Ok(task_receipt(&record));
-    }
-    let parent_state = inner.parents.entry(parent.into()).or_default();
-    parent_state.started_this_round += 1;
-    let siblings = parent_state.children.clone();
-    parent_state.children.push(child.clone());
-    task.round = parent_state.round;
-    task.refresh_activity();
-    inner.tasks.insert(child.clone(), task.clone());
-    drop(inner);
+        let mut record = record_of(&child, &task);
+        record.workspace_id = workspace_id.clone();
+        record.cwd = cwd.clone();
+        record.parent_run_id = run_id.map(str::to_string).or_else(|| {
+            app.try_state::<crate::agent_control::NativeControlState>()
+                .and_then(|state| state.thread_runtime(parent))
+                .and_then(|runtime| runtime.turn_id)
+        });
+        let root = db.orchestration_context(parent)?;
+        record.budget_root_id = Some(root.root_id);
+        if let Some(ancestor) = db.delegation_task_for_child(parent)? {
+            record.lineage = ancestor.lineage.clone(); record.lineage.push(ancestor.task_id.clone());
+            record.root_task_id = ancestor.root_task_id;
+        }
+        record.parent_title = db.get_agent_chat_title(parent);
+        let mode = args.permission_mode.clone().map(Ok).unwrap_or_else(|| ceiling.inherited(provider).map_err(|e|e.to_string()))?;
+        let target = crate::agent_control::permissions::Ceiling::for_mode(provider,Some(&mode)).ok_or("unsupported_permission_ceiling")?;
+        if !ceiling.permits(target) { return Err("permission_ceiling: child mode exceeds this chat".into()); }
+        if args.permission_mode.is_some() && !validated_mode {
+            return Err("unsupported_permission_mode: explicit delegate modes require async catalog validation".into());
+        }
+        record.plan_mode = provider == ProviderKind::Codex && (mode == "plan" || (args.permission_mode.is_none() && ceiling.plan));
+        record.permission_mode = Some(if provider == ProviderKind::Codex && mode == "plan" { "read-only".into() } else { mode });
+        record.caller = caller.control.clone().map(|mut caller|{caller.admitted=Some(crate::agent_control::AdmittedAuthority::Task {task_id:record.task_id.clone()});caller});
+        record.admission_generation = Some(admission_generation);
+        record.wait_until = wait_until;
+        let (record, new) = db.admit_delegation_task(&record, args.client_request_id.as_deref(), &payload)?;
+        if !new {
+            return Ok((record, None));
+        }
+        let parent_state = inner.parents.entry(parent.into()).or_default();
+        parent_state.started_this_round += 1;
+        let siblings = parent_state.children.clone();
+        parent_state.children.push(child.clone());
+        task.round = parent_state.round;
+        task.refresh_activity();
+        inner.tasks.insert(child.clone(), task.clone());
+        Ok((record, Some(siblings)))
+    })?;
+    let Some(siblings) = siblings else { return Ok(task_receipt(&record)); };
     let tab_title = format!("{} · {}", provider_label(provider), task.title);
     let pane = app_state.create_background_chat_tab(
         &workspace_id,
@@ -1217,6 +1224,7 @@ pub(crate) fn resume_followup<R:Runtime>(app:&AppHandle<R>,delivery:&str){
     let mut inner=state.lock();
     if inner.tasks.get(&child).is_some_and(|t|t.task_id==record.task_id){return;}
     let mut task=Task::new(&record.parent_thread_id,provider,&record.title,&record.brief,record.created_at).with_identity(record.task_id);
+    task.placement=durable::placement_for_child(&db,&child);
     task.phase=Phase::Running;task.model=record.model;task.effort=record.effort;task.refresh_activity();inner.tasks.insert(child.clone(),task);drop(inner);
     state.emit_card(app,&child);
 }
@@ -1895,6 +1903,49 @@ mod tests {
         task.finished_at_ms = phase.is_terminal().then_some(373_000);
         task.phase = phase;
         task
+    }
+
+    #[test]
+    fn review600_concurrent_admission_and_cancel_share_authority_first_lock_order() {
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+        let thread = "review600-lock-order";
+        let authority = crate::delegation::authority::NativeAuthority::new(thread);
+        let generation = authority.begin(0);
+        assert!(authority.bind(generation, "turn"));
+        let identity = authority.capture().identity().unwrap();
+        let control = crate::agent_control::ControlCaller {
+            identity: crate::agent_control::CallerPrincipal::Thread {
+                thread_id: thread.into(), provider: ProviderKind::Claude, provider_instance_id: "claude".into(), session_id: "session".into(),
+                authority: identity.clone(), ceiling: crate::agent_control::permissions::Ceiling::for_mode(ProviderKind::Claude, Some("default")).unwrap(),
+            }, ..crate::agent_control::ControlCaller::trusted()
+        };
+        let state = Arc::new(DelegationState::default());
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut worker = None;
+        let available = identity.admit(thread, || {
+            let worker_state = state.clone();
+            worker = Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                worker_state.admit(Some(&control), |inner| {
+                    inner.parents.entry(thread.into()).or_default().started_this_round += 1;
+                    Ok(())
+                })
+            }));
+            started_rx.recv().unwrap();
+            // Cancellation owns authority and must be able to take live state.
+            // Probe instead of blocking so an inverted order fails without hanging CI.
+            let until = Instant::now() + Duration::from_millis(150);
+            while Instant::now() < until {
+                if state.inner.try_lock().is_err() { return Ok(false); }
+                std::thread::yield_now();
+            }
+            state.lock().parents.entry(thread.into()).or_default().children.clear();
+            Ok(true)
+        }).unwrap();
+        worker.unwrap().join().unwrap().unwrap();
+        assert!(available, "admission held delegation state while waiting for cancellation's authority");
+        assert_eq!(state.lock().parents[thread].started_this_round, 1);
     }
 
     #[test]

@@ -360,6 +360,12 @@ fn event_child_run(event: &ProviderRuntimeEvent) -> Option<&str> {
     }
 }
 
+pub(super) fn placement_for_child(db: &DatabaseStore, child: &str) -> Placement {
+    db.get_follow_up_task(child)
+        .map(|row| Placement::Worktree(super::super::follow_ups::placement_of(&row)))
+        .unwrap_or(Placement::Tab)
+}
+
 pub(super) fn recover_tasks<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let db = app.state::<DatabaseStore>();
     let state = app.state::<DelegationState>();
@@ -381,9 +387,7 @@ pub(super) fn recover_tasks<R: Runtime>(app: &AppHandle<R>) -> Result<(), String
             "",
             row.created_at_ms,
         );
-        if let Some(f) = db.get_follow_up_task(&row.child_thread_id) {
-            task.placement = Placement::Worktree(super::super::follow_ups::placement_of(&f));
-        }
+        task.placement = placement_for_child(&db, &row.child_thread_id);
         let mut record = record_of(&row.child_thread_id, &task);
         record.preparation_state = "legacy_import".into();
         if let Some(delivery) =
@@ -425,9 +429,7 @@ pub(super) fn recover_tasks<R: Runtime>(app: &AppHandle<R>) -> Result<(), String
         task.task_id = record.task_id.clone();
         task.tool_call_id = record.tool_call_id.clone();
         task.role = record.role.clone();
-        if let Some(f) = db.get_follow_up_task(child) {
-            task.placement = Placement::Worktree(super::super::follow_ups::placement_of(&f));
-        }
+        task.placement = placement_for_child(&db, child);
         if let Some(result) = &record.result {
             task.phase = match result.status {
                 TaskStatus::Completed => Phase::Completed(result.text.clone()),
@@ -671,6 +673,28 @@ mod tests {
         };
         db.append_agent_chat_message("child", &serde_json::to_string(&event).unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn review600_worktree_followup_survives_parent_close() {
+        let app = recovery_app();
+        let row = super::super::super::follow_ups::tests::task_row("child", "parent");
+        let db = app.state::<DatabaseStore>();
+        db.insert_follow_up_task(&row).unwrap();
+        let mut record = record_of("child", &Task::new("parent", ProviderKind::Codex, "Follow up", "More work", 1));
+        record.task_id = "local:followup:next-delivery".into();
+        record.status = TaskStatus::Running;
+        db.admit_delegation_task(&record, None, &json!({})).unwrap();
+        super::super::resume_followup(app.handle(), "next-delivery");
+        on_thread_stopped(app.handle(), "parent", StopKind::Close);
+        assert!(app.state::<DelegationState>().is_running_child("child"));
+        assert!(matches!(app.state::<DelegationState>().lock().tasks["child"].placement, Placement::Worktree(_)));
+        let retained = db.delegation_task(&record.task_id).unwrap().unwrap();
+        assert!(retained.result.is_none());
+        assert_eq!(retained.completion_delivery, "pending");
+        // Completion must still use the worktree hook (outcome is persisted synchronously).
+        app.state::<DelegationState>().finish(app.handle(), "child", Phase::Completed("Follow-up done".into()));
+        assert_eq!(db.get_follow_up_task("child").unwrap().outcome, "completed");
     }
 
     #[test]
