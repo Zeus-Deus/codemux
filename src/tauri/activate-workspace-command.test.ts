@@ -145,3 +145,49 @@ describe("remote activation", () => {
     }
   });
 });
+
+it.each([false, true])("keeps the newest chat navigation when hydration finishes in reverse (different workspace: %s)", async (differentWorkspace) => {
+  const { openDelegatedChat } = await import("@/components/chat/delegation-actions");
+  const { useAppStore, selectActiveWorkspaceId } = await import("@/stores/app-store");
+  const { setRemoteViewHost } = await import("@/remote/client-view");
+  const remoteWindow = window as Window & { __CODEMUX_REMOTE__?: boolean };
+  remoteWindow.__CODEMUX_REMOTE__ = true;
+  setRemoteViewHost(`review600-navigation-${differentWorkspace}`);
+  const previous = useAppStore.getState();
+  const workspaceB = differentWorkspace ? "b" : "a";
+  const workspace = (id: string) => ({
+    workspace_id: id, active_tab_id: `${id}-initial`, active_surface_id: `${id}-initial-surface`,
+    tabs: ["initial", "first", "second"].map(name => ({tab_id:`${id}-${name}`,surface_id:`${id}-${name}-surface`})),
+    surfaces: ["initial", "first", "second"].map(name => ({surface_id:`${id}-${name}-surface`,active_pane_id:`${id}-${name}-pane`,root:{kind:"agent_chat",pane_id:`${id}-${name}-pane`}})),
+  });
+  const snapshot = {active_workspace_id:"a",workspaces:[workspace("a"),...(differentWorkspace ? [workspace("b")] : [])]} as import("./types").AppStateSnapshot;
+  const hydrations: Array<(value: typeof snapshot) => void> = [];
+  mockInvoke.mockImplementation(async (command, args) => {
+    if (command === "agent_chat_open_search_result") {
+      const first = (args as {threadId:string}).threadId === "first";
+      return {workspace_id:first ? "a" : workspaceB,pane_id:first ? "a-first-pane" : `${workspaceB}-second-pane`};
+    }
+    if (command === "get_app_state") return new Promise(resolve => hydrations.push(resolve));
+    return undefined;
+  });
+  try {
+    useAppStore.setState({appState:null,remoteActiveWorkspaceId:null,pendingActiveWorkspaceId:null});
+    useAppStore.getState().setAppState(snapshot);
+    const first = openDelegatedChat("first");
+    await vi.waitFor(() => expect(hydrations).toHaveLength(1));
+    const second = openDelegatedChat("second");
+    await vi.waitFor(() => expect(hydrations).toHaveLength(2));
+    hydrations[1](structuredClone(snapshot));
+    await second;
+    hydrations[0](structuredClone(snapshot));
+    await first;
+    expect(selectActiveWorkspaceId(useAppStore.getState())).toBe(workspaceB);
+    expect(useAppStore.getState().appState?.workspaces.find(w => w.workspace_id === workspaceB)?.active_tab_id).toBe(`${workspaceB}-second`);
+    expect(mockInvoke.mock.calls.filter(([command]) => command === "touch_workspace")).toEqual([["touch_workspace",{workspaceId:workspaceB}]]);
+  } finally {
+    delete remoteWindow.__CODEMUX_REMOTE__;
+    useAppStore.setState(previous, true);
+    localStorage.clear();
+    mockInvoke.mockReset().mockResolvedValue(undefined);
+  }
+});

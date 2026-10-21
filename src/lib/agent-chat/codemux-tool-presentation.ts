@@ -1,5 +1,6 @@
 import { Bot, CircleStop, List, MessageSquareText, Search, Send, Timer, type LucideIcon } from "lucide-react";
 import type { ToolCallItem } from "./types";
+import { toolPresentation } from "./native-tool-call";
 
 type Presentation = { present: string; progressive: string; past: string; icon: LucideIcon };
 const tools: Record<string, Presentation> = {
@@ -16,14 +17,20 @@ const tools: Record<string, Presentation> = {
   thread_search: { present: "Search chats", progressive: "Searching chats", past: "Searched chats", icon: Search },
   thread_interrupt: { present: "Interrupt chat run", progressive: "Interrupting chat run", past: "Requested chat run interruption", icon: CircleStop },
 };
+export function codemuxToolName(name: string): string {
+  for (const prefix of ["codemux_mcp__codemux__", "mcp__codemux__"]) {
+    if (name.startsWith(prefix)) return name.slice(prefix.length);
+  }
+  return name;
+}
 export function codemuxToolPresentation(name: string): Presentation | null {
-  const raw = name.startsWith("mcp__codemux__") ? name.slice("mcp__codemux__".length) : name;
-  return tools[raw] ?? null;
+  return tools[codemuxToolName(name)] ?? null;
 }
 export function orchestrationSummary(item: ToolCallItem): { verb: string; target: string } | null {
-  const presentation = codemuxToolPresentation(item.tool_name);
+  const presented = toolPresentation(item);
+  const presentation = codemuxToolPresentation(presented.name);
   if (!presentation) return null;
-  const input = item.input && typeof item.input === "object" ? item.input as Record<string, unknown> : {};
+  const input = presented.input && typeof presented.input === "object" ? presented.input as Record<string, unknown> : {};
   const target = [input.title, input.query].find((v): v is string => typeof v === "string") ?? "";
   return { verb: item.status === "running" ? presentation.progressive : item.status === "done" ? presentation.past : presentation.present, target };
 }

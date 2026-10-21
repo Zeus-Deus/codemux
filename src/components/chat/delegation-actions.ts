@@ -1,3 +1,4 @@
+import { beginRemoteNavigation, isCurrentRemoteNavigation } from "@/remote/navigation";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { toast } from "@/lib/toast";
@@ -15,8 +16,10 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 /** Focus the child chat's tab. */
 export async function openDelegatedChat(childThreadId: string): Promise<void> {
   try {
-    const opened = await agentChatOpenSearchResult(childThreadId);
-    if (isRemoteClient()) await activateWorkspaceInteraction(opened.workspace_id);
+    const remote = isRemoteClient();
+    const sequence = beginRemoteNavigation();
+    const opened = await (remote ? agentChatOpenSearchResult(childThreadId, sequence) : agentChatOpenSearchResult(childThreadId));
+    if (remote && isCurrentRemoteNavigation(sequence)) await activateWorkspaceInteraction(opened.workspace_id);
   } catch (error) {
     toast.error("Couldn't open the delegated chat", {
       description: error instanceof Error ? error.message : String(error),

@@ -1,4 +1,4 @@
-import { launchedChatId } from "@/lib/agent-chat/codemux-tool-presentation";
+import { codemuxToolName, launchedChatId } from "@/lib/agent-chat/codemux-tool-presentation";
 import { openDelegatedChat } from "./delegation-actions";
 import { isWorkspaceLaunchCall, workspaceLaunchFailed } from "@/lib/agent-chat/workspace-launch";
 import { Kbd } from "@/components/ui/kbd";
@@ -30,7 +30,7 @@ import {
   type PermissionScope,
 } from "@/lib/agent-chat/permission-rules";
 import { isLazyToolResultStub } from "@/lib/agent-chat/lazy-tool-result";
-import { presentationToolName } from "@/lib/agent-chat/native-tool-call";
+import { presentationToolName, toolPresentation } from "@/lib/agent-chat/native-tool-call";
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
@@ -166,12 +166,12 @@ export const ToolCallCard = memo(function ToolCallCard({
     isError,
   });
 
-  const launchToolName = displayItem.tool_name.startsWith("mcp__codemux__")
-    ? displayItem.tool_name.slice("mcp__codemux__".length)
-    : displayItem.tool_name;
-  const launchedThread = launchToolName === "thread_launch" && item.status === "done"
+  const launchTool = toolPresentation(displayItem);
+  const launchedThread = codemuxToolName(launchTool.name) === "thread_launch" && item.status === "done"
     ? launchedChatId(item.result_content)
     : null;
+  const launchTitle = launchTool.input && typeof launchTool.input === "object" && "title" in launchTool.input && typeof launchTool.input.title === "string"
+    ? launchTool.input.title : null;
   const hasResultBody = hasRenderableContent(item.result_content);
   const inputText = hasRenderableInput(displayItem.input)
     ? safeStringify(displayItem.input)
@@ -268,7 +268,7 @@ export const ToolCallCard = memo(function ToolCallCard({
         <div className={headerClass}>{headerContent}</div>
       )}
 
-      {launchedThread && <div className="flex items-center justify-between gap-3 border-t border-border/60 p-3 text-body-sm"><span>Started chat{typeof (displayItem.input as Record<string, unknown> | null)?.title === "string" ? ` · ${(displayItem.input as Record<string, unknown>).title}` : ""}</span><Button variant="outline" size="xs" onClick={() => void openDelegatedChat(launchedThread)}>Open chat</Button></div>}
+      {launchedThread && <div className="flex items-center justify-between gap-3 border-t border-border/60 p-3 text-body-sm"><span>Started chat{launchTitle ? ` · ${launchTitle}` : ""}</span><Button variant="outline" size="xs" onClick={() => void openDelegatedChat(launchedThread)}>Open chat</Button></div>}
       {/* Approval footer (pending). Keyed on the approval request id so
           a fresh approval (different request_id) remounts the footer
           and clears the deny textarea / dropdown state — otherwise

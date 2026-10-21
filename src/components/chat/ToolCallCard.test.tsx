@@ -790,6 +790,18 @@ describe("native chat launch result", () => {
     expect(screen.queryByRole("button", {name:"Open chat"})).not.toBeInTheDocument();
   });
 
+  it.each(["codemux", "other"])("handles the real Codex dynamic envelope for %s", (server) => {
+    openChat.mockClear();
+    render(<ToolCallCard item={makeTool({tool_name:"dynamicToolCall",status:"done",input:{type:"dynamicToolCall",tool:`codemux_mcp__${server}__thread_launch`,arguments:{title:"Codex launch"}},result_content:{type:"dynamicToolCall",success:true,contentItems:[{type:"inputText",text:JSON.stringify({state:"accepted",thread_id:"codex-chat"})}]}})} approval={null} onDecide={vi.fn()} />);
+    if (server === "other") {
+      expect(screen.queryByRole("button", {name:"Open chat"})).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByText("Started chat · Codex launch")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button",{name:"Open chat"}));
+      expect(openChat).toHaveBeenCalledWith("codex-chat");
+    }
+  });
+
   it.each(["thread_launch", "mcp__codemux__thread_launch"])("opens a chat from %s through app navigation", (toolName) => {
     openChat.mockClear();
     render(<ToolCallCard item={makeTool({tool_name:toolName,status:"done",input:{title:"Parser review"},result_content:[{type:"text",text:JSON.stringify({state:"accepted",thread_id:"launched-chat"})}]})} approval={null} onDecide={vi.fn()} />);
